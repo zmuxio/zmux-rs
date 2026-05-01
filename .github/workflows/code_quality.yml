@@ -1,15 +1,11 @@
 name: Qodana
-
 on:
   workflow_dispatch:
   pull_request:
   push:
-    branches:
-      - main
-      - 'releases/*'
-
-permissions:
-  contents: read
+    branches: # Specify your branches here
+      - main # The 'main' branch
+      - 'releases/*' # The release branches
 
 jobs:
   rust-checks:
@@ -59,41 +55,20 @@ jobs:
         run: cargo package -p zmux
 
   qodana:
-    name: Qodana
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
       checks: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-
-      - name: Detect Qodana token
-        id: qodana-token
-        shell: bash
-        env:
-          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
-        run: |
-          if [[ -n "${QODANA_TOKEN}" ]]; then
-            echo "present=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "present=false" >> "${GITHUB_OUTPUT}"
-            echo "QODANA_TOKEN is not configured; skipping Qodana scan."
-          fi
-
-      - name: Qodana Scan
-        if: steps.qodana-token.outputs.present == 'true'
+          fetch-depth: 0  # a full history is required for pull request analysis
+      - name: 'Qodana Scan'
         uses: JetBrains/qodana-action@v2026.1.0
         with:
           pr-mode: false
-          args: >
-            --image jetbrains/qodana-rust:2026.1-eap
-            -e CARGO_TARGET_DIR=/data/project/target/qodana
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
-          QODANA_ENDPOINT: https://qodana.cloud
+          QODANA_ENDPOINT: 'https://qodana.cloud'
