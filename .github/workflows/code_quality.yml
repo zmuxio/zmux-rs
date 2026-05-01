@@ -93,8 +93,6 @@ jobs:
           pr-mode: false
           args: >
             --image jetbrains/qodana-rust:2026.1-eap
-            -e CARGO_HOME=/data/project/.cargo
-            -e RUSTUP_HOME=/data/project/.rustup
             -e CARGO_TARGET_DIR=/data/project/target/qodana
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
