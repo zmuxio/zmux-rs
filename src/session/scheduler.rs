@@ -1492,7 +1492,7 @@ fn should_apply_aging(
 ) -> bool {
     active_class_streams > 1
         && bypass_count(bypass_selections, stream_id)
-            >= active_class_streams.saturating_mul(AGING_ROUND_THRESHOLD)
+        >= active_class_streams.saturating_mul(AGING_ROUND_THRESHOLD)
 }
 
 fn class_adjusted_weight(
@@ -2352,7 +2352,7 @@ mod tests {
             TrafficClass::Interactive
         );
         assert_eq!(
-            classify_stream_class(quantum + 1, 3, SchedulerHint::BalancedFair, None, quantum,),
+            classify_stream_class(quantum + 1, 3, SchedulerHint::BalancedFair, None, quantum, ),
             TrafficClass::Interactive
         );
         assert_eq!(

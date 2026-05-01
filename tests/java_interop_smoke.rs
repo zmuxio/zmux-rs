@@ -475,7 +475,7 @@ fn rust_client_talks_to_java_server_with_open_metadata() {
         &java_root,
         &["server", ready_file.to_str().expect("non-utf8 temp path")],
     )
-    .unwrap();
+        .unwrap();
     let address = wait_for_ready_addr(&ready_file).unwrap();
 
     let session = tcp_session_client(connect_with_retry(&address).unwrap());

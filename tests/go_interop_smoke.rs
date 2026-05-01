@@ -583,7 +583,7 @@ fn rust_client_talks_to_go_server_with_open_metadata() {
             ready_file.to_str().expect("non-utf8 temp path"),
         ],
     )
-    .unwrap();
+        .unwrap();
     let address = wait_for_ready_addr(&ready_file).unwrap();
 
     let socket = connect_with_retry(&address).unwrap();

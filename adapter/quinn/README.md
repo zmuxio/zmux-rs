@@ -72,24 +72,24 @@ stream.write_final(b"hello").await?;
 - `new`, `with_options`
 - `local_addr`, `peer_addr`, `remote_addr`
 - stream lifecycle:
-  - `open_stream`, `open_stream_timeout`
-  - `open_stream_with_options`, `open_stream_with_options_timeout`
-  - `open_uni_stream`, `open_uni_stream_timeout`
-  - `open_uni_stream_with_options`, `open_uni_stream_with_options_timeout`
-  - `open_and_send`, `open_and_send_timeout`
-  - `open_and_send_with_options`, `open_and_send_with_options_timeout`
-  - `open_and_send_vectored`, `open_and_send_vectored_timeout`
-  - `open_and_send_vectored_with_options`, `open_and_send_vectored_with_options_timeout`
-  - `open_uni_and_send`, `open_uni_and_send_timeout`
-  - `open_uni_and_send_with_options`, `open_uni_and_send_with_options_timeout`
-  - `open_uni_and_send_vectored`, `open_uni_and_send_vectored_timeout`
-  - `open_uni_and_send_vectored_with_options`, `open_uni_and_send_vectored_with_options_timeout`
-  - `accept_stream`, `accept_stream_timeout`
-  - `accept_uni_stream`, `accept_uni_stream_timeout`
+    - `open_stream`, `open_stream_timeout`
+    - `open_stream_with_options`, `open_stream_with_options_timeout`
+    - `open_uni_stream`, `open_uni_stream_timeout`
+    - `open_uni_stream_with_options`, `open_uni_stream_with_options_timeout`
+    - `open_and_send`, `open_and_send_timeout`
+    - `open_and_send_with_options`, `open_and_send_with_options_timeout`
+    - `open_and_send_vectored`, `open_and_send_vectored_timeout`
+    - `open_and_send_vectored_with_options`, `open_and_send_vectored_with_options_timeout`
+    - `open_uni_and_send`, `open_uni_and_send_timeout`
+    - `open_uni_and_send_with_options`, `open_uni_and_send_with_options_timeout`
+    - `open_uni_and_send_vectored`, `open_uni_and_send_vectored_timeout`
+    - `open_uni_and_send_vectored_with_options`, `open_uni_and_send_vectored_with_options_timeout`
+    - `accept_stream`, `accept_stream_timeout`
+    - `accept_uni_stream`, `accept_uni_stream_timeout`
 - control and lifecycle:
-  - `close`, `close_with_error`
-  - `closed`
-  - `close_error`, `state`, `stats`
+    - `close`, `close_with_error`
+    - `closed`
+    - `close_error`, `state`, `stats`
 
 ### `QuinnStream` (implements `zmux::{StreamApi, SendStreamApi, RecvStreamApi}`)
 
@@ -97,22 +97,22 @@ stream.write_final(b"hello").await?;
 - metadata: `open_info`, `copy_open_info_to`, `metadata`, `update_metadata`
 - addresses: `local_addr`, `peer_addr`, `remote_addr`
 - read:
-  - `read`, `read_timeout`
-  - `read_vectored`, `readv`, `read_vectored_timeout`, `readv_timeout`
-  - `read_closed`
-  - `set_read_deadline`, `set_deadline`, `set_read_timeout`, `set_timeout`
-  - `close_read`, `cancel_read`
+    - `read`, `read_timeout`
+    - `read_vectored`, `readv`, `read_vectored_timeout`, `readv_timeout`
+    - `read_closed`
+    - `set_read_deadline`, `set_deadline`, `set_read_timeout`, `set_timeout`
+    - `close_read`, `cancel_read`
 - write:
-  - `write`, `write_timeout`, `write_all`
-  - `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
-  - `write_final`, `write_final_timeout`
-  - `write_vectored_final`, `writev_final`, `write_vectored_final_timeout`, `writev_final_timeout`
-  - `write_chunks_final`
-  - `write_closed`
-  - `set_write_deadline`, `set_timeout`, `set_write_timeout`
-  - `close_write`, `cancel_write`
+    - `write`, `write_timeout`, `write_all`
+    - `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
+    - `write_final`, `write_final_timeout`
+    - `write_vectored_final`, `writev_final`, `write_vectored_final_timeout`, `writev_final_timeout`
+    - `write_chunks_final`
+    - `write_closed`
+    - `set_write_deadline`, `set_timeout`, `set_write_timeout`
+    - `close_write`, `cancel_write`
 - close:
-  - `close`, `close_with_error`
+    - `close`, `close_with_error`
 
 ### `QuinnSendStream` (implements `zmux::SendStreamApi`)
 
@@ -120,17 +120,17 @@ stream.write_final(b"hello").await?;
 - metadata: `open_info`, `copy_open_info_to`, `metadata`, `update_metadata`
 - addresses: `local_addr`, `peer_addr`, `remote_addr`
 - write:
-  - `write`, `write_timeout`, `write_all`
-  - `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
-  - `write_final`, `write_final_timeout`
-  - `write_vectored_final`, `writev_final`
-  - `write_vectored_final_timeout`, `writev_final_timeout`
-  - `write_chunks_final`
+    - `write`, `write_timeout`, `write_all`
+    - `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
+    - `write_final`, `write_final_timeout`
+    - `write_vectored_final`, `writev_final`
+    - `write_vectored_final_timeout`, `writev_final_timeout`
+    - `write_chunks_final`
 - state/deadline:
-  - `write_closed`
-  - `set_write_deadline`, `set_deadline`, `set_write_timeout`, `set_timeout`
+    - `write_closed`
+    - `set_write_deadline`, `set_deadline`, `set_write_timeout`, `set_timeout`
 - close:
-  - `close_write`, `cancel_write`, `close`, `close_with_error`
+    - `close_write`, `cancel_write`, `close`, `close_with_error`
 
 ### `QuinnRecvStream` (implements `zmux::RecvStreamApi`)
 
@@ -138,13 +138,13 @@ stream.write_final(b"hello").await?;
 - metadata: `open_info`, `copy_open_info_to`, `metadata`
 - addresses: `local_addr`, `peer_addr`, `remote_addr`
 - read:
-  - `read`, `read_timeout`, `read_exact`, `read_exact_timeout`
-  - `read_vectored`, `readv`, `read_vectored_timeout`, `readv_timeout`
+    - `read`, `read_timeout`, `read_exact`, `read_exact_timeout`
+    - `read_vectored`, `readv`, `read_vectored_timeout`, `readv_timeout`
 - state/deadline:
-  - `read_closed`
-  - `set_read_deadline`, `set_deadline`, `set_read_timeout`, `set_timeout`
+    - `read_closed`
+    - `set_read_deadline`, `set_deadline`, `set_read_timeout`, `set_timeout`
 - close:
-  - `close_read`, `cancel_read`, `close`, `close_with_error`
+    - `close_read`, `cancel_read`, `close`, `close_with_error`
 
 ## Notes
 

@@ -391,13 +391,13 @@ fn error_payload_with_duplicate_standard_diag(code: u64, reason: &str) -> Vec<u8
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut payload,
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     if !reason.is_empty() {
         append_tlv(&mut payload, DIAG_DEBUG_TEXT, reason.as_bytes()).unwrap();
     }
@@ -493,7 +493,7 @@ fn pre_open_overflow_open_info(
             &candidate,
             max_frame_payload,
         )
-        .is_err()
+            .is_err()
         {
             return candidate;
         }
@@ -1028,10 +1028,10 @@ fn inbound_stream_control_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: encode_varint(MAX_VARINT62).unwrap(),
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1063,10 +1063,10 @@ fn inbound_abort_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: vec![0],
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1097,10 +1097,10 @@ fn inbound_data_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: b"y".to_vec(),
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1131,10 +1131,10 @@ fn inbound_stop_sending_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: vec![0],
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1165,10 +1165,10 @@ fn inbound_reset_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: vec![0],
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1199,10 +1199,10 @@ fn inbound_blocked_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: encode_varint(0).unwrap(),
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1232,10 +1232,10 @@ fn inbound_late_data_can_make_local_stream_peer_visible() {
             stream_id: stream.stream_id(),
             payload: b"late".to_vec(),
         }
-        .marshal()
-        .unwrap(),
+            .marshal()
+            .unwrap(),
     )
-    .unwrap();
+        .unwrap();
     peer.flush().unwrap();
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1271,10 +1271,10 @@ fn inbound_control_peer_visibility_event_is_emitted_once() {
                 stream_id: stream.stream_id(),
                 payload,
             }
-            .marshal()
-            .unwrap(),
+                .marshal()
+                .unwrap(),
         )
-        .unwrap();
+            .unwrap();
         peer.flush().unwrap();
     }
 
@@ -3035,7 +3035,7 @@ fn pre_open_open_metadata_updates_merge_partial_fields() {
         &[],
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     assert!(opening.flags & FRAME_FLAG_OPEN_METADATA != 0);
     assert!(opening.payload.starts_with(&expected_prefix));
 }
@@ -3084,7 +3084,7 @@ fn group_zero_is_wire_clear_not_public_group() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap()
+            .unwrap()
     );
 }
 
@@ -3124,7 +3124,7 @@ fn open_metadata_preserves_explicit_group_zero_when_rebuilt() {
         &[],
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     assert!(opening.flags & FRAME_FLAG_OPEN_METADATA != 0);
     assert!(opening.payload.starts_with(&expected_prefix));
 }
@@ -3157,7 +3157,7 @@ fn unnegotiated_priority_update_is_ignored() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     thread::sleep(Duration::from_millis(50));
 
@@ -3191,7 +3191,7 @@ fn open_metadata_ignores_unnegotiated_priority_and_group_fields() {
         b"ssh",
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     payload.extend_from_slice(b"body");
 
     peer.write_frame(Frame {
@@ -3253,7 +3253,7 @@ fn priority_update_ignores_unnegotiated_priority_and_group_fields() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     thread::sleep(Duration::from_millis(50));
 
@@ -3288,7 +3288,7 @@ fn inbound_partial_priority_updates_preserve_unspecified_fields() {
         &[],
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     payload.extend_from_slice(b"body");
 
     peer.write_frame(Frame {
@@ -3316,7 +3316,7 @@ fn inbound_partial_priority_updates_preserve_unspecified_fields() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     let deadline = Instant::now() + Duration::from_secs(1);
     while stream.metadata().priority != Some(9) && Instant::now() < deadline {
@@ -3337,7 +3337,7 @@ fn inbound_partial_priority_updates_preserve_unspecified_fields() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     let deadline = Instant::now() + Duration::from_secs(1);
     while stream.metadata().group != Some(11) && Instant::now() < deadline {
@@ -3358,7 +3358,7 @@ fn inbound_partial_priority_updates_preserve_unspecified_fields() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     let deadline = Instant::now() + Duration::from_secs(1);
     while stream.metadata().group.is_some() && Instant::now() < deadline {
@@ -4353,7 +4353,7 @@ fn peer_stop_sending_unblocks_graceful_close_with_local_send_work() {
     let terminal = peer.wait_for_frame(|frame| {
         frame.stream_id == 1
             && (frame.frame_type == FrameType::Reset
-                || (frame.frame_type == FrameType::Data && frame.flags & FRAME_FLAG_FIN != 0))
+            || (frame.frame_type == FrameType::Data && frame.flags & FRAME_FLAG_FIN != 0))
     });
     assert!(matches!(
         terminal.frame_type,
@@ -5113,13 +5113,13 @@ fn peer_goaway_bad_diag_drops_reason_but_keeps_watermarks() {
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut duplicate_diag,
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(&mut duplicate_diag, DIAG_DEBUG_TEXT, b"maintenance").unwrap();
 
     peer.write_frame(Frame {
@@ -6922,7 +6922,7 @@ fn unnegotiated_open_metadata_emits_fatal_close() {
         b"meta",
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     payload.extend_from_slice(b"x");
 
     peer.write_frame(Frame {
@@ -7195,7 +7195,7 @@ fn marker_only_priority_update_does_not_consume_noop_budget() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
 
     for _ in 0..2 {
         peer.write_frame(Frame {
@@ -9967,7 +9967,7 @@ fn repeated_noop_priority_update_exhausts_priority_budget() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
     for _ in 0..3 {
         peer.write_frame(Frame {
             frame_type: FrameType::Ext,
@@ -10074,13 +10074,13 @@ fn duplicate_priority_update_payload() -> Vec<u8> {
         METADATA_STREAM_PRIORITY,
         &encode_varint(3).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut payload,
         METADATA_STREAM_PRIORITY,
         &encode_varint(7).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     payload
 }
 
@@ -10219,7 +10219,7 @@ fn priority_update_does_not_revive_terminal_stream_metadata() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
     thread::sleep(Duration::from_millis(50));
 
@@ -10277,7 +10277,7 @@ fn priority_update_after_graceful_close_start_is_ignored() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
     peer.write_frame(Frame {
         frame_type: FrameType::Ext,
         flags: 0,
@@ -10375,7 +10375,7 @@ fn priority_update_on_fully_terminal_live_stream_counts_as_noop() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
     for _ in 0..2 {
         peer.write_frame(Frame {
             frame_type: FrameType::Ext,
@@ -10427,7 +10427,7 @@ fn group_rebucket_churn_budget_fails_repeated_effective_group_updates() {
                 },
                 Settings::default().max_extension_payload_bytes,
             )
-            .unwrap(),
+                .unwrap(),
         });
     }
 
@@ -10475,7 +10475,7 @@ fn priority_update_group_rebucket_tracks_diagnostic() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
 
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -10520,7 +10520,7 @@ fn group_update_outside_group_fair_does_not_track_rebucket_diagnostic() {
             },
             Settings::default().max_extension_payload_bytes,
         )
-        .unwrap(),
+            .unwrap(),
     });
 
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -10951,7 +10951,7 @@ fn retained_open_info_budget_refuses_newest_visible_stream() {
         b"aa",
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     first_payload.extend_from_slice(b"a");
     peer.write_frame(Frame {
         frame_type: FrameType::Data,
@@ -10967,7 +10967,7 @@ fn retained_open_info_budget_refuses_newest_visible_stream() {
         b"bb",
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     second_payload.extend_from_slice(b"b");
     peer.write_frame(Frame {
         frame_type: FrameType::Data,
@@ -11015,7 +11015,7 @@ fn tracked_session_memory_counts_open_metadata_backing_until_consumed() {
         &open_info,
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     payload.extend_from_slice(b"x");
     let expected_frame_storage = payload.len();
 
@@ -11073,7 +11073,7 @@ fn terminal_unaccepted_uni_stream_preserves_open_info_until_accept() {
         b"ssh",
         Settings::default().max_frame_payload,
     )
-    .unwrap();
+        .unwrap();
     peer.write_frame(Frame {
         frame_type: FrameType::Data,
         flags: FRAME_FLAG_OPEN_METADATA | FRAME_FLAG_FIN,

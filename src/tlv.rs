@@ -274,7 +274,7 @@ mod tests {
             seen = true;
             Ok(())
         })
-        .unwrap();
+            .unwrap();
         assert!(seen);
     }
 

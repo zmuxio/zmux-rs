@@ -483,7 +483,7 @@ impl Error {
     pub fn is_keepalive_timeout(&self) -> bool {
         self.code() == Some(ErrorCode::IdleTimeout)
             && (self.message.as_ref() == KEEPALIVE_TIMEOUT_MESSAGE
-                || self.reason() == Some(KEEPALIVE_TIMEOUT_MESSAGE))
+            || self.reason() == Some(KEEPALIVE_TIMEOUT_MESSAGE))
     }
 
     pub fn is_graceful_close_timeout(&self) -> bool {
@@ -541,8 +541,8 @@ impl Error {
     pub fn with_session_context(mut self, operation: ErrorOperation) -> Self {
         let is_terminal = self.termination_kind == TerminationKind::Unknown
             && (self.is_session_closed()
-                || (self.application_code.is_some()
-                    && matches!(self.scope, ErrorScope::Unknown | ErrorScope::Session)));
+            || (self.application_code.is_some()
+            && matches!(self.scope, ErrorScope::Unknown | ErrorScope::Session)));
         self.scope = ErrorScope::Session;
         if operation != ErrorOperation::Unknown {
             self.operation = operation;

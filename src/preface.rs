@@ -127,10 +127,10 @@ impl Preface {
             self.capabilities,
             settings_len,
         ]
-        .into_iter()
-        .try_fold(MAGIC.len() + 2 + settings_bytes, |len, value| {
-            checked_len_add(len, varint_len(value)?, "preface too large")
-        })
+            .into_iter()
+            .try_fold(MAGIC.len() + 2 + settings_bytes, |len, value| {
+                checked_len_add(len, varint_len(value)?, "preface too large")
+            })
     }
 
     pub fn parse(data: &[u8]) -> Result<Self> {

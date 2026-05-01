@@ -61,7 +61,7 @@ fn fail_session_inner(inner: &Arc<Inner>, err: Error, close_frame: Option<Frame>
     } else {
         err
     }
-    .with_session_context(ErrorOperation::Unknown);
+        .with_session_context(ErrorOperation::Unknown);
     let event = {
         let mut state = inner.state.lock().unwrap();
         if matches!(state.state, SessionState::Closed | SessionState::Failed) {
@@ -433,10 +433,10 @@ pub(super) fn ensure_local_open_memory_cap_locked(
             ErrorCode::StreamLimit,
             "zmux: local open limited by session memory cap",
         )
-        .with_scope(ErrorScope::Session)
-        .with_operation(ErrorOperation::Open)
-        .with_source(ErrorSource::Local)
-        .with_direction(ErrorDirection::Both));
+            .with_scope(ErrorScope::Session)
+            .with_operation(ErrorOperation::Open)
+            .with_source(ErrorSource::Local)
+            .with_direction(ErrorDirection::Both));
     }
     Ok(())
 }
@@ -462,11 +462,11 @@ fn retained_state_unit_locked(inner: &Inner) -> usize {
         settings.max_control_payload_bytes,
         settings.max_extension_payload_bytes,
     ]
-    .into_iter()
-    .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-    .max()
-    .unwrap_or(0)
-    .max(MIN_RETAINED_STATE_UNIT)
+        .into_iter()
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+        .max()
+        .unwrap_or(0)
+        .max(MIN_RETAINED_STATE_UNIT)
 }
 
 fn session_memory_hard_cap_locked(
@@ -1480,9 +1480,9 @@ pub(super) fn maybe_compact_stream_locked(
     }
     if stream_id == 0
         || !state
-            .streams
-            .get(&stream_id)
-            .is_some_and(|stored| std::ptr::eq(Arc::as_ptr(stored), stream))
+        .streams
+        .get(&stream_id)
+        .is_some_and(|stored| std::ptr::eq(Arc::as_ptr(stored), stream))
     {
         return;
     }
@@ -1615,9 +1615,9 @@ pub(super) fn record_tombstone_locked(
 ) {
     let newly_hidden = tombstone.hidden
         && !state
-            .tombstones
-            .get(&stream_id)
-            .is_some_and(|old| old.hidden);
+        .tombstones
+        .get(&stream_id)
+        .is_some_and(|old| old.hidden);
     if newly_hidden {
         state.hidden_streams_reaped = state.hidden_streams_reaped.saturating_add(1);
     }
@@ -1826,7 +1826,7 @@ fn compact_marker_only_ranges_locked(state: &mut ConnState) {
     let marker_count = marker_only_map_count_locked(state);
     if marker_count == 0
         || (marker_count <= state.used_marker_limit
-            && marker_count < MARKER_ONLY_RANGE_COMPACT_THRESHOLD)
+        && marker_count < MARKER_ONLY_RANGE_COMPACT_THRESHOLD)
     {
         return;
     }
@@ -1980,9 +1980,9 @@ fn set_contained_marker_range_locked(
 fn merge_marker_ranges_around_locked(state: &mut ConnState, mut index: usize) {
     while index > 0
         && marker_ranges_mergeable(
-            state.used_marker_ranges[index - 1],
-            state.used_marker_ranges[index],
-        )
+        state.used_marker_ranges[index - 1],
+        state.used_marker_ranges[index],
+    )
     {
         let current = state.used_marker_ranges.remove(index);
         let previous = &mut state.used_marker_ranges[index - 1];
@@ -1991,9 +1991,9 @@ fn merge_marker_ranges_around_locked(state: &mut ConnState, mut index: usize) {
     }
     while index + 1 < state.used_marker_ranges.len()
         && marker_ranges_mergeable(
-            state.used_marker_ranges[index],
-            state.used_marker_ranges[index + 1],
-        )
+        state.used_marker_ranges[index],
+        state.used_marker_ranges[index + 1],
+    )
     {
         let next = state.used_marker_ranges.remove(index + 1);
         state.used_marker_ranges[index].end = state.used_marker_ranges[index].end.max(next.end);

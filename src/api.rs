@@ -758,7 +758,7 @@ fn unexpected_eof_error() -> Error {
         io::ErrorKind::UnexpectedEof,
         "failed to fill whole buffer",
     ))
-    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn invalid_write_progress_error() -> Error {
@@ -1345,8 +1345,7 @@ impl<R, W> StreamApi for DuplexStream<R, W>
 where
     R: RecvStreamApi,
     W: SendStreamApi,
-{
-}
+{}
 
 pub trait Session: Send + Sync {
     fn accept_stream(&self) -> Result<BoxStream>;
@@ -1988,8 +1987,7 @@ where
     T: StreamApi + ?Sized,
     for<'a> &'a T: Read,
     for<'a> &'a T: Write,
-{
-}
+{}
 impl<T> StreamApi for Box<T> where T: StreamApi + ?Sized {}
 
 macro_rules! impl_session_forward {

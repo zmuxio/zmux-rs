@@ -18,7 +18,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-fn fixture_values(name: &'static str, content: &'static str) -> impl Iterator<Item = Value> {
+fn fixture_values(name: &'static str, content: &'static str) -> impl Iterator<Item=Value> {
     serde_json::Deserializer::from_str(content)
         .into_iter::<Value>()
         .enumerate()
@@ -380,13 +380,13 @@ fn priority_update_parser_ignores_open_info_and_rejects_duplicates() {
         METADATA_STREAM_PRIORITY,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut duplicate,
         METADATA_STREAM_PRIORITY,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     let (_, valid) = parse_priority_update_payload(&duplicate).unwrap();
     assert!(!valid);
 }
@@ -400,14 +400,14 @@ fn priority_update_parser_ignores_unknown_advisory_tlvs() {
         METADATA_STREAM_PRIORITY,
         &encode_varint(5).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(&mut payload, 99, b"ignored").unwrap();
     append_tlv(
         &mut payload,
         METADATA_STREAM_GROUP,
         &encode_varint(7).unwrap(),
     )
-    .unwrap();
+        .unwrap();
 
     let (metadata, valid) = parse_priority_update_payload(&payload).unwrap();
 
@@ -449,14 +449,14 @@ fn open_metadata_parser_ignores_unknown_metadata_tlvs() {
         METADATA_STREAM_PRIORITY,
         &encode_varint(7).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(&mut metadata, 99, b"ignored").unwrap();
     append_tlv(
         &mut metadata,
         METADATA_STREAM_GROUP,
         &encode_varint(11).unwrap(),
     )
-    .unwrap();
+        .unwrap();
 
     let (view, valid) = parse_stream_metadata_bytes_view(&metadata).unwrap();
 
@@ -475,7 +475,7 @@ fn stream_metadata_view_borrows_open_info_and_owned_metadata_copies() {
         b"ssh",
         1024,
     )
-    .unwrap();
+        .unwrap();
     let (metadata_len, metadata_offset) = parse_varint(&prefix).unwrap();
     let metadata_len = usize::try_from(metadata_len).unwrap();
     let mut metadata = prefix[metadata_offset..metadata_offset + metadata_len].to_vec();
@@ -519,13 +519,13 @@ fn duplicate_metadata_singletons_short_circuit_later_bad_tlvs() {
         METADATA_STREAM_PRIORITY,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut payload,
         METADATA_STREAM_PRIORITY,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     payload.extend_from_slice(&[0x40, 0x01, 0x00]);
 
     let (_, valid) = parse_priority_update_payload(&payload).unwrap();
@@ -546,13 +546,13 @@ fn diagnostic_reason_scans_for_later_standard_duplicates() {
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut diag,
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
 
     let mut payload = encode_varint(42).unwrap();
     payload.extend_from_slice(&diag);
@@ -583,13 +583,13 @@ fn goaway_diagnostic_duplicate_retry_after_drops_reason() {
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(1).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(
         &mut payload,
         DIAG_RETRY_AFTER_MILLIS,
         &encode_varint(2).unwrap(),
     )
-    .unwrap();
+        .unwrap();
     append_tlv(&mut payload, DIAG_DEBUG_TEXT, b"maintenance").unwrap();
 
     let parsed = parse_goaway_payload(&payload).unwrap();
@@ -691,8 +691,8 @@ fn buffered_frame_parse_checks_payload_limit_before_full_body_presence() {
             ..Limits::default()
         },
     )
-    .map(|_| ())
-    .unwrap_err();
+        .map(|_| ())
+        .unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::FrameSize));
     assert!(err.to_string().contains("payload exceeds configured limit"));
 }
@@ -806,7 +806,7 @@ fn direct_frame_read_rejects_oversized_frame_length_before_body_read() {
             max_extension_payload_bytes: 8,
         },
     )
-    .unwrap_err();
+        .unwrap_err();
 
     assert_eq!(err.code(), Some(ErrorCode::FrameSize));
     assert_eq!(err.source(), ErrorSource::Remote);
@@ -825,8 +825,8 @@ fn direct_preface_read_non_byte_reader_does_not_overread_following_frame() {
         capabilities: 0,
         settings: Settings::default(),
     }
-    .marshal()
-    .unwrap();
+        .marshal()
+        .unwrap();
     let frame = Frame::new(FrameType::Data, 4, b"after-preface".to_vec())
         .marshal()
         .unwrap();
@@ -950,19 +950,19 @@ fn direct_frame_read_rejects_invalid_frame_scopes_and_ext_subtypes() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
     let cancelled = build_code_payload(
         ErrorCode::Cancelled.as_u64(),
         "",
         Settings::default().max_control_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
     let close = build_code_payload(
         ErrorCode::Internal.as_u64(),
         "close",
         Settings::default().max_control_payload_bytes,
     )
-    .unwrap();
+        .unwrap();
 
     let protocol_cases = [
         frame_bytes(FrameType::Ping, 0, 4, &[0; 8]),
@@ -1027,7 +1027,7 @@ fn priority_update_builder_wraps_local_capability_failure() {
         },
         Settings::default().max_extension_payload_bytes,
     )
-    .unwrap_err();
+        .unwrap_err();
 
     assert_eq!(err.code(), Some(ErrorCode::Protocol));
     assert_eq!(err.scope(), ErrorScope::Session);
@@ -1045,7 +1045,7 @@ fn buffered_frame_parse_rejects_truncated_stream_id_without_panic() {
             ..Limits::default()
         },
     )
-    .unwrap_err();
+        .unwrap_err();
 
     assert_eq!(err.code(), Some(ErrorCode::FrameSize));
     assert!(err.to_string().contains("truncated frame"));
@@ -1060,7 +1060,7 @@ fn buffered_frame_parse_checks_stream_id_canonical_before_payload_limit() {
             ..Limits::default()
         },
     )
-    .unwrap_err();
+        .unwrap_err();
 
     assert_eq!(err.code(), Some(ErrorCode::Protocol));
     assert!(err.to_string().contains("non-canonical varint62"));
@@ -1077,7 +1077,7 @@ fn direct_frame_read_checks_stream_id_canonical_before_payload_limit() {
             ..Limits::default()
         },
     )
-    .unwrap_err();
+        .unwrap_err();
 
     assert_eq!(err.code(), Some(ErrorCode::Protocol));
     assert!(err.to_string().contains("non-canonical varint62"));
@@ -1103,8 +1103,8 @@ fn priority_update_frame_validation_parses_metadata_values() {
         &[0x07, 0x0b, 0x04, 0x01, 0x01, 0x02, 0x01, 0x00],
         Limits::default(),
     )
-    .map(|_| ())
-    .unwrap_err();
+        .map(|_| ())
+        .unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::FrameSize));
     assert!(err.to_string().contains("tlv value overruns"));
 }
