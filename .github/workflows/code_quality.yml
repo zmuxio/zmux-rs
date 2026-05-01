@@ -87,9 +87,10 @@ jobs:
 
       - name: Qodana Scan
         if: steps.qodana-token.outputs.present == 'true'
-        uses: JetBrains/qodana-action@v2026.1
+        uses: JetBrains/qodana-action@v2026.1.0
         with:
           pr-mode: false
+          args: --image jetbrains/qodana-rust:2026.1-eap
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
           QODANA_ENDPOINT: https://qodana.cloud
