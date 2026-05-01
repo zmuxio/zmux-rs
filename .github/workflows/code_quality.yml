@@ -50,10 +50,10 @@ jobs:
         run: cargo clippy -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
       - name: Build docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --all-features --no-deps
 
       - name: Package core crate
         run: cargo package -p zmux
@@ -82,6 +82,7 @@ jobs:
           if [[ -n "${QODANA_TOKEN}" ]]; then
             echo "present=true" >> "${GITHUB_OUTPUT}"
           else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
             echo "QODANA_TOKEN is not configured; skipping Qodana scan."
           fi
 
@@ -90,7 +91,11 @@ jobs:
         uses: JetBrains/qodana-action@v2026.1.0
         with:
           pr-mode: false
-          args: --image jetbrains/qodana-rust:2026.1-eap
+          args: >
+            --image jetbrains/qodana-rust:2026.1-eap
+            -e CARGO_HOME=/data/project/.cargo
+            -e RUSTUP_HOME=/data/project/.rustup
+            -e CARGO_TARGET_DIR=/data/project/target/qodana
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
           QODANA_ENDPOINT: https://qodana.cloud
