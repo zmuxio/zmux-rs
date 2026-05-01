@@ -7,9 +7,9 @@ The API here is designed to follow the same usage patterns as `zmux` async API.
 
 ```toml
 [dependencies]
-zmux = "0.1"
-zmux-quinn = "0.1"
-quinn = "0.11"
+zmux = "<version>"
+zmux-quinn = "<same version as zmux>"
+quinn = "<version>"
 ```
 
 ## Quick Start

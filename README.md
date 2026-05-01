@@ -9,14 +9,14 @@ Rust implementation of the ZMux v1 single-connection multiplexing protocol.
 
 ```toml
 [dependencies]
-zmux = "0.1"
+zmux = "<version>"
 ```
 
 If you need the QUIC adapter:
 
 ```toml
 [dependencies]
-zmux-quinn = "0.1"
+zmux-quinn = "<same version as zmux>"
 ```
 
 ## Quick Start (synchronous, blocking)
