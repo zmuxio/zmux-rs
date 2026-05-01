@@ -25,16 +25,16 @@ zmux-quinn = "<same version as zmux>"
 use std::net::TcpStream;
 use zmux::{client_tcp, Config};
 
-let socket = TcpStream::connect("127.0.0.1:9000")?;
-let conn = client_tcp(socket, Config::default())?;
+let socket = TcpStream::connect("127.0.0.1:9000") ?;
+let conn = client_tcp(socket, Config::default ()) ?;
 
-let mut stream = conn.open_stream()?;
-stream.write_all(b"hello")?;
-stream.close_write()?;
+let mut stream = conn.open_stream() ?;
+stream.write_all(b"hello") ?;
+stream.close_write() ?;
 
-let mut peer = conn.accept_stream()?;
+let mut peer = conn.accept_stream() ?;
 let mut buf = [0u8; 64];
-let n = peer.read(&mut buf)?;
+let n = peer.read( & mut buf) ?;
 let _ = peer.close();
 ```
 
@@ -42,12 +42,12 @@ let _ = peer.close();
 use std::net::TcpStream;
 use zmux::{new_tcp, Config, OpenOptions};
 
-let socket = TcpStream::connect("127.0.0.1:9000")?;
+let socket = TcpStream::connect("127.0.0.1:9000") ?;
 let options = OpenOptions::open_info_bytes(b"route:v1")
-    .with_initial_priority(7)
-    .with_initial_group(3);
-let conn = new_tcp(socket, Config::default())?;
-let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
+.with_initial_priority(7)
+.with_initial_group(3);
+let conn = new_tcp(socket, Config::default ()) ?;
+let (_stream, n) = conn.open_and_send_with_options(options, b"payload") ?;
 ```
 
 ## Public API (all exported items)
@@ -95,8 +95,8 @@ let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
 - `StreamMetadata`, `StreamMetadataView`, `MetadataUpdate`, `DataPayload`, `DataPayloadView`
 - `GoAwayPayload`
 - capability helpers:
-  - `has_capability`, `Role`, `CAPABILITY_*`, `EXT_*`, `METADATA_*`
-  - `SETTING_*`
+    - `has_capability`, `Role`, `CAPABILITY_*`, `EXT_*`, `METADATA_*`
+    - `SETTING_*`
 
 ### Stream ID helpers
 
@@ -119,9 +119,9 @@ let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
   `PressureStats`, `ProgressStats`, `ProvisionalStats`, `ReasonStats`, `RetentionStats`,
   `TelemetryStats`, `WriterQueueStats`
 - Boxed/native trait-object types:
-  - `BoxSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
-  - `BoxNativeSession`, `BoxNativeStream`, `BoxNativeSendStream`, `BoxNativeRecvStream`
-  - `ClosedSession`, `ClosedNativeSession`
+    - `BoxSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
+    - `BoxNativeSession`, `BoxNativeStream`, `BoxNativeSendStream`, `BoxNativeRecvStream`
+    - `ClosedSession`, `ClosedNativeSession`
 
 ### Async API aliases and wrappers
 
@@ -141,37 +141,37 @@ let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
 - `new_transport`, `client_transport`, `server_transport`
 - `local_addr`, `peer_addr`, `remote_addr`
 - Stream open/accept:
-  - `open_stream`, `open_stream_timeout`
-  - `open_uni_stream`, `open_uni_stream_timeout`
-  - `open_stream_with_options`, `open_stream_with_options_timeout`
-  - `open_uni_stream_with_options`, `open_uni_stream_with_options_timeout`
-  - `open_and_send`, `open_and_send_timeout`
-  - `open_and_send_with_options`, `open_and_send_with_options_timeout`
-  - `open_and_send_vectored`, `open_and_send_vectored_timeout`
-  - `open_and_send_vectored_with_options`, `open_and_send_vectored_with_options_timeout`
-  - `open_uni_and_send`, `open_uni_and_send_timeout`
-  - `open_uni_and_send_with_options`, `open_uni_and_send_with_options_timeout`
-  - `open_uni_and_send_vectored`, `open_uni_and_send_vectored_timeout`
-  - `open_uni_and_send_vectored_with_options`, `open_uni_and_send_vectored_with_options_timeout`
-  - `accept_stream`, `accept_stream_timeout`
-  - `accept_uni_stream`, `accept_uni_stream_timeout`
+    - `open_stream`, `open_stream_timeout`
+    - `open_uni_stream`, `open_uni_stream_timeout`
+    - `open_stream_with_options`, `open_stream_with_options_timeout`
+    - `open_uni_stream_with_options`, `open_uni_stream_with_options_timeout`
+    - `open_and_send`, `open_and_send_timeout`
+    - `open_and_send_with_options`, `open_and_send_with_options_timeout`
+    - `open_and_send_vectored`, `open_and_send_vectored_timeout`
+    - `open_and_send_vectored_with_options`, `open_and_send_vectored_with_options_timeout`
+    - `open_uni_and_send`, `open_uni_and_send_timeout`
+    - `open_uni_and_send_with_options`, `open_uni_and_send_with_options_timeout`
+    - `open_uni_and_send_vectored`, `open_uni_and_send_vectored_timeout`
+    - `open_uni_and_send_vectored_with_options`, `open_uni_and_send_vectored_with_options_timeout`
+    - `accept_stream`, `accept_stream_timeout`
+    - `accept_uni_stream`, `accept_uni_stream_timeout`
 - lifecycle / control:
-  - `ping`, `ping_timeout`
-  - `goaway`, `goaway_with_error`
-  - `close`, `close_with_error`
-  - `wait`, `wait_timeout`
-  - `closed`
-  - `close_error`, `state`, `stats`
-  - `peer_close_error`, `peer_goaway_error`
-  - `local_preface`, `peer_preface`, `negotiated`
+    - `ping`, `ping_timeout`
+    - `goaway`, `goaway_with_error`
+    - `close`, `close_with_error`
+    - `wait`, `wait_timeout`
+    - `closed`
+    - `close_error`, `state`, `stats`
+    - `peer_close_error`, `peer_goaway_error`
+    - `local_preface`, `peer_preface`, `negotiated`
 
 ### `Stream` methods
 
 - identity: `stream_id`, `close_identity`, `opened_locally`, `bidirectional`
 - state: `read_closed`, `write_closed`
 - open metadata:
-  - `open_info`, `open_info_len`, `has_open_info`, `copy_open_info_to`
-  - `metadata`, `update_metadata`
+    - `open_info`, `open_info_len`, `has_open_info`, `copy_open_info_to`
+    - `metadata`, `update_metadata`
 - address: `local_addr`, `peer_addr`, `remote_addr`
 - read ops: `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`
 - read state: `set_read_deadline`, `set_read_timeout`, `set_deadline`, `clear_read_deadline`, `clear_deadline`
@@ -184,18 +184,19 @@ let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
 
 - same identity/open metadata/address set as `Stream`
 - write-only operations:
-  - `write`, `write_timeout`, `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
-  - `write_final`, `write_vectored_final`, `writev_final`
-  - `write_final_timeout`, `write_vectored_final_timeout`, `writev_final_timeout`
+    - `write`, `write_timeout`, `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`
+    - `write_final`, `write_vectored_final`, `writev_final`
+    - `write_final_timeout`, `write_vectored_final_timeout`, `writev_final_timeout`
 - metadata: `metadata`, `update_metadata`
-- deadlines/timeouts: `set_write_deadline`, `set_write_timeout`, `set_deadline`, `clear_write_deadline`, `clear_deadline`
+- deadlines/timeouts: `set_write_deadline`, `set_write_timeout`, `set_deadline`, `clear_write_deadline`,
+  `clear_deadline`
 - close ops: `close_write`, `cancel_write`, `close`, `close_with_error`
 
 ### `RecvStream` methods
 
 - same identity/open metadata/address set as `Stream`
 - read-only operations:
-  - `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`
+    - `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`
 - deadlines/timeouts: `set_read_deadline`, `set_read_timeout`, `set_deadline`, `clear_read_deadline`, `clear_deadline`
 - close ops: `close_read`, `cancel_read`, `close`, `close_with_error`
 
@@ -204,18 +205,18 @@ let (_stream, n) = conn.open_and_send_with_options(options, b"payload")?;
 All async operations in `zmux` mirror the synchronous API through trait aliases and async futures:
 
 - `AsyncSession` methods:
-  - `accept_stream*`, `accept_uni_stream*`, `open_stream*`, `open_uni_stream*`,
-    `open_stream_with_options*`, `open_uni_stream_with_options*`
-  - `open_and_send*`, `open_and_send_vectored*`, `open_and_send_with_options*`
-  - `open_and_send_vectored_with_options*`
-  - `open_uni_and_send*`, `open_uni_and_send_vectored*`, `open_uni_and_send_with_options*`
-  - `open_uni_and_send_vectored_with_options*`
-  - `close`, `close_with_error`, `wait`, `wait_timeout`, `closed`, `close_error`, `state`, `stats`
+    - `accept_stream*`, `accept_uni_stream*`, `open_stream*`, `open_uni_stream*`,
+      `open_stream_with_options*`, `open_uni_stream_with_options*`
+    - `open_and_send*`, `open_and_send_vectored*`, `open_and_send_with_options*`
+    - `open_and_send_vectored_with_options*`
+    - `open_uni_and_send*`, `open_uni_and_send_vectored*`, `open_uni_and_send_with_options*`
+    - `open_uni_and_send_vectored_with_options*`
+    - `close`, `close_with_error`, `wait`, `wait_timeout`, `closed`, `close_error`, `state`, `stats`
 - async stream methods are the same set as sync versions, returning boxed futures:
-  - `read/read_timeout`, `read_vectored/read_vectored_timeout`, `read_exact/read_exact_timeout`
-  - `write/write_timeout`, `write_vectored/write_vectored_timeout`
-  - `write_final/write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`
-  - `close_read`, `close_write`, `cancel_read`, `cancel_write`, `close`, `close_with_error`
+    - `read/read_timeout`, `read_vectored/read_vectored_timeout`, `read_exact/read_exact_timeout`
+    - `write/write_timeout`, `write_vectored/write_vectored_timeout`
+    - `write_final/write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`
+    - `close_read`, `close_write`, `cancel_read`, `cancel_write`, `close`, `close_with_error`
 
 ### Errors and events
 
@@ -226,12 +227,6 @@ All async operations in `zmux` mirror the synchronous API through trait aliases 
   `FlushStats`, `HiddenStateStats`, `LivenessStats`, `MemoryStats`, `PressureStats`,
   `ProgressStats`, `ProvisionalStats`, `ReasonStats`, `RetentionStats`,
   `TelemetryStats`, `WriterQueueStats`
-
-## Release automation status
-
-There is a GitHub release workflow in `.github/workflows/release.yml` and quality checks in
-`.github/workflows/code_quality.yml`.
-I only reviewed them here; no changes were made.
 
 ## Note
 
