@@ -1052,8 +1052,8 @@ fn metadata_update_can_carry_on_open(caps: u64, update: &MetadataUpdate) -> bool
         .priority
         .is_none_or(|_| capabilities_can_carry_priority_on_open(caps))
         && update
-        .group
-        .is_none_or(|_| capabilities_can_carry_group_on_open(caps))
+            .group
+            .is_none_or(|_| capabilities_can_carry_group_on_open(caps))
 }
 
 fn validate_open_metadata_update_capability(caps: u64, update: &MetadataUpdate) -> Result<()> {
@@ -1276,10 +1276,10 @@ fn tx_fragment_cap_locked(
         priority,
         peer.scheduler_hints,
     ))
-        .unwrap_or(usize::MAX)
+    .unwrap_or(usize::MAX)
 }
 
-fn checked_io_slice_total_len(lengths: impl IntoIterator<Item=usize>) -> Result<usize> {
+fn checked_io_slice_total_len(lengths: impl IntoIterator<Item = usize>) -> Result<usize> {
     lengths.into_iter().try_fold(0usize, |total, len| {
         total
             .checked_add(len)
@@ -1484,8 +1484,8 @@ impl StreamInner {
                 ErrorCode::Cancelled.as_u64(),
                 provisional_open_expired_reason(),
             )
-                .with_source(ErrorSource::Local)
-                .with_termination_kind(TerminationKind::Abort));
+            .with_source(ErrorSource::Local)
+            .with_termination_kind(TerminationKind::Abort));
         }
 
         let id = if self.bidi {
@@ -1542,7 +1542,7 @@ impl StreamInner {
                 ErrorCode::RefusedStream,
                 "peer incoming stream limit reached",
             )
-                .with_source(ErrorSource::Remote));
+            .with_source(ErrorSource::Remote));
         }
 
         let stream = queue.pop_front().expect("head checked above");
@@ -1909,7 +1909,7 @@ impl StreamInner {
                 &err.to_string(),
                 self.conn.peer_preface.settings.max_control_payload_bytes,
             )
-                .unwrap_or_default(),
+            .unwrap_or_default(),
         };
         fail_session_with_close(&self.conn, err, close_frame);
     }
@@ -2726,7 +2726,7 @@ impl StreamInner {
             };
             if should_queue
                 && blocked_frame(0, offset)
-                .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
+                    .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
             {
                 let mut conn_state = self.conn.state.lock().unwrap();
                 conn_state.send_session_blocked_at = Some(offset);
@@ -2739,7 +2739,7 @@ impl StreamInner {
             };
             if should_queue
                 && blocked_frame(self.id(), offset)
-                .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
+                    .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
             {
                 let mut stream_state = self.state.lock().unwrap();
                 stream_state.send_blocked_at = Some(offset);
@@ -2923,9 +2923,9 @@ impl StreamInner {
             priority,
             self.conn.peer_preface.settings.scheduler_hints,
         ))
-            .unwrap_or(usize::MAX)
-            .max(1)
-            .min(self.conn.write_queue.max_batch_frames().max(1))
+        .unwrap_or(usize::MAX)
+        .max(1)
+        .min(self.conn.write_queue.max_batch_frames().max(1))
     }
 
     fn queue_prepared_data_until<D, C>(
@@ -3574,7 +3574,7 @@ mod tests {
 
         let prefix_len = 11;
         assert_eq!(
-            fragment_cap(16_384, prefix_len, 20, SchedulerHint::UnspecifiedOrBalanced, ),
+            fragment_cap(16_384, prefix_len, 20, SchedulerHint::UnspecifiedOrBalanced,),
             scaled_fragment_cap(16_384 - prefix_len, 1, 4)
         );
         assert_eq!(
@@ -3599,7 +3599,7 @@ mod tests {
             1_000_000_000_000
         );
         assert_eq!(
-            rate_limited_fragment_cap(4_096, 1 << 20, 20, SchedulerHint::UnspecifiedOrBalanced, ),
+            rate_limited_fragment_cap(4_096, 1 << 20, 20, SchedulerHint::UnspecifiedOrBalanced,),
             4_096
         );
         assert_eq!(

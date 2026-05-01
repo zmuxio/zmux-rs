@@ -467,7 +467,7 @@ fn async_session_default_open_and_send_skips_empty_bidi_writes() -> zmux::Result
             zmux::OpenOptions::default(),
             b"",
         ))?
-            .1,
+        .1,
         0
     );
     assert_eq!(write_attempts.load(Ordering::Relaxed), 0);
@@ -497,7 +497,7 @@ fn closed_session_helpers_match_user_facing_session_contract() -> zmux::Result<(
         &session,
         Duration::from_millis(1)
     ))?
-        .is_none());
+    .is_none());
 
     let err = match block_on(zmux::Session::open_stream(&session)) {
         Ok(_) => panic!("closed async session opened a stream"),
@@ -883,7 +883,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
         &mut buf,
         Duration::from_secs(1),
     ))
-        .unwrap_err();
+    .unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
     let async_joined =
@@ -899,7 +899,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
         b"abc",
         Duration::from_secs(1),
     ))
-        .unwrap_err();
+    .unwrap_err();
     assert!(err.to_string().contains("write reported invalid progress"));
 
     let invalid_reader = InvalidProgressStream::read_progress(8193);
@@ -916,7 +916,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
         &mut one,
         Duration::from_secs(1),
     )
-        .unwrap_err();
+    .unwrap_err();
     assert_eq!(
         err.source_io_error_kind(),
         Some(io::ErrorKind::UnexpectedEof)
@@ -926,7 +926,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
         &ZeroSizedCloseProbe,
         &mut one,
     ))
-        .unwrap_err();
+    .unwrap_err();
     assert_eq!(
         err.source_io_error_kind(),
         Some(io::ErrorKind::UnexpectedEof)

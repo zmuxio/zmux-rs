@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Boxed future used by the async session and stream traits.
-pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output=T> + Send + 'a>>;
+pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Boxed bidirectional async stream trait object.
 pub type BoxAsyncStream = Box<dyn AsyncStreamApi>;
@@ -27,9 +27,9 @@ pub type BoxAsyncRecvStream = Box<dyn AsyncRecvStreamApi>;
 /// Boxed async session trait object.
 pub type BoxAsyncSession = Box<
     dyn AsyncSession<
-        Stream=BoxAsyncStream,
-        SendStream=BoxAsyncSendStream,
-        RecvStream=BoxAsyncRecvStream,
+        Stream = BoxAsyncStream,
+        SendStream = BoxAsyncSendStream,
+        RecvStream = BoxAsyncRecvStream,
     >,
 >;
 
@@ -122,7 +122,7 @@ pub trait AsyncStreamInfo: Send + Sync {
     }
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn close_with_error<'a>(&'a self, code: u64, reason: &'a str)
-                            -> AsyncBoxFuture<'a, Result<()>>;
+        -> AsyncBoxFuture<'a, Result<()>>;
 }
 
 /// Runtime-neutral receive stream operations.
@@ -703,7 +703,7 @@ pub trait AsyncSession: Send + Sync {
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn close_with_error<'a>(&'a self, code: u64, reason: &'a str)
-                            -> AsyncBoxFuture<'a, Result<()>>;
+        -> AsyncBoxFuture<'a, Result<()>>;
     fn wait(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>>;
     fn wait_close_error(&self) -> AsyncBoxFuture<'_, Result<Option<Error>>> {
@@ -1233,9 +1233,9 @@ impl<T> AsyncJoinedHalf<T> {
         if result.is_ok()
             && state.deadline_generation == generation
             && state
-            .current
-            .as_ref()
-            .is_some_and(|stored| Arc::ptr_eq(stored, current))
+                .current
+                .as_ref()
+                .is_some_and(|stored| Arc::ptr_eq(stored, current))
         {
             state.deadline_applied_generation = generation;
         }
@@ -1967,7 +1967,8 @@ impl<R, W> AsyncStreamApi for AsyncDuplexStream<R, W>
 where
     R: AsyncRecvStreamApi,
     W: AsyncSendStreamApi,
-{}
+{
+}
 
 macro_rules! impl_async_stream_info_forward {
     ($target:ty) => {
@@ -3059,7 +3060,7 @@ impl AsyncSession for Conn {
                 data,
                 timeout,
             )
-                .await
+            .await
         })
     }
 
@@ -3090,7 +3091,7 @@ impl AsyncSession for Conn {
                 OpenOptions::default(),
                 data,
             )
-                .await
+            .await
         })
     }
 
@@ -3106,7 +3107,7 @@ impl AsyncSession for Conn {
                 data,
                 timeout,
             )
-                .await
+            .await
         })
     }
 
@@ -3225,7 +3226,7 @@ fn unexpected_eof_error() -> Error {
         io::ErrorKind::UnexpectedEof,
         "failed to fill whole buffer",
     ))
-        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn invalid_write_progress_error() -> Error {
@@ -3243,7 +3244,7 @@ fn read_limit_exceeded_error(max_bytes: usize) -> Error {
         crate::ErrorCode::FrameSize,
         format!("zmux: read limit exceeded ({max_bytes} bytes)"),
     )
-        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn vectored_len_overflow_error() -> Error {

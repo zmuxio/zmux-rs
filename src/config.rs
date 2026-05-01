@@ -1232,8 +1232,8 @@ mod tests {
             settings: zero_settings(),
             ..Config::builtin_default()
         }
-            .normalized()
-            .unwrap();
+        .normalized()
+        .unwrap();
 
         assert_eq!(cfg.settings, Settings::default());
     }
@@ -1331,8 +1331,8 @@ mod tests {
             ping_padding: true,
             ..Config::default()
         }
-            .local_preface()
-            .unwrap();
+        .local_preface()
+        .unwrap();
         assert_ne!(enabled.settings.ping_padding_key, 0);
         assert!(enabled.settings.ping_padding_key <= MAX_VARINT62);
 
@@ -1343,8 +1343,8 @@ mod tests {
             },
             ..Config::default()
         }
-            .local_preface()
-            .unwrap();
+        .local_preface()
+        .unwrap();
         assert_eq!(disabled.settings.ping_padding_key, 0);
 
         let configured_key = Config {
@@ -1355,8 +1355,8 @@ mod tests {
             },
             ..Config::default()
         }
-            .local_preface()
-            .unwrap();
+        .local_preface()
+        .unwrap();
         assert_eq!(configured_key.settings.ping_padding_key, 77);
 
         let disabled_dirty_key = Config {
@@ -1366,8 +1366,8 @@ mod tests {
             },
             ..Config::default()
         }
-            .local_preface()
-            .unwrap();
+        .local_preface()
+        .unwrap();
         assert_eq!(disabled_dirty_key.settings.ping_padding_key, 0);
     }
 

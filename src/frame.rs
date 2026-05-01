@@ -595,21 +595,21 @@ fn validate_frame_flags(frame_type: FrameType, flags: u8) -> Result<()> {
 fn validate_frame_scope(frame_type: FrameType, stream_id: u64) -> Result<()> {
     match frame_type {
         FrameType::Data | FrameType::StopSending | FrameType::Reset | FrameType::Abort
-        if stream_id == 0 =>
-            {
-                return Err(Error::protocol(format!(
-                    "{} requires non-zero stream_id",
-                    frame_type
-                )));
-            }
+            if stream_id == 0 =>
+        {
+            return Err(Error::protocol(format!(
+                "{} requires non-zero stream_id",
+                frame_type
+            )));
+        }
         FrameType::Ping | FrameType::Pong | FrameType::GoAway | FrameType::Close
-        if stream_id != 0 =>
-            {
-                return Err(Error::protocol(format!(
-                    "{} requires stream_id = 0",
-                    frame_type
-                )));
-            }
+            if stream_id != 0 =>
+        {
+            return Err(Error::protocol(format!(
+                "{} requires stream_id = 0",
+                frame_type
+            )));
+        }
         _ => {}
     }
     Ok(())
@@ -715,7 +715,7 @@ mod tests {
             max_control_payload_bytes: 128,
             max_extension_payload_bytes: 0,
         }
-            .normalized();
+        .normalized();
 
         assert_eq!(
             normalized.max_frame_payload,

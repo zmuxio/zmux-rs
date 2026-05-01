@@ -1131,7 +1131,7 @@ impl Conn {
                 ErrorCode::RefusedStream,
                 "peer incoming stream limit reached",
             )
-                .with_source(ErrorSource::Remote));
+            .with_source(ErrorSource::Remote));
         }
         if opts.open_info.len() > retained_open_info_available(&state) {
             return Err(
@@ -1866,9 +1866,9 @@ impl Conn {
         let keepalive_timeout = effective_keepalive_timeout_locked(&self.inner, &state);
         let ping_stalled = !terminal
             && outstanding_ping_sent_at(&state).is_some_and(|sent_at| {
-            !keepalive_timeout.is_zero()
-                && now.saturating_duration_since(sent_at) > keepalive_timeout / 2
-        });
+                !keepalive_timeout.is_zero()
+                    && now.saturating_duration_since(sent_at) > keepalive_timeout / 2
+            });
         SessionStats {
             state: state.state,
             sent_frames: state.sent_frames,
@@ -2274,9 +2274,9 @@ fn default_pending_control_bytes_budget(
     } else {
         peer.max_control_payload_bytes
     })
-        .unwrap_or(usize::MAX / 8)
-        .saturating_mul(8)
-        .max(DEFAULT_PENDING_CONTROL_BYTES_BUDGET_FLOOR)
+    .unwrap_or(usize::MAX / 8)
+    .saturating_mul(8)
+    .max(DEFAULT_PENDING_CONTROL_BYTES_BUDGET_FLOOR)
 }
 
 fn default_pending_priority_bytes_budget(
@@ -2288,9 +2288,9 @@ fn default_pending_priority_bytes_budget(
     } else {
         peer.max_extension_payload_bytes
     })
-        .unwrap_or(usize::MAX / 8)
-        .saturating_mul(8)
-        .max(DEFAULT_PENDING_PRIORITY_BYTES_BUDGET_FLOOR)
+    .unwrap_or(usize::MAX / 8)
+    .saturating_mul(8)
+    .max(DEFAULT_PENDING_PRIORITY_BYTES_BUDGET_FLOOR)
 }
 
 fn default_inbound_control_bytes_budget(settings: crate::settings::Settings) -> usize {
@@ -3533,7 +3533,7 @@ mod tests {
             Duration::from_millis(200)
         );
         assert_eq!(
-            effective_goaway_drain_interval(Duration::ZERO, Some(Duration::from_millis(800)), ),
+            effective_goaway_drain_interval(Duration::ZERO, Some(Duration::from_millis(800)),),
             Duration::ZERO
         );
     }
@@ -3563,7 +3563,7 @@ mod tests {
     #[test]
     fn explicit_close_drain_timeout_override_wins_over_observed_rtt() {
         assert_eq!(
-            effective_close_drain_timeout(Duration::from_millis(200), Some(Duration::from_secs(2)), ),
+            effective_close_drain_timeout(Duration::from_millis(200), Some(Duration::from_secs(2)),),
             Duration::from_millis(200)
         );
         assert_eq!(
@@ -4022,8 +4022,8 @@ mod tests {
             Stream {
                 inner: stream.clone(),
             }
-                .close_with_error(12, "abort")
-                .unwrap();
+            .close_with_error(12, "abort")
+            .unwrap();
 
             let batch = inner.write_queue.pop_batch().expect("queued abort");
             assert_eq!(batch.len(), 1);
@@ -4040,7 +4040,7 @@ mod tests {
             let stats = Conn {
                 inner: inner.clone(),
             }
-                .stats();
+            .stats();
             assert_eq!(stats.diagnostics.coalesced_terminal_signals, 0);
             assert_eq!(stats.diagnostics.superseded_terminal_signals, 1);
             assert_eq!(stream.state.lock().unwrap().pending_terminal_frames, 1);
@@ -4298,11 +4298,11 @@ mod tests {
                 settings.max_control_payload_bytes,
                 settings.max_extension_payload_bytes,
             ]
-                .into_iter()
-                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-                .max()
-                .unwrap_or(0)
-                .max(4096)
+            .into_iter()
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+            .max()
+            .unwrap_or(0)
+            .max(4096)
         }
 
         let mut exact = test_inner();
@@ -4346,8 +4346,8 @@ mod tests {
         Stream {
             inner: stream.clone(),
         }
-            .cancel_write(ErrorCode::Cancelled.as_u64())
-            .unwrap();
+        .cancel_write(ErrorCode::Cancelled.as_u64())
+        .unwrap();
 
         let state = inner.state.lock().unwrap();
         let stream_state = stream.state.lock().unwrap();

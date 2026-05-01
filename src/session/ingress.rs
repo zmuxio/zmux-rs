@@ -80,7 +80,7 @@ where
                                 &err.to_string(),
                                 inner.peer_preface.settings.max_control_payload_bytes,
                             )
-                                .unwrap_or_default(),
+                            .unwrap_or_default(),
                         };
                         fail_session_with_close(&inner, err, close_frame);
                         break;

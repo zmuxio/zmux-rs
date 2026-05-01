@@ -191,7 +191,7 @@ impl DataCosts {
             .unwrap_or(0)
     }
 
-    fn iter(&self) -> impl Iterator<Item=(u64, usize)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.first.iter().copied().chain(self.rest.iter().copied())
     }
 }
@@ -258,10 +258,10 @@ impl WriteQueue {
                 }
                 if !bypass_urgent_capacity
                     && self.replacement_would_exceed_urgent_capacity(
-                    &state,
-                    old_accounting.urgent,
-                    new_accounting.urgent,
-                )
+                        &state,
+                        old_accounting.urgent,
+                        new_accounting.urgent,
+                    )
                 {
                     state = self.not_full.wait(state).unwrap();
                     continue;
@@ -294,7 +294,7 @@ impl WriteQueue {
             }
             if (!bypass_capacity && self.would_exceed_capacity(&state, cost))
                 || (!bypass_urgent_capacity
-                && self.would_exceed_urgent_capacity(&state, accounting.urgent))
+                    && self.would_exceed_urgent_capacity(&state, accounting.urgent))
                 || self.would_exceed_pending_capacity(&state, &accounting)
                 || self.would_exceed_data_capacity(&state, &accounting)
             {
@@ -362,10 +362,10 @@ impl WriteQueue {
                 }
                 if !bypass_urgent_capacity
                     && self.replacement_would_exceed_urgent_capacity(
-                    &state,
-                    old_accounting.urgent,
-                    new_accounting.urgent,
-                )
+                        &state,
+                        old_accounting.urgent,
+                        new_accounting.urgent,
+                    )
                 {
                     pending = Some(job);
                     drop(self.wait_not_full_until_tracked(
@@ -412,7 +412,7 @@ impl WriteQueue {
             }
             if (!bypass_capacity && self.would_exceed_capacity(&state, cost))
                 || (!bypass_urgent_capacity
-                && self.would_exceed_urgent_capacity(&state, accounting.urgent))
+                    && self.would_exceed_urgent_capacity(&state, accounting.urgent))
                 || self.would_exceed_pending_capacity(&state, &accounting)
                 || self.would_exceed_data_capacity(&state, &accounting)
             {
@@ -450,10 +450,10 @@ impl WriteQueue {
             }
             if !bypass_urgent_capacity
                 && self.replacement_would_exceed_urgent_capacity(
-                &state,
-                old_accounting.urgent,
-                new_accounting.urgent,
-            )
+                    &state,
+                    old_accounting.urgent,
+                    new_accounting.urgent,
+                )
             {
                 return Err(Error::new(
                     ErrorCode::Internal,
@@ -807,10 +807,10 @@ impl WriteQueue {
     ) -> bool {
         new_cost > old_cost
             && state
-            .queued_bytes
-            .saturating_sub(old_cost)
-            .saturating_add(new_cost)
-            > self.max_bytes
+                .queued_bytes
+                .saturating_sub(old_cost)
+                .saturating_add(new_cost)
+                > self.max_bytes
     }
 
     fn would_exceed_urgent_capacity(&self, state: &WriteQueueState, cost: usize) -> bool {
@@ -825,10 +825,10 @@ impl WriteQueue {
     ) -> bool {
         new_cost > old_cost
             && state
-            .urgent_queued_bytes
-            .saturating_sub(old_cost)
-            .saturating_add(new_cost)
-            > self.urgent_max_bytes
+                .urgent_queued_bytes
+                .saturating_sub(old_cost)
+                .saturating_add(new_cost)
+                > self.urgent_max_bytes
     }
 
     fn would_exceed_pending_capacity(&self, state: &WriteQueueState, cost: &QueueCost) -> bool {
@@ -852,16 +852,16 @@ impl WriteQueue {
     ) -> Option<&'static str> {
         if cost.pending_control > 0
             && state
-            .pending_control_bytes
-            .saturating_add(cost.pending_control)
-            > self.pending_control_max_bytes
+                .pending_control_bytes
+                .saturating_add(cost.pending_control)
+                > self.pending_control_max_bytes
         {
             Some("zmux: pending control budget exceeded")
         } else if cost.pending_priority > 0
             && state
-            .pending_priority_bytes
-            .saturating_add(cost.pending_priority)
-            > self.pending_priority_max_bytes
+                .pending_priority_bytes
+                .saturating_add(cost.pending_priority)
+                > self.pending_priority_max_bytes
         {
             Some("zmux: pending priority budget exceeded")
         } else {
@@ -887,18 +887,18 @@ impl WriteQueue {
     ) -> Option<&'static str> {
         if new.pending_control > old.pending_control
             && state
-            .pending_control_bytes
-            .saturating_sub(old.pending_control)
-            .saturating_add(new.pending_control)
-            > self.pending_control_max_bytes
+                .pending_control_bytes
+                .saturating_sub(old.pending_control)
+                .saturating_add(new.pending_control)
+                > self.pending_control_max_bytes
         {
             Some("zmux: pending control budget exceeded")
         } else if new.pending_priority > old.pending_priority
             && state
-            .pending_priority_bytes
-            .saturating_sub(old.pending_priority)
-            .saturating_add(new.pending_priority)
-            > self.pending_priority_max_bytes
+                .pending_priority_bytes
+                .saturating_sub(old.pending_priority)
+                .saturating_add(new.pending_priority)
+                > self.pending_priority_max_bytes
         {
             Some("zmux: pending priority budget exceeded")
         } else {
@@ -934,9 +934,9 @@ impl WriteQueue {
         }
         data_cost_total(&cost.data) > self.session_data_max_bytes
             || cost
-            .data
-            .iter()
-            .any(|(_, bytes)| bytes > self.per_stream_data_max_bytes)
+                .data
+                .iter()
+                .any(|(_, bytes)| bytes > self.per_stream_data_max_bytes)
     }
 
     fn replacement_would_exceed_data_capacity(
@@ -952,10 +952,10 @@ impl WriteQueue {
         let new_total = data_cost_total(&new.data);
         if new_total > old_total
             && state
-            .data_queued_bytes
-            .saturating_sub(old_total)
-            .saturating_add(new_total)
-            > self.session_data_max_bytes
+                .data_queued_bytes
+                .saturating_sub(old_total)
+                .saturating_add(new_total)
+                > self.session_data_max_bytes
         {
             return true;
         }
@@ -963,13 +963,13 @@ impl WriteQueue {
             let old_bytes = old.data.get(stream_id);
             new_bytes > old_bytes
                 && state
-                .data_queued_by_stream
-                .get(&stream_id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(old_bytes)
-                .saturating_add(new_bytes)
-                > self.per_stream_data_max_bytes
+                    .data_queued_by_stream
+                    .get(&stream_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes)
+                    > self.per_stream_data_max_bytes
         })
     }
 
@@ -1493,7 +1493,7 @@ fn clear_queue_locked(state: &mut WriteQueueState) {
 
 fn complete_drained_jobs<I>(jobs: I, err: Error)
 where
-    I: IntoIterator<Item=WriteJob>,
+    I: IntoIterator<Item = WriteJob>,
 {
     for job in jobs {
         complete_job_error(job, err.clone());
@@ -1586,17 +1586,17 @@ fn metadata_varint_tlv_len(typ: u64, value: u64) -> Result<usize> {
 fn merge_coalesced_priority_update(old: &WriteJob, new: &mut WriteJob) -> Result<()> {
     let (
         WriteJob::Frame(Frame {
-                            frame_type: FrameType::Ext,
-                            stream_id: old_stream_id,
-                            payload: old_payload,
-                            ..
-                        }),
+            frame_type: FrameType::Ext,
+            stream_id: old_stream_id,
+            payload: old_payload,
+            ..
+        }),
         WriteJob::Frame(Frame {
-                            frame_type: FrameType::Ext,
-                            stream_id: new_stream_id,
-                            payload: new_payload,
-                            ..
-                        }),
+            frame_type: FrameType::Ext,
+            stream_id: new_stream_id,
+            payload: new_payload,
+            ..
+        }),
     ) = (old, new)
     else {
         return Ok(());
@@ -1981,7 +1981,7 @@ impl Inner {
                     &err.to_string(),
                     self.peer_preface.settings.max_control_payload_bytes,
                 )
-                    .unwrap_or_default(),
+                .unwrap_or_default(),
             };
             fail_session_with_close(self, err.clone(), close_frame);
             return Err(err);
@@ -2457,10 +2457,10 @@ mod tests {
             .iter()
             .filter_map(|job| match job {
                 WriteJob::Frame(frame) | WriteJob::GracefulClose(frame)
-                if frame.frame_type == FrameType::Ext =>
-                    {
-                        Some(frame)
-                    }
+                    if frame.frame_type == FrameType::Ext =>
+                {
+                    Some(frame)
+                }
                 _ => None,
             })
             .collect();
@@ -2486,7 +2486,7 @@ mod tests {
                     },
                     1024,
                 )
-                    .unwrap(),
+                .unwrap(),
             }))
             .unwrap();
         queue
@@ -2502,7 +2502,7 @@ mod tests {
                     },
                     1024,
                 )
-                    .unwrap(),
+                .unwrap(),
             }))
             .unwrap();
 
@@ -2524,7 +2524,7 @@ mod tests {
                 },
                 1024,
             )
-                .unwrap()
+            .unwrap()
         );
     }
 
@@ -3160,7 +3160,7 @@ mod tests {
                     },
                     1024,
                 )
-                    .unwrap(),
+                .unwrap(),
             }))
             .unwrap();
         queue
@@ -3176,7 +3176,7 @@ mod tests {
                     },
                     1024,
                 )
-                    .unwrap(),
+                .unwrap(),
             }))
             .unwrap();
 
@@ -3198,7 +3198,7 @@ mod tests {
                         },
                         1024,
                     )
-                        .unwrap(),
+                    .unwrap(),
                 }),
                 || Some(deadline),
                 || Ok(()),

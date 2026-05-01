@@ -44,7 +44,7 @@ impl Pair {
             server_config,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         )
-            .unwrap();
+        .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
         let mut client_endpoint =
             quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
@@ -895,7 +895,7 @@ async fn stats_track_active_streams_progress_and_byte_totals() {
             && stats.progress.transport_write_at.is_some()
             && stats.progress.stream_progress_at.is_some()
     })
-        .await;
+    .await;
     assert_eq!(client_stats.hidden.refused, 0);
 
     let server_stats = wait_until_stats(&pair.server, |stats| {
@@ -904,7 +904,7 @@ async fn stats_track_active_streams_progress_and_byte_totals() {
             && stats.active_streams.total == 0
             && stats.progress.inbound_frame_at.is_some()
     })
-        .await;
+    .await;
     assert_eq!(server_stats.hidden.refused, 0);
     pair.close().await;
 }
@@ -1021,7 +1021,7 @@ async fn ready_accepted_stream_bypasses_stalled_prelude_and_counts_hidden_refuse
             .with_accepted_prelude_read_timeout(Duration::from_millis(100))
             .with_accepted_prelude_max_concurrent(2),
     )
-        .await;
+    .await;
     let (mut stalled_send, _stalled_recv) = pair.client_conn.open_bi().await.unwrap();
     stalled_send.write_all(&[0x40]).await.unwrap();
 
@@ -1047,7 +1047,7 @@ async fn concurrent_accepts_allow_ready_streams_to_bypass_stalled_prelude() {
             .with_accepted_prelude_read_timeout(Duration::from_millis(100))
             .with_accepted_prelude_max_concurrent(3),
     )
-        .await;
+    .await;
     let (mut stalled_send, _stalled_recv) = pair.client_conn.open_bi().await.unwrap();
     stalled_send.write_all(&[0x40]).await.unwrap();
 
@@ -1146,13 +1146,13 @@ async fn remote_stream_reset_updates_reason_stats_on_both_sides() {
     let client_stats = wait_until_stats(&pair.client, |stats| {
         stats.reasons.reset.get(&41) == Some(&1)
     })
-        .await;
+    .await;
     assert_eq!(client_stats.reasons.reset.get(&41), Some(&1));
 
     let server_stats = wait_until_stats(&pair.server, |stats| {
         stats.reasons.reset.get(&41) == Some(&1)
     })
-        .await;
+    .await;
     assert_eq!(server_stats.reasons.reset.get(&41), Some(&1));
     pair.close().await;
 }
