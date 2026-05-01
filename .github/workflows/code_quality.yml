@@ -87,7 +87,7 @@ jobs:
 
       - name: Qodana Scan
         if: steps.qodana-token.outputs.present == 'true'
-        uses: JetBrains/qodana-action@v2025.3
+        uses: JetBrains/qodana-action@v2026.1
         with:
           pr-mode: false
         env:
