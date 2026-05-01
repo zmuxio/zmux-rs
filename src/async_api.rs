@@ -5,10 +5,10 @@ use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::session::{Conn, RecvStream, SendStream, SessionState, SessionStats, Stream};
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
-use std::mem;
+use std::mem::{self, size_of_val};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::ptr;
+use std::ptr::{from_ref, null};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -114,10 +114,10 @@ pub trait AsyncStreamInfo: Send + Sync {
     /// Stable resource identity used to avoid closing the same joined full
     /// stream twice.
     fn close_identity(&self) -> *const () {
-        if mem::size_of_val(self) == 0 {
-            ptr::null()
+        if size_of_val(self) == 0 {
+            null()
         } else {
-            ptr::from_ref(self).cast::<()>()
+            from_ref(self).cast::<()>()
         }
     }
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
