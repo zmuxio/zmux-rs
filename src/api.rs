@@ -9,8 +9,10 @@ use crate::session::{
 };
 use crate::settings::{SchedulerHint, Settings};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+use std::mem;
 use std::net::SocketAddr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::ptr;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Boxed bidirectional stream trait object used by the native blocking API.
@@ -59,10 +61,10 @@ pub trait StreamInfo: Send + Sync {
     /// Stable resource identity used to avoid closing the same joined full
     /// stream twice.
     fn close_identity(&self) -> *const () {
-        if std::mem::size_of_val(self) == 0 {
-            std::ptr::null()
+        if mem::size_of_val(self) == 0 {
+            ptr::null()
         } else {
-            std::ptr::from_ref(self).cast::<()>()
+            ptr::from_ref(self).cast::<()>()
         }
     }
     fn close(&self) -> Result<()>;
@@ -304,9 +306,9 @@ impl<T> NativeJoinedHalf<T> {
     fn with_current_io<U>(
         self: &Arc<Self>,
         missing: impl FnOnce() -> Error,
-        visit: impl FnOnce(&mut T) -> std::io::Result<U>,
-    ) -> std::io::Result<U> {
-        let mut active = self.enter(missing).map_err(std::io::Error::from)?;
+        visit: impl FnOnce(&mut T) -> io::Result<U>,
+    ) -> io::Result<U> {
+        let mut active = self.enter(missing).map_err(io::Error::from)?;
         visit(active.current_mut())
     }
 
@@ -406,7 +408,7 @@ impl<T> NativeJoinedHalf<T> {
                     state = self.state.lock().unwrap();
                     continue;
                 }
-                let previous = std::mem::replace(&mut state.current, next);
+                let previous = mem::replace(&mut state.current, next);
                 self.changed.notify_all();
                 return Ok(previous);
             }
@@ -519,8 +521,8 @@ impl<T> NativeJoinedHalf<T> {
 
     fn wait_while_paused<'a>(
         &self,
-        state: std::sync::MutexGuard<'a, NativeJoinedHalfState<T>>,
-    ) -> Result<std::sync::MutexGuard<'a, NativeJoinedHalfState<T>>> {
+        state: MutexGuard<'a, NativeJoinedHalfState<T>>,
+    ) -> Result<MutexGuard<'a, NativeJoinedHalfState<T>>> {
         match state.deadline.and_then(|deadline| {
             deadline
                 .checked_duration_since(Instant::now())
@@ -594,7 +596,7 @@ impl<T> PausedNativeHalf<T> {
     }
 
     pub fn set(&mut self, next: Option<T>) -> Option<T> {
-        std::mem::replace(&mut self.current, next)
+        mem::replace(&mut self.current, next)
     }
 
     pub fn replace(&mut self, next: T) -> Option<T> {
@@ -620,10 +622,10 @@ impl<T> Drop for PausedNativeHalf<T> {
 
 fn wait_native_joined_half_state<'a, T>(
     changed: &Condvar,
-    state: std::sync::MutexGuard<'a, NativeJoinedHalfState<T>>,
+    state: MutexGuard<'a, NativeJoinedHalfState<T>>,
     start: Instant,
     timeout: Option<Duration>,
-) -> Result<std::sync::MutexGuard<'a, NativeJoinedHalfState<T>>> {
+) -> Result<MutexGuard<'a, NativeJoinedHalfState<T>>> {
     match timeout.and_then(|timeout| {
         timeout
             .checked_sub(start.elapsed())
@@ -756,7 +758,7 @@ fn unexpected_eof_error() -> Error {
         io::ErrorKind::UnexpectedEof,
         "failed to fill whole buffer",
     ))
-        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn invalid_write_progress_error() -> Error {
@@ -913,7 +915,7 @@ impl<R, W> Read for DuplexStream<R, W>
 where
     R: Read,
 {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
                 let n = recv.read(buf)?;
@@ -921,7 +923,7 @@ where
             })
     }
 
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let requested = checked_io_vectored_read_len(bufs)?;
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
@@ -930,7 +932,7 @@ where
             })
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
                 Read::read_exact(recv, buf)
@@ -942,7 +944,7 @@ impl<R, W> Read for &DuplexStream<R, W>
 where
     R: Read,
 {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
                 let n = recv.read(buf)?;
@@ -950,7 +952,7 @@ where
             })
     }
 
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let requested = checked_io_vectored_read_len(bufs)?;
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
@@ -959,7 +961,7 @@ where
             })
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.recv
             .with_current_io(joined_read_half_missing_error, |recv| {
                 Read::read_exact(recv, buf)
@@ -971,7 +973,7 @@ impl<R, W> Write for DuplexStream<R, W>
 where
     W: Write,
 {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.send
             .with_current_io(joined_write_half_missing_error, |send| {
                 let n = send.write(buf)?;
@@ -979,7 +981,7 @@ where
             })
     }
 
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let requested = checked_io_vectored_len(bufs)?;
         self.send
             .with_current_io(joined_write_half_missing_error, |send| {
@@ -988,7 +990,7 @@ where
             })
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.send
             .with_current_io(joined_write_half_missing_error, |send| send.flush())
     }
@@ -998,7 +1000,7 @@ impl<R, W> Write for &DuplexStream<R, W>
 where
     W: Write,
 {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.send
             .with_current_io(joined_write_half_missing_error, |send| {
                 let n = send.write(buf)?;
@@ -1006,7 +1008,7 @@ where
             })
     }
 
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let requested = checked_io_vectored_len(bufs)?;
         self.send
             .with_current_io(joined_write_half_missing_error, |send| {
@@ -1015,7 +1017,7 @@ where
             })
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.send
             .with_current_io(joined_write_half_missing_error, |send| send.flush())
     }
@@ -1343,7 +1345,8 @@ impl<R, W> StreamApi for DuplexStream<R, W>
 where
     R: RecvStreamApi,
     W: SendStreamApi,
-{}
+{
+}
 
 pub trait Session: Send + Sync {
     fn accept_stream(&self) -> Result<BoxStream>;
@@ -1985,7 +1988,8 @@ where
     T: StreamApi + ?Sized,
     for<'a> &'a T: Read,
     for<'a> &'a T: Write,
-{}
+{
+}
 impl<T> StreamApi for Box<T> where T: StreamApi + ?Sized {}
 
 macro_rules! impl_session_forward {

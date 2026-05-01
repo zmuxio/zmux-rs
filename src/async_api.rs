@@ -5,13 +5,15 @@ use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::session::{Conn, RecvStream, SendStream, SessionState, SessionStats, Stream};
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
+use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
+use std::ptr;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Boxed future used by the async session and stream traits.
-pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output=T> + Send + 'a>>;
+pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Boxed bidirectional async stream trait object.
 pub type BoxAsyncStream = Box<dyn AsyncStreamApi>;
@@ -25,9 +27,9 @@ pub type BoxAsyncRecvStream = Box<dyn AsyncRecvStreamApi>;
 /// Boxed async session trait object.
 pub type BoxAsyncSession = Box<
     dyn AsyncSession<
-        Stream=BoxAsyncStream,
-        SendStream=BoxAsyncSendStream,
-        RecvStream=BoxAsyncRecvStream,
+        Stream = BoxAsyncStream,
+        SendStream = BoxAsyncSendStream,
+        RecvStream = BoxAsyncRecvStream,
     >,
 >;
 
@@ -112,15 +114,15 @@ pub trait AsyncStreamInfo: Send + Sync {
     /// Stable resource identity used to avoid closing the same joined full
     /// stream twice.
     fn close_identity(&self) -> *const () {
-        if std::mem::size_of_val(self) == 0 {
-            std::ptr::null()
+        if mem::size_of_val(self) == 0 {
+            ptr::null()
         } else {
-            std::ptr::from_ref(self).cast::<()>()
+            ptr::from_ref(self).cast::<()>()
         }
     }
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn close_with_error<'a>(&'a self, code: u64, reason: &'a str)
-                            -> AsyncBoxFuture<'a, Result<()>>;
+        -> AsyncBoxFuture<'a, Result<()>>;
 }
 
 /// Runtime-neutral receive stream operations.
@@ -232,7 +234,7 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
             }
         })
     }
-    fn read_to_end_limited<'a>(&'a self, max_bytes: usize) -> AsyncBoxFuture<'a, Result<Vec<u8>>> {
+    fn read_to_end_limited(&self, max_bytes: usize) -> AsyncBoxFuture<'_, Result<Vec<u8>>> {
         Box::pin(async move {
             let mut out = Vec::with_capacity(max_bytes.min(8 * 1024));
             let mut buf = [0u8; 8 * 1024];
@@ -701,7 +703,7 @@ pub trait AsyncSession: Send + Sync {
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn close_with_error<'a>(&'a self, code: u64, reason: &'a str)
-                            -> AsyncBoxFuture<'a, Result<()>>;
+        -> AsyncBoxFuture<'a, Result<()>>;
     fn wait(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>>;
     fn wait_close_error(&self) -> AsyncBoxFuture<'_, Result<Option<Error>>> {
@@ -1117,7 +1119,7 @@ impl<T> AsyncJoinedHalf<T> {
                     state = self.state.lock().unwrap();
                     continue;
                 }
-                let previous = std::mem::replace(&mut state.current, next);
+                let previous = mem::replace(&mut state.current, next);
                 self.changed.notify_all();
                 return Ok(previous);
             }
@@ -1231,9 +1233,9 @@ impl<T> AsyncJoinedHalf<T> {
         if result.is_ok()
             && state.deadline_generation == generation
             && state
-            .current
-            .as_ref()
-            .is_some_and(|stored| Arc::ptr_eq(stored, current))
+                .current
+                .as_ref()
+                .is_some_and(|stored| Arc::ptr_eq(stored, current))
         {
             state.deadline_applied_generation = generation;
         }
@@ -1262,8 +1264,8 @@ impl<T> AsyncJoinedHalf<T> {
 
     fn wait_while_paused<'a>(
         &self,
-        state: std::sync::MutexGuard<'a, AsyncJoinedHalfState<T>>,
-    ) -> Result<std::sync::MutexGuard<'a, AsyncJoinedHalfState<T>>> {
+        state: MutexGuard<'a, AsyncJoinedHalfState<T>>,
+    ) -> Result<MutexGuard<'a, AsyncJoinedHalfState<T>>> {
         match deadline_remaining(state.deadline) {
             Some(remaining) => {
                 let (state, wait) = self.changed.wait_timeout(state, remaining).unwrap();
@@ -1313,7 +1315,7 @@ impl<T> PausedAsyncHalf<T> {
     }
 
     pub fn set_arc(&mut self, next: Option<Arc<T>>) -> Option<Arc<T>> {
-        std::mem::replace(&mut self.current, next)
+        mem::replace(&mut self.current, next)
     }
 
     pub fn replace(&mut self, next: T) -> Option<Arc<T>> {
@@ -1377,10 +1379,10 @@ fn remaining_read_timeout(start: Instant, timeout: Duration) -> Result<Duration>
 
 fn wait_joined_half_state<'a, T>(
     changed: &Condvar,
-    state: std::sync::MutexGuard<'a, AsyncJoinedHalfState<T>>,
+    state: MutexGuard<'a, AsyncJoinedHalfState<T>>,
     start: Instant,
     timeout: Option<Duration>,
-) -> Result<std::sync::MutexGuard<'a, AsyncJoinedHalfState<T>>> {
+) -> Result<MutexGuard<'a, AsyncJoinedHalfState<T>>> {
     match timeout.and_then(|timeout| remaining_timeout(start, timeout)) {
         Some(remaining) => {
             let (state, wait) = changed.wait_timeout(state, remaining).unwrap();
@@ -1965,7 +1967,8 @@ impl<R, W> AsyncStreamApi for AsyncDuplexStream<R, W>
 where
     R: AsyncRecvStreamApi,
     W: AsyncSendStreamApi,
-{}
+{
+}
 
 macro_rules! impl_async_stream_info_forward {
     ($target:ty) => {
@@ -2113,10 +2116,7 @@ macro_rules! impl_async_recv_stream_api_forward {
                 (**self).read_to_end(dst)
             }
 
-            fn read_to_end_limited<'a>(
-                &'a self,
-                max_bytes: usize,
-            ) -> AsyncBoxFuture<'a, Result<Vec<u8>>> {
+            fn read_to_end_limited(&self, max_bytes: usize) -> AsyncBoxFuture<'_, Result<Vec<u8>>> {
                 (**self).read_to_end_limited(max_bytes)
             }
 
@@ -3060,7 +3060,7 @@ impl AsyncSession for Conn {
                 data,
                 timeout,
             )
-                .await
+            .await
         })
     }
 
@@ -3091,7 +3091,7 @@ impl AsyncSession for Conn {
                 OpenOptions::default(),
                 data,
             )
-                .await
+            .await
         })
     }
 
@@ -3107,7 +3107,7 @@ impl AsyncSession for Conn {
                 data,
                 timeout,
             )
-                .await
+            .await
         })
     }
 
@@ -3226,7 +3226,7 @@ fn unexpected_eof_error() -> Error {
         io::ErrorKind::UnexpectedEof,
         "failed to fill whole buffer",
     ))
-        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn invalid_write_progress_error() -> Error {
@@ -3244,7 +3244,7 @@ fn read_limit_exceeded_error(max_bytes: usize) -> Error {
         crate::ErrorCode::FrameSize,
         format!("zmux: read limit exceeded ({max_bytes} bytes)"),
     )
-        .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
+    .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
 fn vectored_len_overflow_error() -> Error {
