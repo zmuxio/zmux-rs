@@ -1,0 +1,2943 @@
+{
+  "id": "bidi_data_then_fin",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_DATA",
+      "expect_state": {
+        "send_half": "send_open",
+        "recv_half": "recv_open"
+      }
+    },
+    {
+      "event": "peer_DATA_FIN",
+      "expect_state": {
+        "send_half": "send_open",
+        "recv_half": "recv_fin"
+      }
+    },
+    {
+      "event": "local_DATA_FIN",
+      "expect_state": {
+        "send_half": "send_fin",
+        "recv_half": "recv_fin"
+      }
+    }
+  ]
+}
+{
+  "id": "peer_first_reset_is_invalid",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_RESET",
+      "expect_result": "stream_state_violation"
+    }
+  ]
+}
+{
+  "id": "peer_first_abort_is_legal",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_ABORT",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    }
+  ]
+}
+{
+  "id": "late_data_after_peer_reset_is_ignored",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_reset"
+  },
+  "steps": [
+    {
+      "event": "peer_late_DATA",
+      "expect_result": "restore_session_budget_only_after_terminal_data",
+      "expect_state": {
+        "send_half": "send_open",
+        "recv_half": "recv_reset"
+      }
+    }
+  ]
+}
+{
+  "id": "late_data_after_peer_abort_is_ignored",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_aborted",
+    "recv_half": "recv_aborted"
+  },
+  "steps": [
+    {
+      "event": "peer_late_DATA",
+      "expect_result": "restore_session_budget_only_after_terminal_data",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    }
+  ]
+}
+{
+  "id": "local_zero_window_write_opens_before_blocked",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_write_then_deadline",
+      "expect_result": "queues_opening_data_then_pending_blocked"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_write_final_opens_before_blocked",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_write_final_then_deadline",
+      "expect_result": "queues_opening_data_then_pending_blocked"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_close_read_opens_before_stop_sending",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_close_read",
+      "expect_result": "queues_opening_data_then_stop_sending"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_close_write_queues_only_opening_fin",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_close_write",
+      "expect_result": "queues_opening_fin_only_without_blocked"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_write_open_metadata_opens_before_blocked",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_write_open_metadata_then_deadline",
+      "expect_result": "queues_opening_metadata_data_then_pending_blocked"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_write_final_open_metadata_opens_before_blocked",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_write_final_open_metadata_then_deadline",
+      "expect_result": "queues_opening_metadata_data_then_pending_blocked"
+    }
+  ]
+}
+{
+  "id": "local_zero_window_close_write_open_metadata_queues_only_opening_fin",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_zero_window_close_write_open_metadata",
+      "expect_result": "queues_opening_metadata_fin_only_without_blocked"
+    }
+  ]
+}
+{
+  "id": "local_concrete_id_close_read_open_metadata_opens_before_stop_sending",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_concrete_id_close_read_open_metadata",
+      "expect_result": "queues_opening_metadata_data_then_stop_sending"
+    }
+  ]
+}
+{
+  "id": "local_concrete_id_close_write_open_metadata_queues_opening_fin",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_concrete_id_close_write_open_metadata",
+      "expect_result": "queues_opening_metadata_fin_only_without_blocked"
+    }
+  ]
+}
+{
+  "id": "local_concrete_id_close_with_error_queues_opening_abort",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": null,
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_concrete_id_close_with_error",
+      "expect_result": "queues_opening_abort"
+    }
+  ]
+}
+{
+  "id": "session_max_data_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_higher_MAX_DATA",
+      "expect_result": "session_max_data_ignored_without_side_effects"
+    }
+  ]
+}
+{
+  "id": "session_blocked_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_BLOCKED_at_advertised",
+      "expect_result": "session_blocked_ignored_without_side_effects"
+    }
+  ]
+}
+{
+  "id": "session_max_data_applies_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_higher_MAX_DATA",
+      "expect_result": "session_max_data_applies"
+    }
+  ]
+}
+{
+  "id": "session_blocked_replenishes_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_BLOCKED_at_advertised",
+      "expect_result": "force_flush_session_max_data"
+    }
+  ]
+}
+{
+  "id": "session_peer_data_ignored_while_closing_without_side_effects",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_closing_DATA",
+      "expect_result": "session_data_ignored_without_side_effects"
+    }
+  ]
+}
+{
+  "id": "session_peer_stream_controls_ignored_while_closing_without_side_effects",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_closing_stream_MAX_DATA",
+      "expect_result": "session_stream_control_ignored_without_side_effects"
+    },
+    {
+      "event": "peer_closing_stream_BLOCKED",
+      "expect_result": "session_stream_control_ignored_without_side_effects"
+    },
+    {
+      "event": "peer_closing_STOP_SENDING",
+      "expect_result": "session_stream_control_ignored_without_side_effects"
+    },
+    {
+      "event": "peer_closing_RESET",
+      "expect_result": "session_stream_control_ignored_without_side_effects"
+    },
+    {
+      "event": "peer_closing_ABORT",
+      "expect_result": "session_stream_control_ignored_without_side_effects"
+    }
+  ]
+}
+{
+  "id": "session_peer_goaway_ignored_while_closing_without_side_effects",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_closing_GOAWAY",
+      "expect_result": "session_goaway_ignored_without_side_effects"
+    }
+  ]
+}
+{
+  "id": "peer_nonclose_frames_ignored_after_transport_failure",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_peer_nonclose_frames_ignored_after_transport_failure",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "duplicate_peer_close_ignored_before_parse_and_budget_accounting",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_duplicate_peer_close_ignored_before_parse_and_budget_accounting",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "direct_handle_close_frame_ignores_duplicate_malformed_payload",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_direct_handle_close_frame_ignores_duplicate_malformed_payload",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "peer_close_after_transport_failure_still_parses_diagnostics",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_peer_close_after_transport_failure_still_parses_diagnostics",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "direct_nonclose_handlers_ignored_when_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_direct_nonclose_handlers_ignored_when_closing",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "direct_terminal_data_handler_ignored_when_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_direct_terminal_data_handler_ignored_when_closing",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_noop_session_blocked_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_noop_session_BLOCKED_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_noop_session_max_data_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_noop_session_MAX_DATA_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_max_data_increase_clears_noop_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_noop_session_MAX_DATA_threshold_minus_one",
+      "expect_result": "accepted"
+    },
+    {
+      "event": "peer_session_MAX_DATA_plus_one",
+      "expect_result": "session_max_data_increased"
+    },
+    {
+      "event": "repeat_noop_session_MAX_DATA_threshold",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_replenish_clears_noop_blocked_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_noop_session_BLOCKED_threshold_minus_one",
+      "expect_result": "accepted"
+    },
+    {
+      "event": "peer_session_BLOCKED_with_pending_credit",
+      "expect_result": "force_flush_session_max_data"
+    },
+    {
+      "event": "repeat_noop_session_BLOCKED_threshold",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_mixed_noop_control_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_mixed_noop_control_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_drain_pending_control_frames_allows_draining_state",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_drain_pending_control_frames",
+      "expect_result": "drain_pending_control_allows_draining_state"
+    }
+  ]
+}
+{
+  "id": "session_drain_pending_control_frames_drops_nonclose_control_when_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_drain_pending_control_frames",
+      "expect_result": "drain_pending_control_drops_nonclose_when_closing"
+    }
+  ]
+}
+{
+  "id": "session_queue_pending_control_ignored_when_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_queue_pending_control_while_closing",
+      "expect_result": "queue_pending_control_ignored_when_closing"
+    }
+  ]
+}
+{
+  "id": "session_take_pending_priority_update_drops_when_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_take_pending_priority_update_while_closing",
+      "expect_result": "take_pending_priority_update_drops_when_closing"
+    }
+  ]
+}
+{
+  "id": "session_close_without_open_streams_only_sends_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close",
+      "expect_result": "close_only_sends_close"
+    }
+  ]
+}
+{
+  "id": "session_close_after_peer_noerror_close_is_noop",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_CLOSE_no_error",
+      "expect_result": "peer_close_terminates_session_without_local_echo"
+    },
+    {
+      "event": "local_Close",
+      "expect_result": "close_after_peer_close_noerror_is_noop"
+    }
+  ]
+}
+{
+  "id": "session_close_after_peer_error_close_returns_error",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_CLOSE_protocol",
+      "expect_result": "peer_close_terminates_session_without_local_echo"
+    },
+    {
+      "event": "local_Close",
+      "expect_result": "close_after_peer_close_returns_peer_error"
+    }
+  ]
+}
+{
+  "id": "session_close_signals_control_notify_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_internal_bye_observe_control_notify",
+      "expect_result": "session_close_signals_control_notify_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_does_not_wait_forever_for_buffered_close_done",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_internal_bye_with_buffered_close_done",
+      "expect_result": "session_close_buffered_close_done_finishes"
+    }
+  ]
+}
+{
+  "id": "session_blocked_urgent_queue_returns_session_error_before_closed_ch_on_closeSession",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_protocol_bye_then_blocked_urgent_queue",
+      "expect_result": "session_blocked_urgent_queue_returns_session_error_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_graceful_close_emits_goaway_then_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close",
+      "expect_result": "graceful_close_emits_goaway_then_close_timeout"
+    }
+  ]
+}
+{
+  "id": "session_close_recomputes_final_goaway_after_drain_interval",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close_recomputes_final_GOAWAY_after_drain_interval",
+      "expect_result": "graceful_close_recomputes_final_goaway_after_drain_interval_timeout"
+    }
+  ]
+}
+{
+  "id": "session_close_concurrent_calls_emit_single_close_frame",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close_concurrent_second_call",
+      "expect_result": "concurrent_close_calls_emit_single_close_frame"
+    }
+  ]
+}
+{
+  "id": "session_concurrent_local_goaway_keeps_only_most_restrictive_pending_replacement",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_concurrent_GOAWAY_replacement",
+      "expect_result": "goaway_replacement_retains_most_restrictive_pending"
+    }
+  ]
+}
+{
+  "id": "session_close_after_prior_goaway_sends_more_restrictive_replacement",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prior_GOAWAY_then_Close",
+      "expect_result": "close_after_prior_goaway_sends_more_restrictive_replacement"
+    }
+  ]
+}
+{
+  "id": "session_graceful_close_blocks_local_open_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close_then_OpenStream_while_draining",
+      "expect_result": "graceful_close_blocks_local_open_while_draining"
+    }
+  ]
+}
+{
+  "id": "session_graceful_close_waits_for_active_streams_before_close_frame",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_graceful_Close_waits_for_active_stream_drain",
+      "expect_result": "graceful_close_waits_for_active_streams_before_close"
+    }
+  ]
+}
+{
+  "id": "session_graceful_close_reclaims_committed_never_peer_visible_local_stream",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close_reclaims_committed_never_peer_visible_stream",
+      "expect_result": "graceful_close_reclaims_committed_never_peer_visible_stream"
+    }
+  ]
+}
+{
+  "id": "session_graceful_close_reclaims_provisional_never_peer_visible_local_stream",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Close_reclaims_provisional_never_peer_visible_stream",
+      "expect_result": "graceful_close_reclaims_provisional_never_peer_visible_stream"
+    }
+  ]
+}
+{
+  "id": "session_abort_clears_streams_and_session_pending_state",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_internal_bye_clears_pending_runtime_state",
+      "expect_result": "termination_clears_streams_and_pending_state"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_wait_after_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_Wait_waiter",
+      "expect_result": "session_wait_returns_after_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_accept_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_Accept_waiter",
+      "expect_result": "session_accept_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_blocked_Read_waiter",
+      "expect_result": "session_read_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_blocked_write_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_blocked_Write_waiter",
+      "expect_result": "session_write_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_blocked_write_final_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_blocked_WriteFinal_waiter",
+      "expect_result": "session_write_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_AcceptUni_waiter",
+      "expect_result": "session_accept_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_close_returns_provisional_commit_waiter_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_closeSession_then_provisional_commit_waiter",
+      "expect_result": "session_provisional_commit_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_wait_after_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_Wait_waiter",
+      "expect_result": "session_wait_returns_after_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_accept_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_Accept_waiter",
+      "expect_result": "session_accept_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_AcceptUni_waiter",
+      "expect_result": "session_accept_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_blocked_Read_waiter",
+      "expect_result": "session_read_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_blocked_write_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_blocked_Write_waiter",
+      "expect_result": "session_write_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_blocked_write_final_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_blocked_WriteFinal_waiter",
+      "expect_result": "session_write_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_abort_returns_provisional_commit_waiter_before_closed_ch_when_close_frame_send_stalls",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_Abort_then_provisional_commit_waiter",
+      "expect_result": "session_provisional_commit_waiter_returns_before_closed_ch"
+    }
+  ]
+}
+{
+  "id": "session_flow_control_noop_controls_do_not_force_flush",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_same_MAX_DATA",
+      "expect_result": "no_control_flush"
+    },
+    {
+      "event": "peer_session_BLOCKED",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "stream_flow_control_noop_controls_do_not_force_flush",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "peer_same_MAX_DATA",
+      "expect_result": "no_control_flush"
+    },
+    {
+      "event": "peer_same_BLOCKED",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "first_max_data_on_unused_stream_is_invalid",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_MAX_DATA",
+      "expect_result": "stream_state_violation"
+    }
+  ]
+}
+{
+  "id": "first_blocked_on_unused_stream_is_invalid",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_BLOCKED",
+      "expect_result": "stream_state_violation"
+    }
+  ]
+}
+{
+  "id": "uni_wrong_direction_data_rejected",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_DATA",
+      "expect_result": "stream_state_violation"
+    }
+  ]
+}
+{
+  "id": "uni_wrong_direction_blocked_rejected",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_BLOCKED",
+      "expect_result": "stream_state_violation"
+    }
+  ]
+}
+{
+  "id": "uni_wrong_side_max_data_rejected",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "local_MAX_DATA",
+      "expect_result": "local_invalid"
+    }
+  ]
+}
+{
+  "id": "uni_wrong_side_stop_sending_rejected",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "local_STOP_SENDING",
+      "expect_result": "local_invalid"
+    }
+  ]
+}
+{
+  "id": "terminal_control_ignored",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": {
+    "send_half": "send_aborted",
+    "recv_half": "recv_aborted"
+  },
+  "steps": [
+    {
+      "event": "peer_same_MAX_DATA",
+      "expect_result": "no_control_flush",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    },
+    {
+      "event": "peer_same_BLOCKED",
+      "expect_result": "no_control_flush",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    },
+    {
+      "event": "peer_late_RESET",
+      "expect_result": "no_control_flush",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    },
+    {
+      "event": "peer_late_STOP_SENDING",
+      "expect_result": "no_control_flush",
+      "expect_state": {
+        "send_half": "send_aborted",
+        "recv_half": "recv_aborted"
+      }
+    }
+  ]
+}
+{
+  "id": "stop_sending_requires_terminal_sender_followup",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "peer_STOP_SENDING",
+      "expect_result": "sender_must_finish_with_reset_or_fin"
+    }
+  ]
+}
+{
+  "id": "goaway_monotonic",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_GOAWAY_last_accepted_bidi_101_uni_99",
+      "expect_result": "accepted"
+    },
+    {
+      "event": "peer_GOAWAY_last_accepted_bidi_81_uni_99",
+      "expect_result": "accepted"
+    },
+    {
+      "event": "peer_GOAWAY_last_accepted_bidi_81_uni_103",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "peer_stream_id_gap_rejected",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_first_opening_frame_stream_id_gap",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "read_stop_discard_restores_session_budget_but_not_stream_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "local_STOP_SENDING_then_discard_unread_DATA",
+      "expect_result": "restore_session_budget_only"
+    }
+  ]
+}
+{
+  "id": "session_blocked_force_flushes_pending_credit_below_pacing_threshold",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_session_BLOCKED",
+      "expect_result": "force_flush_session_max_data"
+    }
+  ]
+}
+{
+  "id": "stream_blocked_force_flushes_pending_credit_below_pacing_threshold",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "peer_same_BLOCKED",
+      "expect_result": "force_flush_stream_max_data"
+    }
+  ]
+}
+{
+  "id": "stream_blocked_after_read_stop_force_flushes_session_only",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_stop_sent"
+  },
+  "steps": [
+    {
+      "event": "peer_same_BLOCKED",
+      "expect_result": "force_flush_session_only"
+    }
+  ]
+}
+{
+  "id": "local_open_cancel_before_first_frame_commit_does_not_consume_id",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_semantics",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_open_allocates_provisional_stream_then_cancels_before_first_frame_commit",
+      "expect_result": "stream_id_not_consumed"
+    },
+    {
+      "event": "next_local_open_commits_first_frame",
+      "expect_result": "uses_same_next_stream_id_without_gap"
+    }
+  ]
+}
+{
+  "id": "provisional_open_limit_prevents_unbounded_head_of_line_stall",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "api_semantics",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "too_many_provisional_uncommitted_opens_exist_for_one_class",
+      "expect_result": "later_open_requests_are_locally_failed_or_delayed_by_policy"
+    },
+    {
+      "event": "oldest_provisional_open_exceeds_age_limit",
+      "expect_result": "it_is_failed_and_released_without_consuming_peer_visible_id"
+    }
+  ]
+}
+{
+  "id": "late_data_after_close_read_honors_session_aggregate_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "many_stopped_directions_receive_late_tail_data",
+      "expect_result": "per_direction_and_aggregate_late_tail_caps_apply"
+    },
+    {
+      "event": "aggregate_cap_is_exceeded",
+      "expect_result": "additional_late_tail_is_discarded_or_local_policy_escalates"
+    }
+  ]
+}
+{
+  "id": "session_unexpected_pong_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_unexpected_PONG_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_handle_frame_unexpected_pong_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "handle_frame_unexpected_PONG_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_matching_pong_clears_mixed_noop_control_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "unexpected_pong_threshold_minus_one_then_matching_pong_then_threshold",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "session_handle_frame_matching_pong_clears_mixed_noop_control_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "handle_frame_unexpected_pong_threshold_minus_one_then_matching_pong_then_threshold",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "session_reset_change_clears_mixed_noop_control_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "unexpected_pong_threshold_minus_one_then_peer_RESET_then_threshold",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "session_noop_goaway_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_GOAWAY_then_repeat_same_GOAWAY_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_goaway_change_clears_mixed_noop_control_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "noop_session_BLOCKED_threshold_minus_one_then_peer_GOAWAY_then_repeat_same_GOAWAY_threshold",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "session_ignored_stop_sending_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_ignored_STOP_SENDING_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_ignored_reset_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_ignored_RESET_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_ignored_abort_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_ignored_ABORT_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_noop_priority_update_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_noop_priority_update_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_effective_priority_update_clears_noop_priority_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "noop_priority_update_threshold_minus_one_then_effective_update_then_threshold",
+      "expect_result": "no_control_flush"
+    }
+  ]
+}
+{
+  "id": "session_ignored_terminal_stream_max_data_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_terminal_stream_MAX_DATA_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_ignored_terminal_stream_blocked_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_terminal_stream_BLOCKED_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_ignored_terminal_stream_priority_update_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_terminal_stream_PRIORITY_UPDATE_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_material_data_clears_noop_zero_length_data_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "noop_zero_length_DATA_threshold_minus_one_then_material_DATA_then_threshold",
+      "expect_result": "material_data_clears_zero_length_budget"
+    }
+  ]
+}
+{
+  "id": "session_repeated_effective_group_rebucket_churn_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "effective_group_rebucket_limit_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_effective_group_updates_do_not_trigger_churn_outside_group_fair",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "effective_group_updates_apply_without_group_fair_churn",
+      "expect_result": "group_updates_apply_without_churn"
+    }
+  ]
+}
+{
+  "id": "stream_noop_zero_length_data_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "repeat_noop_zero_length_DATA_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "stream_noop_blocked_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "repeat_noop_stream_BLOCKED_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "stream_noop_max_data_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "flow_control",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "repeat_noop_stream_MAX_DATA_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_effective_control_change_clears_mixed_noop_control_budget",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "bidi",
+  "ownership": "peer_owned",
+  "scope": "session",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "recv_open"
+  },
+  "steps": [
+    {
+      "event": "repeat_mixed_noop_control_threshold_minus_one",
+      "expect_result": "accepted"
+    },
+    {
+      "event": "peer_session_MAX_DATA_plus_one",
+      "expect_result": "session_max_data_increased"
+    },
+    {
+      "event": "repeat_noop_session_BLOCKED_threshold",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_hidden_abort_churn_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_hidden_open_then_ABORT_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_hidden_abort_churn_window_expiry_resets_counter",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "record_hidden_abort_churn_threshold_then_after_window",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_visible_abort_churn_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_visible_open_then_ABORT_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_visible_uni_reset_churn_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_visible_uni_open_then_RESET_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_visible_terminal_churn_window_expiry_resets_counter",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "record_visible_terminal_churn_threshold_then_after_window",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_visible_terminal_churn_ignores_accepted_stream",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "visible_terminal_churn_accepted_stream_not_counted",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_visible_terminal_churn_ignores_bidi_reset_only",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "visible_terminal_churn_bidi_recv_reset_only_not_counted",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_peer_ping_replies_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_PING_opaque_01234567",
+      "expect_result": "ping_replied_with_matching_pong"
+    }
+  ]
+}
+{
+  "id": "session_peer_ping_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_PING_opaque_01234567",
+      "expect_result": "ping_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_peer_pong_clears_outstanding_ping_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_matching_PONG_direct_handler",
+      "expect_result": "pong_clears_outstanding_ping"
+    }
+  ]
+}
+{
+  "id": "session_peer_pong_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_matching_PONG_direct_handler",
+      "expect_result": "pong_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_malformed_peer_pong_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_malformed_PONG_direct_handler",
+      "expect_result": "malformed_pong_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_priority_update_applies_while_draining",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_PRIORITY_UPDATE_priority_9_ext",
+      "expect_result": "priority_update_applies_while_draining"
+    }
+  ]
+}
+{
+  "id": "session_priority_update_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_PRIORITY_UPDATE_priority_9_ext",
+      "expect_result": "priority_update_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_malformed_priority_update_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_malformed_PRIORITY_UPDATE_ext",
+      "expect_result": "malformed_priority_update_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_direct_priority_update_handler_ignored_while_closing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "peer_PRIORITY_UPDATE_priority_9_direct_handler",
+      "expect_result": "priority_update_ignored_while_closing"
+    }
+  ]
+}
+{
+  "id": "session_take_pending_priority_update_handoff_transfers_tracked_bytes_to_advisory_queue",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_take_pending_priority_update_handoff_transfers_tracked_bytes_to_advisory_queue",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_take_pending_priority_update_handoff_respects_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_take_pending_priority_update_handoff_fails_when_memory_cap_exceeded",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_control_flush_transfers_pending_priority_bytes_to_advisory_queue",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_control_flush_transfers_pending_priority_bytes_to_advisory_queue",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_write_deadline_restores_pending_priority_update_while_blocked_on_writer_queue",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_write_deadline_restores_pending_priority_update_while_blocked_on_writer_queue",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_close_write_deadline_restores_pending_priority_update_while_blocked_on_writer_queue",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_write_deadline_restores_pending_priority_update_while_blocked_on_writer_queue",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_standing_growth_suppressed_while_released_credit_still_reflects_high_usage",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_session_standing_growth_suppressed_while_released_credit_still_reflects_high_usage",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "stream_standing_growth_suppressed_while_released_credit_still_reflects_high_usage",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_stream_standing_growth_suppressed_while_released_credit_still_reflects_high_usage",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_standing_growth_suppressed_under_tracked_memory_pressure",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_session_standing_growth_suppressed_under_tracked_memory_pressure",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "stream_standing_growth_suppressed_under_tracked_memory_pressure",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_stream_standing_growth_suppressed_under_tracked_memory_pressure",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "open_metadata_prefix_does_not_consume_zero_windows",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_open_metadata_prefix_does_not_consume_zero_windows",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "open_metadata_flow_control_charges_only_trailing_application_bytes",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_open_metadata_flow_control_charges_only_trailing_application_bytes",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "open_metadata_trailing_application_byte_over_stream_window_locally_aborts",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_open_metadata_trailing_application_byte_over_stream_window_locally_aborts",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "update_metadata_tightens_oversized_open_metadata_prefix_backing",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_update_metadata_tightens_oversized_open_metadata_prefix_backing",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "compact_terminal_releases_open_info_bytes_and_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_compact_terminal_releases_open_info_bytes_and_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "fail_provisional_releases_open_info_bytes_and_clears_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_fail_provisional_releases_open_info_bytes_and_clears_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "fail_unopened_local_stream_clears_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_fail_unopened_local_stream_clears_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "mark_peer_visible_clears_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_mark_peer_visible_clears_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_stream_on_session_releases_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_stream_on_session_releases_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_session_releases_provisional_open_metadata_prefix",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_session_releases_provisional_open_metadata_prefix",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_read_with_oversized_open_metadata_keeps_read_stop_without_committing_opener",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_read_with_oversized_open_metadata_keeps_read_stop_without_committing_opener",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_read_with_malformed_open_metadata_keeps_read_stop_without_committing_opener",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_read_with_malformed_open_metadata_keeps_read_stop_without_committing_opener",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_write_with_oversized_open_metadata_without_committing_opener",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_write_with_oversized_open_metadata_without_committing_opener",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "close_write_with_malformed_open_metadata_without_committing_opener",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_close_write_with_malformed_open_metadata_without_committing_opener",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_max_data_increase_broadcasts_conn_write_wake",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_session_max_data_increase_broadcasts_conn_write_wake",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "prepare_write_wakes_on_session_max_data_increase",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prepare_write_wakes_on_session_max_data_increase",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "prepare_write_final_wakes_on_session_max_data_increase",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prepare_write_final_wakes_on_session_max_data_increase",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "release_receive_zero_window_wakes_write_waiters_when_memory_pressure_drops",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_release_receive_zero_window_wakes_write_waiters_when_memory_pressure_drops",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "release_write_queue_reservation_wakes_blocked_write_at_low_watermark",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_release_write_queue_reservation_wakes_blocked_write_at_low_watermark",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "release_batch_reservations_clears_inflight_queued",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_release_batch_reservations_clears_inflight_queued",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "release_batch_reservations_wakes_distinct_streams_crossing_low_watermark",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_release_batch_reservations_wakes_distinct_streams_crossing_low_watermark",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "suppress_write_batch_marks_inflight_queued_for_accepted_requests",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_suppress_write_batch_marks_inflight_queued_for_accepted_requests",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "suppress_write_batch_aggregates_inflight_queued_across_streams",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_suppress_write_batch_aggregates_inflight_queued_across_streams",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "write_deadline_expires_while_blocked_by_session_queued_data_watermark",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_write_deadline_expires_while_blocked_by_session_queued_data_watermark",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "write_deadline_expires_while_blocked_by_per_stream_queued_data_watermark",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_write_deadline_expires_while_blocked_by_per_stream_queued_data_watermark",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "write_closes_session_when_tracked_memory_cap_would_be_exceeded",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_write_closes_session_when_tracked_memory_cap_would_be_exceeded",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "prepare_write_burst_batch_caps_single_request_at_per_stream_hwm",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prepare_write_burst_batch_caps_single_request_at_per_stream_hwm",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "prepare_write_final_burst_batch_caps_single_request_at_per_stream_hwm",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prepare_write_final_burst_batch_caps_single_request_at_per_stream_hwm",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "prepare_write_burst_batch_uses_smaller_session_queue_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_prepare_write_burst_batch_uses_smaller_session_queue_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "reserve_write_queue_tracks_only_queued_streams",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_reserve_write_queue_tracks_only_queued_streams",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "release_write_queue_reservation_untracks_drained_stream",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_release_write_queue_reservation_untracks_drained_stream",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "clear_write_queue_reservations_locked_uses_tracked_set",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_clear_write_queue_reservations_locked_uses_tracked_set",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "clear_write_queue_reservations_locked_rebuilds_tracked_set_from_seeded_streams",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "flow_control",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_clear_write_queue_reservations_locked_rebuilds_tracked_set_from_seeded_streams",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "handle_data_frame_open_metadata_retains_open_info_after_payload_mutation",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_handle_data_frame_open_metadata_retains_open_info_after_payload_mutation",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "check_local_open_possible_with_open_info_limited_by_tracked_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_check_local_open_possible_with_open_info_limited_by_tracked_memory_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "enforce_visible_accept_backlog_sheds_newest_when_open_info_budget_exceeded",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "open_metadata",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_enforce_visible_accept_backlog_sheds_newest_when_open_info_budget_exceeded",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "visible_accept_backlog_refuses_newest_stream",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_visible_accept_backlog_refuses_newest_stream",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "visible_accept_backlog_counts_only_unaccepted_streams",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_visible_accept_backlog_counts_only_unaccepted_streams",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "visible_accept_backlog_bytes_refuse_newest_by_visibility_sequence",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_visible_accept_backlog_bytes_refuse_newest_by_visibility_sequence",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "visible_accept_backlog_bytes_track_growth_and_accept_pop",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_visible_accept_backlog_bytes_track_growth_and_accept_pop",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "enforce_visible_accept_backlog_sheds_newest_under_tracked_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_enforce_visible_accept_backlog_sheds_newest_under_tracked_memory_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "check_local_open_possible_limited_by_tracked_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_check_local_open_possible_limited_by_tracked_memory_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "tracked_session_memory_includes_retained_state_residency",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_tracked_session_memory_includes_retained_state_residency",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "enforce_hidden_control_state_budget_sheds_hidden_state_under_tracked_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_enforce_hidden_control_state_budget_sheds_hidden_state_under_tracked_memory_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "reap_excess_tombstones_sheds_oldest_visible_tombstone_under_tracked_memory_cap",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "local_reap_excess_tombstones_sheds_oldest_visible_tombstone_under_tracked_memory_cap",
+      "expect_result": "accepted"
+    }
+  ]
+}
+{
+  "id": "session_inbound_ping_flood_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_PING_threshold_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_control_frame_budget_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_control_frame_budget_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_control_byte_budget_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_control_byte_budget_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_ext_frame_budget_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_EXT_frame_budget_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_mixed_control_ext_frame_budget_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_mixed_control_ext_frame_budget_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_mixed_control_ext_byte_budget_triggers_protocol_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "repeat_inbound_mixed_control_ext_byte_budget_plus_one",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "session_inbound_data_session_memory_cap_triggers_internal_close",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": null,
+  "ownership": null,
+  "scope": "session",
+  "initial_state": null,
+  "steps": [
+    {
+      "event": "inbound_DATA_exceeds_session_memory_cap",
+      "expect_result": "internal_close"
+    }
+  ]
+}

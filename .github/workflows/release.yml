@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-rust-${{ runner.os }}-
+            rust-${{ runner.os }}-
+
+      - name: Validate crates.io token
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+            echo "Missing CARGO_REGISTRY_TOKEN secret." >&2
+            exit 1
+          fi
+
+      - name: Validate release tag and crate versions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          packages = {package["name"]: package for package in metadata["packages"]}
+          core = packages.get("zmux")
+          adapter = packages.get("zmux-quinn")
+          if core is None or adapter is None:
+              sys.exit("workspace must contain both zmux and zmux-quinn packages")
+
+          core_version = core["version"]
+          adapter_version = adapter["version"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", core_version):
+              sys.exit(f"zmux version {core_version!r} is not a plain X.Y.Z release")
+          if adapter_version != core_version:
+              sys.exit(
+                  f"zmux-quinn version {adapter_version!r} must match zmux {core_version!r}"
+              )
+
+          dep = next(
+              (
+                  dependency
+                  for dependency in adapter["dependencies"]
+                  if dependency["name"] == "zmux"
+              ),
+              None,
+          )
+          if dep is None:
+              sys.exit("zmux-quinn must depend on zmux")
+          allowed = {core_version, f"^{core_version}", f"={core_version}"}
+          if dep["req"] not in allowed:
+              sys.exit(
+                  f"zmux-quinn dependency on zmux is {dep['req']!r}, expected {core_version!r}"
+              )
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          expected_tag = f"v{core_version}"
+          if tag != expected_tag:
+              sys.exit(f"tag {tag!r} does not match crate version {expected_tag!r}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"ZMUX_VERSION={core_version}\n")
+          PY
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run clippy with optional async I/O features
+        run: cargo clippy -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build docs
+        run: cargo doc --workspace --no-deps
+
+      - name: Dry-run core publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p zmux --dry-run
+
+      - name: Publish core crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p zmux
+
+      - name: Wait for core crate indexing
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for attempt in {1..30}; do
+            echo "Checking whether zmux ${ZMUX_VERSION} is available for adapter verification, attempt ${attempt}/30"
+            if cargo publish -p zmux-quinn --dry-run; then
+              exit 0
+            fi
+            sleep 20
+          done
+
+          echo "zmux ${ZMUX_VERSION} was not visible to crates.io dependency resolution in time." >&2
+          exit 1
+
+      - name: Publish Quinn adapter crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p zmux-quinn

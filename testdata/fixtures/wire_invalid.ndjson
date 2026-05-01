@@ -1,0 +1,27 @@
+{
+  "id": "invalid_noncanonical_varint_stream_id",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "044140046869",
+  "expect_error": "PROTOCOL",
+  "notes": "stream_id = 4 is encoded non-canonically"
+}
+{
+  "id": "invalid_truncated_varint62",
+  "source": "wire_corpus",
+  "category": "bytes_invalid",
+  "hex": "800001",
+  "expect_error": "PROTOCOL",
+  "notes": "first byte announces a 4-byte varint62 but only 3 bytes are present"
+}
+{
+  "id": "invalid_oversized_frame_for_receiver_limit",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "800040030104",
+  "expect_error": "FRAME_SIZE",
+  "receiver_limits": {
+    "max_frame_payload": 16384
+  },
+  "notes": "frame_length = 16387, code = DATA, stream_id = 4, derived payload length = 16385"
+}

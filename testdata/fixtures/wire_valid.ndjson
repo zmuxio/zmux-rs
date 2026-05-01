@@ -1,0 +1,220 @@
+{
+  "id": "preface_initiator_minimal",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d555801000001010000",
+  "expect": {
+    "preface_ver": 1,
+    "role": "initiator",
+    "tie_breaker_nonce": 0,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 0,
+    "settings_len": 0
+  }
+}
+{
+  "id": "preface_responder_minimal",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d555801010001010000",
+  "expect": {
+    "preface_ver": 1,
+    "role": "responder",
+    "tie_breaker_nonce": 0,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 0,
+    "settings_len": 0
+  }
+}
+{
+  "id": "preface_auto_nonce_5",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d555801020501010000",
+  "expect": {
+    "preface_ver": 1,
+    "role": "auto",
+    "tie_breaker_nonce": 5,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 0,
+    "settings_len": 0
+  }
+}
+{
+  "id": "frame_data_open_bidi_4_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0401046869",
+  "expect": {
+    "frame_length": 4,
+    "frame_type": "DATA",
+    "flags": [],
+    "stream_id": 4,
+    "payload_hex": "6869"
+  }
+}
+{
+  "id": "frame_data_open_metadata_priority_2_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "082104030101026869",
+  "expect": {
+    "frame_length": 8,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "stream_metadata_tlvs": [
+        {
+          "type": "stream_priority",
+          "value": 2
+        }
+      ],
+      "application_payload_hex": "6869"
+    }
+  }
+}
+{
+  "id": "frame_data_open_metadata_info_ssh_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0a21040503037373686869",
+  "expect": {
+    "frame_length": 10,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "stream_metadata_tlvs": [
+        {
+          "type": "open_info",
+          "value_hex": "737368"
+        }
+      ],
+      "application_payload_hex": "6869"
+    }
+  }
+}
+{
+  "id": "frame_data_fin_empty",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "024104",
+  "expect": {
+    "frame_length": 2,
+    "frame_type": "DATA",
+    "flags": [
+      "FIN"
+    ],
+    "stream_id": 4,
+    "payload_hex": ""
+  }
+}
+{
+  "id": "frame_session_max_data_1024",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0402004400",
+  "expect": {
+    "frame_length": 4,
+    "frame_type": "MAX_DATA",
+    "stream_id": 0,
+    "payload_hex": "4400",
+    "decoded": {
+      "max_offset": 1024
+    }
+  }
+}
+{
+  "id": "frame_ping_minimal",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0a04000102030405060708",
+  "expect": {
+    "frame_length": 10,
+    "frame_type": "PING",
+    "stream_id": 0,
+    "payload_hex": "0102030405060708"
+  }
+}
+{
+  "id": "frame_pong_with_opaque",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0e05000102030405060708aabbccdd",
+  "expect": {
+    "frame_length": 14,
+    "frame_type": "PONG",
+    "stream_id": 0,
+    "payload_hex": "0102030405060708aabbccdd"
+  }
+}
+{
+  "id": "frame_stop_sending_cancelled",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "03030408",
+  "expect": {
+    "frame_length": 3,
+    "frame_type": "STOP_SENDING",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 8
+    }
+  }
+}
+{
+  "id": "frame_session_blocked_1024",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0406004400",
+  "expect": {
+    "frame_length": 4,
+    "frame_type": "BLOCKED",
+    "stream_id": 0,
+    "decoded": {
+      "blocked_at": 1024
+    }
+  }
+}
+{
+  "id": "frame_abort_cancelled",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "03080408",
+  "expect": {
+    "frame_length": 3,
+    "frame_type": "ABORT",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 8
+    }
+  }
+}
+{
+  "id": "frame_priority_update_priority_2",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "060b0401010102",
+  "expect": {
+    "frame_length": 6,
+    "frame_type": "EXT",
+    "stream_id": 4,
+    "decoded": {
+      "ext_type": "PRIORITY_UPDATE",
+      "stream_metadata_tlvs": [
+        {
+          "type": "stream_priority",
+          "value": 2
+        }
+      ]
+    }
+  }
+}

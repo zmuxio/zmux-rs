@@ -1,0 +1,27 @@
+{
+  "schema": "zmux-fixture-bundle-v1",
+  "version": 1,
+  "generated_from": "assets/golden_cases.json",
+  "files": [
+    {
+      "path": "fixtures/wire_valid.ndjson",
+      "kind": "wire_valid",
+      "count": 14
+    },
+    {
+      "path": "fixtures/wire_invalid.ndjson",
+      "kind": "wire_invalid",
+      "count": 3
+    },
+    {
+      "path": "fixtures/state_cases.ndjson",
+      "kind": "state_cases",
+      "count": 185
+    },
+    {
+      "path": "fixtures/invalid_cases.ndjson",
+      "kind": "invalid_cases",
+      "count": 43
+    }
+  ]
+}

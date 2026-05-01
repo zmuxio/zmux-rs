@@ -1,0 +1,25 @@
+[package]
+name = "zmux"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust implementation of the ZMux v1 stream multiplexing protocol"
+repository = "https://github.com/zmuxio/zmux-rs"
+
+[workspace]
+members = [".", "adapter/quinn"]
+default-members = ["."]
+resolver = "2"
+
+[features]
+default = []
+futures-io = ["dep:futures-io"]
+tokio-io = ["dep:tokio"]
+
+[dependencies]
+futures-io = { version = "0.3", optional = true }
+getrandom = "0.4.2"
+tokio = { version = "1.28.1", optional = true, default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+serde_json = "1"

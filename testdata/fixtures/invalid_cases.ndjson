@@ -1,0 +1,660 @@
+{
+  "id": "preface_duplicate_setting_id",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A preface settings block repeats the same setting ID.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "type": "settings_tlv",
+    "setting_ids": [
+      6,
+      6
+    ]
+  }
+}
+{
+  "id": "preface_invalid_role_value",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer advertises an unsupported role value.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "role": 7
+  }
+}
+{
+  "id": "preface_auto_equal_nonce_conflict",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "Both peers use role=auto with the same tie_breaker_nonce.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "ROLE_CONFLICT"
+  },
+  "input_shape": {
+    "local_role": "auto",
+    "peer_role": "auto",
+    "local_tie_breaker_nonce": 17,
+    "peer_tie_breaker_nonce": 17
+  }
+}
+{
+  "id": "preface_auto_zero_nonce",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer uses role=auto with tie_breaker_nonce = 0.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "role": "auto",
+    "tie_breaker_nonce": 0
+  }
+}
+{
+  "id": "preface_frame_payload_limit_too_small",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer advertises max_frame_payload below the v1 minimum.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "setting": "max_frame_payload",
+    "value": 16383
+  }
+}
+{
+  "id": "preface_control_payload_limit_too_small",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer advertises max_control_payload_bytes below the v1 minimum.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "setting": "max_control_payload_bytes",
+    "value": 4095
+  }
+}
+{
+  "id": "preface_extension_payload_limit_too_small",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer advertises max_extension_payload_bytes below the v1 minimum.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "setting": "max_extension_payload_bytes",
+    "value": 4095
+  }
+}
+{
+  "id": "frame_length_too_small",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A frame advertises frame_length smaller than the mandatory code plus shortest stream_id encoding.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_length": 1
+  }
+}
+{
+  "id": "frame_ext_payload_underflow",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "EXT derives a payload shorter than the encoded ext_type prefix.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "frame_length_shape": "too_small_for_ext_type_prefix"
+  }
+}
+{
+  "id": "frame_length_smaller_than_stream_id_prefix",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A frame_length remains too small for the actual encoded stream_id prefix after stream_id parsing.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_length": 2,
+    "stream_id_encoding_length": 4
+  }
+}
+{
+  "id": "frame_ping_with_forbidden_fin_flag",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PING carries a forbidden non-zero flag.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "hex": "0a44000102030405060708"
+}
+{
+  "id": "frame_pong_too_short",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PONG payload is shorter than the required 8-byte token.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "PONG",
+    "payload_len": 7
+  }
+}
+{
+  "id": "frame_ping_payload_exceeds_local_echoable_limit",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A locally originated PING chooses a payload longer than the smaller of local and peer control-payload limits.",
+  "expected_result": {
+    "scope": "local_send_policy",
+    "action": "forbid_send"
+  },
+  "input_shape": {
+    "local_max_control_payload_bytes": 4096,
+    "peer_max_control_payload_bytes": 16384,
+    "attempted_ping_payload_len": 8000
+  }
+}
+{
+  "id": "frame_abort_on_stream_zero",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "ABORT is invalid on the session control stream_id 0.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "ABORT",
+    "stream_id": 0
+  }
+}
+{
+  "id": "frame_max_data_trailing_garbage",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "MAX_DATA carries trailing bytes beyond its one canonical max_offset field.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "MAX_DATA",
+    "stream_id": 0,
+    "payload_shape": "canonical_varint_plus_trailing_bytes"
+  }
+}
+{
+  "id": "frame_blocked_trailing_garbage",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "BLOCKED carries trailing bytes beyond its one canonical blocked_at field.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "BLOCKED",
+    "stream_id": 0,
+    "payload_shape": "canonical_varint_plus_trailing_bytes"
+  }
+}
+{
+  "id": "frame_unknown_core_type",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A frame uses an unassigned core frame type.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "hex": "020c00"
+}
+{
+  "id": "frame_priority_update_duplicate_singleton",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE repeats a singleton STREAM-METADATA-TLV.",
+  "expected_result": {
+    "scope": "stream",
+    "action": "ignore_entire_update_payload"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "stream_metadata_tlvs": [
+      {
+        "type": "stream_priority",
+        "value": 2
+      },
+      {
+        "type": "stream_priority",
+        "value": 3
+      }
+    ]
+  }
+}
+{
+  "id": "frame_priority_update_truncated_tlv_header",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE contains a structurally truncated TLV header.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "payload_shape": "truncated_stream_hint_tlv_header"
+  }
+}
+{
+  "id": "frame_priority_update_tlv_value_overrun",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE contains a TLV value length that overruns the enclosing payload.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "payload_shape": "stream_hint_tlv_value_overrun"
+  }
+}
+{
+  "id": "frame_priority_update_without_capability",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE arrives without negotiated priority_update capability.",
+  "expected_result": {
+    "scope": "stream",
+    "action": "ignore"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4
+  }
+}
+{
+  "id": "frame_priority_update_on_unused_stream",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE targets a previously unused valid stream ID.",
+  "expected_result": {
+    "scope": "stream",
+    "action": "ignore"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "stream_exists": false
+  }
+}
+{
+  "id": "frame_priority_update_on_terminal_stream",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE targets a stream that is already terminal.",
+  "expected_result": {
+    "scope": "stream",
+    "action": "ignore"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "stream_state": "terminal"
+  }
+}
+{
+  "id": "frame_unknown_ext_subtype",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "An unknown EXT subtype is received.",
+  "expected_result": {
+    "scope": "session",
+    "action": "ignore"
+  },
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": 99,
+    "stream_id": 0
+  }
+}
+{
+  "id": "frame_data_open_metadata_without_capability",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A DATA frame uses OPEN_METADATA without negotiated open_metadata capability.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "capabilities": []
+  }
+}
+{
+  "id": "frame_data_open_metadata_on_open_stream",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "A DATA frame uses OPEN_METADATA after the stream is already open.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "stream_exists": true
+  }
+}
+{
+  "id": "frame_data_open_metadata_duplicate_singleton",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "OPEN_METADATA repeats a singleton STREAM-METADATA-TLV on the opening DATA frame.",
+  "expected_result": {
+    "scope": "stream",
+    "action": "ignore_entire_open_metadata_block"
+  },
+  "input_shape": {
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "stream_metadata_tlvs": [
+      {
+        "type": "open_info",
+        "value_hex": "61"
+      },
+      {
+        "type": "open_info",
+        "value_hex": "62"
+      }
+    ],
+    "application_payload_hex": "6869"
+  }
+}
+{
+  "id": "frame_data_exceeds_stream_max_data",
+  "source": "invalid_corpus",
+  "category": "flow_control",
+  "description": "Incoming DATA would exceed the effective stream MAX_DATA limit.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "FLOW_CONTROL"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "stream_bytes_received": 1000,
+    "peer_stream_max_data": 1004,
+    "incoming_data_length": 8
+  }
+}
+{
+  "id": "frame_first_max_data_on_unused_stream",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "A stream-scoped MAX_DATA arrives for a previously unused valid stream ID.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "incoming_frame": "MAX_DATA",
+    "initial_stream_state": "idle"
+  }
+}
+{
+  "id": "frame_first_blocked_on_unused_stream",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "A stream-scoped BLOCKED arrives for a previously unused valid stream ID.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "incoming_frame": "BLOCKED",
+    "initial_stream_state": "idle"
+  }
+}
+{
+  "id": "frame_first_stop_sending_on_unused_stream",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "A STOP_SENDING arrives for a previously unused valid stream ID.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "incoming_frame": "STOP_SENDING",
+    "initial_stream_state": "idle"
+  }
+}
+{
+  "id": "frame_first_reset_on_unused_stream",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "A RESET arrives for a previously unused valid stream ID.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "incoming_frame": "RESET",
+    "initial_stream_state": "idle"
+  }
+}
+{
+  "id": "frame_data_exceeds_session_max_data",
+  "source": "invalid_corpus",
+  "category": "flow_control",
+  "description": "Incoming DATA would exceed the effective session MAX_DATA limit.",
+  "expected_result": {
+    "scope": "session",
+    "error": "FLOW_CONTROL"
+  },
+  "input_shape": {
+    "stream_id": 4,
+    "session_bytes_received": 1000,
+    "peer_session_max_data": 1004,
+    "incoming_data_length": 8
+  }
+}
+{
+  "id": "frame_peer_stream_id_gap",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "A peer opens a new stream ID that skips lower still-unused IDs of the same class.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "expected_next_stream_id": 4,
+    "incoming_stream_id": 8,
+    "incoming_frame": "DATA"
+  }
+}
+{
+  "id": "frame_blocked_wrong_side_uni",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "BLOCKED arrives from the non-sending side of a unidirectional stream.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_kind": "uni_local_send_only",
+    "incoming_frame": "BLOCKED"
+  }
+}
+{
+  "id": "frame_max_data_wrong_side_uni",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "MAX_DATA arrives from the sending side of a unidirectional stream.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_kind": "uni_local_receive_only",
+    "incoming_frame": "MAX_DATA"
+  }
+}
+{
+  "id": "frame_stop_sending_wrong_side_uni",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "STOP_SENDING arrives from the sending side of a unidirectional stream.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_kind": "uni_local_receive_only",
+    "incoming_frame": "STOP_SENDING"
+  }
+}
+{
+  "id": "frame_reset_wrong_side_uni",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "RESET arrives from the non-sending side of a unidirectional stream.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_kind": "uni_local_send_only",
+    "incoming_frame": "RESET"
+  }
+}
+{
+  "id": "session_goaway_last_accepted_increase",
+  "source": "invalid_corpus",
+  "category": "session",
+  "description": "A later GOAWAY increases one of its per-kind acceptance watermarks.",
+  "expected_result": {
+    "scope": "session",
+    "error": "PROTOCOL"
+  },
+  "input_shape": {
+    "prior_last_accepted_bidi_stream_id": 81,
+    "prior_last_accepted_uni_stream_id": 99,
+    "incoming_last_accepted_bidi_stream_id": 81,
+    "incoming_last_accepted_uni_stream_id": 103
+  }
+}
+{
+  "id": "local_provisional_open_cancel_must_not_burn_stream_id",
+  "source": "invalid_corpus",
+  "category": "open_semantics",
+  "description": "A provisional local open is cancelled before first-frame commit but still advances the next local stream_id cursor.",
+  "expected_result": {
+    "scope": "local_send_policy",
+    "action": "forbid_gap"
+  },
+  "input_shape": {
+    "local_stream_id": 4,
+    "open_stage": "provisional",
+    "cancel_before_first_frame_commit": true,
+    "next_committed_stream_id": 8
+  }
+}
+{
+  "id": "hidden_control_opened_stream_exceeds_hard_cap_without_shedding",
+  "source": "invalid_corpus",
+  "category": "api_semantics",
+  "description": "Hidden control-opened-only nonterminal state exceeds the local hard cap but the implementation neither sheds nor refuses the newest hidden stream.",
+  "expected_result": {
+    "scope": "local_policy",
+    "action": "forbid_unbounded_hidden_state"
+  },
+  "input_shape": {
+    "hidden_control_opened_count": 65,
+    "hidden_control_opened_hard_cap": 64,
+    "attempted_action": "keep_all_hidden_streams"
+  }
+}
+{
+  "id": "late_data_after_close_read_exceeds_session_aggregate_cap",
+  "source": "invalid_corpus",
+  "category": "flow_control",
+  "description": "Many stopped directions together exceed the repository-default aggregate late-data allowance without triggering local shedding or termination policy.",
+  "expected_result": {
+    "scope": "local_policy",
+    "action": "forbid_unbounded_late_tail_buffering"
+  },
+  "input_shape": {
+    "stopped_directions": 128,
+    "late_data_session_aggregate": "above_cap",
+    "attempted_action": "continue_buffering_without_bound"
+  }
+}
+{
+  "id": "rapid_open_abort_churn_without_local_limit",
+  "source": "invalid_corpus",
+  "category": "security",
+  "description": "A peer repeatedly opens and immediately aborts streams at abusive rates while the implementation applies no churn limit or disconnect policy.",
+  "expected_result": {
+    "scope": "local_policy",
+    "action": "forbid_unbounded_stream_churn"
+  },
+  "input_shape": {
+    "pattern": "open_then_abort_loop",
+    "observed_stream_churn": "above_local_policy_threshold"
+  }
+}
