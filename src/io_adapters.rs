@@ -14,7 +14,7 @@ const DEFAULT_READ_CHUNK: usize = 16 * 1024;
 const DEFAULT_WRITE_CHUNK: usize = 16 * 1024;
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
-type BoxIoFuture<T> = Pin<Box<dyn Future<Output=T> + Send + 'static>>;
+type BoxIoFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
 type PendingWriteFuture = BoxIoFuture<(Vec<u8>, io::Result<usize>)>;
 
@@ -217,7 +217,7 @@ impl<T: ?Sized> AsyncIo<T> {
                 }
                 Ok(n)
             }
-                .await;
+            .await;
             (data, result)
         }));
     }
@@ -239,7 +239,7 @@ impl<T: ?Sized> AsyncIo<T> {
                 }
                 Ok(n)
             }
-                .await;
+            .await;
             (data, result)
         }));
     }

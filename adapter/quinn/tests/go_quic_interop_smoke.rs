@@ -658,7 +658,7 @@ func main() {
     }
 }
 "#
-        .replace("APPLICATION_PROTOCOL_PLACEHOLDER", APPLICATION_PROTOCOL)
+    .replace("APPLICATION_PROTOCOL_PLACEHOLDER", APPLICATION_PROTOCOL)
 }
 
 #[tokio::test]
@@ -709,7 +709,7 @@ async fn go_quic_client_talks_to_rust_quinn_server_with_open_metadata() {
         quinn_server_config(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     )
-        .unwrap();
+    .unwrap();
     let address = endpoint.local_addr().unwrap().to_string();
     let mut child = spawn_helper_with_piped_stdin(&exe, &[&address]).unwrap();
 

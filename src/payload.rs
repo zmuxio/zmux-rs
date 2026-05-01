@@ -891,7 +891,7 @@ mod tests {
             b"ssh",
             1024,
         )
-            .unwrap();
+        .unwrap();
         let mut payload = parse_data_payload(&raw, FRAME_FLAG_OPEN_METADATA).unwrap();
         assert!(!payload.metadata_tlvs.is_empty());
         let values = payload
@@ -964,7 +964,7 @@ mod tests {
             },
             64,
         )
-            .unwrap();
+        .unwrap();
         let (metadata, valid) = parse_priority_update_payload(&payload).unwrap();
 
         assert!(valid);
@@ -986,7 +986,7 @@ mod tests {
             },
             1024,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert_eq!(err.code(), Some(ErrorCode::Protocol));
         assert_eq!(err.scope(), ErrorScope::Session);
         assert_eq!(err.operation(), ErrorOperation::Write);
@@ -1004,7 +1004,7 @@ mod tests {
             },
             1,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert!(err
             .to_string()
             .contains("priority update exceeds peer max_extension_payload_bytes"));
@@ -1022,7 +1022,7 @@ mod tests {
             },
             1024,
         )
-            .unwrap();
+        .unwrap();
 
         let (subtype, n) = parse_varint(&payload).unwrap();
         assert_eq!(subtype, crate::protocol::EXT_PRIORITY_UPDATE);
@@ -1089,7 +1089,7 @@ mod tests {
             },
             1024,
         )
-            .is_err());
+        .is_err());
         assert!(build_priority_update_payload(
             caps,
             MetadataUpdate {
@@ -1098,7 +1098,7 @@ mod tests {
             },
             1024,
         )
-            .is_err());
+        .is_err());
     }
 
     #[test]

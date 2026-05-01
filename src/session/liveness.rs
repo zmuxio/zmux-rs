@@ -656,9 +656,9 @@ fn earliest_due(state: &ConnState) -> Option<Instant> {
         state.write_idle_ping_due_at,
         state.max_ping_due_at,
     ]
-        .into_iter()
-        .flatten()
-        .min()
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 fn outstanding_ping_sent_at(state: &ConnState) -> Option<Instant> {
@@ -694,7 +694,7 @@ pub(super) fn close_for_idle_timeout(inner: &Arc<Inner>) {
             "zmux: keepalive timeout",
             inner.peer_preface.settings.max_control_payload_bytes,
         )
-            .unwrap_or_default(),
+        .unwrap_or_default(),
     };
     fail_session_with_close(inner, err, close_frame);
 }

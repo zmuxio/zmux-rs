@@ -346,7 +346,7 @@ impl QuinnSession {
                             Err(translate_connection_error(err)),
                             &conn,
                         )
-                            .await;
+                        .await;
                         return;
                     }
                 };
@@ -374,7 +374,7 @@ impl QuinnSession {
                         stats,
                         &mut worker_shutdown,
                     )
-                        .await
+                    .await
                     {
                         publish_bidi_accept_result(&tx, result, &conn).await;
                     }
@@ -428,7 +428,7 @@ impl QuinnSession {
                         stats,
                         &mut worker_shutdown,
                     )
-                        .await
+                    .await
                     {
                         publish_uni_accept_result(&tx, result, &conn).await;
                     }
@@ -800,7 +800,7 @@ impl QuinnSession {
 }
 
 async fn with_timeout<T>(
-    fut: impl Future<Output=Result<T>>,
+    fut: impl Future<Output = Result<T>>,
     timeout: Duration,
     operation: &'static str,
 ) -> Result<T> {
@@ -813,7 +813,7 @@ async fn with_timeout<T>(
 }
 
 async fn with_optional_timeout<T>(
-    fut: impl Future<Output=Result<T>>,
+    fut: impl Future<Output = Result<T>>,
     timeout: Option<Duration>,
     operation: &'static str,
 ) -> Result<T> {
@@ -1388,10 +1388,10 @@ async fn read_accepted_metadata(recv: &mut quinn::RecvStream) -> Result<Accepted
 fn accepted_prelude_rejectable(err: &zmux::Error) -> bool {
     err.scope() == zmux::ErrorScope::Stream
         && (err.operation() == zmux::ErrorOperation::Accept
-        || err.operation() == zmux::ErrorOperation::Read)
+            || err.operation() == zmux::ErrorOperation::Read)
         && (err.is_timeout()
-        || err.is_error_code(zmux::ErrorCode::Protocol)
-        || matches!(
+            || err.is_error_code(zmux::ErrorCode::Protocol)
+            || matches!(
                 err.termination_kind(),
                 zmux::TerminationKind::Abort
                     | zmux::TerminationKind::Reset
@@ -1944,7 +1944,7 @@ impl QuinnStream {
             ensure_open_prelude(&self.prelude, &mut send, &self.stats).await?;
             write_payload_all(&mut send, src, &self.stats).await
         }
-            .await;
+        .await;
         if result.is_err() {
             self.mark_write_closed_with(result.as_ref().err().cloned());
         }
@@ -1969,7 +1969,7 @@ impl QuinnStream {
             ensure_open_prelude(&self.prelude, &mut send, &self.stats).await?;
             write_io_slices_once(&mut send, parts, total, &self.stats).await
         }
-            .await;
+        .await;
         if let Err(err) = &result {
             self.mark_write_closed_with(Some(err.clone()));
         }
@@ -2071,7 +2071,7 @@ impl QuinnStream {
             timeout,
             "write",
         )
-            .await
+        .await
     }
 
     async fn write_chunks_final_with_total_inner(
@@ -2461,7 +2461,7 @@ impl QuinnSendStream {
             ensure_open_prelude(&self.prelude, &mut send, &self.stats).await?;
             write_payload_all(&mut send, src, &self.stats).await
         }
-            .await;
+        .await;
         if result.is_err() {
             self.mark_write_closed_with(result.as_ref().err().cloned());
         }
@@ -2486,7 +2486,7 @@ impl QuinnSendStream {
             ensure_open_prelude(&self.prelude, &mut send, &self.stats).await?;
             write_io_slices_once(&mut send, parts, total, &self.stats).await
         }
-            .await;
+        .await;
         if let Err(err) = &result {
             self.mark_write_closed_with(Some(err.clone()));
         }
@@ -2588,7 +2588,7 @@ impl QuinnSendStream {
             timeout,
             "write",
         )
-            .await
+        .await
     }
 
     async fn write_chunks_final_with_total_inner(
@@ -3871,7 +3871,7 @@ async fn finish_send(send: &mut quinn::SendStream, stats: &AdapterStats) -> Resu
     Ok(())
 }
 
-fn total_bytes(lengths: impl IntoIterator<Item=usize>) -> Result<usize> {
+fn total_bytes(lengths: impl IntoIterator<Item = usize>) -> Result<usize> {
     lengths.into_iter().try_fold(0usize, |total, len| {
         total.checked_add(len).ok_or_else(|| {
             zmux::Error::local("zmux-quinn: vectored payload length exceeds usize")
@@ -3969,9 +3969,9 @@ fn protocol_prelude_error(reason: &str) -> zmux::Error {
         zmux::ErrorCode::Protocol.as_u64(),
         format!("zmux-quinn: {reason}"),
     )
-        .with_source(zmux::ErrorSource::Remote)
-        .with_stream_context(zmux::ErrorOperation::Accept, zmux::ErrorDirection::Both)
-        .with_termination_kind(zmux::TerminationKind::Abort)
+    .with_source(zmux::ErrorSource::Remote)
+    .with_stream_context(zmux::ErrorOperation::Accept, zmux::ErrorDirection::Both)
+    .with_termination_kind(zmux::TerminationKind::Abort)
 }
 
 fn local_stream_application_error(
@@ -4005,7 +4005,7 @@ fn unexpected_eof_error() -> zmux::Error {
         ErrorKind::UnexpectedEof,
         "failed to fill whole buffer",
     ))
-        .with_stream_context(zmux::ErrorOperation::Read, zmux::ErrorDirection::Read)
+    .with_stream_context(zmux::ErrorOperation::Read, zmux::ErrorDirection::Read)
 }
 
 fn local_write_closed_error() -> zmux::Error {
@@ -4074,9 +4074,9 @@ fn translate_connection_error(err: quinn::ConnectionError) -> zmux::Error {
             zmux::ErrorCode::IdleTimeout,
             "zmux-quinn: QUIC connection idle timeout",
         )
-            .with_source(zmux::ErrorSource::Transport)
-            .with_session_context(zmux::ErrorOperation::Close)
-            .with_termination_kind(zmux::TerminationKind::Timeout),
+        .with_source(zmux::ErrorSource::Transport)
+        .with_session_context(zmux::ErrorOperation::Close)
+        .with_termination_kind(zmux::TerminationKind::Timeout),
         other => zmux::Error::local(format!("zmux-quinn: {other}"))
             .with_source(zmux::ErrorSource::Transport)
             .with_session_context(zmux::ErrorOperation::Close),
@@ -4087,10 +4087,10 @@ fn translate_wait_error(err: quinn::ConnectionError) -> Result<()> {
     match err {
         quinn::ConnectionError::LocallyClosed => Ok(()),
         quinn::ConnectionError::ApplicationClosed(close)
-        if close.error_code.into_inner() == 0 && close.reason.is_empty() =>
-            {
-                Ok(())
-            }
+            if close.error_code.into_inner() == 0 && close.reason.is_empty() =>
+        {
+            Ok(())
+        }
         other => Err(translate_connection_error(other)),
     }
 }

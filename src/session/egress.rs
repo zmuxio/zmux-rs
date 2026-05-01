@@ -546,7 +546,7 @@ fn priority_update_allowed_before_following_data(
     let decision = writable_frame_decision(inner, frame.stream_id, writable_cache);
     decision.data
         && (decision.priority_update_before_data
-        || (next.flags & FRAME_FLAG_FIN != 0 && decision.priority_update_before_fin))
+            || (next.flags & FRAME_FLAG_FIN != 0 && decision.priority_update_before_fin))
 }
 
 fn next_opening_priority_stream(
@@ -1108,7 +1108,7 @@ fn frame_stream_scope(frame: &Frame) -> Option<u64> {
             | FrameType::Abort
             | FrameType::Ext
     )
-        .then_some(frame.stream_id)
+    .then_some(frame.stream_id)
 }
 
 fn job_is_priority_update(job: &WriteJob) -> bool {
@@ -1742,7 +1742,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         assert!(should_use_vectored_batch(&stats));
         let mut writer = PartialVectoredWriter {
@@ -1772,7 +1772,7 @@ mod tests {
             b"meta",
             limits.max_frame_payload,
         )
-            .unwrap();
+        .unwrap();
         payload.extend_from_slice(&vec![b'a'; 8 * 1024]);
         payload.extend_from_slice(&vec![b'b'; 8 * 1024]);
         let mut batch = vec![WriteJob::Frame(Frame {
@@ -1800,7 +1800,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         let mut merged = Vec::new();
         append_encoded_frames(&encoded, stats.encoded_bytes, &mut merged).unwrap();
@@ -1843,7 +1843,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         assert!(!should_use_vectored_batch(&stats));
         let mut merged = Vec::new();
@@ -1884,7 +1884,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         assert!(batch.is_empty());
         assert!(batch.capacity() >= 8);
@@ -1990,7 +1990,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(stats.data_cost_by_stream, vec![(1, 12), (2, 9)]);
         assert_eq!(stats.data_frame_count_by_stream, vec![(1, 2), (2, 1)]);
@@ -2036,7 +2036,7 @@ mod tests {
                 completions: &mut completions,
             },
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             opened_streams,
