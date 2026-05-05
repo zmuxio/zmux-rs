@@ -1402,6 +1402,7 @@ impl Conn {
                 canceled_ping_payload(&active.payload, active.slot.accepts_padded_pong);
         }
         reset_keepalive_idle_schedules_locked(&self.inner, &mut state, Instant::now());
+        drop(state);
         self.inner.cond.notify_all();
         true
     }
@@ -2368,8 +2369,9 @@ fn reclaim_graceful_close_local_streams_locked(
         clear_stream_open_prefix_locked(&mut stream_state);
         clear_stream_open_info_locked(state, &mut stream_state);
         maybe_release_active_count(state, &stream, &mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
-        reclaimed.push(stream.clone());
+        reclaimed.push(stream);
     }
     inner.cond.notify_all();
     reclaimed
@@ -2400,6 +2402,7 @@ fn reject_graceful_close_provisionals_locked(state: &mut ConnState, bidi: bool) 
         clear_stream_open_prefix_locked(&mut stream_state);
         clear_stream_open_info_locked(state, &mut stream_state);
         maybe_release_active_count(state, &stream, &mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
     }
     shrink_provisional_queue_locked(state, bidi);
@@ -2412,6 +2415,7 @@ fn apply_discarded_stream_frames_locked(
 ) {
     let mut state = inner.state.lock().unwrap();
     release_discarded_queued_stream_frames_locked(&mut state, stream, stats);
+    drop(state);
     inner.cond.notify_all();
 }
 

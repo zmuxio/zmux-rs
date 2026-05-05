@@ -104,6 +104,7 @@ struct QueueCost {
 
 #[derive(Debug, Clone, Default)]
 struct DataCosts {
+    total: usize,
     first: Option<(u64, usize)>,
     rest: Vec<(u64, usize)>,
 }
@@ -158,10 +159,15 @@ fn frame_data_app_bytes(frame: &Frame) -> usize {
 
 impl DataCosts {
     fn is_empty(&self) -> bool {
-        self.first.is_none()
+        self.total == 0
+    }
+
+    fn total(&self) -> usize {
+        self.total
     }
 
     fn add(&mut self, stream_id: u64, bytes: usize) {
+        self.total = self.total.saturating_add(bytes);
         if let Some((id, existing)) = self.first.as_mut() {
             if *id == stream_id {
                 *existing = existing.saturating_add(bytes);
@@ -617,6 +623,7 @@ impl WriteQueue {
             frame_belongs_to_stream,
         ));
         if stats.removed_any() {
+            drop(state);
             self.not_full.notify_all();
         }
         stats
@@ -646,6 +653,7 @@ impl WriteQueue {
             frame_is_send_tail_for_stream,
         ));
         if stats.removed_any() {
+            drop(state);
             self.not_full.notify_all();
         }
         stats
@@ -677,6 +685,7 @@ impl WriteQueue {
         let queued = job.cost_bytes();
         let cost = queue_cost_for(lane, &job, queued);
         apply_queue_cost_remove(&mut state, &cost);
+        drop(state);
         self.not_full.notify_all();
         match job {
             WriteJob::TrackedFrames(tracked) => Some(tracked),
@@ -697,6 +706,7 @@ impl WriteQueue {
             removed = true;
         }
         if removed {
+            drop(state);
             self.not_full.notify_all();
         }
         removed
@@ -791,6 +801,7 @@ impl WriteQueue {
             }
         }
         maybe_shrink_empty_lanes(&mut state);
+        drop(state);
         self.not_full.notify_all();
         WriteQueuePopStatus::Batch
     }
@@ -913,7 +924,7 @@ impl WriteQueue {
         if self.intrinsic_data_capacity_error(cost) {
             return true;
         }
-        let data_total = data_cost_total(&cost.data);
+        let data_total = cost.data.total();
         if state.data_queued_bytes.saturating_add(data_total) > self.session_data_max_bytes {
             return true;
         }
@@ -932,7 +943,7 @@ impl WriteQueue {
         if cost.data.is_empty() {
             return false;
         }
-        data_cost_total(&cost.data) > self.session_data_max_bytes
+        cost.data.total() > self.session_data_max_bytes
             || cost
                 .data
                 .iter()
@@ -948,8 +959,8 @@ impl WriteQueue {
         if new.data.is_empty() {
             return false;
         }
-        let old_total = data_cost_total(&old.data);
-        let new_total = data_cost_total(&new.data);
+        let old_total = old.data.total();
+        let new_total = new.data.total();
         if new_total > old_total
             && state
                 .data_queued_bytes
@@ -1470,12 +1481,6 @@ fn add_data_cost(costs: &mut DataCosts, stream_id: u64, bytes: usize) {
     costs.add(stream_id, bytes);
 }
 
-fn data_cost_total(costs: &DataCosts) -> usize {
-    costs
-        .iter()
-        .fold(0usize, |sum, (_, bytes)| sum.saturating_add(bytes))
-}
-
 fn clear_queue_locked(state: &mut WriteQueueState) {
     complete_drained_jobs(state.urgent_jobs.drain(..), Error::session_closed());
     complete_drained_jobs(state.advisory_jobs.drain(..), Error::session_closed());
@@ -1620,7 +1625,7 @@ fn apply_queue_cost_add(state: &mut WriteQueueState, cost: &QueueCost) {
     state.pending_priority_bytes = state
         .pending_priority_bytes
         .saturating_add(cost.pending_priority);
-    let data_total = data_cost_total(&cost.data);
+    let data_total = cost.data.total();
     state.data_queued_bytes = state.data_queued_bytes.saturating_add(data_total);
     for (stream_id, bytes) in cost.data.iter() {
         let entry = state.data_queued_by_stream.entry(stream_id).or_default();
@@ -1638,7 +1643,7 @@ fn apply_queue_cost_remove(state: &mut WriteQueueState, cost: &QueueCost) {
     state.pending_priority_bytes = state
         .pending_priority_bytes
         .saturating_sub(cost.pending_priority);
-    let data_total = data_cost_total(&cost.data);
+    let data_total = cost.data.total();
     state.data_queued_bytes = state.data_queued_bytes.saturating_sub(data_total);
     for (stream_id, bytes) in cost.data.iter() {
         let mut remove = false;

@@ -612,13 +612,15 @@ pub(super) fn mark_stream_peer_visible_by_id(
     inner: &Arc<Inner>,
     stream_id: u64,
 ) -> Option<PeerVisibleUpdate> {
-    let state = inner.state.lock().unwrap();
-    let stream = state.streams.get(&stream_id).cloned()?;
+    let (stream, session_state) = {
+        let state = inner.state.lock().unwrap();
+        (state.streams.get(&stream_id).cloned()?, state.state)
+    };
     let mut stream_state = stream.state.lock().unwrap();
     if stream_state.aborted.is_some() && stream_state.abort_source == ErrorSource::Remote {
         return None;
     }
-    mark_stream_peer_visible_locked(inner, &stream, &mut stream_state, state.state)
+    mark_stream_peer_visible_locked(inner, &stream, &mut stream_state, session_state)
 }
 
 pub(super) fn queue_peer_visible_pending_priority(
@@ -648,8 +650,10 @@ pub(super) fn fail_pending_pings_locked(state: &mut ConnState, err: Error) {
     state.canceled_ping_payload = None;
     if let Some(ping) = state.ping_waiter.take() {
         let slot = ping.slot;
-        let mut result = slot.result.lock().unwrap();
-        *result = Some(Err(err.clone()));
+        {
+            let mut result = slot.result.lock().unwrap();
+            *result = Some(Err(err));
+        }
         slot.cond.notify_all();
     }
 }
@@ -689,6 +693,7 @@ pub(super) fn release_session_runtime_state_locked(state: &mut ConnState) {
         clear_accept_backlog_entry_locked(state, &mut stream_state);
         clear_stream_open_info_locked(state, &mut stream_state);
         clear_stream_peer_reasons_locked(state, &mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
     }
 
@@ -934,6 +939,7 @@ pub(super) fn reclaim_provisionals_after_goaway(state: &mut ConnState, bidi: boo
         );
         clear_stream_open_info_locked(state, &mut stream_state);
         clear_stream_open_prefix_locked(&mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
     }
     shrink_provisional_queue_locked(state, bidi);
@@ -989,8 +995,9 @@ pub(super) fn reclaim_unseen_local_streams_after_goaway(
         clear_stream_open_prefix_locked(&mut stream_state);
         clear_stream_open_info_locked(state, &mut stream_state);
         maybe_release_active_count(state, &stream, &mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
-        reclaimed.push(stream.clone());
+        reclaimed.push(stream);
     }
     reclaimed
 }

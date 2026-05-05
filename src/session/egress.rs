@@ -682,8 +682,10 @@ fn release_dropped_data(inner: &Arc<Inner>, dropped: &[(u64, usize, u64)]) {
         stream_state.send_used = stream_state.send_used.saturating_sub(released);
         conn_state.send_session_used = conn_state.send_session_used.saturating_sub(released);
         maybe_release_active_count(&mut conn_state, &stream, &mut stream_state);
+        drop(stream_state);
         stream.cond.notify_all();
     }
+    drop(conn_state);
     inner.cond.notify_all();
 }
 

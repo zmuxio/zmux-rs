@@ -343,6 +343,7 @@ impl<T> NativeJoinedHalf<T> {
                         state.paused = false;
                         self.changed.notify_all();
                     }
+                    drop(state);
                     return Err(err);
                 }
             }
@@ -367,6 +368,7 @@ impl<T> NativeJoinedHalf<T> {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 state.paused = false;
+                drop(state);
                 self.changed.notify_all();
                 return Err(Error::session_closed());
             }
@@ -380,6 +382,7 @@ impl<T> NativeJoinedHalf<T> {
             }
             state.current = current.take();
             state.paused = false;
+            drop(state);
             self.changed.notify_all();
             return deadline_result;
         }
@@ -426,6 +429,7 @@ impl<T> NativeJoinedHalf<T> {
                 state.closed = true;
                 state.paused = false;
                 let current = state.current.take();
+                drop(state);
                 self.changed.notify_all();
                 return current;
             }
@@ -453,7 +457,7 @@ impl<T> NativeJoinedHalf<T> {
             state.deadline_generation = state.deadline_generation.wrapping_add(1);
             state.deadline_applier = Some(applier);
             self.changed.notify_all();
-            if state.paused || state.active_ops != 0 {
+            let current = if state.paused || state.active_ops != 0 {
                 None
             } else {
                 match state.current.take() {
@@ -463,7 +467,9 @@ impl<T> NativeJoinedHalf<T> {
                     }
                     None => None,
                 }
-            }
+            };
+            drop(state);
+            current
         };
 
         let Some(current) = current else {
@@ -495,6 +501,7 @@ impl<T> NativeJoinedHalf<T> {
             if state.active_ops > 0 {
                 state.active_ops -= 1;
             }
+            drop(state);
             self.changed.notify_all();
             return deadline_result;
         }
@@ -505,9 +512,11 @@ impl<T> NativeJoinedHalf<T> {
             return Ok(None);
         };
         applier(current, deadline)?;
-        let mut state = self.state.lock().unwrap();
-        if state.deadline_generation == generation {
-            state.deadline_applied_generation = generation;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.deadline_generation == generation {
+                state.deadline_applied_generation = generation;
+            }
         }
         Ok(Some(generation))
     }
@@ -576,6 +585,7 @@ impl<T> Drop for ActiveNativeHalf<T> {
             if state.active_ops > 0 {
                 state.active_ops -= 1;
             }
+            drop(state);
             self.owner.changed.notify_all();
             return;
         }
@@ -600,7 +610,7 @@ impl<T> PausedNativeHalf<T> {
     }
 
     pub fn replace(&mut self, next: T) -> Option<T> {
-        self.set(Some(next))
+        self.current.replace(next)
     }
 
     pub fn resume(mut self) -> Result<()> {

@@ -3680,6 +3680,7 @@ async fn ensure_open_prelude(
             let mut state = state.lock().unwrap();
             state.prelude_sent = true;
             state.prelude = Bytes::new();
+            drop(state);
             return Ok(());
         }
         let started_at = Instant::now();
@@ -3702,6 +3703,7 @@ async fn ensure_open_prelude(
             state.prelude_sent = true;
             state.prelude = Bytes::new();
             state.prelude_offset = 0;
+            drop(state);
             return Ok(());
         }
     }

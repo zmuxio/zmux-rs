@@ -118,8 +118,10 @@ fn complete_local_close_after_peer_read_error(inner: &Arc<Inner>, err: &Error) -
         state.scheduler.clear();
         fail_pending_pings_locked(&mut state, Error::session_closed());
         release_session_runtime_state_locked(&mut state);
+        let event = take_session_closed_event_locked(inner, &mut state);
+        drop(state);
         inner.cond.notify_all();
-        take_session_closed_event_locked(inner, &mut state)
+        event
     };
     inner.shutdown_writer();
     emit_event(inner, close_event);

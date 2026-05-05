@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -64,7 +67,7 @@ jobs:
 
           metadata = json.loads(
               subprocess.check_output(
-                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
                   text=True,
               )
           )
@@ -112,26 +115,26 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run clippy with optional async I/O features
-        run: cargo clippy -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
+        run: cargo clippy --locked -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
 
       - name: Dry-run core publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p zmux --dry-run
+        run: cargo publish --locked -p zmux --dry-run
 
       - name: Publish core crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p zmux
+        run: cargo publish --locked -p zmux
 
       - name: Wait for core crate indexing
         shell: bash
@@ -140,7 +143,7 @@ jobs:
         run: |
           for attempt in {1..30}; do
             echo "Checking whether zmux ${ZMUX_VERSION} is available for adapter verification, attempt ${attempt}/30"
-            if cargo publish -p zmux-quinn --dry-run; then
+            if cargo publish --locked -p zmux-quinn --dry-run; then
               exit 0
             fi
             sleep 20
@@ -152,4 +155,4 @@ jobs:
       - name: Publish Quinn adapter crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p zmux-quinn
+        run: cargo publish --locked -p zmux-quinn

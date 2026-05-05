@@ -543,16 +543,25 @@ impl WriteCompletion {
     }
 
     pub(super) fn notify_waiters(&self) {
-        let mut state = self.inner.state.lock().unwrap();
-        state.generation = state.generation.wrapping_add(1);
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+        }
         self.inner.cond.notify_all();
     }
 
     fn complete(&self, result: Result<()>) {
-        let mut state = self.inner.state.lock().unwrap();
-        if state.result.is_none() {
-            state.result = Some(result);
-            state.generation = state.generation.wrapping_add(1);
+        let completed = {
+            let mut state = self.inner.state.lock().unwrap();
+            if state.result.is_some() {
+                false
+            } else {
+                state.result = Some(result);
+                state.generation = state.generation.wrapping_add(1);
+                true
+            }
+        };
+        if completed {
             self.inner.cond.notify_all();
         }
     }

@@ -1050,6 +1050,7 @@ impl<T> AsyncJoinedHalf<T> {
                         state.paused = false;
                         self.changed.notify_all();
                     }
+                    drop(state);
                     return Err(err);
                 }
             }
@@ -1074,6 +1075,7 @@ impl<T> AsyncJoinedHalf<T> {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 state.paused = false;
+                drop(state);
                 self.changed.notify_all();
                 return Err(Error::session_closed());
             }
@@ -1087,6 +1089,7 @@ impl<T> AsyncJoinedHalf<T> {
             }
             state.current = current.take();
             state.paused = false;
+            drop(state);
             self.changed.notify_all();
             return deadline_result;
         }
@@ -1135,14 +1138,17 @@ impl<T> AsyncJoinedHalf<T> {
         state.closed = true;
         state.paused = false;
         let current = state.current.take();
+        drop(state);
         self.changed.notify_all();
         current
     }
 
     fn leave(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.active_ops > 0 {
-            state.active_ops -= 1;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.active_ops > 0 {
+                state.active_ops -= 1;
+            }
         }
         self.changed.notify_all();
     }
@@ -1161,13 +1167,15 @@ impl<T> AsyncJoinedHalf<T> {
             state.deadline_generation = state.deadline_generation.wrapping_add(1);
             state.deadline_applier = Some(applier);
             self.changed.notify_all();
-            match state.current.clone() {
+            let current = match state.current.clone() {
                 Some(current) => {
                     state.active_ops += 1;
                     Some(current)
                 }
                 None => None,
-            }
+            };
+            drop(state);
+            current
         };
         let Some(current) = current else {
             return Ok(());
@@ -1196,6 +1204,7 @@ impl<T> AsyncJoinedHalf<T> {
             if state.active_ops > 0 {
                 state.active_ops -= 1;
             }
+            drop(state);
             self.changed.notify_all();
             return deadline_result;
         }
@@ -1239,6 +1248,7 @@ impl<T> AsyncJoinedHalf<T> {
         {
             state.deadline_applied_generation = generation;
         }
+        drop(state);
         self.changed.notify_all();
         result.map(|_| Some(generation))
     }
@@ -1248,9 +1258,11 @@ impl<T> AsyncJoinedHalf<T> {
             return Ok(None);
         };
         applier(current, deadline)?;
-        let mut state = self.state.lock().unwrap();
-        if state.deadline_generation == generation {
-            state.deadline_applied_generation = generation;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.deadline_generation == generation {
+                state.deadline_applied_generation = generation;
+            }
         }
         Ok(Some(generation))
     }
@@ -1319,7 +1331,7 @@ impl<T> PausedAsyncHalf<T> {
     }
 
     pub fn replace(&mut self, next: T) -> Option<Arc<T>> {
-        self.set(Some(next))
+        self.current.replace(Arc::new(next))
     }
 
     pub fn resume(mut self) -> Result<()> {

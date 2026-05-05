@@ -81,6 +81,7 @@ pub(super) fn record_outbound_activity(
     }
     state.last_outbound_at = now;
     reset_write_idle_ping_due_locked(inner, &mut state, now);
+    drop(state);
     inner.cond.notify_all();
 }
 
@@ -162,6 +163,7 @@ pub(super) fn clear_unsent_keepalive_ping(inner: &Arc<Inner>) {
     }
     state.keepalive_ping = None;
     reset_keepalive_idle_schedules_locked(inner, &mut state, Instant::now());
+    drop(state);
     inner.cond.notify_all();
 }
 

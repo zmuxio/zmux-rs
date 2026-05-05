@@ -881,8 +881,10 @@ struct WritePermit<'a> {
 
 impl Drop for WritePermit<'_> {
     fn drop(&mut self) {
-        let mut state = self.stream.state.lock().unwrap();
-        state.write_in_progress = false;
+        {
+            let mut state = self.stream.state.lock().unwrap();
+            state.write_in_progress = false;
+        }
         self.stream.cond.notify_all();
     }
 }
