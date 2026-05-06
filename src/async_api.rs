@@ -2996,7 +2996,7 @@ fn deadline_unsupported_error() -> Error {
 
 fn read_limit_exceeded_error(max_bytes: usize) -> Error {
     Error::new(
-        crate::ErrorCode::FrameSize,
+        ErrorCode::FrameSize,
         format!("zmux: read limit exceeded ({max_bytes} bytes)"),
     )
     .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)

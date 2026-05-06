@@ -1331,8 +1331,8 @@ where
 
 impl<R, W> StreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamHandle,
-    W: SendStreamHandle,
+    R: RecvStreamHandle + Read,
+    W: SendStreamHandle + Write,
 {
     fn stream_id(&self) -> u64 {
         match self.info_side {
@@ -1485,8 +1485,8 @@ where
 
 impl<R, W> RecvStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamHandle,
-    W: SendStreamHandle,
+    R: RecvStreamHandle + Read,
+    W: SendStreamHandle + Write,
 {
     fn is_read_closed(&self) -> bool {
         self.recv
@@ -1545,8 +1545,8 @@ where
 
 impl<R, W> SendStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamHandle,
-    W: SendStreamHandle,
+    R: RecvStreamHandle + Read,
+    W: SendStreamHandle + Write,
 {
     fn is_write_closed(&self) -> bool {
         self.send
@@ -1664,8 +1664,8 @@ where
 
 impl<R, W> DuplexStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamHandle,
-    W: SendStreamHandle,
+    R: RecvStreamHandle + Read,
+    W: SendStreamHandle + Write,
 {
 }
 
@@ -2420,7 +2420,10 @@ impl StreamHandle for Stream {
     }
 }
 
-impl RecvStreamHandle for Stream {
+impl RecvStreamHandle for Stream
+where
+    Stream: StreamHandle + Read,
+{
     fn is_read_closed(&self) -> bool {
         Stream::is_read_closed(self)
     }
@@ -2454,7 +2457,10 @@ impl RecvStreamHandle for Stream {
     }
 }
 
-impl SendStreamHandle for Stream {
+impl SendStreamHandle for Stream
+where
+    Stream: StreamHandle + Write,
+{
     fn is_write_closed(&self) -> bool {
         Stream::is_write_closed(self)
     }
@@ -2516,7 +2522,7 @@ impl SendStreamHandle for Stream {
     }
 }
 
-impl DuplexStreamHandle for Stream {}
+impl DuplexStreamHandle for Stream where Stream: RecvStreamHandle + SendStreamHandle {}
 
 impl StreamHandle for SendStream {
     fn stream_id(&self) -> u64 {
@@ -2572,7 +2578,10 @@ impl StreamHandle for SendStream {
     }
 }
 
-impl SendStreamHandle for SendStream {
+impl SendStreamHandle for SendStream
+where
+    SendStream: StreamHandle + Write,
+{
     fn is_write_closed(&self) -> bool {
         SendStream::is_write_closed(self)
     }
@@ -2688,7 +2697,10 @@ impl StreamHandle for RecvStream {
     }
 }
 
-impl RecvStreamHandle for RecvStream {
+impl RecvStreamHandle for RecvStream
+where
+    RecvStream: StreamHandle + Read,
+{
     fn is_read_closed(&self) -> bool {
         RecvStream::is_read_closed(self)
     }
