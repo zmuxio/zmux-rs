@@ -46,20 +46,44 @@ fn interop_java_root() -> Option<PathBuf> {
         );
         return None;
     }
-    for tool in ["java", "javac", "mvn"] {
-        if Command::new(tool)
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| !status.success())
-            .unwrap_or(true)
-        {
+    for tool in ["java", "javac"] {
+        if !command_exists(tool) {
             eprintln!("skipping Java interop smoke: {tool} executable not found");
             return None;
         }
     }
-    root.canonicalize().ok()
+    let mvn = maven_command();
+    if !command_exists(mvn) {
+        eprintln!("skipping Java interop smoke: {mvn} executable not found");
+        return None;
+    }
+    absolute_path(root)
+}
+
+fn absolute_path(path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+fn command_exists(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn maven_command() -> &'static str {
+    if cfg!(windows) && command_exists("mvn.cmd") {
+        "mvn.cmd"
+    } else {
+        "mvn"
+    }
 }
 
 fn interop_config() -> Config {
@@ -206,7 +230,7 @@ fn assert_process_success(name: &str, output: ProcessOutput) {
 }
 
 fn ensure_java_module_built(java_root: &Path) {
-    let child = Command::new("mvn")
+    let child = Command::new(maven_command())
         .arg("-q")
         .arg("-pl")
         .arg("zmux")
@@ -423,7 +447,10 @@ public final class InteropHelper {
             fatal("payload = " + string(payload));
         }
         stream.writeFinal(bytes("java:" + string(payload)));
-        stream.close();
+        try {
+            stream.close();
+        } catch (SessionClosedException ignored) {
+        }
         session.close();
         session.awaitTerminationOrThrow(TIMEOUT);
         listener.close();
