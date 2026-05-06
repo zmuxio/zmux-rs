@@ -3,13 +3,14 @@ use crate::payload::parse_priority_update_metadata;
 use crate::protocol::EXT_PRIORITY_UPDATE;
 use crate::tlv::validate_tlvs;
 use crate::varint::{
-    decode_varint_with_len, encode_varint_to_slice, parse_varint, read_exact_checked,
+    decode_varint_with_len, encode_varint_to_slice, parse_varint, read_exact_checked, PackedVarint,
 };
 use std::fmt;
 use std::io;
 
 pub const FRAME_FLAG_OPEN_METADATA: u8 = 0x20;
 pub const FRAME_FLAG_FIN: u8 = 0x40;
+const FRAME_FLAG_OPEN_METADATA_FIN: u8 = FRAME_FLAG_OPEN_METADATA | FRAME_FLAG_FIN;
 pub(crate) const MAX_FRAME_HEADER_LEN: usize = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,10 +30,7 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    pub fn from_code(code: u8) -> Result<Self> {
-        Self::from_u8(code)
-    }
-
+    #[inline]
     pub fn from_u8(v: u8) -> Result<Self> {
         Ok(match v {
             1 => Self::Data,
@@ -50,10 +48,12 @@ impl FrameType {
         })
     }
 
+    #[inline]
     pub fn as_u8(self) -> u8 {
         self as u8
     }
 
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Data => "DATA",
@@ -74,12 +74,14 @@ impl FrameType {
 impl TryFrom<u8> for FrameType {
     type Error = Error;
 
+    #[inline]
     fn try_from(value: u8) -> Result<Self> {
         Self::from_u8(value)
     }
 }
 
 impl From<FrameType> for u8 {
+    #[inline]
     fn from(value: FrameType) -> Self {
         value.as_u8()
     }
@@ -92,6 +94,7 @@ impl fmt::Display for FrameType {
 }
 
 impl AsRef<str> for FrameType {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -105,43 +108,54 @@ pub struct Limits {
 }
 
 impl Default for Limits {
+    #[inline]
     fn default() -> Self {
-        Self {
-            max_frame_payload: 16_384,
-            max_control_payload_bytes: 4096,
-            max_extension_payload_bytes: 4096,
-        }
+        Self::DEFAULT
     }
 }
 
 impl Limits {
+    pub const DEFAULT: Self = Self {
+        max_frame_payload: 16_384,
+        max_control_payload_bytes: 4096,
+        max_extension_payload_bytes: 4096,
+    };
+
+    #[inline]
     pub fn normalized(self) -> Self {
-        let defaults = Self::default();
+        let defaults = Self::DEFAULT;
         Self {
-            max_frame_payload: if self.max_frame_payload == 0 {
-                defaults.max_frame_payload
-            } else {
-                self.max_frame_payload
-            },
-            max_control_payload_bytes: if self.max_control_payload_bytes == 0 {
-                defaults.max_control_payload_bytes
-            } else {
-                self.max_control_payload_bytes
-            },
-            max_extension_payload_bytes: if self.max_extension_payload_bytes == 0 {
-                defaults.max_extension_payload_bytes
-            } else {
-                self.max_extension_payload_bytes
-            },
+            max_frame_payload: nonzero_or_default(
+                self.max_frame_payload,
+                defaults.max_frame_payload,
+            ),
+            max_control_payload_bytes: nonzero_or_default(
+                self.max_control_payload_bytes,
+                defaults.max_control_payload_bytes,
+            ),
+            max_extension_payload_bytes: nonzero_or_default(
+                self.max_extension_payload_bytes,
+                defaults.max_extension_payload_bytes,
+            ),
         }
     }
 
+    #[inline]
     pub fn inbound_payload_limit(self, frame_type: FrameType) -> u64 {
         match frame_type {
             FrameType::Data => self.max_frame_payload,
             FrameType::Ext => self.max_extension_payload_bytes,
             _ => self.max_control_payload_bytes,
         }
+    }
+}
+
+#[inline]
+fn nonzero_or_default(value: u64, default: u64) -> u64 {
+    if value == 0 {
+        default
+    } else {
+        value
     }
 }
 
@@ -166,19 +180,16 @@ impl<'a> FrameView<'a> {
         self.frame_type.as_u8() | self.flags
     }
 
-    pub fn to_owned_frame(&self) -> Frame {
-        Frame {
-            frame_type: self.frame_type,
-            flags: self.flags,
-            stream_id: self.stream_id,
-            payload: self.payload.to_vec(),
-        }
-    }
-
-    pub fn try_to_owned_frame(&self) -> Result<Frame> {
-        let mut payload = Vec::new();
-        reserve_frame_payload(&mut payload, self.payload.len())?;
-        payload.extend_from_slice(self.payload);
+    #[inline]
+    pub fn try_to_owned(&self) -> Result<Frame> {
+        let payload = if self.payload.is_empty() {
+            Vec::new()
+        } else {
+            let mut payload = Vec::new();
+            reserve_frame_payload(&mut payload, self.payload.len())?;
+            payload.extend_from_slice(self.payload);
+            payload
+        };
         Ok(Frame {
             frame_type: self.frame_type,
             flags: self.flags,
@@ -193,7 +204,7 @@ impl<'a> FrameView<'a> {
         if frame_len < 2 {
             return Err(Error::frame_size("frame too short"));
         }
-        if src.len() < n_len.saturating_add(1) {
+        if src.len() < n_len + 1 {
             return Err(Error::frame_size("truncated frame"));
         }
         let code = src[n_len];
@@ -204,14 +215,11 @@ impl<'a> FrameView<'a> {
             return Err(Error::frame_size("truncated frame"));
         }
         let stream_len = 1usize << (src[stream_start] >> 6);
-        let stream_len_u64 =
-            u64::try_from(stream_len).map_err(|_| Error::frame_size("frame too large"))?;
+        let stream_len_u64 = stream_len as u64;
         if frame_len < 1 + stream_len_u64 {
             return Err(Error::frame_size("frame too short"));
         }
-        let stream_end = stream_start
-            .checked_add(stream_len)
-            .ok_or_else(|| Error::frame_size("payload exceeds configured limit"))?;
+        let stream_end = stream_start + stream_len;
         if src.len() < stream_end {
             return Err(Error::frame_size("truncated frame"));
         }
@@ -221,24 +229,21 @@ impl<'a> FrameView<'a> {
         if payload_len > limits.inbound_payload_limit(frame_type) {
             return Err(Error::frame_size("payload exceeds configured limit"));
         }
-        let payload_len = usize::try_from(payload_len)
-            .map_err(|_| Error::frame_size("payload exceeds configured limit"))?;
-        let frame_len = usize::try_from(frame_len)
-            .map_err(|_| Error::frame_size("payload exceeds configured limit"))?;
+        if frame_len > usize::MAX as u64 {
+            return Err(Error::frame_size("payload exceeds configured limit"));
+        }
+        let frame_len = frame_len as usize;
         let total_len = n_len
             .checked_add(frame_len)
             .ok_or_else(|| Error::frame_size("payload exceeds configured limit"))?;
         if src.len() < total_len {
             return Err(Error::frame_size("truncated frame"));
         }
-        let payload_end = payload_start
-            .checked_add(payload_len)
-            .ok_or_else(|| Error::frame_size("payload exceeds configured limit"))?;
         let frame = Self {
             frame_type,
             flags,
             stream_id,
-            payload: &src[payload_start..payload_end],
+            payload: &src[payload_start..total_len],
         };
         frame.validate(limits, true)?;
         Ok((frame, total_len))
@@ -257,6 +262,7 @@ impl<'a> FrameView<'a> {
 }
 
 impl Frame {
+    #[inline]
     pub fn new(frame_type: FrameType, stream_id: u64, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             frame_type,
@@ -266,6 +272,7 @@ impl Frame {
         }
     }
 
+    #[inline]
     pub fn with_flags(
         frame_type: FrameType,
         flags: u8,
@@ -280,6 +287,7 @@ impl Frame {
         }
     }
 
+    #[inline]
     pub fn code(&self) -> u8 {
         self.frame_type.as_u8() | self.flags
     }
@@ -305,12 +313,14 @@ impl Frame {
         Ok(out)
     }
 
+    #[inline]
     pub fn encoded_len(&self) -> Result<usize> {
         let body_len = frame_body_len(self.stream_id, self.payload.len())?;
         let body_len_u64 = frame_body_len_u64(body_len)?;
         encoded_total_len(crate::varint::varint_len(body_len_u64)?, body_len)
     }
 
+    #[inline]
     pub fn append_to(&self, out: &mut Vec<u8>) -> Result<()> {
         let mut header = [0u8; MAX_FRAME_HEADER_LEN];
         let header_len = self.encode_header(&mut header)?;
@@ -322,7 +332,7 @@ impl Frame {
     }
 
     pub(crate) fn encode_header(&self, out: &mut [u8; MAX_FRAME_HEADER_LEN]) -> Result<usize> {
-        self.encode_header_with_limits(Limits::default(), out)
+        self.encode_header_with_limits(Limits::DEFAULT, out)
     }
 
     pub(crate) fn encode_header_with_limits(
@@ -331,25 +341,53 @@ impl Frame {
         out: &mut [u8; MAX_FRAME_HEADER_LEN],
     ) -> Result<usize> {
         self.validate(limits, false)?;
-        let stream_id_len = crate::varint::varint_len(self.stream_id)?;
+        let stream_id = PackedVarint::new(self.stream_id)?;
+        self.encode_validated_header_with_packed_stream_id(stream_id, out)
+    }
+
+    pub(crate) fn encode_header_with_stream_id_cache(
+        &self,
+        limits: Limits,
+        stream_id_cache: &mut Option<PackedVarint>,
+        out: &mut [u8; MAX_FRAME_HEADER_LEN],
+    ) -> Result<usize> {
+        self.validate(limits, false)?;
+        let stream_id = match *stream_id_cache {
+            Some(cached) if cached.value() == self.stream_id => cached,
+            _ => {
+                let encoded = PackedVarint::new(self.stream_id)?;
+                *stream_id_cache = Some(encoded);
+                encoded
+            }
+        };
+        self.encode_validated_header_with_packed_stream_id(stream_id, out)
+    }
+
+    fn encode_validated_header_with_packed_stream_id(
+        &self,
+        stream_id: PackedVarint,
+        out: &mut [u8; MAX_FRAME_HEADER_LEN],
+    ) -> Result<usize> {
+        if stream_id.value() != self.stream_id {
+            return Err(Error::local("zmux: cached stream_id mismatch"));
+        }
+        let stream_id_len = stream_id.len();
         let body_len = frame_body_len_for_stream_len(stream_id_len, self.payload.len())?;
         let body_len_u64 = frame_body_len_u64(body_len)?;
         let frame_len_len = crate::varint::varint_len(body_len_u64)?;
-        let expected_header_len = frame_len_len
-            .checked_add(1)
-            .and_then(|n| n.checked_add(stream_id_len))
-            .ok_or_else(|| Error::frame_size("frame too large"))?;
+        let expected_header_len = frame_len_len + 1 + stream_id_len;
         let mut off = encode_varint_to_slice(out, body_len_u64)?;
         out[off] = self.code();
         off += 1;
-        off += encode_varint_to_slice(&mut out[off..], self.stream_id)?;
+        out[off..off + stream_id_len].copy_from_slice(stream_id.as_slice());
+        off += stream_id_len;
         debug_assert_eq!(off, expected_header_len);
         Ok(off)
     }
 
     pub fn parse(src: &[u8], limits: Limits) -> Result<(Self, usize)> {
         let (frame, total_len) = FrameView::parse(src, limits)?;
-        Ok((frame.try_to_owned_frame()?, total_len))
+        Ok((frame.try_to_owned()?, total_len))
     }
 
     pub fn validate(&self, limits: Limits, inbound: bool) -> Result<()> {
@@ -369,14 +407,18 @@ fn frame_body_len(stream_id: u64, payload_len: usize) -> Result<usize> {
 }
 
 fn frame_body_len_for_stream_len(stream_id_len: usize, payload_len: usize) -> Result<usize> {
-    1usize
+    let len = 1usize
         .checked_add(stream_id_len)
-        .and_then(|n| n.checked_add(payload_len))
+        .ok_or_else(|| Error::frame_size("frame too large"))?;
+    len.checked_add(payload_len)
         .ok_or_else(|| Error::frame_size("frame too large"))
 }
 
 fn frame_body_len_u64(body_len: usize) -> Result<u64> {
-    let body_len = u64::try_from(body_len).map_err(|_| Error::frame_size("frame too large"))?;
+    if body_len > u64::MAX as usize {
+        return Err(Error::frame_size("frame too large"));
+    }
+    let body_len = body_len as u64;
     if body_len > crate::varint::MAX_VARINT62 {
         return Err(Error::frame_size("frame too large"));
     }
@@ -387,10 +429,6 @@ fn encoded_total_len(header_len: usize, payload_len: usize) -> Result<usize> {
     header_len
         .checked_add(payload_len)
         .ok_or_else(|| Error::frame_size("frame too large"))
-}
-
-fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn reserve_frame_payload(payload: &mut Vec<u8>, payload_len: usize) -> Result<()> {
@@ -424,7 +462,7 @@ fn validate_frame_parts(
         FrameType::StopSending | FrameType::Reset | FrameType::Abort | FrameType::Close => {
             validate_error_and_diag_payload(payload)
         }
-        FrameType::GoAway => validate_goaway_payload(payload),
+        FrameType::GoAway => validate_go_away_payload(payload),
         FrameType::Ext => validate_ext_payload(stream_id, payload),
     }
 }
@@ -439,8 +477,7 @@ fn validate_frame_envelope(
 ) -> Result<()> {
     validate_frame_flags(frame_type, flags)?;
     validate_frame_scope(frame_type, stream_id)?;
-    if inbound && usize_to_u64_saturating(payload.len()) > limits.inbound_payload_limit(frame_type)
-    {
+    if inbound && (payload.len() as u64) > limits.inbound_payload_limit(frame_type) {
         return Err(Error::frame_size("payload exceeds configured limit"));
     }
     Ok(())
@@ -485,7 +522,7 @@ fn read_frame_inner<R: io::Read>(
     let mut stream_buf = [0u8; 8];
     read_frame_exact(reader, &mut stream_buf[..1], "truncated frame")?;
     let stream_len = 1usize << (stream_buf[0] >> 6);
-    let stream_len_u64 = usize_to_u64_saturating(stream_len);
+    let stream_len_u64 = stream_len as u64;
     if frame_len < 1 + stream_len_u64 {
         return Err(Error::frame_size("frame too short"));
     }
@@ -497,8 +534,10 @@ fn read_frame_inner<R: io::Read>(
     if payload_len > limits.inbound_payload_limit(frame_type) {
         return Err(Error::frame_size("payload exceeds configured limit"));
     }
-    let payload_len = usize::try_from(payload_len)
-        .map_err(|_| Error::frame_size("payload exceeds configured limit"))?;
+    if payload_len > usize::MAX as u64 {
+        return Err(Error::frame_size("payload exceeds configured limit"));
+    }
+    let payload_len = payload_len as usize;
     let mut payload = Vec::new();
     reserve_frame_payload(&mut payload, payload_len)?;
     payload.resize(payload_len, 0);
@@ -581,11 +620,10 @@ fn validate_frame_flags(frame_type: FrameType, flags: u8) -> Result<()> {
         }
         return Err(Error::protocol("invalid flags for frame type"));
     }
-    if flags == 0
-        || flags == FRAME_FLAG_OPEN_METADATA
-        || flags == FRAME_FLAG_FIN
-        || flags == (FRAME_FLAG_OPEN_METADATA | FRAME_FLAG_FIN)
-    {
+    if matches!(
+        flags,
+        0 | FRAME_FLAG_OPEN_METADATA | FRAME_FLAG_FIN | FRAME_FLAG_OPEN_METADATA_FIN
+    ) {
         Ok(())
     } else {
         Err(Error::protocol("invalid flags for frame type"))
@@ -593,24 +631,19 @@ fn validate_frame_flags(frame_type: FrameType, flags: u8) -> Result<()> {
 }
 
 fn validate_frame_scope(frame_type: FrameType, stream_id: u64) -> Result<()> {
-    match frame_type {
-        FrameType::Data | FrameType::StopSending | FrameType::Reset | FrameType::Abort
-            if stream_id == 0 =>
-        {
-            return Err(Error::protocol(format!(
-                "{} requires non-zero stream_id",
-                frame_type
-            )));
-        }
-        FrameType::Ping | FrameType::Pong | FrameType::GoAway | FrameType::Close
-            if stream_id != 0 =>
-        {
-            return Err(Error::protocol(format!(
-                "{} requires stream_id = 0",
-                frame_type
-            )));
-        }
-        _ => {}
+    let message = match (frame_type, stream_id == 0) {
+        (FrameType::Data, true) => Some("DATA requires non-zero stream_id"),
+        (FrameType::StopSending, true) => Some("STOP_SENDING requires non-zero stream_id"),
+        (FrameType::Reset, true) => Some("RESET requires non-zero stream_id"),
+        (FrameType::Abort, true) => Some("ABORT requires non-zero stream_id"),
+        (FrameType::Ping, false) => Some("PING requires stream_id = 0"),
+        (FrameType::Pong, false) => Some("PONG requires stream_id = 0"),
+        (FrameType::GoAway, false) => Some("GOAWAY requires stream_id = 0"),
+        (FrameType::Close, false) => Some("CLOSE requires stream_id = 0"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return Err(Error::protocol(message));
     }
     Ok(())
 }
@@ -621,23 +654,33 @@ fn validate_data_payload(payload: &[u8], flags: u8) -> Result<()> {
     }
     let (metadata_len, n) = parse_varint(payload)
         .map_err(|err| frame_size_with_error("invalid OPEN_METADATA length", err))?;
-    let metadata_len = usize::try_from(metadata_len)
-        .map_err(|_| Error::frame_size("OPEN_METADATA payload overrun"))?;
-    if payload.len() - n < metadata_len {
+    if metadata_len > (payload.len() - n) as u64 {
         return Err(Error::frame_size("OPEN_METADATA payload overrun"));
     }
+    let metadata_len = metadata_len as usize;
     validate_tlvs(&payload[n..n + metadata_len])
         .map_err(|err| frame_size_with_error("invalid OPEN_METADATA payload", err))
 }
 
 fn validate_exact_one_varint_payload(frame_type: FrameType, payload: &[u8]) -> Result<()> {
-    let (_, n) = parse_varint(payload)
-        .map_err(|err| frame_size_with_error(&format!("invalid {} payload", frame_type), err))?;
+    let (invalid_message, trailing_message) = match frame_type {
+        FrameType::MaxData => (
+            "invalid MAX_DATA payload",
+            "MAX_DATA payload has trailing bytes",
+        ),
+        FrameType::Blocked => (
+            "invalid BLOCKED payload",
+            "BLOCKED payload has trailing bytes",
+        ),
+        _ => (
+            "invalid varint payload",
+            "varint payload has trailing bytes",
+        ),
+    };
+    let (_, n) =
+        parse_varint(payload).map_err(|err| frame_size_with_error(invalid_message, err))?;
     if n != payload.len() {
-        return Err(Error::protocol(format!(
-            "{} payload has trailing bytes",
-            frame_type
-        )));
+        return Err(Error::protocol(trailing_message));
     }
     Ok(())
 }
@@ -649,7 +692,7 @@ fn validate_error_and_diag_payload(payload: &[u8]) -> Result<()> {
         .map_err(|err| frame_size_with_error("invalid diagnostic payload", err))
 }
 
-fn validate_goaway_payload(payload: &[u8]) -> Result<()> {
+fn validate_go_away_payload(payload: &[u8]) -> Result<()> {
     let mut off = 0usize;
     for _ in 0..3 {
         let (_, n) = parse_varint(&payload[off..])

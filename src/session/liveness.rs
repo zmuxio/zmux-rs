@@ -4,6 +4,7 @@ use crate::config::{DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYT
 use crate::error::{Error, ErrorCode, ErrorSource, Result};
 use crate::frame::{Frame, FrameType};
 use crate::payload::build_code_payload;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ const PING_PADDING_TAG_BYTES_U64: u64 = 8;
 const PING_PADDING_TAG_SALT: u64 = 0x6d1d_9f6d_33f9_772d;
 const PING_PAYLOAD_HASH_OFFSET64: u64 = 14_695_981_039_346_656_037;
 const PING_PAYLOAD_HASH_PRIME64: u64 = 1_099_511_628_211;
+const KEEPALIVE_TIMEOUT_REASON: &str = "zmux: keepalive timeout";
 
 static KEEPALIVE_JITTER_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -98,6 +100,7 @@ pub(super) fn note_blocked_write_locked(state: &mut ConnState, blocked: Duration
     state.blocked_write_total = state.blocked_write_total.saturating_add(blocked);
 }
 
+#[inline]
 fn send_rate_sample(bytes: usize, elapsed: Duration) -> Option<u64> {
     if bytes == 0 || elapsed.is_zero() {
         return None;
@@ -108,20 +111,18 @@ fn send_rate_sample(bytes: usize, elapsed: Duration) -> Option<u64> {
     Some(rate_bytes_per_second(bytes, elapsed).max(1))
 }
 
+#[inline]
 fn rate_bytes_per_second(bytes: usize, elapsed: Duration) -> u64 {
     let nanos = elapsed.as_nanos();
     if nanos == 0 {
         return 0;
     }
-    let bytes = u128::try_from(bytes).unwrap_or(u128::MAX);
-    let rate = bytes
-        .saturating_mul(1_000_000_000)
-        .checked_div(nanos)
-        .unwrap_or(u128::from(u64::MAX))
-        .min(u128::from(u64::MAX));
-    u64::try_from(rate).unwrap_or(u64::MAX)
+    let bytes = bytes as u128;
+    let rate = bytes.saturating_mul(1_000_000_000) / nanos;
+    rate.min(u128::from(u64::MAX)) as u64
 }
 
+#[inline]
 fn average_u64_floor(a: u64, b: u64) -> u64 {
     if a <= b {
         a + (b - a) / 2
@@ -174,17 +175,27 @@ pub(super) fn next_session_ping_token_locked(state: &mut ConnState) -> u64 {
 pub(super) fn ping_payload_limit(inner: &Inner) -> u64 {
     let local = inner.local_preface.settings.max_control_payload_bytes;
     let peer = inner.peer_preface.settings.max_control_payload_bytes;
-    match (local, peer) {
+    min_nonzero_or_zero(local, peer)
+}
+
+#[inline]
+fn min_nonzero_or_zero(a: u64, b: u64) -> u64 {
+    match (a, b) {
         (0, 0) => 0,
-        (0, peer) => peer,
-        (local, 0) => local,
-        (local, peer) => local.min(peer),
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
     }
 }
 
+#[inline]
 pub(super) fn ping_payload_len(echo_len: usize) -> Option<u64> {
     let total = echo_len.checked_add(PING_NONCE_BYTES)?;
-    u64::try_from(total).ok()
+    if total > u64::MAX as usize {
+        None
+    } else {
+        Some(total as u64)
+    }
 }
 
 pub(super) fn build_ping_payload_locked(
@@ -195,31 +206,28 @@ pub(super) fn build_ping_payload_locked(
 ) -> Result<(Vec<u8>, bool)> {
     let padding_len = outbound_ping_padding_len_locked(inner, state, echo.len())?;
     let accepts_padded_pong = padding_len.is_some();
+    let padding_len = padding_len.unwrap_or(0);
     let payload_len = PING_NONCE_BYTES
         .checked_add(echo.len())
-        .and_then(|len| len.checked_add(padding_len.unwrap_or(0)))
+        .ok_or_else(|| Error::frame_size("PING payload length overflows usize"))?;
+    let payload_len = payload_len
+        .checked_add(padding_len)
         .ok_or_else(|| Error::frame_size("PING payload length overflows usize"))?;
     let mut payload = Vec::new();
     payload
         .try_reserve_exact(payload_len)
         .map_err(|_| Error::local("zmux: PING payload allocation failed"))?;
-    if let Some(padding_len) = padding_len {
-        payload.resize(payload_len, 0);
-        payload[..PING_NONCE_BYTES].copy_from_slice(&nonce.to_be_bytes());
-        fill_ping_padding_from_state(
-            &mut payload[PING_NONCE_BYTES..PING_NONCE_BYTES + PING_PADDING_TAG_BYTES],
-            &mut state.ping_nonce_state,
-        );
-        payload[PING_NONCE_BYTES..PING_NONCE_BYTES + PING_PADDING_TAG_BYTES].copy_from_slice(
+    payload.extend_from_slice(&nonce.to_be_bytes());
+    if accepts_padded_pong {
+        payload.extend_from_slice(
             &ping_padding_tag(inner.local_preface.settings.ping_padding_key, nonce).to_be_bytes(),
         );
-        let echo_start = PING_NONCE_BYTES + PING_PADDING_TAG_BYTES;
-        let echo_end = echo_start + echo.len();
-        payload[echo_start..echo_end].copy_from_slice(echo);
-        fill_ping_padding_from_state(&mut payload[echo_end..], &mut state.ping_nonce_state);
+        payload.extend_from_slice(echo);
+        let padding_start = payload.len();
+        payload.resize(payload_len, 0);
+        fill_ping_padding_from_state(&mut payload[padding_start..], &mut state.ping_nonce_state);
         debug_assert_eq!(payload_len, PING_NONCE_BYTES + echo.len() + padding_len);
     } else {
-        payload.extend_from_slice(&nonce.to_be_bytes());
         payload.extend_from_slice(echo);
     }
     Ok((payload, accepts_padded_pong))
@@ -234,15 +242,16 @@ pub(super) fn pong_payload_for_ping_locked(
         return Ok(payload);
     }
     let max_payload = ping_payload_limit(inner);
-    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let payload_len = usize_to_u64_saturating(payload.len());
     if payload_len >= max_payload {
         return Ok(payload);
     }
-    let max_allowed = max_payload
-        .saturating_sub(payload_len)
-        .min(usize_to_u64_saturating(
-            usize::MAX.saturating_sub(payload.len()),
-        ));
+    let protocol_room = max_payload - payload_len;
+    let platform_room = usize_to_u64_saturating(usize::MAX.saturating_sub(payload.len()));
+    let max_allowed = protocol_room.min(platform_room);
+    if max_allowed == 0 {
+        return Ok(payload);
+    }
     let Some(padding_len) = choose_ping_padding_len_locked(inner, state, max_allowed, 0)? else {
         return Ok(payload);
     };
@@ -255,6 +264,7 @@ pub(super) fn pong_payload_for_ping_locked(
     Ok(payload)
 }
 
+#[inline]
 pub(super) fn pong_payload_matches_ping(pong: &[u8], ping: &[u8], allow_padding: bool) -> bool {
     if allow_padding {
         pong.len() >= ping.len() && &pong[..ping.len()] == ping
@@ -263,6 +273,7 @@ pub(super) fn pong_payload_matches_ping(pong: &[u8], ping: &[u8], allow_padding:
     }
 }
 
+#[inline]
 pub(super) fn canceled_ping_payload(
     payload: &[u8],
     accepts_padded_pong: bool,
@@ -278,6 +289,7 @@ pub(super) fn canceled_ping_payload(
     })
 }
 
+#[inline]
 pub(super) fn canceled_ping_payload_matches(pong: &[u8], canceled: &CanceledPingPayload) -> bool {
     if pong.len() < PING_NONCE_BYTES || ping_payload_nonce(pong) != canceled.nonce {
         return false;
@@ -400,19 +412,11 @@ fn ensure_keepalive_schedules_locked(inner: &Arc<Inner>, state: &mut ConnState, 
         return;
     }
     if state.read_idle_ping_due_at.is_none() {
-        let base = if state.last_inbound_at > now {
-            now
-        } else {
-            state.last_inbound_at
-        };
+        let base = state.last_inbound_at.min(now);
         reset_read_idle_ping_due_locked(inner, state, base);
     }
     if state.write_idle_ping_due_at.is_none() {
-        let base = if state.last_outbound_at > now {
-            now
-        } else {
-            state.last_outbound_at
-        };
+        let base = state.last_outbound_at.min(now);
         reset_write_idle_ping_due_locked(inner, state, base);
     }
     if state.max_ping_due_at.is_none() {
@@ -476,7 +480,7 @@ fn next_keepalive_jitter(base: Duration, state: &mut u64) -> Duration {
     if window.is_zero() {
         return Duration::ZERO;
     }
-    let nanos = u64::try_from(window.as_nanos().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+    let nanos = window.as_nanos().min(u128::from(u64::MAX)) as u64;
     Duration::from_nanos(next_nonce(state) % nanos.saturating_add(1))
 }
 
@@ -489,24 +493,28 @@ fn outbound_ping_padding_len_locked(
         return Ok(None);
     }
     let limit = ping_payload_limit(inner);
-    let Some(min_payload_len_usize) = echo_len
-        .checked_add(PING_NONCE_BYTES)
-        .and_then(|len| len.checked_add(PING_PADDING_TAG_BYTES))
+    let Some(min_payload_len_usize) = echo_len.checked_add(PING_NONCE_BYTES) else {
+        return Ok(None);
+    };
+    let Some(min_payload_len_usize) = min_payload_len_usize.checked_add(PING_PADDING_TAG_BYTES)
     else {
         return Ok(None);
     };
-    let Ok(min_payload_len) = u64::try_from(min_payload_len_usize) else {
+    if min_payload_len_usize > u64::MAX as usize {
         return Ok(None);
-    };
+    }
+    let min_payload_len = min_payload_len_usize as u64;
     if limit < min_payload_len {
         return Ok(None);
     }
-    let echo_len_u64 = u64::try_from(echo_len).unwrap_or(u64::MAX);
-    let max_allowed = (limit - echo_len_u64 - PING_NONCE_BYTES_U64).min(usize_to_u64_saturating(
+    let echo_len_u64 = usize_to_u64_saturating(echo_len);
+    let protocol_room = limit - echo_len_u64 - PING_NONCE_BYTES_U64;
+    let platform_room = usize_to_u64_saturating(
         usize::MAX
             .saturating_sub(echo_len)
             .saturating_sub(PING_NONCE_BYTES),
-    ));
+    );
+    let max_allowed = protocol_room.min(platform_room);
     let (_, max_padding) = ping_padding_bounds(
         max_allowed,
         inner.ping_padding_min_bytes,
@@ -553,9 +561,13 @@ fn choose_ping_padding_len_locked(
     }
     state.last_ping_padding_len = padding_len;
 
-    let padding_len = usize::try_from(padding_len)
-        .map_err(|_| Error::frame_size("PING padding length exceeds platform capacity"))?;
-    Ok(Some(padding_len))
+    if padding_len > usize::MAX as u64 {
+        Err(Error::frame_size(
+            "PING padding length exceeds platform capacity",
+        ))
+    } else {
+        Ok(Some(padding_len as usize))
+    }
 }
 
 fn ping_padding_bounds(max_allowed: u64, configured_min: u64, configured_max: u64) -> (u64, u64) {
@@ -593,15 +605,14 @@ fn next_uint64n_from_state(state: &mut u64, n: u64) -> u64 {
     }
 }
 
-fn fill_ping_padding_from_state(mut dst: &mut [u8], state: &mut u64) {
-    while !dst.is_empty() {
+fn fill_ping_padding_from_state(dst: &mut [u8], state: &mut u64) {
+    for chunk in dst.chunks_mut(size_of::<u64>()) {
         let block = next_nonce(state).to_be_bytes();
-        let n = dst.len().min(block.len());
-        dst[..n].copy_from_slice(&block[..n]);
-        dst = &mut dst[n..];
+        chunk.copy_from_slice(&block[..chunk.len()]);
     }
 }
 
+#[inline]
 fn ping_padding_tag(key: u64, nonce: u64) -> u64 {
     let mut z = key ^ nonce ^ PING_PADDING_TAG_SALT;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -609,35 +620,43 @@ fn ping_padding_tag(key: u64, nonce: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+#[inline]
 fn has_ping_padding_tag(payload: &[u8], key: u64) -> bool {
     if key == 0 || payload.len() < PING_NONCE_BYTES + PING_PADDING_TAG_BYTES {
         return false;
     }
     let nonce = ping_payload_nonce(payload);
-    let tag = u64::from_be_bytes(
-        payload[PING_NONCE_BYTES..PING_NONCE_BYTES + PING_PADDING_TAG_BYTES]
-            .try_into()
-            .unwrap(),
-    );
+    let tag = read_u64_be_prefix(&payload[PING_NONCE_BYTES..]);
     tag == ping_padding_tag(key, nonce)
 }
 
+#[inline]
 fn ping_payload_nonce(payload: &[u8]) -> u64 {
-    u64::from_be_bytes(payload[..PING_NONCE_BYTES].try_into().unwrap())
+    read_u64_be_prefix(payload)
 }
 
+#[inline]
+fn read_u64_be_prefix(payload: &[u8]) -> u64 {
+    let mut value = [0u8; PING_NONCE_BYTES];
+    value.copy_from_slice(&payload[..PING_NONCE_BYTES]);
+    u64::from_be_bytes(value)
+}
+
+#[inline]
 fn ping_payload_hash(payload: &[u8]) -> u64 {
-    payload
-        .iter()
-        .fold(PING_PAYLOAD_HASH_OFFSET64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(PING_PAYLOAD_HASH_PRIME64)
-        })
+    let mut hash = PING_PAYLOAD_HASH_OFFSET64;
+    for &byte in payload {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PING_PAYLOAD_HASH_PRIME64);
+    }
+    hash
 }
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
+#[inline]
 fn next_nonce(state: &mut u64) -> u64 {
     let mut x = *state;
     if x == 0 {
@@ -652,17 +671,24 @@ fn next_nonce(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+#[inline]
 fn earliest_due(state: &ConnState) -> Option<Instant> {
-    [
-        state.read_idle_ping_due_at,
-        state.write_idle_ping_due_at,
+    min_due(
+        min_due(state.read_idle_ping_due_at, state.write_idle_ping_due_at),
         state.max_ping_due_at,
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+    )
 }
 
+#[inline]
+fn min_due(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+#[inline]
 fn outstanding_ping_sent_at(state: &ConnState) -> Option<Instant> {
     state
         .keepalive_ping
@@ -671,17 +697,21 @@ fn outstanding_ping_sent_at(state: &ConnState) -> Option<Instant> {
         .or_else(|| state.ping_waiter.as_ref().map(|ping| ping.slot.sent_at))
 }
 
+#[inline]
 fn rtt_floor(rtt: Duration) -> Duration {
     if rtt.is_zero() {
         return Duration::ZERO;
     }
-    rtt.checked_mul(4)
-        .and_then(|duration| duration.checked_add(RTT_ADAPTIVE_SLACK))
-        .unwrap_or(Duration::MAX)
+    match rtt.checked_mul(4) {
+        Some(duration) => duration
+            .checked_add(RTT_ADAPTIVE_SLACK)
+            .unwrap_or(Duration::MAX),
+        None => Duration::MAX,
+    }
 }
 
 pub(super) fn close_for_idle_timeout(inner: &Arc<Inner>) {
-    let err = Error::application(ErrorCode::IdleTimeout.as_u64(), "zmux: keepalive timeout")
+    let err = Error::application(ErrorCode::IdleTimeout.as_u64(), KEEPALIVE_TIMEOUT_REASON)
         .with_source(ErrorSource::Local);
     {
         let mut state = inner.state.lock().unwrap();
@@ -693,7 +723,7 @@ pub(super) fn close_for_idle_timeout(inner: &Arc<Inner>) {
         stream_id: 0,
         payload: build_code_payload(
             ErrorCode::IdleTimeout.as_u64(),
-            "zmux: keepalive timeout",
+            KEEPALIVE_TIMEOUT_REASON,
             inner.peer_preface.settings.max_control_payload_bytes,
         )
         .unwrap_or_default(),

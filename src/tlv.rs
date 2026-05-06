@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::varint::{append_varint, parse_varint, varint_len};
+use crate::varint::{append_varint_reserved, parse_varint, varint_len};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tlv {
@@ -8,14 +8,16 @@ pub struct Tlv {
 }
 
 impl Tlv {
+    #[inline]
     pub fn new(typ: u64, value: impl Into<Vec<u8>>) -> Result<Self> {
-        validate_tlv_header(typ, 0)?;
+        let typ_len = varint_len(typ)?;
         let value = value.into();
-        validate_tlv_header(typ, value.len())?;
+        let _ = tlv_encoded_len_with_type_len(typ_len, value.len())?;
         Ok(Self { typ, value })
     }
 
     #[must_use]
+    #[inline]
     pub fn as_view(&self) -> TlvView<'_> {
         TlvView {
             typ: self.typ,
@@ -24,18 +26,22 @@ impl Tlv {
     }
 
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.value.is_empty()
     }
 
+    #[inline]
     pub fn validate(&self) -> Result<()> {
         validate_tlv_header(self.typ, self.value.len())
     }
 
+    #[inline]
     pub fn encoded_len(&self) -> Result<usize> {
         tlv_encoded_len(self.typ, self.value.len())
     }
 
+    #[inline]
     pub fn append_to(&self, dst: &mut Vec<u8>) -> Result<()> {
         append_tlv(dst, self.typ, &self.value)
     }
@@ -49,23 +55,28 @@ pub struct TlvView<'a> {
 
 impl<'a> TlvView<'a> {
     #[must_use]
+    #[inline]
     pub fn is_empty(self) -> bool {
         self.value.is_empty()
     }
 
+    #[inline]
     pub fn validate(self) -> Result<()> {
         validate_tlv_header(self.typ, self.value.len())
     }
 
+    #[inline]
     pub fn encoded_len(self) -> Result<usize> {
         tlv_encoded_len(self.typ, self.value.len())
     }
 
+    #[inline]
     pub fn append_to(self, dst: &mut Vec<u8>) -> Result<()> {
         append_tlv(dst, self.typ, self.value)
     }
 
-    pub fn to_tlv(self) -> Result<Tlv> {
+    #[inline]
+    pub fn try_to_owned(self) -> Result<Tlv> {
         validate_tlv_header(self.typ, self.value.len())?;
         Ok(Tlv {
             typ: self.typ,
@@ -81,6 +92,7 @@ pub(crate) struct TlvViews<'a> {
 impl<'a> Iterator for TlvViews<'a> {
     type Item = Result<TlvView<'a>>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.src.is_empty() {
             return None;
@@ -103,21 +115,13 @@ impl<'a> Iterator for TlvViews<'a> {
             }
         };
         let src = &src[n_len..];
-        let len = match usize::try_from(len) {
-            Ok(len) => len,
-            Err(_) => {
-                self.src = &[];
-                return Some(Err(Error::protocol(
-                    "tlv value overruns containing payload",
-                )));
-            }
-        };
-        if src.len() < len {
+        if len > src.len() as u64 {
             self.src = &[];
             return Some(Err(Error::protocol(
                 "tlv value overruns containing payload",
             )));
         }
+        let len = len as usize;
 
         let (value, rest) = src.split_at(len);
         self.src = rest;
@@ -135,11 +139,8 @@ pub fn append_tlv(dst: &mut Vec<u8>, typ: u64, value: &[u8]) -> Result<()> {
     dst.try_reserve(encoded_len)
         .map_err(|_| Error::local("zmux: tlv allocation failed"))?;
 
-    append_varint(dst, typ)?;
-    append_varint(
-        dst,
-        u64::try_from(value.len()).map_err(|_| Error::frame_size("tlv value too large"))?,
-    )?;
+    append_varint_reserved(dst, typ)?;
+    append_varint_reserved(dst, tlv_value_len_u64(value.len())?)?;
     dst.extend_from_slice(value);
     Ok(())
 }
@@ -153,6 +154,7 @@ pub fn visit_tlvs(src: &[u8], mut visit: impl FnMut(u64, &[u8]) -> Result<()>) -
     Ok(())
 }
 
+#[inline]
 pub fn parse_tlvs_view(src: &[u8]) -> Result<Vec<TlvView<'_>>> {
     let mut out = tlv_vec_with_capacity(tlv_parse_capacity_hint(src.len()))?;
     for tlv in tlv_views(src) {
@@ -161,17 +163,19 @@ pub fn parse_tlvs_view(src: &[u8]) -> Result<Vec<TlvView<'_>>> {
     Ok(out)
 }
 
+#[inline]
 pub fn parse_tlvs(src: &[u8]) -> Result<Vec<Tlv>> {
     let mut out = tlv_vec_with_capacity(tlv_parse_capacity_hint(src.len()))?;
-    visit_tlvs(src, |typ, value| {
+    for tlv in tlv_views(src) {
+        let tlv = tlv?;
         push_tlv(
             &mut out,
             Tlv {
-                typ,
-                value: clone_tlv_value(value)?,
+                typ: tlv.typ,
+                value: clone_tlv_value(tlv.value)?,
             },
-        )
-    })?;
+        )?;
+    }
     Ok(out)
 }
 
@@ -180,6 +184,7 @@ pub(crate) fn validate_tlvs(src: &[u8]) -> Result<()> {
     visit_tlvs(src, |_, _| Ok(()))
 }
 
+#[inline]
 fn parse_tlv_varint(src: &[u8]) -> Result<(u64, usize)> {
     parse_varint(src).map_err(|err| {
         if err.is_protocol_message("truncated varint62") {
@@ -190,25 +195,44 @@ fn parse_tlv_varint(src: &[u8]) -> Result<(u64, usize)> {
     })
 }
 
+#[inline]
 fn validate_tlv_header(typ: u64, value_len: usize) -> Result<()> {
     let _ = tlv_encoded_len(typ, value_len)?;
     Ok(())
 }
 
+#[inline]
 fn tlv_encoded_len(typ: u64, value_len: usize) -> Result<usize> {
-    let value_len_u64 =
-        u64::try_from(value_len).map_err(|_| Error::frame_size("tlv value too large"))?;
-    varint_len(typ)?
+    tlv_encoded_len_with_type_len(varint_len(typ)?, value_len)
+}
+
+#[inline]
+fn tlv_encoded_len_with_type_len(typ_len: usize, value_len: usize) -> Result<usize> {
+    let value_len_u64 = tlv_value_len_u64(value_len)?;
+    let header_len = typ_len
         .checked_add(varint_len(value_len_u64)?)
-        .and_then(|len| len.checked_add(value_len))
+        .ok_or_else(|| Error::frame_size("tlv value too large"))?;
+    header_len
+        .checked_add(value_len)
         .ok_or_else(|| Error::frame_size("tlv value too large"))
 }
 
+#[inline]
+fn tlv_value_len_u64(value_len: usize) -> Result<u64> {
+    if value_len > u64::MAX as usize {
+        Err(Error::frame_size("tlv value too large"))
+    } else {
+        Ok(value_len as u64)
+    }
+}
+
+#[inline]
 fn tlv_parse_capacity_hint(src_len: usize) -> usize {
     const MAX_HINT: usize = 64;
     (src_len / 2).min(MAX_HINT)
 }
 
+#[inline]
 fn tlv_vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>> {
     let mut out = Vec::new();
     out.try_reserve_exact(capacity)
@@ -216,6 +240,7 @@ fn tlv_vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>> {
     Ok(out)
 }
 
+#[inline]
 fn push_tlv<T>(out: &mut Vec<T>, tlv: T) -> Result<()> {
     if out.len() == out.capacity() {
         out.try_reserve(1)
@@ -225,7 +250,11 @@ fn push_tlv<T>(out: &mut Vec<T>, tlv: T) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn clone_tlv_value(value: &[u8]) -> Result<Vec<u8>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     out.try_reserve_exact(value.len())
         .map_err(|_| Error::local("zmux: tlv allocation failed"))?;
@@ -318,7 +347,7 @@ mod tests {
         view.append_to(&mut from_view).unwrap();
         assert_eq!(from_owned, from_view);
 
-        let cloned = view.to_tlv().unwrap();
+        let cloned = view.try_to_owned().unwrap();
         assert_eq!(cloned, tlv);
         assert_ne!(cloned.value.as_ptr(), tlv.value.as_ptr());
     }

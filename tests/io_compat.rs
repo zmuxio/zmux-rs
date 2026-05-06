@@ -30,21 +30,21 @@ impl CompatStream {
         self.written.lock().unwrap().clone()
     }
 
-    fn write_closed(&self) -> bool {
+    fn is_write_closed(&self) -> bool {
         self.write_closed.load(Ordering::Acquire)
     }
 }
 
-impl zmux::StreamInfo for CompatStream {
+impl zmux::AsyncStreamInfo for CompatStream {
     fn stream_id(&self) -> u64 {
         7
     }
 
-    fn opened_locally(&self) -> bool {
+    fn is_opened_locally(&self) -> bool {
         true
     }
 
-    fn bidirectional(&self) -> bool {
+    fn is_bidirectional(&self) -> bool {
         true
     }
 
@@ -52,15 +52,13 @@ impl zmux::StreamInfo for CompatStream {
         0
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        dst.clear();
-    }
+    fn append_open_info_to(&self, _dst: &mut Vec<u8>) {}
 
     fn metadata(&self) -> zmux::StreamMetadata {
         zmux::StreamMetadata::default()
     }
 
-    fn close(&self) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    fn close(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         Box::pin(async move {
             self.write_closed.store(true, Ordering::Release);
             Ok(())
@@ -71,13 +69,13 @@ impl zmux::StreamInfo for CompatStream {
         &'a self,
         _code: u64,
         _reason: &'a str,
-    ) -> zmux::BoxFuture<'a, zmux::Result<()>> {
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<()>> {
         self.close()
     }
 }
 
-impl zmux::RecvStreamApi for CompatStream {
-    fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+impl zmux::AsyncRecvStreamApi for CompatStream {
+    fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let mut read = self.read.lock().unwrap();
             let n = dst.len().min(read.len());
@@ -91,25 +89,25 @@ impl zmux::RecvStreamApi for CompatStream {
         &'a self,
         dst: &'a mut [u8],
         _timeout: std::time::Duration,
-    ) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         self.read(dst)
     }
 
-    fn read_closed(&self) -> bool {
+    fn is_read_closed(&self) -> bool {
         self.read.lock().unwrap().is_empty()
     }
 
-    fn close_read(&self) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    fn close_read(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn cancel_read(&self, _code: u64) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    fn cancel_read(&self, _code: u64) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 }
 
-impl zmux::SendStreamApi for CompatStream {
-    fn write<'a>(&'a self, src: &'a [u8]) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+impl zmux::AsyncSendStreamApi for CompatStream {
+    fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             self.written.lock().unwrap().extend_from_slice(src);
             Ok(src.len())
@@ -120,7 +118,7 @@ impl zmux::SendStreamApi for CompatStream {
         &'a self,
         src: &'a [u8],
         _timeout: std::time::Duration,
-    ) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         self.write(src)
     }
 
@@ -128,7 +126,7 @@ impl zmux::SendStreamApi for CompatStream {
         &'a self,
         src: &'a [u8],
         _timeout: std::time::Duration,
-    ) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let n = self.write(src).await?;
             self.close_write().await?;
@@ -140,7 +138,7 @@ impl zmux::SendStreamApi for CompatStream {
         &'a self,
         parts: &'a [IoSlice<'_>],
         _timeout: std::time::Duration,
-    ) -> zmux::BoxFuture<'a, zmux::Result<usize>> {
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let mut total = 0usize;
             for part in parts {
@@ -151,30 +149,30 @@ impl zmux::SendStreamApi for CompatStream {
         })
     }
 
-    fn write_closed(&self) -> bool {
-        self.write_closed()
+    fn is_write_closed(&self) -> bool {
+        self.is_write_closed()
     }
 
     fn update_metadata(
         &self,
         update: zmux::MetadataUpdate,
-    ) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         Box::pin(async move { update.validate() })
     }
 
-    fn close_write(&self) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    fn close_write(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         Box::pin(async move {
             self.write_closed.store(true, Ordering::Release);
             Ok(())
         })
     }
 
-    fn cancel_write(&self, _code: u64) -> zmux::BoxFuture<'_, zmux::Result<()>> {
+    fn cancel_write(&self, _code: u64) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
         self.close_write()
     }
 }
 
-impl zmux::StreamApi for CompatStream {}
+impl zmux::AsyncStreamApi for CompatStream {}
 
 #[cfg(feature = "tokio-io")]
 fn block_on<F>(future: F) -> F::Output
@@ -229,7 +227,7 @@ fn tokio_io_compat_reads_writes_and_shutdown() -> IoResult<()> {
     block_on(AsyncWriteExt::shutdown(&mut io))?;
 
     assert_eq!(stream.written(), b"pong-vec");
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
     Ok(())
 }
 
@@ -254,6 +252,6 @@ fn futures_io_compat_reads_writes_and_closes() -> IoResult<()> {
     poll_ready(|cx| Pin::new(&mut io).poll_close(cx))?;
 
     assert_eq!(stream.written(), b"xyz-vec");
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
     Ok(())
 }

@@ -36,15 +36,14 @@ Adapter usage is documented in [`adapter/quinn/README.md`](adapter/quinn/README.
 
 ## Start A Session
 
-Use `zmux::new_tcp(...)` when both peers can use auto role negotiation on an already established TCP connection.
+Use `zmux::Conn::new_tcp(...)` when both peers can use auto role negotiation on an already established TCP connection.
 
 ```rust
 use std::net::TcpStream;
-use zmux::Config;
 
 fn main() -> zmux::Result<()> {
     let socket = TcpStream::connect("127.0.0.1:9000")?;
-    let session = zmux::new_tcp(socket, Config::default())?;
+    let session = zmux::Conn::new_tcp(socket)?;
 
     let stream = session.open_stream()?;
     stream.write_final(b"hello")?;
@@ -59,15 +58,15 @@ fn main() -> zmux::Result<()> {
 
 Constructor choice:
 
-- `new(...)`, `new_tcp(...)`, `new_transport(...)`: auto role negotiation.
-- `client(...)`, `client_tcp(...)`, `client_transport(...)`: fixed initiator/client role.
-- `server(...)`, `server_tcp(...)`, `server_transport(...)`: fixed responder/server role.
-- `Conn::new*`, `Conn::client*`, and `Conn::server*`: native session constructors with the same transport choices.
+- `Conn::new(...)`, `Conn::new_tcp(...)`, `Conn::new_transport(...)`: auto role negotiation with the default config.
+- `Conn::client(...)`, `Conn::client_tcp(...)`, `Conn::client_transport(...)`: fixed initiator/client role with the default config.
+- `Conn::server(...)`, `Conn::server_tcp(...)`, `Conn::server_transport(...)`: fixed responder/server role with the default config.
+- `Conn::new_with_config(...)` and `Conn::*_with_config(...)`: same constructors with an explicit `Config`.
 
 Use the stable trait surfaces when application code should not depend on `Conn` directly:
 
-- `NativeSession`, `NativeStreamApi`, `NativeSendStreamApi`, `NativeRecvStreamApi`: blocking native API.
-- `Session` / `AsyncSession`, `StreamApi` / `AsyncStreamApi`, `SendStreamApi` / `AsyncSendStreamApi`, `RecvStreamApi` / `AsyncRecvStreamApi`: async API used by adapters and async integration code.
+- `Conn` plus `Session`, `StreamApi`, `SendStreamApi`, `RecvStreamApi`: blocking API. Prefer concrete `Conn` when you own the transport; use the traits only when type erasure is useful.
+- `AsyncSession`, `AsyncStreamApi`, `AsyncSendStreamApi`, `AsyncRecvStreamApi`: runtime-neutral async API used by adapters and async integration code.
 
 ## Streams
 
@@ -103,8 +102,11 @@ let _n = recv.read(&mut buf)?;
 Open a stream and send the first payload in one call:
 
 ```rust
-let (stream, _n) = session.open_and_send(b"hello")?;
-let (send, _n) = session.open_uni_and_send(b"event")?;
+let (stream, _n) = session.open_and_send(b"\x01hello")?;
+let (send, _n) = session.open_uni_and_send(b"\x02event")?;
+
+let buf = vec![0x01, 0x02, 0x03];
+let (stream, _n) = session.open_and_send(&buf)?;
 ```
 
 `open_and_send(...)` leaves a bidirectional stream open. `open_uni_and_send(...)` writes the final payload for a unidirectional send stream.
@@ -125,43 +127,73 @@ let capabilities = CAPABILITY_OPEN_METADATA
     | CAPABILITY_PRIORITY_UPDATE;
 
 let config = Config::default().with_capabilities(capabilities);
-let options = OpenOptions::open_info("rpc")
-    .with_initial_priority(7)
-    .with_initial_group(2);
+let options = OpenOptions::new()
+    .with_open_info(b"\x01\x00\x00\x2a")
+    .priority(7)
+    .group(2);
 
-let stream = session.open_stream_with_options(options)?;
-stream.update_metadata(MetadataUpdate::priority(3))?;
+let stream = session.open_stream_with(options)?;
+stream.update_metadata(MetadataUpdate::new().with_priority(3))?;
 stream.write_final(b"hello")?;
 ```
 
-The peer reads opener metadata through `stream.open_info()` or `stream.metadata()`.
+Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it into the options without another copy. ZMux stores its own copy for borrowed metadata and owns the bytes once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic `Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the bytes into a reusable buffer without allocating a fresh `Vec`.
+
+Stream payloads are binary bytes, not text. Reads follow the standard Rust I/O
+shape: `read(&mut [u8])` fills caller-owned memory, while async callers can use
+`read_to_end(&mut Vec<u8>)` / `read_to_end_limited(...)` when they want an owned
+result buffer. Writes keep the TCP-style partial-write entry point as
+`write(&[u8])`; because partial writes must leave the caller owning any unwritten
+bytes, owned buffers are accepted by complete-consumption APIs instead:
+`write_all(Vec<u8>)`, `write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)`.
+For erased or generic async streams, pass `WritePayload::from(vec)` to
+`write_all(...)` or `write_final(...)` when ownership should travel through
+`SendStreamApi`.
+Borrowed payloads are copied into native queued frames when ZMux must own data
+past the call boundary. Owned payloads move into the operation and let native
+ZMux avoid that queue copy when a whole frame can use the buffer directly; if
+open metadata or fragmentation requires a combined frame payload, only that
+fragment is copied. Bidirectional `open_and_send(...)` returns the number of
+bytes accepted by that first stream write; adapters with partial-write semantics
+may return before the whole payload is consumed.
 
 ## Custom Transports
 
 Wrap split blocking halves directly:
 
 ```rust
-let session = zmux::new(reader, writer, Config::default())?;
+let session = zmux::Conn::new(reader, writer)?;
 ```
+
+The native Rust API intentionally takes split `Read` / `Write` halves, or a
+`TcpStream` through `Conn::new_tcp(...)`. For other reliable byte streams, prefer the
+transport's own split/clone API and pass those halves to ZMux. If the underlying
+object must still be closed as one resource, attach that close operation with
+`DuplexTransport::with_close_fn(...)`. Avoid hiding one blocking duplex object
+behind a single `Mutex`: a blocking read can hold the lock and prevent writes or
+close progress.
 
 Use `DuplexTransport` when the transport can expose addresses, timeouts, or a close hook:
 
 ```rust
 let transport = zmux::DuplexTransport::new(reader, writer)
-    .with_addresses(local_addr, peer_addr)
+    .with_local_addr(local_addr)
+    .with_peer_addr(peer_addr)
     .with_close_fn(close_transport);
 
-let session = zmux::new_transport(transport, Config::default())?;
+let session = zmux::Conn::new_transport(transport)?;
 ```
+
+When addresses are discovered as optional values, use `with_addresses(local_addr, peer_addr)`.
 
 Join existing stream halves when an API expects a duplex object:
 
 ```rust
-let duplex = zmux::join_native_streams(recv_half, send_half);
-let optional = zmux::join_optional_native_streams(Some(recv_half), Some(send_half));
+let duplex = zmux::join_streams(recv_half, send_half);
+let optional = zmux::join_optional_streams(Some(recv_half), Some(send_half));
 ```
 
-Async equivalents are `join_streams(...)`, `join_async_streams(...)`, and `join_optional_streams(...)`.
+Async equivalents are `join_async_streams(...)` and `join_optional_async_streams(...)`. Closing a joined duplex stream closes both original halves, and skips the second close only when both halves report the same close identity.
 
 ## Closing And Errors
 
@@ -200,71 +232,83 @@ let config = Config::default()
 
 `Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, idle timeout hints, keepalive hints, scheduler hints, and padding keys.
 
-`configure_default_config(...)` updates the process-wide default template during startup. `reset_default_config()` restores built-in defaults.
+`Config::default()` and `default_config()` return a copy of the process-wide
+default template. Use `configure_default_config(...)` during startup when every
+new session should inherit the same changes. Constructors without a `Config`
+argument use that template; use `Conn::new_with_config(...)` or `Conn::*_with_config(...)`
+when one session needs an explicit override:
+
+```rust
+zmux::configure_default_config(|config| {
+    config.capabilities |= CAPABILITY_OPEN_METADATA;
+    config.keepalive_interval = std::time::Duration::from_secs(30);
+});
+```
+
+`reset_default_config()` restores the built-in template. Existing sessions keep
+the config they were created with.
 
 ## Public API Surface
 
-Root constructors and wrappers:
+Root wrappers:
 
-- `new`, `client`, `server`
-- `new_tcp`, `client_tcp`, `server_tcp`
-- `new_transport`, `client_transport`, `server_transport`
-- `box_native_session`, `box_session`, `box_async_session`
-- `closed_native_session`, `closed_session`, `closed_async_session`
-- `boxed_closed_native_session`, `boxed_closed_session`, `boxed_closed_async_session`
-- `join_native_streams`, `join_optional_native_streams`
-- `join_streams`, `join_async_streams`, `join_optional_streams`, `join_optional_async_streams`
+- `box_session`, `box_async_session`
+- `closed_session`, `closed_async_session`
+- `join_streams`, `join_optional_streams`
+- `join_async_streams`, `join_optional_async_streams`
 
-Configuration and settings:
+Configuration and open requests:
 
-- `Config`, `OpenOptions`, `Settings`, `SchedulerHint`
+- `Config`, `OpenOptions`, `OpenRequest`, `OpenSend`, `WritePayload`, `Settings`, `SchedulerHint`
 - `default_config`, `configure_default_config`, `reset_default_config`
 - `default_settings`, `marshal_settings_tlv`, `parse_settings_tlv`
 - `DEFAULT_PREFACE_PADDING_MIN_BYTES`, `DEFAULT_PREFACE_PADDING_MAX_BYTES`
 - `DEFAULT_PING_PADDING_MIN_BYTES`, `DEFAULT_PING_PADDING_MAX_BYTES`
-- `Config` methods: `builtin_default`, `configure_default`, `reset_default`, `initiator`, `responder`, `with_role`, `with_capabilities`, `enable_capabilities`, `with_settings`, `with_event_handler`, `normalized`, `local_preface`
-- `OpenOptions` methods: `new`, `priority`, `group`, `open_info`, `open_info_bytes`, `with_initial_priority`, `try_with_initial_priority`, `with_initial_group`, `try_with_initial_group`, `with_open_info`, `with_open_info_bytes`, `is_empty`, `validate`
+- `Config` methods: `initiator`, `responder`, `with_role`, `with_capabilities`, `enable_capabilities`, `with_settings`, `with_event_handler`, `normalized`, `local_preface`
+- `OpenOptions` methods: `new`, `priority`, `group`, `with_open_info`, `initial_priority`, `initial_group`, `open_info`, `open_info_len`, `has_open_info`, `is_empty`, `validate`, `into_parts`
+- `OpenRequest` methods: `new`, `with_options`, `with_timeout`, `options`, `timeout`, `into_parts`
+- `OpenSend` methods: `new`, `vectored`, `with_options`, `with_timeout`, `options`, `payload`, `timeout`, `into_parts`
+- `WritePayload` methods: `bytes`, `vectored`, `checked_len`, `is_empty`
 - `Settings` methods: `limits`, `validate`, `encoded_tlv_len`, `append_tlv_to`
-- `SchedulerHint` methods: `from_code`, `from_u64`, `as_u64`, `as_str`
+- `SchedulerHint` methods: `from_u64`, `as_u64`, `as_str`
 
-Native session and stream types:
+Blocking session and stream types:
 
 - `Conn`, `Stream`, `SendStream`, `RecvStream`
-- `NativeSession`, `NativeStreamApi`, `NativeSendStreamApi`, `NativeRecvStreamApi`, `NativeStreamInfo`
-- `BoxNativeSession`, `BoxNativeStream`, `BoxNativeSendStream`, `BoxNativeRecvStream`
-- `ClosedNativeSession`
-- `NativeDuplexStream`, `DuplexInfoSide`, `PausedNativeHalf`, `PausedNativeRecvHalf`, `PausedNativeSendHalf`
+- `Session`, `StreamApi`, `SendStreamApi`, `RecvStreamApi`, `StreamInfo`
+- `BoxSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
+- `ClosedSession`
+- `DuplexStream`, `DuplexInfoSide`, `PausedHalf`, `PausedRecvHalf`, `PausedSendHalf`
 - joined native stream methods: `new`, `from_parts`, `empty`, `with_info_side`, `info_side`, `recv`, `send`, `into_parts`, `pause_read`, `pause_read_timeout`, `pause_write`, `pause_write_timeout`, `replace_recv`, `replace_send`, `detach_recv`, `detach_send`, `read_stream_id`, `write_stream_id`
 - paused native half methods: `current`, `current_mut`, `take`, `set`, `replace`, `resume`
 
 Async session and stream types:
 
-- `Session`, `AsyncSession`
-- `StreamApi`, `AsyncStreamApi`, `SendStreamApi`, `AsyncSendStreamApi`, `RecvStreamApi`, `AsyncRecvStreamApi`, `StreamInfo`, `AsyncStreamInfo`
-- `BoxSession`, `BoxedSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
-- `BoxAsyncSession`, `BoxedAsyncSession`, `BoxAsyncStream`, `BoxAsyncSendStream`, `BoxAsyncRecvStream`
-- `ClosedSession`, `ClosedAsyncSession`
-- `DuplexStream`, `AsyncDuplexStream`, `AsyncBoxFuture`, `BoxFuture`
+- `AsyncSession`
+- `AsyncStreamApi`, `AsyncSendStreamApi`, `AsyncRecvStreamApi`, `AsyncStreamInfo`
+- `BoxAsyncSession`, `BoxAsyncStream`, `BoxAsyncSendStream`, `BoxAsyncRecvStream`
+- `ClosedAsyncSession`
+- `AsyncDuplexStream`, `AsyncBoxFuture`
 - `PausedAsyncHalf`, `PausedAsyncRecvHalf`, `PausedAsyncSendHalf`
-- `async_io`, `AsyncIo`
-- `BoxedAsyncSession` methods: `new`, `inner`, `into_inner`
+- `AsyncIo`
+- `AsyncIo` methods: `new`, `from_arc`, `get_ref`, `as_arc`, `into_inner`, `read_chunk_size`, `set_read_chunk_size`, `write_chunk_size`, `set_write_chunk_size`
 - joined async stream methods: `new`, `from_parts`, `empty`, `with_info_side`, `info_side`, `recv`, `send`, `into_parts`, `pause_read`, `pause_read_timeout`, `pause_write`, `pause_write_timeout`, `replace_recv`, `replace_send`, `detach_recv`, `detach_send`, `read_stream_id`, `write_stream_id`
 - paused async half methods: `current`, `take`, `set`, `set_arc`, `replace`, `resume`
 
 Session methods:
 
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_stream_timeout`, `open_uni_stream`, `open_uni_stream_timeout`, `open_stream_with_options`, `open_stream_with_options_timeout`, `open_uni_stream_with_options`, `open_uni_stream_with_options_timeout`
-- open and write: `open_and_send`, `open_and_send_timeout`, `open_and_send_with_options`, `open_and_send_with_options_timeout`, `open_and_send_vectored`, `open_and_send_vectored_timeout`, `open_and_send_vectored_with_options`, `open_and_send_vectored_with_options_timeout`, `open_uni_and_send`, `open_uni_and_send_timeout`, `open_uni_and_send_with_options`, `open_uni_and_send_with_options_timeout`, `open_uni_and_send_vectored`, `open_uni_and_send_vectored_timeout`, `open_uni_and_send_vectored_with_options`, `open_uni_and_send_vectored_with_options_timeout`
-- lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `wait_close_error`, `wait_close_error_timeout`, `closed`, `close_error`, `state`, `stats`
-- native controls: `ping`, `ping_timeout`, `goaway`, `goaway_with_error`, `peer_goaway_error`, `peer_close_error`, `local_preface`, `peer_preface`, `negotiated`
-- addresses: `local_addr`, `peer_addr`, `remote_addr`
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete sessions accept `OpenOptions` directly, use `OpenRequest::new`, `OpenRequest::with_options`, and `OpenRequest::with_timeout` when open metadata and timeout must be carried through trait/object-safe APIs
+- open and write: `open_and_send`, `open_uni_and_send`; concrete sessions accept byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `OpenSend::new`, `OpenSend::vectored`, `OpenSend::with_options`, and `OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait/object-safe APIs
+- lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
+- session controls: `ping`, `ping_timeout`, `go_away`, `go_away_with_error`, `peer_go_away_error`, `peer_close_error`, `local_preface`, `peer_preface`, `negotiated`
+- addresses: `local_addr`, `peer_addr`
 
 Stream methods:
 
-- identity/info: `stream_id`, `close_identity`, `opened_locally`, `bidirectional`, `open_info`, `copy_open_info_to`, `open_info_len`, `has_open_info`, `metadata`, `local_addr`, `peer_addr`, `remote_addr`
-- read side: `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`, `read_closed`, `set_read_deadline`, `set_read_timeout`, `clear_read_deadline`, `close_read`, `cancel_read`
-- write side: `write`, `write_timeout`, `write_vectored`, `writev`, `write_vectored_timeout`, `writev_timeout`, `write_final`, `write_final_timeout`, `write_vectored_final`, `writev_final`, `write_vectored_final_timeout`, `writev_final_timeout`, `write_closed`, `set_write_deadline`, `set_write_timeout`, `clear_write_deadline`, `update_metadata`, `close_write`, `cancel_write`
-- async read/write helpers: `read_exact`, `read_to_end`, `read_to_end_limited`, `write_all`
+- identity/info: `stream_id`, `close_identity`, `is_opened_locally`, `is_bidirectional`, `open_info`, `append_open_info_to`, `open_info_len`, `has_open_info`, `metadata`, `local_addr`, `peer_addr`; open info is opaque bytes, not text, and `append_open_info_to` appends to the caller's buffer
+- read side: `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`, `is_read_closed`, `set_read_deadline`, `set_read_timeout`, `clear_read_deadline`, `close_read`, `cancel_read`
+- write side: `write`, `write_timeout`, `write_all`, `write_all_timeout`, `write_vectored`, `write_vectored_timeout`, `write_final`, `write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`, `is_write_closed`, `set_write_deadline`, `set_write_timeout`, `clear_write_deadline`, `update_metadata`, `close_write`, `cancel_write`
+- async read/write helpers: `read_exact`, `read_to_end`, `read_to_end_limited`
 - combined stream helpers: `set_deadline`, `set_timeout`, `clear_deadline`, `close`, `close_with_error`
 - `SendStream` exposes write-side methods. `RecvStream` exposes read-side methods. `Stream` exposes both.
 
@@ -276,21 +320,21 @@ Wire codec and protocol helpers:
 - `Negotiated` methods: `has_capability`, `supports_open_metadata`, `supports_priority_update`, `can_carry_open_info`, `can_carry_priority_on_open`, `can_carry_group_on_open`, `can_carry_priority_in_update`, `can_carry_group_in_update`, `has_peer_visible_priority_semantics`, `has_peer_visible_group_semantics`
 - `parse_preface`, `parse_preface_prefix`, `read_preface`, `negotiate_prefaces`, `resolve_roles`
 - `Frame`, `FrameView`, `FrameType`, `Limits`, `FRAME_FLAG_FIN`, `FRAME_FLAG_OPEN_METADATA`
-- `FrameType` methods: `from_code`, `from_u8`, `as_u8`, `as_str`
+- `FrameType` methods: `from_u8`, `as_u8`, `as_str`
 - `Limits` methods: `normalized`, `inbound_payload_limit`
 - `Frame` methods: `new`, `with_flags`, `code`, `as_view`, `marshal`, `encoded_len`, `append_to`, `parse`, `validate`
-- `FrameView` methods: `code`, `to_owned_frame`, `try_to_owned_frame`, `parse`, `validate`
+- `FrameView` methods: `code`, `try_to_owned`, `parse`, `validate`
 - `parse_frame`, `read_frame`
 - `append_varint`, `encode_varint`, `encode_varint_to_slice`, `parse_varint`, `read_varint`, `varint_len`, `MAX_VARINT62`, `MAX_VARINT_LEN`
 - `Tlv`, `TlvView`, `append_tlv`, `parse_tlvs`, `parse_tlvs_view`, `visit_tlvs`
 - `Tlv` methods: `new`, `as_view`, `is_empty`, `validate`, `encoded_len`, `append_to`
-- `TlvView` methods: `is_empty`, `validate`, `encoded_len`, `append_to`, `to_tlv`
+- `TlvView` methods: `is_empty`, `validate`, `encoded_len`, `append_to`, `try_to_owned`
 - `DataPayload`, `DataPayloadView`, `GoAwayPayload`, `MetadataUpdate`, `StreamMetadata`, `StreamMetadataView`
-- `StreamMetadata` methods: `as_view`, `open_info`, `has_open_info`, `is_empty`
-- `StreamMetadataView` methods: `open_info`, `has_open_info`, `is_empty`, `to_owned_metadata`, `try_to_owned_metadata`
-- `MetadataUpdate` methods: `new`, `priority`, `group`, `with_priority`, `try_with_priority`, `with_group`, `try_with_group`, `is_empty`, `validate`
-- `build_code_payload`, `build_goaway_payload`, `build_open_metadata_prefix`, `build_priority_update_payload`
-- `parse_data_payload`, `parse_data_payload_view`, `parse_error_payload`, `parse_goaway_payload`, `parse_priority_update_payload`, `parse_stream_metadata_tlvs`, `parse_stream_metadata_bytes_view`
+- `StreamMetadata` methods: `as_view`, `open_info`, `open_info_len`, `has_open_info`, `is_empty`
+- `StreamMetadataView` methods: `open_info`, `open_info_len`, `has_open_info`, `is_empty`, `try_to_owned`
+- `MetadataUpdate` methods: `new`, `with_priority`, `with_group`, `is_empty`, `validate`
+- `build_code_payload`, `build_go_away_payload`, `build_open_metadata_prefix`, `build_priority_update_payload`
+- `parse_data_payload`, `parse_data_payload_view`, `parse_error_payload`, `parse_go_away_payload`, `parse_priority_update_payload`, `parse_stream_metadata_tlvs`, `parse_stream_metadata_bytes_view`
 
 Protocol constants and capability helpers:
 
@@ -301,22 +345,13 @@ Protocol constants and capability helpers:
 - `DIAG_DEBUG_TEXT`, `DIAG_RETRY_AFTER_MILLIS`, `DIAG_OFFENDING_STREAM_ID`, `DIAG_OFFENDING_FRAME_TYPE`
 - `SETTING_INITIAL_MAX_STREAM_DATA_BIDI_LOCALLY_OPENED`, `SETTING_INITIAL_MAX_STREAM_DATA_BIDI_PEER_OPENED`, `SETTING_INITIAL_MAX_STREAM_DATA_UNI`, `SETTING_INITIAL_MAX_DATA`, `SETTING_MAX_INCOMING_STREAMS_BIDI`, `SETTING_MAX_INCOMING_STREAMS_UNI`, `SETTING_MAX_FRAME_PAYLOAD`, `SETTING_IDLE_TIMEOUT_MILLIS`, `SETTING_KEEPALIVE_HINT_MILLIS`, `SETTING_MAX_CONTROL_PAYLOAD_BYTES`, `SETTING_MAX_EXTENSION_PAYLOAD_BYTES`, `SETTING_SCHEDULER_HINTS`, `SETTING_PING_PADDING_KEY`, `SETTING_PREFACE_PADDING`
 - `has_capability`, `capabilities_support_open_metadata`, `capabilities_support_priority_update`
-- `capabilities_can_carry_open_info`, `capabilities_can_carry_priority_on_open`, `capabilities_can_carry_group_on_open`, `capabilities_can_carry_priority_update`, `capabilities_can_carry_priority_in_update`, `capabilities_can_carry_group_update`, `capabilities_can_carry_group_in_update`
+- `capabilities_can_carry_open_info`, `capabilities_can_carry_priority_on_open`, `capabilities_can_carry_group_on_open`, `capabilities_can_carry_priority_in_update`, `capabilities_can_carry_group_in_update`
 - `capabilities_have_peer_visible_priority_semantics`, `capabilities_have_peer_visible_group_semantics`
-
-Stream ID helpers:
-
-- `expected_next_peer_stream_id`, `first_local_stream_id`, `first_peer_stream_id`
-- `initial_receive_window`, `initial_send_window`
-- `local_open_refused_by_goaway`, `peer_open_refused_by_goaway`
-- `max_stream_id_for_class`, `projected_local_open_id`
-- `stream_is_bidi`, `stream_is_local`, `stream_kind_for_local`, `stream_opener`
-- `validate_local_open_id`, `validate_stream_id_for_role`
 
 Errors, events, diagnostics, and conformance:
 
 - `Error`, `Result`, `ErrorCode`, `ErrorScope`, `ErrorOperation`, `ErrorSource`, `ErrorDirection`, `TerminationKind`
-- enum helpers: `ErrorCode::from_code`, `ErrorCode::from_u64`, `ErrorCode::as_u64`, `ErrorCode::as_str`, `ErrorCode::name`; `ErrorScope::as_str`; `ErrorOperation::as_str`; `ErrorSource::as_str`; `ErrorDirection::as_str`; `TerminationKind::as_str`
+- enum helpers: `ErrorCode::from_u64`, `ErrorCode::as_u64`, `ErrorCode::as_str`; `ErrorScope::as_str`; `ErrorOperation::as_str`; `ErrorSource::as_str`; `ErrorDirection::as_str`; `TerminationKind::as_str`
 - `Error` constructors: `new`, `local`, `protocol`, `frame_size`, `unsupported_version`, `role_conflict`, `flow_control`, `stream_state`, `stream_closed`, `read_closed`, `write_closed`, `session_closed`, `application`, `try_application`, `io`, `timeout`, `graceful_close_timeout`
 - `Error` accessors: `code`, `application_code`, `numeric_code`, `reason`, `message`, `source_io_error_kind`, `scope`, `operation`, `source`, `direction`, `termination_kind`, `io_error_kind`
 - `Error` classification helpers: `is_error_code`, `is_application_code`, `is_session_closed`, `is_timeout`, `is_interrupted`, `is_stream_not_readable`, `is_stream_not_writable`, `is_read_closed`, `is_write_closed`, `is_open_limited`, `is_open_expired`, `is_open_info_unavailable`, `is_open_metadata_too_large`, `is_adapter_unsupported`, `is_priority_update_unavailable`, `is_priority_update_too_large`, `is_empty_metadata_update`, `is_keepalive_timeout`, `is_graceful_close_timeout`
@@ -326,10 +361,10 @@ Errors, events, diagnostics, and conformance:
 - `SessionState`, `SessionStats`, `PeerCloseError`, `PeerGoAwayError`
 - `AbuseStats`, `AcceptBacklogStats`, `ActiveStreamStats`, `DiagnosticStats`, `FlushStats`, `HiddenStateStats`, `LivenessStats`, `MemoryStats`, `PressureStats`, `ProgressStats`, `ProvisionalStats`, `ReasonStats`, `RetentionStats`, `TelemetryStats`, `WriterQueueStats`
 - `DuplexTransport`, `DuplexTransportControl`
-- `DuplexTransport` methods: `new`, `with_local_addr`, `with_peer_addr`, `with_addresses`, `with_control`, `with_close_fn`, `local_addr`, `peer_addr`, `remote_addr`, `set_read_timeout`, `set_write_timeout`, `close`, `reader`, `reader_mut`, `writer`, `writer_mut`, `into_parts`
+- `DuplexTransport` methods: `new`, `with_local_addr`, `with_peer_addr`, `with_addresses`, `with_control`, `with_close_fn`, `local_addr`, `peer_addr`, `set_read_timeout`, `set_write_timeout`, `close`, `reader`, `reader_mut`, `writer`, `writer_mut`, `into_parts`
 - `Claim`, `ConformanceSuite`, `ImplementationProfile`, `ParseConformanceError`
 - conformance methods: `Claim::as_str`, `Claim::acceptance_checklist`, `Claim::required_conformance_suites`, `ImplementationProfile::as_str`, `ImplementationProfile::claims`, `ImplementationProfile::acceptance_checklist`, `ImplementationProfile::required_conformance_suites`, `ImplementationProfile::release_certification_gate`, `ConformanceSuite::as_str`
-- `known_claims`, `known_conformance_suites`, `known_implementation_profiles`, `core_module_target_claims`, `core_module_target_suites`, `core_module_target_implementation_profiles`, `reference_profile_claim_gate`
+- `claim_by_name`, `implementation_profile_by_name`, `conformance_suite_by_name`, `known_claims`, `known_conformance_suites`, `known_implementation_profiles`, `core_module_target_claims`, `core_module_target_suites`, `core_module_target_implementation_profiles`, `reference_profile_claim_gate`
 
 ## Semantics
 
@@ -338,3 +373,16 @@ Errors, events, diagnostics, and conformance:
 - `close_write()` finishes only the local send half.
 - `close_read()` cancels local interest in inbound bytes.
 - Open metadata is sent only when negotiated; required but unavailable metadata fails instead of being silently discarded.
+
+## Unified async interface
+
+Use `zmux::AsyncSession` and `zmux::BoxAsyncSession` when upper layers need one storage path for native zmux sessions and adapter-backed sessions. Native `zmux::Conn` implements the trait directly, and adapters such as `zmux_quinn::QuinnSession` implement the same async trait.
+
+```rust
+let native: zmux::BoxAsyncSession = zmux::box_async_session(native_conn);
+let quic: zmux::BoxAsyncSession = zmux::box_async_session(quinn_session);
+
+let sessions: Vec<zmux::BoxAsyncSession> = vec![native, quic];
+```
+
+Use `zmux::AsyncStreamApi`, `zmux::AsyncSendStreamApi`, and `zmux::AsyncRecvStreamApi` for heterogeneous async stream storage. Blocking/native code can use the short `Session`, `StreamApi`, `SendStreamApi`, and `RecvStreamApi` names.

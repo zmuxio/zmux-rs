@@ -13,6 +13,18 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+
+#[inline]
+fn next_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Ready,
@@ -59,6 +71,7 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
+    #[inline]
     pub fn empty(state: SessionState) -> Self {
         Self {
             state,
@@ -106,13 +119,11 @@ pub struct PeerGoAwayError {
 /// needs to wake or close the underlying transport. Implement only the hooks
 /// your transport can support; the timeout hooks default to no-ops.
 pub trait DuplexTransportControl: Send + Sync {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let _ = timeout;
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
         Ok(())
     }
 
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let _ = timeout;
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
         Ok(())
     }
 
@@ -127,6 +138,7 @@ impl<F> DuplexTransportControl for CloseFnTransportControl<F>
 where
     F: Fn() -> io::Result<()> + Send + Sync,
 {
+    #[inline]
     fn close(&self) -> io::Result<()> {
         (self.close)()
     }
@@ -142,6 +154,12 @@ pub struct DuplexTransport<R, W> {
 }
 
 impl<R, W> DuplexTransport<R, W> {
+    /// Builds a transport from already split blocking read and write halves.
+    ///
+    /// Prefer the underlying connection type's native split/clone operation.
+    /// Wrapping a single blocking duplex object behind one shared lock can let a
+    /// blocked read starve writes and close propagation.
+    #[inline]
     pub fn new(reader: R, writer: W) -> Self {
         Self {
             reader,
@@ -152,16 +170,25 @@ impl<R, W> DuplexTransport<R, W> {
         }
     }
 
-    pub fn with_local_addr(mut self, local_addr: Option<SocketAddr>) -> Self {
-        self.local_addr = local_addr;
+    /// Records the local address reported by this transport.
+    #[inline]
+    pub fn with_local_addr(mut self, local_addr: SocketAddr) -> Self {
+        self.local_addr = Some(local_addr);
         self
     }
 
-    pub fn with_peer_addr(mut self, peer_addr: Option<SocketAddr>) -> Self {
-        self.peer_addr = peer_addr;
+    /// Records the peer address reported by this transport.
+    #[inline]
+    pub fn with_peer_addr(mut self, peer_addr: SocketAddr) -> Self {
+        self.peer_addr = Some(peer_addr);
         self
     }
 
+    /// Records optional local and peer addresses in one step.
+    ///
+    /// This is useful for adapters that can discover either address
+    /// independently.
+    #[inline]
     pub fn with_addresses(
         mut self,
         local_addr: Option<SocketAddr>,
@@ -172,6 +199,8 @@ impl<R, W> DuplexTransport<R, W> {
         self
     }
 
+    /// Installs transport-specific timeout and close operations.
+    #[inline]
     pub fn with_control<C>(mut self, control: C) -> Self
     where
         C: DuplexTransportControl + 'static,
@@ -180,6 +209,11 @@ impl<R, W> DuplexTransport<R, W> {
         self
     }
 
+    /// Installs a close hook for the underlying connection resource.
+    ///
+    /// `Conn::close` calls this hook before tearing down the ZMux session, so a
+    /// joined or split transport can still shut down its original connection.
+    #[inline]
     pub fn with_close_fn<F>(self, close: F) -> Self
     where
         F: Fn() -> io::Result<()> + Send + Sync + 'static,
@@ -187,18 +221,20 @@ impl<R, W> DuplexTransport<R, W> {
         self.with_control(CloseFnTransportControl { close })
     }
 
+    /// Returns the configured local address, when known.
+    #[inline]
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
     }
 
+    /// Returns the configured peer address, when known.
+    #[inline]
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
     }
 
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
+    /// Applies a read timeout through the optional transport control.
+    #[inline]
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match &self.control {
             Some(control) => control.set_read_timeout(timeout),
@@ -206,6 +242,8 @@ impl<R, W> DuplexTransport<R, W> {
         }
     }
 
+    /// Applies a write timeout through the optional transport control.
+    #[inline]
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match &self.control {
             Some(control) => control.set_write_timeout(timeout),
@@ -213,6 +251,8 @@ impl<R, W> DuplexTransport<R, W> {
         }
     }
 
+    /// Closes the underlying transport resource through the optional control.
+    #[inline]
     pub fn close(&self) -> io::Result<()> {
         match &self.control {
             Some(control) => control.close(),
@@ -220,22 +260,32 @@ impl<R, W> DuplexTransport<R, W> {
         }
     }
 
+    /// Borrows the read half.
+    #[inline]
     pub fn reader(&self) -> &R {
         &self.reader
     }
 
+    /// Mutably borrows the read half.
+    #[inline]
     pub fn reader_mut(&mut self) -> &mut R {
         &mut self.reader
     }
 
+    /// Borrows the write half.
+    #[inline]
     pub fn writer(&self) -> &W {
         &self.writer
     }
 
+    /// Mutably borrows the write half.
+    #[inline]
     pub fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
     }
 
+    /// Returns the owned split halves.
+    #[inline]
     pub fn into_parts(self) -> (R, W) {
         (self.reader, self.writer)
     }
@@ -245,10 +295,12 @@ impl<R, W> Read for DuplexTransport<R, W>
 where
     R: Read,
 {
+    #[inline]
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         self.reader.read(dst)
     }
 
+    #[inline]
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.reader.read_vectored(bufs)
     }
@@ -258,14 +310,17 @@ impl<R, W> Write for DuplexTransport<R, W>
 where
     W: Write,
 {
+    #[inline]
     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         self.writer.write(src)
     }
 
+    #[inline]
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.writer.write_vectored(bufs)
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
@@ -281,6 +336,26 @@ pub struct ProvisionalStats {
     pub expired: u64,
 }
 
+impl ProvisionalStats {
+    #[inline]
+    #[must_use]
+    pub fn bidi_at_limit(self) -> bool {
+        self.bidi_limit != 0 && self.bidi >= self.bidi_limit
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn uni_at_limit(self) -> bool {
+        self.uni_limit != 0 && self.uni >= self.uni_limit
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn at_limit(self) -> bool {
+        self.bidi_at_limit() || self.uni_at_limit()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AcceptBacklogStats {
     pub bidi: usize,
@@ -291,6 +366,26 @@ pub struct AcceptBacklogStats {
     pub bytes: usize,
     pub bytes_limit: usize,
     pub refused: u64,
+}
+
+impl AcceptBacklogStats {
+    #[inline]
+    #[must_use]
+    pub fn count(self) -> usize {
+        self.bidi.saturating_add(self.uni)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn at_count_limit(self) -> bool {
+        self.limit != 0 && self.count() >= self.limit
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn at_bytes_limit(self) -> bool {
+        self.bytes_limit != 0 && self.bytes >= self.bytes_limit
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -496,6 +591,7 @@ struct WriteCompletionState {
 }
 
 impl WriteCompletion {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             inner: Arc::new(WriteCompletionInner {
@@ -508,21 +604,28 @@ impl WriteCompletion {
         }
     }
 
+    #[inline]
     pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    #[inline]
     pub(super) fn try_result(&self) -> Option<Result<()>> {
         self.inner.state.lock().unwrap().result.clone()
     }
 
+    #[inline]
     pub(super) fn generation(&self) -> u64 {
         self.inner.state.lock().unwrap().generation
     }
 
     pub(super) fn wait_for_change_since(&self, generation: u64, timeout: Duration) {
+        if timeout.is_zero() {
+            return;
+        }
         let state = self.inner.state.lock().unwrap();
         if state.result.is_none() && state.generation == generation {
+            let timeout = timeout.min(MAX_CONDVAR_TIMED_WAIT);
             drop(
                 self.inner
                     .cond
@@ -534,22 +637,26 @@ impl WriteCompletion {
         }
     }
 
+    #[inline]
     pub(super) fn complete_ok(&self) {
         self.complete(Ok(()));
     }
 
+    #[inline]
     pub(super) fn complete_err(&self, err: Error) {
         self.complete(Err(err));
     }
 
+    #[inline]
     pub(super) fn notify_waiters(&self) {
         {
             let mut state = self.inner.state.lock().unwrap();
-            state.generation = state.generation.wrapping_add(1);
+            state.generation = next_generation(state.generation);
         }
         self.inner.cond.notify_all();
     }
 
+    #[inline]
     fn complete(&self, result: Result<()>) {
         let completed = {
             let mut state = self.inner.state.lock().unwrap();
@@ -557,7 +664,7 @@ impl WriteCompletion {
                 false
             } else {
                 state.result = Some(result);
-                state.generation = state.generation.wrapping_add(1);
+                state.generation = next_generation(state.generation);
                 true
             }
         };
@@ -587,7 +694,7 @@ pub(super) struct Inner {
     pub(super) peer_preface: Preface,
     pub(super) negotiated: Negotiated,
     pub(super) close_drain_timeout: Duration,
-    pub(super) goaway_drain_interval: Duration,
+    pub(super) go_away_drain_interval: Duration,
     pub(super) session_memory_cap: Option<usize>,
     pub(super) session_data_high_watermark: usize,
     pub(super) per_stream_data_high_watermark: usize,
@@ -612,7 +719,7 @@ pub(super) struct ConnState {
     pub(super) state: SessionState,
     pub(super) close_error: Option<Error>,
     pub(super) peer_close_error: Option<PeerCloseError>,
-    pub(super) peer_goaway_error: Option<PeerGoAwayError>,
+    pub(super) peer_go_away_error: Option<PeerGoAwayError>,
     pub(super) session_closed_event_sent: bool,
     pub(super) graceful_close_active: bool,
     pub(super) ignore_peer_non_close: bool,
@@ -729,11 +836,11 @@ pub(super) struct ConnState {
     pub(super) visible_terminal_churn_window_start: Option<Instant>,
     pub(super) visible_terminal_churn_count: u64,
     pub(super) visible_terminal_churn_budget: u64,
-    pub(super) local_goaway_bidi: u64,
-    pub(super) local_goaway_uni: u64,
-    pub(super) local_goaway_issued: bool,
-    pub(super) peer_goaway_bidi: u64,
-    pub(super) peer_goaway_uni: u64,
+    pub(super) local_go_away_bidi: u64,
+    pub(super) local_go_away_uni: u64,
+    pub(super) local_go_away_issued: bool,
+    pub(super) peer_go_away_bidi: u64,
+    pub(super) peer_go_away_uni: u64,
     pub(super) ping_waiter: Option<UserPing>,
     pub(super) canceled_ping_payload: Option<CanceledPingPayload>,
     pub(super) keepalive_ping: Option<KeepalivePing>,

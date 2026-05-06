@@ -1,5 +1,5 @@
-use crate::config::OpenOptions;
 use crate::error::{Error, ErrorDirection, ErrorOperation, Result};
+use crate::open_send::{OpenRequest, OpenSend, WritePayload};
 use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::preface::{Negotiated, Preface};
 use crate::protocol::Role;
@@ -15,6 +15,30 @@ use std::ptr::{from_ref, null};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+const MAX_OPEN_INFO_PREALLOC: usize = 64 * 1024;
+
+#[inline]
+fn nonzero_duration_value(value: Duration) -> Option<Duration> {
+    (!value.is_zero()).then_some(value)
+}
+
+#[inline]
+fn condvar_timed_wait_step(remaining: Duration) -> (Duration, bool) {
+    let wait = remaining.min(MAX_CONDVAR_TIMED_WAIT);
+    (wait, wait == remaining)
+}
+
+#[inline]
+fn next_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
 /// Boxed bidirectional stream trait object used by the native blocking API.
 pub type BoxStream = Box<dyn StreamApi>;
 
@@ -29,16 +53,18 @@ pub type BoxSession = Box<dyn Session>;
 
 pub trait StreamInfo: Send + Sync {
     fn stream_id(&self) -> u64;
-    fn opened_locally(&self) -> bool;
-    fn bidirectional(&self) -> bool;
+    fn is_opened_locally(&self) -> bool;
+    fn is_bidirectional(&self) -> bool;
     fn open_info_len(&self) -> usize;
     fn has_open_info(&self) -> bool {
         self.open_info_len() != 0
     }
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>);
+    /// Append opaque binary open metadata to `dst`.
+    fn append_open_info_to(&self, dst: &mut Vec<u8>);
+    /// Return opaque binary open metadata.
     fn open_info(&self) -> Vec<u8> {
-        let mut open_info = Vec::with_capacity(self.open_info_len());
-        self.copy_open_info_to(&mut open_info);
+        let mut open_info = Vec::with_capacity(self.open_info_len().min(MAX_OPEN_INFO_PREALLOC));
+        self.append_open_info_to(&mut open_info);
         open_info
     }
     fn metadata(&self) -> StreamMetadata;
@@ -47,9 +73,6 @@ pub trait StreamInfo: Send + Sync {
     }
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
-    }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()>;
     fn clear_deadline(&self) -> Result<()> {
@@ -72,17 +95,19 @@ pub trait StreamInfo: Send + Sync {
 }
 
 pub trait RecvStreamApi: StreamInfo + Read {
-    fn read_closed(&self) -> bool;
+    fn is_read_closed(&self) -> bool;
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize>;
     fn read_vectored_timeout(
         &self,
         dsts: &mut [IoSliceMut<'_>],
         timeout: Duration,
     ) -> Result<usize> {
-        match dsts.iter_mut().find(|dst| !dst.is_empty()) {
-            Some(dst) => self.read_timeout(dst, timeout),
-            None => Ok(0),
+        for dst in dsts {
+            if !dst.is_empty() {
+                return self.read_timeout(dst, timeout);
+            }
         }
+        Ok(0)
     }
     fn read_exact_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<()> {
         let start = Instant::now();
@@ -111,28 +136,33 @@ pub trait RecvStreamApi: StreamInfo + Read {
 }
 
 pub trait SendStreamApi: StreamInfo + Write {
-    fn write_closed(&self) -> bool;
+    fn is_write_closed(&self) -> bool;
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()>;
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize>;
-    fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize>;
-    fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize>;
-    fn writev_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout)
+    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut remaining = src;
+        while !remaining.is_empty() {
+            let timeout = remaining_write_timeout(start, timeout)?;
+            let n =
+                validate_write_progress(self.write_timeout(remaining, timeout)?, remaining.len())?;
+            if n == 0 {
+                return Err(zero_length_write_error());
+            }
+            remaining = &remaining[n..];
+        }
+        Ok(())
     }
+    fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize>;
+    fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize>;
     fn write_final(&self, src: &[u8]) -> Result<usize>;
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize>;
-    fn writev_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts)
-    }
     fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize>;
     fn write_vectored_final_timeout(
         &self,
         parts: &[IoSlice<'_>],
         timeout: Duration,
     ) -> Result<usize>;
-    fn writev_final_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout)
-    }
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()>;
     fn clear_write_deadline(&self) -> Result<()> {
         self.set_write_deadline(None)
@@ -206,10 +236,10 @@ pub struct PausedNativeHalf<T> {
     resumed: bool,
 }
 
-/// Detached receive half handle for `NativeDuplexStream`.
+/// Detached receive half handle for `DuplexStream`.
 pub type PausedNativeRecvHalf<R> = PausedNativeHalf<R>;
 
-/// Detached send half handle for `NativeDuplexStream`.
+/// Detached send half handle for `DuplexStream`.
 pub type PausedNativeSendHalf<W> = PausedNativeHalf<W>;
 
 impl<T> NativeJoinedHalf<T> {
@@ -235,10 +265,7 @@ impl<T> NativeJoinedHalf<T> {
         if state.closed || state.paused {
             return default;
         }
-        match state.current.as_ref() {
-            Some(current) => visit(current),
-            None => default,
-        }
+        state.current.as_ref().map_or(default, visit)
     }
 
     fn enter(self: &Arc<Self>, missing: impl FnOnce() -> Error) -> Result<ActiveNativeHalf<T>> {
@@ -248,6 +275,10 @@ impl<T> NativeJoinedHalf<T> {
                 return Err(Error::session_closed());
             }
             if !state.paused {
+                if state.active_ops != 0 {
+                    state = self.changed.wait(state).unwrap();
+                    continue;
+                }
                 let current = state.current.take().ok_or_else(missing)?;
                 state.active_ops += 1;
                 let deadline_generation = state.deadline_generation;
@@ -268,6 +299,10 @@ impl<T> NativeJoinedHalf<T> {
                 return Err(Error::session_closed());
             }
             if !state.paused {
+                if state.active_ops != 0 {
+                    state = self.changed.wait(state).unwrap();
+                    continue;
+                }
                 let Some(current) = state.current.take() else {
                     return Ok(None);
                 };
@@ -421,20 +456,19 @@ impl<T> NativeJoinedHalf<T> {
 
     fn close_detached(&self) -> Option<T> {
         let mut state = self.state.lock().unwrap();
-        loop {
-            if state.closed {
-                return None;
-            }
-            if state.active_ops == 0 {
-                state.closed = true;
-                state.paused = false;
-                let current = state.current.take();
-                drop(state);
-                self.changed.notify_all();
-                return current;
-            }
+        if state.closed {
+            return None;
+        }
+        state.closed = true;
+        state.paused = false;
+        self.changed.notify_all();
+        while state.active_ops != 0 {
             state = self.changed.wait(state).unwrap();
         }
+        let current = state.current.take();
+        drop(state);
+        self.changed.notify_all();
+        current
     }
 
     fn into_current(self: Arc<Self>) -> Option<T> {
@@ -454,7 +488,7 @@ impl<T> NativeJoinedHalf<T> {
                 return Err(Error::session_closed());
             }
             state.deadline = deadline;
-            state.deadline_generation = state.deadline_generation.wrapping_add(1);
+            state.deadline_generation = next_generation(state.deadline_generation);
             state.deadline_applier = Some(applier);
             self.changed.notify_all();
             let current = if state.paused || state.active_ops != 0 {
@@ -495,7 +529,7 @@ impl<T> NativeJoinedHalf<T> {
                 drop(state);
                 continue;
             }
-            if !state.closed && state.current.is_none() {
+            if state.current.is_none() {
                 state.current = current.take();
             }
             if state.active_ops > 0 {
@@ -535,11 +569,12 @@ impl<T> NativeJoinedHalf<T> {
         match state.deadline.and_then(|deadline| {
             deadline
                 .checked_duration_since(Instant::now())
-                .filter(|duration| !duration.is_zero())
+                .and_then(nonzero_duration_value)
         }) {
             Some(remaining) => {
-                let (state, wait) = self.changed.wait_timeout(state, remaining).unwrap();
-                if wait.timed_out() && state.paused {
+                let (wait_for, reaches_deadline) = condvar_timed_wait_step(remaining);
+                let (state, wait) = self.changed.wait_timeout(state, wait_for).unwrap();
+                if wait.timed_out() && reaches_deadline && state.paused {
                     Err(Error::timeout(self.deadline_operation))
                 } else {
                     Ok(state)
@@ -579,7 +614,7 @@ impl<T> Drop for ActiveNativeHalf<T> {
                 state = self.owner.state.lock().unwrap();
                 continue;
             }
-            if !state.closed && state.current.is_none() {
+            if state.current.is_none() {
                 state.current = current.take();
             }
             if state.active_ops > 0 {
@@ -636,14 +671,11 @@ fn wait_native_joined_half_state<'a, T>(
     start: Instant,
     timeout: Option<Duration>,
 ) -> Result<MutexGuard<'a, NativeJoinedHalfState<T>>> {
-    match timeout.and_then(|timeout| {
-        timeout
-            .checked_sub(start.elapsed())
-            .filter(|d| !d.is_zero())
-    }) {
+    match timeout.and_then(|timeout| remaining_timeout(start, timeout)) {
         Some(remaining) => {
-            let (state, wait) = changed.wait_timeout(state, remaining).unwrap();
-            if wait.timed_out() {
+            let (wait_for, reaches_deadline) = condvar_timed_wait_step(remaining);
+            let (state, wait) = changed.wait_timeout(state, wait_for).unwrap();
+            if wait.timed_out() && reaches_deadline {
                 Err(Error::timeout("joined half pause"))
             } else {
                 Ok(state)
@@ -685,7 +717,7 @@ fn validate_write_progress(n: usize, requested: usize) -> Result<usize> {
 fn remaining_timeout(start: Instant, timeout: Duration) -> Option<Duration> {
     timeout
         .checked_sub(start.elapsed())
-        .filter(|duration| !duration.is_zero())
+        .and_then(nonzero_duration_value)
 }
 
 fn timeout_to_deadline(timeout: Option<Duration>) -> Option<Instant> {
@@ -696,6 +728,55 @@ fn remaining_read_timeout(start: Instant, timeout: Duration) -> Result<Duration>
     remaining_timeout(start, timeout).ok_or_else(|| {
         Error::timeout("read").with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
     })
+}
+
+fn ensure_positive_open_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() {
+        Err(Error::timeout("open").with_session_context(ErrorOperation::Open))
+    } else {
+        Ok(())
+    }
+}
+
+fn remaining_write_timeout(start: Instant, timeout: Duration) -> Result<Duration> {
+    remaining_timeout(start, timeout).ok_or_else(|| {
+        Error::timeout("write").with_stream_context(ErrorOperation::Write, ErrorDirection::Write)
+    })
+}
+
+fn write_open_payload_native<S>(
+    stream: &mut S,
+    payload: WritePayload<'_>,
+    timeout: Option<Duration>,
+    fin: bool,
+    skip_empty: bool,
+) -> Result<usize>
+where
+    S: SendStreamApi + ?Sized,
+{
+    let requested = payload.checked_len()?;
+    if skip_empty && requested == 0 {
+        return Ok(0);
+    }
+    let n = match (payload, timeout, fin) {
+        (WritePayload::Bytes(data), Some(timeout), false) => {
+            stream.write_timeout(data.as_ref(), timeout)?
+        }
+        (WritePayload::Bytes(data), Some(timeout), true) => {
+            stream.write_final_timeout(data.as_ref(), timeout)?
+        }
+        (WritePayload::Bytes(data), None, false) => Write::write(stream, data.as_ref())?,
+        (WritePayload::Bytes(data), None, true) => stream.write_final(data.as_ref())?,
+        (WritePayload::Vectored(parts), Some(timeout), false) => {
+            stream.write_vectored_timeout(parts, timeout)?
+        }
+        (WritePayload::Vectored(parts), Some(timeout), true) => {
+            stream.write_vectored_final_timeout(parts, timeout)?
+        }
+        (WritePayload::Vectored(parts), None, false) => stream.write_vectored(parts)?,
+        (WritePayload::Vectored(parts), None, true) => stream.write_vectored_final(parts)?,
+    };
+    validate_write_progress(n, requested)
 }
 
 fn validate_io_read_progress(n: usize, requested: usize) -> io::Result<usize> {
@@ -774,6 +855,14 @@ fn unexpected_eof_error() -> Error {
 fn invalid_write_progress_error() -> Error {
     Error::local("zmux: write reported invalid progress")
         .with_stream_context(ErrorOperation::Write, ErrorDirection::Write)
+}
+
+fn zero_length_write_error() -> Error {
+    Error::io(io::Error::new(
+        io::ErrorKind::WriteZero,
+        "failed to write whole buffer",
+    ))
+    .with_stream_context(ErrorOperation::Write, ErrorDirection::Write)
 }
 
 fn vectored_len_overflow_error() -> Error {
@@ -1045,18 +1134,18 @@ where
         }
     }
 
-    fn opened_locally(&self) -> bool {
+    fn is_opened_locally(&self) -> bool {
         match self.info_side {
             DuplexInfoSide::Read => self
                 .recv
-                .with_current_or(false, |recv| recv.opened_locally()),
+                .with_current_or(false, |recv| recv.is_opened_locally()),
             DuplexInfoSide::Write => self
                 .send
-                .with_current_or(false, |send| send.opened_locally()),
+                .with_current_or(false, |send| send.is_opened_locally()),
         }
     }
 
-    fn bidirectional(&self) -> bool {
+    fn is_bidirectional(&self) -> bool {
         true
     }
 
@@ -1078,16 +1167,15 @@ where
         }
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        dst.clear();
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
         match self.info_side {
             DuplexInfoSide::Read => {
                 self.recv
-                    .with_current_or((), |recv| recv.copy_open_info_to(dst));
+                    .with_current_or((), |recv| recv.append_open_info_to(dst));
             }
             DuplexInfoSide::Write => {
                 self.send
-                    .with_current_or((), |send| send.copy_open_info_to(dst));
+                    .with_current_or((), |send| send.append_open_info_to(dst));
             }
         }
     }
@@ -1149,12 +1237,12 @@ where
     fn close(&self) -> Result<()> {
         let send = self.send.close_detached();
         let recv = self.recv.close_detached();
-        let same_identity = match (send.as_ref(), recv.as_ref()) {
-            (Some(send), Some(recv)) => {
+        let same_identity = send
+            .as_ref()
+            .zip(recv.as_ref())
+            .is_some_and(|(send, recv)| {
                 same_close_identity(send.close_identity(), recv.close_identity())
-            }
-            _ => false,
-        };
+            });
 
         let write = send.as_ref().map_or(Ok(()), |send| send.close());
         let read = if same_identity {
@@ -1168,12 +1256,12 @@ where
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
         let send = self.send.close_detached();
         let recv = self.recv.close_detached();
-        let same_identity = match (send.as_ref(), recv.as_ref()) {
-            (Some(send), Some(recv)) => {
+        let same_identity = send
+            .as_ref()
+            .zip(recv.as_ref())
+            .is_some_and(|(send, recv)| {
                 same_close_identity(send.close_identity(), recv.close_identity())
-            }
-            _ => false,
-        };
+            });
 
         let write = send
             .as_ref()
@@ -1193,8 +1281,9 @@ where
     R: RecvStreamApi,
     W: SendStreamApi,
 {
-    fn read_closed(&self) -> bool {
-        self.recv.with_current_or(true, |recv| recv.read_closed())
+    fn is_read_closed(&self) -> bool {
+        self.recv
+            .with_current_or(true, |recv| recv.is_read_closed())
     }
 
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
@@ -1226,8 +1315,7 @@ where
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.recv
-            .set_deadline(deadline, apply_native_read_deadline::<R>)
+        NativeJoinedHalf::set_deadline(&self.recv, deadline, apply_native_read_deadline::<R>)
     }
 
     fn close_read(&self) -> Result<()> {
@@ -1253,8 +1341,9 @@ where
     R: RecvStreamApi,
     W: SendStreamApi,
 {
-    fn write_closed(&self) -> bool {
-        self.send.with_current_or(true, |send| send.write_closed())
+    fn is_write_closed(&self) -> bool {
+        self.send
+            .with_current_or(true, |send| send.is_write_closed())
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
@@ -1272,11 +1361,18 @@ where
             })
     }
 
-    fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+        self.send
+            .with_current_result(joined_write_half_missing_error, |send| {
+                send.write_all_timeout(src, timeout)
+            })
+    }
+
+    fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         let requested = checked_vectored_len(parts)?;
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
-                let n = send.writev(parts)?;
+                let n = send.write_vectored(parts)?;
                 validate_write_progress(n, requested)
             })
     }
@@ -1329,8 +1425,7 @@ where
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.send
-            .set_deadline(deadline, apply_native_write_deadline::<W>)
+        NativeJoinedHalf::set_deadline(&self.send, deadline, apply_native_write_deadline::<W>)
     }
 
     fn close_write(&self) -> Result<()> {
@@ -1363,56 +1458,48 @@ pub trait Session: Send + Sync {
     fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxStream>;
     fn accept_uni_stream(&self) -> Result<BoxRecvStream>;
     fn accept_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxRecvStream>;
-    fn open_stream(&self) -> Result<BoxStream>;
-    fn open_stream_timeout(&self, timeout: Duration) -> Result<BoxStream>;
-    fn open_uni_stream(&self) -> Result<BoxSendStream>;
-    fn open_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxSendStream>;
-    fn open_stream_with_options(&self, opts: OpenOptions) -> Result<BoxStream>;
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<BoxStream>;
-    fn open_uni_stream_with_options(&self, opts: OpenOptions) -> Result<BoxSendStream>;
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<BoxSendStream>;
-    fn open_and_send(&self, data: &[u8]) -> Result<(BoxStream, usize)>;
-    fn open_and_send_timeout(&self, data: &[u8], timeout: Duration) -> Result<(BoxStream, usize)>;
-    fn open_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(BoxStream, usize)>;
-    fn open_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxStream, usize)>;
-    fn open_uni_and_send(&self, data: &[u8]) -> Result<(BoxSendStream, usize)>;
-    fn open_uni_and_send_timeout(
-        &self,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)>;
-    fn open_uni_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(BoxSendStream, usize)>;
-    fn open_uni_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)>;
+    fn open_stream(&self) -> Result<BoxStream> {
+        self.open_stream_with(OpenRequest::new())
+    }
+    fn open_uni_stream(&self) -> Result<BoxSendStream> {
+        self.open_uni_stream_with(OpenRequest::new())
+    }
+    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream>;
+    fn open_uni_stream_with(&self, request: OpenRequest) -> Result<BoxSendStream>;
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+        let (opts, payload, timeout) = request.into_parts();
+        let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            ensure_positive_open_timeout(timeout)?;
+            open = open.with_timeout(timeout);
+        }
+        let mut stream = self.open_stream_with(open)?;
+        let write_timeout = timeout
+            .map(|timeout| remaining_write_timeout(start, timeout))
+            .transpose()?;
+        let n = write_open_payload_native(stream.as_mut(), payload, write_timeout, false, true)?;
+        Ok((stream, n))
+    }
+    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+        let (opts, payload, timeout) = request.into_parts();
+        let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            ensure_positive_open_timeout(timeout)?;
+            open = open.with_timeout(timeout);
+        }
+        let mut stream = self.open_uni_stream_with(open)?;
+        let write_timeout = timeout
+            .map(|timeout| remaining_write_timeout(start, timeout))
+            .transpose()?;
+        let n = write_open_payload_native(stream.as_mut(), payload, write_timeout, true, false)?;
+        Ok((stream, n))
+    }
     fn ping(&self, echo: &[u8]) -> Result<Duration>;
     fn ping_timeout(&self, echo: &[u8], timeout: Duration) -> Result<Duration>;
-    fn goaway(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()>;
-    fn goaway_with_error(
+    fn go_away(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()>;
+    fn go_away_with_error(
         &self,
         last_accepted_bidi: u64,
         last_accepted_uni: u64,
@@ -1423,61 +1510,41 @@ pub trait Session: Send + Sync {
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()>;
     fn wait(&self) -> Result<()>;
     fn wait_timeout(&self, timeout: Duration) -> Result<bool>;
-    fn wait_close_error(&self) -> Result<Option<Error>> {
-        self.wait()?;
-        Ok(self.close_error())
-    }
-    fn wait_close_error_timeout(&self, timeout: Duration) -> Result<Option<Error>> {
-        if !self.wait_timeout(timeout)? {
-            return Err(
-                Error::timeout("session termination").with_session_context(ErrorOperation::Close)
-            );
-        }
-        Ok(self.close_error())
-    }
-    fn closed(&self) -> bool;
+    fn is_closed(&self) -> bool;
     fn local_addr(&self) -> Option<SocketAddr> {
         None
     }
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
     }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
     fn close_error(&self) -> Option<Error>;
     fn state(&self) -> SessionState;
     fn stats(&self) -> SessionStats;
-    fn peer_goaway_error(&self) -> Option<PeerGoAwayError>;
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError>;
     fn peer_close_error(&self) -> Option<PeerCloseError>;
     fn local_preface(&self) -> Preface;
     fn peer_preface(&self) -> Preface;
     fn negotiated(&self) -> Negotiated;
 }
 
-/// A permanently closed native blocking session.
+/// A permanently closed blocking session.
 ///
-/// Use this as a no-op fallback when upper-layer code wants a native session
+/// Use this as a no-op fallback when upper-layer code wants a session
 /// handle but no transport/session is available.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ClosedNativeSession;
+pub struct ClosedSession;
 
-/// Create a permanently closed native blocking session.
-pub fn closed_native_session() -> ClosedNativeSession {
-    ClosedNativeSession
+/// Create a permanently closed blocking session.
+pub fn closed_session() -> ClosedSession {
+    ClosedSession
 }
 
-/// Create a boxed permanently closed native blocking session.
-pub fn boxed_closed_native_session() -> BoxSession {
-    Box::new(ClosedNativeSession)
-}
-
-fn closed_native_session_error(operation: ErrorOperation) -> Error {
+fn closed_session_error(operation: ErrorOperation) -> Error {
     Error::session_closed().with_session_context(operation)
 }
 
-fn closed_native_session_result<T>(operation: ErrorOperation) -> Result<T> {
-    Err(closed_native_session_error(operation))
+fn closed_session_result<T>(operation: ErrorOperation) -> Result<T> {
+    Err(closed_session_error(operation))
 }
 
 fn zero_session_settings() -> Settings {
@@ -1520,141 +1587,59 @@ fn zero_session_negotiated() -> Negotiated {
     }
 }
 
-impl Session for ClosedNativeSession {
+impl Session for ClosedSession {
     fn accept_stream(&self) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Accept)
+        closed_session_result(ErrorOperation::Accept)
     }
 
     fn accept_stream_timeout(&self, _timeout: Duration) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Accept)
+        closed_session_result(ErrorOperation::Accept)
     }
 
     fn accept_uni_stream(&self) -> Result<BoxRecvStream> {
-        closed_native_session_result(ErrorOperation::Accept)
+        closed_session_result(ErrorOperation::Accept)
     }
 
     fn accept_uni_stream_timeout(&self, _timeout: Duration) -> Result<BoxRecvStream> {
-        closed_native_session_result(ErrorOperation::Accept)
+        closed_session_result(ErrorOperation::Accept)
     }
 
-    fn open_stream(&self) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Open)
+    fn open_stream_with(&self, _request: OpenRequest) -> Result<BoxStream> {
+        closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_stream_timeout(&self, _timeout: Duration) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Open)
+    fn open_uni_stream_with(&self, _request: OpenRequest) -> Result<BoxSendStream> {
+        closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_uni_stream(&self) -> Result<BoxSendStream> {
-        closed_native_session_result(ErrorOperation::Open)
+    fn open_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+        closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_uni_stream_timeout(&self, _timeout: Duration) -> Result<BoxSendStream> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_stream_with_options(&self, _opts: OpenOptions) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_stream_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
-        _timeout: Duration,
-    ) -> Result<BoxStream> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_stream_with_options(&self, _opts: OpenOptions) -> Result<BoxSendStream> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
-        _timeout: Duration,
-    ) -> Result<BoxSendStream> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_and_send(&self, _data: &[u8]) -> Result<(BoxStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_and_send_timeout(
-        &self,
-        _data: &[u8],
-        _timeout: Duration,
-    ) -> Result<(BoxStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_and_send_with_options(
-        &self,
-        _opts: OpenOptions,
-        _data: &[u8],
-    ) -> Result<(BoxStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_and_send_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
-        _data: &[u8],
-        _timeout: Duration,
-    ) -> Result<(BoxStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_and_send(&self, _data: &[u8]) -> Result<(BoxSendStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_and_send_timeout(
-        &self,
-        _data: &[u8],
-        _timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_and_send_with_options(
-        &self,
-        _opts: OpenOptions,
-        _data: &[u8],
-    ) -> Result<(BoxSendStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_and_send_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
-        _data: &[u8],
-        _timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)> {
-        closed_native_session_result(ErrorOperation::Open)
+    fn open_uni_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+        closed_session_result(ErrorOperation::Open)
     }
 
     fn ping(&self, _echo: &[u8]) -> Result<Duration> {
-        closed_native_session_result(ErrorOperation::Unknown)
+        closed_session_result(ErrorOperation::Ping)
     }
 
     fn ping_timeout(&self, _echo: &[u8], _timeout: Duration) -> Result<Duration> {
-        closed_native_session_result(ErrorOperation::Unknown)
+        closed_session_result(ErrorOperation::Ping)
     }
 
-    fn goaway(&self, _last_accepted_bidi: u64, _last_accepted_uni: u64) -> Result<()> {
-        closed_native_session_result(ErrorOperation::Close)
+    fn go_away(&self, _last_accepted_bidi: u64, _last_accepted_uni: u64) -> Result<()> {
+        closed_session_result(ErrorOperation::Close)
     }
 
-    fn goaway_with_error(
+    fn go_away_with_error(
         &self,
         _last_accepted_bidi: u64,
         _last_accepted_uni: u64,
         _code: u64,
         _reason: &str,
     ) -> Result<()> {
-        closed_native_session_result(ErrorOperation::Close)
+        closed_session_result(ErrorOperation::Close)
     }
 
     fn close(&self) -> Result<()> {
@@ -1673,7 +1658,7 @@ impl Session for ClosedNativeSession {
         Ok(true)
     }
 
-    fn closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         true
     }
 
@@ -1689,7 +1674,7 @@ impl Session for ClosedNativeSession {
         SessionStats::empty(SessionState::Closed)
     }
 
-    fn peer_goaway_error(&self) -> Option<PeerGoAwayError> {
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
         None
     }
 
@@ -1720,12 +1705,12 @@ macro_rules! impl_stream_info_forward {
                 (**self).stream_id()
             }
 
-            fn opened_locally(&self) -> bool {
-                (**self).opened_locally()
+            fn is_opened_locally(&self) -> bool {
+                (**self).is_opened_locally()
             }
 
-            fn bidirectional(&self) -> bool {
-                (**self).bidirectional()
+            fn is_bidirectional(&self) -> bool {
+                (**self).is_bidirectional()
             }
 
             fn open_info_len(&self) -> usize {
@@ -1736,8 +1721,8 @@ macro_rules! impl_stream_info_forward {
                 (**self).has_open_info()
             }
 
-            fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-                (**self).copy_open_info_to(dst)
+            fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+                (**self).append_open_info_to(dst)
             }
 
             fn open_info(&self) -> Vec<u8> {
@@ -1754,10 +1739,6 @@ macro_rules! impl_stream_info_forward {
 
             fn peer_addr(&self) -> Option<SocketAddr> {
                 (**self).peer_addr()
-            }
-
-            fn remote_addr(&self) -> Option<SocketAddr> {
-                (**self).remote_addr()
             }
 
             fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -1790,8 +1771,8 @@ macro_rules! impl_recv_stream_api_forward {
         where
             T: RecvStreamApi + ?Sized,
         {
-            fn read_closed(&self) -> bool {
-                (**self).read_closed()
+            fn is_read_closed(&self) -> bool {
+                (**self).is_read_closed()
             }
 
             fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
@@ -1833,8 +1814,8 @@ where
     T: RecvStreamApi + ?Sized,
     for<'a> &'a T: Read,
 {
-    fn read_closed(&self) -> bool {
-        (**self).read_closed()
+    fn is_read_closed(&self) -> bool {
+        (**self).is_read_closed()
     }
 
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
@@ -1872,8 +1853,8 @@ macro_rules! impl_send_stream_api_forward {
         where
             T: SendStreamApi + ?Sized,
         {
-            fn write_closed(&self) -> bool {
-                (**self).write_closed()
+            fn is_write_closed(&self) -> bool {
+                (**self).is_write_closed()
             }
 
             fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
@@ -1884,8 +1865,12 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_timeout(src, timeout)
             }
 
-            fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-                (**self).writev(parts)
+            fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+                (**self).write_all_timeout(src, timeout)
+            }
+
+            fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+                (**self).write_vectored(parts)
             }
 
             fn write_vectored_timeout(
@@ -1939,8 +1924,8 @@ where
     T: SendStreamApi + ?Sized,
     for<'a> &'a T: Write,
 {
-    fn write_closed(&self) -> bool {
-        (**self).write_closed()
+    fn is_write_closed(&self) -> bool {
+        (**self).is_write_closed()
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
@@ -1951,8 +1936,8 @@ where
         (**self).write_timeout(src, timeout)
     }
 
-    fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        (**self).writev(parts)
+    fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+        (**self).write_vectored(parts)
     }
 
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
@@ -2024,102 +2009,20 @@ macro_rules! impl_session_forward {
                 (**self).accept_uni_stream_timeout(timeout)
             }
 
-            fn open_stream(&self) -> Result<BoxStream> {
-                (**self).open_stream()
+            fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream> {
+                (**self).open_stream_with(request)
             }
 
-            fn open_stream_timeout(&self, timeout: Duration) -> Result<BoxStream> {
-                (**self).open_stream_timeout(timeout)
+            fn open_uni_stream_with(&self, request: OpenRequest) -> Result<BoxSendStream> {
+                (**self).open_uni_stream_with(request)
             }
 
-            fn open_uni_stream(&self) -> Result<BoxSendStream> {
-                (**self).open_uni_stream()
+            fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+                (**self).open_and_send(request)
             }
 
-            fn open_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxSendStream> {
-                (**self).open_uni_stream_timeout(timeout)
-            }
-
-            fn open_stream_with_options(&self, opts: OpenOptions) -> Result<BoxStream> {
-                (**self).open_stream_with_options(opts)
-            }
-
-            fn open_stream_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                timeout: Duration,
-            ) -> Result<BoxStream> {
-                (**self).open_stream_with_options_timeout(opts, timeout)
-            }
-
-            fn open_uni_stream_with_options(&self, opts: OpenOptions) -> Result<BoxSendStream> {
-                (**self).open_uni_stream_with_options(opts)
-            }
-
-            fn open_uni_stream_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                timeout: Duration,
-            ) -> Result<BoxSendStream> {
-                (**self).open_uni_stream_with_options_timeout(opts, timeout)
-            }
-
-            fn open_and_send(&self, data: &[u8]) -> Result<(BoxStream, usize)> {
-                (**self).open_and_send(data)
-            }
-
-            fn open_and_send_timeout(
-                &self,
-                data: &[u8],
-                timeout: Duration,
-            ) -> Result<(BoxStream, usize)> {
-                (**self).open_and_send_timeout(data, timeout)
-            }
-
-            fn open_and_send_with_options(
-                &self,
-                opts: OpenOptions,
-                data: &[u8],
-            ) -> Result<(BoxStream, usize)> {
-                (**self).open_and_send_with_options(opts, data)
-            }
-
-            fn open_and_send_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                data: &[u8],
-                timeout: Duration,
-            ) -> Result<(BoxStream, usize)> {
-                (**self).open_and_send_with_options_timeout(opts, data, timeout)
-            }
-
-            fn open_uni_and_send(&self, data: &[u8]) -> Result<(BoxSendStream, usize)> {
-                (**self).open_uni_and_send(data)
-            }
-
-            fn open_uni_and_send_timeout(
-                &self,
-                data: &[u8],
-                timeout: Duration,
-            ) -> Result<(BoxSendStream, usize)> {
-                (**self).open_uni_and_send_timeout(data, timeout)
-            }
-
-            fn open_uni_and_send_with_options(
-                &self,
-                opts: OpenOptions,
-                data: &[u8],
-            ) -> Result<(BoxSendStream, usize)> {
-                (**self).open_uni_and_send_with_options(opts, data)
-            }
-
-            fn open_uni_and_send_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                data: &[u8],
-                timeout: Duration,
-            ) -> Result<(BoxSendStream, usize)> {
-                (**self).open_uni_and_send_with_options_timeout(opts, data, timeout)
+            fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+                (**self).open_uni_and_send(request)
             }
 
             fn ping(&self, echo: &[u8]) -> Result<Duration> {
@@ -2130,18 +2033,18 @@ macro_rules! impl_session_forward {
                 (**self).ping_timeout(echo, timeout)
             }
 
-            fn goaway(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
-                (**self).goaway(last_accepted_bidi, last_accepted_uni)
+            fn go_away(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
+                (**self).go_away(last_accepted_bidi, last_accepted_uni)
             }
 
-            fn goaway_with_error(
+            fn go_away_with_error(
                 &self,
                 last_accepted_bidi: u64,
                 last_accepted_uni: u64,
                 code: u64,
                 reason: &str,
             ) -> Result<()> {
-                (**self).goaway_with_error(last_accepted_bidi, last_accepted_uni, code, reason)
+                (**self).go_away_with_error(last_accepted_bidi, last_accepted_uni, code, reason)
             }
 
             fn close(&self) -> Result<()> {
@@ -2160,8 +2063,8 @@ macro_rules! impl_session_forward {
                 (**self).wait_timeout(timeout)
             }
 
-            fn closed(&self) -> bool {
-                (**self).closed()
+            fn is_closed(&self) -> bool {
+                (**self).is_closed()
             }
 
             fn local_addr(&self) -> Option<SocketAddr> {
@@ -2170,10 +2073,6 @@ macro_rules! impl_session_forward {
 
             fn peer_addr(&self) -> Option<SocketAddr> {
                 (**self).peer_addr()
-            }
-
-            fn remote_addr(&self) -> Option<SocketAddr> {
-                (**self).remote_addr()
             }
 
             fn close_error(&self) -> Option<Error> {
@@ -2188,8 +2087,8 @@ macro_rules! impl_session_forward {
                 (**self).stats()
             }
 
-            fn peer_goaway_error(&self) -> Option<PeerGoAwayError> {
-                (**self).peer_goaway_error()
+            fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+                (**self).peer_go_away_error()
             }
 
             fn peer_close_error(&self) -> Option<PeerCloseError> {
@@ -2218,23 +2117,23 @@ impl_session_forward!(Arc<T>);
 
 impl StreamInfo for Stream {
     fn stream_id(&self) -> u64 {
-        self.stream_id()
+        Stream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        self.opened_locally()
+    fn is_opened_locally(&self) -> bool {
+        Stream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        self.bidirectional()
+    fn is_bidirectional(&self) -> bool {
+        Stream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
-        self.open_info_len()
+        Stream::open_info_len(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.copy_open_info_to(dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        Stream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -2242,45 +2141,41 @@ impl StreamInfo for Stream {
     }
 
     fn metadata(&self) -> StreamMetadata {
-        self.metadata()
+        Stream::metadata(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr()
+        Stream::local_addr(self)
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr()
+        Stream::peer_addr(self)
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_deadline(deadline)
+        Stream::set_deadline(self, deadline)
     }
 
     fn close_identity(&self) -> *const () {
-        self.close_identity()
+        Stream::close_identity(self)
     }
 
     fn close(&self) -> Result<()> {
-        self.close()
+        Stream::close(self)
     }
 
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
-        self.close_with_error(code, reason)
+        Stream::close_with_error(self, code, reason)
     }
 }
 
 impl RecvStreamApi for Stream {
-    fn read_closed(&self) -> bool {
-        self.read_closed()
+    fn is_read_closed(&self) -> bool {
+        Stream::is_read_closed(self)
     }
 
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
-        self.read_timeout(dst, timeout)
+        Stream::read_timeout(self, dst, timeout)
     }
 
     fn read_vectored_timeout(
@@ -2288,57 +2183,61 @@ impl RecvStreamApi for Stream {
         dsts: &mut [IoSliceMut<'_>],
         timeout: Duration,
     ) -> Result<usize> {
-        self.read_vectored_timeout(dsts, timeout)
+        Stream::read_vectored_timeout(self, dsts, timeout)
     }
 
     fn read_exact_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<()> {
-        self.read_exact_timeout(dst, timeout)
+        Stream::read_exact_timeout(self, dst, timeout)
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_read_deadline(deadline)
+        Stream::set_read_deadline(self, deadline)
     }
 
     fn close_read(&self) -> Result<()> {
-        self.close_read()
+        Stream::close_read(self)
     }
 
     fn cancel_read(&self, code: u64) -> Result<()> {
-        self.cancel_read(code)
+        Stream::cancel_read(self, code)
     }
 }
 
 impl SendStreamApi for Stream {
-    fn write_closed(&self) -> bool {
-        self.write_closed()
+    fn is_write_closed(&self) -> bool {
+        Stream::is_write_closed(self)
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
-        self.update_metadata(update)
+        Stream::update_metadata(self, update)
     }
 
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_timeout(src, timeout)
+        Stream::write_timeout(self, src, timeout)
     }
 
-    fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.writev(parts)
+    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+        Stream::write_all_timeout(self, src, timeout)
+    }
+
+    fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+        Stream::write_vectored(self, parts)
     }
 
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout)
+        Stream::write_vectored_timeout(self, parts, timeout)
     }
 
     fn write_final(&self, src: &[u8]) -> Result<usize> {
-        self.write_final(src)
+        Stream::write_final(self, src)
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts)
+        Stream::write_vectored_final(self, parts)
     }
 
     fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_final_timeout(src, timeout)
+        Stream::write_final_timeout(self, src, timeout)
     }
 
     fn write_vectored_final_timeout(
@@ -2346,19 +2245,19 @@ impl SendStreamApi for Stream {
         parts: &[IoSlice<'_>],
         timeout: Duration,
     ) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout)
+        Stream::write_vectored_final_timeout(self, parts, timeout)
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_write_deadline(deadline)
+        Stream::set_write_deadline(self, deadline)
     }
 
     fn close_write(&self) -> Result<()> {
-        self.close_write()
+        Stream::close_write(self)
     }
 
     fn cancel_write(&self, code: u64) -> Result<()> {
-        self.cancel_write(code)
+        Stream::cancel_write(self, code)
     }
 }
 
@@ -2366,23 +2265,23 @@ impl StreamApi for Stream {}
 
 impl StreamInfo for SendStream {
     fn stream_id(&self) -> u64 {
-        self.stream_id()
+        SendStream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        self.opened_locally()
+    fn is_opened_locally(&self) -> bool {
+        SendStream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        self.bidirectional()
+    fn is_bidirectional(&self) -> bool {
+        SendStream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
-        self.open_info_len()
+        SendStream::open_info_len(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.copy_open_info_to(dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        SendStream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -2390,69 +2289,69 @@ impl StreamInfo for SendStream {
     }
 
     fn metadata(&self) -> StreamMetadata {
-        self.metadata()
+        SendStream::metadata(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr()
+        SendStream::local_addr(self)
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr()
+        SendStream::peer_addr(self)
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_deadline(deadline)
+        SendStream::set_deadline(self, deadline)
     }
 
     fn close_identity(&self) -> *const () {
-        self.close_identity()
+        SendStream::close_identity(self)
     }
 
     fn close(&self) -> Result<()> {
-        self.close()
+        SendStream::close(self)
     }
 
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
-        self.close_with_error(code, reason)
+        SendStream::close_with_error(self, code, reason)
     }
 }
 
 impl SendStreamApi for SendStream {
-    fn write_closed(&self) -> bool {
-        self.write_closed()
+    fn is_write_closed(&self) -> bool {
+        SendStream::is_write_closed(self)
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
-        self.update_metadata(update)
+        SendStream::update_metadata(self, update)
     }
 
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_timeout(src, timeout)
+        SendStream::write_timeout(self, src, timeout)
     }
 
-    fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.writev(parts)
+    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+        SendStream::write_all_timeout(self, src, timeout)
+    }
+
+    fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+        SendStream::write_vectored(self, parts)
     }
 
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout)
+        SendStream::write_vectored_timeout(self, parts, timeout)
     }
 
     fn write_final(&self, src: &[u8]) -> Result<usize> {
-        self.write_final(src)
+        SendStream::write_final(self, src)
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts)
+        SendStream::write_vectored_final(self, parts)
     }
 
     fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_final_timeout(src, timeout)
+        SendStream::write_final_timeout(self, src, timeout)
     }
 
     fn write_vectored_final_timeout(
@@ -2460,41 +2359,41 @@ impl SendStreamApi for SendStream {
         parts: &[IoSlice<'_>],
         timeout: Duration,
     ) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout)
+        SendStream::write_vectored_final_timeout(self, parts, timeout)
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_write_deadline(deadline)
+        SendStream::set_write_deadline(self, deadline)
     }
 
     fn close_write(&self) -> Result<()> {
-        self.close_write()
+        SendStream::close_write(self)
     }
 
     fn cancel_write(&self, code: u64) -> Result<()> {
-        self.cancel_write(code)
+        SendStream::cancel_write(self, code)
     }
 }
 
 impl StreamInfo for RecvStream {
     fn stream_id(&self) -> u64 {
-        self.stream_id()
+        RecvStream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        self.opened_locally()
+    fn is_opened_locally(&self) -> bool {
+        RecvStream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        self.bidirectional()
+    fn is_bidirectional(&self) -> bool {
+        RecvStream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
-        self.open_info_len()
+        RecvStream::open_info_len(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.copy_open_info_to(dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        RecvStream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -2502,45 +2401,41 @@ impl StreamInfo for RecvStream {
     }
 
     fn metadata(&self) -> StreamMetadata {
-        self.metadata()
+        RecvStream::metadata(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr()
+        RecvStream::local_addr(self)
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr()
+        RecvStream::peer_addr(self)
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_deadline(deadline)
+        RecvStream::set_deadline(self, deadline)
     }
 
     fn close_identity(&self) -> *const () {
-        self.close_identity()
+        RecvStream::close_identity(self)
     }
 
     fn close(&self) -> Result<()> {
-        self.close()
+        RecvStream::close(self)
     }
 
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
-        self.close_with_error(code, reason)
+        RecvStream::close_with_error(self, code, reason)
     }
 }
 
 impl RecvStreamApi for RecvStream {
-    fn read_closed(&self) -> bool {
-        self.read_closed()
+    fn is_read_closed(&self) -> bool {
+        RecvStream::is_read_closed(self)
     }
 
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
-        self.read_timeout(dst, timeout)
+        RecvStream::read_timeout(self, dst, timeout)
     }
 
     fn read_vectored_timeout(
@@ -2548,233 +2443,141 @@ impl RecvStreamApi for RecvStream {
         dsts: &mut [IoSliceMut<'_>],
         timeout: Duration,
     ) -> Result<usize> {
-        self.read_vectored_timeout(dsts, timeout)
+        RecvStream::read_vectored_timeout(self, dsts, timeout)
     }
 
     fn read_exact_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<()> {
-        self.read_exact_timeout(dst, timeout)
+        RecvStream::read_exact_timeout(self, dst, timeout)
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.set_read_deadline(deadline)
+        RecvStream::set_read_deadline(self, deadline)
     }
 
     fn close_read(&self) -> Result<()> {
-        self.close_read()
+        RecvStream::close_read(self)
     }
 
     fn cancel_read(&self, code: u64) -> Result<()> {
-        self.cancel_read(code)
+        RecvStream::cancel_read(self, code)
     }
 }
 
 impl Session for Conn {
     fn accept_stream(&self) -> Result<BoxStream> {
-        Ok(Box::new(self.accept_stream()?))
+        Ok(Box::new(Conn::accept_stream(self)?))
     }
 
     fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxStream> {
-        Ok(Box::new(self.accept_stream_timeout(timeout)?))
+        Ok(Box::new(Conn::accept_stream_timeout(self, timeout)?))
     }
 
     fn accept_uni_stream(&self) -> Result<BoxRecvStream> {
-        Ok(Box::new(self.accept_uni_stream()?))
+        Ok(Box::new(Conn::accept_uni_stream(self)?))
     }
 
     fn accept_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxRecvStream> {
-        Ok(Box::new(self.accept_uni_stream_timeout(timeout)?))
+        Ok(Box::new(Conn::accept_uni_stream_timeout(self, timeout)?))
     }
 
-    fn open_stream(&self) -> Result<BoxStream> {
-        Ok(Box::new(self.open_stream()?))
+    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream> {
+        Ok(Box::new(Conn::open_stream_with(self, request)?))
     }
 
-    fn open_stream_timeout(&self, timeout: Duration) -> Result<BoxStream> {
-        Ok(Box::new(self.open_stream_timeout(timeout)?))
+    fn open_uni_stream_with(&self, request: OpenRequest) -> Result<BoxSendStream> {
+        Ok(Box::new(Conn::open_uni_stream_with(self, request)?))
     }
 
-    fn open_uni_stream(&self) -> Result<BoxSendStream> {
-        Ok(Box::new(self.open_uni_stream()?))
-    }
-
-    fn open_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxSendStream> {
-        Ok(Box::new(self.open_uni_stream_timeout(timeout)?))
-    }
-
-    fn open_stream_with_options(&self, opts: OpenOptions) -> Result<BoxStream> {
-        Ok(Box::new(self.open_stream_with_options(opts)?))
-    }
-
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<BoxStream> {
-        Ok(Box::new(
-            self.open_stream_with_options_timeout(opts, timeout)?,
-        ))
-    }
-
-    fn open_uni_stream_with_options(&self, opts: OpenOptions) -> Result<BoxSendStream> {
-        Ok(Box::new(self.open_uni_stream_with_options(opts)?))
-    }
-
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<BoxSendStream> {
-        Ok(Box::new(
-            self.open_uni_stream_with_options_timeout(opts, timeout)?,
-        ))
-    }
-
-    fn open_and_send(&self, data: &[u8]) -> Result<(BoxStream, usize)> {
-        let (stream, n) = self.open_and_send(data)?;
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+        let (stream, n) = Conn::open_and_send(self, request)?;
         Ok((Box::new(stream), n))
     }
 
-    fn open_and_send_timeout(&self, data: &[u8], timeout: Duration) -> Result<(BoxStream, usize)> {
-        let (stream, n) = self.open_and_send_timeout(data, timeout)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(BoxStream, usize)> {
-        let (stream, n) = self.open_and_send_with_options(opts, data)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxStream, usize)> {
-        let (stream, n) = self.open_and_send_with_options_timeout(opts, data, timeout)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_uni_and_send(&self, data: &[u8]) -> Result<(BoxSendStream, usize)> {
-        let (stream, n) = self.open_uni_and_send(data)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_uni_and_send_timeout(
-        &self,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)> {
-        let (stream, n) = self.open_uni_and_send_timeout(data, timeout)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_uni_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(BoxSendStream, usize)> {
-        let (stream, n) = self.open_uni_and_send_with_options(opts, data)?;
-        Ok((Box::new(stream), n))
-    }
-
-    fn open_uni_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(BoxSendStream, usize)> {
-        let (stream, n) = self.open_uni_and_send_with_options_timeout(opts, data, timeout)?;
+    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+        let (stream, n) = Conn::open_uni_and_send(self, request)?;
         Ok((Box::new(stream), n))
     }
 
     fn ping(&self, echo: &[u8]) -> Result<Duration> {
-        self.ping(echo)
+        Conn::ping(self, echo)
     }
 
     fn ping_timeout(&self, echo: &[u8], timeout: Duration) -> Result<Duration> {
-        self.ping_timeout(echo, timeout)
+        Conn::ping_timeout(self, echo, timeout)
     }
 
-    fn goaway(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
-        self.goaway(last_accepted_bidi, last_accepted_uni)
+    fn go_away(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
+        Conn::go_away(self, last_accepted_bidi, last_accepted_uni)
     }
 
-    fn goaway_with_error(
+    fn go_away_with_error(
         &self,
         last_accepted_bidi: u64,
         last_accepted_uni: u64,
         code: u64,
         reason: &str,
     ) -> Result<()> {
-        self.goaway_with_error(last_accepted_bidi, last_accepted_uni, code, reason)
+        Conn::go_away_with_error(self, last_accepted_bidi, last_accepted_uni, code, reason)
     }
 
     fn close(&self) -> Result<()> {
-        self.close()
+        Conn::close(self)
     }
 
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
-        self.close_with_error(code, reason)
+        Conn::close_with_error(self, code, reason)
     }
 
     fn wait(&self) -> Result<()> {
-        self.wait()
+        Conn::wait(self)
     }
 
     fn wait_timeout(&self, timeout: Duration) -> Result<bool> {
-        self.wait_timeout(timeout)
+        Conn::wait_timeout(self, timeout)
     }
 
-    fn closed(&self) -> bool {
-        self.closed()
+    fn is_closed(&self) -> bool {
+        Conn::is_closed(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr()
+        Conn::local_addr(self)
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr()
+        Conn::peer_addr(self)
     }
 
     fn close_error(&self) -> Option<Error> {
-        self.close_error()
+        Conn::close_error(self)
     }
 
     fn state(&self) -> SessionState {
-        self.state()
+        Conn::state(self)
     }
 
     fn stats(&self) -> SessionStats {
-        self.stats()
+        Conn::stats(self)
     }
 
-    fn peer_goaway_error(&self) -> Option<PeerGoAwayError> {
-        self.peer_goaway_error()
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+        Conn::peer_go_away_error(self)
     }
 
     fn peer_close_error(&self) -> Option<PeerCloseError> {
-        self.peer_close_error()
+        Conn::peer_close_error(self)
     }
 
     fn local_preface(&self) -> Preface {
-        self.local_preface()
+        Conn::local_preface(self)
     }
 
     fn peer_preface(&self) -> Preface {
-        self.peer_preface()
+        Conn::peer_preface(self)
     }
 
     fn negotiated(&self) -> Negotiated {
-        self.negotiated()
+        Conn::negotiated(self)
     }
 }
 
@@ -2784,20 +2587,20 @@ mod tests {
     use std::ops::Deref;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CopyOnlyStreamInfo {
-        copies: AtomicUsize,
+    struct AppendOnlyStreamInfo {
+        appends: AtomicUsize,
     }
 
-    impl StreamInfo for CopyOnlyStreamInfo {
+    impl StreamInfo for AppendOnlyStreamInfo {
         fn stream_id(&self) -> u64 {
             7
         }
 
-        fn opened_locally(&self) -> bool {
+        fn is_opened_locally(&self) -> bool {
             true
         }
 
-        fn bidirectional(&self) -> bool {
+        fn is_bidirectional(&self) -> bool {
             true
         }
 
@@ -2805,9 +2608,8 @@ mod tests {
             3
         }
 
-        fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-            self.copies.fetch_add(1, Ordering::Relaxed);
-            dst.clear();
+        fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+            self.appends.fetch_add(1, Ordering::Relaxed);
             dst.extend_from_slice(b"abc");
         }
 
@@ -2832,27 +2634,28 @@ mod tests {
     }
 
     #[test]
-    fn default_open_info_builds_from_copy_method() {
-        let info = CopyOnlyStreamInfo {
-            copies: AtomicUsize::new(0),
+    fn default_open_info_builds_from_append_method() {
+        let info = AppendOnlyStreamInfo {
+            appends: AtomicUsize::new(0),
         };
 
         assert_eq!(info.open_info(), b"abc");
-        assert_eq!(info.copies.load(Ordering::Relaxed), 1);
+        assert_eq!(info.appends.load(Ordering::Relaxed), 1);
 
         let mut dst = Vec::with_capacity(16);
-        info.copy_open_info_to(&mut dst);
-        assert_eq!(dst, b"abc");
+        dst.extend_from_slice(b"pre:");
+        info.append_open_info_to(&mut dst);
+        assert_eq!(dst, b"pre:abc");
         assert!(dst.capacity() >= 16);
-        assert_eq!(info.copies.load(Ordering::Relaxed), 2);
+        assert_eq!(info.appends.load(Ordering::Relaxed), 2);
     }
 
     struct CustomInfoWrapper {
-        inner: CopyOnlyStreamInfo,
+        inner: AppendOnlyStreamInfo,
     }
 
     impl Deref for CustomInfoWrapper {
-        type Target = CopyOnlyStreamInfo;
+        type Target = AppendOnlyStreamInfo;
 
         fn deref(&self) -> &Self::Target {
             &self.inner
@@ -2864,11 +2667,11 @@ mod tests {
             99
         }
 
-        fn opened_locally(&self) -> bool {
+        fn is_opened_locally(&self) -> bool {
             false
         }
 
-        fn bidirectional(&self) -> bool {
+        fn is_bidirectional(&self) -> bool {
             false
         }
 
@@ -2876,8 +2679,7 @@ mod tests {
             7
         }
 
-        fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-            dst.clear();
+        fn append_open_info_to(&self, dst: &mut Vec<u8>) {
             dst.extend_from_slice(b"wrapped");
         }
 
@@ -2904,15 +2706,15 @@ mod tests {
     #[test]
     fn custom_deref_wrapper_can_define_its_own_stream_info_surface() {
         let info = CustomInfoWrapper {
-            inner: CopyOnlyStreamInfo {
-                copies: AtomicUsize::new(0),
+            inner: AppendOnlyStreamInfo {
+                appends: AtomicUsize::new(0),
             },
         };
 
         assert_eq!(info.stream_id(), 99);
-        assert!(!info.opened_locally());
-        assert!(!info.bidirectional());
+        assert!(!info.is_opened_locally());
+        assert!(!info.is_bidirectional());
         assert_eq!(info.open_info(), b"wrapped");
-        assert_eq!(info.inner.copies.load(Ordering::Relaxed), 0);
+        assert_eq!(info.inner.appends.load(Ordering::Relaxed), 0);
     }
 }

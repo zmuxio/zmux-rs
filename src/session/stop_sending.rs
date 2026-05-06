@@ -32,19 +32,19 @@ pub(super) fn evaluate_graceful(input: GracefulInput) -> GracefulDecision {
         input.fragment_cap,
         input.explicit_tail_cap,
         input.send_rate_estimate,
-        drain_window(input.drain_window),
+        input.drain_window,
     );
 
-    let mut attempt = false;
-    if !input.recv_abortive && !input.needs_local_opener {
-        if committed_tail == 0 {
-            attempt = input.local_opened && input.send_committed;
+    let attempt = !input.recv_abortive
+        && !input.needs_local_opener
+        && input.send_committed
+        && if committed_tail == 0 {
+            input.local_opened
         } else if inflight_tail > 0 {
-            attempt = input.send_committed && inflight_tail <= tail_budget;
+            inflight_tail <= tail_budget
         } else {
-            attempt = input.send_committed && queued_only_tail <= tail_budget;
-        }
-    }
+            queued_only_tail <= tail_budget
+        };
 
     GracefulDecision {
         attempt,
@@ -55,26 +55,35 @@ pub(super) fn evaluate_graceful(input: GracefulInput) -> GracefulDecision {
     }
 }
 
+#[inline]
 fn committed_tail(queued_data_bytes: u64, inflight_queued: u64) -> u64 {
     queued_data_bytes.max(inflight_queued)
 }
 
+#[inline]
 fn queued_only_tail(queued_data_bytes: u64, inflight_queued: u64) -> u64 {
     queued_data_bytes.saturating_sub(inflight_queued)
 }
 
+#[inline]
 fn tail_budget(
     fragment_cap: u64,
     explicit_tail_cap: Option<u64>,
     send_rate_estimate: u64,
-    drain_window: Duration,
+    window: Duration,
 ) -> u64 {
-    if let Some(cap) = explicit_tail_cap.filter(|cap| *cap > 0) {
+    if let Some(cap) = positive_tail_cap(explicit_tail_cap) {
         return cap;
     }
-    static_tail_cap(fragment_cap).max(rate_budget(send_rate_estimate, drain_window))
+    static_tail_cap(fragment_cap).max(rate_budget(send_rate_estimate, drain_window(window)))
 }
 
+#[inline]
+fn positive_tail_cap(cap: Option<u64>) -> Option<u64> {
+    cap.filter(|cap| *cap > 0)
+}
+
+#[inline]
 fn static_tail_cap(fragment_cap: u64) -> u64 {
     if fragment_cap == 0 {
         return 0;
@@ -82,6 +91,7 @@ fn static_tail_cap(fragment_cap: u64) -> u64 {
     (fragment_cap / 4).clamp(1, 512)
 }
 
+#[inline]
 fn rate_budget(rate_bytes_per_second: u64, window: Duration) -> u64 {
     if rate_bytes_per_second == 0 || window.is_zero() {
         return 0;
@@ -90,18 +100,15 @@ fn rate_budget(rate_bytes_per_second: u64, window: Duration) -> u64 {
 
     let raw_budget =
         u128::from(rate_bytes_per_second).saturating_mul(window.as_nanos()) / NANOS_PER_SECOND;
-    let budget = u128_to_u64_saturating(raw_budget);
-    if budget == 0 {
-        1
-    } else {
-        budget
-    }
+    u128_to_u64_saturating(raw_budget).max(1)
 }
 
+#[inline]
 fn u128_to_u64_saturating(value: u128) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u128::from(u64::MAX)) as u64
 }
 
+#[inline]
 fn drain_window(window: Duration) -> Duration {
     if window.is_zero() {
         DEFAULT_STOP_SENDING_GRACEFUL_DRAIN_WINDOW

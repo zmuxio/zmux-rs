@@ -126,25 +126,107 @@ jobs:
       - name: Build docs
         run: cargo doc --locked --workspace --no-deps
 
+      - name: Check existing crates.io versions
+        id: published
+        shell: bash
+        run: |
+          crate_version_exists() {
+            local crate="$1"
+            local version="$2"
+            python3 - "${crate}" "${version}" <<'PY'
+          import sys
+          import urllib.error
+          import urllib.request
+
+          crate, version = sys.argv[1], sys.argv[2]
+          request = urllib.request.Request(
+              f"https://crates.io/api/v1/crates/{crate}/{version}",
+              headers={"User-Agent": "zmux-rs-release-workflow"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  sys.exit(0 if response.status == 200 else 1)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  sys.exit(1)
+              print(f"crates.io returned HTTP {exc.code} for {crate} {version}", file=sys.stderr)
+              sys.exit(2)
+          except Exception as exc:
+              print(f"could not query crates.io for {crate} {version}: {exc}", file=sys.stderr)
+              sys.exit(2)
+          PY
+          }
+
+          record_version_status() {
+            local crate="$1"
+            local output="$2"
+            if crate_version_exists "${crate}" "${ZMUX_VERSION}"; then
+              echo "${output}=true" >> "${GITHUB_OUTPUT}"
+              echo "${crate} ${ZMUX_VERSION} is already published; publish will be skipped."
+              return
+            fi
+            local status=$?
+            if [[ "${status}" -eq 1 ]]; then
+              echo "${output}=false" >> "${GITHUB_OUTPUT}"
+              return
+            fi
+            exit "${status}"
+          }
+
+          record_version_status zmux core
+          record_version_status zmux-quinn quinn
+
       - name: Dry-run core publish
+        if: steps.published.outputs.core != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked -p zmux --dry-run
 
       - name: Publish core crate
+        if: steps.published.outputs.core != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked -p zmux
 
       - name: Wait for core crate indexing
+        if: steps.published.outputs.quinn != 'true'
         shell: bash
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          crate_version_exists() {
+            local crate="$1"
+            local version="$2"
+            python3 - "${crate}" "${version}" <<'PY'
+          import sys
+          import urllib.error
+          import urllib.request
+
+          crate, version = sys.argv[1], sys.argv[2]
+          request = urllib.request.Request(
+              f"https://crates.io/api/v1/crates/{crate}/{version}",
+              headers={"User-Agent": "zmux-rs-release-workflow"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  sys.exit(0 if response.status == 200 else 1)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  sys.exit(1)
+              print(f"crates.io returned HTTP {exc.code} for {crate} {version}", file=sys.stderr)
+              sys.exit(2)
+          except Exception as exc:
+              print(f"could not query crates.io for {crate} {version}: {exc}", file=sys.stderr)
+              sys.exit(2)
+          PY
+          }
+
           for attempt in {1..30}; do
             echo "Checking whether zmux ${ZMUX_VERSION} is available for adapter verification, attempt ${attempt}/30"
-            if cargo publish --locked -p zmux-quinn --dry-run; then
+            if crate_version_exists zmux "${ZMUX_VERSION}"; then
               exit 0
+            fi
+            status=$?
+            if [[ "${status}" -ne 1 ]]; then
+              echo "crates.io version check failed; retrying." >&2
             fi
             sleep 20
           done
@@ -152,7 +234,14 @@ jobs:
           echo "zmux ${ZMUX_VERSION} was not visible to crates.io dependency resolution in time." >&2
           exit 1
 
+      - name: Dry-run Quinn adapter publish
+        if: steps.published.outputs.quinn != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p zmux-quinn --dry-run
+
       - name: Publish Quinn adapter crate
+        if: steps.published.outputs.quinn != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked -p zmux-quinn

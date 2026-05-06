@@ -4,6 +4,41 @@ use std::io;
 pub const MAX_VARINT62: u64 = (1u64 << 62) - 1;
 pub const MAX_VARINT_LEN: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackedVarint {
+    value: u64,
+    bytes: [u8; MAX_VARINT_LEN],
+    len: u8,
+}
+
+impl PackedVarint {
+    #[inline]
+    pub(crate) fn new(value: u64) -> Result<Self> {
+        let mut bytes = [0u8; MAX_VARINT_LEN];
+        let len = encode_varint_to_slice(&mut bytes, value)?;
+        Ok(Self {
+            value,
+            bytes,
+            len: len as u8,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
+
+    #[inline]
+    pub(crate) fn len(self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len()]
+    }
+}
+
 #[inline]
 pub fn varint_len(v: u64) -> Result<usize> {
     if v <= MAX_VARINT62 {
@@ -18,6 +53,20 @@ pub fn append_varint(dst: &mut Vec<u8>, v: u64) -> Result<()> {
     let n = varint_len(v)?;
     dst.try_reserve(n)
         .map_err(|_| Error::local("zmux: varint allocation failed"))?;
+    append_varint_reserved_with_len(dst, v, n);
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn append_varint_reserved(dst: &mut Vec<u8>, v: u64) -> Result<()> {
+    let n = varint_len(v)?;
+    append_varint_reserved_with_len(dst, v, n);
+    Ok(())
+}
+
+#[inline]
+fn append_varint_reserved_with_len(dst: &mut Vec<u8>, v: u64, n: usize) {
+    debug_assert!(dst.capacity().saturating_sub(dst.len()) >= n);
     match n {
         1 => dst.push(v as u8),
         2 => dst.extend_from_slice(&[((v >> 8) as u8 & 0x3f) | 0x40, v as u8]),
@@ -39,7 +88,6 @@ pub fn append_varint(dst: &mut Vec<u8>, v: u64) -> Result<()> {
         ]),
         _ => unreachable!(),
     }
-    Ok(())
 }
 
 #[inline]
@@ -126,8 +174,8 @@ pub(crate) fn read_exact_checked<R: io::Read>(
         match reader.read(dst) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(n) if n <= dst.len() => {
-                let remaining = dst;
-                dst = &mut remaining[n..];
+                let (_, remaining) = dst.split_at_mut(n);
+                dst = remaining;
             }
             Ok(_) => {
                 return Err(io::Error::new(
@@ -143,12 +191,12 @@ pub(crate) fn read_exact_checked<R: io::Read>(
 }
 
 #[inline]
-fn encoded_len_from_first(first: u8) -> usize {
+const fn encoded_len_from_first(first: u8) -> usize {
     1usize << (first >> 6)
 }
 
 #[inline]
-fn canonical_varint_len(v: u64) -> usize {
+const fn canonical_varint_len(v: u64) -> usize {
     match v {
         0..=63 => 1,
         64..=16_383 => 2,
@@ -162,23 +210,18 @@ fn decode_varint_value(src: &[u8], n: usize) -> u64 {
     debug_assert!(src.len() >= n);
     match n {
         1 => (src[0] & 0x3f) as u64,
-        2 => (((src[0] & 0x3f) as u64) << 8) | src[1] as u64,
-        4 => {
-            (((src[0] & 0x3f) as u64) << 24)
-                | ((src[1] as u64) << 16)
-                | ((src[2] as u64) << 8)
-                | src[3] as u64
-        }
-        8 => {
-            (((src[0] & 0x3f) as u64) << 56)
-                | ((src[1] as u64) << 48)
-                | ((src[2] as u64) << 40)
-                | ((src[3] as u64) << 32)
-                | ((src[4] as u64) << 24)
-                | ((src[5] as u64) << 16)
-                | ((src[6] as u64) << 8)
-                | src[7] as u64
-        }
+        2 => u16::from_be_bytes([src[0] & 0x3f, src[1]]) as u64,
+        4 => u32::from_be_bytes([src[0] & 0x3f, src[1], src[2], src[3]]) as u64,
+        8 => u64::from_be_bytes([
+            src[0] & 0x3f,
+            src[1],
+            src[2],
+            src[3],
+            src[4],
+            src[5],
+            src[6],
+            src[7],
+        ]),
         _ => unreachable!("varint62 prefix produces only 1, 2, 4, or 8 byte lengths"),
     }
 }
@@ -197,27 +240,25 @@ fn validate_decoded_varint(value: u64, n: usize) -> Result<(u64, usize)> {
 #[inline]
 fn read_first_varint_byte<R: io::Read>(reader: &mut R) -> Result<u8> {
     let mut byte = [0u8; 1];
-    read_exact_checked(reader, &mut byte).map_err(|err| {
-        if err.kind() == io::ErrorKind::UnexpectedEof {
-            varint_wire_error("truncated varint62")
-        } else {
-            Error::from(err)
-        }
-    })?;
+    read_exact_checked(reader, &mut byte).map_err(map_varint_read_error)?;
     Ok(byte[0])
 }
 
 #[inline]
 fn read_varint_tail_bytes<R: io::Read>(reader: &mut R, dst: &mut [u8]) -> Result<()> {
-    read_exact_checked(reader, dst).map_err(|err| {
-        if err.kind() == io::ErrorKind::UnexpectedEof {
-            varint_wire_error("truncated varint62")
-        } else {
-            Error::from(err)
-        }
-    })
+    read_exact_checked(reader, dst).map_err(map_varint_read_error)
 }
 
+#[inline]
+fn map_varint_read_error(err: io::Error) -> Error {
+    if err.kind() == io::ErrorKind::UnexpectedEof {
+        varint_wire_error("truncated varint62")
+    } else {
+        Error::from(err)
+    }
+}
+
+#[inline]
 fn varint_wire_error(message: &'static str) -> Error {
     Error::protocol(message)
         .with_scope(ErrorScope::Session)

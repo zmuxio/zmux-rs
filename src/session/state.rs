@@ -13,6 +13,7 @@ use crate::error::{
 use crate::event::{dispatch_event, Event, EventType, StreamEventInfo};
 use crate::frame::{Frame, FrameType};
 use crate::payload::StreamMetadata;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -30,19 +31,47 @@ const PROVISIONAL_OPEN_RTT_MULTIPLIER: u32 = 6;
 const MAX_REASON_STATS_CODES: usize = 1024;
 const ACCEPT_QUEUE_RETAIN_MIN_CAP: usize = 1024;
 const PROVISIONAL_QUEUE_RETAIN_MIN_CAP: usize = 1024;
+const RETENTION_QUEUE_RETAIN_MIN_CAP: usize = 1024;
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
-pub(super) fn compact_retained_bytes(bytes: Vec<u8>) -> Vec<u8> {
-    if bytes.is_empty() {
-        Vec::new()
-    } else {
-        bytes.into_boxed_slice().into_vec()
+#[inline]
+fn u64_to_usize_saturating(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+#[inline]
+fn effective_session_memory_cap(inner: &Inner) -> Option<usize> {
+    match inner.session_memory_cap {
+        Some(cap) if cap > 0 => Some(cap),
+        _ => None,
     }
 }
 
+#[inline]
+fn nonzero_duration(value: Option<Duration>) -> Option<Duration> {
+    match value {
+        Some(value) if !value.is_zero() => Some(value),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(super) fn compact_retained_bytes(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.is_empty() {
+        Vec::new()
+    } else if bytes.len() == bytes.capacity() {
+        bytes
+    } else {
+        bytes.shrink_to_fit();
+        bytes
+    }
+}
+
+#[inline]
 pub(super) fn clear_stream_open_prefix_locked(stream_state: &mut StreamState) {
     stream_state.open_prefix = Vec::new();
 }
@@ -69,16 +98,15 @@ fn fail_session_inner(inner: &Arc<Inner>, err: Error, close_frame: Option<Frame>
         }
         state.state = SessionState::Failed;
         state.graceful_close_active = false;
+        let ping_err = err.clone();
         state.close_error = Some(err);
         state.scheduler.clear();
-        let ping_err = state
-            .close_error
-            .clone()
-            .unwrap_or_else(Error::session_closed);
         fail_pending_pings_locked(&mut state, ping_err);
         release_session_runtime_state_locked(&mut state);
+        let event = take_session_closed_event_locked(inner, &mut state);
+        drop(state);
         inner.cond.notify_all();
-        take_session_closed_event_locked(inner, &mut state)
+        event
     };
     if let Some(frame) = close_frame {
         inner.shutdown_writer_with_close(frame);
@@ -92,7 +120,7 @@ pub(super) fn emit_event(inner: &Arc<Inner>, event: Option<Event>) {
     let Some(mut event) = event else {
         return;
     };
-    let Some(handler) = inner.event_handler.as_ref().cloned() else {
+    let Some(handler) = inner.event_handler.as_ref() else {
         return;
     };
     {
@@ -105,10 +133,11 @@ pub(super) fn emit_event(inner: &Arc<Inner>, event: Option<Event>) {
     }
 
     loop {
-        dispatch_event(&handler, event);
+        dispatch_event(handler, event);
         let mut dispatch = inner.event_dispatch.lock().unwrap();
         let Some(next_event) = dispatch.queue.pop_front() else {
             dispatch.emitting = false;
+            drop(dispatch);
             return;
         };
         event = next_event;
@@ -216,9 +245,10 @@ pub(super) fn ensure_pending_priority_update_limits_locked(
     operation: &str,
 ) -> Result<()> {
     let writer = inner.write_queue.stats();
-    let pending = pending_priority_update_bytes_with_replacement_locked(
+    let (pending, stream_metadata) = stream_metadata_pending_priority_replacement_totals_locked(
         state,
         current_stream_id,
+        current_stream,
         replacement_len,
     );
     if pending > writer.pending_priority_bytes_budget {
@@ -228,14 +258,8 @@ pub(super) fn ensure_pending_priority_update_limits_locked(
         ));
     }
 
-    let tracked = tracked_session_memory_with_pending_priority_replacement_locked(
-        inner,
-        state,
-        &writer,
-        current_stream_id,
-        current_stream,
-        replacement_len,
-    );
+    let tracked =
+        tracked_session_memory_base_locked(inner, state, &writer).saturating_add(stream_metadata);
     let hard_cap = session_memory_hard_cap_locked(inner, state, &writer);
     if tracked > hard_cap {
         return Err(Error::new(
@@ -253,11 +277,12 @@ pub(super) fn session_memory_pressure_high_fast_locked(inner: &Inner, state: &Co
     tracked >= memory_high_threshold(hard_cap)
 }
 
+#[inline]
 pub(super) fn memory_high_threshold(hard_cap: usize) -> usize {
     if hard_cap <= 4 {
         hard_cap
     } else {
-        hard_cap.saturating_sub(hard_cap / 4)
+        hard_cap - hard_cap / 4
     }
 }
 
@@ -266,102 +291,66 @@ fn tracked_session_memory_locked(
     state: &ConnState,
     writer: &WriterQueueStats,
 ) -> usize {
-    let mut total = writer.queued_bytes;
-    total = total.saturating_add(state.retained_open_info_bytes);
-    total = total.saturating_add(state.retained_peer_reason_bytes);
-    total = total.saturating_add(tracked_retained_state_memory_locked(inner, state));
-    total = total.saturating_add(state.recv_session_retained);
+    let mut total = tracked_session_memory_base_locked(inner, state, writer);
     for stream in state.streams.values() {
         let stream_state = stream.state.lock().unwrap();
-        total = total.saturating_add(stream_state.open_prefix.len());
-        total = total.saturating_add(
-            stream_state
-                .open_info
-                .len()
-                .saturating_sub(stream_state.retained_open_info_bytes),
-        );
-        total = total.saturating_add(
-            stream_state
-                .pending_priority_update
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or(0),
-        );
-    }
-    total
-}
-
-fn tracked_session_memory_with_pending_priority_replacement_locked(
-    inner: &Inner,
-    state: &ConnState,
-    writer: &WriterQueueStats,
-    current_stream_id: u64,
-    current_stream: &StreamState,
-    replacement_len: usize,
-) -> usize {
-    let mut total = writer.queued_bytes;
-    total = total.saturating_add(state.retained_open_info_bytes);
-    total = total.saturating_add(state.retained_peer_reason_bytes);
-    total = total.saturating_add(tracked_retained_state_memory_locked(inner, state));
-    total = total.saturating_add(state.recv_session_retained);
-
-    let mut current_counted = false;
-    for (stream_id, stream) in &state.streams {
-        if *stream_id == current_stream_id {
-            current_counted = true;
-            total = total.saturating_add(stream_retained_metadata_bytes(
-                current_stream,
-                replacement_len,
-            ));
-        } else {
-            let stream_state = stream.state.lock().unwrap();
-            total = total.saturating_add(stream_retained_metadata_bytes(
-                &stream_state,
-                stream_state
-                    .pending_priority_update
-                    .as_ref()
-                    .map(Vec::len)
-                    .unwrap_or(0),
-            ));
-        }
-    }
-    if !current_counted {
         total = total.saturating_add(stream_retained_metadata_bytes(
-            current_stream,
-            replacement_len,
+            &stream_state,
+            pending_priority_update_len(&stream_state),
         ));
     }
     total
 }
 
-fn pending_priority_update_bytes_with_replacement_locked(
+#[inline]
+fn tracked_session_memory_base_locked(
+    inner: &Inner,
     state: &ConnState,
-    current_stream_id: u64,
-    replacement_len: usize,
+    writer: &WriterQueueStats,
 ) -> usize {
-    let mut total = 0usize;
-    let mut current_counted = false;
-    for (stream_id, stream) in &state.streams {
-        if *stream_id == current_stream_id {
-            current_counted = true;
-            total = total.saturating_add(replacement_len);
-        } else {
-            let stream_state = stream.state.lock().unwrap();
-            total = total.saturating_add(
-                stream_state
-                    .pending_priority_update
-                    .as_ref()
-                    .map(Vec::len)
-                    .unwrap_or(0),
-            );
-        }
-    }
-    if !current_counted {
-        total = total.saturating_add(replacement_len);
-    }
-    total
+    let mut total = writer.queued_bytes;
+    total = total.saturating_add(state.retained_open_info_bytes);
+    total = total.saturating_add(state.retained_peer_reason_bytes);
+    total = total.saturating_add(tracked_retained_state_memory_locked(inner, state));
+    total.saturating_add(state.recv_session_retained)
 }
 
+fn stream_metadata_pending_priority_replacement_totals_locked(
+    state: &ConnState,
+    current_stream_id: u64,
+    current_stream: &StreamState,
+    replacement_len: usize,
+) -> (usize, usize) {
+    let mut pending_total = 0usize;
+    let mut metadata_total = 0usize;
+    let mut current_counted = false;
+    for (stream_id, stream) in &state.streams {
+        let (stream_state, pending_len) = if *stream_id == current_stream_id {
+            current_counted = true;
+            (current_stream, replacement_len)
+        } else {
+            let stream_state = stream.state.lock().unwrap();
+            let pending_len = pending_priority_update_len(&stream_state);
+            pending_total = pending_total.saturating_add(pending_len);
+            metadata_total = metadata_total
+                .saturating_add(stream_retained_metadata_bytes(&stream_state, pending_len));
+            continue;
+        };
+        pending_total = pending_total.saturating_add(pending_len);
+        metadata_total = metadata_total
+            .saturating_add(stream_retained_metadata_bytes(stream_state, pending_len));
+    }
+    if !current_counted {
+        pending_total = pending_total.saturating_add(replacement_len);
+        metadata_total = metadata_total.saturating_add(stream_retained_metadata_bytes(
+            current_stream,
+            replacement_len,
+        ));
+    }
+    (pending_total, metadata_total)
+}
+
+#[inline]
 fn stream_retained_metadata_bytes(
     stream_state: &StreamState,
     pending_priority_len: usize,
@@ -378,17 +367,22 @@ fn stream_retained_metadata_bytes(
         .saturating_add(pending_priority_len)
 }
 
+#[inline]
+fn pending_priority_update_len(stream_state: &StreamState) -> usize {
+    if let Some(payload) = stream_state.pending_priority_update.as_ref() {
+        payload.len()
+    } else {
+        0
+    }
+}
+
+#[inline]
 fn tracked_session_memory_fast_locked(
     inner: &Inner,
     state: &ConnState,
     writer: &WriterQueueStats,
 ) -> usize {
-    let mut total = writer.queued_bytes;
-    total = total.saturating_add(state.retained_open_info_bytes);
-    total = total.saturating_add(state.retained_peer_reason_bytes);
-    total = total.saturating_add(tracked_retained_state_memory_locked(inner, state));
-    total = total.saturating_add(state.recv_session_retained);
-    total
+    tracked_session_memory_base_locked(inner, state, writer)
 }
 
 fn live_stream_pressure_units_locked(state: &ConnState) -> usize {
@@ -398,7 +392,7 @@ fn live_stream_pressure_units_locked(state: &ConnState) -> usize {
         .saturating_add(state.active.local_uni)
         .saturating_add(state.active.peer_bidi)
         .saturating_add(state.active.peer_uni);
-    let live_streams = usize::try_from(live_streams).unwrap_or(usize::MAX);
+    let live_streams = u64_to_usize_saturating(live_streams);
     state
         .provisional_bidi
         .len()
@@ -422,7 +416,7 @@ pub(super) fn ensure_local_open_memory_cap_locked(
     state: &ConnState,
     additional_retained_bytes: usize,
 ) -> Result<()> {
-    let Some(cap) = inner.session_memory_cap.filter(|cap| *cap > 0) else {
+    let Some(cap) = effective_session_memory_cap(inner) else {
         return Ok(());
     };
     let writer = inner.write_queue.stats();
@@ -455,30 +449,27 @@ pub(super) fn tracked_retained_state_memory_locked(inner: &Inner, state: &ConnSt
     hidden.saturating_add(visible).saturating_add(markers)
 }
 
+#[inline]
 fn retained_state_unit_locked(inner: &Inner) -> usize {
     let settings = inner.local_preface.settings;
-    [
-        settings.max_frame_payload,
-        settings.max_control_payload_bytes,
-        settings.max_extension_payload_bytes,
-    ]
-    .into_iter()
-    .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-    .max()
-    .unwrap_or(0)
-    .max(MIN_RETAINED_STATE_UNIT)
+    u64_to_usize_saturating(settings.max_frame_payload)
+        .max(u64_to_usize_saturating(settings.max_control_payload_bytes))
+        .max(u64_to_usize_saturating(
+            settings.max_extension_payload_bytes,
+        ))
+        .max(MIN_RETAINED_STATE_UNIT)
 }
 
+#[inline]
 fn session_memory_hard_cap_locked(
     inner: &Inner,
     state: &ConnState,
     writer: &WriterQueueStats,
 ) -> usize {
-    if let Some(cap) = inner.session_memory_cap.filter(|cap| *cap > 0) {
+    if let Some(cap) = effective_session_memory_cap(inner) {
         return cap;
     }
-    let recv_window =
-        usize::try_from(inner.local_preface.settings.initial_max_data).unwrap_or(usize::MAX);
+    let recv_window = u64_to_usize_saturating(inner.local_preface.settings.initial_max_data);
     recv_window
         .saturating_add(state.accept_backlog_bytes_limit)
         .saturating_add(writer.session_data_high_watermark)
@@ -629,15 +620,15 @@ pub(super) fn queue_peer_visible_pending_priority(
     payload: Vec<u8>,
 ) {
     let queued_cost = payload.len().saturating_add(1);
-    let queued = ensure_projected_session_memory_cap(inner, queued_cost, "priority update")
-        .and_then(|()| {
-            inner.try_queue_frame(Frame {
-                frame_type: FrameType::Ext,
-                flags: 0,
-                stream_id,
-                payload,
-            })
-        });
+    let queued = match ensure_projected_session_memory_cap(inner, queued_cost, "priority update") {
+        Ok(()) => inner.try_queue_frame(Frame {
+            frame_type: FrameType::Ext,
+            flags: 0,
+            stream_id,
+            payload,
+        }),
+        Err(err) => Err(err),
+    };
     if queued.is_err() {
         let mut state = inner.state.lock().unwrap();
         state.dropped_local_priority_update_count =
@@ -725,8 +716,10 @@ pub(super) fn release_session_runtime_state_locked(state: &mut ConnState) {
     state.keepalive_ping = None;
     state.canceled_ping_payload = None;
     if let Some(ping) = state.ping_waiter.take() {
-        let mut result = ping.slot.result.lock().unwrap();
-        *result = Some(Err(Error::session_closed()));
+        {
+            let mut result = ping.slot.result.lock().unwrap();
+            *result = Some(Err(Error::session_closed()));
+        }
         ping.slot.cond.notify_all();
     }
     state.last_ping_sent_at = None;
@@ -787,12 +780,13 @@ pub(super) fn ensure_session_not_closed(state: &ConnState) -> Result<()> {
     }
 }
 
+#[inline]
 pub(super) fn provisional_available_count(next_id: u64, goaway: u64) -> usize {
     if next_id > goaway {
         return 0;
     }
     let slots = (goaway - next_id) / 4 + 1;
-    usize::try_from(slots).unwrap_or(usize::MAX)
+    u64_to_usize_saturating(slots)
 }
 
 pub(super) fn reap_expired_provisionals_locked(
@@ -838,10 +832,12 @@ pub(super) fn reap_expired_provisionals_locked(
     }
 }
 
+#[inline]
 pub(super) fn provisional_open_expired_reason() -> &'static str {
     PROVISIONAL_OPEN_EXPIRED_REASON
 }
 
+#[inline]
 pub(super) fn provisional_expired_locked(
     stream_state: &StreamState,
     now: Instant,
@@ -854,10 +850,9 @@ pub(super) fn provisional_expired_locked(
 
 pub(super) fn provisional_open_max_age(last_ping_rtt: Option<Duration>) -> Duration {
     let mut timeout = PROVISIONAL_OPEN_BASE_MAX_AGE;
-    if let Some(rtt) = last_ping_rtt.filter(|rtt| !rtt.is_zero()) {
+    if let Some(rtt) = nonzero_duration(last_ping_rtt) {
         let candidate = rtt
-            .checked_mul(PROVISIONAL_OPEN_RTT_MULTIPLIER)
-            .unwrap_or(Duration::MAX)
+            .saturating_mul(PROVISIONAL_OPEN_RTT_MULTIPLIER)
             .saturating_add(PROVISIONAL_OPEN_RTT_ADAPTIVE_SLACK);
         timeout = timeout.max(candidate);
     }
@@ -886,25 +881,27 @@ pub(super) fn fail_expired_provisional_locked(
     state.provisional_open_expired_count = state.provisional_open_expired_count.saturating_add(1);
 }
 
+#[inline]
 pub(super) fn late_data_per_stream_cap(
     configured: Option<u64>,
     initial_stream_window: u64,
     max_frame_payload: u64,
 ) -> u64 {
-    configured.unwrap_or_else(|| {
-        DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR.max(
+    match configured {
+        Some(cap) => cap,
+        None => DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR.max(
             max_frame_payload
                 .saturating_mul(2)
                 .min(initial_stream_window / 8),
-        )
-    })
+        ),
+    }
 }
 
-pub(super) fn reclaim_provisionals_after_goaway(state: &mut ConnState, bidi: bool) {
+pub(super) fn reclaim_provisionals_after_go_away(state: &mut ConnState, bidi: bool) {
     let (next_id, goaway) = if bidi {
-        (state.next_local_bidi, state.peer_goaway_bidi)
+        (state.next_local_bidi, state.peer_go_away_bidi)
     } else {
-        (state.next_local_uni, state.peer_goaway_uni)
+        (state.next_local_uni, state.peer_go_away_uni)
     };
     let available = provisional_available_count(next_id, goaway);
     loop {
@@ -945,27 +942,29 @@ pub(super) fn reclaim_provisionals_after_goaway(state: &mut ConnState, bidi: boo
     shrink_provisional_queue_locked(state, bidi);
 }
 
-pub(super) fn reclaim_unseen_local_streams_after_goaway(
+pub(super) fn reclaim_unseen_local_streams_after_go_away(
     state: &mut ConnState,
     bidi: bool,
 ) -> Vec<Arc<StreamInner>> {
     let goaway = if bidi {
-        state.peer_goaway_bidi
+        state.peer_go_away_bidi
     } else {
-        state.peer_goaway_uni
+        state.peer_go_away_uni
     };
-    let streams: Vec<_> = state
-        .streams
-        .values()
-        .filter(|stream| stream.opened_locally && stream.bidi == bidi)
-        .cloned()
-        .collect();
+    let mut streams = Vec::new();
+    for stream in state.streams.values() {
+        if !stream.opened_locally || stream.bidi != bidi {
+            continue;
+        }
+        let stream_id = stream.id.load(Ordering::Acquire);
+        if stream_id != 0 && stream_id > goaway {
+            streams.push(Arc::clone(stream));
+        }
+    }
     let mut reclaimed = Vec::new();
     for stream in streams {
         let stream_id = stream.id.load(Ordering::Acquire);
-        if stream_id == 0 || stream_id <= goaway {
-            continue;
-        }
+        debug_assert!(stream_id != 0 && stream_id > goaway);
         let mut stream_state = stream.state.lock().unwrap();
         if stream_state.peer_visible
             || stream_state.aborted.is_some()
@@ -1014,11 +1013,7 @@ pub(super) fn shrink_accept_queue_locked(state: &mut ConnState, bidi: bool) {
     } else {
         &mut state.accept_uni
     };
-    let sparse = queue.capacity() > ACCEPT_QUEUE_RETAIN_MIN_CAP
-        && queue.len().saturating_mul(4) < queue.capacity();
-    if sparse {
-        queue.shrink_to_fit();
-    }
+    shrink_queue_if_sparse(queue, ACCEPT_QUEUE_RETAIN_MIN_CAP, false);
 }
 
 pub(super) fn shrink_provisional_queue_locked(state: &mut ConnState, bidi: bool) {
@@ -1027,11 +1022,7 @@ pub(super) fn shrink_provisional_queue_locked(state: &mut ConnState, bidi: bool)
     } else {
         &mut state.provisional_uni
     };
-    let sparse = queue.capacity() > PROVISIONAL_QUEUE_RETAIN_MIN_CAP
-        && queue.len().saturating_mul(4) < queue.capacity();
-    if sparse {
-        queue.shrink_to_fit();
-    }
+    shrink_queue_if_sparse(queue, PROVISIONAL_QUEUE_RETAIN_MIN_CAP, false);
 }
 
 pub(super) fn refresh_accept_backlog_bytes_locked(
@@ -1175,7 +1166,7 @@ pub(super) fn enforce_session_memory_accept_backlog_locked(
     inner: &Inner,
     state: &mut ConnState,
 ) -> Vec<(u64, u64, usize)> {
-    let Some(cap) = inner.session_memory_cap.filter(|cap| *cap > 0) else {
+    let Some(cap) = effective_session_memory_cap(inner) else {
         return Vec::new();
     };
     let mut refused = Vec::new();
@@ -1213,6 +1204,7 @@ pub(super) fn enforce_session_memory_accept_backlog_locked(
     refused
 }
 
+#[inline]
 pub(super) fn retained_open_info_available(state: &ConnState) -> usize {
     state
         .retained_open_info_bytes_budget
@@ -1242,21 +1234,22 @@ pub(super) fn retain_peer_reason_locked(
     (retained, retained_len)
 }
 
+#[inline]
 pub(super) fn release_peer_reason_locked(state: &mut ConnState, bytes: usize) {
     state.retained_peer_reason_bytes = state.retained_peer_reason_bytes.saturating_sub(bytes);
 }
 
-pub(super) fn retain_peer_goaway_error_locked(
+pub(super) fn retain_peer_go_away_error_locked(
     inner: &Inner,
     state: &mut ConnState,
     code: u64,
     reason: String,
 ) {
-    if let Some(old) = state.peer_goaway_error.take() {
+    if let Some(old) = state.peer_go_away_error.take() {
         release_peer_reason_locked(state, old.reason.len());
     }
     let (reason, _) = retain_peer_reason_locked(inner, state, reason);
-    state.peer_goaway_error = Some(PeerGoAwayError { code, reason });
+    state.peer_go_away_error = Some(PeerGoAwayError { code, reason });
 }
 
 pub(super) fn retain_stream_recv_reset_reason_locked(
@@ -1322,12 +1315,18 @@ fn note_reason_locked(
     overflow: &mut u64,
     code: u64,
 ) {
-    if let Some(count) = counts.get_mut(&code) {
-        *count = count.saturating_add(1);
-    } else if counts.len() < MAX_REASON_STATS_CODES {
-        counts.insert(code, 1);
-    } else {
-        *overflow = overflow.saturating_add(1);
+    let can_insert = counts.len() < MAX_REASON_STATS_CODES;
+    match counts.entry(code) {
+        Entry::Occupied(mut entry) => {
+            let count = entry.get_mut();
+            *count = (*count).saturating_add(1);
+        }
+        Entry::Vacant(entry) if can_insert => {
+            entry.insert(1);
+        }
+        Entry::Vacant(_) => {
+            *overflow = overflow.saturating_add(1);
+        }
     }
 }
 
@@ -1335,17 +1334,23 @@ pub(super) fn clear_stream_peer_reasons_locked(
     state: &mut ConnState,
     stream_state: &mut StreamState,
 ) {
-    release_peer_reason_locked(state, stream_state.retained_recv_reset_reason_bytes);
-    stream_state.retained_recv_reset_reason_bytes = 0;
-    release_peer_reason_locked(state, stream_state.retained_abort_reason_bytes);
-    stream_state.retained_abort_reason_bytes = 0;
-    release_peer_reason_locked(state, stream_state.retained_stopped_reason_bytes);
-    stream_state.retained_stopped_reason_bytes = 0;
+    release_peer_reason_field_locked(state, &mut stream_state.retained_recv_reset_reason_bytes);
+    release_peer_reason_field_locked(state, &mut stream_state.retained_abort_reason_bytes);
+    release_peer_reason_field_locked(state, &mut stream_state.retained_stopped_reason_bytes);
 }
 
+#[inline]
+fn release_peer_reason_field_locked(state: &mut ConnState, bytes: &mut usize) {
+    release_peer_reason_locked(state, *bytes);
+    *bytes = 0;
+}
+
+#[inline]
 fn compact_retained_string(value: String) -> String {
     if value.is_empty() {
         String::new()
+    } else if value.len() == value.capacity() {
+        value
     } else {
         value.into_boxed_str().into_string()
     }
@@ -1364,6 +1369,11 @@ fn truncate_utf8(mut value: String, max_len: usize) -> String {
     }
     value.truncate(keep);
     compact_retained_string(value)
+}
+
+#[inline]
+fn accept_seq_is_newer_or_equal(lhs: u64, rhs: u64) -> bool {
+    lhs.wrapping_sub(rhs) < (1u64 << 63)
 }
 
 pub(super) fn pop_newest_accept_pending_locked(state: &mut ConnState) -> Option<Arc<StreamInner>> {
@@ -1387,7 +1397,7 @@ pub(super) fn pop_newest_accept_pending_locked(state: &mut ConnState) -> Option<
             shrink_accept_queue_locked(state, false);
             stream
         }
-        (Some(bidi), Some(uni)) if bidi >= uni => {
+        (Some(bidi), Some(uni)) if accept_seq_is_newer_or_equal(bidi, uni) => {
             let stream = state.accept_bidi.pop_back();
             shrink_accept_queue_locked(state, true);
             stream
@@ -1400,6 +1410,7 @@ pub(super) fn pop_newest_accept_pending_locked(state: &mut ConnState) -> Option<
     }
 }
 
+#[inline]
 pub(super) fn check_write_open(state: &StreamState) -> Result<()> {
     if state.send_fin {
         return Err(Error::write_closed().with_termination_kind(TerminationKind::Graceful));
@@ -1528,6 +1539,7 @@ pub(super) fn note_written_stream_frames_locked(
         .pending_terminal_frames
         .saturating_sub(terminal_frames);
     maybe_compact_stream_locked(state, &stream, &mut stream_state);
+    drop(stream_state);
     stream.cond.notify_all();
 }
 
@@ -1554,10 +1566,11 @@ pub(super) fn release_discarded_queued_stream_frames_locked(
         state.send_session_blocked_at = None;
     }
     maybe_release_active_count(state, stream, &mut stream_state);
-    maybe_compact_stream_locked(state, stream, &mut stream_state);
+    drop(stream_state);
     stream.cond.notify_all();
 }
 
+#[inline]
 pub(super) fn stream_fully_terminal(stream: &StreamInner, state: &StreamState) -> bool {
     if state.aborted.is_some() {
         return true;
@@ -1583,6 +1596,7 @@ fn terminal_data_disposition(
     }
 }
 
+#[inline]
 pub(super) fn late_data_cause_for(state: &StreamState) -> super::types::LateDataCause {
     if state.read_stopped {
         return super::types::LateDataCause::CloseRead;
@@ -1596,6 +1610,7 @@ pub(super) fn late_data_cause_for(state: &StreamState) -> super::types::LateData
     super::types::LateDataCause::None
 }
 
+#[inline]
 fn terminal_data_action_for(
     local_recv: bool,
     aborted: bool,
@@ -1603,10 +1618,7 @@ fn terminal_data_action_for(
     read_stopped: bool,
     recv_fin: bool,
 ) -> super::types::TerminalDataAction {
-    if !local_recv || aborted || recv_reset {
-        return super::types::TerminalDataAction::Ignore;
-    }
-    if read_stopped {
+    if !local_recv || aborted || recv_reset || read_stopped {
         return super::types::TerminalDataAction::Ignore;
     }
     if recv_fin {
@@ -1620,16 +1632,12 @@ pub(super) fn record_tombstone_locked(
     stream_id: u64,
     tombstone: super::types::StreamTombstone,
 ) {
-    let newly_hidden = tombstone.hidden
-        && !state
-            .tombstones
-            .get(&stream_id)
-            .is_some_and(|old| old.hidden);
-    if newly_hidden {
-        state.hidden_streams_reaped = state.hidden_streams_reaped.saturating_add(1);
-    }
     if state.tombstone_limit == 0 {
-        if let Some(old) = state.tombstones.remove(&stream_id) {
+        let old = state.tombstones.remove(&stream_id);
+        if tombstone.hidden && !old.as_ref().is_some_and(|old| old.hidden) {
+            state.hidden_streams_reaped = state.hidden_streams_reaped.saturating_add(1);
+        }
+        if let Some(old) = old {
             if old.hidden {
                 state.hidden_tombstones = state.hidden_tombstones.saturating_sub(1);
             }
@@ -1639,7 +1647,11 @@ pub(super) fn record_tombstone_locked(
         }
         return;
     }
-    match state.tombstones.insert(stream_id, tombstone) {
+    let old = state.tombstones.insert(stream_id, tombstone);
+    if tombstone.hidden && !old.as_ref().is_some_and(|old| old.hidden) {
+        state.hidden_streams_reaped = state.hidden_streams_reaped.saturating_add(1);
+    }
+    match old {
         Some(old) => {
             if old.hidden && !tombstone.hidden {
                 state.hidden_tombstones = state.hidden_tombstones.saturating_sub(1);
@@ -1699,9 +1711,10 @@ pub(super) fn reap_tombstones_for_memory_pressure_locked(
     state: &mut ConnState,
     writer: &WriterQueueStats,
 ) {
+    let hard_cap = session_memory_hard_cap_locked(inner, state, writer);
     loop {
         let tracked = tracked_session_memory_locked(inner, state, writer);
-        if tracked <= session_memory_hard_cap_locked(inner, state, writer) {
+        if tracked <= hard_cap {
             break;
         }
         let Some(stream_id) = pop_oldest_tombstone_id_locked(state) else {
@@ -1719,6 +1732,7 @@ pub(super) fn reap_tombstones_for_memory_pressure_locked(
     shrink_retention_queues_locked(state);
 }
 
+#[inline]
 fn visible_tombstone_count_locked(state: &ConnState) -> usize {
     state
         .tombstones
@@ -1779,12 +1793,13 @@ pub(super) fn terminal_marker_disposition_locked(
     if let Some(tombstone) = state.tombstones.get(&stream_id) {
         return Some(tombstone.data_disposition);
     }
-    if let Some(disposition) = state.used_markers.get(&stream_id) {
-        return Some(*disposition);
+    if let Some(disposition) = state.used_markers.get(&stream_id).copied() {
+        return Some(disposition);
     }
     marker_range_disposition_locked(state, stream_id)
 }
 
+#[inline]
 pub(super) fn has_terminal_marker_locked(state: &ConnState, stream_id: u64) -> bool {
     terminal_marker_disposition_locked(state, stream_id).is_some()
 }
@@ -1809,6 +1824,7 @@ pub(super) fn record_used_marker_locked(
     enforce_used_marker_limit_locked(state);
 }
 
+#[inline]
 pub(super) fn marker_only_retained_count_locked(state: &ConnState) -> usize {
     marker_only_map_count_locked(state).saturating_add(state.used_marker_ranges.len())
 }
@@ -1817,11 +1833,13 @@ fn marker_only_map_count_locked(state: &ConnState) -> usize {
     if state.used_markers.is_empty() || state.tombstones.is_empty() {
         return state.used_markers.len();
     }
-    state
-        .used_markers
-        .keys()
-        .filter(|&&stream_id| !state.tombstones.contains_key(&stream_id))
-        .count()
+    let mut count = 0usize;
+    for stream_id in state.used_markers.keys() {
+        if !state.tombstones.contains_key(stream_id) {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn enforce_used_marker_limit_locked(state: &mut ConnState) {
@@ -1837,7 +1855,10 @@ fn compact_marker_only_ranges_locked(state: &mut ConnState) {
     {
         return;
     }
-    let mut stream_ids = Vec::with_capacity(marker_count);
+    let mut stream_ids = Vec::new();
+    if stream_ids.try_reserve(marker_count).is_err() {
+        return;
+    }
     for stream_id in state.used_markers.keys() {
         if !state.tombstones.contains_key(stream_id) {
             stream_ids.push(*stream_id);
@@ -1891,7 +1912,7 @@ fn shrink_retention_queues_locked(state: &mut ConnState) {
     shrink_sparse_queue(&mut state.tombstone_order);
     shrink_sparse_queue(&mut state.hidden_tombstone_order);
     shrink_sparse_queue(&mut state.used_marker_order);
-    let ranges_sparse = state.used_marker_ranges.capacity() > 1024
+    let ranges_sparse = state.used_marker_ranges.capacity() > RETENTION_QUEUE_RETAIN_MIN_CAP
         && state.used_marker_ranges.len().saturating_mul(4) < state.used_marker_ranges.capacity();
     if state.used_marker_ranges.is_empty() || ranges_sparse {
         state.used_marker_ranges.shrink_to_fit();
@@ -1899,8 +1920,18 @@ fn shrink_retention_queues_locked(state: &mut ConnState) {
 }
 
 fn shrink_sparse_queue<T>(queue: &mut std::collections::VecDeque<T>) {
-    let sparse = queue.capacity() > 1024 && queue.len().saturating_mul(4) < queue.capacity();
-    if queue.is_empty() || sparse {
+    shrink_queue_if_sparse(queue, RETENTION_QUEUE_RETAIN_MIN_CAP, true);
+}
+
+#[inline]
+fn shrink_queue_if_sparse<T>(
+    queue: &mut std::collections::VecDeque<T>,
+    retain_min_cap: usize,
+    shrink_empty: bool,
+) {
+    let sparse =
+        queue.capacity() > retain_min_cap && queue.len().saturating_mul(4) < queue.capacity();
+    if (shrink_empty && queue.is_empty()) || sparse {
         queue.shrink_to_fit();
     }
 }
@@ -1914,7 +1945,11 @@ fn marker_range_disposition_locked(
         return None;
     }
     let range = state.used_marker_ranges[index - 1];
-    marker_range_contains(range, stream_id).then_some(range.disposition)
+    if marker_range_contains(range, stream_id) {
+        Some(range.disposition)
+    } else {
+        None
+    }
 }
 
 fn upsert_marker_range_locked(
@@ -1951,15 +1986,17 @@ fn set_contained_marker_range_locked(
     state.used_marker_ranges.remove(index);
     let mut insert = index;
     if current.start < stream_id {
-        state.used_marker_ranges.insert(
-            insert,
-            super::types::UsedMarkerRange {
-                start: current.start,
-                end: stream_id.saturating_sub(4),
-                disposition: current.disposition,
-            },
-        );
-        insert += 1;
+        if let Some(end) = stream_id.checked_sub(4) {
+            state.used_marker_ranges.insert(
+                insert,
+                super::types::UsedMarkerRange {
+                    start: current.start,
+                    end,
+                    disposition: current.disposition,
+                },
+            );
+            insert += 1;
+        }
     }
     let inserted = insert;
     state.used_marker_ranges.insert(
@@ -1972,14 +2009,16 @@ fn set_contained_marker_range_locked(
     );
     insert += 1;
     if stream_id < current.end {
-        state.used_marker_ranges.insert(
-            insert,
-            super::types::UsedMarkerRange {
-                start: stream_id.saturating_add(4),
-                end: current.end,
-                disposition: current.disposition,
-            },
-        );
+        if let Some(start) = stream_id.checked_add(4) {
+            state.used_marker_ranges.insert(
+                insert,
+                super::types::UsedMarkerRange {
+                    start,
+                    end: current.end,
+                    disposition: current.disposition,
+                },
+            );
+        }
     }
     merge_marker_ranges_around_locked(state, inserted);
 }
@@ -2007,22 +2046,30 @@ fn merge_marker_ranges_around_locked(state: &mut ConnState, mut index: usize) {
     }
 }
 
+#[inline]
 fn marker_ranges_mergeable(
     left: super::types::UsedMarkerRange,
     right: super::types::UsedMarkerRange,
 ) -> bool {
     left.disposition == right.disposition
         && left.start % 4 == right.start % 4
-        && left.end.saturating_add(4) >= right.start
-        && right.end.saturating_add(4) >= left.start
+        && marker_range_end_reaches(left.end, right.start)
+        && marker_range_end_reaches(right.end, left.start)
 }
 
+#[inline]
+fn marker_range_end_reaches(end: u64, start: u64) -> bool {
+    end >= start || end.checked_add(4).is_some_and(|next| next >= start)
+}
+
+#[inline]
 fn marker_range_contains(range: super::types::UsedMarkerRange, stream_id: u64) -> bool {
     stream_id >= range.start
         && stream_id <= range.end
         && (stream_id - range.start).is_multiple_of(4)
 }
 
+#[inline]
 fn first_marker_range_starting_after(
     ranges: &[super::types::UsedMarkerRange],
     stream_id: u64,

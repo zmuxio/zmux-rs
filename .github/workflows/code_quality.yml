@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: # Specify your branches here
-      - main # The 'main' branch
-      - 'releases/*' # The release branches
+    branches:
+      - main
+      - 'releases/*'
 
 jobs:
   rust-checks:
@@ -39,16 +39,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run clippy with optional async I/O features
-        run: cargo clippy -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
+        run: cargo clippy --locked -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
       - name: Build docs
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
 
       - name: Package core crate
-        run: cargo package -p zmux
+        run: cargo package --locked -p zmux

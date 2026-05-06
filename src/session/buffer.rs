@@ -31,11 +31,26 @@ struct RecvChunk {
     offset: usize,
 }
 
+impl RecvChunk {
+    #[inline]
+    fn remaining(&self) -> usize {
+        debug_assert!(self.offset <= self.bytes.len());
+        self.bytes.len() - self.offset
+    }
+
+    #[inline]
+    fn is_consumed(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 impl RecvBuffer {
+    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -50,14 +65,18 @@ impl RecvBuffer {
             return 0;
         }
         let offset = offset.min(bytes.len());
-        let len = bytes.len().saturating_sub(offset);
+        let len = bytes.len() - offset;
         if len == 0 {
             return 0;
         }
-        let retained = bytes.capacity();
+        let mut chunk = RecvChunk { bytes, offset };
+        if offset != 0 {
+            let _ = tighten_chunk_after_consume(&mut chunk);
+        }
+        let retained = chunk.bytes.capacity();
         self.len = self.len.saturating_add(len);
         self.retained_bytes = self.retained_bytes.saturating_add(retained);
-        self.chunks.push_back(RecvChunk { bytes, offset });
+        self.chunks.push_back(chunk);
         retained
     }
 
@@ -70,30 +89,31 @@ impl RecvBuffer {
         let mut copied = 0;
         let mut released_retained_bytes = 0usize;
         while copied < dst.len() {
-            let Some(front) = self.chunks.front_mut() else {
-                break;
-            };
-            let available = front.bytes.len().saturating_sub(front.offset);
-            let n = (dst.len() - copied).min(available);
-            dst[copied..copied + n].copy_from_slice(&front.bytes[front.offset..front.offset + n]);
-            copied += n;
-            self.len -= n;
-            front.offset += n;
+            let mut released_front = None;
+            {
+                let Some(front) = self.chunks.front_mut() else {
+                    break;
+                };
+                let n = (dst.len() - copied).min(front.remaining());
+                dst[copied..copied + n]
+                    .copy_from_slice(&front.bytes[front.offset..front.offset + n]);
+                copied += n;
+                self.len -= n;
+                front.offset += n;
 
-            if front.offset == front.bytes.len() {
-                let released = front.bytes.capacity();
-                self.retained_bytes = self.retained_bytes.saturating_sub(released);
-                released_retained_bytes = released_retained_bytes.saturating_add(released);
-                self.chunks.pop_front();
-                if self.chunks.is_empty() {
-                    self.len = 0;
-                    self.retained_bytes = 0;
+                if front.is_consumed() {
+                    released_front = Some(front.bytes.capacity());
+                } else if let Some((old_capacity, new_capacity)) =
+                    tighten_chunk_after_consume(front)
+                {
+                    update_retained_capacity(&mut self.retained_bytes, old_capacity, new_capacity);
+                    released_retained_bytes = released_retained_bytes
+                        .saturating_add(old_capacity.saturating_sub(new_capacity));
                 }
-                self.release_empty_chunk_deque_storage(1);
-            } else if let Some((old_capacity, new_capacity)) = tighten_chunk_after_consume(front) {
-                update_retained_capacity(&mut self.retained_bytes, old_capacity, new_capacity);
-                released_retained_bytes = released_retained_bytes
-                    .saturating_add(old_capacity.saturating_sub(new_capacity));
+            }
+
+            if let Some(released) = released_front {
+                self.release_front_chunk(released, &mut released_retained_bytes);
             }
         }
         RecvBufferRead {
@@ -103,6 +123,10 @@ impl RecvBuffer {
     }
 
     pub(super) fn read_vectored_detailed(&mut self, dsts: &mut [IoSliceMut<'_>]) -> RecvBufferRead {
+        if let Some(index) = single_non_empty_slice_index(dsts) {
+            return self.read_detailed(&mut dsts[index]);
+        }
+
         let mut copied = 0;
         let mut released_retained_bytes = 0usize;
         let mut dst_index = 0usize;
@@ -117,16 +141,14 @@ impl RecvBuffer {
                 break;
             }
 
-            let mut finished_front = false;
-            let mut released_front = 0usize;
+            let mut released_front = None;
             {
                 let Some(front) = self.chunks.front_mut() else {
                     break;
                 };
-                let available = front.bytes.len().saturating_sub(front.offset);
                 let dst = &mut *dsts[dst_index];
                 let room = dst.len() - dst_offset;
-                let n = room.min(available);
+                let n = room.min(front.remaining());
                 dst[dst_offset..dst_offset + n]
                     .copy_from_slice(&front.bytes[front.offset..front.offset + n]);
                 copied += n;
@@ -134,9 +156,8 @@ impl RecvBuffer {
                 front.offset += n;
                 dst_offset += n;
 
-                if front.offset == front.bytes.len() {
-                    finished_front = true;
-                    released_front = front.bytes.capacity();
+                if front.is_consumed() {
+                    released_front = Some(front.bytes.capacity());
                 } else if let Some((old_capacity, new_capacity)) =
                     tighten_chunk_after_consume(front)
                 {
@@ -146,15 +167,8 @@ impl RecvBuffer {
                 }
             }
 
-            if finished_front {
-                self.retained_bytes = self.retained_bytes.saturating_sub(released_front);
-                released_retained_bytes = released_retained_bytes.saturating_add(released_front);
-                self.chunks.pop_front();
-                if self.chunks.is_empty() {
-                    self.len = 0;
-                    self.retained_bytes = 0;
-                }
-                self.release_empty_chunk_deque_storage(1);
+            if let Some(released) = released_front {
+                self.release_front_chunk(released, &mut released_retained_bytes);
             }
         }
 
@@ -182,6 +196,19 @@ impl RecvBuffer {
         released
     }
 
+    #[inline]
+    fn release_front_chunk(&mut self, released: usize, released_retained_bytes: &mut usize) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(released);
+        *released_retained_bytes = (*released_retained_bytes).saturating_add(released);
+        let _ = self.chunks.pop_front();
+        if self.chunks.is_empty() {
+            self.len = 0;
+            self.retained_bytes = 0;
+        }
+        self.release_empty_chunk_deque_storage(1);
+    }
+
+    #[inline]
     fn release_empty_chunk_deque_storage(&mut self, removed_chunks: usize) {
         self.removed_chunks_since_deque_reset = self
             .removed_chunks_since_deque_reset
@@ -196,19 +223,22 @@ impl RecvBuffer {
     }
 }
 
-fn should_tighten_chunk_after_consume(chunk: &RecvChunk) -> bool {
-    let tail_len = chunk.bytes.len().saturating_sub(chunk.offset);
-    tail_len > 0
-        && chunk.bytes.capacity() >= SHRINK_MIN_RETAINED_BYTES
-        && tail_len <= SHRINK_MAX_TAIL_BYTES
+#[inline]
+fn tighten_tail_len_after_consume(chunk: &RecvChunk) -> Option<usize> {
+    let tail_len = chunk.remaining();
+    if tail_len == 0
+        || chunk.bytes.capacity() < SHRINK_MIN_RETAINED_BYTES
+        || tail_len > SHRINK_MAX_TAIL_BYTES
+    {
+        None
+    } else {
+        Some(tail_len)
+    }
 }
 
+#[inline]
 fn tighten_chunk_after_consume(chunk: &mut RecvChunk) -> Option<(usize, usize)> {
-    if !should_tighten_chunk_after_consume(chunk) {
-        return None;
-    }
-
-    let tail_len = chunk.bytes.len().saturating_sub(chunk.offset);
+    let tail_len = tighten_tail_len_after_consume(chunk)?;
     let mut tail = Vec::new();
     if tail.try_reserve_exact(tail_len).is_err() {
         return None;
@@ -221,12 +251,28 @@ fn tighten_chunk_after_consume(chunk: &mut RecvChunk) -> Option<(usize, usize)> 
     Some((old_capacity, chunk.bytes.capacity()))
 }
 
+#[inline]
 fn update_retained_capacity(retained_bytes: &mut usize, old_capacity: usize, new_capacity: usize) {
+    let diff = old_capacity.abs_diff(new_capacity);
     if old_capacity >= new_capacity {
-        *retained_bytes = retained_bytes.saturating_sub(old_capacity - new_capacity);
+        *retained_bytes = (*retained_bytes).saturating_sub(diff);
     } else {
-        *retained_bytes = retained_bytes.saturating_add(new_capacity - old_capacity);
+        *retained_bytes = (*retained_bytes).saturating_add(diff);
     }
+}
+
+#[inline]
+fn single_non_empty_slice_index(dsts: &[IoSliceMut<'_>]) -> Option<usize> {
+    let mut found = None;
+    for (index, dst) in dsts.iter().enumerate() {
+        if dst.is_empty() {
+            continue;
+        }
+        if found.replace(index).is_some() {
+            return None;
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -444,6 +490,25 @@ mod tests {
         assert_eq!(buffer.read(&mut rest), 1);
         assert_eq!(rest[0], b'z');
         assert_eq!(buffer.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn offset_push_tightens_large_metadata_prefix_for_small_app_tail() {
+        let mut backing = Vec::with_capacity(512 << 10);
+        backing.resize((512 << 10) - 3, b'm');
+        backing.extend_from_slice(b"app");
+
+        let mut buffer = RecvBuffer::default();
+        let retained = buffer.push_chunk_with_offset(backing, (512 << 10) - 3);
+
+        assert_eq!(buffer.len(), 3);
+        assert!(retained <= 64 << 10);
+        assert_eq!(buffer.retained_bytes(), retained);
+
+        let mut out = [0u8; 3];
+        assert_eq!(buffer.read(&mut out), 3);
+        assert_eq!(&out, b"app");
+        assert!(buffer.is_empty());
     }
 
     #[test]

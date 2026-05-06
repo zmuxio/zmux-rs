@@ -1,8 +1,19 @@
 use crate::error::{Error, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource, Result};
 use crate::protocol::*;
 use crate::settings::{parse_settings_tlv, Settings};
-use crate::varint::{append_varint, parse_varint, read_exact_checked, read_varint, varint_len};
+use crate::varint::{
+    append_varint_reserved, parse_varint, read_exact_checked, read_varint, varint_len,
+};
+use std::cmp::Ordering;
 use std::io;
+
+const PREFACE_FIXED_LEN: usize = 6;
+const PREFACE_VERSION_OFFSET: usize = 4;
+const PREFACE_ROLE_OFFSET: usize = 5;
+const PREFACE_SETTINGS_TOO_LARGE: &str = "settings_tlv exceeds 4096 bytes";
+const MIN_COMPAT_FRAME_PAYLOAD: u64 = 16_384;
+const MIN_COMPAT_CONTROL_PAYLOAD: u64 = 4096;
+const MIN_COMPAT_EXTENSION_PAYLOAD: u64 = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preface {
@@ -66,6 +77,7 @@ impl Preface {
         capabilities_have_peer_visible_group_semantics(self.capabilities)
     }
 
+    #[inline]
     pub fn marshal(&self) -> Result<Vec<u8>> {
         self.marshal_with_settings_padding(&[])
     }
@@ -92,11 +104,11 @@ impl Preface {
         let settings_bytes = checked_len_add(
             base_settings_len,
             padding_tlv_len,
-            "settings_tlv exceeds 4096 bytes",
+            PREFACE_SETTINGS_TOO_LARGE,
         )?;
         let settings_len = settings_len_u64(settings_bytes)?;
         if settings_len > MAX_PREFACE_SETTINGS_BYTES {
-            return Err(Error::frame_size("settings_tlv exceeds 4096 bytes"));
+            return Err(Error::frame_size(PREFACE_SETTINGS_TOO_LARGE));
         }
 
         let encoded_len = self.encoded_len(settings_len, settings_bytes)?;
@@ -106,12 +118,12 @@ impl Preface {
         out.extend_from_slice(MAGIC);
         out.push(self.preface_version);
         out.push(self.role.as_u8());
-        append_varint(&mut out, self.tie_breaker_nonce)?;
-        append_varint(&mut out, self.min_proto)?;
-        append_varint(&mut out, self.max_proto)?;
-        append_varint(&mut out, self.capabilities)?;
-        append_varint(&mut out, settings_len)?;
-        self.settings.append_tlv_to(&mut out)?;
+        append_varint_reserved(&mut out, self.tie_breaker_nonce)?;
+        append_varint_reserved(&mut out, self.min_proto)?;
+        append_varint_reserved(&mut out, self.max_proto)?;
+        append_varint_reserved(&mut out, self.capabilities)?;
+        append_varint_reserved(&mut out, settings_len)?;
+        self.settings.append_tlv_to_prevalidated(&mut out)?;
         if !padding.is_empty() {
             crate::tlv::append_tlv(&mut out, SETTING_PREFACE_PADDING, padding)?;
         }
@@ -119,6 +131,7 @@ impl Preface {
         Ok(out)
     }
 
+    #[inline]
     fn encoded_len(&self, settings_len: u64, settings_bytes: usize) -> Result<usize> {
         [
             self.tie_breaker_nonce,
@@ -127,12 +140,14 @@ impl Preface {
             self.capabilities,
             settings_len,
         ]
-        .into_iter()
-        .try_fold(MAGIC.len() + 2 + settings_bytes, |len, value| {
+        .iter()
+        .copied()
+        .try_fold(PREFACE_FIXED_LEN + settings_bytes, |len, value| {
             checked_len_add(len, varint_len(value)?, "preface too large")
         })
     }
 
+    #[inline]
     pub fn parse(data: &[u8]) -> Result<Self> {
         let (p, n) = parse_preface_prefix(data)?;
         if n != data.len() {
@@ -142,38 +157,40 @@ impl Preface {
     }
 }
 
+#[inline]
 pub fn read_preface<R: io::Read>(reader: &mut R) -> Result<Preface> {
     read_preface_inner(reader).map_err(preface_read_error)
 }
 
+#[inline]
 pub fn parse_preface(data: &[u8]) -> Result<Preface> {
     Preface::parse(data)
 }
 
 fn read_preface_inner<R: io::Read>(reader: &mut R) -> Result<Preface> {
-    let mut fixed = [0u8; 6];
+    let mut fixed = [0u8; PREFACE_FIXED_LEN];
     read_exact_checked(reader, &mut fixed)?;
-    if &fixed[..4] != MAGIC {
+    if !fixed.starts_with(MAGIC) {
         return Err(Error::protocol("invalid magic"));
     }
-    if fixed[4] != PREFACE_VERSION {
+    if fixed[PREFACE_VERSION_OFFSET] != PREFACE_VERSION {
         return Err(Error::unsupported_version("unsupported preface version"));
     }
-    let role = Role::from_u8(fixed[5])?;
+    let role = Role::from_u8(fixed[PREFACE_ROLE_OFFSET])?;
     let (tie_breaker_nonce, _) = read_varint(reader)?;
     let (min_proto, _) = read_varint(reader)?;
     let (max_proto, _) = read_varint(reader)?;
     let (capabilities, _) = read_varint(reader)?;
     let (settings_len, _) = read_varint(reader)?;
     if settings_len > MAX_PREFACE_SETTINGS_BYTES {
-        return Err(Error::frame_size("settings_tlv exceeds 4096 bytes"));
+        return Err(Error::frame_size(PREFACE_SETTINGS_TOO_LARGE));
     }
     let settings_len = checked_settings_len(settings_len)?;
     let mut settings_buf = [0u8; MAX_PREFACE_SETTINGS_BYTES as usize];
     let settings = &mut settings_buf[..settings_len];
     read_exact_checked(reader, settings)?;
     Ok(Preface {
-        preface_version: fixed[4],
+        preface_version: PREFACE_VERSION,
         role,
         tie_breaker_nonce,
         min_proto,
@@ -183,6 +200,7 @@ fn read_preface_inner<R: io::Read>(reader: &mut R) -> Result<Preface> {
     })
 }
 
+#[inline]
 fn preface_read_error(err: Error) -> Error {
     let err = if err.source_io_error_kind() == Some(io::ErrorKind::UnexpectedEof) {
         Error::protocol("truncated preface")
@@ -192,6 +210,7 @@ fn preface_read_error(err: Error) -> Error {
     with_session_read_context(err)
 }
 
+#[inline]
 fn with_session_read_context(mut err: Error) -> Error {
     if err.source() == ErrorSource::Unknown && err.source_io_error_kind().is_none() {
         err = err.with_source(ErrorSource::Remote);
@@ -202,17 +221,17 @@ fn with_session_read_context(mut err: Error) -> Error {
 }
 
 pub fn parse_preface_prefix(data: &[u8]) -> Result<(Preface, usize)> {
-    if data.len() < 6 {
+    if data.len() < PREFACE_FIXED_LEN {
         return Err(Error::protocol("truncated preface"));
     }
-    if &data[..4] != MAGIC {
+    if !data.starts_with(MAGIC) {
         return Err(Error::protocol("invalid magic"));
     }
-    if data[4] != PREFACE_VERSION {
+    if data[PREFACE_VERSION_OFFSET] != PREFACE_VERSION {
         return Err(Error::unsupported_version("unsupported preface version"));
     }
-    let role = Role::from_u8(data[5])?;
-    let mut off = 6usize;
+    let role = Role::from_u8(data[PREFACE_ROLE_OFFSET])?;
+    let mut off = PREFACE_FIXED_LEN;
     let read = |off: &mut usize| -> Result<u64> {
         let (v, n) = parse_varint(&data[*off..])?;
         *off += n;
@@ -224,7 +243,7 @@ pub fn parse_preface_prefix(data: &[u8]) -> Result<(Preface, usize)> {
     let capabilities = read(&mut off)?;
     let settings_len = read(&mut off)?;
     if settings_len > MAX_PREFACE_SETTINGS_BYTES {
-        return Err(Error::frame_size("settings_tlv exceeds 4096 bytes"));
+        return Err(Error::frame_size(PREFACE_SETTINGS_TOO_LARGE));
     }
     let settings_len = checked_settings_len(settings_len)?;
     if data.len() - off < settings_len {
@@ -247,26 +266,32 @@ pub fn parse_preface_prefix(data: &[u8]) -> Result<(Preface, usize)> {
     ))
 }
 
+#[inline]
 fn settings_len_u64(len: usize) -> Result<u64> {
-    u64::try_from(len).map_err(|_| Error::frame_size("settings_tlv exceeds 4096 bytes"))
+    u64::try_from(len).map_err(|_| Error::frame_size(PREFACE_SETTINGS_TOO_LARGE))
 }
 
+#[inline]
 fn checked_settings_len(len: u64) -> Result<usize> {
-    usize::try_from(len).map_err(|_| Error::frame_size("settings_tlv exceeds 4096 bytes"))
+    usize::try_from(len).map_err(|_| Error::frame_size(PREFACE_SETTINGS_TOO_LARGE))
 }
 
+#[inline]
 fn settings_padding_tlv_len(padding_len: usize) -> Result<usize> {
-    checked_len_add(
-        checked_len_add(
-            varint_len(SETTING_PREFACE_PADDING)?,
-            varint_len(settings_len_u64(padding_len)?)?,
-            "settings_tlv exceeds 4096 bytes",
-        )?,
+    checked_len_sum3(
+        varint_len(SETTING_PREFACE_PADDING)?,
+        varint_len(settings_len_u64(padding_len)?)?,
         padding_len,
-        "settings_tlv exceeds 4096 bytes",
+        PREFACE_SETTINGS_TOO_LARGE,
     )
 }
 
+#[inline]
+fn checked_len_sum3(a: usize, b: usize, c: usize, context: &'static str) -> Result<usize> {
+    checked_len_add(checked_len_add(a, b, context)?, c, context)
+}
+
+#[inline]
 fn checked_len_add(lhs: usize, rhs: usize, context: &'static str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::frame_size(context))
@@ -345,10 +370,10 @@ pub fn negotiate_prefaces(local: &Preface, peer: &Preface) -> Result<Negotiated>
     if proto < local.min_proto.max(peer.min_proto) {
         return Err(Error::unsupported_version("no compatible protocol version"));
     }
-    for settings in [local.settings, peer.settings] {
-        if settings.max_frame_payload < 16_384
-            || settings.max_control_payload_bytes < 4096
-            || settings.max_extension_payload_bytes < 4096
+    for settings in [&local.settings, &peer.settings] {
+        if settings.max_frame_payload < MIN_COMPAT_FRAME_PAYLOAD
+            || settings.max_control_payload_bytes < MIN_COMPAT_CONTROL_PAYLOAD
+            || settings.max_extension_payload_bytes < MIN_COMPAT_EXTENSION_PAYLOAD
         {
             return Err(Error::protocol("receive limits below compatibility floor"));
         }
@@ -370,6 +395,7 @@ pub fn negotiate_prefaces(local: &Preface, peer: &Preface) -> Result<Negotiated>
     })
 }
 
+#[inline]
 pub fn resolve_roles(
     local_role: Role,
     local_nonce: u64,
@@ -389,16 +415,11 @@ pub fn resolve_roles(
         (Role::Responder, Role::Responder) => Err(Error::role_conflict(
             "both peers explicitly requested responder",
         )),
-        (Role::Auto, Role::Auto) => {
-            if local_nonce == peer_nonce {
-                return Err(Error::role_conflict("equal auto-role nonces"));
-            }
-            if local_nonce > peer_nonce {
-                Ok((Role::Initiator, Role::Responder))
-            } else {
-                Ok((Role::Responder, Role::Initiator))
-            }
-        }
+        (Role::Auto, Role::Auto) => match local_nonce.cmp(&peer_nonce) {
+            Ordering::Equal => Err(Error::role_conflict("equal auto-role nonces")),
+            Ordering::Greater => Ok((Role::Initiator, Role::Responder)),
+            Ordering::Less => Ok((Role::Responder, Role::Initiator)),
+        },
     }
 }
 

@@ -12,6 +12,8 @@ pub const CAPABILITY_MULTILINK_BASIC_RETIRED: u64 = 1 << 2;
 pub const CAPABILITY_MULTILINK_BASIC: u64 = CAPABILITY_MULTILINK_BASIC_RETIRED;
 pub const CAPABILITY_PRIORITY_UPDATE: u64 = 1 << 3;
 pub const CAPABILITY_OPEN_METADATA: u64 = 1 << 4;
+const CAPABILITY_METADATA_CARRIAGE_MASK: u64 =
+    CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_UPDATE;
 
 pub const EXT_PRIORITY_UPDATE: u64 = 1;
 pub const EXT_ML_READY_RETIRED: u64 = 2;
@@ -83,24 +85,28 @@ impl Role {
 impl TryFrom<u8> for Role {
     type Error = Error;
 
+    #[inline]
     fn try_from(value: u8) -> Result<Self> {
         Self::from_u8(value)
     }
 }
 
 impl From<Role> for u8 {
+    #[inline]
     fn from(value: Role) -> Self {
         value.as_u8()
     }
 }
 
 impl fmt::Display for Role {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 impl AsRef<str> for Role {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -109,7 +115,19 @@ impl AsRef<str> for Role {
 #[must_use]
 #[inline]
 pub fn has_capability(caps: u64, bit: u64) -> bool {
-    caps & bit != 0
+    has_any_capability(caps, bit)
+}
+
+#[must_use]
+#[inline]
+fn has_any_capability(caps: u64, bits: u64) -> bool {
+    caps & bits != 0
+}
+
+#[must_use]
+#[inline]
+fn has_all_capabilities(caps: u64, bits: u64) -> bool {
+    caps & bits == bits
 }
 
 #[must_use]
@@ -133,49 +151,39 @@ pub fn capabilities_can_carry_open_info(caps: u64) -> bool {
 #[must_use]
 #[inline]
 pub fn capabilities_can_carry_priority_on_open(caps: u64) -> bool {
-    capabilities_support_open_metadata(caps) && has_capability(caps, CAPABILITY_PRIORITY_HINTS)
+    has_all_capabilities(caps, CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_HINTS)
 }
 
 #[must_use]
 #[inline]
 pub fn capabilities_can_carry_group_on_open(caps: u64) -> bool {
-    capabilities_support_open_metadata(caps) && has_capability(caps, CAPABILITY_STREAM_GROUPS)
-}
-
-#[must_use]
-#[inline]
-pub fn capabilities_can_carry_priority_update(caps: u64) -> bool {
-    capabilities_support_priority_update(caps) && has_capability(caps, CAPABILITY_PRIORITY_HINTS)
+    has_all_capabilities(caps, CAPABILITY_OPEN_METADATA | CAPABILITY_STREAM_GROUPS)
 }
 
 #[must_use]
 #[inline]
 pub fn capabilities_can_carry_priority_in_update(caps: u64) -> bool {
-    capabilities_can_carry_priority_update(caps)
-}
-
-#[must_use]
-#[inline]
-pub fn capabilities_can_carry_group_update(caps: u64) -> bool {
-    capabilities_support_priority_update(caps) && has_capability(caps, CAPABILITY_STREAM_GROUPS)
+    has_all_capabilities(caps, CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS)
 }
 
 #[must_use]
 #[inline]
 pub fn capabilities_can_carry_group_in_update(caps: u64) -> bool {
-    capabilities_can_carry_group_update(caps)
+    has_all_capabilities(caps, CAPABILITY_PRIORITY_UPDATE | CAPABILITY_STREAM_GROUPS)
 }
 
 #[must_use]
 #[inline]
 pub fn capabilities_have_peer_visible_priority_semantics(caps: u64) -> bool {
-    capabilities_can_carry_priority_on_open(caps) || capabilities_can_carry_priority_update(caps)
+    has_capability(caps, CAPABILITY_PRIORITY_HINTS)
+        && has_any_capability(caps, CAPABILITY_METADATA_CARRIAGE_MASK)
 }
 
 #[must_use]
 #[inline]
 pub fn capabilities_have_peer_visible_group_semantics(caps: u64) -> bool {
-    capabilities_can_carry_group_on_open(caps) || capabilities_can_carry_group_update(caps)
+    has_capability(caps, CAPABILITY_STREAM_GROUPS)
+        && has_any_capability(caps, CAPABILITY_METADATA_CARRIAGE_MASK)
 }
 
 #[cfg(test)]
@@ -218,13 +226,11 @@ mod tests {
         assert!(capabilities_support_open_metadata(priority_open));
         assert!(!capabilities_support_priority_update(priority_open));
         assert!(capabilities_can_carry_priority_on_open(priority_open));
-        assert!(!capabilities_can_carry_priority_update(priority_open));
         assert!(!capabilities_can_carry_priority_in_update(priority_open));
         assert!(capabilities_have_peer_visible_priority_semantics(
             priority_open
         ));
 
-        assert!(capabilities_can_carry_group_update(group_update));
         assert!(capabilities_can_carry_group_in_update(group_update));
         assert!(!capabilities_can_carry_group_on_open(group_update));
         assert!(capabilities_have_peer_visible_group_semantics(group_update));

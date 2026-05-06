@@ -1,7 +1,8 @@
 //! Rust implementation of the ZMux v1 stream multiplexing protocol.
 //!
-//! The crate exposes public codec helpers for the normative wire format and a
-//! synchronous session/stream runtime built on split `Read` / `Write` halves.
+//! The crate exposes public codec helpers for the normative wire format, a
+//! synchronous native session/stream runtime built on split `Read` / `Write`
+//! halves, and explicit `Async*` traits for runtime-neutral adapters.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +14,7 @@ mod error;
 mod event;
 mod frame;
 mod io_adapters;
+mod open_send;
 mod payload;
 mod preface;
 mod protocol;
@@ -23,28 +25,16 @@ mod tlv;
 mod varint;
 
 pub use api::{
-    boxed_closed_native_session, closed_native_session,
-    join_optional_streams as join_optional_native_streams, join_streams as join_native_streams,
-    BoxRecvStream as BoxNativeRecvStream, BoxSendStream as BoxNativeSendStream,
-    BoxSession as BoxNativeSession, BoxStream as BoxNativeStream, ClosedNativeSession,
-    DuplexInfoSide, DuplexStream as NativeDuplexStream, PausedNativeHalf, PausedNativeRecvHalf,
-    PausedNativeSendHalf, RecvStreamApi as NativeRecvStreamApi,
-    SendStreamApi as NativeSendStreamApi, Session as NativeSession, StreamApi as NativeStreamApi,
-    StreamInfo as NativeStreamInfo,
+    closed_session, join_optional_streams, join_streams, BoxRecvStream, BoxSendStream, BoxSession,
+    BoxStream, ClosedSession, DuplexInfoSide, DuplexStream, PausedNativeHalf as PausedHalf,
+    PausedNativeRecvHalf as PausedRecvHalf, PausedNativeSendHalf as PausedSendHalf, RecvStreamApi,
+    SendStreamApi, Session, StreamApi, StreamInfo,
 };
 pub use async_api::{
-    box_async_session, box_async_session as box_session, boxed_closed_session,
-    boxed_closed_session as boxed_closed_async_session, closed_session,
-    closed_session as closed_async_session, join_async_streams, join_async_streams as join_streams,
-    join_optional_streams, join_optional_streams as join_optional_async_streams, AsyncBoxFuture,
-    AsyncBoxFuture as BoxFuture, AsyncDuplexStream, AsyncDuplexStream as DuplexStream,
-    AsyncRecvStreamApi, AsyncRecvStreamApi as RecvStreamApi, AsyncSendStreamApi,
-    AsyncSendStreamApi as SendStreamApi, AsyncSession, AsyncSession as Session, AsyncStreamApi,
-    AsyncStreamApi as StreamApi, AsyncStreamInfo, AsyncStreamInfo as StreamInfo,
-    BoxAsyncRecvStream, BoxAsyncRecvStream as BoxRecvStream, BoxAsyncSendStream,
-    BoxAsyncSendStream as BoxSendStream, BoxAsyncSession, BoxAsyncSession as BoxSession,
-    BoxAsyncStream, BoxAsyncStream as BoxStream, BoxedAsyncSession,
-    BoxedAsyncSession as BoxedSession, ClosedSession, ClosedSession as ClosedAsyncSession,
+    box_async_session, closed_async_session, join_async_streams,
+    join_optional_streams as join_optional_async_streams, AsyncBoxFuture, AsyncDuplexStream,
+    AsyncRecvStreamApi, AsyncSendStreamApi, AsyncSession, AsyncStreamApi, AsyncStreamInfo,
+    BoxAsyncRecvStream, BoxAsyncSendStream, BoxAsyncSession, BoxAsyncStream, ClosedAsyncSession,
     PausedAsyncHalf, PausedAsyncRecvHalf, PausedAsyncSendHalf,
 };
 pub use config::{
@@ -53,8 +43,9 @@ pub use config::{
     DEFAULT_PREFACE_PADDING_MAX_BYTES, DEFAULT_PREFACE_PADDING_MIN_BYTES,
 };
 pub use conformance::{
-    core_module_target_claims, core_module_target_implementation_profiles,
-    core_module_target_suites, known_claims, known_conformance_suites,
+    claim_by_name, conformance_suite_by_name, core_module_target_claims,
+    core_module_target_implementation_profiles, core_module_target_suites,
+    implementation_profile_by_name, known_claims, known_conformance_suites,
     known_implementation_profiles, reference_profile_claim_gate, Claim, ConformanceSuite,
     ImplementationProfile, ParseConformanceError,
 };
@@ -67,11 +58,13 @@ pub use frame::{
     parse_frame, read_frame, Frame, FrameType, FrameView, Limits, FRAME_FLAG_FIN,
     FRAME_FLAG_OPEN_METADATA,
 };
-pub use io_adapters::{async_io, AsyncIo};
+pub use io_adapters::AsyncIo;
+pub use open_send::{OpenRequest, OpenSend, WritePayload};
 pub use payload::{
-    build_code_payload, build_goaway_payload, build_open_metadata_prefix,
-    build_priority_update_payload, parse_data_payload, parse_data_payload_view,
-    parse_error_payload, parse_goaway_payload, parse_priority_update_payload,
+    build_code_payload, build_go_away_payload, build_open_metadata_prefix,
+    build_open_metadata_prefix_into, build_priority_update_payload,
+    build_priority_update_payload_into, parse_data_payload, parse_data_payload_view,
+    parse_error_payload, parse_go_away_payload, parse_priority_update_payload,
     parse_stream_metadata_bytes_view, parse_stream_metadata_tlvs, DataPayload, DataPayloadView,
     GoAwayPayload, MetadataUpdate, StreamMetadata, StreamMetadataView,
 };
@@ -81,9 +74,8 @@ pub use preface::{
 };
 pub use protocol::{
     capabilities_can_carry_group_in_update, capabilities_can_carry_group_on_open,
-    capabilities_can_carry_group_update, capabilities_can_carry_open_info,
-    capabilities_can_carry_priority_in_update, capabilities_can_carry_priority_on_open,
-    capabilities_can_carry_priority_update, capabilities_have_peer_visible_group_semantics,
+    capabilities_can_carry_open_info, capabilities_can_carry_priority_in_update,
+    capabilities_can_carry_priority_on_open, capabilities_have_peer_visible_group_semantics,
     capabilities_have_peer_visible_priority_semantics, capabilities_support_open_metadata,
     capabilities_support_priority_update, has_capability, Role, CAPABILITY_MULTILINK_BASIC,
     CAPABILITY_MULTILINK_BASIC_RETIRED, CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS,
@@ -110,92 +102,17 @@ pub use session::{
 pub use settings::{
     default_settings, marshal_settings_tlv, parse_settings_tlv, SchedulerHint, Settings,
 };
-pub use stream_id::{
-    expected_next_peer_stream_id, first_local_stream_id, first_peer_stream_id,
-    initial_receive_window, initial_send_window, local_open_refused_by_goaway,
-    max_stream_id_for_class, peer_open_refused_by_goaway, projected_local_open_id, stream_is_bidi,
-    stream_is_local, stream_kind_for_local, stream_opener, validate_local_open_id,
-    validate_stream_id_for_role,
-};
 pub use tlv::{append_tlv, parse_tlvs, parse_tlvs_view, visit_tlvs, Tlv, TlvView};
 pub use varint::{
     append_varint, encode_varint, encode_varint_to_slice, parse_varint, read_varint, varint_len,
     MAX_VARINT62, MAX_VARINT_LEN,
 };
 
-/// Create a native ZMux session over split blocking `Read` / `Write` halves.
-pub fn new<R, W>(reader: R, writer: W, config: Config) -> Result<Conn>
+/// Erase a blocking session behind the session trait object.
+#[inline]
+pub fn box_session<S>(session: S) -> BoxSession
 where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::new(reader, writer, config)
-}
-
-/// Create an initiator/client native ZMux session over split blocking halves.
-pub fn client<R, W>(reader: R, writer: W, config: Config) -> Result<Conn>
-where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::client(reader, writer, config)
-}
-
-/// Create a responder/server native ZMux session over split blocking halves.
-pub fn server<R, W>(reader: R, writer: W, config: Config) -> Result<Conn>
-where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::server(reader, writer, config)
-}
-
-/// Create a native ZMux session over a blocking TCP stream.
-pub fn new_tcp(stream: std::net::TcpStream, config: Config) -> Result<Conn> {
-    Conn::new_tcp(stream, config)
-}
-
-/// Create a native ZMux session over a custom duplex transport wrapper.
-pub fn new_transport<R, W>(transport: DuplexTransport<R, W>, config: Config) -> Result<Conn>
-where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::new_transport(transport, config)
-}
-
-/// Create an initiator/client native ZMux session over a blocking TCP stream.
-pub fn client_tcp(stream: std::net::TcpStream, config: Config) -> Result<Conn> {
-    Conn::client_tcp(stream, config)
-}
-
-/// Create an initiator/client native ZMux session over a custom duplex transport wrapper.
-pub fn client_transport<R, W>(transport: DuplexTransport<R, W>, config: Config) -> Result<Conn>
-where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::client_transport(transport, config)
-}
-
-/// Create a responder/server native ZMux session over a blocking TCP stream.
-pub fn server_tcp(stream: std::net::TcpStream, config: Config) -> Result<Conn> {
-    Conn::server_tcp(stream, config)
-}
-
-/// Create a responder/server native ZMux session over a custom duplex transport wrapper.
-pub fn server_transport<R, W>(transport: DuplexTransport<R, W>, config: Config) -> Result<Conn>
-where
-    R: std::io::Read + Send + 'static,
-    W: std::io::Write + Send + 'static,
-{
-    Conn::server_transport(transport, config)
-}
-
-/// Erase a native blocking session behind the native session trait object.
-pub fn box_native_session<S>(session: S) -> BoxNativeSession
-where
-    S: NativeSession + 'static,
+    S: Session + 'static,
 {
     Box::new(session)
 }

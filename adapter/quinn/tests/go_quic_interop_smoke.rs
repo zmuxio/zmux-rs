@@ -12,7 +12,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use zmux::OpenOptions;
-use zmux_quinn::{wrap_session, QuinnStream};
+use zmux_quinn::{QuinnSession, QuinnStream};
 
 const APPLICATION_PROTOCOL: &str = "zmux-rust-go-quic-interop";
 const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
@@ -677,13 +677,13 @@ async fn rust_quinn_client_talks_to_go_quic_server_with_open_metadata() {
     let address = wait_for_ready_addr(&ready_file).unwrap();
 
     let conn = connect_to_go_server(&address).await;
-    let session = wrap_session(conn);
+    let session = QuinnSession::new(conn);
     let stream = session
-        .open_stream_with_options(
+        .open_stream_with(
             OpenOptions::new()
-                .with_initial_priority(7)
-                .with_initial_group(11)
-                .with_open_info(b"rust-open".to_vec()),
+                .priority(7)
+                .group(11)
+                .with_open_info(b"rust-open"),
         )
         .await
         .unwrap();
@@ -691,7 +691,7 @@ async fn rust_quinn_client_talks_to_go_quic_server_with_open_metadata() {
     assert_eq!(read_all_stream(&stream).await, b"go:rust->go");
     child.send_start_signal().unwrap();
     assert_go_child_success(child).await;
-    session.close();
+    session.close().await.unwrap();
     let _ = session.wait().await;
 }
 
@@ -714,7 +714,7 @@ async fn go_quic_client_talks_to_rust_quinn_server_with_open_metadata() {
     let mut child = spawn_helper_with_piped_stdin(&exe, &[&address]).unwrap();
 
     let conn = accept_one_quinn_connection(&endpoint).await;
-    let session = wrap_session(conn);
+    let session = QuinnSession::new(conn);
     child.send_start_signal().unwrap();
 
     let stream = session.accept_stream_timeout(STREAM_TIMEOUT).await.unwrap();
@@ -725,7 +725,7 @@ async fn go_quic_client_talks_to_rust_quinn_server_with_open_metadata() {
     assert_eq!(read_all_stream(&stream).await, b"go->rust");
     stream.write_final(b"rust:go->rust").await.unwrap();
     assert_go_child_success(child).await;
-    session.close();
+    session.close().await.unwrap();
     let _ = session.wait().await;
     endpoint.close(quinn::VarInt::from_u32(0), b"");
     endpoint.wait_idle().await;

@@ -339,7 +339,7 @@ fn wire_invalid_fixtures_are_rejected() {
         };
         let expected = case["expect_error"].as_str().unwrap();
         assert_eq!(
-            err.code().map(|c| c.name()),
+            err.code().map(|c| c.as_str()),
             Some(expected),
             "{id} at line {} got {err}",
             idx + 1
@@ -490,7 +490,7 @@ fn stream_metadata_view_borrows_open_info_and_owned_metadata_copies() {
         let end = base + metadata.len();
         let ptr = view.open_info.as_ptr() as usize;
         assert!(ptr >= base && ptr + view.open_info.len() <= end);
-        view.try_to_owned_metadata().unwrap()
+        view.try_to_owned().unwrap()
     };
 
     metadata.fill(b'x');
@@ -592,7 +592,7 @@ fn goaway_diagnostic_duplicate_retry_after_drops_reason() {
     .unwrap();
     append_tlv(&mut payload, DIAG_DEBUG_TEXT, b"maintenance").unwrap();
 
-    let parsed = parse_goaway_payload(&payload).unwrap();
+    let parsed = parse_go_away_payload(&payload).unwrap();
 
     assert_eq!(parsed.last_accepted_bidi, 8);
     assert_eq!(parsed.last_accepted_uni, 12);
@@ -621,7 +621,7 @@ fn diagnostic_reason_invalid_utf8_drops_reason() {
     goaway.extend_from_slice(&encode_varint(ErrorCode::Internal.as_u64()).unwrap());
     append_tlv(&mut goaway, DIAG_DEBUG_TEXT, &[0xe2, 0x82]).unwrap();
 
-    let parsed = parse_goaway_payload(&goaway).unwrap();
+    let parsed = parse_go_away_payload(&goaway).unwrap();
 
     assert_eq!(parsed.last_accepted_bidi, 8);
     assert_eq!(parsed.last_accepted_uni, 12);
@@ -1094,7 +1094,7 @@ fn frame_view_parses_without_copying_payload() {
     assert_eq!(view.frame_type, FrameType::Data);
     assert_eq!(view.stream_id, 4);
     assert_eq!(view.payload, b"payload");
-    assert_eq!(view.to_owned_frame(), frame);
+    assert_eq!(view.try_to_owned().unwrap(), frame);
 }
 
 #[test]
@@ -1182,32 +1182,6 @@ fn tlv_parser_rejects_huge_value_length_without_truncation() {
 
     assert_eq!(err.code(), Some(ErrorCode::Protocol));
     assert!(err.to_string().contains("tlv value overruns"));
-}
-
-#[test]
-fn stream_id_helpers_match_role_and_kind_semantics() {
-    assert_eq!(first_local_stream_id(Role::Initiator, true), 4);
-    assert_eq!(first_peer_stream_id(Role::Initiator, false), 3);
-    assert_eq!(stream_kind_for_local(Role::Initiator, 4), (true, true));
-    assert_eq!(stream_kind_for_local(Role::Initiator, 2), (true, false));
-    assert_eq!(stream_kind_for_local(Role::Initiator, 3), (false, true));
-
-    validate_local_open_id(Role::Initiator, 4, true).unwrap();
-    validate_local_open_id(Role::Initiator, 2, false).unwrap();
-    assert!(validate_stream_id_for_role(Role::Initiator, 0).is_err());
-    assert_eq!(max_stream_id_for_class(4) % 4, 0);
-    assert_eq!(projected_local_open_id(4, 2), 12);
-    assert!(local_open_refused_by_goaway(20, true, 16, 15));
-    assert!(peer_open_refused_by_goaway(23, 20, 19));
-    assert_eq!(expected_next_peer_stream_id(23, 4, 7), 7);
-    assert!(validate_local_open_id(Role::Initiator, 1, true)
-        .unwrap_err()
-        .to_string()
-        .contains("not locally owned"));
-    assert!(validate_local_open_id(Role::Initiator, 2, true)
-        .unwrap_err()
-        .to_string()
-        .contains("not bidirectional"));
 }
 
 #[test]

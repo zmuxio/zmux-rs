@@ -14,6 +14,7 @@ pub enum EventType {
 }
 
 impl EventType {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StreamOpened => "stream_opened",
@@ -30,6 +31,7 @@ impl fmt::Display for EventType {
 }
 
 impl AsRef<str> for EventType {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -45,14 +47,17 @@ pub struct StreamEventInfo {
 }
 
 impl StreamEventInfo {
+    #[inline]
     pub fn open_info(&self) -> &[u8] {
         &self.metadata.open_info
     }
 
+    #[inline]
     pub fn open_info_len(&self) -> usize {
         self.metadata.open_info.len()
     }
 
+    #[inline]
     pub fn has_open_info(&self) -> bool {
         !self.metadata.open_info.is_empty()
     }
@@ -73,6 +78,7 @@ pub struct Event {
 
 pub type EventHandler = Arc<dyn Fn(Event) + Send + Sync + 'static>;
 
+#[inline]
 pub(crate) fn dispatch_event(handler: &EventHandler, event: Event) {
     let _ = catch_unwind(AssertUnwindSafe(|| handler(event)));
 }

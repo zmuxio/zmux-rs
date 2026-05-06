@@ -10,7 +10,7 @@ use super::queue::StreamDiscardStats;
 use super::scheduler::write_burst_limit;
 use super::state::{
     check_write_open, clear_accept_backlog_entry_locked, clear_stream_open_info_locked,
-    clear_stream_open_prefix_locked, clear_stream_receive_credit_locked, compact_retained_bytes,
+    clear_stream_open_prefix_locked, clear_stream_receive_credit_locked,
     ensure_pending_priority_update_limits_locked, ensure_projected_session_memory_cap_locked,
     ensure_session_not_closed, ensure_session_open, fail_expired_provisional_locked,
     fail_session_with_close, late_data_per_stream_cap, local_reset_error,
@@ -30,9 +30,11 @@ use crate::error::{
     Error, ErrorCode, ErrorDirection, ErrorOperation, ErrorSource, Result, TerminationKind,
 };
 use crate::frame::{Frame, FrameType, FRAME_FLAG_FIN, FRAME_FLAG_OPEN_METADATA};
+use crate::open_send::WritePayload;
 use crate::payload::{
-    build_code_payload, build_open_metadata_prefix, build_priority_update_payload,
-    normalize_stream_group, parse_priority_update_metadata, MetadataUpdate, StreamMetadata,
+    build_code_payload, build_open_metadata_prefix_into, build_priority_update_payload,
+    build_priority_update_payload_into, normalize_stream_group, parse_priority_update_metadata,
+    priority_update_payload_len, MetadataUpdate, StreamMetadata,
 };
 use crate::protocol::{
     capabilities_can_carry_group_on_open, capabilities_can_carry_priority_on_open,
@@ -40,7 +42,8 @@ use crate::protocol::{
 };
 use crate::settings::SchedulerHint;
 use crate::stream_id::{initial_receive_window, initial_send_window};
-use crate::varint::{append_varint, parse_varint, varint_len, MAX_VARINT62};
+use crate::varint::{append_varint_reserved, parse_varint, varint_len, MAX_VARINT62};
+use std::borrow::Cow;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::SocketAddr;
 use std::ptr;
@@ -48,6 +51,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+
+#[inline]
 fn stream_result<T>(
     result: Result<T>,
     operation: ErrorOperation,
@@ -56,6 +62,7 @@ fn stream_result<T>(
     result.map_err(|err| err.with_stream_context(operation, direction))
 }
 
+#[inline]
 fn unexpected_eof_error() -> Error {
     Error::io(io::Error::new(
         io::ErrorKind::UnexpectedEof,
@@ -63,16 +70,19 @@ fn unexpected_eof_error() -> Error {
     ))
 }
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
+#[inline]
 fn u64_to_usize_saturating(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
+    value.min(usize::MAX as u64) as usize
 }
 
+#[inline]
 fn u128_to_u64_saturating(value: u128) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u128::from(u64::MAX)) as u64
 }
 
 impl Stream {
@@ -84,28 +94,28 @@ impl Stream {
         Arc::as_ptr(&self.inner).cast::<()>()
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         self.inner.opened_locally
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         self.inner.bidi
     }
 
-    pub fn read_closed(&self) -> bool {
-        self.inner.read_closed()
+    pub fn is_read_closed(&self) -> bool {
+        self.inner.is_read_closed()
     }
 
-    pub fn write_closed(&self) -> bool {
-        self.inner.write_closed()
+    pub fn is_write_closed(&self) -> bool {
+        self.inner.is_write_closed()
     }
 
     pub fn open_info(&self) -> Vec<u8> {
-        self.inner.state.lock().unwrap().open_info.clone()
+        self.inner.open_info()
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.inner.copy_open_info_to(dst)
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        self.inner.append_open_info_to(dst)
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -113,11 +123,11 @@ impl Stream {
     }
 
     pub fn has_open_info(&self) -> bool {
-        self.open_info_len() != 0
+        self.inner.has_open_info()
     }
 
     pub fn metadata(&self) -> StreamMetadata {
-        self.inner.state.lock().unwrap().metadata.clone()
+        self.inner.metadata()
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -128,13 +138,9 @@ impl Stream {
         self.inner.conn.peer_addr
     }
 
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
     pub fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
         stream_result(
-            self.inner.update_metadata(update),
+            StreamInner::update_metadata(self.inner.as_ref(), update),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -142,7 +148,7 @@ impl Stream {
 
     pub fn read(&self, dst: &mut [u8]) -> Result<usize> {
         stream_result(
-            self.inner.read(dst),
+            StreamInner::read(self.inner.as_ref(), dst),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -150,7 +156,7 @@ impl Stream {
 
     pub fn read_vectored(&self, dsts: &mut [IoSliceMut<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.read_vectored(dsts),
+            StreamInner::read_vectored(self.inner.as_ref(), dsts),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -162,7 +168,7 @@ impl Stream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.read_vectored_timeout(dsts, timeout),
+            StreamInner::read_vectored_timeout(self.inner.as_ref(), dsts, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -170,7 +176,7 @@ impl Stream {
 
     pub fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
         stream_result(
-            self.inner.read_timeout(dst, timeout),
+            StreamInner::read_timeout(self.inner.as_ref(), dst, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -178,7 +184,7 @@ impl Stream {
 
     pub fn read_exact_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<()> {
         stream_result(
-            self.inner.read_exact_timeout(dst, timeout),
+            StreamInner::read_exact_timeout(self.inner.as_ref(), dst, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -186,7 +192,7 @@ impl Stream {
 
     pub fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_read_deadline(deadline),
+            StreamInner::set_read_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -194,7 +200,7 @@ impl Stream {
 
     pub fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_write_deadline(deadline),
+            StreamInner::set_write_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -202,7 +208,7 @@ impl Stream {
 
     pub fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_deadline(deadline),
+            StreamInner::set_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Unknown,
             ErrorDirection::Both,
         )
@@ -234,7 +240,7 @@ impl Stream {
 
     pub fn write(&self, src: &[u8]) -> Result<usize> {
         stream_result(
-            self.inner.write(src, false),
+            StreamInner::write(self.inner.as_ref(), src, false),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -242,7 +248,34 @@ impl Stream {
 
     pub fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
         stream_result(
-            self.inner.write_timeout(src, timeout),
+            StreamInner::write_timeout(self.inner.as_ref(), src, timeout),
+            ErrorOperation::Write,
+            ErrorDirection::Write,
+        )
+    }
+
+    pub fn write_all<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<()> {
+        stream_result(
+            StreamInner::write_payload_until(self.inner.as_ref(), src.into(), false, None)
+                .map(|_| ()),
+            ErrorOperation::Write,
+            ErrorDirection::Write,
+        )
+    }
+
+    pub fn write_all_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<()> {
+        stream_result(
+            StreamInner::write_payload_until(
+                self.inner.as_ref(),
+                src.into(),
+                false,
+                deadline_after(timeout),
+            )
+            .map(|_| ()),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -250,14 +283,10 @@ impl Stream {
 
     pub fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored(parts, false),
+            StreamInner::write_vectored(self.inner.as_ref(), parts, false),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
-    }
-
-    pub fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored(parts)
     }
 
     pub fn write_vectored_timeout(
@@ -266,19 +295,15 @@ impl Stream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_timeout(parts, timeout),
+            StreamInner::write_vectored_timeout(self.inner.as_ref(), parts, timeout),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout)
-    }
-
-    pub fn write_final(&self, src: &[u8]) -> Result<usize> {
+    pub fn write_final<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<usize> {
         stream_result(
-            self.inner.write(src, true),
+            StreamInner::write_payload_until(self.inner.as_ref(), src.into(), true, None),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -286,19 +311,24 @@ impl Stream {
 
     pub fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_final(parts),
+            StreamInner::write_vectored_final(self.inner.as_ref(), parts),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts)
-    }
-
-    pub fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
+    pub fn write_final_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<usize> {
         stream_result(
-            self.inner.write_final_timeout(src, timeout),
+            StreamInner::write_payload_until(
+                self.inner.as_ref(),
+                src.into(),
+                true,
+                deadline_after(timeout),
+            ),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -310,19 +340,15 @@ impl Stream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_final_timeout(parts, timeout),
+            StreamInner::write_vectored_final_timeout(self.inner.as_ref(), parts, timeout),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_final_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout)
-    }
-
     pub fn close_read(&self) -> Result<()> {
         stream_result(
-            self.inner.close_read(ErrorCode::Cancelled.as_u64()),
+            StreamInner::close_read(self.inner.as_ref(), ErrorCode::Cancelled.as_u64()),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -330,7 +356,7 @@ impl Stream {
 
     pub fn cancel_read(&self, code: u64) -> Result<()> {
         stream_result(
-            self.inner.close_read(code),
+            StreamInner::close_read(self.inner.as_ref(), code),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -338,7 +364,7 @@ impl Stream {
 
     pub fn close_write(&self) -> Result<()> {
         stream_result(
-            self.inner.close_write(),
+            StreamInner::close_write(self.inner.as_ref()),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -346,7 +372,7 @@ impl Stream {
 
     pub fn cancel_write(&self, code: u64) -> Result<()> {
         stream_result(
-            self.inner.cancel_write(code, ""),
+            StreamInner::cancel_write(self.inner.as_ref(), code, ""),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -354,7 +380,7 @@ impl Stream {
 
     pub fn close(&self) -> Result<()> {
         stream_result(
-            self.inner.close(),
+            StreamInner::close(self.inner.as_ref()),
             ErrorOperation::Close,
             ErrorDirection::Both,
         )
@@ -362,37 +388,37 @@ impl Stream {
 
     pub fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
         stream_result(
-            self.inner.abort(code, reason),
+            StreamInner::abort(self.inner.as_ref(), code, reason),
             ErrorOperation::Close,
             ErrorDirection::Both,
         )
     }
 }
 
+#[inline]
 fn blocked_frame(stream_id: u64, offset: u64) -> Option<Frame> {
-    let offset = offset.min(MAX_VARINT62);
-    let mut payload = Vec::with_capacity(varint_len(offset).ok()?);
-    append_varint(&mut payload, offset).ok()?;
-    Some(Frame {
-        frame_type: FrameType::Blocked,
-        flags: 0,
-        stream_id,
-        payload,
-    })
+    varint_control_frame(FrameType::Blocked, stream_id, offset)
 }
 
+#[inline]
 fn max_data_frame(stream_id: u64, limit: u64) -> Option<Frame> {
-    let limit = limit.min(MAX_VARINT62);
-    let mut payload = Vec::with_capacity(varint_len(limit).ok()?);
-    append_varint(&mut payload, limit).ok()?;
+    varint_control_frame(FrameType::MaxData, stream_id, limit)
+}
+
+#[inline]
+fn varint_control_frame(frame_type: FrameType, stream_id: u64, value: u64) -> Option<Frame> {
+    let value = value.min(MAX_VARINT62);
+    let mut payload = Vec::with_capacity(varint_len(value).ok()?);
+    append_varint_reserved(&mut payload, value).ok()?;
     Some(Frame {
-        frame_type: FrameType::MaxData,
+        frame_type,
         flags: 0,
         stream_id,
         payload,
     })
 }
 
+#[inline]
 fn try_queue_bounded_control(conn: &Arc<Inner>, frame: Frame) -> bool {
     conn.try_queue_frame(frame).is_ok()
 }
@@ -406,24 +432,24 @@ impl SendStream {
         Arc::as_ptr(&self.inner).cast::<()>()
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         self.inner.opened_locally
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         self.inner.bidi
     }
 
-    pub fn write_closed(&self) -> bool {
-        self.inner.write_closed()
+    pub fn is_write_closed(&self) -> bool {
+        self.inner.is_write_closed()
     }
 
     pub fn open_info(&self) -> Vec<u8> {
-        self.inner.state.lock().unwrap().open_info.clone()
+        self.inner.open_info()
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.inner.copy_open_info_to(dst)
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        self.inner.append_open_info_to(dst)
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -431,11 +457,11 @@ impl SendStream {
     }
 
     pub fn has_open_info(&self) -> bool {
-        self.open_info_len() != 0
+        self.inner.has_open_info()
     }
 
     pub fn metadata(&self) -> StreamMetadata {
-        self.inner.state.lock().unwrap().metadata.clone()
+        self.inner.metadata()
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -446,13 +472,9 @@ impl SendStream {
         self.inner.conn.peer_addr
     }
 
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
     pub fn update_metadata(&self, update: MetadataUpdate) -> Result<()> {
         stream_result(
-            self.inner.update_metadata(update),
+            StreamInner::update_metadata(self.inner.as_ref(), update),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -460,7 +482,7 @@ impl SendStream {
 
     pub fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_write_deadline(deadline),
+            StreamInner::set_write_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -468,7 +490,7 @@ impl SendStream {
 
     pub fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_write_deadline(deadline),
+            StreamInner::set_write_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -492,7 +514,7 @@ impl SendStream {
 
     pub fn write(&self, src: &[u8]) -> Result<usize> {
         stream_result(
-            self.inner.write(src, false),
+            StreamInner::write(self.inner.as_ref(), src, false),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -500,7 +522,34 @@ impl SendStream {
 
     pub fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
         stream_result(
-            self.inner.write_timeout(src, timeout),
+            StreamInner::write_timeout(self.inner.as_ref(), src, timeout),
+            ErrorOperation::Write,
+            ErrorDirection::Write,
+        )
+    }
+
+    pub fn write_all<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<()> {
+        stream_result(
+            StreamInner::write_payload_until(self.inner.as_ref(), src.into(), false, None)
+                .map(|_| ()),
+            ErrorOperation::Write,
+            ErrorDirection::Write,
+        )
+    }
+
+    pub fn write_all_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<()> {
+        stream_result(
+            StreamInner::write_payload_until(
+                self.inner.as_ref(),
+                src.into(),
+                false,
+                deadline_after(timeout),
+            )
+            .map(|_| ()),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -508,14 +557,10 @@ impl SendStream {
 
     pub fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored(parts, false),
+            StreamInner::write_vectored(self.inner.as_ref(), parts, false),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
-    }
-
-    pub fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored(parts)
     }
 
     pub fn write_vectored_timeout(
@@ -524,19 +569,15 @@ impl SendStream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_timeout(parts, timeout),
+            StreamInner::write_vectored_timeout(self.inner.as_ref(), parts, timeout),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout)
-    }
-
-    pub fn write_final(&self, src: &[u8]) -> Result<usize> {
+    pub fn write_final<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<usize> {
         stream_result(
-            self.inner.write(src, true),
+            StreamInner::write_payload_until(self.inner.as_ref(), src.into(), true, None),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -544,19 +585,24 @@ impl SendStream {
 
     pub fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_final(parts),
+            StreamInner::write_vectored_final(self.inner.as_ref(), parts),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts)
-    }
-
-    pub fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
+    pub fn write_final_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<usize> {
         stream_result(
-            self.inner.write_final_timeout(src, timeout),
+            StreamInner::write_payload_until(
+                self.inner.as_ref(),
+                src.into(),
+                true,
+                deadline_after(timeout),
+            ),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
@@ -568,19 +614,15 @@ impl SendStream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.write_vectored_final_timeout(parts, timeout),
+            StreamInner::write_vectored_final_timeout(self.inner.as_ref(), parts, timeout),
             ErrorOperation::Write,
             ErrorDirection::Write,
         )
     }
 
-    pub fn writev_final_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout)
-    }
-
     pub fn close_write(&self) -> Result<()> {
         stream_result(
-            self.inner.close_write(),
+            StreamInner::close_write(self.inner.as_ref()),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -588,7 +630,7 @@ impl SendStream {
 
     pub fn cancel_write(&self, code: u64) -> Result<()> {
         stream_result(
-            self.inner.cancel_write(code, ""),
+            StreamInner::cancel_write(self.inner.as_ref(), code, ""),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -596,7 +638,7 @@ impl SendStream {
 
     pub fn close(&self) -> Result<()> {
         stream_result(
-            self.inner.close(),
+            StreamInner::close(self.inner.as_ref()),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -604,7 +646,7 @@ impl SendStream {
 
     pub fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
         stream_result(
-            self.inner.abort(code, reason),
+            StreamInner::abort(self.inner.as_ref(), code, reason),
             ErrorOperation::Close,
             ErrorDirection::Write,
         )
@@ -620,24 +662,24 @@ impl RecvStream {
         Arc::as_ptr(&self.inner).cast::<()>()
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         self.inner.opened_locally
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         self.inner.bidi
     }
 
-    pub fn read_closed(&self) -> bool {
-        self.inner.read_closed()
+    pub fn is_read_closed(&self) -> bool {
+        self.inner.is_read_closed()
     }
 
     pub fn open_info(&self) -> Vec<u8> {
-        self.inner.state.lock().unwrap().open_info.clone()
+        self.inner.open_info()
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        self.inner.copy_open_info_to(dst)
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        self.inner.append_open_info_to(dst)
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -645,11 +687,11 @@ impl RecvStream {
     }
 
     pub fn has_open_info(&self) -> bool {
-        self.open_info_len() != 0
+        self.inner.has_open_info()
     }
 
     pub fn metadata(&self) -> StreamMetadata {
-        self.inner.state.lock().unwrap().metadata.clone()
+        self.inner.metadata()
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -660,13 +702,9 @@ impl RecvStream {
         self.inner.conn.peer_addr
     }
 
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
-
     pub fn read(&self, dst: &mut [u8]) -> Result<usize> {
         stream_result(
-            self.inner.read(dst),
+            StreamInner::read(self.inner.as_ref(), dst),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -674,7 +712,7 @@ impl RecvStream {
 
     pub fn read_vectored(&self, dsts: &mut [IoSliceMut<'_>]) -> Result<usize> {
         stream_result(
-            self.inner.read_vectored(dsts),
+            StreamInner::read_vectored(self.inner.as_ref(), dsts),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -686,7 +724,7 @@ impl RecvStream {
         timeout: Duration,
     ) -> Result<usize> {
         stream_result(
-            self.inner.read_vectored_timeout(dsts, timeout),
+            StreamInner::read_vectored_timeout(self.inner.as_ref(), dsts, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -694,7 +732,7 @@ impl RecvStream {
 
     pub fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize> {
         stream_result(
-            self.inner.read_timeout(dst, timeout),
+            StreamInner::read_timeout(self.inner.as_ref(), dst, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -702,7 +740,7 @@ impl RecvStream {
 
     pub fn read_exact_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<()> {
         stream_result(
-            self.inner.read_exact_timeout(dst, timeout),
+            StreamInner::read_exact_timeout(self.inner.as_ref(), dst, timeout),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -710,7 +748,7 @@ impl RecvStream {
 
     pub fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_read_deadline(deadline),
+            StreamInner::set_read_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -718,7 +756,7 @@ impl RecvStream {
 
     pub fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         stream_result(
-            self.inner.set_read_deadline(deadline),
+            StreamInner::set_read_deadline(self.inner.as_ref(), deadline),
             ErrorOperation::Read,
             ErrorDirection::Read,
         )
@@ -742,7 +780,7 @@ impl RecvStream {
 
     pub fn close_read(&self) -> Result<()> {
         stream_result(
-            self.inner.close_read(ErrorCode::Cancelled.as_u64()),
+            StreamInner::close_read(self.inner.as_ref(), ErrorCode::Cancelled.as_u64()),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -750,7 +788,7 @@ impl RecvStream {
 
     pub fn cancel_read(&self, code: u64) -> Result<()> {
         stream_result(
-            self.inner.close_read(code),
+            StreamInner::close_read(self.inner.as_ref(), code),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -758,7 +796,7 @@ impl RecvStream {
 
     pub fn close(&self) -> Result<()> {
         stream_result(
-            self.inner.close(),
+            StreamInner::close(self.inner.as_ref()),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -766,7 +804,7 @@ impl RecvStream {
 
     pub fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
         stream_result(
-            self.inner.abort(code, reason),
+            StreamInner::abort(self.inner.as_ref(), code, reason),
             ErrorOperation::Close,
             ErrorDirection::Read,
         )
@@ -929,6 +967,7 @@ enum PreparedPriorityUpdate {
 }
 
 impl PreparedPriorityUpdate {
+    #[inline]
     fn queued_cost(&self) -> usize {
         match self {
             Self::BeforeData(payload) | Self::AfterData(payload) => payload.len().saturating_add(1),
@@ -936,10 +975,12 @@ impl PreparedPriorityUpdate {
         }
     }
 
+    #[inline]
     fn dropped(&self) -> bool {
         matches!(self, Self::Dropped(_))
     }
 
+    #[inline]
     fn into_restore_payload(self) -> Option<Vec<u8>> {
         match self {
             Self::BeforeData(payload) | Self::AfterData(payload) | Self::Dropped(payload) => {
@@ -950,6 +991,74 @@ impl PreparedPriorityUpdate {
     }
 }
 
+enum WriteBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned { bytes: Option<Vec<u8>>, len: usize },
+}
+
+impl<'a> WriteBytes<'a> {
+    #[inline]
+    fn borrowed(bytes: &'a [u8]) -> Self {
+        Self::Borrowed(bytes)
+    }
+
+    #[inline]
+    fn owned(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self::Owned {
+            bytes: Some(bytes),
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(bytes) => bytes.len(),
+            Self::Owned { len, .. } => *len,
+        }
+    }
+
+    #[inline]
+    fn can_move_range_into_empty_payload(&self, start: usize, end: usize) -> bool {
+        match self {
+            Self::Owned { bytes, len } => bytes.is_some() && start == 0 && end == *len,
+            Self::Borrowed(_) => false,
+        }
+    }
+
+    fn append_range_to(&mut self, dst: &mut Vec<u8>, start: usize, end: usize) -> Result<()> {
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| Error::local("zmux: invalid write payload range"))?;
+        match self {
+            Self::Borrowed(bytes) => append_payload_range(dst, &bytes[start..end], len),
+            Self::Owned { bytes, len: total } => {
+                if start == 0 && end == *total && dst.is_empty() {
+                    *dst = bytes.take().ok_or_else(|| {
+                        Error::local("zmux: owned write payload already consumed")
+                    })?;
+                    Ok(())
+                } else {
+                    let src = bytes.as_ref().ok_or_else(|| {
+                        Error::local("zmux: owned write payload already consumed")
+                    })?;
+                    append_payload_range(dst, &src[start..end], len)
+                }
+            }
+        }
+    }
+}
+
+fn append_payload_range(dst: &mut Vec<u8>, src: &[u8], len: usize) -> Result<()> {
+    if dst.try_reserve_exact(len).is_err() {
+        return Err(Error::local("zmux: DATA payload allocation failed"));
+    }
+    dst.extend_from_slice(src);
+    Ok(())
+}
+
+#[inline]
 fn prepared_data_queue_cost(prepared: &PreparedDataFrame) -> usize {
     prepared
         .frame
@@ -959,6 +1068,7 @@ fn prepared_data_queue_cost(prepared: &PreparedDataFrame) -> usize {
         .saturating_add(prepared.state.priority_update.queued_cost())
 }
 
+#[inline]
 fn prepared_priority_frame(stream_id: u64, payload: &[u8]) -> Frame {
     Frame {
         frame_type: FrameType::Ext,
@@ -991,34 +1101,64 @@ fn push_prepared_data_frame(
     states.push(state);
 }
 
+fn prepared_data_frames(
+    stream_id: u64,
+    frame: Frame,
+    priority_update: &PreparedPriorityUpdate,
+) -> Vec<Frame> {
+    let mut frames = Vec::with_capacity(match priority_update {
+        PreparedPriorityUpdate::BeforeData(_) | PreparedPriorityUpdate::AfterData(_) => 2,
+        PreparedPriorityUpdate::None | PreparedPriorityUpdate::Dropped(_) => 1,
+    });
+    match priority_update {
+        PreparedPriorityUpdate::BeforeData(payload) => {
+            frames.push(prepared_priority_frame(stream_id, payload));
+            frames.push(frame);
+        }
+        PreparedPriorityUpdate::AfterData(payload) => {
+            frames.push(frame);
+            frames.push(prepared_priority_frame(stream_id, payload));
+        }
+        PreparedPriorityUpdate::None | PreparedPriorityUpdate::Dropped(_) => frames.push(frame),
+    }
+    frames
+}
+
 const WRITE_COMPLETION_DEADLINE_POLL: Duration = Duration::from_millis(10);
 const WRITE_COMPLETION_IDLE_POLL: Duration = Duration::from_secs(1);
 
+#[inline]
 fn deadline_after(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
+#[inline]
 fn timeout_to_deadline(timeout: Option<Duration>) -> Option<Instant> {
-    timeout.and_then(deadline_after)
+    match timeout {
+        Some(timeout) => deadline_after(timeout),
+        None => None,
+    }
 }
 
+#[inline]
 fn effective_deadline(
     stream_deadline: Option<Instant>,
     operation_deadline: Option<Instant>,
 ) -> Option<Instant> {
     match (stream_deadline, operation_deadline) {
         (Some(stream), Some(operation)) => Some(stream.min(operation)),
-        (Some(stream), None) => Some(stream),
-        (None, Some(operation)) => Some(operation),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     }
 }
 
+#[inline]
 fn write_deadline_expired(state: &StreamState, operation_deadline: Option<Instant>) -> bool {
     effective_deadline(state.write_deadline, operation_deadline)
         .is_some_and(|deadline| deadline <= Instant::now())
 }
 
+#[inline]
 fn stop_sending_drain_window_locked(inner: &Inner, state: &ConnState) -> Duration {
     stop_sending_drain_window(
         inner.stop_sending_graceful_drain_window,
@@ -1030,16 +1170,23 @@ fn stop_sending_drain_window(
     configured: Option<Duration>,
     last_ping_rtt: Option<Duration>,
 ) -> Duration {
-    if let Some(window) = configured.filter(|window| !window.is_zero()) {
+    if let Some(window) = nonzero_duration(configured) {
         return window;
     }
     if let Some(rtt) = last_ping_rtt {
-        rtt.checked_mul(2)
-            .unwrap_or(Duration::MAX)
+        rtt.saturating_mul(2)
             .max(DEFAULT_STOP_SENDING_GRACEFUL_DRAIN_WINDOW)
             .min(DEFAULT_STOP_SENDING_GRACEFUL_DRAIN_WINDOW_MAX)
     } else {
         DEFAULT_STOP_SENDING_GRACEFUL_DRAIN_WINDOW
+    }
+}
+
+#[inline]
+fn nonzero_duration(value: Option<Duration>) -> Option<Duration> {
+    match value {
+        Some(value) if !value.is_zero() => Some(value),
+        _ => None,
     }
 }
 
@@ -1049,6 +1196,7 @@ fn priority_update_unavailable() -> Error {
     )
 }
 
+#[inline]
 fn metadata_update_can_carry_on_open(caps: u64, update: &MetadataUpdate) -> bool {
     update
         .priority
@@ -1064,6 +1212,23 @@ fn validate_open_metadata_update_capability(caps: u64, update: &MetadataUpdate) 
     } else {
         Err(priority_update_unavailable())
     }
+}
+
+fn rebuild_open_metadata_prefix_locked(
+    state: &mut StreamState,
+    caps: u64,
+    priority: Option<u64>,
+    group: Option<u64>,
+    max_frame_payload: u64,
+) -> Result<()> {
+    build_open_metadata_prefix_into(
+        &mut state.open_prefix,
+        caps,
+        priority,
+        group,
+        &state.open_info,
+        max_frame_payload,
+    )
 }
 
 fn parse_pending_priority_update(payload: &[u8]) -> Result<StreamMetadata> {
@@ -1084,12 +1249,21 @@ fn parse_pending_priority_update(payload: &[u8]) -> Result<StreamMetadata> {
     Ok(metadata)
 }
 
-fn build_merged_priority_update_payload(
+fn merged_priority_update_payload_len(
     caps: u64,
-    mut update: MetadataUpdate,
+    update: MetadataUpdate,
     pending_payload: Option<&[u8]>,
     max_payload: u64,
-) -> Result<Vec<u8>> {
+) -> Result<(MetadataUpdate, usize)> {
+    let update = merge_pending_priority_update(update, pending_payload)?;
+    let len = priority_update_payload_len(caps, update, max_payload)?;
+    Ok((update, len))
+}
+
+fn merge_pending_priority_update(
+    mut update: MetadataUpdate,
+    pending_payload: Option<&[u8]>,
+) -> Result<MetadataUpdate> {
     if let Some(pending_payload) = pending_payload {
         let pending = parse_pending_priority_update(pending_payload)?;
         if update.priority.is_none() {
@@ -1099,18 +1273,39 @@ fn build_merged_priority_update_payload(
             update.group = pending.group;
         }
     }
-    build_priority_update_payload(caps, update, max_payload)
+    Ok(update)
 }
 
+fn build_priority_update_payload_reusing_pending(
+    caps: u64,
+    update: MetadataUpdate,
+    pending_payload: &mut Option<Vec<u8>>,
+    max_payload: u64,
+) -> Result<Vec<u8>> {
+    let mut payload = pending_payload.take().unwrap_or_default();
+    match build_priority_update_payload_into(&mut payload, caps, update, max_payload) {
+        Ok(()) => Ok(payload),
+        Err(err) => {
+            if !payload.is_empty() {
+                *pending_payload = Some(payload);
+            }
+            Err(err)
+        }
+    }
+}
+
+#[inline]
 fn close_write_noop_after_stop_reset(state: &StreamState) -> bool {
     state.stopped_by_peer.is_some()
         && (state.send_fin || (state.send_reset.is_some() && state.send_reset_from_stop))
 }
 
+#[inline]
 fn close_write_error_ignored(err: &Error) -> bool {
     err.is_stream_not_writable() || err.is_write_closed() || err.is_read_closed()
 }
 
+#[inline]
 fn close_read_error_ignored(err: &Error) -> bool {
     err.is_stream_not_readable() || err.is_read_closed() || err.is_write_closed()
 }
@@ -1125,7 +1320,8 @@ enum LocalOpenPhase {
 }
 
 impl LocalOpenPhase {
-    fn from(
+    #[inline]
+    fn from_flags(
         opened_locally: bool,
         send_committed: bool,
         peer_visible: bool,
@@ -1146,6 +1342,7 @@ impl LocalOpenPhase {
         Self::NeedsEmit
     }
 
+    #[inline]
     fn needs_local_opener(self) -> bool {
         self == Self::NeedsCommit
     }
@@ -1155,6 +1352,7 @@ impl LocalOpenPhase {
         matches!(self, Self::NeedsCommit | Self::NeedsEmit | Self::Queued)
     }
 
+    #[inline]
     fn should_emit_opener_frame(self) -> bool {
         matches!(self, Self::NeedsCommit | Self::NeedsEmit)
     }
@@ -1164,10 +1362,12 @@ impl LocalOpenPhase {
         self != Self::None && self != Self::PeerVisible
     }
 
+    #[inline]
     fn can_take_pending_priority_update(self) -> bool {
         !matches!(self, Self::NeedsCommit | Self::NeedsEmit | Self::Queued)
     }
 
+    #[inline]
     fn pending_priority_can_precede_data(self) -> bool {
         matches!(self, Self::None | Self::Queued | Self::PeerVisible)
     }
@@ -1178,8 +1378,9 @@ impl LocalOpenPhase {
     }
 }
 
+#[inline]
 fn local_open_phase(opened_locally: bool, state: &StreamState) -> LocalOpenPhase {
-    LocalOpenPhase::from(
+    LocalOpenPhase::from_flags(
         opened_locally,
         state.opened_on_wire,
         state.peer_visible,
@@ -1192,6 +1393,7 @@ const MILD_FRAGMENT_TIME_BUDGET: Duration = Duration::from_millis(150);
 const STRONG_FRAGMENT_TIME_BUDGET: Duration = Duration::from_millis(100);
 const SATURATED_FRAGMENT_TIME_BUDGET: Duration = Duration::from_millis(50);
 
+#[inline]
 fn scaled_fragment_cap(max: u64, numerator: u64, denominator: u64) -> u64 {
     if max == 0 {
         return 0;
@@ -1200,17 +1402,15 @@ fn scaled_fragment_cap(max: u64, numerator: u64, denominator: u64) -> u64 {
         return max;
     }
     let value = u128_to_u64_saturating(
-        u128::from(max)
-            .saturating_mul(u128::from(numerator))
-            .checked_div(u128::from(denominator))
-            .unwrap_or(u128::from(max)),
+        u128::from(max).saturating_mul(u128::from(numerator)) / u128::from(denominator),
     );
     value.clamp(1, max)
 }
 
+#[inline]
 fn fragment_cap(max_payload: u64, prefix_len: u64, priority: u64, hint: SchedulerHint) -> u64 {
     let max_payload = if max_payload == 0 {
-        crate::settings::Settings::default().max_frame_payload
+        crate::settings::Settings::DEFAULT.max_frame_payload
     } else {
         max_payload
     };
@@ -1227,6 +1427,7 @@ fn fragment_cap(max_payload: u64, prefix_len: u64, priority: u64, hint: Schedule
     }
 }
 
+#[inline]
 fn fragment_time_budget(priority: u64, hint: SchedulerHint) -> Duration {
     match priority {
         16..=u64::MAX => SATURATED_FRAGMENT_TIME_BUDGET,
@@ -1237,6 +1438,7 @@ fn fragment_time_budget(priority: u64, hint: SchedulerHint) -> Duration {
     }
 }
 
+#[inline]
 fn rate_limited_fragment_cap(
     base_cap: u64,
     estimated_send_rate_bps: u64,
@@ -1272,15 +1474,28 @@ fn tx_fragment_cap_locked(
         priority,
         peer.scheduler_hints,
     );
-    usize::try_from(rate_limited_fragment_cap(
+    u64_to_usize_saturating(rate_limited_fragment_cap(
         base,
         conn_state.send_rate_estimate,
         priority,
         peer.scheduler_hints,
     ))
-    .unwrap_or(usize::MAX)
 }
 
+#[inline]
+fn writable_data_bytes(
+    frame_payload_room: usize,
+    session_avail: u64,
+    stream_avail: u64,
+    remaining: usize,
+) -> usize {
+    frame_payload_room
+        .min(u64_to_usize_saturating(session_avail))
+        .min(u64_to_usize_saturating(stream_avail))
+        .min(remaining)
+}
+
+#[inline]
 fn checked_io_slice_total_len(lengths: impl IntoIterator<Item = usize>) -> Result<usize> {
     lengths.into_iter().try_fold(0usize, |total, len| {
         total
@@ -1289,6 +1504,7 @@ fn checked_io_slice_total_len(lengths: impl IntoIterator<Item = usize>) -> Resul
     })
 }
 
+#[inline]
 fn total_io_slice_len(parts: &[IoSlice<'_>]) -> Result<usize> {
     checked_io_slice_total_len(parts.iter().map(|part| part.len()))
 }
@@ -1299,11 +1515,11 @@ fn append_io_slices(
     mut part_idx: usize,
     mut part_off: usize,
     mut len: usize,
-) {
+) -> (usize, usize) {
     while len > 0 && part_idx < parts.len() {
         let part = parts[part_idx].as_ref();
         if part_off >= part.len() {
-            part_idx = part_idx.saturating_add(1);
+            part_idx += 1;
             part_off = 0;
             continue;
         }
@@ -1311,30 +1527,12 @@ fn append_io_slices(
         dst.extend_from_slice(&part[part_off..part_off + take]);
         len -= take;
         part_off += take;
-    }
-}
-
-fn advance_io_slices(
-    parts: &[IoSlice<'_>],
-    mut part_idx: usize,
-    mut part_off: usize,
-    mut len: usize,
-) -> (usize, usize) {
-    while len > 0 && part_idx < parts.len() {
-        let part_len = parts[part_idx].len();
-        if part_off >= part_len {
-            part_idx = part_idx.saturating_add(1);
-            part_off = 0;
-            continue;
-        }
-        let take = len.min(part_len - part_off);
-        len -= take;
-        part_off += take;
-        if part_off == part_len {
-            part_idx = part_idx.saturating_add(1);
+        if part_off == part.len() {
+            part_idx += 1;
             part_off = 0;
         }
     }
+    debug_assert_eq!(len, 0);
     (part_idx, part_off)
 }
 
@@ -1347,7 +1545,7 @@ impl StreamInner {
         self.opened_locally && self.id() == 0
     }
 
-    fn read_closed(&self) -> bool {
+    fn is_read_closed(&self) -> bool {
         if !self.local_recv {
             return true;
         }
@@ -1358,7 +1556,7 @@ impl StreamInner {
             || state.recv_reset.is_some()
     }
 
-    fn write_closed(&self) -> bool {
+    fn is_write_closed(&self) -> bool {
         if !self.local_send {
             return true;
         }
@@ -1373,11 +1571,21 @@ impl StreamInner {
         self.state.lock().unwrap().open_info.len()
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
+    fn has_open_info(&self) -> bool {
+        !self.state.lock().unwrap().open_info.is_empty()
+    }
+
+    fn open_info(&self) -> Vec<u8> {
+        self.state.lock().unwrap().open_info.clone()
+    }
+
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
         let state = self.state.lock().unwrap();
-        dst.clear();
-        dst.reserve(state.open_info.len());
         dst.extend_from_slice(&state.open_info);
+    }
+
+    fn metadata(&self) -> StreamMetadata {
+        self.state.lock().unwrap().metadata.clone()
     }
 
     pub(super) fn try_graceful_finish_after_stop_sending(&self) -> Result<bool> {
@@ -1398,10 +1606,11 @@ impl StreamInner {
         let prepared = {
             let mut conn_state = self.conn.state.lock().unwrap();
             ensure_session_not_closed(&conn_state)?;
+            let stream_id = self.id();
             let queued_data_bytes = self
                 .conn
                 .write_queue
-                .data_queued_bytes_for_stream(self.id());
+                .data_queued_bytes_for_stream(stream_id);
             let mut stream_state = self.state.lock().unwrap();
             if stream_state.stopped_by_peer.is_none()
                 || stream_state.send_fin
@@ -1413,7 +1622,7 @@ impl StreamInner {
             }
             let inflight_queued = conn_state
                 .inflight_data_by_stream
-                .get(&self.id())
+                .get(&stream_id)
                 .copied()
                 .unwrap_or(0);
             let fragment_cap = tx_fragment_cap_locked(&self.conn, &conn_state, &stream_state, 0);
@@ -1496,10 +1705,25 @@ impl StreamInner {
             conn_state.next_local_uni
         };
         let goaway = if self.bidi {
-            conn_state.peer_goaway_bidi
+            conn_state.peer_go_away_bidi
         } else {
-            conn_state.peer_goaway_uni
+            conn_state.peer_go_away_uni
         };
+        if id > MAX_VARINT62 {
+            stream_state.aborted = Some((
+                ErrorCode::Protocol.as_u64(),
+                "stream id overflow".to_owned(),
+            ));
+            stream_state.abort_source = ErrorSource::Local;
+            stream_state.provisional_created_at = None;
+            queue.pop_front();
+            clear_stream_open_info_locked(conn_state, stream_state);
+            clear_stream_open_prefix_locked(stream_state);
+            self.conn.cond.notify_all();
+            self.cond.notify_all();
+            return Err(Error::new(ErrorCode::Protocol, "stream id overflow")
+                .with_source(ErrorSource::Local));
+        }
         if id > goaway {
             stream_state.aborted = Some((
                 ErrorCode::RefusedStream.as_u64(),
@@ -1549,11 +1773,12 @@ impl StreamInner {
 
         let stream = queue.pop_front().expect("head checked above");
         self.id.store(id, Ordering::Release);
+        let next_id = id + 4;
         if self.bidi {
-            conn_state.next_local_bidi = conn_state.next_local_bidi.saturating_add(4);
+            conn_state.next_local_bidi = next_id;
             conn_state.active.local_bidi = conn_state.active.local_bidi.saturating_add(1);
         } else {
-            conn_state.next_local_uni = conn_state.next_local_uni.saturating_add(4);
+            conn_state.next_local_uni = next_id;
             conn_state.active.local_uni = conn_state.active.local_uni.saturating_add(1);
         }
         stream_state.send_max = initial_send_window(
@@ -1576,7 +1801,7 @@ impl StreamInner {
                 Some(Instant::now().saturating_duration_since(created_at));
         }
         stream_state.active_counted = true;
-        conn_state.streams.insert(id, stream.clone());
+        conn_state.streams.insert(id, Arc::clone(&stream));
         self.conn.cond.notify_all();
         self.cond.notify_all();
         Ok(LocalCommitStatus::Committed)
@@ -1599,7 +1824,7 @@ impl StreamInner {
             .iter()
             .position(|stream| ptr::eq(Arc::as_ptr(stream), self))
         {
-            queue.remove(pos);
+            let _ = queue.remove(pos);
             shrink_provisional_queue_locked(conn_state, self.bidi);
             stream_state.provisional_created_at = None;
             clear_stream_open_info_locked(conn_state, stream_state);
@@ -1697,9 +1922,11 @@ impl StreamInner {
             if self.local_send {
                 state.write_deadline = deadline;
             }
-            self.local_send
-                .then(|| state.write_completion.clone())
-                .flatten()
+            if self.local_send {
+                state.write_completion.clone()
+            } else {
+                None
+            }
         };
         self.cond.notify_all();
         if self.local_send {
@@ -1743,6 +1970,9 @@ impl StreamInner {
         dsts: &mut [IoSliceMut<'_>],
         operation_deadline: Option<Instant>,
     ) -> Result<usize> {
+        if let [single] = dsts {
+            return self.read_until(single.as_mut(), operation_deadline);
+        }
         if !self.local_recv {
             return Err(Error::local("zmux: stream is not readable"));
         }
@@ -1822,6 +2052,7 @@ impl StreamInner {
                 let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
                     return Err(Error::timeout("read"));
                 };
+                let wait = wait.min(MAX_CONDVAR_TIMED_WAIT);
                 let (next, _) = self.cond.wait_timeout(state, wait).unwrap();
                 state = next;
             } else {
@@ -1836,10 +2067,6 @@ impl StreamInner {
 
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
         self.write_until(src, false, deadline_after(timeout))
-    }
-
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_until(src, true, deadline_after(timeout))
     }
 
     fn write_vectored(&self, parts: &[IoSlice<'_>], fin: bool) -> Result<usize> {
@@ -1886,10 +2113,12 @@ impl StreamInner {
             .send_session_max
             .saturating_sub(conn_state.send_session_used);
         let stream_avail = stream_state.send_max.saturating_sub(stream_state.send_used);
-        let available = frame_payload_room
-            .min(u64_to_usize_saturating(session_avail))
-            .min(u64_to_usize_saturating(stream_avail))
-            .min(data_remaining);
+        let available = writable_data_bytes(
+            frame_payload_room,
+            session_avail,
+            stream_avail,
+            data_remaining,
+        );
         if available == 0 && stream_state.opened_on_wire {
             return 0;
         }
@@ -1922,10 +2151,39 @@ impl StreamInner {
         fin: bool,
         operation_deadline: Option<Instant>,
     ) -> Result<usize> {
+        self.write_bytes_until(WriteBytes::borrowed(src), fin, operation_deadline)
+    }
+
+    fn write_payload_until(
+        &self,
+        payload: WritePayload<'_>,
+        fin: bool,
+        operation_deadline: Option<Instant>,
+    ) -> Result<usize> {
+        match payload {
+            WritePayload::Bytes(Cow::Borrowed(src)) => {
+                self.write_bytes_until(WriteBytes::borrowed(src), fin, operation_deadline)
+            }
+            WritePayload::Bytes(Cow::Owned(src)) => {
+                self.write_bytes_until(WriteBytes::owned(src), fin, operation_deadline)
+            }
+            WritePayload::Vectored(parts) => {
+                self.write_vectored_until(parts, fin, operation_deadline)
+            }
+        }
+    }
+
+    fn write_bytes_until(
+        &self,
+        mut src: WriteBytes<'_>,
+        fin: bool,
+        operation_deadline: Option<Instant>,
+    ) -> Result<usize> {
         if !self.local_send {
             return Err(Error::local("zmux: stream is not writable"));
         }
-        if src.is_empty() && !fin {
+        let src_len = src.len();
+        if src_len == 0 && !fin {
             return Ok(0);
         }
 
@@ -1966,8 +2224,8 @@ impl StreamInner {
                         let projected_cost = self.projected_next_data_queue_cost_locked(
                             &conn_state,
                             &stream_state,
-                            src.len().saturating_sub(current_written),
-                            fin && current_written == src.len(),
+                            src_len.saturating_sub(current_written),
+                            fin && current_written == src_len,
                         );
                         if projected_cost > 0 {
                             drop(stream_state);
@@ -2025,7 +2283,7 @@ impl StreamInner {
                         break;
                     }
 
-                    if fin && current_written == src.len() {
+                    if fin && current_written == src_len {
                         if stream_state.send_fin {
                             self.rollback_prepared_states_batch(prepared_states);
                             return Ok(written.saturating_add(batch_progress));
@@ -2063,10 +2321,12 @@ impl StreamInner {
                             .saturating_sub(conn_state.send_session_used);
                         let stream_avail =
                             stream_state.send_max.saturating_sub(stream_state.send_used);
-                        let available = frame_payload_room
-                            .min(u64_to_usize_saturating(session_avail))
-                            .min(u64_to_usize_saturating(stream_avail))
-                            .min(src.len() - current_written);
+                        let available = writable_data_bytes(
+                            frame_payload_room,
+                            session_avail,
+                            stream_avail,
+                            src_len - current_written,
+                        );
 
                         if available == 0 {
                             if !stream_state.opened_on_wire {
@@ -2087,10 +2347,16 @@ impl StreamInner {
                                 byte_progress = 0;
                                 frame_done = false;
                             } else if prepared_states.is_empty() {
-                                let session_blocked =
-                                    (session_avail == 0).then_some(conn_state.send_session_max);
-                                let stream_blocked =
-                                    (stream_avail == 0).then_some(stream_state.send_max);
+                                let session_blocked = if session_avail == 0 {
+                                    Some(conn_state.send_session_max)
+                                } else {
+                                    None
+                                };
+                                let stream_blocked = if stream_avail == 0 {
+                                    Some(stream_state.send_max)
+                                } else {
+                                    None
+                                };
                                 drop(stream_state);
                                 drop(conn_state);
                                 self.queue_blocked_signals(session_blocked, stream_blocked);
@@ -2107,12 +2373,13 @@ impl StreamInner {
                             }
                         } else {
                             let end = current_written + available;
-                            let is_final = fin && end == src.len();
+                            let is_final = fin && end == src_len;
                             prepared = match self.prepare_data_frame_header_locked(
                                 &mut conn_state,
                                 &mut stream_state,
                                 available,
                                 is_final,
+                                !src.can_move_range_into_empty_payload(current_written, end),
                             ) {
                                 Ok(prepared) => prepared,
                                 Err(err) => {
@@ -2124,23 +2391,17 @@ impl StreamInner {
                             };
                             byte_progress = available;
                             app_copy = Some((current_written, end));
-                            frame_done = end == src.len();
+                            frame_done = end == src_len;
                         }
                     }
                 }
 
                 if let Some((start, end)) = app_copy {
-                    if prepared
-                        .frame
-                        .payload
-                        .try_reserve_exact(end.saturating_sub(start))
-                        .is_err()
-                    {
+                    if let Err(err) = src.append_range_to(&mut prepared.frame.payload, start, end) {
                         self.rollback_prepared_data(prepared.state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(Error::local("zmux: DATA payload allocation failed"));
+                        return Err(err);
                     }
-                    prepared.frame.payload.extend_from_slice(&src[start..end]);
                 }
 
                 let prepared_cost = prepared_data_queue_cost(&prepared);
@@ -2322,10 +2583,12 @@ impl StreamInner {
                         .send_session_max
                         .saturating_sub(conn_state.send_session_used);
                     let stream_avail = stream_state.send_max.saturating_sub(stream_state.send_used);
-                    let available = frame_payload_room
-                        .min(u64_to_usize_saturating(session_avail))
-                        .min(u64_to_usize_saturating(stream_avail))
-                        .min(total - current_written);
+                    let available = writable_data_bytes(
+                        frame_payload_room,
+                        session_avail,
+                        stream_avail,
+                        total - current_written,
+                    );
 
                     if available == 0 {
                         if !stream_state.opened_on_wire {
@@ -2346,10 +2609,16 @@ impl StreamInner {
                             byte_progress = 0;
                             frame_done = false;
                         } else if prepared_states.is_empty() {
-                            let session_blocked =
-                                (session_avail == 0).then_some(conn_state.send_session_max);
-                            let stream_blocked =
-                                (stream_avail == 0).then_some(stream_state.send_max);
+                            let session_blocked = if session_avail == 0 {
+                                Some(conn_state.send_session_max)
+                            } else {
+                                None
+                            };
+                            let stream_blocked = if stream_avail == 0 {
+                                Some(stream_state.send_max)
+                            } else {
+                                None
+                            };
                             drop(stream_state);
                             drop(conn_state);
                             self.queue_blocked_signals(session_blocked, stream_blocked);
@@ -2371,6 +2640,7 @@ impl StreamInner {
                             &mut stream_state,
                             available,
                             is_final,
+                            true,
                         ) {
                             Ok(prepared) => prepared,
                             Err(err) => {
@@ -2386,20 +2656,23 @@ impl StreamInner {
                     }
                 }
 
-                if let Some((copy_part_idx, copy_part_off, copy_len)) = app_copy {
-                    if prepared.frame.payload.try_reserve_exact(copy_len).is_err() {
-                        self.rollback_prepared_data(prepared.state);
-                        self.rollback_prepared_states_batch(prepared_states);
-                        return Err(Error::local("zmux: DATA payload allocation failed"));
-                    }
-                    append_io_slices(
-                        &mut prepared.frame.payload,
-                        parts,
-                        copy_part_idx,
-                        copy_part_off,
-                        copy_len,
-                    );
-                }
+                let advanced_cursor =
+                    if let Some((copy_part_idx, copy_part_off, copy_len)) = app_copy {
+                        if prepared.frame.payload.try_reserve_exact(copy_len).is_err() {
+                            self.rollback_prepared_data(prepared.state);
+                            self.rollback_prepared_states_batch(prepared_states);
+                            return Err(Error::local("zmux: DATA payload allocation failed"));
+                        }
+                        Some(append_io_slices(
+                            &mut prepared.frame.payload,
+                            parts,
+                            copy_part_idx,
+                            copy_part_off,
+                            copy_len,
+                        ))
+                    } else {
+                        None
+                    };
 
                 let prepared_cost = prepared_data_queue_cost(&prepared);
                 if !prepared_states.is_empty()
@@ -2412,8 +2685,10 @@ impl StreamInner {
                 batch_cost = batch_cost.saturating_add(prepared_cost);
                 push_prepared_data_frame(&mut prepared_frames, &mut prepared_states, prepared);
                 batch_progress = batch_progress.saturating_add(byte_progress);
-                (batch_part_idx, batch_part_off) =
-                    advance_io_slices(parts, batch_part_idx, batch_part_off, byte_progress);
+                if let Some((next_part_idx, next_part_off)) = advanced_cursor {
+                    batch_part_idx = next_part_idx;
+                    batch_part_off = next_part_off;
+                }
                 done = frame_done;
 
                 if byte_progress == 0 || done {
@@ -2477,6 +2752,7 @@ impl StreamInner {
                 let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
                     return Err(Error::timeout("write"));
                 };
+                let wait = wait.min(MAX_CONDVAR_TIMED_WAIT);
                 let (next, _) = self.cond.wait_timeout(state, wait).unwrap();
                 state = next;
             } else {
@@ -2555,8 +2831,10 @@ impl StreamInner {
     }
 
     fn ensure_prepared_write_not_aborted(&self) -> Result<()> {
-        let conn_state = self.conn.state.lock().unwrap();
-        ensure_session_not_closed(&conn_state)?;
+        {
+            let conn_state = self.conn.state.lock().unwrap();
+            ensure_session_not_closed(&conn_state)?;
+        }
         let state = self.state.lock().unwrap();
         if let Some((code, reason)) = &state.aborted {
             return Err(stream_abort_error(&state, *code, reason.clone()));
@@ -2573,8 +2851,10 @@ impl StreamInner {
     }
 
     fn ensure_graceful_stop_sending_still_pending(&self) -> Result<()> {
-        let conn_state = self.conn.state.lock().unwrap();
-        ensure_session_not_closed(&conn_state)?;
+        {
+            let conn_state = self.conn.state.lock().unwrap();
+            ensure_session_not_closed(&conn_state)?;
+        }
         let state = self.state.lock().unwrap();
         if let Some((code, reason)) = &state.aborted {
             return Err(stream_abort_error(&state, *code, reason.clone()));
@@ -2600,10 +2880,13 @@ impl StreamInner {
         let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
             return Err(Error::timeout("write"));
         };
+        let wait_for = wait.min(MAX_CONDVAR_TIMED_WAIT);
+        let reaches_deadline = wait_for == wait;
         let blocked_started = Instant::now();
-        let (mut conn_state, timed_out) = self.conn.cond.wait_timeout(conn_state, wait).unwrap();
+        let (mut conn_state, timed_out) =
+            self.conn.cond.wait_timeout(conn_state, wait_for).unwrap();
         note_blocked_write_locked(&mut conn_state, blocked_started.elapsed());
-        if timed_out.timed_out() {
+        if timed_out.timed_out() && reaches_deadline {
             return Err(Error::timeout("write"));
         }
         Ok(conn_state)
@@ -2669,6 +2952,7 @@ impl StreamInner {
             }
 
             if replenish_stream {
+                let stream_id = self.id();
                 let mut stream_state = self.state.lock().unwrap();
                 if self.local_recv
                     && !stream_state.read_stopped
@@ -2680,7 +2964,7 @@ impl StreamInner {
                     let initial = initial_receive_window(
                         self.conn.negotiated.local_role,
                         &self.conn.local_preface.settings,
-                        self.id(),
+                        stream_id,
                     );
                     let target =
                         stream_window_target(initial, self.conn.per_stream_data_high_watermark);
@@ -2705,7 +2989,7 @@ impl StreamInner {
                                 self.conn.per_stream_data_high_watermark,
                             ),
                         );
-                        if let Some(frame) = max_data_frame(self.id(), stream_limit) {
+                        if let Some(frame) = max_data_frame(stream_id, stream_limit) {
                             if try_queue_bounded_control(&self.conn, frame) {
                                 stream_state.recv_advertised = stream_limit;
                                 stream_state.recv_pending = 0;
@@ -2762,8 +3046,13 @@ impl StreamInner {
         app_data: &[u8],
         fin: bool,
     ) -> Result<PreparedDataFrame> {
-        let mut prepared =
-            self.prepare_data_frame_header_locked(conn_state, stream_state, app_data.len(), fin)?;
+        let mut prepared = self.prepare_data_frame_header_locked(
+            conn_state,
+            stream_state,
+            app_data.len(),
+            fin,
+            true,
+        )?;
         prepared.frame.payload.extend_from_slice(app_data);
         Ok(prepared)
     }
@@ -2774,6 +3063,7 @@ impl StreamInner {
         stream_state: &mut StreamState,
         app_len: usize,
         fin: bool,
+        reserve_app_payload: bool,
     ) -> Result<PreparedDataFrame> {
         let stream_id = self.id();
         if stream_id == 0 {
@@ -2791,9 +3081,14 @@ impl StreamInner {
         } else {
             stream_state.open_prefix.len()
         };
-        let payload_capacity = prefix_len
+        let payload_len = prefix_len
             .checked_add(app_len)
             .ok_or_else(|| Error::frame_size("DATA payload too large"))?;
+        let payload_capacity = if reserve_app_payload || prefix_len != 0 {
+            payload_len
+        } else {
+            prefix_len
+        };
         let mut payload = Vec::new();
         if payload_capacity != 0 {
             payload
@@ -2870,6 +3165,8 @@ impl StreamInner {
         conn_state.send_session_used = conn_state
             .send_session_used
             .saturating_sub(prepared.send_session_used_delta);
+        drop(stream_state);
+        drop(conn_state);
         self.conn.cond.notify_all();
         self.cond.notify_all();
     }
@@ -2891,6 +3188,8 @@ impl StreamInner {
         if prepared.releases_active_on_commit {
             maybe_release_active_count(&mut conn_state, self, &mut stream_state);
         }
+        drop(stream_state);
+        drop(conn_state);
         self.conn.cond.notify_all();
         self.cond.notify_all();
     }
@@ -2899,13 +3198,14 @@ impl StreamInner {
         if states.is_empty() {
             return;
         }
-        let releases_active = states
-            .iter()
-            .any(|prepared| prepared.releases_active_on_commit);
-        let dropped_priority_updates = states
-            .iter()
-            .filter(|prepared| prepared.priority_update.dropped())
-            .count();
+        let mut releases_active = false;
+        let mut dropped_priority_updates = 0usize;
+        for prepared in &states {
+            releases_active |= prepared.releases_active_on_commit;
+            if prepared.priority_update.dropped() {
+                dropped_priority_updates = dropped_priority_updates.saturating_add(1);
+            }
+        }
         let mut conn_state = self.conn.state.lock().unwrap();
         let mut stream_state = self.state.lock().unwrap();
         if dropped_priority_updates != 0 {
@@ -2916,16 +3216,17 @@ impl StreamInner {
         if releases_active {
             maybe_release_active_count(&mut conn_state, self, &mut stream_state);
         }
+        drop(stream_state);
+        drop(conn_state);
         self.conn.cond.notify_all();
         self.cond.notify_all();
     }
 
     fn write_burst_frame_limit_for_priority(&self, priority: u64) -> usize {
-        usize::try_from(write_burst_limit(
+        u64_to_usize_saturating(u64::from(write_burst_limit(
             priority,
             self.conn.peer_preface.settings.scheduler_hints,
-        ))
-        .unwrap_or(usize::MAX)
+        )))
         .max(1)
         .min(self.conn.write_queue.max_batch_frames().max(1))
     }
@@ -2944,28 +3245,31 @@ impl StreamInner {
     {
         let PreparedDataFrame { frame, state } = prepared;
         let stream_id = frame.stream_id;
-        let frames = match &state.priority_update {
-            PreparedPriorityUpdate::BeforeData(payload) => {
-                vec![prepared_priority_frame(stream_id, payload), frame]
-            }
-            PreparedPriorityUpdate::AfterData(payload) => {
-                vec![frame, prepared_priority_frame(stream_id, payload)]
-            }
-            PreparedPriorityUpdate::None | PreparedPriorityUpdate::Dropped(_) => vec![frame],
-        };
-        let queued = if let Some(completion) = completion {
-            self.conn
-                .queue_tracked_frames_until(frames, completion, deadline, check, operation)
-        } else if frames.len() == 1 {
-            self.conn.queue_frame_until(
-                frames.into_iter().next().unwrap(),
+        let queued = match completion {
+            Some(completion) => self.conn.queue_tracked_frames_until(
+                prepared_data_frames(stream_id, frame, &state.priority_update),
+                completion,
                 deadline,
                 check,
                 operation,
-            )
-        } else {
-            self.conn
-                .queue_frames_until(frames, deadline, check, operation)
+            ),
+            None => match &state.priority_update {
+                PreparedPriorityUpdate::BeforeData(payload) => self.conn.queue_frames_until(
+                    vec![prepared_priority_frame(stream_id, payload), frame],
+                    deadline,
+                    check,
+                    operation,
+                ),
+                PreparedPriorityUpdate::AfterData(payload) => self.conn.queue_frames_until(
+                    vec![frame, prepared_priority_frame(stream_id, payload)],
+                    deadline,
+                    check,
+                    operation,
+                ),
+                PreparedPriorityUpdate::None | PreparedPriorityUpdate::Dropped(_) => self
+                    .conn
+                    .queue_frame_until(frame, deadline, check, operation),
+            },
         };
         match queued {
             Ok(()) => Ok(state),
@@ -3017,7 +3321,10 @@ impl StreamInner {
                 return Err(Error::write_closed().with_termination_kind(TerminationKind::Graceful));
             }
         }
-        self.write(&[], true).map(|_| ())
+        match self.write(&[], true) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     fn close(&self) -> Result<()> {
@@ -3045,7 +3352,9 @@ impl StreamInner {
                     first_err = Some(err);
                 }
                 if write_timed_out {
-                    if let Err(cancel_err) = self.cancel_write(ErrorCode::Cancelled.as_u64(), "") {
+                    if let Err(cancel_err) =
+                        StreamInner::cancel_write(self, ErrorCode::Cancelled.as_u64(), "")
+                    {
                         if !close_write_error_ignored(&cancel_err)
                             && !cancel_err.is_session_closed()
                             && first_err.is_none()
@@ -3057,7 +3366,7 @@ impl StreamInner {
             }
         }
         if needs_close_read {
-            if let Err(err) = self.close_read(ErrorCode::Cancelled.as_u64()) {
+            if let Err(err) = StreamInner::close_read(self, ErrorCode::Cancelled.as_u64()) {
                 if !close_read_error_ignored(&err) && first_err.is_none() {
                     first_err = Some(err);
                 }
@@ -3144,10 +3453,11 @@ impl StreamInner {
                 released_recv_retained_bytes = 0;
             }
             let pending_code = stream_state.read_stop_pending_code.unwrap_or(code);
+            let stream_id = self.id();
             let stop_frame = Frame {
                 frame_type: FrameType::StopSending,
                 flags: 0,
-                stream_id: self.id(),
+                stream_id,
                 payload: if pending_code == code {
                     stop_payload.clone()
                 } else {
@@ -3238,13 +3548,14 @@ impl StreamInner {
         if stats.removed_frames == 0 {
             return;
         }
+        let stream_id = self.id();
         let mut conn_state = self.conn.state.lock().unwrap();
         if count_superseded && stats.terminal_frames != 0 {
             conn_state.superseded_terminal_signal_count = conn_state
                 .superseded_terminal_signal_count
                 .saturating_add(usize_to_u64_saturating(stats.terminal_frames));
         }
-        if let Some(stream) = conn_state.streams.get(&self.id()).cloned() {
+        if let Some(stream) = conn_state.streams.get(&stream_id).cloned() {
             release_discarded_queued_stream_frames_locked(&mut conn_state, &stream, stats);
         }
         self.conn.cond.notify_all();
@@ -3319,6 +3630,7 @@ impl StreamInner {
             reason,
             self.conn.peer_preface.settings.max_control_payload_bytes,
         )?;
+        let stream_id;
         {
             let mut conn_state = self.conn.state.lock().unwrap();
             ensure_session_not_closed(&conn_state)?;
@@ -3339,6 +3651,7 @@ impl StreamInner {
                 self.cond.notify_all();
                 return Ok(());
             }
+            stream_id = self.id();
             note_abort_reason_locked(&mut conn_state, code);
             stream_state.aborted = Some((code, reason.to_owned()));
             stream_state.abort_source = ErrorSource::Local;
@@ -3356,12 +3669,12 @@ impl StreamInner {
                 false,
             );
         }
-        let discarded = self.conn.write_queue.discard_stream(self.id());
+        let discarded = self.conn.write_queue.discard_stream(stream_id);
         self.apply_discarded_queued_frames(discarded, true);
         if let Err(err) = self.conn.queue_frame(Frame {
             frame_type: FrameType::Abort,
             flags: 0,
-            stream_id: self.id(),
+            stream_id,
             payload,
         }) {
             self.rollback_pending_terminal_frame();
@@ -3414,46 +3727,45 @@ impl StreamInner {
                 state.open_initial_group
             };
             let local_phase = local_open_phase(self.opened_locally, &state);
-            let needs_local_opener = self.opened_locally && self.id() == 0;
+            let stream_id = self.id();
+            let needs_local_opener = self.opened_locally && stream_id == 0;
             let can_carry_on_open = metadata_update_can_carry_on_open(caps, &wire_update);
             if needs_local_opener {
                 validate_open_metadata_update_capability(caps, &wire_update)?;
-                let prefix = build_open_metadata_prefix(
+                rebuild_open_metadata_prefix_locked(
+                    &mut state,
                     caps,
                     next.priority,
                     next_open_initial_group,
-                    &state.open_info,
                     peer_settings.max_frame_payload,
                 )?;
                 if metadata_changed {
                     state.metadata = next;
-                    state.metadata_revision = state.metadata_revision.saturating_add(1);
+                    state.metadata_revision = state.metadata_revision.wrapping_add(1);
                 }
                 state.open_initial_group = next_open_initial_group;
-                state.open_prefix = compact_retained_bytes(prefix);
                 return Ok(());
             }
 
             let should_emit_opener = local_phase.should_emit_opener_frame();
             if should_emit_opener && can_carry_on_open {
                 validate_open_metadata_update_capability(caps, &wire_update)?;
-                let prefix = build_open_metadata_prefix(
+                rebuild_open_metadata_prefix_locked(
+                    &mut state,
                     caps,
                     next.priority,
                     next_open_initial_group,
-                    &state.open_info,
                     peer_settings.max_frame_payload,
                 )?;
                 if metadata_changed {
                     state.metadata = next;
-                    state.metadata_revision = state.metadata_revision.saturating_add(1);
+                    state.metadata_revision = state.metadata_revision.wrapping_add(1);
                 }
                 state.open_initial_group = next_open_initial_group;
-                state.open_prefix = compact_retained_bytes(prefix);
                 return Ok(());
             }
 
-            let payload = build_merged_priority_update_payload(
+            let (merged_update, payload_len) = merged_priority_update_payload_len(
                 caps,
                 wire_update,
                 state.pending_priority_update.as_deref(),
@@ -3463,15 +3775,21 @@ impl StreamInner {
                 ensure_pending_priority_update_limits_locked(
                     &self.conn,
                     &conn_state,
-                    self.id(),
+                    stream_id,
                     &state,
-                    payload.len(),
+                    payload_len,
                     "write",
+                )?;
+                let payload = build_priority_update_payload_reusing_pending(
+                    caps,
+                    merged_update,
+                    &mut state.pending_priority_update,
+                    peer_settings.max_extension_payload_bytes,
                 )?;
                 state.pending_priority_update = Some(payload);
                 if metadata_changed {
                     state.metadata = next;
-                    state.metadata_revision = state.metadata_revision.saturating_add(1);
+                    state.metadata_revision = state.metadata_revision.wrapping_add(1);
                 }
                 return Ok(());
             }
@@ -3479,23 +3797,34 @@ impl StreamInner {
                 ensure_pending_priority_update_limits_locked(
                     &self.conn,
                     &conn_state,
-                    self.id(),
+                    stream_id,
                     &state,
-                    payload.len(),
+                    payload_len,
                     "write",
+                )?;
+                let payload = build_priority_update_payload_reusing_pending(
+                    caps,
+                    merged_update,
+                    &mut state.pending_priority_update,
+                    peer_settings.max_extension_payload_bytes,
                 )?;
                 state.pending_priority_update = Some(payload);
                 if metadata_changed {
                     state.metadata = next;
-                    state.metadata_revision = state.metadata_revision.saturating_add(1);
+                    state.metadata_revision = state.metadata_revision.wrapping_add(1);
                 }
                 return Ok(());
             }
+            let payload = build_priority_update_payload(
+                caps,
+                merged_update,
+                peer_settings.max_extension_payload_bytes,
+            )?;
             if metadata_changed {
-                state.metadata_revision = state.metadata_revision.saturating_add(1);
+                state.metadata_revision = state.metadata_revision.wrapping_add(1);
             }
             (
-                self.id(),
+                stream_id,
                 payload,
                 state.metadata_revision,
                 next,
@@ -3523,7 +3852,7 @@ impl StreamInner {
             }
             Err(err) => {
                 if metadata_changed && state.metadata_revision == queued_revision {
-                    state.metadata_revision = state.metadata_revision.saturating_sub(1);
+                    state.metadata_revision = state.metadata_revision.wrapping_sub(1);
                 }
                 drop(state);
                 let mut conn_state = self.conn.state.lock().unwrap();
@@ -3618,6 +3947,34 @@ mod tests {
     }
 
     #[test]
+    fn owned_write_payload_moves_full_frame_without_copy() {
+        let payload = b"owned write payload".to_vec();
+        let ptr = payload.as_ptr();
+        let len = payload.len();
+        let mut source = WriteBytes::owned(payload);
+        let mut frame_payload = Vec::new();
+
+        source.append_range_to(&mut frame_payload, 0, len).unwrap();
+
+        assert_eq!(frame_payload.as_ptr(), ptr);
+        assert_eq!(frame_payload, b"owned write payload");
+    }
+
+    #[test]
+    fn owned_write_payload_copies_when_frame_has_metadata_prefix() {
+        let payload = b"owned write payload".to_vec();
+        let ptr = payload.as_ptr();
+        let len = payload.len();
+        let mut source = WriteBytes::owned(payload);
+        let mut frame_payload = b"prefix".to_vec();
+
+        source.append_range_to(&mut frame_payload, 0, len).unwrap();
+
+        assert_ne!(frame_payload.as_ptr(), ptr);
+        assert_eq!(frame_payload, b"prefixowned write payload");
+    }
+
+    #[test]
     fn stop_sending_drain_window_uses_override_or_adaptive_rtt() {
         assert_eq!(
             stop_sending_drain_window(None, None),
@@ -3643,7 +4000,7 @@ mod tests {
 
     #[test]
     fn local_open_phase_predicates_follow_visibility_transitions() {
-        let needs_commit = LocalOpenPhase::from(true, false, false, false);
+        let needs_commit = LocalOpenPhase::from_flags(true, false, false, false);
         assert_eq!(needs_commit, LocalOpenPhase::NeedsCommit);
         assert!(needs_commit.needs_local_opener());
         assert!(needs_commit.awaiting_peer_visibility());
@@ -3651,19 +4008,19 @@ mod tests {
         assert!(needs_commit.should_mark_peer_visible());
         assert!(!needs_commit.can_take_pending_priority_update());
 
-        let needs_emit = LocalOpenPhase::from(true, true, false, false);
+        let needs_emit = LocalOpenPhase::from_flags(true, true, false, false);
         assert_eq!(needs_emit, LocalOpenPhase::NeedsEmit);
         assert!(!needs_emit.needs_local_opener());
         assert!(needs_emit.awaiting_peer_visibility());
         assert!(needs_emit.should_emit_opener_frame());
 
-        let queued = LocalOpenPhase::from(true, true, false, true);
+        let queued = LocalOpenPhase::from_flags(true, true, false, true);
         assert_eq!(queued, LocalOpenPhase::Queued);
         assert!(queued.awaiting_peer_visibility());
         assert!(!queued.should_emit_opener_frame());
         assert!(!queued.can_take_pending_priority_update());
 
-        let peer_visible = LocalOpenPhase::from(true, true, true, true);
+        let peer_visible = LocalOpenPhase::from_flags(true, true, true, true);
         assert_eq!(peer_visible, LocalOpenPhase::PeerVisible);
         assert!(!peer_visible.awaiting_peer_visibility());
         assert!(!peer_visible.should_mark_peer_visible());
@@ -3671,7 +4028,7 @@ mod tests {
         assert!(peer_visible.should_queue_stream_blocked(0));
 
         assert_eq!(
-            LocalOpenPhase::from(false, false, false, false),
+            LocalOpenPhase::from_flags(false, false, false, false),
             LocalOpenPhase::None
         );
     }

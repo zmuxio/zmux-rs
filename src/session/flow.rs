@@ -1,56 +1,58 @@
 use crate::settings::Settings;
 use crate::varint::MAX_VARINT62;
 
+#[inline]
 pub(super) fn negotiated_frame_payload(local: &Settings, peer: &Settings) -> u64 {
     min_nonzero(local.max_frame_payload, peer.max_frame_payload)
-        .unwrap_or_else(|| Settings::default().max_frame_payload)
+        .unwrap_or(Settings::DEFAULT.max_frame_payload)
 }
 
+#[inline]
 pub(super) fn session_window_target(local: &Settings, session_data_high_watermark: usize) -> u64 {
-    local.initial_max_data.max(
-        usize_to_u64_saturating(session_data_high_watermark)
-            .saturating_mul(4)
-            .min(MAX_VARINT62),
-    )
+    local
+        .initial_max_data
+        .max(scaled_high_watermark(session_data_high_watermark, 4))
 }
 
+#[inline]
 pub(super) fn stream_window_target(
     initial_receive_window: u64,
     per_stream_data_high_watermark: usize,
 ) -> u64 {
-    initial_receive_window.max(
-        usize_to_u64_saturating(per_stream_data_high_watermark)
-            .saturating_mul(2)
-            .min(MAX_VARINT62),
-    )
+    initial_receive_window.max(scaled_high_watermark(per_stream_data_high_watermark, 2))
 }
 
+#[inline]
 pub(super) fn session_emergency_threshold(payload: u64) -> u64 {
     payload.saturating_mul(2)
 }
 
+#[inline]
 pub(super) fn stream_emergency_threshold(target: u64, payload: u64) -> u64 {
+    let threshold = quarter_threshold(target);
     if payload == 0 {
-        return 0;
+        threshold
+    } else {
+        payload.min(threshold)
     }
-    min_nonzero(payload, quarter_threshold(target)).unwrap_or(payload)
 }
 
+#[inline]
 pub(super) fn replenish_min_pending(target: u64, payload: u64) -> u64 {
-    let mut min_pending = quarter_threshold(target);
-    if min_pending == 0 {
-        min_pending = 1;
+    let min_pending = quarter_threshold(target);
+    if payload == 0 {
+        min_pending
+    } else {
+        min_pending.min(payload)
     }
-    if payload > 0 && payload < min_pending {
-        min_pending = payload;
-    }
-    min_pending
 }
 
+#[inline]
 pub(super) fn receive_window_exceeded(received: u64, advertised: u64, amount: u64) -> bool {
     amount > advertised.saturating_sub(received)
 }
 
+#[inline]
 pub(super) fn should_flush_receive_credit(
     advertised: u64,
     received: u64,
@@ -76,6 +78,7 @@ pub(super) fn should_flush_receive_credit(
     pending >= min_pending
 }
 
+#[inline]
 pub(super) fn next_credit_limit(
     advertised: u64,
     pending: u64,
@@ -92,6 +95,7 @@ pub(super) fn next_credit_limit(
     desired.min(MAX_VARINT62)
 }
 
+#[inline]
 pub(super) fn session_standing_growth_allowed(
     memory_pressure_high: bool,
     buffered: u64,
@@ -106,6 +110,7 @@ pub(super) fn session_standing_growth_allowed(
     )
 }
 
+#[inline]
 pub(super) fn stream_standing_growth_allowed(
     memory_pressure_high: bool,
     buffered: u64,
@@ -120,6 +125,7 @@ pub(super) fn stream_standing_growth_allowed(
     )
 }
 
+#[inline]
 fn quarter_threshold(value: u64) -> u64 {
     if value <= 4 {
         1
@@ -128,6 +134,7 @@ fn quarter_threshold(value: u64) -> u64 {
     }
 }
 
+#[inline]
 fn standing_growth_allowed(
     memory_pressure_high: bool,
     buffered: u64,
@@ -138,9 +145,10 @@ fn standing_growth_allowed(
         return false;
     }
     let high_watermark = usize_to_u64_saturating(high_watermark);
-    buffered < high_watermark && buffered.saturating_add(pending) < high_watermark
+    buffered < high_watermark && pending < high_watermark - buffered
 }
 
+#[inline]
 fn min_nonzero(a: u64, b: u64) -> Option<u64> {
     match (a, b) {
         (0, 0) => None,
@@ -150,8 +158,16 @@ fn min_nonzero(a: u64, b: u64) -> Option<u64> {
     }
 }
 
+#[inline]
+fn scaled_high_watermark(value: usize, scale: u64) -> u64 {
+    usize_to_u64_saturating(value)
+        .saturating_mul(scale)
+        .min(MAX_VARINT62)
+}
+
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
 #[cfg(test)]
@@ -225,6 +241,7 @@ mod tests {
         assert_eq!(session_emergency_threshold(u64::MAX), u64::MAX);
         assert_eq!(stream_emergency_threshold(1024, 256), 256);
         assert_eq!(stream_emergency_threshold(64, 256), 16);
+        assert_eq!(stream_emergency_threshold(1024, 0), 256);
     }
 
     #[test]

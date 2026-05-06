@@ -1,7 +1,9 @@
 use crate::error::{Error, Result};
 use crate::frame::Limits;
 use crate::protocol::*;
-use crate::varint::{append_varint, parse_varint, varint_len, MAX_VARINT62};
+#[cfg(test)]
+use crate::varint::append_varint;
+use crate::varint::{append_varint_reserved, parse_varint, varint_len, MAX_VARINT62};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -20,8 +22,8 @@ pub enum SchedulerHint {
 
 impl SchedulerHint {
     #[must_use]
-    pub fn from_code(code: u64) -> Self {
-        match code {
+    pub const fn from_u64(v: u64) -> Self {
+        match v {
             1 => Self::Latency,
             2 => Self::BalancedFair,
             3 => Self::BulkThroughput,
@@ -31,12 +33,7 @@ impl SchedulerHint {
     }
 
     #[must_use]
-    pub fn from_u64(v: u64) -> Self {
-        Self::from_code(v)
-    }
-
-    #[must_use]
-    pub fn as_u64(self) -> u64 {
+    pub const fn as_u64(self) -> u64 {
         self as u64
     }
 
@@ -53,18 +50,21 @@ impl SchedulerHint {
 }
 
 impl fmt::Display for SchedulerHint {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 impl AsRef<str> for SchedulerHint {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
 impl From<SchedulerHint> for u64 {
+    #[inline]
     fn from(value: SchedulerHint) -> Self {
         value.as_u64()
     }
@@ -105,7 +105,7 @@ impl Settings {
     };
 
     #[must_use]
-    pub fn limits(self) -> Limits {
+    pub const fn limits(self) -> Limits {
         Limits {
             max_frame_payload: self.max_frame_payload,
             max_control_payload_bytes: self.max_control_payload_bytes,
@@ -156,16 +156,21 @@ impl Settings {
         reserve_settings_bytes(dst, settings_tlv_len(self, defaults)?)?;
         append_settings_tlv_to(dst, self, defaults)
     }
+
+    pub(crate) fn append_tlv_to_prevalidated(self, dst: &mut Vec<u8>) -> Result<()> {
+        append_settings_tlv_to(dst, self, Self::DEFAULT)
+    }
 }
 
 impl Default for Settings {
+    #[inline]
     fn default() -> Self {
         Self::DEFAULT
     }
 }
 
 #[must_use]
-pub fn default_settings() -> Settings {
+pub const fn default_settings() -> Settings {
     Settings::DEFAULT
 }
 
@@ -173,6 +178,9 @@ pub fn marshal_settings_tlv(settings: Settings) -> Result<Vec<u8>> {
     settings.validate()?;
     let defaults = Settings::DEFAULT;
     let encoded_len = settings_tlv_len(settings, defaults)?;
+    if encoded_len == 0 {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     reserve_settings_bytes(&mut out, encoded_len)?;
     append_settings_tlv_to(&mut out, settings, defaults)?;
@@ -180,6 +188,7 @@ pub fn marshal_settings_tlv(settings: Settings) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[inline]
 fn append_settings_tlv_to(dst: &mut Vec<u8>, settings: Settings, defaults: Settings) -> Result<()> {
     for (id, value, default) in settings_entries(settings, defaults) {
         if value != default {
@@ -189,19 +198,23 @@ fn append_settings_tlv_to(dst: &mut Vec<u8>, settings: Settings, defaults: Setti
     Ok(())
 }
 
+#[inline]
 fn settings_tlv_len(settings: Settings, defaults: Settings) -> Result<usize> {
-    settings_entries(settings, defaults)
-        .into_iter()
-        .filter(|(_, value, default)| value != default)
-        .try_fold(0usize, |len, (id, value, _)| {
-            checked_len_add(
-                len,
-                setting_varint_tlv_len(id, value)?,
-                "settings_tlv too large",
-            )
-        })
+    let mut len = 0usize;
+    for (id, value, default) in settings_entries(settings, defaults) {
+        if value == default {
+            continue;
+        }
+        len = checked_len_add(
+            len,
+            setting_varint_tlv_len(id, value)?,
+            "settings_tlv too large",
+        )?;
+    }
+    Ok(len)
 }
 
+#[inline]
 fn settings_entries(settings: Settings, defaults: Settings) -> [(u64, u64, u64); 13] {
     [
         (
@@ -272,27 +285,26 @@ fn settings_entries(settings: Settings, defaults: Settings) -> [(u64, u64, u64);
     ]
 }
 
+#[inline]
 fn setting_varint_tlv_len(id: u64, value: u64) -> Result<usize> {
     let value_len = varint_len(value)?;
     checked_len_sum3(
         varint_len(id)?,
-        varint_len(usize_to_u64_len(value_len, "setting value too large")?)?,
+        varint_len(value_len as u64)?,
         value_len,
         "setting tlv too large",
     )
 }
 
+#[inline]
 fn append_setting_varint(dst: &mut Vec<u8>, id: u64, value: u64) -> Result<()> {
-    append_varint(dst, id)?;
-    append_varint(
-        dst,
-        usize_to_u64_len(varint_len(value)?, "setting value too large")?,
-    )?;
-    append_varint(dst, value)
+    append_varint_reserved(dst, id)?;
+    append_varint_reserved(dst, varint_len(value)? as u64)?;
+    append_varint_reserved(dst, value)
 }
 
 pub fn parse_settings_tlv(mut src: &[u8]) -> Result<Settings> {
-    let mut settings = Settings::default();
+    let mut settings = Settings::DEFAULT;
     let mut seen_known = 0u16;
     let mut seen_unknown = UnknownSettingTracker::default();
 
@@ -301,11 +313,10 @@ pub fn parse_settings_tlv(mut src: &[u8]) -> Result<Settings> {
         src = &src[n_typ..];
         let (len, n_len) = parse_varint(src)?;
         src = &src[n_len..];
-        let len = usize::try_from(len)
-            .map_err(|_| Error::protocol("tlv value overruns containing payload"))?;
-        if src.len() < len {
+        if len > src.len() as u64 {
             return Err(Error::protocol("tlv value overruns containing payload"));
         }
+        let len = len as usize;
         let value_bytes = &src[..len];
         src = &src[len..];
 
@@ -345,7 +356,7 @@ pub fn parse_settings_tlv(mut src: &[u8]) -> Result<Settings> {
             SETTING_KEEPALIVE_HINT_MILLIS => settings.keepalive_hint_millis = value,
             SETTING_MAX_CONTROL_PAYLOAD_BYTES => settings.max_control_payload_bytes = value,
             SETTING_MAX_EXTENSION_PAYLOAD_BYTES => settings.max_extension_payload_bytes = value,
-            SETTING_SCHEDULER_HINTS => settings.scheduler_hints = SchedulerHint::from_code(value),
+            SETTING_SCHEDULER_HINTS => settings.scheduler_hints = SchedulerHint::from_u64(value),
             SETTING_PING_PADDING_KEY => settings.ping_padding_key = value,
             _ => {}
         }
@@ -362,6 +373,7 @@ struct UnknownSettingTracker {
 }
 
 impl UnknownSettingTracker {
+    #[inline]
     fn insert(&mut self, typ: u64) -> Result<bool> {
         if let Some(seen) = self.overflow.as_mut() {
             return Ok(seen.insert(typ));
@@ -387,24 +399,24 @@ impl UnknownSettingTracker {
     }
 }
 
+#[inline]
 fn checked_len_add(lhs: usize, rhs: usize, context: &'static str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::frame_size(context))
 }
 
+#[inline]
 fn checked_len_sum3(a: usize, b: usize, c: usize, context: &'static str) -> Result<usize> {
     checked_len_add(checked_len_add(a, b, context)?, c, context)
 }
 
+#[inline]
 fn reserve_settings_bytes(dst: &mut Vec<u8>, additional: usize) -> Result<()> {
     dst.try_reserve_exact(additional)
         .map_err(|_| Error::local("zmux: settings allocation failed"))
 }
 
-fn usize_to_u64_len(value: usize, context: &'static str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| Error::frame_size(context))
-}
-
+#[inline]
 fn validate_setting_varint(name: &'static str, value: u64) -> Result<()> {
     if value <= MAX_VARINT62 {
         Ok(())
@@ -415,6 +427,7 @@ fn validate_setting_varint(name: &'static str, value: u64) -> Result<()> {
     }
 }
 
+#[inline]
 fn known_setting_seen_bit(typ: u64) -> Option<u16> {
     let bit = match typ {
         SETTING_INITIAL_MAX_STREAM_DATA_BIDI_LOCALLY_OPENED => 1 << 0,
@@ -703,10 +716,10 @@ mod tests {
 
     #[test]
     fn scheduler_hint_conversion_matches_registry() {
-        assert_eq!(SchedulerHint::from_code(1), SchedulerHint::Latency);
-        assert_eq!(SchedulerHint::from_code(4), SchedulerHint::GroupFair);
+        assert_eq!(SchedulerHint::from_u64(1), SchedulerHint::Latency);
+        assert_eq!(SchedulerHint::from_u64(4), SchedulerHint::GroupFair);
         assert_eq!(
-            SchedulerHint::from_code(99),
+            SchedulerHint::from_u64(99),
             SchedulerHint::UnspecifiedOrBalanced
         );
         assert_eq!(SchedulerHint::from_u64(2), SchedulerHint::BalancedFair);

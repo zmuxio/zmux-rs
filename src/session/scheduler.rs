@@ -1,5 +1,9 @@
 use crate::settings::{SchedulerHint, Settings};
-use std::{collections::HashMap, hash::Hash, mem};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    hash::Hash,
+    mem,
+};
 
 const WFQ_TAG_SCALE: u64 = 256;
 const MAX_EXPLICIT_GROUPS: usize = 16;
@@ -28,6 +32,7 @@ pub(super) struct GroupKey {
 }
 
 impl GroupKey {
+    #[inline]
     pub(super) fn stream(stream_id: u64) -> Self {
         Self {
             kind: 0,
@@ -35,6 +40,7 @@ impl GroupKey {
         }
     }
 
+    #[inline]
     pub(super) fn explicit(group_id: u64) -> Self {
         Self {
             kind: 1,
@@ -42,6 +48,7 @@ impl GroupKey {
         }
     }
 
+    #[inline]
     pub(super) fn transient(index: usize) -> Self {
         Self {
             kind: 2,
@@ -49,6 +56,7 @@ impl GroupKey {
         }
     }
 
+    #[inline]
     fn is_transient(self) -> bool {
         self.kind == 2
     }
@@ -87,7 +95,7 @@ impl Default for BatchConfig {
         Self {
             urgent: false,
             scheduler_hint: SchedulerHint::UnspecifiedOrBalanced,
-            max_frame_payload: Settings::default().max_frame_payload,
+            max_frame_payload: Settings::DEFAULT.max_frame_payload,
         }
     }
 }
@@ -102,11 +110,17 @@ enum TrafficClass {
 pub(super) struct BatchScheduler {
     state: BatchState,
     active_group_refs: HashMap<u64, u64>,
-    stream_group_buckets: HashMap<u64, u64>,
-    stream_group_values: HashMap<u64, u64>,
+    stream_groups: HashMap<u64, StreamGroupBinding>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamGroupBinding {
+    group: u64,
+    bucket: u64,
 }
 
 impl BatchScheduler {
+    #[inline]
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
@@ -118,6 +132,7 @@ impl BatchScheduler {
         out
     }
 
+    #[inline]
     pub(super) fn order_into(
         &mut self,
         cfg: BatchConfig,
@@ -127,6 +142,7 @@ impl BatchScheduler {
         order_batch_indices_into(cfg, &mut self.state, items, out);
     }
 
+    #[inline]
     pub(super) fn group_key_for_stream(
         &mut self,
         stream_id: u64,
@@ -139,11 +155,9 @@ impl BatchScheduler {
             return GroupKey::stream(stream_id);
         }
 
-        if self.stream_group_values.get(&stream_id).copied() == Some(group) {
-            if let Some(bucket) = self.stream_group_buckets.get(&stream_id).copied() {
-                if bucket != 0 {
-                    return GroupKey::explicit(bucket);
-                }
+        if let Some(binding) = self.stream_groups.get(&stream_id).copied() {
+            if binding.group == group && binding.bucket != 0 {
+                return GroupKey::explicit(binding.bucket);
             }
         }
 
@@ -158,6 +172,7 @@ impl BatchScheduler {
         GroupKey::explicit(bucket)
     }
 
+    #[inline]
     pub(super) fn drop_stream(&mut self, stream_id: u64) {
         if stream_id == 0 {
             return;
@@ -173,62 +188,58 @@ impl BatchScheduler {
         self.maybe_clear_idle_state();
     }
 
+    #[inline]
     fn set_stream_group_bucket(&mut self, stream_id: u64, group: u64, bucket: u64) {
         if stream_id == 0 {
             return;
         }
-        let old_bucket = self
-            .stream_group_buckets
+        let old = self
+            .stream_groups
             .get(&stream_id)
             .copied()
-            .unwrap_or(0);
-        let old_group = self
-            .stream_group_values
-            .get(&stream_id)
-            .copied()
-            .unwrap_or(0);
-        if old_group == group && old_bucket == bucket {
+            .unwrap_or_default();
+        if old.group == group && old.bucket == bucket {
             return;
         }
         self.untrack_stream_group(stream_id);
         if bucket == 0 {
-            self.stream_group_values.remove(&stream_id);
-            self.stream_group_buckets.remove(&stream_id);
             return;
         }
         let refs = self.active_group_refs.entry(bucket).or_default();
         *refs = refs.saturating_add(1);
-        self.stream_group_values.insert(stream_id, group);
-        self.stream_group_buckets.insert(stream_id, bucket);
+        self.stream_groups
+            .insert(stream_id, StreamGroupBinding { group, bucket });
         self.drop_group_state(GroupKey::stream(stream_id));
     }
 
+    #[inline]
     fn untrack_stream_group(&mut self, stream_id: u64) {
-        let Some(bucket) = self.stream_group_buckets.remove(&stream_id) else {
-            self.stream_group_values.remove(&stream_id);
+        let Some(binding) = self.stream_groups.remove(&stream_id) else {
             return;
         };
-        self.stream_group_values.remove(&stream_id);
+        let bucket = binding.bucket;
         if bucket == 0 {
             return;
         }
-        match self.active_group_refs.get_mut(&bucket) {
-            Some(refs) if *refs > 1 => *refs -= 1,
-            Some(_) => {
-                self.active_group_refs.remove(&bucket);
+        match self.active_group_refs.entry(bucket) {
+            Entry::Occupied(mut entry) if *entry.get() > 1 => *entry.get_mut() -= 1,
+            Entry::Occupied(entry) => {
+                entry.remove();
                 self.drop_group_state(GroupKey::explicit(bucket));
             }
-            None => {}
+            Entry::Vacant(_) => {}
         }
     }
 
+    #[inline]
     fn tracked_explicit_group_count(&self) -> usize {
         self.active_group_refs
             .keys()
-            .filter(|group| **group != 0 && **group != FALLBACK_GROUP_BUCKET)
+            .filter(|&&group| group != 0 && group != FALLBACK_GROUP_BUCKET)
             .count()
     }
 
+    #[inline]
     fn drop_group_state(&mut self, group: GroupKey) {
         self.state.group_virtual_time.remove(&group);
         self.state.group_finish_tag.remove(&group);
@@ -240,10 +251,11 @@ impl BatchScheduler {
         }
     }
 
+    #[inline]
     fn maybe_clear_idle_state(&mut self) {
         if self.state.has_retained_real_state()
             || !self.active_group_refs.is_empty()
-            || !self.stream_group_buckets.is_empty()
+            || !self.stream_groups.is_empty()
         {
             return;
         }
@@ -274,6 +286,7 @@ struct BatchState {
 }
 
 impl BatchState {
+    #[inline]
     fn has_retained_real_state(&self) -> bool {
         !self.group_virtual_time.is_empty()
             || !self.group_finish_tag.is_empty()
@@ -287,10 +300,12 @@ impl BatchState {
             || self.preferred_group_head.is_some()
     }
 
+    #[inline]
     fn clear_idle_retained(&mut self) {
         *self = Self::default();
     }
 
+    #[inline]
     fn clear_idle_retained_preserving_heads(&mut self) {
         let preferred_group_head = self.preferred_group_head;
         let preferred_stream_head = mem::take(&mut self.preferred_stream_head);
@@ -326,12 +341,13 @@ struct BatchBuildResult {
 }
 
 impl BatchBuildResult {
+    #[inline]
     fn prepared_stream(&self, stream_id: u64) -> Option<&PreparedStream> {
-        self.prepared_stream_index
-            .get(&stream_id)
-            .and_then(|index| self.prepared_streams.get(*index))
+        let index = *self.prepared_stream_index.get(&stream_id)?;
+        self.prepared_streams.get(index)
     }
 
+    #[inline]
     fn prepared_stream_mut(&mut self, stream_id: u64) -> Option<&mut PreparedStream> {
         let index = *self.prepared_stream_index.get(&stream_id)?;
         self.prepared_streams.get_mut(index)
@@ -346,22 +362,20 @@ struct BatchBuiltGroup {
 }
 
 impl BatchBuiltGroup {
-    fn queue_mut(&mut self, stream_id: u64) -> &mut BatchStreamQueue {
-        if let Some(pos) = self
-            .stream_index
-            .as_ref()
-            .and_then(|index| index.get(&stream_id).copied())
-        {
-            return &mut self.streams[pos];
+    #[inline]
+    fn stream_pos(&self, stream_id: u64) -> Option<usize> {
+        if let Some(index) = self.stream_index.as_ref() {
+            return index.get(&stream_id).copied();
         }
-        if let Some(pos) = self
+        let pos = self
             .streams
             .iter()
-            .position(|stream| stream.stream_id == stream_id)
-        {
-            if let Some(index) = self.stream_index.as_mut() {
-                index.insert(stream_id, pos);
-            }
+            .position(|stream| stream.stream_id == stream_id)?;
+        Some(pos)
+    }
+
+    fn queue_mut(&mut self, stream_id: u64) -> &mut BatchStreamQueue {
+        if let Some(pos) = self.stream_pos(stream_id) {
             return &mut self.streams[pos];
         }
         let pos = self.streams.len();
@@ -375,20 +389,7 @@ impl BatchBuiltGroup {
     }
 
     fn stream_mut(&mut self, stream_id: u64) -> Option<&mut BatchStreamQueue> {
-        if let Some(pos) = self
-            .stream_index
-            .as_ref()
-            .and_then(|index| index.get(&stream_id).copied())
-        {
-            return self.streams.get_mut(pos);
-        }
-        let pos = self
-            .streams
-            .iter()
-            .position(|stream| stream.stream_id == stream_id)?;
-        if let Some(index) = self.stream_index.as_mut() {
-            index.insert(stream_id, pos);
-        }
+        let pos = self.stream_pos(stream_id)?;
         self.streams.get_mut(pos)
     }
 }
@@ -396,62 +397,107 @@ impl BatchBuiltGroup {
 #[derive(Debug)]
 struct BatchStreamQueue {
     stream_id: u64,
+    first: Option<usize>,
     queue: Vec<usize>,
     head: usize,
 }
 
 impl BatchStreamQueue {
+    #[inline]
     fn new(stream_id: u64) -> Self {
         Self {
             stream_id,
+            first: None,
             queue: Vec::new(),
             head: 0,
         }
     }
 
+    #[inline]
     fn push(&mut self, req_idx: usize) {
-        if self.head == self.queue.len() {
-            self.queue.clear();
-            self.head = 0;
+        if self.head == self.len() {
+            self.clear();
         }
-        self.queue.push(req_idx);
+        if self.first.is_none() && self.queue.is_empty() {
+            self.first = Some(req_idx);
+        } else {
+            self.queue.push(req_idx);
+        }
     }
 
-    fn active(&self) -> &[usize] {
-        self.queue.get(self.head..).unwrap_or(&[])
+    #[inline]
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.queue.len()
     }
 
+    #[inline]
+    fn clear(&mut self) {
+        self.first = None;
+        self.queue.clear();
+        self.head = 0;
+    }
+
+    #[inline]
+    fn get(&self, pos: usize) -> Option<usize> {
+        match (self.first, pos) {
+            (Some(req_idx), 0) => Some(req_idx),
+            (Some(_), pos) => self.queue.get(pos - 1).copied(),
+            (None, pos) => self.queue.get(pos).copied(),
+        }
+    }
+
+    #[inline]
+    fn front(&self) -> Option<(usize, usize)> {
+        self.get(self.head).map(|req_idx| (self.head, req_idx))
+    }
+
+    #[inline]
+    fn active_indices(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (self.head..self.len()).filter_map(|pos| self.get(pos).map(|req_idx| (pos, req_idx)))
+    }
+
+    #[inline]
     fn pop_front(&mut self) -> Option<usize> {
-        let req_idx = *self.queue.get(self.head)?;
+        let (_, req_idx) = self.front()?;
         self.head += 1;
         self.compact_consumed_head();
         Some(req_idx)
     }
 
+    #[inline]
     fn remove(&mut self, queue_pos: usize) -> Option<usize> {
         if queue_pos == self.head {
             return self.pop_front();
         }
-        if queue_pos < self.head || queue_pos >= self.queue.len() {
+        if queue_pos < self.head || queue_pos >= self.len() {
             return None;
         }
-        let req_idx = self.queue.remove(queue_pos);
+        let req_idx = if self.first.is_some() {
+            self.queue.remove(queue_pos - 1)
+        } else {
+            self.queue.remove(queue_pos)
+        };
         self.compact_consumed_head();
         Some(req_idx)
     }
 
+    #[inline]
     fn compact_consumed_head(&mut self) {
         if self.head == 0 {
             return;
         }
-        if self.head >= self.queue.len() {
-            self.queue.clear();
-            self.head = 0;
+        if self.head >= self.len() {
+            self.clear();
             return;
         }
-        if self.head >= STREAM_QUEUE_COMPACT_HEAD_MIN
-            && self.head.saturating_mul(2) >= self.queue.len()
-        {
+        if self.first.is_some() {
+            self.first = None;
+            self.head -= 1;
+        }
+        if self.head == 0 {
+            return;
+        }
+        if self.head >= STREAM_QUEUE_COMPACT_HEAD_MIN && self.head >= self.queue.len() - self.head {
             self.queue.drain(..self.head);
             self.head = 0;
         }
@@ -582,9 +628,8 @@ fn order_batch_indices_into(
         order_urgent_batch_into(items, ordered);
         return;
     }
-    if items.len() < 2 {
-        if !items.iter().any(|item| item.request.stream_scoped) && !state.has_retained_real_state()
-        {
+    if items.len() < 2 && items.first().is_none_or(|item| !item.request.stream_scoped) {
+        if !state.has_retained_real_state() {
             state.clear_idle_retained_preserving_heads();
         }
         append_identity_order(ordered, items.len());
@@ -611,7 +656,7 @@ fn order_batch_indices_into(
     let tie_prefs = snapshot_tie_prefs(state);
     let interactive_quantum = scheduler_quantum(cfg.max_frame_payload);
     let feedback_window = feedback_window(cfg.scheduler_hint, cfg.max_frame_payload);
-    let batch_seq = state.batch_seq.saturating_add(1);
+    let batch_seq = state.batch_seq.wrapping_add(1);
     apply_batch_stream_classes(
         state,
         &mut prepared,
@@ -620,7 +665,7 @@ fn order_batch_indices_into(
         batch_seq,
     );
 
-    if ordered.capacity() < items.len() && ordered.try_reserve(items.len()).is_err() {
+    if !try_reserve_vec_capacity(ordered, items.len()) {
         recycle_build_scratch(state, prepared);
         return;
     }
@@ -730,16 +775,15 @@ fn order_batch_indices_into(
             class_selections_since_bulk,
         );
         let candidate_info = match selected_class {
-            TrafficClass::Bulk => bulk_best
-                .map(|candidate| {
-                    (
+            TrafficClass::Bulk => {
+                if let Some(candidate) = bulk_best {
+                    Some((
                         candidate,
                         bulk_candidates.as_slice(),
                         bulk_group_weight,
                         bulk_active.as_slice(),
-                    )
-                })
-                .or_else(|| {
+                    ))
+                } else {
                     interactive_best.map(|candidate| {
                         (
                             candidate,
@@ -748,17 +792,17 @@ fn order_batch_indices_into(
                             interactive_active.as_slice(),
                         )
                     })
-                }),
-            TrafficClass::Interactive => interactive_best
-                .map(|candidate| {
-                    (
+                }
+            }
+            TrafficClass::Interactive => {
+                if let Some(candidate) = interactive_best {
+                    Some((
                         candidate,
                         interactive_candidates.as_slice(),
                         interactive_group_weight,
                         interactive_active.as_slice(),
-                    )
-                })
-                .or_else(|| {
+                    ))
+                } else {
                     bulk_best.map(|candidate| {
                         (
                             candidate,
@@ -767,7 +811,8 @@ fn order_batch_indices_into(
                             bulk_active.as_slice(),
                         )
                     })
-                }),
+                }
+            }
         };
         let Some((candidate, candidates, total_group_weight, active_class_streams)) =
             candidate_info
@@ -886,21 +931,24 @@ fn build_batch_groups(state: &mut BatchState, items: &[BatchItem]) -> BatchBuild
         let cost = normalize_cost_u64(req.cost);
         if req.stream_scoped {
             has_real_stream_scoped = true;
-            if let Some(prepared_idx) = prepared_stream_index.get(&req.stream_id).copied() {
-                let prepared = &mut prepared_streams[prepared_idx];
-                prepared.meta = item.stream;
-                prepared.queued_bytes = prepared.queued_bytes.saturating_add(cost);
-            } else {
-                let prepared_idx = prepared_streams.len();
-                prepared_streams.push(PreparedStream {
-                    stream_id: req.stream_id,
-                    meta: item.stream,
-                    selection: None,
-                    queued_bytes: cost,
-                    class: TrafficClass::Interactive,
-                    small_burst_armed: false,
-                });
-                prepared_stream_index.insert(req.stream_id, prepared_idx);
+            match prepared_stream_index.entry(req.stream_id) {
+                Entry::Occupied(entry) => {
+                    let prepared = &mut prepared_streams[*entry.get()];
+                    prepared.meta = item.stream;
+                    prepared.queued_bytes = prepared.queued_bytes.saturating_add(cost);
+                }
+                Entry::Vacant(entry) => {
+                    let prepared_idx = prepared_streams.len();
+                    prepared_streams.push(PreparedStream {
+                        stream_id: req.stream_id,
+                        meta: item.stream,
+                        selection: None,
+                        queued_bytes: cost,
+                        class: TrafficClass::Interactive,
+                        small_burst_armed: false,
+                    });
+                    entry.insert(prepared_idx);
+                }
             }
         }
         if req.is_priority_update {
@@ -919,6 +967,7 @@ fn build_batch_groups(state: &mut BatchState, items: &[BatchItem]) -> BatchBuild
     }
 }
 
+#[inline]
 fn recycle_build_scratch(state: &mut BatchState, mut prepared: BatchBuildResult) {
     prepared.groups.clear();
     prepared.prepared_streams.clear();
@@ -952,9 +1001,10 @@ fn recycle_order_scratch(
     state.scratch.bulk_candidates = scratch.bulk_candidates;
 }
 
+#[inline]
 fn take_vec_scratch<T>(slot: &mut Vec<T>, capacity: usize) -> Vec<T> {
     let mut out = if batch_scratch_oversized(slot.capacity(), capacity) {
-        Vec::new()
+        new_vec_scratch(capacity)
     } else {
         mem::take(slot)
     };
@@ -963,18 +1013,20 @@ fn take_vec_scratch<T>(slot: &mut Vec<T>, capacity: usize) -> Vec<T> {
     out
 }
 
+#[inline]
 fn take_bool_scratch(slot: &mut Vec<bool>, len: usize) -> Vec<bool> {
     let mut out = take_vec_scratch(slot, len);
     out.resize(len, false);
     out
 }
 
+#[inline]
 fn take_hashmap_scratch<K, V>(slot: &mut HashMap<K, V>, capacity: usize) -> HashMap<K, V>
 where
     K: Eq + Hash,
 {
     let mut out = if batch_scratch_oversized(slot.capacity(), capacity) {
-        HashMap::new()
+        new_hashmap_scratch(capacity)
     } else {
         mem::take(slot)
     };
@@ -983,57 +1035,89 @@ where
     out
 }
 
+#[inline]
+fn new_vec_scratch<T>(capacity: usize) -> Vec<T> {
+    let mut out = Vec::new();
+    reserve_vec_capacity(&mut out, capacity);
+    out
+}
+
+#[inline]
 fn reserve_vec_capacity<T>(values: &mut Vec<T>, capacity: usize) {
     if values.capacity() < capacity {
-        values.reserve(capacity.saturating_sub(values.len()));
+        let _ = values.try_reserve(capacity - values.len());
     }
 }
 
+#[inline]
+fn try_reserve_vec_capacity<T>(values: &mut Vec<T>, capacity: usize) -> bool {
+    values.capacity() >= capacity || values.try_reserve(capacity - values.len()).is_ok()
+}
+
+#[inline]
 fn batch_scratch_oversized(retained_capacity: usize, capacity_hint: usize) -> bool {
     retained_capacity > batch_scratch_retain_limit(capacity_hint)
 }
 
+#[inline]
 fn batch_scratch_retain_limit(capacity_hint: usize) -> usize {
     capacity_hint
         .max(MIN_BATCH_SCRATCH_RETAIN_HINT)
         .saturating_mul(BATCH_SCRATCH_RETAIN_FACTOR)
 }
 
+#[inline]
+fn new_hashmap_scratch<K, V>(capacity: usize) -> HashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    let mut out = HashMap::new();
+    reserve_hashmap_capacity(&mut out, capacity);
+    out
+}
+
+#[inline]
 fn reserve_hashmap_capacity<K, V>(values: &mut HashMap<K, V>, capacity: usize)
 where
     K: Eq + Hash,
 {
     if values.capacity() < capacity {
-        values.reserve(capacity.saturating_sub(values.len()));
+        let _ = values.try_reserve(capacity - values.len());
     }
 }
 
+#[inline]
 fn group_index(
     groups: &mut Vec<BatchBuiltGroup>,
     group_indices: &mut HashMap<GroupKey, usize>,
     group_key: GroupKey,
 ) -> usize {
-    if let Some(index) = group_indices.get(&group_key).copied() {
-        return index;
+    match group_indices.entry(group_key) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => {
+            let index = groups.len();
+            groups.push(BatchBuiltGroup {
+                key: group_key,
+                streams: Vec::new(),
+                stream_index: None,
+            });
+            entry.insert(index);
+            index
+        }
     }
-    let index = groups.len();
-    groups.push(BatchBuiltGroup {
-        key: group_key,
-        streams: Vec::new(),
-        stream_index: None,
-    });
-    group_indices.insert(group_key, index);
-    index
 }
 
+#[inline]
 fn group_stream_index(streams: &[BatchStreamQueue]) -> HashMap<u64, usize> {
-    let mut index = HashMap::with_capacity(streams.len());
+    let mut index = HashMap::new();
+    let _ = index.try_reserve(streams.len());
     for (pos, stream) in streams.iter().enumerate() {
         index.insert(stream.stream_id, pos);
     }
     index
 }
 
+#[inline]
 fn synthetic_stream_key(req: RequestMeta, idx: usize) -> u64 {
     if req.stream_scoped {
         req.stream_id
@@ -1042,6 +1126,7 @@ fn synthetic_stream_key(req: RequestMeta, idx: usize) -> u64 {
     }
 }
 
+#[inline]
 fn is_synthetic_stream_key(stream_id: u64) -> bool {
     stream_id & SYNTHETIC_STREAM_KEY_BIT != 0
 }
@@ -1080,7 +1165,7 @@ fn apply_batch_stream_classes(
         if state
             .stream_last_seen_batch
             .get(&stream_id)
-            .is_none_or(|last| batch_seq.saturating_sub(*last) >= 2)
+            .is_none_or(|last| batch_seq.wrapping_sub(*last) >= 2)
         {
             state.small_burst_disarmed.remove(&stream_id);
         }
@@ -1135,27 +1220,24 @@ fn refresh_active_stream_selections(
     }
 }
 
+#[inline]
 fn select_stream_candidate(
     stream: &BatchStreamQueue,
     items: &[BatchItem],
     advisory_only: bool,
 ) -> Option<(usize, usize, i64, bool)> {
-    for (offset, &idx) in stream.active().iter().enumerate() {
-        if items[idx].request.is_priority_update {
-            let pos = stream.head + offset;
-            return Some((idx, pos, normalize_cost(items[idx].request.cost), true));
+    for (pos, idx) in stream.active_indices() {
+        let request = items[idx].request;
+        if request.is_priority_update {
+            return Some((idx, pos, normalize_cost(request.cost), true));
         }
     }
     if advisory_only {
         return None;
     }
-    let idx = *stream.active().first()?;
-    Some((
-        idx,
-        stream.head,
-        normalize_cost(items[idx].request.cost),
-        false,
-    ))
+    let (pos, idx) = stream.front()?;
+    let request = items[idx].request;
+    Some((idx, pos, normalize_cost(request.cost), false))
 }
 
 fn top_candidates_for_group_classes(
@@ -1185,14 +1267,17 @@ fn top_candidates_for_group_classes(
         let Some(selection) = prepared_stream.selection else {
             continue;
         };
+        let class = prepared_stream.class;
         let base_weight = selection.base_weight;
+        let stream_lag_value = stream_lag(ctx.state, stream_id);
+        let fresh_stream = is_fresh_stream(ctx.state, stream_id);
         let lag_adjusted_weight = adjust_weight_for_lag(
             base_weight,
-            stream_lag(ctx.state, stream_id),
+            stream_lag_value,
             ctx.feedback_window,
-            is_fresh_stream(ctx.state, stream_id),
+            fresh_stream,
         );
-        let active_class_streams = match prepared_stream.class {
+        let active_class_streams = match class {
             TrafficClass::Bulk => ctx.bulk_active.len(),
             TrafficClass::Interactive => ctx.interactive_active.len(),
         };
@@ -1207,6 +1292,7 @@ fn top_candidates_for_group_classes(
         let stream_start = stream_finish_tag(ctx.state, stream_id).max(group_virtual);
         let stream_finish =
             stream_start.saturating_add(service_tag(selection.cost, effective_weight.max(1)));
+        let stream_last_served = stream_last_served(ctx.state, stream_id);
         let candidate = StreamCandidate {
             stream_id,
             req_idx: selection.req_idx,
@@ -1215,12 +1301,12 @@ fn top_candidates_for_group_classes(
             base_weight,
             stream_start,
             stream_finish,
-            stream_last_served: stream_last_served(ctx.state, stream_id),
+            stream_last_served,
             eligible: stream_start <= group_virtual,
             is_priority_update: selection.is_priority_update,
             stream_order,
         };
-        match prepared_stream.class {
+        match class {
             TrafficClass::Bulk => {
                 total_bulk_base = total_bulk_base.saturating_add(base_weight);
                 total_bulk_weight = total_bulk_weight.saturating_add(effective_weight);
@@ -1243,46 +1329,45 @@ fn top_candidates_for_group_classes(
         }
     }
 
-    CandidatePair {
-        interactive: interactive_top.map(|top| {
-            build_group_class_candidate(
-                ctx.cfg,
-                GroupCandidateState {
-                    group_key: group.key,
-                    group_order,
-                    class: TrafficClass::Interactive,
-                    total_base_stream_weight: total_interactive_base,
-                    total_stream_weight: total_interactive_weight,
-                    feedback_window: ctx.feedback_window,
-                    root_virtual,
-                    group_finish_base,
-                    group_last_served: group_last_served_value,
-                    group_lag: group_lag_value,
-                    fresh_group,
-                },
-                top,
-            )
-        }),
-        bulk: bulk_top.map(|top| {
-            build_group_class_candidate(
-                ctx.cfg,
-                GroupCandidateState {
-                    group_key: group.key,
-                    group_order,
-                    class: TrafficClass::Bulk,
-                    total_base_stream_weight: total_bulk_base,
-                    total_stream_weight: total_bulk_weight,
-                    feedback_window: ctx.feedback_window,
-                    root_virtual,
-                    group_finish_base,
-                    group_last_served: group_last_served_value,
-                    group_lag: group_lag_value,
-                    fresh_group,
-                },
-                top,
-            )
-        }),
-    }
+    let interactive = interactive_top.map(|top| {
+        build_group_class_candidate(
+            ctx.cfg,
+            GroupCandidateState {
+                group_key: group.key,
+                group_order,
+                class: TrafficClass::Interactive,
+                total_base_stream_weight: total_interactive_base,
+                total_stream_weight: total_interactive_weight,
+                feedback_window: ctx.feedback_window,
+                root_virtual,
+                group_finish_base,
+                group_last_served: group_last_served_value,
+                group_lag: group_lag_value,
+                fresh_group,
+            },
+            top,
+        )
+    });
+    let bulk = bulk_top.map(|top| {
+        build_group_class_candidate(
+            ctx.cfg,
+            GroupCandidateState {
+                group_key: group.key,
+                group_order,
+                class: TrafficClass::Bulk,
+                total_base_stream_weight: total_bulk_base,
+                total_stream_weight: total_bulk_weight,
+                feedback_window: ctx.feedback_window,
+                root_virtual,
+                group_finish_base,
+                group_last_served: group_last_served_value,
+                group_lag: group_lag_value,
+                fresh_group,
+            },
+            top,
+        )
+    });
+    CandidatePair { interactive, bulk }
 }
 
 fn build_group_class_candidate(
@@ -1541,7 +1626,7 @@ fn commit_wfq_selection(
     active_group_weight: u64,
     active_stream_weight: u64,
 ) {
-    state.service_seq = state.service_seq.saturating_add(1);
+    state.service_seq = next_service_seq(state.service_seq);
     let seq = state.service_seq;
 
     let root_virtual = state.root_virtual_time.max(candidate.group_start);
@@ -1654,6 +1739,7 @@ fn next_real_stream_head(streams: &[BatchStreamQueue], selected: usize) -> Optio
     None
 }
 
+#[inline]
 fn append_remaining_in_input_order(ordered: &mut Vec<usize>, selected: &mut [bool], size: usize) {
     for (idx, selected) in selected.iter_mut().enumerate().take(size) {
         if !*selected {
@@ -1663,9 +1749,10 @@ fn append_remaining_in_input_order(ordered: &mut Vec<usize>, selected: &mut [boo
     }
 }
 
+#[inline]
 fn append_identity_order(order: &mut Vec<usize>, n: usize) {
     order.clear();
-    if order.capacity() < n && order.try_reserve(n).is_err() {
+    if !try_reserve_vec_capacity(order, n) {
         return;
     }
     order.extend(0..n);
@@ -1724,10 +1811,13 @@ fn better_group_candidate(prefs: &TiePrefs, left: GroupCandidate, right: GroupCa
         return left.stream.stream_start < right.stream.stream_start;
     }
     if left.group_last_served != right.group_last_served {
-        return left.group_last_served < right.group_last_served;
+        return service_seq_precedes(left.group_last_served, right.group_last_served);
     }
     if left.stream.stream_last_served != right.stream.stream_last_served {
-        return left.stream.stream_last_served < right.stream.stream_last_served;
+        return service_seq_precedes(
+            left.stream.stream_last_served,
+            right.stream.stream_last_served,
+        );
     }
     if left.group_order != right.group_order {
         return left.group_order < right.group_order;
@@ -1760,9 +1850,29 @@ fn better_stream_candidate(
         }
     }
     if left.stream_last_served != right.stream_last_served {
-        return left.stream_last_served < right.stream_last_served;
+        return service_seq_precedes(left.stream_last_served, right.stream_last_served);
     }
     left.stream_order < right.stream_order
+}
+
+#[inline]
+fn next_service_seq(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
+#[inline]
+fn service_seq_precedes(left: u64, right: u64) -> bool {
+    match (left, right) {
+        (0, 0) => false,
+        (0, _) => true,
+        (_, 0) => false,
+        (left, right) => right.wrapping_sub(left) < (1u64 << 63),
+    }
 }
 
 fn better_eligible_window(
@@ -1795,12 +1905,9 @@ fn snapshot_tie_prefs(state: &mut BatchState) -> TiePrefs {
         &mut state.scratch.tie_pref_streams,
         state.preferred_stream_head.len(),
     );
-    streams.extend(
-        state
-            .preferred_stream_head
-            .iter()
-            .map(|(group, stream)| (*group, *stream)),
-    );
+    for (&group, &stream) in &state.preferred_stream_head {
+        streams.insert(group, stream);
+    }
     TiePrefs {
         group: state.preferred_group_head,
         streams,
@@ -1842,6 +1949,7 @@ fn classify_stream_class(
     }
 }
 
+#[inline]
 pub(super) fn write_burst_limit(priority: u64, hint: SchedulerHint) -> u32 {
     match priority {
         16..=u64::MAX => SATURATED_WRITE_BURST_FRAMES,
@@ -1852,9 +1960,10 @@ pub(super) fn write_burst_limit(priority: u64, hint: SchedulerHint) -> u32 {
     }
 }
 
+#[inline]
 fn scheduler_quantum(max_payload: u64) -> u64 {
     if max_payload == 0 {
-        Settings::default().max_frame_payload
+        Settings::DEFAULT.max_frame_payload
     } else {
         max_payload
     }
@@ -1890,6 +1999,7 @@ fn stream_weight(priority: u64, queued_bytes: u64, hint: SchedulerHint, max_payl
     base.max(1)
 }
 
+#[inline]
 fn feedback_window(hint: SchedulerHint, max_payload: u64) -> i64 {
     let window = match hint {
         SchedulerHint::Latency => scheduler_quantum(max_payload).saturating_mul(6),
@@ -1903,6 +2013,7 @@ fn feedback_window(hint: SchedulerHint, max_payload: u64) -> i64 {
     }
 }
 
+#[inline]
 fn adjust_weight_for_lag(base: u64, lag: i64, window: i64, fresh: bool) -> u64 {
     let mut base = base.max(1);
     if fresh {
@@ -1924,6 +2035,7 @@ fn adjust_weight_for_lag(base: u64, lag: i64, window: i64, fresh: bool) -> u64 {
     base.saturating_sub(penalty).max(1)
 }
 
+#[inline]
 fn lag_scaled_weight(base: u64, magnitude: i64, divisor: u64) -> u64 {
     if base == 0 || magnitude <= 0 || divisor == 0 {
         0
@@ -1932,6 +2044,7 @@ fn lag_scaled_weight(base: u64, magnitude: i64, divisor: u64) -> u64 {
     }
 }
 
+#[inline]
 fn group_weight(group_key: GroupKey, stream_weight: u64, hint: SchedulerHint) -> u64 {
     if group_key.kind != 1 {
         return stream_weight.max(1);
@@ -1943,6 +2056,7 @@ fn group_weight(group_key: GroupKey, stream_weight: u64, hint: SchedulerHint) ->
     }
 }
 
+#[inline]
 fn priority_weight(priority: u64, hint: SchedulerHint) -> u64 {
     match hint {
         SchedulerHint::Latency => banded_weight(priority, 16, 24, 32, 48, 64, 96),
@@ -1951,6 +2065,7 @@ fn priority_weight(priority: u64, hint: SchedulerHint) -> u64 {
     }
 }
 
+#[inline]
 fn banded_weight(
     priority: u64,
     base: u64,
@@ -1970,19 +2085,23 @@ fn banded_weight(
     }
 }
 
+#[inline]
 fn service_tag(cost: i64, weight: u64) -> u64 {
     let total = saturating_mul_div_ceil(normalize_cost_u64(cost), WFQ_TAG_SCALE, weight.max(1));
     total.max(1)
 }
 
+#[inline]
 fn normalize_cost(cost: i64) -> i64 {
     cost.max(1)
 }
 
+#[inline]
 fn normalize_cost_u64(cost: i64) -> u64 {
     i64_to_u64_saturating(normalize_cost(cost))
 }
 
+#[inline]
 fn fair_share(cost: i64, weight: u64, total_weight: u64) -> i64 {
     if cost <= 0 || weight == 0 || total_weight == 0 {
         return 0;
@@ -1994,6 +2113,7 @@ fn fair_share(cost: i64, weight: u64, total_weight: u64) -> i64 {
     ))
 }
 
+#[inline]
 fn apply_lag_feedback(current: i64, expected: i64, actual: i64, window: i64) -> i64 {
     if window <= 0 {
         return 0;
@@ -2004,18 +2124,16 @@ fn apply_lag_feedback(current: i64, expected: i64, actual: i64, window: i64) -> 
     clamp_lag(current.saturating_sub(actual - expected), window)
 }
 
+#[inline]
 fn clamp_lag(value: i64, window: i64) -> i64 {
     if window <= 0 {
         return 0;
     }
-    let limit = if window <= MAX_SIGNED_I64 / 2 {
-        window * 2
-    } else {
-        MAX_SIGNED_I64
-    };
+    let limit = window.saturating_mul(2);
     value.clamp(-limit, limit)
 }
 
+#[inline]
 fn is_fresh_stream(state: &BatchState, stream_id: u64) -> bool {
     !is_synthetic_stream_key(stream_id)
         && !state.stream_finish_tag.contains_key(&stream_id)
@@ -2023,6 +2141,7 @@ fn is_fresh_stream(state: &BatchState, stream_id: u64) -> bool {
         && !state.stream_lag.contains_key(&stream_id)
 }
 
+#[inline]
 fn is_fresh_group(state: &BatchState, group_key: GroupKey) -> bool {
     !group_key.is_transient()
         && !state.group_finish_tag.contains_key(&group_key)
@@ -2030,6 +2149,7 @@ fn is_fresh_group(state: &BatchState, group_key: GroupKey) -> bool {
         && !state.group_lag.contains_key(&group_key)
 }
 
+#[inline]
 fn group_virtual_time(state: &BatchState, group_key: GroupKey) -> u64 {
     state
         .group_virtual_time
@@ -2038,10 +2158,12 @@ fn group_virtual_time(state: &BatchState, group_key: GroupKey) -> u64 {
         .unwrap_or(0)
 }
 
+#[inline]
 fn group_finish_tag(state: &BatchState, group_key: GroupKey) -> u64 {
     state.group_finish_tag.get(&group_key).copied().unwrap_or(0)
 }
 
+#[inline]
 fn group_last_served(state: &BatchState, group_key: GroupKey) -> u64 {
     state
         .group_last_service
@@ -2050,6 +2172,7 @@ fn group_last_served(state: &BatchState, group_key: GroupKey) -> u64 {
         .unwrap_or(0)
 }
 
+#[inline]
 fn stream_finish_tag(state: &BatchState, stream_id: u64) -> u64 {
     state
         .stream_finish_tag
@@ -2058,6 +2181,7 @@ fn stream_finish_tag(state: &BatchState, stream_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
+#[inline]
 fn stream_last_served(state: &BatchState, stream_id: u64) -> u64 {
     state
         .stream_last_service
@@ -2066,10 +2190,12 @@ fn stream_last_served(state: &BatchState, stream_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
+#[inline]
 fn group_lag(state: &BatchState, group_key: GroupKey) -> i64 {
     state.group_lag.get(&group_key).copied().unwrap_or(0)
 }
 
+#[inline]
 fn stream_lag(state: &BatchState, stream_id: u64) -> i64 {
     state.stream_lag.get(&stream_id).copied().unwrap_or(0)
 }
@@ -2078,12 +2204,13 @@ fn maybe_rebase_wfq_state(state: &mut BatchState) {
     if state.root_virtual_time < (1u64 << 48) {
         return;
     }
-    let floor = state
-        .group_virtual_time
-        .values()
+    let floor = std::iter::once(&state.root_virtual_time)
+        .chain(state.group_virtual_time.values())
         .chain(state.group_finish_tag.values())
         .chain(state.stream_finish_tag.values())
-        .fold(state.root_virtual_time, |floor, tag| floor.min(*tag));
+        .copied()
+        .min()
+        .unwrap_or(0);
     if floor == 0 {
         return;
     }
@@ -2099,6 +2226,7 @@ fn maybe_rebase_wfq_state(state: &mut BatchState) {
     }
 }
 
+#[inline]
 fn saturating_mul_div_ceil(value: u64, multiplier: u64, divisor: u64) -> u64 {
     if divisor == 0 {
         return u64::MAX;
@@ -2107,6 +2235,7 @@ fn saturating_mul_div_ceil(value: u64, multiplier: u64, divisor: u64) -> u64 {
     u128_to_u64_saturating(product.div_ceil(u128::from(divisor)))
 }
 
+#[inline]
 fn saturating_mul_div_floor(value: u64, multiplier: u64, divisor: u64) -> u64 {
     if divisor == 0 {
         return u64::MAX;
@@ -2115,20 +2244,28 @@ fn saturating_mul_div_floor(value: u64, multiplier: u64, divisor: u64) -> u64 {
     u128_to_u64_saturating(product / u128::from(divisor))
 }
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
+#[inline]
 fn i64_to_u64_saturating(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or(0)
+    if value <= 0 {
+        0
+    } else {
+        value as u64
+    }
 }
 
+#[inline]
 fn u64_to_i64_saturating(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(MAX_SIGNED_I64)
+    value.min(MAX_SIGNED_I64 as u64) as i64
 }
 
+#[inline]
 fn u128_to_u64_saturating(value: u128) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -2228,7 +2365,7 @@ mod tests {
         let (req_idx, queue_pos, _, is_priority_update) =
             select_stream_candidate(&queue, &items, false).unwrap();
         assert_eq!(req_idx, 4);
-        assert_eq!(queue_pos, 4);
+        assert_eq!(queue_pos, 3);
         assert!(is_priority_update);
 
         assert_eq!(queue.remove(queue_pos), Some(4));
@@ -2310,8 +2447,7 @@ mod tests {
         scheduler.state.stream_finish_tag = HashMap::with_capacity(2048);
         scheduler.state.preferred_stream_head = HashMap::with_capacity(2048);
         scheduler.active_group_refs = HashMap::with_capacity(2048);
-        scheduler.stream_group_buckets = HashMap::with_capacity(2048);
-        scheduler.stream_group_values = HashMap::with_capacity(2048);
+        scheduler.stream_groups = HashMap::with_capacity(2048);
 
         scheduler
             .state
@@ -2323,8 +2459,13 @@ mod tests {
             .preferred_stream_head
             .insert(GroupKey::explicit(7), 4);
         scheduler.active_group_refs.insert(7, 1);
-        scheduler.stream_group_buckets.insert(4, 7);
-        scheduler.stream_group_values.insert(4, 7);
+        scheduler.stream_groups.insert(
+            4,
+            StreamGroupBinding {
+                group: 7,
+                bucket: 7,
+            },
+        );
         assert!(scheduler.active_group_refs.capacity() >= 2048);
 
         scheduler.clear();
@@ -2333,8 +2474,7 @@ mod tests {
         assert_eq!(scheduler.state.stream_finish_tag.capacity(), 0);
         assert_eq!(scheduler.state.preferred_stream_head.capacity(), 0);
         assert_eq!(scheduler.active_group_refs.capacity(), 0);
-        assert_eq!(scheduler.stream_group_buckets.capacity(), 0);
-        assert_eq!(scheduler.stream_group_values.capacity(), 0);
+        assert_eq!(scheduler.stream_groups.capacity(), 0);
     }
 
     #[test]
@@ -2803,10 +2943,19 @@ mod tests {
             scheduler.active_group_refs.get(&FALLBACK_GROUP_BUCKET),
             Some(&1)
         );
-        assert_eq!(scheduler.stream_group_values.get(&99), Some(&99));
         assert_eq!(
-            scheduler.stream_group_buckets.get(&99),
-            Some(&FALLBACK_GROUP_BUCKET)
+            scheduler
+                .stream_groups
+                .get(&99)
+                .map(|binding| binding.group),
+            Some(99)
+        );
+        assert_eq!(
+            scheduler
+                .stream_groups
+                .get(&99)
+                .map(|binding| binding.bucket),
+            Some(FALLBACK_GROUP_BUCKET)
         );
 
         scheduler.drop_stream(1);
@@ -2861,7 +3010,13 @@ mod tests {
         assert_eq!(scheduler.active_group_refs.get(&7), Some(&1));
         assert_eq!(scheduler.active_group_refs.get(&9), Some(&1));
         assert!(scheduler.state.group_virtual_time.contains_key(&old_group));
-        assert_eq!(scheduler.stream_group_buckets.get(&8), Some(&7));
+        assert_eq!(
+            scheduler
+                .stream_groups
+                .get(&8)
+                .map(|binding| binding.bucket),
+            Some(7)
+        );
 
         assert_eq!(scheduler.group_key_for_stream(8, Some(9), true), new_group);
 
@@ -2884,8 +3039,7 @@ mod tests {
         );
 
         assert!(!scheduler.active_group_refs.contains_key(&7));
-        assert!(!scheduler.stream_group_buckets.contains_key(&4));
-        assert!(!scheduler.stream_group_values.contains_key(&4));
+        assert!(!scheduler.stream_groups.contains_key(&4));
         assert!(!scheduler.state.group_virtual_time.contains_key(&old_group));
     }
 

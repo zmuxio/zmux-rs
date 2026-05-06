@@ -34,13 +34,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Semaphore};
 use zmux::{
-    build_open_metadata_prefix, parse_stream_metadata_bytes_view, read_varint, BoxFuture,
-    OpenOptions, RecvStreamApi, Result, SendStreamApi, Session, StreamApi, StreamInfo,
-    StreamMetadata, CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS, CAPABILITY_STREAM_GROUPS,
+    build_open_metadata_prefix, parse_stream_metadata_bytes_view, read_varint, AsyncBoxFuture,
+    AsyncRecvStreamApi, AsyncSendStreamApi, AsyncSession, AsyncStreamApi, AsyncStreamInfo,
+    OpenOptions, OpenRequest, OpenSend, Result, StreamMetadata, WritePayload,
+    CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS, CAPABILITY_STREAM_GROUPS,
 };
 
 pub const STREAM_PRELUDE_MAX_PAYLOAD: u64 = 16 << 10;
-pub const QUINN_WRITEV_COALESCE_MAX_BYTES: usize = 64 << 10;
+pub const QUINN_WRITE_VECTORED_COALESCE_MAX_BYTES: usize = 64 << 10;
 pub const OPEN_METADATA_CAPABILITIES: u64 =
     CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_HINTS | CAPABILITY_STREAM_GROUPS;
 pub const DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +71,32 @@ pub fn target_suites() -> &'static [zmux::ConformanceSuite] {
     &[zmux::ConformanceSuite::StreamAdapterProfile]
 }
 
+/// Returns the process-wide default accepted prelude parsing concurrency.
+///
+/// `SessionOptions::default()` follows this value until a session explicitly
+/// sets `accepted_prelude_max_concurrent`.
+pub fn default_accepted_prelude_max_concurrent() -> usize {
+    let current = DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT_VALUE.load(Ordering::Acquire);
+    if current > 0 {
+        current.min(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
+    } else {
+        1
+    }
+}
+
+/// Updates the process-wide accepted prelude parsing concurrency default.
+///
+/// Values above `MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT` are clamped. Passing zero
+/// restores the built-in `DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT` value.
+pub fn set_default_accepted_prelude_max_concurrent(max: usize) {
+    let max = if max == 0 {
+        DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
+    } else {
+        max.min(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
+    };
+    DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT_VALUE.store(max, Ordering::Release);
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcceptedStreamMetadata {
     pub metadata: StreamMetadata,
@@ -95,13 +122,29 @@ impl AcceptedStreamMetadata {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AcceptedPreludeReadTimeout {
+    #[default]
+    Default,
+    Disabled,
+    Timeout(Duration),
+}
+
+impl AcceptedPreludeReadTimeout {
+    fn normalize(self) -> Option<Duration> {
+        match self {
+            Self::Default => Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT),
+            Self::Disabled => None,
+            Self::Timeout(timeout) if timeout.is_zero() => {
+                Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT)
+            }
+            Self::Timeout(timeout) => Some(timeout),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionOptions {
-    /// `None` and `Some(Duration::ZERO)` use the repository default. Set
-    /// `disable_accepted_prelude_read_timeout` to disable the adapter-managed
-    /// timeout, matching Go/Java's negative-duration disable knob without
-    /// introducing signed durations into this API.
-    pub accepted_prelude_read_timeout: Option<Duration>,
-    pub disable_accepted_prelude_read_timeout: bool,
+    pub accepted_prelude_read_timeout: AcceptedPreludeReadTimeout,
     pub accepted_prelude_max_concurrent: Option<usize>,
     pub local_addr: Option<SocketAddr>,
     pub peer_addr: Option<SocketAddr>,
@@ -113,17 +156,18 @@ impl SessionOptions {
     }
 
     pub fn with_accepted_prelude_read_timeout(mut self, timeout: Duration) -> Self {
-        self.accepted_prelude_read_timeout = Some(timeout);
-        self.disable_accepted_prelude_read_timeout = false;
+        self.accepted_prelude_read_timeout = AcceptedPreludeReadTimeout::Timeout(timeout);
         self
     }
 
-    pub fn without_accepted_prelude_read_timeout(mut self) -> Self {
-        self.accepted_prelude_read_timeout = None;
-        self.disable_accepted_prelude_read_timeout = true;
+    pub fn disable_accepted_prelude_read_timeout(mut self) -> Self {
+        self.accepted_prelude_read_timeout = AcceptedPreludeReadTimeout::Disabled;
         self
     }
 
+    /// Sets this session's accepted prelude parsing concurrency.
+    ///
+    /// Passing zero leaves the session on the current process-wide default.
     pub fn with_accepted_prelude_max_concurrent(mut self, max: usize) -> Self {
         self.accepted_prelude_max_concurrent = Some(max);
         self
@@ -153,9 +197,9 @@ impl SessionOptions {
 pub fn build_stream_prelude(opts: &OpenOptions) -> Result<Vec<u8>> {
     let prelude = build_open_metadata_prefix(
         OPEN_METADATA_CAPABILITIES,
-        opts.initial_priority,
-        opts.initial_group,
-        &opts.open_info,
+        opts.initial_priority(),
+        opts.initial_group(),
+        opts.open_info(),
         STREAM_PRELUDE_MAX_PAYLOAD,
     )?;
     if prelude.is_empty() {
@@ -186,41 +230,20 @@ pub fn read_stream_prelude<R: Read>(reader: &mut R) -> Result<AcceptedStreamMeta
     let (metadata, metadata_valid) = parse_stream_metadata_bytes_view(&metadata_raw)
         .map_err(|_| protocol_prelude_error("malformed stream prelude metadata"))?;
     Ok(AcceptedStreamMetadata {
-        metadata: metadata.to_owned_metadata(),
+        metadata: metadata.try_to_owned()?,
         metadata_valid,
     })
 }
 
-pub fn default_accepted_prelude_max_concurrent() -> usize {
-    DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT_VALUE
-        .load(Ordering::Relaxed)
-        .clamp(1, MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
-}
-
-pub fn set_default_accepted_prelude_max_concurrent(max: usize) {
-    let max = if max == 0 {
-        DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
-    } else {
-        max.min(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
-    };
-    DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT_VALUE.store(max, Ordering::Relaxed);
-}
-
 fn normalize_accepted_prelude_read_timeout(opts: SessionOptions) -> Option<Duration> {
-    if opts.disable_accepted_prelude_read_timeout {
-        return None;
-    }
-    match opts.accepted_prelude_read_timeout {
-        None => Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT),
-        Some(timeout) if timeout.is_zero() => Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT),
-        Some(timeout) => Some(timeout),
-    }
+    opts.accepted_prelude_read_timeout.normalize()
 }
 
 fn normalize_accepted_prelude_max_concurrent(max: Option<usize>) -> usize {
-    max.filter(|max| *max > 0)
-        .unwrap_or_else(default_accepted_prelude_max_concurrent)
-        .clamp(1, MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
+    match max {
+        Some(max) if max > 0 => max.min(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT),
+        _ => default_accepted_prelude_max_concurrent(),
+    }
 }
 
 #[derive(Clone)]
@@ -268,10 +291,6 @@ impl QuinnSession {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
-    }
-
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
 
     pub async fn accept_stream(&self) -> Result<QuinnStream> {
@@ -438,14 +457,19 @@ impl QuinnSession {
     }
 
     pub async fn open_stream(&self) -> Result<QuinnStream> {
-        self.open_stream_with_options(OpenOptions::default()).await
+        self.open_stream_with(OpenRequest::new()).await
     }
 
-    pub async fn open_stream_timeout(&self, timeout: Duration) -> Result<QuinnStream> {
-        with_timeout(self.open_stream(), timeout, "open").await
+    pub async fn open_stream_with(&self, request: impl Into<OpenRequest>) -> Result<QuinnStream> {
+        let (opts, timeout) = request.into().into_parts();
+        let open = self.open_stream_inner(opts);
+        match timeout {
+            Some(timeout) => with_timeout(open, timeout, "open").await,
+            None => open.await,
+        }
     }
 
-    pub async fn open_stream_with_options(&self, opts: OpenOptions) -> Result<QuinnStream> {
+    async fn open_stream_inner(&self, opts: OpenOptions) -> Result<QuinnStream> {
         let prelude = PreludeState::local(opts)?;
         let started_at = Instant::now();
         let (send, recv) = self
@@ -469,24 +493,23 @@ impl QuinnSession {
         Ok(stream.with_active(self.active.clone(), ActiveKind::LocalBidi))
     }
 
-    pub async fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<QuinnStream> {
-        with_timeout(self.open_stream_with_options(opts), timeout, "open").await
-    }
-
     pub async fn open_uni_stream(&self) -> Result<QuinnSendStream> {
-        self.open_uni_stream_with_options(OpenOptions::default())
-            .await
+        self.open_uni_stream_with(OpenRequest::new()).await
     }
 
-    pub async fn open_uni_stream_timeout(&self, timeout: Duration) -> Result<QuinnSendStream> {
-        with_timeout(self.open_uni_stream(), timeout, "open").await
+    pub async fn open_uni_stream_with(
+        &self,
+        request: impl Into<OpenRequest>,
+    ) -> Result<QuinnSendStream> {
+        let (opts, timeout) = request.into().into_parts();
+        let open = self.open_uni_stream_inner(opts);
+        match timeout {
+            Some(timeout) => with_timeout(open, timeout, "open").await,
+            None => open.await,
+        }
     }
 
-    pub async fn open_uni_stream_with_options(&self, opts: OpenOptions) -> Result<QuinnSendStream> {
+    async fn open_uni_stream_inner(&self, opts: OpenOptions) -> Result<QuinnSendStream> {
         let prelude = PreludeState::local(opts)?;
         let started_at = Instant::now();
         let send = self
@@ -509,225 +532,113 @@ impl QuinnSession {
         Ok(stream.with_active(self.active.clone(), ActiveKind::LocalUni))
     }
 
-    pub async fn open_uni_stream_with_options_timeout(
+    pub async fn open_and_send<'a>(
         &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<QuinnSendStream> {
-        with_timeout(self.open_uni_stream_with_options(opts), timeout, "open").await
-    }
-
-    pub async fn open_and_send(&self, data: &[u8]) -> Result<(QuinnStream, usize)> {
-        self.open_and_send_with_options(OpenOptions::default(), data)
-            .await
-    }
-
-    pub async fn open_and_send_timeout(
-        &self,
-        data: &[u8],
-        timeout: Duration,
+        request: impl Into<OpenSend<'a>>,
     ) -> Result<(QuinnStream, usize)> {
-        self.open_and_send_with_options_timeout(OpenOptions::default(), data, timeout)
-            .await
-    }
-
-    pub async fn open_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(QuinnStream, usize)> {
-        let stream = self.open_stream_with_options(opts).await?;
-        if data.is_empty() {
-            return Ok((stream, 0));
-        }
-        let n = stream.write(data).await?;
-        Ok((stream, n))
-    }
-
-    pub async fn open_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(QuinnStream, usize)> {
-        ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
+        let (opts, payload, timeout) = request.into().into_parts();
+        let requested = payload.checked_len()?;
         let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
+            open = open.with_timeout(timeout);
+        }
         let stream = self
-            .open_stream_with_options_timeout(opts, timeout)
+            .open_stream_with(open)
             .await
             .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
-        if data.is_empty() {
+        if requested == 0 {
             return Ok((stream, 0));
         }
-        let timeout = remaining_write_timeout(start, timeout)?;
-        let n = stream.write_timeout(data, timeout).await.map_err(|err| {
-            err.with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write)
-        })?;
-        Ok((stream, n))
+        let timeout = timeout
+            .map(|timeout| remaining_write_timeout(start, timeout))
+            .transpose()?;
+        let n = match (payload, timeout) {
+            (WritePayload::Bytes(data), Some(timeout)) => stream
+                .write_timeout(data.as_ref(), timeout)
+                .await
+                .map_err(|err| {
+                    err.with_stream_context(
+                        zmux::ErrorOperation::Write,
+                        zmux::ErrorDirection::Write,
+                    )
+                })?,
+            (WritePayload::Bytes(data), None) => stream.write(data.as_ref()).await?,
+            (WritePayload::Vectored(parts), Some(timeout)) => stream
+                .write_vectored_timeout(parts, timeout)
+                .await
+                .map_err(|err| {
+                    err.with_stream_context(
+                        zmux::ErrorOperation::Write,
+                        zmux::ErrorDirection::Write,
+                    )
+                })?,
+            (WritePayload::Vectored(parts), None) => stream.write_vectored(parts).await?,
+        };
+        Ok((stream, validate_progress(n, requested)?))
     }
 
-    pub async fn open_and_send_vectored(
+    pub async fn open_uni_and_send<'a>(
         &self,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(QuinnStream, usize)> {
-        self.open_and_send_vectored_with_options(OpenOptions::default(), parts)
-            .await
-    }
-
-    pub async fn open_and_send_vectored_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(QuinnStream, usize)> {
-        self.open_and_send_vectored_with_options_timeout(OpenOptions::default(), parts, timeout)
-            .await
-    }
-
-    pub async fn open_and_send_vectored_with_options(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(QuinnStream, usize)> {
-        let total = total_bytes(parts.iter().map(|part| part.len()))?;
-        let stream = self.open_stream_with_options(opts).await?;
-        if total == 0 {
-            return Ok((stream, 0));
+        request: impl Into<OpenSend<'a>>,
+    ) -> Result<(QuinnSendStream, usize)> {
+        let (opts, payload, timeout) = request.into().into_parts();
+        let requested = payload.checked_len()?;
+        let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
+            open = open.with_timeout(timeout);
         }
-        let n = stream.write_vectored(parts).await?;
-        Ok((stream, n))
-    }
-
-    pub async fn open_and_send_vectored_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(QuinnStream, usize)> {
-        ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
-        let total = total_bytes(parts.iter().map(|part| part.len()))?;
-        let start = Instant::now();
         let stream = self
-            .open_stream_with_options_timeout(opts, timeout)
+            .open_uni_stream_with(open)
             .await
             .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
-        if total == 0 {
-            return Ok((stream, 0));
-        }
-        let timeout = remaining_write_timeout(start, timeout)?;
-        let n = stream
-            .write_vectored_timeout(parts, timeout)
-            .await
-            .map_err(|err| {
-                err.with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write)
-            })?;
-        Ok((stream, n))
+        let timeout = timeout
+            .map(|timeout| remaining_write_timeout(start, timeout))
+            .transpose()?;
+        let n = match (payload, timeout) {
+            (WritePayload::Bytes(data), Some(timeout)) => stream
+                .write_final_timeout(WritePayload::Bytes(data), timeout)
+                .await
+                .map_err(|err| {
+                    err.with_stream_context(
+                        zmux::ErrorOperation::Write,
+                        zmux::ErrorDirection::Write,
+                    )
+                })?,
+            (WritePayload::Bytes(data), None) => {
+                stream.write_final(WritePayload::Bytes(data)).await?
+            }
+            (WritePayload::Vectored(parts), Some(timeout)) => stream
+                .write_vectored_final_timeout(parts, timeout)
+                .await
+                .map_err(|err| {
+                    err.with_stream_context(
+                        zmux::ErrorOperation::Write,
+                        zmux::ErrorDirection::Write,
+                    )
+                })?,
+            (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts).await?,
+        };
+        Ok((stream, validate_progress(n, requested)?))
     }
 
-    pub async fn open_uni_and_send(&self, data: &[u8]) -> Result<(QuinnSendStream, usize)> {
-        self.open_uni_and_send_with_options(OpenOptions::default(), data)
-            .await
-    }
-
-    pub async fn open_uni_and_send_timeout(
-        &self,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(QuinnSendStream, usize)> {
-        self.open_uni_and_send_with_options_timeout(OpenOptions::default(), data, timeout)
-            .await
-    }
-
-    pub async fn open_uni_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(QuinnSendStream, usize)> {
-        let stream = self.open_uni_stream_with_options(opts).await?;
-        let n = stream.write_final(data).await?;
-        Ok((stream, n))
-    }
-
-    pub async fn open_uni_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(QuinnSendStream, usize)> {
-        ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
-        let start = Instant::now();
-        let stream = self
-            .open_uni_stream_with_options_timeout(opts, timeout)
-            .await
-            .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
-        let timeout = remaining_write_timeout(start, timeout)?;
-        let n = stream
-            .write_final_timeout(data, timeout)
-            .await
-            .map_err(|err| {
-                err.with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write)
-            })?;
-        Ok((stream, n))
-    }
-
-    pub async fn open_uni_and_send_vectored(
-        &self,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(QuinnSendStream, usize)> {
-        self.open_uni_and_send_vectored_with_options(OpenOptions::default(), parts)
-            .await
-    }
-
-    pub async fn open_uni_and_send_vectored_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(QuinnSendStream, usize)> {
-        self.open_uni_and_send_vectored_with_options_timeout(OpenOptions::default(), parts, timeout)
-            .await
-    }
-
-    pub async fn open_uni_and_send_vectored_with_options(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(QuinnSendStream, usize)> {
-        total_bytes(parts.iter().map(|part| part.len()))?;
-        let stream = self.open_uni_stream_with_options(opts).await?;
-        let n = stream.write_vectored_final(parts).await?;
-        Ok((stream, n))
-    }
-
-    pub async fn open_uni_and_send_vectored_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(QuinnSendStream, usize)> {
-        ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
-        total_bytes(parts.iter().map(|part| part.len()))?;
-        let start = Instant::now();
-        let stream = self
-            .open_uni_stream_with_options_timeout(opts, timeout)
-            .await
-            .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
-        let timeout = remaining_write_timeout(start, timeout)?;
-        let n = stream
-            .write_vectored_final_timeout(parts, timeout)
-            .await
-            .map_err(|err| {
-                err.with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write)
-            })?;
-        Ok((stream, n))
-    }
-
-    pub fn close(&self) {
+    fn close_now(&self, code: quinn::VarInt, reason: &[u8]) {
         let _ = self.accept_shutdown.send(());
-        self.conn.close(quinn_varint(0), &[]);
+        self.conn.close(code, reason);
     }
 
-    pub fn close_with_error(&self, code: u64, reason: &str) {
-        let _ = self.accept_shutdown.send(());
-        self.conn.close(quinn_varint(code), reason.as_bytes());
+    pub async fn close(&self) -> Result<()> {
+        self.close_now(quinn_varint(0), &[]);
+        Ok(())
+    }
+
+    pub async fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
+        let code = checked_session_quinn_varint(code, zmux::ErrorOperation::Close)?;
+        self.close_now(code, reason.as_bytes());
+        Ok(())
     }
 
     pub async fn wait(&self) -> Result<()> {
@@ -735,7 +646,7 @@ impl QuinnSession {
     }
 
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool> {
-        if self.closed() {
+        if self.is_closed() {
             return Ok(true);
         }
         if timeout.is_zero() {
@@ -747,7 +658,7 @@ impl QuinnSession {
         }
     }
 
-    pub fn closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.conn.close_reason().is_some()
     }
 
@@ -758,7 +669,7 @@ impl QuinnSession {
     }
 
     pub fn state(&self) -> zmux::SessionState {
-        if self.closed() {
+        if self.is_closed() {
             zmux::SessionState::Closed
         } else {
             zmux::SessionState::Ready
@@ -861,25 +772,6 @@ fn timeout_until(deadline: Option<Instant>, operation: &'static str) -> Result<O
             .ok_or_else(|| zmux::Error::timeout(operation)),
         None => Ok(None),
     }
-}
-
-pub fn wrap_session(conn: quinn::Connection) -> QuinnSession {
-    QuinnSession::new(conn)
-}
-
-pub fn wrap_session_with_options(conn: quinn::Connection, opts: SessionOptions) -> QuinnSession {
-    QuinnSession::with_options(conn, opts)
-}
-
-pub fn wrap_session_with_addresses(
-    conn: quinn::Connection,
-    local_addr: Option<SocketAddr>,
-    peer_addr: Option<SocketAddr>,
-) -> QuinnSession {
-    QuinnSession::with_options(
-        conn,
-        SessionOptions::new().with_addresses(local_addr, peer_addr),
-    )
 }
 
 #[derive(Debug)]
@@ -1424,7 +1316,7 @@ async fn read_stream_prelude_quinn(recv: &mut quinn::RecvStream) -> Result<Accep
     let (metadata, metadata_valid) = parse_stream_metadata_bytes_view(&payload)
         .map_err(|_| protocol_prelude_error("malformed stream prelude metadata"))?;
     Ok(AcceptedStreamMetadata {
-        metadata: metadata.to_owned_metadata(),
+        metadata: metadata.try_to_owned()?,
         metadata_valid,
     })
 }
@@ -1468,15 +1360,16 @@ struct PreludeState {
 impl PreludeState {
     fn local(opts: OpenOptions) -> Result<Self> {
         let prelude = build_stream_prelude(&opts)?;
+        let (priority, group, open_info) = opts.into_parts();
         Ok(Self {
             send_prelude: true,
             prelude_sent: false,
             prelude: Bytes::from(prelude),
             prelude_offset: 0,
             metadata: StreamMetadata {
-                priority: opts.initial_priority,
-                group: opts.initial_group,
-                open_info: opts.open_info,
+                priority,
+                group,
+                open_info,
             },
         })
     }
@@ -1510,11 +1403,14 @@ impl PreludeState {
         if let Some(group) = update.group {
             self.metadata.group = Some(group);
         }
-        self.prelude = Bytes::from(build_stream_prelude(&OpenOptions {
-            initial_priority: self.metadata.priority,
-            initial_group: self.metadata.group,
-            open_info: self.metadata.open_info.clone(),
-        })?);
+        let mut opts = OpenOptions::new().with_open_info(&self.metadata.open_info);
+        if let Some(priority) = self.metadata.priority {
+            opts = opts.priority(priority);
+        }
+        if let Some(group) = self.metadata.group {
+            opts = opts.group(group);
+        }
+        self.prelude = Bytes::from(build_stream_prelude(&opts)?);
         self.prelude_offset = 0;
         Ok(true)
     }
@@ -1524,8 +1420,7 @@ fn prelude_open_info(prelude: &Mutex<PreludeState>) -> Vec<u8> {
     prelude.lock().unwrap().metadata.open_info.clone()
 }
 
-fn copy_prelude_open_info_to(prelude: &Mutex<PreludeState>, dst: &mut Vec<u8>) {
-    dst.clear();
+fn append_prelude_open_info_to(prelude: &Mutex<PreludeState>, dst: &mut Vec<u8>) {
     dst.extend_from_slice(prelude.lock().unwrap().metadata.open_info());
 }
 
@@ -1619,6 +1514,9 @@ impl QuinnStream {
     }
 
     fn mark_read_closed_with(&self, err: Option<zmux::Error>) {
+        if self.read_closed.load(Ordering::Acquire) {
+            return;
+        }
         let first = {
             let mut terminal = self.terminal.lock().unwrap();
             if self.read_closed.load(Ordering::Acquire) {
@@ -1641,6 +1539,9 @@ impl QuinnStream {
     }
 
     fn mark_write_closed_with(&self, err: Option<zmux::Error>) {
+        if self.write_closed.load(Ordering::Acquire) {
+            return;
+        }
         let first = {
             let mut terminal = self.terminal.lock().unwrap();
             if self.write_closed.load(Ordering::Acquire) {
@@ -1670,19 +1571,19 @@ impl QuinnStream {
         self.stream_id
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         self.opened_locally
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         true
     }
 
-    pub fn read_closed(&self) -> bool {
+    pub fn is_read_closed(&self) -> bool {
         self.read_closed.load(Ordering::Acquire)
     }
 
-    pub fn write_closed(&self) -> bool {
+    pub fn is_write_closed(&self) -> bool {
         self.write_closed.load(Ordering::Acquire)
     }
 
@@ -1694,8 +1595,8 @@ impl QuinnStream {
         prelude_open_info(&self.prelude)
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        copy_prelude_open_info_to(&self.prelude, dst);
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        append_prelude_open_info_to(&self.prelude, dst);
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -1712,10 +1613,6 @@ impl QuinnStream {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
-    }
-
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
 
     pub fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -1877,24 +1774,12 @@ impl QuinnStream {
         }
     }
 
-    pub async fn readv(&self, dsts: &mut [IoSliceMut<'_>]) -> Result<usize> {
-        self.read_vectored(dsts).await
-    }
-
     pub async fn read_vectored_timeout(
         &self,
         dsts: &mut [IoSliceMut<'_>],
         timeout: Duration,
     ) -> Result<usize> {
         with_timeout(self.read_vectored(dsts), timeout, "read").await
-    }
-
-    pub async fn readv_timeout(
-        &self,
-        dsts: &mut [IoSliceMut<'_>],
-        timeout: Duration,
-    ) -> Result<usize> {
-        self.read_vectored_timeout(dsts, timeout).await
     }
 
     pub async fn write(&self, src: &[u8]) -> Result<usize> {
@@ -1927,12 +1812,34 @@ impl QuinnStream {
         with_timeout(self.write(src), timeout, "write").await
     }
 
-    pub async fn write_all(&self, src: &[u8]) -> Result<()> {
+    pub async fn write_all<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<()> {
         let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(self.write_all_inner(src), timeout, "write").await
+        with_optional_timeout(self.write_all_inner(src.into()), timeout, "write").await
     }
 
-    async fn write_all_inner(&self, src: &[u8]) -> Result<()> {
+    pub async fn write_all_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<()> {
+        with_timeout(self.write_all(src), timeout, "write").await
+    }
+
+    async fn write_all_inner(&self, payload: WritePayload<'_>) -> Result<()> {
+        match payload {
+            WritePayload::Bytes(data) => self.write_all_bytes_inner(data.as_ref()).await,
+            WritePayload::Vectored(parts) => {
+                for part in parts {
+                    if !part.is_empty() {
+                        self.write_all_bytes_inner(part.as_ref()).await?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn write_all_bytes_inner(&self, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
         }
@@ -1976,10 +1883,6 @@ impl QuinnStream {
         result
     }
 
-    pub async fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored(parts).await
-    }
-
     pub async fn write_vectored_timeout(
         &self,
         parts: &[IoSlice<'_>],
@@ -1988,16 +1891,19 @@ impl QuinnStream {
         with_timeout(self.write_vectored(parts), timeout, "write").await
     }
 
-    pub async fn writev_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout).await
-    }
-
-    pub async fn write_final(&self, src: &[u8]) -> Result<usize> {
+    pub async fn write_final<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<usize> {
         let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(self.write_final_inner(src), timeout, "write").await
+        with_optional_timeout(self.write_final_inner(src.into()), timeout, "write").await
     }
 
-    async fn write_final_inner(&self, src: &[u8]) -> Result<usize> {
+    async fn write_final_inner(&self, payload: WritePayload<'_>) -> Result<usize> {
+        match payload {
+            WritePayload::Bytes(data) => self.write_final_bytes_inner(data.as_ref()).await,
+            WritePayload::Vectored(parts) => self.write_vectored_final_inner(parts).await,
+        }
+    }
+
+    async fn write_final_bytes_inner(&self, src: &[u8]) -> Result<usize> {
         if self.write_closed.load(Ordering::Acquire) {
             return Err(self.write_terminal_error());
         }
@@ -2014,7 +1920,11 @@ impl QuinnStream {
         }
     }
 
-    pub async fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
+    pub async fn write_final_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<usize> {
         with_timeout(self.write_final(src), timeout, "write").await
     }
 
@@ -2040,24 +1950,12 @@ impl QuinnStream {
         }
     }
 
-    pub async fn writev_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts).await
-    }
-
     pub async fn write_vectored_final_timeout(
         &self,
         parts: &[IoSlice<'_>],
         timeout: Duration,
     ) -> Result<usize> {
         with_timeout(self.write_vectored_final(parts), timeout, "write").await
-    }
-
-    pub async fn writev_final_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout).await
     }
 
     async fn write_chunks_final_with_total(
@@ -2122,6 +2020,7 @@ impl QuinnStream {
         drop(send);
         let mut recv = self.recv.lock().await;
         let result = recv.stop(code).map_err(translate_read_closed_stream);
+        drop(recv);
         if result.is_ok() {
             self.stats.note_control_progress();
         }
@@ -2144,6 +2043,7 @@ impl QuinnStream {
             return Err(err);
         }
         let result = finish_send(&mut send, &self.stats).await;
+        drop(send);
         self.mark_write_closed_with(result.as_ref().err().cloned());
         result
     }
@@ -2166,6 +2066,7 @@ impl QuinnStream {
         }
         let mut send = self.send.lock().await;
         let result = send.reset(code).map_err(translate_write_closed_stream);
+        drop(send);
         if result.is_ok() {
             self.stats.note_control_progress();
             self.stats.note_reset_reason(code.into_inner());
@@ -2299,6 +2200,9 @@ impl QuinnSendStream {
     }
 
     fn mark_write_closed_with(&self, err: Option<zmux::Error>) {
+        if self.write_closed.load(Ordering::Acquire) {
+            return;
+        }
         let first = {
             let mut terminal = self.terminal.lock().unwrap();
             if self.write_closed.load(Ordering::Acquire) {
@@ -2322,15 +2226,15 @@ impl QuinnSendStream {
         self.stream_id
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         true
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         false
     }
 
-    pub fn write_closed(&self) -> bool {
+    pub fn is_write_closed(&self) -> bool {
         self.write_closed.load(Ordering::Acquire)
     }
 
@@ -2342,8 +2246,8 @@ impl QuinnSendStream {
         prelude_open_info(&self.prelude)
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        copy_prelude_open_info_to(&self.prelude, dst);
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        append_prelude_open_info_to(&self.prelude, dst);
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -2360,10 +2264,6 @@ impl QuinnSendStream {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
-    }
-
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
 
     pub fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2444,12 +2344,34 @@ impl QuinnSendStream {
         with_timeout(self.write(src), timeout, "write").await
     }
 
-    pub async fn write_all(&self, src: &[u8]) -> Result<()> {
+    pub async fn write_all<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<()> {
         let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(self.write_all_inner(src), timeout, "write").await
+        with_optional_timeout(self.write_all_inner(src.into()), timeout, "write").await
     }
 
-    async fn write_all_inner(&self, src: &[u8]) -> Result<()> {
+    pub async fn write_all_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<()> {
+        with_timeout(self.write_all(src), timeout, "write").await
+    }
+
+    async fn write_all_inner(&self, payload: WritePayload<'_>) -> Result<()> {
+        match payload {
+            WritePayload::Bytes(data) => self.write_all_bytes_inner(data.as_ref()).await,
+            WritePayload::Vectored(parts) => {
+                for part in parts {
+                    if !part.is_empty() {
+                        self.write_all_bytes_inner(part.as_ref()).await?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn write_all_bytes_inner(&self, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
         }
@@ -2493,10 +2415,6 @@ impl QuinnSendStream {
         result
     }
 
-    pub async fn writev(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored(parts).await
-    }
-
     pub async fn write_vectored_timeout(
         &self,
         parts: &[IoSlice<'_>],
@@ -2505,16 +2423,19 @@ impl QuinnSendStream {
         with_timeout(self.write_vectored(parts), timeout, "write").await
     }
 
-    pub async fn writev_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_timeout(parts, timeout).await
-    }
-
-    pub async fn write_final(&self, src: &[u8]) -> Result<usize> {
+    pub async fn write_final<'a>(&self, src: impl Into<WritePayload<'a>>) -> Result<usize> {
         let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(self.write_final_inner(src), timeout, "write").await
+        with_optional_timeout(self.write_final_inner(src.into()), timeout, "write").await
     }
 
-    async fn write_final_inner(&self, src: &[u8]) -> Result<usize> {
+    async fn write_final_inner(&self, payload: WritePayload<'_>) -> Result<usize> {
+        match payload {
+            WritePayload::Bytes(data) => self.write_final_bytes_inner(data.as_ref()).await,
+            WritePayload::Vectored(parts) => self.write_vectored_final_inner(parts).await,
+        }
+    }
+
+    async fn write_final_bytes_inner(&self, src: &[u8]) -> Result<usize> {
         if self.write_closed.load(Ordering::Acquire) {
             return Err(self.write_terminal_error());
         }
@@ -2531,7 +2452,11 @@ impl QuinnSendStream {
         }
     }
 
-    pub async fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
+    pub async fn write_final_timeout<'a>(
+        &self,
+        src: impl Into<WritePayload<'a>>,
+        timeout: Duration,
+    ) -> Result<usize> {
         with_timeout(self.write_final(src), timeout, "write").await
     }
 
@@ -2557,24 +2482,12 @@ impl QuinnSendStream {
         }
     }
 
-    pub async fn writev_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
-        self.write_vectored_final(parts).await
-    }
-
     pub async fn write_vectored_final_timeout(
         &self,
         parts: &[IoSlice<'_>],
         timeout: Duration,
     ) -> Result<usize> {
         with_timeout(self.write_vectored_final(parts), timeout, "write").await
-    }
-
-    pub async fn writev_final_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<usize> {
-        self.write_vectored_final_timeout(parts, timeout).await
     }
 
     async fn write_chunks_final_with_total(
@@ -2632,6 +2545,7 @@ impl QuinnSendStream {
             return Err(err);
         }
         let result = finish_send(&mut send, &self.stats).await;
+        drop(send);
         self.mark_write_closed_with(result.as_ref().err().cloned());
         result
     }
@@ -2654,6 +2568,7 @@ impl QuinnSendStream {
         }
         let mut send = self.send.lock().await;
         let result = send.reset(code).map_err(translate_write_closed_stream);
+        drop(send);
         if result.is_ok() {
             self.stats.note_control_progress();
             self.stats.note_reset_reason(code.into_inner());
@@ -2686,6 +2601,7 @@ impl QuinnSendStream {
         );
         let mut send = self.send.lock().await;
         let _ = send.reset(code);
+        drop(send);
         self.stats.note_control_progress();
         self.stats.note_abort_reason(code.into_inner());
         self.mark_write_closed_with(Some(terminal));
@@ -2768,6 +2684,9 @@ impl QuinnRecvStream {
     }
 
     fn mark_read_closed_with(&self, err: Option<zmux::Error>) {
+        if self.read_closed.load(Ordering::Acquire) {
+            return;
+        }
         let first = {
             let mut terminal = self.terminal.lock().unwrap();
             if self.read_closed.load(Ordering::Acquire) {
@@ -2791,15 +2710,15 @@ impl QuinnRecvStream {
         self.stream_id
     }
 
-    pub fn opened_locally(&self) -> bool {
+    pub fn is_opened_locally(&self) -> bool {
         false
     }
 
-    pub fn bidirectional(&self) -> bool {
+    pub fn is_bidirectional(&self) -> bool {
         false
     }
 
-    pub fn read_closed(&self) -> bool {
+    pub fn is_read_closed(&self) -> bool {
         self.read_closed.load(Ordering::Acquire)
     }
 
@@ -2811,8 +2730,8 @@ impl QuinnRecvStream {
         prelude_open_info(&self.prelude)
     }
 
-    pub fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        copy_prelude_open_info_to(&self.prelude, dst);
+    pub fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        append_prelude_open_info_to(&self.prelude, dst);
     }
 
     pub fn open_info_len(&self) -> usize {
@@ -2829,10 +2748,6 @@ impl QuinnRecvStream {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
-    }
-
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
 
     pub fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2953,24 +2868,12 @@ impl QuinnRecvStream {
         }
     }
 
-    pub async fn readv(&self, dsts: &mut [IoSliceMut<'_>]) -> Result<usize> {
-        self.read_vectored(dsts).await
-    }
-
     pub async fn read_vectored_timeout(
         &self,
         dsts: &mut [IoSliceMut<'_>],
         timeout: Duration,
     ) -> Result<usize> {
         with_timeout(self.read_vectored(dsts), timeout, "read").await
-    }
-
-    pub async fn readv_timeout(
-        &self,
-        dsts: &mut [IoSliceMut<'_>],
-        timeout: Duration,
-    ) -> Result<usize> {
-        self.read_vectored_timeout(dsts, timeout).await
     }
 
     pub async fn close_read(&self) -> Result<()> {
@@ -2989,6 +2892,7 @@ impl QuinnRecvStream {
     async fn cancel_read_varint(&self, code: quinn::VarInt) -> Result<()> {
         let mut recv = self.recv.lock().await;
         let result = recv.stop(code).map_err(translate_read_closed_stream);
+        drop(recv);
         if result.is_ok() {
             self.stats.note_control_progress();
         }
@@ -3014,6 +2918,7 @@ impl QuinnRecvStream {
         );
         let mut recv = self.recv.lock().await;
         let _ = recv.stop(code);
+        drop(recv);
         self.stats.note_control_progress();
         self.stats.note_abort_reason(code.into_inner());
         self.mark_read_closed_with(Some(terminal));
@@ -3029,17 +2934,17 @@ impl QuinnRecvStream {
     }
 }
 
-impl StreamInfo for QuinnStream {
+impl AsyncStreamInfo for QuinnStream {
     fn stream_id(&self) -> u64 {
         QuinnStream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        QuinnStream::opened_locally(self)
+    fn is_opened_locally(&self) -> bool {
+        QuinnStream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        QuinnStream::bidirectional(self)
+    fn is_bidirectional(&self) -> bool {
+        QuinnStream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
@@ -3050,8 +2955,8 @@ impl StreamInfo for QuinnStream {
         QuinnStream::has_open_info(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        QuinnStream::copy_open_info_to(self, dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        QuinnStream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -3070,29 +2975,32 @@ impl StreamInfo for QuinnStream {
         QuinnStream::peer_addr(self)
     }
 
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        QuinnStream::remote_addr(self)
-    }
-
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnStream::set_deadline(self, deadline)
     }
 
-    fn close(&self) -> BoxFuture<'_, Result<()>> {
+    fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::close(self).await })
     }
 
-    fn close_with_error<'a>(&'a self, code: u64, reason: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn close_with_error<'a>(
+        &'a self,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnStream::close_with_error(self, code, reason).await })
     }
 }
 
-impl RecvStreamApi for QuinnStream {
-    fn read<'a>(&'a self, dst: &'a mut [u8]) -> BoxFuture<'a, Result<usize>> {
+impl AsyncRecvStreamApi for QuinnStream {
+    fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::read(self, dst).await })
     }
 
-    fn read_vectored<'a>(&'a self, dsts: &'a mut [IoSliceMut<'_>]) -> BoxFuture<'a, Result<usize>> {
+    fn read_vectored<'a>(
+        &'a self,
+        dsts: &'a mut [IoSliceMut<'_>],
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::read_vectored(self, dsts).await })
     }
 
@@ -3100,7 +3008,7 @@ impl RecvStreamApi for QuinnStream {
         &'a self,
         dst: &'a mut [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::read_timeout(self, dst, timeout).await })
     }
 
@@ -3108,11 +3016,11 @@ impl RecvStreamApi for QuinnStream {
         &'a self,
         dsts: &'a mut [IoSliceMut<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::read_vectored_timeout(self, dsts, timeout).await })
     }
 
-    fn read_exact<'a>(&'a self, dst: &'a mut [u8]) -> BoxFuture<'a, Result<()>> {
+    fn read_exact<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnStream::read_exact(self, dst).await })
     }
 
@@ -3120,45 +3028,53 @@ impl RecvStreamApi for QuinnStream {
         &'a self,
         dst: &'a mut [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnStream::read_exact_timeout(self, dst, timeout).await })
     }
 
-    fn read_closed(&self) -> bool {
-        QuinnStream::read_closed(self)
+    fn is_read_closed(&self) -> bool {
+        QuinnStream::is_read_closed(self)
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnStream::set_read_deadline(self, deadline)
     }
 
-    fn close_read(&self) -> BoxFuture<'_, Result<()>> {
+    fn close_read(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::close_read(self).await })
     }
 
-    fn cancel_read(&self, code: u64) -> BoxFuture<'_, Result<()>> {
+    fn cancel_read(&self, code: u64) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::cancel_read(self, code).await })
     }
 }
 
-impl SendStreamApi for QuinnStream {
-    fn write<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<usize>> {
+impl AsyncSendStreamApi for QuinnStream {
+    fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write(self, src).await })
     }
 
-    fn write_all<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+    fn write_all<'a>(&'a self, src: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnStream::write_all(self, src).await })
+    }
+
+    fn write_all_timeout<'a>(
+        &'a self,
+        src: WritePayload<'a>,
+        timeout: Duration,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move { QuinnStream::write_all_timeout(self, src, timeout).await })
     }
 
     fn write_timeout<'a>(
         &'a self,
         src: &'a [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_timeout(self, src, timeout).await })
     }
 
-    fn write_vectored<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> BoxFuture<'a, Result<usize>> {
+    fn write_vectored<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_vectored(self, parts).await })
     }
 
@@ -3166,26 +3082,26 @@ impl SendStreamApi for QuinnStream {
         &'a self,
         parts: &'a [IoSlice<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_vectored_timeout(self, parts, timeout).await })
     }
 
-    fn write_final<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<usize>> {
+    fn write_final<'a>(&'a self, src: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_final(self, src).await })
     }
 
     fn write_final_timeout<'a>(
         &'a self,
-        src: &'a [u8],
+        src: WritePayload<'a>,
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_final_timeout(self, src, timeout).await })
     }
 
     fn write_vectored_final<'a>(
         &'a self,
         parts: &'a [IoSlice<'_>],
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write_vectored_final(self, parts).await })
     }
 
@@ -3193,46 +3109,46 @@ impl SendStreamApi for QuinnStream {
         &'a self,
         parts: &'a [IoSlice<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(
             async move { QuinnStream::write_vectored_final_timeout(self, parts, timeout).await },
         )
     }
 
-    fn write_closed(&self) -> bool {
-        QuinnStream::write_closed(self)
+    fn is_write_closed(&self) -> bool {
+        QuinnStream::is_write_closed(self)
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnStream::set_write_deadline(self, deadline)
     }
 
-    fn update_metadata(&self, update: zmux::MetadataUpdate) -> BoxFuture<'_, Result<()>> {
+    fn update_metadata(&self, update: zmux::MetadataUpdate) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::update_metadata(self, update).await })
     }
 
-    fn close_write(&self) -> BoxFuture<'_, Result<()>> {
+    fn close_write(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::close_write(self).await })
     }
 
-    fn cancel_write(&self, code: u64) -> BoxFuture<'_, Result<()>> {
+    fn cancel_write(&self, code: u64) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnStream::cancel_write(self, code).await })
     }
 }
 
-impl StreamApi for QuinnStream {}
+impl AsyncStreamApi for QuinnStream {}
 
-impl StreamInfo for QuinnSendStream {
+impl AsyncStreamInfo for QuinnSendStream {
     fn stream_id(&self) -> u64 {
         QuinnSendStream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        QuinnSendStream::opened_locally(self)
+    fn is_opened_locally(&self) -> bool {
+        QuinnSendStream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        QuinnSendStream::bidirectional(self)
+    fn is_bidirectional(&self) -> bool {
+        QuinnSendStream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
@@ -3243,8 +3159,8 @@ impl StreamInfo for QuinnSendStream {
         QuinnSendStream::has_open_info(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        QuinnSendStream::copy_open_info_to(self, dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        QuinnSendStream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -3263,41 +3179,49 @@ impl StreamInfo for QuinnSendStream {
         QuinnSendStream::peer_addr(self)
     }
 
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        QuinnSendStream::remote_addr(self)
-    }
-
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnSendStream::set_deadline(self, deadline)
     }
 
-    fn close(&self) -> BoxFuture<'_, Result<()>> {
+    fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSendStream::close(self).await })
     }
 
-    fn close_with_error<'a>(&'a self, code: u64, reason: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn close_with_error<'a>(
+        &'a self,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnSendStream::close_with_error(self, code, reason).await })
     }
 }
 
-impl SendStreamApi for QuinnSendStream {
-    fn write<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<usize>> {
+impl AsyncSendStreamApi for QuinnSendStream {
+    fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write(self, src).await })
     }
 
-    fn write_all<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+    fn write_all<'a>(&'a self, src: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnSendStream::write_all(self, src).await })
+    }
+
+    fn write_all_timeout<'a>(
+        &'a self,
+        src: WritePayload<'a>,
+        timeout: Duration,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move { QuinnSendStream::write_all_timeout(self, src, timeout).await })
     }
 
     fn write_timeout<'a>(
         &'a self,
         src: &'a [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_timeout(self, src, timeout).await })
     }
 
-    fn write_vectored<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> BoxFuture<'a, Result<usize>> {
+    fn write_vectored<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_vectored(self, parts).await })
     }
 
@@ -3305,26 +3229,26 @@ impl SendStreamApi for QuinnSendStream {
         &'a self,
         parts: &'a [IoSlice<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_vectored_timeout(self, parts, timeout).await })
     }
 
-    fn write_final<'a>(&'a self, src: &'a [u8]) -> BoxFuture<'a, Result<usize>> {
+    fn write_final<'a>(&'a self, src: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_final(self, src).await })
     }
 
     fn write_final_timeout<'a>(
         &'a self,
-        src: &'a [u8],
+        src: WritePayload<'a>,
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_final_timeout(self, src, timeout).await })
     }
 
     fn write_vectored_final<'a>(
         &'a self,
         parts: &'a [IoSlice<'_>],
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write_vectored_final(self, parts).await })
     }
 
@@ -3332,44 +3256,44 @@ impl SendStreamApi for QuinnSendStream {
         &'a self,
         parts: &'a [IoSlice<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             QuinnSendStream::write_vectored_final_timeout(self, parts, timeout).await
         })
     }
 
-    fn write_closed(&self) -> bool {
-        QuinnSendStream::write_closed(self)
+    fn is_write_closed(&self) -> bool {
+        QuinnSendStream::is_write_closed(self)
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnSendStream::set_write_deadline(self, deadline)
     }
 
-    fn update_metadata(&self, update: zmux::MetadataUpdate) -> BoxFuture<'_, Result<()>> {
+    fn update_metadata(&self, update: zmux::MetadataUpdate) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSendStream::update_metadata(self, update).await })
     }
 
-    fn close_write(&self) -> BoxFuture<'_, Result<()>> {
+    fn close_write(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSendStream::close_write(self).await })
     }
 
-    fn cancel_write(&self, code: u64) -> BoxFuture<'_, Result<()>> {
+    fn cancel_write(&self, code: u64) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSendStream::cancel_write(self, code).await })
     }
 }
 
-impl StreamInfo for QuinnRecvStream {
+impl AsyncStreamInfo for QuinnRecvStream {
     fn stream_id(&self) -> u64 {
         QuinnRecvStream::stream_id(self)
     }
 
-    fn opened_locally(&self) -> bool {
-        QuinnRecvStream::opened_locally(self)
+    fn is_opened_locally(&self) -> bool {
+        QuinnRecvStream::is_opened_locally(self)
     }
 
-    fn bidirectional(&self) -> bool {
-        QuinnRecvStream::bidirectional(self)
+    fn is_bidirectional(&self) -> bool {
+        QuinnRecvStream::is_bidirectional(self)
     }
 
     fn open_info_len(&self) -> usize {
@@ -3380,8 +3304,8 @@ impl StreamInfo for QuinnRecvStream {
         QuinnRecvStream::has_open_info(self)
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        QuinnRecvStream::copy_open_info_to(self, dst)
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+        QuinnRecvStream::append_open_info_to(self, dst)
     }
 
     fn open_info(&self) -> Vec<u8> {
@@ -3400,29 +3324,32 @@ impl StreamInfo for QuinnRecvStream {
         QuinnRecvStream::peer_addr(self)
     }
 
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        QuinnRecvStream::remote_addr(self)
-    }
-
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnRecvStream::set_deadline(self, deadline)
     }
 
-    fn close(&self) -> BoxFuture<'_, Result<()>> {
+    fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnRecvStream::close(self).await })
     }
 
-    fn close_with_error<'a>(&'a self, code: u64, reason: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn close_with_error<'a>(
+        &'a self,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnRecvStream::close_with_error(self, code, reason).await })
     }
 }
 
-impl RecvStreamApi for QuinnRecvStream {
-    fn read<'a>(&'a self, dst: &'a mut [u8]) -> BoxFuture<'a, Result<usize>> {
+impl AsyncRecvStreamApi for QuinnRecvStream {
+    fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnRecvStream::read(self, dst).await })
     }
 
-    fn read_vectored<'a>(&'a self, dsts: &'a mut [IoSliceMut<'_>]) -> BoxFuture<'a, Result<usize>> {
+    fn read_vectored<'a>(
+        &'a self,
+        dsts: &'a mut [IoSliceMut<'_>],
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnRecvStream::read_vectored(self, dsts).await })
     }
 
@@ -3430,7 +3357,7 @@ impl RecvStreamApi for QuinnRecvStream {
         &'a self,
         dst: &'a mut [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnRecvStream::read_timeout(self, dst, timeout).await })
     }
 
@@ -3438,11 +3365,11 @@ impl RecvStreamApi for QuinnRecvStream {
         &'a self,
         dsts: &'a mut [IoSliceMut<'_>],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<usize>> {
+    ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnRecvStream::read_vectored_timeout(self, dsts, timeout).await })
     }
 
-    fn read_exact<'a>(&'a self, dst: &'a mut [u8]) -> BoxFuture<'a, Result<()>> {
+    fn read_exact<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnRecvStream::read_exact(self, dst).await })
     }
 
@@ -3450,192 +3377,168 @@ impl RecvStreamApi for QuinnRecvStream {
         &'a self,
         dst: &'a mut [u8],
         timeout: Duration,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move { QuinnRecvStream::read_exact_timeout(self, dst, timeout).await })
     }
 
-    fn read_closed(&self) -> bool {
-        QuinnRecvStream::read_closed(self)
+    fn is_read_closed(&self) -> bool {
+        QuinnRecvStream::is_read_closed(self)
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         QuinnRecvStream::set_read_deadline(self, deadline)
     }
 
-    fn close_read(&self) -> BoxFuture<'_, Result<()>> {
+    fn close_read(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnRecvStream::close_read(self).await })
     }
 
-    fn cancel_read(&self, code: u64) -> BoxFuture<'_, Result<()>> {
+    fn cancel_read(&self, code: u64) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnRecvStream::cancel_read(self, code).await })
     }
 }
 
-impl Session for QuinnSession {
+impl AsyncSession for QuinnSession {
     type Stream = QuinnStream;
     type SendStream = QuinnSendStream;
     type RecvStream = QuinnRecvStream;
 
-    fn accept_stream(&self) -> BoxFuture<'_, Result<Self::Stream>> {
+    fn accept_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move { QuinnSession::accept_stream(self).await })
     }
 
-    fn accept_stream_timeout(&self, timeout: Duration) -> BoxFuture<'_, Result<Self::Stream>> {
+    fn accept_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move { QuinnSession::accept_stream_timeout(self, timeout).await })
     }
 
-    fn accept_uni_stream(&self) -> BoxFuture<'_, Result<Self::RecvStream>> {
+    fn accept_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
         Box::pin(async move { QuinnSession::accept_uni_stream(self).await })
     }
 
     fn accept_uni_stream_timeout(
         &self,
         timeout: Duration,
-    ) -> BoxFuture<'_, Result<Self::RecvStream>> {
+    ) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
         Box::pin(async move { QuinnSession::accept_uni_stream_timeout(self, timeout).await })
     }
 
-    fn open_stream(&self) -> BoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { QuinnSession::open_stream(self).await })
+    fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
+        Box::pin(async move { QuinnSession::open_stream_with(self, request).await })
     }
 
-    fn open_stream_timeout(&self, timeout: Duration) -> BoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { QuinnSession::open_stream_timeout(self, timeout).await })
-    }
-
-    fn open_uni_stream(&self) -> BoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { QuinnSession::open_uni_stream(self).await })
-    }
-
-    fn open_uni_stream_timeout(
+    fn open_uni_stream_with(
         &self,
-        timeout: Duration,
-    ) -> BoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { QuinnSession::open_uni_stream_timeout(self, timeout).await })
+        request: OpenRequest,
+    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
+        Box::pin(async move { QuinnSession::open_uni_stream_with(self, request).await })
     }
 
-    fn open_stream_with_options(&self, opts: OpenOptions) -> BoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { QuinnSession::open_stream_with_options(self, opts).await })
-    }
-
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> BoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move {
-            QuinnSession::open_stream_with_options_timeout(self, opts, timeout).await
-        })
-    }
-
-    fn open_uni_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> BoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { QuinnSession::open_uni_stream_with_options(self, opts).await })
-    }
-
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> BoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move {
-            QuinnSession::open_uni_stream_with_options_timeout(self, opts, timeout).await
-        })
-    }
-
-    fn open_and_send<'a>(&'a self, data: &'a [u8]) -> BoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move { QuinnSession::open_and_send(self, data).await })
-    }
-
-    fn open_and_send_timeout<'a>(
+    fn open_and_send<'a>(
         &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move { QuinnSession::open_and_send_timeout(self, data, timeout).await })
-    }
-
-    fn open_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> BoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move { QuinnSession::open_and_send_with_options(self, opts, data).await })
-    }
-
-    fn open_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            QuinnSession::open_and_send_with_options_timeout(self, opts, data, timeout).await
-        })
+        request: OpenSend<'a>,
+    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+        Box::pin(async move { QuinnSession::open_and_send(self, request).await })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
-        data: &'a [u8],
-    ) -> BoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move { QuinnSession::open_uni_and_send(self, data).await })
+        request: OpenSend<'a>,
+    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+        Box::pin(async move { QuinnSession::open_uni_and_send(self, request).await })
     }
 
-    fn open_uni_and_send_timeout<'a>(
-        &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move { QuinnSession::open_uni_and_send_timeout(self, data, timeout).await })
-    }
-
-    fn open_uni_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> BoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(
-            async move { QuinnSession::open_uni_and_send_with_options(self, opts, data).await },
-        )
-    }
-
-    fn open_uni_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    fn ping<'a>(&'a self, _echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
         Box::pin(async move {
-            QuinnSession::open_uni_and_send_with_options_timeout(self, opts, data, timeout).await
+            Err(adapter_session_control_unavailable(
+                zmux::ErrorOperation::Ping,
+                "zmux: feature not supported by adapter: ping",
+            ))
         })
     }
 
-    fn close(&self) -> BoxFuture<'_, Result<()>> {
+    fn ping_timeout<'a>(
+        &'a self,
+        _echo: &'a [u8],
+        _timeout: Duration,
+    ) -> AsyncBoxFuture<'a, Result<Duration>> {
         Box::pin(async move {
-            QuinnSession::close(self);
-            Ok(())
+            Err(adapter_session_control_unavailable(
+                zmux::ErrorOperation::Ping,
+                "zmux: feature not supported by adapter: ping_timeout",
+            ))
         })
     }
 
-    fn close_with_error<'a>(&'a self, code: u64, reason: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn go_away(
+        &self,
+        _last_accepted_bidi: u64,
+        _last_accepted_uni: u64,
+    ) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            QuinnSession::close_with_error(self, code, reason);
-            Ok(())
+            Err(adapter_session_control_unavailable(
+                zmux::ErrorOperation::Close,
+                "zmux: feature not supported by adapter: go_away",
+            ))
         })
     }
 
-    fn wait(&self) -> BoxFuture<'_, Result<()>> {
+    fn go_away_with_error<'a>(
+        &'a self,
+        _last_accepted_bidi: u64,
+        _last_accepted_uni: u64,
+        _code: u64,
+        _reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            Err(adapter_session_control_unavailable(
+                zmux::ErrorOperation::Close,
+                "zmux: feature not supported by adapter: go_away_with_error",
+            ))
+        })
+    }
+
+    fn peer_go_away_error(&self) -> Option<zmux::PeerGoAwayError> {
+        None
+    }
+
+    fn peer_close_error(&self) -> Option<zmux::PeerCloseError> {
+        None
+    }
+
+    fn local_preface(&self) -> zmux::Preface {
+        adapter_empty_preface()
+    }
+
+    fn peer_preface(&self) -> zmux::Preface {
+        adapter_empty_preface()
+    }
+
+    fn negotiated(&self) -> zmux::Negotiated {
+        adapter_empty_negotiated()
+    }
+
+    fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
+        Box::pin(async move { QuinnSession::close(self).await })
+    }
+
+    fn close_with_error<'a>(
+        &'a self,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move { QuinnSession::close_with_error(self, code, reason).await })
+    }
+
+    fn wait(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSession::wait(self).await })
     }
 
-    fn wait_timeout(&self, timeout: Duration) -> BoxFuture<'_, Result<bool>> {
+    fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>> {
         Box::pin(async move { QuinnSession::wait_timeout(self, timeout).await })
     }
 
-    fn closed(&self) -> bool {
-        QuinnSession::closed(self)
+    fn is_closed(&self) -> bool {
+        QuinnSession::is_closed(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
@@ -3644,10 +3547,6 @@ impl Session for QuinnSession {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         QuinnSession::peer_addr(self)
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        QuinnSession::remote_addr(self)
     }
 
     fn close_error(&self) -> Option<zmux::Error> {
@@ -3740,7 +3639,7 @@ async fn write_io_slices_final(
         finish_send(send, stats).await?;
         return Ok(total);
     }
-    if total <= QUINN_WRITEV_COALESCE_MAX_BYTES {
+    if total <= QUINN_WRITE_VECTORED_COALESCE_MAX_BYTES {
         let mut coalesced = Vec::with_capacity(total);
         for part in parts {
             coalesced.extend_from_slice(part.as_ref());
@@ -3770,7 +3669,7 @@ async fn write_io_slices_once(
         return write_payload_once(send, single, stats).await;
     }
 
-    let prefix_len = total.min(QUINN_WRITEV_COALESCE_MAX_BYTES);
+    let prefix_len = total.min(QUINN_WRITE_VECTORED_COALESCE_MAX_BYTES);
     let mut coalesced = Vec::with_capacity(prefix_len);
     for part in parts {
         if coalesced.len() == prefix_len {
@@ -3882,6 +3781,17 @@ fn total_bytes(lengths: impl IntoIterator<Item = usize>) -> Result<usize> {
     })
 }
 
+fn validate_progress(n: usize, requested: usize) -> Result<usize> {
+    if n > requested {
+        Err(
+            zmux::Error::local("zmux-quinn: write reported invalid progress")
+                .with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write),
+        )
+    } else {
+        Ok(n)
+    }
+}
+
 fn checked_prelude_metadata_len(metadata_len: u64, prefix_len: usize) -> Result<usize> {
     let prefix_len = u64::try_from(prefix_len)
         .map_err(|_| protocol_prelude_error("stream prelude prefix length exceeds u64"))?;
@@ -3966,6 +3876,16 @@ fn checked_quinn_varint(
     })
 }
 
+fn checked_session_quinn_varint(
+    value: u64,
+    operation: zmux::ErrorOperation,
+) -> Result<quinn::VarInt> {
+    quinn::VarInt::from_u64(value).map_err(|_| {
+        zmux::Error::local("zmux-quinn: QUIC application error code exceeds varint62")
+            .with_session_context(operation)
+    })
+}
+
 fn protocol_prelude_error(reason: &str) -> zmux::Error {
     zmux::Error::application(
         zmux::ErrorCode::Protocol.as_u64(),
@@ -3994,6 +3914,35 @@ fn priority_update_unavailable() -> zmux::Error {
         "zmux: feature not supported by adapter: metadata update requires negotiated priority_update",
     )
         .with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write)
+}
+
+fn adapter_session_control_unavailable(
+    operation: zmux::ErrorOperation,
+    message: &'static str,
+) -> zmux::Error {
+    zmux::Error::local(message).with_session_context(operation)
+}
+
+fn adapter_empty_preface() -> zmux::Preface {
+    zmux::Preface {
+        preface_version: 0,
+        role: zmux::Role::Initiator,
+        tie_breaker_nonce: 0,
+        min_proto: 0,
+        max_proto: 0,
+        capabilities: 0,
+        settings: zmux::default_settings(),
+    }
+}
+
+fn adapter_empty_negotiated() -> zmux::Negotiated {
+    zmux::Negotiated {
+        proto: 0,
+        capabilities: 0,
+        local_role: zmux::Role::Initiator,
+        peer_role: zmux::Role::Initiator,
+        peer_settings: zmux::default_settings(),
+    }
 }
 
 fn local_read_closed_error() -> zmux::Error {
@@ -4113,11 +4062,10 @@ mod tests {
 
     #[test]
     fn prelude_round_trip_with_open_info_and_priority() {
-        let opts = OpenOptions {
-            initial_priority: Some(7),
-            initial_group: Some(11),
-            open_info: vec![1, 2, 3, 4],
-        };
+        let opts = OpenOptions::new()
+            .priority(7)
+            .group(11)
+            .with_open_info(&[1, 2, 3, 4]);
         let prelude = build_stream_prelude(&opts).unwrap();
         let parsed = read_stream_prelude(&mut prelude.as_slice()).unwrap();
         assert!(parsed.metadata_valid);
@@ -4174,17 +4122,26 @@ mod tests {
 
     #[test]
     fn session_option_defaults_match_go_adapter_bounds() {
+        let previous_default = default_accepted_prelude_max_concurrent();
         set_default_accepted_prelude_max_concurrent(0);
+        assert_eq!(
+            normalize_accepted_prelude_max_concurrent(None),
+            DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
+        );
         assert_eq!(
             default_accepted_prelude_max_concurrent(),
             DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
         );
+        set_default_accepted_prelude_max_concurrent(5);
+        assert_eq!(default_accepted_prelude_max_concurrent(), 5);
+        assert_eq!(normalize_accepted_prelude_max_concurrent(None), 5);
+        assert_eq!(normalize_accepted_prelude_max_concurrent(Some(0)), 5);
         set_default_accepted_prelude_max_concurrent(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT + 1);
         assert_eq!(
             default_accepted_prelude_max_concurrent(),
             MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT
         );
-        set_default_accepted_prelude_max_concurrent(DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT);
+        set_default_accepted_prelude_max_concurrent(previous_default);
         assert_eq!(
             normalize_accepted_prelude_read_timeout(SessionOptions::default()),
             Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT)
@@ -4204,28 +4161,28 @@ mod tests {
             normalize_accepted_prelude_read_timeout(
                 SessionOptions::new()
                     .with_accepted_prelude_read_timeout(Duration::from_secs(2))
-                    .without_accepted_prelude_read_timeout()
+                    .disable_accepted_prelude_read_timeout()
             ),
             None
         );
         assert_eq!(
             normalize_accepted_prelude_read_timeout(
                 SessionOptions::new()
-                    .without_accepted_prelude_read_timeout()
+                    .disable_accepted_prelude_read_timeout()
                     .with_accepted_prelude_read_timeout(Duration::from_secs(2))
             ),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
             normalize_accepted_prelude_read_timeout(SessionOptions {
-                accepted_prelude_read_timeout: Some(Duration::ZERO),
+                accepted_prelude_read_timeout: AcceptedPreludeReadTimeout::Timeout(Duration::ZERO),
                 ..SessionOptions::default()
             }),
             Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT)
         );
         assert_eq!(
             normalize_accepted_prelude_read_timeout(SessionOptions {
-                disable_accepted_prelude_read_timeout: true,
+                accepted_prelude_read_timeout: AcceptedPreludeReadTimeout::Disabled,
                 ..SessionOptions::default()
             }),
             None

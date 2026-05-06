@@ -32,6 +32,24 @@ pub enum Claim {
 }
 
 impl Claim {
+    #[inline]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "zmux-wire-v1" => Some(Self::WireV1),
+            "zmux-api-semantics-profile-v1" => Some(Self::ApiSemanticsProfileV1),
+            "zmux-stream-adapter-profile-v1" => Some(Self::StreamAdapterProfileV1),
+            "zmux-open_metadata" => Some(Self::OpenMetadata),
+            "zmux-priority_update" => Some(Self::PriorityUpdate),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_known_name(value: &str) -> bool {
+        Self::from_name(value).is_some()
+    }
+
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WireV1 => "zmux-wire-v1",
@@ -42,6 +60,7 @@ impl Claim {
         }
     }
 
+    #[inline]
     pub fn acceptance_checklist(self) -> &'static [&'static str] {
         match self {
             Self::WireV1 => &[
@@ -78,6 +97,7 @@ impl Claim {
         }
     }
 
+    #[inline]
     pub fn required_conformance_suites(self) -> &'static [ConformanceSuite] {
         match self {
             Self::WireV1 => &[
@@ -113,14 +133,7 @@ impl FromStr for Claim {
     type Err = ParseConformanceError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "zmux-wire-v1" => Ok(Self::WireV1),
-            "zmux-api-semantics-profile-v1" => Ok(Self::ApiSemanticsProfileV1),
-            "zmux-stream-adapter-profile-v1" => Ok(Self::StreamAdapterProfileV1),
-            "zmux-open_metadata" => Ok(Self::OpenMetadata),
-            "zmux-priority_update" => Ok(Self::PriorityUpdate),
-            _ => Err(ParseConformanceError::Claim),
-        }
+        Self::from_name(value).ok_or(ParseConformanceError::Claim)
     }
 }
 
@@ -132,6 +145,21 @@ pub enum ImplementationProfile {
 }
 
 impl ImplementationProfile {
+    #[inline]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "zmux-v1" => Some(Self::V1),
+            "zmux-reference-profile-v1" => Some(Self::ReferenceProfileV1),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_known_name(value: &str) -> bool {
+        Self::from_name(value).is_some()
+    }
+
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::V1 => "zmux-v1",
@@ -139,6 +167,7 @@ impl ImplementationProfile {
         }
     }
 
+    #[inline]
     pub fn claims(self) -> &'static [Claim] {
         match self {
             Self::V1 => &[Claim::WireV1, Claim::OpenMetadata, Claim::PriorityUpdate],
@@ -152,6 +181,7 @@ impl ImplementationProfile {
         }
     }
 
+    #[inline]
     pub fn acceptance_checklist(self) -> &'static [&'static str] {
         match self {
             Self::V1 => &[
@@ -171,6 +201,7 @@ impl ImplementationProfile {
         }
     }
 
+    #[inline]
     pub fn required_conformance_suites(self) -> &'static [ConformanceSuite] {
         match self {
             Self::V1 => &[
@@ -204,6 +235,7 @@ impl ImplementationProfile {
         }
     }
 
+    #[inline]
     pub fn release_certification_gate(self) -> &'static [ConformanceSuite] {
         self.required_conformance_suites()
     }
@@ -219,11 +251,7 @@ impl FromStr for ImplementationProfile {
     type Err = ParseConformanceError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "zmux-v1" => Ok(Self::V1),
-            "zmux-reference-profile-v1" => Ok(Self::ReferenceProfileV1),
-            _ => Err(ParseConformanceError::Profile),
-        }
+        Self::from_name(value).ok_or(ParseConformanceError::Profile)
     }
 }
 
@@ -247,6 +275,33 @@ pub enum ConformanceSuite {
 }
 
 impl ConformanceSuite {
+    #[inline]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "core-wire-interoperability" => Some(Self::CoreWireInteroperability),
+            "invalid-input-handling" => Some(Self::InvalidInputHandling),
+            "extension-tolerance" => Some(Self::ExtensionTolerance),
+            "core-stream-lifecycle" => Some(Self::CoreStreamLifecycle),
+            "core-flow-control" => Some(Self::CoreFlowControl),
+            "core-session-lifecycle" => Some(Self::CoreSessionLifecycle),
+            "open_metadata" => Some(Self::OpenMetadata),
+            "priority_update" => Some(Self::PriorityUpdate),
+            "priority-hints-and-stream-groups" => Some(Self::PriorityHintsAndStreamGroups),
+            "v1-profile-compatibility" => Some(Self::V1ProfileCompatibility),
+            "api-semantics-profile" => Some(Self::ApiSemanticsProfile),
+            "stream-adapter-profile" => Some(Self::StreamAdapterProfile),
+            "reference-profile-claim-gate" => Some(Self::ReferenceProfileClaimGate),
+            "reference-quality-behaviors" => Some(Self::ReferenceQualityBehaviors),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_known_name(value: &str) -> bool {
+        Self::from_name(value).is_some()
+    }
+
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CoreWireInteroperability => "core-wire-interoperability",
@@ -277,26 +332,26 @@ impl FromStr for ConformanceSuite {
     type Err = ParseConformanceError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "core-wire-interoperability" => Ok(Self::CoreWireInteroperability),
-            "invalid-input-handling" => Ok(Self::InvalidInputHandling),
-            "extension-tolerance" => Ok(Self::ExtensionTolerance),
-            "core-stream-lifecycle" => Ok(Self::CoreStreamLifecycle),
-            "core-flow-control" => Ok(Self::CoreFlowControl),
-            "core-session-lifecycle" => Ok(Self::CoreSessionLifecycle),
-            "open_metadata" => Ok(Self::OpenMetadata),
-            "priority_update" => Ok(Self::PriorityUpdate),
-            "priority-hints-and-stream-groups" => Ok(Self::PriorityHintsAndStreamGroups),
-            "v1-profile-compatibility" => Ok(Self::V1ProfileCompatibility),
-            "api-semantics-profile" => Ok(Self::ApiSemanticsProfile),
-            "stream-adapter-profile" => Ok(Self::StreamAdapterProfile),
-            "reference-profile-claim-gate" => Ok(Self::ReferenceProfileClaimGate),
-            "reference-quality-behaviors" => Ok(Self::ReferenceQualityBehaviors),
-            _ => Err(ParseConformanceError::Suite),
-        }
+        Self::from_name(value).ok_or(ParseConformanceError::Suite)
     }
 }
 
+#[inline]
+pub fn claim_by_name(value: &str) -> Option<Claim> {
+    Claim::from_name(value)
+}
+
+#[inline]
+pub fn implementation_profile_by_name(value: &str) -> Option<ImplementationProfile> {
+    ImplementationProfile::from_name(value)
+}
+
+#[inline]
+pub fn conformance_suite_by_name(value: &str) -> Option<ConformanceSuite> {
+    ConformanceSuite::from_name(value)
+}
+
+#[inline]
 pub fn known_claims() -> &'static [Claim] {
     &[
         Claim::WireV1,
@@ -307,6 +362,7 @@ pub fn known_claims() -> &'static [Claim] {
     ]
 }
 
+#[inline]
 pub fn known_implementation_profiles() -> &'static [ImplementationProfile] {
     &[
         ImplementationProfile::V1,
@@ -314,6 +370,7 @@ pub fn known_implementation_profiles() -> &'static [ImplementationProfile] {
     ]
 }
 
+#[inline]
 pub fn known_conformance_suites() -> &'static [ConformanceSuite] {
     &[
         ConformanceSuite::CoreWireInteroperability,
@@ -333,6 +390,7 @@ pub fn known_conformance_suites() -> &'static [ConformanceSuite] {
     ]
 }
 
+#[inline]
 pub fn reference_profile_claim_gate() -> &'static [&'static str] {
     &[
         "repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT",
@@ -345,6 +403,7 @@ pub fn reference_profile_claim_gate() -> &'static [&'static str] {
     ]
 }
 
+#[inline]
 pub fn core_module_target_claims() -> &'static [Claim] {
     &[
         Claim::WireV1,
@@ -354,10 +413,12 @@ pub fn core_module_target_claims() -> &'static [Claim] {
     ]
 }
 
+#[inline]
 pub fn core_module_target_implementation_profiles() -> &'static [ImplementationProfile] {
     &[ImplementationProfile::V1]
 }
 
+#[inline]
 pub fn core_module_target_suites() -> &'static [ConformanceSuite] {
     &[
         ConformanceSuite::CoreWireInteroperability,

@@ -1,21 +1,28 @@
 use crate::error::{Error, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource, Result};
 use crate::frame::FRAME_FLAG_OPEN_METADATA;
 use crate::protocol::*;
-use crate::tlv::{append_tlv, parse_tlvs, tlv_views, visit_tlvs, Tlv};
-use crate::varint::{append_varint, parse_varint, varint_len, MAX_VARINT62};
+use crate::tlv::{append_tlv, parse_tlvs, tlv_views, Tlv};
+use crate::varint::{append_varint_reserved, parse_varint, varint_len, MAX_VARINT62};
 use std::str;
 
-const DUPLICATE_METADATA_SINGLETON: &str = "duplicate metadata singleton";
-const DUPLICATE_DIAG_SINGLETON: &str = "duplicate diagnostic singleton";
+const SEEN_METADATA_PRIORITY: u8 = 1 << 0;
+const SEEN_METADATA_GROUP: u8 = 1 << 1;
+const SEEN_METADATA_OPEN_INFO: u8 = 1 << 2;
+const SEEN_DIAG_DEBUG_TEXT: u8 = 1 << 0;
+const SEEN_DIAG_RETRY_AFTER_MILLIS: u8 = 1 << 1;
+const SEEN_DIAG_OFFENDING_STREAM_ID: u8 = 1 << 2;
+const SEEN_DIAG_OFFENDING_FRAME_TYPE: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamMetadata {
     pub priority: Option<u64>,
     pub group: Option<u64>,
+    /// Opaque binary metadata supplied by the stream opener.
     pub open_info: Vec<u8>,
 }
 
 impl StreamMetadata {
+    #[inline]
     pub fn as_view(&self) -> StreamMetadataView<'_> {
         StreamMetadataView {
             priority: self.priority,
@@ -24,14 +31,22 @@ impl StreamMetadata {
         }
     }
 
+    #[inline]
     pub fn open_info(&self) -> &[u8] {
         &self.open_info
     }
 
+    #[inline]
+    pub fn open_info_len(&self) -> usize {
+        self.open_info.len()
+    }
+
+    #[inline]
     pub fn has_open_info(&self) -> bool {
         !self.open_info.is_empty()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.priority.is_none() && self.group.is_none() && self.open_info.is_empty()
     }
@@ -41,84 +56,71 @@ impl StreamMetadata {
 pub struct StreamMetadataView<'a> {
     pub priority: Option<u64>,
     pub group: Option<u64>,
+    /// Opaque binary metadata supplied by the stream opener.
     pub open_info: &'a [u8],
 }
 
 impl StreamMetadataView<'_> {
+    #[inline]
     pub fn open_info(&self) -> &[u8] {
         self.open_info
     }
 
-    pub fn has_open_info(&self) -> bool {
-        !self.open_info.is_empty()
+    #[inline]
+    pub fn open_info_len(&self) -> usize {
+        self.open_info.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.priority.is_none() && self.group.is_none() && self.open_info.is_empty()
-    }
-
-    pub fn to_owned_metadata(self) -> StreamMetadata {
-        StreamMetadata {
-            priority: self.priority,
-            group: self.group,
-            open_info: self.open_info.to_vec(),
-        }
-    }
-
-    pub fn try_to_owned_metadata(self) -> Result<StreamMetadata> {
+    #[inline]
+    pub fn try_to_owned(self) -> Result<StreamMetadata> {
         Ok(StreamMetadata {
             priority: self.priority,
             group: self.group,
             open_info: copy_payload_slice(self.open_info)?,
         })
     }
+
+    #[inline]
+    pub fn has_open_info(&self) -> bool {
+        !self.open_info.is_empty()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.priority.is_none() && self.group.is_none() && self.open_info.is_empty()
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataUpdate {
     pub priority: Option<u64>,
     pub group: Option<u64>,
 }
 
 impl MetadataUpdate {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn priority(priority: u64) -> Self {
-        Self::new().with_priority(priority)
-    }
-
-    pub fn group(group: u64) -> Self {
-        Self::new().with_group(group)
-    }
-
+    #[inline]
     pub fn with_priority(mut self, priority: u64) -> Self {
         self.priority = Some(priority);
         self
     }
 
-    pub fn try_with_priority(mut self, priority: u64) -> Result<Self> {
-        validate_metadata_update_varint(priority, "priority")?;
-        self.priority = Some(priority);
-        Ok(self)
-    }
-
+    #[inline]
     pub fn with_group(mut self, group: u64) -> Self {
         self.group = Some(group);
         self
     }
 
-    pub fn try_with_group(mut self, group: u64) -> Result<Self> {
-        validate_metadata_update_varint(group, "group")?;
-        self.group = Some(group);
-        Ok(self)
-    }
-
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.priority.is_none() && self.group.is_none()
     }
 
+    #[inline]
     pub fn validate(&self) -> Result<()> {
         if let Some(priority) = self.priority {
             validate_metadata_update_varint(priority, "priority")?;
@@ -139,8 +141,12 @@ fn validate_metadata_update_varint(value: u64, field: &str) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 pub(crate) fn normalize_stream_group(group: Option<u64>) -> Option<u64> {
-    group.filter(|group| *group != 0)
+    match group {
+        Some(group) if group != 0 => Some(group),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +157,7 @@ pub struct DataPayload {
     pub metadata_valid: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataPayloadView<'a> {
     pub metadata: StreamMetadataView<'a>,
     pub app_data: &'a [u8],
@@ -217,45 +223,37 @@ pub(crate) fn parse_data_payload_metadata_offset(
     let (metadata_len, n) = parse_open_metadata_len(payload)?;
     let metadata_raw = &payload[n..n + metadata_len];
     let (metadata, valid) = parse_stream_metadata_bytes_view(metadata_raw)?;
-    Ok((metadata.try_to_owned_metadata()?, valid, n + metadata_len))
+    Ok((metadata.try_to_owned()?, valid, n + metadata_len))
 }
 
 fn parse_open_metadata_len(payload: &[u8]) -> Result<(usize, usize)> {
     let (metadata_len, n) = parse_varint(payload)?;
-    let metadata_len = usize::try_from(metadata_len)
-        .map_err(|_| Error::frame_size("OPEN_METADATA payload overrun"))?;
-    if payload.len() - n < metadata_len {
+    if metadata_len > (payload.len() - n) as u64 {
         return Err(Error::frame_size("OPEN_METADATA payload overrun"));
     }
+    let metadata_len = metadata_len as usize;
     Ok((metadata_len, n))
 }
 
 pub fn parse_stream_metadata_tlvs(tlvs: &[Tlv]) -> Result<(StreamMetadata, bool)> {
     let mut metadata = StreamMetadata::default();
-    let mut seen_priority = false;
-    let mut seen_group = false;
-    let mut seen_open_info = false;
+    let mut seen = 0u8;
     for tlv in tlvs {
+        let Some(seen_bit) = metadata_singleton_seen_bit(tlv.typ) else {
+            continue;
+        };
+        if seen & seen_bit != 0 {
+            return Ok((StreamMetadata::default(), false));
+        }
+        seen |= seen_bit;
         match tlv.typ {
             METADATA_STREAM_PRIORITY => {
-                if seen_priority {
-                    return Ok((StreamMetadata::default(), false));
-                }
-                seen_priority = true;
                 metadata.priority = Some(parse_metadata_varint(&tlv.value)?);
             }
             METADATA_STREAM_GROUP => {
-                if seen_group {
-                    return Ok((StreamMetadata::default(), false));
-                }
-                seen_group = true;
                 metadata.group = Some(parse_metadata_varint(&tlv.value)?);
             }
             METADATA_OPEN_INFO => {
-                if seen_open_info {
-                    return Ok((StreamMetadata::default(), false));
-                }
-                seen_open_info = true;
                 metadata.open_info = copy_payload_slice(&tlv.value)?;
             }
             _ => {}
@@ -266,48 +264,43 @@ pub fn parse_stream_metadata_tlvs(tlvs: &[Tlv]) -> Result<(StreamMetadata, bool)
 
 pub fn parse_stream_metadata_bytes_view(src: &[u8]) -> Result<(StreamMetadataView<'_>, bool)> {
     let mut metadata = StreamMetadataView::default();
-    let mut seen_priority = false;
-    let mut seen_group = false;
-    let mut seen_open_info = false;
-    let result = (|| {
-        for tlv in tlv_views(src) {
-            let tlv = tlv?;
-            match tlv.typ {
-                METADATA_STREAM_PRIORITY => {
-                    if seen_priority {
-                        return Err(Error::protocol(DUPLICATE_METADATA_SINGLETON));
-                    }
-                    seen_priority = true;
-                    metadata.priority = Some(parse_metadata_varint(tlv.value)?);
-                }
-                METADATA_STREAM_GROUP => {
-                    if seen_group {
-                        return Err(Error::protocol(DUPLICATE_METADATA_SINGLETON));
-                    }
-                    seen_group = true;
-                    metadata.group = Some(parse_metadata_varint(tlv.value)?);
-                }
-                METADATA_OPEN_INFO => {
-                    if seen_open_info {
-                        return Err(Error::protocol(DUPLICATE_METADATA_SINGLETON));
-                    }
-                    seen_open_info = true;
-                    metadata.open_info = tlv.value;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    })();
-    if let Err(err) = result {
-        if err.is_protocol_message(DUPLICATE_METADATA_SINGLETON) {
+    let mut seen = 0u8;
+    for tlv in tlv_views(src) {
+        let tlv = tlv?;
+        let Some(seen_bit) = metadata_singleton_seen_bit(tlv.typ) else {
+            continue;
+        };
+        if seen & seen_bit != 0 {
             return Ok((StreamMetadataView::default(), false));
         }
-        return Err(err);
+        seen |= seen_bit;
+        match tlv.typ {
+            METADATA_STREAM_PRIORITY => {
+                metadata.priority = Some(parse_metadata_varint(tlv.value)?);
+            }
+            METADATA_STREAM_GROUP => {
+                metadata.group = Some(parse_metadata_varint(tlv.value)?);
+            }
+            METADATA_OPEN_INFO => {
+                metadata.open_info = tlv.value;
+            }
+            _ => {}
+        }
     }
     Ok((metadata, true))
 }
 
+#[inline]
+fn metadata_singleton_seen_bit(typ: u64) -> Option<u8> {
+    match typ {
+        METADATA_STREAM_PRIORITY => Some(SEEN_METADATA_PRIORITY),
+        METADATA_STREAM_GROUP => Some(SEEN_METADATA_GROUP),
+        METADATA_OPEN_INFO => Some(SEEN_METADATA_OPEN_INFO),
+        _ => None,
+    }
+}
+
+#[inline]
 fn parse_metadata_varint(value: &[u8]) -> Result<u64> {
     let (v, n) = parse_varint(value)?;
     if n != value.len() {
@@ -323,6 +316,26 @@ pub fn build_open_metadata_prefix(
     open_info: &[u8],
     max_frame_payload: u64,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    build_open_metadata_prefix_into(
+        &mut out,
+        caps,
+        priority,
+        group,
+        open_info,
+        max_frame_payload,
+    )?;
+    Ok(out)
+}
+
+pub fn build_open_metadata_prefix_into(
+    out: &mut Vec<u8>,
+    caps: u64,
+    priority: Option<u64>,
+    group: Option<u64>,
+    open_info: &[u8],
+    max_frame_payload: u64,
+) -> Result<()> {
     if !open_info.is_empty() && !capabilities_can_carry_open_info(caps) {
         return Err(
             Error::protocol("zmux: open_info requires negotiated open_metadata")
@@ -333,7 +346,8 @@ pub fn build_open_metadata_prefix(
         );
     }
     if caps & CAPABILITY_OPEN_METADATA == 0 {
-        return Ok(Vec::new());
+        out.clear();
+        return Ok(());
     }
 
     let mut metadata_len = 0usize;
@@ -363,7 +377,8 @@ pub fn build_open_metadata_prefix(
         )?;
     }
     if metadata_len == 0 {
-        return Ok(Vec::new());
+        out.clear();
+        return Ok(());
     }
     let metadata_len_u64 = usize_to_u64_len(metadata_len, "opening metadata too large")?;
     let total_len = checked_len_add(
@@ -381,23 +396,23 @@ pub fn build_open_metadata_prefix(
         );
     }
 
-    let mut out = payload_vec_with_capacity(total_len)?;
-    append_varint(&mut out, metadata_len_u64)?;
+    reset_payload_vec(out, total_len)?;
+    append_varint_reserved(out, metadata_len_u64)?;
     if let Some(priority) = priority {
         if capabilities_can_carry_priority_on_open(caps) {
-            append_varint_tlv(&mut out, METADATA_STREAM_PRIORITY, priority)?;
+            append_varint_tlv(out, METADATA_STREAM_PRIORITY, priority)?;
         }
     }
     if let Some(group) = group {
         if capabilities_can_carry_group_on_open(caps) {
-            append_varint_tlv(&mut out, METADATA_STREAM_GROUP, group)?;
+            append_varint_tlv(out, METADATA_STREAM_GROUP, group)?;
         }
     }
     if !open_info.is_empty() {
-        append_tlv(&mut out, METADATA_OPEN_INFO, open_info)?;
+        append_tlv(out, METADATA_OPEN_INFO, open_info)?;
     }
     debug_assert_eq!(out.len(), total_len);
-    Ok(out)
+    Ok(())
 }
 
 pub fn build_priority_update_payload(
@@ -405,12 +420,22 @@ pub fn build_priority_update_payload(
     update: MetadataUpdate,
     max_payload: u64,
 ) -> Result<Vec<u8>> {
-    if update.priority.is_none() && update.group.is_none() {
+    let mut out = Vec::new();
+    build_priority_update_payload_into(&mut out, caps, update, max_payload)?;
+    Ok(out)
+}
+
+pub(crate) fn priority_update_payload_len(
+    caps: u64,
+    update: MetadataUpdate,
+    max_payload: u64,
+) -> Result<usize> {
+    if update.is_empty() {
         return Err(Error::local("zmux: metadata update has no fields"));
     }
     let mut total_len = varint_len(EXT_PRIORITY_UPDATE)?;
     if let Some(priority) = update.priority {
-        if !capabilities_can_carry_priority_update(caps) {
+        if !capabilities_can_carry_priority_in_update(caps) {
             return Err(metadata_update_capability_error());
         }
         total_len = checked_len_add(
@@ -420,7 +445,7 @@ pub fn build_priority_update_payload(
         )?;
     }
     if let Some(group) = update.group {
-        if !capabilities_can_carry_group_update(caps) {
+        if !capabilities_can_carry_group_in_update(caps) {
             return Err(metadata_update_capability_error());
         }
         total_len = checked_len_add(
@@ -434,16 +459,26 @@ pub fn build_priority_update_payload(
             "zmux: priority update exceeds peer max_extension_payload_bytes",
         ));
     }
-    let mut out = payload_vec_with_capacity(total_len)?;
-    append_varint(&mut out, EXT_PRIORITY_UPDATE)?;
+    Ok(total_len)
+}
+
+pub fn build_priority_update_payload_into(
+    out: &mut Vec<u8>,
+    caps: u64,
+    update: MetadataUpdate,
+    max_payload: u64,
+) -> Result<()> {
+    let total_len = priority_update_payload_len(caps, update, max_payload)?;
+    reset_payload_vec(out, total_len)?;
+    append_varint_reserved(out, EXT_PRIORITY_UPDATE)?;
     if let Some(priority) = update.priority {
-        append_varint_tlv(&mut out, METADATA_STREAM_PRIORITY, priority)?;
+        append_varint_tlv(out, METADATA_STREAM_PRIORITY, priority)?;
     }
     if let Some(group) = update.group {
-        append_varint_tlv(&mut out, METADATA_STREAM_GROUP, group)?;
+        append_varint_tlv(out, METADATA_STREAM_GROUP, group)?;
     }
     debug_assert_eq!(out.len(), total_len);
-    Ok(out)
+    Ok(())
 }
 
 fn metadata_update_capability_error() -> Error {
@@ -466,55 +501,51 @@ pub fn parse_priority_update_payload(payload: &[u8]) -> Result<(StreamMetadata, 
 
 pub(crate) fn parse_priority_update_metadata(payload: &[u8]) -> Result<(StreamMetadata, bool)> {
     let mut metadata = StreamMetadata::default();
-    let mut seen_priority = false;
-    let mut seen_group = false;
-    let result = visit_tlvs(payload, |typ, value| {
-        match typ {
+    let mut seen = 0u8;
+    for tlv in tlv_views(payload) {
+        let tlv = tlv?;
+        match tlv.typ {
             METADATA_STREAM_PRIORITY => {
-                if seen_priority {
-                    return Err(Error::protocol(DUPLICATE_METADATA_SINGLETON));
+                if seen & SEEN_METADATA_PRIORITY != 0 {
+                    return Ok((StreamMetadata::default(), false));
                 }
-                seen_priority = true;
-                metadata.priority = Some(parse_metadata_varint(value)?);
+                seen |= SEEN_METADATA_PRIORITY;
+                metadata.priority = Some(parse_metadata_varint(tlv.value)?);
             }
             METADATA_STREAM_GROUP => {
-                if seen_group {
-                    return Err(Error::protocol(DUPLICATE_METADATA_SINGLETON));
+                if seen & SEEN_METADATA_GROUP != 0 {
+                    return Ok((StreamMetadata::default(), false));
                 }
-                seen_group = true;
-                metadata.group = Some(parse_metadata_varint(value)?);
+                seen |= SEEN_METADATA_GROUP;
+                metadata.group = Some(parse_metadata_varint(tlv.value)?);
             }
             METADATA_OPEN_INFO => {}
             _ => {}
         }
-        Ok(())
-    });
-    if let Err(err) = result {
-        if err.is_protocol_message(DUPLICATE_METADATA_SINGLETON) {
-            return Ok((StreamMetadata::default(), false));
-        }
-        return Err(err);
     }
     Ok((metadata, true))
 }
 
+#[inline]
 fn append_varint_tlv(dst: &mut Vec<u8>, typ: u64, value: u64) -> Result<()> {
-    append_varint(dst, typ)?;
-    let value_len = usize_to_u64_len(varint_len(value)?, "metadata tlv too large")?;
-    append_varint(dst, value_len)?;
-    append_varint(dst, value)
+    append_varint_reserved(dst, typ)?;
+    let value_len = varint_len(value)? as u64;
+    append_varint_reserved(dst, value_len)?;
+    append_varint_reserved(dst, value)
 }
 
+#[inline]
 fn metadata_varint_tlv_len(typ: u64, value: u64) -> Result<usize> {
     let value_len = varint_len(value)?;
     checked_len_sum3(
         varint_len(typ)?,
-        varint_len(usize_to_u64_len(value_len, "metadata tlv too large")?)?,
+        varint_len(value_len as u64)?,
         value_len,
         "metadata tlv too large",
     )
 }
 
+#[inline]
 fn metadata_bytes_tlv_len(typ: u64, value_len: usize) -> Result<usize> {
     checked_len_sum3(
         varint_len(typ)?,
@@ -532,37 +563,56 @@ pub struct GoAwayPayload {
     pub reason: String,
 }
 
-pub fn build_goaway_payload(
+pub fn build_go_away_payload(
     last_accepted_bidi: u64,
     last_accepted_uni: u64,
     code: u64,
     reason: &str,
 ) -> Result<Vec<u8>> {
-    let mut out = payload_vec_with_capacity(goaway_payload_len(
+    let mut out = payload_vec_with_capacity(go_away_payload_len(
         last_accepted_bidi,
         last_accepted_uni,
         code,
         reason,
     )?)?;
-    append_varint(&mut out, last_accepted_bidi)?;
-    append_varint(&mut out, last_accepted_uni)?;
-    append_varint(&mut out, code)?;
+    append_go_away_base(&mut out, last_accepted_bidi, last_accepted_uni, code)?;
     append_debug_text_tlv(&mut out, reason)?;
     Ok(out)
 }
 
-fn goaway_payload_len(
+#[inline]
+fn append_go_away_base(
+    dst: &mut Vec<u8>,
+    last_accepted_bidi: u64,
+    last_accepted_uni: u64,
+    code: u64,
+) -> Result<()> {
+    append_varint_reserved(dst, last_accepted_bidi)?;
+    append_varint_reserved(dst, last_accepted_uni)?;
+    append_varint_reserved(dst, code)
+}
+
+#[inline]
+fn go_away_base_payload_len(
+    last_accepted_bidi: u64,
+    last_accepted_uni: u64,
+    code: u64,
+) -> Result<usize> {
+    checked_len_sum3(
+        varint_len(last_accepted_bidi)?,
+        varint_len(last_accepted_uni)?,
+        varint_len(code)?,
+        "goaway payload too large",
+    )
+}
+
+fn go_away_payload_len(
     last_accepted_bidi: u64,
     last_accepted_uni: u64,
     code: u64,
     reason: &str,
 ) -> Result<usize> {
-    let mut len = checked_len_sum3(
-        varint_len(last_accepted_bidi)?,
-        varint_len(last_accepted_uni)?,
-        varint_len(code)?,
-        "goaway payload too large",
-    )?;
+    let mut len = go_away_base_payload_len(last_accepted_bidi, last_accepted_uni, code)?;
     if !reason.is_empty() {
         len = checked_len_add(
             len,
@@ -573,19 +623,26 @@ fn goaway_payload_len(
     Ok(len)
 }
 
-pub(crate) fn build_goaway_payload_capped(
+pub(crate) fn build_go_away_payload_capped(
     last_accepted_bidi: u64,
     last_accepted_uni: u64,
     code: u64,
     reason: &str,
     max_payload: u64,
 ) -> Result<Vec<u8>> {
-    let mut out = build_goaway_payload(last_accepted_bidi, last_accepted_uni, code, "")?;
+    let capacity = capped_diag_payload_capacity(
+        go_away_base_payload_len(last_accepted_bidi, last_accepted_uni, code)?,
+        reason,
+        max_payload,
+        "goaway payload too large",
+    )?;
+    let mut out = payload_vec_with_capacity(capacity)?;
+    append_go_away_base(&mut out, last_accepted_bidi, last_accepted_uni, code)?;
     append_debug_text_tlv_capped(&mut out, reason, max_payload)?;
     Ok(out)
 }
 
-pub fn parse_goaway_payload(payload: &[u8]) -> Result<GoAwayPayload> {
+pub fn parse_go_away_payload(payload: &[u8]) -> Result<GoAwayPayload> {
     let mut off = 0usize;
     let read = |off: &mut usize| -> Result<u64> {
         let (v, n) = parse_varint(&payload[*off..])?;
@@ -606,7 +663,7 @@ pub fn parse_goaway_payload(payload: &[u8]) -> Result<GoAwayPayload> {
 
 pub fn build_code_payload(code: u64, reason: &str, max_payload: u64) -> Result<Vec<u8>> {
     let mut out = payload_vec_with_capacity(code_payload_capacity(code, reason, max_payload)?)?;
-    append_varint(&mut out, code)?;
+    append_varint_reserved(&mut out, code)?;
     if usize_to_u64_len(out.len(), "error payload too large")? < max_payload {
         append_debug_text_tlv_capped(&mut out, reason, max_payload)?;
     }
@@ -615,24 +672,31 @@ pub fn build_code_payload(code: u64, reason: &str, max_payload: u64) -> Result<V
 
 fn code_payload_capacity(code: u64, reason: &str, max_payload: u64) -> Result<usize> {
     let code_len = varint_len(code)?;
-    let code_len_u64 = usize_to_u64_len(code_len, "error payload too large")?;
-    if reason.is_empty() || code_len_u64 >= max_payload {
-        return Ok(code_len);
-    }
-    let uncapped = checked_len_add(
-        code_len,
-        debug_text_tlv_len(reason.len())?,
-        "error payload too large",
-    )?;
-    Ok(match usize::try_from(max_payload) {
-        Ok(max_payload) => uncapped.min(max_payload),
-        Err(_) => uncapped,
-    })
+    capped_diag_payload_capacity(code_len, reason, max_payload, "error payload too large")
 }
 
+#[inline]
+fn capped_diag_payload_capacity(
+    base_len: usize,
+    reason: &str,
+    max_payload: u64,
+    context: &'static str,
+) -> Result<usize> {
+    if reason.is_empty() || usize_to_u64_len(base_len, context)? >= max_payload {
+        return Ok(base_len);
+    }
+    let uncapped = checked_len_add(base_len, debug_text_tlv_len(reason.len())?, context)?;
+    Ok(uncapped.min(max_payload.min(usize::MAX as u64) as usize))
+}
+
+#[inline]
 fn debug_text_tlv_len(value_len: usize) -> Result<usize> {
-    usize::try_from(debug_text_tlv_len_u64(value_len)?)
-        .map_err(|_| Error::frame_size("diagnostic text too large"))
+    let len = debug_text_tlv_len_u64(value_len)?;
+    if len > usize::MAX as u64 {
+        Err(Error::frame_size("diagnostic text too large"))
+    } else {
+        Ok(len as usize)
+    }
 }
 
 pub fn parse_error_payload(payload: &[u8]) -> Result<(u64, String)> {
@@ -641,60 +705,47 @@ pub fn parse_error_payload(payload: &[u8]) -> Result<(u64, String)> {
 }
 
 fn parse_diag_reason(payload: &[u8]) -> Result<String> {
-    let mut seen_debug = false;
-    let mut seen_retry = false;
-    let mut seen_stream = false;
-    let mut seen_frame = false;
+    let mut seen = 0u8;
     let mut debug_text: Option<&[u8]> = None;
-    let result = (|| {
-        for tlv in tlv_views(payload) {
-            let tlv = tlv?;
-            match tlv.typ {
-                DIAG_DEBUG_TEXT => {
-                    if seen_debug {
-                        return Err(Error::protocol(DUPLICATE_DIAG_SINGLETON));
-                    }
-                    seen_debug = true;
-                    debug_text = Some(tlv.value);
-                }
-                DIAG_RETRY_AFTER_MILLIS => {
-                    if seen_retry {
-                        return Err(Error::protocol(DUPLICATE_DIAG_SINGLETON));
-                    }
-                    seen_retry = true;
-                }
-                DIAG_OFFENDING_STREAM_ID => {
-                    if seen_stream {
-                        return Err(Error::protocol(DUPLICATE_DIAG_SINGLETON));
-                    }
-                    seen_stream = true;
-                }
-                DIAG_OFFENDING_FRAME_TYPE => {
-                    if seen_frame {
-                        return Err(Error::protocol(DUPLICATE_DIAG_SINGLETON));
-                    }
-                    seen_frame = true;
-                }
-                _ => {}
+    for tlv in tlv_views(payload) {
+        let tlv = match tlv {
+            Ok(tlv) => tlv,
+            Err(err) if err.is_frame_size_message("truncated tlv") => {
+                return Err(Error::protocol("truncated tlv"));
             }
-        }
-        Ok(())
-    })();
-    if let Err(err) = result {
-        if err.is_protocol_message(DUPLICATE_DIAG_SINGLETON) {
+            Err(err) => return Err(err),
+        };
+        let Some(seen_bit) = diag_singleton_seen_bit(tlv.typ) else {
+            continue;
+        };
+        if seen & seen_bit != 0 {
             return Ok(String::new());
         }
-        if err.is_frame_size_message("truncated tlv") {
-            return Err(Error::protocol("truncated tlv"));
+        seen |= seen_bit;
+        if tlv.typ == DIAG_DEBUG_TEXT {
+            debug_text = Some(tlv.value);
         }
-        return Err(err);
     }
-    Ok(debug_text
-        .and_then(|value| str::from_utf8(value).ok())
-        .unwrap_or_default()
-        .to_owned())
+    if let Some(value) = debug_text {
+        if let Ok(value) = str::from_utf8(value) {
+            return Ok(value.to_owned());
+        }
+    }
+    Ok(String::new())
 }
 
+#[inline]
+fn diag_singleton_seen_bit(typ: u64) -> Option<u8> {
+    match typ {
+        DIAG_DEBUG_TEXT => Some(SEEN_DIAG_DEBUG_TEXT),
+        DIAG_RETRY_AFTER_MILLIS => Some(SEEN_DIAG_RETRY_AFTER_MILLIS),
+        DIAG_OFFENDING_STREAM_ID => Some(SEEN_DIAG_OFFENDING_STREAM_ID),
+        DIAG_OFFENDING_FRAME_TYPE => Some(SEEN_DIAG_OFFENDING_FRAME_TYPE),
+        _ => None,
+    }
+}
+
+#[inline]
 fn append_debug_text_tlv(dst: &mut Vec<u8>, reason: &str) -> Result<()> {
     if reason.is_empty() {
         return Ok(());
@@ -719,12 +770,12 @@ fn append_debug_text_tlv_capped(dst: &mut Vec<u8>, reason: &str, max_payload: u6
 }
 
 fn capped_debug_text_value_len(reason: &str, remaining: u64) -> Result<usize> {
-    let typ_len = usize_to_u64_len(varint_len(DIAG_DEBUG_TEXT)?, "diagnostic text too large")?;
+    let typ_len = varint_len(DIAG_DEBUG_TEXT)? as u64;
     if remaining <= typ_len {
         return Ok(0);
     }
-    let max_payload_value_len = usize::try_from(MAX_VARINT62).unwrap_or(usize::MAX);
-    let max_remaining_value_len = usize::try_from(remaining - typ_len).unwrap_or(usize::MAX);
+    let max_payload_value_len = MAX_VARINT62.min(usize::MAX as u64) as usize;
+    let max_remaining_value_len = (remaining - typ_len).min(usize::MAX as u64) as usize;
     let mut low = 0usize;
     let mut high = reason
         .len()
@@ -732,7 +783,7 @@ fn capped_debug_text_value_len(reason: &str, remaining: u64) -> Result<usize> {
         .min(max_remaining_value_len);
     while low < high {
         let mid = low + (high - low).div_ceil(2);
-        if debug_text_tlv_len_u64(mid)? <= remaining {
+        if debug_text_tlv_len_with_type_len(mid, typ_len)? <= remaining {
             low = mid;
         } else {
             high = mid - 1;
@@ -744,29 +795,45 @@ fn capped_debug_text_value_len(reason: &str, remaining: u64) -> Result<usize> {
     Ok(low)
 }
 
+#[inline]
 fn debug_text_tlv_len_u64(value_len: usize) -> Result<u64> {
+    let typ_len = varint_len(DIAG_DEBUG_TEXT)? as u64;
+    debug_text_tlv_len_with_type_len(value_len, typ_len)
+}
+
+#[inline]
+fn debug_text_tlv_len_with_type_len(value_len: usize, typ_len: u64) -> Result<u64> {
     let value_len = usize_to_u64_len(value_len, "diagnostic text too large")?;
-    let typ_len = usize_to_u64_len(varint_len(DIAG_DEBUG_TEXT)?, "diagnostic text too large")?;
-    let len_len = usize_to_u64_len(varint_len(value_len)?, "diagnostic text too large")?;
-    typ_len
+    let len_len = varint_len(value_len)? as u64;
+    let header_len = typ_len
         .checked_add(len_len)
-        .and_then(|n| n.checked_add(value_len))
+        .ok_or_else(|| Error::frame_size("diagnostic text too large"))?;
+    header_len
+        .checked_add(value_len)
         .ok_or_else(|| Error::frame_size("diagnostic text too large"))
 }
 
+#[inline]
 fn checked_len_add(lhs: usize, rhs: usize, context: &'static str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::frame_size(context))
 }
 
+#[inline]
 fn checked_len_sum3(a: usize, b: usize, c: usize, context: &'static str) -> Result<usize> {
     checked_len_add(checked_len_add(a, b, context)?, c, context)
 }
 
+#[inline]
 fn usize_to_u64_len(value: usize, context: &'static str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| Error::frame_size(context))
+    if value > u64::MAX as usize {
+        Err(Error::frame_size(context))
+    } else {
+        Ok(value as u64)
+    }
 }
 
+#[inline]
 fn payload_vec_with_capacity(capacity: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.try_reserve_exact(capacity)
@@ -774,7 +841,21 @@ fn payload_vec_with_capacity(capacity: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[inline]
+fn reset_payload_vec(out: &mut Vec<u8>, capacity: usize) -> Result<()> {
+    if out.capacity() == capacity {
+        out.clear();
+    } else {
+        *out = payload_vec_with_capacity(capacity)?;
+    }
+    Ok(())
+}
+
+#[inline]
 fn copy_payload_slice(value: &[u8]) -> Result<Vec<u8>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     out.try_reserve_exact(value.len())
         .map_err(|_| Error::local("zmux: payload allocation failed"))?;
@@ -785,9 +866,9 @@ fn copy_payload_slice(value: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_code_payload, build_goaway_payload_capped, build_open_metadata_prefix,
+        build_code_payload, build_go_away_payload_capped, build_open_metadata_prefix,
         build_priority_update_payload, normalize_stream_group, parse_data_payload,
-        parse_error_payload, parse_goaway_payload, parse_priority_update_payload,
+        parse_error_payload, parse_go_away_payload, parse_priority_update_payload,
         parse_stream_metadata_tlvs, MetadataUpdate, StreamMetadata, StreamMetadataView,
     };
     use crate::error::{ErrorCode, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource};
@@ -840,11 +921,15 @@ mod tests {
         assert_eq!(view.open_info, &[4, 5, 6]);
         assert_eq!(metadata.open_info(), &[4, 5, 6]);
         assert_eq!(view.open_info(), &[4, 5, 6]);
+        assert_eq!(metadata.open_info().len(), 3);
+        assert_eq!(view.open_info().len(), 3);
         assert_eq!(view.open_info.as_ptr(), metadata.open_info.as_ptr());
         assert!(metadata.has_open_info());
         assert!(view.has_open_info());
         assert!(!metadata.is_empty());
         assert!(!view.is_empty());
+        assert_eq!(StreamMetadata::default().open_info().len(), 0);
+        assert_eq!(StreamMetadataView::default().open_info().len(), 0);
         assert!(!StreamMetadata::default().has_open_info());
         assert!(!StreamMetadataView::default().has_open_info());
         assert!(StreamMetadata::default().is_empty());
@@ -852,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_metadata_tlvs_round_trip_and_copy_open_info() {
+    fn stream_metadata_tlvs_round_trip_and_preserve_open_info() {
         let mut tlvs = vec![
             Tlv::new(METADATA_STREAM_PRIORITY, encode_varint(7).unwrap()).unwrap(),
             Tlv::new(METADATA_STREAM_GROUP, encode_varint(11).unwrap()).unwrap(),
@@ -919,14 +1004,14 @@ mod tests {
     fn metadata_update_builders_match_struct_literal_semantics() {
         assert!(MetadataUpdate::new().is_empty());
         assert_eq!(
-            MetadataUpdate::priority(7),
+            MetadataUpdate::new().with_priority(7),
             MetadataUpdate {
                 priority: Some(7),
                 group: None,
             }
         );
         assert_eq!(
-            MetadataUpdate::group(9),
+            MetadataUpdate::new().with_group(9),
             MetadataUpdate {
                 priority: None,
                 group: Some(9),
@@ -940,12 +1025,13 @@ mod tests {
             }
         );
         assert!(MetadataUpdate::new()
-            .try_with_priority(MAX_VARINT62)
-            .unwrap()
-            .try_with_group(MAX_VARINT62)
+            .with_priority(MAX_VARINT62)
+            .with_group(MAX_VARINT62)
+            .validate()
             .is_ok());
         assert!(MetadataUpdate::new()
-            .try_with_priority(MAX_VARINT62 + 1)
+            .with_priority(MAX_VARINT62 + 1)
+            .validate()
             .is_err());
         assert!(MetadataUpdate::new()
             .with_group(MAX_VARINT62 + 1)
@@ -1111,8 +1197,8 @@ mod tests {
 
     #[test]
     fn capped_goaway_payload_omits_reason_when_cap_is_zero() {
-        let payload = build_goaway_payload_capped(4, 8, 7, "reason", 0).unwrap();
-        let parsed = parse_goaway_payload(&payload).unwrap();
+        let payload = build_go_away_payload_capped(4, 8, 7, "reason", 0).unwrap();
+        let parsed = parse_go_away_payload(&payload).unwrap();
         assert_eq!(parsed.code, 7);
         assert_eq!(parsed.reason, "");
     }

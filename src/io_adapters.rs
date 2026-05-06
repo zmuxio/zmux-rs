@@ -12,6 +12,8 @@ use std::task::{Context, Poll};
 
 const DEFAULT_READ_CHUNK: usize = 16 * 1024;
 const DEFAULT_WRITE_CHUNK: usize = 16 * 1024;
+#[cfg(any(feature = "tokio-io", feature = "futures-io"))]
+const MAX_RETAINED_IO_BUFFER: usize = 64 * 1024;
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
 type BoxIoFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -47,24 +49,20 @@ pub struct AsyncIo<T: ?Sized> {
     shutdown_done: bool,
 }
 
-/// Wrap a ZMux async stream for standard async I/O trait compatibility.
-pub fn async_io<T>(stream: T) -> AsyncIo<T>
-where
-    T: Send + Sync + 'static,
-{
-    AsyncIo::new(stream)
-}
-
 impl<T> AsyncIo<T>
 where
     T: Send + Sync + 'static,
 {
+    /// Wraps an owned async ZMux stream behind standard async I/O traits.
+    #[inline]
     pub fn new(stream: T) -> Self {
         Self::from_arc(Arc::new(stream))
     }
 }
 
 impl<T: ?Sized> AsyncIo<T> {
+    /// Wraps an already shared async ZMux stream.
+    #[inline]
     pub fn from_arc(inner: Arc<T>) -> Self {
         Self {
             inner,
@@ -87,43 +85,61 @@ impl<T: ?Sized> AsyncIo<T> {
         }
     }
 
+    /// Borrows the wrapped stream.
+    #[inline]
     pub fn get_ref(&self) -> &T {
         &self.inner
     }
 
-    pub fn inner_arc(&self) -> &Arc<T> {
+    /// Borrows the shared owner for callers that need to clone it.
+    #[inline]
+    pub fn as_arc(&self) -> &Arc<T> {
         &self.inner
     }
 
+    /// Returns the shared owner of the wrapped stream.
+    #[inline]
     pub fn into_inner(self) -> Arc<T> {
         self.inner
     }
 
+    /// Returns the maximum read buffer used per poll operation.
+    #[inline]
     pub fn read_chunk_size(&self) -> usize {
         self.read_chunk_size
     }
 
+    /// Sets the maximum read buffer used per poll operation.
+    ///
+    /// A value of zero is clamped to one byte.
+    #[inline]
     pub fn set_read_chunk_size(&mut self, size: usize) {
         self.read_chunk_size = size.max(1);
     }
 
+    /// Returns the maximum write buffer copied per poll operation.
+    #[inline]
     pub fn write_chunk_size(&self) -> usize {
         self.write_chunk_size
     }
 
+    /// Sets the maximum write buffer copied per poll operation.
+    ///
+    /// A value of zero is clamped to one byte.
+    #[inline]
     pub fn set_write_chunk_size(&mut self, size: usize) {
         self.write_chunk_size = size.max(1);
     }
 
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn copy_ready_read(&mut self, dst: &mut [u8]) -> usize {
-        let available = self.read_ready.len().saturating_sub(self.read_ready_offset);
+        let available = self.read_ready.len() - self.read_ready_offset;
         let n = available.min(dst.len());
         dst[..n]
             .copy_from_slice(&self.read_ready[self.read_ready_offset..self.read_ready_offset + n]);
         self.read_ready_offset += n;
         if self.read_ready_offset >= self.read_ready.len() {
-            self.read_ready.clear();
+            recycle_io_buffer(&mut self.read_ready);
             self.read_ready_offset = 0;
         }
         n
@@ -145,6 +161,10 @@ impl<T: ?Sized> AsyncIo<T> {
             let len = dst.len().min(self.read_chunk_size);
             let mut buf = std::mem::take(&mut self.read_ready);
             self.pending_read = Some(Box::pin(async move {
+                if buf.len() < len {
+                    buf.try_reserve_exact(len - buf.len())
+                        .map_err(|_| io_buffer_allocation_failed("read"))?;
+                }
                 buf.resize(len, 0);
                 let n = stream.read(&mut buf).await.map_err(io::Error::from)?;
                 if n > buf.len() {
@@ -172,7 +192,7 @@ impl<T: ?Sized> AsyncIo<T> {
                 if n < self.read_ready.len() {
                     self.read_ready_offset = n;
                 } else {
-                    self.read_ready.clear();
+                    recycle_io_buffer(&mut self.read_ready);
                     self.read_ready_offset = 0;
                 }
                 Poll::Ready(Ok(n))
@@ -193,7 +213,7 @@ impl<T: ?Sized> AsyncIo<T> {
             Poll::Ready(result) => {
                 self.pending_write = None;
                 let (mut data, result) = result;
-                data.clear();
+                recycle_io_buffer(&mut data);
                 self.write_buf = data;
                 Poll::Ready(result)
             }
@@ -201,36 +221,37 @@ impl<T: ?Sized> AsyncIo<T> {
     }
 
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
-    fn start_pending_write(&mut self, src: &[u8])
+    fn start_pending_write(&mut self, src: &[u8]) -> io::Result<()>
     where
         T: AsyncSendStreamApi + 'static,
     {
-        let stream = Arc::clone(&self.inner);
         let mut data = std::mem::take(&mut self.write_buf);
         data.clear();
+        data.try_reserve_exact(src.len())
+            .map_err(|_| io_buffer_allocation_failed("write"))?;
         data.extend_from_slice(src);
-        self.pending_write = Some(Box::pin(async move {
-            let result = async {
-                let n = stream.write(&data).await.map_err(io::Error::from)?;
-                if n > data.len() {
-                    return Err(invalid_progress_io("write"));
-                }
-                Ok(n)
-            }
-            .await;
-            (data, result)
-        }));
+        self.start_pending_write_data(data);
+        Ok(())
     }
 
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
-    fn start_pending_vectored_write(&mut self, bufs: &[IoSlice<'_>], len: usize)
+    fn start_pending_vectored_write(&mut self, bufs: &[IoSlice<'_>], len: usize) -> io::Result<()>
+    where
+        T: AsyncSendStreamApi + 'static,
+    {
+        let mut data = std::mem::take(&mut self.write_buf);
+        data.clear();
+        copy_vectored_prefix_into(bufs, len, &mut data)?;
+        self.start_pending_write_data(data);
+        Ok(())
+    }
+
+    #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
+    fn start_pending_write_data(&mut self, data: Vec<u8>)
     where
         T: AsyncSendStreamApi + 'static,
     {
         let stream = Arc::clone(&self.inner);
-        let mut data = std::mem::take(&mut self.write_buf);
-        data.clear();
-        copy_vectored_prefix_into(bufs, len, &mut data);
         self.pending_write = Some(Box::pin(async move {
             let result = async {
                 let n = stream.write(&data).await.map_err(io::Error::from)?;
@@ -256,7 +277,9 @@ impl<T: ?Sized> AsyncIo<T> {
             return Poll::Ready(Ok(0));
         }
         let len = src.len().min(self.write_chunk_size);
-        self.start_pending_write(&src[..len]);
+        if let Err(err) = self.start_pending_write(&src[..len]) {
+            return Poll::Ready(Err(err));
+        }
 
         self.poll_pending_write(cx)
     }
@@ -275,7 +298,9 @@ impl<T: ?Sized> AsyncIo<T> {
             if len == 0 {
                 return Poll::Ready(Ok(0));
             }
-            self.start_pending_vectored_write(bufs, len);
+            if let Err(err) = self.start_pending_vectored_write(bufs, len) {
+                return Poll::Ready(Err(err));
+            }
         }
 
         self.poll_pending_write(cx)
@@ -288,7 +313,7 @@ impl<T: ?Sized> AsyncIo<T> {
     {
         if self.pending_write.is_none() {
             return Poll::Ready(Ok(()));
-        };
+        }
 
         match self.poll_pending_write(cx) {
             Poll::Pending => Poll::Pending,
@@ -442,19 +467,22 @@ fn vectored_prefix_len(bufs: &[IoSlice<'_>], limit: usize) -> usize {
     let limit = limit.max(1);
     let mut total = 0usize;
     for buf in bufs {
-        if total >= limit {
+        if total == limit {
             break;
         }
-        total = total.saturating_add(buf.len()).min(limit);
+        total += (limit - total).min(buf.len());
     }
     total
 }
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
-fn copy_vectored_prefix_into(bufs: &[IoSlice<'_>], len: usize, data: &mut Vec<u8>) {
-    if data.capacity() < len {
-        data.reserve(len - data.capacity());
-    }
+fn copy_vectored_prefix_into(
+    bufs: &[IoSlice<'_>],
+    len: usize,
+    data: &mut Vec<u8>,
+) -> io::Result<()> {
+    data.try_reserve_exact(len)
+        .map_err(|_| io_buffer_allocation_failed("write"))?;
     for buf in bufs {
         if data.len() == len {
             break;
@@ -463,6 +491,23 @@ fn copy_vectored_prefix_into(bufs: &[IoSlice<'_>], len: usize, data: &mut Vec<u8
         let take = remaining.min(buf.len());
         data.extend_from_slice(&buf[..take]);
     }
+    Ok(())
+}
+
+#[cfg(any(feature = "tokio-io", feature = "futures-io"))]
+fn recycle_io_buffer(buffer: &mut Vec<u8>) {
+    buffer.clear();
+    if buffer.capacity() > MAX_RETAINED_IO_BUFFER {
+        *buffer = Vec::new();
+    }
+}
+
+#[cfg(any(feature = "tokio-io", feature = "futures-io"))]
+fn io_buffer_allocation_failed(direction: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("zmux: async {direction} buffer allocation failed"),
+    )
 }
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]

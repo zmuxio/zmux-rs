@@ -4,6 +4,7 @@ use crate::preface::Preface;
 use crate::protocol::{Role, PREFACE_VERSION, PROTO_VERSION};
 use crate::settings::Settings;
 use crate::varint::{varint_len, MAX_VARINT62};
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
@@ -38,7 +39,7 @@ pub const DEFAULT_HIDDEN_ABORT_CHURN_BUDGET: u64 = 128;
 pub const DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW: Duration = Duration::from_secs(1);
 pub const DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET: u64 = 128;
 pub const DEFAULT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-pub const DEFAULT_GOAWAY_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+pub const DEFAULT_GO_AWAY_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_KEEPALIVE_MAX_PING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(0);
@@ -106,7 +107,7 @@ pub struct Config {
     pub visible_terminal_churn_window: Duration,
     pub visible_terminal_churn_budget: u64,
     pub close_drain_timeout: Duration,
-    pub goaway_drain_interval: Duration,
+    pub go_away_drain_interval: Duration,
     pub stop_sending_graceful_drain_window: Option<Duration>,
     pub stop_sending_graceful_tail_cap: Option<u64>,
     pub keepalive_interval: Duration,
@@ -217,7 +218,7 @@ impl fmt::Debug for Config {
                 &self.visible_terminal_churn_budget,
             )
             .field("close_drain_timeout", &self.close_drain_timeout)
-            .field("goaway_drain_interval", &self.goaway_drain_interval)
+            .field("go_away_drain_interval", &self.go_away_drain_interval)
             .field(
                 "stop_sending_graceful_drain_window",
                 &self.stop_sending_graceful_drain_window,
@@ -262,6 +263,7 @@ fn default_config_template() -> &'static RwLock<Config> {
     DEFAULT_CONFIG_TEMPLATE.get_or_init(|| RwLock::new(builtin_default_config()))
 }
 
+/// Return a copy of the process-wide default configuration template.
 pub fn default_config() -> Config {
     default_config_template()
         .read()
@@ -269,6 +271,12 @@ pub fn default_config() -> Config {
         .clone()
 }
 
+/// Mutate the process-wide default configuration template.
+///
+/// Call this during process initialization before creating sessions. Existing
+/// sessions are not affected. Concurrent calls are race-safe, but the last
+/// completed update wins. Per-session random fields are cleared after the
+/// closure returns so later sessions can generate fresh values.
 pub fn configure_default_config(update: impl FnOnce(&mut Config)) {
     let mut next = default_config();
     update(&mut next);
@@ -280,6 +288,7 @@ pub fn configure_default_config(update: impl FnOnce(&mut Config)) {
     *template = next;
 }
 
+/// Restore the built-in process-wide default configuration template.
 pub fn reset_default_config() {
     let mut template = default_config_template()
         .write()
@@ -294,7 +303,7 @@ fn builtin_default_config() -> Config {
         min_proto: PROTO_VERSION,
         max_proto: PROTO_VERSION,
         capabilities: 0,
-        settings: Settings::default(),
+        settings: Settings::DEFAULT,
         preface_padding: false,
         preface_padding_min_bytes: DEFAULT_PREFACE_PADDING_MIN_BYTES,
         preface_padding_max_bytes: DEFAULT_PREFACE_PADDING_MAX_BYTES,
@@ -336,7 +345,7 @@ fn builtin_default_config() -> Config {
         visible_terminal_churn_window: DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW,
         visible_terminal_churn_budget: DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET,
         close_drain_timeout: DEFAULT_CLOSE_DRAIN_TIMEOUT,
-        goaway_drain_interval: DEFAULT_GOAWAY_DRAIN_INTERVAL,
+        go_away_drain_interval: DEFAULT_GO_AWAY_DRAIN_INTERVAL,
         stop_sending_graceful_drain_window: None,
         stop_sending_graceful_tail_cap: None,
         keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -350,57 +359,37 @@ fn builtin_default_config() -> Config {
     }
 }
 
-fn sanitize_default_config_template(config: Config) -> Config {
-    let mut config = normalize_config_defaults(config);
+fn sanitize_default_config_template(mut config: Config) -> Config {
+    config.min_proto = nonzero_or_default(config.min_proto, PROTO_VERSION);
+    config.max_proto = nonzero_or_default(config.max_proto, PROTO_VERSION);
+    if config.settings == ZERO_SETTINGS {
+        config.settings = Settings::DEFAULT;
+    } else {
+        normalize_settings_payload_limits(&mut config.settings);
+    }
     config.tie_breaker_nonce = 0;
     config.settings.ping_padding_key = 0;
     config
 }
 
-fn normalize_config_defaults(mut config: Config) -> Config {
-    if config.min_proto == 0 {
-        config.min_proto = PROTO_VERSION;
-    }
-    if config.max_proto == 0 {
-        config.max_proto = PROTO_VERSION;
-    }
-    if config.settings == zero_settings() {
-        config.settings = Settings::default();
-    } else {
-        let defaults = Settings::default();
-        if config.settings.max_frame_payload == 0 {
-            config.settings.max_frame_payload = defaults.max_frame_payload;
-        }
-        if config.settings.max_control_payload_bytes == 0 {
-            config.settings.max_control_payload_bytes = defaults.max_control_payload_bytes;
-        }
-        if config.settings.max_extension_payload_bytes == 0 {
-            config.settings.max_extension_payload_bytes = defaults.max_extension_payload_bytes;
-        }
-    }
-    config
-}
-
-fn zero_settings() -> Settings {
-    Settings {
-        initial_max_stream_data_bidi_locally_opened: 0,
-        initial_max_stream_data_bidi_peer_opened: 0,
-        initial_max_stream_data_uni: 0,
-        initial_max_data: 0,
-        max_incoming_streams_bidi: 0,
-        max_incoming_streams_uni: 0,
-        max_frame_payload: 0,
-        idle_timeout_millis: 0,
-        keepalive_hint_millis: 0,
-        max_control_payload_bytes: 0,
-        max_extension_payload_bytes: 0,
-        scheduler_hints: crate::settings::SchedulerHint::UnspecifiedOrBalanced,
-        ping_padding_key: 0,
-    }
-}
+const ZERO_SETTINGS: Settings = Settings {
+    initial_max_stream_data_bidi_locally_opened: 0,
+    initial_max_stream_data_bidi_peer_opened: 0,
+    initial_max_stream_data_uni: 0,
+    initial_max_data: 0,
+    max_incoming_streams_bidi: 0,
+    max_incoming_streams_uni: 0,
+    max_frame_payload: 0,
+    idle_timeout_millis: 0,
+    keepalive_hint_millis: 0,
+    max_control_payload_bytes: 0,
+    max_extension_payload_bytes: 0,
+    scheduler_hints: crate::settings::SchedulerHint::UnspecifiedOrBalanced,
+    ping_padding_key: 0,
+};
 
 pub(crate) fn default_accept_backlog_bytes_limit(max_frame_payload: u64) -> usize {
-    let max_frame_payload = usize::try_from(max_frame_payload).unwrap_or(usize::MAX);
+    let max_frame_payload = max_frame_payload.min(usize::MAX as u64) as usize;
     let per_stream = max_frame_payload
         .saturating_mul(DEFAULT_ACCEPT_BACKLOG_PER_STREAM_FRAMES)
         .max(DEFAULT_ACCEPT_BACKLOG_PER_STREAM_BYTES_FLOOR);
@@ -414,18 +403,6 @@ pub(crate) fn default_late_data_aggregate_cap(max_frame_payload: u64) -> u64 {
 }
 
 impl Config {
-    pub fn builtin_default() -> Self {
-        builtin_default_config()
-    }
-
-    pub fn configure_default(update: impl FnOnce(&mut Config)) {
-        configure_default_config(update);
-    }
-
-    pub fn reset_default() {
-        reset_default_config();
-    }
-
     pub fn initiator() -> Self {
         Self {
             role: Role::Initiator,
@@ -497,18 +474,15 @@ impl Config {
 
     pub fn local_preface(&self) -> Result<Preface> {
         let mut cfg = self.normalized()?;
-        if cfg.role == Role::Auto && cfg.tie_breaker_nonce == 0 {
-            cfg.tie_breaker_nonce = random_varint62()?;
-        }
-        if cfg.role != Role::Auto {
-            cfg.tie_breaker_nonce = 0;
-        }
-        if cfg.ping_padding {
-            if cfg.settings.ping_padding_key == 0 {
-                cfg.settings.ping_padding_key = random_varint62()?;
+        match cfg.role {
+            Role::Auto if cfg.tie_breaker_nonce == 0 => {
+                cfg.tie_breaker_nonce = random_varint62()?;
             }
-        } else {
-            cfg.settings.ping_padding_key = 0;
+            Role::Auto => {}
+            _ => cfg.tie_breaker_nonce = 0,
+        }
+        if cfg.ping_padding && cfg.settings.ping_padding_key == 0 {
+            cfg.settings.ping_padding_key = random_varint62()?;
         }
         Ok(Preface {
             preface_version: PREFACE_VERSION,
@@ -534,11 +508,15 @@ impl Config {
     }
 }
 
+/// Options used when opening a stream.
+///
+/// `open_info` is opaque application metadata carried as bytes. ZMux does not
+/// interpret it as text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenOptions {
-    pub initial_priority: Option<u64>,
-    pub initial_group: Option<u64>,
-    pub open_info: Vec<u8>,
+    initial_priority: Option<u64>,
+    initial_group: Option<u64>,
+    open_info: Vec<u8>,
 }
 
 impl OpenOptions {
@@ -546,52 +524,46 @@ impl OpenOptions {
         Self::default()
     }
 
-    pub fn priority(priority: u64) -> Self {
-        Self::new().with_initial_priority(priority)
-    }
-
-    pub fn group(group: u64) -> Self {
-        Self::new().with_initial_group(group)
-    }
-
-    pub fn open_info(open_info: impl Into<Vec<u8>>) -> Self {
-        Self::new().with_open_info(open_info)
-    }
-
-    pub fn open_info_bytes(open_info: impl AsRef<[u8]>) -> Self {
-        Self::new().with_open_info_bytes(open_info)
-    }
-
-    pub fn with_initial_priority(mut self, priority: u64) -> Self {
+    /// Set the initial peer-visible priority hint for the opened stream.
+    pub fn priority(mut self, priority: u64) -> Self {
         self.initial_priority = Some(priority);
         self
     }
 
-    pub fn try_with_initial_priority(mut self, priority: u64) -> Result<Self> {
-        validate_open_option_varint(priority, "initial_priority")?;
-        self.initial_priority = Some(priority);
-        Ok(self)
-    }
-
-    pub fn with_initial_group(mut self, group: u64) -> Self {
+    /// Set the initial peer-visible stream group hint for the opened stream.
+    pub fn group(mut self, group: u64) -> Self {
         self.initial_group = Some(group);
         self
     }
 
-    pub fn try_with_initial_group(mut self, group: u64) -> Result<Self> {
-        validate_open_option_varint(group, "initial_group")?;
-        self.initial_group = Some(group);
-        Ok(self)
-    }
-
-    pub fn with_open_info(mut self, open_info: impl Into<Vec<u8>>) -> Self {
-        self.open_info = open_info.into();
+    /// Set opaque binary metadata sent with the stream open.
+    ///
+    /// Borrowed bytes are copied into the request options; owned `Vec<u8>` or
+    /// `Cow::Owned` values are moved in without another copy.
+    pub fn with_open_info<'a>(mut self, open_info: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.open_info = open_info.into().into_owned();
         self
     }
 
-    pub fn with_open_info_bytes(mut self, open_info: impl AsRef<[u8]>) -> Self {
-        self.open_info = open_info.as_ref().to_vec();
-        self
+    pub fn initial_priority(&self) -> Option<u64> {
+        self.initial_priority
+    }
+
+    pub fn initial_group(&self) -> Option<u64> {
+        self.initial_group
+    }
+
+    /// Return the opaque binary metadata sent with the stream open.
+    pub fn open_info(&self) -> &[u8] {
+        &self.open_info
+    }
+
+    pub fn open_info_len(&self) -> usize {
+        self.open_info.len()
+    }
+
+    pub fn has_open_info(&self) -> bool {
+        !self.open_info.is_empty()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -607,6 +579,10 @@ impl OpenOptions {
         }
         Ok(())
     }
+
+    pub fn into_parts(self) -> (Option<u64>, Option<u64>, Vec<u8>) {
+        (self.initial_priority, self.initial_group, self.open_info)
+    }
 }
 
 fn validate_open_option_varint(value: u64, field: &str) -> Result<()> {
@@ -620,9 +596,9 @@ fn validate_open_option_varint(value: u64, field: &str) -> Result<()> {
 
 fn random_varint62() -> Result<u64> {
     loop {
-        let v = random_uint62()?;
-        if v != 0 {
-            return Ok(v);
+        let value = random_uint62()?;
+        if value != 0 {
+            return Ok(value);
         }
     }
 }
@@ -665,18 +641,13 @@ fn random_preface_padding(
     if max_payload == 0 {
         return Ok(Vec::new());
     }
-    let mut min_payload = configured_min;
-    if min_payload == 0 {
-        min_payload = DEFAULT_PREFACE_PADDING_MIN_BYTES;
-    }
-    if min_payload > max_payload {
-        min_payload = max_payload;
-    }
+    let min_payload =
+        nonzero_or_default(configured_min, DEFAULT_PREFACE_PADDING_MIN_BYTES).min(max_payload);
     let span = max_payload - min_payload + 1;
     let padding_len = min_payload + random_uint64n(span)?;
     let padding_len = u64_to_usize_len(padding_len, "preface padding too large")?;
     let mut padding = vec![0u8; padding_len];
-    fill_random(padding.as_mut_slice())?;
+    fill_random(&mut padding)?;
     Ok(padding)
 }
 
@@ -697,21 +668,23 @@ fn max_preface_padding_payload_bytes(settings: Settings, configured_max: u64) ->
         varint_len(crate::protocol::SETTING_PREFACE_PADDING)?,
         "preface padding too large",
     )?;
-    while max_payload > 0 {
-        let len_len = usize_to_u64_len(varint_len(max_payload)?, "preface padding too large")?;
+    let mut low = 0;
+    let mut high = max_payload;
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        let len_len = usize_to_u64_len(varint_len(candidate)?, "preface padding too large")?;
         let overhead = type_len + len_len;
-        if overhead <= remaining && max_payload <= remaining - overhead {
-            return Ok(max_payload);
+        if overhead <= remaining && candidate <= remaining - overhead {
+            low = candidate;
+        } else {
+            high = candidate - 1;
         }
-        max_payload -= 1;
     }
-    Ok(0)
+    Ok(low)
 }
 
 fn normalize_protocol_version(value: u64, field: &str) -> Result<u64> {
-    if value == 0 {
-        return Ok(PROTO_VERSION);
-    }
+    let value = nonzero_or_default(value, PROTO_VERSION);
     if value > MAX_VARINT62 {
         return Err(Error::protocol(format!(
             "zmux config {field} exceeds varint62"
@@ -722,20 +695,35 @@ fn normalize_protocol_version(value: u64, field: &str) -> Result<u64> {
 
 fn normalize_config_settings(mut settings: Settings) -> Result<Settings> {
     validate_settings(settings)?;
-    if settings == zero_settings() {
-        return Ok(Settings::default());
+    if settings == ZERO_SETTINGS {
+        return Ok(Settings::DEFAULT);
     }
-    let defaults = Settings::default();
-    if settings.max_frame_payload == 0 {
-        settings.max_frame_payload = defaults.max_frame_payload;
-    }
-    if settings.max_control_payload_bytes == 0 {
-        settings.max_control_payload_bytes = defaults.max_control_payload_bytes;
-    }
-    if settings.max_extension_payload_bytes == 0 {
-        settings.max_extension_payload_bytes = defaults.max_extension_payload_bytes;
-    }
+    normalize_settings_payload_limits(&mut settings);
     Ok(settings)
+}
+
+#[inline]
+fn normalize_settings_payload_limits(settings: &mut Settings) {
+    let defaults = Settings::DEFAULT;
+    settings.max_frame_payload =
+        nonzero_or_default(settings.max_frame_payload, defaults.max_frame_payload);
+    settings.max_control_payload_bytes = nonzero_or_default(
+        settings.max_control_payload_bytes,
+        defaults.max_control_payload_bytes,
+    );
+    settings.max_extension_payload_bytes = nonzero_or_default(
+        settings.max_extension_payload_bytes,
+        defaults.max_extension_payload_bytes,
+    );
+}
+
+#[inline]
+fn nonzero_or_default(value: u64, default: u64) -> u64 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
 }
 
 fn validate_settings(settings: Settings) -> Result<()> {
@@ -785,11 +773,19 @@ fn validate_settings(settings: Settings) -> Result<()> {
 }
 
 fn usize_to_u64_len(value: usize, context: &'static str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| Error::frame_size(context))
+    if value > u64::MAX as usize {
+        Err(Error::frame_size(context))
+    } else {
+        Ok(value as u64)
+    }
 }
 
 fn u64_to_usize_len(value: u64, context: &'static str) -> Result<usize> {
-    usize::try_from(value).map_err(|_| Error::frame_size(context))
+    if value > usize::MAX as u64 {
+        Err(Error::frame_size(context))
+    } else {
+        Ok(value as usize)
+    }
 }
 
 #[cfg(test)]
@@ -818,7 +814,7 @@ mod tests {
                 max_extension_payload_bytes: 8_192,
                 scheduler_hints: SchedulerHint::Latency,
                 ping_padding_key: 123,
-                ..Settings::default()
+                ..Settings::DEFAULT
             },
             preface_padding: true,
             preface_padding_min_bytes: 3,
@@ -861,7 +857,7 @@ mod tests {
             visible_terminal_churn_window: Duration::from_millis(666),
             visible_terminal_churn_budget: 17,
             close_drain_timeout: Duration::from_millis(333),
-            goaway_drain_interval: Duration::from_millis(44),
+            go_away_drain_interval: Duration::from_millis(44),
             stop_sending_graceful_drain_window: Some(Duration::from_millis(444)),
             stop_sending_graceful_tail_cap: Some(6_666),
             keepalive_interval: Duration::from_secs(3),
@@ -1019,7 +1015,10 @@ mod tests {
             actual.visible_terminal_churn_budget
         );
         assert_eq!(expected.close_drain_timeout, actual.close_drain_timeout);
-        assert_eq!(expected.goaway_drain_interval, actual.goaway_drain_interval);
+        assert_eq!(
+            expected.go_away_drain_interval,
+            actual.go_away_drain_interval
+        );
         assert_eq!(
             expected.stop_sending_graceful_drain_window,
             actual.stop_sending_graceful_drain_window
@@ -1192,6 +1191,19 @@ mod tests {
     }
 
     #[test]
+    fn config_default_uses_repository_template_before_global_updates() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.role, Role::Auto);
+        assert_eq!(cfg.tie_breaker_nonce, 0);
+        assert_eq!(cfg.min_proto, PROTO_VERSION);
+        assert_eq!(cfg.max_proto, PROTO_VERSION);
+        assert_eq!(cfg.settings, Settings::DEFAULT);
+        assert!(!cfg.preface_padding);
+        assert!(!cfg.ping_padding);
+    }
+
+    #[test]
     fn default_config_template_sanitizes_random_fields() {
         let cfg = sanitize_default_config_template(Config {
             write_batch_max_frames: 64,
@@ -1205,9 +1217,9 @@ mod tests {
             settings: Settings {
                 max_control_payload_bytes: 8_192,
                 ping_padding_key: 456,
-                ..Settings::default()
+                ..Settings::DEFAULT
             },
-            ..Config::builtin_default()
+            ..builtin_default_config()
         });
 
         assert_eq!(cfg.write_batch_max_frames, 64);
@@ -1221,7 +1233,7 @@ mod tests {
         assert_eq!(cfg.settings.max_control_payload_bytes, 8_192);
         assert_eq!(
             cfg.settings.max_frame_payload,
-            Settings::default().max_frame_payload
+            Settings::DEFAULT.max_frame_payload
         );
         assert_eq!(cfg.settings.ping_padding_key, 0);
     }
@@ -1229,8 +1241,8 @@ mod tests {
     #[test]
     fn all_zero_settings_normalize_to_repository_defaults() {
         let cfg = Config {
-            settings: zero_settings(),
-            ..Config::builtin_default()
+            settings: ZERO_SETTINGS,
+            ..Config::default()
         }
         .normalized()
         .unwrap();
@@ -1241,24 +1253,28 @@ mod tests {
     #[test]
     fn open_options_builder_sets_fields_without_struct_literal() {
         let opts = OpenOptions::new()
-            .with_initial_priority(7)
-            .with_initial_group(3)
-            .with_open_info(b"info".to_vec());
+            .priority(7)
+            .group(3)
+            .with_open_info(b"info");
 
-        assert_eq!(opts.initial_priority, Some(7));
-        assert_eq!(opts.initial_group, Some(3));
-        assert_eq!(opts.open_info, b"info");
+        assert_eq!(opts.initial_priority(), Some(7));
+        assert_eq!(opts.initial_group(), Some(3));
+        assert_eq!(opts.open_info(), b"info");
+        assert_eq!(opts.open_info().len(), 4);
+        assert!(opts.has_open_info());
         assert!(OpenOptions::new().is_empty());
+        assert_eq!(OpenOptions::new().open_info().len(), 0);
+        assert!(!OpenOptions::new().has_open_info());
         assert!(!opts.is_empty());
-        assert_eq!(OpenOptions::priority(5).initial_priority, Some(5));
-        assert_eq!(OpenOptions::group(6).initial_group, Some(6));
-        assert_eq!(OpenOptions::open_info("abc").open_info, b"abc");
-        assert_eq!(OpenOptions::open_info_bytes(b"abc").open_info, b"abc");
+        assert_eq!(OpenOptions::new().priority(5).initial_priority(), Some(5));
+        assert_eq!(OpenOptions::new().group(6).initial_group(), Some(6));
         assert_eq!(
-            OpenOptions::new()
-                .with_open_info_bytes(b"borrowed")
-                .open_info,
+            OpenOptions::new().with_open_info(b"borrowed").open_info(),
             b"borrowed"
+        );
+        assert_eq!(
+            OpenOptions::new().with_open_info(vec![4, 5, 6]).open_info(),
+            &[4, 5, 6]
         );
     }
 
@@ -1266,51 +1282,45 @@ mod tests {
     fn open_options_owned_open_info_uses_value_semantics() {
         let mut source = vec![1, 2, 3];
         let opts = OpenOptions::new()
-            .with_initial_priority(7)
-            .with_initial_group(9)
-            .with_open_info(source.clone());
+            .priority(7)
+            .group(9)
+            .with_open_info(&source);
         source[0] = 9;
 
-        assert_eq!(opts.open_info, vec![1, 2, 3]);
+        assert_eq!(opts.open_info(), &[1, 2, 3]);
 
-        let mut exposed = opts.open_info.clone();
+        let mut exposed = opts.open_info().to_vec();
         exposed[1] = 8;
-        assert_eq!(opts.open_info, vec![1, 2, 3]);
+        assert_eq!(opts.open_info(), &[1, 2, 3]);
         assert_eq!(
             opts,
-            OpenOptions {
-                initial_priority: Some(7),
-                initial_group: Some(9),
-                open_info: vec![1, 2, 3],
-            }
+            OpenOptions::new()
+                .priority(7)
+                .group(9)
+                .with_open_info(&[1, 2, 3])
         );
         assert_ne!(
             opts,
-            OpenOptions {
-                initial_priority: Some(7),
-                initial_group: Some(9),
-                open_info: vec![1, 2, 4],
-            }
+            OpenOptions::new()
+                .priority(7)
+                .group(9)
+                .with_open_info(&[1, 2, 4])
         );
     }
 
     #[test]
     fn open_options_validate_varint_metadata_fields() {
         assert!(OpenOptions::new()
-            .try_with_initial_priority(MAX_VARINT62)
-            .unwrap()
-            .try_with_initial_group(MAX_VARINT62)
-            .unwrap()
+            .priority(MAX_VARINT62)
+            .group(MAX_VARINT62)
             .validate()
             .is_ok());
         assert!(OpenOptions::new()
-            .try_with_initial_priority(MAX_VARINT62 + 1)
+            .priority(MAX_VARINT62 + 1)
+            .validate()
             .is_err());
         assert!(OpenOptions::new()
-            .try_with_initial_group(MAX_VARINT62 + 1)
-            .is_err());
-        assert!(OpenOptions::new()
-            .with_initial_priority(MAX_VARINT62 + 1)
+            .group(MAX_VARINT62 + 1)
             .validate()
             .is_err());
     }

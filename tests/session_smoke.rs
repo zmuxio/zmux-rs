@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zmux::SchedulerHint;
 use zmux::{
-    append_tlv, build_goaway_payload, build_open_metadata_prefix, build_priority_update_payload,
-    encode_varint, parse_data_payload, parse_error_payload, parse_goaway_payload, parse_varint,
+    append_tlv, build_go_away_payload, build_open_metadata_prefix, build_priority_update_payload,
+    encode_varint, parse_data_payload, parse_error_payload, parse_go_away_payload, parse_varint,
     read_preface, Config, Conn, ErrorCode, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource,
     Event, EventType, Frame, FrameType, Limits, MetadataUpdate, OpenOptions, SessionState,
     Settings, TerminationKind, CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS,
@@ -523,10 +523,12 @@ fn connected_pair(client_config: Config, server_config: Config) -> (Conn, Conn) 
     let server_read = server_io.clone();
     let server_write = server_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
-    let server_thread =
-        thread::spawn(move || Conn::server(server_read, server_write, server_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
+    let server_thread = thread::spawn(move || {
+        Conn::server_with_config(server_read, server_write, server_config).unwrap()
+    });
 
     (client_thread.join().unwrap(), server_thread.join().unwrap())
 }
@@ -534,12 +536,12 @@ fn connected_pair(client_config: Config, server_config: Config) -> (Conn, Conn) 
 fn wait_closed_for_contract(conn: &Conn) -> Option<zmux::Error> {
     match conn.wait_timeout(Duration::from_secs(1)) {
         Ok(true) => {
-            assert!(conn.closed());
+            assert!(conn.is_closed());
             None
         }
         Ok(false) => panic!("session did not close before contract deadline"),
         Err(err) => {
-            assert!(conn.closed());
+            assert!(conn.is_closed());
             Some(err)
         }
     }
@@ -562,10 +564,10 @@ fn tcp_constructors_establish_session_with_deadline_control() {
     let addr = listener.local_addr().unwrap();
     let server_thread = thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
-        Conn::server_tcp(socket, Config::default()).unwrap()
+        Conn::server_tcp(socket).unwrap()
     });
 
-    let client = Conn::client_tcp(TcpStream::connect(addr).unwrap(), Config::default()).unwrap();
+    let client = Conn::client_tcp(TcpStream::connect(addr).unwrap()).unwrap();
     let server = server_thread.join().unwrap();
 
     assert_eq!(client.state(), SessionState::Ready);
@@ -583,18 +585,12 @@ fn establishment_preface_exchange_does_not_deadlock_on_zero_buffer_transport() {
     let client_thread = thread::spawn(move || {
         let client_read = client_io.clone();
         let client_write = client_io;
-        let _ = client_done.send((
-            "client",
-            Conn::client(client_read, client_write, Config::default()),
-        ));
+        let _ = client_done.send(("client", Conn::client(client_read, client_write)));
     });
     let server_thread = thread::spawn(move || {
         let server_read = server_io.clone();
         let server_write = server_io;
-        let _ = done_tx.send((
-            "server",
-            Conn::server(server_read, server_write, Config::default()),
-        ));
+        let _ = done_tx.send(("server", Conn::server(server_read, server_write)));
     });
 
     let mut client = None;
@@ -632,8 +628,9 @@ fn preface_padding_is_accepted_during_session_establishment() {
         ..Config::default()
     };
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
     let _client_preface = read_preface(&mut peer_io).unwrap();
 
     let server_preface = Config::responder().local_preface().unwrap();
@@ -662,63 +659,70 @@ fn preface_padding_is_accepted_during_session_establishment() {
 #[test]
 fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     fn assert_send_sync<T: Send + Sync>() {}
-    fn assert_session<T: zmux::NativeSession>() {}
-    fn assert_stream_info<T: zmux::NativeStreamInfo>() {}
-    fn assert_recv_stream<T: zmux::NativeRecvStreamApi>() {}
-    fn assert_send_stream<T: zmux::NativeSendStreamApi>() {}
-    fn assert_bidi_stream<T: zmux::NativeStreamApi>() {}
+    fn assert_session<T: zmux::Session>() {}
+    fn assert_stream_info<T: zmux::StreamInfo>() {}
+    fn assert_recv_stream<T: zmux::RecvStreamApi>() {}
+    fn assert_send_stream<T: zmux::SendStreamApi>() {}
+    fn assert_bidi_stream<T: zmux::StreamApi>() {}
 
-    assert_send_sync::<Box<dyn zmux::NativeStreamApi>>();
-    assert_send_sync::<Box<dyn zmux::NativeSendStreamApi>>();
-    assert_send_sync::<Box<dyn zmux::NativeRecvStreamApi>>();
-    assert_session::<Box<dyn zmux::NativeSession>>();
-    assert_session::<Arc<dyn zmux::NativeSession>>();
-    assert_session::<&'static dyn zmux::NativeSession>();
-    assert_stream_info::<Box<dyn zmux::NativeStreamApi>>();
-    assert_recv_stream::<Box<dyn zmux::NativeRecvStreamApi>>();
-    assert_send_stream::<Box<dyn zmux::NativeSendStreamApi>>();
-    assert_bidi_stream::<Box<dyn zmux::NativeStreamApi>>();
+    assert_send_sync::<Box<dyn zmux::StreamApi>>();
+    assert_send_sync::<Box<dyn zmux::SendStreamApi>>();
+    assert_send_sync::<Box<dyn zmux::RecvStreamApi>>();
+    assert_session::<Box<dyn zmux::Session>>();
+    assert_session::<Arc<dyn zmux::Session>>();
+    assert_session::<&'static dyn zmux::Session>();
+    assert_stream_info::<Box<dyn zmux::StreamApi>>();
+    assert_recv_stream::<Box<dyn zmux::RecvStreamApi>>();
+    assert_send_stream::<Box<dyn zmux::SendStreamApi>>();
+    assert_bidi_stream::<Box<dyn zmux::StreamApi>>();
 
     let (client, server) = connected_pair(Config::default(), Config::default());
-    let session: &dyn zmux::NativeSession = &client;
+    let session: &dyn zmux::Session = &client;
 
     assert!(!session.wait_timeout(Duration::ZERO).unwrap());
 
     let stream = session
-        .open_stream_timeout(Duration::from_millis(10))
+        .open_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
         .unwrap();
-    assert!(stream.opened_locally());
-    assert!(stream.bidirectional());
+    assert!(stream.is_opened_locally());
+    assert!(stream.is_bidirectional());
     assert_eq!(stream.open_info_len(), 0);
     assert!(!stream.has_open_info());
     let mut scratch = Vec::with_capacity(8);
-    stream.copy_open_info_to(&mut scratch);
-    assert!(scratch.is_empty());
+    scratch.extend_from_slice(b"pre");
+    stream.append_open_info_to(&mut scratch);
+    assert_eq!(scratch, b"pre");
     stream.write_final(b"trait-api").unwrap();
 
     let recv = server
         .accept_stream_timeout(Duration::from_secs(1))
         .unwrap();
-    assert!(!recv.opened_locally());
-    assert!(recv.bidirectional());
+    assert!(!recv.is_opened_locally());
+    assert!(recv.is_bidirectional());
     assert_eq!(recv.open_info_len(), 0);
     assert!(!recv.has_open_info());
-    recv.copy_open_info_to(&mut scratch);
-    assert!(scratch.is_empty());
+    recv.append_open_info_to(&mut scratch);
+    assert_eq!(scratch, b"pre");
 
-    let send = session
-        .open_uni_stream_timeout(Duration::from_millis(10))
+    let mut send = session
+        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
         .unwrap();
-    let parts = [IoSlice::new(b"trait-"), IoSlice::new(b"writev-plain")];
-    assert_eq!(send.writev(&parts).unwrap(), 18);
+    let parts = [
+        IoSlice::new(b"trait-"),
+        IoSlice::new(b"write-vectored-plain"),
+    ];
+    assert_eq!(send.write_vectored(&parts).unwrap(), 26);
     send.close_write().unwrap();
     let recv_uni = server
         .accept_uni_stream_timeout(Duration::from_secs(1))
         .unwrap();
-    assert_eq!(read_all_recv_stream(&recv_uni), b"trait-writev-plain");
+    assert_eq!(
+        read_all_recv_stream(&recv_uni),
+        b"trait-write-vectored-plain"
+    );
 
     let mut send = session
-        .open_uni_stream_timeout(Duration::from_millis(10))
+        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
         .unwrap();
     let parts = [IoSlice::new(b"std-"), IoSlice::new(b"write-vectored")];
     assert_eq!(
@@ -732,14 +736,14 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     assert_eq!(read_all_recv_stream(&recv_uni), b"std-write-vectored");
 
     let send = session
-        .open_uni_stream_timeout(Duration::from_millis(10))
+        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
         .unwrap();
-    let parts = [IoSlice::new(b"trait-"), IoSlice::new(b"writev")];
-    assert_eq!(send.writev_final(&parts).unwrap(), 12);
+    let parts = [IoSlice::new(b"trait-"), IoSlice::new(b"write-vectored")];
+    assert_eq!(send.write_vectored_final(&parts).unwrap(), 20);
     let recv_uni = server
         .accept_uni_stream_timeout(Duration::from_secs(1))
         .unwrap();
-    assert_eq!(read_all_recv_stream(&recv_uni), b"trait-writev");
+    assert_eq!(read_all_recv_stream(&recv_uni), b"trait-write-vectored");
 }
 
 #[test]
@@ -910,10 +914,10 @@ fn event_handler_reports_stream_and_session_lifecycle() {
 
     let open_info = b"event-info".to_vec();
     let open_options = OpenOptions::new()
-        .with_initial_priority(7)
-        .with_initial_group(9)
-        .with_open_info(open_info.clone());
-    let stream = client.open_stream_with_options(open_options).unwrap();
+        .priority(7)
+        .group(9)
+        .with_open_info(&open_info);
+    let stream = client.open_stream_with(open_options).unwrap();
     stream.write_final(b"event").unwrap();
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
     assert_eq!(opened.session_state, SessionState::Ready);
@@ -1711,16 +1715,18 @@ fn session_timeouts_fail_locally_without_protocol_side_effects() {
     };
     assert!(accept_err.to_string().contains("accept timed out"));
 
-    let open_err = match client.open_stream_timeout(Duration::ZERO) {
-        Ok(_) => panic!("open timeout unexpectedly returned a stream"),
-        Err(err) => err,
-    };
+    let open_err =
+        match client.open_stream_with(zmux::OpenRequest::new().with_timeout(Duration::ZERO)) {
+            Ok(_) => panic!("open timeout unexpectedly returned a stream"),
+            Err(err) => err,
+        };
     assert!(open_err.to_string().contains("open timed out"));
 
-    let open_uni_err = match client.open_uni_stream_timeout(Duration::ZERO) {
-        Ok(_) => panic!("open_uni timeout unexpectedly returned a stream"),
-        Err(err) => err,
-    };
+    let open_uni_err =
+        match client.open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::ZERO)) {
+            Ok(_) => panic!("open_uni timeout unexpectedly returned a stream"),
+            Err(err) => err,
+        };
     assert!(open_uni_err.to_string().contains("open timed out"));
     assert_eq!(client.stats().provisional.bidi, 0);
     assert_eq!(client.stats().provisional.uni, 0);
@@ -1741,7 +1747,7 @@ fn session_timeouts_fail_locally_without_protocol_side_effects() {
 }
 
 #[test]
-fn open_and_send_timeout_carries_budget_into_first_write() {
+fn open_send_request_timeout_carries_budget_into_first_write() {
     let mut server_config = Config::default();
     server_config.settings.initial_max_data = 1;
     server_config
@@ -1750,34 +1756,76 @@ fn open_and_send_timeout_carries_budget_into_first_write() {
     server_config.role = zmux::Role::Responder;
     let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
 
-    let err = match client.open_and_send_timeout(b"xy", Duration::from_millis(30)) {
-        Ok(_) => panic!("open_and_send_timeout unexpectedly succeeded"),
+    let err = match client
+        .open_and_send(zmux::OpenSend::new(b"xy").with_timeout(Duration::from_millis(30)))
+    {
+        Ok(_) => panic!("open_send request unexpectedly succeeded"),
         Err(err) => err,
     };
     assert!(err.to_string().contains("write timed out"));
 }
 
 #[test]
-fn open_uni_and_send_timeout_carries_budget_into_final_write() {
+fn open_uni_send_request_timeout_carries_budget_into_final_write() {
     let mut server_config = Config::default();
     server_config.settings.initial_max_data = 1;
     server_config.settings.initial_max_stream_data_uni = 1;
     server_config.role = zmux::Role::Responder;
     let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
 
-    let err = match client.open_uni_and_send_timeout(b"xy", Duration::from_millis(30)) {
-        Ok(_) => panic!("open_uni_and_send_timeout unexpectedly succeeded"),
+    let err = match client
+        .open_uni_and_send(zmux::OpenSend::new(b"xy").with_timeout(Duration::from_millis(30)))
+    {
+        Ok(_) => panic!("open_uni_send request unexpectedly succeeded"),
         Err(err) => err,
     };
     assert!(err.to_string().contains("write timed out"));
 }
 
 #[test]
-fn open_and_send_timeout_success_uses_single_budget() {
+fn vectored_open_send_request_timeout_carries_budget_into_first_write() {
+    let mut server_config = Config::default();
+    server_config.settings.initial_max_data = 1;
+    server_config
+        .settings
+        .initial_max_stream_data_bidi_peer_opened = 1;
+    server_config.role = zmux::Role::Responder;
+    let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
+    let parts = [IoSlice::new(b"x"), IoSlice::new(b"y")];
+
+    let err = match client
+        .open_and_send(zmux::OpenSend::vectored(&parts).with_timeout(Duration::from_millis(30)))
+    {
+        Ok(_) => panic!("vectored open_send request unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("write timed out"));
+}
+
+#[test]
+fn vectored_open_uni_send_request_timeout_carries_budget_into_final_write() {
+    let mut server_config = Config::default();
+    server_config.settings.initial_max_data = 1;
+    server_config.settings.initial_max_stream_data_uni = 1;
+    server_config.role = zmux::Role::Responder;
+    let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
+    let parts = [IoSlice::new(b"x"), IoSlice::new(b"y")];
+
+    let err = match client
+        .open_uni_and_send(zmux::OpenSend::vectored(&parts).with_timeout(Duration::from_millis(30)))
+    {
+        Ok(_) => panic!("vectored open_uni_send request unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("write timed out"));
+}
+
+#[test]
+fn open_send_request_timeout_success_uses_single_budget() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     let (stream, n) = client
-        .open_and_send_timeout(b"ok", Duration::from_secs(1))
+        .open_and_send(zmux::OpenSend::new(b"ok").with_timeout(Duration::from_secs(1)))
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
     assert_eq!(n, 2);
@@ -1792,7 +1840,7 @@ fn open_and_send_timeout_success_uses_single_budget() {
 }
 
 #[test]
-fn open_uni_and_send_with_options_preserves_open_info() {
+fn open_uni_send_request_options_preserve_open_info() {
     let caps = CAPABILITY_OPEN_METADATA;
     let client_config = Config {
         capabilities: caps,
@@ -1805,7 +1853,9 @@ fn open_uni_and_send_with_options_preserves_open_info() {
     let (client, server) = connected_pair(client_config, server_config);
 
     let (stream, n) = client
-        .open_uni_and_send_with_options(OpenOptions::open_info(b"ssh".to_vec()), b"hello")
+        .open_uni_and_send(
+            zmux::OpenSend::new(b"hello").with_options(OpenOptions::new().with_open_info(b"ssh")),
+        )
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
     assert_eq!(n, 5);
@@ -2008,7 +2058,7 @@ fn native_async_write_waits_for_transport_flush() {
     let writer = stream.clone();
     let (result_tx, result_rx) = mpsc::channel();
     let write_thread = thread::spawn(move || {
-        let _ = result_tx.send(block_on(zmux::SendStreamApi::write(&writer, b"x")));
+        let _ = result_tx.send(block_on(zmux::AsyncSendStreamApi::write(&writer, b"x")));
     });
 
     assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
@@ -2040,7 +2090,7 @@ fn native_async_write_reports_transport_write_error() {
         client_with_raw_peer_and_failing_writer_after_preface(Config::default(), message);
     let stream = client.open_stream().unwrap();
 
-    let write_err = block_on(zmux::SendStreamApi::write(&stream, b"payload")).unwrap_err();
+    let write_err = block_on(zmux::AsyncSendStreamApi::write(&stream, b"payload")).unwrap_err();
     assert_eq!(write_err.code(), Some(ErrorCode::Internal));
     assert_eq!(write_err.scope(), ErrorScope::Stream);
     assert_eq!(write_err.operation(), ErrorOperation::Write);
@@ -2187,7 +2237,7 @@ fn peer_stream_max_data_wakes_flow_blocked_write() {
     let writer = stream.clone();
     let (result_tx, result_rx) = mpsc::channel();
     let write_thread = thread::spawn(move || {
-        let _ = result_tx.send(writer.write_timeout(b"e", Duration::from_secs(5)));
+        let _ = result_tx.send(writer.write_timeout(b"e", Duration::from_secs(30)));
     });
 
     let blocked = peer.wait_for_frame(|frame| {
@@ -2206,7 +2256,7 @@ fn peer_stream_max_data_wakes_flow_blocked_write() {
 
     assert_eq!(
         result_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .unwrap(),
         1
@@ -2349,7 +2399,7 @@ fn final_write_deadline_before_queue_admission_does_not_latch_fin() {
     let err = stream.write_final(b"\x01").unwrap_err();
 
     assert!(err.is_timeout());
-    assert!(!stream.write_closed());
+    assert!(!stream.is_write_closed());
     assert_eq!(client.stats().writer_queue.data_queued_bytes, 0);
     assert!(!peer
         .collect_frames_for(Duration::from_millis(50))
@@ -2367,8 +2417,7 @@ fn final_write_deadline_after_queue_admission_cancels_before_writer_starts() {
     let client_read = client_io.clone();
     let (client_write, writer_gate) = blocking_writer(client_io, 1);
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, Config::default()).unwrap());
+    let client_thread = thread::spawn(move || Conn::client(client_read, client_write).unwrap());
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -2425,7 +2474,7 @@ fn final_write_deadline_after_queue_admission_cancels_before_writer_starts() {
         .unwrap_err();
     assert!(err.is_timeout());
     second_thread.join().unwrap();
-    assert!(!second.write_closed());
+    assert!(!second.is_write_closed());
     assert_eq!(client.stats().writer_queue.data_queued_bytes, 0);
 
     writer_gate.release();
@@ -2485,8 +2534,7 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
     let client_read = client_io.clone();
     let (client_write, writer_gate) = blocking_writer(client_io, 1);
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, Config::default()).unwrap());
+    let client_thread = thread::spawn(move || Conn::client(client_read, client_write).unwrap());
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -2509,7 +2557,10 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
     let (second_tx, second_rx) = mpsc::channel();
     let second_writer = second.clone();
     let second_thread = thread::spawn(move || {
-        let _ = second_tx.send(block_on(zmux::SendStreamApi::write(&second_writer, b"y")));
+        let _ = second_tx.send(block_on(zmux::AsyncSendStreamApi::write(
+            &second_writer,
+            b"y",
+        )));
     });
 
     let queue_deadline = Instant::now() + Duration::from_secs(1);
@@ -2529,7 +2580,7 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
         .unwrap_err();
     assert!(err.is_timeout());
     second_thread.join().unwrap();
-    assert!(!second.write_closed());
+    assert!(!second.is_write_closed());
     assert_eq!(client.stats().writer_queue.data_queued_bytes, 0);
 
     writer_gate.release();
@@ -2562,20 +2613,20 @@ fn close_write_deadline_failure_keeps_local_write_open_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(b"x".to_vec()))
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
     let err = stream.close_write().unwrap_err();
     assert!(err.is_timeout());
-    assert!(!stream.write_closed());
+    assert!(!stream.is_write_closed());
     assert!(peer
         .collect_frames_for(Duration::from_millis(50))
         .is_empty());
 
     stream.clear_write_deadline().unwrap();
     stream.close_write().unwrap();
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
 
     let stream_id = stream.stream_id();
     let frames = peer.collect_frames_for(Duration::from_millis(100));
@@ -2617,20 +2668,20 @@ fn write_deadline_failure_keeps_local_write_open_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(b"x".to_vec()))
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
     let err = stream.write(b"x").unwrap_err();
     assert!(err.is_timeout());
-    assert!(!stream.write_closed());
+    assert!(!stream.is_write_closed());
     assert!(peer
         .collect_frames_for(Duration::from_millis(50))
         .is_empty());
 
     stream.clear_write_deadline().unwrap();
     assert_eq!(stream.write(b"x").unwrap(), 1);
-    assert!(!stream.write_closed());
+    assert!(!stream.is_write_closed());
 
     let stream_id = stream.stream_id();
     let frames = peer.collect_frames_for(Duration::from_millis(100));
@@ -2661,7 +2712,7 @@ fn set_write_deadline_wakes_close_read_blocked_on_writer_queue() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(b"x".to_vec()))
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
 
     let closer = stream.clone();
@@ -2701,7 +2752,7 @@ fn close_read_deadline_keeps_pending_signal_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(b"x".to_vec()))
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
 
     stream
@@ -2733,13 +2784,13 @@ fn close_read_retry_after_deadline_failure_queues_opener_and_stop_sending() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(b"x".to_vec()))
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
     let first_err = stream.close_read().unwrap_err();
     assert!(first_err.is_timeout());
-    assert!(stream.read_closed());
+    assert!(stream.is_read_closed());
     let mut buf = [0u8; 1];
     let read_err = stream.read(&mut buf).unwrap_err();
     assert_local_read_stopped_error(&read_err);
@@ -2961,7 +3012,7 @@ fn pre_open_metadata_update_overflow_does_not_mutate() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let open_info = pre_open_overflow_open_info(caps, Settings::default().max_frame_payload, 7, 11);
     let stream = client
-        .open_stream_with_options(OpenOptions::open_info(open_info.clone()))
+        .open_stream_with(OpenOptions::new().with_open_info(&open_info))
         .unwrap();
 
     let err = stream
@@ -3102,10 +3153,7 @@ fn open_metadata_preserves_explicit_group_zero_when_rebuilt() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions {
-            initial_group: Some(0),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().group(0))
         .unwrap();
     assert_eq!(stream.metadata().group, None);
 
@@ -3678,7 +3726,7 @@ fn committed_local_cancel_read_invalid_code_keeps_stream_read_stoppable() {
     assert!(err.is_error_code(ErrorCode::Protocol));
     assert_eq!(err.operation(), ErrorOperation::Close);
     assert_eq!(err.direction(), ErrorDirection::Read);
-    assert!(!stream.read_closed());
+    assert!(!stream.is_read_closed());
     assert!(!peer
         .collect_frames_for(Duration::from_millis(50))
         .iter()
@@ -3801,8 +3849,9 @@ fn client_with_raw_peer_configs(client_config: Config, peer_config: Config) -> (
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = peer_config.local_preface().unwrap();
     peer_io
@@ -3824,8 +3873,9 @@ fn client_with_rendezvous_raw_peer(client_config: Config) -> (Conn, RendezvousCo
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -3843,8 +3893,9 @@ fn client_with_rendezvous_raw_peer_and_write_probe(
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -3901,8 +3952,9 @@ fn client_with_raw_peer_and_failing_writer_after_preface(
         message,
     };
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, client_config).unwrap());
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+    });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -3925,8 +3977,7 @@ fn failed_establishment_emits_fatal_close_after_local_preface() {
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, Config::default()));
+    let client_thread = thread::spawn(move || Conn::client(client_read, client_write));
     let _client_preface = read_preface(&mut peer_io).unwrap();
     peer_io.write_all(b"ZMUX\x01\xff").unwrap();
     peer_io.flush().unwrap();
@@ -3949,8 +4000,7 @@ fn same_role_establishment_conflict_emits_role_conflict_close() {
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread =
-        thread::spawn(move || Conn::client(client_read, client_write, Config::default()));
+    let client_thread = thread::spawn(move || Conn::client(client_read, client_write));
     let client_preface = read_preface(&mut peer_io).unwrap();
     assert_eq!(client_preface.role, zmux::Role::Initiator);
 
@@ -4008,7 +4058,7 @@ fn graceful_close_sends_final_goaway_before_close() {
 
     assert!(goaway_index < close_index);
 
-    let goaway = parse_goaway_payload(&frames[goaway_index].payload).unwrap();
+    let goaway = parse_go_away_payload(&frames[goaway_index].payload).unwrap();
     assert_eq!(goaway.last_accepted_bidi, 0);
     assert_eq!(goaway.last_accepted_uni, 0);
     assert_eq!(goaway.code, ErrorCode::NoError.as_u64());
@@ -4042,7 +4092,7 @@ fn manual_goaway_still_allows_local_open() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     client
-        .goaway_with_error(0, 0, ErrorCode::NoError.as_u64(), "")
+        .go_away_with_error(0, 0, ErrorCode::NoError.as_u64(), "")
         .unwrap();
 
     let stream = client.open_stream().unwrap();
@@ -4103,7 +4153,7 @@ fn graceful_close_blocks_new_local_opens_during_drain() {
 fn graceful_close_blocks_new_local_opens_during_initial_goaway_drain() {
     let client_config = Config {
         close_drain_timeout: Duration::from_secs(5),
-        goaway_drain_interval: Duration::from_millis(200),
+        go_away_drain_interval: Duration::from_millis(200),
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -4171,7 +4221,7 @@ fn local_close_start_rejects_session_ops_and_deadline_updates() {
     assert_eq!(ping_err.source(), ErrorSource::Local);
     assert!(!client.stats().liveness.ping_outstanding);
 
-    let goaway_err = client.goaway(0, 0).unwrap_err();
+    let goaway_err = client.go_away(0, 0).unwrap_err();
     assert!(goaway_err.is_session_closed());
     assert_eq!(goaway_err.scope(), ErrorScope::Session);
     assert_eq!(goaway_err.operation(), ErrorOperation::Close);
@@ -4213,7 +4263,7 @@ fn completed_local_close_blocks_subsequent_open_with_local_session_error() {
 fn graceful_close_reclaims_provisional_local_streams_with_refused_stream() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(20),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, server) = connected_pair(client_config, Config::default());
@@ -4239,7 +4289,7 @@ fn graceful_close_reclaims_provisional_local_streams_with_refused_stream() {
 fn graceful_close_ignores_unread_peer_uni_stream() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(20),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, server) = connected_pair(client_config, Config::default());
@@ -4293,7 +4343,7 @@ fn graceful_close_waits_for_peer_bidi_local_send_to_finish() {
 fn local_abort_releases_graceful_close_blocker() {
     let client_config = Config {
         close_drain_timeout: Duration::from_secs(1),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -4511,7 +4561,7 @@ fn peer_transport_eof_while_ready_fails_session() {
 fn peer_transport_eof_while_local_close_in_progress_completes_closed() {
     let client_config = Config {
         close_drain_timeout: Duration::from_secs(5),
-        goaway_drain_interval: Duration::from_millis(100),
+        go_away_drain_interval: Duration::from_millis(100),
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -4535,7 +4585,7 @@ fn peer_transport_eof_while_local_close_in_progress_completes_closed() {
 fn peer_truncated_frame_while_local_close_in_progress_fails_session() {
     let client_config = Config {
         close_drain_timeout: Duration::from_secs(5),
-        goaway_drain_interval: Duration::from_millis(100),
+        go_away_drain_interval: Duration::from_millis(100),
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -5056,7 +5106,7 @@ fn structured_errors_mark_session_open_failures() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 0, ErrorCode::RefusedStream.as_u64(), "drain").unwrap(),
+        payload: build_go_away_payload(0, 0, ErrorCode::RefusedStream.as_u64(), "drain").unwrap(),
     });
     wait_for_state(&client, SessionState::Draining);
 
@@ -5073,32 +5123,33 @@ fn structured_errors_mark_session_open_failures() {
 }
 
 #[test]
-fn peer_goaway_error_preserves_latest_payload_without_closing() {
+fn peer_go_away_error_preserves_latest_payload_without_closing() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
     peer.write_frame(Frame {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 0, ErrorCode::Protocol.as_u64(), "maintenance").unwrap(),
+        payload: build_go_away_payload(0, 0, ErrorCode::Protocol.as_u64(), "maintenance").unwrap(),
     });
     wait_for_state(&client, SessionState::Draining);
-    let first = client.peer_goaway_error().unwrap();
+    let first = client.peer_go_away_error().unwrap();
     assert_eq!(first.code, ErrorCode::Protocol.as_u64());
     assert_eq!(first.reason, "maintenance");
-    assert!(!client.closed());
+    assert!(!client.is_closed());
 
     peer.write_frame(Frame {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 0, ErrorCode::FrameSize.as_u64(), "closing soon").unwrap(),
+        payload: build_go_away_payload(0, 0, ErrorCode::FrameSize.as_u64(), "closing soon")
+            .unwrap(),
     });
     thread::sleep(Duration::from_millis(20));
-    let second = client.peer_goaway_error().unwrap();
+    let second = client.peer_go_away_error().unwrap();
     assert_eq!(second.code, ErrorCode::FrameSize.as_u64());
     assert_eq!(second.reason, "closing soon");
-    assert!(!client.closed());
+    assert!(!client.is_closed());
 }
 
 #[test]
@@ -5130,7 +5181,7 @@ fn peer_goaway_bad_diag_drops_reason_but_keeps_watermarks() {
     });
     wait_for_state(&client, SessionState::Draining);
 
-    let first = client.peer_goaway_error().unwrap();
+    let first = client.peer_go_away_error().unwrap();
     assert_eq!(first.code, ErrorCode::Protocol.as_u64());
     assert_eq!(first.reason, "");
 
@@ -5148,7 +5199,7 @@ fn peer_goaway_bad_diag_drops_reason_but_keeps_watermarks() {
     });
     wait_for_state(&client, SessionState::Draining);
 
-    let second = client.peer_goaway_error().unwrap();
+    let second = client.peer_go_away_error().unwrap();
     assert_eq!(second.code, ErrorCode::Internal.as_u64());
     assert_eq!(second.reason, "");
     assert_eq!(client.state(), SessionState::Draining);
@@ -5168,11 +5219,11 @@ fn peer_goaway_reason_uses_retained_reason_budget() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 0, ErrorCode::NoError.as_u64(), "first").unwrap(),
+        payload: build_go_away_payload(0, 0, ErrorCode::NoError.as_u64(), "first").unwrap(),
     });
     wait_for_state(&client, SessionState::Draining);
 
-    let first = client.peer_goaway_error().unwrap();
+    let first = client.peer_go_away_error().unwrap();
     assert_eq!(first.code, ErrorCode::NoError.as_u64());
     assert_eq!(first.reason, "fi");
     assert_eq!(client.stats().retention.retained_peer_reason_bytes, 2);
@@ -5185,25 +5236,25 @@ fn peer_goaway_reason_uses_retained_reason_budget() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 0, ErrorCode::NoError.as_u64(), "xy").unwrap(),
+        payload: build_go_away_payload(0, 0, ErrorCode::NoError.as_u64(), "xy").unwrap(),
     });
     thread::sleep(Duration::from_millis(20));
 
-    let second = client.peer_goaway_error().unwrap();
+    let second = client.peer_go_away_error().unwrap();
     assert_eq!(second.code, ErrorCode::NoError.as_u64());
     assert_eq!(second.reason, "xy");
     assert_eq!(client.stats().retention.retained_peer_reason_bytes, 2);
-    assert!(!client.closed());
+    assert!(!client.is_closed());
 }
 
 #[test]
 fn local_goaway_validates_watermark_direction_and_creator() {
     let (client, _server) = connected_pair(Config::default(), Config::default());
 
-    let err = client.goaway(4, 0).unwrap_err();
+    let err = client.go_away(4, 0).unwrap_err();
     assert!(err.to_string().contains("not creatable"));
 
-    let err = client.goaway(0, 1).unwrap_err();
+    let err = client.go_away(0, 1).unwrap_err();
     assert!(err.to_string().contains("wrong direction"));
 
     client.close().unwrap();
@@ -5214,7 +5265,7 @@ fn invalid_local_goaway_code_does_not_commit_or_queue() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
     let err = client
-        .goaway_with_error(0, 0, MAX_VARINT62 + 1, "invalid")
+        .go_away_with_error(0, 0, MAX_VARINT62 + 1, "invalid")
         .unwrap_err();
 
     assert!(err.to_string().contains("varint62 value out of range"));
@@ -5255,7 +5306,7 @@ fn local_goaway_reason_is_capped_to_peer_control_payload_limit() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
     client
-        .goaway_with_error(0, 0, ErrorCode::Protocol.as_u64(), &"x".repeat(10_000))
+        .go_away_with_error(0, 0, ErrorCode::Protocol.as_u64(), &"x".repeat(10_000))
         .unwrap();
 
     let goaway = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
@@ -5263,7 +5314,7 @@ fn local_goaway_reason_is_capped_to_peer_control_payload_limit() {
         usize_to_u64(goaway.payload.len())
             <= client.peer_preface().settings.max_control_payload_bytes
     );
-    let parsed = parse_goaway_payload(&goaway.payload).unwrap();
+    let parsed = parse_go_away_payload(&goaway.payload).unwrap();
     assert_eq!(parsed.code, ErrorCode::Protocol.as_u64());
     assert!(!parsed.reason.is_empty());
     assert!(parsed.reason.len() < 10_000);
@@ -5348,13 +5399,13 @@ fn outbound_control_reasons_may_exceed_local_default_when_peer_limit_allows() {
     };
 
     client
-        .goaway_with_error(0, 0, ErrorCode::Internal.as_u64(), &reason)
+        .go_away_with_error(0, 0, ErrorCode::Internal.as_u64(), &reason)
         .unwrap();
     let goaway =
         peer.wait_for_frame_with_limits(limits, |frame| frame.frame_type == FrameType::GoAway);
     assert!(goaway.payload.len() > u64_to_usize(Settings::default().max_control_payload_bytes));
     assert!(goaway.payload.len() <= 8192);
-    let parsed_goaway = parse_goaway_payload(&goaway.payload).unwrap();
+    let parsed_goaway = parse_go_away_payload(&goaway.payload).unwrap();
     assert_eq!(parsed_goaway.code, ErrorCode::Internal.as_u64());
     assert!(parsed_goaway.reason.len() > 4090);
 
@@ -5374,13 +5425,13 @@ fn outbound_control_reasons_may_exceed_local_default_when_peer_limit_allows() {
 fn duplicate_local_goaway_is_not_resent_after_first_frame() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    client.goaway(0, 0).unwrap();
+    client.go_away(0, 0).unwrap();
     let first = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
-    let parsed = parse_goaway_payload(&first.payload).unwrap();
+    let parsed = parse_go_away_payload(&first.payload).unwrap();
     assert_eq!(parsed.last_accepted_bidi, 0);
     assert_eq!(parsed.last_accepted_uni, 0);
 
-    client.goaway(0, 0).unwrap();
+    client.go_away(0, 0).unwrap();
     let frames = peer.collect_frames_for(Duration::from_millis(80));
     assert!(!frames
         .iter()
@@ -5393,13 +5444,13 @@ fn duplicate_local_goaway_is_not_resent_after_first_frame() {
 fn weaker_local_goaway_covered_by_existing_strict_watermark_is_not_sent() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    client.goaway(0, 0).unwrap();
+    client.go_away(0, 0).unwrap();
     let first = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
-    let parsed = parse_goaway_payload(&first.payload).unwrap();
+    let parsed = parse_go_away_payload(&first.payload).unwrap();
     assert_eq!(parsed.last_accepted_bidi, 0);
     assert_eq!(parsed.last_accepted_uni, 0);
 
-    client.goaway(1, 3).unwrap();
+    client.go_away(1, 3).unwrap();
     let frames = peer.collect_frames_for(Duration::from_millis(80));
     assert!(!frames
         .iter()
@@ -5416,7 +5467,7 @@ fn peer_goaway_wrong_direction_fails_session() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(0, 1, ErrorCode::Protocol.as_u64(), "bad").unwrap(),
+        payload: build_go_away_payload(0, 1, ErrorCode::Protocol.as_u64(), "bad").unwrap(),
     });
 
     let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
@@ -5432,7 +5483,7 @@ fn peer_goaway_wrong_creator_fails_session() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(1, 0, ErrorCode::Protocol.as_u64(), "bad").unwrap(),
+        payload: build_go_away_payload(1, 0, ErrorCode::Protocol.as_u64(), "bad").unwrap(),
     });
 
     let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
@@ -5445,20 +5496,20 @@ fn stream_closed_state_matches_native_api_surface() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     let stream = client.open_stream().unwrap();
-    assert!(!stream.read_closed());
-    assert!(!stream.write_closed());
+    assert!(!stream.is_read_closed());
+    assert!(!stream.is_write_closed());
 
     stream.write_final(b"ping").unwrap();
-    assert!(stream.write_closed());
-    assert!(!stream.read_closed());
+    assert!(stream.is_write_closed());
+    assert!(!stream.is_read_closed());
 
     let accepted = server.accept_stream().unwrap();
     assert_eq!(read_all_stream(&accepted), b"ping");
-    assert!(accepted.read_closed());
-    assert!(!accepted.write_closed());
+    assert!(accepted.is_read_closed());
+    assert!(!accepted.is_write_closed());
 
     stream.close_read().unwrap();
-    assert!(stream.read_closed());
+    assert!(stream.is_read_closed());
 }
 
 #[test]
@@ -5466,34 +5517,34 @@ fn native_stream_direction_queries_match_public_surface() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     let bidi = client.open_stream().unwrap();
-    assert!(bidi.opened_locally());
-    assert!(bidi.bidirectional());
-    assert!(!bidi.read_closed());
-    assert!(!bidi.write_closed());
+    assert!(bidi.is_opened_locally());
+    assert!(bidi.is_bidirectional());
+    assert!(!bidi.is_read_closed());
+    assert!(!bidi.is_write_closed());
     bidi.write(b"x").unwrap();
 
     let accepted_bidi = server.accept_stream().unwrap();
-    assert!(!accepted_bidi.opened_locally());
-    assert!(accepted_bidi.bidirectional());
-    assert!(!accepted_bidi.read_closed());
-    assert!(!accepted_bidi.write_closed());
+    assert!(!accepted_bidi.is_opened_locally());
+    assert!(accepted_bidi.is_bidirectional());
+    assert!(!accepted_bidi.is_read_closed());
+    assert!(!accepted_bidi.is_write_closed());
 
     let send = client.open_uni_stream().unwrap();
-    assert!(send.opened_locally());
-    assert!(!send.bidirectional());
-    assert!(!send.write_closed());
+    assert!(send.is_opened_locally());
+    assert!(!send.is_bidirectional());
+    assert!(!send.is_write_closed());
     send.write(b"y").unwrap();
 
     let recv = server.accept_uni_stream().unwrap();
-    assert!(!recv.opened_locally());
-    assert!(!recv.bidirectional());
-    assert!(!recv.read_closed());
+    assert!(!recv.is_opened_locally());
+    assert!(!recv.is_bidirectional());
+    assert!(!recv.is_read_closed());
 
     bidi.close_read().unwrap();
-    assert!(bidi.read_closed());
+    assert!(bidi.is_read_closed());
 
     send.cancel_write(ErrorCode::Cancelled.as_u64()).unwrap();
-    assert!(send.write_closed());
+    assert!(send.is_write_closed());
 }
 
 #[test]
@@ -5503,11 +5554,11 @@ fn uni_stream_close_helpers_ignore_absent_directions() {
     let send = client.open_uni_stream().unwrap();
     send.write(b"payload").unwrap();
     send.close().unwrap();
-    assert!(send.write_closed());
+    assert!(send.is_write_closed());
 
     let recv = server.accept_uni_stream().unwrap();
     recv.close().unwrap();
-    assert!(recv.read_closed());
+    assert!(recv.is_read_closed());
 }
 
 #[test]
@@ -5517,7 +5568,7 @@ fn write_vectored_sends_all_parts_without_closing_write_side() {
     let parts = [IoSlice::new(b"he"), IoSlice::new(b"ll"), IoSlice::new(b"o")];
 
     assert_eq!(stream.write_vectored(&parts).unwrap(), 5);
-    assert!(!stream.write_closed());
+    assert!(!stream.is_write_closed());
 
     let frame = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
     assert_eq!(frame.flags & FRAME_FLAG_FIN, 0);
@@ -5551,7 +5602,7 @@ fn write_vectored_final_sends_all_parts_and_closes_write_side() {
     let parts = [IoSlice::new(b"he"), IoSlice::new(b"ll"), IoSlice::new(b"o")];
 
     assert_eq!(stream.write_vectored_final(&parts).unwrap(), 5);
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
 
     let accepted = server.accept_uni_stream().unwrap();
     assert_eq!(read_all_recv_stream(&accepted), b"hello");
@@ -5560,7 +5611,7 @@ fn write_vectored_final_sends_all_parts_and_closes_write_side() {
     let parts = [IoSlice::new(b"ti"), IoSlice::new(b"med")];
     assert_eq!(
         timed
-            .writev_final_timeout(&parts, Duration::from_secs(1))
+            .write_vectored_final_timeout(&parts, Duration::from_secs(1))
             .unwrap(),
         5
     );
@@ -5569,7 +5620,7 @@ fn write_vectored_final_sends_all_parts_and_closes_write_side() {
 }
 
 #[test]
-fn writev_final_packs_small_parts_into_single_fin_frame() {
+fn write_vectored_final_packs_small_parts_into_single_fin_frame() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
     let stream = client.open_stream().unwrap();
     let parts = [
@@ -5578,8 +5629,8 @@ fn writev_final_packs_small_parts_into_single_fin_frame() {
         IoSlice::new(b"world"),
     ];
 
-    assert_eq!(stream.writev_final(&parts).unwrap(), 10);
-    assert!(stream.write_closed());
+    assert_eq!(stream.write_vectored_final(&parts).unwrap(), 10);
+    assert!(stream.is_write_closed());
 
     let frames = peer.collect_frames_for(Duration::from_millis(100));
     let data_frames = frames
@@ -5602,8 +5653,8 @@ fn write_final_empty_opens_and_finishes_stream() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
     let stream = client.open_stream().unwrap();
 
-    assert_eq!(stream.write_final(&[]).unwrap(), 0);
-    assert!(stream.write_closed());
+    assert_eq!(stream.write_final([]).unwrap(), 0);
+    assert!(stream.is_write_closed());
 
     let frame = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
     assert_eq!(frame.stream_id, stream.stream_id());
@@ -5626,10 +5677,7 @@ fn zero_length_write_does_not_emit_open_metadata_opener() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions {
-            open_info: b"meta".to_vec(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().with_open_info(b"meta"))
         .unwrap();
 
     assert_eq!(stream.write(&[]).unwrap(), 0);
@@ -5653,12 +5701,8 @@ fn open_and_send_empty_does_not_emit_open_metadata_opener() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let (stream, n) = client
-        .open_and_send_with_options(
-            OpenOptions {
-                open_info: b"meta".to_vec(),
-                ..OpenOptions::default()
-            },
-            &[],
+        .open_and_send(
+            zmux::OpenSend::new([]).with_options(OpenOptions::new().with_open_info(b"meta")),
         )
         .unwrap();
 
@@ -5683,7 +5727,7 @@ fn open_and_send_empty_does_not_emit_open_metadata_opener() {
 }
 
 #[test]
-fn writev_final_splits_when_open_metadata_consumes_whole_first_frame() {
+fn write_vectored_final_splits_when_open_metadata_consumes_whole_first_frame() {
     let caps = CAPABILITY_OPEN_METADATA;
     let settings = Settings::default();
     let max_frame_payload = settings.max_frame_payload;
@@ -5700,15 +5744,12 @@ fn writev_final_splits_when_open_metadata_consumes_whole_first_frame() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions {
-            open_info: open_info.clone(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().with_open_info(&open_info))
         .unwrap();
     let parts = [IoSlice::new(b"x")];
 
-    assert_eq!(stream.writev_final(&parts).unwrap(), 1);
-    assert!(stream.write_closed());
+    assert_eq!(stream.write_vectored_final(&parts).unwrap(), 1);
+    assert!(stream.is_write_closed());
 
     let frames = peer.collect_frames_for(Duration::from_millis(100));
     let data_frames = frames
@@ -5912,11 +5953,7 @@ fn saturated_priority_chunks_after_open_metadata_prefix() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with_options(OpenOptions {
-            initial_priority: Some(20),
-            open_info: b"ssh".to_vec(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().priority(20).with_open_info(b"ssh"))
         .unwrap();
     let payload = vec![b's'; 5_000];
 
@@ -5964,7 +6001,7 @@ fn saturated_priority_chunks_after_open_metadata_prefix() {
 #[test]
 fn graceful_close_initial_goaway_allows_inflight_peer_open() {
     let client_config = Config {
-        goaway_drain_interval: Duration::from_millis(100),
+        go_away_drain_interval: Duration::from_millis(100),
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -5973,7 +6010,7 @@ fn graceful_close_initial_goaway_allows_inflight_peer_open() {
     let closer = client.clone();
     let close_thread = thread::spawn(move || closer.close().unwrap());
     let initial_goaway = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
-    let initial = parse_goaway_payload(&initial_goaway.payload).unwrap();
+    let initial = parse_go_away_payload(&initial_goaway.payload).unwrap();
     assert!(initial.last_accepted_bidi > 0);
 
     peer.write_frame(Frame {
@@ -5992,7 +6029,7 @@ fn graceful_close_initial_goaway_allows_inflight_peer_open() {
 #[test]
 fn peer_goaway_is_ignored_while_closing() {
     let client_config = Config {
-        goaway_drain_interval: Duration::from_millis(100),
+        go_away_drain_interval: Duration::from_millis(100),
         ignored_control_budget: 0,
         ..Config::default()
     };
@@ -6009,7 +6046,7 @@ fn peer_goaway_is_ignored_while_closing() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(MAX_VARINT62, MAX_VARINT62, 0, "").unwrap(),
+        payload: build_go_away_payload(MAX_VARINT62, MAX_VARINT62, 0, "").unwrap(),
     });
     peer.write_frame(Frame {
         frame_type: FrameType::Close,
@@ -6035,7 +6072,7 @@ fn peer_goaway_is_ignored_while_closing() {
 #[test]
 fn concurrent_close_waits_for_existing_close() {
     let client_config = Config {
-        goaway_drain_interval: Duration::from_millis(100),
+        go_away_drain_interval: Duration::from_millis(100),
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -6115,7 +6152,7 @@ fn graceful_close_drain_timeout_returns_error_after_no_error_close() {
 fn graceful_close_reclaims_uncommitted_local_open_without_timeout() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(20),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, server) = connected_pair(client_config, Config::default());
@@ -6135,7 +6172,7 @@ fn graceful_close_reclaims_uncommitted_local_open_without_timeout() {
 fn graceful_close_drain_ignores_peer_stream_without_local_send_commit() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(20),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, server) = connected_pair(client_config, Config::default());
@@ -6174,8 +6211,8 @@ fn bidirectional_stream_round_trip_over_memory_transport() {
 #[test]
 fn native_session_contract_bidi() {
     let (client, server) = connected_pair(Config::default(), Config::default());
-    assert!(!client.closed());
-    assert!(!server.closed());
+    assert!(!client.is_closed());
+    assert!(!server.is_closed());
 
     let client_stream = client.open_stream().unwrap();
     assert_eq!(client_stream.write(b"adapter-contract-bidi").unwrap(), 21);
@@ -6195,8 +6232,8 @@ fn native_session_contract_bidi() {
 #[test]
 fn native_session_contract_uni() {
     let (client, server) = connected_pair(Config::default(), Config::default());
-    assert!(!client.closed());
-    assert!(!server.closed());
+    assert!(!client.is_closed());
+    assert!(!server.is_closed());
 
     let send = client.open_uni_stream().unwrap();
     assert_eq!(send.write(b"adapter-contract-uni").unwrap(), 20);
@@ -6514,7 +6551,7 @@ fn peer_incoming_stream_limit_refuses_new_active_peer_stream() {
 fn peer_goaway_rejects_new_local_streams() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
-    server.goaway(0, 0).unwrap();
+    server.go_away(0, 0).unwrap();
     wait_for_state(&client, SessionState::Draining);
 
     let err = client.open_stream().err().unwrap();
@@ -6528,7 +6565,7 @@ fn peer_goaway_rejects_new_local_streams() {
 }
 
 #[test]
-fn peer_goaway_reclaims_excess_provisional_streams() {
+fn peer_go_away_reclaims_excess_provisional_streams() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     let first = client.open_stream().unwrap();
@@ -6536,7 +6573,7 @@ fn peer_goaway_reclaims_excess_provisional_streams() {
     assert_eq!(first.stream_id(), 0);
     assert_eq!(second.stream_id(), 0);
 
-    server.goaway(4, MAX_VARINT62 - 1).unwrap();
+    server.go_away(4, MAX_VARINT62 - 1).unwrap();
     wait_for_state(&client, SessionState::Draining);
 
     let err = second.write_final(b"second").err().unwrap();
@@ -6861,7 +6898,7 @@ fn close_read_late_data_per_stream_cap_fails_session() {
 fn local_goaway_refuses_too_new_peer_stream() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    client.goaway(1, 0).unwrap();
+    client.go_away(1, 0).unwrap();
     let goaway = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
     assert_eq!(goaway.stream_id, 0);
 
@@ -6894,7 +6931,7 @@ fn goaway_refused_opening_data_does_not_parse_malformed_open_metadata() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
 
-    client.goaway(0, 0).unwrap();
+    client.go_away(0, 0).unwrap();
     let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
 
     peer.write_raw_frame_parts(FrameType::Data, FRAME_FLAG_OPEN_METADATA, 5, &[]);
@@ -6955,7 +6992,7 @@ fn open_metadata_on_existing_local_stream_fails_session() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
 
-    let mut stream = client.open_stream().unwrap();
+    let stream = client.open_stream().unwrap();
     stream.write_all(b"open").unwrap();
     let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
 
@@ -8111,7 +8148,7 @@ fn late_data_on_terminal_hidden_stream_still_obeys_session_flow_control() {
 fn hidden_abort_after_local_goaway_gets_refused_abort() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    client.goaway(0, 0).unwrap();
+    client.go_away(0, 0).unwrap();
     peer.write_frame(Frame {
         frame_type: FrameType::Abort,
         flags: 0,
@@ -8412,7 +8449,7 @@ fn malformed_pong_before_close_start_fails_session() {
 fn ping_after_graceful_close_start_is_ignored() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(300),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -8451,7 +8488,7 @@ fn ping_after_graceful_close_start_is_ignored() {
 fn malformed_pong_after_graceful_close_start_is_ignored() {
     let client_config = Config {
         close_drain_timeout: Duration::from_millis(300),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -10253,7 +10290,7 @@ fn priority_update_after_graceful_close_start_is_ignored() {
     let client_config = Config {
         capabilities: caps,
         close_drain_timeout: Duration::from_millis(300),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let peer_config = Config {
@@ -10306,7 +10343,7 @@ fn malformed_priority_update_after_graceful_close_start_is_ignored() {
     let client_config = Config {
         capabilities: caps,
         close_drain_timeout: Duration::from_millis(300),
-        goaway_drain_interval: Duration::ZERO,
+        go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
     let peer_config = Config {
@@ -10756,7 +10793,7 @@ fn max_varint_goaway_watermark_fails_direction_validation() {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_goaway_payload(MAX_VARINT62, MAX_VARINT62, 0, "").unwrap(),
+        payload: build_go_away_payload(MAX_VARINT62, MAX_VARINT62, 0, "").unwrap(),
     });
 
     let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
@@ -10773,7 +10810,7 @@ fn duplicate_goaway_exhausts_control_budget() {
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
-    let payload = build_goaway_payload(0, 0, 0, "").unwrap();
+    let payload = build_go_away_payload(0, 0, 0, "").unwrap();
 
     peer.write_frame(Frame {
         frame_type: FrameType::GoAway,
@@ -10807,8 +10844,8 @@ fn changed_peer_goaway_clears_ignored_control_budget() {
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
-    let high = build_goaway_payload(4, 0, 0, "").unwrap();
-    let low = build_goaway_payload(0, 0, 0, "").unwrap();
+    let high = build_go_away_payload(4, 0, 0, "").unwrap();
+    let low = build_go_away_payload(0, 0, 0, "").unwrap();
 
     peer.write_frame(Frame {
         frame_type: FrameType::GoAway,
@@ -11347,18 +11384,12 @@ fn local_open_info_budget_releases_when_uncommitted_open_is_cancelled() {
     let (client, _peer) = client_with_raw_peer_configs(client_config, peer_config);
 
     let first = client
-        .open_stream_with_options(OpenOptions {
-            open_info: b"abc".to_vec(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().with_open_info(b"abc"))
         .unwrap();
     assert_eq!(client.stats().retention.retained_open_info_bytes, 3);
 
-    let err = match client.open_stream_with_options(OpenOptions {
-        open_info: b"x".to_vec(),
-        ..OpenOptions::default()
-    }) {
-        Ok(_) => panic!("open_stream_with_options unexpectedly succeeded"),
+    let err = match client.open_stream_with(OpenOptions::new().with_open_info(b"x")) {
+        Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
     assert_eq!(err.code(), Some(ErrorCode::StreamLimit));
@@ -11372,10 +11403,7 @@ fn local_open_info_budget_releases_when_uncommitted_open_is_cancelled() {
     assert_eq!(client.stats().retention.retained_open_info_bytes, 0);
 
     let replacement = client
-        .open_stream_with_options(OpenOptions {
-            open_info: b"x".to_vec(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
         .unwrap();
     assert_eq!(client.stats().retention.retained_open_info_bytes, 1);
     replacement
@@ -11401,11 +11429,8 @@ fn local_open_session_memory_cap_rejects_open_info_over_cap() {
     };
     let (client, _peer) = client_with_raw_peer_configs(client_config, peer_config);
 
-    let err = match client.open_stream_with_options(OpenOptions {
-        open_info,
-        ..OpenOptions::default()
-    }) {
-        Ok(_) => panic!("open_stream_with_options unexpectedly succeeded"),
+    let err = match client.open_stream_with(OpenOptions::new().with_open_info(&open_info)) {
+        Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
 
@@ -11438,11 +11463,8 @@ fn local_open_memory_cap_baseline(caps: u64) -> usize {
 fn local_open_rejects_open_info_without_negotiated_open_metadata() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    let err = match client.open_stream_with_options(OpenOptions {
-        open_info: b"need-metadata".to_vec(),
-        ..OpenOptions::default()
-    }) {
-        Ok(_) => panic!("open_stream_with_options unexpectedly succeeded"),
+    let err = match client.open_stream_with(OpenOptions::new().with_open_info(b"need-metadata")) {
+        Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
 
@@ -11476,11 +11498,8 @@ fn local_open_rejects_oversized_open_metadata_at_open_time() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let open_info = vec![0; Settings::default().max_frame_payload as usize + 1];
 
-    let err = match client.open_stream_with_options(OpenOptions {
-        open_info,
-        ..OpenOptions::default()
-    }) {
-        Ok(_) => panic!("open_stream_with_options unexpectedly succeeded"),
+    let err = match client.open_stream_with(OpenOptions::new().with_open_info(&open_info)) {
+        Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
 
@@ -11568,10 +11587,7 @@ fn local_open_metadata_prefix_releases_after_first_frame_is_visible_to_peer() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
 
     let stream = client
-        .open_stream_with_options(OpenOptions {
-            open_info: b"abc".to_vec(),
-            ..OpenOptions::default()
-        })
+        .open_stream_with(OpenOptions::new().with_open_info(b"abc"))
         .unwrap();
     stream.write_final(b"x").unwrap();
 
@@ -11702,7 +11718,7 @@ fn peer_reset_reason_is_trimmed_by_session_memory_cap() {
     let err = accepted.read(&mut byte).unwrap_err();
     assert!(err.to_string().contains(": abc"));
     assert!(!err.to_string().contains("abcd"));
-    assert!(!client.closed());
+    assert!(!client.is_closed());
 
     client.close().unwrap();
 }

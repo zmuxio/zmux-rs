@@ -79,11 +79,11 @@ fn interop_config() -> Config {
 }
 
 fn tcp_session_client(socket: TcpStream) -> Conn {
-    Conn::client_tcp(socket, interop_config()).unwrap()
+    Conn::client_tcp_with_config(socket, interop_config()).unwrap()
 }
 
 fn tcp_session_server(socket: TcpStream) -> Conn {
-    Conn::server_tcp(socket, interop_config()).unwrap()
+    Conn::server_tcp_with_config(socket, interop_config()).unwrap()
 }
 
 fn temp_work_dir(prefix: &str) -> io::Result<PathBuf> {
@@ -485,11 +485,11 @@ fn rust_client_talks_to_java_server_with_open_metadata() {
         .ping_timeout(b"rust-ping-java-server", Duration::from_secs(5))
         .unwrap();
     let stream = session
-        .open_stream_with_options(
+        .open_stream_with(
             OpenOptions::new()
-                .with_initial_priority(7)
-                .with_initial_group(9)
-                .with_open_info(b"rust-open".to_vec()),
+                .priority(7)
+                .group(9)
+                .with_open_info(b"rust-open"),
         )
         .unwrap();
     stream.write_final(b"rust->java").unwrap();

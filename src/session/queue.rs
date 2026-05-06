@@ -8,8 +8,8 @@ use crate::payload::{
     build_code_payload, parse_data_payload_metadata_offset, parse_priority_update_metadata,
 };
 use crate::protocol::{EXT_PRIORITY_UPDATE, METADATA_STREAM_GROUP, METADATA_STREAM_PRIORITY};
-use crate::varint::{append_varint, parse_varint, varint_len};
-use std::collections::{HashMap, VecDeque};
+use crate::varint::{append_varint_reserved, parse_varint, varint_len};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ const FRAME_QUEUE_OVERHEAD_BYTES: usize = 1;
 const RETAINED_DATA_STREAM_COST_CAP: usize = 64;
 const SHRINK_DATA_STREAM_COST_CAP: usize = 4096;
 const DATA_STREAM_COST_SHRINK_FACTOR: usize = 8;
+const LANE_SPARSE_SHRINK_FACTOR: usize = 4;
 
 #[derive(Debug)]
 pub(super) struct WriteQueue {
@@ -118,6 +119,7 @@ pub(super) struct StreamDiscardStats {
 }
 
 impl StreamDiscardStats {
+    #[inline]
     fn add_frame(&mut self, frame: &Frame) {
         self.removed_frames = self.removed_frames.saturating_add(1);
         if frame.frame_type == FrameType::Data {
@@ -132,6 +134,7 @@ impl StreamDiscardStats {
         }
     }
 
+    #[inline]
     fn add(&mut self, other: Self) {
         self.removed_frames = self.removed_frames.saturating_add(other.removed_frames);
         self.data_frames = self.data_frames.saturating_add(other.data_frames);
@@ -139,33 +142,40 @@ impl StreamDiscardStats {
         self.terminal_frames = self.terminal_frames.saturating_add(other.terminal_frames);
     }
 
+    #[inline]
     pub(super) fn removed_any(self) -> bool {
         self.removed_frames != 0
     }
 }
 
+#[inline]
 fn frame_data_app_bytes(frame: &Frame) -> usize {
     if frame.frame_type != FrameType::Data {
         return 0;
     }
+    let payload_len = frame.payload.len();
     if frame.flags & FRAME_FLAG_OPEN_METADATA == 0 {
-        return frame.payload.len();
+        return payload_len;
     }
-    let offset = parse_data_payload_metadata_offset(&frame.payload, frame.flags)
-        .map(|(_, _, offset)| offset)
-        .unwrap_or(0);
-    frame.payload.len().saturating_sub(offset)
+    let offset = match parse_data_payload_metadata_offset(&frame.payload, frame.flags) {
+        Ok((_, _, offset)) => offset,
+        Err(_) => 0,
+    };
+    payload_len - offset
 }
 
 impl DataCosts {
+    #[inline]
     fn is_empty(&self) -> bool {
         self.total == 0
     }
 
+    #[inline]
     fn total(&self) -> usize {
         self.total
     }
 
+    #[inline]
     fn add(&mut self, stream_id: u64, bytes: usize) {
         self.total = self.total.saturating_add(bytes);
         if let Some((id, existing)) = self.first.as_mut() {
@@ -177,26 +187,31 @@ impl DataCosts {
             self.first = Some((stream_id, bytes));
             return;
         }
-        if let Some((_, existing)) = self.rest.iter_mut().find(|(id, _)| *id == stream_id) {
-            *existing = existing.saturating_add(bytes);
-        } else {
-            self.rest.push((stream_id, bytes));
+        for (id, existing) in &mut self.rest {
+            if *id == stream_id {
+                *existing = existing.saturating_add(bytes);
+                return;
+            }
         }
+        self.rest.push((stream_id, bytes));
     }
 
+    #[inline]
     fn get(&self, stream_id: u64) -> usize {
-        if self
-            .first
-            .is_some_and(|(existing_stream_id, _)| existing_stream_id == stream_id)
-        {
-            return self.first.map(|(_, bytes)| bytes).unwrap_or(0);
+        if let Some((existing_stream_id, bytes)) = self.first {
+            if existing_stream_id == stream_id {
+                return bytes;
+            }
         }
-        self.rest
-            .iter()
-            .find_map(|(id, bytes)| (*id == stream_id).then_some(*bytes))
-            .unwrap_or(0)
+        for &(id, bytes) in &self.rest {
+            if id == stream_id {
+                return bytes;
+            }
+        }
+        0
     }
 
+    #[inline]
     fn iter(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.first.iter().copied().chain(self.rest.iter().copied())
     }
@@ -241,7 +256,7 @@ impl WriteQueue {
             if state.closed {
                 return Err(Error::session_closed());
             }
-            if let Some((lane, index)) = coalesce_key.and_then(|key| state.find_coalesced(key)) {
+            if let Some((lane, index)) = find_coalesced_key(&state, coalesce_key) {
                 merge_coalesced_priority_update(state.job(lane, index), &mut job)?;
                 cost = job.cost_bytes();
                 let old_cost = state.job(lane, index).cost_bytes();
@@ -338,7 +353,7 @@ impl WriteQueue {
             if state.closed {
                 return Err(Error::session_closed());
             }
-            if let Some((lane, index)) = coalesce_key.and_then(|key| state.find_coalesced(key)) {
+            if let Some((lane, index)) = find_coalesced_key(&state, coalesce_key) {
                 let mut job = pending.take().expect("queued job already consumed");
                 merge_coalesced_priority_update(state.job(lane, index), &mut job)?;
                 let cost = job.cost_bytes();
@@ -445,7 +460,7 @@ impl WriteQueue {
         if state.closed {
             return Err(Error::session_closed());
         }
-        if let Some((lane, index)) = coalesce_key.and_then(|key| state.find_coalesced(key)) {
+        if let Some((lane, index)) = find_coalesced_key(&state, coalesce_key) {
             merge_coalesced_priority_update(state.job(lane, index), &mut job)?;
             cost = job.cost_bytes();
             let old_cost = state.job(lane, index).cost_bytes();
@@ -511,7 +526,7 @@ impl WriteQueue {
         if state.closed {
             return Err(Error::session_closed());
         }
-        if let Some((lane, index)) = coalesce_key.and_then(|key| state.find_coalesced(key)) {
+        if let Some((lane, index)) = find_coalesced_key(&state, coalesce_key) {
             merge_coalesced_priority_update(state.job(lane, index), &mut job)?;
             cost = job.cost_bytes();
             let old_cost = state.job(lane, index).cost_bytes();
@@ -591,12 +606,9 @@ impl WriteQueue {
 
     pub(super) fn terminal_control_queued_for_stream(&self, stream_id: u64) -> bool {
         let state = self.state.lock().unwrap();
-        state
-            .urgent_jobs
-            .iter()
-            .chain(state.advisory_jobs.iter())
-            .chain(state.ordinary_jobs.iter())
-            .any(|job| job_has_terminal_control_for_stream(job, stream_id))
+        jobs_have_terminal_control_for_stream(&state.urgent_jobs, stream_id)
+            || jobs_have_terminal_control_for_stream(&state.advisory_jobs, stream_id)
+            || jobs_have_terminal_control_for_stream(&state.ordinary_jobs, stream_id)
     }
 
     pub(super) fn discard_stream(&self, stream_id: u64) -> StreamDiscardStats {
@@ -678,9 +690,11 @@ impl WriteQueue {
         completion: &super::types::WriteCompletion,
     ) -> Option<super::types::TrackedWriteJob> {
         let mut state = self.state.lock().unwrap();
-        let removed = find_tracked_completion(&state, completion).and_then(|(lane, index)| {
+        let removed = if let Some((lane, index)) = find_tracked_completion(&state, completion) {
             remove_lane_job(&mut state, lane, index).map(|job| (lane, job))
-        });
+        } else {
+            None
+        };
         let (lane, job) = removed?;
         let queued = job.cost_bytes();
         let cost = queue_cost_for(lane, &job, queued);
@@ -737,18 +751,27 @@ impl WriteQueue {
         timeout: Option<Duration>,
     ) -> WriteQueuePopStatus {
         batch.clear();
-        let min_capacity = self.max_batch_frames.min(MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
+        let batch_frame_limit = self.max_batch_frames.max(1);
+        let min_capacity = batch_frame_limit.min(MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
         if batch.capacity() < min_capacity {
-            let _ = batch.try_reserve(min_capacity - batch.capacity());
+            let _ = batch.try_reserve(min_capacity - batch.len());
         }
         let mut state = self.state.lock().unwrap();
-        let started = timeout.map(|_| Instant::now());
+        let started = if timeout.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         while state.is_empty() && !state.closed {
             let Some(timeout) = timeout else {
                 state = self.not_empty.wait(state).unwrap();
                 continue;
             };
-            let elapsed = started.map(|started| started.elapsed()).unwrap_or_default();
+            let elapsed = if let Some(started) = started {
+                started.elapsed()
+            } else {
+                Duration::default()
+            };
             if elapsed >= timeout {
                 return WriteQueuePopStatus::TimedOut;
             }
@@ -770,7 +793,7 @@ impl WriteQueue {
         let mut prefer_advisory = true;
         let mut saw_nonurgent = false;
         let mut nonurgent_batch_bytes = 0usize;
-        for _ in 0..self.max_batch_frames {
+        for _ in 0..batch_frame_limit {
             let Some((lane, job)) = pop_next_batch_job(&mut state, prefer_advisory) else {
                 break;
             };
@@ -807,7 +830,7 @@ impl WriteQueue {
     }
 
     fn would_exceed_capacity(&self, state: &WriteQueueState, cost: usize) -> bool {
-        cost > 0 && state.queued_bytes.saturating_add(cost) > self.max_bytes
+        cost > self.max_bytes.saturating_sub(state.queued_bytes)
     }
 
     fn replacement_would_exceed_capacity(
@@ -816,16 +839,13 @@ impl WriteQueue {
         old_cost: usize,
         new_cost: usize,
     ) -> bool {
-        new_cost > old_cost
-            && state
-                .queued_bytes
-                .saturating_sub(old_cost)
-                .saturating_add(new_cost)
-                > self.max_bytes
+        replacement_would_exceed_limit(state.queued_bytes, old_cost, new_cost, self.max_bytes)
     }
 
     fn would_exceed_urgent_capacity(&self, state: &WriteQueueState, cost: usize) -> bool {
-        cost > 0 && state.urgent_queued_bytes.saturating_add(cost) > self.urgent_max_bytes
+        cost > self
+            .urgent_max_bytes
+            .saturating_sub(state.urgent_queued_bytes)
     }
 
     fn replacement_would_exceed_urgent_capacity(
@@ -834,12 +854,12 @@ impl WriteQueue {
         old_cost: usize,
         new_cost: usize,
     ) -> bool {
-        new_cost > old_cost
-            && state
-                .urgent_queued_bytes
-                .saturating_sub(old_cost)
-                .saturating_add(new_cost)
-                > self.urgent_max_bytes
+        replacement_would_exceed_limit(
+            state.urgent_queued_bytes,
+            old_cost,
+            new_cost,
+            self.urgent_max_bytes,
+        )
     }
 
     fn would_exceed_pending_capacity(&self, state: &WriteQueueState, cost: &QueueCost) -> bool {
@@ -861,18 +881,16 @@ impl WriteQueue {
         state: &WriteQueueState,
         cost: &QueueCost,
     ) -> Option<&'static str> {
-        if cost.pending_control > 0
-            && state
-                .pending_control_bytes
-                .saturating_add(cost.pending_control)
-                > self.pending_control_max_bytes
+        if cost.pending_control
+            > self
+                .pending_control_max_bytes
+                .saturating_sub(state.pending_control_bytes)
         {
             Some("zmux: pending control budget exceeded")
-        } else if cost.pending_priority > 0
-            && state
-                .pending_priority_bytes
-                .saturating_add(cost.pending_priority)
-                > self.pending_priority_max_bytes
+        } else if cost.pending_priority
+            > self
+                .pending_priority_max_bytes
+                .saturating_sub(state.pending_priority_bytes)
         {
             Some("zmux: pending priority budget exceeded")
         } else {
@@ -896,21 +914,19 @@ impl WriteQueue {
         old: &QueueCost,
         new: &QueueCost,
     ) -> Option<&'static str> {
-        if new.pending_control > old.pending_control
-            && state
-                .pending_control_bytes
-                .saturating_sub(old.pending_control)
-                .saturating_add(new.pending_control)
-                > self.pending_control_max_bytes
-        {
+        if replacement_would_exceed_limit(
+            state.pending_control_bytes,
+            old.pending_control,
+            new.pending_control,
+            self.pending_control_max_bytes,
+        ) {
             Some("zmux: pending control budget exceeded")
-        } else if new.pending_priority > old.pending_priority
-            && state
-                .pending_priority_bytes
-                .saturating_sub(old.pending_priority)
-                .saturating_add(new.pending_priority)
-                > self.pending_priority_max_bytes
-        {
+        } else if replacement_would_exceed_limit(
+            state.pending_priority_bytes,
+            old.pending_priority,
+            new.pending_priority,
+            self.pending_priority_max_bytes,
+        ) {
             Some("zmux: pending priority budget exceeded")
         } else {
             None
@@ -925,29 +941,39 @@ impl WriteQueue {
             return true;
         }
         let data_total = cost.data.total();
-        if state.data_queued_bytes.saturating_add(data_total) > self.session_data_max_bytes {
+        if data_total
+            > self
+                .session_data_max_bytes
+                .saturating_sub(state.data_queued_bytes)
+        {
             return true;
         }
-        cost.data.iter().any(|(stream_id, bytes)| {
-            state
+        for (stream_id, bytes) in cost.data.iter() {
+            let queued = state
                 .data_queued_by_stream
                 .get(&stream_id)
                 .copied()
-                .unwrap_or(0)
-                .saturating_add(bytes)
-                > self.per_stream_data_max_bytes
-        })
+                .unwrap_or(0);
+            if bytes > self.per_stream_data_max_bytes.saturating_sub(queued) {
+                return true;
+            }
+        }
+        false
     }
 
     fn intrinsic_data_capacity_error(&self, cost: &QueueCost) -> bool {
         if cost.data.is_empty() {
             return false;
         }
-        cost.data.total() > self.session_data_max_bytes
-            || cost
-                .data
-                .iter()
-                .any(|(_, bytes)| bytes > self.per_stream_data_max_bytes)
+        if cost.data.total() > self.session_data_max_bytes {
+            return true;
+        }
+        for (_, bytes) in cost.data.iter() {
+            if bytes > self.per_stream_data_max_bytes {
+                return true;
+            }
+        }
+        false
     }
 
     fn replacement_would_exceed_data_capacity(
@@ -961,27 +987,30 @@ impl WriteQueue {
         }
         let old_total = old.data.total();
         let new_total = new.data.total();
-        if new_total > old_total
-            && state
-                .data_queued_bytes
-                .saturating_sub(old_total)
-                .saturating_add(new_total)
-                > self.session_data_max_bytes
-        {
+        if replacement_would_exceed_limit(
+            state.data_queued_bytes,
+            old_total,
+            new_total,
+            self.session_data_max_bytes,
+        ) {
             return true;
         }
-        new.data.iter().any(|(stream_id, new_bytes)| {
+        for (stream_id, new_bytes) in new.data.iter() {
             let old_bytes = old.data.get(stream_id);
-            new_bytes > old_bytes
-                && state
+            if replacement_would_exceed_limit(
+                state
                     .data_queued_by_stream
                     .get(&stream_id)
                     .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(old_bytes)
-                    .saturating_add(new_bytes)
-                    > self.per_stream_data_max_bytes
-        })
+                    .unwrap_or(0),
+                old_bytes,
+                new_bytes,
+                self.per_stream_data_max_bytes,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     fn replace_locked(
@@ -1054,6 +1083,16 @@ impl WriteQueue {
     }
 }
 
+#[inline]
+fn replacement_would_exceed_limit(
+    current: usize,
+    old_cost: usize,
+    new_cost: usize,
+    limit: usize,
+) -> bool {
+    new_cost > old_cost && new_cost > limit.saturating_sub(current.saturating_sub(old_cost))
+}
+
 fn push_front_batch_job(state: &mut WriteQueueState, lane: QueueLane, job: WriteJob) {
     match lane {
         QueueLane::Urgent => state.urgent_jobs.push_front(job),
@@ -1066,25 +1105,30 @@ fn find_tracked_completion(
     state: &WriteQueueState,
     completion: &super::types::WriteCompletion,
 ) -> Option<(QueueLane, usize)> {
-    state
-        .urgent_jobs
-        .iter()
-        .position(|job| job.tracks_completion(completion))
-        .map(|index| (QueueLane::Urgent, index))
-        .or_else(|| {
-            state
-                .advisory_jobs
-                .iter()
-                .position(|job| job.tracks_completion(completion))
-                .map(|index| (QueueLane::Advisory, index))
-        })
-        .or_else(|| {
-            state
-                .ordinary_jobs
-                .iter()
-                .position(|job| job.tracks_completion(completion))
-                .map(|index| (QueueLane::Ordinary, index))
-        })
+    if let Some(found) =
+        find_tracked_completion_in_lane(&state.urgent_jobs, QueueLane::Urgent, completion)
+    {
+        return Some(found);
+    }
+    if let Some(found) =
+        find_tracked_completion_in_lane(&state.advisory_jobs, QueueLane::Advisory, completion)
+    {
+        return Some(found);
+    }
+    find_tracked_completion_in_lane(&state.ordinary_jobs, QueueLane::Ordinary, completion)
+}
+
+fn find_tracked_completion_in_lane(
+    jobs: &VecDeque<WriteJob>,
+    lane: QueueLane,
+    completion: &super::types::WriteCompletion,
+) -> Option<(QueueLane, usize)> {
+    for (index, job) in jobs.iter().enumerate() {
+        if job.tracks_completion(completion) {
+            return Some((lane, index));
+        }
+    }
+    None
 }
 
 fn pop_next_batch_job(
@@ -1095,27 +1139,23 @@ fn pop_next_batch_job(
         return Some((QueueLane::Urgent, job));
     }
     if prefer_advisory {
-        state
-            .advisory_jobs
-            .pop_front()
-            .map(|job| (QueueLane::Advisory, job))
-            .or_else(|| {
-                state
-                    .ordinary_jobs
-                    .pop_front()
-                    .map(|job| (QueueLane::Ordinary, job))
-            })
+        if let Some(job) = state.advisory_jobs.pop_front() {
+            Some((QueueLane::Advisory, job))
+        } else {
+            state
+                .ordinary_jobs
+                .pop_front()
+                .map(|job| (QueueLane::Ordinary, job))
+        }
     } else {
-        state
-            .ordinary_jobs
-            .pop_front()
-            .map(|job| (QueueLane::Ordinary, job))
-            .or_else(|| {
-                state
-                    .advisory_jobs
-                    .pop_front()
-                    .map(|job| (QueueLane::Advisory, job))
-            })
+        if let Some(job) = state.ordinary_jobs.pop_front() {
+            Some((QueueLane::Ordinary, job))
+        } else {
+            state
+                .advisory_jobs
+                .pop_front()
+                .map(|job| (QueueLane::Advisory, job))
+        }
     }
 }
 
@@ -1125,11 +1165,7 @@ fn discard_stream_from_lane(
     stream_id: u64,
     remove: fn(&Frame, u64) -> bool,
 ) -> StreamDiscardStats {
-    if !state
-        .lane(lane)
-        .iter()
-        .any(|job| job_has_removable_stream_frame(job, stream_id, remove))
-    {
+    if !jobs_have_removable_stream_frame(state.lane(lane), stream_id, remove) {
         return StreamDiscardStats::default();
     }
 
@@ -1139,7 +1175,8 @@ fn discard_stream_from_lane(
         QueueLane::Ordinary => std::mem::take(&mut state.ordinary_jobs),
     };
     let original_len = jobs.len();
-    let mut kept = VecDeque::with_capacity(original_len);
+    let mut kept = VecDeque::new();
+    let _ = kept.try_reserve(original_len.min(MAX_INITIAL_QUEUE_SCRATCH_RESERVE));
     let mut stats = StreamDiscardStats::default();
     while let Some(job) = jobs.pop_front() {
         let queued = job.cost_bytes();
@@ -1158,9 +1195,7 @@ fn discard_stream_from_lane(
             kept.push_back(next);
         }
     }
-    if kept.len() <= MAX_INITIAL_QUEUE_SCRATCH_RESERVE {
-        kept.shrink_to(MAX_INITIAL_QUEUE_SCRATCH_RESERVE.min(kept.len()));
-    }
+    shrink_sparse_lane(&mut kept);
 
     match lane {
         QueueLane::Urgent => state.urgent_jobs = kept,
@@ -1177,12 +1212,38 @@ fn job_has_removable_stream_frame(
 ) -> bool {
     match job {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => remove(frame, stream_id),
-        WriteJob::Frames(frames) => frames.iter().any(|frame| remove(frame, stream_id)),
+        WriteJob::Frames(frames) => frames_have_removable_stream_frame(frames, stream_id, remove),
         WriteJob::TrackedFrames(tracked) => {
-            tracked.frames.iter().any(|frame| remove(frame, stream_id))
+            frames_have_removable_stream_frame(&tracked.frames, stream_id, remove)
         }
         WriteJob::Shutdown | WriteJob::DrainShutdown => false,
     }
+}
+
+fn frames_have_removable_stream_frame(
+    frames: &[Frame],
+    stream_id: u64,
+    remove: fn(&Frame, u64) -> bool,
+) -> bool {
+    for frame in frames {
+        if remove(frame, stream_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn jobs_have_removable_stream_frame(
+    jobs: &VecDeque<WriteJob>,
+    stream_id: u64,
+    remove: fn(&Frame, u64) -> bool,
+) -> bool {
+    for job in jobs {
+        if job_has_removable_stream_frame(job, stream_id, remove) {
+            return true;
+        }
+    }
+    false
 }
 
 fn remove_lane_job(state: &mut WriteQueueState, lane: QueueLane, index: usize) -> Option<WriteJob> {
@@ -1220,55 +1281,43 @@ fn remove_stream_frames(
                 )
             }
         }
-        WriteJob::Frames(frames) => {
-            if !frames.iter().any(|frame| remove(frame, stream_id)) {
-                return (
-                    Some(WriteJob::Frames(frames)),
-                    StreamDiscardStats::default(),
-                );
-            }
-            let before = frames.len();
-            let mut kept = Vec::with_capacity(before.min(MAX_INITIAL_QUEUE_SCRATCH_RESERVE));
+        WriteJob::Frames(mut frames) => {
             let mut stats = StreamDiscardStats::default();
-            for frame in frames {
-                if !remove(&frame, stream_id) {
-                    kept.push(frame);
+            frames.retain(|frame| {
+                if remove(frame, stream_id) {
+                    stats.add_frame(frame);
+                    false
                 } else {
-                    stats.add_frame(&frame);
+                    true
                 }
-            }
+            });
             if !stats.removed_any() {
-                (Some(WriteJob::Frames(kept)), stats)
-            } else if kept.is_empty() {
+                (Some(WriteJob::Frames(frames)), stats)
+            } else if frames.is_empty() {
                 (None, stats)
             } else {
-                (Some(WriteJob::Frames(kept)), stats)
+                (Some(WriteJob::Frames(frames)), stats)
             }
         }
         WriteJob::TrackedFrames(mut tracked) => {
-            if !tracked.frames.iter().any(|frame| remove(frame, stream_id)) {
-                return (
-                    Some(WriteJob::TrackedFrames(tracked)),
-                    StreamDiscardStats::default(),
-                );
-            }
-            let before = tracked.frames.len();
-            let mut kept = Vec::with_capacity(before.min(MAX_INITIAL_QUEUE_SCRATCH_RESERVE));
             let mut stats = StreamDiscardStats::default();
-            for frame in tracked.frames {
-                if !remove(&frame, stream_id) {
-                    kept.push(frame);
+            tracked.frames.retain(|frame| {
+                if remove(frame, stream_id) {
+                    stats.add_frame(frame);
+                    false
                 } else {
-                    stats.add_frame(&frame);
+                    true
                 }
+            });
+            if !stats.removed_any() {
+                return (Some(WriteJob::TrackedFrames(tracked)), stats);
             }
             tracked
                 .completion
                 .complete_err(Error::local("zmux: queued write was discarded"));
-            if kept.is_empty() {
+            if tracked.frames.is_empty() {
                 (None, stats)
             } else {
-                tracked.frames = kept;
                 (Some(WriteJob::TrackedFrames(tracked)), stats)
             }
         }
@@ -1277,10 +1326,12 @@ fn remove_stream_frames(
     }
 }
 
+#[inline]
 fn frame_belongs_to_stream(frame: &Frame, stream_id: u64) -> bool {
     stream_id != 0 && frame.stream_id == stream_id
 }
 
+#[inline]
 fn frame_is_send_tail_for_stream(frame: &Frame, stream_id: u64) -> bool {
     frame_belongs_to_stream(frame, stream_id)
         && matches!(
@@ -1290,6 +1341,7 @@ fn frame_is_send_tail_for_stream(frame: &Frame, stream_id: u64) -> bool {
 }
 
 impl WriteQueueState {
+    #[inline]
     fn is_empty(&self) -> bool {
         self.urgent_jobs.is_empty()
             && self.advisory_jobs.is_empty()
@@ -1318,6 +1370,7 @@ impl WriteQueueState {
         }
     }
 
+    #[inline]
     fn has_queued_data_for_stream(&self, stream_id: u64) -> bool {
         self.data_queued_by_stream
             .get(&stream_id)
@@ -1325,24 +1378,16 @@ impl WriteQueueState {
     }
 
     fn find_coalesced(&self, key: CoalesceKey) -> Option<(QueueLane, usize)> {
-        self.urgent_jobs
-            .iter()
-            .rposition(|job| job.coalesce_key() == Some(key))
-            .map(|index| (QueueLane::Urgent, index))
-            .or_else(|| {
-                self.advisory_jobs
-                    .iter()
-                    .rposition(|job| job.coalesce_key() == Some(key))
-                    .map(|index| (QueueLane::Advisory, index))
-            })
-            .or_else(|| {
-                self.ordinary_jobs
-                    .iter()
-                    .rposition(|job| job.coalesce_key() == Some(key))
-                    .map(|index| (QueueLane::Ordinary, index))
-            })
+        if let Some(found) = find_coalesced_in_lane(&self.urgent_jobs, QueueLane::Urgent, key) {
+            return Some(found);
+        }
+        if let Some(found) = find_coalesced_in_lane(&self.advisory_jobs, QueueLane::Advisory, key) {
+            return Some(found);
+        }
+        find_coalesced_in_lane(&self.ordinary_jobs, QueueLane::Ordinary, key)
     }
 
+    #[inline]
     fn lane(&self, lane: QueueLane) -> &VecDeque<WriteJob> {
         match lane {
             QueueLane::Urgent => &self.urgent_jobs,
@@ -1351,6 +1396,7 @@ impl WriteQueueState {
         }
     }
 
+    #[inline]
     fn job(&self, lane: QueueLane, index: usize) -> &WriteJob {
         match lane {
             QueueLane::Urgent => &self.urgent_jobs[index],
@@ -1359,6 +1405,7 @@ impl WriteQueueState {
         }
     }
 
+    #[inline]
     fn job_mut(&mut self, lane: QueueLane, index: usize) -> &mut WriteJob {
         match lane {
             QueueLane::Urgent => &mut self.urgent_jobs[index],
@@ -1368,6 +1415,29 @@ impl WriteQueueState {
     }
 }
 
+fn find_coalesced_in_lane(
+    jobs: &VecDeque<WriteJob>,
+    lane: QueueLane,
+    key: CoalesceKey,
+) -> Option<(QueueLane, usize)> {
+    for (index, job) in jobs.iter().enumerate().rev() {
+        if job.coalesce_key() == Some(key) {
+            return Some((lane, index));
+        }
+    }
+    None
+}
+
+#[inline]
+fn find_coalesced_key(
+    state: &WriteQueueState,
+    key: Option<CoalesceKey>,
+) -> Option<(QueueLane, usize)> {
+    let key = key?;
+    state.find_coalesced(key)
+}
+
+#[inline]
 fn queue_cost_for(lane: QueueLane, job: &WriteJob, queued: usize) -> QueueCost {
     let urgent = if lane == QueueLane::Urgent && job.is_urgent() && !job.bypasses_urgent_capacity()
     {
@@ -1422,14 +1492,19 @@ fn terminal_control_bytes(job: &WriteJob) -> usize {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => {
             frame_terminal_control_bytes(frame)
         }
-        WriteJob::Frames(frames) => frames.iter().fold(0usize, |sum, frame| {
-            sum.saturating_add(frame_terminal_control_bytes(frame))
-        }),
-        WriteJob::TrackedFrames(tracked) => tracked.frames.iter().fold(0usize, |sum, frame| {
-            sum.saturating_add(frame_terminal_control_bytes(frame))
-        }),
+        WriteJob::Frames(frames) => frames_terminal_control_bytes(frames),
+        WriteJob::TrackedFrames(tracked) => frames_terminal_control_bytes(&tracked.frames),
         WriteJob::Shutdown | WriteJob::DrainShutdown => 0,
     }
+}
+
+#[inline]
+fn frames_terminal_control_bytes(frames: &[Frame]) -> usize {
+    let mut bytes = 0usize;
+    for frame in frames {
+        bytes = bytes.saturating_add(frame_terminal_control_bytes(frame));
+    }
+    bytes
 }
 
 fn frame_terminal_control_bytes(frame: &Frame) -> usize {
@@ -1451,15 +1526,30 @@ fn job_has_terminal_control_for_stream(job: &WriteJob, stream_id: u64) -> bool {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => {
             frame_has_terminal_control_for_stream(frame, stream_id)
         }
-        WriteJob::Frames(frames) => frames
-            .iter()
-            .any(|frame| frame_has_terminal_control_for_stream(frame, stream_id)),
-        WriteJob::TrackedFrames(tracked) => tracked
-            .frames
-            .iter()
-            .any(|frame| frame_has_terminal_control_for_stream(frame, stream_id)),
+        WriteJob::Frames(frames) => frames_have_terminal_control_for_stream(frames, stream_id),
+        WriteJob::TrackedFrames(tracked) => {
+            frames_have_terminal_control_for_stream(&tracked.frames, stream_id)
+        }
         WriteJob::Shutdown | WriteJob::DrainShutdown => false,
     }
+}
+
+fn frames_have_terminal_control_for_stream(frames: &[Frame], stream_id: u64) -> bool {
+    for frame in frames {
+        if frame_has_terminal_control_for_stream(frame, stream_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn jobs_have_terminal_control_for_stream(jobs: &VecDeque<WriteJob>, stream_id: u64) -> bool {
+    for job in jobs {
+        if job_has_terminal_control_for_stream(job, stream_id) {
+            return true;
+        }
+    }
+    false
 }
 
 fn frame_has_terminal_control_for_stream(frame: &Frame, stream_id: u64) -> bool {
@@ -1482,9 +1572,10 @@ fn add_data_cost(costs: &mut DataCosts, stream_id: u64, bytes: usize) {
 }
 
 fn clear_queue_locked(state: &mut WriteQueueState) {
-    complete_drained_jobs(state.urgent_jobs.drain(..), Error::session_closed());
-    complete_drained_jobs(state.advisory_jobs.drain(..), Error::session_closed());
-    complete_drained_jobs(state.ordinary_jobs.drain(..), Error::session_closed());
+    let err = Error::session_closed();
+    complete_drained_jobs(state.urgent_jobs.drain(..), &err);
+    complete_drained_jobs(state.advisory_jobs.drain(..), &err);
+    complete_drained_jobs(state.ordinary_jobs.drain(..), &err);
     state.queued_bytes = 0;
     state.urgent_queued_bytes = 0;
     state.advisory_queued_bytes = 0;
@@ -1496,18 +1587,18 @@ fn clear_queue_locked(state: &mut WriteQueueState) {
     maybe_shrink_data_queued_by_stream(state);
 }
 
-fn complete_drained_jobs<I>(jobs: I, err: Error)
+fn complete_drained_jobs<I>(jobs: I, err: &Error)
 where
     I: IntoIterator<Item = WriteJob>,
 {
     for job in jobs {
-        complete_job_error(job, err.clone());
+        complete_job_error(job, err);
     }
 }
 
-fn complete_job_error(job: WriteJob, err: Error) {
+fn complete_job_error(job: WriteJob, err: &Error) {
     if let WriteJob::TrackedFrames(tracked) = job {
-        tracked.completion.complete_err(err);
+        tracked.completion.complete_err(err.clone());
     }
 }
 
@@ -1523,14 +1614,24 @@ fn shrink_empty_lane(lane: &mut VecDeque<WriteJob>) {
     }
 }
 
-fn append_metadata_varint(dst: &mut Vec<u8>, typ: u64, value: u64) -> Result<()> {
-    append_varint(dst, typ)?;
-    append_varint(dst, usize_to_u64_checked(varint_len(value)?)?)?;
-    append_varint(dst, value)
+fn shrink_sparse_lane<T>(lane: &mut VecDeque<T>) {
+    if lane.is_empty() {
+        if lane.capacity() > MAX_INITIAL_QUEUE_SCRATCH_RESERVE {
+            lane.shrink_to(0);
+        }
+        return;
+    }
+    if lane.capacity() > MAX_INITIAL_QUEUE_SCRATCH_RESERVE
+        && lane.len().saturating_mul(LANE_SPARSE_SHRINK_FACTOR) < lane.capacity()
+    {
+        lane.shrink_to(lane.len().max(MAX_INITIAL_QUEUE_SCRATCH_RESERVE));
+    }
 }
 
-fn usize_to_u64_checked(value: usize) -> Result<u64> {
-    u64::try_from(value).map_err(|_| Error::frame_size("metadata varint length overflows u64"))
+fn append_metadata_varint(dst: &mut Vec<u8>, typ: u64, value: u64) -> Result<()> {
+    append_varint_reserved(dst, typ)?;
+    append_varint_reserved(dst, varint_len(value)? as u64)?;
+    append_varint_reserved(dst, value)
 }
 
 fn priority_update_fields(payload: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
@@ -1539,7 +1640,11 @@ fn priority_update_fields(payload: &[u8]) -> Option<(Option<u64>, Option<u64>)> 
         return None;
     }
     let (metadata, valid) = parse_priority_update_metadata(&payload[n..]).ok()?;
-    valid.then_some((metadata.priority, metadata.group))
+    if valid {
+        Some((metadata.priority, metadata.group))
+    } else {
+        None
+    }
 }
 
 fn merged_priority_update_payload(
@@ -1562,7 +1667,7 @@ fn merged_priority_update_payload(
     let mut out = Vec::new();
     out.try_reserve_exact(len)
         .map_err(|_| Error::local("zmux: priority update merge allocation failed"))?;
-    append_varint(&mut out, EXT_PRIORITY_UPDATE)?;
+    append_varint_reserved(&mut out, EXT_PRIORITY_UPDATE)?;
     if let Some(priority) = priority {
         append_metadata_varint(&mut out, METADATA_STREAM_PRIORITY, priority)?;
     }
@@ -1585,7 +1690,7 @@ fn merged_priority_update_payload_len(priority: Option<u64>, group: Option<u64>)
 
 fn metadata_varint_tlv_len(typ: u64, value: u64) -> Result<usize> {
     let value_len = varint_len(value)?;
-    Ok(varint_len(typ)? + varint_len(usize_to_u64_checked(value_len)?)? + value_len)
+    Ok(varint_len(typ)? + varint_len(value_len as u64)? + value_len)
 }
 
 fn merge_coalesced_priority_update(old: &WriteJob, new: &mut WriteJob) -> Result<()> {
@@ -1646,13 +1751,16 @@ fn apply_queue_cost_remove(state: &mut WriteQueueState, cost: &QueueCost) {
     let data_total = cost.data.total();
     state.data_queued_bytes = state.data_queued_bytes.saturating_sub(data_total);
     for (stream_id, bytes) in cost.data.iter() {
-        let mut remove = false;
-        if let Some(entry) = state.data_queued_by_stream.get_mut(&stream_id) {
-            *entry = entry.saturating_sub(bytes);
-            remove = *entry == 0;
-        }
-        if remove {
-            state.data_queued_by_stream.remove(&stream_id);
+        match state.data_queued_by_stream.entry(stream_id) {
+            Entry::Occupied(mut entry) => {
+                let remaining = entry.get().saturating_sub(bytes);
+                if remaining == 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = remaining;
+                }
+            }
+            Entry::Vacant(_) => {}
         }
     }
     maybe_shrink_data_queued_by_stream(state);
@@ -1662,12 +1770,8 @@ impl WriteJob {
     fn cost_bytes(&self) -> usize {
         match self {
             Self::Frame(frame) | Self::GracefulClose(frame) => retained_frame_queue_cost(frame),
-            Self::Frames(frames) => frames.iter().fold(0usize, |sum, frame| {
-                sum.saturating_add(retained_frame_queue_cost(frame))
-            }),
-            Self::TrackedFrames(tracked) => tracked.frames.iter().fold(0usize, |sum, frame| {
-                sum.saturating_add(retained_frame_queue_cost(frame))
-            }),
+            Self::Frames(frames) => retained_frames_queue_cost(frames),
+            Self::TrackedFrames(tracked) => retained_frames_queue_cost(&tracked.frames),
             Self::Shutdown | Self::DrainShutdown => 0,
         }
     }
@@ -1677,16 +1781,16 @@ impl WriteJob {
             Self::Shutdown => true,
             Self::DrainShutdown | Self::GracefulClose(_) => false,
             Self::Frame(frame) => frame_is_urgent(frame),
-            Self::Frames(frames) => frames.iter().all(frame_is_urgent),
-            Self::TrackedFrames(tracked) => tracked.frames.iter().all(frame_is_urgent),
+            Self::Frames(frames) => frames_are_all_urgent(frames),
+            Self::TrackedFrames(tracked) => frames_are_all_urgent(&tracked.frames),
         }
     }
 
     fn bypasses_capacity(&self) -> bool {
         match self {
             Self::Frame(frame) => frame_bypasses_capacity(frame),
-            Self::Frames(frames) => frames.iter().all(frame_bypasses_capacity),
-            Self::TrackedFrames(tracked) => tracked.frames.iter().all(frame_bypasses_capacity),
+            Self::Frames(frames) => frames_bypass_capacity(frames),
+            Self::TrackedFrames(tracked) => frames_bypass_capacity(&tracked.frames),
             Self::Shutdown | Self::DrainShutdown => true,
             Self::GracefulClose(_) => false,
         }
@@ -1697,10 +1801,8 @@ impl WriteJob {
             Self::Frame(frame) | Self::GracefulClose(frame) => {
                 frame_bypasses_urgent_capacity(frame)
             }
-            Self::Frames(frames) => frames.iter().all(frame_bypasses_urgent_capacity),
-            Self::TrackedFrames(tracked) => {
-                tracked.frames.iter().all(frame_bypasses_urgent_capacity)
-            }
+            Self::Frames(frames) => frames_bypass_urgent_capacity(frames),
+            Self::TrackedFrames(tracked) => frames_bypass_urgent_capacity(&tracked.frames),
             Self::Shutdown | Self::DrainShutdown => true,
         }
     }
@@ -1716,13 +1818,8 @@ impl WriteJob {
     fn contains_data_frame(&self) -> bool {
         match self {
             Self::Frame(frame) | Self::GracefulClose(frame) => frame.frame_type == FrameType::Data,
-            Self::Frames(frames) => frames
-                .iter()
-                .any(|frame| frame.frame_type == FrameType::Data),
-            Self::TrackedFrames(tracked) => tracked
-                .frames
-                .iter()
-                .any(|frame| frame.frame_type == FrameType::Data),
+            Self::Frames(frames) => frames_contain_data_frame(frames),
+            Self::TrackedFrames(tracked) => frames_contain_data_frame(&tracked.frames),
             Self::Shutdown | Self::DrainShutdown => false,
         }
     }
@@ -1732,34 +1829,8 @@ impl WriteJob {
             Self::Frame(frame) if frame_is_urgent(frame) && frame.stream_id != 0 => {
                 Some(frame.stream_id)
             }
-            Self::Frames(frames) => {
-                let mut stream_id = None;
-                for frame in frames {
-                    if !frame_is_urgent(frame) || frame.stream_id == 0 {
-                        return None;
-                    }
-                    match stream_id {
-                        Some(existing) if existing != frame.stream_id => return None,
-                        Some(_) => {}
-                        None => stream_id = Some(frame.stream_id),
-                    }
-                }
-                stream_id
-            }
-            Self::TrackedFrames(tracked) => {
-                let mut stream_id = None;
-                for frame in &tracked.frames {
-                    if !frame_is_urgent(frame) || frame.stream_id == 0 {
-                        return None;
-                    }
-                    match stream_id {
-                        Some(existing) if existing != frame.stream_id => return None,
-                        Some(_) => {}
-                        None => stream_id = Some(frame.stream_id),
-                    }
-                }
-                stream_id
-            }
+            Self::Frames(frames) => urgent_frames_stream_id(frames),
+            Self::TrackedFrames(tracked) => urgent_frames_stream_id(&tracked.frames),
             _ => None,
         }
     }
@@ -1778,9 +1849,13 @@ impl WriteJob {
                 let Ok((extension_id, _)) = parse_varint(&frame.payload) else {
                     return None;
                 };
-                (extension_id == EXT_PRIORITY_UPDATE).then_some(CoalesceKey::PriorityUpdate {
-                    stream_id: frame.stream_id,
-                })
+                if extension_id == EXT_PRIORITY_UPDATE {
+                    Some(CoalesceKey::PriorityUpdate {
+                        stream_id: frame.stream_id,
+                    })
+                } else {
+                    None
+                }
             }
             FrameType::MaxData => Some(CoalesceKey::MaxData {
                 stream_id: frame.stream_id,
@@ -1789,9 +1864,13 @@ impl WriteJob {
                 let Ok((_, n)) = parse_varint(&frame.payload) else {
                     return None;
                 };
-                (n == frame.payload.len()).then_some(CoalesceKey::Blocked {
-                    stream_id: frame.stream_id,
-                })
+                if n == frame.payload.len() {
+                    Some(CoalesceKey::Blocked {
+                        stream_id: frame.stream_id,
+                    })
+                } else {
+                    None
+                }
             }
             FrameType::GoAway => Some(CoalesceKey::GoAway),
             _ => None,
@@ -1810,6 +1889,58 @@ impl WriteJob {
     }
 }
 
+fn urgent_frames_stream_id(frames: &[Frame]) -> Option<u64> {
+    let mut stream_id = None;
+    for frame in frames {
+        if !frame_is_urgent(frame) || frame.stream_id == 0 {
+            return None;
+        }
+        match stream_id {
+            Some(existing) if existing != frame.stream_id => return None,
+            Some(_) => {}
+            None => stream_id = Some(frame.stream_id),
+        }
+    }
+    stream_id
+}
+
+fn frames_are_all_urgent(frames: &[Frame]) -> bool {
+    for frame in frames {
+        if !frame_is_urgent(frame) {
+            return false;
+        }
+    }
+    true
+}
+
+fn frames_bypass_capacity(frames: &[Frame]) -> bool {
+    for frame in frames {
+        if !frame_bypasses_capacity(frame) {
+            return false;
+        }
+    }
+    true
+}
+
+fn frames_bypass_urgent_capacity(frames: &[Frame]) -> bool {
+    for frame in frames {
+        if !frame_bypasses_urgent_capacity(frame) {
+            return false;
+        }
+    }
+    true
+}
+
+fn frames_contain_data_frame(frames: &[Frame]) -> bool {
+    for frame in frames {
+        if frame.frame_type == FrameType::Data {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
 fn retained_frame_queue_cost(frame: &Frame) -> usize {
     frame
         .payload
@@ -1835,6 +1966,16 @@ fn maybe_shrink_data_queued_by_stream(state: &mut WriteQueueState) {
     }
 }
 
+#[inline]
+fn retained_frames_queue_cost(frames: &[Frame]) -> usize {
+    let mut cost = 0usize;
+    for frame in frames {
+        cost = cost.saturating_add(retained_frame_queue_cost(frame));
+    }
+    cost
+}
+
+#[inline]
 fn frame_is_urgent(frame: &Frame) -> bool {
     matches!(
         frame.frame_type,
@@ -1850,10 +1991,12 @@ fn frame_is_urgent(frame: &Frame) -> bool {
     )
 }
 
+#[inline]
 fn frame_bypasses_capacity(frame: &Frame) -> bool {
     frame_is_urgent(frame)
 }
 
+#[inline]
 fn frame_bypasses_urgent_capacity(frame: &Frame) -> bool {
     matches!(
         frame.frame_type,
@@ -2013,7 +2156,7 @@ mod tests {
     use super::*;
     use crate::frame::{Frame, FrameType};
     use crate::payload::{
-        build_goaway_payload, build_priority_update_payload, parse_goaway_payload,
+        build_go_away_payload, build_priority_update_payload, parse_go_away_payload,
     };
     use crate::MetadataUpdate;
     use crate::{CAPABILITY_PRIORITY_HINTS, CAPABILITY_PRIORITY_UPDATE, CAPABILITY_STREAM_GROUPS};
@@ -2748,7 +2891,7 @@ mod tests {
                 frame_type: FrameType::GoAway,
                 flags: 0,
                 stream_id: 0,
-                payload: build_goaway_payload(100, 100, 0, "initial").unwrap(),
+                payload: build_go_away_payload(100, 100, 0, "initial").unwrap(),
             }))
             .unwrap();
         queue
@@ -2756,7 +2899,7 @@ mod tests {
                 frame_type: FrameType::GoAway,
                 flags: 0,
                 stream_id: 0,
-                payload: build_goaway_payload(40, 80, 0, "final").unwrap(),
+                payload: build_go_away_payload(40, 80, 0, "final").unwrap(),
             }))
             .unwrap();
 
@@ -2769,7 +2912,7 @@ mod tests {
             })
             .collect();
         assert_eq!(goaways.len(), 1);
-        let payload = parse_goaway_payload(&goaways[0].payload).unwrap();
+        let payload = parse_go_away_payload(&goaways[0].payload).unwrap();
         assert_eq!(payload.last_accepted_bidi, 40);
         assert_eq!(payload.last_accepted_uni, 80);
         assert_eq!(payload.reason, "final");

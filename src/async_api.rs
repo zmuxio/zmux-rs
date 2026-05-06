@@ -1,8 +1,14 @@
 use crate::api::DuplexInfoSide;
-use crate::config::OpenOptions;
 use crate::error::{Error, ErrorDirection, ErrorOperation, Result};
+use crate::open_send::{OpenRequest, OpenSend, WritePayload};
 use crate::payload::{MetadataUpdate, StreamMetadata};
-use crate::session::{Conn, RecvStream, SendStream, SessionState, SessionStats, Stream};
+use crate::preface::{Negotiated, Preface};
+use crate::protocol::Role;
+use crate::session::{
+    Conn, PeerCloseError, PeerGoAwayError, RecvStream, SendStream, SessionState, SessionStats,
+    Stream,
+};
+use crate::settings::{SchedulerHint, Settings};
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::{self, size_of_val};
@@ -11,6 +17,30 @@ use std::pin::Pin;
 use std::ptr::{from_ref, null};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+const MAX_OPEN_INFO_PREALLOC: usize = 64 * 1024;
+
+#[inline]
+fn nonzero_duration_value(value: Duration) -> Option<Duration> {
+    (!value.is_zero()).then_some(value)
+}
+
+#[inline]
+fn condvar_timed_wait_step(remaining: Duration) -> (Duration, bool) {
+    let wait = remaining.min(MAX_CONDVAR_TIMED_WAIT);
+    (wait, wait == remaining)
+}
+
+#[inline]
+fn next_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
 
 /// Boxed future used by the async session and stream traits.
 pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -46,50 +76,39 @@ where
 /// Use this as a no-op fallback when upper-layer code wants to keep a concrete
 /// session handle but no transport/session is available.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ClosedSession;
+pub struct ClosedAsyncSession;
 
 /// Create a permanently closed async session.
-pub fn closed_session() -> ClosedSession {
-    ClosedSession
-}
-
-/// Create a boxed permanently closed async session.
-pub fn boxed_closed_session() -> BoxAsyncSession {
-    Box::new(ClosedSession)
+pub fn closed_async_session() -> ClosedAsyncSession {
+    ClosedAsyncSession
 }
 
 /// Adapter that turns any `AsyncSession` into a boxed common async session.
-pub struct BoxedAsyncSession<S> {
+pub(crate) struct BoxedAsyncSession<S> {
     inner: S,
 }
 
 impl<S> BoxedAsyncSession<S> {
-    pub fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S) -> Self {
         Self { inner }
-    }
-
-    pub fn inner(&self) -> &S {
-        &self.inner
-    }
-
-    pub fn into_inner(self) -> S {
-        self.inner
     }
 }
 
 /// Runtime-neutral stream metadata and close operations for async upper layers.
 pub trait AsyncStreamInfo: Send + Sync {
     fn stream_id(&self) -> u64;
-    fn opened_locally(&self) -> bool;
-    fn bidirectional(&self) -> bool;
+    fn is_opened_locally(&self) -> bool;
+    fn is_bidirectional(&self) -> bool;
     fn open_info_len(&self) -> usize;
     fn has_open_info(&self) -> bool {
         self.open_info_len() != 0
     }
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>);
+    /// Append opaque binary open metadata to `dst`.
+    fn append_open_info_to(&self, dst: &mut Vec<u8>);
+    /// Return opaque binary open metadata.
     fn open_info(&self) -> Vec<u8> {
-        let mut open_info = Vec::with_capacity(self.open_info_len());
-        self.copy_open_info_to(&mut open_info);
+        let mut open_info = Vec::with_capacity(self.open_info_len().min(MAX_OPEN_INFO_PREALLOC));
+        self.append_open_info_to(&mut open_info);
         open_info
     }
     fn metadata(&self) -> StreamMetadata;
@@ -98,9 +117,6 @@ pub trait AsyncStreamInfo: Send + Sync {
     }
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
-    }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
     fn set_deadline(&self, _deadline: Option<Instant>) -> Result<()> {
         Err(deadline_unsupported_error())
@@ -143,9 +159,6 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
             Ok(0)
         })
     }
-    fn readv<'a>(&'a self, dsts: &'a mut [IoSliceMut<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.read_vectored(dsts)
-    }
     fn read_timeout<'a>(
         &'a self,
         dst: &'a mut [u8],
@@ -166,13 +179,6 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
             }
             Ok(0)
         })
-    }
-    fn readv_timeout<'a>(
-        &'a self,
-        dsts: &'a mut [IoSliceMut<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.read_vectored_timeout(dsts, timeout)
     }
     fn read_exact<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move {
@@ -211,7 +217,7 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
             Ok(())
         })
     }
-    fn read_closed(&self) -> bool;
+    fn is_read_closed(&self) -> bool;
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         self.set_deadline(deadline)
     }
@@ -230,6 +236,8 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
                 if n == 0 {
                     return Ok(dst.len() - start_len);
                 }
+                dst.try_reserve(n)
+                    .map_err(|_| Error::local("zmux: read_to_end allocation failed"))?;
                 dst.extend_from_slice(&buf[..n]);
             }
         })
@@ -254,6 +262,8 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
                 if n == 0 {
                     return Ok(out);
                 }
+                out.try_reserve(n)
+                    .map_err(|_| Error::local("zmux: read_to_end allocation failed"))?;
                 out.extend_from_slice(&buf[..n]);
             }
         })
@@ -266,15 +276,78 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
 pub trait AsyncSendStreamApi: AsyncStreamInfo {
     fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>>;
 
-    fn write_all<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<()>> {
+    fn write_all<'a>(&'a self, payload: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let mut remaining = src;
-            while !remaining.is_empty() {
-                let n = validate_write_progress(self.write(remaining).await?, remaining.len())?;
-                if n == 0 {
-                    return Err(zero_length_write_error());
+            match payload {
+                WritePayload::Bytes(data) => {
+                    let mut remaining = data.as_ref();
+                    while !remaining.is_empty() {
+                        let n =
+                            validate_write_progress(self.write(remaining).await?, remaining.len())?;
+                        if n == 0 {
+                            return Err(zero_length_write_error());
+                        }
+                        remaining = &remaining[n..];
+                    }
                 }
-                remaining = &remaining[n..];
+                WritePayload::Vectored(parts) => {
+                    for part in parts {
+                        let mut remaining = part.as_ref();
+                        while !remaining.is_empty() {
+                            let n = validate_write_progress(
+                                self.write(remaining).await?,
+                                remaining.len(),
+                            )?;
+                            if n == 0 {
+                                return Err(zero_length_write_error());
+                            }
+                            remaining = &remaining[n..];
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn write_all_timeout<'a>(
+        &'a self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let start = Instant::now();
+            match payload {
+                WritePayload::Bytes(data) => {
+                    let mut remaining = data.as_ref();
+                    while !remaining.is_empty() {
+                        let timeout = remaining_write_timeout(start, timeout)?;
+                        let n = validate_write_progress(
+                            self.write_timeout(remaining, timeout).await?,
+                            remaining.len(),
+                        )?;
+                        if n == 0 {
+                            return Err(zero_length_write_error());
+                        }
+                        remaining = &remaining[n..];
+                    }
+                }
+                WritePayload::Vectored(parts) => {
+                    for part in parts {
+                        let mut remaining = part.as_ref();
+                        while !remaining.is_empty() {
+                            let timeout = remaining_write_timeout(start, timeout)?;
+                            let n = validate_write_progress(
+                                self.write_timeout(remaining, timeout).await?,
+                                remaining.len(),
+                            )?;
+                            if n == 0 {
+                                return Err(zero_length_write_error());
+                            }
+                            remaining = &remaining[n..];
+                        }
+                    }
+                }
             }
             Ok(())
         })
@@ -288,18 +361,14 @@ pub trait AsyncSendStreamApi: AsyncStreamInfo {
 
     fn write_vectored<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            match parts.iter().find(|part| !part.is_empty()) {
-                Some(part) => {
+            for part in parts {
+                if !part.is_empty() {
                     let n = self.write(part).await?;
-                    validate_write_progress(n, part.len())
+                    return validate_write_progress(n, part.len());
                 }
-                None => Ok(0),
             }
+            Ok(0)
         })
-    }
-
-    fn writev<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.write_vectored(parts)
     }
 
     fn write_vectored_timeout<'a>(
@@ -308,35 +377,28 @@ pub trait AsyncSendStreamApi: AsyncStreamInfo {
         timeout: Duration,
     ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            match parts.iter().find(|part| !part.is_empty()) {
-                Some(part) => {
+            for part in parts {
+                if !part.is_empty() {
                     let n = self.write_timeout(part, timeout).await?;
-                    validate_write_progress(n, part.len())
+                    return validate_write_progress(n, part.len());
                 }
-                None => Ok(0),
             }
+            Ok(0)
         })
     }
 
-    fn writev_timeout<'a>(
-        &'a self,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.write_vectored_timeout(parts, timeout)
-    }
-
-    fn write_final<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
+    fn write_final<'a>(&'a self, payload: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            self.write_all(src).await?;
+            let total = payload.checked_len()?;
+            self.write_all(payload).await?;
             self.close_write().await?;
-            Ok(src.len())
+            Ok(total)
         })
     }
 
     fn write_final_timeout<'a>(
         &'a self,
-        src: &'a [u8],
+        payload: WritePayload<'a>,
         timeout: Duration,
     ) -> AsyncBoxFuture<'a, Result<usize>>;
 
@@ -344,35 +406,21 @@ pub trait AsyncSendStreamApi: AsyncStreamInfo {
         &'a self,
         parts: &'a [IoSlice<'_>],
     ) -> AsyncBoxFuture<'a, Result<usize>> {
-        Box::pin(async move {
-            let total = checked_vectored_len(parts)?;
-            for part in parts.iter().filter(|part| !part.is_empty()) {
-                self.write_all(part).await?;
-            }
-            self.close_write().await?;
-            Ok(total)
-        })
-    }
-
-    fn writev_final<'a>(&'a self, parts: &'a [IoSlice<'_>]) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.write_vectored_final(parts)
+        Box::pin(async move { self.write_final(WritePayload::vectored(parts)).await })
     }
 
     fn write_vectored_final_timeout<'a>(
         &'a self,
         parts: &'a [IoSlice<'_>],
         timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<usize>>;
-
-    fn writev_final_timeout<'a>(
-        &'a self,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
     ) -> AsyncBoxFuture<'a, Result<usize>> {
-        self.write_vectored_final_timeout(parts, timeout)
+        Box::pin(async move {
+            self.write_final_timeout(WritePayload::vectored(parts), timeout)
+                .await
+        })
     }
 
-    fn write_closed(&self) -> bool;
+    fn is_write_closed(&self) -> bool;
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         self.set_deadline(deadline)
     }
@@ -403,340 +451,101 @@ pub trait AsyncSession: Send + Sync {
         &self,
         timeout: Duration,
     ) -> AsyncBoxFuture<'_, Result<Self::RecvStream>>;
-    fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
-    fn open_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
-    fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>>;
-    fn open_uni_stream_timeout(
+    fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
+        self.open_stream_with(OpenRequest::new())
+    }
+    fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
+        self.open_uni_stream_with(OpenRequest::new())
+    }
+    fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
+    fn open_uni_stream_with(
         &self,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>>;
-    fn open_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
-    fn open_uni_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>>;
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
+        request: OpenRequest,
     ) -> AsyncBoxFuture<'_, Result<Self::SendStream>>;
 
     fn open_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
         Box::pin(async move {
-            let stream = self.open_stream().await?;
-            if data.is_empty() {
-                return Ok((stream, 0));
-            }
-            let n = validate_write_progress(stream.write(data).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_timeout<'a>(
-        &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
+            let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
-            let stream = self.open_stream_timeout(timeout).await?;
-            if data.is_empty() {
-                return Ok((stream, 0));
+            let mut open = OpenRequest::new().with_options(opts);
+            if let Some(timeout) = timeout {
+                ensure_positive_open_timeout(timeout)?;
+                open = open.with_timeout(timeout);
             }
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n =
-                validate_write_progress(stream.write_timeout(data, timeout).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let stream = self.open_stream_with_options(opts).await?;
-            if data.is_empty() {
-                return Ok((stream, 0));
-            }
-            let n = validate_write_progress(stream.write(data).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let start = Instant::now();
-            let stream = self.open_stream_with_options_timeout(opts, timeout).await?;
-            if data.is_empty() {
-                return Ok((stream, 0));
-            }
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n =
-                validate_write_progress(stream.write_timeout(data, timeout).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_vectored<'a>(
-        &'a self,
-        parts: &'a [IoSlice<'_>],
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let requested = checked_vectored_len(parts)?;
-            let stream = self.open_stream().await?;
-            if requested == 0 {
-                return Ok((stream, 0));
-            }
-            let n = validate_write_progress(stream.write_vectored(parts).await?, requested)?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_vectored_timeout<'a>(
-        &'a self,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let requested = checked_vectored_len(parts)?;
-            let start = Instant::now();
-            let stream = self.open_stream_timeout(timeout).await?;
-            if requested == 0 {
-                return Ok((stream, 0));
-            }
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_vectored_timeout(parts, timeout).await?,
-                requested,
-            )?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_vectored_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        parts: &'a [IoSlice<'_>],
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let requested = checked_vectored_len(parts)?;
-            let stream = self.open_stream_with_options(opts).await?;
-            if requested == 0 {
-                return Ok((stream, 0));
-            }
-            let n = validate_write_progress(stream.write_vectored(parts).await?, requested)?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_and_send_vectored_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let requested = checked_vectored_len(parts)?;
-            let start = Instant::now();
-            let stream = self.open_stream_with_options_timeout(opts, timeout).await?;
-            if requested == 0 {
-                return Ok((stream, 0));
-            }
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_vectored_timeout(parts, timeout).await?,
-                requested,
-            )?;
+            let stream = self.open_stream_with(open).await?;
+            let timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            let n = write_open_payload_async(&stream, payload, timeout, false, true).await?;
             Ok((stream, n))
         })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
         Box::pin(async move {
-            let stream = self.open_uni_stream().await?;
-            let n = validate_write_progress(stream.write_final(data).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_uni_and_send_timeout<'a>(
-        &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
+            let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
-            let stream = self.open_uni_stream_timeout(timeout).await?;
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_final_timeout(data, timeout).await?,
-                data.len(),
-            )?;
+            let mut open = OpenRequest::new().with_options(opts);
+            if let Some(timeout) = timeout {
+                ensure_positive_open_timeout(timeout)?;
+                open = open.with_timeout(timeout);
+            }
+            let stream = self.open_uni_stream_with(open).await?;
+            let timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            let n = write_open_payload_async(&stream, payload, timeout, true, false).await?;
             Ok((stream, n))
         })
     }
 
-    fn open_uni_and_send_with_options<'a>(
+    fn ping<'a>(&'a self, echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>>;
+    fn ping_timeout<'a>(
         &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let stream = self.open_uni_stream_with_options(opts).await?;
-            let n = validate_write_progress(stream.write_final(data).await?, data.len())?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_uni_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
+        echo: &'a [u8],
         timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let start = Instant::now();
-            let stream = self
-                .open_uni_stream_with_options_timeout(opts, timeout)
-                .await?;
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_final_timeout(data, timeout).await?,
-                data.len(),
-            )?;
-            Ok((stream, n))
-        })
-    }
+    ) -> AsyncBoxFuture<'a, Result<Duration>>;
 
-    fn open_uni_and_send_vectored<'a>(
-        &'a self,
-        parts: &'a [IoSlice<'_>],
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let requested = checked_vectored_len(parts)?;
-            let stream = self.open_uni_stream().await?;
-            let n = validate_write_progress(stream.write_vectored_final(parts).await?, requested)?;
-            Ok((stream, n))
-        })
-    }
+    fn go_away(
+        &self,
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+    ) -> AsyncBoxFuture<'_, Result<()>>;
 
-    fn open_uni_and_send_vectored_timeout<'a>(
+    fn go_away_with_error<'a>(
         &'a self,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let requested = checked_vectored_len(parts)?;
-            let start = Instant::now();
-            let stream = self.open_uni_stream_timeout(timeout).await?;
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_vectored_final_timeout(parts, timeout).await?,
-                requested,
-            )?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_uni_and_send_vectored_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        parts: &'a [IoSlice<'_>],
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let requested = checked_vectored_len(parts)?;
-            let stream = self.open_uni_stream_with_options(opts).await?;
-            let n = validate_write_progress(stream.write_vectored_final(parts).await?, requested)?;
-            Ok((stream, n))
-        })
-    }
-
-    fn open_uni_and_send_vectored_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        parts: &'a [IoSlice<'_>],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            ensure_positive_open_timeout(timeout)?;
-            let requested = checked_vectored_len(parts)?;
-            let start = Instant::now();
-            let stream = self
-                .open_uni_stream_with_options_timeout(opts, timeout)
-                .await?;
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n = validate_write_progress(
-                stream.write_vectored_final_timeout(parts, timeout).await?,
-                requested,
-            )?;
-            Ok((stream, n))
-        })
-    }
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>>;
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn close_with_error<'a>(&'a self, code: u64, reason: &'a str)
         -> AsyncBoxFuture<'a, Result<()>>;
     fn wait(&self) -> AsyncBoxFuture<'_, Result<()>>;
     fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>>;
-    fn wait_close_error(&self) -> AsyncBoxFuture<'_, Result<Option<Error>>> {
-        Box::pin(async move {
-            self.wait().await?;
-            Ok(self.close_error())
-        })
-    }
-    fn wait_close_error_timeout(
-        &self,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Option<Error>>> {
-        Box::pin(async move {
-            if !self.wait_timeout(timeout).await? {
-                return Err(Error::timeout("session termination")
-                    .with_session_context(ErrorOperation::Close));
-            }
-            Ok(self.close_error())
-        })
-    }
-    fn closed(&self) -> bool;
+    fn is_closed(&self) -> bool;
     fn local_addr(&self) -> Option<SocketAddr> {
         None
     }
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
     }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
-    }
     fn close_error(&self) -> Option<Error>;
     fn state(&self) -> SessionState;
     fn stats(&self) -> SessionStats;
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError>;
+    fn peer_close_error(&self) -> Option<PeerCloseError>;
+    fn local_preface(&self) -> Preface;
+    fn peer_preface(&self) -> Preface;
+    fn negotiated(&self) -> Negotiated;
 }
 
 fn closed_async_session_error(operation: ErrorOperation) -> Error {
@@ -747,7 +556,47 @@ fn closed_async_session_result<T>(operation: ErrorOperation) -> AsyncBoxFuture<'
     Box::pin(async move { Err(closed_async_session_error(operation)) })
 }
 
-impl AsyncSession for ClosedSession {
+fn zero_session_settings() -> Settings {
+    Settings {
+        initial_max_stream_data_bidi_locally_opened: 0,
+        initial_max_stream_data_bidi_peer_opened: 0,
+        initial_max_stream_data_uni: 0,
+        initial_max_data: 0,
+        max_incoming_streams_bidi: 0,
+        max_incoming_streams_uni: 0,
+        max_frame_payload: 0,
+        idle_timeout_millis: 0,
+        keepalive_hint_millis: 0,
+        max_control_payload_bytes: 0,
+        max_extension_payload_bytes: 0,
+        scheduler_hints: SchedulerHint::UnspecifiedOrBalanced,
+        ping_padding_key: 0,
+    }
+}
+
+fn zero_session_preface() -> Preface {
+    Preface {
+        preface_version: 0,
+        role: Role::Initiator,
+        tie_breaker_nonce: 0,
+        min_proto: 0,
+        max_proto: 0,
+        capabilities: 0,
+        settings: zero_session_settings(),
+    }
+}
+
+fn zero_session_negotiated() -> Negotiated {
+    Negotiated {
+        proto: 0,
+        capabilities: 0,
+        local_role: Role::Initiator,
+        peer_role: Role::Initiator,
+        peer_settings: zero_session_settings(),
+    }
+}
+
+impl AsyncSession for ClosedAsyncSession {
     type Stream = BoxAsyncStream;
     type SendStream = BoxAsyncSendStream;
     type RecvStream = BoxAsyncRecvStream;
@@ -774,53 +623,45 @@ impl AsyncSession for ClosedSession {
         closed_async_session_result(ErrorOperation::Accept)
     }
 
-    fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
+    fn open_stream_with(&self, _request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         closed_async_session_result(ErrorOperation::Open)
     }
 
-    fn open_stream_timeout(&self, _timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        closed_async_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        closed_async_session_result(ErrorOperation::Open)
-    }
-
-    fn open_uni_stream_timeout(
+    fn open_uni_stream_with(
         &self,
-        _timeout: Duration,
+        _request: OpenRequest,
     ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
         closed_async_session_result(ErrorOperation::Open)
     }
 
-    fn open_stream_with_options(
-        &self,
-        _opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        closed_async_session_result(ErrorOperation::Open)
+    fn ping<'a>(&'a self, _echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
+        closed_async_session_result(ErrorOperation::Ping)
     }
 
-    fn open_stream_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
+    fn ping_timeout<'a>(
+        &'a self,
+        _echo: &'a [u8],
         _timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        closed_async_session_result(ErrorOperation::Open)
+    ) -> AsyncBoxFuture<'a, Result<Duration>> {
+        closed_async_session_result(ErrorOperation::Ping)
     }
 
-    fn open_uni_stream_with_options(
+    fn go_away(
         &self,
-        _opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        closed_async_session_result(ErrorOperation::Open)
+        _last_accepted_bidi: u64,
+        _last_accepted_uni: u64,
+    ) -> AsyncBoxFuture<'_, Result<()>> {
+        closed_async_session_result(ErrorOperation::Close)
     }
 
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        _opts: OpenOptions,
-        _timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        closed_async_session_result(ErrorOperation::Open)
+    fn go_away_with_error<'a>(
+        &'a self,
+        _last_accepted_bidi: u64,
+        _last_accepted_uni: u64,
+        _code: u64,
+        _reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        closed_async_session_result(ErrorOperation::Close)
     }
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
@@ -843,7 +684,7 @@ impl AsyncSession for ClosedSession {
         Box::pin(async { Ok(true) })
     }
 
-    fn closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         true
     }
 
@@ -857,6 +698,26 @@ impl AsyncSession for ClosedSession {
 
     fn stats(&self) -> SessionStats {
         SessionStats::empty(SessionState::Closed)
+    }
+
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+        None
+    }
+
+    fn peer_close_error(&self) -> Option<PeerCloseError> {
+        None
+    }
+
+    fn local_preface(&self) -> Preface {
+        zero_session_preface()
+    }
+
+    fn peer_preface(&self) -> Preface {
+        zero_session_preface()
+    }
+
+    fn negotiated(&self) -> Negotiated {
+        zero_session_negotiated()
     }
 }
 
@@ -944,10 +805,7 @@ impl<T> AsyncJoinedHalf<T> {
     }
 
     fn with_current_or<U>(&self, default: U, visit: impl FnOnce(&T) -> U) -> U {
-        match self.current() {
-            Some(current) => visit(&current),
-            None => default,
-        }
+        self.current().as_deref().map_or(default, visit)
     }
 
     fn enter(self: &Arc<Self>, missing: impl FnOnce() -> Error) -> Result<ActiveAsyncHalf<T>> {
@@ -1011,9 +869,10 @@ impl<T> AsyncJoinedHalf<T> {
             let Some(remaining) = self.paused_wait_timeout(&state, start, timeout) else {
                 return Err(Error::timeout(operation));
             };
-            let (next, wait) = self.changed.wait_timeout(state, remaining).unwrap();
+            let (wait_for, reaches_deadline) = condvar_timed_wait_step(remaining);
+            let (next, wait) = self.changed.wait_timeout(state, wait_for).unwrap();
             state = next;
-            if wait.timed_out() && state.paused {
+            if wait.timed_out() && reaches_deadline && state.paused {
                 return Err(Error::timeout(operation));
             }
         }
@@ -1164,7 +1023,7 @@ impl<T> AsyncJoinedHalf<T> {
                 return Err(Error::session_closed());
             }
             state.deadline = deadline;
-            state.deadline_generation = state.deadline_generation.wrapping_add(1);
+            state.deadline_generation = next_generation(state.deadline_generation);
             state.deadline_applier = Some(applier);
             self.changed.notify_all();
             let current = match state.current.clone() {
@@ -1280,8 +1139,9 @@ impl<T> AsyncJoinedHalf<T> {
     ) -> Result<MutexGuard<'a, AsyncJoinedHalfState<T>>> {
         match deadline_remaining(state.deadline) {
             Some(remaining) => {
-                let (state, wait) = self.changed.wait_timeout(state, remaining).unwrap();
-                if wait.timed_out() && state.paused {
+                let (wait_for, reaches_deadline) = condvar_timed_wait_step(remaining);
+                let (state, wait) = self.changed.wait_timeout(state, wait_for).unwrap();
+                if wait.timed_out() && reaches_deadline && state.paused {
                     Err(Error::timeout(self.deadline_operation))
                 } else {
                     Ok(state)
@@ -1314,26 +1174,35 @@ impl<T> Drop for ActiveAsyncHalf<T> {
 }
 
 impl<T> PausedAsyncHalf<T> {
-    pub fn current(&self) -> Option<Arc<T>> {
-        self.current.clone()
+    /// Borrows the detached half currently staged for resume.
+    pub fn current(&self) -> Option<&T> {
+        self.current.as_deref()
     }
 
+    /// Takes the detached half out of this pause handle.
     pub fn take(&mut self) -> Option<Arc<T>> {
         self.current.take()
     }
 
+    /// Replaces the staged half with a newly owned value.
     pub fn set(&mut self, next: Option<T>) -> Option<Arc<T>> {
         self.set_arc(next.map(Arc::new))
     }
 
+    /// Replaces the staged half with an existing shared owner.
+    ///
+    /// Use this when the async transport half is already in an `Arc`; it avoids
+    /// adding a second layer of shared ownership.
     pub fn set_arc(&mut self, next: Option<Arc<T>>) -> Option<Arc<T>> {
         mem::replace(&mut self.current, next)
     }
 
+    /// Replaces the staged half with a new value and returns the previous one.
     pub fn replace(&mut self, next: T) -> Option<Arc<T>> {
         self.current.replace(Arc::new(next))
     }
 
+    /// Reattaches the currently staged half and wakes waiters.
     pub fn resume(mut self) -> Result<()> {
         self.resumed = true;
         let current = self.current.take();
@@ -1354,7 +1223,7 @@ impl<T> Drop for PausedAsyncHalf<T> {
 fn remaining_timeout(start: Instant, timeout: Duration) -> Option<Duration> {
     timeout
         .checked_sub(start.elapsed())
-        .filter(|d| !d.is_zero())
+        .and_then(nonzero_duration_value)
 }
 
 fn timeout_to_deadline(timeout: Option<Duration>) -> Option<Instant> {
@@ -1365,7 +1234,7 @@ fn deadline_remaining(deadline: Option<Instant>) -> Option<Duration> {
     deadline.and_then(|deadline| {
         deadline
             .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
+            .and_then(nonzero_duration_value)
     })
 }
 
@@ -1383,6 +1252,49 @@ fn remaining_write_timeout(start: Instant, timeout: Duration) -> Result<Duration
     })
 }
 
+async fn write_open_payload_async<S>(
+    stream: &S,
+    payload: WritePayload<'_>,
+    timeout: Option<Duration>,
+    fin: bool,
+    skip_empty: bool,
+) -> Result<usize>
+where
+    S: AsyncSendStreamApi + ?Sized,
+{
+    let requested = payload.checked_len()?;
+    if skip_empty && requested == 0 {
+        return Ok(0);
+    }
+    let n = match (payload, timeout, fin) {
+        (WritePayload::Bytes(data), Some(timeout), false) => {
+            stream.write_timeout(data.as_ref(), timeout).await?
+        }
+        (WritePayload::Bytes(data), Some(timeout), true) => {
+            stream
+                .write_final_timeout(WritePayload::Bytes(data), timeout)
+                .await?
+        }
+        (WritePayload::Bytes(data), None, false) => stream.write(data.as_ref()).await?,
+        (WritePayload::Bytes(data), None, true) => {
+            stream.write_final(WritePayload::Bytes(data)).await?
+        }
+        (WritePayload::Vectored(parts), Some(timeout), false) => {
+            stream.write_vectored_timeout(parts, timeout).await?
+        }
+        (WritePayload::Vectored(parts), Some(timeout), true) => {
+            stream
+                .write_final_timeout(WritePayload::Vectored(parts), timeout)
+                .await?
+        }
+        (WritePayload::Vectored(parts), None, false) => stream.write_vectored(parts).await?,
+        (WritePayload::Vectored(parts), None, true) => {
+            stream.write_final(WritePayload::Vectored(parts)).await?
+        }
+    };
+    validate_write_progress(n, requested)
+}
+
 fn remaining_read_timeout(start: Instant, timeout: Duration) -> Result<Duration> {
     remaining_timeout(start, timeout).ok_or_else(|| {
         Error::timeout("read").with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
@@ -1397,8 +1309,9 @@ fn wait_joined_half_state<'a, T>(
 ) -> Result<MutexGuard<'a, AsyncJoinedHalfState<T>>> {
     match timeout.and_then(|timeout| remaining_timeout(start, timeout)) {
         Some(remaining) => {
-            let (state, wait) = changed.wait_timeout(state, remaining).unwrap();
-            if wait.timed_out() {
+            let (wait_for, reaches_deadline) = condvar_timed_wait_step(remaining);
+            let (state, wait) = changed.wait_timeout(state, wait_for).unwrap();
+            if wait.timed_out() && reaches_deadline {
                 Err(Error::timeout("joined half pause"))
             } else {
                 Ok(state)
@@ -1554,18 +1467,18 @@ where
         }
     }
 
-    fn opened_locally(&self) -> bool {
+    fn is_opened_locally(&self) -> bool {
         match self.info_side {
             DuplexInfoSide::Read => self
                 .recv
-                .with_current_or(false, |recv| recv.opened_locally()),
+                .with_current_or(false, |recv| recv.is_opened_locally()),
             DuplexInfoSide::Write => self
                 .send
-                .with_current_or(false, |send| send.opened_locally()),
+                .with_current_or(false, |send| send.is_opened_locally()),
         }
     }
 
-    fn bidirectional(&self) -> bool {
+    fn is_bidirectional(&self) -> bool {
         true
     }
 
@@ -1587,16 +1500,15 @@ where
         }
     }
 
-    fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-        dst.clear();
+    fn append_open_info_to(&self, dst: &mut Vec<u8>) {
         match self.info_side {
             DuplexInfoSide::Read => {
                 self.recv
-                    .with_current_or((), |recv| recv.copy_open_info_to(dst));
+                    .with_current_or((), |recv| recv.append_open_info_to(dst));
             }
             DuplexInfoSide::Write => {
                 self.send
-                    .with_current_or((), |send| send.copy_open_info_to(dst));
+                    .with_current_or((), |send| send.append_open_info_to(dst));
             }
         }
     }
@@ -1659,12 +1571,12 @@ where
         Box::pin(async move {
             let send = self.send.close_detached();
             let recv = self.recv.close_detached();
-            let same_identity = match (send.as_deref(), recv.as_deref()) {
-                (Some(send), Some(recv)) => {
+            let same_identity = send
+                .as_deref()
+                .zip(recv.as_deref())
+                .is_some_and(|(send, recv)| {
                     same_close_identity(send.close_identity(), recv.close_identity())
-                }
-                _ => false,
-            };
+                });
 
             let write = match send.as_ref() {
                 Some(send) => send.close().await,
@@ -1690,12 +1602,12 @@ where
         Box::pin(async move {
             let send = self.send.close_detached();
             let recv = self.recv.close_detached();
-            let same_identity = match (send.as_deref(), recv.as_deref()) {
-                (Some(send), Some(recv)) => {
+            let same_identity = send
+                .as_deref()
+                .zip(recv.as_deref())
+                .is_some_and(|(send, recv)| {
                     same_close_identity(send.close_identity(), recv.close_identity())
-                }
-                _ => false,
-            };
+                });
 
             let write = match send.as_ref() {
                 Some(send) => send.close_with_error(code, reason).await,
@@ -1749,7 +1661,7 @@ where
             let active =
                 self.recv
                     .enter_timeout(timeout, "read", joined_read_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
+            let remaining = remaining_read_timeout(start, timeout)?;
             let n = active.half.read_timeout(dst, remaining).await?;
             validate_read_progress(n, dst.len())
         })
@@ -1766,7 +1678,7 @@ where
             let active =
                 self.recv
                     .enter_timeout(timeout, "read", joined_read_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
+            let remaining = remaining_read_timeout(start, timeout)?;
             let n = active.half.read_vectored_timeout(dsts, remaining).await?;
             validate_read_progress(n, requested)
         })
@@ -1794,13 +1706,13 @@ where
         })
     }
 
-    fn read_closed(&self) -> bool {
-        self.recv.with_current_or(true, |recv| recv.read_closed())
+    fn is_read_closed(&self) -> bool {
+        self.recv
+            .with_current_or(true, |recv| recv.is_read_closed())
     }
 
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.recv
-            .set_deadline(deadline, apply_async_read_deadline::<R>)
+        AsyncJoinedHalf::set_deadline(self.recv.as_ref(), deadline, apply_async_read_deadline::<R>)
     }
 
     fn close_read(&self) -> AsyncBoxFuture<'_, Result<()>> {
@@ -1835,10 +1747,25 @@ where
         })
     }
 
-    fn write_all<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<()>> {
+    fn write_all<'a>(&'a self, payload: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let active = self.send.enter(joined_write_half_missing_error)?;
-            active.half.write_all(src).await
+            active.half.write_all(payload).await
+        })
+    }
+
+    fn write_all_timeout<'a>(
+        &'a self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let start = Instant::now();
+            let active =
+                self.send
+                    .enter_timeout(timeout, "write", joined_write_half_missing_error)?;
+            let remaining = remaining_write_timeout(start, timeout)?;
+            active.half.write_all_timeout(payload, remaining).await
         })
     }
 
@@ -1852,7 +1779,7 @@ where
             let active =
                 self.send
                     .enter_timeout(timeout, "write", joined_write_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
+            let remaining = remaining_write_timeout(start, timeout)?;
             let n = active.half.write_timeout(src, remaining).await?;
             validate_write_progress(n, src.len())
         })
@@ -1878,33 +1805,35 @@ where
             let active =
                 self.send
                     .enter_timeout(timeout, "write", joined_write_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
+            let remaining = remaining_write_timeout(start, timeout)?;
             let n = active.half.write_vectored_timeout(parts, remaining).await?;
             validate_write_progress(n, requested)
         })
     }
 
-    fn write_final<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
+    fn write_final<'a>(&'a self, payload: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
+            let requested = payload.checked_len()?;
             let active = self.send.enter(joined_write_half_missing_error)?;
-            let n = active.half.write_final(src).await?;
-            validate_write_progress(n, src.len())
+            let n = active.half.write_final(payload).await?;
+            validate_write_progress(n, requested)
         })
     }
 
     fn write_final_timeout<'a>(
         &'a self,
-        src: &'a [u8],
+        payload: WritePayload<'a>,
         timeout: Duration,
     ) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
+            let requested = payload.checked_len()?;
             let start = Instant::now();
             let active =
                 self.send
                     .enter_timeout(timeout, "write", joined_write_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
-            let n = active.half.write_final_timeout(src, remaining).await?;
-            validate_write_progress(n, src.len())
+            let remaining = remaining_write_timeout(start, timeout)?;
+            let n = active.half.write_final_timeout(payload, remaining).await?;
+            validate_write_progress(n, requested)
         })
     }
 
@@ -1931,7 +1860,7 @@ where
             let active =
                 self.send
                     .enter_timeout(timeout, "write", joined_write_half_missing_error)?;
-            let remaining = remaining_timeout(start, timeout).unwrap_or(Duration::ZERO);
+            let remaining = remaining_write_timeout(start, timeout)?;
             let n = active
                 .half
                 .write_vectored_final_timeout(parts, remaining)
@@ -1940,13 +1869,17 @@ where
         })
     }
 
-    fn write_closed(&self) -> bool {
-        self.send.with_current_or(true, |send| send.write_closed())
+    fn is_write_closed(&self) -> bool {
+        self.send
+            .with_current_or(true, |send| send.is_write_closed())
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        self.send
-            .set_deadline(deadline, apply_async_write_deadline::<W>)
+        AsyncJoinedHalf::set_deadline(
+            self.send.as_ref(),
+            deadline,
+            apply_async_write_deadline::<W>,
+        )
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> AsyncBoxFuture<'_, Result<()>> {
@@ -1992,12 +1925,12 @@ macro_rules! impl_async_stream_info_forward {
                 (**self).stream_id()
             }
 
-            fn opened_locally(&self) -> bool {
-                (**self).opened_locally()
+            fn is_opened_locally(&self) -> bool {
+                (**self).is_opened_locally()
             }
 
-            fn bidirectional(&self) -> bool {
-                (**self).bidirectional()
+            fn is_bidirectional(&self) -> bool {
+                (**self).is_bidirectional()
             }
 
             fn open_info_len(&self) -> usize {
@@ -2008,8 +1941,8 @@ macro_rules! impl_async_stream_info_forward {
                 (**self).has_open_info()
             }
 
-            fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-                (**self).copy_open_info_to(dst)
+            fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+                (**self).append_open_info_to(dst)
             }
 
             fn open_info(&self) -> Vec<u8> {
@@ -2026,10 +1959,6 @@ macro_rules! impl_async_stream_info_forward {
 
             fn peer_addr(&self) -> Option<SocketAddr> {
                 (**self).peer_addr()
-            }
-
-            fn remote_addr(&self) -> Option<SocketAddr> {
-                (**self).remote_addr()
             }
 
             fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2109,8 +2038,8 @@ macro_rules! impl_async_recv_stream_api_forward {
                 (**self).read_exact_timeout(dst, timeout)
             }
 
-            fn read_closed(&self) -> bool {
-                (**self).read_closed()
+            fn is_read_closed(&self) -> bool {
+                (**self).is_read_closed()
             }
 
             fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2158,8 +2087,19 @@ macro_rules! impl_async_send_stream_api_forward {
                 (**self).write(src)
             }
 
-            fn write_all<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<()>> {
-                (**self).write_all(src)
+            fn write_all<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+            ) -> AsyncBoxFuture<'a, Result<()>> {
+                (**self).write_all(payload)
+            }
+
+            fn write_all_timeout<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+                timeout: Duration,
+            ) -> AsyncBoxFuture<'a, Result<()>> {
+                (**self).write_all_timeout(payload, timeout)
             }
 
             fn write_timeout<'a>(
@@ -2185,16 +2125,19 @@ macro_rules! impl_async_send_stream_api_forward {
                 (**self).write_vectored_timeout(parts, timeout)
             }
 
-            fn write_final<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
-                (**self).write_final(src)
+            fn write_final<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+            ) -> AsyncBoxFuture<'a, Result<usize>> {
+                (**self).write_final(payload)
             }
 
             fn write_final_timeout<'a>(
                 &'a self,
-                src: &'a [u8],
+                payload: WritePayload<'a>,
                 timeout: Duration,
             ) -> AsyncBoxFuture<'a, Result<usize>> {
-                (**self).write_final_timeout(src, timeout)
+                (**self).write_final_timeout(payload, timeout)
             }
 
             fn write_vectored_final<'a>(
@@ -2212,8 +2155,8 @@ macro_rules! impl_async_send_stream_api_forward {
                 (**self).write_vectored_final_timeout(parts, timeout)
             }
 
-            fn write_closed(&self) -> bool {
-                (**self).write_closed()
+            fn is_write_closed(&self) -> bool {
+                (**self).is_write_closed()
             }
 
             fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2260,145 +2203,93 @@ macro_rules! impl_async_session_forward {
             type RecvStream = T::RecvStream;
 
             fn accept_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).accept_stream()
+                AsyncSession::accept_stream(&**self)
             }
 
             fn accept_stream_timeout(
                 &self,
                 timeout: Duration,
             ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).accept_stream_timeout(timeout)
+                AsyncSession::accept_stream_timeout(&**self, timeout)
             }
 
             fn accept_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
-                (**self).accept_uni_stream()
+                AsyncSession::accept_uni_stream(&**self)
             }
 
             fn accept_uni_stream_timeout(
                 &self,
                 timeout: Duration,
             ) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
-                (**self).accept_uni_stream_timeout(timeout)
+                AsyncSession::accept_uni_stream_timeout(&**self, timeout)
             }
 
-            fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).open_stream()
-            }
-
-            fn open_stream_timeout(
+            fn open_stream_with(
                 &self,
-                timeout: Duration,
+                request: OpenRequest,
             ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).open_stream_timeout(timeout)
+                AsyncSession::open_stream_with(&**self, request)
             }
 
-            fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-                (**self).open_uni_stream()
-            }
-
-            fn open_uni_stream_timeout(
+            fn open_uni_stream_with(
                 &self,
-                timeout: Duration,
+                request: OpenRequest,
             ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-                (**self).open_uni_stream_timeout(timeout)
-            }
-
-            fn open_stream_with_options(
-                &self,
-                opts: OpenOptions,
-            ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).open_stream_with_options(opts)
-            }
-
-            fn open_stream_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                timeout: Duration,
-            ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-                (**self).open_stream_with_options_timeout(opts, timeout)
-            }
-
-            fn open_uni_stream_with_options(
-                &self,
-                opts: OpenOptions,
-            ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-                (**self).open_uni_stream_with_options(opts)
-            }
-
-            fn open_uni_stream_with_options_timeout(
-                &self,
-                opts: OpenOptions,
-                timeout: Duration,
-            ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-                (**self).open_uni_stream_with_options_timeout(opts, timeout)
+                AsyncSession::open_uni_stream_with(&**self, request)
             }
 
             fn open_and_send<'a>(
                 &'a self,
-                data: &'a [u8],
+                request: OpenSend<'a>,
             ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-                (**self).open_and_send(data)
-            }
-
-            fn open_and_send_timeout<'a>(
-                &'a self,
-                data: &'a [u8],
-                timeout: Duration,
-            ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-                (**self).open_and_send_timeout(data, timeout)
-            }
-
-            fn open_and_send_with_options<'a>(
-                &'a self,
-                opts: OpenOptions,
-                data: &'a [u8],
-            ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-                (**self).open_and_send_with_options(opts, data)
-            }
-
-            fn open_and_send_with_options_timeout<'a>(
-                &'a self,
-                opts: OpenOptions,
-                data: &'a [u8],
-                timeout: Duration,
-            ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-                (**self).open_and_send_with_options_timeout(opts, data, timeout)
+                AsyncSession::open_and_send(&**self, request)
             }
 
             fn open_uni_and_send<'a>(
                 &'a self,
-                data: &'a [u8],
+                request: OpenSend<'a>,
             ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-                (**self).open_uni_and_send(data)
+                AsyncSession::open_uni_and_send(&**self, request)
             }
 
-            fn open_uni_and_send_timeout<'a>(
+            fn ping<'a>(&'a self, echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
+                AsyncSession::ping(&**self, echo)
+            }
+
+            fn ping_timeout<'a>(
                 &'a self,
-                data: &'a [u8],
+                echo: &'a [u8],
                 timeout: Duration,
-            ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-                (**self).open_uni_and_send_timeout(data, timeout)
+            ) -> AsyncBoxFuture<'a, Result<Duration>> {
+                AsyncSession::ping_timeout(&**self, echo, timeout)
             }
 
-            fn open_uni_and_send_with_options<'a>(
-                &'a self,
-                opts: OpenOptions,
-                data: &'a [u8],
-            ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-                (**self).open_uni_and_send_with_options(opts, data)
+            fn go_away(
+                &self,
+                last_accepted_bidi: u64,
+                last_accepted_uni: u64,
+            ) -> AsyncBoxFuture<'_, Result<()>> {
+                AsyncSession::go_away(&**self, last_accepted_bidi, last_accepted_uni)
             }
 
-            fn open_uni_and_send_with_options_timeout<'a>(
+            fn go_away_with_error<'a>(
                 &'a self,
-                opts: OpenOptions,
-                data: &'a [u8],
-                timeout: Duration,
-            ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-                (**self).open_uni_and_send_with_options_timeout(opts, data, timeout)
+                last_accepted_bidi: u64,
+                last_accepted_uni: u64,
+                code: u64,
+                reason: &'a str,
+            ) -> AsyncBoxFuture<'a, Result<()>> {
+                AsyncSession::go_away_with_error(
+                    &**self,
+                    last_accepted_bidi,
+                    last_accepted_uni,
+                    code,
+                    reason,
+                )
             }
 
             fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
-                (**self).close()
+                AsyncSession::close(&**self)
             }
 
             fn close_with_error<'a>(
@@ -2406,43 +2297,59 @@ macro_rules! impl_async_session_forward {
                 code: u64,
                 reason: &'a str,
             ) -> AsyncBoxFuture<'a, Result<()>> {
-                (**self).close_with_error(code, reason)
+                AsyncSession::close_with_error(&**self, code, reason)
             }
 
             fn wait(&self) -> AsyncBoxFuture<'_, Result<()>> {
-                (**self).wait()
+                AsyncSession::wait(&**self)
             }
 
             fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>> {
-                (**self).wait_timeout(timeout)
+                AsyncSession::wait_timeout(&**self, timeout)
             }
 
-            fn closed(&self) -> bool {
-                (**self).closed()
+            fn is_closed(&self) -> bool {
+                AsyncSession::is_closed(&**self)
             }
 
             fn local_addr(&self) -> Option<SocketAddr> {
-                (**self).local_addr()
+                AsyncSession::local_addr(&**self)
             }
 
             fn peer_addr(&self) -> Option<SocketAddr> {
-                (**self).peer_addr()
-            }
-
-            fn remote_addr(&self) -> Option<SocketAddr> {
-                (**self).remote_addr()
+                AsyncSession::peer_addr(&**self)
             }
 
             fn close_error(&self) -> Option<Error> {
-                (**self).close_error()
+                AsyncSession::close_error(&**self)
             }
 
             fn state(&self) -> SessionState {
-                (**self).state()
+                AsyncSession::state(&**self)
             }
 
             fn stats(&self) -> SessionStats {
-                (**self).stats()
+                AsyncSession::stats(&**self)
+            }
+
+            fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+                AsyncSession::peer_go_away_error(&**self)
+            }
+
+            fn peer_close_error(&self) -> Option<PeerCloseError> {
+                AsyncSession::peer_close_error(&**self)
+            }
+
+            fn local_preface(&self) -> Preface {
+                AsyncSession::local_preface(&**self)
+            }
+
+            fn peer_preface(&self) -> Preface {
+                AsyncSession::peer_preface(&**self)
+            }
+
+            fn negotiated(&self) -> Negotiated {
+                AsyncSession::negotiated(&**self)
             }
         }
     };
@@ -2492,188 +2399,72 @@ where
         })
     }
 
-    fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
+    fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move {
-            let stream = self.inner.open_stream().await?;
+            let stream = self.inner.open_stream_with(request).await?;
             Ok(Box::new(stream) as BoxAsyncStream)
         })
     }
 
-    fn open_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move {
-            let stream = self.inner.open_stream_timeout(timeout).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
-        })
-    }
-
-    fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move {
-            let stream = self.inner.open_uni_stream().await?;
-            Ok(Box::new(stream) as BoxAsyncSendStream)
-        })
-    }
-
-    fn open_uni_stream_timeout(
+    fn open_uni_stream_with(
         &self,
-        timeout: Duration,
+        request: OpenRequest,
     ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
         Box::pin(async move {
-            let stream = self.inner.open_uni_stream_timeout(timeout).await?;
-            Ok(Box::new(stream) as BoxAsyncSendStream)
-        })
-    }
-
-    fn open_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move {
-            let stream = self.inner.open_stream_with_options(opts).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
-        })
-    }
-
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move {
-            let stream = self
-                .inner
-                .open_stream_with_options_timeout(opts, timeout)
-                .await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
-        })
-    }
-
-    fn open_uni_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move {
-            let stream = self.inner.open_uni_stream_with_options(opts).await?;
-            Ok(Box::new(stream) as BoxAsyncSendStream)
-        })
-    }
-
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move {
-            let stream = self
-                .inner
-                .open_uni_stream_with_options_timeout(opts, timeout)
-                .await?;
+            let stream = self.inner.open_uni_stream_with(request).await?;
             Ok(Box::new(stream) as BoxAsyncSendStream)
         })
     }
 
     fn open_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
         Box::pin(async move {
-            let (stream, n) = self.inner.open_and_send(data).await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncStream, n))
-        })
-    }
-
-    fn open_and_send_timeout<'a>(
-        &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self.inner.open_and_send_timeout(data, timeout).await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncStream, n))
-        })
-    }
-
-    fn open_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self.inner.open_and_send_with_options(opts, data).await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncStream, n))
-        })
-    }
-
-    fn open_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self
-                .inner
-                .open_and_send_with_options_timeout(opts, data, timeout)
-                .await?;
-            let n = validate_write_progress(n, data.len())?;
+            let (stream, n) = self.inner.open_and_send(request).await?;
             Ok((Box::new(stream) as BoxAsyncStream, n))
         })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
         Box::pin(async move {
-            let (stream, n) = self.inner.open_uni_and_send(data).await?;
-            let n = validate_write_progress(n, data.len())?;
+            let (stream, n) = self.inner.open_uni_and_send(request).await?;
             Ok((Box::new(stream) as BoxAsyncSendStream, n))
         })
     }
 
-    fn open_uni_and_send_timeout<'a>(
+    fn ping<'a>(&'a self, echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
+        self.inner.ping(echo)
+    }
+
+    fn ping_timeout<'a>(
         &'a self,
-        data: &'a [u8],
+        echo: &'a [u8],
         timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self.inner.open_uni_and_send_timeout(data, timeout).await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncSendStream, n))
-        })
+    ) -> AsyncBoxFuture<'a, Result<Duration>> {
+        self.inner.ping_timeout(echo, timeout)
     }
 
-    fn open_uni_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self
-                .inner
-                .open_uni_and_send_with_options(opts, data)
-                .await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncSendStream, n))
-        })
+    fn go_away(
+        &self,
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+    ) -> AsyncBoxFuture<'_, Result<()>> {
+        self.inner.go_away(last_accepted_bidi, last_accepted_uni)
     }
 
-    fn open_uni_and_send_with_options_timeout<'a>(
+    fn go_away_with_error<'a>(
         &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            let (stream, n) = self
-                .inner
-                .open_uni_and_send_with_options_timeout(opts, data, timeout)
-                .await?;
-            let n = validate_write_progress(n, data.len())?;
-            Ok((Box::new(stream) as BoxAsyncSendStream, n))
-        })
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
+        self.inner
+            .go_away_with_error(last_accepted_bidi, last_accepted_uni, code, reason)
     }
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
@@ -2696,8 +2487,8 @@ where
         self.inner.wait_timeout(timeout)
     }
 
-    fn closed(&self) -> bool {
-        self.inner.closed()
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
@@ -2706,10 +2497,6 @@ where
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        self.inner.remote_addr()
     }
 
     fn close_error(&self) -> Option<Error> {
@@ -2723,6 +2510,26 @@ where
     fn stats(&self) -> SessionStats {
         self.inner.stats()
     }
+
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+        self.inner.peer_go_away_error()
+    }
+
+    fn peer_close_error(&self) -> Option<PeerCloseError> {
+        self.inner.peer_close_error()
+    }
+
+    fn local_preface(&self) -> Preface {
+        self.inner.local_preface()
+    }
+
+    fn peer_preface(&self) -> Preface {
+        self.inner.peer_preface()
+    }
+
+    fn negotiated(&self) -> Negotiated {
+        self.inner.negotiated()
+    }
 }
 
 macro_rules! impl_native_async_stream_info {
@@ -2732,12 +2539,12 @@ macro_rules! impl_native_async_stream_info {
                 <$ty>::stream_id(self)
             }
 
-            fn opened_locally(&self) -> bool {
-                <$ty>::opened_locally(self)
+            fn is_opened_locally(&self) -> bool {
+                <$ty>::is_opened_locally(self)
             }
 
-            fn bidirectional(&self) -> bool {
-                <$ty>::bidirectional(self)
+            fn is_bidirectional(&self) -> bool {
+                <$ty>::is_bidirectional(self)
             }
 
             fn open_info_len(&self) -> usize {
@@ -2748,8 +2555,8 @@ macro_rules! impl_native_async_stream_info {
                 <$ty>::has_open_info(self)
             }
 
-            fn copy_open_info_to(&self, dst: &mut Vec<u8>) {
-                <$ty>::copy_open_info_to(self, dst)
+            fn append_open_info_to(&self, dst: &mut Vec<u8>) {
+                <$ty>::append_open_info_to(self, dst)
             }
 
             fn open_info(&self) -> Vec<u8> {
@@ -2766,10 +2573,6 @@ macro_rules! impl_native_async_stream_info {
 
             fn peer_addr(&self) -> Option<SocketAddr> {
                 <$ty>::peer_addr(self)
-            }
-
-            fn remote_addr(&self) -> Option<SocketAddr> {
-                <$ty>::remote_addr(self)
             }
 
             fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2853,8 +2656,8 @@ macro_rules! impl_native_async_recv {
                 Box::pin(async move { <$ty>::read_exact_timeout(self, dst, timeout) })
             }
 
-            fn read_closed(&self) -> bool {
-                <$ty>::read_closed(self)
+            fn is_read_closed(&self) -> bool {
+                <$ty>::is_read_closed(self)
             }
 
             fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -2882,21 +2685,19 @@ macro_rules! impl_native_async_send {
                 Box::pin(async move { <$ty>::write(self, src) })
             }
 
-            fn write_all<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<()>> {
-                Box::pin(async move {
-                    let mut remaining = src;
-                    while !remaining.is_empty() {
-                        let n = <$ty>::write(self, remaining)?;
-                        if n == 0 {
-                            return Err(zero_length_write_error());
-                        }
-                        if n > remaining.len() {
-                            return Err(invalid_write_progress_error());
-                        }
-                        remaining = &remaining[n..];
-                    }
-                    Ok(())
-                })
+            fn write_all<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+            ) -> AsyncBoxFuture<'a, Result<()>> {
+                Box::pin(async move { <$ty>::write_all(self, payload) })
+            }
+
+            fn write_all_timeout<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+                timeout: Duration,
+            ) -> AsyncBoxFuture<'a, Result<()>> {
+                Box::pin(async move { <$ty>::write_all_timeout(self, payload, timeout) })
             }
 
             fn write_timeout<'a>(
@@ -2922,16 +2723,19 @@ macro_rules! impl_native_async_send {
                 Box::pin(async move { <$ty>::write_vectored_timeout(self, parts, timeout) })
             }
 
-            fn write_final<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
-                Box::pin(async move { <$ty>::write_final(self, src) })
+            fn write_final<'a>(
+                &'a self,
+                payload: WritePayload<'a>,
+            ) -> AsyncBoxFuture<'a, Result<usize>> {
+                Box::pin(async move { <$ty>::write_final(self, payload) })
             }
 
             fn write_final_timeout<'a>(
                 &'a self,
-                src: &'a [u8],
+                payload: WritePayload<'a>,
                 timeout: Duration,
             ) -> AsyncBoxFuture<'a, Result<usize>> {
-                Box::pin(async move { <$ty>::write_final_timeout(self, src, timeout) })
+                Box::pin(async move { <$ty>::write_final_timeout(self, payload, timeout) })
             }
 
             fn write_vectored_final<'a>(
@@ -2949,8 +2753,8 @@ macro_rules! impl_native_async_send {
                 Box::pin(async move { <$ty>::write_vectored_final_timeout(self, parts, timeout) })
             }
 
-            fn write_closed(&self) -> bool {
-                <$ty>::write_closed(self)
+            fn is_write_closed(&self) -> bool {
+                <$ty>::is_write_closed(self)
             }
 
             fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
@@ -3001,145 +2805,61 @@ impl AsyncSession for Conn {
         Box::pin(async move { Conn::accept_uni_stream_timeout(self, timeout) })
     }
 
-    fn open_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_stream(self) })
+    fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
+        Box::pin(async move { Conn::open_stream_with(self, request) })
     }
 
-    fn open_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_stream_timeout(self, timeout) })
-    }
-
-    fn open_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_stream(self) })
-    }
-
-    fn open_uni_stream_timeout(
+    fn open_uni_stream_with(
         &self,
-        timeout: Duration,
+        request: OpenRequest,
     ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_stream_timeout(self, timeout) })
-    }
-
-    fn open_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_stream_with_options(self, opts) })
-    }
-
-    fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_stream_with_options_timeout(self, opts, timeout) })
-    }
-
-    fn open_uni_stream_with_options(
-        &self,
-        opts: OpenOptions,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_stream_with_options(self, opts) })
-    }
-
-    fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_stream_with_options_timeout(self, opts, timeout) })
+        Box::pin(async move { Conn::open_uni_stream_with(self, request) })
     }
 
     fn open_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            <Self as AsyncSession>::open_and_send_with_options(self, OpenOptions::default(), data)
-                .await
-        })
-    }
-
-    fn open_and_send_timeout<'a>(
-        &'a self,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move {
-            <Self as AsyncSession>::open_and_send_with_options_timeout(
-                self,
-                OpenOptions::default(),
-                data,
-                timeout,
-            )
-            .await
-        })
-    }
-
-    fn open_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move { Conn::open_and_send_with_options(self, opts, data) })
-    }
-
-    fn open_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
-        Box::pin(async move { Conn::open_and_send_with_options_timeout(self, opts, data, timeout) })
+        Box::pin(async move { Conn::open_and_send(self, request) })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
-        data: &'a [u8],
+        request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move {
-            <Self as AsyncSession>::open_uni_and_send_with_options(
-                self,
-                OpenOptions::default(),
-                data,
-            )
-            .await
-        })
+        Box::pin(async move { Conn::open_uni_and_send(self, request) })
     }
 
-    fn open_uni_and_send_timeout<'a>(
+    fn ping<'a>(&'a self, echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
+        Box::pin(async move { Conn::ping(self, echo) })
+    }
+
+    fn ping_timeout<'a>(
         &'a self,
-        data: &'a [u8],
+        echo: &'a [u8],
         timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Duration>> {
+        Box::pin(async move { Conn::ping_timeout(self, echo, timeout) })
+    }
+
+    fn go_away(
+        &self,
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+    ) -> AsyncBoxFuture<'_, Result<()>> {
+        Box::pin(async move { Conn::go_away(self, last_accepted_bidi, last_accepted_uni) })
+    }
+
+    fn go_away_with_error<'a>(
+        &'a self,
+        last_accepted_bidi: u64,
+        last_accepted_uni: u64,
+        code: u64,
+        reason: &'a str,
+    ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            <Self as AsyncSession>::open_uni_and_send_with_options_timeout(
-                self,
-                OpenOptions::default(),
-                data,
-                timeout,
-            )
-            .await
+            Conn::go_away_with_error(self, last_accepted_bidi, last_accepted_uni, code, reason)
         })
-    }
-
-    fn open_uni_and_send_with_options<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(async move { Conn::open_uni_and_send_with_options(self, opts, data) })
-    }
-
-    fn open_uni_and_send_with_options_timeout<'a>(
-        &'a self,
-        opts: OpenOptions,
-        data: &'a [u8],
-        timeout: Duration,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
-        Box::pin(
-            async move { Conn::open_uni_and_send_with_options_timeout(self, opts, data, timeout) },
-        )
     }
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
@@ -3162,8 +2882,8 @@ impl AsyncSession for Conn {
         Box::pin(async move { Conn::wait_timeout(self, timeout) })
     }
 
-    fn closed(&self) -> bool {
-        Conn::closed(self)
+    fn is_closed(&self) -> bool {
+        Conn::is_closed(self)
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
@@ -3172,10 +2892,6 @@ impl AsyncSession for Conn {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         Conn::peer_addr(self)
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        Conn::remote_addr(self)
     }
 
     fn close_error(&self) -> Option<Error> {
@@ -3188,6 +2904,26 @@ impl AsyncSession for Conn {
 
     fn stats(&self) -> SessionStats {
         Conn::stats(self)
+    }
+
+    fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+        Conn::peer_go_away_error(self)
+    }
+
+    fn peer_close_error(&self) -> Option<PeerCloseError> {
+        Conn::peer_close_error(self)
+    }
+
+    fn local_preface(&self) -> Preface {
+        Conn::local_preface(self)
+    }
+
+    fn peer_preface(&self) -> Preface {
+        Conn::peer_preface(self)
+    }
+
+    fn negotiated(&self) -> Negotiated {
+        Conn::negotiated(self)
     }
 }
 

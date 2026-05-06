@@ -5,7 +5,7 @@ use crate::varint::MAX_VARINT62;
 
 #[inline]
 #[must_use]
-pub fn first_local_stream_id(role: Role, bidi: bool) -> u64 {
+pub(crate) const fn first_local_stream_id(role: Role, bidi: bool) -> u64 {
     match (role, bidi) {
         (Role::Initiator, true) => 4,
         (Role::Initiator, false) => 2,
@@ -17,7 +17,7 @@ pub fn first_local_stream_id(role: Role, bidi: bool) -> u64 {
 
 #[inline]
 #[must_use]
-pub fn first_peer_stream_id(local_role: Role, bidi: bool) -> u64 {
+pub(crate) const fn first_peer_stream_id(local_role: Role, bidi: bool) -> u64 {
     match (local_role, bidi) {
         (Role::Initiator, true) => 1,
         (Role::Initiator, false) => 3,
@@ -29,13 +29,13 @@ pub fn first_peer_stream_id(local_role: Role, bidi: bool) -> u64 {
 
 #[inline]
 #[must_use]
-pub fn stream_is_bidi(stream_id: u64) -> bool {
+pub(crate) const fn stream_is_bidi(stream_id: u64) -> bool {
     stream_id & 0x2 == 0
 }
 
 #[inline]
 #[must_use]
-pub fn stream_opener(stream_id: u64) -> Role {
+pub(crate) const fn stream_opener(stream_id: u64) -> Role {
     if stream_id & 0x1 == 0 {
         Role::Initiator
     } else {
@@ -45,56 +45,23 @@ pub fn stream_opener(stream_id: u64) -> Role {
 
 #[inline]
 #[must_use]
-pub fn stream_is_local(local_role: Role, stream_id: u64) -> bool {
-    stream_opener(stream_id) == local_role
+pub(crate) const fn stream_is_local(local_role: Role, stream_id: u64) -> bool {
+    matches!(
+        (local_role, stream_opener(stream_id)),
+        (Role::Initiator, Role::Initiator) | (Role::Responder, Role::Responder)
+    )
 }
 
 #[inline]
 #[must_use]
-pub fn local_open_refused_by_goaway(
-    stream_id: u64,
-    bidi: bool,
-    peer_goaway_bidi: u64,
-    peer_goaway_uni: u64,
-) -> bool {
-    if bidi {
-        stream_id > peer_goaway_bidi
-    } else {
-        stream_id > peer_goaway_uni
-    }
-}
-
-#[inline]
-#[must_use]
-pub fn peer_open_refused_by_goaway(
-    stream_id: u64,
-    local_goaway_bidi: u64,
-    local_goaway_uni: u64,
-) -> bool {
-    if stream_is_bidi(stream_id) {
-        stream_id > local_goaway_bidi
-    } else {
-        stream_id > local_goaway_uni
-    }
-}
-
-#[inline]
-#[must_use]
-pub fn max_stream_id_for_class(next_id: u64) -> u64 {
-    if next_id == 0 || next_id > MAX_VARINT62 {
-        return 0;
-    }
-    next_id + ((MAX_VARINT62 - next_id) / 4) * 4
-}
-
-#[inline]
-#[must_use]
-pub fn projected_local_open_id(next_id: u64, queue_len: usize) -> u64 {
+pub(crate) fn projected_local_open_id(next_id: u64, queue_len: usize) -> u64 {
     if queue_len == 0 || next_id == 0 || next_id > MAX_VARINT62 {
         return next_id;
     }
     let remaining = (MAX_VARINT62 - next_id) / 4;
-    let queue_len = u64::try_from(queue_len).unwrap_or(u64::MAX);
+    let Ok(queue_len) = u64::try_from(queue_len) else {
+        return MAX_VARINT62 + 1;
+    };
     if queue_len > remaining {
         MAX_VARINT62 + 1
     } else {
@@ -103,67 +70,7 @@ pub fn projected_local_open_id(next_id: u64, queue_len: usize) -> u64 {
 }
 
 #[inline]
-#[must_use]
-pub fn expected_next_peer_stream_id(
-    stream_id: u64,
-    next_peer_bidi: u64,
-    next_peer_uni: u64,
-) -> u64 {
-    if stream_is_bidi(stream_id) {
-        next_peer_bidi
-    } else {
-        next_peer_uni
-    }
-}
-
-#[inline]
-#[must_use]
-pub fn stream_kind_for_local(local_role: Role, stream_id: u64) -> (bool, bool) {
-    let bidi = stream_is_bidi(stream_id);
-    let local_opened = stream_is_local(local_role, stream_id);
-    match (bidi, local_opened) {
-        (true, _) => (true, true),
-        (false, true) => (true, false),
-        (false, false) => (false, true),
-    }
-}
-
-#[inline]
-pub fn validate_stream_id_for_role(_local_role: Role, stream_id: u64) -> Result<()> {
-    if stream_id == 0 {
-        return Err(Error::protocol("stream_id = 0 is session-scoped"));
-    }
-    if stream_id > MAX_VARINT62 {
-        return Err(Error::protocol(format!(
-            "stream_id {stream_id} exceeds varint62 range"
-        )));
-    }
-    Ok(())
-}
-
-#[inline]
-pub fn validate_local_open_id(local_role: Role, stream_id: u64, bidi: bool) -> Result<()> {
-    validate_stream_id_for_role(local_role, stream_id)?;
-    if !stream_is_local(local_role, stream_id) {
-        return Err(Error::protocol(format!(
-            "stream_id {stream_id} is not locally owned for role {local_role}"
-        )));
-    }
-    if stream_is_bidi(stream_id) != bidi {
-        let want = if bidi {
-            "bidirectional"
-        } else {
-            "unidirectional"
-        };
-        return Err(Error::protocol(format!(
-            "stream_id {stream_id} is not {want}"
-        )));
-    }
-    Ok(())
-}
-
-#[inline]
-pub(crate) fn validate_goaway_watermark_for_direction(stream_id: u64, bidi: bool) -> Result<()> {
+pub(crate) fn validate_go_away_watermark_for_direction(stream_id: u64, bidi: bool) -> Result<()> {
     if stream_id == 0 {
         return Ok(());
     }
@@ -181,7 +88,7 @@ pub(crate) fn validate_goaway_watermark_for_direction(stream_id: u64, bidi: bool
 }
 
 #[inline]
-pub(crate) fn validate_goaway_watermark_creator(owner: Role, stream_id: u64) -> Result<()> {
+pub(crate) fn validate_go_away_watermark_creator(owner: Role, stream_id: u64) -> Result<()> {
     if stream_id == 0 {
         return Ok(());
     }
@@ -195,14 +102,16 @@ pub(crate) fn validate_goaway_watermark_creator(owner: Role, stream_id: u64) -> 
 
 #[inline]
 #[must_use]
-pub fn initial_send_window(local_role: Role, peer: &Settings, stream_id: u64) -> u64 {
-    if !stream_is_bidi(stream_id) {
-        if stream_is_local(local_role, stream_id) {
+pub(crate) fn initial_send_window(local_role: Role, peer: &Settings, stream_id: u64) -> u64 {
+    let bidi = stream_is_bidi(stream_id);
+    let local = stream_is_local(local_role, stream_id);
+    if !bidi {
+        if local {
             peer.initial_max_stream_data_uni
         } else {
             0
         }
-    } else if stream_is_local(local_role, stream_id) {
+    } else if local {
         peer.initial_max_stream_data_bidi_peer_opened
     } else {
         peer.initial_max_stream_data_bidi_locally_opened
@@ -211,14 +120,16 @@ pub fn initial_send_window(local_role: Role, peer: &Settings, stream_id: u64) ->
 
 #[inline]
 #[must_use]
-pub fn initial_receive_window(local_role: Role, local: &Settings, stream_id: u64) -> u64 {
-    if !stream_is_bidi(stream_id) {
-        if stream_is_local(local_role, stream_id) {
+pub(crate) fn initial_receive_window(local_role: Role, local: &Settings, stream_id: u64) -> u64 {
+    let bidi = stream_is_bidi(stream_id);
+    let opened_locally = stream_is_local(local_role, stream_id);
+    if !bidi {
+        if opened_locally {
             0
         } else {
             local.initial_max_stream_data_uni
         }
-    } else if stream_is_local(local_role, stream_id) {
+    } else if opened_locally {
         local.initial_max_stream_data_bidi_locally_opened
     } else {
         local.initial_max_stream_data_bidi_peer_opened
@@ -246,19 +157,15 @@ mod tests {
         assert_eq!(stream_opener(1), Role::Responder);
         assert!(stream_is_local(Role::Initiator, 2));
         assert!(!stream_is_local(Role::Initiator, 3));
-        assert_eq!(stream_kind_for_local(Role::Initiator, 4), (true, true));
-        assert_eq!(stream_kind_for_local(Role::Initiator, 2), (true, false));
-        assert_eq!(stream_kind_for_local(Role::Initiator, 3), (false, true));
     }
 
     #[test]
     fn stream_id_projection_and_watermarks_do_not_wrap() {
         let next = first_local_stream_id(Role::Responder, true);
-        let last = max_stream_id_for_class(next);
+        let last = next + ((MAX_VARINT62 - next) / 4) * 4;
 
         assert_eq!(last & 0x3, next & 0x3);
         assert!(last <= MAX_VARINT62);
-        assert_eq!(max_stream_id_for_class(9), 9 + ((MAX_VARINT62 - 9) / 4) * 4);
         assert_eq!(projected_local_open_id(9, 3), 21);
         assert_eq!(projected_local_open_id(next, 3), next + 12);
         assert_eq!(projected_local_open_id(last - 4, 1), last);
@@ -268,39 +175,13 @@ mod tests {
             projected_local_open_id(MAX_VARINT62 + 1, 1),
             MAX_VARINT62 + 1
         );
-
-        assert!(local_open_refused_by_goaway(12, true, 8, 99));
-        assert!(!local_open_refused_by_goaway(8, true, 8, 99));
-        assert!(local_open_refused_by_goaway(
-            last,
-            true,
-            last - 4,
-            MAX_VARINT62
-        ));
-        assert!(!local_open_refused_by_goaway(
-            last - 4,
-            true,
-            last - 4,
-            MAX_VARINT62
-        ));
-        assert!(peer_open_refused_by_goaway(13, 12, 99));
-        assert!(peer_open_refused_by_goaway(last, last - 4, MAX_VARINT62));
-        assert_eq!(expected_next_peer_stream_id(3, 1, 3), 3);
-        assert_eq!(expected_next_peer_stream_id(4, 4, 3), 4);
     }
 
     #[test]
     fn stream_id_validation_rejects_reserved_range_and_wrong_local_class() {
-        validate_local_open_id(Role::Initiator, 4, true).unwrap();
-        validate_local_open_id(Role::Initiator, 2, false).unwrap();
-
-        assert!(validate_stream_id_for_role(Role::Initiator, 0).is_err());
-        assert!(validate_stream_id_for_role(Role::Initiator, MAX_VARINT62 + 1).is_err());
-        assert!(validate_local_open_id(Role::Initiator, 1, true).is_err());
-        assert!(validate_local_open_id(Role::Initiator, 2, true).is_err());
-        assert!(validate_goaway_watermark_for_direction(MAX_VARINT62 + 1, true).is_err());
-        assert!(validate_goaway_watermark_for_direction(2, true).is_err());
-        assert!(validate_goaway_watermark_creator(Role::Responder, 4).is_err());
+        assert!(validate_go_away_watermark_for_direction(MAX_VARINT62 + 1, true).is_err());
+        assert!(validate_go_away_watermark_for_direction(2, true).is_err());
+        assert!(validate_go_away_watermark_creator(Role::Responder, 4).is_err());
     }
 
     #[test]

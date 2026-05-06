@@ -10,11 +10,30 @@ const OPEN_METADATA_TOO_LARGE_MESSAGE: &str =
     "zmux: opening metadata exceeds peer max_frame_payload";
 const EMPTY_METADATA_UPDATE_MESSAGE: &str = "zmux: metadata update has no fields";
 const PRIORITY_UPDATE_UNAVAILABLE_MESSAGE: &str =
+    "zmux: metadata update requires negotiated priority_update and matching semantic capability";
+const PRIORITY_UPDATE_UNAVAILABLE_FRAGMENT: &str =
     "metadata update requires negotiated priority_update";
 const PRIORITY_UPDATE_TOO_LARGE_MESSAGE: &str =
     "zmux: priority update exceeds peer max_extension_payload_bytes";
 const KEEPALIVE_TIMEOUT_MESSAGE: &str = "zmux: keepalive timeout";
+const ACCEPT_TIMEOUT_MESSAGE: &str = "zmux: accept timed out";
+const OPEN_TIMEOUT_MESSAGE: &str = "zmux: open timed out";
+const READ_TIMEOUT_MESSAGE: &str = "zmux: read timed out";
+const WRITE_TIMEOUT_MESSAGE: &str = "zmux: write timed out";
+const PING_TIMEOUT_MESSAGE: &str = "zmux: ping timed out";
+const JOINED_HALF_PAUSE_TIMEOUT_MESSAGE: &str = "zmux: joined half pause timed out";
 const GRACEFUL_CLOSE_TIMEOUT_MESSAGE: &str = "zmux: graceful close drain timed out";
+const STREAM_CLOSED_MESSAGE: &str = "zmux: stream closed";
+const STREAM_NOT_READABLE_MESSAGE: &str = "zmux: stream is not readable";
+const STREAM_NOT_WRITABLE_MESSAGE: &str = "zmux: stream is not writable";
+const READ_SIDE_CLOSED_MESSAGE: &str = "zmux: read side closed";
+const WRITE_SIDE_CLOSED_MESSAGE: &str = "zmux: write side closed";
+const URGENT_WRITER_QUEUE_FULL_MESSAGE: &str = "zmux: urgent writer queue full";
+const ADAPTER_UNSUPPORTED_FRAGMENT: &str = "feature not supported by adapter";
+const LOCAL_OPEN_LIMITED_BY_SESSION_MEMORY_CAP_FRAGMENT: &str =
+    "local open limited by session memory cap";
+const PROVISIONAL_OPEN_LIMIT_REACHED_FRAGMENT: &str = "provisional open limit reached";
+const PROVISIONAL_LOCAL_OPEN_EXPIRED_FRAGMENT: &str = "provisional local open expired";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ErrorScope {
@@ -25,6 +44,7 @@ pub enum ErrorScope {
 }
 
 impl ErrorScope {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -41,6 +61,7 @@ impl fmt::Display for ErrorScope {
 }
 
 impl AsRef<str> for ErrorScope {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -52,17 +73,20 @@ pub enum ErrorOperation {
     Unknown,
     Open,
     Accept,
+    Ping,
     Read,
     Write,
     Close,
 }
 
 impl ErrorOperation {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
             Self::Open => "open",
             Self::Accept => "accept",
+            Self::Ping => "ping",
             Self::Read => "read",
             Self::Write => "write",
             Self::Close => "close",
@@ -77,6 +101,7 @@ impl fmt::Display for ErrorOperation {
 }
 
 impl AsRef<str> for ErrorOperation {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -92,6 +117,7 @@ pub enum ErrorSource {
 }
 
 impl ErrorSource {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -109,6 +135,7 @@ impl fmt::Display for ErrorSource {
 }
 
 impl AsRef<str> for ErrorSource {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -124,6 +151,7 @@ pub enum ErrorDirection {
 }
 
 impl ErrorDirection {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -141,6 +169,7 @@ impl fmt::Display for ErrorDirection {
 }
 
 impl AsRef<str> for ErrorDirection {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -160,6 +189,7 @@ pub enum TerminationKind {
 }
 
 impl TerminationKind {
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -181,6 +211,7 @@ impl fmt::Display for TerminationKind {
 }
 
 impl AsRef<str> for TerminationKind {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -206,23 +237,18 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub fn from_code(code: u64) -> Option<Self> {
-        Self::from_u64(code)
-    }
-
+    #[inline]
     pub fn from_u64(v: u64) -> Option<Self> {
         Self::try_from(v).ok()
     }
 
+    #[inline]
     pub fn as_u64(self) -> u64 {
         self as u64
     }
 
+    #[inline]
     pub fn as_str(self) -> &'static str {
-        self.name()
-    }
-
-    pub fn name(self) -> &'static str {
         match self {
             Self::NoError => "NO_ERROR",
             Self::Protocol => "PROTOCOL",
@@ -244,11 +270,12 @@ impl ErrorCode {
 
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(self.as_str())
     }
 }
 
 impl AsRef<str> for ErrorCode {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -257,6 +284,7 @@ impl AsRef<str> for ErrorCode {
 impl TryFrom<u64> for ErrorCode {
     type Error = u64;
 
+    #[inline]
     fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
         Ok(match value {
             0 => Self::NoError,
@@ -279,6 +307,7 @@ impl TryFrom<u64> for ErrorCode {
 }
 
 impl From<ErrorCode> for u64 {
+    #[inline]
     fn from(value: ErrorCode) -> Self {
         value.as_u64()
     }
@@ -301,6 +330,7 @@ pub struct Error {
 impl Error {
     const SESSION_CLOSED_MESSAGE: &'static str = "zmux: session closed";
 
+    #[inline]
     fn default_termination_kind(code: Option<ErrorCode>) -> TerminationKind {
         match code {
             Some(ErrorCode::IdleTimeout) => TerminationKind::Timeout,
@@ -338,65 +368,80 @@ impl Error {
         }
     }
 
+    #[inline]
     pub fn code(&self) -> Option<ErrorCode> {
         self.code
             .or_else(|| self.application_code.and_then(ErrorCode::from_u64))
     }
 
+    #[inline]
     pub fn application_code(&self) -> Option<u64> {
         self.application_code
     }
 
+    #[inline]
     pub fn numeric_code(&self) -> Option<u64> {
         self.application_code
             .or_else(|| self.code.map(ErrorCode::as_u64))
     }
 
+    #[inline]
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
     }
 
+    #[inline]
     pub fn message(&self) -> &str {
         self.message.as_ref()
     }
 
+    #[inline]
     pub fn source_io_error_kind(&self) -> Option<io::ErrorKind> {
         self.io_kind
     }
 
+    #[inline]
     pub fn scope(&self) -> ErrorScope {
         self.scope
     }
 
+    #[inline]
     pub fn operation(&self) -> ErrorOperation {
         self.operation
     }
 
+    #[inline]
     pub fn source(&self) -> ErrorSource {
         self.source
     }
 
+    #[inline]
     pub fn direction(&self) -> ErrorDirection {
         self.direction
     }
 
+    #[inline]
     pub fn termination_kind(&self) -> TerminationKind {
         self.termination_kind
     }
 
+    #[inline]
     pub fn is_error_code(&self, code: ErrorCode) -> bool {
         self.code() == Some(code)
     }
 
+    #[inline]
     pub fn is_application_code(&self, code: u64) -> bool {
         self.application_code == Some(code)
     }
 
+    #[inline]
     pub fn is_session_closed(&self) -> bool {
         self.code() == Some(ErrorCode::SessionClosing)
             || self.message.as_ref() == Self::SESSION_CLOSED_MESSAGE
     }
 
+    #[inline]
     pub fn is_timeout(&self) -> bool {
         let message = self.message.as_ref();
         self.termination_kind == TerminationKind::Timeout
@@ -405,6 +450,7 @@ impl Error {
             || (message.starts_with("zmux: ") && message.ends_with(" timed out"))
     }
 
+    #[inline]
     pub fn is_interrupted(&self) -> bool {
         self.termination_kind == TerminationKind::Interrupted
             || self.io_kind == Some(io::ErrorKind::Interrupted)
@@ -425,31 +471,31 @@ impl Error {
     }
 
     pub fn is_stream_not_readable(&self) -> bool {
-        self.message.as_ref() == "zmux: stream is not readable"
+        self.message.as_ref() == STREAM_NOT_READABLE_MESSAGE
     }
 
     pub fn is_stream_not_writable(&self) -> bool {
-        self.message.as_ref() == "zmux: stream is not writable"
+        self.message.as_ref() == STREAM_NOT_WRITABLE_MESSAGE
     }
 
     pub fn is_read_closed(&self) -> bool {
-        self.message.as_ref() == "zmux: read side closed"
+        self.message.as_ref() == READ_SIDE_CLOSED_MESSAGE
     }
 
     pub fn is_write_closed(&self) -> bool {
-        self.message.as_ref() == "zmux: write side closed"
+        self.message.as_ref() == WRITE_SIDE_CLOSED_MESSAGE
     }
 
     pub fn is_open_limited(&self) -> bool {
         let message = self.message.as_ref();
-        message.contains("local open limited by session memory cap")
-            || message.contains("provisional open limit reached")
+        message.contains(LOCAL_OPEN_LIMITED_BY_SESSION_MEMORY_CAP_FRAGMENT)
+            || message.contains(PROVISIONAL_OPEN_LIMIT_REACHED_FRAGMENT)
     }
 
     pub fn is_open_expired(&self) -> bool {
         self.message
             .as_ref()
-            .contains("provisional local open expired")
+            .contains(PROVISIONAL_LOCAL_OPEN_EXPIRED_FRAGMENT)
     }
 
     pub fn is_open_info_unavailable(&self) -> bool {
@@ -461,15 +507,13 @@ impl Error {
     }
 
     pub fn is_adapter_unsupported(&self) -> bool {
-        self.message
-            .as_ref()
-            .contains("feature not supported by adapter")
+        self.message.as_ref().contains(ADAPTER_UNSUPPORTED_FRAGMENT)
     }
 
     pub fn is_priority_update_unavailable(&self) -> bool {
-        self.message
-            .as_ref()
-            .contains(PRIORITY_UPDATE_UNAVAILABLE_MESSAGE)
+        let message = self.message.as_ref();
+        message == PRIORITY_UPDATE_UNAVAILABLE_MESSAGE
+            || message.contains(PRIORITY_UPDATE_UNAVAILABLE_FRAGMENT)
     }
 
     pub fn is_priority_update_too_large(&self) -> bool {
@@ -492,7 +536,7 @@ impl Error {
 
     pub(crate) fn is_urgent_writer_queue_full(&self) -> bool {
         self.code == Some(ErrorCode::Internal)
-            && self.message.as_ref() == "zmux: urgent writer queue full"
+            && self.message.as_ref() == URGENT_WRITER_QUEUE_FULL_MESSAGE
     }
 
     pub(crate) fn is_protocol_message(&self, message: &str) -> bool {
@@ -601,15 +645,15 @@ impl Error {
     }
 
     pub fn stream_closed() -> Self {
-        Self::new(ErrorCode::StreamClosed, "zmux: stream closed")
+        Self::new(ErrorCode::StreamClosed, STREAM_CLOSED_MESSAGE)
     }
 
     pub fn read_closed() -> Self {
-        Self::local("zmux: read side closed").with_termination_kind(TerminationKind::Stopped)
+        Self::local(READ_SIDE_CLOSED_MESSAGE).with_termination_kind(TerminationKind::Stopped)
     }
 
     pub fn write_closed() -> Self {
-        Self::local("zmux: write side closed")
+        Self::local(WRITE_SIDE_CLOSED_MESSAGE)
     }
 
     pub fn session_closed() -> Self {
@@ -617,7 +661,9 @@ impl Error {
     }
 
     pub fn application(code: u64, reason: impl Into<String>) -> Self {
-        Self::try_application(code, reason).unwrap_or_else(|err| err)
+        match Self::try_application(code, reason) {
+            Ok(error) | Err(error) => error,
+        }
     }
 
     pub fn try_application(code: u64, reason: impl Into<String>) -> Result<Self> {
@@ -649,24 +695,36 @@ impl Error {
 
     pub fn io(err: io::Error) -> Self {
         let kind = err.kind();
-        let mut error =
-            Self::new(ErrorCode::Internal, err.to_string()).with_source(ErrorSource::Transport);
-        error.io_kind = Some(kind);
-        match kind {
-            io::ErrorKind::Interrupted => {
-                error = error.with_termination_kind(TerminationKind::Interrupted);
-            }
-            io::ErrorKind::TimedOut => {
-                error = error.with_termination_kind(TerminationKind::Timeout);
-            }
-            _ => {}
+        let termination_kind = match kind {
+            io::ErrorKind::Interrupted => TerminationKind::Interrupted,
+            io::ErrorKind::TimedOut => TerminationKind::Timeout,
+            _ => TerminationKind::Unknown,
+        };
+        Self {
+            code: Some(ErrorCode::Internal),
+            application_code: None,
+            reason: None,
+            io_kind: Some(kind),
+            scope: ErrorScope::Unknown,
+            operation: ErrorOperation::Unknown,
+            source: ErrorSource::Transport,
+            direction: ErrorDirection::Unknown,
+            termination_kind,
+            message: Cow::Owned(err.to_string()),
         }
-        error
     }
 
     pub fn timeout(operation: impl AsRef<str>) -> Self {
-        Self::local(format!("zmux: {} timed out", operation.as_ref()))
-            .with_termination_kind(TerminationKind::Timeout)
+        let message = match operation.as_ref() {
+            "accept" => Cow::Borrowed(ACCEPT_TIMEOUT_MESSAGE),
+            "open" => Cow::Borrowed(OPEN_TIMEOUT_MESSAGE),
+            "read" => Cow::Borrowed(READ_TIMEOUT_MESSAGE),
+            "write" => Cow::Borrowed(WRITE_TIMEOUT_MESSAGE),
+            "ping" => Cow::Borrowed(PING_TIMEOUT_MESSAGE),
+            "joined half pause" => Cow::Borrowed(JOINED_HALF_PAUSE_TIMEOUT_MESSAGE),
+            operation => Cow::Owned(format!("zmux: {operation} timed out")),
+        };
+        Self::local(message).with_termination_kind(TerminationKind::Timeout)
     }
 
     pub fn graceful_close_timeout() -> Self {
@@ -692,12 +750,14 @@ impl fmt::Display for Error {
 impl StdError for Error {}
 
 impl From<io::Error> for Error {
+    #[inline]
     fn from(value: io::Error) -> Self {
         Self::io(value)
     }
 }
 
 impl From<Error> for io::Error {
+    #[inline]
     fn from(value: Error) -> Self {
         io::Error::new(value.io_error_kind(), value)
     }
@@ -790,13 +850,20 @@ mod tests {
             "zmux application error 78"
         );
 
-        let dynamic = Error::timeout("read");
+        let common_timeout = Error::timeout("read");
+        assert!(matches!(
+            common_timeout.message,
+            Cow::Borrowed(message) if message == super::READ_TIMEOUT_MESSAGE
+        ));
+
+        let dynamic = Error::timeout("custom");
         assert!(matches!(dynamic.message, Cow::Owned(_)));
     }
 
     #[test]
     fn structured_error_enums_are_displayable_and_string_borrowable() {
         assert_eq!(ErrorScope::Session.to_string(), "session");
+        assert_eq!(ErrorOperation::Ping.as_ref(), "ping");
         assert_eq!(ErrorOperation::Write.as_ref(), "write");
         assert_eq!(ErrorSource::Transport.to_string(), "transport");
         assert_eq!(ErrorDirection::Both.as_ref(), "both");

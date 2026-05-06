@@ -7,9 +7,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use zmux::{MetadataUpdate, OpenOptions};
-use zmux_quinn::{
-    wrap_session_with_options, QuinnRecvStream, QuinnSession, QuinnStream, SessionOptions,
-};
+use zmux_quinn::{QuinnRecvStream, QuinnSession, QuinnStream, SessionOptions};
 
 const APPLICATION_PROTOCOL: &str = "zmux-rust-quinn-session-contract";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,7 +68,7 @@ impl Pair {
             }
         );
         let client_addr = client_endpoint.local_addr().unwrap();
-        let client = wrap_session_with_options(
+        let client = QuinnSession::with_options(
             client_conn.clone(),
             SessionOptions::new().with_local_addr(client_addr),
         );
@@ -79,7 +77,7 @@ impl Pair {
         } else {
             server_options
         };
-        let server = wrap_session_with_options(server_conn.clone(), server_options);
+        let server = QuinnSession::with_options(server_conn.clone(), server_options);
         Self {
             client_endpoint,
             server_endpoint,
@@ -91,8 +89,8 @@ impl Pair {
     }
 
     async fn close(self) {
-        self.client.close();
-        self.server.close();
+        let _ = self.client.close().await;
+        let _ = self.server.close().await;
         self.client_endpoint.close(quinn::VarInt::from_u32(0), b"");
         self.server_endpoint.close(quinn::VarInt::from_u32(0), b"");
         let _ = tokio::time::timeout(Duration::from_millis(200), self.client_endpoint.wait_idle())
@@ -201,12 +199,12 @@ async fn read_all_recv(stream: &QuinnRecvStream) -> Vec<u8> {
 
 async fn read_all_async<S>(stream: &S) -> zmux::Result<Vec<u8>>
 where
-    S: zmux::RecvStreamApi + ?Sized,
+    S: zmux::AsyncRecvStreamApi + ?Sized,
 {
     let mut out = Vec::new();
     let mut buffer = [0u8; 1024];
     loop {
-        let n = zmux::RecvStreamApi::read_timeout(stream, &mut buffer, STREAM_TIMEOUT).await?;
+        let n = zmux::AsyncRecvStreamApi::read_timeout(stream, &mut buffer, STREAM_TIMEOUT).await?;
         if n == 0 {
             return Ok(out);
         }
@@ -216,67 +214,79 @@ where
 
 async fn exercise_common_async_session<S>(client: &S, server: &S) -> zmux::Result<()>
 where
-    S: zmux::Session + ?Sized,
+    S: zmux::AsyncSession + ?Sized,
 {
-    assert!(!zmux::Session::closed(client));
-    assert!(!zmux::Session::closed(server));
+    assert!(!zmux::AsyncSession::is_closed(client));
+    assert!(!zmux::AsyncSession::is_closed(server));
     assert_eq!(
-        zmux::Session::state(client),
-        zmux::Session::stats(client).state
+        zmux::AsyncSession::state(client),
+        zmux::AsyncSession::stats(client).state
     );
     assert_eq!(
-        zmux::Session::state(server),
-        zmux::Session::stats(server).state
+        zmux::AsyncSession::state(server),
+        zmux::AsyncSession::stats(server).state
     );
 
-    let outbound = zmux::Session::open_stream(client).await?;
-    zmux::SendStreamApi::write_final(&outbound, b"client-to-server").await?;
-    let inbound = zmux::Session::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
+    let outbound = zmux::AsyncSession::open_stream(client).await?;
+    zmux::AsyncSendStreamApi::write_final(
+        &outbound,
+        zmux::WritePayload::from(&b"client-to-server"[..]),
+    )
+    .await?;
+    let inbound = zmux::AsyncSession::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"client-to-server");
 
-    zmux::SendStreamApi::write_final(&inbound, b"server-to-client").await?;
+    zmux::AsyncSendStreamApi::write_final(
+        &inbound,
+        zmux::WritePayload::from(&b"server-to-client"[..]),
+    )
+    .await?;
     assert_eq!(read_all_async(&outbound).await?, b"server-to-client");
-    zmux::StreamInfo::close(&outbound).await?;
-    zmux::StreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamInfo::close(&outbound).await?;
+    zmux::AsyncStreamInfo::close(&inbound).await?;
 
-    let (outbound, n) = zmux::Session::open_and_send(client, b"open-and-send").await?;
+    let (outbound, n) =
+        zmux::AsyncSession::open_and_send(client, zmux::OpenSend::new(b"open-and-send")).await?;
     assert_eq!(n, b"open-and-send".len());
-    zmux::SendStreamApi::close_write(&outbound).await?;
-    let inbound = zmux::Session::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
+    zmux::AsyncSendStreamApi::close_write(&outbound).await?;
+    let inbound = zmux::AsyncSession::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-and-send");
-    zmux::StreamInfo::close(&outbound).await?;
-    zmux::StreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamInfo::close(&outbound).await?;
+    zmux::AsyncStreamInfo::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"open-"), IoSlice::new(b"vectored")];
-    let (outbound, n) = zmux::Session::open_and_send_vectored(client, &parts).await?;
+    let (outbound, n) =
+        zmux::AsyncSession::open_and_send(client, zmux::OpenSend::vectored(&parts)).await?;
     assert_eq!(n, b"open-vectored".len());
-    zmux::SendStreamApi::close_write(&outbound).await?;
-    let inbound = zmux::Session::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
+    zmux::AsyncSendStreamApi::close_write(&outbound).await?;
+    let inbound = zmux::AsyncSession::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-vectored");
-    zmux::StreamInfo::close(&outbound).await?;
-    zmux::StreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamInfo::close(&outbound).await?;
+    zmux::AsyncStreamInfo::close(&inbound).await?;
 
-    let (outbound, n) = zmux::Session::open_uni_and_send(server, b"server-uni").await?;
+    let (outbound, n) =
+        zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::new(b"server-uni")).await?;
     assert_eq!(n, b"server-uni".len());
-    let inbound = zmux::Session::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
+    let inbound = zmux::AsyncSession::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni");
-    zmux::StreamInfo::close(&outbound).await?;
-    zmux::StreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamInfo::close(&outbound).await?;
+    zmux::AsyncStreamInfo::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"server-"), IoSlice::new(b"uni-vectored")];
-    let (outbound, n) = zmux::Session::open_uni_and_send_vectored(server, &parts).await?;
+    let (outbound, n) =
+        zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::vectored(&parts)).await?;
     assert_eq!(n, b"server-uni-vectored".len());
-    let inbound = zmux::Session::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
+    let inbound = zmux::AsyncSession::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni-vectored");
-    zmux::StreamInfo::close(&outbound).await?;
-    zmux::StreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamInfo::close(&outbound).await?;
+    zmux::AsyncStreamInfo::close(&inbound).await?;
 
-    zmux::Session::close(client).await?;
-    zmux::Session::close(server).await?;
-    assert!(zmux::Session::wait_timeout(client, STREAM_TIMEOUT).await?);
-    assert!(zmux::Session::wait_timeout(server, STREAM_TIMEOUT).await?);
-    assert!(zmux::Session::closed(client));
-    assert!(zmux::Session::closed(server));
+    zmux::AsyncSession::close(client).await?;
+    zmux::AsyncSession::close(server).await?;
+    assert!(zmux::AsyncSession::wait_timeout(client, STREAM_TIMEOUT).await?);
+    assert!(zmux::AsyncSession::wait_timeout(server, STREAM_TIMEOUT).await?);
+    assert!(zmux::AsyncSession::is_closed(client));
+    assert!(zmux::AsyncSession::is_closed(server));
     Ok(())
 }
 
@@ -321,11 +331,35 @@ async fn common_async_session_code_works_with_quinn_session() {
 #[tokio::test]
 async fn common_async_session_code_works_with_erased_quinn_session() {
     let pair = Pair::new().await;
-    let client = zmux::box_session(pair.client.clone());
-    let server = zmux::box_session(pair.server.clone());
-    exercise_common_async_session(client.as_ref(), server.as_ref())
+    let sessions: Vec<zmux::BoxAsyncSession> = vec![
+        zmux::box_async_session(pair.client.clone()),
+        zmux::box_async_session(pair.server.clone()),
+    ];
+    exercise_common_async_session(sessions[0].as_ref(), sessions[1].as_ref())
         .await
         .unwrap();
+    pair.close().await;
+}
+
+#[tokio::test]
+async fn native_only_controls_are_exposed_as_adapter_unsupported() {
+    let pair = Pair::new().await;
+    let err = zmux::AsyncSession::ping(&pair.client, b"ping")
+        .await
+        .unwrap_err();
+    assert!(err.is_adapter_unsupported());
+    assert_eq!(err.operation(), zmux::ErrorOperation::Ping);
+    assert!(zmux::AsyncSession::peer_go_away_error(&pair.client).is_none());
+    assert!(zmux::AsyncSession::peer_close_error(&pair.client).is_none());
+    assert_eq!(
+        zmux::AsyncSession::local_preface(&pair.client).capabilities,
+        0
+    );
+    assert_eq!(
+        zmux::AsyncSession::peer_preface(&pair.client).capabilities,
+        0
+    );
+    assert_eq!(zmux::AsyncSession::negotiated(&pair.client).proto, 0);
     pair.close().await;
 }
 
@@ -336,7 +370,7 @@ async fn open_and_send_uses_one_write_under_flow_control() {
 
     let (stream, n) = pair
         .client
-        .open_and_send_timeout(&payload, STREAM_TIMEOUT)
+        .open_and_send(zmux::OpenSend::new(payload.as_slice()).with_timeout(STREAM_TIMEOUT))
         .await
         .unwrap();
     assert!(n > 0);
@@ -379,8 +413,6 @@ async fn shared_session_and_stream_api_exposes_addresses_and_deadlines() {
         pair.server.local_addr(),
         Some(pair.server_endpoint.local_addr().unwrap())
     );
-    assert_eq!(pair.client.remote_addr(), pair.client.peer_addr());
-    assert_eq!(pair.server.remote_addr(), pair.server.peer_addr());
     assert_eq!(
         pair.client.peer_addr(),
         Some(pair.server_endpoint.local_addr().unwrap())
@@ -389,14 +421,15 @@ async fn shared_session_and_stream_api_exposes_addresses_and_deadlines() {
     let stream = pair.client.open_stream().await.unwrap();
     assert_eq!(stream.local_addr(), pair.client.local_addr());
     assert_eq!(stream.peer_addr(), pair.client.peer_addr());
-    zmux::StreamInfo::set_deadline(&stream, Some(Instant::now() + STREAM_TIMEOUT)).unwrap();
-    zmux::StreamInfo::clear_deadline(&stream).unwrap();
+    zmux::AsyncStreamInfo::set_deadline(&stream, Some(Instant::now() + STREAM_TIMEOUT)).unwrap();
+    zmux::AsyncStreamInfo::clear_deadline(&stream).unwrap();
     stream.set_timeout(Some(STREAM_TIMEOUT)).unwrap();
     stream.set_read_timeout(None).unwrap();
-    zmux::SendStreamApi::set_write_timeout(&stream, Some(STREAM_TIMEOUT)).unwrap();
+    zmux::AsyncSendStreamApi::set_write_timeout(&stream, Some(STREAM_TIMEOUT)).unwrap();
     stream.set_write_timeout(None).unwrap();
 
-    zmux::SendStreamApi::set_write_deadline(&stream, Some(Instant::now() - SHORT_TIMEOUT)).unwrap();
+    zmux::AsyncSendStreamApi::set_write_deadline(&stream, Some(Instant::now() - SHORT_TIMEOUT))
+        .unwrap();
     let err = stream.write(b"x").await.unwrap_err();
     assert!(err.is_timeout());
 
@@ -408,47 +441,47 @@ async fn bidi_open_accept_round_trips_payload() {
     let pair = Pair::new().await;
     let stream = pair
         .client
-        .open_stream_with_options(
+        .open_stream_with(
             OpenOptions::new()
-                .with_initial_priority(7)
-                .with_initial_group(11)
-                .with_open_info_bytes(b"client-open"),
+                .priority(7)
+                .group(11)
+                .with_open_info(b"client-open"),
         )
         .await
         .unwrap();
-    assert!(stream.opened_locally());
-    assert!(stream.bidirectional());
-    assert!(!stream.read_closed());
-    assert!(!stream.write_closed());
+    assert!(stream.is_opened_locally());
+    assert!(stream.is_bidirectional());
+    assert!(!stream.is_read_closed());
+    assert!(!stream.is_write_closed());
     assert!(stream.has_open_info());
     assert_eq!(stream.open_info_len(), b"client-open".len());
     stream.write_final(b"hello server").await.unwrap();
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
 
     let accepted = pair
         .server
         .accept_stream_timeout(STREAM_TIMEOUT)
         .await
         .unwrap();
-    assert!(!accepted.opened_locally());
-    assert!(accepted.bidirectional());
-    assert!(!accepted.read_closed());
-    assert!(!accepted.write_closed());
+    assert!(!accepted.is_opened_locally());
+    assert!(accepted.is_bidirectional());
+    assert!(!accepted.is_read_closed());
+    assert!(!accepted.is_write_closed());
     assert_eq!(accepted.metadata().priority, Some(7));
     assert_eq!(accepted.metadata().group, Some(11));
     assert_eq!(accepted.open_info(), b"client-open");
     assert!(accepted.has_open_info());
     assert_eq!(accepted.open_info_len(), b"client-open".len());
-    let mut open_info = Vec::new();
-    accepted.copy_open_info_to(&mut open_info);
-    assert_eq!(open_info, b"client-open");
+    let mut open_info = b"pre:".to_vec();
+    accepted.append_open_info_to(&mut open_info);
+    assert_eq!(open_info, b"pre:client-open");
     assert_eq!(read_all_stream(&accepted).await, b"hello server");
-    assert!(accepted.read_closed());
+    assert!(accepted.is_read_closed());
 
     accepted.write_final(b"hello client").await.unwrap();
-    assert!(accepted.write_closed());
+    assert!(accepted.is_write_closed());
     assert_eq!(read_all_stream(&stream).await, b"hello client");
-    assert!(stream.read_closed());
+    assert!(stream.is_read_closed());
     pair.close().await;
 }
 
@@ -456,12 +489,12 @@ async fn bidi_open_accept_round_trips_payload() {
 async fn uni_open_accept_round_trips_payload_and_empty_final() {
     let pair = Pair::new().await;
     let uni = pair.client.open_uni_stream().await.unwrap();
-    assert!(uni.opened_locally());
-    assert!(!uni.bidirectional());
-    assert!(!uni.write_closed());
+    assert!(uni.is_opened_locally());
+    assert!(!uni.is_bidirectional());
+    assert!(!uni.is_write_closed());
     assert_eq!(pair.client.stats().active_streams.local_uni, 1);
     assert_eq!(
-        uni.writev_timeout(&[IoSlice::new(b"terminal ")], STREAM_TIMEOUT)
+        uni.write_vectored_timeout(&[IoSlice::new(b"terminal ")], STREAM_TIMEOUT)
             .await
             .unwrap(),
         9
@@ -472,22 +505,22 @@ async fn uni_open_accept_round_trips_payload_and_empty_final() {
             .unwrap(),
         3
     );
-    assert!(uni.write_closed());
+    assert!(uni.is_write_closed());
     assert_eq!(pair.client.stats().active_streams.local_uni, 0);
     let accepted = pair
         .server
         .accept_uni_stream_timeout(STREAM_TIMEOUT)
         .await
         .unwrap();
-    assert!(!accepted.opened_locally());
-    assert!(!accepted.bidirectional());
-    assert!(!accepted.read_closed());
+    assert!(!accepted.is_opened_locally());
+    assert!(!accepted.is_bidirectional());
+    assert!(!accepted.is_read_closed());
     assert_eq!(pair.server.stats().active_streams.peer_uni, 1);
     let mut received = Vec::new();
     let mut empty = [0u8; 0];
     let mut first = [0u8; 16];
     let n = accepted
-        .readv_timeout(
+        .read_vectored_timeout(
             &mut [IoSliceMut::new(&mut empty), IoSliceMut::new(&mut first)],
             STREAM_TIMEOUT,
         )
@@ -497,10 +530,14 @@ async fn uni_open_accept_round_trips_payload_and_empty_final() {
     received.extend_from_slice(&first[..n]);
     received.extend_from_slice(&read_all_recv(&accepted).await);
     assert_eq!(received, b"terminal uni");
-    assert!(accepted.read_closed());
+    assert!(accepted.is_read_closed());
     assert_eq!(pair.server.stats().active_streams.peer_uni, 0);
 
-    let (stream, n) = pair.client.open_uni_and_send(b"hello uni").await.unwrap();
+    let (stream, n) = pair
+        .client
+        .open_uni_and_send(zmux::OpenSend::new(b"hello uni"))
+        .await
+        .unwrap();
     assert_eq!(n, 9);
     let accepted = pair
         .server
@@ -511,7 +548,11 @@ async fn uni_open_accept_round_trips_payload_and_empty_final() {
     assert_eq!(read_all_recv(&accepted).await, b"hello uni");
     drop(stream);
 
-    let (_empty, n) = pair.client.open_uni_and_send(b"").await.unwrap();
+    let (_empty, n) = pair
+        .client
+        .open_uni_and_send(zmux::OpenSend::new(b""))
+        .await
+        .unwrap();
     assert_eq!(n, 0);
     let accepted = pair
         .server
@@ -527,11 +568,11 @@ async fn uni_open_metadata_prelude_is_visible_on_accept() {
     let pair = Pair::new().await;
     let stream = pair
         .client
-        .open_uni_stream_with_options(
+        .open_uni_stream_with(
             OpenOptions::new()
-                .with_initial_priority(3)
-                .with_initial_group(21)
-                .with_open_info_bytes(b"rpc"),
+                .priority(3)
+                .group(21)
+                .with_open_info(b"rpc"),
         )
         .await
         .unwrap();
@@ -550,9 +591,9 @@ async fn uni_open_metadata_prelude_is_visible_on_accept() {
     assert_eq!(accepted.open_info(), b"rpc");
     assert!(accepted.has_open_info());
     assert_eq!(accepted.open_info_len(), b"rpc".len());
-    let mut open_info = Vec::new();
-    accepted.copy_open_info_to(&mut open_info);
-    assert_eq!(open_info, b"rpc");
+    let mut open_info = b"pre:".to_vec();
+    accepted.append_open_info_to(&mut open_info);
+    assert_eq!(open_info, b"pre:rpc");
     drop(stream);
     pair.close().await;
 }
@@ -562,7 +603,7 @@ async fn join_streams_combines_quinn_uni_halves() {
     let pair = Pair::new().await;
     let client_send = pair
         .client
-        .open_uni_stream_with_options(OpenOptions::open_info_bytes(b"\0route"))
+        .open_uni_stream_with(OpenOptions::new().with_open_info(b"\0route"))
         .await
         .unwrap();
     client_send.write_all(b"ping ").await.unwrap();
@@ -584,24 +625,24 @@ async fn join_streams_combines_quinn_uni_halves() {
         zmux::join_streams(client_recv, client_send).with_info_side(zmux::DuplexInfoSide::Write);
     let server = zmux::join_streams(server_recv, server_send);
 
-    assert!(zmux::StreamInfo::bidirectional(&client));
-    assert!(zmux::StreamInfo::bidirectional(&server));
-    assert_eq!(zmux::StreamInfo::open_info(&client), b"\0route");
-    assert_eq!(zmux::StreamInfo::open_info(&server), b"\0route");
+    assert!(zmux::AsyncStreamInfo::is_bidirectional(&client));
+    assert!(zmux::AsyncStreamInfo::is_bidirectional(&server));
+    assert_eq!(zmux::AsyncStreamInfo::open_info(&client), b"\0route");
+    assert_eq!(zmux::AsyncStreamInfo::open_info(&server), b"\0route");
     assert_ne!(client.read_stream_id(), client.write_stream_id());
     assert_ne!(server.read_stream_id(), server.write_stream_id());
 
-    zmux::SendStreamApi::write_final(&client, b"from-client")
+    zmux::AsyncSendStreamApi::write_final(&client, zmux::WritePayload::from(&b"from-client"[..]))
         .await
         .unwrap();
-    zmux::SendStreamApi::write_final(&server, b"from-server")
+    zmux::AsyncSendStreamApi::write_final(&server, zmux::WritePayload::from(&b"from-server"[..]))
         .await
         .unwrap();
 
     assert_eq!(read_all_async(&server).await.unwrap(), b"ping from-client");
     assert_eq!(read_all_async(&client).await.unwrap(), b"pong from-server");
-    zmux::StreamInfo::close(&client).await.unwrap();
-    zmux::StreamInfo::close(&server).await.unwrap();
+    zmux::AsyncStreamInfo::close(&client).await.unwrap();
+    zmux::AsyncStreamInfo::close(&server).await.unwrap();
     pair.close().await;
 }
 
@@ -622,7 +663,7 @@ async fn write_vectored_final_combines_payload_and_closes_stream() {
             .unwrap(),
         16
     );
-    assert!(stream.write_closed());
+    assert!(stream.is_write_closed());
 
     let accepted = pair
         .server
@@ -634,7 +675,7 @@ async fn write_vectored_final_combines_payload_and_closes_stream() {
 }
 
 #[tokio::test]
-async fn stream_timeout_and_writev_aliases_match_native_surface() {
+async fn stream_timeout_vectored_methods_match_native_surface() {
     let pair = Pair::new().await;
     let stream = pair.client.open_stream().await.unwrap();
 
@@ -647,14 +688,14 @@ async fn stream_timeout_and_writev_aliases_match_native_surface() {
     );
     assert_eq!(
         stream
-            .writev_timeout(&[IoSlice::new(b"world")], STREAM_TIMEOUT)
+            .write_vectored_timeout(&[IoSlice::new(b"world")], STREAM_TIMEOUT)
             .await
             .unwrap(),
         5
     );
     assert_eq!(
         stream
-            .writev_final_timeout(&[IoSlice::new(b"!")], STREAM_TIMEOUT)
+            .write_vectored_final_timeout(&[IoSlice::new(b"!")], STREAM_TIMEOUT)
             .await
             .unwrap(),
         1
@@ -679,7 +720,7 @@ async fn stream_timeout_and_writev_aliases_match_native_surface() {
     let n = {
         let mut bufs = [IoSliceMut::new(&mut empty), IoSliceMut::new(&mut first)];
         accepted
-            .readv_timeout(&mut bufs, STREAM_TIMEOUT)
+            .read_vectored_timeout(&mut bufs, STREAM_TIMEOUT)
             .await
             .unwrap()
     };
@@ -742,7 +783,11 @@ async fn zero_length_write_does_not_submit_adapter_prelude() {
 #[tokio::test]
 async fn open_and_send_empty_payload_does_not_submit_adapter_prelude() {
     let pair = Pair::new().await;
-    let (stream, written) = pair.client.open_and_send(b"").await.unwrap();
+    let (stream, written) = pair
+        .client
+        .open_and_send(zmux::OpenSend::new(b""))
+        .await
+        .unwrap();
     assert_eq!(written, 0);
 
     let err = match pair.server.accept_stream_timeout(SHORT_TIMEOUT).await {
@@ -1160,7 +1205,10 @@ async fn remote_stream_reset_updates_reason_stats_on_both_sides() {
 #[tokio::test]
 async fn session_abort_propagates_application_error_to_peer() {
     let pair = Pair::new().await;
-    pair.client.close_with_error(1234, "client abort");
+    pair.client
+        .close_with_error(1234, "client abort")
+        .await
+        .unwrap();
     let err = tokio::time::timeout(STREAM_TIMEOUT, pair.server.wait())
         .await
         .unwrap()
@@ -1175,14 +1223,29 @@ async fn session_abort_propagates_application_error_to_peer() {
 }
 
 #[tokio::test]
+async fn session_close_with_error_rejects_invalid_code_without_closing() {
+    let pair = Pair::new().await;
+    let err = pair
+        .client
+        .close_with_error(zmux::MAX_VARINT62 + 1, "too large")
+        .await
+        .unwrap_err();
+    assert_eq!(err.scope(), zmux::ErrorScope::Session);
+    assert_eq!(err.source(), zmux::ErrorSource::Local);
+    assert_eq!(err.operation(), zmux::ErrorOperation::Close);
+    assert!(!pair.client.is_closed());
+    pair.close().await;
+}
+
+#[tokio::test]
 async fn graceful_session_close_waits_successfully_and_blocks_new_opens() {
     let pair = Pair::new().await;
-    pair.client.close();
+    pair.client.close().await.unwrap();
     tokio::time::timeout(STREAM_TIMEOUT, pair.client.wait())
         .await
         .unwrap()
         .unwrap();
-    pair.client.close();
+    pair.client.close().await.unwrap();
 
     let err = match pair.client.open_stream().await {
         Ok(_) => panic!("open_stream succeeded after local session close"),

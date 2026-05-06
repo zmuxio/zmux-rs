@@ -42,7 +42,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-If the workflow fails before publishing, fix the issue, delete the failed remote tag, retag the fixed commit, and push again. crates.io versions are immutable after publication.
+If the workflow fails before publishing, fix the issue, delete the failed remote tag, retag the fixed commit, and push again. If `zmux` was published but `zmux-quinn` was not, rerun the workflow from the same tag after fixing the adapter-side problem; already published crate versions are skipped. crates.io versions are immutable after publication.
 
 After the workflow succeeds:
 

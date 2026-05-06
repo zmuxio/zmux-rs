@@ -17,8 +17,8 @@ use crate::frame::{
 use crate::payload::parse_data_payload_metadata_offset;
 use crate::protocol::EXT_PRIORITY_UPDATE;
 use crate::settings::SchedulerHint;
-use crate::varint::parse_varint;
-use std::collections::HashSet;
+use crate::varint::{parse_varint, PackedVarint};
+use std::collections::{hash_map::Entry, HashSet};
 use std::io::{ErrorKind, IoSlice, Write};
 use std::sync::Arc;
 use std::thread;
@@ -30,7 +30,7 @@ where
 {
     thread::spawn(move || {
         let _close_on_exit = TransportCloseOnExit {
-            inner: inner.clone(),
+            inner: Arc::clone(&inner),
         };
         let mut encoded = Vec::new();
         let mut encoded_frames = Vec::new();
@@ -130,8 +130,10 @@ where
             let write_result = if should_use_vectored_batch(&stats) {
                 write_encoded_frames_vectored(&mut writer, &encoded_frames).map_err(Error::from)
             } else {
-                append_encoded_frames(&encoded_frames, stats.encoded_bytes, &mut encoded)
-                    .and_then(|()| writer.write_all(&encoded).map_err(Error::from))
+                match append_encoded_frames(&encoded_frames, stats.encoded_bytes, &mut encoded) {
+                    Ok(()) => writer.write_all(&encoded).map_err(Error::from),
+                    Err(err) => Err(err),
+                }
             };
             if let Err(err) = write_result {
                 remove_inflight_data(&inner, &stats.data_cost_by_stream);
@@ -151,8 +153,8 @@ where
             clear_written_batch_scratch(&mut encoded, &mut encoded_frames, &stats);
             remove_inflight_data(&inner, &stats.data_cost_by_stream);
             let opened_count = opened_streams.len();
-            if opened_events.try_reserve(opened_count).is_err()
-                || pending_priorities.try_reserve(opened_count).is_err()
+            if !reserve_vec_capacity(&mut opened_events, opened_count)
+                || !reserve_vec_capacity(&mut pending_priorities, opened_count)
             {
                 let err = Error::local("zmux: stream-open event allocation failed");
                 complete_write_completions(&mut write_completions, Err(err.clone()));
@@ -249,34 +251,32 @@ fn next_writer_batch(inner: &Arc<Inner>, batch: &mut Vec<WriteJob>) -> bool {
                 fail_session(inner, err);
                 continue;
             }
-            Ok(action) => match action {
-                KeepaliveAction::SendPing(payload) => {
-                    if let Err(err) = inner.force_queue_frame(Frame {
-                        frame_type: FrameType::Ping,
-                        flags: 0,
-                        stream_id: 0,
-                        payload,
-                    }) {
-                        clear_unsent_keepalive_ping(inner);
-                        if err.is_session_closed() {
-                            return false;
-                        }
-                        fail_session(inner, err);
+            Ok(KeepaliveAction::SendPing(payload)) => {
+                if let Err(err) = inner.force_queue_frame(Frame {
+                    frame_type: FrameType::Ping,
+                    flags: 0,
+                    stream_id: 0,
+                    payload,
+                }) {
+                    clear_unsent_keepalive_ping(inner);
+                    if err.is_session_closed() {
+                        return false;
                     }
-                    continue;
+                    fail_session(inner, err);
                 }
-                KeepaliveAction::Timeout => {
-                    close_for_idle_timeout(inner);
-                    continue;
+                continue;
+            }
+            Ok(KeepaliveAction::Timeout) => {
+                close_for_idle_timeout(inner);
+                continue;
+            }
+            Ok(KeepaliveAction::Wait(wait)) => {
+                match inner.write_queue.pop_batch_wait_into(batch, wait) {
+                    WriteQueuePopStatus::Batch => return true,
+                    WriteQueuePopStatus::TimedOut => continue,
+                    WriteQueuePopStatus::Closed => return false,
                 }
-                KeepaliveAction::Wait(wait) => {
-                    match inner.write_queue.pop_batch_wait_into(batch, wait) {
-                        WriteQueuePopStatus::Batch => return true,
-                        WriteQueuePopStatus::TimedOut => continue,
-                        WriteQueuePopStatus::Closed => return false,
-                    }
-                }
-            },
+            }
         }
     }
 }
@@ -304,34 +304,31 @@ fn encode_batch(
         stats,
         completions,
     } = scratch;
-    let frame_count = batch.iter().try_fold(0usize, |sum, job| {
-        sum.checked_add(job_frame_count(job))
+    let frame_count = batch.iter().try_fold(0usize, |frame_count, job| {
+        frame_count
+            .checked_add(job_frame_count(job))
             .ok_or_else(|| Error::frame_size("write batch frame count overflow"))
     })?;
-    encoded
-        .try_reserve(frame_count)
-        .map_err(|_| Error::local("zmux: encoded frame batch allocation failed"))?;
-    opened_streams
-        .try_reserve(frame_count)
-        .map_err(|_| Error::local("zmux: opened stream batch allocation failed"))?;
-    stats
-        .data_cost_by_stream
-        .try_reserve(frame_count)
-        .map_err(|_| Error::local("zmux: write accounting allocation failed"))?;
-    stats
-        .data_frame_count_by_stream
-        .try_reserve(frame_count)
-        .map_err(|_| Error::local("zmux: write accounting allocation failed"))?;
-    stats
-        .terminal_frame_count_by_stream
-        .try_reserve(frame_count)
-        .map_err(|_| Error::local("zmux: write accounting allocation failed"))?;
+    if !reserve_vec_capacity(encoded, frame_count) {
+        return Err(Error::local("zmux: encoded frame batch allocation failed"));
+    }
+    if !reserve_vec_capacity(opened_streams, frame_count) {
+        return Err(Error::local("zmux: opened stream batch allocation failed"));
+    }
+    if !reserve_vec_capacity(&mut stats.data_cost_by_stream, frame_count)
+        || !reserve_vec_capacity(&mut stats.data_frame_count_by_stream, frame_count)
+        || !reserve_vec_capacity(&mut stats.terminal_frame_count_by_stream, frame_count)
+    {
+        return Err(Error::local("zmux: write accounting allocation failed"));
+    }
+    let mut stream_id_cache: Option<PackedVarint> = None;
     for job in batch.drain(..) {
         match job {
             WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => {
                 encode_frame(
                     frame,
                     limits,
+                    &mut stream_id_cache,
                     encoded,
                     opened_streams,
                     opened_stream_seen,
@@ -343,6 +340,7 @@ fn encode_batch(
                     encode_frame(
                         frame,
                         limits,
+                        &mut stream_id_cache,
                         encoded,
                         opened_streams,
                         opened_stream_seen,
@@ -356,6 +354,7 @@ fn encode_batch(
                     encode_frame(
                         frame,
                         limits,
+                        &mut stream_id_cache,
                         encoded,
                         opened_streams,
                         opened_stream_seen,
@@ -439,6 +438,7 @@ struct WritableFrameDecision {
 }
 
 impl WritableFrameDecision {
+    #[inline]
     fn blocked(stream_id: u64) -> Self {
         Self {
             stream_id,
@@ -468,6 +468,9 @@ fn retain_writable_job(
             let dropped_data_frame =
                 retain_writable_frames(inner, &mut tracked.frames, dropped, writable_cache);
             if tracked.frames.is_empty() || dropped_data_frame {
+                if dropped_data_frame {
+                    note_dropped_frame_data(dropped, &tracked.frames);
+                }
                 tracked
                     .completion
                     .complete_err(Error::local("zmux: queued write is no longer writable"));
@@ -487,30 +490,32 @@ fn retain_writable_frames(
 ) -> bool {
     let mut dropped_data_frame = false;
     let mut opening_priority_stream = None;
-    let has_priority_before_data_candidate = frames.windows(2).any(|pair| {
-        frame_is_priority_update(&pair[0])
-            && pair[1].frame_type == FrameType::Data
-            && pair[1].stream_id == pair[0].stream_id
-    });
-    let mut priority_before_data = Vec::new();
-    if has_priority_before_data_candidate {
-        priority_before_data.reserve_exact(frames.len());
-        for index in 0..frames.len() {
-            priority_before_data.push(priority_update_allowed_before_following_data(
-                inner,
-                frames,
-                index,
-                writable_cache,
-            ));
+    let mut has_priority_before_data_candidate = has_priority_update_before_data_candidate(frames);
+    let priority_before_data = if has_priority_before_data_candidate {
+        let mut priority_before_data = Vec::new();
+        if priority_before_data.try_reserve(frames.len()).is_ok() {
+            for index in 0..frames.len() {
+                priority_before_data.push(priority_update_allowed_before_following_data(
+                    inner,
+                    frames,
+                    index,
+                    writable_cache,
+                ));
+            }
+        } else {
+            has_priority_before_data_candidate = false;
         }
-    }
+        priority_before_data
+    } else {
+        Vec::new()
+    };
     let mut index = 0usize;
     frames.retain(|frame| {
         let allow_opening_priority_update =
             frame_is_priority_update(frame) && opening_priority_stream == Some(frame.stream_id);
-        let allow_priority_before_data = has_priority_before_data_candidate
-            && priority_before_data.get(index).copied().unwrap_or(false);
-        index = index.saturating_add(1);
+        let allow_priority_before_data =
+            has_priority_before_data_candidate && priority_before_data[index];
+        index += 1;
         let keep = retain_writable_frame(
             inner,
             frame,
@@ -525,6 +530,20 @@ fn retain_writable_frames(
     dropped_data_frame
 }
 
+fn has_priority_update_before_data_candidate(frames: &[Frame]) -> bool {
+    for pair in frames.windows(2) {
+        let priority = &pair[0];
+        let data = &pair[1];
+        if frame_is_priority_update(priority)
+            && data.frame_type == FrameType::Data
+            && data.stream_id == priority.stream_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn priority_update_allowed_before_following_data(
     inner: &Arc<Inner>,
     frames: &[Frame],
@@ -537,7 +556,7 @@ fn priority_update_allowed_before_following_data(
     if !frame_is_priority_update(frame) {
         return false;
     }
-    let Some(next) = frames.get(index.saturating_add(1)) else {
+    let Some(next) = frames.get(index + 1) else {
         return false;
     };
     if next.frame_type != FrameType::Data || next.stream_id != frame.stream_id {
@@ -588,12 +607,10 @@ fn writable_frame_decision(
     stream_id: u64,
     writable_cache: &mut Vec<WritableFrameDecision>,
 ) -> WritableFrameDecision {
-    if let Some(decision) = writable_cache
-        .iter()
-        .find(|decision| decision.stream_id == stream_id)
-        .copied()
-    {
-        return decision;
+    for decision in writable_cache.iter() {
+        if decision.stream_id == stream_id {
+            return *decision;
+        }
     }
     let decision = stream_writable_decision(inner, stream_id);
     writable_cache.push(decision);
@@ -612,25 +629,27 @@ fn stream_writable_decision(inner: &Arc<Inner>, stream_id: u64) -> WritableFrame
         return WritableFrameDecision::blocked(stream_id);
     };
     let state = stream.state.lock().unwrap();
-    let data = state.aborted.is_none() && state.send_reset.is_none();
-    let priority_update_non_terminal =
-        stream.local_send && state.aborted.is_none() && state.stopped_by_peer.is_none();
+    let aborted = state.aborted.is_some();
+    let stopped_by_peer = state.stopped_by_peer.is_some();
+    let send_reset = state.send_reset.is_some();
+    let data = !aborted && !send_reset;
+    let priority_update_non_terminal = stream.local_send && !aborted && !stopped_by_peer;
     let priority_update = priority_update_send_state_allows(
         stream.local_send,
         stream.opened_locally,
         state.peer_visible,
-        state.aborted.is_some(),
-        state.stopped_by_peer.is_some(),
+        aborted,
+        stopped_by_peer,
         state.send_fin,
-        state.send_reset.is_some(),
+        send_reset,
     );
     let priority_update_before_data = priority_update_non_terminal
-        && state.send_reset.is_none()
+        && !send_reset
         && stream.opened_locally
         && state.opened_on_wire
         && !state.peer_visible;
     let priority_update_before_fin = priority_update_non_terminal
-        && state.send_reset.is_none()
+        && !send_reset
         && (!stream.opened_locally || state.opened_on_wire);
     WritableFrameDecision {
         stream_id,
@@ -641,6 +660,7 @@ fn stream_writable_decision(inner: &Arc<Inner>, stream_id: u64) -> WritableFrame
     }
 }
 
+#[inline]
 fn priority_update_send_state_allows(
     local_send: bool,
     opened_locally: bool,
@@ -659,11 +679,21 @@ fn priority_update_send_state_allows(
 }
 
 fn note_dropped_data(dropped: &mut Vec<(u64, usize, u64)>, stream_id: u64, bytes: u64) {
-    if let Some((_, frames, total)) = dropped.iter_mut().find(|(id, _, _)| *id == stream_id) {
-        *frames = frames.saturating_add(1);
-        *total = total.saturating_add(bytes);
-    } else {
-        dropped.push((stream_id, 1, bytes));
+    for (id, frames, total) in dropped.iter_mut() {
+        if *id == stream_id {
+            *frames = frames.saturating_add(1);
+            *total = total.saturating_add(bytes);
+            return;
+        }
+    }
+    dropped.push((stream_id, 1, bytes));
+}
+
+fn note_dropped_frame_data(dropped: &mut Vec<(u64, usize, u64)>, frames: &[Frame]) {
+    for frame in frames {
+        if frame.frame_type == FrameType::Data {
+            note_dropped_data(dropped, frame.stream_id, frame_data_bytes(frame));
+        }
     }
 }
 
@@ -681,6 +711,10 @@ fn release_dropped_data(inner: &Arc<Inner>, dropped: &[(u64, usize, u64)]) {
         let released = (*bytes).min(stream_state.send_used);
         stream_state.send_used = stream_state.send_used.saturating_sub(released);
         conn_state.send_session_used = conn_state.send_session_used.saturating_sub(released);
+        stream_state.send_blocked_at = None;
+        if released != 0 {
+            conn_state.send_session_blocked_at = None;
+        }
         maybe_release_active_count(&mut conn_state, &stream, &mut stream_state);
         drop(stream_state);
         stream.cond.notify_all();
@@ -689,6 +723,7 @@ fn release_dropped_data(inner: &Arc<Inner>, dropped: &[(u64, usize, u64)]) {
     inner.cond.notify_all();
 }
 
+#[inline]
 fn job_frame_count(job: &WriteJob) -> usize {
     match job {
         WriteJob::Frame(_) | WriteJob::GracefulClose(_) => 1,
@@ -713,7 +748,7 @@ struct EncodedBatchStats {
 
 impl EncodedBatchStats {
     fn clear(&mut self) {
-        let recent_frames = usize::try_from(self.frames).unwrap_or(usize::MAX);
+        let recent_frames = u64_to_usize_saturating(self.frames);
         self.frames = 0;
         self.close_frames = 0;
         self.encoded_bytes = 0;
@@ -810,7 +845,7 @@ fn order_batch_frames(
     }
 
     order.clear();
-    if order.capacity() < batch.len() && order.try_reserve(batch.len()).is_err() {
+    if !reserve_vec_capacity(order, batch.len()) {
         return;
     }
     order.extend(0..batch.len());
@@ -849,6 +884,7 @@ fn apply_order_if_needed(batch: &mut [WriteJob], order: &[usize], inverse_order:
     let _ = apply_order_in_place(batch, order, inverse_order);
 }
 
+#[inline]
 fn job_is_ordered_tail(job: &WriteJob) -> bool {
     matches!(
         job,
@@ -857,10 +893,12 @@ fn job_is_ordered_tail(job: &WriteJob) -> bool {
 }
 
 fn order_is_identity(order: &[usize]) -> bool {
-    order
-        .iter()
-        .enumerate()
-        .all(|(idx, ordered)| idx == *ordered)
+    for (idx, &ordered) in order.iter().enumerate() {
+        if idx != ordered {
+            return false;
+        }
+    }
+    true
 }
 
 fn order_with_scheduler(
@@ -873,7 +911,7 @@ fn order_with_scheduler(
     order.clear();
     let group_fair = inner.peer_preface.settings.scheduler_hints == SchedulerHint::GroupFair;
     items.clear();
-    if items.try_reserve(jobs.len()).is_err() {
+    if !reserve_vec_capacity(items, jobs.len()) {
         return;
     }
     let mut state = inner.state.lock().unwrap();
@@ -883,15 +921,11 @@ fn order_with_scheduler(
         let mut stream = StreamMeta::default();
         if request.stream_scoped {
             request.group_key = GroupKey::stream(request.stream_id);
-            if let Some((priority, group)) =
-                state.streams.get(&request.stream_id).map(|stream_inner| {
-                    let stream_state = stream_inner.state.lock().unwrap();
-                    (
-                        stream_state.metadata.priority.unwrap_or(0),
-                        stream_state.metadata.group,
-                    )
-                })
-            {
+            if let Some(stream_inner) = state.streams.get(&request.stream_id) {
+                let stream_state = stream_inner.state.lock().unwrap();
+                let priority = stream_state.metadata.priority.unwrap_or(0);
+                let group = stream_state.metadata.group;
+                drop(stream_state);
                 stream.priority = priority;
                 if !urgent {
                     request.group_key =
@@ -928,7 +962,7 @@ fn apply_order_in_place(
         return false;
     }
     inverse_order.clear();
-    if inverse_order.try_reserve(order.len()).is_err() {
+    if !reserve_vec_capacity(inverse_order, order.len()) {
         return false;
     }
     inverse_order.resize(order.len(), usize::MAX);
@@ -952,16 +986,33 @@ fn apply_order_in_place(
 }
 
 fn same_stream_burst_keeps_order(jobs: &[WriteJob]) -> bool {
-    let Some(first) = jobs.first() else {
+    let Some(first) = jobs.first().and_then(job_same_stream_fast_path_meta) else {
         return false;
     };
-    let first = classify_job_for_scheduler(first);
-    if !first.stream_scoped || first.is_priority_update {
+    if first.is_priority_update {
         return false;
     }
-    jobs.iter().skip(1).all(|job| {
-        let request = classify_job_for_scheduler(job);
-        request.stream_scoped && !request.is_priority_update && request.stream_id == first.stream_id
+    for job in &jobs[1..] {
+        let Some(request) = job_same_stream_fast_path_meta(job) else {
+            return false;
+        };
+        if request.is_priority_update || request.stream_id != first.stream_id {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct SameStreamFastPathMeta {
+    stream_id: u64,
+    is_priority_update: bool,
+}
+
+fn job_same_stream_fast_path_meta(job: &WriteJob) -> Option<SameStreamFastPathMeta> {
+    Some(SameStreamFastPathMeta {
+        stream_id: job_stream_scope(job)?,
+        is_priority_update: job_is_priority_update(job),
     })
 }
 
@@ -983,16 +1034,21 @@ fn classify_job_for_scheduler(job: &WriteJob) -> RequestMeta {
 fn job_cost(job: &WriteJob) -> i64 {
     let cost = match job {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => frame_cost(frame),
-        WriteJob::Frames(frames) => frames
-            .iter()
-            .fold(0usize, |sum, frame| sum.saturating_add(frame_cost(frame))),
-        WriteJob::TrackedFrames(tracked) => tracked
-            .frames
-            .iter()
-            .fold(0usize, |sum, frame| sum.saturating_add(frame_cost(frame))),
+        WriteJob::Frames(frames) => frames_cost(frames),
+        WriteJob::TrackedFrames(tracked) => frames_cost(&tracked.frames),
         WriteJob::Shutdown | WriteJob::DrainShutdown => 1,
     };
-    i64::try_from(cost.max(1)).unwrap_or(i64::MAX)
+    let max = i64::MAX as usize;
+    cost.clamp(1, max) as i64
+}
+
+#[inline]
+fn frames_cost(frames: &[Frame]) -> usize {
+    let mut cost = 0usize;
+    for frame in frames {
+        cost = cost.saturating_add(frame_cost(frame));
+    }
+    cost
 }
 
 fn frame_cost(frame: &Frame) -> usize {
@@ -1005,19 +1061,22 @@ fn frame_cost(frame: &Frame) -> usize {
 fn job_urgency_rank(job: &WriteJob) -> i32 {
     match job {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => frame_urgency_rank(frame),
-        WriteJob::Frames(frames) => frames
-            .iter()
-            .map(frame_urgency_rank)
-            .min()
-            .unwrap_or(DEFAULT_URGENCY_RANK),
-        WriteJob::TrackedFrames(tracked) => tracked
-            .frames
-            .iter()
-            .map(frame_urgency_rank)
-            .min()
-            .unwrap_or(DEFAULT_URGENCY_RANK),
+        WriteJob::Frames(frames) => frames_min_urgency_rank(frames),
+        WriteJob::TrackedFrames(tracked) => frames_min_urgency_rank(&tracked.frames),
         WriteJob::Shutdown | WriteJob::DrainShutdown => 0,
     }
+}
+
+#[inline]
+fn frames_min_urgency_rank(frames: &[Frame]) -> i32 {
+    let mut rank = DEFAULT_URGENCY_RANK;
+    for frame in frames {
+        rank = rank.min(frame_urgency_rank(frame));
+        if rank == 0 {
+            break;
+        }
+    }
+    rank
 }
 
 const DEFAULT_URGENCY_RANK: i32 = 100;
@@ -1043,11 +1102,22 @@ fn job_is_urgent(job: &WriteJob) -> bool {
         WriteJob::Shutdown => true,
         WriteJob::DrainShutdown | WriteJob::GracefulClose(_) => false,
         WriteJob::Frame(frame) => frame_is_urgent(frame),
-        WriteJob::Frames(frames) => !frames.is_empty() && frames.iter().all(frame_is_urgent),
-        WriteJob::TrackedFrames(tracked) => {
-            !tracked.frames.is_empty() && tracked.frames.iter().all(frame_is_urgent)
+        WriteJob::Frames(frames) => frames_are_all_urgent(frames),
+        WriteJob::TrackedFrames(tracked) => frames_are_all_urgent(&tracked.frames),
+    }
+}
+
+#[inline]
+fn frames_are_all_urgent(frames: &[Frame]) -> bool {
+    if frames.is_empty() {
+        return false;
+    }
+    for frame in frames {
+        if !frame_is_urgent(frame) {
+            return false;
         }
     }
+    true
 }
 
 fn frame_is_urgent(frame: &Frame) -> bool {
@@ -1068,39 +1138,32 @@ fn frame_is_urgent(frame: &Frame) -> bool {
 fn job_stream_scope(job: &WriteJob) -> Option<u64> {
     match job {
         WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => frame_stream_scope(frame),
-        WriteJob::Frames(frames) => {
-            let mut stream_id = None;
-            for frame in frames {
-                let id = frame_stream_scope(frame)?;
-                match stream_id {
-                    Some(existing) if existing != id => return None,
-                    Some(_) => {}
-                    None => stream_id = Some(id),
-                }
-            }
-            stream_id
-        }
-        WriteJob::TrackedFrames(tracked) => {
-            let mut stream_id = None;
-            for frame in &tracked.frames {
-                let id = frame_stream_scope(frame)?;
-                match stream_id {
-                    Some(existing) if existing != id => return None,
-                    Some(_) => {}
-                    None => stream_id = Some(id),
-                }
-            }
-            stream_id
-        }
+        WriteJob::Frames(frames) => frames_stream_scope(frames),
+        WriteJob::TrackedFrames(tracked) => frames_stream_scope(&tracked.frames),
         WriteJob::Shutdown | WriteJob::DrainShutdown => None,
     }
 }
 
+#[inline]
+fn frames_stream_scope(frames: &[Frame]) -> Option<u64> {
+    let mut stream_id = None;
+    for frame in frames {
+        let id = frame_stream_scope(frame)?;
+        match stream_id {
+            Some(existing) if existing != id => return None,
+            Some(_) => {}
+            None => stream_id = Some(id),
+        }
+    }
+    stream_id
+}
+
+#[inline]
 fn frame_stream_scope(frame: &Frame) -> Option<u64> {
     if frame.stream_id == 0 {
         return None;
     }
-    matches!(
+    if matches!(
         frame.frame_type,
         FrameType::Data
             | FrameType::MaxData
@@ -1109,8 +1172,11 @@ fn frame_stream_scope(frame: &Frame) -> Option<u64> {
             | FrameType::Reset
             | FrameType::Abort
             | FrameType::Ext
-    )
-    .then_some(frame.stream_id)
+    ) {
+        Some(frame.stream_id)
+    } else {
+        None
+    }
 }
 
 fn job_is_priority_update(job: &WriteJob) -> bool {
@@ -1134,6 +1200,7 @@ fn frame_is_priority_update(frame: &Frame) -> bool {
 fn encode_frame(
     frame: Frame,
     limits: Limits,
+    stream_id_cache: &mut Option<PackedVarint>,
     encoded: &mut Vec<EncodedFrame>,
     opened_streams: &mut Vec<u64>,
     opened_stream_seen: &mut HashSet<u64>,
@@ -1144,7 +1211,8 @@ fn encode_frame(
     let data_bytes = frame_data_bytes(&frame);
     let payload_len = frame.payload.len();
     let mut header = [0u8; MAX_FRAME_HEADER_LEN];
-    let header_len = frame.encode_header_with_limits(limits, &mut header)?;
+    let header_len =
+        frame.encode_header_with_stream_id_cache(limits, stream_id_cache, &mut header)?;
     let encoded_len = header_len
         .checked_add(payload_len)
         .ok_or_else(|| Error::frame_size("write batch too large"))?;
@@ -1198,6 +1266,7 @@ const MAX_RETAINED_ACCOUNTING_ENTRIES: usize = 4096;
 const SCRATCH_RETAIN_FACTOR: usize = 4;
 const OPENED_STREAM_LINEAR_DEDUP_LIMIT: usize = 64;
 
+#[inline]
 fn should_use_vectored_batch(stats: &EncodedBatchStats) -> bool {
     stats.payload_bytes >= MIN_VECTORED_PAYLOAD_BYTES
         && stats.segments > 0
@@ -1211,9 +1280,9 @@ fn append_encoded_frames(
     encoded: &mut Vec<u8>,
 ) -> Result<()> {
     encoded.clear();
-    encoded
-        .try_reserve(encoded_bytes)
-        .map_err(|_| Error::local("zmux: encoded write batch allocation failed"))?;
+    if !reserve_vec_capacity(encoded, encoded_bytes) {
+        return Err(Error::local("zmux: encoded write batch allocation failed"));
+    }
     for frame in frames {
         encoded.extend_from_slice(&frame.header[..frame.header_len as usize]);
         encoded.extend_from_slice(&frame.payload);
@@ -1239,7 +1308,7 @@ fn clear_written_batch_scratch(
     );
     trim_vec_capacity(
         encoded_frames,
-        usize::try_from(stats.frames).unwrap_or(usize::MAX),
+        u64_to_usize_saturating(stats.frames),
         MIN_RETAINED_BATCH_FRAMES,
         usize::MAX,
     );
@@ -1287,6 +1356,25 @@ fn trim_hashset_capacity<T: Eq + std::hash::Hash>(
     if values.capacity() > retain_limit {
         values.shrink_to(retain_limit);
     }
+}
+
+#[inline]
+fn reserve_vec_capacity<T>(values: &mut Vec<T>, capacity: usize) -> bool {
+    if values.capacity() >= capacity {
+        return true;
+    }
+    values.try_reserve(capacity - values.len()).is_ok()
+}
+
+#[inline]
+fn reserve_hash_set_capacity<T: Eq + std::hash::Hash>(
+    values: &mut HashSet<T>,
+    capacity: usize,
+) -> bool {
+    if values.capacity() >= capacity {
+        return true;
+    }
+    values.try_reserve(capacity - values.len()).is_ok()
 }
 
 fn write_encoded_frames_vectored<W: Write>(
@@ -1354,7 +1442,7 @@ fn advance_encoded_position(
 ) {
     while *frame_idx < frames.len() && written > 0 {
         let part = encoded_part(&frames[*frame_idx], *part_idx);
-        let remaining = part.len().saturating_sub(*offset);
+        let remaining = part.len() - *offset;
         if written < remaining {
             *offset += written;
             return;
@@ -1386,6 +1474,7 @@ fn skip_empty_parts(
     }
 }
 
+#[inline]
 fn encoded_part(frame: &EncodedFrame, part_idx: usize) -> &[u8] {
     if part_idx == 0 {
         &frame.header[..frame.header_len as usize]
@@ -1411,13 +1500,16 @@ fn remove_inflight_data(inner: &Arc<Inner>, data: &[(u64, usize)]) {
     }
     let mut state = inner.state.lock().unwrap();
     for (stream_id, bytes) in data {
-        let mut remove = false;
-        if let Some(entry) = state.inflight_data_by_stream.get_mut(stream_id) {
-            *entry = entry.saturating_sub(*bytes);
-            remove = *entry == 0;
-        }
-        if remove {
-            state.inflight_data_by_stream.remove(stream_id);
+        match state.inflight_data_by_stream.entry(*stream_id) {
+            Entry::Occupied(mut entry) => {
+                let remaining = entry.get().saturating_sub(*bytes);
+                if remaining == 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = remaining;
+                }
+            }
+            Entry::Vacant(_) => {}
         }
     }
 }
@@ -1480,10 +1572,8 @@ fn add_stream_id_once(stream_ids: &mut Vec<u64>, seen: &mut HashSet<u64>, stream
         }
         return;
     }
-    if seen
-        .try_reserve(stream_ids.len().saturating_add(1))
-        .is_err()
-    {
+    let needed = stream_ids.len().saturating_add(1);
+    if !reserve_hash_set_capacity(seen, needed) {
         if !stream_ids.contains(&stream_id) {
             stream_ids.push(stream_id);
         }
@@ -1496,24 +1586,34 @@ fn add_stream_id_once(stream_ids: &mut Vec<u64>, seen: &mut HashSet<u64>, stream
     stream_ids.push(stream_id);
 }
 
+#[inline]
 fn frame_data_bytes(frame: &Frame) -> u64 {
     if frame.frame_type != FrameType::Data {
         return 0;
     }
+    let payload_len = frame.payload.len();
     let offset = if frame.flags & FRAME_FLAG_OPEN_METADATA != 0 {
-        parse_data_payload_metadata_offset(&frame.payload, frame.flags)
-            .map(|(_, _, offset)| offset)
-            .unwrap_or(frame.payload.len())
+        match parse_data_payload_metadata_offset(&frame.payload, frame.flags) {
+            Ok((_, _, offset)) => offset,
+            Err(_) => payload_len,
+        }
     } else {
         0
     };
-    usize_to_u64_saturating(frame.payload.len().saturating_sub(offset))
+    usize_to_u64_saturating(payload_len - offset)
 }
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
+#[inline]
+fn u64_to_usize_saturating(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+#[inline]
 fn frame_opens_local_stream(frame: &Frame) -> bool {
     frame.stream_id != 0 && matches!(frame.frame_type, FrameType::Data | FrameType::Abort)
 }

@@ -37,19 +37,20 @@ use crate::event::EventType;
 #[cfg(test)]
 use crate::frame::FRAME_FLAG_FIN;
 use crate::frame::{Frame, FrameType};
+use crate::open_send::{OpenRequest, OpenSend, WritePayload};
 use crate::payload::{
-    build_code_payload, build_goaway_payload, build_goaway_payload_capped,
+    build_code_payload, build_go_away_payload, build_go_away_payload_capped,
     build_open_metadata_prefix, normalize_stream_group, StreamMetadata,
 };
 use crate::preface::{negotiate_prefaces, read_preface, Negotiated, Preface};
 use crate::protocol::Role;
 use crate::stream_id::{
     first_local_stream_id, first_peer_stream_id, projected_local_open_id,
-    validate_goaway_watermark_creator, validate_goaway_watermark_for_direction,
+    validate_go_away_watermark_creator, validate_go_away_watermark_for_direction,
 };
 use crate::varint::MAX_VARINT62;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -64,15 +65,14 @@ const ESTABLISHMENT_EXPEDITE_TIMEOUT: Duration = Duration::from_millis(1);
 const CONN_READ_BUFFER_SIZE: usize = 512;
 const CLOSE_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(5);
 const CLOSE_DRAIN_RTT_SLACK: Duration = Duration::from_millis(100);
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
 
 fn session_result<T>(result: Result<T>, operation: ErrorOperation) -> Result<T> {
-    result.map_err(|err| {
+    result.map_err(|mut err| {
         if err.scope() == ErrorScope::Stream {
-            let err = if err.operation() == ErrorOperation::Unknown {
-                err.with_operation(operation)
-            } else {
-                err
-            };
+            if err.operation() == ErrorOperation::Unknown {
+                err = err.with_operation(operation);
+            }
             if err.direction() == ErrorDirection::Unknown {
                 err.with_direction(ErrorDirection::Both)
             } else {
@@ -84,12 +84,10 @@ fn session_result<T>(result: Result<T>, operation: ErrorOperation) -> Result<T> 
     })
 }
 
-fn establishment_error(err: Error) -> Error {
-    let err = if err.source() == ErrorSource::Unknown {
-        err.with_source(ErrorSource::Local)
-    } else {
-        err
-    };
+fn establishment_error(mut err: Error) -> Error {
+    if err.source() == ErrorSource::Unknown {
+        err = err.with_source(ErrorSource::Local);
+    }
     if err.termination_kind() == TerminationKind::Unknown {
         err.with_termination_kind(TerminationKind::SessionTermination)
     } else {
@@ -161,10 +159,10 @@ where
 {
     let (tx, rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let result = writer
-            .write_all(&payload)
-            .and_then(|_| writer.flush())
-            .map_err(Error::from);
+        let result = match writer.write_all(&payload) {
+            Ok(()) => writer.flush().map_err(Error::from),
+            Err(err) => Err(Error::from(err)),
+        };
         let _ = tx.send((writer, result));
     });
     PrefaceWriter { result: rx }
@@ -228,28 +226,25 @@ fn arm_establishment_read_timeout(
     control: Option<&dyn EstablishmentControl>,
     timeout: Duration,
 ) -> bool {
-    control
-        .and_then(|control| control.set_read_timeout(Some(timeout)).ok())
-        .is_some()
+    control.is_some_and(|control| control.set_read_timeout(Some(timeout)).is_ok())
 }
 
 fn arm_establishment_write_timeout(
     control: Option<&dyn EstablishmentControl>,
     timeout: Duration,
 ) -> bool {
-    control
-        .and_then(|control| control.set_write_timeout(Some(timeout)).ok())
-        .is_some()
+    control.is_some_and(|control| control.set_write_timeout(Some(timeout)).is_ok())
 }
 
 fn clear_establishment_read_timeout(
     control: Option<&dyn EstablishmentControl>,
     armed: bool,
 ) -> Result<()> {
-    if armed {
-        if let Some(control) = control {
-            control.set_read_timeout(None).map_err(Error::from)?;
-        }
+    if !armed {
+        return Ok(());
+    }
+    if let Some(control) = control {
+        control.set_read_timeout(None).map_err(Error::from)?;
     }
     Ok(())
 }
@@ -258,19 +253,21 @@ fn clear_establishment_write_timeout(
     control: Option<&dyn EstablishmentControl>,
     armed: bool,
 ) -> Result<()> {
-    if armed {
-        if let Some(control) = control {
-            control.set_write_timeout(None).map_err(Error::from)?;
-        }
+    if !armed {
+        return Ok(());
+    }
+    if let Some(control) = control {
+        control.set_write_timeout(None).map_err(Error::from)?;
     }
     Ok(())
 }
 
 fn expedite_establishment_write_timeout(control: Option<&dyn EstablishmentControl>, armed: bool) {
-    if armed {
-        if let Some(control) = control {
-            let _ = control.set_write_timeout(Some(ESTABLISHMENT_EXPEDITE_TIMEOUT));
-        }
+    if !armed {
+        return;
+    }
+    if let Some(control) = control {
+        let _ = control.set_write_timeout(Some(ESTABLISHMENT_EXPEDITE_TIMEOUT));
     }
 }
 
@@ -284,7 +281,11 @@ fn wait_timeout_for_control(
     control: Option<&dyn EstablishmentControl>,
     timeout: Duration,
 ) -> Option<Duration> {
-    control.is_some().then_some(timeout)
+    if control.is_some() {
+        Some(timeout)
+    } else {
+        None
+    }
 }
 
 fn finish_establishment_failure<W>(
@@ -313,32 +314,52 @@ fn finish_establishment_failure<W>(
             }
             close_establishment_transport(control);
         }
-        Ok((_writer, Err(_))) => {
-            close_establishment_transport(control);
-        }
-        Err(_) => {
+        Ok((_, Err(_))) | Err(_) => {
             close_establishment_transport(control);
         }
     }
 }
 
 impl Conn {
-    pub fn new<R, W>(reader: R, writer: W, config: Config) -> Result<Self>
+    pub fn new<R, W>(reader: R, writer: W) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::new_with_config(reader, writer, Config::default())
+    }
+
+    pub fn new_with_config<R, W>(reader: R, writer: W, config: Config) -> Result<Self>
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
         session_result(
-            Self::with_config(reader, writer, config),
+            Self::with_config_control(reader, writer, config, None, None, None, None),
             ErrorOperation::Open,
         )
     }
 
-    pub fn new_tcp(stream: TcpStream, config: Config) -> Result<Self> {
+    pub fn new_tcp(stream: TcpStream) -> Result<Self> {
+        Self::new_tcp_with_config(stream, Config::default())
+    }
+
+    pub fn new_tcp_with_config(stream: TcpStream, config: Config) -> Result<Self> {
         session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
     }
 
-    pub fn new_transport<R, W>(transport: DuplexTransport<R, W>, config: Config) -> Result<Self>
+    pub fn new_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::new_transport_with_config(transport, Config::default())
+    }
+
+    pub fn new_transport_with_config<R, W>(
+        transport: DuplexTransport<R, W>,
+        config: Config,
+    ) -> Result<Self>
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
@@ -349,12 +370,24 @@ impl Conn {
         )
     }
 
-    pub fn client_tcp(stream: TcpStream, mut config: Config) -> Result<Self> {
+    pub fn client_tcp(stream: TcpStream) -> Result<Self> {
+        Self::client_tcp_with_config(stream, Config::default())
+    }
+
+    pub fn client_tcp_with_config(stream: TcpStream, mut config: Config) -> Result<Self> {
         config.role = Role::Initiator;
         session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
     }
 
-    pub fn client_transport<R, W>(
+    pub fn client_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::client_transport_with_config(transport, Config::default())
+    }
+
+    pub fn client_transport_with_config<R, W>(
         transport: DuplexTransport<R, W>,
         mut config: Config,
     ) -> Result<Self>
@@ -369,12 +402,24 @@ impl Conn {
         )
     }
 
-    pub fn server_tcp(stream: TcpStream, mut config: Config) -> Result<Self> {
+    pub fn server_tcp(stream: TcpStream) -> Result<Self> {
+        Self::server_tcp_with_config(stream, Config::default())
+    }
+
+    pub fn server_tcp_with_config(stream: TcpStream, mut config: Config) -> Result<Self> {
         config.role = Role::Responder;
         session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
     }
 
-    pub fn server_transport<R, W>(
+    pub fn server_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::server_transport_with_config(transport, Config::default())
+    }
+
+    pub fn server_transport_with_config<R, W>(
         transport: DuplexTransport<R, W>,
         mut config: Config,
     ) -> Result<Self>
@@ -389,26 +434,42 @@ impl Conn {
         )
     }
 
-    pub fn client<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
+    pub fn client<R, W>(reader: R, writer: W) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::client_with_config(reader, writer, Config::default())
+    }
+
+    pub fn client_with_config<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
         config.role = Role::Initiator;
         session_result(
-            Self::with_config(reader, writer, config),
+            Self::with_config_control(reader, writer, config, None, None, None, None),
             ErrorOperation::Open,
         )
     }
 
-    pub fn server<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
+    pub fn server<R, W>(reader: R, writer: W) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::server_with_config(reader, writer, Config::default())
+    }
+
+    pub fn server_with_config<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
         config.role = Role::Responder;
         session_result(
-            Self::with_config(reader, writer, config),
+            Self::with_config_control(reader, writer, config, None, None, None, None),
             ErrorOperation::Open,
         )
     }
@@ -419,10 +480,6 @@ impl Conn {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr
-    }
-
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr()
     }
 
     fn with_tcp_config(stream: TcpStream, config: Config) -> Result<Self> {
@@ -472,14 +529,6 @@ impl Conn {
             local_addr,
             peer_addr,
         )
-    }
-
-    fn with_config<R, W>(reader: R, writer: W, config: Config) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        Self::with_config_control(reader, writer, config, None, None, None, None)
     }
 
     fn with_config_control<R, W>(
@@ -576,48 +625,53 @@ impl Conn {
         let local_settings = local_preface.settings;
         let peer_settings = peer_preface.settings;
 
-        let urgent_queue_max_bytes = config.urgent_queue_max_bytes.unwrap_or_else(|| {
-            default_urgent_queue_max_bytes(local_preface.settings, peer_preface.settings)
-        });
-        let per_stream_data_hwm = config
-            .per_stream_queued_data_high_watermark
-            .unwrap_or_else(|| {
-                default_per_stream_queued_data_high_watermark(
-                    local_preface.settings,
-                    peer_preface.settings,
-                )
-            })
-            .max(1);
-        let session_data_hwm = config
-            .session_queued_data_high_watermark
-            .unwrap_or_else(|| default_session_queued_data_high_watermark(per_stream_data_hwm))
-            .max(1);
-        let pending_control_budget = config.pending_control_bytes_budget.unwrap_or_else(|| {
-            default_pending_control_bytes_budget(peer_preface.settings, local_preface.settings)
-        });
-        let pending_priority_budget = config.pending_priority_bytes_budget.unwrap_or_else(|| {
-            default_pending_priority_bytes_budget(peer_preface.settings, local_preface.settings)
-        });
-        let inbound_control_bytes_budget = config
-            .inbound_control_bytes_budget
-            .unwrap_or_else(|| default_inbound_control_bytes_budget(local_preface.settings));
-        let inbound_ext_bytes_budget = config
-            .inbound_ext_bytes_budget
-            .unwrap_or_else(|| default_inbound_ext_bytes_budget(local_preface.settings));
-        let inbound_mixed_frame_budget = config.inbound_mixed_frame_budget.unwrap_or_else(|| {
-            config
+        let urgent_queue_max_bytes = match config.urgent_queue_max_bytes {
+            Some(bytes) => bytes,
+            None => default_urgent_queue_max_bytes(local_settings, peer_settings),
+        };
+        let per_stream_data_hwm = match config.per_stream_queued_data_high_watermark {
+            Some(bytes) => bytes,
+            None => default_per_stream_queued_data_high_watermark(local_settings, peer_settings),
+        }
+        .max(1);
+        let session_data_hwm = match config.session_queued_data_high_watermark {
+            Some(bytes) => bytes,
+            None => default_session_queued_data_high_watermark(per_stream_data_hwm),
+        }
+        .max(1);
+        let pending_control_budget = match config.pending_control_bytes_budget {
+            Some(bytes) => bytes,
+            None => default_pending_control_bytes_budget(peer_settings, local_settings),
+        };
+        let pending_priority_budget = match config.pending_priority_bytes_budget {
+            Some(bytes) => bytes,
+            None => default_pending_priority_bytes_budget(peer_settings, local_settings),
+        };
+        let inbound_control_bytes_budget = match config.inbound_control_bytes_budget {
+            Some(bytes) => bytes,
+            None => default_inbound_control_bytes_budget(local_settings),
+        };
+        let inbound_ext_bytes_budget = match config.inbound_ext_bytes_budget {
+            Some(bytes) => bytes,
+            None => default_inbound_ext_bytes_budget(local_settings),
+        };
+        let inbound_mixed_frame_budget = match config.inbound_mixed_frame_budget {
+            Some(frames) => frames,
+            None => config
                 .inbound_control_frame_budget
-                .max(config.inbound_ext_frame_budget)
-        });
-        let inbound_mixed_bytes_budget = config
-            .inbound_mixed_bytes_budget
-            .unwrap_or_else(|| inbound_control_bytes_budget.max(inbound_ext_bytes_budget));
+                .max(config.inbound_ext_frame_budget),
+        };
+        let inbound_mixed_bytes_budget = match config.inbound_mixed_bytes_budget {
+            Some(bytes) => bytes,
+            None => inbound_control_bytes_budget.max(inbound_ext_bytes_budget),
+        };
         let accept_backlog_limit = config
             .accept_backlog_limit
             .unwrap_or(DEFAULT_ACCEPT_BACKLOG_LIMIT);
-        let hidden_tombstone_limit = config
-            .hidden_control_opened_limit
-            .unwrap_or_else(|| hidden_control_opened_limit(accept_backlog_limit));
+        let hidden_tombstone_limit = match config.hidden_control_opened_limit {
+            Some(limit) => limit,
+            None => hidden_control_opened_limit(accept_backlog_limit),
+        };
         let write_queue = Arc::new(WriteQueue::new(WriteQueueLimits {
             max_bytes: config.write_queue_max_bytes,
             urgent_max_bytes: urgent_queue_max_bytes,
@@ -625,9 +679,7 @@ impl Conn {
             per_stream_data_max_bytes: per_stream_data_hwm,
             pending_control_max_bytes: pending_control_budget,
             pending_priority_max_bytes: pending_priority_budget,
-            max_batch_bytes: default_write_batch_cost_limit(
-                peer_preface.settings.max_frame_payload,
-            ),
+            max_batch_bytes: default_write_batch_cost_limit(peer_settings.max_frame_payload),
             max_batch_frames: config.write_batch_max_frames,
         }));
         let now = Instant::now();
@@ -640,7 +692,7 @@ impl Conn {
                 state: SessionState::Ready,
                 close_error: None,
                 peer_close_error: None,
-                peer_goaway_error: None,
+                peer_go_away_error: None,
                 session_closed_event_sent: false,
                 graceful_close_active: false,
                 ignore_peer_non_close: false,
@@ -665,10 +717,10 @@ impl Conn {
                 accept_bidi: VecDeque::new(),
                 accept_uni: VecDeque::new(),
                 accept_backlog_limit,
-                accept_limit_bidi: usize::try_from(local_settings.max_incoming_streams_bidi)
-                    .unwrap_or(usize::MAX),
-                accept_limit_uni: usize::try_from(local_settings.max_incoming_streams_uni)
-                    .unwrap_or(usize::MAX),
+                accept_limit_bidi: u64_to_usize_saturating(
+                    local_settings.max_incoming_streams_bidi,
+                ),
+                accept_limit_uni: u64_to_usize_saturating(local_settings.max_incoming_streams_uni),
                 accept_backlog_bytes: 0,
                 accept_backlog_bytes_limit: config.accept_backlog_bytes_limit.unwrap_or_else(
                     || default_accept_backlog_bytes_limit(local_settings.max_frame_payload),
@@ -707,9 +759,10 @@ impl Conn {
                 recv_replenish_retry: false,
                 late_data_per_stream_cap: config.late_data_per_stream_cap,
                 late_data_aggregate_received: 0,
-                late_data_aggregate_cap: config.late_data_aggregate_cap.unwrap_or_else(|| {
-                    default_late_data_aggregate_cap(local_settings.max_frame_payload)
-                }),
+                late_data_aggregate_cap: match config.late_data_aggregate_cap {
+                    Some(cap) => cap,
+                    None => default_late_data_aggregate_cap(local_settings.max_frame_payload),
+                },
                 ignored_control_window_start: None,
                 ignored_control_count: 0,
                 ignored_control_budget: config.ignored_control_budget,
@@ -769,11 +822,11 @@ impl Conn {
                 visible_terminal_churn_window_start: None,
                 visible_terminal_churn_count: 0,
                 visible_terminal_churn_budget: config.visible_terminal_churn_budget,
-                local_goaway_bidi: MAX_VARINT62,
-                local_goaway_uni: MAX_VARINT62,
-                local_goaway_issued: false,
-                peer_goaway_bidi: MAX_VARINT62,
-                peer_goaway_uni: MAX_VARINT62,
+                local_go_away_bidi: MAX_VARINT62,
+                local_go_away_uni: MAX_VARINT62,
+                local_go_away_issued: false,
+                peer_go_away_bidi: MAX_VARINT62,
+                peer_go_away_uni: MAX_VARINT62,
                 ping_waiter: None,
                 canceled_ping_payload: None,
                 keepalive_ping: None,
@@ -813,7 +866,7 @@ impl Conn {
             peer_preface,
             negotiated,
             close_drain_timeout: config.close_drain_timeout,
-            goaway_drain_interval: config.goaway_drain_interval,
+            go_away_drain_interval: config.go_away_drain_interval,
             session_memory_cap: config.session_memory_cap,
             session_data_high_watermark: session_data_hwm,
             per_stream_data_high_watermark: per_stream_data_hwm,
@@ -836,238 +889,108 @@ impl Conn {
         });
 
         initialize_keepalive_schedules(&inner, now);
-        spawn_writer(inner.clone(), writer);
+        spawn_writer(Arc::clone(&inner), writer);
         spawn_reader(
-            inner.clone(),
+            Arc::clone(&inner),
             io::BufReader::with_capacity(CONN_READ_BUFFER_SIZE, reader),
         );
         Ok(Self { inner })
     }
 
     pub fn open_stream(&self) -> Result<Stream> {
-        let stream = session_result(
-            self.open_stream_inner(true, OpenOptions::default()),
-            ErrorOperation::Open,
-        )?;
-        Ok(Stream { inner: stream })
-    }
-
-    pub fn open_stream_timeout(&self, timeout: Duration) -> Result<Stream> {
-        session_result(
-            ensure_positive_timeout("open", timeout),
-            ErrorOperation::Open,
-        )?;
-        self.open_stream()
+        self.open_stream_with(OpenRequest::new())
     }
 
     pub fn open_uni_stream(&self) -> Result<SendStream> {
-        let stream = session_result(
-            self.open_stream_inner(false, OpenOptions::default()),
-            ErrorOperation::Open,
-        )?;
-        Ok(SendStream { inner: stream })
+        self.open_uni_stream_with(OpenRequest::new())
     }
 
-    pub fn open_uni_stream_timeout(&self, timeout: Duration) -> Result<SendStream> {
-        session_result(
-            ensure_positive_timeout("open", timeout),
-            ErrorOperation::Open,
-        )?;
-        self.open_uni_stream()
-    }
-
-    pub fn open_stream_with_options(&self, opts: OpenOptions) -> Result<Stream> {
+    pub fn open_stream_with(&self, request: impl Into<OpenRequest>) -> Result<Stream> {
+        let (opts, timeout) = request.into().into_parts();
+        if let Some(timeout) = timeout {
+            session_result(
+                ensure_positive_timeout("open", timeout),
+                ErrorOperation::Open,
+            )?;
+        }
         let stream = session_result(self.open_stream_inner(true, opts), ErrorOperation::Open)?;
         Ok(Stream { inner: stream })
     }
 
-    pub fn open_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<Stream> {
-        session_result(
-            ensure_positive_timeout("open", timeout),
-            ErrorOperation::Open,
-        )?;
-        self.open_stream_with_options(opts)
-    }
-
-    pub fn open_uni_stream_with_options(&self, opts: OpenOptions) -> Result<SendStream> {
+    pub fn open_uni_stream_with(&self, request: impl Into<OpenRequest>) -> Result<SendStream> {
+        let (opts, timeout) = request.into().into_parts();
+        if let Some(timeout) = timeout {
+            session_result(
+                ensure_positive_timeout("open", timeout),
+                ErrorOperation::Open,
+            )?;
+        }
         let stream = session_result(self.open_stream_inner(false, opts), ErrorOperation::Open)?;
         Ok(SendStream { inner: stream })
     }
 
-    pub fn open_uni_stream_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        timeout: Duration,
-    ) -> Result<SendStream> {
-        session_result(
-            ensure_positive_timeout("open", timeout),
-            ErrorOperation::Open,
-        )?;
-        self.open_uni_stream_with_options(opts)
-    }
-
-    pub fn open_and_send(&self, data: &[u8]) -> Result<(Stream, usize)> {
-        self.open_and_send_with_options(OpenOptions::default(), data)
-    }
-
-    pub fn open_and_send_timeout(&self, data: &[u8], timeout: Duration) -> Result<(Stream, usize)> {
-        self.open_and_send_with_options_timeout(OpenOptions::default(), data, timeout)
-    }
-
-    pub fn open_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(Stream, usize)> {
-        let stream = self.open_stream_with_options(opts)?;
-        if data.is_empty() {
+    pub fn open_and_send<'a>(&self, request: impl Into<OpenSend<'a>>) -> Result<(Stream, usize)> {
+        let (opts, payload, timeout) = request.into().into_parts();
+        let requested = payload.checked_len()?;
+        let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            open = open.with_timeout(timeout);
+        }
+        let stream = self.open_stream_with(open)?;
+        if requested == 0 {
             return Ok((stream, 0));
         }
-        let n = stream.write(data)?;
-        Ok((stream, n))
+        let timeout = timeout
+            .map(|timeout| remaining_open_send_write_timeout(start, timeout))
+            .transpose()?;
+        let n = match (payload, timeout) {
+            (WritePayload::Bytes(data), Some(timeout)) => {
+                stream.write_all_timeout(WritePayload::Bytes(data), timeout)?;
+                requested
+            }
+            (WritePayload::Bytes(data), None) => {
+                stream.write_all(WritePayload::Bytes(data))?;
+                requested
+            }
+            (WritePayload::Vectored(parts), Some(timeout)) => {
+                stream.write_all_timeout(WritePayload::Vectored(parts), timeout)?;
+                requested
+            }
+            (WritePayload::Vectored(parts), None) => {
+                stream.write_all(WritePayload::Vectored(parts))?;
+                requested
+            }
+        };
+        Ok((stream, validate_open_send_progress(n, requested)?))
     }
 
-    pub fn open_and_send_with_options_timeout(
+    pub fn open_uni_and_send<'a>(
         &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(Stream, usize)> {
-        let deadline = session_result(timeout_deadline("open", timeout), ErrorOperation::Open)?;
-        let stream = self.open_stream_with_options_timeout(opts, timeout)?;
-        if data.is_empty() {
-            return Ok((stream, 0));
+        request: impl Into<OpenSend<'a>>,
+    ) -> Result<(SendStream, usize)> {
+        let (opts, payload, timeout) = request.into().into_parts();
+        let requested = payload.checked_len()?;
+        let start = Instant::now();
+        let mut open = OpenRequest::new().with_options(opts);
+        if let Some(timeout) = timeout {
+            open = open.with_timeout(timeout);
         }
-        let n = match remaining_timeout(deadline) {
-            Some(timeout) => stream.write_timeout(data, timeout)?,
-            None => stream.write(data)?,
+        let stream = self.open_uni_stream_with(open)?;
+        let timeout = timeout
+            .map(|timeout| remaining_open_send_write_timeout(start, timeout))
+            .transpose()?;
+        let n = match (payload, timeout) {
+            (WritePayload::Bytes(data), Some(timeout)) => {
+                stream.write_final_timeout(WritePayload::Bytes(data), timeout)?
+            }
+            (WritePayload::Bytes(data), None) => stream.write_final(WritePayload::Bytes(data))?,
+            (WritePayload::Vectored(parts), Some(timeout)) => {
+                stream.write_vectored_final_timeout(parts, timeout)?
+            }
+            (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts)?,
         };
-        Ok((stream, n))
-    }
-
-    pub fn open_and_send_vectored(&self, parts: &[IoSlice<'_>]) -> Result<(Stream, usize)> {
-        self.open_and_send_vectored_with_options(OpenOptions::default(), parts)
-    }
-
-    pub fn open_and_send_vectored_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(Stream, usize)> {
-        self.open_and_send_vectored_with_options_timeout(OpenOptions::default(), parts, timeout)
-    }
-
-    pub fn open_and_send_vectored_with_options(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(Stream, usize)> {
-        let total = checked_open_vectored_len(parts)?;
-        let stream = self.open_stream_with_options(opts)?;
-        if total == 0 {
-            return Ok((stream, 0));
-        }
-        let n = stream.write_vectored(parts)?;
-        Ok((stream, n))
-    }
-
-    pub fn open_and_send_vectored_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(Stream, usize)> {
-        let deadline = session_result(timeout_deadline("open", timeout), ErrorOperation::Open)?;
-        let total = checked_open_vectored_len(parts)?;
-        let stream = self.open_stream_with_options_timeout(opts, timeout)?;
-        if total == 0 {
-            return Ok((stream, 0));
-        }
-        let n = match remaining_timeout(deadline) {
-            Some(timeout) => stream.write_vectored_timeout(parts, timeout)?,
-            None => stream.write_vectored(parts)?,
-        };
-        Ok((stream, n))
-    }
-
-    pub fn open_uni_and_send(&self, data: &[u8]) -> Result<(SendStream, usize)> {
-        self.open_uni_and_send_with_options(OpenOptions::default(), data)
-    }
-
-    pub fn open_uni_and_send_timeout(
-        &self,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(SendStream, usize)> {
-        self.open_uni_and_send_with_options_timeout(OpenOptions::default(), data, timeout)
-    }
-
-    pub fn open_uni_and_send_with_options(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-    ) -> Result<(SendStream, usize)> {
-        let stream = self.open_uni_stream_with_options(opts)?;
-        let n = stream.write_final(data)?;
-        Ok((stream, n))
-    }
-
-    pub fn open_uni_and_send_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<(SendStream, usize)> {
-        let deadline = session_result(timeout_deadline("open", timeout), ErrorOperation::Open)?;
-        let stream = self.open_uni_stream_with_options_timeout(opts, timeout)?;
-        let n = match remaining_timeout(deadline) {
-            Some(timeout) => stream.write_final_timeout(data, timeout)?,
-            None => stream.write_final(data)?,
-        };
-        Ok((stream, n))
-    }
-
-    pub fn open_uni_and_send_vectored(&self, parts: &[IoSlice<'_>]) -> Result<(SendStream, usize)> {
-        self.open_uni_and_send_vectored_with_options(OpenOptions::default(), parts)
-    }
-
-    pub fn open_uni_and_send_vectored_timeout(
-        &self,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(SendStream, usize)> {
-        self.open_uni_and_send_vectored_with_options_timeout(OpenOptions::default(), parts, timeout)
-    }
-
-    pub fn open_uni_and_send_vectored_with_options(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-    ) -> Result<(SendStream, usize)> {
-        checked_open_vectored_len(parts)?;
-        let stream = self.open_uni_stream_with_options(opts)?;
-        let n = stream.write_vectored_final(parts)?;
-        Ok((stream, n))
-    }
-
-    pub fn open_uni_and_send_vectored_with_options_timeout(
-        &self,
-        opts: OpenOptions,
-        parts: &[IoSlice<'_>],
-        timeout: Duration,
-    ) -> Result<(SendStream, usize)> {
-        let deadline = session_result(timeout_deadline("open", timeout), ErrorOperation::Open)?;
-        checked_open_vectored_len(parts)?;
-        let stream = self.open_uni_stream_with_options_timeout(opts, timeout)?;
-        let n = match remaining_timeout(deadline) {
-            Some(timeout) => stream.write_vectored_final_timeout(parts, timeout)?,
-            None => stream.write_vectored_final(parts)?,
-        };
-        Ok((stream, n))
+        Ok((stream, validate_open_send_progress(n, requested)?))
     }
 
     fn open_stream_inner(&self, bidi: bool, opts: OpenOptions) -> Result<Arc<StreamInner>> {
@@ -1076,9 +999,9 @@ impl Conn {
         let caps = self.inner.negotiated.capabilities;
         let open_prefix = compact_retained_bytes(build_open_metadata_prefix(
             caps,
-            opts.initial_priority,
-            opts.initial_group,
-            &opts.open_info,
+            opts.initial_priority(),
+            opts.initial_group(),
+            opts.open_info(),
             peer_settings.max_frame_payload,
         )?);
 
@@ -1091,7 +1014,7 @@ impl Conn {
         let (next_id, goaway, queued, configured_cap, active_local, peer_stream_limit) = if bidi {
             (
                 state.next_local_bidi,
-                state.peer_goaway_bidi,
+                state.peer_go_away_bidi,
                 state.provisional_bidi.len(),
                 state.max_provisional_bidi,
                 state.active.local_bidi,
@@ -1100,7 +1023,7 @@ impl Conn {
         } else {
             (
                 state.next_local_uni,
-                state.peer_goaway_uni,
+                state.peer_go_away_uni,
                 state.provisional_uni.len(),
                 state.max_provisional_uni,
                 state.active.local_uni,
@@ -1133,13 +1056,14 @@ impl Conn {
             )
             .with_source(ErrorSource::Remote));
         }
-        if opts.open_info.len() > retained_open_info_available(&state) {
+        let open_info_len = opts.open_info().len();
+        if open_info_len > retained_open_info_available(&state) {
             return Err(
                 Error::new(ErrorCode::StreamLimit, "zmux: open_info budget exceeded")
                     .with_source(ErrorSource::Local),
             );
         }
-        let additional_retained_bytes = opts.open_info.len().saturating_add(open_prefix.len());
+        let additional_retained_bytes = open_info_len.saturating_add(open_prefix.len());
         ensure_local_open_memory_cap_locked(&self.inner, &state, additional_retained_bytes)?;
         let cap = configured_cap.min(available_by_goaway);
         if queued >= cap {
@@ -1147,11 +1071,11 @@ impl Conn {
                 state.provisional_open_limited_count.saturating_add(1);
             return Err(Error::local("zmux: provisional open limit reached"));
         }
-        let initial_priority = opts.initial_priority;
-        let initial_group = opts.initial_group;
-        let open_info = compact_retained_bytes(opts.open_info);
+        let (initial_priority, initial_group, open_info) = opts.into_parts();
+        let open_info = compact_retained_bytes(open_info);
+        let retained_open_info_bytes = open_info.len();
         let stream = Arc::new(StreamInner {
-            conn: self.inner.clone(),
+            conn: Arc::clone(&self.inner),
             id: Default::default(),
             bidi,
             opened_locally: true,
@@ -1190,7 +1114,7 @@ impl Conn {
                 late_data_cap: 0,
                 open_prefix,
                 open_info,
-                retained_open_info_bytes: 0,
+                retained_open_info_bytes,
                 metadata: StreamMetadata {
                     priority: initial_priority,
                     group: normalize_stream_group(initial_group),
@@ -1213,19 +1137,16 @@ impl Conn {
             cond: Condvar::new(),
         });
         if bidi {
-            state.provisional_bidi.push_back(stream.clone());
+            state.provisional_bidi.push_back(Arc::clone(&stream));
         } else {
-            state.provisional_uni.push_back(stream.clone());
+            state.provisional_uni.push_back(Arc::clone(&stream));
         }
-        {
-            let mut stream_state = stream.state.lock().unwrap();
-            if !stream_state.open_info.is_empty() {
-                stream_state.retained_open_info_bytes = stream_state.open_info.len();
-                state.retained_open_info_bytes = state
-                    .retained_open_info_bytes
-                    .saturating_add(stream_state.retained_open_info_bytes);
-            }
+        if retained_open_info_bytes != 0 {
+            state.retained_open_info_bytes = state
+                .retained_open_info_bytes
+                .saturating_add(retained_open_info_bytes);
         }
+        drop(state);
         self.inner.cond.notify_all();
         Ok(stream)
     }
@@ -1255,28 +1176,13 @@ impl Conn {
     fn accept_inner(&self, bidi: bool, deadline: Option<Instant>) -> Result<Arc<StreamInner>> {
         let mut state = self.inner.state.lock().unwrap();
         loop {
-            if bidi {
-                if let Some(stream) = state.accept_bidi.pop_front() {
-                    shrink_accept_queue_locked(&mut state, true);
-                    state.accepted_streams = state.accepted_streams.saturating_add(1);
-                    clear_accepted_backlog_accounting(&mut state, &stream);
-                    let event = {
-                        let mut stream_state = stream.state.lock().unwrap();
-                        take_stream_event_locked(
-                            &self.inner,
-                            &stream,
-                            &mut stream_state,
-                            state.state,
-                            EventType::StreamAccepted,
-                            None,
-                        )
-                    };
-                    drop(state);
-                    emit_event(&self.inner, event);
-                    return Ok(stream);
-                }
-            } else if let Some(stream) = state.accept_uni.pop_front() {
-                shrink_accept_queue_locked(&mut state, false);
+            let next = if bidi {
+                state.accept_bidi.pop_front()
+            } else {
+                state.accept_uni.pop_front()
+            };
+            if let Some(stream) = next {
+                shrink_accept_queue_locked(&mut state, bidi);
                 state.accepted_streams = state.accepted_streams.saturating_add(1);
                 clear_accepted_backlog_accounting(&mut state, &stream);
                 let event = {
@@ -1300,12 +1206,12 @@ impl Conn {
     }
 
     pub fn ping(&self, echo: &[u8]) -> Result<Duration> {
-        session_result(self.ping_inner(echo, None), ErrorOperation::Unknown)
+        session_result(self.ping_inner(echo, None), ErrorOperation::Ping)
     }
 
     pub fn ping_timeout(&self, echo: &[u8], timeout: Duration) -> Result<Duration> {
-        let deadline = session_result(timeout_deadline("ping", timeout), ErrorOperation::Unknown)?;
-        session_result(self.ping_inner(echo, deadline), ErrorOperation::Unknown)
+        let deadline = session_result(timeout_deadline("ping", timeout), ErrorOperation::Ping)?;
+        session_result(self.ping_inner(echo, deadline), ErrorOperation::Ping)
     }
 
     fn ping_inner(&self, echo: &[u8], deadline: Option<Instant>) -> Result<Duration> {
@@ -1371,10 +1277,12 @@ impl Conn {
                     result = slot.result.lock().unwrap();
                     continue;
                 }
-                let wait = deadline.saturating_duration_since(now);
+                let remaining = deadline.saturating_duration_since(now);
+                let wait = remaining.min(MAX_CONDVAR_TIMED_WAIT);
+                let reaches_deadline = wait == remaining;
                 let (next, timeout) = slot.cond.wait_timeout(result, wait).unwrap();
                 result = next;
-                if timeout.timed_out() && result.is_none() {
+                if timeout.timed_out() && reaches_deadline && result.is_none() {
                     drop(result);
                     if self.remove_ping_waiter(&slot, true) {
                         return Err(Error::timeout("ping"));
@@ -1407,9 +1315,9 @@ impl Conn {
         true
     }
 
-    pub fn goaway(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
+    pub fn go_away(&self, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
         session_result(
-            self.goaway_with_error(
+            self.go_away_with_error(
                 last_accepted_bidi,
                 last_accepted_uni,
                 ErrorCode::NoError.as_u64(),
@@ -1419,7 +1327,7 @@ impl Conn {
         )
     }
 
-    pub fn goaway_with_error(
+    pub fn go_away_with_error(
         &self,
         last_accepted_bidi: u64,
         last_accepted_uni: u64,
@@ -1427,23 +1335,23 @@ impl Conn {
         reason: &str,
     ) -> Result<()> {
         session_result(
-            validate_goaway_watermark_for_direction(last_accepted_bidi, true),
+            validate_go_away_watermark_for_direction(last_accepted_bidi, true),
             ErrorOperation::Close,
         )?;
         session_result(
-            validate_goaway_watermark_creator(self.inner.negotiated.peer_role, last_accepted_bidi),
+            validate_go_away_watermark_creator(self.inner.negotiated.peer_role, last_accepted_bidi),
             ErrorOperation::Close,
         )?;
         session_result(
-            validate_goaway_watermark_for_direction(last_accepted_uni, false),
+            validate_go_away_watermark_for_direction(last_accepted_uni, false),
             ErrorOperation::Close,
         )?;
         session_result(
-            validate_goaway_watermark_creator(self.inner.negotiated.peer_role, last_accepted_uni),
+            validate_go_away_watermark_creator(self.inner.negotiated.peer_role, last_accepted_uni),
             ErrorOperation::Close,
         )?;
         let payload = session_result(
-            build_goaway_payload_capped(
+            build_go_away_payload_capped(
                 last_accepted_bidi,
                 last_accepted_uni,
                 code,
@@ -1455,12 +1363,12 @@ impl Conn {
         {
             let mut state = self.inner.state.lock().unwrap();
             ensure_session_open(&state)?;
-            if last_accepted_bidi > state.local_goaway_bidi
-                || last_accepted_uni > state.local_goaway_uni
+            if last_accepted_bidi > state.local_go_away_bidi
+                || last_accepted_uni > state.local_go_away_uni
             {
-                if state.local_goaway_issued
-                    && state.local_goaway_bidi <= last_accepted_bidi
-                    && state.local_goaway_uni <= last_accepted_uni
+                if state.local_go_away_issued
+                    && state.local_go_away_bidi <= last_accepted_bidi
+                    && state.local_go_away_uni <= last_accepted_uni
                 {
                     return Ok(());
                 }
@@ -1469,15 +1377,15 @@ impl Conn {
                         .with_session_context(ErrorOperation::Close),
                 );
             }
-            if state.local_goaway_issued
-                && last_accepted_bidi == state.local_goaway_bidi
-                && last_accepted_uni == state.local_goaway_uni
+            if state.local_go_away_issued
+                && last_accepted_bidi == state.local_go_away_bidi
+                && last_accepted_uni == state.local_go_away_uni
             {
                 return Ok(());
             }
-            state.local_goaway_bidi = last_accepted_bidi;
-            state.local_goaway_uni = last_accepted_uni;
-            state.local_goaway_issued = true;
+            state.local_go_away_bidi = last_accepted_bidi;
+            state.local_go_away_uni = last_accepted_uni;
+            state.local_go_away_issued = true;
             state.state = SessionState::Draining;
         }
         self.inner.cond.notify_all();
@@ -1503,19 +1411,20 @@ impl Conn {
                 if matches!(state.state, SessionState::Closed | SessionState::Failed) {
                     return Ok(());
                 }
+                let no_error = code == 0;
                 let close_payload = build_code_payload(
                     code,
                     reason,
                     self.inner.peer_preface.settings.max_control_payload_bytes,
                 )?;
-                state.state = if code == 0 {
+                state.state = if no_error {
                     SessionState::Closed
                 } else {
                     SessionState::Failed
                 };
                 state.graceful_close_active = false;
                 state.peer_close_error = None;
-                state.close_error = if code == 0 {
+                state.close_error = if no_error {
                     None
                 } else {
                     Some(
@@ -1557,7 +1466,7 @@ impl Conn {
         )?;
         let mut direct_close = false;
         let mut direct_close_event = None;
-        let mut initial_goaway_payload = None;
+        let mut initial_go_away_payload = None;
         {
             let mut state = self.inner.state.lock().unwrap();
             if matches!(state.state, SessionState::Closed | SessionState::Failed) {
@@ -1582,22 +1491,23 @@ impl Conn {
                 release_session_runtime_state_locked(&mut state);
                 direct_close_event = take_session_closed_event_locked(&self.inner, &mut state);
             } else {
-                if state.local_goaway_bidi == MAX_VARINT62 && state.local_goaway_uni == MAX_VARINT62
+                if state.local_go_away_bidi == MAX_VARINT62
+                    && state.local_go_away_uni == MAX_VARINT62
                 {
-                    let initial_bidi = effective_goaway_send_watermark(
+                    let initial_bidi = effective_go_away_send_watermark(
                         self.inner.negotiated.local_role,
                         true,
                         MAX_VARINT62,
                     );
-                    let initial_uni = effective_goaway_send_watermark(
+                    let initial_uni = effective_go_away_send_watermark(
                         self.inner.negotiated.local_role,
                         false,
                         MAX_VARINT62,
                     );
-                    state.local_goaway_bidi = initial_bidi;
-                    state.local_goaway_uni = initial_uni;
-                    state.local_goaway_issued = true;
-                    initial_goaway_payload = Some(build_goaway_payload(
+                    state.local_go_away_bidi = initial_bidi;
+                    state.local_go_away_uni = initial_uni;
+                    state.local_go_away_issued = true;
+                    initial_go_away_payload = Some(build_go_away_payload(
                         initial_bidi,
                         initial_uni,
                         ErrorCode::NoError.as_u64(),
@@ -1622,16 +1532,16 @@ impl Conn {
             self.inner.cond.notify_all();
             return Ok(());
         }
-        if let Some(payload) = initial_goaway_payload {
+        if let Some(payload) = initial_go_away_payload {
             self.queue_graceful_control_frame(Frame {
                 frame_type: FrameType::GoAway,
                 flags: 0,
                 stream_id: 0,
                 payload,
             })?;
-            self.wait_for_goaway_drain();
+            self.wait_for_go_away_drain();
         }
-        let mut final_goaway_payload = None;
+        let mut final_go_away_payload = None;
         let reclaim_streams;
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -1646,21 +1556,23 @@ impl Conn {
             }
             state.state = SessionState::Closing;
             state.graceful_close_active = false;
-            let final_bidi = state.local_goaway_bidi.min(accepted_peer_goaway_watermark(
-                self.inner.negotiated.local_role,
-                true,
-                state.next_peer_bidi,
-            ));
-            let final_uni = state.local_goaway_uni.min(accepted_peer_goaway_watermark(
+            let final_bidi = state
+                .local_go_away_bidi
+                .min(accepted_peer_go_away_watermark(
+                    self.inner.negotiated.local_role,
+                    true,
+                    state.next_peer_bidi,
+                ));
+            let final_uni = state.local_go_away_uni.min(accepted_peer_go_away_watermark(
                 self.inner.negotiated.local_role,
                 false,
                 state.next_peer_uni,
             ));
-            if final_bidi < state.local_goaway_bidi || final_uni < state.local_goaway_uni {
-                state.local_goaway_bidi = final_bidi;
-                state.local_goaway_uni = final_uni;
-                state.local_goaway_issued = true;
-                final_goaway_payload = Some(build_goaway_payload(
+            if final_bidi < state.local_go_away_bidi || final_uni < state.local_go_away_uni {
+                state.local_go_away_bidi = final_bidi;
+                state.local_go_away_uni = final_uni;
+                state.local_go_away_issued = true;
+                final_go_away_payload = Some(build_go_away_payload(
                     final_bidi,
                     final_uni,
                     ErrorCode::NoError.as_u64(),
@@ -1670,7 +1582,7 @@ impl Conn {
             reclaim_streams = reclaim_graceful_close_local_streams_locked(&self.inner, &mut state);
             state.ignore_peer_non_close = true;
         }
-        if let Some(payload) = final_goaway_payload {
+        if let Some(payload) = final_go_away_payload {
             self.queue_graceful_control_frame(Frame {
                 frame_type: FrameType::GoAway,
                 flags: 0,
@@ -1719,10 +1631,12 @@ impl Conn {
         drain_result
     }
 
-    fn wait_for_goaway_drain(&self) {
+    fn wait_for_go_away_drain(&self) {
         let mut state = self.inner.state.lock().unwrap();
-        let interval =
-            effective_goaway_drain_interval(self.inner.goaway_drain_interval, state.last_ping_rtt);
+        let interval = effective_go_away_drain_interval(
+            self.inner.go_away_drain_interval,
+            state.last_ping_rtt,
+        );
         if interval.is_zero() {
             return;
         }
@@ -1805,10 +1719,11 @@ impl Conn {
                             return Ok(false);
                         }
                         let remaining = deadline.saturating_duration_since(now);
-                        let (next, timed_out) =
-                            self.inner.cond.wait_timeout(state, remaining).unwrap();
+                        let wait = remaining.min(MAX_CONDVAR_TIMED_WAIT);
+                        let reaches_deadline = wait == remaining;
+                        let (next, timed_out) = self.inner.cond.wait_timeout(state, wait).unwrap();
                         state = next;
-                        if timed_out.timed_out() {
+                        if timed_out.timed_out() && reaches_deadline {
                             return match state.state {
                                 SessionState::Closed => Ok(true),
                                 SessionState::Failed => Err(state
@@ -1825,7 +1740,7 @@ impl Conn {
         session_result(result, ErrorOperation::Close)
     }
 
-    pub fn closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         let state = self.inner.state.lock().unwrap();
         matches!(state.state, SessionState::Closed | SessionState::Failed)
     }
@@ -2038,8 +1953,8 @@ impl Conn {
         self.inner.state.lock().unwrap().peer_close_error.clone()
     }
 
-    pub fn peer_goaway_error(&self) -> Option<PeerGoAwayError> {
-        self.inner.state.lock().unwrap().peer_goaway_error.clone()
+    pub fn peer_go_away_error(&self) -> Option<PeerGoAwayError> {
+        self.inner.state.lock().unwrap().peer_go_away_error.clone()
     }
 
     pub fn local_preface(&self) -> Preface {
@@ -2079,15 +1994,14 @@ impl Conn {
     }
 }
 
-fn effective_goaway_drain_interval(
+fn effective_go_away_drain_interval(
     configured: Duration,
     last_ping_rtt: Option<Duration>,
 ) -> Duration {
     if configured.is_zero() {
         return Duration::ZERO;
     }
-    last_ping_rtt
-        .filter(|rtt| !rtt.is_zero())
+    nonzero_duration(last_ping_rtt)
         .map(|rtt| configured.max(rtt / 4))
         .unwrap_or(configured)
 }
@@ -2099,13 +2013,15 @@ fn effective_close_drain_timeout(
     if configured.is_zero() || configured != DEFAULT_CLOSE_DRAIN_TIMEOUT {
         return configured;
     }
-    let Some(rtt) = last_ping_rtt.filter(|rtt| !rtt.is_zero()) else {
+    let Some(rtt) = nonzero_duration(last_ping_rtt) else {
         return configured;
     };
-    let adaptive = rtt
-        .checked_mul(4)
-        .and_then(|timeout| timeout.checked_add(CLOSE_DRAIN_RTT_SLACK))
-        .unwrap_or(Duration::MAX);
+    let adaptive = match rtt.checked_mul(4) {
+        Some(timeout) => timeout
+            .checked_add(CLOSE_DRAIN_RTT_SLACK)
+            .unwrap_or(Duration::MAX),
+        None => Duration::MAX,
+    };
     configured.max(adaptive).min(CLOSE_DRAIN_TIMEOUT_MAX)
 }
 
@@ -2144,22 +2060,38 @@ fn memory_high_threshold(hard_cap: usize) -> usize {
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
+}
+
+#[inline]
+fn u64_to_usize_saturating(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+#[inline]
+fn u64_to_usize_or(value: u64, fallback: usize) -> usize {
+    if value > usize::MAX as u64 {
+        fallback
+    } else {
+        value as usize
+    }
 }
 
 fn buffered_receive_bytes_locked(state: &ConnState) -> usize {
-    usize::try_from(state.recv_session_buffered).unwrap_or(usize::MAX)
+    u64_to_usize_saturating(state.recv_session_buffered)
 }
 
 fn outstanding_ping_bytes_locked(state: &ConnState) -> usize {
-    let keepalive = state
-        .keepalive_ping
-        .as_ref()
-        .map(|ping| ping.payload.len())
-        .unwrap_or(0);
-    state.ping_waiter.as_ref().map_or(keepalive, |ping| {
+    let keepalive = if let Some(ping) = state.keepalive_ping.as_ref() {
+        ping.payload.len()
+    } else {
+        0
+    };
+    if let Some(ping) = state.ping_waiter.as_ref() {
         keepalive.saturating_add(ping.payload.len())
-    })
+    } else {
+        keepalive
+    }
 }
 
 fn outstanding_ping_sent_at(state: &ConnState) -> Option<Instant> {
@@ -2174,17 +2106,12 @@ fn default_urgent_queue_max_bytes(
     local: crate::settings::Settings,
     peer: crate::settings::Settings,
 ) -> usize {
-    let payload = match (
+    let payload = min_nonzero_or_default(
         local.max_control_payload_bytes,
         peer.max_control_payload_bytes,
-    ) {
-        (0, 0) => crate::settings::Settings::default().max_control_payload_bytes,
-        (0, peer) => peer,
-        (local, 0) => local,
-        (local, peer) => local.min(peer),
-    };
-    usize::try_from(payload)
-        .unwrap_or(usize::MAX / 8)
+        crate::settings::Settings::DEFAULT.max_control_payload_bytes,
+    );
+    u64_to_usize_or(payload, usize::MAX / 8)
         .saturating_mul(8)
         .max(DEFAULT_URGENT_QUEUE_MAX_BYTES_FLOOR)
 }
@@ -2195,19 +2122,18 @@ fn emit_establishment_close<W: Write>(
     peer: Option<&Preface>,
     err: &Error,
 ) -> Result<()> {
-    let max_payload = peer
-        .map(|preface| preface.settings.max_control_payload_bytes)
-        .filter(|limit| *limit != 0)
-        .or_else(|| {
-            (local.settings.max_control_payload_bytes != 0)
-                .then_some(local.settings.max_control_payload_bytes)
-        })
-        .unwrap_or_else(|| crate::settings::Settings::default().max_control_payload_bytes);
-    let reason = err.reason().unwrap_or("");
-    let reason = if reason.is_empty() {
-        err.to_string()
-    } else {
-        reason.to_owned()
+    let max_payload = match peer {
+        Some(preface) if preface.settings.max_control_payload_bytes != 0 => {
+            preface.settings.max_control_payload_bytes
+        }
+        _ => nonzero_or_default(
+            local.settings.max_control_payload_bytes,
+            crate::settings::Settings::DEFAULT.max_control_payload_bytes,
+        ),
+    };
+    let reason = match err.reason() {
+        Some(reason) if !reason.is_empty() => std::borrow::Cow::Borrowed(reason),
+        _ => std::borrow::Cow::Owned(err.to_string()),
     };
     let frame = Frame {
         frame_type: FrameType::Close,
@@ -2215,7 +2141,7 @@ fn emit_establishment_close<W: Write>(
         stream_id: 0,
         payload: build_code_payload(
             err.numeric_code().unwrap_or(ErrorCode::Internal.as_u64()),
-            &reason,
+            reason.as_ref(),
             max_payload,
         )?,
     };
@@ -2234,11 +2160,46 @@ fn negotiated_nonzero_payload(
     local: crate::settings::Settings,
     peer: crate::settings::Settings,
 ) -> u64 {
-    match (local.max_frame_payload, peer.max_frame_payload) {
-        (0, 0) => crate::settings::Settings::default().max_frame_payload,
-        (0, peer) => peer,
-        (local, 0) => local,
-        (local, peer) => local.min(peer),
+    min_nonzero_or_default(
+        local.max_frame_payload,
+        peer.max_frame_payload,
+        crate::settings::Settings::DEFAULT.max_frame_payload,
+    )
+}
+
+#[inline]
+fn min_nonzero_or_default(lhs: u64, rhs: u64, default: u64) -> u64 {
+    match (lhs, rhs) {
+        (0, 0) => default,
+        (0, rhs) => rhs,
+        (lhs, 0) => lhs,
+        (lhs, rhs) => lhs.min(rhs),
+    }
+}
+
+#[inline]
+fn nonzero_or_default(value: u64, default: u64) -> u64 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
+}
+
+#[inline]
+fn nonzero_duration(value: Option<Duration>) -> Option<Duration> {
+    match value {
+        Some(value) if !value.is_zero() => Some(value),
+        _ => None,
+    }
+}
+
+#[inline]
+fn nonzero_duration_value(value: Duration) -> Option<Duration> {
+    if value.is_zero() {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -2246,8 +2207,7 @@ fn default_per_stream_queued_data_high_watermark(
     local: crate::settings::Settings,
     peer: crate::settings::Settings,
 ) -> usize {
-    usize::try_from(negotiated_nonzero_payload(local, peer))
-        .unwrap_or(usize::MAX / 16)
+    u64_to_usize_or(negotiated_nonzero_payload(local, peer), usize::MAX / 16)
         .saturating_mul(16)
         .max(DEFAULT_PER_STREAM_QUEUED_DATA_HIGH_WATERMARK_FLOOR)
 }
@@ -2259,8 +2219,11 @@ fn default_session_queued_data_high_watermark(per_stream_hwm: usize) -> usize {
 }
 
 fn default_write_batch_cost_limit(max_frame_payload: u64) -> usize {
-    usize::try_from(max_frame_payload)
-        .unwrap_or(usize::MAX / 4)
+    let max_frame_payload = nonzero_or_default(
+        max_frame_payload,
+        crate::settings::Settings::DEFAULT.max_frame_payload,
+    );
+    u64_to_usize_or(max_frame_payload, usize::MAX / 4)
         .saturating_add(1)
         .saturating_mul(4)
         .max(1)
@@ -2270,12 +2233,13 @@ fn default_pending_control_bytes_budget(
     peer: crate::settings::Settings,
     local: crate::settings::Settings,
 ) -> usize {
-    usize::try_from(if peer.max_control_payload_bytes == 0 {
-        local.max_control_payload_bytes
-    } else {
-        peer.max_control_payload_bytes
-    })
-    .unwrap_or(usize::MAX / 8)
+    u64_to_usize_or(
+        nonzero_or_default(
+            peer.max_control_payload_bytes,
+            local.max_control_payload_bytes,
+        ),
+        usize::MAX / 8,
+    )
     .saturating_mul(8)
     .max(DEFAULT_PENDING_CONTROL_BYTES_BUDGET_FLOOR)
 }
@@ -2284,31 +2248,30 @@ fn default_pending_priority_bytes_budget(
     peer: crate::settings::Settings,
     local: crate::settings::Settings,
 ) -> usize {
-    usize::try_from(if peer.max_extension_payload_bytes == 0 {
-        local.max_extension_payload_bytes
-    } else {
-        peer.max_extension_payload_bytes
-    })
-    .unwrap_or(usize::MAX / 8)
+    u64_to_usize_or(
+        nonzero_or_default(
+            peer.max_extension_payload_bytes,
+            local.max_extension_payload_bytes,
+        ),
+        usize::MAX / 8,
+    )
     .saturating_mul(8)
     .max(DEFAULT_PENDING_PRIORITY_BYTES_BUDGET_FLOOR)
 }
 
 fn default_inbound_control_bytes_budget(settings: crate::settings::Settings) -> usize {
-    usize::try_from(settings.max_control_payload_bytes)
-        .unwrap_or(usize::MAX / 64)
+    u64_to_usize_or(settings.max_control_payload_bytes, usize::MAX / 64)
         .saturating_mul(64)
         .max(DEFAULT_INBOUND_CONTROL_BYTES_BUDGET_FLOOR)
 }
 
 fn default_inbound_ext_bytes_budget(settings: crate::settings::Settings) -> usize {
-    usize::try_from(settings.max_extension_payload_bytes)
-        .unwrap_or(usize::MAX / 64)
+    u64_to_usize_or(settings.max_extension_payload_bytes, usize::MAX / 64)
         .saturating_mul(64)
         .max(DEFAULT_INBOUND_EXT_BYTES_BUDGET_FLOOR)
 }
 
-fn accepted_peer_goaway_watermark(local_role: Role, bidi: bool, next_peer_id: u64) -> u64 {
+fn accepted_peer_go_away_watermark(local_role: Role, bidi: bool, next_peer_id: u64) -> u64 {
     let first_peer_id = first_peer_stream_id(local_role, bidi);
     if next_peer_id <= first_peer_id {
         0
@@ -2317,15 +2280,15 @@ fn accepted_peer_goaway_watermark(local_role: Role, bidi: bool, next_peer_id: u6
     }
 }
 
-fn effective_goaway_send_watermark(local_role: Role, bidi: bool, watermark: u64) -> u64 {
+fn effective_go_away_send_watermark(local_role: Role, bidi: bool, watermark: u64) -> u64 {
     if watermark == MAX_VARINT62 {
-        max_peer_goaway_watermark(local_role, bidi)
+        max_peer_go_away_watermark(local_role, bidi)
     } else {
         watermark
     }
 }
 
-fn max_peer_goaway_watermark(local_role: Role, bidi: bool) -> u64 {
+fn max_peer_go_away_watermark(local_role: Role, bidi: bool) -> u64 {
     let first_peer_id = first_peer_stream_id(local_role, bidi);
     if first_peer_id > MAX_VARINT62 {
         return 0;
@@ -2340,18 +2303,18 @@ fn reclaim_graceful_close_local_streams_locked(
     reject_graceful_close_provisionals_locked(state, true);
     reject_graceful_close_provisionals_locked(state, false);
 
-    let streams: Vec<_> = state
-        .streams
-        .values()
-        .filter(|stream| stream.opened_locally)
-        .cloned()
-        .collect();
-    let mut reclaimed = Vec::new();
-    for stream in streams {
-        let stream_id = stream.id.load(Ordering::Acquire);
-        if stream_id == 0 {
+    let mut streams = Vec::new();
+    for stream in state.streams.values() {
+        if !stream.opened_locally || stream.id.load(Ordering::Acquire) == 0 {
             continue;
         }
+        let stream_state = stream.state.lock().unwrap();
+        if !stream_state.peer_visible && stream_state.aborted.is_none() {
+            streams.push(Arc::clone(stream));
+        }
+    }
+    let mut reclaimed = Vec::new();
+    for stream in streams {
         let mut stream_state = stream.state.lock().unwrap();
         if stream_state.peer_visible || stream_state.aborted.is_some() {
             continue;
@@ -2495,16 +2458,28 @@ fn timeout_deadline(operation: &str, timeout: Duration) -> Result<Option<Instant
     Ok(deadline_after(timeout))
 }
 
+#[cfg(test)]
 fn remaining_timeout(deadline: Option<Instant>) -> Option<Duration> {
     deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
-fn checked_open_vectored_len(parts: &[IoSlice<'_>]) -> Result<usize> {
-    parts.iter().try_fold(0usize, |total, part| {
-        total
-            .checked_add(part.len())
-            .ok_or_else(|| Error::local("zmux: vectored write length overflow"))
-    })
+fn remaining_open_send_write_timeout(start: Instant, timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(start.elapsed())
+        .and_then(nonzero_duration_value)
+        .ok_or_else(|| {
+            Error::timeout("write")
+                .with_stream_context(ErrorOperation::Write, ErrorDirection::Write)
+        })
+}
+
+fn validate_open_send_progress(n: usize, requested: usize) -> Result<usize> {
+    if n > requested {
+        Err(Error::local("zmux: write reported invalid progress")
+            .with_stream_context(ErrorOperation::Write, ErrorDirection::Write))
+    } else {
+        Ok(n)
+    }
 }
 
 const DRAIN_WAIT_POLL: Duration = Duration::from_millis(10);
@@ -2544,7 +2519,8 @@ fn wait_conn_until<'a>(
         return Err(Error::timeout(operation));
     }
     let remaining = deadline.saturating_duration_since(now);
-    let (state, timed_out) = inner.cond.wait_timeout(state, remaining).unwrap();
+    let wait = remaining.min(MAX_CONDVAR_TIMED_WAIT);
+    let (state, timed_out) = inner.cond.wait_timeout(state, wait).unwrap();
     if timed_out.timed_out() {
         check_deadline(Some(deadline), operation)?;
     }
@@ -2557,7 +2533,7 @@ mod tests {
         late_data_per_stream_cap, marker_only_retained_count_locked,
         note_written_stream_frames_locked, pop_newest_accept_pending_locked,
         queue_peer_visible_pending_priority, reap_expired_hidden_tombstones_locked,
-        reap_tombstones_for_memory_pressure_locked, reclaim_unseen_local_streams_after_goaway,
+        reap_tombstones_for_memory_pressure_locked, reclaim_unseen_local_streams_after_go_away,
         record_tombstone_locked, record_used_marker_locked, retain_stream_open_info_locked,
         retain_stream_recv_reset_reason_locked, shrink_accept_queue_locked,
     };
@@ -2582,7 +2558,7 @@ mod tests {
             self.write_timeouts.lock().unwrap().clone()
         }
 
-        fn closed(&self) -> bool {
+        fn is_closed(&self) -> bool {
             *self.closed.lock().unwrap()
         }
     }
@@ -2926,7 +2902,7 @@ mod tests {
 
         assert_eq!(err.code(), Some(ErrorCode::Internal));
         assert!(err.is_timeout());
-        assert!(control.closed());
+        assert!(control.is_closed());
         assert!(control
             .write_timeouts()
             .contains(&Some(ESTABLISHMENT_SUCCESS_WRITE_WAIT)));
@@ -2958,7 +2934,7 @@ mod tests {
         };
 
         assert_eq!(err.code(), Some(ErrorCode::Protocol));
-        assert!(control.closed());
+        assert!(control.is_closed());
         assert_eq!(*writer_calls.lock().unwrap(), 2);
         let write_timeouts = control.write_timeouts();
         assert!(write_timeouts.contains(&Some(ESTABLISHMENT_SUCCESS_WRITE_WAIT)));
@@ -2993,7 +2969,7 @@ mod tests {
                 state: SessionState::Ready,
                 close_error: None,
                 peer_close_error: None,
-                peer_goaway_error: None,
+                peer_go_away_error: None,
                 session_closed_event_sent: false,
                 graceful_close_active: false,
                 ignore_peer_non_close: false,
@@ -3114,11 +3090,11 @@ mod tests {
                 visible_terminal_churn_window_start: None,
                 visible_terminal_churn_count: 0,
                 visible_terminal_churn_budget: config.visible_terminal_churn_budget,
-                local_goaway_bidi: MAX_VARINT62,
-                local_goaway_uni: MAX_VARINT62,
-                local_goaway_issued: false,
-                peer_goaway_bidi: MAX_VARINT62,
-                peer_goaway_uni: MAX_VARINT62,
+                local_go_away_bidi: MAX_VARINT62,
+                local_go_away_uni: MAX_VARINT62,
+                local_go_away_issued: false,
+                peer_go_away_bidi: MAX_VARINT62,
+                peer_go_away_uni: MAX_VARINT62,
                 ping_waiter: None,
                 canceled_ping_payload: None,
                 keepalive_ping: None,
@@ -3154,7 +3130,7 @@ mod tests {
             peer_preface,
             negotiated,
             close_drain_timeout: config.close_drain_timeout,
-            goaway_drain_interval: config.goaway_drain_interval,
+            go_away_drain_interval: config.go_away_drain_interval,
             session_memory_cap: None,
             session_data_high_watermark: 1 << 20,
             per_stream_data_high_watermark: 1 << 20,
@@ -3524,20 +3500,20 @@ mod tests {
     }
 
     #[test]
-    fn goaway_drain_interval_uses_recent_rtt_floor_unless_disabled() {
+    fn go_away_drain_interval_uses_recent_rtt_floor_unless_disabled() {
         assert_eq!(
-            effective_goaway_drain_interval(Duration::from_millis(10), None),
+            effective_go_away_drain_interval(Duration::from_millis(10), None),
             Duration::from_millis(10)
         );
         assert_eq!(
-            effective_goaway_drain_interval(
+            effective_go_away_drain_interval(
                 Duration::from_millis(10),
                 Some(Duration::from_millis(800)),
             ),
             Duration::from_millis(200)
         );
         assert_eq!(
-            effective_goaway_drain_interval(Duration::ZERO, Some(Duration::from_millis(800)),),
+            effective_go_away_drain_interval(Duration::ZERO, Some(Duration::from_millis(800)),),
             Duration::ZERO
         );
     }
@@ -4158,14 +4134,14 @@ mod tests {
     }
 
     #[test]
-    fn peer_goaway_reclaim_discards_committed_not_peer_visible_local_opener() {
+    fn peer_go_away_reclaim_discards_committed_not_peer_visible_local_opener() {
         let inner = test_inner();
         let stream = test_local_opened_bidi(&inner, 4);
         {
             let mut state = inner.state.lock().unwrap();
             state.active.local_bidi = 1;
             state.send_session_used = 6;
-            state.peer_goaway_bidi = 0;
+            state.peer_go_away_bidi = 0;
             state.streams.insert(4, stream.clone());
             let mut stream_state = stream.state.lock().unwrap();
             stream_state.pending_priority_update = Some(vec![1]);
@@ -4182,7 +4158,7 @@ mod tests {
 
         let reclaimed = {
             let mut state = inner.state.lock().unwrap();
-            reclaim_unseen_local_streams_after_goaway(&mut state, true)
+            reclaim_unseen_local_streams_after_go_away(&mut state, true)
         };
         assert_eq!(reclaimed.len(), 1);
         assert!(Arc::ptr_eq(&reclaimed[0], &stream));
@@ -4829,20 +4805,20 @@ mod tests {
     }
 
     #[test]
-    fn peer_goaway_reclaim_keeps_peer_visible_local_stream() {
+    fn peer_go_away_reclaim_keeps_peer_visible_local_stream() {
         let inner = test_inner();
         let stream = test_local_opened_bidi(&inner, 4);
         {
             let mut state = inner.state.lock().unwrap();
             state.active.local_bidi = 1;
-            state.peer_goaway_bidi = 0;
+            state.peer_go_away_bidi = 0;
             state.streams.insert(4, stream.clone());
             stream.state.lock().unwrap().peer_visible = true;
         }
 
         let reclaimed = {
             let mut state = inner.state.lock().unwrap();
-            reclaim_unseen_local_streams_after_goaway(&mut state, true)
+            reclaim_unseen_local_streams_after_go_away(&mut state, true)
         };
         assert!(reclaimed.is_empty());
 

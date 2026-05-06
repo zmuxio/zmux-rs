@@ -16,11 +16,11 @@ use super::state::{
     has_terminal_marker_locked, late_data_cause_for, late_data_per_stream_cap,
     mark_stream_peer_visible_locked, maybe_release_active_count, note_abort_reason_locked,
     note_written_stream_frames_locked, queue_peer_visible_pending_priority,
-    reap_expired_hidden_tombstones_locked, reclaim_provisionals_after_goaway,
-    reclaim_unseen_local_streams_after_goaway, refresh_accept_backlog_bytes_locked,
+    reap_expired_hidden_tombstones_locked, reclaim_provisionals_after_go_away,
+    reclaim_unseen_local_streams_after_go_away, refresh_accept_backlog_bytes_locked,
     release_discarded_queued_stream_frames_locked, release_peer_reason_locked,
     release_session_receive_buffered_locked, release_session_runtime_state_locked,
-    remove_accept_queue_entry_locked, retain_peer_goaway_error_locked, retain_peer_reason_locked,
+    remove_accept_queue_entry_locked, retain_peer_go_away_error_locked, retain_peer_reason_locked,
     retain_stream_abort_reason_locked, retain_stream_open_info_locked,
     retain_stream_recv_reset_reason_locked, retain_stream_stopped_reason_locked,
     session_memory_pressure_high_fast_locked, stream_fully_terminal,
@@ -33,20 +33,20 @@ use crate::frame::{
 };
 use crate::payload::{
     build_code_payload, normalize_stream_group, parse_data_payload_metadata_offset,
-    parse_error_payload, parse_goaway_payload, parse_priority_update_metadata, StreamMetadata,
+    parse_error_payload, parse_go_away_payload, parse_priority_update_metadata, StreamMetadata,
 };
 use crate::protocol::{
-    capabilities_can_carry_group_on_open, capabilities_can_carry_group_update,
-    capabilities_can_carry_priority_on_open, capabilities_can_carry_priority_update,
+    capabilities_can_carry_group_in_update, capabilities_can_carry_group_on_open,
+    capabilities_can_carry_priority_in_update, capabilities_can_carry_priority_on_open,
     CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_UPDATE, CAPABILITY_STREAM_GROUPS,
     EXT_PRIORITY_UPDATE,
 };
 use crate::settings::SchedulerHint;
 use crate::stream_id::{
     initial_receive_window, initial_send_window, stream_is_bidi, stream_is_local,
-    validate_goaway_watermark_creator, validate_goaway_watermark_for_direction,
+    validate_go_away_watermark_creator, validate_go_away_watermark_for_direction,
 };
-use crate::varint::{append_varint, parse_varint};
+use crate::varint::{append_varint_reserved, parse_varint, MAX_VARINT62};
 use std::io::Read;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
@@ -128,6 +128,7 @@ fn complete_local_close_after_peer_read_error(inner: &Arc<Inner>, err: &Error) -
     true
 }
 
+#[inline]
 fn is_transport_close_error(err: &Error) -> bool {
     matches!(
         err.source_io_error_kind(),
@@ -140,6 +141,7 @@ fn is_transport_close_error(err: &Error) -> bool {
     )
 }
 
+#[inline]
 fn mark_inbound_error_source(err: Error) -> Error {
     if err.source() != ErrorSource::Unknown || err.source_io_error_kind().is_some() {
         return err;
@@ -178,7 +180,7 @@ fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         FrameType::Abort => handle_abort(inner, frame),
         FrameType::Ping => handle_ping(inner, frame),
         FrameType::Pong => handle_pong(inner, frame),
-        FrameType::GoAway => handle_goaway(inner, frame),
+        FrameType::GoAway => handle_go_away(inner, frame),
         FrameType::Close => {
             {
                 let mut state = inner.state.lock().unwrap();
@@ -210,7 +212,8 @@ fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 if matches!(state.state, SessionState::Closed | SessionState::Failed) {
                     return Ok(());
                 }
-                state.state = if code == 0 {
+                let no_error = code == 0;
+                state.state = if no_error {
                     SessionState::Closed
                 } else {
                     SessionState::Failed
@@ -219,17 +222,21 @@ fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 if let Some(old) = state.peer_close_error.take() {
                     release_peer_reason_locked(&mut state, old.reason.len());
                 }
-                let retained_reason = if code == 0 {
+                let retained_reason = if no_error {
                     String::new()
                 } else {
                     let (retained, _) = retain_peer_reason_locked(inner, &mut state, reason);
                     retained
                 };
-                state.peer_close_error = (code != 0).then(|| PeerCloseError {
-                    code,
-                    reason: retained_reason.clone(),
-                });
-                state.close_error = if code == 0 {
+                state.peer_close_error = if no_error {
+                    None
+                } else {
+                    Some(PeerCloseError {
+                        code,
+                        reason: retained_reason.clone(),
+                    })
+                };
+                state.close_error = if no_error {
                     None
                 } else {
                     Some(
@@ -260,11 +267,13 @@ fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn ignore_peer_non_close_locked(state: &ConnState) -> bool {
     state.ignore_peer_non_close
         || matches!(state.state, SessionState::Closed | SessionState::Failed)
 }
 
+#[inline]
 fn ignore_session_control_while_closing_locked(state: &ConnState) -> bool {
     ignore_peer_non_close_locked(state) || state.state == SessionState::Closing
 }
@@ -379,14 +388,14 @@ fn record_traffic_budget_locked(
 ) -> Result<()> {
     if counters
         .window_start
-        .is_none_or(|start| now.duration_since(start) > policy.abuse_window)
+        .is_none_or(|start| now.saturating_duration_since(start) > policy.abuse_window)
     {
         *counters.window_start = Some(now);
         *counters.frames = 0;
         *counters.bytes = 0;
     }
-    *counters.frames = counters.frames.saturating_add(1);
-    *counters.bytes = counters.bytes.saturating_add(payload_len);
+    *counters.frames = (*counters.frames).saturating_add(1);
+    *counters.bytes = (*counters.bytes).saturating_add(payload_len);
     if *counters.frames <= policy.frame_budget && *counters.bytes <= policy.byte_budget {
         Ok(())
     } else {
@@ -395,41 +404,29 @@ fn record_traffic_budget_locked(
 }
 
 fn record_group_rebucket_churn_locked(state: &mut ConnState) -> Result<()> {
-    let now = Instant::now();
-    if state
-        .group_rebucket_churn_window_start
-        .is_none_or(|start| now.duration_since(start) > state.abuse_window)
-    {
-        state.group_rebucket_churn_window_start = Some(now);
-        state.group_rebucket_churn_count = 0;
-    }
-    state.group_rebucket_churn_count = state.group_rebucket_churn_count.saturating_add(1);
-    if state.group_rebucket_churn_count <= state.group_rebucket_churn_budget {
-        Ok(())
-    } else {
-        Err(Error::protocol(
-            "high-rate effective stream_group rebucketing churn exceeded local threshold",
-        ))
-    }
+    let (start, count, result) = advance_windowed_count(
+        state.abuse_window,
+        state.group_rebucket_churn_window_start,
+        state.group_rebucket_churn_count,
+        state.group_rebucket_churn_budget,
+        "high-rate effective stream_group rebucketing churn exceeded local threshold",
+    );
+    state.group_rebucket_churn_window_start = start;
+    state.group_rebucket_churn_count = count;
+    result
 }
 
 fn record_hidden_abort_churn_locked(state: &mut ConnState) -> Result<()> {
-    let now = Instant::now();
-    if state
-        .hidden_abort_churn_window_start
-        .is_none_or(|start| now.duration_since(start) > state.hidden_abort_churn_window)
-    {
-        state.hidden_abort_churn_window_start = Some(now);
-        state.hidden_abort_churn_count = 0;
-    }
-    state.hidden_abort_churn_count = state.hidden_abort_churn_count.saturating_add(1);
-    if state.hidden_abort_churn_count <= state.hidden_abort_churn_budget {
-        Ok(())
-    } else {
-        Err(Error::protocol(
-            "rapid hidden open-then-abort churn exceeded local threshold",
-        ))
-    }
+    let (start, count, result) = advance_windowed_count(
+        state.hidden_abort_churn_window,
+        state.hidden_abort_churn_window_start,
+        state.hidden_abort_churn_count,
+        state.hidden_abort_churn_budget,
+        "rapid hidden open-then-abort churn exceeded local threshold",
+    );
+    state.hidden_abort_churn_window_start = start;
+    state.hidden_abort_churn_count = count;
+    result
 }
 
 fn record_visible_terminal_churn_locked(
@@ -446,22 +443,16 @@ fn record_visible_terminal_churn_locked(
         return Ok(());
     }
     stream_state.visible_churn_counted = true;
-    let now = Instant::now();
-    if state
-        .visible_terminal_churn_window_start
-        .is_none_or(|start| now.duration_since(start) > state.visible_terminal_churn_window)
-    {
-        state.visible_terminal_churn_window_start = Some(now);
-        state.visible_terminal_churn_count = 0;
-    }
-    state.visible_terminal_churn_count = state.visible_terminal_churn_count.saturating_add(1);
-    if state.visible_terminal_churn_count <= state.visible_terminal_churn_budget {
-        Ok(())
-    } else {
-        Err(Error::protocol(
-            "rapid open-then-reset/abort churn exceeded local threshold",
-        ))
-    }
+    let (start, count, result) = advance_windowed_count(
+        state.visible_terminal_churn_window,
+        state.visible_terminal_churn_window_start,
+        state.visible_terminal_churn_count,
+        state.visible_terminal_churn_budget,
+        "rapid open-then-reset/abort churn exceeded local threshold",
+    );
+    state.visible_terminal_churn_window_start = start;
+    state.visible_terminal_churn_count = count;
+    result
 }
 
 fn finish_peer_visible_update(
@@ -483,7 +474,8 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     let flags = frame.flags;
     let payload = frame.payload;
     let has_open_metadata = flags & FRAME_FLAG_OPEN_METADATA != 0;
-    if has_open_metadata && refuse_opening_data_past_goaway_before_metadata_parse(inner, stream_id)?
+    if has_open_metadata
+        && refuse_opening_data_past_go_away_before_metadata_parse(inner, stream_id)?
     {
         return Ok(());
     }
@@ -493,6 +485,19 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             Error::protocol("DATA|OPEN_METADATA is not negotiated"),
         );
     }
+    if has_open_metadata && ignore_or_reject_misplaced_open_metadata_before_parse(inner, stream_id)?
+    {
+        return Ok(());
+    }
+    let (metadata, app_offset) = if has_open_metadata {
+        match parse_data_payload_metadata_offset(&payload, flags) {
+            Ok((metadata, true, app_offset)) => (Some(metadata), app_offset),
+            Ok((_, false, app_offset)) => (None, app_offset),
+            Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
+        }
+    } else {
+        (None, 0)
+    };
     let (stream, refused_accept_ids, peer_visible_update) = {
         let mut state = inner.state.lock().unwrap();
         if ignore_peer_non_close_locked(&state) {
@@ -500,9 +505,9 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         }
         let mut refused_accepts = Vec::new();
         let (stream, stream_existed) = if let Some(stream) = state.streams.get(&stream_id) {
-            (stream.clone(), true)
+            (Arc::clone(stream), true)
         } else if known_absent_stream_locked(&state, inner, stream_id) {
-            if flags & FRAME_FLAG_OPEN_METADATA != 0 {
+            if has_open_metadata {
                 return Err(Error::protocol(
                     "OPEN_METADATA is valid only on the first DATA",
                 ));
@@ -525,15 +530,6 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 "OPEN_METADATA is valid only on the first DATA",
             ));
         }
-        let (metadata, app_offset) = if has_open_metadata {
-            match parse_data_payload_metadata_offset(&payload, flags) {
-                Ok((metadata, true, app_offset)) => (Some(metadata), app_offset),
-                Ok((_, false, app_offset)) => (None, app_offset),
-                Err(err) => return Err(err),
-            }
-        } else {
-            (None, 0)
-        };
         let app_len = usize_to_u64_saturating(payload.len() - app_offset);
         let app_chunk = if app_len == 0 {
             None
@@ -580,7 +576,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 return Ok(());
             }
             if ss.recv_reset.is_some() || ss.aborted.is_some() || ss.read_stopped {
-                if flags & FRAME_FLAG_OPEN_METADATA != 0 {
+                if has_open_metadata {
                     return Err(Error::protocol(
                         "OPEN_METADATA is valid only on the first DATA",
                     ));
@@ -647,7 +643,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                     ss.metadata.group = normalize_stream_group(group);
                 }
                 if ss.metadata != before {
-                    ss.metadata_revision = ss.metadata_revision.saturating_add(1);
+                    ss.metadata_revision = ss.metadata_revision.wrapping_add(1);
                 }
             }
             ss.recv_used = ss.recv_used.saturating_add(app_len);
@@ -669,14 +665,12 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         refused_accepts.extend(enforce_session_memory_accept_backlog_locked(
             inner, &mut state,
         ));
-        let released_refused: u64 = refused_accepts
-            .iter()
-            .fold(0u64, |sum, (_, released, _)| sum.saturating_add(*released));
-        let released_refused_retained: usize = refused_accepts
-            .iter()
-            .fold(0usize, |sum, (_, _, retained)| {
-                sum.saturating_add(*retained)
-            });
+        let mut released_refused = 0u64;
+        let mut released_refused_retained = 0usize;
+        for (_, released, retained) in &refused_accepts {
+            released_refused = released_refused.saturating_add(*released);
+            released_refused_retained = released_refused_retained.saturating_add(*retained);
+        }
         replenish_buffered_session_credit_locked(
             inner,
             &mut state,
@@ -694,7 +688,26 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     Ok(())
 }
 
-fn refuse_opening_data_past_goaway_before_metadata_parse(
+fn ignore_or_reject_misplaced_open_metadata_before_parse(
+    inner: &Arc<Inner>,
+    stream_id: u64,
+) -> Result<bool> {
+    let state = inner.state.lock().unwrap();
+    if ignore_peer_non_close_locked(&state) {
+        return Ok(true);
+    }
+    if stream_is_local(inner.negotiated.local_role, stream_id)
+        || state.streams.contains_key(&stream_id)
+        || known_absent_stream_locked(&state, inner, stream_id)
+    {
+        return Err(Error::protocol(
+            "OPEN_METADATA is valid only on the first DATA",
+        ));
+    }
+    Ok(false)
+}
+
+fn refuse_opening_data_past_go_away_before_metadata_parse(
     inner: &Arc<Inner>,
     stream_id: u64,
 ) -> Result<bool> {
@@ -709,9 +722,9 @@ fn refuse_opening_data_past_goaway_before_metadata_parse(
         return Ok(false);
     }
     let goaway = if stream_is_bidi(stream_id) {
-        state.local_goaway_bidi
+        state.local_go_away_bidi
     } else {
-        state.local_goaway_uni
+        state.local_go_away_uni
     };
     if stream_id <= goaway {
         return Ok(false);
@@ -743,16 +756,16 @@ fn handle_absent_terminal_data_locked(
 }
 
 fn record_ignored_control_locked(state: &mut ConnState) -> Result<()> {
-    let (start, count) = advance_windowed_count(
+    let (start, count, result) = advance_windowed_count(
         state.abuse_window,
         state.ignored_control_window_start,
         state.ignored_control_count,
         state.ignored_control_budget,
         "ignored control budget exceeded",
-    )?;
+    );
     state.ignored_control_window_start = start;
     state.ignored_control_count = count;
-    Ok(())
+    result
 }
 
 fn clear_ignored_control_budget_locked(state: &mut ConnState) {
@@ -762,16 +775,16 @@ fn clear_ignored_control_budget_locked(state: &mut ConnState) {
 
 fn record_no_op_max_data_locked(state: &mut ConnState) -> Result<()> {
     record_ignored_control_locked(state)?;
-    let (start, count) = advance_windowed_count(
+    let (start, count, result) = advance_windowed_count(
         state.abuse_window,
         state.no_op_max_data_window_start,
         state.no_op_max_data_count,
         state.no_op_max_data_budget,
         "no-op MAX_DATA budget exceeded",
-    )?;
+    );
     state.no_op_max_data_window_start = start;
     state.no_op_max_data_count = count;
-    Ok(())
+    result
 }
 
 fn clear_no_op_max_data_budget_locked(state: &mut ConnState) {
@@ -780,16 +793,16 @@ fn clear_no_op_max_data_budget_locked(state: &mut ConnState) {
 
 fn record_no_op_blocked_locked(state: &mut ConnState) -> Result<()> {
     record_ignored_control_locked(state)?;
-    let (start, count) = advance_windowed_count(
+    let (start, count, result) = advance_windowed_count(
         state.abuse_window,
         state.no_op_blocked_window_start,
         state.no_op_blocked_count,
         state.no_op_blocked_budget,
         "no-op BLOCKED budget exceeded",
-    )?;
+    );
     state.no_op_blocked_window_start = start;
     state.no_op_blocked_count = count;
-    Ok(())
+    result
 }
 
 fn clear_no_op_blocked_budget_locked(state: &mut ConnState) {
@@ -798,26 +811,29 @@ fn clear_no_op_blocked_budget_locked(state: &mut ConnState) {
 
 fn record_no_op_priority_update_locked(state: &mut ConnState) -> Result<()> {
     record_ignored_control_locked(state)?;
-    let (start, count) = advance_windowed_count(
+    let (start, count, result) = advance_windowed_count(
         state.abuse_window,
         state.no_op_priority_update_window_start,
         state.no_op_priority_update_count,
         state.no_op_priority_update_budget,
         "no-op PRIORITY_UPDATE budget exceeded",
-    )?;
+    );
     state.no_op_priority_update_window_start = start;
     state.no_op_priority_update_count = count;
-    Ok(())
+    result
 }
 
+#[inline]
 fn record_dropped_priority_update_locked(state: &mut ConnState) {
     state.dropped_priority_update_count = state.dropped_priority_update_count.saturating_add(1);
 }
 
+#[inline]
 fn clear_no_op_priority_update_budget_locked(state: &mut ConnState) {
     clear_no_op_control_budgets_locked(state);
 }
 
+#[inline]
 fn clear_no_op_control_budgets_locked(state: &mut ConnState) {
     clear_ignored_control_budget_locked(state);
     state.no_op_max_data_window_start = None;
@@ -829,16 +845,16 @@ fn clear_no_op_control_budgets_locked(state: &mut ConnState) {
 }
 
 fn record_inbound_ping_locked(state: &mut ConnState) -> Result<()> {
-    let (start, count) = advance_windowed_count(
+    let (start, count, result) = advance_windowed_count(
         state.abuse_window,
         state.inbound_ping_window_start,
         state.inbound_ping_count,
         state.inbound_ping_budget,
         "inbound PING budget exceeded",
-    )?;
+    );
     state.inbound_ping_window_start = start;
     state.inbound_ping_count = count;
-    Ok(())
+    result
 }
 
 fn clear_inbound_ping_budget_locked(state: &mut ConnState) {
@@ -852,19 +868,20 @@ fn update_no_op_zero_data_locked(
     app_len: u64,
     flags: u8,
 ) -> Result<()> {
-    let no_op =
-        stream_existed && app_len == 0 && flags & (FRAME_FLAG_FIN | FRAME_FLAG_OPEN_METADATA) == 0;
+    let data_control_flags = flags & (FRAME_FLAG_FIN | FRAME_FLAG_OPEN_METADATA);
+    let no_op = stream_existed && app_len == 0 && data_control_flags == 0;
     if no_op {
-        let (start, count) = advance_windowed_count(
+        let (start, count, result) = advance_windowed_count(
             state.abuse_window,
             state.no_op_zero_data_window_start,
             state.no_op_zero_data_count,
             state.no_op_zero_data_budget,
             "zero-length DATA budget exceeded",
-        )?;
+        );
         state.no_op_zero_data_window_start = start;
         state.no_op_zero_data_count = count;
-    } else if app_len > 0 || flags & (FRAME_FLAG_FIN | FRAME_FLAG_OPEN_METADATA) != 0 {
+        result?;
+    } else if app_len > 0 || data_control_flags != 0 {
         state.no_op_zero_data_window_start = None;
         state.no_op_zero_data_count = 0;
         clear_inbound_ping_budget_locked(state);
@@ -878,20 +895,21 @@ fn advance_windowed_count(
     count: u64,
     budget: u64,
     message: &'static str,
-) -> Result<(Option<Instant>, u64)> {
+) -> (Option<Instant>, u64, Result<()>) {
     let now = Instant::now();
     let mut start = window_start;
     let mut next_count = count;
-    if start.is_none_or(|start| now.duration_since(start) > abuse_window) {
+    if start.is_none_or(|start| now.saturating_duration_since(start) > abuse_window) {
         start = Some(now);
         next_count = 0;
     }
     next_count = next_count.saturating_add(1);
-    if next_count <= budget {
-        Ok((start, next_count))
+    let result = if next_count <= budget {
+        Ok(())
     } else {
         Err(Error::protocol(message))
-    }
+    };
+    (start, next_count, result)
 }
 
 fn discard_peer_data_locked(
@@ -1004,13 +1022,11 @@ fn advance_discarded_session_credit_locked(
         false,
     );
 
-    let mut session_payload = Vec::new();
-    append_varint(&mut session_payload, state.recv_session_advertised)?;
     inner.force_queue_frame(Frame {
         frame_type: FrameType::MaxData,
         flags: 0,
         stream_id: 0,
-        payload: session_payload,
+        payload: max_data_payload(state.recv_session_advertised)?,
     })?;
     Ok(())
 }
@@ -1136,18 +1152,23 @@ fn flush_pending_stream_credit_locked(
 }
 
 fn try_queue_max_data(inner: &Arc<Inner>, stream_id: u64, limit: u64) -> Result<bool> {
-    let mut payload = Vec::with_capacity(crate::varint::varint_len(limit)?);
-    append_varint(&mut payload, limit)?;
     match inner.try_queue_frame(Frame {
         frame_type: FrameType::MaxData,
         flags: 0,
         stream_id,
-        payload,
+        payload: max_data_payload(limit)?,
     }) {
         Ok(()) => Ok(true),
         Err(err) if err.is_urgent_writer_queue_full() || err.is_session_closed() => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+#[inline]
+fn max_data_payload(limit: u64) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(crate::varint::varint_len(limit)?);
+    append_varint_reserved(&mut payload, limit)?;
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -1199,6 +1220,7 @@ pub(super) fn retry_pending_receive_credit(inner: &Arc<Inner>) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn stream_id_previously_used(state: &ConnState, inner: &Arc<Inner>, stream_id: u64) -> bool {
     if stream_is_local(inner.negotiated.local_role, stream_id) {
         if stream_is_bidi(stream_id) {
@@ -1226,11 +1248,13 @@ fn marker_data_disposition(inner: &Arc<Inner>, stream_id: u64) -> TerminalDataDi
     }
 }
 
+#[inline]
 fn known_absent_stream_locked(state: &ConnState, inner: &Arc<Inner>, stream_id: u64) -> bool {
     has_terminal_marker_locked(state, stream_id)
         || stream_id_previously_used(state, inner, stream_id)
 }
 
+#[inline]
 fn has_marker_only_terminal_marker_locked(state: &ConnState, stream_id: u64) -> bool {
     terminal_marker_disposition_locked(state, stream_id).is_some()
         && !state.tombstones.contains_key(&stream_id)
@@ -1247,9 +1271,9 @@ fn create_peer_stream(
     }
     let bidi = stream_is_bidi(stream_id);
     let goaway = if bidi {
-        state.local_goaway_bidi
+        state.local_go_away_bidi
     } else {
-        state.local_goaway_uni
+        state.local_go_away_uni
     };
     if stream_id > goaway {
         if !application_visible {
@@ -1264,24 +1288,30 @@ fn create_peer_stream(
     } else {
         state.next_peer_uni
     };
+    if expected > MAX_VARINT62 {
+        return Err(Error::protocol("peer stream id overflow"));
+    }
     if stream_id != expected {
         return Err(Error::protocol("peer stream id skipped expected id"));
     }
+    let local_settings = &inner.local_preface.settings;
+    let peer_settings = &inner.peer_preface.settings;
     let visible_backlog_len = state
         .accept_bidi
         .len()
         .saturating_add(state.accept_uni.len());
     let over_stream_limit = if bidi {
-        state.active.peer_bidi >= inner.local_preface.settings.max_incoming_streams_bidi
+        state.active.peer_bidi >= local_settings.max_incoming_streams_bidi
     } else {
-        state.active.peer_uni >= inner.local_preface.settings.max_incoming_streams_uni
+        state.active.peer_uni >= local_settings.max_incoming_streams_uni
     };
     let over_visible_limit = visible_backlog_len >= state.accept_backlog_limit;
     let refused = over_stream_limit || (application_visible && over_visible_limit);
+    let next_peer_id = stream_id + 4;
     if bidi {
-        state.next_peer_bidi = state.next_peer_bidi.saturating_add(4);
+        state.next_peer_bidi = next_peer_id;
     } else {
-        state.next_peer_uni = state.next_peer_uni.saturating_add(4);
+        state.next_peer_uni = next_peer_id;
     }
     if refused {
         if application_visible {
@@ -1303,23 +1333,16 @@ fn create_peer_stream(
     }
     let accept_seq = if application_visible {
         let seq = state.next_accept_seq;
-        state.next_accept_seq = state.next_accept_seq.saturating_add(1);
+        state.next_accept_seq = state.next_accept_seq.wrapping_add(1);
         seq
     } else {
         0
     };
-    let recv_advertised = initial_receive_window(
-        inner.negotiated.local_role,
-        &inner.local_preface.settings,
-        stream_id,
-    );
-    let send_max = initial_send_window(
-        inner.negotiated.local_role,
-        &inner.peer_preface.settings,
-        stream_id,
-    );
+    let recv_advertised =
+        initial_receive_window(inner.negotiated.local_role, local_settings, stream_id);
+    let send_max = initial_send_window(inner.negotiated.local_role, peer_settings, stream_id);
     let stream = Arc::new(StreamInner {
-        conn: inner.clone(),
+        conn: Arc::clone(inner),
         id: AtomicU64::new(stream_id),
         bidi,
         opened_locally: false,
@@ -1358,7 +1381,7 @@ fn create_peer_stream(
             late_data_cap: late_data_per_stream_cap(
                 state.late_data_per_stream_cap,
                 recv_advertised,
-                inner.local_preface.settings.max_frame_payload,
+                local_settings.max_frame_payload,
             ),
             open_prefix: Vec::new(),
             open_info: Vec::new(),
@@ -1380,13 +1403,13 @@ fn create_peer_stream(
         }),
         cond: Condvar::new(),
     });
-    state.streams.insert(stream_id, stream.clone());
+    state.streams.insert(stream_id, Arc::clone(&stream));
     clear_ignored_control_budget_locked(state);
     if application_visible {
         if bidi {
-            state.accept_bidi.push_back(stream.clone());
+            state.accept_bidi.push_back(Arc::clone(&stream));
         } else {
-            state.accept_uni.push_back(stream.clone());
+            state.accept_uni.push_back(Arc::clone(&stream));
         }
         inner.cond.notify_all();
     }
@@ -1627,7 +1650,11 @@ fn handle_stop_sending(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             return Ok(());
         }
 
-        let mut reply = abort_unopened.then_some(FrameType::Abort);
+        let mut reply = if abort_unopened {
+            Some(FrameType::Abort)
+        } else {
+            None
+        };
         if !abort_unopened {
             let mut conn_state = inner.state.lock().unwrap();
             if ignore_peer_non_close_locked(&conn_state) {
@@ -1759,8 +1786,8 @@ fn handle_abort(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     if ignore_peer_non_close_locked(&conn_state) {
         return Ok(());
     }
-    let stream = if let Some(stream) = conn_state.streams.get(&frame.stream_id) {
-        Some(stream.clone())
+    let stream = if let Some(stream) = conn_state.streams.get(&frame.stream_id).cloned() {
+        Some(stream)
     } else if has_marker_only_terminal_marker_locked(&conn_state, frame.stream_id) {
         None
     } else if known_absent_stream_locked(&conn_state, inner, frame.stream_id) {
@@ -1849,13 +1876,15 @@ fn handle_pong(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             return Err(Error::frame_size("PONG payload too short"));
         }
         let now = Instant::now();
-        let keepalive_sent_at = state
-            .keepalive_ping
-            .as_ref()
-            .filter(|ping| {
-                pong_payload_matches_ping(&frame.payload, &ping.payload, ping.accepts_padded_pong)
-            })
-            .map(|ping| ping.sent_at);
+        let keepalive_sent_at = if let Some(ping) = state.keepalive_ping.as_ref() {
+            if pong_payload_matches_ping(&frame.payload, &ping.payload, ping.accepts_padded_pong) {
+                Some(ping.sent_at)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(sent_at) = keepalive_sent_at {
             state.keepalive_ping = None;
             note_matching_pong_locked(inner, &mut state, now, sent_at);
@@ -1905,14 +1934,14 @@ fn handle_pong(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     Ok(())
 }
 
-fn handle_goaway(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
+fn handle_go_away(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     {
         let state = inner.state.lock().unwrap();
         if ignore_session_control_while_closing_locked(&state) {
             return Ok(());
         }
     }
-    let payload = match parse_goaway_payload(&frame.payload) {
+    let payload = match parse_go_away_payload(&frame.payload) {
         Ok(payload) => payload,
         Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
     };
@@ -1921,28 +1950,33 @@ fn handle_goaway(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         if ignore_session_control_while_closing_locked(&state) {
             return Ok(());
         }
-        validate_goaway_watermark_for_direction(payload.last_accepted_bidi, true)?;
-        validate_goaway_watermark_creator(inner.negotiated.local_role, payload.last_accepted_bidi)?;
-        validate_goaway_watermark_for_direction(payload.last_accepted_uni, false)?;
-        validate_goaway_watermark_creator(inner.negotiated.local_role, payload.last_accepted_uni)?;
-        if payload.last_accepted_bidi > state.peer_goaway_bidi
-            || payload.last_accepted_uni > state.peer_goaway_uni
+        validate_go_away_watermark_for_direction(payload.last_accepted_bidi, true)?;
+        validate_go_away_watermark_creator(
+            inner.negotiated.local_role,
+            payload.last_accepted_bidi,
+        )?;
+        validate_go_away_watermark_for_direction(payload.last_accepted_uni, false)?;
+        validate_go_away_watermark_creator(inner.negotiated.local_role, payload.last_accepted_uni)?;
+        if payload.last_accepted_bidi > state.peer_go_away_bidi
+            || payload.last_accepted_uni > state.peer_go_away_uni
         {
             return Err(Error::protocol("GOAWAY watermarks must be non-increasing"));
         }
-        retain_peer_goaway_error_locked(inner, &mut state, payload.code, payload.reason);
-        let changed = payload.last_accepted_bidi < state.peer_goaway_bidi
-            || payload.last_accepted_uni < state.peer_goaway_uni;
+        retain_peer_go_away_error_locked(inner, &mut state, payload.code, payload.reason);
+        let changed = payload.last_accepted_bidi < state.peer_go_away_bidi
+            || payload.last_accepted_uni < state.peer_go_away_uni;
         if !changed {
             record_ignored_control_locked(&mut state)?;
             return Ok(());
         }
-        state.peer_goaway_bidi = payload.last_accepted_bidi;
-        state.peer_goaway_uni = payload.last_accepted_uni;
-        let mut reclaimed = reclaim_unseen_local_streams_after_goaway(&mut state, true);
-        reclaimed.extend(reclaim_unseen_local_streams_after_goaway(&mut state, false));
-        reclaim_provisionals_after_goaway(&mut state, true);
-        reclaim_provisionals_after_goaway(&mut state, false);
+        state.peer_go_away_bidi = payload.last_accepted_bidi;
+        state.peer_go_away_uni = payload.last_accepted_uni;
+        let mut reclaimed = reclaim_unseen_local_streams_after_go_away(&mut state, true);
+        reclaimed.extend(reclaim_unseen_local_streams_after_go_away(
+            &mut state, false,
+        ));
+        reclaim_provisionals_after_go_away(&mut state, true);
+        reclaim_provisionals_after_go_away(&mut state, false);
         if state.state == SessionState::Ready {
             state.state = SessionState::Draining;
         }
@@ -2008,27 +2042,28 @@ fn handle_ext(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         if stream.opened_locally && !ss.peer_visible {
             return Ok(());
         }
-        let before = ss.metadata.clone();
+        let before_priority = ss.metadata.priority;
+        let before_group = ss.metadata.group;
         let caps = inner.negotiated.capabilities;
-        if metadata.priority.is_some() && capabilities_can_carry_priority_update(caps) {
+        if metadata.priority.is_some() && capabilities_can_carry_priority_in_update(caps) {
             ss.metadata.priority = metadata.priority;
         }
-        if metadata.group.is_some() && capabilities_can_carry_group_update(caps) {
+        if metadata.group.is_some() && capabilities_can_carry_group_in_update(caps) {
             ss.metadata.group = normalize_stream_group(metadata.group);
         }
-        if ss.metadata == before {
+        if ss.metadata.priority == before_priority && ss.metadata.group == before_group {
             record_no_op_priority_update_locked(&mut state)?;
         } else {
-            ss.metadata_revision = ss.metadata_revision.saturating_add(1);
-            if should_record_group_rebucket_churn_locked(inner, &stream, &ss, before.group) {
+            ss.metadata_revision = ss.metadata_revision.wrapping_add(1);
+            if should_record_group_rebucket_churn_locked(inner, &stream, &ss, before_group) {
                 record_group_rebucket_churn_locked(&mut state)?;
             }
             clear_no_op_priority_update_budget_locked(&mut state);
         }
-    } else if has_marker_only_terminal_marker_locked(&state, frame.stream_id) {
+    } else if has_marker_only_terminal_marker_locked(&state, frame.stream_id)
+        || known_absent_stream_locked(&state, inner, frame.stream_id)
+    {
         return Ok(());
-    } else if known_absent_stream_locked(&state, inner, frame.stream_id) {
-        record_no_op_priority_update_locked(&mut state)?;
     }
     Ok(())
 }
@@ -2104,8 +2139,9 @@ fn abort_stream_for_peer_violation_locked(
     Ok(())
 }
 
+#[inline]
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    value.min(u64::MAX as usize) as u64
 }
 
 fn queue_abort(inner: &Arc<Inner>, stream_id: u64, code: u64, reason: &str) -> Result<()> {
