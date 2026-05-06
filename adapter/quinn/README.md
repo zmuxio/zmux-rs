@@ -71,8 +71,8 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 
 `QuinnSession` implements the async `zmux::AsyncSession` surface:
 
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::with_options`, and `zmux::OpenRequest::with_timeout` when open metadata and timeout must be carried through trait-object or generic APIs
-- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::with_options`, and `zmux::OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait-object or generic APIs
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::options`, and `zmux::OpenRequest::timeout` when open metadata and timeout must be carried through trait-object or generic APIs
+- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::options`, and `zmux::OpenSend::timeout` when payload shape, open metadata, or timeout must be carried through trait-object or generic APIs
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 - addresses: `local_addr`, `peer_addr`
 
@@ -166,8 +166,8 @@ Types:
 
 - construction: `new`, `with_options`
 - addresses: `local_addr`, `peer_addr`
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::with_options`, and `zmux::OpenRequest::with_timeout` for trait-object or generic calls
-- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::with_options`, and `zmux::OpenSend::with_timeout` for trait-object or generic calls
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::options`, and `zmux::OpenRequest::timeout` for trait-object or generic calls
+- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::options`, and `zmux::OpenSend::timeout` for trait-object or generic calls
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 
 `QuinnStream` methods:
@@ -231,5 +231,3 @@ let sessions: Vec<zmux::BoxAsyncSession> = vec![native, quic];
 ```
 
 The stream side follows the same rule: use `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHandle`, and `zmux::AsyncRecvStreamHandle` for adapter/native async code that must share storage. QUIC cannot represent native zmux ping, go-away, or preface negotiation state exactly; those control methods are still present on the common trait and return adapter-unsupported errors or empty snapshots instead of requiring a separate API.
-
-

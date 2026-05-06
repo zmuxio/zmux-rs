@@ -683,7 +683,7 @@ async fn rust_quinn_client_talks_to_go_quic_server_with_open_metadata() {
             OpenOptions::new()
                 .priority(7)
                 .group(11)
-                .with_open_info(b"rust-open"),
+                .open_info(b"rust-open"),
         )
         .await
         .unwrap();

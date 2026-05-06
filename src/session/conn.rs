@@ -51,7 +51,7 @@ use crate::stream_id::{
 use crate::varint::MAX_VARINT62;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -99,30 +99,6 @@ trait EstablishmentControl {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn close(&self) -> io::Result<()>;
-}
-
-struct TcpTransportControl {
-    stream: TcpStream,
-}
-
-impl EstablishmentControl for TcpTransportControl {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.set_read_timeout(timeout)
-    }
-
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.set_write_timeout(timeout)
-    }
-
-    fn close(&self) -> io::Result<()> {
-        self.stream.shutdown(Shutdown::Both)
-    }
-}
-
-impl RuntimeTransportControl for TcpTransportControl {
-    fn close(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
-    }
 }
 
 struct DuplexTransportControlAdapter {
@@ -321,157 +297,57 @@ fn finish_establishment_failure<W>(
 }
 
 impl Conn {
-    pub fn new<R, W>(reader: R, writer: W) -> Result<Self>
+    pub fn new<T>(transport: T) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
-        Self::new_with_config(reader, writer, Config::default())
+        Self::with_config(transport, Config::default())
     }
 
-    pub fn new_with_config<R, W>(reader: R, writer: W, config: Config) -> Result<Self>
+    pub fn with_config<T>(transport: T, config: Config) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
-        session_result(
-            Self::with_config_control(reader, writer, config, None, None, None, None),
-            ErrorOperation::Open,
-        )
+        let result = transport
+            .into_transport()
+            .and_then(|transport| Self::with_transport_config(transport, config));
+        session_result(result, ErrorOperation::Open)
     }
 
-    pub fn new_tcp(stream: TcpStream) -> Result<Self> {
-        Self::new_tcp_with_config(stream, Config::default())
-    }
-
-    pub fn new_tcp_with_config(stream: TcpStream, config: Config) -> Result<Self> {
-        session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
-    }
-
-    pub fn new_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
+    pub fn client<T>(transport: T) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
-        Self::new_transport_with_config(transport, Config::default())
+        Self::client_with_config(transport, Config::default())
     }
 
-    pub fn new_transport_with_config<R, W>(
-        transport: DuplexTransport<R, W>,
-        config: Config,
-    ) -> Result<Self>
+    pub fn client_with_config<T>(transport: T, mut config: Config) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        session_result(
-            Self::with_transport_config(transport, config),
-            ErrorOperation::Open,
-        )
-    }
-
-    pub fn client_tcp(stream: TcpStream) -> Result<Self> {
-        Self::client_tcp_with_config(stream, Config::default())
-    }
-
-    pub fn client_tcp_with_config(stream: TcpStream, mut config: Config) -> Result<Self> {
-        config.role = Role::Initiator;
-        session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
-    }
-
-    pub fn client_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        Self::client_transport_with_config(transport, Config::default())
-    }
-
-    pub fn client_transport_with_config<R, W>(
-        transport: DuplexTransport<R, W>,
-        mut config: Config,
-    ) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
         config.role = Role::Initiator;
-        session_result(
-            Self::with_transport_config(transport, config),
-            ErrorOperation::Open,
-        )
+        let result = transport
+            .into_transport()
+            .and_then(|transport| Self::with_transport_config(transport, config));
+        session_result(result, ErrorOperation::Open)
     }
 
-    pub fn server_tcp(stream: TcpStream) -> Result<Self> {
-        Self::server_tcp_with_config(stream, Config::default())
-    }
-
-    pub fn server_tcp_with_config(stream: TcpStream, mut config: Config) -> Result<Self> {
-        config.role = Role::Responder;
-        session_result(Self::with_tcp_config(stream, config), ErrorOperation::Open)
-    }
-
-    pub fn server_transport<R, W>(transport: DuplexTransport<R, W>) -> Result<Self>
+    pub fn server<T>(transport: T) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
-        Self::server_transport_with_config(transport, Config::default())
+        Self::server_with_config(transport, Config::default())
     }
 
-    pub fn server_transport_with_config<R, W>(
-        transport: DuplexTransport<R, W>,
-        mut config: Config,
-    ) -> Result<Self>
+    pub fn server_with_config<T>(transport: T, mut config: Config) -> Result<Self>
     where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
+        T: DuplexConnection,
     {
         config.role = Role::Responder;
-        session_result(
-            Self::with_transport_config(transport, config),
-            ErrorOperation::Open,
-        )
-    }
-
-    pub fn client<R, W>(reader: R, writer: W) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        Self::client_with_config(reader, writer, Config::default())
-    }
-
-    pub fn client_with_config<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        config.role = Role::Initiator;
-        session_result(
-            Self::with_config_control(reader, writer, config, None, None, None, None),
-            ErrorOperation::Open,
-        )
-    }
-
-    pub fn server<R, W>(reader: R, writer: W) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        Self::server_with_config(reader, writer, Config::default())
-    }
-
-    pub fn server_with_config<R, W>(reader: R, writer: W, mut config: Config) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-        W: Write + Send + 'static,
-    {
-        config.role = Role::Responder;
-        session_result(
-            Self::with_config_control(reader, writer, config, None, None, None, None),
-            ErrorOperation::Open,
-        )
+        let result = transport
+            .into_transport()
+            .and_then(|transport| Self::with_transport_config(transport, config));
+        session_result(result, ErrorOperation::Open)
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -480,25 +356,6 @@ impl Conn {
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr
-    }
-
-    fn with_tcp_config(stream: TcpStream, config: Config) -> Result<Self> {
-        let local_addr = stream.local_addr().ok();
-        let peer_addr = stream.peer_addr().ok();
-        let reader = stream.try_clone().map_err(Error::from)?;
-        let control = Arc::new(TcpTransportControl {
-            stream: stream.try_clone().map_err(Error::from)?,
-        });
-        let runtime_control: Arc<dyn RuntimeTransportControl> = control.clone();
-        Self::with_config_control(
-            reader,
-            stream,
-            config,
-            Some(control.as_ref()),
-            Some(runtime_control),
-            local_addr,
-            peer_addr,
-        )
     }
 
     fn with_transport_config<R, W>(transport: DuplexTransport<R, W>, config: Config) -> Result<Self>
@@ -933,9 +790,9 @@ impl Conn {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let stream = self.open_stream_with(open)?;
         if requested == 0 {
@@ -972,9 +829,9 @@ impl Conn {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let stream = self.open_uni_stream_with(open)?;
         let timeout = timeout
@@ -1001,7 +858,7 @@ impl Conn {
             caps,
             opts.initial_priority(),
             opts.initial_group(),
-            opts.open_info(),
+            opts.open_info_bytes(),
             peer_settings.max_frame_payload,
         )?);
 
@@ -1056,7 +913,7 @@ impl Conn {
             )
             .with_source(ErrorSource::Remote));
         }
-        let open_info_len = opts.open_info().len();
+        let open_info_len = opts.open_info_bytes().len();
         if open_info_len > retained_open_info_available(&state) {
             return Err(
                 Error::new(ErrorCode::StreamLimit, "zmux: open_info budget exceeded")

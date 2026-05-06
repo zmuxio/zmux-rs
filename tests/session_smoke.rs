@@ -26,6 +26,12 @@ struct MemoryConn {
     outbound: Arc<Queue>,
 }
 
+#[derive(Clone)]
+struct TlsLikeConn {
+    inner: MemoryConn,
+    close_count: Option<Arc<AtomicUsize>>,
+}
+
 struct Queue {
     state: Mutex<QueueState>,
     cond: Condvar,
@@ -303,6 +309,56 @@ impl Drop for MemoryConn {
     }
 }
 
+impl Read for TlsLikeConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for TlsLikeConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl TlsLikeConn {
+    fn new(inner: MemoryConn) -> Self {
+        Self {
+            inner,
+            close_count: None,
+        }
+    }
+
+    fn with_close_count(inner: MemoryConn, close_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner,
+            close_count: Some(close_count),
+        }
+    }
+}
+
+impl zmux::DuplexConnection for TlsLikeConn {
+    type Reader = TlsLikeConn;
+    type Writer = TlsLikeConn;
+
+    fn into_transport(self) -> zmux::Result<zmux::DuplexTransport<Self::Reader, Self::Writer>> {
+        let reader = self.clone();
+        let close_count = self.close_count.clone();
+        let transport = zmux::DuplexTransport::new(reader, self);
+        Ok(match close_count {
+            Some(close_count) => transport.with_close_fn(move || {
+                close_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+            None => transport,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct FailAfterWrites {
     inner: MemoryConn,
@@ -524,10 +580,10 @@ fn connected_pair(client_config: Config, server_config: Config) -> (Conn, Conn) 
     let server_write = server_io;
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let server_thread = thread::spawn(move || {
-        Conn::server_with_config(server_read, server_write, server_config).unwrap()
+        Conn::server_with_config((server_read, server_write), server_config).unwrap()
     });
 
     (client_thread.join().unwrap(), server_thread.join().unwrap())
@@ -564,16 +620,125 @@ fn tcp_constructors_establish_session_with_deadline_control() {
     let addr = listener.local_addr().unwrap();
     let server_thread = thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
-        Conn::server_tcp(socket).unwrap()
+        Conn::server(socket).unwrap()
     });
 
-    let client = Conn::client_tcp(TcpStream::connect(addr).unwrap()).unwrap();
+    let client = Conn::client(TcpStream::connect(addr).unwrap()).unwrap();
     let server = server_thread.join().unwrap();
 
     assert_eq!(client.state(), SessionState::Ready);
     assert_eq!(server.state(), SessionState::Ready);
-    client.close().unwrap();
-    server.close().unwrap();
+    let _ = client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+}
+
+#[test]
+fn custom_duplex_connection_can_back_native_session_and_close_underlying_resource() {
+    let (client_io, server_io) = memory_pair();
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let client_close_count = Arc::clone(&close_count);
+    let client_thread = thread::spawn(move || {
+        Conn::client(TlsLikeConn::with_close_count(client_io, client_close_count)).unwrap()
+    });
+    let server_thread =
+        thread::spawn(move || Conn::server(Box::new(TlsLikeConn::new(server_io))).unwrap());
+
+    let client = client_thread.join().unwrap();
+    let server = server_thread.join().unwrap();
+
+    let stream = client.open_stream().unwrap();
+    stream.write_final(b"tls-like").unwrap();
+
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(&buf, b"tls-like");
+
+    let _ = client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = client.wait_timeout(Duration::from_secs(1));
+    let _ = server.wait_timeout(Duration::from_secs(1));
+
+    for _ in 0..50 {
+        if close_count.load(Ordering::Relaxed) != 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(close_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn joined_streams_can_back_nested_native_session() {
+    let (outer_client, outer_server) = connected_pair(Config::default(), Config::default());
+
+    let outer_client_stream = outer_client.open_stream().unwrap();
+    let inner_client_transport =
+        zmux::join_streams(outer_client_stream.clone(), outer_client_stream);
+    let inner_client_thread = thread::spawn(move || Conn::client(inner_client_transport).unwrap());
+
+    let outer_server_stream = outer_server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let inner_server_transport =
+        zmux::join_streams(outer_server_stream.clone(), outer_server_stream);
+    let inner_server_thread = thread::spawn(move || Conn::server(inner_server_transport).unwrap());
+    let inner_client = inner_client_thread.join().unwrap();
+    let inner_server = inner_server_thread.join().unwrap();
+
+    let stream = inner_client.open_stream().unwrap();
+    stream.write_final(b"nested").unwrap();
+    let accepted = inner_server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let mut buf = [0u8; 6];
+    assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(&buf, b"nested");
+
+    let _ = inner_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = inner_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = outer_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = outer_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+}
+
+#[test]
+fn joined_uni_streams_bridge_as_duplex_byte_stream() {
+    let (outer_client, outer_server) = connected_pair(Config::default(), Config::default());
+
+    let client_send = outer_client.open_uni_stream().unwrap();
+    let server_send = outer_server.open_uni_stream().unwrap();
+    client_send.write_all(b"hi").unwrap();
+    server_send.write_all(b"yo").unwrap();
+
+    let client_recv = outer_client
+        .accept_uni_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let server_recv = outer_server
+        .accept_uni_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let mut client_conn = zmux::join_streams(client_recv, client_send);
+    let mut server_conn = zmux::join_streams(server_recv, server_send);
+
+    let mut buf = [0u8; 8];
+    let n = Read::read(&mut server_conn, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hi");
+    let n = Read::read(&mut client_conn, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"yo");
+
+    Write::write_all(&mut client_conn, b"ping").unwrap();
+    let n = Read::read(&mut server_conn, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"ping");
+
+    Write::write_all(&mut server_conn, b"pong").unwrap();
+    let n = Read::read(&mut client_conn, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"pong");
+
+    zmux::StreamHandle::close(&client_conn).unwrap();
+    zmux::StreamHandle::close(&server_conn).unwrap();
+    let _ = outer_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = outer_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
 }
 
 #[test]
@@ -585,12 +750,12 @@ fn establishment_preface_exchange_does_not_deadlock_on_zero_buffer_transport() {
     let client_thread = thread::spawn(move || {
         let client_read = client_io.clone();
         let client_write = client_io;
-        let _ = client_done.send(("client", Conn::client(client_read, client_write)));
+        let _ = client_done.send(("client", Conn::client((client_read, client_write))));
     });
     let server_thread = thread::spawn(move || {
         let server_read = server_io.clone();
         let server_write = server_io;
-        let _ = done_tx.send(("server", Conn::server(server_read, server_write)));
+        let _ = done_tx.send(("server", Conn::server((server_read, server_write))));
     });
 
     let mut client = None;
@@ -629,7 +794,7 @@ fn preface_padding_is_accepted_during_session_establishment() {
     };
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let _client_preface = read_preface(&mut peer_io).unwrap();
 
@@ -682,7 +847,7 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     assert!(!session.wait_timeout(Duration::ZERO).unwrap());
 
     let stream = session
-        .open_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
+        .open_stream_with(zmux::OpenRequest::new().timeout(Duration::from_millis(10)))
         .unwrap();
     assert!(stream.is_opened_locally());
     assert!(stream.is_bidirectional());
@@ -707,7 +872,7 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     assert_eq!(scratch, b"pre");
 
     let mut send = session
-        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
+        .open_uni_stream_with(zmux::OpenRequest::new().timeout(Duration::from_millis(10)))
         .unwrap();
     let parts = [
         IoSlice::new(b"trait-"),
@@ -724,7 +889,7 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     );
 
     let mut send = session
-        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
+        .open_uni_stream_with(zmux::OpenRequest::new().timeout(Duration::from_millis(10)))
         .unwrap();
     let parts = [IoSlice::new(b"std-"), IoSlice::new(b"write-vectored")];
     assert_eq!(
@@ -738,7 +903,7 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     assert_eq!(read_all_recv_stream(&recv_uni), b"std-write-vectored");
 
     let send = session
-        .open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::from_millis(10)))
+        .open_uni_stream_with(zmux::OpenRequest::new().timeout(Duration::from_millis(10)))
         .unwrap();
     let parts = [IoSlice::new(b"trait-"), IoSlice::new(b"write-vectored")];
     assert_eq!(send.write_vectored_final(&parts).unwrap(), 20);
@@ -918,7 +1083,7 @@ fn event_handler_reports_stream_and_session_lifecycle() {
     let open_options = OpenOptions::new()
         .priority(7)
         .group(9)
-        .with_open_info(&open_info);
+        .open_info(&open_info);
     let stream = client.open_stream_with(open_options).unwrap();
     stream.write_final(b"event").unwrap();
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
@@ -1717,15 +1882,14 @@ fn session_timeouts_fail_locally_without_protocol_side_effects() {
     };
     assert!(accept_err.to_string().contains("accept timed out"));
 
-    let open_err =
-        match client.open_stream_with(zmux::OpenRequest::new().with_timeout(Duration::ZERO)) {
-            Ok(_) => panic!("open timeout unexpectedly returned a stream"),
-            Err(err) => err,
-        };
+    let open_err = match client.open_stream_with(zmux::OpenRequest::new().timeout(Duration::ZERO)) {
+        Ok(_) => panic!("open timeout unexpectedly returned a stream"),
+        Err(err) => err,
+    };
     assert!(open_err.to_string().contains("open timed out"));
 
     let open_uni_err =
-        match client.open_uni_stream_with(zmux::OpenRequest::new().with_timeout(Duration::ZERO)) {
+        match client.open_uni_stream_with(zmux::OpenRequest::new().timeout(Duration::ZERO)) {
             Ok(_) => panic!("open_uni timeout unexpectedly returned a stream"),
             Err(err) => err,
         };
@@ -1758,12 +1922,11 @@ fn open_send_request_timeout_carries_budget_into_first_write() {
     server_config.role = zmux::Role::Responder;
     let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
 
-    let err = match client
-        .open_and_send(zmux::OpenSend::new(b"xy").with_timeout(Duration::from_millis(30)))
-    {
-        Ok(_) => panic!("open_send request unexpectedly succeeded"),
-        Err(err) => err,
-    };
+    let err =
+        match client.open_and_send(zmux::OpenSend::new(b"xy").timeout(Duration::from_millis(30))) {
+            Ok(_) => panic!("open_send request unexpectedly succeeded"),
+            Err(err) => err,
+        };
     assert!(err.to_string().contains("write timed out"));
 }
 
@@ -1776,7 +1939,7 @@ fn open_uni_send_request_timeout_carries_budget_into_final_write() {
     let (client, _peer) = client_with_raw_peer_configs(Config::default(), server_config);
 
     let err = match client
-        .open_uni_and_send(zmux::OpenSend::new(b"xy").with_timeout(Duration::from_millis(30)))
+        .open_uni_and_send(zmux::OpenSend::new(b"xy").timeout(Duration::from_millis(30)))
     {
         Ok(_) => panic!("open_uni_send request unexpectedly succeeded"),
         Err(err) => err,
@@ -1796,7 +1959,7 @@ fn vectored_open_send_request_timeout_carries_budget_into_first_write() {
     let parts = [IoSlice::new(b"x"), IoSlice::new(b"y")];
 
     let err = match client
-        .open_and_send(zmux::OpenSend::vectored(&parts).with_timeout(Duration::from_millis(30)))
+        .open_and_send(zmux::OpenSend::vectored(&parts).timeout(Duration::from_millis(30)))
     {
         Ok(_) => panic!("vectored open_send request unexpectedly succeeded"),
         Err(err) => err,
@@ -1814,7 +1977,7 @@ fn vectored_open_uni_send_request_timeout_carries_budget_into_final_write() {
     let parts = [IoSlice::new(b"x"), IoSlice::new(b"y")];
 
     let err = match client
-        .open_uni_and_send(zmux::OpenSend::vectored(&parts).with_timeout(Duration::from_millis(30)))
+        .open_uni_and_send(zmux::OpenSend::vectored(&parts).timeout(Duration::from_millis(30)))
     {
         Ok(_) => panic!("vectored open_uni_send request unexpectedly succeeded"),
         Err(err) => err,
@@ -1827,7 +1990,7 @@ fn open_send_request_timeout_success_uses_single_budget() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
     let (stream, n) = client
-        .open_and_send(zmux::OpenSend::new(b"ok").with_timeout(Duration::from_secs(1)))
+        .open_and_send(zmux::OpenSend::new(b"ok").timeout(Duration::from_secs(1)))
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
     assert_eq!(n, 2);
@@ -1856,7 +2019,7 @@ fn open_uni_send_request_options_preserve_open_info() {
 
     let (stream, n) = client
         .open_uni_and_send(
-            zmux::OpenSend::new(b"hello").with_options(OpenOptions::new().with_open_info(b"ssh")),
+            zmux::OpenSend::new(b"hello").options(OpenOptions::new().open_info(b"ssh")),
         )
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
@@ -2419,7 +2582,7 @@ fn final_write_deadline_after_queue_admission_cancels_before_writer_starts() {
     let client_read = client_io.clone();
     let (client_write, writer_gate) = blocking_writer(client_io, 1);
 
-    let client_thread = thread::spawn(move || Conn::client(client_read, client_write).unwrap());
+    let client_thread = thread::spawn(move || Conn::client((client_read, client_write)).unwrap());
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -2536,7 +2699,7 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
     let client_read = client_io.clone();
     let (client_write, writer_gate) = blocking_writer(client_io, 1);
 
-    let client_thread = thread::spawn(move || Conn::client(client_read, client_write).unwrap());
+    let client_thread = thread::spawn(move || Conn::client((client_read, client_write)).unwrap());
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
     peer_io
@@ -2615,7 +2778,7 @@ fn close_write_deadline_failure_keeps_local_write_open_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
@@ -2670,7 +2833,7 @@ fn write_deadline_failure_keeps_local_write_open_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
@@ -2714,7 +2877,7 @@ fn set_write_deadline_wakes_close_read_blocked_on_writer_queue() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
 
     let closer = stream.clone();
@@ -2754,7 +2917,7 @@ fn close_read_deadline_keeps_pending_signal_for_retry() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
 
     stream
@@ -2786,7 +2949,7 @@ fn close_read_retry_after_deadline_failure_queues_opener_and_stop_sending() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
 
     stream.set_write_deadline(Some(Instant::now())).unwrap();
@@ -3014,7 +3177,7 @@ fn pre_open_metadata_update_overflow_does_not_mutate() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let open_info = pre_open_overflow_open_info(caps, Settings::default().max_frame_payload, 7, 11);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(&open_info))
+        .open_stream_with(OpenOptions::new().open_info(&open_info))
         .unwrap();
 
     let err = stream
@@ -3852,7 +4015,7 @@ fn client_with_raw_peer_configs(client_config: Config, peer_config: Config) -> (
     let client_write = client_io;
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = peer_config.local_preface().unwrap();
@@ -3876,7 +4039,7 @@ fn client_with_rendezvous_raw_peer(client_config: Config) -> (Conn, RendezvousCo
     let client_write = client_io;
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
@@ -3896,7 +4059,7 @@ fn client_with_rendezvous_raw_peer_and_write_probe(
     let client_write = client_io;
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
@@ -3955,7 +4118,7 @@ fn client_with_raw_peer_and_failing_writer_after_preface(
     };
 
     let client_thread = thread::spawn(move || {
-        Conn::client_with_config(client_read, client_write, client_config).unwrap()
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
     });
     let _client_preface = read_preface(&mut peer_io).unwrap();
     let server_preface = Config::responder().local_preface().unwrap();
@@ -3979,7 +4142,7 @@ fn failed_establishment_emits_fatal_close_after_local_preface() {
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread = thread::spawn(move || Conn::client(client_read, client_write));
+    let client_thread = thread::spawn(move || Conn::client((client_read, client_write)));
     let _client_preface = read_preface(&mut peer_io).unwrap();
     peer_io.write_all(b"ZMUX\x01\xff").unwrap();
     peer_io.flush().unwrap();
@@ -4002,7 +4165,7 @@ fn same_role_establishment_conflict_emits_role_conflict_close() {
     let client_read = client_io.clone();
     let client_write = client_io;
 
-    let client_thread = thread::spawn(move || Conn::client(client_read, client_write));
+    let client_thread = thread::spawn(move || Conn::client((client_read, client_write)));
     let client_preface = read_preface(&mut peer_io).unwrap();
     assert_eq!(client_preface.role, zmux::Role::Initiator);
 
@@ -5679,7 +5842,7 @@ fn zero_length_write_does_not_emit_open_metadata_opener() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"meta"))
+        .open_stream_with(OpenOptions::new().open_info(b"meta"))
         .unwrap();
 
     assert_eq!(stream.write(&[]).unwrap(), 0);
@@ -5703,9 +5866,7 @@ fn open_and_send_empty_does_not_emit_open_metadata_opener() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let (stream, n) = client
-        .open_and_send(
-            zmux::OpenSend::new([]).with_options(OpenOptions::new().with_open_info(b"meta")),
-        )
+        .open_and_send(zmux::OpenSend::new([]).options(OpenOptions::new().open_info(b"meta")))
         .unwrap();
 
     assert_eq!(n, 0);
@@ -5746,7 +5907,7 @@ fn write_vectored_final_splits_when_open_metadata_consumes_whole_first_frame() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(&open_info))
+        .open_stream_with(OpenOptions::new().open_info(&open_info))
         .unwrap();
     let parts = [IoSlice::new(b"x")];
 
@@ -5955,7 +6116,7 @@ fn saturated_priority_chunks_after_open_metadata_prefix() {
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let stream = client
-        .open_stream_with(OpenOptions::new().priority(20).with_open_info(b"ssh"))
+        .open_stream_with(OpenOptions::new().priority(20).open_info(b"ssh"))
         .unwrap();
     let payload = vec![b's'; 5_000];
 
@@ -11386,11 +11547,11 @@ fn local_open_info_budget_releases_when_uncommitted_open_is_cancelled() {
     let (client, _peer) = client_with_raw_peer_configs(client_config, peer_config);
 
     let first = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"abc"))
+        .open_stream_with(OpenOptions::new().open_info(b"abc"))
         .unwrap();
     assert_eq!(client.stats().retention.retained_open_info_bytes, 3);
 
-    let err = match client.open_stream_with(OpenOptions::new().with_open_info(b"x")) {
+    let err = match client.open_stream_with(OpenOptions::new().open_info(b"x")) {
         Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
@@ -11405,7 +11566,7 @@ fn local_open_info_budget_releases_when_uncommitted_open_is_cancelled() {
     assert_eq!(client.stats().retention.retained_open_info_bytes, 0);
 
     let replacement = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"x"))
+        .open_stream_with(OpenOptions::new().open_info(b"x"))
         .unwrap();
     assert_eq!(client.stats().retention.retained_open_info_bytes, 1);
     replacement
@@ -11431,7 +11592,7 @@ fn local_open_session_memory_cap_rejects_open_info_over_cap() {
     };
     let (client, _peer) = client_with_raw_peer_configs(client_config, peer_config);
 
-    let err = match client.open_stream_with(OpenOptions::new().with_open_info(&open_info)) {
+    let err = match client.open_stream_with(OpenOptions::new().open_info(&open_info)) {
         Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
@@ -11465,7 +11626,7 @@ fn local_open_memory_cap_baseline(caps: u64) -> usize {
 fn local_open_rejects_open_info_without_negotiated_open_metadata() {
     let (client, mut peer) = client_with_raw_peer(Config::default());
 
-    let err = match client.open_stream_with(OpenOptions::new().with_open_info(b"need-metadata")) {
+    let err = match client.open_stream_with(OpenOptions::new().open_info(b"need-metadata")) {
         Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
@@ -11500,7 +11661,7 @@ fn local_open_rejects_oversized_open_metadata_at_open_time() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
     let open_info = vec![0; Settings::default().max_frame_payload as usize + 1];
 
-    let err = match client.open_stream_with(OpenOptions::new().with_open_info(&open_info)) {
+    let err = match client.open_stream_with(OpenOptions::new().open_info(&open_info)) {
         Ok(_) => panic!("open_stream_with unexpectedly succeeded"),
         Err(err) => err,
     };
@@ -11589,7 +11750,7 @@ fn local_open_metadata_prefix_releases_after_first_frame_is_visible_to_peer() {
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
 
     let stream = client
-        .open_stream_with(OpenOptions::new().with_open_info(b"abc"))
+        .open_stream_with(OpenOptions::new().open_info(b"abc"))
         .unwrap();
     stream.write_final(b"x").unwrap();
 

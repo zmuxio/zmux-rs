@@ -206,7 +206,7 @@ pub fn build_stream_prelude(opts: &OpenOptions) -> Result<Vec<u8>> {
         OPEN_METADATA_CAPABILITIES,
         opts.initial_priority(),
         opts.initial_group(),
-        opts.open_info(),
+        opts.open_info_bytes(),
         STREAM_PRELUDE_MAX_PAYLOAD,
     )?;
     if prelude.is_empty() {
@@ -548,10 +548,10 @@ impl QuinnSession {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
             ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let stream = self
             .open_stream_with(open)
@@ -591,10 +591,10 @@ impl QuinnSession {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
             ensure_positive_session_timeout(timeout, "open", zmux::ErrorOperation::Open)?;
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let stream = self
             .open_uni_stream_with(open)
@@ -1408,7 +1408,7 @@ impl PreludeState {
         if let Some(group) = update.group {
             self.metadata.group = Some(group);
         }
-        let mut opts = OpenOptions::new().with_open_info(&self.metadata.open_info);
+        let mut opts = OpenOptions::new().open_info(&self.metadata.open_info);
         if let Some(priority) = self.metadata.priority {
             opts = opts.priority(priority);
         }
@@ -4066,11 +4066,11 @@ mod tests {
     }
 
     #[test]
-    fn prelude_round_trip_with_open_info_and_priority() {
+    fn prelude_round_trip_open_info_and_priority() {
         let opts = OpenOptions::new()
             .priority(7)
             .group(11)
-            .with_open_info(&[1, 2, 3, 4]);
+            .open_info(&[1, 2, 3, 4]);
         let prelude = build_stream_prelude(&opts).unwrap();
         let parsed = read_stream_prelude(&mut prelude.as_slice()).unwrap();
         assert!(parsed.metadata_valid);

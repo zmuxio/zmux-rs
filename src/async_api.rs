@@ -126,8 +126,9 @@ pub trait AsyncStreamHandle: Send + Sync {
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
     }
-    /// Stable resource identity used to avoid closing the same joined full
-    /// stream twice.
+    /// Stable resource identity used internally to avoid closing the same
+    /// joined full stream twice.
+    #[doc(hidden)]
     fn close_identity(&self) -> *const () {
         if size_of_val(self) == 0 {
             null()
@@ -463,10 +464,10 @@ pub trait AsyncSession: Send + Sync {
         Box::pin(async move {
             let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
-            let mut open = OpenRequest::new().with_options(opts);
+            let mut open = OpenRequest::new().options(opts);
             if let Some(timeout) = timeout {
                 ensure_positive_open_timeout(timeout)?;
-                open = open.with_timeout(timeout);
+                open = open.timeout(timeout);
             }
             let stream = self.open_stream_with(open).await?;
             let timeout = timeout
@@ -484,10 +485,10 @@ pub trait AsyncSession: Send + Sync {
         Box::pin(async move {
             let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
-            let mut open = OpenRequest::new().with_options(opts);
+            let mut open = OpenRequest::new().options(opts);
             if let Some(timeout) = timeout {
                 ensure_positive_open_timeout(timeout)?;
-                open = open.with_timeout(timeout);
+                open = open.timeout(timeout);
             }
             let stream = self.open_uni_stream_with(open).await?;
             let timeout = timeout
@@ -765,14 +766,6 @@ pub type PausedAsyncSendHalf<W> = PausedAsyncHalf<W>;
 #[must_use]
 pub fn join_async_streams<R, W>(recv: R, send: W) -> AsyncDuplexStream<R, W> {
     AsyncDuplexStream::new(recv, send)
-}
-
-#[must_use]
-pub fn join_optional_async_streams<R, W>(
-    recv: Option<R>,
-    send: Option<W>,
-) -> AsyncDuplexStream<R, W> {
-    AsyncDuplexStream::from_parts(recv, send)
 }
 
 impl<T> AsyncJoinedHalf<T> {

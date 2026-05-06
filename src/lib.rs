@@ -25,18 +25,17 @@ mod tlv;
 mod varint;
 
 pub use api::{
-    closed_session, join_optional_streams, join_streams, BoxDuplexStream, BoxRecvStream,
-    BoxSendStream, BoxSession, ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
+    closed_session, join_streams, BoxDuplexStream, BoxRecvStream, BoxSendStream, BoxSession,
+    ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
     PausedNativeHalf as PausedHalf, PausedNativeRecvHalf as PausedRecvHalf,
     PausedNativeSendHalf as PausedSendHalf, RecvStreamHandle, SendStreamHandle, Session,
     StreamHandle,
 };
 pub use async_api::{
-    box_async_session, closed_async_session, join_async_streams, join_optional_async_streams,
-    AsyncBoxFuture, AsyncDuplexStream, AsyncDuplexStreamHandle, AsyncRecvStreamHandle,
-    AsyncSendStreamHandle, AsyncSession, AsyncStreamHandle, BoxAsyncDuplexStream,
-    BoxAsyncRecvStream, BoxAsyncSendStream, BoxAsyncSession, ClosedAsyncSession, PausedAsyncHalf,
-    PausedAsyncRecvHalf, PausedAsyncSendHalf,
+    box_async_session, closed_async_session, join_async_streams, AsyncBoxFuture, AsyncDuplexStream,
+    AsyncDuplexStreamHandle, AsyncRecvStreamHandle, AsyncSendStreamHandle, AsyncSession,
+    AsyncStreamHandle, BoxAsyncDuplexStream, BoxAsyncRecvStream, BoxAsyncSendStream,
+    BoxAsyncSession, ClosedAsyncSession, PausedAsyncHalf, PausedAsyncRecvHalf, PausedAsyncSendHalf,
 };
 pub use config::{
     configure_default_config, default_config, reset_default_config, Config, OpenOptions,
@@ -93,11 +92,11 @@ pub use protocol::{
     SETTING_PREFACE_PADDING, SETTING_SCHEDULER_HINTS,
 };
 pub use session::{
-    AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn, DiagnosticStats, DuplexTransport,
-    DuplexTransportControl, FlushStats, HiddenStateStats, LivenessStats, MemoryStats,
-    PeerCloseError, PeerGoAwayError, PressureStats, ProgressStats, ProvisionalStats, ReasonStats,
-    RecvStream, RetentionStats, SendStream, SessionState, SessionStats, Stream, TelemetryStats,
-    WriterQueueStats,
+    AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn, DiagnosticStats, DuplexConnection,
+    DuplexTransport, DuplexTransportControl, FlushStats, HiddenStateStats, LivenessStats,
+    MemoryStats, PeerCloseError, PeerGoAwayError, PressureStats, ProgressStats, ProvisionalStats,
+    ReasonStats, RecvStream, RetentionStats, SendStream, SessionState, SessionStats, Stream,
+    TelemetryStats, WriterQueueStats,
 };
 pub use settings::{
     default_settings, marshal_settings_tlv, parse_settings_tlv, SchedulerHint, Settings,
@@ -107,13 +106,3 @@ pub use varint::{
     append_varint, encode_varint, encode_varint_to_slice, parse_varint, read_varint, varint_len,
     MAX_VARINT62, MAX_VARINT_LEN,
 };
-
-/// Erase a blocking session behind the session trait object.
-#[inline]
-#[must_use]
-pub fn box_session<S>(session: S) -> BoxSession
-where
-    S: Session + 'static,
-{
-    Box::new(session)
-}

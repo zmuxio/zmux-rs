@@ -90,6 +90,7 @@ impl Stream {
         self.inner.id()
     }
 
+    #[doc(hidden)]
     pub fn close_identity(&self) -> *const () {
         Arc::as_ptr(&self.inner).cast::<()>()
     }
@@ -416,6 +417,7 @@ impl SendStream {
         self.inner.id()
     }
 
+    #[doc(hidden)]
     pub fn close_identity(&self) -> *const () {
         Arc::as_ptr(&self.inner).cast::<()>()
     }
@@ -638,6 +640,7 @@ impl RecvStream {
         self.inner.id()
     }
 
+    #[doc(hidden)]
     pub fn close_identity(&self) -> *const () {
         Arc::as_ptr(&self.inner).cast::<()>()
     }

@@ -12,9 +12,9 @@ mod stream;
 mod types;
 
 pub use types::{
-    AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn, DiagnosticStats, DuplexTransport,
-    DuplexTransportControl, FlushStats, HiddenStateStats, LivenessStats, MemoryStats,
-    PeerCloseError, PeerGoAwayError, PressureStats, ProgressStats, ProvisionalStats, ReasonStats,
-    RecvStream, RetentionStats, SendStream, SessionState, SessionStats, Stream, TelemetryStats,
-    WriterQueueStats,
+    AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn, DiagnosticStats, DuplexConnection,
+    DuplexTransport, DuplexTransportControl, FlushStats, HiddenStateStats, LivenessStats,
+    MemoryStats, PeerCloseError, PeerGoAwayError, PressureStats, ProgressStats, ProvisionalStats,
+    ReasonStats, RecvStream, RetentionStats, SendStream, SessionState, SessionStats, Stream,
+    TelemetryStats, WriterQueueStats,
 };

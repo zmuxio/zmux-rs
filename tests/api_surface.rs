@@ -146,33 +146,33 @@ fn public_config_builders_remain_ergonomic() {
     let opts = zmux::OpenOptions::new()
         .priority(zmux::MAX_VARINT62)
         .group(9)
-        .with_open_info(b"hello");
+        .open_info(b"hello");
     assert_eq!(opts.initial_priority(), Some(zmux::MAX_VARINT62));
     assert_eq!(opts.initial_group(), Some(9));
-    assert_eq!(opts.open_info(), b"hello");
+    assert_eq!(opts.open_info_bytes(), b"hello");
     assert_eq!(
         zmux::OpenOptions::new()
-            .with_open_info(b"borrowed")
-            .open_info(),
+            .open_info(b"borrowed")
+            .open_info_bytes(),
         b"borrowed"
     );
     let open_info_buf = vec![0, 1, 2, 3];
     assert_eq!(
         zmux::OpenOptions::new()
-            .with_open_info(&open_info_buf)
-            .open_info(),
+            .open_info(&open_info_buf)
+            .open_info_bytes(),
         open_info_buf.as_slice()
     );
     assert_eq!(
         zmux::OpenOptions::new()
-            .with_open_info(open_info_buf.as_slice())
-            .open_info(),
+            .open_info(open_info_buf.as_slice())
+            .open_info_bytes(),
         open_info_buf.as_slice()
     );
     assert_eq!(
         zmux::OpenOptions::new()
-            .with_open_info(open_info_buf.clone())
-            .open_info(),
+            .open_info(open_info_buf.clone())
+            .open_info_bytes(),
         open_info_buf.as_slice()
     );
     assert!(opts.validate().is_ok());
@@ -339,7 +339,7 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
     );
     assert_eq!(
         session
-            .open_and_send(zmux::OpenSend::vectored(&parts).with_options(zmux::OpenOptions::new()))?
+            .open_and_send(zmux::OpenSend::vectored(&parts).options(zmux::OpenOptions::new()))?
             .1,
         5
     );
@@ -351,9 +351,7 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
     );
     assert_eq!(
         session
-            .open_uni_and_send(
-                zmux::OpenSend::vectored(&parts).with_options(zmux::OpenOptions::new())
-            )?
+            .open_uni_and_send(zmux::OpenSend::vectored(&parts).options(zmux::OpenOptions::new()))?
             .1,
         5
     );
@@ -451,23 +449,23 @@ fn async_session_timeout_defaults_share_one_budget() -> zmux::Result<()> {
 
     block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::new(b"bidi").with_timeout(original_timeout),
+        zmux::OpenSend::new(b"bidi").timeout(original_timeout),
     ))?;
     block_on(zmux::AsyncSession::open_and_send(
         &session,
         zmux::OpenSend::new(b"bidi-opts")
-            .with_options(zmux::OpenOptions::default())
-            .with_timeout(original_timeout),
+            .options(zmux::OpenOptions::default())
+            .timeout(original_timeout),
     ))?;
     block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::new(b"uni").with_timeout(original_timeout),
+        zmux::OpenSend::new(b"uni").timeout(original_timeout),
     ))?;
     block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
         zmux::OpenSend::new(b"uni-opts")
-            .with_options(zmux::OpenOptions::default())
-            .with_timeout(original_timeout),
+            .options(zmux::OpenOptions::default())
+            .timeout(original_timeout),
     ))?;
 
     let timeouts = write_timeouts.lock().unwrap();
@@ -490,7 +488,7 @@ fn async_session_timeout_defaults_fail_when_open_consumes_budget() {
 
     let err = match block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::new(b"bidi").with_timeout(Duration::from_millis(1)),
+        zmux::OpenSend::new(b"bidi").timeout(Duration::from_millis(1)),
     )) {
         Ok(_) => panic!("open_send request unexpectedly succeeded"),
         Err(err) => err,
@@ -523,7 +521,7 @@ fn async_session_default_open_and_send_skips_empty_bidi_writes() -> zmux::Result
     assert_eq!(
         block_on(zmux::AsyncSession::open_and_send(
             &session,
-            zmux::OpenSend::new(b"").with_options(zmux::OpenOptions::default()),
+            zmux::OpenSend::new(b"").options(zmux::OpenOptions::default()),
         ))?
         .1,
         0
@@ -629,7 +627,7 @@ fn closed_session_helpers_match_user_facing_session_contract() -> zmux::Result<(
     assert!(err.is_session_closed());
     assert_eq!(err.operation(), zmux::ErrorOperation::Close);
 
-    let boxed_native = zmux::box_session(zmux::closed_session());
+    let boxed_native: zmux::BoxSession = Box::new(zmux::closed_session());
     assert!(zmux::Session::is_closed(&boxed_native));
     assert!(zmux::Session::wait(&boxed_native).is_ok());
 
@@ -712,13 +710,13 @@ fn duplex_transport_wrapper_carries_addresses_and_close_control() -> zmux::Resul
     let client = thread::spawn(move || {
         let socket = TcpStream::connect(addr).unwrap();
         let transport = tcp_duplex_transport(socket, Some(client_close_count));
-        zmux::Conn::client_transport(transport).unwrap()
+        zmux::Conn::client(transport).unwrap()
     });
 
     let (socket, _) = listener.accept()?;
     let server = thread::spawn(move || {
         let transport = tcp_duplex_transport(socket, None);
-        zmux::Conn::server_transport(transport).unwrap()
+        zmux::Conn::server(transport).unwrap()
     });
 
     let client = client.join().unwrap();
@@ -759,11 +757,11 @@ fn duplex_transport_is_a_rust_read_write_connection() -> io::Result<()> {
         zmux::DuplexTransport::new(io::Cursor::new(b"hello".to_vec()), Vec::<u8>::new())
             .with_local_addr(local_addr)
             .with_peer_addr(peer_addr)
-            .with_control(RecordingTransportControl {
+            .with_control(Box::new(RecordingTransportControl {
                 read_timeouts: Arc::clone(&read_timeouts),
                 write_timeouts: Arc::clone(&write_timeouts),
                 closes: Arc::clone(&closes),
-            });
+            }));
 
     let mut buf = [0u8; 2];
     assert_eq!(Read::read(&mut transport, &mut buf)?, 2);
@@ -1108,17 +1106,17 @@ fn async_session_open_and_send_rejects_invalid_stream_progress() {
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::new(b"abc").with_timeout(timeout),
+        zmux::OpenSend::new(b"abc").timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::new(b"abc").with_options(opts.clone()),
+        zmux::OpenSend::new(b"abc").options(opts.clone()),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
         zmux::OpenSend::new(b"abc")
-            .with_options(opts.clone())
-            .with_timeout(timeout),
+            .options(opts.clone())
+            .timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
@@ -1126,17 +1124,17 @@ fn async_session_open_and_send_rejects_invalid_stream_progress() {
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::vectored(&parts).with_timeout(timeout),
+        zmux::OpenSend::vectored(&parts).timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
-        zmux::OpenSend::vectored(&parts).with_options(opts.clone()),
+        zmux::OpenSend::vectored(&parts).options(opts.clone()),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
         &session,
         zmux::OpenSend::vectored(&parts)
-            .with_options(opts.clone())
-            .with_timeout(timeout),
+            .options(opts.clone())
+            .timeout(timeout),
     )));
 
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
@@ -1145,17 +1143,15 @@ fn async_session_open_and_send_rejects_invalid_stream_progress() {
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::new(b"abc").with_timeout(timeout),
+        zmux::OpenSend::new(b"abc").timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::new(b"abc").with_options(opts.clone()),
+        zmux::OpenSend::new(b"abc").options(opts.clone()),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::new(b"abc")
-            .with_options(opts)
-            .with_timeout(timeout),
+        zmux::OpenSend::new(b"abc").options(opts).timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
@@ -1163,17 +1159,17 @@ fn async_session_open_and_send_rejects_invalid_stream_progress() {
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::vectored(&parts).with_timeout(timeout),
+        zmux::OpenSend::vectored(&parts).timeout(timeout),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
-        zmux::OpenSend::vectored(&parts).with_options(zmux::OpenOptions::default()),
+        zmux::OpenSend::vectored(&parts).options(zmux::OpenOptions::default()),
     )));
     assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
         zmux::OpenSend::vectored(&parts)
-            .with_options(zmux::OpenOptions::default())
-            .with_timeout(timeout),
+            .options(zmux::OpenOptions::default())
+            .timeout(timeout),
     )));
 
     let boxed = zmux::box_async_session(InvalidProgressAsyncSession);
@@ -1247,7 +1243,7 @@ fn joined_streams_can_start_empty_and_hot_plug_halves() -> zmux::Result<()> {
     let read_deadline = Instant::now() + Duration::from_secs(30);
     let write_deadline = Instant::now() + Duration::from_secs(60);
     let mut native =
-        zmux::join_optional_streams::<DeadlineProbeStream, DeadlineProbeStream>(None, None);
+        zmux::DuplexStream::<DeadlineProbeStream, DeadlineProbeStream>::from_parts(None, None);
     assert_eq!(native.read_stream_id(), 0);
     assert_eq!(native.write_stream_id(), 0);
     assert!(Read::read(&mut native, &mut [0u8; 1]).is_err());
@@ -1277,7 +1273,7 @@ fn joined_streams_can_start_empty_and_hot_plug_halves() -> zmux::Result<()> {
 
     let async_events = Arc::new(Mutex::new(Vec::new()));
     let async_joined =
-        zmux::join_optional_async_streams::<DeadlineProbeStream, DeadlineProbeStream>(None, None);
+        zmux::AsyncDuplexStream::<DeadlineProbeStream, DeadlineProbeStream>::from_parts(None, None);
     assert_eq!(async_joined.read_stream_id(), 0);
     assert_eq!(async_joined.write_stream_id(), 0);
     assert!(block_on(zmux::AsyncRecvStreamHandle::read(
@@ -1743,7 +1739,7 @@ fn joined_stream_default_close_identity_does_not_dedupe_zero_sized_halves() -> z
 fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -> zmux::Result<()> {
     let native_read_events = Arc::new(Mutex::new(Vec::new()));
     let native_read_only =
-        zmux::join_optional_streams::<DirectionalCloseProbe, DirectionalCloseProbe>(
+        zmux::DuplexStream::<DirectionalCloseProbe, DirectionalCloseProbe>::from_parts(
             Some(DirectionalCloseProbe::new(
                 "native-read",
                 Arc::clone(&native_read_events),
@@ -1757,7 +1753,7 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
 
     let native_write_events = Arc::new(Mutex::new(Vec::new()));
     let native_write_only =
-        zmux::join_optional_streams::<DirectionalCloseProbe, DirectionalCloseProbe>(
+        zmux::DuplexStream::<DirectionalCloseProbe, DirectionalCloseProbe>::from_parts(
             None,
             Some(DirectionalCloseProbe::new(
                 "native-write",
@@ -1774,7 +1770,7 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
 
     let async_read_events = Arc::new(Mutex::new(Vec::new()));
     let async_read_only =
-        zmux::join_optional_async_streams::<DirectionalCloseProbe, DirectionalCloseProbe>(
+        zmux::AsyncDuplexStream::<DirectionalCloseProbe, DirectionalCloseProbe>::from_parts(
             Some(DirectionalCloseProbe::new(
                 "async-read",
                 Arc::clone(&async_read_events),
@@ -1788,7 +1784,7 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
 
     let async_write_events = Arc::new(Mutex::new(Vec::new()));
     let async_write_only =
-        zmux::join_optional_async_streams::<DirectionalCloseProbe, DirectionalCloseProbe>(
+        zmux::AsyncDuplexStream::<DirectionalCloseProbe, DirectionalCloseProbe>::from_parts(
             None,
             Some(DirectionalCloseProbe::new(
                 "async-write",
@@ -2069,10 +2065,10 @@ fn native_tcp_pair() -> (zmux::Conn, zmux::Conn) {
     let addr = listener.local_addr().unwrap();
     let client = thread::spawn(move || {
         let socket = TcpStream::connect(addr).unwrap();
-        zmux::Conn::client_tcp(socket).unwrap()
+        zmux::Conn::client(socket).unwrap()
     });
     let (socket, _) = listener.accept().unwrap();
-    let server = thread::spawn(move || zmux::Conn::server_tcp(socket).unwrap());
+    let server = thread::spawn(move || zmux::Conn::server(socket).unwrap());
     (client.join().unwrap(), server.join().unwrap())
 }
 
@@ -4587,7 +4583,7 @@ impl zmux::AsyncSession for PayloadRouteAsyncSession {
     ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::Stream>> {
         let stream = self.stream();
         Box::pin(async move {
-            request.options().validate()?;
+            request.open_options().validate()?;
             Ok(stream)
         })
     }
@@ -4598,7 +4594,7 @@ impl zmux::AsyncSession for PayloadRouteAsyncSession {
     ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::SendStream>> {
         let stream = self.stream();
         Box::pin(async move {
-            request.options().validate()?;
+            request.open_options().validate()?;
             Ok(stream)
         })
     }
@@ -5020,7 +5016,7 @@ impl zmux::AsyncSession for DummyAsyncSession {
         &self,
         request: zmux::OpenRequest,
     ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::Stream>> {
-        let opts = request.options().clone();
+        let opts = request.open_options().clone();
         Box::pin(async move {
             opts.validate()?;
             Ok(DummyAsyncStream)
@@ -5031,7 +5027,7 @@ impl zmux::AsyncSession for DummyAsyncSession {
         &self,
         request: zmux::OpenRequest,
     ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::SendStream>> {
-        let opts = request.options().clone();
+        let opts = request.open_options().clone();
         Box::pin(async move {
             opts.validate()?;
             Ok(DummyAsyncStream)
@@ -5097,7 +5093,7 @@ impl zmux::Session for DummySession {
     }
 
     fn open_stream_with(&self, request: zmux::OpenRequest) -> zmux::Result<zmux::BoxDuplexStream> {
-        request.options().validate()?;
+        request.open_options().validate()?;
         Ok(Box::new(DummyStream))
     }
 
@@ -5105,7 +5101,7 @@ impl zmux::Session for DummySession {
         &self,
         request: zmux::OpenRequest,
     ) -> zmux::Result<zmux::BoxSendStream> {
-        request.options().validate()?;
+        request.open_options().validate()?;
         Ok(Box::new(DummyStream))
     }
 
@@ -5113,7 +5109,7 @@ impl zmux::Session for DummySession {
         &self,
         request: zmux::OpenSend<'_>,
     ) -> zmux::Result<(zmux::BoxDuplexStream, usize)> {
-        let opts = request.options();
+        let opts = request.open_options();
         opts.validate()?;
         Ok((Box::new(DummyStream), request.payload().checked_len()?))
     }
@@ -5122,7 +5118,7 @@ impl zmux::Session for DummySession {
         &self,
         request: zmux::OpenSend<'_>,
     ) -> zmux::Result<(zmux::BoxSendStream, usize)> {
-        let opts = request.options();
+        let opts = request.open_options();
         opts.validate()?;
         Ok((Box::new(DummyStream), request.payload().checked_len()?))
     }

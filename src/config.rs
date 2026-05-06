@@ -551,7 +551,7 @@ impl OpenOptions {
     /// Borrowed bytes are copied into the request options; owned `Vec<u8>` or
     /// `Cow::Owned` values are moved in without another copy.
     #[must_use]
-    pub fn with_open_info<'a>(mut self, open_info: impl Into<Cow<'a, [u8]>>) -> Self {
+    pub fn open_info<'a>(mut self, open_info: impl Into<Cow<'a, [u8]>>) -> Self {
         self.open_info = open_info.into().into_owned();
         self
     }
@@ -565,7 +565,7 @@ impl OpenOptions {
     }
 
     /// Return the opaque binary metadata sent with the stream open.
-    pub fn open_info(&self) -> &[u8] {
+    pub fn open_info_bytes(&self) -> &[u8] {
         &self.open_info
     }
 
@@ -1263,28 +1263,27 @@ mod tests {
 
     #[test]
     fn open_options_builder_sets_fields_without_struct_literal() {
-        let opts = OpenOptions::new()
-            .priority(7)
-            .group(3)
-            .with_open_info(b"info");
+        let opts = OpenOptions::new().priority(7).group(3).open_info(b"info");
 
         assert_eq!(opts.initial_priority(), Some(7));
         assert_eq!(opts.initial_group(), Some(3));
-        assert_eq!(opts.open_info(), b"info");
-        assert_eq!(opts.open_info().len(), 4);
+        assert_eq!(opts.open_info_bytes(), b"info");
+        assert_eq!(opts.open_info_bytes().len(), 4);
         assert!(opts.has_open_info());
         assert!(OpenOptions::new().is_empty());
-        assert_eq!(OpenOptions::new().open_info().len(), 0);
+        assert_eq!(OpenOptions::new().open_info_bytes().len(), 0);
         assert!(!OpenOptions::new().has_open_info());
         assert!(!opts.is_empty());
         assert_eq!(OpenOptions::new().priority(5).initial_priority(), Some(5));
         assert_eq!(OpenOptions::new().group(6).initial_group(), Some(6));
         assert_eq!(
-            OpenOptions::new().with_open_info(b"borrowed").open_info(),
+            OpenOptions::new().open_info(b"borrowed").open_info_bytes(),
             b"borrowed"
         );
         assert_eq!(
-            OpenOptions::new().with_open_info(vec![4, 5, 6]).open_info(),
+            OpenOptions::new()
+                .open_info(vec![4, 5, 6])
+                .open_info_bytes(),
             &[4, 5, 6]
         );
     }
@@ -1292,30 +1291,27 @@ mod tests {
     #[test]
     fn open_options_owned_open_info_uses_value_semantics() {
         let mut source = vec![1, 2, 3];
-        let opts = OpenOptions::new()
-            .priority(7)
-            .group(9)
-            .with_open_info(&source);
+        let opts = OpenOptions::new().priority(7).group(9).open_info(&source);
         source[0] = 9;
 
-        assert_eq!(opts.open_info(), &[1, 2, 3]);
+        assert_eq!(opts.open_info_bytes(), &[1, 2, 3]);
 
-        let mut exposed = opts.open_info().to_vec();
+        let mut exposed = opts.open_info_bytes().to_vec();
         exposed[1] = 8;
-        assert_eq!(opts.open_info(), &[1, 2, 3]);
+        assert_eq!(opts.open_info_bytes(), &[1, 2, 3]);
         assert_eq!(
             opts,
             OpenOptions::new()
                 .priority(7)
                 .group(9)
-                .with_open_info(&[1, 2, 3])
+                .open_info(&[1, 2, 3])
         );
         assert_ne!(
             opts,
             OpenOptions::new()
                 .priority(7)
                 .group(9)
-                .with_open_info(&[1, 2, 4])
+                .open_info(&[1, 2, 4])
         );
     }
 

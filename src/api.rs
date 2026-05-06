@@ -4,8 +4,8 @@ use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::preface::{Negotiated, Preface};
 use crate::protocol::Role;
 use crate::session::{
-    Conn, PeerCloseError, PeerGoAwayError, RecvStream, SendStream, SessionState, SessionStats,
-    Stream,
+    Conn, DuplexConnection, DuplexTransport, PeerCloseError, PeerGoAwayError, RecvStream,
+    SendStream, SessionState, SessionStats, Stream,
 };
 use crate::settings::{SchedulerHint, Settings};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -78,8 +78,9 @@ pub trait StreamHandle: Send + Sync {
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
     }
-    /// Stable resource identity used to avoid closing the same joined full
-    /// stream twice.
+    /// Stable resource identity used internally to avoid closing the same
+    /// joined full stream twice.
+    #[doc(hidden)]
     fn close_identity(&self) -> *const () {
         if size_of_val(self) == 0 {
             null()
@@ -231,10 +232,24 @@ pub enum DuplexInfoSide {
 }
 
 /// Bidirectional stream view backed by one receive-only half and one send-only half.
+///
+/// When both halves are ZMux stream handles, this view is also a
+/// `DuplexConnection`, so it can be used as the reliable byte transport for a
+/// nested native `Conn`.
 pub struct DuplexStream<R, W> {
     recv: Arc<NativeJoinedHalf<R>>,
     send: Arc<NativeJoinedHalf<W>>,
     info_side: DuplexInfoSide,
+}
+
+impl<R, W> Clone for DuplexStream<R, W> {
+    fn clone(&self) -> Self {
+        Self {
+            recv: Arc::clone(&self.recv),
+            send: Arc::clone(&self.send),
+            info_side: self.info_side,
+        }
+    }
 }
 
 type NativeDeadlineApplier<T> = fn(&T, Option<Instant>) -> Result<()>;
@@ -1049,9 +1064,20 @@ pub fn join_streams<R, W>(recv: R, send: W) -> DuplexStream<R, W> {
     DuplexStream::new(recv, send)
 }
 
-#[must_use]
-pub fn join_optional_streams<R, W>(recv: Option<R>, send: Option<W>) -> DuplexStream<R, W> {
-    DuplexStream::from_parts(recv, send)
+impl<R, W> DuplexConnection for DuplexStream<R, W>
+where
+    R: RecvStreamHandle + 'static,
+    W: SendStreamHandle + 'static,
+{
+    type Reader = Self;
+    type Writer = Self;
+
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        let reader = self.clone();
+        let close_handle = self.clone();
+        Ok(DuplexTransport::new(reader, self)
+            .with_close_fn(move || close_handle.close().map_err(io::Error::other)))
+    }
 }
 
 impl<R, W> Read for DuplexStream<R, W>
@@ -1522,10 +1548,10 @@ pub trait Session: Send + Sync {
     fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
         let (opts, payload, timeout) = request.into_parts();
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
             ensure_positive_open_timeout(timeout)?;
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let mut stream = self.open_stream_with(open)?;
         let write_timeout = timeout
@@ -1537,10 +1563,10 @@ pub trait Session: Send + Sync {
     fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
         let (opts, payload, timeout) = request.into_parts();
         let start = Instant::now();
-        let mut open = OpenRequest::new().with_options(opts);
+        let mut open = OpenRequest::new().options(opts);
         if let Some(timeout) = timeout {
             ensure_positive_open_timeout(timeout)?;
-            open = open.with_timeout(timeout);
+            open = open.timeout(timeout);
         }
         let mut stream = self.open_uni_stream_with(open)?;
         let write_timeout = timeout

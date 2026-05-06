@@ -390,7 +390,7 @@ async fn open_and_send_writes_whole_payload_under_flow_control() {
 
     let (stream, n) = pair
         .client
-        .open_and_send(zmux::OpenSend::new(payload.as_slice()).with_timeout(STREAM_TIMEOUT))
+        .open_and_send(zmux::OpenSend::new(payload.as_slice()).timeout(STREAM_TIMEOUT))
         .await
         .unwrap();
     assert_eq!(n, payload.len());
@@ -443,7 +443,7 @@ async fn bidi_open_accept_round_trips_payload() {
             OpenOptions::new()
                 .priority(7)
                 .group(11)
-                .with_open_info(b"client-open"),
+                .open_info(b"client-open"),
         )
         .await
         .unwrap();
@@ -566,12 +566,7 @@ async fn uni_open_metadata_prelude_is_visible_on_accept() {
     let pair = Pair::new().await;
     let stream = pair
         .client
-        .open_uni_stream_with(
-            OpenOptions::new()
-                .priority(3)
-                .group(21)
-                .with_open_info(b"rpc"),
-        )
+        .open_uni_stream_with(OpenOptions::new().priority(3).group(21).open_info(b"rpc"))
         .await
         .unwrap();
     assert!(stream.has_open_info());
@@ -601,7 +596,7 @@ async fn join_streams_combines_quinn_uni_halves() {
     let pair = Pair::new().await;
     let client_send = pair
         .client
-        .open_uni_stream_with(OpenOptions::new().with_open_info(b"\0route"))
+        .open_uni_stream_with(OpenOptions::new().open_info(b"\0route"))
         .await
         .unwrap();
     client_send.write_all(b"ping ").await.unwrap();

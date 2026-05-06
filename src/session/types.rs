@@ -8,7 +8,7 @@ use crate::payload::StreamMetadata;
 use crate::preface::{Negotiated, Preface};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -128,6 +128,44 @@ pub trait DuplexTransportControl: Send + Sync {
     }
 
     fn close(&self) -> io::Result<()>;
+}
+
+struct TcpDuplexTransportControl {
+    stream: TcpStream,
+}
+
+impl DuplexTransportControl for TcpDuplexTransportControl {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)
+    }
+}
+
+impl<T> DuplexTransportControl for Box<T>
+where
+    T: DuplexTransportControl + ?Sized,
+{
+    #[inline]
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_timeout(timeout)
+    }
+
+    #[inline]
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_write_timeout(timeout)
+    }
+
+    #[inline]
+    fn close(&self) -> io::Result<()> {
+        (**self).close()
+    }
 }
 
 struct CloseFnTransportControl<F> {
@@ -294,6 +332,119 @@ impl<R, W> DuplexTransport<R, W> {
     #[inline]
     pub fn into_parts(self) -> (R, W) {
         (self.reader, self.writer)
+    }
+}
+
+impl DuplexTransport<(), ()> {
+    /// Builds a transport by cloning a single reliable duplex I/O object into
+    /// independent read and write handles.
+    ///
+    /// Use this only when `Clone` creates another handle that can read and
+    /// write concurrently with the original handle. If the clone just shares
+    /// one blocking mutex internally, prefer the transport's real split API or
+    /// an async adapter.
+    #[inline]
+    #[must_use]
+    pub fn from_cloneable<T>(io: T) -> DuplexTransport<T, T>
+    where
+        T: Clone + Read + Write + Send + 'static,
+    {
+        let reader = io.clone();
+        DuplexTransport::new(reader, io)
+    }
+
+    /// Builds a transport by using a transport-specific clone operation.
+    ///
+    /// This is useful for reliable stream types that do not implement `Clone`
+    /// but expose a `try_clone`-style API. The cloned value becomes the read
+    /// half and the original value becomes the write half.
+    #[inline]
+    pub fn try_clone_with<T>(
+        io: T,
+        clone: impl FnOnce(&T) -> io::Result<T>,
+    ) -> Result<DuplexTransport<T, T>>
+    where
+        T: Read + Write + Send + 'static,
+    {
+        let reader = clone(&io).map_err(Error::from)?;
+        Ok(DuplexTransport::new(reader, io))
+    }
+}
+
+/// Reliable blocking duplex connection accepted by `Conn`.
+///
+/// Rust's standard library has `Read` and `Write`, but no single trait like
+/// Go's `net.Conn` that also promises connection cloning, splitting, timeout
+/// control, and full-resource close semantics. ZMux uses this trait for that
+/// boundary. Implement it for reliable byte streams that can become
+/// independent blocking read/write handles.
+///
+/// Implementations are provided for `TcpStream`, `(reader, writer)`, and
+/// `DuplexTransport`. Use `DuplexTransport` from custom implementations when a
+/// transport needs addresses, timeout hooks, a close hook, or a clone-based
+/// split.
+pub trait DuplexConnection: Send + 'static {
+    type Reader: Read + Send + 'static;
+    type Writer: Write + Send + 'static;
+
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>>;
+}
+
+impl<R, W> DuplexConnection for DuplexTransport<R, W>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    type Reader = R;
+    type Writer = W;
+
+    #[inline]
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        Ok(self)
+    }
+}
+
+impl<R, W> DuplexConnection for (R, W)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    type Reader = R;
+    type Writer = W;
+
+    #[inline]
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        Ok(DuplexTransport::new(self.0, self.1))
+    }
+}
+
+impl<T> DuplexConnection for Box<T>
+where
+    T: DuplexConnection,
+{
+    type Reader = T::Reader;
+    type Writer = T::Writer;
+
+    #[inline]
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        (*self).into_transport()
+    }
+}
+
+impl DuplexConnection for TcpStream {
+    type Reader = TcpStream;
+    type Writer = TcpStream;
+
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        let local_addr = self.local_addr().ok();
+        let peer_addr = self.peer_addr().ok();
+        let reader = self.try_clone().map_err(Error::from)?;
+        let control = TcpDuplexTransportControl {
+            stream: self.try_clone().map_err(Error::from)?,
+        };
+        Ok(DuplexTransport::new(reader, self)
+            .with_addresses(local_addr, peer_addr)
+            .with_control(control))
     }
 }
 

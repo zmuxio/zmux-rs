@@ -22,25 +22,25 @@ impl OpenRequest {
 
     #[inline]
     #[must_use]
-    pub fn with_options(mut self, options: OpenOptions) -> Self {
+    pub fn options(mut self, options: OpenOptions) -> Self {
         self.options = options;
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
     #[inline]
-    pub fn options(&self) -> &OpenOptions {
+    pub fn open_options(&self) -> &OpenOptions {
         &self.options
     }
 
     #[inline]
-    pub fn timeout(&self) -> Option<Duration> {
+    pub fn timeout_duration(&self) -> Option<Duration> {
         self.timeout
     }
 
@@ -53,7 +53,7 @@ impl OpenRequest {
 impl From<OpenOptions> for OpenRequest {
     #[inline]
     fn from(options: OpenOptions) -> Self {
-        Self::new().with_options(options)
+        Self::new().options(options)
     }
 }
 
@@ -189,20 +189,20 @@ impl<'a> OpenSend<'a> {
 
     #[inline]
     #[must_use]
-    pub fn with_options(mut self, options: OpenOptions) -> Self {
+    pub fn options(mut self, options: OpenOptions) -> Self {
         self.options = options;
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
     #[inline]
-    pub fn options(&self) -> &OpenOptions {
+    pub fn open_options(&self) -> &OpenOptions {
         &self.options
     }
 
@@ -212,7 +212,7 @@ impl<'a> OpenSend<'a> {
     }
 
     #[inline]
-    pub fn timeout(&self) -> Option<Duration> {
+    pub fn timeout_duration(&self) -> Option<Duration> {
         self.timeout
     }
 
