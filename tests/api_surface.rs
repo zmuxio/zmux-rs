@@ -265,7 +265,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
     let goaway = zmux::build_go_away_payload(0, 0, 8, "drain")?;
     assert_eq!(zmux::parse_go_away_payload(&goaway)?.reason, "drain");
 
-    let preface = test_preface(zmux::Role::Initiator);
+    let preface = test_preface_with_role(zmux::Role::Initiator);
     let preface_bytes = preface.marshal_with_settings_padding(b"pad")?;
     let (parsed, consumed) = zmux::parse_preface_prefix(&preface_bytes)?;
     assert_eq!(parsed, preface);
@@ -275,7 +275,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
     preface_with_trailing.push(0);
     assert!(zmux::parse_preface(&preface_with_trailing).is_err());
 
-    let peer = test_preface(zmux::Role::Responder);
+    let peer = test_preface_with_role(zmux::Role::Responder);
     let negotiated = zmux::negotiate_prefaces(&preface, &peer)?;
     assert_eq!(negotiated.local_role, zmux::Role::Initiator);
     assert!(negotiated.supports_open_metadata());
@@ -5144,11 +5144,11 @@ impl zmux::Session for DummySession {
     }
 
     fn local_preface(&self) -> zmux::Preface {
-        test_preface(zmux::Role::Initiator)
+        test_preface_with_role(zmux::Role::Initiator)
     }
 
     fn peer_preface(&self) -> zmux::Preface {
-        test_preface(zmux::Role::Responder)
+        test_preface_with_role(zmux::Role::Responder)
     }
 
     fn negotiated(&self) -> zmux::Negotiated {
@@ -5162,7 +5162,7 @@ impl zmux::Session for DummySession {
     }
 }
 
-fn test_preface(role: zmux::Role) -> zmux::Preface {
+fn test_preface_with_role(role: zmux::Role) -> zmux::Preface {
     zmux::Preface {
         preface_version: zmux::PREFACE_VERSION,
         role,

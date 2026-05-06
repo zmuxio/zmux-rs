@@ -3497,26 +3497,6 @@ impl AsyncSession for QuinnSession {
         })
     }
 
-    fn peer_go_away_error(&self) -> Option<zmux::PeerGoAwayError> {
-        None
-    }
-
-    fn peer_close_error(&self) -> Option<zmux::PeerCloseError> {
-        None
-    }
-
-    fn local_preface(&self) -> zmux::Preface {
-        adapter_empty_preface()
-    }
-
-    fn peer_preface(&self) -> zmux::Preface {
-        adapter_empty_preface()
-    }
-
-    fn negotiated(&self) -> zmux::Negotiated {
-        adapter_empty_negotiated()
-    }
-
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
         Box::pin(async move { QuinnSession::close(self).await })
     }
@@ -3559,6 +3539,26 @@ impl AsyncSession for QuinnSession {
 
     fn stats(&self) -> zmux::SessionStats {
         QuinnSession::stats(self)
+    }
+
+    fn peer_go_away_error(&self) -> Option<zmux::PeerGoAwayError> {
+        None
+    }
+
+    fn peer_close_error(&self) -> Option<zmux::PeerCloseError> {
+        None
+    }
+
+    fn local_preface(&self) -> zmux::Preface {
+        adapter_empty_preface()
+    }
+
+    fn peer_preface(&self) -> zmux::Preface {
+        adapter_empty_preface()
+    }
+
+    fn negotiated(&self) -> zmux::Negotiated {
+        adapter_empty_negotiated()
     }
 }
 

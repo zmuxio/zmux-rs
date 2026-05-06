@@ -621,9 +621,10 @@ async fn join_streams_combines_quinn_uni_halves() {
         .await
         .unwrap();
 
-    let client =
-        zmux::join_streams(client_recv, client_send).with_info_side(zmux::DuplexInfoSide::Write);
-    let server = zmux::join_streams(server_recv, server_send);
+    let client: zmux::AsyncDuplexStream<_, _> = zmux::join_async_streams(client_recv, client_send)
+        .with_info_side(zmux::DuplexInfoSide::Write);
+    let server: zmux::AsyncDuplexStream<_, _> =
+        zmux::join_async_streams(server_recv, server_send);
 
     assert!(zmux::AsyncStreamInfo::is_bidirectional(&client));
     assert!(zmux::AsyncStreamInfo::is_bidirectional(&server));
