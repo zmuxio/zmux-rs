@@ -124,11 +124,22 @@ impl zmux::AsyncSendStreamHandle for CompatStream {
 
     fn write_final_timeout<'a>(
         &'a self,
-        src: &'a [u8],
+        src: zmux::WritePayload<'a>,
         _timeout: std::time::Duration,
     ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
-            let n = self.write(src).await?;
+            let n = src.checked_len()?;
+            {
+                let mut written = self.written.lock().unwrap();
+                match src {
+                    zmux::WritePayload::Bytes(bytes) => written.extend_from_slice(&bytes),
+                    zmux::WritePayload::Vectored(parts) => {
+                        for part in parts {
+                            written.extend_from_slice(part);
+                        }
+                    }
+                }
+            }
             self.close_write().await?;
             Ok(n)
         })

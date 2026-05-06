@@ -88,16 +88,12 @@ Wrapped streams expose `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHa
 Payloads are binary bytes. `write(&[u8])` keeps the normal QUIC/TCP partial-write
 shape, so it borrows caller memory and returns the number of bytes Quinn accepted
 for that write. Complete-consumption calls such as `write_all(Vec<u8>)`,
-`write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)` can move owned buffers
-into the async operation and avoid an extra adapter-level copy. `write_final(...)`
-and `open_uni_and_send(...)` write the whole final payload before closing the QUIC
-send side.
-
-Bidirectional `open_and_send(...)` intentionally performs one stream write and
-returns the number of bytes Quinn accepted, so flow control may make it consume
-only part of a larger payload. Use `open_stream(...)` followed by
-`write_all(...)` when the caller requires complete-consumption behavior before
-continuing. Successful Quinn writes mean Quinn accepted the data into its stream
+`write_final(Vec<u8>)`, `open_and_send(Vec<u8>)`, and
+`open_uni_and_send(Vec<u8>)` can move owned buffers into the async operation and
+avoid an extra adapter-level copy. `open_and_send(...)` writes the whole first
+payload and leaves the bidirectional stream open. `write_final(...)` and
+`open_uni_and_send(...)` write the whole final payload before closing the QUIC
+send side. Successful Quinn writes mean Quinn accepted the data into its stream
 path; they are not peer application acknowledgements.
 
 When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call

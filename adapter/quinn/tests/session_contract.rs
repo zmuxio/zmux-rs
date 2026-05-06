@@ -365,41 +365,38 @@ async fn native_only_controls_are_exposed_as_adapter_unsupported() {
 }
 
 #[tokio::test]
-async fn open_and_send_uses_one_write_under_flow_control() {
+async fn open_and_send_writes_whole_payload_under_flow_control() {
     let pair = Pair::new_with_server_options_and_max_data(SessionOptions::default(), 4096).await;
     let payload = vec![0x5a; 256 * 1024];
+    let expected = payload.clone();
+    let server = pair.server.clone();
+
+    let reader = tokio::spawn(async move {
+        let accepted = server.accept_stream_timeout(STREAM_TIMEOUT).await.unwrap();
+        let mut received = Vec::with_capacity(expected.len());
+        let mut buffer = [0; 4096];
+        while received.len() < expected.len() {
+            let remaining = expected.len() - received.len();
+            let len = remaining.min(buffer.len());
+            let read = accepted
+                .read_timeout(&mut buffer[..len], STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert_ne!(read, 0);
+            received.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(received, expected);
+    });
 
     let (stream, n) = pair
         .client
         .open_and_send(zmux::OpenSend::new(payload.as_slice()).with_timeout(STREAM_TIMEOUT))
         .await
         .unwrap();
-    assert!(n > 0);
-    assert!(
-        n < payload.len(),
-        "open_and_send wrote the whole payload; expected one write bounded by flow control"
-    );
-
-    let accepted = pair
-        .server
-        .accept_stream_timeout(STREAM_TIMEOUT)
-        .await
-        .unwrap();
-    let mut received = Vec::with_capacity(n);
-    let mut buffer = [0; 1024];
-    while received.len() < n {
-        let remaining = n - received.len();
-        let len = remaining.min(buffer.len());
-        let read = accepted
-            .read_timeout(&mut buffer[..len], STREAM_TIMEOUT)
-            .await
-            .unwrap();
-        assert_ne!(read, 0);
-        received.extend_from_slice(&buffer[..read]);
-    }
-    assert_eq!(received, payload[..n]);
+    assert_eq!(n, payload.len());
 
     stream.close_write().await.unwrap();
+    reader.await.unwrap();
     pair.close().await;
 }
 
@@ -423,7 +420,7 @@ async fn shared_session_and_stream_api_exposes_addresses_and_deadlines() {
     assert_eq!(stream.local_addr(), pair.client.local_addr());
     assert_eq!(stream.peer_addr(), pair.client.peer_addr());
     zmux::AsyncStreamHandle::set_deadline(&stream, Some(Instant::now() + STREAM_TIMEOUT)).unwrap();
-    zmux::AsyncStreamHandle::clear_deadline(&stream).unwrap();
+    zmux::AsyncStreamHandle::set_deadline(&stream, None).unwrap();
     stream.set_timeout(Some(STREAM_TIMEOUT)).unwrap();
     stream.set_read_timeout(None).unwrap();
     zmux::AsyncSendStreamHandle::set_write_timeout(&stream, Some(STREAM_TIMEOUT)).unwrap();
@@ -1007,12 +1004,12 @@ async fn metadata_update_before_visibility_uses_prelude_and_after_visibility_is_
     let pair = Pair::new().await;
     let stream = pair.client.open_stream().await.unwrap();
     stream
-        .update_metadata(MetadataUpdate::new().with_priority(5).with_group(9))
+        .update_metadata(MetadataUpdate::new().priority(5).group(9))
         .await
         .unwrap();
     stream.write_all(b"visible").await.unwrap();
     let err = stream
-        .update_metadata(MetadataUpdate::new().with_priority(6))
+        .update_metadata(MetadataUpdate::new().priority(6))
         .await
         .unwrap_err();
     assert_local_stream_error(

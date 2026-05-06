@@ -104,13 +104,13 @@ impl MetadataUpdate {
     }
 
     #[inline]
-    pub fn with_priority(mut self, priority: u64) -> Self {
+    pub fn priority(mut self, priority: u64) -> Self {
         self.priority = Some(priority);
         self
     }
 
     #[inline]
-    pub fn with_group(mut self, group: u64) -> Self {
+    pub fn group(mut self, group: u64) -> Self {
         self.group = Some(group);
         self
     }
@@ -1004,37 +1004,37 @@ mod tests {
     fn metadata_update_builders_match_struct_literal_semantics() {
         assert!(MetadataUpdate::new().is_empty());
         assert_eq!(
-            MetadataUpdate::new().with_priority(7),
+            MetadataUpdate::new().priority(7),
             MetadataUpdate {
                 priority: Some(7),
                 group: None,
             }
         );
         assert_eq!(
-            MetadataUpdate::new().with_group(9),
+            MetadataUpdate::new().group(9),
             MetadataUpdate {
                 priority: None,
                 group: Some(9),
             }
         );
         assert_eq!(
-            MetadataUpdate::new().with_priority(7).with_group(9),
+            MetadataUpdate::new().priority(7).group(9),
             MetadataUpdate {
                 priority: Some(7),
                 group: Some(9),
             }
         );
         assert!(MetadataUpdate::new()
-            .with_priority(MAX_VARINT62)
-            .with_group(MAX_VARINT62)
+            .priority(MAX_VARINT62)
+            .group(MAX_VARINT62)
             .validate()
             .is_ok());
         assert!(MetadataUpdate::new()
-            .with_priority(MAX_VARINT62 + 1)
+            .priority(MAX_VARINT62 + 1)
             .validate()
             .is_err());
         assert!(MetadataUpdate::new()
-            .with_group(MAX_VARINT62 + 1)
+            .group(MAX_VARINT62 + 1)
             .validate()
             .is_err());
     }

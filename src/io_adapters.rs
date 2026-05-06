@@ -504,10 +504,7 @@ fn recycle_io_buffer(buffer: &mut Vec<u8>) {
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
 fn io_buffer_allocation_failed(direction: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Other,
-        format!("zmux: async {direction} buffer allocation failed"),
-    )
+    io::Error::other(format!("zmux: async {direction} buffer allocation failed"))
 }
 
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]

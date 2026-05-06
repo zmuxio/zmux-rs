@@ -109,7 +109,7 @@ let buf = vec![0x01, 0x02, 0x03];
 let (stream, _n) = session.open_and_send(&buf)?;
 ```
 
-On native `Conn`, `open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream remains open. `open_uni_and_send(...)` writes the final payload and closes the send side. Some adapter-backed `AsyncSession` implementations may expose a transport-native partial-write `open_and_send(...)`; use `open_stream(...)` followed by `write_all(...)` when portable complete-consumption behavior matters.
+`open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream remains open. `open_uni_and_send(...)` writes the final payload and closes the send side.
 
 ## Metadata And Priority
 
@@ -133,7 +133,7 @@ let options = OpenOptions::new()
     .group(2);
 
 let stream = session.open_stream_with(options)?;
-stream.update_metadata(MetadataUpdate::new().with_priority(3))?;
+stream.update_metadata(MetadataUpdate::new().priority(3))?;
 stream.write_final(b"hello")?;
 ```
 
@@ -276,7 +276,7 @@ Blocking session and stream types:
 
 - `Conn`, `Stream`, `SendStream`, `RecvStream`
 - `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`
-- `BoxSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
+- `BoxSession`, `BoxDuplexStream`, `BoxSendStream`, `BoxRecvStream`
 - `ClosedSession`
 - `DuplexStream`, `DuplexInfoSide`, `PausedHalf`, `PausedRecvHalf`, `PausedSendHalf`
 - joined native stream methods: `new`, `from_parts`, `empty`, `with_info_side`, `info_side`, `recv`, `send`, `into_parts`, `pause_read`, `pause_read_timeout`, `pause_write`, `pause_write_timeout`, `replace_recv`, `replace_send`, `detach_recv`, `detach_send`, `read_stream_id`, `write_stream_id`
@@ -286,7 +286,7 @@ Async session and stream types:
 
 - `AsyncSession`
 - `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`
-- `BoxAsyncSession`, `BoxAsyncStream`, `BoxAsyncSendStream`, `BoxAsyncRecvStream`
+- `BoxAsyncSession`, `BoxAsyncDuplexStream`, `BoxAsyncSendStream`, `BoxAsyncRecvStream`
 - `ClosedAsyncSession`
 - `AsyncDuplexStream`, `AsyncBoxFuture`
 - `PausedAsyncHalf`, `PausedAsyncRecvHalf`, `PausedAsyncSendHalf`
@@ -306,10 +306,10 @@ Session methods:
 Stream methods:
 
 - identity/info: `stream_id`, `close_identity`, `is_opened_locally`, `is_bidirectional`, `open_info`, `append_open_info_to`, `open_info_len`, `has_open_info`, `metadata`, `local_addr`, `peer_addr`; open info is opaque bytes, not text, and `append_open_info_to` appends to the caller's buffer
-- read side: `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`, `is_read_closed`, `set_read_deadline`, `set_read_timeout`, `clear_read_deadline`, `close_read`, `cancel_read`
-- write side: `write`, `write_timeout`, `write_all`, `write_all_timeout`, `write_vectored`, `write_vectored_timeout`, `write_final`, `write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`, `is_write_closed`, `set_write_deadline`, `set_write_timeout`, `clear_write_deadline`, `update_metadata`, `close_write`, `cancel_write`
+- read side: `read`, `read_vectored`, `read_timeout`, `read_vectored_timeout`, `read_exact_timeout`, `is_read_closed`, `set_read_deadline`, `set_read_timeout`, `close_read`, `cancel_read`
+- write side: `write`, `write_timeout`, `write_all`, `write_all_timeout`, `write_vectored`, `write_vectored_timeout`, `write_final`, `write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`, `is_write_closed`, `set_write_deadline`, `set_write_timeout`, `update_metadata`, `close_write`, `cancel_write`
 - async read/write helpers: `read_exact`, `read_to_end`, `read_to_end_limited`
-- combined stream helpers: `set_deadline`, `set_timeout`, `clear_deadline`, `close`, `close_with_error`
+- combined stream helpers: `set_deadline`, `set_timeout`, `close`, `close_with_error`
 - `SendStream` exposes write-side methods. `RecvStream` exposes read-side methods. `Stream` exposes both.
 
 Wire codec and protocol helpers:
@@ -332,7 +332,7 @@ Wire codec and protocol helpers:
 - `DataPayload`, `DataPayloadView`, `GoAwayPayload`, `MetadataUpdate`, `StreamMetadata`, `StreamMetadataView`
 - `StreamMetadata` methods: `as_view`, `open_info`, `open_info_len`, `has_open_info`, `is_empty`
 - `StreamMetadataView` methods: `open_info`, `open_info_len`, `has_open_info`, `is_empty`, `try_to_owned`
-- `MetadataUpdate` methods: `new`, `with_priority`, `with_group`, `is_empty`, `validate`
+- `MetadataUpdate` methods: `new`, `priority`, `group`, `is_empty`, `validate`
 - `build_code_payload`, `build_go_away_payload`, `build_open_metadata_prefix`, `build_priority_update_payload`
 - `parse_data_payload`, `parse_data_payload_view`, `parse_error_payload`, `parse_go_away_payload`, `parse_priority_update_payload`, `parse_stream_metadata_tlvs`, `parse_stream_metadata_bytes_view`
 
@@ -364,7 +364,7 @@ Errors, events, diagnostics, and conformance:
 - `DuplexTransport` methods: `new`, `with_local_addr`, `with_peer_addr`, `with_addresses`, `with_control`, `with_close_fn`, `local_addr`, `peer_addr`, `set_read_timeout`, `set_write_timeout`, `close`, `reader`, `reader_mut`, `writer`, `writer_mut`, `into_parts`
 - `Claim`, `ConformanceSuite`, `ImplementationProfile`, `ParseConformanceError`
 - conformance methods: `Claim::as_str`, `Claim::acceptance_checklist`, `Claim::required_conformance_suites`, `ImplementationProfile::as_str`, `ImplementationProfile::claims`, `ImplementationProfile::acceptance_checklist`, `ImplementationProfile::required_conformance_suites`, `ImplementationProfile::release_certification_gate`, `ConformanceSuite::as_str`
-- `claim_by_name`, `implementation_profile_by_name`, `conformance_suite_by_name`, `known_claims`, `known_conformance_suites`, `known_implementation_profiles`, `core_module_target_claims`, `core_module_target_suites`, `core_module_target_implementation_profiles`, `reference_profile_claim_gate`
+- `known_claims`, `known_conformance_suites`, `known_implementation_profiles`, `core_module_target_claims`, `core_module_target_suites`, `core_module_target_implementation_profiles`, `reference_profile_claim_gate`
 
 ## Semantics
 

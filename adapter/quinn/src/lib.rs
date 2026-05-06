@@ -563,27 +563,23 @@ impl QuinnSession {
         let timeout = timeout
             .map(|timeout| remaining_write_timeout(start, timeout))
             .transpose()?;
-        let n = match (payload, timeout) {
-            (WritePayload::Bytes(data), Some(timeout)) => stream
-                .write_timeout(data.as_ref(), timeout)
-                .await
-                .map_err(|err| {
-                    err.with_stream_context(
-                        zmux::ErrorOperation::Write,
-                        zmux::ErrorDirection::Write,
-                    )
-                })?,
-            (WritePayload::Bytes(data), None) => stream.write(data.as_ref()).await?,
-            (WritePayload::Vectored(parts), Some(timeout)) => stream
-                .write_vectored_timeout(parts, timeout)
-                .await
-                .map_err(|err| {
-                    err.with_stream_context(
-                        zmux::ErrorOperation::Write,
-                        zmux::ErrorDirection::Write,
-                    )
-                })?,
-            (WritePayload::Vectored(parts), None) => stream.write_vectored(parts).await?,
+        let n = match timeout {
+            Some(timeout) => {
+                stream
+                    .write_all_timeout(payload, timeout)
+                    .await
+                    .map_err(|err| {
+                        err.with_stream_context(
+                            zmux::ErrorOperation::Write,
+                            zmux::ErrorDirection::Write,
+                        )
+                    })?;
+                requested
+            }
+            None => {
+                stream.write_all(payload).await?;
+                requested
+            }
         };
         Ok((stream, validate_progress(n, requested)?))
     }

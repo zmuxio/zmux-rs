@@ -1968,7 +1968,7 @@ fn read_deadline_allows_data_before_expiry_and_can_be_cleared() {
     let mut next = [0u8; 1];
     assert_eq!(accepted.read(&mut next).unwrap(), 1);
     assert_eq!(next, *b"y");
-    accepted.clear_read_deadline().unwrap();
+    accepted.set_read_deadline(None).unwrap();
 }
 
 #[test]
@@ -2489,7 +2489,7 @@ fn final_write_deadline_after_queue_admission_cancels_before_writer_starts() {
     );
     first_thread.join().unwrap();
 
-    second.clear_write_deadline().unwrap();
+    second.set_write_deadline(None).unwrap();
     assert_eq!(second.write(b"z").unwrap(), 1);
     let first_id = first.stream_id();
     let second_id = second.stream_id();
@@ -2595,7 +2595,7 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
     );
     first_thread.join().unwrap();
 
-    second.clear_deadline().unwrap();
+    second.set_deadline(None).unwrap();
     assert_eq!(second.write(b"z").unwrap(), 1);
     client
         .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
@@ -2626,7 +2626,7 @@ fn close_write_deadline_failure_keeps_local_write_open_for_retry() {
         .collect_frames_for(Duration::from_millis(50))
         .is_empty());
 
-    stream.clear_write_deadline().unwrap();
+    stream.set_write_deadline(None).unwrap();
     stream.close_write().unwrap();
     assert!(stream.is_write_closed());
 
@@ -2681,7 +2681,7 @@ fn write_deadline_failure_keeps_local_write_open_for_retry() {
         .collect_frames_for(Duration::from_millis(50))
         .is_empty());
 
-    stream.clear_write_deadline().unwrap();
+    stream.set_write_deadline(None).unwrap();
     assert_eq!(stream.write(b"x").unwrap(), 1);
     assert!(!stream.is_write_closed());
 
@@ -2800,7 +2800,7 @@ fn close_read_retry_after_deadline_failure_queues_opener_and_stop_sending() {
         .collect_frames_for(Duration::from_millis(50))
         .is_empty());
 
-    stream.clear_write_deadline().unwrap();
+    stream.set_write_deadline(None).unwrap();
     stream.close_read().unwrap();
 
     let stream_id = stream.stream_id();

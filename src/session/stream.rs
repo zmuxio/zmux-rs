@@ -226,18 +226,6 @@ impl Stream {
         self.set_deadline(timeout_to_deadline(timeout))
     }
 
-    pub fn clear_read_deadline(&self) -> Result<()> {
-        self.set_read_deadline(None)
-    }
-
-    pub fn clear_write_deadline(&self) -> Result<()> {
-        self.set_write_deadline(None)
-    }
-
-    pub fn clear_deadline(&self) -> Result<()> {
-        self.set_deadline(None)
-    }
-
     pub fn write(&self, src: &[u8]) -> Result<usize> {
         stream_result(
             StreamInner::write(self.inner.as_ref(), src, false),
@@ -504,14 +492,6 @@ impl SendStream {
         self.set_deadline(timeout_to_deadline(timeout))
     }
 
-    pub fn clear_write_deadline(&self) -> Result<()> {
-        self.set_write_deadline(None)
-    }
-
-    pub fn clear_deadline(&self) -> Result<()> {
-        self.set_deadline(None)
-    }
-
     pub fn write(&self, src: &[u8]) -> Result<usize> {
         stream_result(
             StreamInner::write(self.inner.as_ref(), src, false),
@@ -768,14 +748,6 @@ impl RecvStream {
 
     pub fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
-    }
-
-    pub fn clear_read_deadline(&self) -> Result<()> {
-        self.set_read_deadline(None)
-    }
-
-    pub fn clear_deadline(&self) -> Result<()> {
-        self.set_deadline(None)
     }
 
     pub fn close_read(&self) -> Result<()> {

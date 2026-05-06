@@ -337,21 +337,6 @@ impl FromStr for ConformanceSuite {
 }
 
 #[inline]
-pub fn claim_by_name(value: &str) -> Option<Claim> {
-    Claim::from_name(value)
-}
-
-#[inline]
-pub fn implementation_profile_by_name(value: &str) -> Option<ImplementationProfile> {
-    ImplementationProfile::from_name(value)
-}
-
-#[inline]
-pub fn conformance_suite_by_name(value: &str) -> Option<ConformanceSuite> {
-    ConformanceSuite::from_name(value)
-}
-
-#[inline]
 pub fn known_claims() -> &'static [Claim] {
     &[
         Claim::WireV1,

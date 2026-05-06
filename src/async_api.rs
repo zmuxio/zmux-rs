@@ -46,7 +46,7 @@ fn next_generation(current: u64) -> u64 {
 pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Boxed bidirectional async stream trait object.
-pub type BoxAsyncStream = Box<dyn AsyncDuplexStreamHandle>;
+pub type BoxAsyncDuplexStream = Box<dyn AsyncDuplexStreamHandle>;
 
 /// Boxed send-only async stream trait object.
 pub type BoxAsyncSendStream = Box<dyn AsyncSendStreamHandle>;
@@ -57,7 +57,7 @@ pub type BoxAsyncRecvStream = Box<dyn AsyncRecvStreamHandle>;
 /// Boxed async session trait object.
 pub type BoxAsyncSession = Box<
     dyn AsyncSession<
-        Stream = BoxAsyncStream,
+        Stream = BoxAsyncDuplexStream,
         SendStream = BoxAsyncSendStream,
         RecvStream = BoxAsyncRecvStream,
     >,
@@ -122,9 +122,6 @@ pub trait AsyncStreamHandle: Send + Sync {
     }
     fn set_deadline(&self, _deadline: Option<Instant>) -> Result<()> {
         Err(deadline_unsupported_error())
-    }
-    fn clear_deadline(&self) -> Result<()> {
-        self.set_deadline(None)
     }
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
@@ -222,9 +219,6 @@ pub trait AsyncRecvStreamHandle: AsyncStreamHandle {
     fn is_read_closed(&self) -> bool;
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         self.set_deadline(deadline)
-    }
-    fn clear_read_deadline(&self) -> Result<()> {
-        self.set_read_deadline(None)
     }
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_read_deadline(timeout_to_deadline(timeout))
@@ -426,9 +420,6 @@ pub trait AsyncSendStreamHandle: AsyncStreamHandle {
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
         self.set_deadline(deadline)
     }
-    fn clear_write_deadline(&self) -> Result<()> {
-        self.set_write_deadline(None)
-    }
     fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_write_deadline(timeout_to_deadline(timeout))
     }
@@ -599,7 +590,7 @@ fn zero_session_negotiated() -> Negotiated {
 }
 
 impl AsyncSession for ClosedAsyncSession {
-    type Stream = BoxAsyncStream;
+    type Stream = BoxAsyncDuplexStream;
     type SendStream = BoxAsyncSendStream;
     type RecvStream = BoxAsyncRecvStream;
 
@@ -1274,27 +1265,27 @@ where
         return Ok(0);
     }
     let n = match (payload, timeout, fin) {
-        (WritePayload::Bytes(data), Some(timeout), false) => {
-            stream.write_timeout(data.as_ref(), timeout).await?
+        (payload, Some(timeout), false) => {
+            stream.write_all_timeout(payload, timeout).await?;
+            requested
         }
         (WritePayload::Bytes(data), Some(timeout), true) => {
             stream
                 .write_final_timeout(WritePayload::Bytes(data), timeout)
                 .await?
         }
-        (WritePayload::Bytes(data), None, false) => stream.write(data.as_ref()).await?,
+        (payload, None, false) => {
+            stream.write_all(payload).await?;
+            requested
+        }
         (WritePayload::Bytes(data), None, true) => {
             stream.write_final(WritePayload::Bytes(data)).await?
-        }
-        (WritePayload::Vectored(parts), Some(timeout), false) => {
-            stream.write_vectored_timeout(parts, timeout).await?
         }
         (WritePayload::Vectored(parts), Some(timeout), true) => {
             stream
                 .write_final_timeout(WritePayload::Vectored(parts), timeout)
                 .await?
         }
-        (WritePayload::Vectored(parts), None, false) => stream.write_vectored(parts).await?,
         (WritePayload::Vectored(parts), None, true) => {
             stream.write_final(WritePayload::Vectored(parts)).await?
         }
@@ -1976,10 +1967,6 @@ macro_rules! impl_async_stream_info_forward {
                 (**self).set_deadline(deadline)
             }
 
-            fn clear_deadline(&self) -> Result<()> {
-                (**self).clear_deadline()
-            }
-
             fn close_identity(&self) -> *const () {
                 (**self).close_identity()
             }
@@ -2055,10 +2042,6 @@ macro_rules! impl_async_recv_stream_api_forward {
 
             fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
                 (**self).set_read_deadline(deadline)
-            }
-
-            fn clear_read_deadline(&self) -> Result<()> {
-                (**self).clear_read_deadline()
             }
 
             fn read_to_end<'a>(
@@ -2172,10 +2155,6 @@ macro_rules! impl_async_send_stream_api_forward {
 
             fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
                 (**self).set_write_deadline(deadline)
-            }
-
-            fn clear_write_deadline(&self) -> Result<()> {
-                (**self).clear_write_deadline()
             }
 
             fn update_metadata(&self, update: MetadataUpdate) -> AsyncBoxFuture<'_, Result<()>> {
@@ -2375,21 +2354,21 @@ impl<S> AsyncSession for BoxedAsyncSession<S>
 where
     S: AsyncSession + 'static,
 {
-    type Stream = BoxAsyncStream;
+    type Stream = BoxAsyncDuplexStream;
     type SendStream = BoxAsyncSendStream;
     type RecvStream = BoxAsyncRecvStream;
 
     fn accept_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move {
             let stream = self.inner.accept_stream().await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            Ok(Box::new(stream) as BoxAsyncDuplexStream)
         })
     }
 
     fn accept_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move {
             let stream = self.inner.accept_stream_timeout(timeout).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            Ok(Box::new(stream) as BoxAsyncDuplexStream)
         })
     }
 
@@ -2413,7 +2392,7 @@ where
     fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
         Box::pin(async move {
             let stream = self.inner.open_stream_with(request).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            Ok(Box::new(stream) as BoxAsyncDuplexStream)
         })
     }
 
@@ -2433,7 +2412,7 @@ where
     ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
         Box::pin(async move {
             let (stream, n) = self.inner.open_and_send(request).await?;
-            Ok((Box::new(stream) as BoxAsyncStream, n))
+            Ok((Box::new(stream) as BoxAsyncDuplexStream, n))
         })
     }
 

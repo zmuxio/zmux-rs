@@ -40,7 +40,7 @@ fn next_generation(current: u64) -> u64 {
 }
 
 /// Boxed bidirectional stream trait object used by the native blocking API.
-pub type BoxStream = Box<dyn DuplexStreamHandle>;
+pub type BoxDuplexStream = Box<dyn DuplexStreamHandle>;
 
 /// Boxed send-only stream trait object used by the native blocking API.
 pub type BoxSendStream = Box<dyn SendStreamHandle>;
@@ -75,9 +75,6 @@ pub trait StreamHandle: Send + Sync {
         None
     }
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()>;
-    fn clear_deadline(&self) -> Result<()> {
-        self.set_deadline(None)
-    }
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
     }
@@ -125,9 +122,6 @@ pub trait RecvStreamHandle: StreamHandle + Read {
         Ok(())
     }
     fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()>;
-    fn clear_read_deadline(&self) -> Result<()> {
-        self.set_read_deadline(None)
-    }
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_read_deadline(timeout_to_deadline(timeout))
     }
@@ -142,12 +136,12 @@ pub trait SendStreamHandle: StreamHandle + Write {
 
     /// Write the whole binary payload, preserving owned-buffer intent for
     /// implementations that can enqueue or frame without another copy.
-    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+    fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
         self.write_all_timeout(payload, Duration::MAX)
     }
 
     /// Write the whole binary payload within one operation timeout.
-    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+    fn write_all_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<()> {
         let start = Instant::now();
         match payload {
             WritePayload::Bytes(data) => {
@@ -188,7 +182,7 @@ pub trait SendStreamHandle: StreamHandle + Write {
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize>;
 
     /// Write the whole binary payload and gracefully close the local send side.
-    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+    fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
         let total = payload.checked_len()?;
         self.write_all(payload)?;
         self.close_write()?;
@@ -201,11 +195,7 @@ pub trait SendStreamHandle: StreamHandle + Write {
 
     /// Write the whole binary payload and gracefully close the local send side
     /// within one operation timeout.
-    fn write_final_timeout<'a>(
-        &self,
-        payload: WritePayload<'a>,
-        timeout: Duration,
-    ) -> Result<usize> {
+    fn write_final_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<usize> {
         let total = payload.checked_len()?;
         self.write_all_timeout(payload, timeout)?;
         self.close_write()?;
@@ -221,9 +211,6 @@ pub trait SendStreamHandle: StreamHandle + Write {
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()>;
-    fn clear_write_deadline(&self) -> Result<()> {
-        self.set_write_deadline(None)
-    }
     fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_write_deadline(timeout_to_deadline(timeout))
     }
@@ -1418,14 +1405,14 @@ where
             })
     }
 
-    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+    fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
                 SendStreamHandle::write_all(send, payload)
             })
     }
 
-    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+    fn write_all_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<()> {
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
                 send.write_all_timeout(payload, timeout)
@@ -1450,7 +1437,7 @@ where
             })
     }
 
-    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+    fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
         let requested = payload.checked_len()?;
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
@@ -1468,11 +1455,7 @@ where
             })
     }
 
-    fn write_final_timeout<'a>(
-        &self,
-        payload: WritePayload<'a>,
-        timeout: Duration,
-    ) -> Result<usize> {
+    fn write_final_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<usize> {
         let requested = payload.checked_len()?;
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
@@ -1524,19 +1507,19 @@ where
 }
 
 pub trait Session: Send + Sync {
-    fn accept_stream(&self) -> Result<BoxStream>;
-    fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxStream>;
+    fn accept_stream(&self) -> Result<BoxDuplexStream>;
+    fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxDuplexStream>;
     fn accept_uni_stream(&self) -> Result<BoxRecvStream>;
     fn accept_uni_stream_timeout(&self, timeout: Duration) -> Result<BoxRecvStream>;
-    fn open_stream(&self) -> Result<BoxStream> {
+    fn open_stream(&self) -> Result<BoxDuplexStream> {
         self.open_stream_with(OpenRequest::new())
     }
     fn open_uni_stream(&self) -> Result<BoxSendStream> {
         self.open_uni_stream_with(OpenRequest::new())
     }
-    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream>;
+    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxDuplexStream>;
     fn open_uni_stream_with(&self, request: OpenRequest) -> Result<BoxSendStream>;
-    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
         let (opts, payload, timeout) = request.into_parts();
         let start = Instant::now();
         let mut open = OpenRequest::new().with_options(opts);
@@ -1659,11 +1642,11 @@ fn zero_session_negotiated() -> Negotiated {
 }
 
 impl Session for ClosedSession {
-    fn accept_stream(&self) -> Result<BoxStream> {
+    fn accept_stream(&self) -> Result<BoxDuplexStream> {
         closed_session_result(ErrorOperation::Accept)
     }
 
-    fn accept_stream_timeout(&self, _timeout: Duration) -> Result<BoxStream> {
+    fn accept_stream_timeout(&self, _timeout: Duration) -> Result<BoxDuplexStream> {
         closed_session_result(ErrorOperation::Accept)
     }
 
@@ -1675,7 +1658,7 @@ impl Session for ClosedSession {
         closed_session_result(ErrorOperation::Accept)
     }
 
-    fn open_stream_with(&self, _request: OpenRequest) -> Result<BoxStream> {
+    fn open_stream_with(&self, _request: OpenRequest) -> Result<BoxDuplexStream> {
         closed_session_result(ErrorOperation::Open)
     }
 
@@ -1683,7 +1666,7 @@ impl Session for ClosedSession {
         closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+    fn open_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
         closed_session_result(ErrorOperation::Open)
     }
 
@@ -1936,13 +1919,13 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_timeout(src, timeout)
             }
 
-            fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+            fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
                 (**self).write_all(payload)
             }
 
-            fn write_all_timeout<'a>(
+            fn write_all_timeout(
                 &self,
-                payload: WritePayload<'a>,
+                payload: WritePayload<'_>,
                 timeout: Duration,
             ) -> Result<()> {
                 (**self).write_all_timeout(payload, timeout)
@@ -1960,7 +1943,7 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_vectored_timeout(parts, timeout)
             }
 
-            fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+            fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
                 (**self).write_final(payload)
             }
 
@@ -1968,9 +1951,9 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_vectored_final(parts)
             }
 
-            fn write_final_timeout<'a>(
+            fn write_final_timeout(
                 &self,
-                payload: WritePayload<'a>,
+                payload: WritePayload<'_>,
                 timeout: Duration,
             ) -> Result<usize> {
                 (**self).write_final_timeout(payload, timeout)
@@ -2019,11 +2002,11 @@ where
         (**self).write_timeout(src, timeout)
     }
 
-    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+    fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
         (**self).write_all(payload)
     }
 
-    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+    fn write_all_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<()> {
         (**self).write_all_timeout(payload, timeout)
     }
 
@@ -2035,7 +2018,7 @@ where
         (**self).write_vectored_timeout(parts, timeout)
     }
 
-    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+    fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
         (**self).write_final(payload)
     }
 
@@ -2043,11 +2026,7 @@ where
         (**self).write_vectored_final(parts)
     }
 
-    fn write_final_timeout<'a>(
-        &self,
-        payload: WritePayload<'a>,
-        timeout: Duration,
-    ) -> Result<usize> {
+    fn write_final_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<usize> {
         (**self).write_final_timeout(payload, timeout)
     }
 
@@ -2088,11 +2067,11 @@ macro_rules! impl_session_forward {
         where
             T: Session + ?Sized,
         {
-            fn accept_stream(&self) -> Result<BoxStream> {
+            fn accept_stream(&self) -> Result<BoxDuplexStream> {
                 (**self).accept_stream()
             }
 
-            fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxStream> {
+            fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxDuplexStream> {
                 (**self).accept_stream_timeout(timeout)
             }
 
@@ -2104,7 +2083,7 @@ macro_rules! impl_session_forward {
                 (**self).accept_uni_stream_timeout(timeout)
             }
 
-            fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream> {
+            fn open_stream_with(&self, request: OpenRequest) -> Result<BoxDuplexStream> {
                 (**self).open_stream_with(request)
             }
 
@@ -2112,7 +2091,7 @@ macro_rules! impl_session_forward {
                 (**self).open_uni_stream_with(request)
             }
 
-            fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+            fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
                 (**self).open_and_send(request)
             }
 
@@ -2311,11 +2290,11 @@ impl SendStreamHandle for Stream {
         Stream::write_timeout(self, src, timeout)
     }
 
-    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+    fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
         Stream::write_all(self, payload)
     }
 
-    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+    fn write_all_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<()> {
         Stream::write_all_timeout(self, payload, timeout)
     }
 
@@ -2327,7 +2306,7 @@ impl SendStreamHandle for Stream {
         Stream::write_vectored_timeout(self, parts, timeout)
     }
 
-    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+    fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
         Stream::write_final(self, payload)
     }
 
@@ -2335,11 +2314,7 @@ impl SendStreamHandle for Stream {
         Stream::write_vectored_final(self, parts)
     }
 
-    fn write_final_timeout<'a>(
-        &self,
-        payload: WritePayload<'a>,
-        timeout: Duration,
-    ) -> Result<usize> {
+    fn write_final_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<usize> {
         Stream::write_final_timeout(self, payload, timeout)
     }
 
@@ -2433,11 +2408,11 @@ impl SendStreamHandle for SendStream {
         SendStream::write_timeout(self, src, timeout)
     }
 
-    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+    fn write_all(&self, payload: WritePayload<'_>) -> Result<()> {
         SendStream::write_all(self, payload)
     }
 
-    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+    fn write_all_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<()> {
         SendStream::write_all_timeout(self, payload, timeout)
     }
 
@@ -2449,7 +2424,7 @@ impl SendStreamHandle for SendStream {
         SendStream::write_vectored_timeout(self, parts, timeout)
     }
 
-    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+    fn write_final(&self, payload: WritePayload<'_>) -> Result<usize> {
         SendStream::write_final(self, payload)
     }
 
@@ -2457,11 +2432,7 @@ impl SendStreamHandle for SendStream {
         SendStream::write_vectored_final(self, parts)
     }
 
-    fn write_final_timeout<'a>(
-        &self,
-        payload: WritePayload<'a>,
-        timeout: Duration,
-    ) -> Result<usize> {
+    fn write_final_timeout(&self, payload: WritePayload<'_>, timeout: Duration) -> Result<usize> {
         SendStream::write_final_timeout(self, payload, timeout)
     }
 
@@ -2575,11 +2546,11 @@ impl RecvStreamHandle for RecvStream {
 }
 
 impl Session for Conn {
-    fn accept_stream(&self) -> Result<BoxStream> {
+    fn accept_stream(&self) -> Result<BoxDuplexStream> {
         Ok(Box::new(Conn::accept_stream(self)?))
     }
 
-    fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxStream> {
+    fn accept_stream_timeout(&self, timeout: Duration) -> Result<BoxDuplexStream> {
         Ok(Box::new(Conn::accept_stream_timeout(self, timeout)?))
     }
 
@@ -2591,7 +2562,7 @@ impl Session for Conn {
         Ok(Box::new(Conn::accept_uni_stream_timeout(self, timeout)?))
     }
 
-    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxStream> {
+    fn open_stream_with(&self, request: OpenRequest) -> Result<BoxDuplexStream> {
         Ok(Box::new(Conn::open_stream_with(self, request)?))
     }
 
@@ -2599,7 +2570,7 @@ impl Session for Conn {
         Ok(Box::new(Conn::open_uni_stream_with(self, request)?))
     }
 
-    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxStream, usize)> {
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
         let (stream, n) = Conn::open_and_send(self, request)?;
         Ok((Box::new(stream), n))
     }

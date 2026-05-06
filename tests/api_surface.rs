@@ -243,7 +243,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
     assert!(data.app_data.is_empty());
     assert!(data.metadata_valid);
 
-    let update = zmux::MetadataUpdate::new().with_priority(11).with_group(12);
+    let update = zmux::MetadataUpdate::new().priority(11).group(12);
     update.validate()?;
     let update_payload = zmux::build_priority_update_payload(
         zmux::CAPABILITY_PRIORITY_UPDATE
@@ -285,7 +285,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
 
 #[test]
 fn public_trait_object_surface_accepts_external_implementations() -> zmux::Result<()> {
-    let mut stream: zmux::BoxStream = Box::new(DummyStream);
+    let mut stream: zmux::BoxDuplexStream = Box::new(DummyStream);
     assert_eq!(stream.stream_id(), 42);
     assert_eq!(stream.open_info(), b"api");
     assert!(stream.has_open_info());
@@ -302,7 +302,7 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
         4
     );
     stream.set_deadline(Some(Instant::now()))?;
-    stream.clear_deadline()?;
+    stream.set_deadline(None)?;
     stream.cancel_read(8)?;
     stream.cancel_write(8)?;
     stream.close_with_error(9, "abort")?;
@@ -1977,7 +1977,7 @@ where
         &outbound,
         Some(Instant::now() + Duration::from_secs(5)),
     )?;
-    zmux::AsyncStreamHandle::clear_deadline(&outbound)?;
+    zmux::AsyncStreamHandle::set_deadline(&outbound, None)?;
     zmux::AsyncSendStreamHandle::write_final(
         &outbound,
         zmux::WritePayload::from(&b"client-to-server"[..]),
@@ -5080,11 +5080,11 @@ impl zmux::AsyncSession for DummyAsyncSession {
 struct DummySession;
 
 impl zmux::Session for DummySession {
-    fn accept_stream(&self) -> zmux::Result<zmux::BoxStream> {
+    fn accept_stream(&self) -> zmux::Result<zmux::BoxDuplexStream> {
         Ok(Box::new(DummyStream))
     }
 
-    fn accept_stream_timeout(&self, _timeout: Duration) -> zmux::Result<zmux::BoxStream> {
+    fn accept_stream_timeout(&self, _timeout: Duration) -> zmux::Result<zmux::BoxDuplexStream> {
         self.accept_stream()
     }
 
@@ -5096,7 +5096,7 @@ impl zmux::Session for DummySession {
         self.accept_uni_stream()
     }
 
-    fn open_stream_with(&self, request: zmux::OpenRequest) -> zmux::Result<zmux::BoxStream> {
+    fn open_stream_with(&self, request: zmux::OpenRequest) -> zmux::Result<zmux::BoxDuplexStream> {
         request.options().validate()?;
         Ok(Box::new(DummyStream))
     }
@@ -5109,7 +5109,10 @@ impl zmux::Session for DummySession {
         Ok(Box::new(DummyStream))
     }
 
-    fn open_and_send(&self, request: zmux::OpenSend<'_>) -> zmux::Result<(zmux::BoxStream, usize)> {
+    fn open_and_send(
+        &self,
+        request: zmux::OpenSend<'_>,
+    ) -> zmux::Result<(zmux::BoxDuplexStream, usize)> {
         let opts = request.options();
         opts.validate()?;
         Ok((Box::new(DummyStream), request.payload().checked_len()?))

@@ -25,8 +25,8 @@ mod tlv;
 mod varint;
 
 pub use api::{
-    closed_session, join_optional_streams, join_streams, BoxRecvStream, BoxSendStream, BoxSession,
-    BoxStream, ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
+    closed_session, join_optional_streams, join_streams, BoxDuplexStream, BoxRecvStream,
+    BoxSendStream, BoxSession, ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
     PausedNativeHalf as PausedHalf, PausedNativeRecvHalf as PausedRecvHalf,
     PausedNativeSendHalf as PausedSendHalf, RecvStreamHandle, SendStreamHandle, Session,
     StreamHandle,
@@ -34,9 +34,9 @@ pub use api::{
 pub use async_api::{
     box_async_session, closed_async_session, join_async_streams, join_optional_async_streams,
     AsyncBoxFuture, AsyncDuplexStream, AsyncDuplexStreamHandle, AsyncRecvStreamHandle,
-    AsyncSendStreamHandle, AsyncSession, AsyncStreamHandle, BoxAsyncRecvStream, BoxAsyncSendStream,
-    BoxAsyncSession, BoxAsyncStream, ClosedAsyncSession, PausedAsyncHalf, PausedAsyncRecvHalf,
-    PausedAsyncSendHalf,
+    AsyncSendStreamHandle, AsyncSession, AsyncStreamHandle, BoxAsyncDuplexStream,
+    BoxAsyncRecvStream, BoxAsyncSendStream, BoxAsyncSession, ClosedAsyncSession, PausedAsyncHalf,
+    PausedAsyncRecvHalf, PausedAsyncSendHalf,
 };
 pub use config::{
     configure_default_config, default_config, reset_default_config, Config, OpenOptions,
@@ -44,9 +44,8 @@ pub use config::{
     DEFAULT_PREFACE_PADDING_MAX_BYTES, DEFAULT_PREFACE_PADDING_MIN_BYTES,
 };
 pub use conformance::{
-    claim_by_name, conformance_suite_by_name, core_module_target_claims,
-    core_module_target_implementation_profiles, core_module_target_suites,
-    implementation_profile_by_name, known_claims, known_conformance_suites,
+    core_module_target_claims, core_module_target_implementation_profiles,
+    core_module_target_suites, known_claims, known_conformance_suites,
     known_implementation_profiles, reference_profile_claim_gate, Claim, ConformanceSuite,
     ImplementationProfile, ParseConformanceError,
 };
