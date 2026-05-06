@@ -40,18 +40,18 @@ fn next_generation(current: u64) -> u64 {
 }
 
 /// Boxed bidirectional stream trait object used by the native blocking API.
-pub type BoxStream = Box<dyn StreamApi>;
+pub type BoxStream = Box<dyn DuplexStreamHandle>;
 
 /// Boxed send-only stream trait object used by the native blocking API.
-pub type BoxSendStream = Box<dyn SendStreamApi>;
+pub type BoxSendStream = Box<dyn SendStreamHandle>;
 
 /// Boxed receive-only stream trait object used by the native blocking API.
-pub type BoxRecvStream = Box<dyn RecvStreamApi>;
+pub type BoxRecvStream = Box<dyn RecvStreamHandle>;
 
 /// Boxed native blocking session trait object.
 pub type BoxSession = Box<dyn Session>;
 
-pub trait StreamInfo: Send + Sync {
+pub trait StreamHandle: Send + Sync {
     fn stream_id(&self) -> u64;
     fn is_opened_locally(&self) -> bool;
     fn is_bidirectional(&self) -> bool;
@@ -94,7 +94,7 @@ pub trait StreamInfo: Send + Sync {
     fn close_with_error(&self, code: u64, reason: &str) -> Result<()>;
 }
 
-pub trait RecvStreamApi: StreamInfo + Read {
+pub trait RecvStreamHandle: StreamHandle + Read {
     fn is_read_closed(&self) -> bool;
     fn read_timeout(&self, dst: &mut [u8], timeout: Duration) -> Result<usize>;
     fn read_vectored_timeout(
@@ -135,7 +135,7 @@ pub trait RecvStreamApi: StreamInfo + Read {
     fn cancel_read(&self, code: u64) -> Result<()>;
 }
 
-pub trait SendStreamApi: StreamInfo + Write {
+pub trait SendStreamHandle: StreamHandle + Write {
     fn is_write_closed(&self) -> bool;
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()>;
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize>;
@@ -174,7 +174,7 @@ pub trait SendStreamApi: StreamInfo + Write {
     fn cancel_write(&self, code: u64) -> Result<()>;
 }
 
-pub trait StreamApi: RecvStreamApi + SendStreamApi {}
+pub trait DuplexStreamHandle: RecvStreamHandle + SendStreamHandle {}
 
 /// Which half supplies metadata for a joined bidirectional stream view.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -752,7 +752,7 @@ fn write_open_payload_native<S>(
     skip_empty: bool,
 ) -> Result<usize>
 where
-    S: SendStreamApi + ?Sized,
+    S: SendStreamHandle + ?Sized,
 {
     let requested = payload.checked_len()?;
     if skip_empty && requested == 0 {
@@ -875,14 +875,14 @@ fn vectored_read_len_overflow_error() -> Error {
         .with_stream_context(ErrorOperation::Read, ErrorDirection::Read)
 }
 
-fn apply_native_read_deadline<T: RecvStreamApi>(
+fn apply_native_read_deadline<T: RecvStreamHandle>(
     stream: &T,
     deadline: Option<Instant>,
 ) -> Result<()> {
     stream.set_read_deadline(deadline)
 }
 
-fn apply_native_write_deadline<T: SendStreamApi>(
+fn apply_native_write_deadline<T: SendStreamHandle>(
     stream: &T,
     deadline: Option<Instant>,
 ) -> Result<()> {
@@ -890,10 +890,12 @@ fn apply_native_write_deadline<T: SendStreamApi>(
 }
 
 impl<R, W> DuplexStream<R, W> {
+    #[must_use]
     pub fn new(recv: R, send: W) -> Self {
         Self::from_parts(Some(recv), Some(send))
     }
 
+    #[must_use]
     pub fn from_parts(recv: Option<R>, send: Option<W>) -> Self {
         Self {
             recv: Arc::new(NativeJoinedHalf::new_optional(recv, "read")),
@@ -902,10 +904,12 @@ impl<R, W> DuplexStream<R, W> {
         }
     }
 
+    #[must_use]
     pub fn empty() -> Self {
         Self::from_parts(None, None)
     }
 
+    #[must_use]
     pub fn with_info_side(mut self, info_side: DuplexInfoSide) -> Self {
         self.info_side = info_side;
         self
@@ -990,8 +994,8 @@ impl<R, W> DuplexStream<R, W> {
 
 impl<R, W> DuplexStream<R, W>
 where
-    R: RecvStreamApi,
-    W: SendStreamApi,
+    R: RecvStreamHandle,
+    W: SendStreamHandle,
 {
     pub fn read_stream_id(&self) -> u64 {
         self.recv.with_current_or(0, |recv| recv.stream_id())
@@ -1002,10 +1006,12 @@ where
     }
 }
 
+#[must_use]
 pub fn join_streams<R, W>(recv: R, send: W) -> DuplexStream<R, W> {
     DuplexStream::new(recv, send)
 }
 
+#[must_use]
 pub fn join_optional_streams<R, W>(recv: Option<R>, send: Option<W>) -> DuplexStream<R, W> {
     DuplexStream::from_parts(recv, send)
 }
@@ -1122,10 +1128,10 @@ where
     }
 }
 
-impl<R, W> StreamInfo for DuplexStream<R, W>
+impl<R, W> StreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamApi,
-    W: SendStreamApi,
+    R: RecvStreamHandle,
+    W: SendStreamHandle,
 {
     fn stream_id(&self) -> u64 {
         match self.info_side {
@@ -1229,8 +1235,8 @@ where
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        let read = <Self as RecvStreamApi>::set_read_deadline(self, deadline);
-        let write = <Self as SendStreamApi>::set_write_deadline(self, deadline);
+        let read = <Self as RecvStreamHandle>::set_read_deadline(self, deadline);
+        let write = <Self as SendStreamHandle>::set_write_deadline(self, deadline);
         read.and(write)
     }
 
@@ -1276,10 +1282,10 @@ where
     }
 }
 
-impl<R, W> RecvStreamApi for DuplexStream<R, W>
+impl<R, W> RecvStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamApi,
-    W: SendStreamApi,
+    R: RecvStreamHandle,
+    W: SendStreamHandle,
 {
     fn is_read_closed(&self) -> bool {
         self.recv
@@ -1336,10 +1342,10 @@ where
     }
 }
 
-impl<R, W> SendStreamApi for DuplexStream<R, W>
+impl<R, W> SendStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamApi,
-    W: SendStreamApi,
+    R: RecvStreamHandle,
+    W: SendStreamHandle,
 {
     fn is_write_closed(&self) -> bool {
         self.send
@@ -1446,10 +1452,10 @@ where
     }
 }
 
-impl<R, W> StreamApi for DuplexStream<R, W>
+impl<R, W> DuplexStreamHandle for DuplexStream<R, W>
 where
-    R: RecvStreamApi,
-    W: SendStreamApi,
+    R: RecvStreamHandle,
+    W: SendStreamHandle,
 {
 }
 
@@ -1535,6 +1541,7 @@ pub trait Session: Send + Sync {
 pub struct ClosedSession;
 
 /// Create a permanently closed blocking session.
+#[must_use]
 pub fn closed_session() -> ClosedSession {
     ClosedSession
 }
@@ -1697,9 +1704,9 @@ impl Session for ClosedSession {
 
 macro_rules! impl_stream_info_forward {
     ($target:ty) => {
-        impl<T> StreamInfo for $target
+        impl<T> StreamHandle for $target
         where
-            T: StreamInfo + ?Sized,
+            T: StreamHandle + ?Sized,
         {
             fn stream_id(&self) -> u64 {
                 (**self).stream_id()
@@ -1767,9 +1774,9 @@ impl_stream_info_forward!(Arc<T>);
 
 macro_rules! impl_recv_stream_api_forward {
     ($target:ty) => {
-        impl<T> RecvStreamApi for $target
+        impl<T> RecvStreamHandle for $target
         where
-            T: RecvStreamApi + ?Sized,
+            T: RecvStreamHandle + ?Sized,
         {
             fn is_read_closed(&self) -> bool {
                 (**self).is_read_closed()
@@ -1809,9 +1816,9 @@ macro_rules! impl_recv_stream_api_forward {
 impl_recv_stream_api_forward!(&mut T);
 impl_recv_stream_api_forward!(Box<T>);
 
-impl<T> RecvStreamApi for &T
+impl<T> RecvStreamHandle for &T
 where
-    T: RecvStreamApi + ?Sized,
+    T: RecvStreamHandle + ?Sized,
     for<'a> &'a T: Read,
 {
     fn is_read_closed(&self) -> bool {
@@ -1849,9 +1856,9 @@ where
 
 macro_rules! impl_send_stream_api_forward {
     ($target:ty) => {
-        impl<T> SendStreamApi for $target
+        impl<T> SendStreamHandle for $target
         where
-            T: SendStreamApi + ?Sized,
+            T: SendStreamHandle + ?Sized,
         {
             fn is_write_closed(&self) -> bool {
                 (**self).is_write_closed()
@@ -1919,9 +1926,9 @@ macro_rules! impl_send_stream_api_forward {
 impl_send_stream_api_forward!(&mut T);
 impl_send_stream_api_forward!(Box<T>);
 
-impl<T> SendStreamApi for &T
+impl<T> SendStreamHandle for &T
 where
-    T: SendStreamApi + ?Sized,
+    T: SendStreamHandle + ?Sized,
     for<'a> &'a T: Write,
 {
     fn is_write_closed(&self) -> bool {
@@ -1977,15 +1984,15 @@ where
     }
 }
 
-impl<T> StreamApi for &mut T where T: StreamApi + ?Sized {}
-impl<T> StreamApi for &T
+impl<T> DuplexStreamHandle for &mut T where T: DuplexStreamHandle + ?Sized {}
+impl<T> DuplexStreamHandle for &T
 where
-    T: StreamApi + ?Sized,
+    T: DuplexStreamHandle + ?Sized,
     for<'a> &'a T: Read,
     for<'a> &'a T: Write,
 {
 }
-impl<T> StreamApi for Box<T> where T: StreamApi + ?Sized {}
+impl<T> DuplexStreamHandle for Box<T> where T: DuplexStreamHandle + ?Sized {}
 
 macro_rules! impl_session_forward {
     ($target:ty) => {
@@ -2115,7 +2122,7 @@ impl_session_forward!(&mut T);
 impl_session_forward!(Box<T>);
 impl_session_forward!(Arc<T>);
 
-impl StreamInfo for Stream {
+impl StreamHandle for Stream {
     fn stream_id(&self) -> u64 {
         Stream::stream_id(self)
     }
@@ -2169,7 +2176,7 @@ impl StreamInfo for Stream {
     }
 }
 
-impl RecvStreamApi for Stream {
+impl RecvStreamHandle for Stream {
     fn is_read_closed(&self) -> bool {
         Stream::is_read_closed(self)
     }
@@ -2203,7 +2210,7 @@ impl RecvStreamApi for Stream {
     }
 }
 
-impl SendStreamApi for Stream {
+impl SendStreamHandle for Stream {
     fn is_write_closed(&self) -> bool {
         Stream::is_write_closed(self)
     }
@@ -2261,9 +2268,9 @@ impl SendStreamApi for Stream {
     }
 }
 
-impl StreamApi for Stream {}
+impl DuplexStreamHandle for Stream {}
 
-impl StreamInfo for SendStream {
+impl StreamHandle for SendStream {
     fn stream_id(&self) -> u64 {
         SendStream::stream_id(self)
     }
@@ -2317,7 +2324,7 @@ impl StreamInfo for SendStream {
     }
 }
 
-impl SendStreamApi for SendStream {
+impl SendStreamHandle for SendStream {
     fn is_write_closed(&self) -> bool {
         SendStream::is_write_closed(self)
     }
@@ -2375,7 +2382,7 @@ impl SendStreamApi for SendStream {
     }
 }
 
-impl StreamInfo for RecvStream {
+impl StreamHandle for RecvStream {
     fn stream_id(&self) -> u64 {
         RecvStream::stream_id(self)
     }
@@ -2429,7 +2436,7 @@ impl StreamInfo for RecvStream {
     }
 }
 
-impl RecvStreamApi for RecvStream {
+impl RecvStreamHandle for RecvStream {
     fn is_read_closed(&self) -> bool {
         RecvStream::is_read_closed(self)
     }
@@ -2587,11 +2594,11 @@ mod tests {
     use std::ops::Deref;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct AppendOnlyStreamInfo {
+    struct AppendOnlyStreamHandle {
         appends: AtomicUsize,
     }
 
-    impl StreamInfo for AppendOnlyStreamInfo {
+    impl StreamHandle for AppendOnlyStreamHandle {
         fn stream_id(&self) -> u64 {
             7
         }
@@ -2635,7 +2642,7 @@ mod tests {
 
     #[test]
     fn default_open_info_builds_from_append_method() {
-        let info = AppendOnlyStreamInfo {
+        let info = AppendOnlyStreamHandle {
             appends: AtomicUsize::new(0),
         };
 
@@ -2651,18 +2658,18 @@ mod tests {
     }
 
     struct CustomInfoWrapper {
-        inner: AppendOnlyStreamInfo,
+        inner: AppendOnlyStreamHandle,
     }
 
     impl Deref for CustomInfoWrapper {
-        type Target = AppendOnlyStreamInfo;
+        type Target = AppendOnlyStreamHandle;
 
         fn deref(&self) -> &Self::Target {
             &self.inner
         }
     }
 
-    impl StreamInfo for CustomInfoWrapper {
+    impl StreamHandle for CustomInfoWrapper {
         fn stream_id(&self) -> u64 {
             99
         }
@@ -2706,7 +2713,7 @@ mod tests {
     #[test]
     fn custom_deref_wrapper_can_define_its_own_stream_info_surface() {
         let info = CustomInfoWrapper {
-            inner: AppendOnlyStreamInfo {
+            inner: AppendOnlyStreamHandle {
                 appends: AtomicUsize::new(0),
             },
         };

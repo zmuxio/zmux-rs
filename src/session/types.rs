@@ -160,6 +160,7 @@ impl<R, W> DuplexTransport<R, W> {
     /// Wrapping a single blocking duplex object behind one shared lock can let a
     /// blocked read starve writes and close propagation.
     #[inline]
+    #[must_use]
     pub fn new(reader: R, writer: W) -> Self {
         Self {
             reader,
@@ -172,6 +173,7 @@ impl<R, W> DuplexTransport<R, W> {
 
     /// Records the local address reported by this transport.
     #[inline]
+    #[must_use]
     pub fn with_local_addr(mut self, local_addr: SocketAddr) -> Self {
         self.local_addr = Some(local_addr);
         self
@@ -179,6 +181,7 @@ impl<R, W> DuplexTransport<R, W> {
 
     /// Records the peer address reported by this transport.
     #[inline]
+    #[must_use]
     pub fn with_peer_addr(mut self, peer_addr: SocketAddr) -> Self {
         self.peer_addr = Some(peer_addr);
         self
@@ -189,6 +192,7 @@ impl<R, W> DuplexTransport<R, W> {
     /// This is useful for adapters that can discover either address
     /// independently.
     #[inline]
+    #[must_use]
     pub fn with_addresses(
         mut self,
         local_addr: Option<SocketAddr>,
@@ -201,6 +205,7 @@ impl<R, W> DuplexTransport<R, W> {
 
     /// Installs transport-specific timeout and close operations.
     #[inline]
+    #[must_use]
     pub fn with_control<C>(mut self, control: C) -> Self
     where
         C: DuplexTransportControl + 'static,
@@ -214,6 +219,7 @@ impl<R, W> DuplexTransport<R, W> {
     /// `Conn::close` calls this hook before tearing down the ZMux session, so a
     /// joined or split transport can still shut down its original connection.
     #[inline]
+    #[must_use]
     pub fn with_close_fn<F>(self, close: F) -> Self
     where
         F: Fn() -> io::Result<()> + Send + Sync + 'static,

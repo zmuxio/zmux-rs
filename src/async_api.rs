@@ -46,13 +46,13 @@ fn next_generation(current: u64) -> u64 {
 pub type AsyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Boxed bidirectional async stream trait object.
-pub type BoxAsyncStream = Box<dyn AsyncStreamApi>;
+pub type BoxAsyncStream = Box<dyn AsyncDuplexStreamHandle>;
 
 /// Boxed send-only async stream trait object.
-pub type BoxAsyncSendStream = Box<dyn AsyncSendStreamApi>;
+pub type BoxAsyncSendStream = Box<dyn AsyncSendStreamHandle>;
 
 /// Boxed receive-only async stream trait object.
-pub type BoxAsyncRecvStream = Box<dyn AsyncRecvStreamApi>;
+pub type BoxAsyncRecvStream = Box<dyn AsyncRecvStreamHandle>;
 
 /// Boxed async session trait object.
 pub type BoxAsyncSession = Box<
@@ -64,6 +64,7 @@ pub type BoxAsyncSession = Box<
 >;
 
 /// Wrap an async session and erase its concrete stream types.
+#[must_use]
 pub fn box_async_session<S>(session: S) -> BoxAsyncSession
 where
     S: AsyncSession + 'static,
@@ -79,6 +80,7 @@ where
 pub struct ClosedAsyncSession;
 
 /// Create a permanently closed async session.
+#[must_use]
 pub fn closed_async_session() -> ClosedAsyncSession {
     ClosedAsyncSession
 }
@@ -95,7 +97,7 @@ impl<S> BoxedAsyncSession<S> {
 }
 
 /// Runtime-neutral stream metadata and close operations for async upper layers.
-pub trait AsyncStreamInfo: Send + Sync {
+pub trait AsyncStreamHandle: Send + Sync {
     fn stream_id(&self) -> u64;
     fn is_opened_locally(&self) -> bool;
     fn is_bidirectional(&self) -> bool;
@@ -142,7 +144,7 @@ pub trait AsyncStreamInfo: Send + Sync {
 }
 
 /// Runtime-neutral receive stream operations.
-pub trait AsyncRecvStreamApi: AsyncStreamInfo {
+pub trait AsyncRecvStreamHandle: AsyncStreamHandle {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>>;
     fn read_vectored<'a>(
         &'a self,
@@ -273,7 +275,7 @@ pub trait AsyncRecvStreamApi: AsyncStreamInfo {
 }
 
 /// Runtime-neutral send stream operations.
-pub trait AsyncSendStreamApi: AsyncStreamInfo {
+pub trait AsyncSendStreamHandle: AsyncStreamHandle {
     fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>>;
 
     fn write_all<'a>(&'a self, payload: WritePayload<'a>) -> AsyncBoxFuture<'a, Result<()>> {
@@ -436,13 +438,13 @@ pub trait AsyncSendStreamApi: AsyncStreamInfo {
 }
 
 /// Runtime-neutral bidirectional async stream operations.
-pub trait AsyncStreamApi: AsyncRecvStreamApi + AsyncSendStreamApi {}
+pub trait AsyncDuplexStreamHandle: AsyncRecvStreamHandle + AsyncSendStreamHandle {}
 
 /// Runtime-neutral async session operations shared by native ZMux and adapters.
 pub trait AsyncSession: Send + Sync {
-    type Stream: AsyncStreamApi + Send + Sync + 'static;
-    type SendStream: AsyncSendStreamApi + Send + Sync + 'static;
-    type RecvStream: AsyncRecvStreamApi + Send + Sync + 'static;
+    type Stream: AsyncDuplexStreamHandle + Send + Sync + 'static;
+    type SendStream: AsyncSendStreamHandle + Send + Sync + 'static;
+    type RecvStream: AsyncRecvStreamHandle + Send + Sync + 'static;
 
     fn accept_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
     fn accept_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>>;
@@ -769,11 +771,16 @@ pub type PausedAsyncRecvHalf<R> = PausedAsyncHalf<R>;
 /// Detached send half handle for `AsyncDuplexStream`.
 pub type PausedAsyncSendHalf<W> = PausedAsyncHalf<W>;
 
+#[must_use]
 pub fn join_async_streams<R, W>(recv: R, send: W) -> AsyncDuplexStream<R, W> {
     AsyncDuplexStream::new(recv, send)
 }
 
-pub fn join_optional_streams<R, W>(recv: Option<R>, send: Option<W>) -> AsyncDuplexStream<R, W> {
+#[must_use]
+pub fn join_optional_async_streams<R, W>(
+    recv: Option<R>,
+    send: Option<W>,
+) -> AsyncDuplexStream<R, W> {
     AsyncDuplexStream::from_parts(recv, send)
 }
 
@@ -1260,7 +1267,7 @@ async fn write_open_payload_async<S>(
     skip_empty: bool,
 ) -> Result<usize>
 where
-    S: AsyncSendStreamApi + ?Sized,
+    S: AsyncSendStreamHandle + ?Sized,
 {
     let requested = payload.checked_len()?;
     if skip_empty && requested == 0 {
@@ -1334,14 +1341,14 @@ fn same_close_identity(first: *const (), second: *const ()) -> bool {
     !first.is_null() && first == second
 }
 
-fn apply_async_read_deadline<T: AsyncRecvStreamApi>(
+fn apply_async_read_deadline<T: AsyncRecvStreamHandle>(
     stream: &T,
     deadline: Option<Instant>,
 ) -> Result<()> {
     stream.set_read_deadline(deadline)
 }
 
-fn apply_async_write_deadline<T: AsyncSendStreamApi>(
+fn apply_async_write_deadline<T: AsyncSendStreamHandle>(
     stream: &T,
     deadline: Option<Instant>,
 ) -> Result<()> {
@@ -1349,10 +1356,12 @@ fn apply_async_write_deadline<T: AsyncSendStreamApi>(
 }
 
 impl<R, W> AsyncDuplexStream<R, W> {
+    #[must_use]
     pub fn new(recv: R, send: W) -> Self {
         Self::from_parts(Some(recv), Some(send))
     }
 
+    #[must_use]
     pub fn from_parts(recv: Option<R>, send: Option<W>) -> Self {
         Self {
             recv: Arc::new(AsyncJoinedHalf::new_optional(recv, "read")),
@@ -1361,10 +1370,12 @@ impl<R, W> AsyncDuplexStream<R, W> {
         }
     }
 
+    #[must_use]
     pub fn empty() -> Self {
         Self::from_parts(None, None)
     }
 
+    #[must_use]
     pub fn with_info_side(mut self, info_side: DuplexInfoSide) -> Self {
         self.info_side = info_side;
         self
@@ -1443,8 +1454,8 @@ impl<R, W> AsyncDuplexStream<R, W> {
 
 impl<R, W> AsyncDuplexStream<R, W>
 where
-    R: AsyncRecvStreamApi,
-    W: AsyncSendStreamApi,
+    R: AsyncRecvStreamHandle,
+    W: AsyncSendStreamHandle,
 {
     pub fn read_stream_id(&self) -> u64 {
         self.recv.with_current_or(0, |recv| recv.stream_id())
@@ -1455,10 +1466,10 @@ where
     }
 }
 
-impl<R, W> AsyncStreamInfo for AsyncDuplexStream<R, W>
+impl<R, W> AsyncStreamHandle for AsyncDuplexStream<R, W>
 where
-    R: AsyncRecvStreamApi,
-    W: AsyncSendStreamApi,
+    R: AsyncRecvStreamHandle,
+    W: AsyncSendStreamHandle,
 {
     fn stream_id(&self) -> u64 {
         match self.info_side {
@@ -1562,8 +1573,8 @@ where
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) -> Result<()> {
-        let read = <Self as AsyncRecvStreamApi>::set_read_deadline(self, deadline);
-        let write = <Self as AsyncSendStreamApi>::set_write_deadline(self, deadline);
+        let read = <Self as AsyncRecvStreamHandle>::set_read_deadline(self, deadline);
+        let write = <Self as AsyncSendStreamHandle>::set_write_deadline(self, deadline);
         read.and(write)
     }
 
@@ -1626,10 +1637,10 @@ where
     }
 }
 
-impl<R, W> AsyncRecvStreamApi for AsyncDuplexStream<R, W>
+impl<R, W> AsyncRecvStreamHandle for AsyncDuplexStream<R, W>
 where
-    R: AsyncRecvStreamApi,
-    W: AsyncSendStreamApi,
+    R: AsyncRecvStreamHandle,
+    W: AsyncSendStreamHandle,
 {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -1734,10 +1745,10 @@ where
     }
 }
 
-impl<R, W> AsyncSendStreamApi for AsyncDuplexStream<R, W>
+impl<R, W> AsyncSendStreamHandle for AsyncDuplexStream<R, W>
 where
-    R: AsyncRecvStreamApi,
-    W: AsyncSendStreamApi,
+    R: AsyncRecvStreamHandle,
+    W: AsyncSendStreamHandle,
 {
     fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -1908,18 +1919,18 @@ where
     }
 }
 
-impl<R, W> AsyncStreamApi for AsyncDuplexStream<R, W>
+impl<R, W> AsyncDuplexStreamHandle for AsyncDuplexStream<R, W>
 where
-    R: AsyncRecvStreamApi,
-    W: AsyncSendStreamApi,
+    R: AsyncRecvStreamHandle,
+    W: AsyncSendStreamHandle,
 {
 }
 
 macro_rules! impl_async_stream_info_forward {
     ($target:ty) => {
-        impl<T> AsyncStreamInfo for $target
+        impl<T> AsyncStreamHandle for $target
         where
-            T: AsyncStreamInfo + ?Sized,
+            T: AsyncStreamHandle + ?Sized,
         {
             fn stream_id(&self) -> u64 {
                 (**self).stream_id()
@@ -1995,9 +2006,9 @@ impl_async_stream_info_forward!(Arc<T>);
 
 macro_rules! impl_async_recv_stream_api_forward {
     ($target:ty) => {
-        impl<T> AsyncRecvStreamApi for $target
+        impl<T> AsyncRecvStreamHandle for $target
         where
-            T: AsyncRecvStreamApi + ?Sized,
+            T: AsyncRecvStreamHandle + ?Sized,
         {
             fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
                 (**self).read(dst)
@@ -2079,9 +2090,9 @@ impl_async_recv_stream_api_forward!(Arc<T>);
 
 macro_rules! impl_async_send_stream_api_forward {
     ($target:ty) => {
-        impl<T> AsyncSendStreamApi for $target
+        impl<T> AsyncSendStreamHandle for $target
         where
-            T: AsyncSendStreamApi + ?Sized,
+            T: AsyncSendStreamHandle + ?Sized,
         {
             fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
                 (**self).write(src)
@@ -2187,10 +2198,10 @@ impl_async_send_stream_api_forward!(&mut T);
 impl_async_send_stream_api_forward!(Box<T>);
 impl_async_send_stream_api_forward!(Arc<T>);
 
-impl<T> AsyncStreamApi for &T where T: AsyncStreamApi + ?Sized {}
-impl<T> AsyncStreamApi for &mut T where T: AsyncStreamApi + ?Sized {}
-impl<T> AsyncStreamApi for Box<T> where T: AsyncStreamApi + ?Sized {}
-impl<T> AsyncStreamApi for Arc<T> where T: AsyncStreamApi + ?Sized {}
+impl<T> AsyncDuplexStreamHandle for &T where T: AsyncDuplexStreamHandle + ?Sized {}
+impl<T> AsyncDuplexStreamHandle for &mut T where T: AsyncDuplexStreamHandle + ?Sized {}
+impl<T> AsyncDuplexStreamHandle for Box<T> where T: AsyncDuplexStreamHandle + ?Sized {}
+impl<T> AsyncDuplexStreamHandle for Arc<T> where T: AsyncDuplexStreamHandle + ?Sized {}
 
 macro_rules! impl_async_session_forward {
     ($target:ty) => {
@@ -2534,7 +2545,7 @@ where
 
 macro_rules! impl_native_async_stream_info {
     ($ty:ty) => {
-        impl AsyncStreamInfo for $ty {
+        impl AsyncStreamHandle for $ty {
             fn stream_id(&self) -> u64 {
                 <$ty>::stream_id(self)
             }
@@ -2604,7 +2615,7 @@ impl_native_async_stream_info!(RecvStream);
 
 macro_rules! impl_native_async_recv {
     ($ty:ty) => {
-        impl AsyncRecvStreamApi for $ty {
+        impl AsyncRecvStreamHandle for $ty {
             fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
                 Box::pin(async move { <$ty>::read(self, dst) })
             }
@@ -2680,7 +2691,7 @@ impl_native_async_recv!(RecvStream);
 
 macro_rules! impl_native_async_send {
     ($ty:ty) => {
-        impl AsyncSendStreamApi for $ty {
+        impl AsyncSendStreamHandle for $ty {
             fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
                 Box::pin(async move { <$ty>::write(self, src) })
             }
@@ -2779,7 +2790,7 @@ macro_rules! impl_native_async_send {
 impl_native_async_send!(Stream);
 impl_native_async_send!(SendStream);
 
-impl AsyncStreamApi for Stream {}
+impl AsyncDuplexStreamHandle for Stream {}
 
 impl AsyncSession for Conn {
     type Stream = Stream;

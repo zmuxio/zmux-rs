@@ -35,8 +35,8 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Semaphore};
 use zmux::{
     build_open_metadata_prefix, parse_stream_metadata_bytes_view, read_varint, AsyncBoxFuture,
-    AsyncRecvStreamApi, AsyncSendStreamApi, AsyncSession, AsyncStreamApi, AsyncStreamInfo,
-    OpenOptions, OpenRequest, OpenSend, Result, StreamMetadata, WritePayload,
+    AsyncDuplexStreamHandle, AsyncRecvStreamHandle, AsyncSendStreamHandle, AsyncSession,
+    AsyncStreamHandle, OpenOptions, OpenRequest, OpenSend, Result, StreamMetadata, WritePayload,
     CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS, CAPABILITY_STREAM_GROUPS,
 };
 
@@ -151,15 +151,18 @@ pub struct SessionOptions {
 }
 
 impl SessionOptions {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_accepted_prelude_read_timeout(mut self, timeout: Duration) -> Self {
+    #[must_use]
+    pub fn accepted_prelude_read_timeout(mut self, timeout: Duration) -> Self {
         self.accepted_prelude_read_timeout = AcceptedPreludeReadTimeout::Timeout(timeout);
         self
     }
 
+    #[must_use]
     pub fn disable_accepted_prelude_read_timeout(mut self) -> Self {
         self.accepted_prelude_read_timeout = AcceptedPreludeReadTimeout::Disabled;
         self
@@ -168,22 +171,26 @@ impl SessionOptions {
     /// Sets this session's accepted prelude parsing concurrency.
     ///
     /// Passing zero leaves the session on the current process-wide default.
-    pub fn with_accepted_prelude_max_concurrent(mut self, max: usize) -> Self {
+    #[must_use]
+    pub fn accepted_prelude_max_concurrent(mut self, max: usize) -> Self {
         self.accepted_prelude_max_concurrent = Some(max);
         self
     }
 
-    pub fn with_local_addr(mut self, addr: SocketAddr) -> Self {
+    #[must_use]
+    pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
     }
 
-    pub fn with_peer_addr(mut self, addr: SocketAddr) -> Self {
+    #[must_use]
+    pub fn peer_addr(mut self, addr: SocketAddr) -> Self {
         self.peer_addr = Some(addr);
         self
     }
 
-    pub fn with_addresses(
+    #[must_use]
+    pub fn addresses(
         mut self,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
@@ -261,10 +268,12 @@ pub struct QuinnSession {
 }
 
 impl QuinnSession {
+    #[must_use]
     pub fn new(conn: quinn::Connection) -> Self {
         Self::with_options(conn, SessionOptions::default())
     }
 
+    #[must_use]
     pub fn with_options(conn: quinn::Connection, opts: SessionOptions) -> Self {
         let (accept_shutdown, _) = watch::channel(());
         let local_addr = opts.local_addr;
@@ -2934,7 +2943,7 @@ impl QuinnRecvStream {
     }
 }
 
-impl AsyncStreamInfo for QuinnStream {
+impl AsyncStreamHandle for QuinnStream {
     fn stream_id(&self) -> u64 {
         QuinnStream::stream_id(self)
     }
@@ -2992,7 +3001,7 @@ impl AsyncStreamInfo for QuinnStream {
     }
 }
 
-impl AsyncRecvStreamApi for QuinnStream {
+impl AsyncRecvStreamHandle for QuinnStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::read(self, dst).await })
     }
@@ -3049,7 +3058,7 @@ impl AsyncRecvStreamApi for QuinnStream {
     }
 }
 
-impl AsyncSendStreamApi for QuinnStream {
+impl AsyncSendStreamHandle for QuinnStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnStream::write(self, src).await })
     }
@@ -3136,9 +3145,9 @@ impl AsyncSendStreamApi for QuinnStream {
     }
 }
 
-impl AsyncStreamApi for QuinnStream {}
+impl AsyncDuplexStreamHandle for QuinnStream {}
 
-impl AsyncStreamInfo for QuinnSendStream {
+impl AsyncStreamHandle for QuinnSendStream {
     fn stream_id(&self) -> u64 {
         QuinnSendStream::stream_id(self)
     }
@@ -3196,7 +3205,7 @@ impl AsyncStreamInfo for QuinnSendStream {
     }
 }
 
-impl AsyncSendStreamApi for QuinnSendStream {
+impl AsyncSendStreamHandle for QuinnSendStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnSendStream::write(self, src).await })
     }
@@ -3283,7 +3292,7 @@ impl AsyncSendStreamApi for QuinnSendStream {
     }
 }
 
-impl AsyncStreamInfo for QuinnRecvStream {
+impl AsyncStreamHandle for QuinnRecvStream {
     fn stream_id(&self) -> u64 {
         QuinnRecvStream::stream_id(self)
     }
@@ -3341,7 +3350,7 @@ impl AsyncStreamInfo for QuinnRecvStream {
     }
 }
 
-impl AsyncRecvStreamApi for QuinnRecvStream {
+impl AsyncRecvStreamHandle for QuinnRecvStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> AsyncBoxFuture<'a, Result<usize>> {
         Box::pin(async move { QuinnRecvStream::read(self, dst).await })
     }
@@ -4147,8 +4156,8 @@ mod tests {
             Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT)
         );
         let custom = SessionOptions::new()
-            .with_accepted_prelude_read_timeout(Duration::from_secs(2))
-            .with_accepted_prelude_max_concurrent(16);
+            .accepted_prelude_read_timeout(Duration::from_secs(2))
+            .accepted_prelude_max_concurrent(16);
         assert_eq!(
             normalize_accepted_prelude_read_timeout(custom),
             Some(Duration::from_secs(2))
@@ -4160,7 +4169,7 @@ mod tests {
         assert_eq!(
             normalize_accepted_prelude_read_timeout(
                 SessionOptions::new()
-                    .with_accepted_prelude_read_timeout(Duration::from_secs(2))
+                    .accepted_prelude_read_timeout(Duration::from_secs(2))
                     .disable_accepted_prelude_read_timeout()
             ),
             None
@@ -4169,7 +4178,7 @@ mod tests {
             normalize_accepted_prelude_read_timeout(
                 SessionOptions::new()
                     .disable_accepted_prelude_read_timeout()
-                    .with_accepted_prelude_read_timeout(Duration::from_secs(2))
+                    .accepted_prelude_read_timeout(Duration::from_secs(2))
             ),
             Some(Duration::from_secs(2))
         );

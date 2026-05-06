@@ -35,7 +35,7 @@ impl CompatStream {
     }
 }
 
-impl zmux::AsyncStreamInfo for CompatStream {
+impl zmux::AsyncStreamHandle for CompatStream {
     fn stream_id(&self) -> u64 {
         7
     }
@@ -74,7 +74,7 @@ impl zmux::AsyncStreamInfo for CompatStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for CompatStream {
+impl zmux::AsyncRecvStreamHandle for CompatStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let mut read = self.read.lock().unwrap();
@@ -106,7 +106,7 @@ impl zmux::AsyncRecvStreamApi for CompatStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for CompatStream {
+impl zmux::AsyncSendStreamHandle for CompatStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             self.written.lock().unwrap().extend_from_slice(src);
@@ -172,7 +172,7 @@ impl zmux::AsyncSendStreamApi for CompatStream {
     }
 }
 
-impl zmux::AsyncStreamApi for CompatStream {}
+impl zmux::AsyncDuplexStreamHandle for CompatStream {}
 
 #[cfg(feature = "tokio-io")]
 fn block_on<F>(future: F) -> F::Output

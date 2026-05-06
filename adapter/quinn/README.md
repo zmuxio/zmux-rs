@@ -25,8 +25,8 @@ use zmux_quinn::{QuinnSession, SessionOptions};
 
 async fn run(conn: quinn::Connection) -> zmux::Result<()> {
     let options = SessionOptions::new()
-        .with_accepted_prelude_read_timeout(Duration::from_secs(2))
-        .with_accepted_prelude_max_concurrent(16);
+        .accepted_prelude_read_timeout(Duration::from_secs(2))
+        .accepted_prelude_max_concurrent(16);
 
     let session = QuinnSession::with_options(conn, options);
     let stream = session.open_stream().await?;
@@ -44,10 +44,10 @@ Use `QuinnSession::new(conn)` when default adapter options are enough.
 use zmux_quinn::SessionOptions;
 
 let options = SessionOptions::new()
-    .with_accepted_prelude_read_timeout(timeout)
-    .with_accepted_prelude_max_concurrent(max_concurrent)
-    .with_local_addr(local_addr)
-    .with_peer_addr(peer_addr);
+    .accepted_prelude_read_timeout(timeout)
+    .accepted_prelude_max_concurrent(max_concurrent)
+    .local_addr(local_addr)
+    .peer_addr(peer_addr);
 
 let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 ```
@@ -55,7 +55,7 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 `accepted_prelude_read_timeout`:
 
 - default: `AcceptedPreludeReadTimeout::Default`, which resolves to `DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT`
-- explicit timeout: `AcceptedPreludeReadTimeout::Timeout(duration)` or `with_accepted_prelude_read_timeout(duration)`
+- explicit timeout: `AcceptedPreludeReadTimeout::Timeout(duration)` or `accepted_prelude_read_timeout(duration)`
 - disabled: `AcceptedPreludeReadTimeout::Disabled`
 - `disable_accepted_prelude_read_timeout()`: disables the adapter-managed read timeout
 - accepted QUIC streams whose adapter prelude never arrives in time are discarded instead of blocking later ready streams
@@ -76,7 +76,7 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 - addresses: `local_addr`, `peer_addr`
 
-Wrapped streams expose `zmux::AsyncStreamApi`, `zmux::AsyncSendStreamApi`, and `zmux::AsyncRecvStreamApi` methods:
+Wrapped streams expose `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHandle`, and `zmux::AsyncRecvStreamHandle` methods:
 
 - identity/info: `stream_id`, `is_opened_locally`, `is_bidirectional`, `open_info`, `append_open_info_to`, `open_info_len`, `has_open_info`, `metadata`, `local_addr`, `peer_addr`
 - read: `read`, `read_timeout`, `read_exact`, `read_exact_timeout`, `read_vectored`, `read_vectored_timeout`, `is_read_closed`, `set_read_deadline`, `set_read_timeout`, `close_read`, `cancel_read`
@@ -93,7 +93,7 @@ copy. Bidirectional `open_and_send(...)` intentionally performs one stream write
 and returns the number of bytes Quinn accepted, so flow control may make it
 consume only part of a larger payload. Quinn still owns its transport buffering
 and completion semantics.
-When using `zmux::AsyncSendStreamApi` through generics or trait objects, call
+When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
 `write_all(WritePayload::from(vec))` or `write_final(WritePayload::from(vec))`
 to preserve owned-buffer intent.
 
@@ -136,12 +136,12 @@ Options and prelude helpers:
 - `AcceptedPreludeReadTimeout`
 - `SessionOptions`
 - `SessionOptions::new`
-- `SessionOptions::with_accepted_prelude_read_timeout`
+- `SessionOptions::accepted_prelude_read_timeout`
 - `SessionOptions::disable_accepted_prelude_read_timeout`
-- `SessionOptions::with_accepted_prelude_max_concurrent`
-- `SessionOptions::with_local_addr`
-- `SessionOptions::with_peer_addr`
-- `SessionOptions::with_addresses`
+- `SessionOptions::accepted_prelude_max_concurrent`
+- `SessionOptions::local_addr`
+- `SessionOptions::peer_addr`
+- `SessionOptions::addresses`
 - `build_stream_prelude`
 - `read_stream_prelude`
 - `AcceptedStreamMetadata`
@@ -227,4 +227,6 @@ let quic: zmux::BoxAsyncSession = zmux::box_async_session(quinn_session);
 let sessions: Vec<zmux::BoxAsyncSession> = vec![native, quic];
 ```
 
-The stream side follows the same rule: use `zmux::AsyncStreamApi`, `zmux::AsyncSendStreamApi`, and `zmux::AsyncRecvStreamApi` for adapter/native async code that must share storage. QUIC cannot represent native zmux ping, go-away, or preface negotiation state exactly; those control methods are still present on the common trait and return adapter-unsupported errors or empty snapshots instead of requiring a separate API.
+The stream side follows the same rule: use `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHandle`, and `zmux::AsyncRecvStreamHandle` for adapter/native async code that must share storage. QUIC cannot represent native zmux ping, go-away, or preface negotiation state exactly; those control methods are still present on the common trait and return adapter-unsupported errors or empty snapshots instead of requiring a separate API.
+
+

@@ -126,7 +126,7 @@ let capabilities = CAPABILITY_OPEN_METADATA
     | CAPABILITY_STREAM_GROUPS
     | CAPABILITY_PRIORITY_UPDATE;
 
-let config = Config::default().with_capabilities(capabilities);
+let config = Config::default().capabilities(capabilities);
 let options = OpenOptions::new()
     .with_open_info(b"\x01\x00\x00\x2a")
     .priority(7)
@@ -224,8 +224,8 @@ Common helpers include `is_session_closed()`, `is_read_closed()`, `is_write_clos
 
 ```rust
 let config = Config::default()
-    .with_capabilities(capabilities)
-    .with_event_handler(|event| {
+    .capabilities(capabilities)
+    .event_handler(|event| {
         let _ = event;
     });
 ```
@@ -264,7 +264,7 @@ Configuration and open requests:
 - `default_settings`, `marshal_settings_tlv`, `parse_settings_tlv`
 - `DEFAULT_PREFACE_PADDING_MIN_BYTES`, `DEFAULT_PREFACE_PADDING_MAX_BYTES`
 - `DEFAULT_PING_PADDING_MIN_BYTES`, `DEFAULT_PING_PADDING_MAX_BYTES`
-- `Config` methods: `initiator`, `responder`, `with_role`, `with_capabilities`, `enable_capabilities`, `with_settings`, `with_event_handler`, `normalized`, `local_preface`
+- `Config` methods: `initiator`, `responder`, `role`, `capabilities`, `enable_capabilities`, `settings`, `event_handler`, `normalized`, `local_preface`
 - `OpenOptions` methods: `new`, `priority`, `group`, `with_open_info`, `initial_priority`, `initial_group`, `open_info`, `open_info_len`, `has_open_info`, `is_empty`, `validate`, `into_parts`
 - `OpenRequest` methods: `new`, `with_options`, `with_timeout`, `options`, `timeout`, `into_parts`
 - `OpenSend` methods: `new`, `vectored`, `with_options`, `with_timeout`, `options`, `payload`, `timeout`, `into_parts`
@@ -386,3 +386,4 @@ let sessions: Vec<zmux::BoxAsyncSession> = vec![native, quic];
 ```
 
 Use `zmux::AsyncStreamApi`, `zmux::AsyncSendStreamApi`, and `zmux::AsyncRecvStreamApi` for heterogeneous async stream storage. Blocking/native code can use the short `Session`, `StreamApi`, `SendStreamApi`, and `RecvStreamApi` names.
+

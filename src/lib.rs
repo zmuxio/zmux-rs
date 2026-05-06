@@ -26,16 +26,17 @@ mod varint;
 
 pub use api::{
     closed_session, join_optional_streams, join_streams, BoxRecvStream, BoxSendStream, BoxSession,
-    BoxStream, ClosedSession, DuplexInfoSide, DuplexStream, PausedNativeHalf as PausedHalf,
-    PausedNativeRecvHalf as PausedRecvHalf, PausedNativeSendHalf as PausedSendHalf, RecvStreamApi,
-    SendStreamApi, Session, StreamApi, StreamInfo,
+    BoxStream, ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
+    PausedNativeHalf as PausedHalf, PausedNativeRecvHalf as PausedRecvHalf,
+    PausedNativeSendHalf as PausedSendHalf, RecvStreamHandle, SendStreamHandle, Session,
+    StreamHandle,
 };
 pub use async_api::{
-    box_async_session, closed_async_session, join_async_streams,
-    join_optional_streams as join_optional_async_streams, AsyncBoxFuture, AsyncDuplexStream,
-    AsyncRecvStreamApi, AsyncSendStreamApi, AsyncSession, AsyncStreamApi, AsyncStreamInfo,
-    BoxAsyncRecvStream, BoxAsyncSendStream, BoxAsyncSession, BoxAsyncStream, ClosedAsyncSession,
-    PausedAsyncHalf, PausedAsyncRecvHalf, PausedAsyncSendHalf,
+    box_async_session, closed_async_session, join_async_streams, join_optional_async_streams,
+    AsyncBoxFuture, AsyncDuplexStream, AsyncDuplexStreamHandle, AsyncRecvStreamHandle,
+    AsyncSendStreamHandle, AsyncSession, AsyncStreamHandle, BoxAsyncRecvStream, BoxAsyncSendStream,
+    BoxAsyncSession, BoxAsyncStream, ClosedAsyncSession, PausedAsyncHalf, PausedAsyncRecvHalf,
+    PausedAsyncSendHalf,
 };
 pub use config::{
     configure_default_config, default_config, reset_default_config, Config, OpenOptions,
@@ -110,6 +111,7 @@ pub use varint::{
 
 /// Erase a blocking session behind the session trait object.
 #[inline]
+#[must_use]
 pub fn box_session<S>(session: S) -> BoxSession
 where
     S: Session + 'static,

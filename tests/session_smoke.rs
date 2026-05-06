@@ -660,21 +660,21 @@ fn preface_padding_is_accepted_during_session_establishment() {
 fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_session<T: zmux::Session>() {}
-    fn assert_stream_info<T: zmux::StreamInfo>() {}
-    fn assert_recv_stream<T: zmux::RecvStreamApi>() {}
-    fn assert_send_stream<T: zmux::SendStreamApi>() {}
-    fn assert_bidi_stream<T: zmux::StreamApi>() {}
+    fn assert_stream_info<T: zmux::StreamHandle>() {}
+    fn assert_recv_stream<T: zmux::RecvStreamHandle>() {}
+    fn assert_send_stream<T: zmux::SendStreamHandle>() {}
+    fn assert_bidi_stream<T: zmux::DuplexStreamHandle>() {}
 
-    assert_send_sync::<Box<dyn zmux::StreamApi>>();
-    assert_send_sync::<Box<dyn zmux::SendStreamApi>>();
-    assert_send_sync::<Box<dyn zmux::RecvStreamApi>>();
+    assert_send_sync::<Box<dyn zmux::DuplexStreamHandle>>();
+    assert_send_sync::<Box<dyn zmux::SendStreamHandle>>();
+    assert_send_sync::<Box<dyn zmux::RecvStreamHandle>>();
     assert_session::<Box<dyn zmux::Session>>();
     assert_session::<Arc<dyn zmux::Session>>();
     assert_session::<&'static dyn zmux::Session>();
-    assert_stream_info::<Box<dyn zmux::StreamApi>>();
-    assert_recv_stream::<Box<dyn zmux::RecvStreamApi>>();
-    assert_send_stream::<Box<dyn zmux::SendStreamApi>>();
-    assert_bidi_stream::<Box<dyn zmux::StreamApi>>();
+    assert_stream_info::<Box<dyn zmux::DuplexStreamHandle>>();
+    assert_recv_stream::<Box<dyn zmux::RecvStreamHandle>>();
+    assert_send_stream::<Box<dyn zmux::SendStreamHandle>>();
+    assert_bidi_stream::<Box<dyn zmux::DuplexStreamHandle>>();
 
     let (client, server) = connected_pair(Config::default(), Config::default());
     let session: &dyn zmux::Session = &client;
@@ -874,7 +874,7 @@ fn event_handler_reports_stream_and_session_lifecycle() {
     let caps = CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_HINTS | CAPABILITY_STREAM_GROUPS;
     let client_config = Config {
         capabilities: caps,
-        ..Config::default().with_event_handler({
+        ..Config::default().event_handler({
             let events = client_events.clone();
             let conn_ref = client_ref.clone();
             move |event| {
@@ -892,7 +892,7 @@ fn event_handler_reports_stream_and_session_lifecycle() {
     };
     let server_config = Config {
         capabilities: caps,
-        ..Config::default().with_event_handler({
+        ..Config::default().event_handler({
             let events = server_events.clone();
             let conn_ref = server_ref.clone();
             move |event| {
@@ -974,7 +974,7 @@ fn event_handler_reports_stream_and_session_lifecycle() {
 #[test]
 fn stream_opened_event_waits_until_stream_is_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1008,7 +1008,7 @@ fn stream_opened_event_waits_until_stream_is_peer_visible() {
 #[test]
 fn inbound_stream_control_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1049,7 +1049,7 @@ fn inbound_stream_control_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_abort_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1083,7 +1083,7 @@ fn inbound_abort_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_data_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1117,7 +1117,7 @@ fn inbound_data_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_stop_sending_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1151,7 +1151,7 @@ fn inbound_stop_sending_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_reset_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1185,7 +1185,7 @@ fn inbound_reset_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_blocked_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1219,7 +1219,7 @@ fn inbound_blocked_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_late_data_can_make_local_stream_peer_visible() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1251,7 +1251,7 @@ fn inbound_late_data_can_make_local_stream_peer_visible() {
 #[test]
 fn inbound_control_peer_visibility_event_is_emitted_once() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1298,7 +1298,7 @@ fn inbound_control_peer_visibility_event_is_emitted_once() {
 #[test]
 fn inbound_stream_control_does_not_emit_opened_for_uncommitted_local_open() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1325,7 +1325,7 @@ fn inbound_stream_control_does_not_emit_opened_for_uncommitted_local_open() {
 #[test]
 fn stream_accepted_event_waits_until_accept_returns_stream() {
     let server_events = Arc::new(Mutex::new(Vec::new()));
-    let server_config = Config::default().with_event_handler({
+    let server_config = Config::default().event_handler({
         let events = server_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1361,7 +1361,7 @@ fn stream_accepted_event_waits_until_accept_returns_stream() {
 #[test]
 fn close_write_emits_stream_opened_event() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1399,7 +1399,7 @@ fn close_write_emits_stream_opened_event() {
 #[test]
 fn close_read_emits_stream_opened_event() {
     let client_events = Arc::new(Mutex::new(Vec::new()));
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let events = client_events.clone();
         move |event| {
             events.lock().unwrap().push(event);
@@ -1439,7 +1439,7 @@ fn session_closed_event_carries_terminal_error_and_allows_reentrant_close() {
     let conn_ref: Arc<Mutex<Option<Conn>>> = Arc::new(Mutex::new(None));
     let handler_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (event_tx, event_rx) = mpsc::channel();
-    let client_config = Config::default().with_event_handler({
+    let client_config = Config::default().event_handler({
         let conn_ref = conn_ref.clone();
         let handler_error = handler_error.clone();
         move |event| {
@@ -1561,7 +1561,7 @@ fn fatal_session_close_surfaces_code_and_reason_on_live_and_provisional_streams(
 
 #[test]
 fn event_handler_panics_are_contained() {
-    let config = Config::default().with_event_handler(|event| {
+    let config = Config::default().event_handler(|event| {
         if event.event_type == EventType::StreamOpened {
             panic!("event handler panic should be contained");
         }
@@ -1593,7 +1593,7 @@ fn event_handler_serializes_concurrent_emitters_without_dropping_events() {
     let max_active_handlers = Arc::new(AtomicUsize::new(0));
     let handler_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let config = Config::default().with_event_handler({
+    let config = Config::default().event_handler({
         let release_rx = release_rx.clone();
         let calls = calls.clone();
         let active_handlers = active_handlers.clone();
@@ -1664,7 +1664,7 @@ fn stream_opened_event_handler_can_close_without_writer_deadlock() {
     let close_called = Arc::new(AtomicBool::new(false));
     let config = Config {
         close_drain_timeout: Duration::from_millis(50),
-        ..Config::default().with_event_handler({
+        ..Config::default().event_handler({
             let conn_ref = conn_ref.clone();
             let close_called = close_called.clone();
             move |event| {
@@ -2058,7 +2058,7 @@ fn native_async_write_waits_for_transport_flush() {
     let writer = stream.clone();
     let (result_tx, result_rx) = mpsc::channel();
     let write_thread = thread::spawn(move || {
-        let _ = result_tx.send(block_on(zmux::AsyncSendStreamApi::write(&writer, b"x")));
+        let _ = result_tx.send(block_on(zmux::AsyncSendStreamHandle::write(&writer, b"x")));
     });
 
     assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
@@ -2090,7 +2090,7 @@ fn native_async_write_reports_transport_write_error() {
         client_with_raw_peer_and_failing_writer_after_preface(Config::default(), message);
     let stream = client.open_stream().unwrap();
 
-    let write_err = block_on(zmux::AsyncSendStreamApi::write(&stream, b"payload")).unwrap_err();
+    let write_err = block_on(zmux::AsyncSendStreamHandle::write(&stream, b"payload")).unwrap_err();
     assert_eq!(write_err.code(), Some(ErrorCode::Internal));
     assert_eq!(write_err.scope(), ErrorScope::Stream);
     assert_eq!(write_err.operation(), ErrorOperation::Write);
@@ -2557,7 +2557,7 @@ fn native_async_set_deadline_after_queue_admission_cancels_queued_write() {
     let (second_tx, second_rx) = mpsc::channel();
     let second_writer = second.clone();
     let second_thread = thread::spawn(move || {
-        let _ = second_tx.send(block_on(zmux::AsyncSendStreamApi::write(
+        let _ = second_tx.send(block_on(zmux::AsyncSendStreamHandle::write(
             &second_writer,
             b"y",
         )));

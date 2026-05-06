@@ -1,5 +1,5 @@
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
-use crate::async_api::{AsyncRecvStreamApi, AsyncSendStreamApi};
+use crate::async_api::{AsyncRecvStreamHandle, AsyncSendStreamHandle};
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
 use std::future::Future;
 #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
@@ -148,7 +148,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn poll_read_into(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>>
     where
-        T: AsyncRecvStreamApi + 'static,
+        T: AsyncRecvStreamHandle + 'static,
     {
         if dst.is_empty() {
             return Poll::Ready(Ok(0));
@@ -223,7 +223,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn start_pending_write(&mut self, src: &[u8]) -> io::Result<()>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         let mut data = std::mem::take(&mut self.write_buf);
         data.clear();
@@ -237,7 +237,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn start_pending_vectored_write(&mut self, bufs: &[IoSlice<'_>], len: usize) -> io::Result<()>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         let mut data = std::mem::take(&mut self.write_buf);
         data.clear();
@@ -249,7 +249,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn start_pending_write_data(&mut self, data: Vec<u8>)
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         let stream = Arc::clone(&self.inner);
         self.pending_write = Some(Box::pin(async move {
@@ -268,7 +268,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn poll_write_bytes(&mut self, cx: &mut Context<'_>, src: &[u8]) -> Poll<io::Result<usize>>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         if self.pending_write.is_some() {
             return self.poll_pending_write(cx);
@@ -291,7 +291,7 @@ impl<T: ?Sized> AsyncIo<T> {
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         if self.pending_write.is_none() {
             let len = vectored_prefix_len(bufs, self.write_chunk_size);
@@ -309,7 +309,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn poll_flush_common(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         if self.pending_write.is_none() {
             return Poll::Ready(Ok(()));
@@ -324,7 +324,7 @@ impl<T: ?Sized> AsyncIo<T> {
     #[cfg(any(feature = "tokio-io", feature = "futures-io"))]
     fn poll_shutdown_common(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
     where
-        T: AsyncSendStreamApi + 'static,
+        T: AsyncSendStreamHandle + 'static,
     {
         match self.poll_flush_common(cx) {
             Poll::Ready(Ok(())) => {}
@@ -363,7 +363,7 @@ impl<T: ?Sized> Unpin for AsyncIo<T> {}
 #[cfg(feature = "tokio-io")]
 impl<T> tokio::io::AsyncRead for AsyncIo<T>
 where
-    T: AsyncRecvStreamApi + ?Sized + 'static,
+    T: AsyncRecvStreamHandle + ?Sized + 'static,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -386,7 +386,7 @@ where
 #[cfg(feature = "tokio-io")]
 impl<T> tokio::io::AsyncWrite for AsyncIo<T>
 where
-    T: AsyncSendStreamApi + ?Sized + 'static,
+    T: AsyncSendStreamHandle + ?Sized + 'static,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -420,7 +420,7 @@ where
 #[cfg(feature = "futures-io")]
 impl<T> futures_io::AsyncRead for AsyncIo<T>
 where
-    T: AsyncRecvStreamApi + ?Sized + 'static,
+    T: AsyncRecvStreamHandle + ?Sized + 'static,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -435,7 +435,7 @@ where
 #[cfg(feature = "futures-io")]
 impl<T> futures_io::AsyncWrite for AsyncIo<T>
 where
-    T: AsyncSendStreamApi + ?Sized + 'static,
+    T: AsyncSendStreamHandle + ?Sized + 'static,
 {
     fn poll_write(
         self: Pin<&mut Self>,

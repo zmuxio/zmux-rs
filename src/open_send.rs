@@ -15,17 +15,20 @@ pub struct OpenRequest {
 
 impl OpenRequest {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[inline]
+    #[must_use]
     pub fn with_options(mut self, options: OpenOptions) -> Self {
         self.options = options;
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -70,16 +73,19 @@ pub enum WritePayload<'a> {
 
 impl<'a> WritePayload<'a> {
     #[inline]
+    #[must_use]
     pub fn bytes(data: &'a [u8]) -> Self {
         Self::Bytes(Cow::Borrowed(data))
     }
 
     #[inline]
+    #[must_use]
     pub fn vectored(parts: &'a [IoSlice<'a>]) -> Self {
         Self::Vectored(parts)
     }
 
     #[inline]
+    #[must_use]
     pub fn checked_len(&self) -> Result<usize> {
         match self {
             Self::Bytes(data) => Ok(data.len()),
@@ -92,6 +98,7 @@ impl<'a> WritePayload<'a> {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Bytes(data) => data.is_empty(),
@@ -166,6 +173,7 @@ pub struct OpenSend<'a> {
 
 impl<'a> OpenSend<'a> {
     #[inline]
+    #[must_use]
     pub fn new(payload: impl Into<WritePayload<'a>>) -> Self {
         Self {
             options: OpenOptions::default(),
@@ -175,17 +183,20 @@ impl<'a> OpenSend<'a> {
     }
 
     #[inline]
+    #[must_use]
     pub fn vectored(parts: &'a [IoSlice<'a>]) -> Self {
         Self::new(WritePayload::vectored(parts))
     }
 
     #[inline]
+    #[must_use]
     pub fn with_options(mut self, options: OpenOptions) -> Self {
         self.options = options;
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self

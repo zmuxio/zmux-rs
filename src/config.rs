@@ -403,6 +403,7 @@ pub(crate) fn default_late_data_aggregate_cap(max_frame_payload: u64) -> u64 {
 }
 
 impl Config {
+    #[must_use]
     pub fn initiator() -> Self {
         Self {
             role: Role::Initiator,
@@ -410,6 +411,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn responder() -> Self {
         Self {
             role: Role::Responder,
@@ -417,7 +419,8 @@ impl Config {
         }
     }
 
-    pub fn with_role(mut self, role: Role) -> Self {
+    #[must_use]
+    pub fn role(mut self, role: Role) -> Self {
         self.role = role;
         if role != Role::Auto {
             self.tie_breaker_nonce = 0;
@@ -425,22 +428,26 @@ impl Config {
         self
     }
 
-    pub fn with_capabilities(mut self, capabilities: u64) -> Self {
+    #[must_use]
+    pub fn capabilities(mut self, capabilities: u64) -> Self {
         self.capabilities = capabilities;
         self
     }
 
+    #[must_use]
     pub fn enable_capabilities(mut self, capabilities: u64) -> Self {
         self.capabilities |= capabilities;
         self
     }
 
-    pub fn with_settings(mut self, settings: Settings) -> Self {
+    #[must_use]
+    pub fn settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
         self
     }
 
-    pub fn with_event_handler<F>(mut self, handler: F) -> Self
+    #[must_use]
+    pub fn event_handler<F>(mut self, handler: F) -> Self
     where
         F: Fn(crate::event::Event) + Send + Sync + 'static,
     {
@@ -520,17 +527,20 @@ pub struct OpenOptions {
 }
 
 impl OpenOptions {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the initial peer-visible priority hint for the opened stream.
+    #[must_use]
     pub fn priority(mut self, priority: u64) -> Self {
         self.initial_priority = Some(priority);
         self
     }
 
     /// Set the initial peer-visible stream group hint for the opened stream.
+    #[must_use]
     pub fn group(mut self, group: u64) -> Self {
         self.initial_group = Some(group);
         self
@@ -540,6 +550,7 @@ impl OpenOptions {
     ///
     /// Borrowed bytes are copied into the request options; owned `Vec<u8>` or
     /// `Cow::Owned` values are moved in without another copy.
+    #[must_use]
     pub fn with_open_info<'a>(mut self, open_info: impl Into<Cow<'a, [u8]>>) -> Self {
         self.open_info = open_info.into().into_owned();
         self
@@ -1061,15 +1072,15 @@ mod tests {
     }
 
     #[test]
-    fn with_role_preserves_components_and_handles_nonce_like_builder() {
+    fn role_preserves_components_and_handles_nonce_like_builder() {
         let original = sample_config();
 
-        let explicit = original.clone().with_role(Role::Initiator);
+        let explicit = original.clone().role(Role::Initiator);
         assert_eq!(explicit.role, Role::Initiator);
         assert_eq!(explicit.tie_breaker_nonce, 0);
         assert_config_components_eq(&original, &explicit, &["role", "tie_breaker_nonce"]);
 
-        let auto = original.clone().with_role(Role::Auto);
+        let auto = original.clone().role(Role::Auto);
         assert_eq!(auto.role, Role::Auto);
         assert_eq!(auto.tie_breaker_nonce, original.tie_breaker_nonce);
         assert_config_components_eq(&original, &auto, &["role"]);
@@ -1082,9 +1093,9 @@ mod tests {
             ..Settings::default()
         };
         let cfg = Config::default()
-            .with_capabilities(crate::protocol::CAPABILITY_OPEN_METADATA)
+            .capabilities(crate::protocol::CAPABILITY_OPEN_METADATA)
             .enable_capabilities(crate::protocol::CAPABILITY_PRIORITY_HINTS)
-            .with_settings(settings);
+            .settings(settings);
 
         assert_eq!(
             cfg.capabilities,
@@ -1185,7 +1196,7 @@ mod tests {
 
     #[test]
     fn explicit_role_clears_tie_breaker_nonce() {
-        let cfg = Config::default().with_role(Role::Initiator);
+        let cfg = Config::default().role(Role::Initiator);
         assert_eq!(cfg.role, Role::Initiator);
         assert_eq!(cfg.tie_breaker_nonce, 0);
     }

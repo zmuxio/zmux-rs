@@ -127,13 +127,13 @@ fn public_config_builders_remain_ergonomic() {
     let initiator = zmux::Config::initiator();
     assert_eq!(initiator.role, zmux::Role::Initiator);
     assert_eq!(
-        zmux::Config::responder().with_role(zmux::Role::Auto).role,
+        zmux::Config::responder().role(zmux::Role::Auto).role,
         zmux::Role::Auto
     );
     let cfg = zmux::Config::default()
-        .with_capabilities(zmux::CAPABILITY_OPEN_METADATA)
+        .capabilities(zmux::CAPABILITY_OPEN_METADATA)
         .enable_capabilities(zmux::CAPABILITY_PRIORITY_HINTS)
-        .with_settings(zmux::Settings {
+        .settings(zmux::Settings {
             max_frame_payload: 32 * 1024,
             ..zmux::Settings::DEFAULT
         });
@@ -265,7 +265,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
     let goaway = zmux::build_go_away_payload(0, 0, 8, "drain")?;
     assert_eq!(zmux::parse_go_away_payload(&goaway)?.reason, "drain");
 
-    let preface = test_preface_with_role(zmux::Role::Initiator);
+    let preface = test_preface_role(zmux::Role::Initiator);
     let preface_bytes = preface.marshal_with_settings_padding(b"pad")?;
     let (parsed, consumed) = zmux::parse_preface_prefix(&preface_bytes)?;
     assert_eq!(parsed, preface);
@@ -275,7 +275,7 @@ fn public_codec_facade_round_trips_without_private_modules() -> zmux::Result<()>
     preface_with_trailing.push(0);
     assert!(zmux::parse_preface(&preface_with_trailing).is_err());
 
-    let peer = test_preface_with_role(zmux::Role::Responder);
+    let peer = test_preface_role(zmux::Role::Responder);
     let negotiated = zmux::negotiate_prefaces(&preface, &peer)?;
     assert_eq!(negotiated.local_role, zmux::Role::Initiator);
     assert!(negotiated.supports_open_metadata());
@@ -291,7 +291,7 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
     assert!(stream.has_open_info());
     assert_eq!(stream.metadata().open_info, b"api");
     assert_eq!(
-        zmux::SendStreamApi::write_vectored(
+        zmux::SendStreamHandle::write_vectored(
             stream.as_ref(),
             &[IoSlice::new(b"a"), IoSlice::new(b"bc")]
         )?,
@@ -379,9 +379,9 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
 #[test]
 fn public_async_surface_accepts_generic_and_erased_sessions() {
     fn assert_session<S: zmux::AsyncSession>() {}
-    fn assert_stream<S: zmux::AsyncStreamApi>() {}
-    fn assert_send_stream<S: zmux::AsyncSendStreamApi>() {}
-    fn assert_recv_stream<S: zmux::AsyncRecvStreamApi>() {}
+    fn assert_stream<S: zmux::AsyncDuplexStreamHandle>() {}
+    fn assert_send_stream<S: zmux::AsyncSendStreamHandle>() {}
+    fn assert_recv_stream<S: zmux::AsyncRecvStreamHandle>() {}
 
     assert_session::<zmux::Conn>();
     assert_session::<zmux::ClosedAsyncSession>();
@@ -400,19 +400,19 @@ fn public_async_surface_accepts_generic_and_erased_sessions() {
     assert!(closed.is_closed());
 
     let stream = DummyAsyncStream;
-    block_on(zmux::AsyncSendStreamApi::write_all_timeout(
+    block_on(zmux::AsyncSendStreamHandle::write_all_timeout(
         &stream,
         zmux::WritePayload::from(&b"timeout-all"[..]),
         Duration::from_secs(1),
     ))
     .unwrap();
-    block_on(zmux::AsyncSendStreamApi::write_all(
+    block_on(zmux::AsyncSendStreamHandle::write_all(
         &stream,
         b"owned-all".to_vec().into(),
     ))
     .unwrap();
     assert_eq!(
-        block_on(zmux::AsyncSendStreamApi::write_final(
+        block_on(zmux::AsyncSendStreamHandle::write_final(
             &stream,
             b"owned-final".to_vec().into(),
         ))
@@ -421,14 +421,14 @@ fn public_async_surface_accepts_generic_and_erased_sessions() {
     );
 
     let boxed_stream: zmux::BoxAsyncSendStream = Box::new(DummyAsyncStream);
-    block_on(zmux::AsyncSendStreamApi::write_all_timeout(
+    block_on(zmux::AsyncSendStreamHandle::write_all_timeout(
         &boxed_stream,
         b"boxed-owned-all".to_vec().into(),
         Duration::from_secs(1),
     ))
     .unwrap();
     assert_eq!(
-        block_on(zmux::AsyncSendStreamApi::write_final_timeout(
+        block_on(zmux::AsyncSendStreamHandle::write_final_timeout(
             &boxed_stream,
             b"boxed-owned-final".to_vec().into(),
             Duration::from_secs(1),
@@ -795,40 +795,42 @@ fn public_join_helpers_build_full_stream_views_from_halves() -> zmux::Result<()>
     assert_eq!(joined.info_side(), zmux::DuplexInfoSide::Write);
     assert_eq!(joined.read_stream_id(), 42);
     assert_eq!(joined.write_stream_id(), 42);
-    assert_eq!(zmux::StreamInfo::stream_id(&joined), 42);
-    assert!(zmux::StreamInfo::is_bidirectional(&joined));
-    assert_eq!(zmux::StreamInfo::open_info(&joined), b"api");
+    assert_eq!(zmux::StreamHandle::stream_id(&joined), 42);
+    assert!(zmux::StreamHandle::is_bidirectional(&joined));
+    assert_eq!(zmux::StreamHandle::open_info(&joined), b"api");
 
     let mut buf = [0; 3];
     assert_eq!(Read::read(&mut joined, &mut buf)?, 3);
     assert_eq!(&buf, b"api");
     assert_eq!(Write::write(&mut joined, b"xy")?, 2);
-    zmux::StreamInfo::set_timeout(&joined, Some(Duration::from_secs(1)))?;
-    zmux::RecvStreamApi::set_read_timeout(&joined, None)?;
-    zmux::SendStreamApi::set_write_timeout(&joined, Some(Duration::from_secs(1)))?;
-    assert_eq!(zmux::SendStreamApi::write_final(&joined, b"fin")?, 3);
-    zmux::StreamInfo::close(&joined)?;
+    zmux::StreamHandle::set_timeout(&joined, Some(Duration::from_secs(1)))?;
+    zmux::RecvStreamHandle::set_read_timeout(&joined, None)?;
+    zmux::SendStreamHandle::set_write_timeout(&joined, Some(Duration::from_secs(1)))?;
+    assert_eq!(zmux::SendStreamHandle::write_final(&joined, b"fin")?, 3);
+    zmux::StreamHandle::close(&joined)?;
 
     let joined = zmux::join_async_streams(DummyAsyncStream, DummyAsyncStream);
     assert_eq!(joined.info_side(), zmux::DuplexInfoSide::Read);
     assert_eq!(joined.read_stream_id(), 42);
     assert_eq!(joined.write_stream_id(), 42);
-    assert_eq!(zmux::AsyncStreamInfo::open_info(&joined), b"api");
-    assert!(zmux::AsyncStreamInfo::is_bidirectional(&joined));
+    assert_eq!(zmux::AsyncStreamHandle::open_info(&joined), b"api");
+    assert!(zmux::AsyncStreamHandle::is_bidirectional(&joined));
 
     let joined = joined.with_info_side(zmux::DuplexInfoSide::Write);
     assert_eq!(joined.info_side(), zmux::DuplexInfoSide::Write);
-    assert_eq!(zmux::AsyncStreamInfo::stream_id(&joined), 42);
-    zmux::AsyncStreamInfo::set_timeout(&joined, Some(Duration::from_secs(1)))?;
-    zmux::AsyncRecvStreamApi::set_read_timeout(&joined, None)?;
-    zmux::AsyncSendStreamApi::set_write_timeout(&joined, Some(Duration::from_secs(1)))?;
+    assert_eq!(zmux::AsyncStreamHandle::stream_id(&joined), 42);
+    zmux::AsyncStreamHandle::set_timeout(&joined, Some(Duration::from_secs(1)))?;
+    zmux::AsyncRecvStreamHandle::set_read_timeout(&joined, None)?;
+    zmux::AsyncSendStreamHandle::set_write_timeout(&joined, Some(Duration::from_secs(1)))?;
 
     let joined = zmux::join_async_streams(LabeledStream::new(77, b"joined"), DummyAsyncStream);
     let mut first = [0u8; 2];
     let mut second = [0u8; 4];
     let n = {
         let mut bufs = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
-        block_on(zmux::AsyncRecvStreamApi::read_vectored(&joined, &mut bufs))?
+        block_on(zmux::AsyncRecvStreamHandle::read_vectored(
+            &joined, &mut bufs,
+        ))?
     };
     assert_eq!(n, 6);
     assert_eq!(&first, b"jo");
@@ -836,12 +838,12 @@ fn public_join_helpers_build_full_stream_views_from_halves() -> zmux::Result<()>
 
     let joined = zmux::join_async_streams(LabeledStream::new(78, b"exact"), DummyAsyncStream);
     let mut exact = [0u8; 5];
-    block_on(zmux::AsyncRecvStreamApi::read_exact(&joined, &mut exact))?;
+    block_on(zmux::AsyncRecvStreamHandle::read_exact(&joined, &mut exact))?;
     assert_eq!(&exact, b"exact");
 
     let joined = zmux::join_async_streams(LabeledStream::new(79, b"timer"), DummyAsyncStream);
     let mut exact = [0u8; 5];
-    block_on(zmux::AsyncRecvStreamApi::read_exact_timeout(
+    block_on(zmux::AsyncRecvStreamHandle::read_exact_timeout(
         &joined,
         &mut exact,
         Duration::from_secs(1),
@@ -857,7 +859,7 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
     let outbound = client.open_stream()?;
     let mut outbound_ref = &outbound;
     Write::write_all(&mut outbound_ref, b"borrowed-bidi")?;
-    zmux::SendStreamApi::close_write(&outbound_ref)?;
+    zmux::SendStreamHandle::close_write(&outbound_ref)?;
 
     let inbound = server.accept_stream_timeout(Duration::from_secs(5))?;
     let mut inbound_ref = &inbound;
@@ -868,7 +870,7 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
     let outbound = client.open_stream()?;
     let mut outbound_ref = &outbound;
     Write::write_all(&mut outbound_ref, b"vectored-bidi")?;
-    zmux::SendStreamApi::close_write(&outbound_ref)?;
+    zmux::SendStreamHandle::close_write(&outbound_ref)?;
 
     let inbound = server.accept_stream_timeout(Duration::from_secs(5))?;
     let mut inbound_ref = &inbound;
@@ -885,7 +887,7 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
     let outbound = client.open_stream()?;
     let mut outbound_ref = &outbound;
     Write::write_all(&mut outbound_ref, b"exact-bidi")?;
-    zmux::SendStreamApi::close_write(&outbound_ref)?;
+    zmux::SendStreamHandle::close_write(&outbound_ref)?;
 
     let inbound = server.accept_stream_timeout(Duration::from_secs(5))?;
     let mut inbound_ref = &inbound;
@@ -896,17 +898,17 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
     let outbound = client.open_stream()?;
     let mut outbound_ref = &outbound;
     Write::write_all(&mut outbound_ref, b"timed-read")?;
-    zmux::SendStreamApi::close_write(&outbound_ref)?;
+    zmux::SendStreamHandle::close_write(&outbound_ref)?;
 
     let inbound = server.accept_stream_timeout(Duration::from_secs(5))?;
     let mut exact = [0u8; 10];
-    zmux::RecvStreamApi::read_exact_timeout(&inbound, &mut exact, Duration::from_secs(5))?;
+    zmux::RecvStreamHandle::read_exact_timeout(&inbound, &mut exact, Duration::from_secs(5))?;
     assert_eq!(&exact, b"timed-read");
 
     let send = client.open_uni_stream()?;
     let mut send_ref = &send;
     Write::write_all(&mut send_ref, b"borrowed-uni")?;
-    zmux::SendStreamApi::close_write(&send_ref)?;
+    zmux::SendStreamHandle::close_write(&send_ref)?;
 
     let recv = server.accept_uni_stream_timeout(Duration::from_secs(5))?;
     let mut recv_ref = &recv;
@@ -919,7 +921,7 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
     let mut joined_buf = [0; 3];
     assert_eq!(Read::read(&mut joined_ref, &mut joined_buf)?, 3);
     assert_eq!(Write::write(&mut joined_ref, b"xy")?, 2);
-    assert_eq!(zmux::StreamInfo::stream_id(&joined_ref), 42);
+    assert_eq!(zmux::StreamHandle::stream_id(&joined_ref), 42);
 
     let joined = zmux::join_streams(LabeledStream::new(77, b"joined"), DummyStream);
     let mut joined_ref = &joined;
@@ -949,14 +951,14 @@ fn native_session_vectored_open_and_send_works_through_trait() -> zmux::Result<(
     let (outbound, n) =
         zmux::Session::open_and_send(&client, zmux::OpenSend::vectored(&bidi_parts))?;
     assert_eq!(n, b"trait-bidi".len());
-    zmux::SendStreamApi::close_write(&outbound)?;
+    zmux::SendStreamHandle::close_write(&outbound)?;
 
     let mut inbound = zmux::Session::accept_stream_timeout(&server, Duration::from_secs(5))?;
     let mut buf = [0u8; 10];
     Read::read_exact(&mut inbound, &mut buf)?;
     assert_eq!(&buf, b"trait-bidi");
-    zmux::StreamInfo::close(&outbound)?;
-    zmux::StreamInfo::close(&inbound)?;
+    zmux::StreamHandle::close(&outbound)?;
+    zmux::StreamHandle::close(&inbound)?;
 
     let uni_parts = [IoSlice::new(b"trait-"), IoSlice::new(b"uni")];
     let (outbound, n) =
@@ -967,8 +969,8 @@ fn native_session_vectored_open_and_send_works_through_trait() -> zmux::Result<(
     let mut buf = [0u8; 9];
     Read::read_exact(&mut inbound, &mut buf)?;
     assert_eq!(&buf, b"trait-uni");
-    zmux::StreamInfo::close(&outbound)?;
-    zmux::StreamInfo::close(&inbound)?;
+    zmux::StreamHandle::close(&outbound)?;
+    zmux::StreamHandle::close(&inbound)?;
 
     let _ = client.close();
     let _ = server.close();
@@ -989,11 +991,11 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
     let err = Read::read_vectored(&mut native, &mut bufs).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-    let err =
-        zmux::RecvStreamApi::read_timeout(&native, &mut buf, Duration::from_secs(1)).unwrap_err();
+    let err = zmux::RecvStreamHandle::read_timeout(&native, &mut buf, Duration::from_secs(1))
+        .unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
-    let err = zmux::RecvStreamApi::read_exact_timeout(&native, &mut buf, Duration::from_secs(1))
+    let err = zmux::RecvStreamHandle::read_exact_timeout(&native, &mut buf, Duration::from_secs(1))
         .unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
@@ -1002,26 +1004,26 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
     let err =
-        zmux::SendStreamApi::write_timeout(&native, b"abc", Duration::from_secs(1)).unwrap_err();
+        zmux::SendStreamHandle::write_timeout(&native, b"abc", Duration::from_secs(1)).unwrap_err();
     assert!(err.to_string().contains("write reported invalid progress"));
 
     let parts = [IoSlice::new(b"a"), IoSlice::new(b"bc")];
-    let err = zmux::SendStreamApi::write_vectored(&native, &parts).unwrap_err();
+    let err = zmux::SendStreamHandle::write_vectored(&native, &parts).unwrap_err();
     assert!(err.to_string().contains("write reported invalid progress"));
 
     let async_joined =
         zmux::join_async_streams(InvalidProgressStream::read_progress(4), DummyAsyncStream);
-    let err = block_on(zmux::AsyncRecvStreamApi::read(&async_joined, &mut buf)).unwrap_err();
+    let err = block_on(zmux::AsyncRecvStreamHandle::read(&async_joined, &mut buf)).unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
-    let err = block_on(zmux::AsyncRecvStreamApi::read_exact(
+    let err = block_on(zmux::AsyncRecvStreamHandle::read_exact(
         &async_joined,
         &mut buf,
     ))
     .unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
-    let err = block_on(zmux::AsyncRecvStreamApi::read_exact_timeout(
+    let err = block_on(zmux::AsyncRecvStreamHandle::read_exact_timeout(
         &async_joined,
         &mut buf,
         Duration::from_secs(1),
@@ -1031,17 +1033,17 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
 
     let async_joined =
         zmux::join_async_streams(DummyAsyncStream, InvalidProgressStream::write_progress(4));
-    let err = block_on(zmux::AsyncSendStreamApi::write(&async_joined, b"abc")).unwrap_err();
+    let err = block_on(zmux::AsyncSendStreamHandle::write(&async_joined, b"abc")).unwrap_err();
     assert!(err.to_string().contains("write reported invalid progress"));
 
-    let err = block_on(zmux::AsyncSendStreamApi::write_vectored(
+    let err = block_on(zmux::AsyncSendStreamHandle::write_vectored(
         &async_joined,
         &parts,
     ))
     .unwrap_err();
     assert!(err.to_string().contains("write reported invalid progress"));
 
-    let err = block_on(zmux::AsyncSendStreamApi::write_final_timeout(
+    let err = block_on(zmux::AsyncSendStreamHandle::write_final_timeout(
         &async_joined,
         zmux::WritePayload::from(&b"abc"[..]),
         Duration::from_secs(1),
@@ -1051,14 +1053,14 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
 
     let invalid_reader = InvalidProgressStream::read_progress(8193);
     let mut out = Vec::new();
-    let err = block_on(zmux::AsyncRecvStreamApi::read_to_end(
+    let err = block_on(zmux::AsyncRecvStreamHandle::read_to_end(
         &invalid_reader,
         &mut out,
     ))
     .unwrap_err();
     assert!(err.to_string().contains("read reported invalid progress"));
 
-    let err = block_on(zmux::AsyncRecvStreamApi::read_to_end_limited(
+    let err = block_on(zmux::AsyncRecvStreamHandle::read_to_end_limited(
         &invalid_reader,
         3,
     ))
@@ -1066,7 +1068,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
     assert!(err.to_string().contains("read reported invalid progress"));
 
     let mut one = [0u8; 1];
-    let err = zmux::RecvStreamApi::read_exact_timeout(
+    let err = zmux::RecvStreamHandle::read_exact_timeout(
         &ZeroSizedCloseProbe,
         &mut one,
         Duration::from_secs(1),
@@ -1077,7 +1079,7 @@ fn joined_streams_reject_invalid_underlying_progress() -> zmux::Result<()> {
         Some(io::ErrorKind::UnexpectedEof)
     );
 
-    let err = block_on(zmux::AsyncRecvStreamApi::read_exact(
+    let err = block_on(zmux::AsyncRecvStreamHandle::read_exact(
         &ZeroSizedCloseProbe,
         &mut one,
     ))
@@ -1220,16 +1222,16 @@ fn joined_stream_halves_can_be_paused_replaced_and_detached() -> zmux::Result<()
     assert_eq!(async_joined.read_stream_id(), 30);
 
     let mut buf = [0u8; 8];
-    let n = block_on(zmux::AsyncRecvStreamApi::read(&async_joined, &mut buf))?;
+    let n = block_on(zmux::AsyncRecvStreamHandle::read(&async_joined, &mut buf))?;
     assert_eq!(&buf[..n], b"gamma");
 
     let detached = async_joined.detach_send()?.unwrap();
     assert_eq!(detached.id, 20);
-    assert!(block_on(zmux::AsyncSendStreamApi::write(&async_joined, b"x")).is_err());
+    assert!(block_on(zmux::AsyncSendStreamHandle::write(&async_joined, b"x")).is_err());
     async_joined.replace_send(LabeledStream::new(40, b"delta"))?;
     assert_eq!(async_joined.write_stream_id(), 40);
     assert_eq!(
-        block_on(zmux::AsyncSendStreamApi::write(&async_joined, b"x"))?,
+        block_on(zmux::AsyncSendStreamHandle::write(&async_joined, b"x"))?,
         1
     );
 
@@ -1247,8 +1249,8 @@ fn joined_streams_can_start_empty_and_hot_plug_halves() -> zmux::Result<()> {
     assert_eq!(native.write_stream_id(), 0);
     assert!(Read::read(&mut native, &mut [0u8; 1]).is_err());
     assert!(Write::write(&mut native, b"x").is_err());
-    zmux::RecvStreamApi::set_read_deadline(&native, Some(read_deadline))?;
-    zmux::SendStreamApi::set_write_deadline(&native, Some(write_deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&native, Some(read_deadline))?;
+    zmux::SendStreamHandle::set_write_deadline(&native, Some(write_deadline))?;
 
     let mut paused_read = native.pause_read()?;
     assert!(paused_read.current().is_none());
@@ -1275,10 +1277,14 @@ fn joined_streams_can_start_empty_and_hot_plug_halves() -> zmux::Result<()> {
         zmux::join_optional_async_streams::<DeadlineProbeStream, DeadlineProbeStream>(None, None);
     assert_eq!(async_joined.read_stream_id(), 0);
     assert_eq!(async_joined.write_stream_id(), 0);
-    assert!(block_on(zmux::AsyncRecvStreamApi::read(&async_joined, &mut [0u8; 1])).is_err());
-    assert!(block_on(zmux::AsyncSendStreamApi::write(&async_joined, b"x")).is_err());
-    zmux::AsyncRecvStreamApi::set_read_deadline(&async_joined, Some(read_deadline))?;
-    zmux::AsyncSendStreamApi::set_write_deadline(&async_joined, Some(write_deadline))?;
+    assert!(block_on(zmux::AsyncRecvStreamHandle::read(
+        &async_joined,
+        &mut [0u8; 1]
+    ))
+    .is_err());
+    assert!(block_on(zmux::AsyncSendStreamHandle::write(&async_joined, b"x")).is_err());
+    zmux::AsyncRecvStreamHandle::set_read_deadline(&async_joined, Some(read_deadline))?;
+    zmux::AsyncSendStreamHandle::set_write_deadline(&async_joined, Some(write_deadline))?;
 
     let mut paused_read = async_joined.pause_read()?;
     assert!(paused_read.current().is_none());
@@ -1313,8 +1319,8 @@ fn joined_stream_deadlines_follow_hot_swapped_halves() -> zmux::Result<()> {
         DeadlineProbeStream::new(2, Arc::clone(&native_events)),
     );
 
-    zmux::RecvStreamApi::set_read_deadline(&native, Some(read_deadline))?;
-    zmux::SendStreamApi::set_write_deadline(&native, Some(write_deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&native, Some(read_deadline))?;
+    zmux::SendStreamHandle::set_write_deadline(&native, Some(write_deadline))?;
     assert_deadline_event(
         &native_events,
         DeadlineEvent::new(1, DeadlineSide::Read, Some(read_deadline)),
@@ -1345,8 +1351,8 @@ fn joined_stream_deadlines_follow_hot_swapped_halves() -> zmux::Result<()> {
         DeadlineProbeStream::new(10, Arc::clone(&async_events)),
         DeadlineProbeStream::new(20, Arc::clone(&async_events)),
     );
-    zmux::AsyncRecvStreamApi::set_read_deadline(&async_joined, Some(read_deadline))?;
-    zmux::AsyncSendStreamApi::set_write_deadline(&async_joined, Some(write_deadline))?;
+    zmux::AsyncRecvStreamHandle::set_read_deadline(&async_joined, Some(read_deadline))?;
+    zmux::AsyncSendStreamHandle::set_write_deadline(&async_joined, Some(write_deadline))?;
     assert_deadline_event(
         &async_events,
         DeadlineEvent::new(10, DeadlineSide::Read, Some(read_deadline)),
@@ -1389,14 +1395,14 @@ fn joined_stream_resume_replays_deadline_refresh_during_apply() -> zmux::Result<
 
     let first_deadline = Instant::now() + Duration::from_secs(30);
     let second_deadline = Instant::now() + Duration::from_secs(60);
-    zmux::RecvStreamApi::set_read_deadline(&native, Some(first_deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&native, Some(first_deadline))?;
     let resume = thread::spawn(move || paused_read.resume());
 
     assert!(
         probe.wait_first_deadline_started(),
         "native read resume did not begin replaying the staged deadline"
     );
-    zmux::RecvStreamApi::set_read_deadline(&native, Some(second_deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&native, Some(second_deadline))?;
     probe.release_deadline();
     resume.join().unwrap()?;
 
@@ -1415,14 +1421,14 @@ fn joined_stream_resume_replays_deadline_refresh_during_apply() -> zmux::Result<
     let probe = replacement.clone();
     let _ = paused_write.replace(replacement);
 
-    zmux::AsyncSendStreamApi::set_write_deadline(&async_joined, Some(first_deadline))?;
+    zmux::AsyncSendStreamHandle::set_write_deadline(&async_joined, Some(first_deadline))?;
     let resume = thread::spawn(move || paused_write.resume());
 
     assert!(
         probe.wait_first_deadline_started(),
         "async write resume did not begin replaying the staged deadline"
     );
-    zmux::AsyncSendStreamApi::set_write_deadline(&async_joined, Some(second_deadline))?;
+    zmux::AsyncSendStreamHandle::set_write_deadline(&async_joined, Some(second_deadline))?;
     probe.release_deadline();
     resume.join().unwrap()?;
 
@@ -1448,14 +1454,14 @@ fn joined_stream_set_deadline_replays_refresh_during_active_apply() -> zmux::Res
     let second_deadline = Instant::now() + Duration::from_secs(60);
     let first_native = Arc::clone(&native);
     let first_setter = thread::spawn(move || {
-        zmux::RecvStreamApi::set_read_deadline(&*first_native, Some(first_deadline))
+        zmux::RecvStreamHandle::set_read_deadline(&*first_native, Some(first_deadline))
     });
 
     assert!(
         native_probe.wait_first_deadline_started(),
         "native read deadline apply did not reach the underlying half"
     );
-    zmux::RecvStreamApi::set_read_deadline(&*native, Some(second_deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&*native, Some(second_deadline))?;
     native_probe.release_deadline();
     first_setter.join().unwrap()?;
 
@@ -1473,14 +1479,14 @@ fn joined_stream_set_deadline_replays_refresh_during_active_apply() -> zmux::Res
     ));
     let first_async = Arc::clone(&async_joined);
     let first_setter = thread::spawn(move || {
-        zmux::AsyncRecvStreamApi::set_read_deadline(&*first_async, Some(first_deadline))
+        zmux::AsyncRecvStreamHandle::set_read_deadline(&*first_async, Some(first_deadline))
     });
 
     assert!(
         async_probe.wait_first_deadline_started(),
         "async read deadline apply did not reach the underlying half"
     );
-    zmux::AsyncRecvStreamApi::set_read_deadline(&*async_joined, Some(second_deadline))?;
+    zmux::AsyncRecvStreamHandle::set_read_deadline(&*async_joined, Some(second_deadline))?;
     async_probe.release_deadline();
     first_setter.join().unwrap()?;
 
@@ -1499,7 +1505,7 @@ fn joined_stream_paused_operations_honor_stored_deadlines() -> zmux::Result<()> 
         LabeledStream::new(2, b"write"),
     ));
     let paused_read = native.pause_read()?;
-    zmux::RecvStreamApi::set_read_deadline(
+    zmux::RecvStreamHandle::set_read_deadline(
         &*native,
         Some(Instant::now() + Duration::from_millis(50)),
     )?;
@@ -1507,11 +1513,14 @@ fn joined_stream_paused_operations_honor_stored_deadlines() -> zmux::Result<()> 
     let reader = Arc::clone(&native);
     let read_thread = thread::spawn(move || {
         let mut buf = [0u8; 1];
-        let timed_out =
-            match zmux::RecvStreamApi::read_timeout(&*reader, &mut buf, Duration::from_secs(5)) {
-                Ok(_) => false,
-                Err(err) => err.is_timeout(),
-            };
+        let timed_out = match zmux::RecvStreamHandle::read_timeout(
+            &*reader,
+            &mut buf,
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => false,
+            Err(err) => err.is_timeout(),
+        };
         done_tx.send(timed_out).unwrap();
     });
     let timed_out = match done_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1532,14 +1541,14 @@ fn joined_stream_paused_operations_honor_stored_deadlines() -> zmux::Result<()> 
         DeadlineProbeStream::new(20, Arc::clone(&async_events)),
     ));
     let paused_write = async_joined.pause_write()?;
-    zmux::AsyncSendStreamApi::set_write_deadline(
+    zmux::AsyncSendStreamHandle::set_write_deadline(
         &*async_joined,
         Some(Instant::now() + Duration::from_millis(50)),
     )?;
     let (done_tx, done_rx) = mpsc::channel();
     let writer = Arc::clone(&async_joined);
     let write_thread = thread::spawn(move || {
-        let timed_out = match block_on(zmux::AsyncSendStreamApi::write_timeout(
+        let timed_out = match block_on(zmux::AsyncSendStreamHandle::write_timeout(
             &*writer,
             b"x",
             Duration::from_secs(5),
@@ -1571,7 +1580,7 @@ fn joined_stream_replace_propagates_deadline_replay_failure() -> zmux::Result<()
         DeadlineProbeStream::new(1, Arc::clone(&native_events)),
         DeadlineProbeStream::new(2, Arc::clone(&native_events)),
     );
-    zmux::RecvStreamApi::set_read_deadline(
+    zmux::RecvStreamHandle::set_read_deadline(
         &native,
         Some(Instant::now() + Duration::from_secs(30)),
     )?;
@@ -1591,7 +1600,7 @@ fn joined_stream_replace_propagates_deadline_replay_failure() -> zmux::Result<()
         DeadlineProbeStream::new(10, Arc::clone(&async_events)),
         DeadlineProbeStream::new(20, Arc::clone(&async_events)),
     );
-    zmux::AsyncSendStreamApi::set_write_deadline(
+    zmux::AsyncSendStreamHandle::set_write_deadline(
         &async_joined,
         Some(Instant::now() + Duration::from_secs(30)),
     )?;
@@ -1616,42 +1625,42 @@ fn native_stream_clones_share_close_identity_for_join_dedup() -> zmux::Result<()
     let stream = client.open_stream()?;
     let stream_clone = stream.clone();
     assert_eq!(
-        zmux::StreamInfo::close_identity(&stream),
-        zmux::StreamInfo::close_identity(&stream_clone)
+        zmux::StreamHandle::close_identity(&stream),
+        zmux::StreamHandle::close_identity(&stream_clone)
     );
     assert_eq!(
-        zmux::AsyncStreamInfo::close_identity(&stream),
-        zmux::AsyncStreamInfo::close_identity(&stream_clone)
+        zmux::AsyncStreamHandle::close_identity(&stream),
+        zmux::AsyncStreamHandle::close_identity(&stream_clone)
     );
 
     let joined = zmux::join_streams(stream.clone(), stream_clone.clone());
-    zmux::StreamInfo::close(&joined)?;
+    zmux::StreamHandle::close(&joined)?;
 
     let send = client.open_uni_stream()?;
     let send_clone = send.clone();
     assert_eq!(
-        zmux::StreamInfo::close_identity(&send),
-        zmux::StreamInfo::close_identity(&send_clone)
+        zmux::StreamHandle::close_identity(&send),
+        zmux::StreamHandle::close_identity(&send_clone)
     );
     assert_eq!(
-        zmux::AsyncStreamInfo::close_identity(&send),
-        zmux::AsyncStreamInfo::close_identity(&send_clone)
+        zmux::AsyncStreamHandle::close_identity(&send),
+        zmux::AsyncStreamHandle::close_identity(&send_clone)
     );
     send.write_final(b"identity")?;
 
     let recv = server.accept_uni_stream_timeout(Duration::from_secs(5))?;
     let recv_clone = recv.clone();
     assert_eq!(
-        zmux::StreamInfo::close_identity(&recv),
-        zmux::StreamInfo::close_identity(&recv_clone)
+        zmux::StreamHandle::close_identity(&recv),
+        zmux::StreamHandle::close_identity(&recv_clone)
     );
     assert_eq!(
-        zmux::AsyncStreamInfo::close_identity(&recv),
-        zmux::AsyncStreamInfo::close_identity(&recv_clone)
+        zmux::AsyncStreamHandle::close_identity(&recv),
+        zmux::AsyncStreamHandle::close_identity(&recv_clone)
     );
 
     let async_joined = zmux::join_async_streams(recv.clone(), send_clone);
-    block_on(zmux::AsyncStreamInfo::close(&async_joined))?;
+    block_on(zmux::AsyncStreamHandle::close(&async_joined))?;
 
     let _ = client.close();
     let _ = server.close();
@@ -1666,7 +1675,7 @@ fn joined_stream_close_closes_supplied_halves_as_full_streams() -> zmux::Result<
         DirectionalCloseProbe::new("native-write", Arc::clone(&native_events)),
     );
 
-    zmux::StreamInfo::close(&native)?;
+    zmux::StreamHandle::close(&native)?;
     assert_eq!(
         close_events(&native_events),
         vec!["native-write:close", "native-read:close"]
@@ -1678,7 +1687,7 @@ fn joined_stream_close_closes_supplied_halves_as_full_streams() -> zmux::Result<
         DirectionalCloseProbe::new("async-write", Arc::clone(&async_events)),
     );
 
-    block_on(zmux::AsyncStreamInfo::close(&async_joined))?;
+    block_on(zmux::AsyncStreamHandle::close(&async_joined))?;
     assert_eq!(
         close_events(&async_events),
         vec!["async-write:close", "async-read:close"]
@@ -1693,14 +1702,16 @@ fn joined_stream_close_deduplicates_shared_async_close_identity() -> zmux::Resul
     let shared = Arc::new(DirectionalCloseProbe::new("shared", Arc::clone(&events)));
     let joined = zmux::join_async_streams(Arc::clone(&shared), Arc::clone(&shared));
 
-    block_on(zmux::AsyncStreamInfo::close(&joined))?;
+    block_on(zmux::AsyncStreamHandle::close(&joined))?;
     assert_eq!(close_events(&events), vec!["shared:close"]);
 
     events.lock().unwrap().clear();
     let shared = Arc::new(DirectionalCloseProbe::new("shared", Arc::clone(&events)));
     let joined = zmux::join_async_streams(Arc::clone(&shared), Arc::clone(&shared));
 
-    block_on(zmux::AsyncStreamInfo::close_with_error(&joined, 7, "boom"))?;
+    block_on(zmux::AsyncStreamHandle::close_with_error(
+        &joined, 7, "boom",
+    ))?;
     assert_eq!(close_events(&events), vec!["shared:close_with_error"]);
 
     Ok(())
@@ -1711,15 +1722,15 @@ fn joined_stream_default_close_identity_does_not_dedupe_zero_sized_halves() -> z
     ZERO_SIZED_NATIVE_CLOSES.store(0, Ordering::Relaxed);
     ZERO_SIZED_ASYNC_CLOSES.store(0, Ordering::Relaxed);
 
-    assert!(zmux::StreamInfo::close_identity(&ZeroSizedCloseProbe).is_null());
-    assert!(zmux::AsyncStreamInfo::close_identity(&ZeroSizedCloseProbe).is_null());
+    assert!(zmux::StreamHandle::close_identity(&ZeroSizedCloseProbe).is_null());
+    assert!(zmux::AsyncStreamHandle::close_identity(&ZeroSizedCloseProbe).is_null());
 
     let native = zmux::join_streams(ZeroSizedCloseProbe, ZeroSizedCloseProbe);
-    zmux::StreamInfo::close(&native)?;
+    zmux::StreamHandle::close(&native)?;
     assert_eq!(ZERO_SIZED_NATIVE_CLOSES.load(Ordering::Relaxed), 2);
 
     let async_joined = zmux::join_async_streams(ZeroSizedCloseProbe, ZeroSizedCloseProbe);
-    block_on(zmux::AsyncStreamInfo::close(&async_joined))?;
+    block_on(zmux::AsyncStreamHandle::close(&async_joined))?;
     assert_eq!(ZERO_SIZED_ASYNC_CLOSES.load(Ordering::Relaxed), 2);
 
     Ok(())
@@ -1736,9 +1747,9 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
             )),
             None,
         );
-    zmux::SendStreamApi::close_write(&native_read_only)?;
+    zmux::SendStreamHandle::close_write(&native_read_only)?;
     assert!(close_events(&native_read_events).is_empty());
-    zmux::StreamInfo::close(&native_read_only)?;
+    zmux::StreamHandle::close(&native_read_only)?;
     assert_eq!(close_events(&native_read_events), vec!["native-read:close"]);
 
     let native_write_events = Arc::new(Mutex::new(Vec::new()));
@@ -1750,9 +1761,9 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
                 Arc::clone(&native_write_events),
             )),
         );
-    zmux::RecvStreamApi::close_read(&native_write_only)?;
+    zmux::RecvStreamHandle::close_read(&native_write_only)?;
     assert!(close_events(&native_write_events).is_empty());
-    zmux::StreamInfo::close(&native_write_only)?;
+    zmux::StreamHandle::close(&native_write_only)?;
     assert_eq!(
         close_events(&native_write_events),
         vec!["native-write:close"]
@@ -1767,9 +1778,9 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
             )),
             None,
         );
-    block_on(zmux::AsyncSendStreamApi::close_write(&async_read_only))?;
+    block_on(zmux::AsyncSendStreamHandle::close_write(&async_read_only))?;
     assert!(close_events(&async_read_events).is_empty());
-    block_on(zmux::AsyncStreamInfo::close(&async_read_only))?;
+    block_on(zmux::AsyncStreamHandle::close(&async_read_only))?;
     assert_eq!(close_events(&async_read_events), vec!["async-read:close"]);
 
     let async_write_events = Arc::new(Mutex::new(Vec::new()));
@@ -1781,9 +1792,9 @@ fn joined_stream_close_ignores_absent_halves_but_fully_closes_present_halves() -
                 Arc::clone(&async_write_events),
             )),
         );
-    block_on(zmux::AsyncRecvStreamApi::close_read(&async_write_only))?;
+    block_on(zmux::AsyncRecvStreamHandle::close_read(&async_write_only))?;
     assert!(close_events(&async_write_events).is_empty());
-    block_on(zmux::AsyncStreamInfo::close(&async_write_only))?;
+    block_on(zmux::AsyncStreamHandle::close(&async_write_only))?;
     assert_eq!(close_events(&async_write_events), vec!["async-write:close"]);
 
     Ok(())
@@ -1818,7 +1829,7 @@ fn async_joined_direct_replace_waits_for_active_io() -> zmux::Result<()> {
     let reader = Arc::clone(&joined);
     let read_thread = thread::spawn(move || {
         let mut buf = [0u8; 1];
-        block_on(zmux::AsyncRecvStreamApi::read(&*reader, &mut buf))
+        block_on(zmux::AsyncRecvStreamHandle::read(&*reader, &mut buf))
     });
     assert!(
         control.wait_read_started(),
@@ -1859,7 +1870,7 @@ fn async_joined_pause_waits_for_active_deadline_replay() -> zmux::Result<()> {
 
     let deadline_joined = Arc::clone(&joined);
     let deadline_thread = thread::spawn(move || {
-        zmux::AsyncRecvStreamApi::set_read_deadline(
+        zmux::AsyncRecvStreamHandle::set_read_deadline(
             &*deadline_joined,
             Some(Instant::now() + Duration::from_secs(30)),
         )
@@ -1901,7 +1912,7 @@ fn native_joined_half_pause_timeout_does_not_block_behind_active_io() -> zmux::R
     let reader = Arc::clone(&joined);
     let read_thread = thread::spawn(move || {
         let mut buf = [0u8; 1];
-        let _ = zmux::RecvStreamApi::read_timeout(&*reader, &mut buf, Duration::from_secs(5));
+        let _ = zmux::RecvStreamHandle::read_timeout(&*reader, &mut buf, Duration::from_secs(5));
     });
 
     control.wait_started();
@@ -1926,12 +1937,12 @@ fn native_joined_active_half_replays_deadline_set_while_io_active() -> zmux::Res
     let reader = Arc::clone(&joined);
     let read_thread = thread::spawn(move || {
         let mut buf = [0u8; 1];
-        zmux::RecvStreamApi::read_timeout(&*reader, &mut buf, Duration::from_secs(5))
+        zmux::RecvStreamHandle::read_timeout(&*reader, &mut buf, Duration::from_secs(5))
     });
 
     control.wait_started();
     let deadline = Instant::now() + Duration::from_secs(30);
-    zmux::RecvStreamApi::set_read_deadline(&*joined, Some(deadline))?;
+    zmux::RecvStreamHandle::set_read_deadline(&*joined, Some(deadline))?;
     assert!(
         control.read_deadlines().is_empty(),
         "deadline should wait for the active native half to return"
@@ -1959,46 +1970,50 @@ where
     );
 
     let outbound = zmux::AsyncSession::open_stream(client).await?;
-    zmux::AsyncStreamInfo::set_deadline(&outbound, Some(Instant::now() + Duration::from_secs(5)))?;
-    zmux::AsyncStreamInfo::clear_deadline(&outbound)?;
-    zmux::AsyncSendStreamApi::write_final(
+    zmux::AsyncStreamHandle::set_deadline(
+        &outbound,
+        Some(Instant::now() + Duration::from_secs(5)),
+    )?;
+    zmux::AsyncStreamHandle::clear_deadline(&outbound)?;
+    zmux::AsyncSendStreamHandle::write_final(
         &outbound,
         zmux::WritePayload::from(&b"client-to-server"[..]),
     )
     .await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, Duration::from_secs(5)).await?;
     assert_eq!(
-        zmux::AsyncRecvStreamApi::read_to_end_limited(&inbound, b"client-to-server".len()).await?,
+        zmux::AsyncRecvStreamHandle::read_to_end_limited(&inbound, b"client-to-server".len())
+            .await?,
         b"client-to-server"
     );
 
-    zmux::AsyncSendStreamApi::write_final(
+    zmux::AsyncSendStreamHandle::write_final(
         &inbound,
         zmux::WritePayload::from(&b"server-to-client"[..]),
     )
     .await?;
     assert_eq!(read_all_async(&outbound).await?, b"server-to-client");
-    zmux::AsyncStreamInfo::close(&outbound).await?;
-    zmux::AsyncStreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamHandle::close(&outbound).await?;
+    zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let (outbound, n) =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::new(b"open-and-send")).await?;
     assert_eq!(n, b"open-and-send".len());
-    zmux::AsyncSendStreamApi::close_write(&outbound).await?;
+    zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-and-send");
-    zmux::AsyncStreamInfo::close(&outbound).await?;
-    zmux::AsyncStreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamHandle::close(&outbound).await?;
+    zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"open-"), IoSlice::new(b"vectored")];
     let (outbound, n) =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::vectored(&parts)).await?;
     assert_eq!(n, b"open-vectored".len());
-    zmux::AsyncSendStreamApi::close_write(&outbound).await?;
+    zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-vectored");
-    zmux::AsyncStreamInfo::close(&outbound).await?;
-    zmux::AsyncStreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamHandle::close(&outbound).await?;
+    zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let (outbound, n) =
         zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::new(b"server-uni")).await?;
@@ -2006,8 +2021,8 @@ where
     let inbound =
         zmux::AsyncSession::accept_uni_stream_timeout(client, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni");
-    zmux::AsyncStreamInfo::close(&outbound).await?;
-    zmux::AsyncStreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamHandle::close(&outbound).await?;
+    zmux::AsyncStreamHandle::close(&inbound).await?;
     drop(outbound);
 
     let parts = [IoSlice::new(b"server-"), IoSlice::new(b"uni-vectored")];
@@ -2017,8 +2032,8 @@ where
     let inbound =
         zmux::AsyncSession::accept_uni_stream_timeout(client, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni-vectored");
-    zmux::AsyncStreamInfo::close(&outbound).await?;
-    zmux::AsyncStreamInfo::close(&inbound).await?;
+    zmux::AsyncStreamHandle::close(&outbound).await?;
+    zmux::AsyncStreamHandle::close(&inbound).await?;
 
     zmux::AsyncSession::close(client).await?;
     zmux::AsyncSession::close(server).await?;
@@ -2031,13 +2046,14 @@ where
 
 async fn read_all_async<S>(stream: &S) -> zmux::Result<Vec<u8>>
 where
-    S: zmux::AsyncRecvStreamApi + ?Sized,
+    S: zmux::AsyncRecvStreamHandle + ?Sized,
 {
     let mut out = Vec::new();
     let mut buffer = [0u8; 1024];
     loop {
-        let n = zmux::AsyncRecvStreamApi::read_timeout(stream, &mut buffer, Duration::from_secs(5))
-            .await?;
+        let n =
+            zmux::AsyncRecvStreamHandle::read_timeout(stream, &mut buffer, Duration::from_secs(5))
+                .await?;
         if n == 0 {
             return Ok(out);
         }
@@ -2130,7 +2146,7 @@ impl Wake for NoopWake {
 
 struct DummyStream;
 
-impl zmux::StreamInfo for DummyStream {
+impl zmux::StreamHandle for DummyStream {
     fn stream_id(&self) -> u64 {
         42
     }
@@ -2190,7 +2206,7 @@ impl Write for DummyStream {
     }
 }
 
-impl zmux::RecvStreamApi for DummyStream {
+impl zmux::RecvStreamHandle for DummyStream {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -2215,7 +2231,7 @@ impl zmux::RecvStreamApi for DummyStream {
     }
 }
 
-impl zmux::SendStreamApi for DummyStream {
+impl zmux::SendStreamHandle for DummyStream {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -2273,7 +2289,7 @@ impl zmux::SendStreamApi for DummyStream {
     }
 }
 
-impl zmux::StreamApi for DummyStream {}
+impl zmux::DuplexStreamHandle for DummyStream {}
 
 #[derive(Clone, Copy)]
 struct InvalidProgressStream {
@@ -2313,7 +2329,7 @@ impl Write for InvalidProgressStream {
     }
 }
 
-impl zmux::StreamInfo for InvalidProgressStream {
+impl zmux::StreamHandle for InvalidProgressStream {
     fn stream_id(&self) -> u64 {
         77
     }
@@ -2349,7 +2365,7 @@ impl zmux::StreamInfo for InvalidProgressStream {
     }
 }
 
-impl zmux::RecvStreamApi for InvalidProgressStream {
+impl zmux::RecvStreamHandle for InvalidProgressStream {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -2371,7 +2387,7 @@ impl zmux::RecvStreamApi for InvalidProgressStream {
     }
 }
 
-impl zmux::SendStreamApi for InvalidProgressStream {
+impl zmux::SendStreamHandle for InvalidProgressStream {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -2429,9 +2445,9 @@ impl zmux::SendStreamApi for InvalidProgressStream {
     }
 }
 
-impl zmux::StreamApi for InvalidProgressStream {}
+impl zmux::DuplexStreamHandle for InvalidProgressStream {}
 
-impl zmux::AsyncStreamInfo for InvalidProgressStream {
+impl zmux::AsyncStreamHandle for InvalidProgressStream {
     fn stream_id(&self) -> u64 {
         77
     }
@@ -2467,7 +2483,7 @@ impl zmux::AsyncStreamInfo for InvalidProgressStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for InvalidProgressStream {
+impl zmux::AsyncRecvStreamHandle for InvalidProgressStream {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(self.read_n) })
     }
@@ -2493,7 +2509,7 @@ impl zmux::AsyncRecvStreamApi for InvalidProgressStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for InvalidProgressStream {
+impl zmux::AsyncSendStreamHandle for InvalidProgressStream {
     fn write<'a>(&'a self, _src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(self.write_n) })
     }
@@ -2542,7 +2558,7 @@ impl zmux::AsyncSendStreamApi for InvalidProgressStream {
     }
 }
 
-impl zmux::AsyncStreamApi for InvalidProgressStream {}
+impl zmux::AsyncDuplexStreamHandle for InvalidProgressStream {}
 
 #[derive(Clone)]
 struct LabeledStream {
@@ -2587,7 +2603,7 @@ impl Write for LabeledStream {
     }
 }
 
-impl zmux::StreamInfo for LabeledStream {
+impl zmux::StreamHandle for LabeledStream {
     fn stream_id(&self) -> u64 {
         self.id
     }
@@ -2628,7 +2644,7 @@ impl zmux::StreamInfo for LabeledStream {
     }
 }
 
-impl zmux::RecvStreamApi for LabeledStream {
+impl zmux::RecvStreamHandle for LabeledStream {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -2652,7 +2668,7 @@ impl zmux::RecvStreamApi for LabeledStream {
     }
 }
 
-impl zmux::SendStreamApi for LabeledStream {
+impl zmux::SendStreamHandle for LabeledStream {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -2710,7 +2726,7 @@ impl zmux::SendStreamApi for LabeledStream {
     }
 }
 
-impl zmux::StreamApi for LabeledStream {}
+impl zmux::DuplexStreamHandle for LabeledStream {}
 
 #[derive(Clone)]
 struct BlockingNativeStream {
@@ -2775,7 +2791,7 @@ impl Read for BlockingNativeStream {
     }
 }
 
-impl zmux::StreamInfo for BlockingNativeStream {
+impl zmux::StreamHandle for BlockingNativeStream {
     fn stream_id(&self) -> u64 {
         99
     }
@@ -2813,7 +2829,7 @@ impl zmux::StreamInfo for BlockingNativeStream {
     }
 }
 
-impl zmux::RecvStreamApi for BlockingNativeStream {
+impl zmux::RecvStreamHandle for BlockingNativeStream {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -2945,7 +2961,7 @@ impl BlockingAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamInfo for BlockingAsyncStream {
+impl zmux::AsyncStreamHandle for BlockingAsyncStream {
     fn stream_id(&self) -> u64 {
         self.id
     }
@@ -2987,7 +3003,7 @@ impl zmux::AsyncStreamInfo for BlockingAsyncStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for BlockingAsyncStream {
+impl zmux::AsyncRecvStreamHandle for BlockingAsyncStream {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             self.wait_for_read_release();
@@ -3027,7 +3043,7 @@ impl zmux::AsyncRecvStreamApi for BlockingAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamInfo for LabeledStream {
+impl zmux::AsyncStreamHandle for LabeledStream {
     fn stream_id(&self) -> u64 {
         self.id
     }
@@ -3068,7 +3084,7 @@ impl zmux::AsyncStreamInfo for LabeledStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for LabeledStream {
+impl zmux::AsyncRecvStreamHandle for LabeledStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let n = dst.len().min(self.data.len());
@@ -3124,7 +3140,7 @@ impl zmux::AsyncRecvStreamApi for LabeledStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for LabeledStream {
+impl zmux::AsyncSendStreamHandle for LabeledStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -3173,7 +3189,7 @@ impl zmux::AsyncSendStreamApi for LabeledStream {
     }
 }
 
-impl zmux::AsyncStreamApi for LabeledStream {}
+impl zmux::AsyncDuplexStreamHandle for LabeledStream {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeadlineSide {
@@ -3364,7 +3380,7 @@ impl Write for DeadlineProbeStream {
     }
 }
 
-impl zmux::StreamInfo for DeadlineProbeStream {
+impl zmux::StreamHandle for DeadlineProbeStream {
     fn stream_id(&self) -> u64 {
         self.id
     }
@@ -3400,7 +3416,7 @@ impl zmux::StreamInfo for DeadlineProbeStream {
     }
 }
 
-impl zmux::RecvStreamApi for DeadlineProbeStream {
+impl zmux::RecvStreamHandle for DeadlineProbeStream {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -3425,7 +3441,7 @@ impl zmux::RecvStreamApi for DeadlineProbeStream {
     }
 }
 
-impl zmux::SendStreamApi for DeadlineProbeStream {
+impl zmux::SendStreamHandle for DeadlineProbeStream {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -3483,9 +3499,9 @@ impl zmux::SendStreamApi for DeadlineProbeStream {
     }
 }
 
-impl zmux::StreamApi for DeadlineProbeStream {}
+impl zmux::DuplexStreamHandle for DeadlineProbeStream {}
 
-impl zmux::AsyncStreamInfo for DeadlineProbeStream {
+impl zmux::AsyncStreamHandle for DeadlineProbeStream {
     fn stream_id(&self) -> u64 {
         self.id
     }
@@ -3525,7 +3541,7 @@ impl zmux::AsyncStreamInfo for DeadlineProbeStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for DeadlineProbeStream {
+impl zmux::AsyncRecvStreamHandle for DeadlineProbeStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let data = b"deadline";
@@ -3560,7 +3576,7 @@ impl zmux::AsyncRecvStreamApi for DeadlineProbeStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for DeadlineProbeStream {
+impl zmux::AsyncSendStreamHandle for DeadlineProbeStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -3613,7 +3629,7 @@ impl zmux::AsyncSendStreamApi for DeadlineProbeStream {
     }
 }
 
-impl zmux::AsyncStreamApi for DeadlineProbeStream {}
+impl zmux::AsyncDuplexStreamHandle for DeadlineProbeStream {}
 
 #[derive(Clone)]
 struct DirectionalCloseProbe {
@@ -3654,7 +3670,7 @@ impl Write for DirectionalCloseProbe {
     }
 }
 
-impl zmux::StreamInfo for DirectionalCloseProbe {
+impl zmux::StreamHandle for DirectionalCloseProbe {
     fn stream_id(&self) -> u64 {
         0
     }
@@ -3692,7 +3708,7 @@ impl zmux::StreamInfo for DirectionalCloseProbe {
     }
 }
 
-impl zmux::RecvStreamApi for DirectionalCloseProbe {
+impl zmux::RecvStreamHandle for DirectionalCloseProbe {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -3716,7 +3732,7 @@ impl zmux::RecvStreamApi for DirectionalCloseProbe {
     }
 }
 
-impl zmux::SendStreamApi for DirectionalCloseProbe {
+impl zmux::SendStreamHandle for DirectionalCloseProbe {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -3776,9 +3792,9 @@ impl zmux::SendStreamApi for DirectionalCloseProbe {
     }
 }
 
-impl zmux::StreamApi for DirectionalCloseProbe {}
+impl zmux::DuplexStreamHandle for DirectionalCloseProbe {}
 
-impl zmux::AsyncStreamInfo for DirectionalCloseProbe {
+impl zmux::AsyncStreamHandle for DirectionalCloseProbe {
     fn stream_id(&self) -> u64 {
         0
     }
@@ -3820,7 +3836,7 @@ impl zmux::AsyncStreamInfo for DirectionalCloseProbe {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for DirectionalCloseProbe {
+impl zmux::AsyncRecvStreamHandle for DirectionalCloseProbe {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async { Ok(0) })
     }
@@ -3852,7 +3868,7 @@ impl zmux::AsyncRecvStreamApi for DirectionalCloseProbe {
     }
 }
 
-impl zmux::AsyncSendStreamApi for DirectionalCloseProbe {
+impl zmux::AsyncSendStreamHandle for DirectionalCloseProbe {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -3907,7 +3923,7 @@ impl zmux::AsyncSendStreamApi for DirectionalCloseProbe {
     }
 }
 
-impl zmux::AsyncStreamApi for DirectionalCloseProbe {}
+impl zmux::AsyncDuplexStreamHandle for DirectionalCloseProbe {}
 
 static ZERO_SIZED_NATIVE_CLOSES: AtomicUsize = AtomicUsize::new(0);
 static ZERO_SIZED_ASYNC_CLOSES: AtomicUsize = AtomicUsize::new(0);
@@ -3931,7 +3947,7 @@ impl Write for ZeroSizedCloseProbe {
     }
 }
 
-impl zmux::StreamInfo for ZeroSizedCloseProbe {
+impl zmux::StreamHandle for ZeroSizedCloseProbe {
     fn stream_id(&self) -> u64 {
         0
     }
@@ -3964,11 +3980,11 @@ impl zmux::StreamInfo for ZeroSizedCloseProbe {
     }
 
     fn close_with_error(&self, _code: u64, _reason: &str) -> zmux::Result<()> {
-        zmux::StreamInfo::close(self)
+        zmux::StreamHandle::close(self)
     }
 }
 
-impl zmux::RecvStreamApi for ZeroSizedCloseProbe {
+impl zmux::RecvStreamHandle for ZeroSizedCloseProbe {
     fn is_read_closed(&self) -> bool {
         false
     }
@@ -3990,7 +4006,7 @@ impl zmux::RecvStreamApi for ZeroSizedCloseProbe {
     }
 }
 
-impl zmux::SendStreamApi for ZeroSizedCloseProbe {
+impl zmux::SendStreamHandle for ZeroSizedCloseProbe {
     fn is_write_closed(&self) -> bool {
         false
     }
@@ -4048,9 +4064,9 @@ impl zmux::SendStreamApi for ZeroSizedCloseProbe {
     }
 }
 
-impl zmux::StreamApi for ZeroSizedCloseProbe {}
+impl zmux::DuplexStreamHandle for ZeroSizedCloseProbe {}
 
-impl zmux::AsyncStreamInfo for ZeroSizedCloseProbe {
+impl zmux::AsyncStreamHandle for ZeroSizedCloseProbe {
     fn stream_id(&self) -> u64 {
         0
     }
@@ -4087,11 +4103,11 @@ impl zmux::AsyncStreamInfo for ZeroSizedCloseProbe {
         _code: u64,
         _reason: &'a str,
     ) -> zmux::AsyncBoxFuture<'a, zmux::Result<()>> {
-        zmux::AsyncStreamInfo::close(self)
+        zmux::AsyncStreamHandle::close(self)
     }
 }
 
-impl zmux::AsyncRecvStreamApi for ZeroSizedCloseProbe {
+impl zmux::AsyncRecvStreamHandle for ZeroSizedCloseProbe {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async { Ok(0) })
     }
@@ -4121,7 +4137,7 @@ impl zmux::AsyncRecvStreamApi for ZeroSizedCloseProbe {
     }
 }
 
-impl zmux::AsyncSendStreamApi for ZeroSizedCloseProbe {
+impl zmux::AsyncSendStreamHandle for ZeroSizedCloseProbe {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -4174,7 +4190,7 @@ impl zmux::AsyncSendStreamApi for ZeroSizedCloseProbe {
     }
 }
 
-impl zmux::AsyncStreamApi for ZeroSizedCloseProbe {}
+impl zmux::AsyncDuplexStreamHandle for ZeroSizedCloseProbe {}
 
 macro_rules! impl_noop_async_session_controls {
     () => {
@@ -4373,7 +4389,7 @@ impl TimeoutBudgetAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamInfo for TimeoutBudgetAsyncStream {
+impl zmux::AsyncStreamHandle for TimeoutBudgetAsyncStream {
     fn stream_id(&self) -> u64 {
         7
     }
@@ -4409,7 +4425,7 @@ impl zmux::AsyncStreamInfo for TimeoutBudgetAsyncStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for TimeoutBudgetAsyncStream {
+impl zmux::AsyncRecvStreamHandle for TimeoutBudgetAsyncStream {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async { Ok(0) })
     }
@@ -4435,7 +4451,7 @@ impl zmux::AsyncRecvStreamApi for TimeoutBudgetAsyncStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for TimeoutBudgetAsyncStream {
+impl zmux::AsyncSendStreamHandle for TimeoutBudgetAsyncStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             self.write_attempts.fetch_add(1, Ordering::Relaxed);
@@ -4496,7 +4512,7 @@ impl zmux::AsyncSendStreamApi for TimeoutBudgetAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamApi for TimeoutBudgetAsyncStream {}
+impl zmux::AsyncDuplexStreamHandle for TimeoutBudgetAsyncStream {}
 
 #[derive(Clone)]
 struct PayloadRouteAsyncSession {
@@ -4604,7 +4620,7 @@ struct PayloadRouteAsyncStream {
     payload_calls: Arc<AtomicUsize>,
 }
 
-impl zmux::AsyncStreamInfo for PayloadRouteAsyncStream {
+impl zmux::AsyncStreamHandle for PayloadRouteAsyncStream {
     fn stream_id(&self) -> u64 {
         99
     }
@@ -4640,7 +4656,7 @@ impl zmux::AsyncStreamInfo for PayloadRouteAsyncStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for PayloadRouteAsyncStream {
+impl zmux::AsyncRecvStreamHandle for PayloadRouteAsyncStream {
     fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async { Ok(0) })
     }
@@ -4666,7 +4682,7 @@ impl zmux::AsyncRecvStreamApi for PayloadRouteAsyncStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for PayloadRouteAsyncStream {
+impl zmux::AsyncSendStreamHandle for PayloadRouteAsyncStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -4725,11 +4741,11 @@ impl zmux::AsyncSendStreamApi for PayloadRouteAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamApi for PayloadRouteAsyncStream {}
+impl zmux::AsyncDuplexStreamHandle for PayloadRouteAsyncStream {}
 
 struct DummyAsyncStream;
 
-impl zmux::AsyncStreamInfo for DummyAsyncStream {
+impl zmux::AsyncStreamHandle for DummyAsyncStream {
     fn stream_id(&self) -> u64 {
         42
     }
@@ -4774,7 +4790,7 @@ impl zmux::AsyncStreamInfo for DummyAsyncStream {
     }
 }
 
-impl zmux::AsyncRecvStreamApi for DummyAsyncStream {
+impl zmux::AsyncRecvStreamHandle for DummyAsyncStream {
     fn read<'a>(&'a self, dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move {
             let data = b"api";
@@ -4805,7 +4821,7 @@ impl zmux::AsyncRecvStreamApi for DummyAsyncStream {
     }
 }
 
-impl zmux::AsyncSendStreamApi for DummyAsyncStream {
+impl zmux::AsyncSendStreamHandle for DummyAsyncStream {
     fn write<'a>(&'a self, src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
         Box::pin(async move { Ok(src.len()) })
     }
@@ -4854,7 +4870,7 @@ impl zmux::AsyncSendStreamApi for DummyAsyncStream {
     }
 }
 
-impl zmux::AsyncStreamApi for DummyAsyncStream {}
+impl zmux::AsyncDuplexStreamHandle for DummyAsyncStream {}
 
 struct InvalidProgressAsyncSession;
 
@@ -5144,11 +5160,11 @@ impl zmux::Session for DummySession {
     }
 
     fn local_preface(&self) -> zmux::Preface {
-        test_preface_with_role(zmux::Role::Initiator)
+        test_preface_role(zmux::Role::Initiator)
     }
 
     fn peer_preface(&self) -> zmux::Preface {
-        test_preface_with_role(zmux::Role::Responder)
+        test_preface_role(zmux::Role::Responder)
     }
 
     fn negotiated(&self) -> zmux::Negotiated {
@@ -5162,7 +5178,7 @@ impl zmux::Session for DummySession {
     }
 }
 
-fn test_preface_with_role(role: zmux::Role) -> zmux::Preface {
+fn test_preface_role(role: zmux::Role) -> zmux::Preface {
     zmux::Preface {
         preface_version: zmux::PREFACE_VERSION,
         role,
