@@ -253,7 +253,7 @@ impl fmt::Debug for Config {
 
 impl Default for Config {
     fn default() -> Self {
-        default_config()
+        current_default_config()
     }
 }
 
@@ -264,7 +264,7 @@ fn default_config_template() -> &'static RwLock<Config> {
 }
 
 /// Return a copy of the process-wide default configuration template.
-pub fn default_config() -> Config {
+fn current_default_config() -> Config {
     default_config_template()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -277,8 +277,8 @@ pub fn default_config() -> Config {
 /// sessions are not affected. Concurrent calls are race-safe, but the last
 /// completed update wins. Per-session random fields are cleared after the
 /// closure returns so later sessions can generate fresh values.
-pub fn configure_default_config(update: impl FnOnce(&mut Config)) {
-    let mut next = default_config();
+fn update_default_config_template(update: impl FnOnce(&mut Config)) {
+    let mut next = current_default_config();
     update(&mut next);
     next = sanitize_default_config_template(next);
 
@@ -289,7 +289,7 @@ pub fn configure_default_config(update: impl FnOnce(&mut Config)) {
 }
 
 /// Restore the built-in process-wide default configuration template.
-pub fn reset_default_config() {
+fn restore_builtin_default_template() {
     let mut template = default_config_template()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -403,6 +403,21 @@ pub(crate) fn default_late_data_aggregate_cap(max_frame_payload: u64) -> u64 {
 }
 
 impl Config {
+    /// Mutate the process-wide default configuration template.
+    ///
+    /// Call this during process initialization before creating sessions.
+    /// Existing sessions are not affected. Per-session random fields are
+    /// cleared after the closure returns so later sessions can generate fresh
+    /// values.
+    pub fn configure_default(update: impl FnOnce(&mut Config)) {
+        update_default_config_template(update);
+    }
+
+    /// Restore the built-in process-wide default configuration template.
+    pub fn reset_default() {
+        restore_builtin_default_template();
+    }
+
     #[must_use]
     pub fn initiator() -> Self {
         Self {

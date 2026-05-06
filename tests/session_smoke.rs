@@ -29,7 +29,6 @@ struct MemoryConn {
 #[derive(Clone)]
 struct TlsLikeConn {
     inner: MemoryConn,
-    close_count: Option<Arc<AtomicUsize>>,
 }
 
 struct Queue {
@@ -327,35 +326,7 @@ impl Write for TlsLikeConn {
 
 impl TlsLikeConn {
     fn new(inner: MemoryConn) -> Self {
-        Self {
-            inner,
-            close_count: None,
-        }
-    }
-
-    fn with_close_count(inner: MemoryConn, close_count: Arc<AtomicUsize>) -> Self {
-        Self {
-            inner,
-            close_count: Some(close_count),
-        }
-    }
-}
-
-impl zmux::DuplexConnection for TlsLikeConn {
-    type Reader = TlsLikeConn;
-    type Writer = TlsLikeConn;
-
-    fn into_transport(self) -> zmux::Result<zmux::DuplexTransport<Self::Reader, Self::Writer>> {
-        let reader = self.clone();
-        let close_count = self.close_count.clone();
-        let transport = zmux::DuplexTransport::new(reader, self);
-        Ok(match close_count {
-            Some(close_count) => transport.with_close_fn(move || {
-                close_count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }),
-            None => transport,
-        })
+        Self { inner }
     }
 }
 
@@ -633,15 +604,12 @@ fn tcp_constructors_establish_session_with_deadline_control() {
 }
 
 #[test]
-fn custom_duplex_connection_can_back_native_session_and_close_underlying_resource() {
+fn cloneable_duplex_io_can_back_native_session_without_manual_split() {
     let (client_io, server_io) = memory_pair();
-    let close_count = Arc::new(AtomicUsize::new(0));
-    let client_close_count = Arc::clone(&close_count);
-    let client_thread = thread::spawn(move || {
-        Conn::client(TlsLikeConn::with_close_count(client_io, client_close_count)).unwrap()
-    });
+    let client_thread =
+        thread::spawn(move || Conn::client(zmux::duplex_io(TlsLikeConn::new(client_io))).unwrap());
     let server_thread =
-        thread::spawn(move || Conn::server(Box::new(TlsLikeConn::new(server_io))).unwrap());
+        thread::spawn(move || Conn::server(zmux::duplex_io(TlsLikeConn::new(server_io))).unwrap());
 
     let client = client_thread.join().unwrap();
     let server = server_thread.join().unwrap();
@@ -655,6 +623,40 @@ fn custom_duplex_connection_can_back_native_session_and_close_underlying_resourc
     let mut buf = [0u8; 8];
     assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
     assert_eq!(&buf, b"tls-like");
+
+    let _ = client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+}
+
+#[test]
+fn try_duplex_io_can_attach_close_hook_for_full_resource_shutdown() {
+    let (client_io, server_io) = memory_pair();
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let client_close_count = Arc::clone(&close_count);
+    let client_thread = thread::spawn(move || {
+        let transport = zmux::try_duplex_io(TlsLikeConn::new(client_io), |io| Ok(io.clone()))
+            .unwrap()
+            .with_close_fn(move || {
+                client_close_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+        Conn::client(transport).unwrap()
+    });
+    let server_thread =
+        thread::spawn(move || Conn::server(zmux::duplex_io(TlsLikeConn::new(server_io))).unwrap());
+
+    let client = client_thread.join().unwrap();
+    let server = server_thread.join().unwrap();
+
+    let stream = client.open_stream().unwrap();
+    stream.write_final(b"close-hook").unwrap();
+
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let mut buf = [0u8; 10];
+    assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(&buf, b"close-hook");
 
     let _ = client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
     let _ = server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
@@ -701,6 +703,72 @@ fn joined_streams_can_back_nested_native_session() {
     let _ = inner_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
     let _ = outer_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
     let _ = outer_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+}
+
+#[test]
+fn bidirectional_stream_can_back_nested_native_session_directly() {
+    let (outer_client, outer_server) = connected_pair(Config::default(), Config::default());
+
+    let outer_client_stream = outer_client.open_stream().unwrap();
+    let inner_client_thread = thread::spawn(move || Conn::client(outer_client_stream).unwrap());
+
+    let outer_server_stream = outer_server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let inner_server_thread = thread::spawn(move || Conn::server(outer_server_stream).unwrap());
+    let inner_client = inner_client_thread.join().unwrap();
+    let inner_server = inner_server_thread.join().unwrap();
+
+    let stream = inner_client.open_stream().unwrap();
+    stream.write_final(b"direct-nested").unwrap();
+    let accepted = inner_server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let mut buf = [0u8; 13];
+    assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(&buf, b"direct-nested");
+
+    let _ = inner_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = inner_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = outer_client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = outer_server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+}
+
+#[test]
+fn joined_ordinary_duplex_ios_can_back_native_session() {
+    let (client_up, server_down) = memory_pair();
+    let (server_up, client_down) = memory_pair();
+
+    let client_joined =
+        zmux::join_streams(TlsLikeConn::new(client_down), TlsLikeConn::new(client_up));
+    let server_joined =
+        zmux::join_streams(TlsLikeConn::new(server_down), TlsLikeConn::new(server_up));
+
+    let client_thread = thread::spawn(move || Conn::client(client_joined).unwrap());
+    let server_thread = thread::spawn(move || Conn::server(server_joined).unwrap());
+    let client = client_thread.join().unwrap();
+    let server = server_thread.join().unwrap();
+
+    let stream = client.open_stream().unwrap();
+    stream.write_final(b"ordinary-joined").unwrap();
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let mut buf = [0u8; 15];
+    assert_eq!(accepted.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(&buf, b"ordinary-joined");
+
+    let reply = server.open_uni_stream().unwrap();
+    reply.write_final(b"reply").unwrap();
+    let recv = client
+        .accept_uni_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let mut reply_buf = [0u8; 5];
+    assert_eq!(recv.read(&mut reply_buf).unwrap(), reply_buf.len());
+    assert_eq!(&reply_buf, b"reply");
+
+    let _ = client.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    let _ = server.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
 }
 
 #[test]
@@ -1928,6 +1996,15 @@ fn open_send_request_timeout_carries_budget_into_first_write() {
             Err(err) => err,
         };
     assert!(err.to_string().contains("write timed out"));
+    assert_open_and_send_failure_released_local_open(&client);
+}
+
+fn assert_open_and_send_failure_released_local_open(conn: &Conn) {
+    let stats = conn.stats();
+    assert_eq!(stats.provisional.bidi, 0);
+    assert_eq!(stats.provisional.uni, 0);
+    assert_eq!(stats.active_streams.local_bidi, 0);
+    assert_eq!(stats.active_streams.local_uni, 0);
 }
 
 #[test]
@@ -1945,6 +2022,7 @@ fn open_uni_send_request_timeout_carries_budget_into_final_write() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("write timed out"));
+    assert_open_and_send_failure_released_local_open(&client);
 }
 
 #[test]
@@ -1965,6 +2043,7 @@ fn vectored_open_send_request_timeout_carries_budget_into_first_write() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("write timed out"));
+    assert_open_and_send_failure_released_local_open(&client);
 }
 
 #[test]
@@ -1983,17 +2062,17 @@ fn vectored_open_uni_send_request_timeout_carries_budget_into_final_write() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("write timed out"));
+    assert_open_and_send_failure_released_local_open(&client);
 }
 
 #[test]
 fn open_send_request_timeout_success_uses_single_budget() {
     let (client, server) = connected_pair(Config::default(), Config::default());
 
-    let (stream, n) = client
+    let stream = client
         .open_and_send(zmux::OpenSend::new(b"ok").timeout(Duration::from_secs(1)))
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
-    assert_eq!(n, 2);
     let write_stats = client.stats();
     assert!(write_stats.progress.stream_progress_at.is_some());
     assert!(write_stats.progress.application_progress_at.is_some());
@@ -2017,13 +2096,12 @@ fn open_uni_send_request_options_preserve_open_info() {
     };
     let (client, server) = connected_pair(client_config, server_config);
 
-    let (stream, n) = client
+    let stream = client
         .open_uni_and_send(
             zmux::OpenSend::new(b"hello").options(OpenOptions::new().open_info(b"ssh")),
         )
         .unwrap();
     assert_ne!(stream.stream_id(), 0);
-    assert_eq!(n, 5);
 
     let accepted = server
         .accept_uni_stream_timeout(Duration::from_secs(1))
@@ -5865,11 +5943,10 @@ fn open_and_send_empty_does_not_emit_open_metadata_opener() {
         ..Config::responder()
     };
     let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
-    let (stream, n) = client
+    let stream = client
         .open_and_send(zmux::OpenSend::new([]).options(OpenOptions::new().open_info(b"meta")))
         .unwrap();
 
-    assert_eq!(n, 0);
     assert!(peer
         .collect_frames_for(Duration::from_millis(150))
         .is_empty());

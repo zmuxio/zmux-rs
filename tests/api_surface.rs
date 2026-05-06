@@ -114,9 +114,6 @@ fn public_conformance_parse_error_is_nameable() {
 #[test]
 fn public_config_builders_remain_ergonomic() {
     let default = zmux::Config::default();
-    let default_config = zmux::default_config();
-    assert_eq!(default_config.role, default.role);
-    assert_eq!(default_config.settings, default.settings);
     assert_eq!(default.role, zmux::Role::Auto);
     assert_eq!(default.min_proto, zmux::PROTO_VERSION);
     assert_eq!(default.max_proto, zmux::PROTO_VERSION);
@@ -321,39 +318,48 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
     assert_eq!(recv.read_timeout(&mut buf, Duration::from_millis(1))?, 3);
     recv.close_read()?;
 
-    let session: zmux::BoxSession = Box::new(DummySession);
+    let session: zmux::BoxSession = zmux::box_session(DummySession);
     assert_eq!(session.state(), zmux::SessionState::Ready);
     assert_eq!(session.ping(b"echo")?, Duration::from_millis(1));
     assert!(session.wait_timeout(Duration::from_millis(1))?);
     assert!(!session.is_closed());
     assert_eq!(session.stats().state, zmux::SessionState::Ready);
-    assert_eq!(session.open_and_send(zmux::OpenSend::new(b"hello"))?.1, 5);
     assert_eq!(
-        session.open_uni_and_send(zmux::OpenSend::new(b"hello"))?.1,
-        5
+        session
+            .open_and_send(zmux::OpenSend::new(b"hello"))?
+            .stream_id(),
+        42
+    );
+    assert_eq!(
+        session
+            .open_uni_and_send(zmux::OpenSend::new(b"hello"))?
+            .stream_id(),
+        42
     );
     let parts = [IoSlice::new(b"he"), IoSlice::new(b"llo")];
     assert_eq!(
-        session.open_and_send(zmux::OpenSend::vectored(&parts))?.1,
-        5
+        session
+            .open_and_send(zmux::OpenSend::vectored(&parts))?
+            .stream_id(),
+        42
     );
     assert_eq!(
         session
             .open_and_send(zmux::OpenSend::vectored(&parts).options(zmux::OpenOptions::new()))?
-            .1,
-        5
+            .stream_id(),
+        42
     );
     assert_eq!(
         session
             .open_uni_and_send(zmux::OpenSend::vectored(&parts))?
-            .1,
-        5
+            .stream_id(),
+        42
     );
     assert_eq!(
         session
             .open_uni_and_send(zmux::OpenSend::vectored(&parts).options(zmux::OpenOptions::new()))?
-            .1,
-        5
+            .stream_id(),
+        42
     );
     assert!(session.peer_go_away_error().is_none());
     assert!(session.peer_close_error().is_none());
@@ -367,8 +373,8 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
         Duration::from_millis(1)
     );
     assert_eq!(
-        zmux::Session::open_and_send(&arc_session, zmux::OpenSend::vectored(&parts))?.1,
-        5
+        zmux::Session::open_and_send(&arc_session, zmux::OpenSend::vectored(&parts))?.stream_id(),
+        42
     );
 
     Ok(())
@@ -510,22 +516,14 @@ fn async_session_default_open_and_send_skips_empty_bidi_writes() -> zmux::Result
         write_attempts: Arc::clone(&write_attempts),
     };
 
-    assert_eq!(
-        block_on(zmux::AsyncSession::open_and_send(
-            &session,
-            zmux::OpenSend::new(b"")
-        ))?
-        .1,
-        0
-    );
-    assert_eq!(
-        block_on(zmux::AsyncSession::open_and_send(
-            &session,
-            zmux::OpenSend::new(b"").options(zmux::OpenOptions::default()),
-        ))?
-        .1,
-        0
-    );
+    block_on(zmux::AsyncSession::open_and_send(
+        &session,
+        zmux::OpenSend::new(b""),
+    ))?;
+    block_on(zmux::AsyncSession::open_and_send(
+        &session,
+        zmux::OpenSend::new(b"").options(zmux::OpenOptions::default()),
+    ))?;
     assert_eq!(write_attempts.load(Ordering::Relaxed), 0);
     assert!(write_timeouts.lock().unwrap().is_empty());
 
@@ -539,12 +537,11 @@ fn async_session_open_uni_and_send_uses_payload_write_path() -> zmux::Result<()>
         payload_calls: Arc::clone(&payload_calls),
     };
 
-    let (_stream, n) = block_on(zmux::AsyncSession::open_uni_and_send(
+    let _stream = block_on(zmux::AsyncSession::open_uni_and_send(
         &session,
         zmux::OpenSend::new(b"owned-default-final".to_vec()),
     ))?;
 
-    assert_eq!(n, b"owned-default-final".len());
     assert_eq!(payload_calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -627,7 +624,7 @@ fn closed_session_helpers_match_user_facing_session_contract() -> zmux::Result<(
     assert!(err.is_session_closed());
     assert_eq!(err.operation(), zmux::ErrorOperation::Close);
 
-    let boxed_native: zmux::BoxSession = Box::new(zmux::closed_session());
+    let boxed_native: zmux::BoxSession = zmux::box_session(zmux::closed_session());
     assert!(zmux::Session::is_closed(&boxed_native));
     assert!(zmux::Session::wait(&boxed_native).is_ok());
 
@@ -658,8 +655,7 @@ fn concrete_native_open_and_send_accepts_binary_slices_directly() -> zmux::Resul
     assert_eq!(empty.payload().checked_len()?, 0);
 
     let payload_buf = vec![0x01, 0x02, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
-    let (_stream, n) = client.open_and_send(&payload_buf)?;
-    assert_eq!(n, 9);
+    let _stream = client.open_and_send(&payload_buf)?;
 
     let accepted = server.accept_stream_timeout(Duration::from_secs(5))?;
     let mut buf = [0u8; 9];
@@ -667,8 +663,7 @@ fn concrete_native_open_and_send_accepts_binary_slices_directly() -> zmux::Resul
     assert_eq!(buf.as_slice(), payload_buf.as_slice());
 
     let owned_payload = vec![0x03, 0x04, b'f', b'i', b'n'];
-    let (_send, n) = client.open_uni_and_send(owned_payload.clone())?;
-    assert_eq!(n, owned_payload.len());
+    let _send = client.open_uni_and_send(owned_payload.clone())?;
     let mut accepted = server.accept_uni_stream_timeout(Duration::from_secs(5))?;
     let mut buf = Vec::new();
     accepted.read_to_end(&mut buf)?;
@@ -783,6 +778,77 @@ fn duplex_transport_is_a_rust_read_write_connection() -> io::Result<()> {
     assert_eq!(closes.load(Ordering::Relaxed), 1);
     let (_reader, writer) = transport.into_parts();
     assert_eq!(writer, b"out!");
+    Ok(())
+}
+
+#[test]
+fn duplex_io_wraps_cloneable_full_duplex_io_without_manual_split() -> io::Result<()> {
+    let wrapped = zmux::duplex_io(io::Cursor::new(b"hello".to_vec()));
+    let mut transport = zmux::DuplexConnection::into_transport(wrapped)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+
+    let mut buf = [0u8; 5];
+    Read::read_exact(&mut transport, &mut buf)?;
+    assert_eq!(&buf, b"hello");
+
+    Write::write_all(&mut transport, b"out")?;
+    assert_eq!(transport.writer().get_ref(), b"outlo");
+
+    let wrapped = zmux::DuplexIo::new(io::Cursor::new(b"inner".to_vec()));
+    assert_eq!(wrapped.into_inner().into_inner(), b"inner");
+
+    let transport = zmux::try_duplex_io(io::Cursor::new(b"try".to_vec()), |io| Ok(io.clone()))
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    assert_eq!(transport.reader().get_ref(), b"try");
+    Ok(())
+}
+
+#[test]
+fn duplex_transport_close_hook_preserves_existing_timeout_control() -> io::Result<()> {
+    let read_timeouts = Arc::new(AtomicUsize::new(0));
+    let write_timeouts = Arc::new(AtomicUsize::new(0));
+    let control_closes = Arc::new(AtomicUsize::new(0));
+    let close_hook_calls = Arc::new(AtomicUsize::new(0));
+    let close_hook_calls_for_transport = Arc::clone(&close_hook_calls);
+
+    let transport = zmux::DuplexTransport::new(io::Cursor::new(Vec::<u8>::new()), Vec::<u8>::new())
+        .with_control(Box::new(RecordingTransportControl {
+            read_timeouts: Arc::clone(&read_timeouts),
+            write_timeouts: Arc::clone(&write_timeouts),
+            closes: Arc::clone(&control_closes),
+        }))
+        .with_close_fn(move || {
+            close_hook_calls_for_transport.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+    transport.set_read_timeout(Some(Duration::from_millis(1)))?;
+    transport.set_write_timeout(None)?;
+    transport.close()?;
+
+    assert_eq!(read_timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(write_timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(control_closes.load(Ordering::Relaxed), 0);
+    assert_eq!(close_hook_calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn duplex_transport_control_can_be_timeout_only() -> io::Result<()> {
+    let read_timeouts = Arc::new(AtomicUsize::new(0));
+    let write_timeouts = Arc::new(AtomicUsize::new(0));
+    let transport = zmux::DuplexTransport::new(io::Cursor::new(Vec::<u8>::new()), Vec::<u8>::new())
+        .with_control(TimeoutOnlyTransportControl {
+            read_timeouts: Arc::clone(&read_timeouts),
+            write_timeouts: Arc::clone(&write_timeouts),
+        });
+
+    transport.set_read_timeout(Some(Duration::from_millis(1)))?;
+    transport.set_write_timeout(None)?;
+    transport.close()?;
+
+    assert_eq!(read_timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(write_timeouts.load(Ordering::Relaxed), 1);
     Ok(())
 }
 
@@ -945,13 +1011,92 @@ fn borrowed_native_streams_follow_std_io_connection_shape() -> zmux::Result<()> 
 }
 
 #[test]
+fn joined_stream_connection_requires_both_halves() {
+    let missing_read =
+        zmux::DuplexStream::<DummyStream, DummyStream>::from_parts(None, Some(DummyStream));
+    let err = match zmux::Conn::client(missing_read) {
+        Ok(_) => panic!("connection unexpectedly accepted a missing read half"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("missing a read half"));
+
+    let missing_write =
+        zmux::DuplexStream::<DummyStream, DummyStream>::from_parts(Some(DummyStream), None);
+    let err = match zmux::Conn::client(missing_write) {
+        Ok(_) => panic!("connection unexpectedly accepted a missing write half"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("missing a write half"));
+}
+
+#[test]
+fn joined_stream_transport_close_does_not_wait_for_active_read() -> io::Result<()> {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let joined = zmux::join_streams(
+        BlockingReadHalf {
+            entered: entered_tx,
+            release: release_rx,
+        },
+        SinkWriteHalf,
+    );
+    let transport = zmux::DuplexConnection::into_transport(joined)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut reader: zmux::DuplexStream<BlockingReadHalf, SinkWriteHalf> =
+        transport.reader().clone();
+    let reader_thread = thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        Read::read(&mut reader, &mut buf)
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("joined read did not become active");
+
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let close_thread = thread::spawn(move || {
+        let _ = closed_tx.send(transport.close());
+    });
+    let close_result = match closed_rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = release_tx.send(());
+            let _ = reader_thread.join();
+            let _ = close_thread.join();
+            panic!("joined transport close waited for the active read: {err}");
+        }
+    };
+    close_result?;
+
+    release_tx.send(()).unwrap();
+    assert_eq!(reader_thread.join().unwrap()?, 0);
+    close_thread.join().unwrap();
+    Ok(())
+}
+
+#[test]
+fn joined_native_stream_transport_close_closes_underlying_zmux_stream() -> zmux::Result<()> {
+    let (client, server) = native_tcp_pair();
+    let stream = client.open_stream()?;
+    let close_probe = stream.clone();
+    let joined = zmux::join_streams(stream.clone(), stream);
+    let transport = zmux::DuplexConnection::into_transport(joined)?;
+
+    transport.close()?;
+
+    assert!(close_probe.is_read_closed());
+    assert!(close_probe.is_write_closed());
+    let _ = client.close();
+    let _ = server.close();
+    Ok(())
+}
+
+#[test]
 fn native_session_vectored_open_and_send_works_through_trait() -> zmux::Result<()> {
     let (client, server) = native_tcp_pair();
 
     let bidi_parts = [IoSlice::new(b"trait-"), IoSlice::new(b"bidi")];
-    let (outbound, n) =
-        zmux::Session::open_and_send(&client, zmux::OpenSend::vectored(&bidi_parts))?;
-    assert_eq!(n, b"trait-bidi".len());
+    let outbound = zmux::Session::open_and_send(&client, zmux::OpenSend::vectored(&bidi_parts))?;
     zmux::SendStreamHandle::close_write(&outbound)?;
 
     let mut inbound = zmux::Session::accept_stream_timeout(&server, Duration::from_secs(5))?;
@@ -962,9 +1107,7 @@ fn native_session_vectored_open_and_send_works_through_trait() -> zmux::Result<(
     zmux::StreamHandle::close(&inbound)?;
 
     let uni_parts = [IoSlice::new(b"trait-"), IoSlice::new(b"uni")];
-    let (outbound, n) =
-        zmux::Session::open_uni_and_send(&server, zmux::OpenSend::vectored(&uni_parts))?;
-    assert_eq!(n, b"trait-uni".len());
+    let outbound = zmux::Session::open_uni_and_send(&server, zmux::OpenSend::vectored(&uni_parts))?;
 
     let mut inbound = zmux::Session::accept_uni_stream_timeout(&client, Duration::from_secs(5))?;
     let mut buf = [0u8; 9];
@@ -1181,6 +1324,42 @@ fn async_session_open_and_send_rejects_invalid_stream_progress() {
         boxed.as_ref(),
         zmux::OpenSend::vectored(&parts),
     )));
+}
+
+#[test]
+fn session_default_open_and_send_closes_stream_after_write_failure() {
+    let closes = Arc::new(AtomicUsize::new(0));
+    let session = CleanupTrackingSession::new(Arc::clone(&closes));
+
+    assert_invalid_write_progress(zmux::Session::open_and_send(
+        &session,
+        zmux::OpenSend::new(b"abc"),
+    ));
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+
+    assert_invalid_write_progress(zmux::Session::open_uni_and_send(
+        &session,
+        zmux::OpenSend::new(b"abc"),
+    ));
+    assert_eq!(closes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn async_session_default_open_and_send_closes_stream_after_write_failure() {
+    let closes = Arc::new(AtomicUsize::new(0));
+    let session = CleanupTrackingSession::new(Arc::clone(&closes));
+
+    assert_invalid_write_progress(block_on(zmux::AsyncSession::open_and_send(
+        &session,
+        zmux::OpenSend::new(b"abc"),
+    )));
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+
+    assert_invalid_write_progress(block_on(zmux::AsyncSession::open_uni_and_send(
+        &session,
+        zmux::OpenSend::new(b"abc"),
+    )));
+    assert_eq!(closes.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1995,9 +2174,8 @@ where
     zmux::AsyncStreamHandle::close(&outbound).await?;
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::new(b"open-and-send")).await?;
-    assert_eq!(n, b"open-and-send".len());
     zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-and-send");
@@ -2005,18 +2183,16 @@ where
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"open-"), IoSlice::new(b"vectored")];
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::vectored(&parts)).await?;
-    assert_eq!(n, b"open-vectored".len());
     zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-vectored");
     zmux::AsyncStreamHandle::close(&outbound).await?;
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::new(b"server-uni")).await?;
-    assert_eq!(n, b"server-uni".len());
     let inbound =
         zmux::AsyncSession::accept_uni_stream_timeout(client, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni");
@@ -2025,9 +2201,8 @@ where
     drop(outbound);
 
     let parts = [IoSlice::new(b"server-"), IoSlice::new(b"uni-vectored")];
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::vectored(&parts)).await?;
-    assert_eq!(n, b"server-uni-vectored".len());
     let inbound =
         zmux::AsyncSession::accept_uni_stream_timeout(client, Duration::from_secs(5)).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni-vectored");
@@ -2120,6 +2295,23 @@ struct RecordingTransportControl {
     closes: Arc<AtomicUsize>,
 }
 
+struct TimeoutOnlyTransportControl {
+    read_timeouts: Arc<AtomicUsize>,
+    write_timeouts: Arc<AtomicUsize>,
+}
+
+impl zmux::DuplexTransportControl for TimeoutOnlyTransportControl {
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        self.read_timeouts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        self.write_timeouts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 impl zmux::DuplexTransportControl for RecordingTransportControl {
     fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
         self.read_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -2133,6 +2325,31 @@ impl zmux::DuplexTransportControl for RecordingTransportControl {
 
     fn close(&self) -> io::Result<()> {
         self.closes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+struct BlockingReadHalf {
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Read for BlockingReadHalf {
+    fn read(&mut self, _dst: &mut [u8]) -> io::Result<usize> {
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+        Ok(0)
+    }
+}
+
+struct SinkWriteHalf;
+
+impl Write for SinkWriteHalf {
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        Ok(src.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -4983,6 +5200,460 @@ impl zmux::AsyncSession for InvalidProgressAsyncSession {
     }
 }
 
+#[derive(Clone)]
+struct CleanupTrackingStream {
+    closes: Arc<AtomicUsize>,
+}
+
+impl CleanupTrackingStream {
+    const INVALID_PROGRESS: usize = 4;
+
+    fn new(closes: Arc<AtomicUsize>) -> Self {
+        Self { closes }
+    }
+}
+
+impl Read for CleanupTrackingStream {
+    fn read(&mut self, _dst: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Write for CleanupTrackingStream {
+    fn write(&mut self, _src: &[u8]) -> io::Result<usize> {
+        Ok(Self::INVALID_PROGRESS)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl zmux::StreamHandle for CleanupTrackingStream {
+    fn stream_id(&self) -> u64 {
+        88
+    }
+
+    fn is_opened_locally(&self) -> bool {
+        true
+    }
+
+    fn is_bidirectional(&self) -> bool {
+        true
+    }
+
+    fn open_info_len(&self) -> usize {
+        0
+    }
+
+    fn append_open_info_to(&self, _dst: &mut Vec<u8>) {}
+
+    fn metadata(&self) -> zmux::StreamMetadata {
+        zmux::StreamMetadata::default()
+    }
+
+    fn set_deadline(&self, _deadline: Option<Instant>) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close_with_error(&self, _code: u64, _reason: &str) -> zmux::Result<()> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl zmux::RecvStreamHandle for CleanupTrackingStream {
+    fn is_read_closed(&self) -> bool {
+        false
+    }
+
+    fn read_timeout(&self, _dst: &mut [u8], _timeout: Duration) -> zmux::Result<usize> {
+        Ok(0)
+    }
+
+    fn set_read_deadline(&self, _deadline: Option<Instant>) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close_read(&self) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn cancel_read(&self, _code: u64) -> zmux::Result<()> {
+        Ok(())
+    }
+}
+
+impl zmux::SendStreamHandle for CleanupTrackingStream {
+    fn is_write_closed(&self) -> bool {
+        false
+    }
+
+    fn update_metadata(&self, update: zmux::MetadataUpdate) -> zmux::Result<()> {
+        update.validate()
+    }
+
+    fn write_timeout(&self, _src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
+        Ok(Self::INVALID_PROGRESS)
+    }
+
+    fn write_vectored(&self, _parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
+        Ok(Self::INVALID_PROGRESS)
+    }
+
+    fn write_vectored_timeout(
+        &self,
+        _parts: &[IoSlice<'_>],
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        Ok(Self::INVALID_PROGRESS)
+    }
+
+    fn set_write_deadline(&self, _deadline: Option<Instant>) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close_write(&self) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn cancel_write(&self, _code: u64) -> zmux::Result<()> {
+        Ok(())
+    }
+}
+
+impl zmux::DuplexStreamHandle for CleanupTrackingStream {}
+
+impl zmux::AsyncStreamHandle for CleanupTrackingStream {
+    fn stream_id(&self) -> u64 {
+        88
+    }
+
+    fn is_opened_locally(&self) -> bool {
+        true
+    }
+
+    fn is_bidirectional(&self) -> bool {
+        true
+    }
+
+    fn open_info_len(&self) -> usize {
+        0
+    }
+
+    fn append_open_info_to(&self, _dst: &mut Vec<u8>) {}
+
+    fn metadata(&self) -> zmux::StreamMetadata {
+        zmux::StreamMetadata::default()
+    }
+
+    fn set_deadline(&self, _deadline: Option<Instant>) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn close_with_error<'a>(
+        &'a self,
+        _code: u64,
+        _reason: &'a str,
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<()>> {
+        Box::pin(async move {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+impl zmux::AsyncRecvStreamHandle for CleanupTrackingStream {
+    fn read<'a>(&'a self, _dst: &'a mut [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn read_timeout<'a>(
+        &'a self,
+        _dst: &'a mut [u8],
+        _timeout: Duration,
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn is_read_closed(&self) -> bool {
+        false
+    }
+
+    fn close_read(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_read(&self, _code: u64) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl zmux::AsyncSendStreamHandle for CleanupTrackingStream {
+    fn write<'a>(&'a self, _src: &'a [u8]) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
+        Box::pin(async { Ok(Self::INVALID_PROGRESS) })
+    }
+
+    fn write_timeout<'a>(
+        &'a self,
+        _src: &'a [u8],
+        _timeout: Duration,
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
+        Box::pin(async { Ok(Self::INVALID_PROGRESS) })
+    }
+
+    fn write_final_timeout<'a>(
+        &'a self,
+        _payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<usize>> {
+        Box::pin(async { Ok(Self::INVALID_PROGRESS) })
+    }
+
+    fn is_write_closed(&self) -> bool {
+        false
+    }
+
+    fn update_metadata(
+        &self,
+        update: zmux::MetadataUpdate,
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async move { update.validate() })
+    }
+
+    fn close_write(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_write(&self, _code: u64) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl zmux::AsyncDuplexStreamHandle for CleanupTrackingStream {}
+
+#[derive(Clone)]
+struct CleanupTrackingSession {
+    closes: Arc<AtomicUsize>,
+}
+
+impl CleanupTrackingSession {
+    fn new(closes: Arc<AtomicUsize>) -> Self {
+        Self { closes }
+    }
+
+    fn stream(&self) -> CleanupTrackingStream {
+        CleanupTrackingStream::new(Arc::clone(&self.closes))
+    }
+}
+
+impl zmux::Session for CleanupTrackingSession {
+    fn accept_stream(&self) -> zmux::Result<zmux::BoxDuplexStream> {
+        Err(zmux::Error::session_closed())
+    }
+
+    fn accept_stream_timeout(&self, _timeout: Duration) -> zmux::Result<zmux::BoxDuplexStream> {
+        zmux::Session::accept_stream(self)
+    }
+
+    fn accept_uni_stream(&self) -> zmux::Result<zmux::BoxRecvStream> {
+        Err(zmux::Error::session_closed())
+    }
+
+    fn accept_uni_stream_timeout(&self, _timeout: Duration) -> zmux::Result<zmux::BoxRecvStream> {
+        zmux::Session::accept_uni_stream(self)
+    }
+
+    fn open_stream_with(&self, request: zmux::OpenRequest) -> zmux::Result<zmux::BoxDuplexStream> {
+        request.open_options().validate()?;
+        Ok(Box::new(self.stream()))
+    }
+
+    fn open_uni_stream_with(
+        &self,
+        request: zmux::OpenRequest,
+    ) -> zmux::Result<zmux::BoxSendStream> {
+        request.open_options().validate()?;
+        Ok(Box::new(self.stream()))
+    }
+
+    fn ping(&self, _echo: &[u8]) -> zmux::Result<Duration> {
+        Err(zmux::Error::session_closed())
+    }
+
+    fn ping_timeout(&self, echo: &[u8], _timeout: Duration) -> zmux::Result<Duration> {
+        zmux::Session::ping(self, echo)
+    }
+
+    fn go_away(&self, _last_accepted_bidi: u64, _last_accepted_uni: u64) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn go_away_with_error(
+        &self,
+        _last_accepted_bidi: u64,
+        _last_accepted_uni: u64,
+        _code: u64,
+        _reason: &str,
+    ) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn close_with_error(&self, _code: u64, _reason: &str) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn wait(&self) -> zmux::Result<()> {
+        Ok(())
+    }
+
+    fn wait_timeout(&self, _timeout: Duration) -> zmux::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn close_error(&self) -> Option<zmux::Error> {
+        None
+    }
+
+    fn state(&self) -> zmux::SessionState {
+        zmux::SessionState::Ready
+    }
+
+    fn stats(&self) -> zmux::SessionStats {
+        empty_stats()
+    }
+
+    fn peer_go_away_error(&self) -> Option<zmux::PeerGoAwayError> {
+        None
+    }
+
+    fn peer_close_error(&self) -> Option<zmux::PeerCloseError> {
+        None
+    }
+
+    fn local_preface(&self) -> zmux::Preface {
+        test_preface_role(zmux::Role::Initiator)
+    }
+
+    fn peer_preface(&self) -> zmux::Preface {
+        test_preface_role(zmux::Role::Responder)
+    }
+
+    fn negotiated(&self) -> zmux::Negotiated {
+        zmux::Negotiated {
+            proto: zmux::PROTO_VERSION,
+            capabilities: common_capabilities(),
+            local_role: zmux::Role::Initiator,
+            peer_role: zmux::Role::Responder,
+            peer_settings: zmux::Settings::DEFAULT,
+        }
+    }
+}
+
+impl zmux::AsyncSession for CleanupTrackingSession {
+    type Stream = CleanupTrackingStream;
+    type SendStream = CleanupTrackingStream;
+    type RecvStream = CleanupTrackingStream;
+
+    fn accept_stream(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::Stream>> {
+        Box::pin(async { Err(zmux::Error::session_closed()) })
+    }
+
+    fn accept_stream_timeout(
+        &self,
+        _timeout: Duration,
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::Stream>> {
+        zmux::AsyncSession::accept_stream(self)
+    }
+
+    fn accept_uni_stream(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::RecvStream>> {
+        Box::pin(async { Err(zmux::Error::session_closed()) })
+    }
+
+    fn accept_uni_stream_timeout(
+        &self,
+        _timeout: Duration,
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::RecvStream>> {
+        zmux::AsyncSession::accept_uni_stream(self)
+    }
+
+    fn open_stream_with(
+        &self,
+        request: zmux::OpenRequest,
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::Stream>> {
+        let stream = self.stream();
+        Box::pin(async move {
+            request.open_options().validate()?;
+            Ok(stream)
+        })
+    }
+
+    fn open_uni_stream_with(
+        &self,
+        request: zmux::OpenRequest,
+    ) -> zmux::AsyncBoxFuture<'_, zmux::Result<Self::SendStream>> {
+        let stream = self.stream();
+        Box::pin(async move {
+            request.open_options().validate()?;
+            Ok(stream)
+        })
+    }
+
+    impl_noop_async_session_controls!();
+
+    fn close(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn close_with_error<'a>(
+        &'a self,
+        _code: u64,
+        _reason: &'a str,
+    ) -> zmux::AsyncBoxFuture<'a, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn wait(&self) -> zmux::AsyncBoxFuture<'_, zmux::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn wait_timeout(&self, _timeout: Duration) -> zmux::AsyncBoxFuture<'_, zmux::Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn close_error(&self) -> Option<zmux::Error> {
+        None
+    }
+
+    fn state(&self) -> zmux::SessionState {
+        zmux::SessionState::Ready
+    }
+
+    fn stats(&self) -> zmux::SessionStats {
+        empty_stats()
+    }
+}
+
 struct DummyAsyncSession;
 
 impl zmux::AsyncSession for DummyAsyncSession {
@@ -5105,22 +5776,18 @@ impl zmux::Session for DummySession {
         Ok(Box::new(DummyStream))
     }
 
-    fn open_and_send(
-        &self,
-        request: zmux::OpenSend<'_>,
-    ) -> zmux::Result<(zmux::BoxDuplexStream, usize)> {
+    fn open_and_send(&self, request: zmux::OpenSend<'_>) -> zmux::Result<zmux::BoxDuplexStream> {
         let opts = request.open_options();
         opts.validate()?;
-        Ok((Box::new(DummyStream), request.payload().checked_len()?))
+        request.payload().checked_len()?;
+        Ok(Box::new(DummyStream))
     }
 
-    fn open_uni_and_send(
-        &self,
-        request: zmux::OpenSend<'_>,
-    ) -> zmux::Result<(zmux::BoxSendStream, usize)> {
+    fn open_uni_and_send(&self, request: zmux::OpenSend<'_>) -> zmux::Result<zmux::BoxSendStream> {
         let opts = request.open_options();
         opts.validate()?;
-        Ok((Box::new(DummyStream), request.payload().checked_len()?))
+        request.payload().checked_len()?;
+        Ok(Box::new(DummyStream))
     }
 
     fn ping(&self, _echo: &[u8]) -> zmux::Result<Duration> {

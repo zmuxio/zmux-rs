@@ -246,9 +246,8 @@ where
     zmux::AsyncStreamHandle::close(&outbound).await?;
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::new(b"open-and-send")).await?;
-    assert_eq!(n, b"open-and-send".len());
     zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-and-send");
@@ -256,27 +255,24 @@ where
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"open-"), IoSlice::new(b"vectored")];
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_and_send(client, zmux::OpenSend::vectored(&parts)).await?;
-    assert_eq!(n, b"open-vectored".len());
     zmux::AsyncSendStreamHandle::close_write(&outbound).await?;
     let inbound = zmux::AsyncSession::accept_stream_timeout(server, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"open-vectored");
     zmux::AsyncStreamHandle::close(&outbound).await?;
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::new(b"server-uni")).await?;
-    assert_eq!(n, b"server-uni".len());
     let inbound = zmux::AsyncSession::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni");
     zmux::AsyncStreamHandle::close(&outbound).await?;
     zmux::AsyncStreamHandle::close(&inbound).await?;
 
     let parts = [IoSlice::new(b"server-"), IoSlice::new(b"uni-vectored")];
-    let (outbound, n) =
+    let outbound =
         zmux::AsyncSession::open_uni_and_send(server, zmux::OpenSend::vectored(&parts)).await?;
-    assert_eq!(n, b"server-uni-vectored".len());
     let inbound = zmux::AsyncSession::accept_uni_stream_timeout(client, STREAM_TIMEOUT).await?;
     assert_eq!(read_all_async(&inbound).await?, b"server-uni-vectored");
     zmux::AsyncStreamHandle::close(&outbound).await?;
@@ -388,12 +384,11 @@ async fn open_and_send_writes_whole_payload_under_flow_control() {
         assert_eq!(received, expected);
     });
 
-    let (stream, n) = pair
+    let stream = pair
         .client
         .open_and_send(zmux::OpenSend::new(payload.as_slice()).timeout(STREAM_TIMEOUT))
         .await
         .unwrap();
-    assert_eq!(n, payload.len());
 
     stream.close_write().await.unwrap();
     reader.await.unwrap();
@@ -531,12 +526,11 @@ async fn uni_open_accept_round_trips_payload_and_empty_final() {
     assert!(accepted.is_read_closed());
     assert_eq!(pair.server.stats().active_streams.peer_uni, 0);
 
-    let (stream, n) = pair
+    let stream = pair
         .client
         .open_uni_and_send(zmux::OpenSend::new(b"hello uni"))
         .await
         .unwrap();
-    assert_eq!(n, 9);
     let accepted = pair
         .server
         .accept_uni_stream_timeout(STREAM_TIMEOUT)
@@ -546,12 +540,11 @@ async fn uni_open_accept_round_trips_payload_and_empty_final() {
     assert_eq!(read_all_recv(&accepted).await, b"hello uni");
     drop(stream);
 
-    let (_empty, n) = pair
+    let _empty = pair
         .client
         .open_uni_and_send(zmux::OpenSend::new(b""))
         .await
         .unwrap();
-    assert_eq!(n, 0);
     let accepted = pair
         .server
         .accept_uni_stream_timeout(STREAM_TIMEOUT)
@@ -782,12 +775,11 @@ async fn zero_length_write_does_not_submit_adapter_prelude() {
 #[tokio::test]
 async fn open_and_send_empty_payload_does_not_submit_adapter_prelude() {
     let pair = Pair::new().await;
-    let (stream, written) = pair
+    let stream = pair
         .client
         .open_and_send(zmux::OpenSend::new(b""))
         .await
         .unwrap();
-    assert_eq!(written, 0);
 
     let err = match pair.server.accept_stream_timeout(SHORT_TIMEOUT).await {
         Ok(_) => panic!("empty open_and_send published a stream before payload"),

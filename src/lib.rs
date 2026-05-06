@@ -25,8 +25,8 @@ mod tlv;
 mod varint;
 
 pub use api::{
-    closed_session, join_streams, BoxDuplexStream, BoxRecvStream, BoxSendStream, BoxSession,
-    ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
+    box_session, closed_session, join_streams, BoxDuplexStream, BoxRecvStream, BoxSendStream,
+    BoxSession, ClosedSession, DuplexInfoSide, DuplexStream, DuplexStreamHandle,
     PausedNativeHalf as PausedHalf, PausedNativeRecvHalf as PausedRecvHalf,
     PausedNativeSendHalf as PausedSendHalf, RecvStreamHandle, SendStreamHandle, Session,
     StreamHandle,
@@ -38,8 +38,7 @@ pub use async_api::{
     BoxAsyncSession, ClosedAsyncSession, PausedAsyncHalf, PausedAsyncRecvHalf, PausedAsyncSendHalf,
 };
 pub use config::{
-    configure_default_config, default_config, reset_default_config, Config, OpenOptions,
-    DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES,
+    Config, OpenOptions, DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES,
     DEFAULT_PREFACE_PADDING_MAX_BYTES, DEFAULT_PREFACE_PADDING_MIN_BYTES,
 };
 pub use conformance::{
@@ -92,11 +91,11 @@ pub use protocol::{
     SETTING_PREFACE_PADDING, SETTING_SCHEDULER_HINTS,
 };
 pub use session::{
-    AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn, DiagnosticStats, DuplexConnection,
-    DuplexTransport, DuplexTransportControl, FlushStats, HiddenStateStats, LivenessStats,
-    MemoryStats, PeerCloseError, PeerGoAwayError, PressureStats, ProgressStats, ProvisionalStats,
-    ReasonStats, RecvStream, RetentionStats, SendStream, SessionState, SessionStats, Stream,
-    TelemetryStats, WriterQueueStats,
+    duplex_io, try_duplex_io, AbuseStats, AcceptBacklogStats, ActiveStreamStats, Conn,
+    DiagnosticStats, DuplexConnection, DuplexIo, DuplexTransport, DuplexTransportControl,
+    FlushStats, HiddenStateStats, LivenessStats, MemoryStats, PeerCloseError, PeerGoAwayError,
+    PressureStats, ProgressStats, ProvisionalStats, ReasonStats, RecvStream, RetentionStats,
+    SendStream, SessionState, SessionStats, Stream, TelemetryStats, WriterQueueStats,
 };
 pub use settings::{
     default_settings, marshal_settings_tlv, parse_settings_tlv, SchedulerHint, Settings,

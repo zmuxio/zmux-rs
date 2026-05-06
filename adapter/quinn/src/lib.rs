@@ -1,9 +1,9 @@
 //! Optional QUIC adapter support for zmux.
 //!
 //! This crate is intentionally separate from the core `zmux` crate so normal
-//! users of native ZMux do not compile or import QUIC dependencies. The first
-//! shared piece is the adapter stream prelude used by the Go and Java QUIC
-//! adapters: `varint(metadata_len) + STREAM-METADATA-TLV...`.
+//! users of native ZMux do not compile or import QUIC dependencies. Adapter
+//! streams start with `varint(metadata_len) + STREAM-METADATA-TLV...` when
+//! open-time metadata is present.
 //!
 //! Mapping rules:
 //! - bidirectional and unidirectional open / accept map directly to QUIC
@@ -71,11 +71,7 @@ pub fn target_suites() -> &'static [zmux::ConformanceSuite] {
     &[zmux::ConformanceSuite::StreamAdapterProfile]
 }
 
-/// Returns the process-wide default accepted prelude parsing concurrency.
-///
-/// `SessionOptions::default()` follows this value until a session explicitly
-/// sets `accepted_prelude_max_concurrent`.
-pub fn default_accepted_prelude_max_concurrent() -> usize {
+fn default_accepted_prelude_max_concurrent() -> usize {
     let current = DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT_VALUE.load(Ordering::Acquire);
     if current > 0 {
         current.min(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT)
@@ -84,11 +80,7 @@ pub fn default_accepted_prelude_max_concurrent() -> usize {
     }
 }
 
-/// Updates the process-wide accepted prelude parsing concurrency default.
-///
-/// Values above `MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT` are clamped. Passing zero
-/// restores the built-in `DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT` value.
-pub fn set_default_accepted_prelude_max_concurrent(max: usize) {
+fn set_default_accepted_prelude_max_concurrent(max: usize) {
     let max = if max == 0 {
         DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
     } else {
@@ -151,6 +143,23 @@ pub struct SessionOptions {
 }
 
 impl SessionOptions {
+    /// Returns the process-wide default accepted prelude parsing concurrency.
+    ///
+    /// `SessionOptions::default()` follows this value until a session explicitly
+    /// sets `accepted_prelude_max_concurrent`.
+    pub fn default_accepted_prelude_max_concurrent() -> usize {
+        default_accepted_prelude_max_concurrent()
+    }
+
+    /// Updates the process-wide accepted prelude parsing concurrency default.
+    ///
+    /// Values above `MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT` are clamped. Passing
+    /// zero restores the built-in `DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT`
+    /// value.
+    pub fn set_default_accepted_prelude_max_concurrent(max: usize) {
+        set_default_accepted_prelude_max_concurrent(max);
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -495,7 +504,7 @@ impl QuinnSession {
             self.peer_addr,
         );
         if let Err(err) = stream.maybe_send_open_prelude_on_open().await {
-            stream.discard_after_open_error().await;
+            stream.discard_after_open_error(&err).await;
             return Err(err);
         }
         self.stats.note_open_latency(started_at, Instant::now());
@@ -534,17 +543,14 @@ impl QuinnSession {
             self.peer_addr,
         );
         if let Err(err) = stream.maybe_send_open_prelude_on_open().await {
-            stream.discard_after_open_error().await;
+            stream.discard_after_open_error(&err).await;
             return Err(err);
         }
         self.stats.note_open_latency(started_at, Instant::now());
         Ok(stream.with_active(self.active.clone(), ActiveKind::LocalUni))
     }
 
-    pub async fn open_and_send<'a>(
-        &self,
-        request: impl Into<OpenSend<'a>>,
-    ) -> Result<(QuinnStream, usize)> {
+    pub async fn open_and_send<'a>(&self, request: impl Into<OpenSend<'a>>) -> Result<QuinnStream> {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
@@ -558,36 +564,42 @@ impl QuinnSession {
             .await
             .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
         if requested == 0 {
-            return Ok((stream, 0));
+            return Ok(stream);
         }
-        let timeout = timeout
-            .map(|timeout| remaining_write_timeout(start, timeout))
-            .transpose()?;
-        let n = match timeout {
-            Some(timeout) => {
-                stream
-                    .write_all_timeout(payload, timeout)
-                    .await
-                    .map_err(|err| {
-                        err.with_stream_context(
-                            zmux::ErrorOperation::Write,
-                            zmux::ErrorDirection::Write,
-                        )
-                    })?;
-                requested
+        let write_result: Result<()> = async {
+            let timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            match timeout {
+                Some(timeout) => {
+                    stream
+                        .write_all_timeout(payload, timeout)
+                        .await
+                        .map_err(|err| {
+                            err.with_stream_context(
+                                zmux::ErrorOperation::Write,
+                                zmux::ErrorDirection::Write,
+                            )
+                        })?;
+                }
+                None => {
+                    stream.write_all(payload).await?;
+                }
             }
-            None => {
-                stream.write_all(payload).await?;
-                requested
-            }
-        };
-        Ok((stream, validate_progress(n, requested)?))
+            Ok(())
+        }
+        .await;
+        if let Err(err) = write_result {
+            stream.discard_after_open_error(&err).await;
+            return Err(err);
+        }
+        Ok(stream)
     }
 
     pub async fn open_uni_and_send<'a>(
         &self,
         request: impl Into<OpenSend<'a>>,
-    ) -> Result<(QuinnSendStream, usize)> {
+    ) -> Result<QuinnSendStream> {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
@@ -600,34 +612,43 @@ impl QuinnSession {
             .open_uni_stream_with(open)
             .await
             .map_err(|err| err.with_session_context(zmux::ErrorOperation::Open))?;
-        let timeout = timeout
-            .map(|timeout| remaining_write_timeout(start, timeout))
-            .transpose()?;
-        let n = match (payload, timeout) {
-            (WritePayload::Bytes(data), Some(timeout)) => stream
-                .write_final_timeout(WritePayload::Bytes(data), timeout)
-                .await
-                .map_err(|err| {
-                    err.with_stream_context(
-                        zmux::ErrorOperation::Write,
-                        zmux::ErrorDirection::Write,
-                    )
-                })?,
-            (WritePayload::Bytes(data), None) => {
-                stream.write_final(WritePayload::Bytes(data)).await?
-            }
-            (WritePayload::Vectored(parts), Some(timeout)) => stream
-                .write_vectored_final_timeout(parts, timeout)
-                .await
-                .map_err(|err| {
-                    err.with_stream_context(
-                        zmux::ErrorOperation::Write,
-                        zmux::ErrorDirection::Write,
-                    )
-                })?,
-            (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts).await?,
-        };
-        Ok((stream, validate_progress(n, requested)?))
+        let write_result: Result<()> = async {
+            let timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            let n = match (payload, timeout) {
+                (WritePayload::Bytes(data), Some(timeout)) => stream
+                    .write_final_timeout(WritePayload::Bytes(data), timeout)
+                    .await
+                    .map_err(|err| {
+                        err.with_stream_context(
+                            zmux::ErrorOperation::Write,
+                            zmux::ErrorDirection::Write,
+                        )
+                    })?,
+                (WritePayload::Bytes(data), None) => {
+                    stream.write_final(WritePayload::Bytes(data)).await?
+                }
+                (WritePayload::Vectored(parts), Some(timeout)) => stream
+                    .write_vectored_final_timeout(parts, timeout)
+                    .await
+                    .map_err(|err| {
+                        err.with_stream_context(
+                            zmux::ErrorOperation::Write,
+                            zmux::ErrorDirection::Write,
+                        )
+                    })?,
+                (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts).await?,
+            };
+            validate_progress(n, requested)?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = write_result {
+            stream.discard_after_open_error(&err).await;
+            return Err(err);
+        }
+        Ok(stream)
     }
 
     fn close_now(&self, code: quinn::VarInt, reason: &[u8]) {
@@ -2144,8 +2165,8 @@ impl QuinnStream {
         ensure_open_prelude(&self.prelude, &mut send, &self.stats).await
     }
 
-    async fn discard_after_open_error(&self) {
-        let code = quinn_varint(zmux::ErrorCode::Internal.as_u64());
+    async fn discard_after_open_error(&self, err: &zmux::Error) {
+        let code = open_error_cleanup_code(err);
         {
             let mut recv = self.recv.lock().await;
             let _ = recv.stop(code);
@@ -2634,8 +2655,8 @@ impl QuinnSendStream {
         ensure_open_prelude(&self.prelude, &mut send, &self.stats).await
     }
 
-    async fn discard_after_open_error(&self) {
-        let code = quinn_varint(zmux::ErrorCode::Internal.as_u64());
+    async fn discard_after_open_error(&self, err: &zmux::Error) {
+        let code = open_error_cleanup_code(err);
         let mut send = self.send.lock().await;
         let _ = send.reset(code);
         drop(send);
@@ -3441,14 +3462,14 @@ impl AsyncSession for QuinnSession {
     fn open_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
         Box::pin(async move { QuinnSession::open_and_send(self, request).await })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
         Box::pin(async move { QuinnSession::open_uni_and_send(self, request).await })
     }
 
@@ -3786,14 +3807,14 @@ fn total_bytes(lengths: impl IntoIterator<Item = usize>) -> Result<usize> {
     })
 }
 
-fn validate_progress(n: usize, requested: usize) -> Result<usize> {
+fn validate_progress(n: usize, requested: usize) -> Result<()> {
     if n > requested {
         Err(
             zmux::Error::local("zmux-quinn: write reported invalid progress")
                 .with_stream_context(zmux::ErrorOperation::Write, zmux::ErrorDirection::Write),
         )
     } else {
-        Ok(n)
+        Ok(())
     }
 }
 
@@ -3868,6 +3889,13 @@ fn quinn_stream_id(id: quinn::StreamId) -> u64 {
 
 fn quinn_varint(value: u64) -> quinn::VarInt {
     quinn::VarInt::from_u64(value).unwrap_or(quinn::VarInt::MAX)
+}
+
+fn open_error_cleanup_code(err: &zmux::Error) -> quinn::VarInt {
+    quinn_varint(
+        err.numeric_code()
+            .unwrap_or(zmux::ErrorCode::Cancelled.as_u64()),
+    )
 }
 
 fn checked_quinn_varint(
@@ -4127,26 +4155,28 @@ mod tests {
 
     #[test]
     fn session_option_defaults_match_go_adapter_bounds() {
-        let previous_default = default_accepted_prelude_max_concurrent();
-        set_default_accepted_prelude_max_concurrent(0);
+        let previous_default = SessionOptions::default_accepted_prelude_max_concurrent();
+        SessionOptions::set_default_accepted_prelude_max_concurrent(0);
         assert_eq!(
             normalize_accepted_prelude_max_concurrent(None),
             DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
         );
         assert_eq!(
-            default_accepted_prelude_max_concurrent(),
+            SessionOptions::default_accepted_prelude_max_concurrent(),
             DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT
         );
-        set_default_accepted_prelude_max_concurrent(5);
-        assert_eq!(default_accepted_prelude_max_concurrent(), 5);
+        SessionOptions::set_default_accepted_prelude_max_concurrent(5);
+        assert_eq!(SessionOptions::default_accepted_prelude_max_concurrent(), 5);
         assert_eq!(normalize_accepted_prelude_max_concurrent(None), 5);
         assert_eq!(normalize_accepted_prelude_max_concurrent(Some(0)), 5);
-        set_default_accepted_prelude_max_concurrent(MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT + 1);
+        SessionOptions::set_default_accepted_prelude_max_concurrent(
+            MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT + 1,
+        );
         assert_eq!(
-            default_accepted_prelude_max_concurrent(),
+            SessionOptions::default_accepted_prelude_max_concurrent(),
             MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT
         );
-        set_default_accepted_prelude_max_concurrent(previous_default);
+        SessionOptions::set_default_accepted_prelude_max_concurrent(previous_default);
         assert_eq!(
             normalize_accepted_prelude_read_timeout(SessionOptions::default()),
             Some(DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT)

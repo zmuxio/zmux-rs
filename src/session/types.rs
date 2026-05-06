@@ -117,7 +117,7 @@ pub struct PeerGoAwayError {
 ///
 /// `Conn` uses these hooks during session establishment and when the runtime
 /// needs to wake or close the underlying transport. Implement only the hooks
-/// your transport can support; the timeout hooks default to no-ops.
+/// your transport can support; every hook defaults to a no-op.
 pub trait DuplexTransportControl: Send + Sync {
     fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
         Ok(())
@@ -127,7 +127,9 @@ pub trait DuplexTransportControl: Send + Sync {
         Ok(())
     }
 
-    fn close(&self) -> io::Result<()>;
+    fn close(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct TcpDuplexTransportControl {
@@ -170,6 +172,7 @@ where
 
 struct CloseFnTransportControl<F> {
     close: F,
+    timeout_control: Option<Arc<dyn DuplexTransportControl>>,
 }
 
 impl<F> DuplexTransportControl for CloseFnTransportControl<F>
@@ -177,9 +180,76 @@ where
     F: Fn() -> io::Result<()> + Send + Sync,
 {
     #[inline]
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match &self.timeout_control {
+            Some(control) => control.set_read_timeout(timeout),
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match &self.timeout_control {
+            Some(control) => control.set_write_timeout(timeout),
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
     fn close(&self) -> io::Result<()> {
         (self.close)()
     }
+}
+
+/// A cloneable full-duplex byte stream accepted by `Conn`.
+///
+/// Use `duplex_io(io)` when a reliable connection object can cheaply create an
+/// independent handle with `Clone`. This keeps the normal connection case out
+/// of `join_streams(...)`, which is meant for already-separated read/write
+/// stream halves.
+#[derive(Debug, Clone)]
+pub struct DuplexIo<T> {
+    io: T,
+}
+
+impl<T> DuplexIo<T> {
+    /// Wraps a cloneable full-duplex I/O object.
+    #[inline]
+    #[must_use]
+    pub fn new(io: T) -> Self {
+        Self { io }
+    }
+
+    /// Returns the wrapped I/O object without building a session.
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.io
+    }
+}
+
+/// Wrap a cloneable full-duplex byte stream as a `DuplexConnection`.
+#[inline]
+#[must_use]
+pub fn duplex_io<T>(io: T) -> DuplexIo<T> {
+    DuplexIo::new(io)
+}
+
+/// Build a transport from a full-duplex byte stream with a custom clone
+/// operation.
+///
+/// Use this for reliable stream types that expose a `try_clone`-style method
+/// instead of implementing `Clone`. The cloned handle becomes the read half and
+/// the original handle becomes the write half.
+#[inline]
+pub fn try_duplex_io<T>(
+    io: T,
+    clone: impl FnOnce(&T) -> io::Result<T>,
+) -> Result<DuplexTransport<T, T>>
+where
+    T: Read + Write + Send + 'static,
+{
+    let reader = clone(&io).map_err(Error::from)?;
+    Ok(DuplexTransport::new(reader, io))
 }
 
 /// Owned split transport plus optional connection metadata for `Conn`.
@@ -254,15 +324,21 @@ impl<R, W> DuplexTransport<R, W> {
 
     /// Installs a close hook for the underlying connection resource.
     ///
-    /// `Conn::close` calls this hook before tearing down the ZMux session, so a
-    /// joined or split transport can still shut down its original connection.
+    /// `Conn` calls this hook on establishment failure and when the writer
+    /// exits after session shutdown, so a joined or split transport can still
+    /// shut down its original connection.
     #[inline]
     #[must_use]
-    pub fn with_close_fn<F>(self, close: F) -> Self
+    pub fn with_close_fn<F>(mut self, close: F) -> Self
     where
         F: Fn() -> io::Result<()> + Send + Sync + 'static,
     {
-        self.with_control(CloseFnTransportControl { close })
+        let timeout_control = self.control.take();
+        self.control = Some(Arc::new(CloseFnTransportControl {
+            close,
+            timeout_control,
+        }));
+        self
     }
 
     /// Returns the configured local address, when known.
@@ -335,59 +411,39 @@ impl<R, W> DuplexTransport<R, W> {
     }
 }
 
-impl DuplexTransport<(), ()> {
-    /// Builds a transport by cloning a single reliable duplex I/O object into
-    /// independent read and write handles.
-    ///
-    /// Use this only when `Clone` creates another handle that can read and
-    /// write concurrently with the original handle. If the clone just shares
-    /// one blocking mutex internally, prefer the transport's real split API or
-    /// an async adapter.
-    #[inline]
-    #[must_use]
-    pub fn from_cloneable<T>(io: T) -> DuplexTransport<T, T>
-    where
-        T: Clone + Read + Write + Send + 'static,
-    {
-        let reader = io.clone();
-        DuplexTransport::new(reader, io)
-    }
-
-    /// Builds a transport by using a transport-specific clone operation.
-    ///
-    /// This is useful for reliable stream types that do not implement `Clone`
-    /// but expose a `try_clone`-style API. The cloned value becomes the read
-    /// half and the original value becomes the write half.
-    #[inline]
-    pub fn try_clone_with<T>(
-        io: T,
-        clone: impl FnOnce(&T) -> io::Result<T>,
-    ) -> Result<DuplexTransport<T, T>>
-    where
-        T: Read + Write + Send + 'static,
-    {
-        let reader = clone(&io).map_err(Error::from)?;
-        Ok(DuplexTransport::new(reader, io))
-    }
-}
-
 /// Reliable blocking duplex connection accepted by `Conn`.
 ///
-/// Rust's standard library has `Read` and `Write`, but no single trait like
-/// Go's `net.Conn` that also promises connection cloning, splitting, timeout
-/// control, and full-resource close semantics. ZMux uses this trait for that
-/// boundary. Implement it for reliable byte streams that can become
-/// independent blocking read/write handles.
+/// `Read` and `Write` describe byte operations, but they do not describe how a
+/// connection is split, how timeout control is applied, or how the complete
+/// underlying resource is closed. ZMux uses this trait for that boundary.
+/// Implement it for reliable byte streams that can become independent blocking
+/// read/write handles.
 ///
-/// Implementations are provided for `TcpStream`, `(reader, writer)`, and
-/// `DuplexTransport`. Use `DuplexTransport` from custom implementations when a
-/// transport needs addresses, timeout hooks, a close hook, or a clone-based
-/// split.
+/// Implementations are provided for `TcpStream`, `(reader, writer)`, native
+/// bidirectional streams, joined stream halves, boxed connections,
+/// `DuplexIo`, and `DuplexTransport`. Use `duplex_io(...)` for cloneable normal
+/// connection objects, `try_duplex_io(...)` for `try_clone`-style objects, and
+/// `DuplexTransport` when a transport needs addresses, timeout hooks, a close
+/// hook, or already split halves.
 pub trait DuplexConnection: Send + 'static {
     type Reader: Read + Send + 'static;
     type Writer: Write + Send + 'static;
 
     fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>>;
+}
+
+impl<T> DuplexConnection for DuplexIo<T>
+where
+    T: Clone + Read + Write + Send + 'static,
+{
+    type Reader = T;
+    type Writer = T;
+
+    #[inline]
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        let reader = self.io.clone();
+        Ok(DuplexTransport::new(reader, self.io))
+    }
 }
 
 impl<R, W> DuplexConnection for DuplexTransport<R, W>

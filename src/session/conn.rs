@@ -786,7 +786,7 @@ impl Conn {
         Ok(SendStream { inner: stream })
     }
 
-    pub fn open_and_send<'a>(&self, request: impl Into<OpenSend<'a>>) -> Result<(Stream, usize)> {
+    pub fn open_and_send<'a>(&self, request: impl Into<OpenSend<'a>>) -> Result<Stream> {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
@@ -796,36 +796,37 @@ impl Conn {
         }
         let stream = self.open_stream_with(open)?;
         if requested == 0 {
-            return Ok((stream, 0));
+            return Ok(stream);
         }
-        let timeout = timeout
-            .map(|timeout| remaining_open_send_write_timeout(start, timeout))
-            .transpose()?;
-        let n = match (payload, timeout) {
-            (WritePayload::Bytes(data), Some(timeout)) => {
-                stream.write_all_timeout(WritePayload::Bytes(data), timeout)?;
-                requested
+        let write_result: Result<()> = (|| {
+            let timeout = timeout
+                .map(|timeout| remaining_open_send_write_timeout(start, timeout))
+                .transpose()?;
+            match (payload, timeout) {
+                (WritePayload::Bytes(data), Some(timeout)) => {
+                    stream.write_all_timeout(WritePayload::Bytes(data), timeout)?;
+                }
+                (WritePayload::Bytes(data), None) => {
+                    stream.write_all(WritePayload::Bytes(data))?;
+                }
+                (WritePayload::Vectored(parts), Some(timeout)) => {
+                    stream.write_all_timeout(WritePayload::Vectored(parts), timeout)?;
+                }
+                (WritePayload::Vectored(parts), None) => {
+                    stream.write_all(WritePayload::Vectored(parts))?;
+                }
             }
-            (WritePayload::Bytes(data), None) => {
-                stream.write_all(WritePayload::Bytes(data))?;
-                requested
-            }
-            (WritePayload::Vectored(parts), Some(timeout)) => {
-                stream.write_all_timeout(WritePayload::Vectored(parts), timeout)?;
-                requested
-            }
-            (WritePayload::Vectored(parts), None) => {
-                stream.write_all(WritePayload::Vectored(parts))?;
-                requested
-            }
-        };
-        Ok((stream, validate_open_send_progress(n, requested)?))
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+            let _ = stream.close_with_error(code, "open_and_send failed");
+            return Err(err);
+        }
+        Ok(stream)
     }
 
-    pub fn open_uni_and_send<'a>(
-        &self,
-        request: impl Into<OpenSend<'a>>,
-    ) -> Result<(SendStream, usize)> {
+    pub fn open_uni_and_send<'a>(&self, request: impl Into<OpenSend<'a>>) -> Result<SendStream> {
         let (opts, payload, timeout) = request.into().into_parts();
         let requested = payload.checked_len()?;
         let start = Instant::now();
@@ -834,20 +835,31 @@ impl Conn {
             open = open.timeout(timeout);
         }
         let stream = self.open_uni_stream_with(open)?;
-        let timeout = timeout
-            .map(|timeout| remaining_open_send_write_timeout(start, timeout))
-            .transpose()?;
-        let n = match (payload, timeout) {
-            (WritePayload::Bytes(data), Some(timeout)) => {
-                stream.write_final_timeout(WritePayload::Bytes(data), timeout)?
-            }
-            (WritePayload::Bytes(data), None) => stream.write_final(WritePayload::Bytes(data))?,
-            (WritePayload::Vectored(parts), Some(timeout)) => {
-                stream.write_vectored_final_timeout(parts, timeout)?
-            }
-            (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts)?,
-        };
-        Ok((stream, validate_open_send_progress(n, requested)?))
+        let write_result: Result<()> = (|| {
+            let timeout = timeout
+                .map(|timeout| remaining_open_send_write_timeout(start, timeout))
+                .transpose()?;
+            let n = match (payload, timeout) {
+                (WritePayload::Bytes(data), Some(timeout)) => {
+                    stream.write_final_timeout(WritePayload::Bytes(data), timeout)?
+                }
+                (WritePayload::Bytes(data), None) => {
+                    stream.write_final(WritePayload::Bytes(data))?
+                }
+                (WritePayload::Vectored(parts), Some(timeout)) => {
+                    stream.write_vectored_final_timeout(parts, timeout)?
+                }
+                (WritePayload::Vectored(parts), None) => stream.write_vectored_final(parts)?,
+            };
+            validate_open_send_progress(n, requested)?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+            let _ = stream.close_with_error(code, "open_uni_and_send failed");
+            return Err(err);
+        }
+        Ok(stream)
     }
 
     fn open_stream_inner(&self, bidi: bool, opts: OpenOptions) -> Result<Arc<StreamInner>> {
@@ -2330,12 +2342,12 @@ fn remaining_open_send_write_timeout(start: Instant, timeout: Duration) -> Resul
         })
 }
 
-fn validate_open_send_progress(n: usize, requested: usize) -> Result<usize> {
+fn validate_open_send_progress(n: usize, requested: usize) -> Result<()> {
     if n > requested {
         Err(Error::local("zmux: write reported invalid progress")
             .with_stream_context(ErrorOperation::Write, ErrorDirection::Write))
     } else {
-        Ok(n)
+        Ok(())
     }
 }
 

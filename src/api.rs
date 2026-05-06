@@ -1,4 +1,4 @@
-use crate::error::{Error, ErrorDirection, ErrorOperation, Result};
+use crate::error::{Error, ErrorCode, ErrorDirection, ErrorOperation, Result};
 use crate::open_send::{OpenRequest, OpenSend, WritePayload};
 use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::preface::{Negotiated, Preface};
@@ -8,6 +8,7 @@ use crate::session::{
     SendStream, SessionState, SessionStats, Stream,
 };
 use crate::settings::{SchedulerHint, Settings};
+use std::any::Any;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::{self, size_of_val};
 use std::net::SocketAddr;
@@ -50,6 +51,15 @@ pub type BoxRecvStream = Box<dyn RecvStreamHandle>;
 
 /// Boxed native blocking session trait object.
 pub type BoxSession = Box<dyn Session>;
+
+/// Box a blocking session as the stable native session trait object.
+#[must_use]
+pub fn box_session<S>(session: S) -> BoxSession
+where
+    S: Session + 'static,
+{
+    Box::new(session)
+}
 
 pub trait StreamHandle: Send + Sync {
     fn stream_id(&self) -> u64;
@@ -233,9 +243,14 @@ pub enum DuplexInfoSide {
 
 /// Bidirectional stream view backed by one receive-only half and one send-only half.
 ///
-/// When both halves are ZMux stream handles, this view is also a
-/// `DuplexConnection`, so it can be used as the reliable byte transport for a
-/// nested native `Conn`.
+/// When the receive half implements `Read` and the send half implements
+/// `Write`, this view is also a `DuplexConnection`, so it can be used as the
+/// reliable byte transport for a nested native `Conn`. When both halves are
+/// ZMux stream handles, the joined view also exposes the stable stream handle
+/// traits. A generic transport close uses native ZMux close semantics for
+/// known ZMux stream halves and otherwise detaches and drops generic halves;
+/// use an explicit `DuplexTransport` close hook when another resource needs a
+/// protocol-level shutdown operation.
 pub struct DuplexStream<R, W> {
     recv: Arc<NativeJoinedHalf<R>>,
     send: Arc<NativeJoinedHalf<W>>,
@@ -265,6 +280,8 @@ struct NativeJoinedHalfState<T> {
     paused: bool,
     active_ops: usize,
     closed: bool,
+    transport_closing: bool,
+    transport_close: fn(T),
     deadline: Option<Instant>,
     deadline_generation: u64,
     deadline_applied_generation: u64,
@@ -309,6 +326,8 @@ impl<T> NativeJoinedHalf<T> {
                 paused: false,
                 active_ops: 0,
                 closed: false,
+                transport_closing: false,
+                transport_close: drop_transport_half::<T>,
                 deadline: None,
                 deadline_generation: 0,
                 deadline_applied_generation: 0,
@@ -530,6 +549,32 @@ impl<T> NativeJoinedHalf<T> {
         current
     }
 
+    fn close_detached_for_transport_nowait(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        state.closed = true;
+        state.paused = false;
+        state.transport_closing = true;
+        let close = state.transport_close;
+        let current = if state.active_ops == 0 {
+            state.current.take()
+        } else {
+            None
+        };
+        drop(state);
+        self.changed.notify_all();
+        if let Some(current) = current {
+            close(current);
+        }
+    }
+
+    fn set_transport_close(&self, close: fn(T)) {
+        let mut state = self.state.lock().unwrap();
+        state.transport_close = close;
+    }
+
     fn into_current(self: Arc<Self>) -> Option<T> {
         Arc::try_unwrap(self)
             .ok()
@@ -588,7 +633,14 @@ impl<T> NativeJoinedHalf<T> {
                 drop(state);
                 continue;
             }
-            if state.current.is_none() {
+            let close_current = if state.closed && state.transport_closing {
+                Some(state.transport_close)
+            } else {
+                None
+            };
+            if close_current.is_none() && state.closed {
+                drop(current.take());
+            } else if state.current.is_none() {
                 state.current = current.take();
             }
             if state.active_ops > 0 {
@@ -596,6 +648,9 @@ impl<T> NativeJoinedHalf<T> {
             }
             drop(state);
             self.changed.notify_all();
+            if let (Some(close), Some(current)) = (close_current, current.take()) {
+                close(current);
+            }
             return deadline_result;
         }
     }
@@ -673,7 +728,14 @@ impl<T> Drop for ActiveNativeHalf<T> {
                 state = self.owner.state.lock().unwrap();
                 continue;
             }
-            if state.current.is_none() {
+            let close_current = if state.closed && state.transport_closing {
+                Some(state.transport_close)
+            } else {
+                None
+            };
+            if close_current.is_none() && state.closed {
+                drop(current.take());
+            } else if state.current.is_none() {
                 state.current = current.take();
             }
             if state.active_ops > 0 {
@@ -681,6 +743,9 @@ impl<T> Drop for ActiveNativeHalf<T> {
             }
             drop(state);
             self.owner.changed.notify_all();
+            if let (Some(close), Some(current)) = (close_current, current.take()) {
+                close(current);
+            }
             return;
         }
     }
@@ -757,6 +822,29 @@ fn same_close_identity(first: *const (), second: *const ()) -> bool {
     !first.is_null() && first == second
 }
 
+fn drop_transport_half<T>(_half: T) {}
+
+fn close_known_transport_half<T: Any>(half: T) {
+    let boxed: Box<dyn Any> = Box::new(half);
+    let boxed = match boxed.downcast::<Stream>() {
+        Ok(stream) => {
+            let _ = stream.close();
+            return;
+        }
+        Err(boxed) => boxed,
+    };
+    let boxed = match boxed.downcast::<SendStream>() {
+        Ok(stream) => {
+            let _ = stream.close();
+            return;
+        }
+        Err(boxed) => boxed,
+    };
+    if let Ok(stream) = boxed.downcast::<RecvStream>() {
+        let _ = stream.close();
+    }
+}
+
 fn validate_read_progress(n: usize, requested: usize) -> Result<usize> {
     if n > requested {
         Err(invalid_read_progress_error())
@@ -809,13 +897,13 @@ fn write_open_payload_native<S>(
     timeout: Option<Duration>,
     fin: bool,
     skip_empty: bool,
-) -> Result<usize>
+) -> Result<()>
 where
     S: SendStreamHandle + ?Sized,
 {
     let requested = payload.checked_len()?;
     if skip_empty && requested == 0 {
-        return Ok(0);
+        return Ok(());
     }
     let n = match (payload, timeout, fin) {
         (payload, Some(timeout), false) => {
@@ -829,7 +917,8 @@ where
         }
         (payload, None, true) => stream.write_final(payload)?,
     };
-    validate_write_progress(n, requested)
+    validate_write_progress(n, requested)?;
+    Ok(())
 }
 
 fn validate_io_read_progress(n: usize, requested: usize) -> io::Result<usize> {
@@ -990,6 +1079,14 @@ impl<R, W> DuplexStream<R, W> {
         (self.recv.into_current(), self.send.into_current())
     }
 
+    fn detach_halves_for_transport_close(&self) {
+        // This hook may run while Conn's reader thread is blocked inside the
+        // receive half. Mark both sides closed without waiting; the active half
+        // is closed or dropped when that operation returns.
+        self.send.close_detached_for_transport_nowait();
+        self.recv.close_detached_for_transport_nowait();
+    }
+
     pub fn pause_read(&self) -> Result<PausedNativeRecvHalf<R>> {
         self.pause_read_timeout_option(None)
     }
@@ -1059,16 +1156,24 @@ where
     }
 }
 
+/// Join one receive-capable stream half and one send-capable stream half into
+/// a bidirectional stream view.
+///
+/// This is intended for already-separated directions, including two
+/// unidirectional streams or halves from different adapters. Use `duplex_io` or
+/// `try_duplex_io` for ordinary full-duplex connection objects.
+///
+/// When the joined value is used as a generic `DuplexConnection`, transport
+/// shutdown uses native ZMux close semantics for known ZMux stream halves and
+/// otherwise detaches and drops generic halves. Wrap the resulting transport
+/// with `with_close_fn(...)` when another whole-resource shutdown hook is
+/// required.
 #[must_use]
 pub fn join_streams<R, W>(recv: R, send: W) -> DuplexStream<R, W> {
     DuplexStream::new(recv, send)
 }
 
-impl<R, W> DuplexConnection for DuplexStream<R, W>
-where
-    R: RecvStreamHandle + 'static,
-    W: SendStreamHandle + 'static,
-{
+impl DuplexConnection for Stream {
     type Reader = Self;
     type Writer = Self;
 
@@ -1077,6 +1182,38 @@ where
         let close_handle = self.clone();
         Ok(DuplexTransport::new(reader, self)
             .with_close_fn(move || close_handle.close().map_err(io::Error::other)))
+    }
+}
+
+impl<R, W> DuplexConnection for DuplexStream<R, W>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    type Reader = Self;
+    type Writer = Self;
+
+    fn into_transport(self) -> Result<DuplexTransport<Self::Reader, Self::Writer>> {
+        if !self.recv.with_current_or(false, |_| true) {
+            return Err(Error::local(
+                "zmux: duplex connection is missing a read half",
+            ));
+        }
+        if !self.send.with_current_or(false, |_| true) {
+            return Err(Error::local(
+                "zmux: duplex connection is missing a write half",
+            ));
+        }
+        self.recv
+            .set_transport_close(close_known_transport_half::<R>);
+        self.send
+            .set_transport_close(close_known_transport_half::<W>);
+        let reader = self.clone();
+        let close_handle = self.clone();
+        Ok(DuplexTransport::new(reader, self).with_close_fn(move || {
+            close_handle.detach_halves_for_transport_close();
+            Ok(())
+        }))
     }
 }
 
@@ -1545,7 +1682,7 @@ pub trait Session: Send + Sync {
     }
     fn open_stream_with(&self, request: OpenRequest) -> Result<BoxDuplexStream>;
     fn open_uni_stream_with(&self, request: OpenRequest) -> Result<BoxSendStream>;
-    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<BoxDuplexStream> {
         let (opts, payload, timeout) = request.into_parts();
         let start = Instant::now();
         let mut open = OpenRequest::new().options(opts);
@@ -1554,13 +1691,20 @@ pub trait Session: Send + Sync {
             open = open.timeout(timeout);
         }
         let mut stream = self.open_stream_with(open)?;
-        let write_timeout = timeout
-            .map(|timeout| remaining_write_timeout(start, timeout))
-            .transpose()?;
-        let n = write_open_payload_native(stream.as_mut(), payload, write_timeout, false, true)?;
-        Ok((stream, n))
+        let write_result: Result<()> = (|| {
+            let write_timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            write_open_payload_native(stream.as_mut(), payload, write_timeout, false, true)
+        })();
+        if let Err(err) = write_result {
+            let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+            let _ = stream.close_with_error(code, "open_and_send failed");
+            return Err(err);
+        }
+        Ok(stream)
     }
-    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<BoxSendStream> {
         let (opts, payload, timeout) = request.into_parts();
         let start = Instant::now();
         let mut open = OpenRequest::new().options(opts);
@@ -1569,11 +1713,18 @@ pub trait Session: Send + Sync {
             open = open.timeout(timeout);
         }
         let mut stream = self.open_uni_stream_with(open)?;
-        let write_timeout = timeout
-            .map(|timeout| remaining_write_timeout(start, timeout))
-            .transpose()?;
-        let n = write_open_payload_native(stream.as_mut(), payload, write_timeout, true, false)?;
-        Ok((stream, n))
+        let write_result: Result<()> = (|| {
+            let write_timeout = timeout
+                .map(|timeout| remaining_write_timeout(start, timeout))
+                .transpose()?;
+            write_open_payload_native(stream.as_mut(), payload, write_timeout, true, false)
+        })();
+        if let Err(err) = write_result {
+            let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+            let _ = stream.close_with_error(code, "open_uni_and_send failed");
+            return Err(err);
+        }
+        Ok(stream)
     }
     fn ping(&self, echo: &[u8]) -> Result<Duration>;
     fn ping_timeout(&self, echo: &[u8], timeout: Duration) -> Result<Duration>;
@@ -1692,11 +1843,11 @@ impl Session for ClosedSession {
         closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
+    fn open_and_send(&self, _request: OpenSend<'_>) -> Result<BoxDuplexStream> {
         closed_session_result(ErrorOperation::Open)
     }
 
-    fn open_uni_and_send(&self, _request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+    fn open_uni_and_send(&self, _request: OpenSend<'_>) -> Result<BoxSendStream> {
         closed_session_result(ErrorOperation::Open)
     }
 
@@ -2117,11 +2268,11 @@ macro_rules! impl_session_forward {
                 (**self).open_uni_stream_with(request)
             }
 
-            fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
+            fn open_and_send(&self, request: OpenSend<'_>) -> Result<BoxDuplexStream> {
                 (**self).open_and_send(request)
             }
 
-            fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
+            fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<BoxSendStream> {
                 (**self).open_uni_and_send(request)
             }
 
@@ -2596,14 +2747,12 @@ impl Session for Conn {
         Ok(Box::new(Conn::open_uni_stream_with(self, request)?))
     }
 
-    fn open_and_send(&self, request: OpenSend<'_>) -> Result<(BoxDuplexStream, usize)> {
-        let (stream, n) = Conn::open_and_send(self, request)?;
-        Ok((Box::new(stream), n))
+    fn open_and_send(&self, request: OpenSend<'_>) -> Result<BoxDuplexStream> {
+        Ok(Box::new(Conn::open_and_send(self, request)?))
     }
 
-    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<(BoxSendStream, usize)> {
-        let (stream, n) = Conn::open_uni_and_send(self, request)?;
-        Ok((Box::new(stream), n))
+    fn open_uni_and_send(&self, request: OpenSend<'_>) -> Result<BoxSendStream> {
+        Ok(Box::new(Conn::open_uni_and_send(self, request)?))
     }
 
     fn ping(&self, echo: &[u8]) -> Result<Duration> {

@@ -1,5 +1,5 @@
 use crate::api::DuplexInfoSide;
-use crate::error::{Error, ErrorDirection, ErrorOperation, Result};
+use crate::error::{Error, ErrorCode, ErrorDirection, ErrorOperation, Result};
 use crate::open_send::{OpenRequest, OpenSend, WritePayload};
 use crate::payload::{MetadataUpdate, StreamMetadata};
 use crate::preface::{Negotiated, Preface};
@@ -460,7 +460,7 @@ pub trait AsyncSession: Send + Sync {
     fn open_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
         Box::pin(async move {
             let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
@@ -470,18 +470,26 @@ pub trait AsyncSession: Send + Sync {
                 open = open.timeout(timeout);
             }
             let stream = self.open_stream_with(open).await?;
-            let timeout = timeout
-                .map(|timeout| remaining_write_timeout(start, timeout))
-                .transpose()?;
-            let n = write_open_payload_async(&stream, payload, timeout, false, true).await?;
-            Ok((stream, n))
+            let write_result: Result<()> = async {
+                let timeout = timeout
+                    .map(|timeout| remaining_write_timeout(start, timeout))
+                    .transpose()?;
+                write_open_payload_async(&stream, payload, timeout, false, true).await
+            }
+            .await;
+            if let Err(err) = write_result {
+                let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+                let _ = stream.close_with_error(code, "open_and_send failed").await;
+                return Err(err);
+            }
+            Ok(stream)
         })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
         Box::pin(async move {
             let (opts, payload, timeout) = request.into_parts();
             let start = Instant::now();
@@ -491,11 +499,21 @@ pub trait AsyncSession: Send + Sync {
                 open = open.timeout(timeout);
             }
             let stream = self.open_uni_stream_with(open).await?;
-            let timeout = timeout
-                .map(|timeout| remaining_write_timeout(start, timeout))
-                .transpose()?;
-            let n = write_open_payload_async(&stream, payload, timeout, true, false).await?;
-            Ok((stream, n))
+            let write_result: Result<()> = async {
+                let timeout = timeout
+                    .map(|timeout| remaining_write_timeout(start, timeout))
+                    .transpose()?;
+                write_open_payload_async(&stream, payload, timeout, true, false).await
+            }
+            .await;
+            if let Err(err) = write_result {
+                let code = err.numeric_code().unwrap_or(ErrorCode::Cancelled.as_u64());
+                let _ = stream
+                    .close_with_error(code, "open_uni_and_send failed")
+                    .await;
+                return Err(err);
+            }
+            Ok(stream)
         })
     }
 
@@ -763,6 +781,11 @@ pub type PausedAsyncRecvHalf<R> = PausedAsyncHalf<R>;
 /// Detached send half handle for `AsyncDuplexStream`.
 pub type PausedAsyncSendHalf<W> = PausedAsyncHalf<W>;
 
+/// Join one async receive-capable stream half and one async send-capable stream
+/// half into a bidirectional stream view.
+///
+/// This is intended for already-separated directions, including two
+/// unidirectional streams or halves from different adapters.
 #[must_use]
 pub fn join_async_streams<R, W>(recv: R, send: W) -> AsyncDuplexStream<R, W> {
     AsyncDuplexStream::new(recv, send)
@@ -1249,13 +1272,13 @@ async fn write_open_payload_async<S>(
     timeout: Option<Duration>,
     fin: bool,
     skip_empty: bool,
-) -> Result<usize>
+) -> Result<()>
 where
     S: AsyncSendStreamHandle + ?Sized,
 {
     let requested = payload.checked_len()?;
     if skip_empty && requested == 0 {
-        return Ok(0);
+        return Ok(());
     }
     let n = match (payload, timeout, fin) {
         (payload, Some(timeout), false) => {
@@ -1283,7 +1306,8 @@ where
             stream.write_final(WritePayload::Vectored(parts)).await?
         }
     };
-    validate_write_progress(n, requested)
+    validate_write_progress(n, requested)?;
+    Ok(())
 }
 
 fn remaining_read_timeout(start: Instant, timeout: Duration) -> Result<Duration> {
@@ -2224,14 +2248,14 @@ macro_rules! impl_async_session_forward {
             fn open_and_send<'a>(
                 &'a self,
                 request: OpenSend<'a>,
-            ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+            ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
                 AsyncSession::open_and_send(&**self, request)
             }
 
             fn open_uni_and_send<'a>(
                 &'a self,
                 request: OpenSend<'a>,
-            ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+            ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
                 AsyncSession::open_uni_and_send(&**self, request)
             }
 
@@ -2402,20 +2426,20 @@ where
     fn open_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
         Box::pin(async move {
-            let (stream, n) = self.inner.open_and_send(request).await?;
-            Ok((Box::new(stream) as BoxAsyncDuplexStream, n))
+            let stream = self.inner.open_and_send(request).await?;
+            Ok(Box::new(stream) as BoxAsyncDuplexStream)
         })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
         Box::pin(async move {
-            let (stream, n) = self.inner.open_uni_and_send(request).await?;
-            Ok((Box::new(stream) as BoxAsyncSendStream, n))
+            let stream = self.inner.open_uni_and_send(request).await?;
+            Ok(Box::new(stream) as BoxAsyncSendStream)
         })
     }
 
@@ -2802,14 +2826,14 @@ impl AsyncSession for Conn {
     fn open_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::Stream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
         Box::pin(async move { Conn::open_and_send(self, request) })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
-    ) -> AsyncBoxFuture<'a, Result<(Self::SendStream, usize)>> {
+    ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
         Box::pin(async move { Conn::open_uni_and_send(self, request) })
     }
 
