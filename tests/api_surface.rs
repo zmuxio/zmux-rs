@@ -314,7 +314,7 @@ fn public_trait_object_surface_accepts_external_implementations() -> zmux::Resul
     stream.flush()?;
 
     let send: zmux::BoxSendStream = Box::new(DummyStream);
-    assert_eq!(send.write_final(b"fin")?, 3);
+    assert_eq!(send.write_final(zmux::WritePayload::from(&b"fin"[..]))?, 3);
     send.close_write()?;
 
     let recv: zmux::BoxRecvStream = Box::new(DummyStream);
@@ -806,7 +806,10 @@ fn public_join_helpers_build_full_stream_views_from_halves() -> zmux::Result<()>
     zmux::StreamHandle::set_timeout(&joined, Some(Duration::from_secs(1)))?;
     zmux::RecvStreamHandle::set_read_timeout(&joined, None)?;
     zmux::SendStreamHandle::set_write_timeout(&joined, Some(Duration::from_secs(1)))?;
-    assert_eq!(zmux::SendStreamHandle::write_final(&joined, b"fin")?, 3);
+    assert_eq!(
+        zmux::SendStreamHandle::write_final(&joined, zmux::WritePayload::from(&b"fin"[..]))?,
+        3
+    );
     zmux::StreamHandle::close(&joined)?;
 
     let joined = zmux::join_async_streams(DummyAsyncStream, DummyAsyncStream);
@@ -2256,16 +2259,20 @@ impl zmux::SendStreamHandle for DummyStream {
         self.write_vectored(parts)
     }
 
-    fn write_final(&self, src: &[u8]) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final<'a>(&self, payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
         self.write_vectored(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final_timeout<'a>(
+        &self,
+        payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final_timeout(
@@ -2412,7 +2419,7 @@ impl zmux::SendStreamHandle for InvalidProgressStream {
         Ok(self.write_n)
     }
 
-    fn write_final(&self, _src: &[u8]) -> zmux::Result<usize> {
+    fn write_final<'a>(&self, _payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
         Ok(self.write_n)
     }
 
@@ -2420,7 +2427,11 @@ impl zmux::SendStreamHandle for InvalidProgressStream {
         Ok(self.write_n)
     }
 
-    fn write_final_timeout(&self, _src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
+    fn write_final_timeout<'a>(
+        &self,
+        _payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
         Ok(self.write_n)
     }
 
@@ -2693,16 +2704,20 @@ impl zmux::SendStreamHandle for LabeledStream {
         self.write_vectored(parts)
     }
 
-    fn write_final(&self, src: &[u8]) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final<'a>(&self, payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
         self.write_vectored(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final_timeout<'a>(
+        &self,
+        payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final_timeout(
@@ -3466,16 +3481,20 @@ impl zmux::SendStreamHandle for DeadlineProbeStream {
         self.write_vectored(parts)
     }
 
-    fn write_final(&self, src: &[u8]) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final<'a>(&self, payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
         self.write_vectored(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final_timeout<'a>(
+        &self,
+        payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final_timeout(
@@ -3757,16 +3776,20 @@ impl zmux::SendStreamHandle for DirectionalCloseProbe {
         self.write_vectored(parts)
     }
 
-    fn write_final(&self, src: &[u8]) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final<'a>(&self, payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
         self.write_vectored(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final_timeout<'a>(
+        &self,
+        payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final_timeout(
@@ -4031,16 +4054,20 @@ impl zmux::SendStreamHandle for ZeroSizedCloseProbe {
         self.write_vectored(parts)
     }
 
-    fn write_final(&self, src: &[u8]) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final<'a>(&self, payload: zmux::WritePayload<'a>) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> zmux::Result<usize> {
         self.write_vectored(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], _timeout: Duration) -> zmux::Result<usize> {
-        Ok(src.len())
+    fn write_final_timeout<'a>(
+        &self,
+        payload: zmux::WritePayload<'a>,
+        _timeout: Duration,
+    ) -> zmux::Result<usize> {
+        payload.checked_len()
     }
 
     fn write_vectored_final_timeout(

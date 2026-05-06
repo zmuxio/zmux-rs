@@ -692,7 +692,9 @@ fn session_trait_object_exposes_timeout_and_open_info_inspection() {
     scratch.extend_from_slice(b"pre");
     stream.append_open_info_to(&mut scratch);
     assert_eq!(scratch, b"pre");
-    stream.write_final(b"trait-api").unwrap();
+    stream
+        .write_final(zmux::WritePayload::from(&b"trait-api"[..]))
+        .unwrap();
 
     let recv = server
         .accept_stream_timeout(Duration::from_secs(1))

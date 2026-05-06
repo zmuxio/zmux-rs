@@ -1,8 +1,8 @@
 # zmux-quinn
 
-`zmux-quinn` wraps an established `quinn::Connection` behind the async `zmux::AsyncSession` API.
+`zmux-quinn` wraps an established `quinn::Connection` behind the async `zmux::AsyncSession` API. It is for applications that already use Quinn and want the same upper-layer session/stream shape as native ZMux.
 
-It is an adapter over QUIC streams. It does not create QUIC connections and it cannot implement native ZMux wire-session controls such as `ping`, `go_away`, prefaces, or negotiated native settings; those methods are exposed through the shared `zmux::AsyncSession` trait and return adapter-unsupported errors or empty snapshots.
+It is an adapter over QUIC streams. It does not create QUIC connections and it cannot implement native ZMux wire-session controls such as `ping`, `go_away`, prefaces, or negotiated native settings; those methods are still present on the shared `zmux::AsyncSession` trait and return adapter-unsupported errors or empty snapshots.
 
 ## Installation
 
@@ -71,8 +71,8 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 
 `QuinnSession` implements the async `zmux::AsyncSession` surface:
 
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `OpenRequest::with_options`, and `OpenRequest::with_timeout` when open metadata and timeout must be carried through trait/object-safe APIs
-- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `OpenSend::with_options`, and `OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait/object-safe APIs
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::with_options`, and `zmux::OpenRequest::with_timeout` when open metadata and timeout must be carried through trait-object or generic APIs
+- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::with_options`, and `zmux::OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait-object or generic APIs
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 - addresses: `local_addr`, `peer_addr`
 
@@ -86,16 +86,23 @@ Wrapped streams expose `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHa
 `QuinnStream` exposes both read and write methods. `QuinnSendStream` exposes write methods. `QuinnRecvStream` exposes read methods.
 
 Payloads are binary bytes. `write(&[u8])` keeps the normal QUIC/TCP partial-write
-shape, so it borrows caller memory. Complete-consumption calls such as
-`write_all(Vec<u8>)`, `write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)` can
-move owned buffers into the async operation and avoid an extra adapter-level
-copy. Bidirectional `open_and_send(...)` intentionally performs one stream write
-and returns the number of bytes Quinn accepted, so flow control may make it
-consume only part of a larger payload. Quinn still owns its transport buffering
-and completion semantics.
+shape, so it borrows caller memory and returns the number of bytes Quinn accepted
+for that write. Complete-consumption calls such as `write_all(Vec<u8>)`,
+`write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)` can move owned buffers
+into the async operation and avoid an extra adapter-level copy. `write_final(...)`
+and `open_uni_and_send(...)` write the whole final payload before closing the QUIC
+send side.
+
+Bidirectional `open_and_send(...)` intentionally performs one stream write and
+returns the number of bytes Quinn accepted, so flow control may make it consume
+only part of a larger payload. Use `open_stream(...)` followed by
+`write_all(...)` when the caller requires complete-consumption behavior before
+continuing. Successful Quinn writes mean Quinn accepted the data into its stream
+path; they are not peer application acknowledgements.
+
 When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
-`write_all(WritePayload::from(vec))` or `write_final(WritePayload::from(vec))`
-to preserve owned-buffer intent.
+`write_all(zmux::WritePayload::from(vec))` or
+`write_final(zmux::WritePayload::from(vec))` to preserve owned-buffer intent.
 
 ## Mapping
 
@@ -163,8 +170,8 @@ Types:
 
 - construction: `new`, `with_options`
 - addresses: `local_addr`, `peer_addr`
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `OpenRequest::with_options`, and `OpenRequest::with_timeout`
-- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `OpenSend::with_options`, and `OpenSend::with_timeout`
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::with_options`, and `zmux::OpenRequest::with_timeout` for trait-object or generic calls
+- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::with_options`, and `zmux::OpenSend::with_timeout` for trait-object or generic calls
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 
 `QuinnStream` methods:

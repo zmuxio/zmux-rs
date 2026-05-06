@@ -85,7 +85,6 @@ impl<'a> WritePayload<'a> {
     }
 
     #[inline]
-    #[must_use]
     pub fn checked_len(&self) -> Result<usize> {
         match self {
             Self::Bytes(data) => Ok(data.len()),

@@ -4,8 +4,8 @@ Rust implementation of the ZMux v1 single-link stream multiplexing protocol.
 
 The workspace publishes two crates:
 
-- `zmux`: native blocking ZMux sessions, stable session/stream traits, wire codec helpers, and conformance helpers.
-- `zmux-quinn`: optional async adapter for applications that already use `quinn`.
+- `zmux`: native blocking ZMux sessions, runtime-neutral async traits, stable stream/session trait objects, wire codec helpers, and conformance helpers.
+- `zmux-quinn`: optional async `quinn` adapter that implements the same async session/stream traits.
 
 `zmux` does not depend on Tokio, Quinn, rustls, or any QUIC stack.
 
@@ -63,10 +63,10 @@ Constructor choice:
 - `Conn::server(...)`, `Conn::server_tcp(...)`, `Conn::server_transport(...)`: fixed responder/server role with the default config.
 - `Conn::new_with_config(...)` and `Conn::*_with_config(...)`: same constructors with an explicit `Config`.
 
-Use the stable trait surfaces when application code should not depend on `Conn` directly:
+Use the stable trait surfaces when application code should not depend on one concrete session type:
 
-- `Conn` plus `Session`, `StreamApi`, `SendStreamApi`, `RecvStreamApi`: blocking API. Prefer concrete `Conn` when you own the transport; use the traits only when type erasure is useful.
-- `AsyncSession`, `AsyncStreamApi`, `AsyncSendStreamApi`, `AsyncRecvStreamApi`: runtime-neutral async API used by adapters and async integration code.
+- `Conn` plus `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`: blocking API. Prefer concrete `Conn` when you own the transport; use the traits when type erasure or generic code is useful.
+- `AsyncSession`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`: runtime-neutral async API shared by native ZMux and adapters.
 
 ## Streams
 
@@ -109,7 +109,7 @@ let buf = vec![0x01, 0x02, 0x03];
 let (stream, _n) = session.open_and_send(&buf)?;
 ```
 
-`open_and_send(...)` leaves a bidirectional stream open. `open_uni_and_send(...)` writes the final payload for a unidirectional send stream.
+On native `Conn`, `open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream remains open. `open_uni_and_send(...)` writes the final payload and closes the send side. Some adapter-backed `AsyncSession` implementations may expose a transport-native partial-write `open_and_send(...)`; use `open_stream(...)` followed by `write_all(...)` when portable complete-consumption behavior matters.
 
 ## Metadata And Priority
 
@@ -137,7 +137,7 @@ stream.update_metadata(MetadataUpdate::new().with_priority(3))?;
 stream.write_final(b"hello")?;
 ```
 
-Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it into the options without another copy. ZMux stores its own copy for borrowed metadata and owns the bytes once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic `Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the bytes into a reusable buffer without allocating a fresh `Vec`.
+Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it into the options without another caller-side copy. ZMux stores its own copy for borrowed metadata and owns the bytes once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic `Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the bytes into a reusable buffer without allocating a fresh `Vec`.
 
 Stream payloads are binary bytes, not text. Reads follow the standard Rust I/O
 shape: `read(&mut [u8])` fills caller-owned memory, while async callers can use
@@ -146,16 +146,16 @@ result buffer. Writes keep the TCP-style partial-write entry point as
 `write(&[u8])`; because partial writes must leave the caller owning any unwritten
 bytes, owned buffers are accepted by complete-consumption APIs instead:
 `write_all(Vec<u8>)`, `write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)`.
-For erased or generic async streams, pass `WritePayload::from(vec)` to
-`write_all(...)` or `write_final(...)` when ownership should travel through
-`SendStreamApi`.
+For erased or generic send handles, pass `WritePayload::from(vec)` to
+`SendStreamHandle::write_all(...)`, `SendStreamHandle::write_final(...)`, or
+their async `AsyncSendStreamHandle` equivalents when ownership should travel
+through the trait object.
+
 Borrowed payloads are copied into native queued frames when ZMux must own data
 past the call boundary. Owned payloads move into the operation and let native
 ZMux avoid that queue copy when a whole frame can use the buffer directly; if
 open metadata or fragmentation requires a combined frame payload, only that
-fragment is copied. Bidirectional `open_and_send(...)` returns the number of
-bytes accepted by that first stream write; adapters with partial-write semantics
-may return before the whole payload is consumed.
+fragment is copied.
 
 ## Custom Transports
 
@@ -275,7 +275,7 @@ Configuration and open requests:
 Blocking session and stream types:
 
 - `Conn`, `Stream`, `SendStream`, `RecvStream`
-- `Session`, `StreamApi`, `SendStreamApi`, `RecvStreamApi`, `StreamInfo`
+- `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`
 - `BoxSession`, `BoxStream`, `BoxSendStream`, `BoxRecvStream`
 - `ClosedSession`
 - `DuplexStream`, `DuplexInfoSide`, `PausedHalf`, `PausedRecvHalf`, `PausedSendHalf`
@@ -285,7 +285,7 @@ Blocking session and stream types:
 Async session and stream types:
 
 - `AsyncSession`
-- `AsyncStreamApi`, `AsyncSendStreamApi`, `AsyncRecvStreamApi`, `AsyncStreamInfo`
+- `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`
 - `BoxAsyncSession`, `BoxAsyncStream`, `BoxAsyncSendStream`, `BoxAsyncRecvStream`
 - `ClosedAsyncSession`
 - `AsyncDuplexStream`, `AsyncBoxFuture`
@@ -297,8 +297,8 @@ Async session and stream types:
 
 Session methods:
 
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete sessions accept `OpenOptions` directly, use `OpenRequest::new`, `OpenRequest::with_options`, and `OpenRequest::with_timeout` when open metadata and timeout must be carried through trait/object-safe APIs
-- open and write: `open_and_send`, `open_uni_and_send`; concrete sessions accept byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `OpenSend::new`, `OpenSend::vectored`, `OpenSend::with_options`, and `OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait/object-safe APIs
+- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete sessions accept `OpenOptions` directly, use `OpenRequest::new`, `OpenRequest::with_options`, and `OpenRequest::with_timeout` when open metadata and timeout must be carried through trait-object or generic APIs
+- open and write: `open_and_send`, `open_uni_and_send`; concrete sessions accept byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `OpenSend::new`, `OpenSend::vectored`, `OpenSend::with_options`, and `OpenSend::with_timeout` when payload shape, open metadata, or timeout must be carried through trait-object or generic APIs
 - lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
 - session controls: `ping`, `ping_timeout`, `go_away`, `go_away_with_error`, `peer_go_away_error`, `peer_close_error`, `local_preface`, `peer_preface`, `negotiated`
 - addresses: `local_addr`, `peer_addr`
@@ -368,8 +368,8 @@ Errors, events, diagnostics, and conformance:
 
 ## Semantics
 
-- Successful write calls mean the local implementation accepted and flushed the write to its backend. They are not peer application acknowledgements.
-- Buffers passed to write/open-and-send methods are not retained after the call returns.
+- Successful native ZMux complete-write calls wait for the local writer path to flush the framed data to its backend. Adapter writes wait for the adapter's backend future. Neither form is a peer application acknowledgement.
+- Borrowed buffers passed to write/open-and-send methods are not retained after the call returns. Owned buffers are consumed by the operation.
 - `close_write()` finishes only the local send half.
 - `close_read()` cancels local interest in inbound bytes.
 - Open metadata is sent only when negotiated; required but unavailable metadata fails instead of being silently discarded.
@@ -385,5 +385,5 @@ let quic: zmux::BoxAsyncSession = zmux::box_async_session(quinn_session);
 let sessions: Vec<zmux::BoxAsyncSession> = vec![native, quic];
 ```
 
-Use `zmux::AsyncStreamApi`, `zmux::AsyncSendStreamApi`, and `zmux::AsyncRecvStreamApi` for heterogeneous async stream storage. Blocking/native code can use the short `Session`, `StreamApi`, `SendStreamApi`, and `RecvStreamApi` names.
+Use `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHandle`, and `zmux::AsyncRecvStreamHandle` for heterogeneous async stream storage. Blocking/native code can use the short `Session`, `DuplexStreamHandle`, `SendStreamHandle`, and `RecvStreamHandle` names.
 

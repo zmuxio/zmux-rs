@@ -139,30 +139,87 @@ pub trait SendStreamHandle: StreamHandle + Write {
     fn is_write_closed(&self) -> bool;
     fn update_metadata(&self, update: MetadataUpdate) -> Result<()>;
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize>;
-    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+
+    /// Write the whole binary payload, preserving owned-buffer intent for
+    /// implementations that can enqueue or frame without another copy.
+    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+        self.write_all_timeout(payload, Duration::MAX)
+    }
+
+    /// Write the whole binary payload within one operation timeout.
+    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
         let start = Instant::now();
-        let mut remaining = src;
-        while !remaining.is_empty() {
-            let timeout = remaining_write_timeout(start, timeout)?;
-            let n =
-                validate_write_progress(self.write_timeout(remaining, timeout)?, remaining.len())?;
-            if n == 0 {
-                return Err(zero_length_write_error());
+        match payload {
+            WritePayload::Bytes(data) => {
+                let mut remaining = data.as_ref();
+                while !remaining.is_empty() {
+                    let timeout = remaining_write_timeout(start, timeout)?;
+                    let n = validate_write_progress(
+                        self.write_timeout(remaining, timeout)?,
+                        remaining.len(),
+                    )?;
+                    if n == 0 {
+                        return Err(zero_length_write_error());
+                    }
+                    remaining = &remaining[n..];
+                }
             }
-            remaining = &remaining[n..];
+            WritePayload::Vectored(parts) => {
+                for part in parts {
+                    let mut remaining = part.as_ref();
+                    while !remaining.is_empty() {
+                        let timeout = remaining_write_timeout(start, timeout)?;
+                        let n = validate_write_progress(
+                            self.write_timeout(remaining, timeout)?,
+                            remaining.len(),
+                        )?;
+                        if n == 0 {
+                            return Err(zero_length_write_error());
+                        }
+                        remaining = &remaining[n..];
+                    }
+                }
+            }
         }
         Ok(())
     }
+
     fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize>;
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize>;
-    fn write_final(&self, src: &[u8]) -> Result<usize>;
-    fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize>;
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize>;
+
+    /// Write the whole binary payload and gracefully close the local send side.
+    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+        let total = payload.checked_len()?;
+        self.write_all(payload)?;
+        self.close_write()?;
+        Ok(total)
+    }
+
+    fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
+        self.write_final(WritePayload::vectored(parts))
+    }
+
+    /// Write the whole binary payload and gracefully close the local send side
+    /// within one operation timeout.
+    fn write_final_timeout<'a>(
+        &self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> Result<usize> {
+        let total = payload.checked_len()?;
+        self.write_all_timeout(payload, timeout)?;
+        self.close_write()?;
+        Ok(total)
+    }
+
     fn write_vectored_final_timeout(
         &self,
         parts: &[IoSlice<'_>],
         timeout: Duration,
-    ) -> Result<usize>;
+    ) -> Result<usize> {
+        self.write_final_timeout(WritePayload::vectored(parts), timeout)
+    }
+
     fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()>;
     fn clear_write_deadline(&self) -> Result<()> {
         self.set_write_deadline(None)
@@ -759,22 +816,16 @@ where
         return Ok(0);
     }
     let n = match (payload, timeout, fin) {
-        (WritePayload::Bytes(data), Some(timeout), false) => {
-            stream.write_timeout(data.as_ref(), timeout)?
+        (payload, Some(timeout), false) => {
+            stream.write_all_timeout(payload, timeout)?;
+            requested
         }
-        (WritePayload::Bytes(data), Some(timeout), true) => {
-            stream.write_final_timeout(data.as_ref(), timeout)?
+        (payload, Some(timeout), true) => stream.write_final_timeout(payload, timeout)?,
+        (payload, None, false) => {
+            SendStreamHandle::write_all(stream, payload)?;
+            requested
         }
-        (WritePayload::Bytes(data), None, false) => Write::write(stream, data.as_ref())?,
-        (WritePayload::Bytes(data), None, true) => stream.write_final(data.as_ref())?,
-        (WritePayload::Vectored(parts), Some(timeout), false) => {
-            stream.write_vectored_timeout(parts, timeout)?
-        }
-        (WritePayload::Vectored(parts), Some(timeout), true) => {
-            stream.write_vectored_final_timeout(parts, timeout)?
-        }
-        (WritePayload::Vectored(parts), None, false) => stream.write_vectored(parts)?,
-        (WritePayload::Vectored(parts), None, true) => stream.write_vectored_final(parts)?,
+        (payload, None, true) => stream.write_final(payload)?,
     };
     validate_write_progress(n, requested)
 }
@@ -1367,10 +1418,17 @@ where
             })
     }
 
-    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
+    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
-                send.write_all_timeout(src, timeout)
+                SendStreamHandle::write_all(send, payload)
+            })
+    }
+
+    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+        self.send
+            .with_current_result(joined_write_half_missing_error, |send| {
+                send.write_all_timeout(payload, timeout)
             })
     }
 
@@ -1392,11 +1450,12 @@ where
             })
     }
 
-    fn write_final(&self, src: &[u8]) -> Result<usize> {
+    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+        let requested = payload.checked_len()?;
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
-                let n = send.write_final(src)?;
-                validate_write_progress(n, src.len())
+                let n = send.write_final(payload)?;
+                validate_write_progress(n, requested)
             })
     }
 
@@ -1409,11 +1468,16 @@ where
             })
     }
 
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
+    fn write_final_timeout<'a>(
+        &self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> Result<usize> {
+        let requested = payload.checked_len()?;
         self.send
             .with_current_result(joined_write_half_missing_error, |send| {
-                let n = send.write_final_timeout(src, timeout)?;
-                validate_write_progress(n, src.len())
+                let n = send.write_final_timeout(payload, timeout)?;
+                validate_write_progress(n, requested)
             })
     }
 
@@ -1872,8 +1936,16 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_timeout(src, timeout)
             }
 
-            fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
-                (**self).write_all_timeout(src, timeout)
+            fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+                (**self).write_all(payload)
+            }
+
+            fn write_all_timeout<'a>(
+                &self,
+                payload: WritePayload<'a>,
+                timeout: Duration,
+            ) -> Result<()> {
+                (**self).write_all_timeout(payload, timeout)
             }
 
             fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
@@ -1888,16 +1960,20 @@ macro_rules! impl_send_stream_api_forward {
                 (**self).write_vectored_timeout(parts, timeout)
             }
 
-            fn write_final(&self, src: &[u8]) -> Result<usize> {
-                (**self).write_final(src)
+            fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+                (**self).write_final(payload)
             }
 
             fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
                 (**self).write_vectored_final(parts)
             }
 
-            fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-                (**self).write_final_timeout(src, timeout)
+            fn write_final_timeout<'a>(
+                &self,
+                payload: WritePayload<'a>,
+                timeout: Duration,
+            ) -> Result<usize> {
+                (**self).write_final_timeout(payload, timeout)
             }
 
             fn write_vectored_final_timeout(
@@ -1943,6 +2019,14 @@ where
         (**self).write_timeout(src, timeout)
     }
 
+    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+        (**self).write_all(payload)
+    }
+
+    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+        (**self).write_all_timeout(payload, timeout)
+    }
+
     fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         (**self).write_vectored(parts)
     }
@@ -1951,16 +2035,20 @@ where
         (**self).write_vectored_timeout(parts, timeout)
     }
 
-    fn write_final(&self, src: &[u8]) -> Result<usize> {
-        (**self).write_final(src)
+    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+        (**self).write_final(payload)
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         (**self).write_vectored_final(parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        (**self).write_final_timeout(src, timeout)
+    fn write_final_timeout<'a>(
+        &self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> Result<usize> {
+        (**self).write_final_timeout(payload, timeout)
     }
 
     fn write_vectored_final_timeout(
@@ -2223,8 +2311,12 @@ impl SendStreamHandle for Stream {
         Stream::write_timeout(self, src, timeout)
     }
 
-    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
-        Stream::write_all_timeout(self, src, timeout)
+    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+        Stream::write_all(self, payload)
+    }
+
+    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+        Stream::write_all_timeout(self, payload, timeout)
     }
 
     fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
@@ -2235,16 +2327,20 @@ impl SendStreamHandle for Stream {
         Stream::write_vectored_timeout(self, parts, timeout)
     }
 
-    fn write_final(&self, src: &[u8]) -> Result<usize> {
-        Stream::write_final(self, src)
+    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+        Stream::write_final(self, payload)
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         Stream::write_vectored_final(self, parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        Stream::write_final_timeout(self, src, timeout)
+    fn write_final_timeout<'a>(
+        &self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> Result<usize> {
+        Stream::write_final_timeout(self, payload, timeout)
     }
 
     fn write_vectored_final_timeout(
@@ -2337,8 +2433,12 @@ impl SendStreamHandle for SendStream {
         SendStream::write_timeout(self, src, timeout)
     }
 
-    fn write_all_timeout(&self, src: &[u8], timeout: Duration) -> Result<()> {
-        SendStream::write_all_timeout(self, src, timeout)
+    fn write_all<'a>(&self, payload: WritePayload<'a>) -> Result<()> {
+        SendStream::write_all(self, payload)
+    }
+
+    fn write_all_timeout<'a>(&self, payload: WritePayload<'a>, timeout: Duration) -> Result<()> {
+        SendStream::write_all_timeout(self, payload, timeout)
     }
 
     fn write_vectored(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
@@ -2349,16 +2449,20 @@ impl SendStreamHandle for SendStream {
         SendStream::write_vectored_timeout(self, parts, timeout)
     }
 
-    fn write_final(&self, src: &[u8]) -> Result<usize> {
-        SendStream::write_final(self, src)
+    fn write_final<'a>(&self, payload: WritePayload<'a>) -> Result<usize> {
+        SendStream::write_final(self, payload)
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         SendStream::write_vectored_final(self, parts)
     }
 
-    fn write_final_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        SendStream::write_final_timeout(self, src, timeout)
+    fn write_final_timeout<'a>(
+        &self,
+        payload: WritePayload<'a>,
+        timeout: Duration,
+    ) -> Result<usize> {
+        SendStream::write_final_timeout(self, payload, timeout)
     }
 
     fn write_vectored_final_timeout(
