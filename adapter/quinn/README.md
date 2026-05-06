@@ -67,23 +67,7 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 - `SessionOptions::set_default_accepted_prelude_max_concurrent(max)` changes the process-wide default used when a session does not override this option; pass `0` to restore the built-in default
 - controls how many accepted QUIC streams may parse adapter preludes concurrently
 
-## Stable API Coverage
-
-`QuinnSession` implements the async `zmux::AsyncSession` surface:
-
-- open/accept: `accept_stream`, `accept_stream_timeout`, `accept_uni_stream`, `accept_uni_stream_timeout`, `open_stream`, `open_uni_stream`, `open_stream_with`, `open_uni_stream_with`; concrete `QuinnSession` accepts `zmux::OpenOptions` directly, use `zmux::OpenRequest::new`, `zmux::OpenRequest::options`, and `zmux::OpenRequest::timeout` when open metadata and timeout must be carried through trait-object or generic APIs
-- open and write: `open_and_send`, `open_uni_and_send`; concrete `QuinnSession` accepts byte buffers such as `&[u8]`, `&Vec<u8>`, and `Vec<u8>` directly, use `zmux::OpenSend::new`, `zmux::OpenSend::vectored`, `zmux::OpenSend::options`, and `zmux::OpenSend::timeout` when payload shape, open metadata, or timeout must be carried through trait-object or generic APIs
-- lifecycle: `close`, `close_with_error`, `wait`, `wait_timeout`, `is_closed`, `close_error`, `state`, `stats`
-- addresses: `local_addr`, `peer_addr`
-
-Wrapped streams expose `zmux::AsyncDuplexStreamHandle`, `zmux::AsyncSendStreamHandle`, and `zmux::AsyncRecvStreamHandle` methods:
-
-- identity/info: `stream_id`, `is_opened_locally`, `is_bidirectional`, `open_info`, `append_open_info_to`, `open_info_len`, `has_open_info`, `metadata`, `local_addr`, `peer_addr`
-- read: `read`, `read_timeout`, `read_exact`, `read_exact_timeout`, `read_vectored`, `read_vectored_timeout`, `is_read_closed`, `set_read_deadline`, `set_read_timeout`, `close_read`, `cancel_read`
-- write: `write`, `write_all`, `write_all_timeout`, `write_timeout`, `write_vectored`, `write_vectored_timeout`, `write_final`, `write_final_timeout`, `write_vectored_final`, `write_vectored_final_timeout`, `write_chunks_final`, `is_write_closed`, `set_write_deadline`, `set_write_timeout`, `update_metadata`, `close_write`, `cancel_write`
-- combined helpers: `set_deadline`, `set_timeout`, `close`, `close_with_error`
-
-`QuinnStream` exposes both read and write methods. `QuinnSendStream` exposes write methods. `QuinnRecvStream` exposes read methods.
+## Payloads
 
 Payloads are binary bytes. `write(&[u8])` keeps the normal QUIC/TCP partial-write
 shape, so it borrows caller memory and returns the number of bytes Quinn accepted

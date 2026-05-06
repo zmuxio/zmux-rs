@@ -1984,46 +1984,6 @@ impl QuinnStream {
         with_timeout(self.write_vectored_final(parts), timeout, "write").await
     }
 
-    async fn write_chunks_final_with_total(
-        &self,
-        chunks: &mut [Bytes],
-        total: usize,
-    ) -> Result<usize> {
-        let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(
-            self.write_chunks_final_with_total_inner(chunks, total),
-            timeout,
-            "write",
-        )
-        .await
-    }
-
-    async fn write_chunks_final_with_total_inner(
-        &self,
-        chunks: &mut [Bytes],
-        total: usize,
-    ) -> Result<usize> {
-        if self.write_closed.load(Ordering::Acquire) {
-            return Err(self.write_terminal_error());
-        }
-        let mut send = self.send.lock().await;
-        match write_chunks_final(&self.prelude, &mut send, chunks, total, &self.stats).await {
-            Ok(n) => {
-                self.mark_write_closed();
-                Ok(n)
-            }
-            Err(err) => {
-                self.mark_write_closed_with(Some(err.clone()));
-                Err(err)
-            }
-        }
-    }
-
-    pub async fn write_chunks_final(&self, chunks: &mut [Bytes]) -> Result<usize> {
-        let total = total_bytes(chunks.iter().map(Bytes::len))?;
-        self.write_chunks_final_with_total(chunks, total).await
-    }
-
     pub async fn close_read(&self) -> Result<()> {
         self.cancel_read(zmux::ErrorCode::Cancelled.as_u64()).await
     }
@@ -2514,46 +2474,6 @@ impl QuinnSendStream {
         timeout: Duration,
     ) -> Result<usize> {
         with_timeout(self.write_vectored_final(parts), timeout, "write").await
-    }
-
-    async fn write_chunks_final_with_total(
-        &self,
-        chunks: &mut [Bytes],
-        total: usize,
-    ) -> Result<usize> {
-        let timeout = self.write_timeout_from_deadline()?;
-        with_optional_timeout(
-            self.write_chunks_final_with_total_inner(chunks, total),
-            timeout,
-            "write",
-        )
-        .await
-    }
-
-    async fn write_chunks_final_with_total_inner(
-        &self,
-        chunks: &mut [Bytes],
-        total: usize,
-    ) -> Result<usize> {
-        if self.write_closed.load(Ordering::Acquire) {
-            return Err(self.write_terminal_error());
-        }
-        let mut send = self.send.lock().await;
-        match write_chunks_final(&self.prelude, &mut send, chunks, total, &self.stats).await {
-            Ok(n) => {
-                self.mark_write_closed();
-                Ok(n)
-            }
-            Err(err) => {
-                self.mark_write_closed_with(Some(err.clone()));
-                Err(err)
-            }
-        }
-    }
-
-    pub async fn write_chunks_final(&self, chunks: &mut [Bytes]) -> Result<usize> {
-        let total = total_bytes(chunks.iter().map(Bytes::len))?;
-        self.write_chunks_final_with_total(chunks, total).await
     }
 
     pub async fn close_write(&self) -> Result<()> {
@@ -3723,21 +3643,6 @@ fn single_non_empty_io_slice<'a>(parts: &'a [IoSlice<'_>]) -> Option<&'a [u8]> {
     single
 }
 
-async fn write_chunks_final(
-    state: &Mutex<PreludeState>,
-    send: &mut quinn::SendStream,
-    chunks: &mut [Bytes],
-    total: usize,
-    stats: &AdapterStats,
-) -> Result<usize> {
-    ensure_open_prelude(state, send, stats).await?;
-    if total != 0 {
-        write_payload_chunks_all(send, chunks, total, stats).await?;
-    }
-    finish_send(send, stats).await?;
-    Ok(total)
-}
-
 async fn write_payload_once(
     send: &mut quinn::SendStream,
     src: &[u8],
@@ -3772,23 +3677,6 @@ async fn write_payload_all(
     stats.note_write_wait(started_at, completed_at);
     stats.note_flush(src.len(), completed_at);
     stats.note_data_write(src.len(), completed_at);
-    Ok(())
-}
-
-async fn write_payload_chunks_all(
-    send: &mut quinn::SendStream,
-    chunks: &mut [Bytes],
-    total: usize,
-    stats: &AdapterStats,
-) -> Result<()> {
-    let started_at = Instant::now();
-    send.write_all_chunks(chunks)
-        .await
-        .map_err(translate_write_error)?;
-    let completed_at = Instant::now();
-    stats.note_write_wait(started_at, completed_at);
-    stats.note_flush(total, completed_at);
-    stats.note_data_write(total, completed_at);
     Ok(())
 }
 
