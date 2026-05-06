@@ -1266,7 +1266,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zmux"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "futures-io",
  "getrandom 0.4.2",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-quinn"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "quinn",
