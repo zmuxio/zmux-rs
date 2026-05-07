@@ -1,8 +1,11 @@
 # zmux-quinn
 
-`zmux-quinn` wraps an established `quinn::Connection` behind the async `zmux::AsyncSession` API. It is for applications that already use Quinn and want the same upper-layer session/stream shape as native ZMux.
+`zmux-quinn` wraps an established `quinn::Connection` behind the async `zmux::AsyncSession` API. It is for applications
+that already use Quinn and want the same upper-layer session/stream shape as native ZMux.
 
-It is an adapter over QUIC streams. It does not create QUIC connections and it cannot implement native ZMux wire-session controls such as `ping`, `go_away`, prefaces, or negotiated native settings; those methods are still present on the shared `zmux::AsyncSession` trait and return adapter-unsupported errors or empty snapshots.
+It is an adapter over QUIC streams. It does not create QUIC connections and it cannot implement native ZMux wire-session
+controls such as `ping`, `go_away`, prefaces, or negotiated native settings; those methods are still present on the
+shared `zmux::AsyncSession` trait and return adapter-unsupported errors or empty snapshots.
 
 ## Installation
 
@@ -14,7 +17,8 @@ quinn = "QUINN_VERSION"
 tokio = "TOKIO_VERSION"
 ```
 
-Enable the Quinn runtime and TLS features your application needs. The adapter itself keeps Quinn default features disabled.
+Enable the Quinn runtime and TLS features your application needs. The adapter itself keeps Quinn default features
+disabled.
 
 ## Usage
 
@@ -58,13 +62,16 @@ let _disabled = SessionOptions::new().disable_accepted_prelude_read_timeout();
 - explicit timeout: `AcceptedPreludeReadTimeout::Timeout(duration)` or `accepted_prelude_read_timeout(duration)`
 - disabled: `AcceptedPreludeReadTimeout::Disabled`
 - `disable_accepted_prelude_read_timeout()`: disables the adapter-managed read timeout
-- accepted QUIC streams whose adapter prelude never arrives in time are discarded instead of blocking later ready streams
+- accepted QUIC streams whose adapter prelude never arrives in time are discarded instead of blocking later ready
+  streams
 
 `accepted_prelude_max_concurrent`:
 
-- default: `SessionOptions::default_accepted_prelude_max_concurrent()`, initially `DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT`
+- default: `SessionOptions::default_accepted_prelude_max_concurrent()`, initially
+  `DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRENT`
 - capped by `MAX_ACCEPTED_PRELUDE_MAX_CONCURRENT`
-- `SessionOptions::set_default_accepted_prelude_max_concurrent(max)` changes the process-wide default used when a session does not override this option; pass `0` to restore the built-in default
+- `SessionOptions::set_default_accepted_prelude_max_concurrent(max)` changes the process-wide default used when a
+  session does not override this option; pass `0` to restore the built-in default
 - controls how many accepted QUIC streams may parse adapter preludes concurrently
 
 ## Payloads
@@ -92,8 +99,10 @@ When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
 - `open_uni_stream(...)` and `accept_uni_stream(...)` map to QUIC unidirectional streams.
 - Open-time ZMux metadata is carried in an adapter prelude: `varint(metadata_len)` followed by stream metadata TLVs.
 - `OpenOptions` supports opaque binary open info, initial priority, and initial group.
-- `open_info()` and `metadata()` expose decoded opener metadata as bytes on accepted streams; `append_open_info_to(...)` appends those bytes into a reusable buffer.
-- `update_metadata(...)` works only before the local stream prelude is emitted. Later updates fail with `PriorityUpdateUnavailable`.
+- `open_info()` and `metadata()` expose decoded opener metadata as bytes on accepted streams; `append_open_info_to(...)`
+  appends those bytes into a reusable buffer.
+- `update_metadata(...)` works only before the local stream prelude is emitted. Later updates fail with
+  `PriorityUpdateUnavailable`.
 - `close_read()` maps to QUIC read-side cancellation with `ErrorCode::Cancelled`.
 - `cancel_read(code)` maps to QUIC read-side cancellation with that code.
 - `close_write()` maps to QUIC send-side graceful close.
@@ -108,7 +117,9 @@ When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
 - QUIC stream-limit failures are normalized to `OpenLimited`.
 - QUIC transport or connection closure is normalized into the stable `zmux::Error` surface.
 
-Use `zmux::Error` helpers such as `is_application_code(...)`, `is_open_limited()`, `is_adapter_unsupported()`, `is_priority_update_unavailable()`, `is_session_closed()`, `is_read_closed()`, `is_write_closed()`, and `is_timeout()` instead of depending on Quinn error variants.
+Use `zmux::Error` helpers such as `is_application_code(...)`, `is_open_limited()`, `is_adapter_unsupported()`,
+`is_priority_update_unavailable()`, `is_session_closed()`, `is_read_closed()`, `is_write_closed()`, and `is_timeout()`
+instead of depending on Quinn error variants.
 
 ## API Overview
 
@@ -133,11 +144,13 @@ metadata prelude directly.
 
 ## Reduced Behavior
 
-- Native ZMux-only session controls such as `ping`, `go_away`, `local_preface`, `peer_preface`, and `negotiated` are present on `zmux::AsyncSession`, but this adapter reports them as unsupported or empty because QUIC owns that layer.
+- Native ZMux-only session controls such as `ping`, `go_away`, `local_preface`, `peer_preface`, and `negotiated` are
+  present on `zmux::AsyncSession`, but this adapter reports them as unsupported or empty because QUIC owns that layer.
 - No post-open native advisory frames such as native `PRIORITY_UPDATE`.
 - No QUIC datagram, packet acknowledgement, RTT, or loss-state API.
 - `stats()` reports adapter-visible counters. It cannot expose native ZMux runtime internals that do not exist in QUIC.
 
 ## Conformance
 
-`target_claims()`, `target_implementation_profiles()`, and `target_suites()` provide adapter conformance metadata for tests that exercise the stable ZMux session contract over Quinn.
+`target_claims()`, `target_implementation_profiles()`, and `target_suites()` provide adapter conformance metadata for
+tests that exercise the stable ZMux session contract over Quinn.

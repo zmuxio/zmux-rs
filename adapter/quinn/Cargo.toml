@@ -1,6 +1,6 @@
 [package]
 name = "zmux-quinn"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Optional QUIC adapter support for zmux, intended for quinn-backed transports"
@@ -10,7 +10,7 @@ repository = "https://github.com/zmuxio/zmux-rs"
 bytes = "1"
 quinn = { version = "0.11.9", default-features = false }
 tokio = { version = "1.28.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
-zmux = { version = "1.0.0", path = "../.." }
+zmux = { version = "1.0.1", path = "../.." }
 
 [dev-dependencies]
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

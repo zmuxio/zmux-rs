@@ -4,7 +4,8 @@ Rust implementation of the ZMux v1 single-link stream multiplexing protocol.
 
 The workspace publishes two crates:
 
-- `zmux`: native blocking ZMux sessions, runtime-neutral async traits, stable stream/session trait objects, wire codec helpers, and conformance helpers.
+- `zmux`: native blocking ZMux sessions, runtime-neutral async traits, stable stream/session trait objects, wire codec
+  helpers, and conformance helpers.
 - `zmux-quinn`: optional async `quinn` adapter that implements the same async session/stream traits.
 
 `zmux` does not depend on Tokio, Quinn, rustls, or any QUIC stack.
@@ -61,14 +62,21 @@ Constructor choice:
 - `Conn::new(transport)`: auto role negotiation with the default config.
 - `Conn::client(transport)`: fixed initiator/client role with the default config.
 - `Conn::server(transport)`: fixed responder/server role with the default config.
-- `Conn::with_config(transport, config)`, `Conn::client_with_config(...)`, and `Conn::server_with_config(...)`: same constructors with an explicit `Config`.
+- `Conn::with_config(transport, config)`, `Conn::client_with_config(...)`, and `Conn::server_with_config(...)`: same
+  constructors with an explicit `Config`.
 
-`transport` is any `DuplexConnection`. Built-in implementations cover `TcpStream`, `duplex_io(...)` wrappers for cloneable full-duplex I/O, `(reader, writer)` pairs, boxed `DuplexConnection` values, native bidirectional `Stream`s, joined stream halves, and `DuplexTransport`. It is not limited to TCP: TLS streams, pipes, in-memory links, and custom reliable byte streams are supported when they can expose independent read/write handles. Attach a close hook when dropping those handles is not enough to close the whole underlying resource.
+`transport` is any `DuplexConnection`. Built-in implementations cover `TcpStream`, `duplex_io(...)` wrappers for
+cloneable full-duplex I/O, `(reader, writer)` pairs, boxed `DuplexConnection` values, native bidirectional `Stream`s,
+joined stream halves, and `DuplexTransport`. It is not limited to TCP: TLS streams, pipes, in-memory links, and custom
+reliable byte streams are supported when they can expose independent read/write handles. Attach a close hook when
+dropping those handles is not enough to close the whole underlying resource.
 
 Use the stable trait surfaces when application code should not depend on one concrete session type:
 
-- `Conn` plus `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`: blocking API. Prefer concrete `Conn` when you own the transport; use the traits when type erasure or generic code is useful.
-- `AsyncSession`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`: runtime-neutral async API shared by native ZMux and adapters.
+- `Conn` plus `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`: blocking API.
+  Prefer concrete `Conn` when you own the transport; use the traits when type erasure or generic code is useful.
+- `AsyncSession`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`:
+  runtime-neutral async API shared by native ZMux and adapters.
 
 ## Streams
 
@@ -111,7 +119,9 @@ let buf = vec![0x01, 0x02, 0x03];
 let stream = session.open_and_send(&buf)?;
 ```
 
-`open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream remains open. `open_uni_and_send(...)` writes the final payload and closes the send side. If the stream opens but the payload write fails, ZMux best-effort closes the opened stream before returning the error.
+`open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream
+remains open. `open_uni_and_send(...)` writes the final payload and closes the send side. If the stream opens but the
+payload write fails, ZMux best-effort closes the opened stream before returning the error.
 
 ## Metadata And Priority
 
@@ -139,7 +149,12 @@ stream.update_metadata(MetadataUpdate::new().priority(3))?;
 stream.write_final(b"hello")?;
 ```
 
-Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it into the options without another caller-side copy. ZMux stores its own copy for borrowed metadata and owns the bytes once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic `Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the bytes into a reusable buffer without allocating a fresh `Vec`.
+Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it
+into the options without another caller-side copy. ZMux stores its own copy for borrowed metadata and owns the bytes
+once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic
+`Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener
+metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the
+bytes into a reusable buffer without allocating a fresh `Vec`.
 
 Stream payloads are binary bytes, not text. Reads follow the standard Rust I/O
 shape: `read(&mut [u8])` fills caller-owned memory, while async callers can use
@@ -308,7 +323,9 @@ match stream.write(payload) {
 }
 ```
 
-Common helpers include `is_session_closed()`, `is_read_closed()`, `is_write_closed()`, `is_timeout()`, `is_interrupted()`, `is_open_limited()`, `is_open_expired()`, `is_open_info_unavailable()`, `is_priority_update_unavailable()`, and `is_adapter_unsupported()`.
+Common helpers include `is_session_closed()`, `is_read_closed()`, `is_write_closed()`, `is_timeout()`,
+`is_interrupted()`, `is_open_limited()`, `is_open_expired()`, `is_open_info_unavailable()`,
+`is_priority_update_unavailable()`, and `is_adapter_unsupported()`.
 
 ## Configuration
 
@@ -320,7 +337,8 @@ let config = Config::default()
     });
 ```
 
-`Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, idle timeout hints, keepalive hints, scheduler hints, and padding keys.
+`Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, idle timeout hints,
+keepalive hints, scheduler hints, and padding keys.
 
 `Config::default()` returns a copy of the process-wide default template. Use
 `Config::configure_default(...)` during startup when every new session should
@@ -349,7 +367,8 @@ Use trait objects when an upper layer should not care which concrete session or
 stream implementation is underneath:
 
 - Blocking: `Session`, `StreamHandle`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, and `BoxSession`.
-- Async: `AsyncSession`, `AsyncStreamHandle`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, and `BoxAsyncSession`.
+- Async: `AsyncSession`, `AsyncStreamHandle`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`,
+  `AsyncRecvStreamHandle`, and `BoxAsyncSession`.
 
 Use request/value helpers only when the simple call needs extra data:
 
@@ -367,8 +386,11 @@ Transport helpers are intentionally small:
 
 ## Semantics
 
-- Successful native ZMux complete-write calls wait for the local writer path to flush the framed data to its backend. Adapter writes wait for the adapter's backend future. Neither form is a peer application acknowledgement.
-- Borrowed buffers passed to write/open-and-send methods are not retained after the call returns. Owned buffers are consumed by the operation.
+- Successful native ZMux complete-write calls wait for the local writer path to flush the framed data to its backend.
+  Adapter writes wait for the adapter's backend future. Neither form is a peer application acknowledgement.
+- Borrowed buffers passed to write/open-and-send methods are not retained after the call returns. Owned buffers are
+  consumed by the operation.
 - `close_write()` finishes only the local send half.
 - `close_read()` cancels local interest in inbound bytes.
-- Open metadata is sent only when negotiated; required but unavailable metadata fails instead of being silently discarded.
+- Open metadata is sent only when negotiated; required but unavailable metadata fails instead of being silently
+  discarded.
