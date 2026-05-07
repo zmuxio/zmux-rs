@@ -2788,57 +2788,143 @@ impl_native_async_send!(SendStream);
 
 impl AsyncDuplexStreamHandle for Stream {}
 
+#[inline]
+fn conn_sync_accept_stream(conn: &Conn) -> Result<Stream> {
+    Conn::accept_stream(conn)
+}
+
+#[inline]
+fn conn_sync_accept_stream_timeout(conn: &Conn, timeout: Duration) -> Result<Stream> {
+    Conn::accept_stream_timeout(conn, timeout)
+}
+
+#[inline]
+fn conn_sync_accept_uni_stream(conn: &Conn) -> Result<RecvStream> {
+    Conn::accept_uni_stream(conn)
+}
+
+#[inline]
+fn conn_sync_accept_uni_stream_timeout(conn: &Conn, timeout: Duration) -> Result<RecvStream> {
+    Conn::accept_uni_stream_timeout(conn, timeout)
+}
+
+#[inline]
+fn conn_sync_open_stream_with(conn: &Conn, request: OpenRequest) -> Result<Stream> {
+    Conn::open_stream_with(conn, request)
+}
+
+#[inline]
+fn conn_sync_open_uni_stream_with(conn: &Conn, request: OpenRequest) -> Result<SendStream> {
+    Conn::open_uni_stream_with(conn, request)
+}
+
+#[inline]
+fn conn_sync_open_and_send(conn: &Conn, request: OpenSend<'_>) -> Result<Stream> {
+    Conn::open_and_send(conn, request)
+}
+
+#[inline]
+fn conn_sync_open_uni_and_send(conn: &Conn, request: OpenSend<'_>) -> Result<SendStream> {
+    Conn::open_uni_and_send(conn, request)
+}
+
+#[inline]
+fn conn_sync_ping(conn: &Conn, echo: &[u8]) -> Result<Duration> {
+    Conn::ping(conn, echo)
+}
+
+#[inline]
+fn conn_sync_ping_timeout(conn: &Conn, echo: &[u8], timeout: Duration) -> Result<Duration> {
+    Conn::ping_timeout(conn, echo, timeout)
+}
+
+#[inline]
+fn conn_sync_go_away(conn: &Conn, last_accepted_bidi: u64, last_accepted_uni: u64) -> Result<()> {
+    Conn::go_away(conn, last_accepted_bidi, last_accepted_uni)
+}
+
+#[inline]
+fn conn_sync_go_away_with_error(
+    conn: &Conn,
+    last_accepted_bidi: u64,
+    last_accepted_uni: u64,
+    code: u64,
+    reason: &str,
+) -> Result<()> {
+    Conn::go_away_with_error(conn, last_accepted_bidi, last_accepted_uni, code, reason)
+}
+
+#[inline]
+fn conn_sync_close(conn: &Conn) -> Result<()> {
+    Conn::close(conn)
+}
+
+#[inline]
+fn conn_sync_close_with_error(conn: &Conn, code: u64, reason: &str) -> Result<()> {
+    Conn::close_with_error(conn, code, reason)
+}
+
+#[inline]
+fn conn_sync_wait(conn: &Conn) -> Result<()> {
+    Conn::wait(conn)
+}
+
+#[inline]
+fn conn_sync_wait_timeout(conn: &Conn, timeout: Duration) -> Result<bool> {
+    Conn::wait_timeout(conn, timeout)
+}
+
 impl AsyncSession for Conn {
     type Stream = Stream;
     type SendStream = SendStream;
     type RecvStream = RecvStream;
 
     fn accept_stream(&self) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::accept_stream(self) })
+        Box::pin(async move { conn_sync_accept_stream(self) })
     }
 
     fn accept_stream_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::accept_stream_timeout(self, timeout) })
+        Box::pin(async move { conn_sync_accept_stream_timeout(self, timeout) })
     }
 
     fn accept_uni_stream(&self) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
-        Box::pin(async move { Conn::accept_uni_stream(self) })
+        Box::pin(async move { conn_sync_accept_uni_stream(self) })
     }
 
     fn accept_uni_stream_timeout(
         &self,
         timeout: Duration,
     ) -> AsyncBoxFuture<'_, Result<Self::RecvStream>> {
-        Box::pin(async move { Conn::accept_uni_stream_timeout(self, timeout) })
+        Box::pin(async move { conn_sync_accept_uni_stream_timeout(self, timeout) })
     }
 
     fn open_stream_with(&self, request: OpenRequest) -> AsyncBoxFuture<'_, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_stream_with(self, request) })
+        Box::pin(async move { conn_sync_open_stream_with(self, request) })
     }
 
     fn open_uni_stream_with(
         &self,
         request: OpenRequest,
     ) -> AsyncBoxFuture<'_, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_stream_with(self, request) })
+        Box::pin(async move { conn_sync_open_uni_stream_with(self, request) })
     }
 
     fn open_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<Self::Stream>> {
-        Box::pin(async move { Conn::open_and_send(self, request) })
+        Box::pin(async move { conn_sync_open_and_send(self, request) })
     }
 
     fn open_uni_and_send<'a>(
         &'a self,
         request: OpenSend<'a>,
     ) -> AsyncBoxFuture<'a, Result<Self::SendStream>> {
-        Box::pin(async move { Conn::open_uni_and_send(self, request) })
+        Box::pin(async move { conn_sync_open_uni_and_send(self, request) })
     }
 
     fn ping<'a>(&'a self, echo: &'a [u8]) -> AsyncBoxFuture<'a, Result<Duration>> {
-        Box::pin(async move { Conn::ping(self, echo) })
+        Box::pin(async move { conn_sync_ping(self, echo) })
     }
 
     fn ping_timeout<'a>(
@@ -2846,7 +2932,7 @@ impl AsyncSession for Conn {
         echo: &'a [u8],
         timeout: Duration,
     ) -> AsyncBoxFuture<'a, Result<Duration>> {
-        Box::pin(async move { Conn::ping_timeout(self, echo, timeout) })
+        Box::pin(async move { conn_sync_ping_timeout(self, echo, timeout) })
     }
 
     fn go_away(
@@ -2854,7 +2940,7 @@ impl AsyncSession for Conn {
         last_accepted_bidi: u64,
         last_accepted_uni: u64,
     ) -> AsyncBoxFuture<'_, Result<()>> {
-        Box::pin(async move { Conn::go_away(self, last_accepted_bidi, last_accepted_uni) })
+        Box::pin(async move { conn_sync_go_away(self, last_accepted_bidi, last_accepted_uni) })
     }
 
     fn go_away_with_error<'a>(
@@ -2865,12 +2951,12 @@ impl AsyncSession for Conn {
         reason: &'a str,
     ) -> AsyncBoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            Conn::go_away_with_error(self, last_accepted_bidi, last_accepted_uni, code, reason)
+            conn_sync_go_away_with_error(self, last_accepted_bidi, last_accepted_uni, code, reason)
         })
     }
 
     fn close(&self) -> AsyncBoxFuture<'_, Result<()>> {
-        Box::pin(async move { Conn::close(self) })
+        Box::pin(async move { conn_sync_close(self) })
     }
 
     fn close_with_error<'a>(
@@ -2878,15 +2964,15 @@ impl AsyncSession for Conn {
         code: u64,
         reason: &'a str,
     ) -> AsyncBoxFuture<'a, Result<()>> {
-        Box::pin(async move { Conn::close_with_error(self, code, reason) })
+        Box::pin(async move { conn_sync_close_with_error(self, code, reason) })
     }
 
     fn wait(&self) -> AsyncBoxFuture<'_, Result<()>> {
-        Box::pin(async move { Conn::wait(self) })
+        Box::pin(async move { conn_sync_wait(self) })
     }
 
     fn wait_timeout(&self, timeout: Duration) -> AsyncBoxFuture<'_, Result<bool>> {
-        Box::pin(async move { Conn::wait_timeout(self, timeout) })
+        Box::pin(async move { conn_sync_wait_timeout(self, timeout) })
     }
 
     fn is_closed(&self) -> bool {
