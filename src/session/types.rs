@@ -787,6 +787,13 @@ pub(super) struct TrackedWriteJob {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct LocalGoAwayInFlight {
+    pub(super) bidi: u64,
+    pub(super) uni: u64,
+    pub(super) completion: WriteCompletion,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct WriteCompletion {
     inner: Arc<WriteCompletionInner>,
 }
@@ -1052,6 +1059,7 @@ pub(super) struct ConnState {
     pub(super) local_go_away_bidi: u64,
     pub(super) local_go_away_uni: u64,
     pub(super) local_go_away_issued: bool,
+    pub(super) local_go_away_in_flight: Option<LocalGoAwayInFlight>,
     pub(super) peer_go_away_bidi: u64,
     pub(super) peer_go_away_uni: u64,
     pub(super) ping_waiter: Option<UserPing>,

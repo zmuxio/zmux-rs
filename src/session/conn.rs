@@ -66,6 +66,7 @@ const CONN_READ_BUFFER_SIZE: usize = 512;
 const CLOSE_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(5);
 const CLOSE_DRAIN_RTT_SLACK: Duration = Duration::from_millis(100);
 const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+const CONTROL_FRAME_COMPLETION_IDLE_POLL: Duration = Duration::from_millis(10);
 
 fn session_result<T>(result: Result<T>, operation: ErrorOperation) -> Result<T> {
     result.map_err(|mut err| {
@@ -682,6 +683,7 @@ impl Conn {
                 local_go_away_bidi: MAX_VARINT62,
                 local_go_away_uni: MAX_VARINT62,
                 local_go_away_issued: false,
+                local_go_away_in_flight: None,
                 peer_go_away_bidi: MAX_VARINT62,
                 peer_go_away_uni: MAX_VARINT62,
                 ping_waiter: None,
@@ -1229,7 +1231,13 @@ impl Conn {
             ),
             ErrorOperation::Close,
         )?;
-        {
+        enum GoAwaySend {
+            AlreadyComplete,
+            Wait(WriteCompletion),
+            Queue(Frame, WriteCompletion),
+        }
+
+        let send = {
             let mut state = self.inner.state.lock().unwrap();
             ensure_session_open(&state)?;
             if last_accepted_bidi > state.local_go_away_bidi
@@ -1239,34 +1247,80 @@ impl Conn {
                     && state.local_go_away_bidi <= last_accepted_bidi
                     && state.local_go_away_uni <= last_accepted_uni
                 {
-                    return Ok(());
+                    if let Some(in_flight) =
+                        state.local_go_away_in_flight.as_ref().filter(|in_flight| {
+                            in_flight.bidi <= last_accepted_bidi
+                                && in_flight.uni <= last_accepted_uni
+                        })
+                    {
+                        GoAwaySend::Wait(in_flight.completion.clone())
+                    } else {
+                        GoAwaySend::AlreadyComplete
+                    }
+                } else {
+                    return Err(
+                        Error::local("zmux: GOAWAY watermarks must be non-increasing")
+                            .with_session_context(ErrorOperation::Close),
+                    );
                 }
-                return Err(
-                    Error::local("zmux: GOAWAY watermarks must be non-increasing")
-                        .with_session_context(ErrorOperation::Close),
-                );
-            }
-            if state.local_go_away_issued
+            } else if state.local_go_away_issued
                 && last_accepted_bidi == state.local_go_away_bidi
                 && last_accepted_uni == state.local_go_away_uni
             {
-                return Ok(());
+                if let Some(in_flight) = state.local_go_away_in_flight.as_ref() {
+                    GoAwaySend::Wait(in_flight.completion.clone())
+                } else {
+                    GoAwaySend::AlreadyComplete
+                }
+            } else {
+                let completion = WriteCompletion::new();
+                state.local_go_away_bidi = last_accepted_bidi;
+                state.local_go_away_uni = last_accepted_uni;
+                state.local_go_away_issued = true;
+                state.local_go_away_in_flight = Some(LocalGoAwayInFlight {
+                    bidi: last_accepted_bidi,
+                    uni: last_accepted_uni,
+                    completion: completion.clone(),
+                });
+                state.state = SessionState::Draining;
+                GoAwaySend::Queue(
+                    Frame {
+                        frame_type: FrameType::GoAway,
+                        flags: 0,
+                        stream_id: 0,
+                        payload,
+                    },
+                    completion,
+                )
             }
-            state.local_go_away_bidi = last_accepted_bidi;
-            state.local_go_away_uni = last_accepted_uni;
-            state.local_go_away_issued = true;
-            state.state = SessionState::Draining;
-        }
+        };
         self.inner.cond.notify_all();
-        session_result(
-            self.queue_frame(Frame {
-                frame_type: FrameType::GoAway,
-                flags: 0,
-                stream_id: 0,
-                payload,
-            }),
-            ErrorOperation::Close,
-        )
+        match send {
+            GoAwaySend::AlreadyComplete => Ok(()),
+            GoAwaySend::Wait(completion) => session_result(
+                self.wait_control_frame_completion(&completion),
+                ErrorOperation::Close,
+            ),
+            GoAwaySend::Queue(frame, completion) => {
+                let queued = self.inner.queue_tracked_frames_until(
+                    vec![frame],
+                    completion.clone(),
+                    || None,
+                    || {
+                        let state = self.inner.state.lock().unwrap();
+                        ensure_session_open(&state)
+                    },
+                    "go_away",
+                );
+                if let Err(err) = queued {
+                    self.clear_go_away_in_flight(&completion);
+                    return session_result(Err(err), ErrorOperation::Close);
+                }
+                let result = self.wait_control_frame_completion(&completion);
+                self.clear_go_away_in_flight(&completion);
+                session_result(result, ErrorOperation::Close)
+            }
+        }
     }
 
     pub fn close(&self) -> Result<()> {
@@ -1860,6 +1914,40 @@ impl Conn {
 
     fn local_close_completed_after_writer_shutdown(&self, err: &Error) -> bool {
         err.is_session_closed() && self.inner.state.lock().unwrap().state == SessionState::Closed
+    }
+
+    fn wait_control_frame_completion(&self, completion: &WriteCompletion) -> Result<()> {
+        loop {
+            if let Some(result) = completion.try_result() {
+                return result;
+            }
+            let observed_generation = completion.generation();
+            {
+                let state = self.inner.state.lock().unwrap();
+                if matches!(state.state, SessionState::Closed | SessionState::Failed) {
+                    if let Some(result) = completion.try_result() {
+                        return result;
+                    }
+                    return Err(state
+                        .close_error
+                        .clone()
+                        .unwrap_or_else(Error::session_closed));
+                }
+            }
+            completion
+                .wait_for_change_since(observed_generation, CONTROL_FRAME_COMPLETION_IDLE_POLL);
+        }
+    }
+
+    fn clear_go_away_in_flight(&self, completion: &WriteCompletion) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state
+            .local_go_away_in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.completion.same(completion))
+        {
+            state.local_go_away_in_flight = None;
+        }
     }
 }
 
@@ -2962,6 +3050,7 @@ mod tests {
                 local_go_away_bidi: MAX_VARINT62,
                 local_go_away_uni: MAX_VARINT62,
                 local_go_away_issued: false,
+                local_go_away_in_flight: None,
                 peer_go_away_bidi: MAX_VARINT62,
                 peer_go_away_uni: MAX_VARINT62,
                 ping_waiter: None,

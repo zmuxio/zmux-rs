@@ -1277,12 +1277,18 @@ fn close_write_noop_after_stop_reset(state: &StreamState) -> bool {
 
 #[inline]
 fn close_write_error_ignored(err: &Error) -> bool {
-    err.is_stream_not_writable() || err.is_write_closed() || err.is_read_closed()
+    err.is_stream_not_writable()
+        || err.is_write_closed()
+        || err.is_read_closed()
+        || err.termination_kind() == TerminationKind::Stopped
 }
 
 #[inline]
 fn close_read_error_ignored(err: &Error) -> bool {
-    err.is_stream_not_readable() || err.is_read_closed() || err.is_write_closed()
+    err.is_stream_not_readable()
+        || err.is_read_closed()
+        || err.is_write_closed()
+        || err.termination_kind() == TerminationKind::Stopped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3453,15 +3459,29 @@ impl StreamInner {
             );
 
             if let Some(prepared) = prepared_opener {
+                let completion = WriteCompletion::new();
                 let prepared_state = self.queue_prepared_data_until(
                     prepared,
                     || self.current_write_deadline(None),
                     || self.ensure_close_read_signal_pending(),
                     "write",
-                    None,
+                    Some(completion.clone()),
                 );
                 let prepared_state = match prepared_state {
                     Ok(prepared_state) => prepared_state,
+                    Err(err) => {
+                        self.cond.notify_all();
+                        return Err(err);
+                    }
+                };
+                let prepared_state = match self.wait_prepared_write_batch_completion(
+                    &completion,
+                    vec![prepared_state],
+                    None,
+                ) {
+                    Ok(mut prepared_states) => prepared_states
+                        .pop()
+                        .expect("close-read opener completion lost prepared state"),
                     Err(err) => {
                         self.cond.notify_all();
                         return Err(err);
@@ -3471,8 +3491,10 @@ impl StreamInner {
             }
 
             self.note_pending_terminal_frame();
-            let queued = self.conn.queue_frame_until(
-                stop_frame,
+            let completion = WriteCompletion::new();
+            let queued = self.conn.queue_tracked_frames_until(
+                vec![stop_frame],
+                completion.clone(),
                 || self.current_write_deadline(None),
                 || self.ensure_close_read_signal_pending(),
                 "write",
@@ -3482,9 +3504,69 @@ impl StreamInner {
                 self.cond.notify_all();
                 return Err(err);
             }
+            if let Err(err) = self.wait_control_frame_completion(&completion, "write") {
+                if err.is_timeout() {
+                    self.rollback_pending_terminal_frame();
+                }
+                self.cond.notify_all();
+                return Err(err);
+            }
             self.clear_close_read_signal_pending();
             self.cond.notify_all();
             return Ok(());
+        }
+    }
+
+    fn wait_control_frame_completion(
+        &self,
+        completion: &WriteCompletion,
+        operation: &'static str,
+    ) -> Result<()> {
+        loop {
+            if let Some(result) = completion.try_result() {
+                return result;
+            }
+            let observed_generation = completion.generation();
+            {
+                let conn_state = self.conn.state.lock().unwrap();
+                if matches!(
+                    conn_state.state,
+                    SessionState::Closed | SessionState::Failed
+                ) {
+                    if let Some(result) = completion.try_result() {
+                        return result;
+                    }
+                    return Err(conn_state
+                        .close_error
+                        .clone()
+                        .unwrap_or_else(Error::session_closed));
+                }
+            }
+
+            let wait = match self.current_write_deadline(None) {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        if self
+                            .conn
+                            .write_queue
+                            .cancel_tracked_write(completion)
+                            .is_some()
+                        {
+                            let err = Error::timeout(operation);
+                            completion.complete_err(err.clone());
+                            return Err(err);
+                        }
+                        WRITE_COMPLETION_IDLE_POLL
+                    } else {
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(WRITE_COMPLETION_DEADLINE_POLL)
+                    }
+                }
+                None => WRITE_COMPLETION_IDLE_POLL,
+            };
+            completion.wait_for_change_since(observed_generation, wait);
         }
     }
 

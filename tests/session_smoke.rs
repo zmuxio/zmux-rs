@@ -1460,22 +1460,16 @@ fn inbound_late_data_can_make_local_stream_peer_visible() {
             events.lock().unwrap().push(event);
         }
     });
-    let (client, mut peer) = client_with_rendezvous_raw_peer(client_config);
+    let (client, mut peer) = client_with_raw_peer(client_config);
 
     let stream = client.open_stream().unwrap();
     stream.close_read().unwrap();
-    peer.write_all(
-        &Frame {
-            frame_type: FrameType::Data,
-            flags: 0,
-            stream_id: stream.stream_id(),
-            payload: b"late".to_vec(),
-        }
-        .marshal()
-        .unwrap(),
-    )
-    .unwrap();
-    peer.flush().unwrap();
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: stream.stream_id(),
+        payload: b"late".to_vec(),
+    });
 
     let opened = wait_for_event(&client_events, EventType::StreamOpened);
     assert_eq!(opened.stream_id, stream.stream_id());
@@ -2256,6 +2250,66 @@ fn native_write_waits_for_transport_flush() {
         1
     );
     write_thread.join().unwrap();
+
+    let closer = client.clone();
+    let close_thread = thread::spawn(move || {
+        let _ = closer.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    });
+    let _ = wait_for_rendezvous_frame(&mut peer, |frame| frame.frame_type == FrameType::Close);
+    close_thread.join().unwrap();
+}
+
+#[test]
+fn native_go_away_waits_for_transport_flush() {
+    let (client, mut peer) = client_with_rendezvous_raw_peer(Config::default());
+    let sender = client.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let go_away_thread = thread::spawn(move || {
+        let _ = result_tx.send(sender.go_away(0, 0));
+    });
+
+    assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+    let goaway =
+        wait_for_rendezvous_frame(&mut peer, |frame| frame.frame_type == FrameType::GoAway);
+    let payload = parse_go_away_payload(&goaway.payload).unwrap();
+    assert_eq!(payload.last_accepted_bidi, 0);
+    assert_eq!(payload.last_accepted_uni, 0);
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    go_away_thread.join().unwrap();
+
+    let closer = client.clone();
+    let close_thread = thread::spawn(move || {
+        let _ = closer.close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown");
+    });
+    let _ = wait_for_rendezvous_frame(&mut peer, |frame| frame.frame_type == FrameType::Close);
+    close_thread.join().unwrap();
+}
+
+#[test]
+fn native_close_read_waits_for_transport_flush() {
+    let (client, mut peer) = client_with_rendezvous_raw_peer(Config::default());
+    let stream = client.open_stream().unwrap();
+    let closer = stream.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let close_read_thread = thread::spawn(move || {
+        let _ = result_tx.send(closer.close_read());
+    });
+
+    assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+    let stop = wait_for_rendezvous_frame(&mut peer, |frame| {
+        frame.frame_type == FrameType::StopSending
+    });
+    assert_eq!(stop.stream_id, stream.stream_id());
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    close_read_thread.join().unwrap();
 
     let closer = client.clone();
     let close_thread = thread::spawn(move || {
