@@ -4,7 +4,7 @@ use std::io::{IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1092,10 +1092,10 @@ fn default_config_uses_repository_keepalive_template() {
     assert_eq!(config.keepalive_timeout, Duration::ZERO);
     assert_eq!(config.close_drain_timeout, Duration::from_millis(500));
     assert_eq!(config.accept_backlog_limit, None);
-    assert!(!config.preface_padding);
+    assert!(config.preface_padding);
     assert_eq!(config.preface_padding_min_bytes, 16);
     assert_eq!(config.preface_padding_max_bytes, 256);
-    assert!(!config.ping_padding);
+    assert!(config.ping_padding);
     assert_eq!(config.ping_padding_min_bytes, 16);
     assert_eq!(config.ping_padding_max_bytes, 64);
 }
@@ -1199,7 +1199,7 @@ fn event_handler_reports_stream_and_session_lifecycle() {
         Some(9)
     );
 
-    stream.close_read().unwrap();
+    accepted.close_write().unwrap();
     client.close().unwrap();
     let closed = wait_for_event(&client_events, EventType::SessionClosed);
     assert_eq!(closed.session_state, SessionState::Closed);
@@ -2349,6 +2349,50 @@ fn native_write_batches_fragmented_payload_into_single_transport_flush() {
 }
 
 #[test]
+fn concurrent_writes_on_same_stream_are_serialized() {
+    let (client, mut peer) = client_with_raw_peer_configs(Config::default(), Config::responder());
+    let stream = client.open_stream().unwrap();
+    let writers = 8usize;
+    let start = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::new();
+
+    for index in 0..writers {
+        let writer = stream.clone();
+        let start = start.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let payload = format!("concurrent-write-{index:02}").into_bytes();
+            writer.write_all(payload.clone()).unwrap();
+            payload
+        }));
+    }
+
+    let mut expected = Vec::new();
+    for handle in handles {
+        expected.push(handle.join().unwrap());
+    }
+    expected.sort();
+
+    let mut actual = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while actual.len() < writers && Instant::now() < deadline {
+        for frame in peer.drain_frames() {
+            if frame.frame_type == FrameType::Data {
+                let data = parse_data_payload(&frame.payload, frame.flags).unwrap();
+                if !data.app_data.is_empty() {
+                    actual.push(data.app_data.to_vec());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    actual.sort();
+
+    assert_eq!(actual, expected);
+    client.close().ok();
+}
+
+#[test]
 fn native_async_write_waits_for_transport_flush() {
     let (client, mut peer) = client_with_rendezvous_raw_peer(Config::default());
     let stream = client.open_stream().unwrap();
@@ -2518,7 +2562,9 @@ fn peer_stream_max_data_wakes_flow_blocked_write() {
     peer_config
         .settings
         .initial_max_stream_data_bidi_peer_opened = 4;
-    let (client, mut peer) = client_with_raw_peer_configs(Config::default(), peer_config);
+    let (client, mut peer) =
+        client_with_raw_peer_configs(Config::default().disable_capabilities(), peer_config);
+    assert_eq!(client.negotiated().capabilities, 0);
     let stream = client.open_stream().unwrap();
     assert_eq!(stream.write(b"abcd").unwrap(), 4);
 
@@ -3139,7 +3185,7 @@ fn close_read_retry_after_deadline_failure_queues_opener_and_stop_sending() {
 }
 
 #[test]
-fn update_metadata_uses_advisory_lane_when_ordinary_limit_tiny() {
+fn update_metadata_bypasses_ordinary_queue_byte_limit() {
     let caps = CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS;
     let client_config = Config {
         capabilities: caps,
@@ -3266,7 +3312,7 @@ fn pre_open_priority_update_requires_open_metadata_capability() {
 
 #[test]
 fn post_open_priority_update_requires_negotiated_capability() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config::default().disable_capabilities());
     let stream = client.open_stream().unwrap();
     stream.write(b"x").unwrap();
     let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
@@ -3292,6 +3338,24 @@ fn post_open_priority_update_requires_negotiated_capability() {
     client
         .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
         .ok();
+}
+
+#[test]
+fn default_metadata_capabilities_do_not_mark_plain_open_data() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let stream = client.open_stream().unwrap();
+
+    stream.write_all(b"x").unwrap();
+    let frame = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+
+    assert_eq!(frame.flags & FRAME_FLAG_OPEN_METADATA, 0);
+    let data = parse_data_payload(&frame.payload, frame.flags).unwrap();
+    assert_eq!(data.app_data, b"x");
+    assert!(peer
+        .collect_frames_for(Duration::from_millis(50))
+        .iter()
+        .all(|frame| frame.frame_type != FrameType::Data));
+    client.close().ok();
 }
 
 #[test]
@@ -3476,7 +3540,7 @@ fn open_metadata_preserves_explicit_group_zero_when_rebuilt() {
 
 #[test]
 fn unnegotiated_priority_update_is_ignored() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config::default().disable_capabilities());
 
     peer.write_frame(Frame {
         frame_type: FrameType::Data,
@@ -5688,7 +5752,8 @@ fn repeated_session_close_with_error_does_not_queue_duplicate_close_frames() {
 fn outbound_control_reasons_may_exceed_local_default_when_peer_limit_allows() {
     let mut peer_config = Config::responder();
     peer_config.settings.max_control_payload_bytes = 8192;
-    let (client, mut peer) = client_with_raw_peer_configs(Config::default(), peer_config);
+    let (client, mut peer) =
+        client_with_raw_peer_configs(Config::default().disable_capabilities(), peer_config);
     let reason = "x".repeat(9_000);
     let limits = Limits {
         max_control_payload_bytes: 8192,
@@ -7245,7 +7310,20 @@ fn unnegotiated_open_metadata_emits_fatal_close() {
         capabilities: caps,
         ..Config::responder()
     };
-    let (client, mut peer) = client_with_raw_peer_configs(Config::default(), peer_config);
+    let (client, mut peer) =
+        client_with_raw_peer_configs(Config::default().disable_capabilities(), peer_config);
+    assert_eq!(client.negotiated().capabilities, 0);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"seed".to_vec(),
+    });
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_once_stream(&stream), b"seed");
+
     let mut payload = build_open_metadata_prefix(
         caps,
         None,
@@ -8506,8 +8584,7 @@ fn hidden_abort_limit_reaps_to_marker_without_late_abort() {
 #[test]
 fn hidden_abort_under_memory_pressure_reaps_to_marker_and_ignores_late_data() {
     let client_config = Config {
-        // Marker-only state is 64 bytes in Rust; leave room for the credit
-        // replenishment frame while still forcing hidden tombstone reaping.
+        // Leave room for credit while still forcing hidden tombstone reaping.
         session_memory_cap: Some(80),
         ..Config::default()
     };
@@ -9353,7 +9430,10 @@ fn tagged_peer_ping_gets_padded_pong_suffix() {
 
 #[test]
 fn second_ping_waits_for_outstanding_ping() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config {
+        ping_padding: false,
+        ..Config::default()
+    });
 
     let first_client = client.clone();
     let first = thread::spawn(move || first_client.ping(b"one"));
@@ -9391,7 +9471,10 @@ fn second_ping_waits_for_outstanding_ping() {
 
 #[test]
 fn ping_fails_when_session_closes() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config {
+        ping_padding: false,
+        ..Config::default()
+    });
 
     let ping_client = client.clone();
     let ping = thread::spawn(move || ping_client.ping_timeout(b"close", Duration::from_secs(1)));
@@ -9419,7 +9502,10 @@ fn ping_fails_when_session_closes() {
 
 #[test]
 fn ping_queues_payload_snapshot() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config {
+        ping_padding: false,
+        ..Config::default()
+    });
     let echo = b"ping-echo".to_vec();
     let expected = echo.clone();
 
@@ -9594,6 +9680,7 @@ fn keepalive_sends_idle_ping_and_records_rtt() {
     let client_config = Config {
         keepalive_interval: Duration::from_millis(20),
         keepalive_timeout: Duration::from_millis(500),
+        ping_padding: false,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -9627,6 +9714,7 @@ fn keepalive_timeout_closes_session_with_idle_timeout() {
     let client_config = Config {
         keepalive_interval: Duration::from_millis(80),
         keepalive_timeout: Duration::from_millis(70),
+        ping_padding: false,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -9714,6 +9802,7 @@ fn outbound_write_does_not_mask_read_idle_keepalive() {
     let client_config = Config {
         keepalive_interval: Duration::from_millis(80),
         keepalive_timeout: Duration::from_millis(500),
+        ping_padding: false,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -9742,6 +9831,7 @@ fn keepalive_max_ping_interval_triggers_before_idle_interval() {
         keepalive_interval: Duration::from_secs(1),
         keepalive_max_ping_interval: Duration::from_millis(80),
         keepalive_timeout: Duration::from_millis(500),
+        ping_padding: false,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
@@ -11755,7 +11845,7 @@ fn local_open_memory_cap_baseline(caps: u64) -> usize {
 
 #[test]
 fn local_open_rejects_open_info_without_negotiated_open_metadata() {
-    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let (client, mut peer) = client_with_raw_peer(Config::default().disable_capabilities());
 
     let err = match client.open_stream_with(OpenOptions::new().open_info(b"need-metadata")) {
         Ok(_) => panic!("open_stream_with unexpectedly succeeded"),

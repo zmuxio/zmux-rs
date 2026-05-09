@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::event::EventHandler;
 use crate::preface::Preface;
-use crate::protocol::{Role, PREFACE_VERSION, PROTO_VERSION};
+use crate::protocol::{Role, DEFAULT_CAPABILITIES, PREFACE_VERSION, PROTO_VERSION};
 use crate::settings::Settings;
 use crate::varint::{varint_len, MAX_VARINT62};
 use std::borrow::Cow;
@@ -65,6 +65,7 @@ pub struct Config {
     pub min_proto: u64,
     pub max_proto: u64,
     pub capabilities: u64,
+    pub disable_capabilities: bool,
     pub settings: Settings,
     pub preface_padding: bool,
     pub preface_padding_min_bytes: u64,
@@ -128,6 +129,7 @@ impl fmt::Debug for Config {
             .field("min_proto", &self.min_proto)
             .field("max_proto", &self.max_proto)
             .field("capabilities", &self.capabilities)
+            .field("disable_capabilities", &self.disable_capabilities)
             .field("settings", &self.settings)
             .field("preface_padding", &self.preface_padding)
             .field("preface_padding_min_bytes", &self.preface_padding_min_bytes)
@@ -263,7 +265,6 @@ fn default_config_template() -> &'static RwLock<Config> {
     DEFAULT_CONFIG_TEMPLATE.get_or_init(|| RwLock::new(builtin_default_config()))
 }
 
-/// Return a copy of the process-wide default configuration template.
 fn current_default_config() -> Config {
     default_config_template()
         .read()
@@ -271,12 +272,6 @@ fn current_default_config() -> Config {
         .clone()
 }
 
-/// Mutate the process-wide default configuration template.
-///
-/// Call this during process initialization before creating sessions. Existing
-/// sessions are not affected. Concurrent calls are race-safe, but the last
-/// completed update wins. Per-session random fields are cleared after the
-/// closure returns so later sessions can generate fresh values.
 fn update_default_config_template(update: impl FnOnce(&mut Config)) {
     let mut next = current_default_config();
     update(&mut next);
@@ -288,7 +283,6 @@ fn update_default_config_template(update: impl FnOnce(&mut Config)) {
     *template = next;
 }
 
-/// Restore the built-in process-wide default configuration template.
 fn restore_builtin_default_template() {
     let mut template = default_config_template()
         .write()
@@ -302,12 +296,13 @@ fn builtin_default_config() -> Config {
         tie_breaker_nonce: 0,
         min_proto: PROTO_VERSION,
         max_proto: PROTO_VERSION,
-        capabilities: 0,
+        capabilities: DEFAULT_CAPABILITIES,
+        disable_capabilities: false,
         settings: Settings::DEFAULT,
-        preface_padding: false,
+        preface_padding: true,
         preface_padding_min_bytes: DEFAULT_PREFACE_PADDING_MIN_BYTES,
         preface_padding_max_bytes: DEFAULT_PREFACE_PADDING_MAX_BYTES,
-        ping_padding: false,
+        ping_padding: true,
         ping_padding_min_bytes: DEFAULT_PING_PADDING_MIN_BYTES,
         ping_padding_max_bytes: DEFAULT_PING_PADDING_MAX_BYTES,
         write_queue_max_bytes: DEFAULT_WRITE_QUEUE_MAX_BYTES,
@@ -362,6 +357,11 @@ fn builtin_default_config() -> Config {
 fn sanitize_default_config_template(mut config: Config) -> Config {
     config.min_proto = nonzero_or_default(config.min_proto, PROTO_VERSION);
     config.max_proto = nonzero_or_default(config.max_proto, PROTO_VERSION);
+    if config.disable_capabilities {
+        config.capabilities = 0;
+    } else if config.capabilities == 0 {
+        config.capabilities = DEFAULT_CAPABILITIES;
+    }
     if config.settings == ZERO_SETTINGS {
         config.settings = Settings::DEFAULT;
     } else {
@@ -380,8 +380,6 @@ const ZERO_SETTINGS: Settings = Settings {
     max_incoming_streams_bidi: 0,
     max_incoming_streams_uni: 0,
     max_frame_payload: 0,
-    idle_timeout_millis: 0,
-    keepalive_hint_millis: 0,
     max_control_payload_bytes: 0,
     max_extension_payload_bytes: 0,
     scheduler_hints: crate::settings::SchedulerHint::UnspecifiedOrBalanced,
@@ -405,10 +403,7 @@ pub(crate) fn default_late_data_aggregate_cap(max_frame_payload: u64) -> u64 {
 impl Config {
     /// Mutate the process-wide default configuration template.
     ///
-    /// Call this during process initialization before creating sessions.
-    /// Existing sessions are not affected. Per-session random fields are
-    /// cleared after the closure returns so later sessions can generate fresh
-    /// values.
+    /// Existing sessions are not affected.
     pub fn configure_default(update: impl FnOnce(&mut Config)) {
         update_default_config_template(update);
     }
@@ -446,12 +441,21 @@ impl Config {
     #[must_use]
     pub fn capabilities(mut self, capabilities: u64) -> Self {
         self.capabilities = capabilities;
+        self.disable_capabilities = false;
         self
     }
 
     #[must_use]
     pub fn enable_capabilities(mut self, capabilities: u64) -> Self {
         self.capabilities |= capabilities;
+        self.disable_capabilities = false;
+        self
+    }
+
+    #[must_use]
+    pub fn disable_capabilities(mut self) -> Self {
+        self.capabilities = 0;
+        self.disable_capabilities = true;
         self
     }
 
@@ -476,6 +480,11 @@ impl Config {
             return Err(Error::protocol(
                 "zmux config tie_breaker_nonce exceeds varint62",
             ));
+        }
+        if cfg.disable_capabilities {
+            cfg.capabilities = 0;
+        } else if cfg.capabilities == 0 {
+            cfg.capabilities = DEFAULT_CAPABILITIES;
         }
         if cfg.capabilities > MAX_VARINT62 {
             return Err(Error::protocol("zmux config capabilities exceeds varint62"));
@@ -776,8 +785,6 @@ fn validate_settings(settings: Settings) -> Result<()> {
             settings.max_incoming_streams_uni,
         ),
         ("max_frame_payload", settings.max_frame_payload),
-        ("idle_timeout_millis", settings.idle_timeout_millis),
-        ("keepalive_hint_millis", settings.keepalive_hint_millis),
         (
             "max_control_payload_bytes",
             settings.max_control_payload_bytes,
@@ -829,13 +836,12 @@ mod tests {
             min_proto: 1,
             max_proto: 2,
             capabilities: 0x55aa,
+            disable_capabilities: false,
             settings: Settings {
                 initial_max_data: 777_777,
                 max_incoming_streams_bidi: 17,
                 max_incoming_streams_uni: 19,
                 max_frame_payload: 32_768,
-                idle_timeout_millis: 9_000,
-                keepalive_hint_millis: 1_500,
                 max_control_payload_bytes: 8_192,
                 max_extension_payload_bytes: 8_192,
                 scheduler_hints: SchedulerHint::Latency,
@@ -909,6 +915,7 @@ mod tests {
         assert_eq!(expected.min_proto, actual.min_proto);
         assert_eq!(expected.max_proto, actual.max_proto);
         assert_eq!(expected.capabilities, actual.capabilities);
+        assert_eq!(expected.disable_capabilities, actual.disable_capabilities);
         assert_eq!(expected.settings, actual.settings);
         assert_eq!(expected.preface_padding, actual.preface_padding);
         assert_eq!(
@@ -1152,7 +1159,11 @@ mod tests {
         );
         assert_eq!(preface.min_proto, PROTO_VERSION);
         assert_eq!(preface.max_proto, PROTO_VERSION);
-        assert_eq!(preface.settings, normalized.settings);
+        let mut expected_settings = normalized.settings;
+        assert_ne!(preface.settings.ping_padding_key, 0);
+        assert!(preface.settings.ping_padding_key <= MAX_VARINT62);
+        expected_settings.ping_padding_key = preface.settings.ping_padding_key;
+        assert_eq!(preface.settings, expected_settings);
     }
 
     #[test]
@@ -1224,9 +1235,11 @@ mod tests {
         assert_eq!(cfg.tie_breaker_nonce, 0);
         assert_eq!(cfg.min_proto, PROTO_VERSION);
         assert_eq!(cfg.max_proto, PROTO_VERSION);
+        assert_eq!(cfg.capabilities, DEFAULT_CAPABILITIES);
+        assert!(!cfg.disable_capabilities);
         assert_eq!(cfg.settings, Settings::DEFAULT);
-        assert!(!cfg.preface_padding);
-        assert!(!cfg.ping_padding);
+        assert!(cfg.preface_padding);
+        assert!(cfg.ping_padding);
     }
 
     #[test]
@@ -1262,6 +1275,33 @@ mod tests {
             Settings::DEFAULT.max_frame_payload
         );
         assert_eq!(cfg.settings.ping_padding_key, 0);
+    }
+
+    #[test]
+    fn zero_capabilities_normalize_to_default_capability_set() {
+        let cfg = Config {
+            capabilities: 0,
+            ..Config::responder()
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(cfg.capabilities, DEFAULT_CAPABILITIES);
+
+        let preface = cfg.local_preface().unwrap();
+        assert_eq!(preface.capabilities, DEFAULT_CAPABILITIES);
+    }
+
+    #[test]
+    fn disable_capabilities_overrides_default_capability_set() {
+        let cfg = Config::default()
+            .disable_capabilities()
+            .normalized()
+            .unwrap();
+        assert_eq!(cfg.capabilities, 0);
+        assert!(cfg.disable_capabilities);
+
+        let preface = cfg.local_preface().unwrap();
+        assert_eq!(preface.capabilities, 0);
     }
 
     #[test]
@@ -1369,6 +1409,7 @@ mod tests {
         assert!(enabled.settings.ping_padding_key <= MAX_VARINT62);
 
         let disabled = Config {
+            ping_padding: false,
             settings: Settings {
                 ping_padding_key: 123,
                 ..Settings::default()
@@ -1392,6 +1433,7 @@ mod tests {
         assert_eq!(configured_key.settings.ping_padding_key, 77);
 
         let disabled_dirty_key = Config {
+            ping_padding: false,
             settings: Settings {
                 ping_padding_key: MAX_VARINT62 + 1,
                 ..Settings::default()

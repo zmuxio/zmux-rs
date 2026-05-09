@@ -125,20 +125,12 @@ payload write fails, ZMux best-effort closes the opened stream before returning 
 
 ## Metadata And Priority
 
-Enable negotiated capabilities before using open metadata, priority hints, stream groups, or priority updates:
+Default sessions advertise the standard metadata capabilities. Open metadata is
+sent only when the open options need it:
 
 ```rust
-use zmux::{
-    Config, MetadataUpdate, OpenOptions, CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS,
-    CAPABILITY_PRIORITY_UPDATE, CAPABILITY_STREAM_GROUPS,
-};
+use zmux::{MetadataUpdate, OpenOptions};
 
-let capabilities = CAPABILITY_OPEN_METADATA
-    | CAPABILITY_PRIORITY_HINTS
-    | CAPABILITY_STREAM_GROUPS
-    | CAPABILITY_PRIORITY_UPDATE;
-
-let config = Config::default().capabilities(capabilities);
 let options = OpenOptions::new()
     .open_info(b"\x01\x00\x00\x2a")
     .priority(7)
@@ -331,14 +323,17 @@ Common helpers include `is_session_closed()`, `is_read_closed()`, `is_write_clos
 
 ```rust
 let config = Config::default()
-    .capabilities(capabilities)
     .event_handler(|event| {
         let _ = event;
     });
 ```
 
-`Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, idle timeout hints,
-keepalive hints, scheduler hints, and padding keys.
+`Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, scheduler hints, and
+padding keys.
+
+The built-in default advertises open metadata, priority hints, stream groups,
+and priority updates. Use `Config::default().disable_capabilities()` when a
+session must advertise no optional protocol capabilities.
 
 `Config::default()` returns a copy of the process-wide default template. Use
 `Config::configure_default(...)` during startup when every new session should
@@ -348,7 +343,6 @@ session needs an explicit override:
 
 ```rust
 zmux::Config::configure_default(|config| {
-    config.capabilities |= CAPABILITY_OPEN_METADATA;
     config.keepalive_interval = std::time::Duration::from_secs(30);
 });
 ```

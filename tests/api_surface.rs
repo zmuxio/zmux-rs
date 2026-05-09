@@ -15,15 +15,11 @@ fn public_protocol_aliases_remain_pinned() {
     assert_eq!(zmux::MAX_PREFACE_SETTINGS_BYTES, 4096);
     assert_eq!(zmux::MAX_VARINT62, (1u64 << 62) - 1);
 
-    assert_eq!(zmux::CAPABILITY_PRIORITY_HINTS, 1);
-    assert_eq!(zmux::CAPABILITY_STREAM_GROUPS, 1 << 1);
-    assert_eq!(zmux::CAPABILITY_MULTILINK_BASIC_RETIRED, 1 << 2);
-    assert_eq!(
-        zmux::CAPABILITY_MULTILINK_BASIC,
-        zmux::CAPABILITY_MULTILINK_BASIC_RETIRED
-    );
+    assert_eq!(zmux::CAPABILITY_OPEN_METADATA, 1);
+    assert_eq!(zmux::CAPABILITY_PRIORITY_HINTS, 1 << 1);
+    assert_eq!(zmux::CAPABILITY_STREAM_GROUPS, 1 << 2);
     assert_eq!(zmux::CAPABILITY_PRIORITY_UPDATE, 1 << 3);
-    assert_eq!(zmux::CAPABILITY_OPEN_METADATA, 1 << 4);
+    assert_eq!(zmux::DEFAULT_CAPABILITIES, 15);
 
     assert_eq!(u64::from(zmux::SchedulerHint::UnspecifiedOrBalanced), 0);
     assert_eq!(u64::from(zmux::SchedulerHint::Latency), 1);
@@ -50,20 +46,13 @@ fn public_protocol_aliases_remain_pinned() {
     assert_eq!(zmux::SETTING_MAX_INCOMING_STREAMS_BIDI, 5);
     assert_eq!(zmux::SETTING_MAX_INCOMING_STREAMS_UNI, 6);
     assert_eq!(zmux::SETTING_MAX_FRAME_PAYLOAD, 7);
-    assert_eq!(zmux::SETTING_IDLE_TIMEOUT_MILLIS, 8);
-    assert_eq!(zmux::SETTING_KEEPALIVE_HINT_MILLIS, 9);
-    assert_eq!(zmux::SETTING_MAX_CONTROL_PAYLOAD_BYTES, 10);
-    assert_eq!(zmux::SETTING_MAX_EXTENSION_PAYLOAD_BYTES, 11);
-    assert_eq!(zmux::SETTING_SCHEDULER_HINTS, 12);
-    assert_eq!(zmux::SETTING_PING_PADDING_KEY, 13);
-    assert_eq!(zmux::SETTING_PREFACE_PADDING, 63);
+    assert_eq!(zmux::SETTING_MAX_CONTROL_PAYLOAD_BYTES, 8);
+    assert_eq!(zmux::SETTING_MAX_EXTENSION_PAYLOAD_BYTES, 9);
+    assert_eq!(zmux::SETTING_SCHEDULER_HINTS, 10);
+    assert_eq!(zmux::SETTING_PING_PADDING_KEY, 11);
+    assert_eq!(zmux::SETTING_PREFACE_PADDING, 12);
 
     assert_eq!(zmux::EXT_PRIORITY_UPDATE, 1);
-    assert_eq!(zmux::EXT_ML_READY_RETIRED, 2);
-    assert_eq!(zmux::EXT_ML_ATTACH_RETIRED, 3);
-    assert_eq!(zmux::EXT_ML_ATTACH_ACK_RETIRED, 4);
-    assert_eq!(zmux::EXT_ML_DRAIN_REQ_RETIRED, 5);
-    assert_eq!(zmux::EXT_ML_DRAIN_ACK_RETIRED, 6);
 
     assert_eq!(zmux::METADATA_STREAM_PRIORITY, 1);
     assert_eq!(zmux::METADATA_STREAM_GROUP, 2);
@@ -117,9 +106,11 @@ fn public_config_builders_remain_ergonomic() {
     assert_eq!(default.role, zmux::Role::Auto);
     assert_eq!(default.min_proto, zmux::PROTO_VERSION);
     assert_eq!(default.max_proto, zmux::PROTO_VERSION);
+    assert_eq!(default.capabilities, zmux::DEFAULT_CAPABILITIES);
+    assert!(!default.disable_capabilities);
     assert_eq!(default.settings, zmux::Settings::DEFAULT);
-    assert!(!default.preface_padding);
-    assert!(!default.ping_padding);
+    assert!(default.preface_padding);
+    assert!(default.ping_padding);
 
     let initiator = zmux::Config::initiator();
     assert_eq!(initiator.role, zmux::Role::Initiator);
@@ -178,7 +169,7 @@ fn public_config_builders_remain_ergonomic() {
         .validate()
         .is_err());
 
-    assert!(!zmux::Config::default().ping_padding);
+    assert!(zmux::Config::default().ping_padding);
 }
 
 #[test]

@@ -25,10 +25,6 @@ type PendingWriteFuture = BoxIoFuture<(Vec<u8>, io::Result<usize>)>;
 /// With the `tokio-io` feature this type implements `tokio::io::AsyncRead`
 /// and/or `tokio::io::AsyncWrite`. With the `futures-io` feature it implements
 /// `futures_io::AsyncRead` and/or `futures_io::AsyncWrite`.
-///
-/// The adapter owns an `Arc` to the wrapped stream and uses owned temporary
-/// buffers for poll-based operations, so it can safely bridge ZMux's
-/// future-returning API to Rust's standard poll traits.
 pub struct AsyncIo<T: ?Sized> {
     inner: Arc<T>,
     read_chunk_size: usize,
@@ -91,7 +87,7 @@ impl<T: ?Sized> AsyncIo<T> {
         &self.inner
     }
 
-    /// Borrows the shared owner for callers that need to clone it.
+    /// Borrows the shared owner.
     #[inline]
     pub fn as_arc(&self) -> &Arc<T> {
         &self.inner
@@ -110,8 +106,6 @@ impl<T: ?Sized> AsyncIo<T> {
     }
 
     /// Sets the maximum read buffer used per poll operation.
-    ///
-    /// A value of zero is clamped to one byte.
     #[inline]
     pub fn set_read_chunk_size(&mut self, size: usize) {
         self.read_chunk_size = size.max(1);
@@ -124,8 +118,6 @@ impl<T: ?Sized> AsyncIo<T> {
     }
 
     /// Sets the maximum write buffer copied per poll operation.
-    ///
-    /// A value of zero is clamped to one byte.
     #[inline]
     pub fn set_write_chunk_size(&mut self, size: usize) {
         self.write_chunk_size = size.max(1);

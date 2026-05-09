@@ -59,12 +59,8 @@ impl From<OpenOptions> for OpenRequest {
 
 /// Binary payload for write operations.
 ///
-/// Byte buffers can be borrowed or owned. Borrowed `&[u8]` / `&Vec<u8>` values
-/// stay borrowed until the operation returns; owned `Vec<u8>` values move into
-/// the write request and let concrete runtimes avoid an internal queue copy
-/// when the transport framing can use the buffer directly. Vectored payloads
-/// are opt-in through `WritePayload::vectored(...)` / `OpenSend::vectored(...)`
-/// so ordinary byte-buffer calls keep the same shape as `Write::write(&[u8])`.
+/// Borrowed buffers stay borrowed until the operation returns. Owned buffers
+/// can be moved into the runtime without another caller-side copy.
 #[derive(Debug, Clone)]
 pub enum WritePayload<'a> {
     Bytes(Cow<'a, [u8]>),

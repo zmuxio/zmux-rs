@@ -1421,17 +1421,3 @@ fn fixture_ids_are_globally_unique_across_bundles() {
         "fixture catalog size should equal the number of loaded fixture ids"
     );
 }
-
-#[test]
-fn retired_registry_aliases_are_public_and_stable() {
-    assert_eq!(
-        CAPABILITY_MULTILINK_BASIC,
-        CAPABILITY_MULTILINK_BASIC_RETIRED
-    );
-    assert_eq!(CAPABILITY_MULTILINK_BASIC, 1 << 2);
-    assert_eq!(EXT_ML_READY_RETIRED, 2);
-    assert_eq!(EXT_ML_ATTACH_RETIRED, 3);
-    assert_eq!(EXT_ML_ATTACH_ACK_RETIRED, 4);
-    assert_eq!(EXT_ML_DRAIN_REQ_RETIRED, 5);
-    assert_eq!(EXT_ML_DRAIN_ACK_RETIRED, 6);
-}

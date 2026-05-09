@@ -52,11 +52,9 @@ pub(super) struct WriteQueueLimits {
 #[derive(Debug, Default)]
 struct WriteQueueState {
     urgent_jobs: VecDeque<WriteJob>,
-    advisory_jobs: VecDeque<WriteJob>,
     ordinary_jobs: VecDeque<WriteJob>,
     queued_bytes: usize,
     urgent_queued_bytes: usize,
-    advisory_queued_bytes: usize,
     data_queued_bytes: usize,
     data_queued_by_stream: HashMap<u64, usize>,
     pending_control_bytes: usize,
@@ -67,7 +65,6 @@ struct WriteQueueState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueLane {
     Urgent,
-    Advisory,
     Ordinary,
 }
 
@@ -97,7 +94,6 @@ enum CoalesceKey {
 struct QueueCost {
     queued: usize,
     urgent: usize,
-    advisory: usize,
     data: DataCosts,
     pending_control: usize,
     pending_priority: usize,
@@ -577,13 +573,11 @@ impl WriteQueue {
         let state = self.state.lock().unwrap();
         WriterQueueStats {
             urgent_jobs: state.urgent_jobs.len(),
-            advisory_jobs: state.advisory_jobs.len(),
             ordinary_jobs: state.ordinary_jobs.len(),
             queued_bytes: state.queued_bytes,
             max_bytes: self.max_bytes,
             urgent_queued_bytes: state.urgent_queued_bytes,
             urgent_max_bytes: self.urgent_max_bytes,
-            advisory_queued_bytes: state.advisory_queued_bytes,
             data_queued_bytes: state.data_queued_bytes,
             session_data_high_watermark: self.session_data_max_bytes,
             per_stream_data_high_watermark: self.per_stream_data_max_bytes,
@@ -607,7 +601,6 @@ impl WriteQueue {
     pub(super) fn terminal_control_queued_for_stream(&self, stream_id: u64) -> bool {
         let state = self.state.lock().unwrap();
         jobs_have_terminal_control_for_stream(&state.urgent_jobs, stream_id)
-            || jobs_have_terminal_control_for_stream(&state.advisory_jobs, stream_id)
             || jobs_have_terminal_control_for_stream(&state.ordinary_jobs, stream_id)
     }
 
@@ -622,12 +615,6 @@ impl WriteQueue {
             stream_id,
             frame_belongs_to_stream,
         );
-        stats.add(discard_stream_from_lane(
-            &mut state,
-            QueueLane::Advisory,
-            stream_id,
-            frame_belongs_to_stream,
-        ));
         stats.add(discard_stream_from_lane(
             &mut state,
             QueueLane::Ordinary,
@@ -652,12 +639,6 @@ impl WriteQueue {
             stream_id,
             frame_is_send_tail_for_stream,
         );
-        stats.add(discard_stream_from_lane(
-            &mut state,
-            QueueLane::Advisory,
-            stream_id,
-            frame_is_send_tail_for_stream,
-        ));
         stats.add(discard_stream_from_lane(
             &mut state,
             QueueLane::Ordinary,
@@ -790,11 +771,10 @@ impl WriteQueue {
             return WriteQueuePopStatus::Closed;
         }
 
-        let mut prefer_advisory = true;
         let mut saw_nonurgent = false;
         let mut nonurgent_batch_bytes = 0usize;
         for _ in 0..batch_frame_limit {
-            let Some((lane, job)) = pop_next_batch_job(&mut state, prefer_advisory) else {
+            let Some((lane, job)) = pop_next_batch_job(&mut state) else {
                 break;
             };
             let cost = job.cost_bytes();
@@ -807,11 +787,6 @@ impl WriteQueue {
                 }
                 saw_nonurgent = true;
                 nonurgent_batch_bytes = nonurgent_batch_bytes.saturating_add(cost);
-            }
-            match lane {
-                QueueLane::Advisory => prefer_advisory = false,
-                QueueLane::Ordinary => prefer_advisory = true,
-                QueueLane::Urgent => {}
             }
             let accounting = queue_cost_for(lane, &job, cost);
             apply_queue_cost_remove(&mut state, &accounting);
@@ -1042,7 +1017,6 @@ impl WriteQueue {
         apply_queue_cost_add(state, &cost);
         match lane {
             QueueLane::Urgent => state.urgent_jobs.push_back(job),
-            QueueLane::Advisory => state.advisory_jobs.push_back(job),
             QueueLane::Ordinary => state.ordinary_jobs.push_back(job),
         }
         self.not_empty.notify_one();
@@ -1096,7 +1070,6 @@ fn replacement_would_exceed_limit(
 fn push_front_batch_job(state: &mut WriteQueueState, lane: QueueLane, job: WriteJob) {
     match lane {
         QueueLane::Urgent => state.urgent_jobs.push_front(job),
-        QueueLane::Advisory => state.advisory_jobs.push_front(job),
         QueueLane::Ordinary => state.ordinary_jobs.push_front(job),
     }
 }
@@ -1107,11 +1080,6 @@ fn find_tracked_completion(
 ) -> Option<(QueueLane, usize)> {
     if let Some(found) =
         find_tracked_completion_in_lane(&state.urgent_jobs, QueueLane::Urgent, completion)
-    {
-        return Some(found);
-    }
-    if let Some(found) =
-        find_tracked_completion_in_lane(&state.advisory_jobs, QueueLane::Advisory, completion)
     {
         return Some(found);
     }
@@ -1131,32 +1099,14 @@ fn find_tracked_completion_in_lane(
     None
 }
 
-fn pop_next_batch_job(
-    state: &mut WriteQueueState,
-    prefer_advisory: bool,
-) -> Option<(QueueLane, WriteJob)> {
+fn pop_next_batch_job(state: &mut WriteQueueState) -> Option<(QueueLane, WriteJob)> {
     if let Some(job) = state.urgent_jobs.pop_front() {
         return Some((QueueLane::Urgent, job));
     }
-    if prefer_advisory {
-        if let Some(job) = state.advisory_jobs.pop_front() {
-            Some((QueueLane::Advisory, job))
-        } else {
-            state
-                .ordinary_jobs
-                .pop_front()
-                .map(|job| (QueueLane::Ordinary, job))
-        }
-    } else {
-        if let Some(job) = state.ordinary_jobs.pop_front() {
-            Some((QueueLane::Ordinary, job))
-        } else {
-            state
-                .advisory_jobs
-                .pop_front()
-                .map(|job| (QueueLane::Advisory, job))
-        }
-    }
+    state
+        .ordinary_jobs
+        .pop_front()
+        .map(|job| (QueueLane::Ordinary, job))
 }
 
 fn discard_stream_from_lane(
@@ -1171,7 +1121,6 @@ fn discard_stream_from_lane(
 
     let mut jobs = match lane {
         QueueLane::Urgent => std::mem::take(&mut state.urgent_jobs),
-        QueueLane::Advisory => std::mem::take(&mut state.advisory_jobs),
         QueueLane::Ordinary => std::mem::take(&mut state.ordinary_jobs),
     };
     let original_len = jobs.len();
@@ -1199,7 +1148,6 @@ fn discard_stream_from_lane(
 
     match lane {
         QueueLane::Urgent => state.urgent_jobs = kept,
-        QueueLane::Advisory => state.advisory_jobs = kept,
         QueueLane::Ordinary => state.ordinary_jobs = kept,
     }
     stats
@@ -1249,7 +1197,6 @@ fn jobs_have_removable_stream_frame(
 fn remove_lane_job(state: &mut WriteQueueState, lane: QueueLane, index: usize) -> Option<WriteJob> {
     match lane {
         QueueLane::Urgent => state.urgent_jobs.remove(index),
-        QueueLane::Advisory => state.advisory_jobs.remove(index),
         QueueLane::Ordinary => state.ordinary_jobs.remove(index),
     }
 }
@@ -1343,18 +1290,12 @@ fn frame_is_send_tail_for_stream(frame: &Frame, stream_id: u64) -> bool {
 impl WriteQueueState {
     #[inline]
     fn is_empty(&self) -> bool {
-        self.urgent_jobs.is_empty()
-            && self.advisory_jobs.is_empty()
-            && self.ordinary_jobs.is_empty()
+        self.urgent_jobs.is_empty() && self.ordinary_jobs.is_empty()
     }
 
     fn lane_for(&self, job: &WriteJob) -> QueueLane {
-        if let Some(CoalesceKey::PriorityUpdate { stream_id }) = job.coalesce_key() {
-            return if self.has_queued_data_for_stream(stream_id) {
-                QueueLane::Ordinary
-            } else {
-                QueueLane::Advisory
-            };
+        if matches!(job.coalesce_key(), Some(CoalesceKey::PriorityUpdate { .. })) {
+            return QueueLane::Ordinary;
         }
         let Some(stream_id) = job.urgent_stream_id() else {
             return if job.is_urgent() {
@@ -1381,9 +1322,6 @@ impl WriteQueueState {
         if let Some(found) = find_coalesced_in_lane(&self.urgent_jobs, QueueLane::Urgent, key) {
             return Some(found);
         }
-        if let Some(found) = find_coalesced_in_lane(&self.advisory_jobs, QueueLane::Advisory, key) {
-            return Some(found);
-        }
         find_coalesced_in_lane(&self.ordinary_jobs, QueueLane::Ordinary, key)
     }
 
@@ -1391,7 +1329,6 @@ impl WriteQueueState {
     fn lane(&self, lane: QueueLane) -> &VecDeque<WriteJob> {
         match lane {
             QueueLane::Urgent => &self.urgent_jobs,
-            QueueLane::Advisory => &self.advisory_jobs,
             QueueLane::Ordinary => &self.ordinary_jobs,
         }
     }
@@ -1400,7 +1337,6 @@ impl WriteQueueState {
     fn job(&self, lane: QueueLane, index: usize) -> &WriteJob {
         match lane {
             QueueLane::Urgent => &self.urgent_jobs[index],
-            QueueLane::Advisory => &self.advisory_jobs[index],
             QueueLane::Ordinary => &self.ordinary_jobs[index],
         }
     }
@@ -1409,7 +1345,6 @@ impl WriteQueueState {
     fn job_mut(&mut self, lane: QueueLane, index: usize) -> &mut WriteJob {
         match lane {
             QueueLane::Urgent => &mut self.urgent_jobs[index],
-            QueueLane::Advisory => &mut self.advisory_jobs[index],
             QueueLane::Ordinary => &mut self.ordinary_jobs[index],
         }
     }
@@ -1445,11 +1380,6 @@ fn queue_cost_for(lane: QueueLane, job: &WriteJob, queued: usize) -> QueueCost {
     } else {
         0
     };
-    let advisory = if lane == QueueLane::Advisory {
-        queued
-    } else {
-        0
-    };
     let (pending_control, pending_priority) = match job.coalesce_key() {
         Some(CoalesceKey::PriorityUpdate { .. }) => (0, queued),
         Some(CoalesceKey::MaxData { .. } | CoalesceKey::Blocked { .. }) => (queued, 0),
@@ -1459,7 +1389,6 @@ fn queue_cost_for(lane: QueueLane, job: &WriteJob, queued: usize) -> QueueCost {
     QueueCost {
         queued,
         urgent,
-        advisory,
         data: data_costs(job),
         pending_control,
         pending_priority,
@@ -1574,11 +1503,9 @@ fn add_data_cost(costs: &mut DataCosts, stream_id: u64, bytes: usize) {
 fn clear_queue_locked(state: &mut WriteQueueState) {
     let err = Error::session_closed();
     complete_drained_jobs(state.urgent_jobs.drain(..), &err);
-    complete_drained_jobs(state.advisory_jobs.drain(..), &err);
     complete_drained_jobs(state.ordinary_jobs.drain(..), &err);
     state.queued_bytes = 0;
     state.urgent_queued_bytes = 0;
-    state.advisory_queued_bytes = 0;
     state.data_queued_bytes = 0;
     state.data_queued_by_stream.clear();
     state.pending_control_bytes = 0;
@@ -1604,7 +1531,6 @@ fn complete_job_error(job: WriteJob, err: &Error) {
 
 fn maybe_shrink_empty_lanes(state: &mut WriteQueueState) {
     shrink_empty_lane(&mut state.urgent_jobs);
-    shrink_empty_lane(&mut state.advisory_jobs);
     shrink_empty_lane(&mut state.ordinary_jobs);
 }
 
@@ -1723,7 +1649,6 @@ fn merge_coalesced_priority_update(old: &WriteJob, new: &mut WriteJob) -> Result
 fn apply_queue_cost_add(state: &mut WriteQueueState, cost: &QueueCost) {
     state.queued_bytes = state.queued_bytes.saturating_add(cost.queued);
     state.urgent_queued_bytes = state.urgent_queued_bytes.saturating_add(cost.urgent);
-    state.advisory_queued_bytes = state.advisory_queued_bytes.saturating_add(cost.advisory);
     state.pending_control_bytes = state
         .pending_control_bytes
         .saturating_add(cost.pending_control);
@@ -1741,7 +1666,6 @@ fn apply_queue_cost_add(state: &mut WriteQueueState, cost: &QueueCost) {
 fn apply_queue_cost_remove(state: &mut WriteQueueState, cost: &QueueCost) {
     state.queued_bytes = state.queued_bytes.saturating_sub(cost.queued);
     state.urgent_queued_bytes = state.urgent_queued_bytes.saturating_sub(cost.urgent);
-    state.advisory_queued_bytes = state.advisory_queued_bytes.saturating_sub(cost.advisory);
     state.pending_control_bytes = state
         .pending_control_bytes
         .saturating_sub(cost.pending_control);
@@ -2381,7 +2305,6 @@ mod tests {
 
         let before = queue.stats();
         assert_ne!(before.ordinary_jobs, 0);
-        assert_ne!(before.advisory_jobs, 0);
         assert_ne!(before.urgent_jobs, 0);
         assert_ne!(before.data_queued_bytes, 0);
         assert_ne!(before.pending_control_bytes, 0);
@@ -2396,7 +2319,6 @@ mod tests {
 
         let after = queue.stats();
         assert_eq!(after.ordinary_jobs, 0);
-        assert_eq!(after.advisory_jobs, 0);
         assert_eq!(after.urgent_jobs, 2);
         assert_eq!(after.data_queued_bytes, 0);
         assert_eq!(after.pending_control_bytes, 0);
@@ -2432,15 +2354,10 @@ mod tests {
         }
         let initial = {
             let state = queue.state.lock().unwrap();
-            (
-                state.urgent_jobs.capacity(),
-                state.advisory_jobs.capacity(),
-                state.ordinary_jobs.capacity(),
-            )
+            (state.urgent_jobs.capacity(), state.ordinary_jobs.capacity())
         };
         assert!(initial.0 > MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
         assert!(initial.1 > MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
-        assert!(initial.2 > MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
 
         while queue.stats().queued_bytes != 0 {
             let batch = queue.pop_batch().expect("queued batch");
@@ -2449,7 +2366,6 @@ mod tests {
 
         let drained = queue.state.lock().unwrap();
         assert!(drained.urgent_jobs.capacity() <= MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
-        assert!(drained.advisory_jobs.capacity() <= MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
         assert!(drained.ordinary_jobs.capacity() <= MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
         assert_eq!(drained.data_queued_by_stream.len(), 0);
     }
@@ -2580,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn advisory_priority_update_is_latest_only_per_stream() {
+    fn priority_update_is_latest_only_per_stream() {
         let queue = queue(1024, 1024, 4);
         queue
             .push(WriteJob::Frame(Frame {
@@ -2617,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn advisory_priority_update_replacement_merges_partial_fields() {
+    fn priority_update_replacement_merges_partial_fields() {
         let caps =
             CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS | CAPABILITY_STREAM_GROUPS;
         let queue = queue(1024, 1024, 4);
@@ -2677,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn advisory_priority_update_bypasses_ordinary_byte_limit() {
+    fn priority_update_bypasses_ordinary_byte_limit() {
         let queue = queue_with_limits(17, 1024, 1024, 1024, 1024, 1024, 4);
         queue
             .try_push(WriteJob::Frame(Frame {
@@ -2689,22 +2605,20 @@ mod tests {
             .unwrap();
 
         let stats = queue.stats();
-        assert_eq!(stats.advisory_jobs, 1);
-        assert_eq!(stats.ordinary_jobs, 0);
-        assert_eq!(stats.advisory_queued_bytes, 33);
+        assert_eq!(stats.ordinary_jobs, 1);
         assert_eq!(stats.pending_priority_bytes, 33);
     }
 
     #[test]
-    fn discard_priority_update_removes_advisory_and_ordinary_updates() {
-        let advisory = queue(1024, 1024, 8);
-        advisory.push(priority_update_frame(1, 10)).unwrap();
-        advisory.push(frame(FrameType::Data, 1)).unwrap();
+    fn discard_priority_update_removes_shared_lane_updates() {
+        let before_data = queue(1024, 1024, 8);
+        before_data.push(priority_update_frame(1, 10)).unwrap();
+        before_data.push(frame(FrameType::Data, 1)).unwrap();
 
-        assert!(advisory.discard_priority_update(1));
-        let batch = advisory.pop_batch().unwrap();
+        assert!(before_data.discard_priority_update(1));
+        let batch = before_data.pop_batch().unwrap();
         assert_eq!(job_frame_types(batch), vec![FrameType::Data]);
-        assert_eq!(advisory.stats().pending_priority_bytes, 0);
+        assert_eq!(before_data.stats().pending_priority_bytes, 0);
 
         let ordinary = queue(1024, 1024, 8);
         ordinary.push(frame(FrameType::Data, 1)).unwrap();
@@ -2739,25 +2653,25 @@ mod tests {
     }
 
     #[test]
-    fn drained_advisory_lane_releases_oversized_backing() {
+    fn drained_priority_updates_release_ordinary_backing() {
         let queue = queue(8192, 8192, 8);
         for stream_id in 1..=96 {
             queue.push(priority_update_frame(stream_id, 1)).unwrap();
         }
-        let initial_capacity = queue.state.lock().unwrap().advisory_jobs.capacity();
+        let initial_capacity = queue.state.lock().unwrap().ordinary_jobs.capacity();
         assert!(initial_capacity > MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
 
-        while queue.stats().advisory_jobs != 0 {
+        while queue.stats().ordinary_jobs != 0 {
             let batch = queue.pop_batch().unwrap();
             assert!(!batch.is_empty());
         }
 
-        let retained_capacity = queue.state.lock().unwrap().advisory_jobs.capacity();
+        let retained_capacity = queue.state.lock().unwrap().ordinary_jobs.capacity();
         assert!(retained_capacity <= MAX_INITIAL_QUEUE_SCRATCH_RESERVE);
     }
 
     #[test]
-    fn advisory_lane_drains_after_urgent_before_ordinary() {
+    fn priority_update_shares_ordinary_lane_after_urgent() {
         let queue = queue(1024, 1024, 4);
         queue.push(frame(FrameType::Data, 1)).unwrap();
         queue
@@ -2773,12 +2687,12 @@ mod tests {
         let batch = queue.pop_batch().unwrap();
         assert_eq!(
             job_frame_types(batch),
-            vec![FrameType::Ping, FrameType::Ext, FrameType::Data]
+            vec![FrameType::Ping, FrameType::Data, FrameType::Ext]
         );
     }
 
     #[test]
-    fn advisory_and_ordinary_lanes_alternate_after_first_advisory() {
+    fn priority_updates_keep_shared_ordinary_lane_order() {
         let queue = queue(1024, 1024, 8);
         for stream_id in [1, 5] {
             queue
@@ -2801,11 +2715,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(stream_ids, vec![1, 9, 5, 13]);
+        assert_eq!(stream_ids, vec![1, 5, 9, 13]);
     }
 
     #[test]
-    fn same_stream_advisory_update_stays_behind_queued_data() {
+    fn same_stream_priority_update_stays_behind_queued_data() {
         let queue = queue(1024, 1024, 4);
         queue.push(frame(FrameType::Data, 1)).unwrap();
         queue
@@ -3223,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_priority_budget_limits_advisory_updates() {
+    fn pending_priority_budget_limits_priority_updates() {
         let queue = queue_with_limits(1024, 1024, 1024, 1024, 1024, 33, 8);
         for stream_id in [1, 5] {
             let mut payload = vec![EXT_PRIORITY_UPDATE as u8, stream_id as u8];
@@ -3482,7 +3396,6 @@ mod tests {
             let cost = QueueCost {
                 queued: requested,
                 urgent: 0,
-                advisory: 0,
                 data,
                 pending_control: 0,
                 pending_priority: 0,

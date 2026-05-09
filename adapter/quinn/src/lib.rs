@@ -1,25 +1,15 @@
 //! Optional QUIC adapter support for zmux.
 //!
-//! This crate is intentionally separate from the core `zmux` crate so normal
-//! users of native ZMux do not compile or import QUIC dependencies. Adapter
-//! streams start with `varint(metadata_len) + STREAM-METADATA-TLV...` when
-//! open-time metadata is present.
+//! Adapter streams start with `varint(metadata_len) + STREAM-METADATA-TLV...`
+//! when open-time metadata is present.
 //!
 //! Mapping rules:
 //! - bidirectional and unidirectional open / accept map directly to QUIC
 //!   streams;
 //! - open-time zmux metadata is carried in the per-stream prelude;
-//! - a fresh locally opened bidirectional stream writes that prelude before a
-//!   read-side stop so the peer can parse adapter metadata before seeing
-//!   STOP_SENDING;
-//! - fresh write-side reset visibility is not treated as portable because QUIC
-//!   RESET_STREAM may discard a just-written prelude;
-//! - accepted-stream prelude parsing is concurrency-bounded so stalled or
-//!   invalid adapter preludes do not block later ready streams;
-//! - post-open metadata updates are not representable on the QUIC stream wire
-//!   and return an adapter-local unsupported error;
-//! - QUIC stream termination carries numeric codes, while stream-level reason
-//!   strings remain advisory at the zmux API layer.
+//! - accepted-stream prelude parsing is concurrency-bounded;
+//! - post-open metadata updates return an unsupported error;
+//! - QUIC stream termination carries numeric codes.
 
 #![forbid(unsafe_code)]
 
@@ -32,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify, Semaphore};
 use zmux::{
     build_open_metadata_prefix, parse_stream_metadata_bytes_view, read_varint, AsyncBoxFuture,
     AsyncDuplexStreamHandle, AsyncRecvStreamHandle, AsyncSendStreamHandle, AsyncSession,
@@ -270,6 +260,7 @@ pub struct QuinnSession {
     peer_addr: Option<SocketAddr>,
     prepare_sem: Arc<Semaphore>,
     active: Arc<ActiveCounters>,
+    internal: Arc<InternalTasks>,
     stats: Arc<AdapterStats>,
     accept_shutdown: watch::Sender<()>,
     bidi_accept: Arc<AsyncMutex<Option<mpsc::Receiver<Result<QuinnStream>>>>>,
@@ -296,6 +287,7 @@ impl QuinnSession {
                 opts.accepted_prelude_max_concurrent,
             ))),
             active: Arc::new(ActiveCounters::default()),
+            internal: Arc::new(InternalTasks::default()),
             stats: Arc::new(AdapterStats::new()),
             accept_shutdown,
             bidi_accept: Arc::new(AsyncMutex::new(None)),
@@ -371,8 +363,9 @@ impl QuinnSession {
         let sem = self.prepare_sem.clone();
         let active = self.active.clone();
         let stats = self.stats.clone();
+        let internal = self.internal.clone();
         let mut shutdown = self.accept_shutdown.subscribe();
-        tokio::spawn(async move {
+        internal.clone().spawn(async move {
             loop {
                 let (send, recv) = match accept_bi_or_shutdown(&conn, &mut shutdown).await {
                     Some(Ok(streams)) => streams,
@@ -399,8 +392,9 @@ impl QuinnSession {
                 let active = active.clone();
                 let stats = stats.clone();
                 let conn = conn.clone();
+                let internal = internal.clone();
                 let mut worker_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                internal.spawn(async move {
                     let _permit = permit;
                     if let Some(result) = prepare_accepted_bidi_stream_or_shutdown(
                         send,
@@ -430,8 +424,9 @@ impl QuinnSession {
         let sem = self.prepare_sem.clone();
         let active = self.active.clone();
         let stats = self.stats.clone();
+        let internal = self.internal.clone();
         let mut shutdown = self.accept_shutdown.subscribe();
-        tokio::spawn(async move {
+        internal.clone().spawn(async move {
             loop {
                 let recv = match accept_uni_or_shutdown(&conn, &mut shutdown).await {
                     Some(Ok(recv)) => recv,
@@ -454,8 +449,9 @@ impl QuinnSession {
                 let active = active.clone();
                 let stats = stats.clone();
                 let conn = conn.clone();
+                let internal = internal.clone();
                 let mut worker_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                internal.spawn(async move {
                     let _permit = permit;
                     if let Some(result) = prepare_accepted_uni_stream_or_shutdown(
                         recv,
@@ -658,7 +654,7 @@ impl QuinnSession {
 
     pub async fn close(&self) -> Result<()> {
         self.close_now(quinn_varint(0), &[]);
-        Ok(())
+        self.wait().await
     }
 
     pub async fn close_with_error(&self, code: u64, reason: &str) -> Result<()> {
@@ -668,7 +664,9 @@ impl QuinnSession {
     }
 
     pub async fn wait(&self) -> Result<()> {
-        translate_wait_error(self.conn.closed().await)
+        let result = translate_wait_error(self.conn.closed().await);
+        self.internal.wait_idle().await;
+        result
     }
 
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool> {
@@ -831,6 +829,37 @@ struct AdapterStatsSnapshot {
     progress: zmux::ProgressStats,
     blocked_write_total: Duration,
     reasons: zmux::ReasonStats,
+}
+
+#[derive(Debug, Default)]
+struct InternalTasks {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl InternalTasks {
+    fn spawn<F>(self: Arc<Self>, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        tokio::spawn(async move {
+            fut.await;
+            if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.idle.notify_waiters();
+            }
+        });
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Debug, Default)]

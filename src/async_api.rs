@@ -74,8 +74,7 @@ where
 
 /// A permanently closed async session.
 ///
-/// Use this as a no-op fallback when upper-layer code wants to keep a concrete
-/// session handle but no transport/session is available.
+/// Use this when no transport/session is available.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClosedAsyncSession;
 
@@ -126,8 +125,7 @@ pub trait AsyncStreamHandle: Send + Sync {
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
     }
-    /// Stable resource identity used internally to avoid closing the same
-    /// joined full stream twice.
+    /// Stable close identity for joined streams.
     #[doc(hidden)]
     fn close_identity(&self) -> *const () {
         if size_of_val(self) == 0 {
@@ -577,8 +575,6 @@ fn zero_session_settings() -> Settings {
         max_incoming_streams_bidi: 0,
         max_incoming_streams_uni: 0,
         max_frame_payload: 0,
-        idle_timeout_millis: 0,
-        keepalive_hint_millis: 0,
         max_control_payload_bytes: 0,
         max_extension_payload_bytes: 0,
         scheduler_hints: SchedulerHint::UnspecifiedOrBalanced,
@@ -767,8 +763,7 @@ struct ActiveAsyncHalf<T> {
 
 /// Pause handle returned by async joined stream read/write half pauses.
 ///
-/// The handle owns the detached half until `resume` reattaches it. Dropping the
-/// handle resumes with the currently staged half on a best-effort basis.
+/// Owns the detached half until `resume` reattaches it.
 pub struct PausedAsyncHalf<T> {
     owner: Arc<AsyncJoinedHalf<T>>,
     current: Option<Arc<T>>,
@@ -781,11 +776,9 @@ pub type PausedAsyncRecvHalf<R> = PausedAsyncHalf<R>;
 /// Detached send half handle for `AsyncDuplexStream`.
 pub type PausedAsyncSendHalf<W> = PausedAsyncHalf<W>;
 
-/// Join one async receive-capable stream half and one async send-capable stream
-/// half into a bidirectional stream view.
+/// Join async receive and send halves into a bidirectional stream view.
 ///
-/// This is intended for already-separated directions, including two
-/// unidirectional streams or halves from different adapters.
+/// Use this for already-separated directions.
 #[must_use]
 pub fn join_async_streams<R, W>(recv: R, send: W) -> AsyncDuplexStream<R, W> {
     AsyncDuplexStream::new(recv, send)
@@ -1204,9 +1197,6 @@ impl<T> PausedAsyncHalf<T> {
     }
 
     /// Replaces the staged half with an existing shared owner.
-    ///
-    /// Use this when the async transport half is already in an `Arc`; it avoids
-    /// adding a second layer of shared ownership.
     pub fn set_arc(&mut self, next: Option<Arc<T>>) -> Option<Arc<T>> {
         mem::replace(&mut self.current, next)
     }

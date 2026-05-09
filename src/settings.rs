@@ -79,8 +79,6 @@ pub struct Settings {
     pub max_incoming_streams_bidi: u64,
     pub max_incoming_streams_uni: u64,
     pub max_frame_payload: u64,
-    pub idle_timeout_millis: u64,
-    pub keepalive_hint_millis: u64,
     pub max_control_payload_bytes: u64,
     pub max_extension_payload_bytes: u64,
     pub scheduler_hints: SchedulerHint,
@@ -96,8 +94,6 @@ impl Settings {
         max_incoming_streams_bidi: 256,
         max_incoming_streams_uni: 256,
         max_frame_payload: 16_384,
-        idle_timeout_millis: 0,
-        keepalive_hint_millis: 0,
         max_control_payload_bytes: 4096,
         max_extension_payload_bytes: 4096,
         scheduler_hints: SchedulerHint::UnspecifiedOrBalanced,
@@ -131,8 +127,6 @@ impl Settings {
             ("max_incoming_streams_bidi", self.max_incoming_streams_bidi),
             ("max_incoming_streams_uni", self.max_incoming_streams_uni),
             ("max_frame_payload", self.max_frame_payload),
-            ("idle_timeout_millis", self.idle_timeout_millis),
-            ("keepalive_hint_millis", self.keepalive_hint_millis),
             ("max_control_payload_bytes", self.max_control_payload_bytes),
             (
                 "max_extension_payload_bytes",
@@ -215,7 +209,7 @@ fn settings_tlv_len(settings: Settings, defaults: Settings) -> Result<usize> {
 }
 
 #[inline]
-fn settings_entries(settings: Settings, defaults: Settings) -> [(u64, u64, u64); 13] {
+fn settings_entries(settings: Settings, defaults: Settings) -> [(u64, u64, u64); 11] {
     [
         (
             SETTING_INITIAL_MAX_STREAM_DATA_BIDI_LOCALLY_OPENED,
@@ -251,16 +245,6 @@ fn settings_entries(settings: Settings, defaults: Settings) -> [(u64, u64, u64);
             SETTING_MAX_FRAME_PAYLOAD,
             settings.max_frame_payload,
             defaults.max_frame_payload,
-        ),
-        (
-            SETTING_IDLE_TIMEOUT_MILLIS,
-            settings.idle_timeout_millis,
-            defaults.idle_timeout_millis,
-        ),
-        (
-            SETTING_KEEPALIVE_HINT_MILLIS,
-            settings.keepalive_hint_millis,
-            defaults.keepalive_hint_millis,
         ),
         (
             SETTING_MAX_CONTROL_PAYLOAD_BYTES,
@@ -352,8 +336,6 @@ pub fn parse_settings_tlv(mut src: &[u8]) -> Result<Settings> {
             SETTING_MAX_INCOMING_STREAMS_BIDI => settings.max_incoming_streams_bidi = value,
             SETTING_MAX_INCOMING_STREAMS_UNI => settings.max_incoming_streams_uni = value,
             SETTING_MAX_FRAME_PAYLOAD => settings.max_frame_payload = value,
-            SETTING_IDLE_TIMEOUT_MILLIS => settings.idle_timeout_millis = value,
-            SETTING_KEEPALIVE_HINT_MILLIS => settings.keepalive_hint_millis = value,
             SETTING_MAX_CONTROL_PAYLOAD_BYTES => settings.max_control_payload_bytes = value,
             SETTING_MAX_EXTENSION_PAYLOAD_BYTES => settings.max_extension_payload_bytes = value,
             SETTING_SCHEDULER_HINTS => settings.scheduler_hints = SchedulerHint::from_u64(value),
@@ -437,13 +419,11 @@ fn known_setting_seen_bit(typ: u64) -> Option<u16> {
         SETTING_MAX_INCOMING_STREAMS_BIDI => 1 << 4,
         SETTING_MAX_INCOMING_STREAMS_UNI => 1 << 5,
         SETTING_MAX_FRAME_PAYLOAD => 1 << 6,
-        SETTING_IDLE_TIMEOUT_MILLIS => 1 << 7,
-        SETTING_KEEPALIVE_HINT_MILLIS => 1 << 8,
-        SETTING_MAX_CONTROL_PAYLOAD_BYTES => 1 << 9,
-        SETTING_MAX_EXTENSION_PAYLOAD_BYTES => 1 << 10,
-        SETTING_SCHEDULER_HINTS => 1 << 11,
-        SETTING_PING_PADDING_KEY => 1 << 12,
-        SETTING_PREFACE_PADDING => 1 << 13,
+        SETTING_MAX_CONTROL_PAYLOAD_BYTES => 1 << 7,
+        SETTING_MAX_EXTENSION_PAYLOAD_BYTES => 1 << 8,
+        SETTING_SCHEDULER_HINTS => 1 << 9,
+        SETTING_PING_PADDING_KEY => 1 << 10,
+        SETTING_PREFACE_PADDING => 1 << 11,
         _ => return None,
     };
     Some(bit)
@@ -532,8 +512,8 @@ mod tests {
 
     #[test]
     fn padding_setting_id_matches_go_compatibility_value() {
-        assert_eq!(SETTING_PING_PADDING_KEY, 13);
-        assert_eq!(SETTING_PREFACE_PADDING, 63);
+        assert_eq!(SETTING_PING_PADDING_KEY, 11);
+        assert_eq!(SETTING_PREFACE_PADDING, 12);
     }
 
     #[test]
@@ -546,8 +526,6 @@ mod tests {
             SETTING_MAX_INCOMING_STREAMS_BIDI,
             SETTING_MAX_INCOMING_STREAMS_UNI,
             SETTING_MAX_FRAME_PAYLOAD,
-            SETTING_IDLE_TIMEOUT_MILLIS,
-            SETTING_KEEPALIVE_HINT_MILLIS,
             SETTING_MAX_CONTROL_PAYLOAD_BYTES,
             SETTING_MAX_EXTENSION_PAYLOAD_BYTES,
             SETTING_SCHEDULER_HINTS,

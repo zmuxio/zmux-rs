@@ -2713,13 +2713,11 @@ mod tests {
             blocked_write_total: Duration::from_millis(6),
             writer_queue: WriterQueueStats {
                 urgent_jobs: 1,
-                advisory_jobs: 2,
                 ordinary_jobs: 3,
                 queued_bytes: 4,
                 max_bytes: 5,
                 urgent_queued_bytes: 6,
                 urgent_max_bytes: 7,
-                advisory_queued_bytes: 8,
                 data_queued_bytes: 9,
                 session_data_high_watermark: 10,
                 per_stream_data_high_watermark: 11,

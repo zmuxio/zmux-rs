@@ -88,8 +88,7 @@ pub trait StreamHandle: Send + Sync {
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.set_deadline(timeout_to_deadline(timeout))
     }
-    /// Stable resource identity used internally to avoid closing the same
-    /// joined full stream twice.
+    /// Stable close identity for joined streams.
     #[doc(hidden)]
     fn close_identity(&self) -> *const () {
         if size_of_val(self) == 0 {
@@ -243,14 +242,8 @@ pub enum DuplexInfoSide {
 
 /// Bidirectional stream view backed by one receive-only half and one send-only half.
 ///
-/// When the receive half implements `Read` and the send half implements
-/// `Write`, this view is also a `DuplexConnection`, so it can be used as the
-/// reliable byte transport for a nested native `Conn`. When both halves are
-/// ZMux stream handles, the joined view also exposes the stable stream handle
-/// traits. A generic transport close uses native ZMux close semantics for
-/// known ZMux stream halves and otherwise detaches and drops generic halves;
-/// use an explicit `DuplexTransport` close hook when another resource needs a
-/// protocol-level shutdown operation.
+/// It is also a `DuplexConnection` when the halves implement `Read` and
+/// `Write`.
 pub struct DuplexStream<R, W> {
     recv: Arc<NativeJoinedHalf<R>>,
     send: Arc<NativeJoinedHalf<W>>,
@@ -304,8 +297,7 @@ impl<T> ActiveNativeHalf<T> {
 
 /// Pause handle returned by native joined stream read/write half pauses.
 ///
-/// The handle owns the detached half until `resume` reattaches it. Dropping the
-/// handle resumes with the currently staged half on a best-effort basis.
+/// Owns the detached half until `resume` reattaches it.
 pub struct PausedNativeHalf<T> {
     owner: Arc<NativeJoinedHalf<T>>,
     current: Option<T>,
@@ -1156,18 +1148,10 @@ where
     }
 }
 
-/// Join one receive-capable stream half and one send-capable stream half into
-/// a bidirectional stream view.
+/// Join receive and send halves into a bidirectional stream view.
 ///
-/// This is intended for already-separated directions, including two
-/// unidirectional streams or halves from different adapters. Use `duplex_io` or
-/// `try_duplex_io` for ordinary full-duplex connection objects.
-///
-/// When the joined value is used as a generic `DuplexConnection`, transport
-/// shutdown uses native ZMux close semantics for known ZMux stream halves and
-/// otherwise detaches and drops generic halves. Wrap the resulting transport
-/// with `with_close_fn(...)` when another whole-resource shutdown hook is
-/// required.
+/// Use this for already-separated directions. Use `duplex_io` or
+/// `try_duplex_io` for ordinary full-duplex connections.
 #[must_use]
 pub fn join_streams<R, W>(recv: R, send: W) -> DuplexStream<R, W> {
     DuplexStream::new(recv, send)
@@ -1759,8 +1743,7 @@ pub trait Session: Send + Sync {
 
 /// A permanently closed blocking session.
 ///
-/// Use this as a no-op fallback when upper-layer code wants a session
-/// handle but no transport/session is available.
+/// Use this when no transport/session is available.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClosedSession;
 
@@ -1787,8 +1770,6 @@ fn zero_session_settings() -> Settings {
         max_incoming_streams_bidi: 0,
         max_incoming_streams_uni: 0,
         max_frame_payload: 0,
-        idle_timeout_millis: 0,
-        keepalive_hint_millis: 0,
         max_control_payload_bytes: 0,
         max_extension_payload_bytes: 0,
         scheduler_hints: SchedulerHint::UnspecifiedOrBalanced,
