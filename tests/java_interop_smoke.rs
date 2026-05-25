@@ -369,6 +369,7 @@ fn read_all_stream(mut stream: zmux::Stream) -> Vec<u8> {
 
 fn java_helper_source() -> &'static str {
     r#"import io.zmux.*;
+import io.zmux.protocol.Protocol;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
