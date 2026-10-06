@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'releases/*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run clippy with optional async I/O features
+        run: cargo clippy --locked -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-features
+
+      - name: Build docs
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Package core crate
+        run: cargo package --locked -p zmux
+
+  interop:
+    name: Interop (Go, Java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout zmux-rs
+        uses: actions/checkout@v5
+        with:
+          path: zmux-rs
+
+      - name: Checkout zmux-go
+        uses: actions/checkout@v5
+        with:
+          repository: zmuxio/zmux-go
+          path: zmux-go
+
+      - name: Checkout zmux-java
+        uses: actions/checkout@v5
+        with:
+          repository: zmuxio/zmux-java
+          path: zmux-java
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: zmux-go/go.mod
+          cache-dependency-path: zmux-go/adapter/quicmux/go.sum
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 21
+          cache: maven
+          cache-dependency-path: zmux-java/**/pom.xml
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            zmux-rs/target
+          key: interop-rust-${{ runner.os }}-${{ hashFiles('zmux-rs/**/Cargo.lock') }}
+          restore-keys: |
+            interop-rust-${{ runner.os }}-
+            rust-${{ runner.os }}-
+
+      - name: Run interop smoke tests
+        working-directory: zmux-rs
+        env:
+          ZMUX_INTEROP: '1'
+          ZMUX_GO_ROOT: ${{ github.workspace }}/zmux-go
+          ZMUX_JAVA_ROOT: ${{ github.workspace }}/zmux-java
+        run: |
+          cargo test --locked --test go_interop_smoke --test java_interop_smoke
+          cargo test --locked -p zmux-quinn --test go_quic_interop_smoke
