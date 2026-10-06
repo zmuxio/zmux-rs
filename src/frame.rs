@@ -704,8 +704,10 @@ fn validate_go_away_payload(payload: &[u8]) -> Result<()> {
 }
 
 fn validate_ext_payload(stream_id: u64, payload: &[u8]) -> Result<()> {
-    let (ext_type, n) =
-        parse_varint(payload).map_err(|err| frame_size_with_error("malformed EXT payload", err))?;
+    // SPEC §6.11: an EXT payload too short for (or otherwise unable to carry)
+    // its ext_type varint is a session PROTOCOL error, not FRAME_SIZE.
+    let (ext_type, n) = parse_varint(payload)
+        .map_err(|err| Error::protocol(format!("malformed EXT payload: {err}")))?;
     if ext_type == EXT_PRIORITY_UPDATE {
         if stream_id == 0 {
             return Err(Error::protocol(

@@ -1,12 +1,13 @@
-use super::state::fail_session_with_close;
+use super::state::{fail_session, fail_session_with_close};
 use super::types::{CanceledPingPayload, ConnState, Inner, KeepalivePing, SessionState};
-use crate::config::{DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES};
+use crate::config::{random_u64, DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES};
 use crate::error::{Error, ErrorCode, ErrorSource, Result};
 use crate::frame::{Frame, FrameType};
 use crate::payload::build_code_payload;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const KEEPALIVE_JITTER_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -23,17 +24,52 @@ const PING_PADDING_TAG_SALT: u64 = 0x6d1d_9f6d_33f9_772d;
 const PING_PAYLOAD_HASH_OFFSET64: u64 = 14_695_981_039_346_656_037;
 const PING_PAYLOAD_HASH_PRIME64: u64 = 1_099_511_628_211;
 const KEEPALIVE_TIMEOUT_REASON: &str = "zmux: keepalive timeout";
+const CLOSE_FRAME_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+const CLOSE_FRAME_SEND_TIMEOUT_MAX: Duration = Duration::from_secs(2);
+const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
 
 static KEEPALIVE_JITTER_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static KEEPALIVE_JITTER_SEED_BASE: OnceLock<u64> = OnceLock::new();
 
 pub(super) fn init_keepalive_jitter_state(seed: u64) -> u64 {
     if seed != 0 {
         seed
     } else {
-        KEEPALIVE_JITTER_SEED_COUNTER
-            .fetch_add(KEEPALIVE_JITTER_GAMMA, Ordering::Relaxed)
-            .wrapping_add(KEEPALIVE_JITTER_GAMMA)
+        // Last-resort fallback when no per-session random seed is available:
+        // distinct per draw, and offset by a per-process random base so fresh
+        // processes do not all start from the same sequence.
+        let base = *KEEPALIVE_JITTER_SEED_BASE.get_or_init(|| random_u64().unwrap_or(0));
+        let state = base.wrapping_add(
+            KEEPALIVE_JITTER_SEED_COUNTER
+                .fetch_add(KEEPALIVE_JITTER_GAMMA, Ordering::Relaxed)
+                .wrapping_add(KEEPALIVE_JITTER_GAMMA),
+        );
+        if state == 0 {
+            KEEPALIVE_JITTER_GAMMA
+        } else {
+            state
+        }
     }
+}
+
+/// Per-session PRNG seed for keepalive jitter and PING tokens/padding: drawn
+/// from the secure random source, mixed with `mix` (the preface nonce mix),
+/// so sessions in different processes do not share jitter schedules or PING
+/// contents (IMPLEMENTATION.md §4). Falls back to `init_keepalive_jitter_state`
+/// when the random source fails.
+pub(super) fn session_prng_seed(mix: u64) -> u64 {
+    init_keepalive_jitter_state(random_u64().unwrap_or(0) ^ mix)
+}
+
+/// How long a terminal close waits for a stalled writer to flush its final
+/// frames before the transport is closed: 100 ms, raised to 4 x RTT + slack
+/// once an RTT is known, at most 2 s (the repository-default close-frame bound).
+pub(super) fn close_frame_send_timeout(last_ping_rtt: Option<Duration>) -> Duration {
+    let mut timeout = CLOSE_FRAME_SEND_TIMEOUT;
+    if let Some(rtt) = last_ping_rtt {
+        timeout = timeout.max(rtt_floor(rtt));
+    }
+    timeout.min(CLOSE_FRAME_SEND_TIMEOUT_MAX)
 }
 
 pub(super) fn configured_keepalive_timeout(interval: Duration, configured: Duration) -> Duration {
@@ -134,6 +170,8 @@ fn average_u64_floor(a: u64, b: u64) -> u64 {
 pub(super) fn note_local_ping_sent_locked(inner: &Arc<Inner>, state: &mut ConnState, now: Instant) {
     state.last_ping_sent_at = Some(now);
     reset_max_ping_due_locked(inner, state, now);
+    // A new outstanding PING brings its timeout into the keepalive schedule.
+    inner.keepalive_cond.notify_all();
 }
 
 pub(super) fn note_matching_pong_locked(
@@ -146,6 +184,8 @@ pub(super) fn note_matching_pong_locked(
     state.last_ping_rtt = Some(now.saturating_duration_since(sent_at));
     reset_read_idle_ping_due_locked(inner, state, now);
     reset_write_idle_ping_due_locked(inner, state, now);
+    // The keepalive thread may be sleeping until the answered PING's timeout.
+    inner.keepalive_cond.notify_all();
 }
 
 pub(super) fn reset_keepalive_idle_schedules_locked(
@@ -155,6 +195,7 @@ pub(super) fn reset_keepalive_idle_schedules_locked(
 ) {
     reset_read_idle_ping_due_locked(inner, state, now);
     reset_write_idle_ping_due_locked(inner, state, now);
+    inner.keepalive_cond.notify_all();
 }
 
 pub(super) fn clear_unsent_keepalive_ping(inner: &Arc<Inner>) {
@@ -345,9 +386,68 @@ pub(super) enum KeepaliveAction {
     Wait(Option<Duration>),
 }
 
+#[cfg(test)]
 pub(super) fn poll_keepalive(inner: &Arc<Inner>, now: Instant) -> Result<KeepaliveAction> {
     let mut state = inner.state.lock().unwrap();
     poll_keepalive_locked(inner, &mut state, now)
+}
+
+/// Runs keepalive on its own thread. The writer thread can block in a
+/// transport write for as long as the peer stops reading; evaluating PING
+/// deadlines there would let exactly that stall hide the keepalive timeout
+/// (IMPLEMENTATION.md §4). A PING originated here is outstanding from
+/// origination even while it waits behind a stalled write, and the timeout
+/// close bounds its wait for the writer (`egress::arm_close_watchdog`).
+pub(super) fn spawn_keepalive(inner: &Arc<Inner>) {
+    if inner.keepalive_interval.is_zero() {
+        return;
+    }
+    let inner = Arc::clone(inner);
+    thread::spawn(move || run_keepalive(&inner));
+}
+
+fn run_keepalive(inner: &Arc<Inner>) {
+    let mut state = inner.state.lock().unwrap();
+    loop {
+        if matches!(state.state, SessionState::Closed | SessionState::Failed) {
+            return;
+        }
+        match poll_keepalive_locked(inner, &mut state, Instant::now()) {
+            Err(err) => {
+                drop(state);
+                fail_session(inner, err);
+                return;
+            }
+            Ok(KeepaliveAction::SendPing(payload)) => {
+                drop(state);
+                if let Err(err) = inner.force_queue_frame(Frame {
+                    frame_type: FrameType::Ping,
+                    flags: 0,
+                    stream_id: 0,
+                    payload,
+                }) {
+                    clear_unsent_keepalive_ping(inner);
+                    if !err.is_session_closed() {
+                        fail_session(inner, err);
+                    }
+                    return;
+                }
+                state = inner.state.lock().unwrap();
+            }
+            Ok(KeepaliveAction::Timeout) => {
+                drop(state);
+                close_for_idle_timeout(inner);
+                return;
+            }
+            Ok(KeepaliveAction::Wait(None)) => {
+                state = inner.keepalive_cond.wait(state).unwrap();
+            }
+            Ok(KeepaliveAction::Wait(Some(wait))) => {
+                let wait = wait.min(MAX_CONDVAR_TIMED_WAIT);
+                state = inner.keepalive_cond.wait_timeout(state, wait).unwrap().0;
+            }
+        }
+    }
 }
 
 fn poll_keepalive_locked(

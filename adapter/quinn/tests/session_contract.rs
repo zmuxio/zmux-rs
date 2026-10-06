@@ -868,6 +868,93 @@ async fn local_close_read_and_close_write_return_sticky_closed_errors() {
 }
 
 #[tokio::test]
+async fn reads_after_consumed_fin_keep_returning_eof() {
+    let pair = Pair::new().await;
+    let stream = pair.client.open_stream().await.unwrap();
+    stream.write_final(b"ab").await.unwrap();
+    let accepted = pair
+        .server
+        .accept_stream_timeout(STREAM_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(read_all_stream(&accepted).await, b"ab");
+    assert!(accepted.is_read_closed());
+    let mut buf = [0u8; 4];
+    assert_eq!(accepted.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(accepted.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(
+        accepted
+            .read_timeout(&mut buf, STREAM_TIMEOUT)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        accepted
+            .read_vectored(&mut [IoSliceMut::new(&mut buf)])
+            .await
+            .unwrap(),
+        0
+    );
+    let handle: &dyn zmux::AsyncRecvStreamHandle = &accepted;
+    assert_eq!(handle.read(&mut buf).await.unwrap(), 0);
+    let err = accepted.read_exact(&mut buf[..1]).await.unwrap_err();
+    assert_eq!(
+        err.source_io_error_kind(),
+        Some(std::io::ErrorKind::UnexpectedEof)
+    );
+    assert!(!err.is_read_closed());
+    // A local stop after EOF is still rejected, and EOF stays EOF.
+    assert!(accepted.close_read().await.unwrap_err().is_read_closed());
+    assert_eq!(accepted.read(&mut buf).await.unwrap(), 0);
+    assert!(accepted.is_read_closed());
+
+    let send = pair.client.open_uni_stream().await.unwrap();
+    send.write_final(b"cd").await.unwrap();
+    let recv = pair
+        .server
+        .accept_uni_stream_timeout(STREAM_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(read_all_recv(&recv).await, b"cd");
+    assert!(recv.is_read_closed());
+    assert_eq!(recv.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(recv.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(
+        recv.read_vectored_timeout(&mut [IoSliceMut::new(&mut buf)], STREAM_TIMEOUT)
+            .await
+            .unwrap(),
+        0
+    );
+    let handle: &dyn zmux::AsyncRecvStreamHandle = &recv;
+    assert_eq!(handle.read(&mut buf).await.unwrap(), 0);
+    let err = recv.read_exact(&mut buf[..1]).await.unwrap_err();
+    assert_eq!(
+        err.source_io_error_kind(),
+        Some(std::io::ErrorKind::UnexpectedEof)
+    );
+    assert_eq!(recv.read(&mut buf).await.unwrap(), 0);
+
+    // A FIN that was received but never consumed does not turn a local stop
+    // into EOF: reads after close_read keep failing as locally stopped.
+    let stream = pair.client.open_stream().await.unwrap();
+    stream.write_final(b"ef").await.unwrap();
+    let accepted = pair
+        .server
+        .accept_stream_timeout(STREAM_TIMEOUT)
+        .await
+        .unwrap();
+    accepted.close_read().await.unwrap();
+    for _ in 0..2 {
+        let err = accepted.read(&mut buf).await.unwrap_err();
+        assert!(err.is_read_closed());
+        assert_local_stream_error(&err, zmux::ErrorOperation::Read, zmux::ErrorDirection::Read);
+        assert_eq!(err.termination_kind(), zmux::TerminationKind::Stopped);
+    }
+    pair.close().await;
+}
+
+#[tokio::test]
 async fn local_cancel_write_and_close_with_error_fail_local_ops_immediately() {
     let pair = Pair::new().await;
     let stream = pair.client.open_stream().await.unwrap();
@@ -1244,6 +1331,90 @@ async fn graceful_session_close_waits_successfully_and_blocks_new_opens() {
     };
     assert_eq!(err.scope(), zmux::ErrorScope::Session);
     assert_eq!(err.source(), zmux::ErrorSource::Local);
+    pair.server_endpoint.close(quinn::VarInt::from_u32(0), b"");
+    pair.client_endpoint.close(quinn::VarInt::from_u32(0), b"");
+}
+
+#[tokio::test]
+async fn peer_graceful_close_surfaces_session_closed_on_blocked_and_new_ops() {
+    fn assert_remote_session_closed(err: &zmux::Error, what: &str) {
+        assert!(err.is_session_closed(), "{what}: {err:?}");
+        assert_eq!(err.numeric_code(), None, "{what}: {err:?}");
+        assert_eq!(err.application_code(), None, "{what}: {err:?}");
+        assert_eq!(err.scope(), zmux::ErrorScope::Session, "{what}: {err:?}");
+        assert_eq!(err.source(), zmux::ErrorSource::Remote, "{what}: {err:?}");
+    }
+
+    let pair = Pair::new().await;
+    let stream = pair.client.open_stream().await.unwrap();
+    stream.write_all(b"x").await.unwrap();
+    let accepted = pair
+        .server
+        .accept_stream_timeout(STREAM_TIMEOUT)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    accepted
+        .read_exact_timeout(&mut buf, STREAM_TIMEOUT)
+        .await
+        .unwrap();
+
+    let client = pair.client.clone();
+    let blocked_accept = tokio::spawn(async move { client.accept_stream().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!blocked_accept.is_finished());
+
+    pair.server.close().await.unwrap();
+    tokio::time::timeout(STREAM_TIMEOUT, pair.client.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pair.client.close_error().is_none());
+    assert_eq!(pair.client.state(), zmux::SessionState::Closed);
+
+    let err = match tokio::time::timeout(STREAM_TIMEOUT, blocked_accept)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Ok(_) => panic!("blocked accept_stream succeeded after peer close"),
+        Err(err) => err,
+    };
+    assert_remote_session_closed(&err, "blocked accept_stream");
+
+    let err = match pair.client.open_stream().await {
+        Ok(_) => panic!("open_stream succeeded after peer close"),
+        Err(err) => err,
+    };
+    assert_remote_session_closed(&err, "open_stream");
+    let err = match pair.client.open_uni_stream().await {
+        Ok(_) => panic!("open_uni_stream succeeded after peer close"),
+        Err(err) => err,
+    };
+    assert_remote_session_closed(&err, "open_uni_stream");
+    let err = match pair.client.accept_uni_stream_timeout(STREAM_TIMEOUT).await {
+        Ok(_) => panic!("accept_uni_stream succeeded after peer close"),
+        Err(err) => err,
+    };
+    assert_remote_session_closed(&err, "accept_uni_stream");
+    let err = match zmux::AsyncSession::open_stream(&pair.client).await {
+        Ok(_) => panic!("AsyncSession::open_stream succeeded after peer close"),
+        Err(err) => err,
+    };
+    assert!(
+        err.is_session_closed(),
+        "AsyncSession::open_stream: {err:?}"
+    );
+    assert_eq!(err.numeric_code(), None);
+
+    let err = tokio::time::timeout(STREAM_TIMEOUT, stream.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_remote_session_closed(&err, "stream read");
+    let err = write_until_stream_error(&stream, b"y").await;
+    assert_remote_session_closed(&err, "stream write");
+
     pair.server_endpoint.close(quinn::VarInt::from_u32(0), b"");
     pair.client_endpoint.close(quinn::VarInt::from_u32(0), b"");
 }

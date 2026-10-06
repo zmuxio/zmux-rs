@@ -7,7 +7,7 @@ use std::io::{IoSlice, Result as IoResult};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 #[cfg(feature = "tokio-io")]
 use std::thread;
 
@@ -190,7 +190,7 @@ fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
     loop {
@@ -203,18 +203,12 @@ where
 
 #[cfg(feature = "futures-io")]
 fn poll_ready<T>(poll: impl FnOnce(&mut Context<'_>) -> Poll<T>) -> T {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut context = Context::from_waker(&waker);
     match poll(&mut context) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("compat stream unexpectedly returned Pending"),
     }
-}
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
 }
 
 #[cfg(feature = "tokio-io")]

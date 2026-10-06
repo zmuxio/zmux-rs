@@ -6,22 +6,22 @@
     {
       "path": "fixtures/wire_valid.ndjson",
       "kind": "wire_valid",
-      "count": 14
+      "count": 33
     },
     {
       "path": "fixtures/wire_invalid.ndjson",
       "kind": "wire_invalid",
-      "count": 3
+      "count": 11
     },
     {
       "path": "fixtures/state_cases.ndjson",
       "kind": "state_cases",
-      "count": 185
+      "count": 187
     },
     {
       "path": "fixtures/invalid_cases.ndjson",
       "kind": "invalid_cases",
-      "count": 43
+      "count": 57
     }
   ]
 }

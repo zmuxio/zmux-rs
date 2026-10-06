@@ -1,4 +1,6 @@
-use crate::error::{Error, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource, Result};
+use crate::error::{
+    Error, ErrorCode, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource, Result,
+};
 use crate::frame::FRAME_FLAG_OPEN_METADATA;
 use crate::protocol::*;
 use crate::tlv::{append_tlv, parse_tlvs, tlv_views, Tlv};
@@ -213,6 +215,10 @@ pub fn parse_data_payload_view(payload: &[u8], flags: u8) -> Result<DataPayloadV
     })
 }
 
+/// Parses the OPEN_METADATA prefix of a DATA payload and returns the offset of
+/// the application bytes. A malformed prefix (missing, truncated or
+/// non-canonical metadata_len, overrun, or malformed metadata TLVs) is
+/// reported as FRAME_SIZE, matching `Frame::validate`.
 pub(crate) fn parse_data_payload_metadata_offset(
     payload: &[u8],
     flags: u8,
@@ -220,10 +226,25 @@ pub(crate) fn parse_data_payload_metadata_offset(
     if flags & FRAME_FLAG_OPEN_METADATA == 0 {
         return Ok((StreamMetadata::default(), true, 0));
     }
-    let (metadata_len, n) = parse_open_metadata_len(payload)?;
+    let (metadata_len, n) = parse_open_metadata_len(payload)
+        .map_err(|err| malformed_payload_error("invalid OPEN_METADATA length", err))?;
     let metadata_raw = &payload[n..n + metadata_len];
-    let (metadata, valid) = parse_stream_metadata_bytes_view(metadata_raw)?;
+    let (metadata, valid) = parse_stream_metadata_bytes_view(metadata_raw)
+        .map_err(|err| malformed_payload_error("invalid OPEN_METADATA payload", err))?;
     Ok((metadata.try_to_owned()?, valid, n + metadata_len))
+}
+
+/// Offset of the application data in a DATA payload, decoding only the
+/// OPEN_METADATA length prefix (the metadata TLVs are not interpreted). Used for
+/// refused openers, whose application bytes still count against the session
+/// window; a malformed prefix is a FRAME_SIZE error like any other.
+pub(crate) fn parse_data_payload_app_offset(payload: &[u8], flags: u8) -> Result<usize> {
+    if flags & FRAME_FLAG_OPEN_METADATA == 0 {
+        return Ok(0);
+    }
+    let (metadata_len, n) = parse_open_metadata_len(payload)
+        .map_err(|err| malformed_payload_error("invalid OPEN_METADATA length", err))?;
+    Ok(n + metadata_len)
 }
 
 fn parse_open_metadata_len(payload: &[u8]) -> Result<(usize, usize)> {
@@ -265,13 +286,20 @@ pub fn parse_stream_metadata_tlvs(tlvs: &[Tlv]) -> Result<(StreamMetadata, bool)
 pub fn parse_stream_metadata_bytes_view(src: &[u8]) -> Result<(StreamMetadataView<'_>, bool)> {
     let mut metadata = StreamMetadataView::default();
     let mut seen = 0u8;
+    let mut duplicate = false;
     for tlv in tlv_views(src) {
+        // A duplicate singleton only drops the block once the whole TLV
+        // sequence is structurally valid, so keep walking after it.
         let tlv = tlv?;
+        if duplicate {
+            continue;
+        }
         let Some(seen_bit) = metadata_singleton_seen_bit(tlv.typ) else {
             continue;
         };
         if seen & seen_bit != 0 {
-            return Ok((StreamMetadataView::default(), false));
+            duplicate = true;
+            continue;
         }
         seen |= seen_bit;
         match tlv.typ {
@@ -286,6 +314,9 @@ pub fn parse_stream_metadata_bytes_view(src: &[u8]) -> Result<(StreamMetadataVie
             }
             _ => {}
         }
+    }
+    if duplicate {
+        return Ok((StreamMetadataView::default(), false));
     }
     Ok((metadata, true))
 }
@@ -502,19 +533,27 @@ pub fn parse_priority_update_payload(payload: &[u8]) -> Result<(StreamMetadata, 
 pub(crate) fn parse_priority_update_metadata(payload: &[u8]) -> Result<(StreamMetadata, bool)> {
     let mut metadata = StreamMetadata::default();
     let mut seen = 0u8;
+    let mut duplicate = false;
     for tlv in tlv_views(payload) {
+        // A duplicate singleton only drops the update once the whole TLV
+        // sequence is structurally valid, so keep walking after it.
         let tlv = tlv?;
+        if duplicate {
+            continue;
+        }
         match tlv.typ {
             METADATA_STREAM_PRIORITY => {
                 if seen & SEEN_METADATA_PRIORITY != 0 {
-                    return Ok((StreamMetadata::default(), false));
+                    duplicate = true;
+                    continue;
                 }
                 seen |= SEEN_METADATA_PRIORITY;
                 metadata.priority = Some(parse_metadata_varint(tlv.value)?);
             }
             METADATA_STREAM_GROUP => {
                 if seen & SEEN_METADATA_GROUP != 0 {
-                    return Ok((StreamMetadata::default(), false));
+                    duplicate = true;
+                    continue;
                 }
                 seen |= SEEN_METADATA_GROUP;
                 metadata.group = Some(parse_metadata_varint(tlv.value)?);
@@ -522,6 +561,9 @@ pub(crate) fn parse_priority_update_metadata(payload: &[u8]) -> Result<(StreamMe
             METADATA_OPEN_INFO => {}
             _ => {}
         }
+    }
+    if duplicate {
+        return Ok((StreamMetadata::default(), false));
     }
     Ok((metadata, true))
 }
@@ -661,6 +703,30 @@ pub fn parse_go_away_payload(payload: &[u8]) -> Result<GoAwayPayload> {
     })
 }
 
+/// Parses a received GOAWAY payload, reporting a missing, truncated or
+/// non-canonical mandatory field or a structurally malformed DIAG-TLV tail as
+/// FRAME_SIZE, the same code `Frame::validate` uses for these bytes.
+pub(crate) fn parse_inbound_go_away_payload(payload: &[u8]) -> Result<GoAwayPayload> {
+    let mut off = 0usize;
+    let mut read = || -> Result<u64> {
+        let (v, n) = parse_varint(&payload[off..])
+            .map_err(|err| malformed_payload_error("malformed GOAWAY payload", err))?;
+        off += n;
+        Ok(v)
+    };
+    let last_accepted_bidi = read()?;
+    let last_accepted_uni = read()?;
+    let code = read()?;
+    let reason = parse_diag_reason(&payload[off..])
+        .map_err(|err| malformed_payload_error("malformed GOAWAY diagnostics", err))?;
+    Ok(GoAwayPayload {
+        last_accepted_bidi,
+        last_accepted_uni,
+        code,
+        reason,
+    })
+}
+
 pub fn build_code_payload(code: u64, reason: &str, max_payload: u64) -> Result<Vec<u8>> {
     let mut out = payload_vec_with_capacity(code_payload_capacity(code, reason, max_payload)?)?;
     append_varint_reserved(&mut out, code)?;
@@ -704,10 +770,42 @@ pub fn parse_error_payload(payload: &[u8]) -> Result<(u64, String)> {
     Ok((code, parse_diag_reason(&payload[n..])?))
 }
 
+/// Parses a received STOP_SENDING, RESET, ABORT or CLOSE payload, reporting a
+/// missing, truncated or non-canonical error_code or a structurally malformed
+/// DIAG-TLV tail as FRAME_SIZE, the same code `Frame::validate` uses for these
+/// bytes.
+pub(crate) fn parse_inbound_error_payload(payload: &[u8]) -> Result<(u64, String)> {
+    let (code, n) =
+        parse_varint(payload).map_err(|err| malformed_payload_error("invalid error_code", err))?;
+    let reason = parse_diag_reason(&payload[n..])
+        .map_err(|err| malformed_payload_error("invalid diagnostic payload", err))?;
+    Ok((code, reason))
+}
+
+/// Maps a wire parse failure found while a session handler decodes a received
+/// payload to FRAME_SIZE. The session reader defers payload validation to the
+/// handlers, so this keeps their CLOSE code aligned with `Frame::validate`.
+/// Errors that are not wire parse failures, such as allocation failures, keep
+/// their own code.
+pub(crate) fn malformed_payload_error(context: &str, err: Error) -> Error {
+    if err.code() != Some(ErrorCode::Protocol) {
+        return err;
+    }
+    Error::frame_size(format!("{context}: {err}"))
+        .with_scope(err.scope())
+        .with_operation(err.operation())
+        .with_source(err.source())
+        .with_direction(err.direction())
+}
+
 fn parse_diag_reason(payload: &[u8]) -> Result<String> {
     let mut seen = 0u8;
+    let mut duplicate = false;
     let mut debug_text: Option<&[u8]> = None;
     for tlv in tlv_views(payload) {
+        // SPEC §7.1: duplicate-singleton tolerance applies only once the whole
+        // DIAG-TLV sequence is structurally parseable, so keep walking after a
+        // duplicate and let a later truncation or overrun fail the frame.
         let tlv = match tlv {
             Ok(tlv) => tlv,
             Err(err) if err.is_frame_size_message("truncated tlv") => {
@@ -715,16 +813,23 @@ fn parse_diag_reason(payload: &[u8]) -> Result<String> {
             }
             Err(err) => return Err(err),
         };
+        if duplicate {
+            continue;
+        }
         let Some(seen_bit) = diag_singleton_seen_bit(tlv.typ) else {
             continue;
         };
         if seen & seen_bit != 0 {
-            return Ok(String::new());
+            duplicate = true;
+            continue;
         }
         seen |= seen_bit;
         if tlv.typ == DIAG_DEBUG_TEXT {
             debug_text = Some(tlv.value);
         }
+    }
+    if duplicate {
+        return Ok(String::new());
     }
     if let Some(value) = debug_text {
         if let Ok(value) = str::from_utf8(value) {
@@ -867,11 +972,13 @@ fn copy_payload_slice(value: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::{
         build_code_payload, build_go_away_payload_capped, build_open_metadata_prefix,
-        build_priority_update_payload, normalize_stream_group, parse_data_payload,
-        parse_error_payload, parse_go_away_payload, parse_priority_update_payload,
-        parse_stream_metadata_tlvs, MetadataUpdate, StreamMetadata, StreamMetadataView,
+        build_priority_update_payload, malformed_payload_error, normalize_stream_group,
+        parse_data_payload, parse_data_payload_metadata_offset, parse_error_payload,
+        parse_go_away_payload, parse_inbound_error_payload, parse_inbound_go_away_payload,
+        parse_priority_update_payload, parse_stream_metadata_tlvs, MetadataUpdate, StreamMetadata,
+        StreamMetadataView,
     };
-    use crate::error::{ErrorCode, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource};
+    use crate::error::{Error, ErrorCode, ErrorDirection, ErrorOperation, ErrorScope, ErrorSource};
     use crate::frame::FRAME_FLAG_OPEN_METADATA;
     use crate::protocol::{
         CAPABILITY_OPEN_METADATA, CAPABILITY_PRIORITY_HINTS, CAPABILITY_PRIORITY_UPDATE,
@@ -1233,5 +1340,80 @@ mod tests {
         assert_eq!(code, ErrorCode::Internal.as_u64());
         assert_eq!(parsed, "");
         assert_eq!(payload.len(), 1);
+    }
+
+    #[test]
+    fn inbound_payload_parsers_report_malformed_fields_as_frame_size() {
+        let cases = [
+            (
+                parse_inbound_error_payload(&[]).map(|_| ()),
+                "invalid error_code",
+            ),
+            (
+                parse_inbound_error_payload(&[0x40, 0x08]).map(|_| ()),
+                "invalid error_code",
+            ),
+            (
+                parse_inbound_error_payload(&[0x08, 0x01]).map(|_| ()),
+                "invalid diagnostic payload",
+            ),
+            (
+                parse_inbound_error_payload(&[0x08, 0x01, 0x01, 0x61, 0x01, 0x01, 0x62, 0x40])
+                    .map(|_| ()),
+                "invalid diagnostic payload",
+            ),
+            (
+                parse_inbound_go_away_payload(&[0x00]).map(|_| ()),
+                "malformed GOAWAY payload",
+            ),
+            (
+                parse_inbound_go_away_payload(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x78]).map(|_| ()),
+                "malformed GOAWAY diagnostics",
+            ),
+            (
+                parse_data_payload_metadata_offset(&[], FRAME_FLAG_OPEN_METADATA).map(|_| ()),
+                "invalid OPEN_METADATA length",
+            ),
+            (
+                parse_data_payload_metadata_offset(&[0x01, 0x01], FRAME_FLAG_OPEN_METADATA)
+                    .map(|_| ()),
+                "invalid OPEN_METADATA payload",
+            ),
+            (
+                parse_data_payload_metadata_offset(&[0x05, 0x01], FRAME_FLAG_OPEN_METADATA)
+                    .map(|_| ()),
+                "OPEN_METADATA payload overrun",
+            ),
+        ];
+
+        for (result, message) in cases {
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), Some(ErrorCode::FrameSize), "{err}");
+            assert!(err.to_string().contains(message), "{err}");
+        }
+
+        let (code, reason) = parse_inbound_error_payload(&[0x08, 0x01, 0x01, 0x61]).unwrap();
+        assert_eq!(code, ErrorCode::Cancelled.as_u64());
+        assert_eq!(reason, "a");
+    }
+
+    #[test]
+    fn malformed_payload_error_keeps_wire_context_and_non_wire_errors() {
+        let wire = parse_varint(&[]).unwrap_err();
+        let mapped = malformed_payload_error("invalid MAX_DATA payload", wire);
+        assert_eq!(mapped.code(), Some(ErrorCode::FrameSize));
+        assert_eq!(mapped.scope(), ErrorScope::Session);
+        assert_eq!(mapped.source(), ErrorSource::Remote);
+        assert_eq!(mapped.direction(), ErrorDirection::Read);
+        assert!(mapped
+            .to_string()
+            .contains("invalid MAX_DATA payload: PROTOCOL: truncated varint62"));
+
+        let local = malformed_payload_error("ctx", Error::local("allocation failed"));
+        assert_eq!(local.code(), None);
+        assert_eq!(local.message(), "allocation failed");
+
+        let frame_size = malformed_payload_error("ctx", Error::frame_size("overrun"));
+        assert_eq!(frame_size.message(), "overrun");
     }
 }

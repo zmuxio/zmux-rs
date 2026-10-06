@@ -112,7 +112,11 @@ When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
 
 ## Errors
 
-- QUIC connection application closes are normalized to `zmux::Error::application(...)`.
+- QUIC connection application closes are normalized to `zmux::Error::application(...)`, except a graceful close
+  (code 0 with an empty reason): `wait()` succeeds and other operations fail with an error whose
+  `is_session_closed()` is true, as on native zmux sessions.
+- Once a peer FIN has been read (`Ok(0)`), later reads keep returning `Ok(0)`. A read side closed first by a local
+  stop, a reset or an abort keeps failing reads with that error.
 - QUIC stream reset/cancel codes are surfaced as application errors where Quinn exposes the numeric code.
 - QUIC stream-limit failures are normalized to `OpenLimited`.
 - QUIC transport or connection closure is normalized into the stable `zmux::Error` surface.

@@ -152,9 +152,14 @@ Stream payloads are binary bytes, not text. Reads follow the standard Rust I/O
 shape: `read(&mut [u8])` fills caller-owned memory, while async callers can use
 `read_to_end(&mut Vec<u8>)` / `read_to_end_limited(...)` when they want an owned
 result buffer. Writes keep the TCP-style partial-write entry point as
-`write(&[u8])`; because partial writes must leave the caller owning any unwritten
+`write(&[u8])` (and `write_vectored`, `write_timeout`, `std::io::Write`): when a
+deadline, flow-control wait, or stream/session error stops a write after some
+bytes were already committed to the send path, the call returns `Ok(n)` with that
+count and the next call reports the error, so `Err` always means no bytes of that
+call were written. Because partial writes must leave the caller owning any unwritten
 bytes, owned buffers are accepted by complete-consumption APIs instead:
 `write_all(Vec<u8>)`, `write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)`.
+These fail with the error even when part of the payload was already committed.
 For erased or generic send handles, pass `WritePayload::from(vec)` to
 `SendStreamHandle::write_all(...)`, `SendStreamHandle::write_final(...)`, or
 their async `AsyncSendStreamHandle` equivalents when ownership should travel
@@ -231,7 +236,18 @@ Avoid hiding one blocking duplex object behind a single `Mutex`: a blocking read
 can hold the lock and prevent writes or close progress.
 
 `Conn::close`, `Conn::close_with_error`, establishment failure, and runtime
-shutdown call the transport close hook when one is present. Passing only split
+shutdown call the transport close hook when one is present. Neither close call
+waits indefinitely on a transport writer that a peer has stopped draining: once
+the session is terminal, the hook is called if the writer makes no progress for
+the close-frame send timeout (100 ms, up to 2 s on high-RTT sessions), even if
+the final `CLOSE` was not flushed. The same applies when the keepalive timeout
+fails a session whose transport writes are stalled. Without a close hook a
+blocked writer cannot be interrupted.
+
+Session establishment is bounded by `Config::establishment_timeout` (default
+10 s; zero selects the default and `Duration::MAX` disables the bound) on
+transports with read/write timeout control, such as `TcpStream`: the whole peer
+preface must arrive, and the local preface must be written, within that time. Passing only split
 halves drops/closes those halves according to their own types; attach
 `with_close_fn(...)` or implement `DuplexConnection` when the original
 underlying connection needs an explicit whole-resource shutdown.

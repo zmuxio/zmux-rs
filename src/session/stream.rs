@@ -1,25 +1,30 @@
 use super::buffer::{RecvBuffer, RecvBufferRead};
+use super::conn::local_stream_ids_exhausted_locked;
 use super::flow::{
     negotiated_frame_payload, next_credit_limit, replenish_min_pending,
     session_emergency_threshold, session_standing_growth_allowed, session_window_target,
     should_flush_receive_credit, stream_emergency_threshold, stream_standing_growth_allowed,
     stream_window_target,
 };
+use super::ingress::grant_exhausted_receive_credit;
 use super::liveness::{note_blocked_write_locked, record_stream_application_progress};
-use super::queue::StreamDiscardStats;
+use super::queue::{OpenerWriteCancel, StreamDiscardStats, FRAME_QUEUE_OVERHEAD_BYTES};
 use super::scheduler::write_burst_limit;
 use super::state::{
-    check_write_open, clear_accept_backlog_entry_locked, clear_stream_open_info_locked,
-    clear_stream_open_prefix_locked, clear_stream_receive_credit_locked,
+    begin_provisional_wait_locked, check_write_open, clear_accept_backlog_entry_locked,
+    clear_stream_open_info_locked, clear_stream_open_prefix_locked,
+    clear_stream_receive_credit_locked, end_provisional_wait_locked,
     ensure_pending_priority_update_limits_locked, ensure_projected_session_memory_cap_locked,
     ensure_session_not_closed, ensure_session_open, fail_expired_provisional_locked,
-    fail_session_with_close, late_data_per_stream_cap, local_reset_error,
+    fail_session_with_close, late_data_per_stream_cap, local_opener_turn,
+    local_opener_turn_in_progress_locked, local_opener_turn_mut, local_reset_error,
     maybe_compact_stream_locked, maybe_release_active_count, note_abort_reason_locked,
     note_reset_reason_locked, note_written_stream_frames_locked, peer_reset_error,
-    provisional_expired_locked, provisional_open_expired_reason, provisional_open_max_age,
-    reap_expired_provisionals_locked, release_discarded_queued_stream_frames_locked,
-    release_session_receive_buffered_locked, session_memory_pressure_high_fast_locked,
-    shrink_provisional_queue_locked, stream_abort_error,
+    provisional_expired_since_locked, provisional_head_expiry_locked,
+    provisional_open_expired_reason, provisional_open_max_age, reap_expired_provisionals_locked,
+    release_discarded_queued_stream_frames_locked, release_local_opener_turn,
+    release_local_opener_turn_locked, release_session_receive_buffered_locked,
+    session_memory_pressure_high_fast_locked, shrink_provisional_queue_locked, stream_abort_error,
 };
 use super::stop_sending::{evaluate_graceful, GracefulInput};
 use super::types::*;
@@ -52,6 +57,11 @@ use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
+/// Provisional expiry needs the age to exceed the limit, so a waiter woken for
+/// it waits this much past the limit.
+const PROVISIONAL_EXPIRY_WAKE_SLACK: Duration = Duration::from_millis(1);
+const ABANDONED_LOCAL_OPENER_REASON: &str =
+    "zmux: local opener abandoned before a later same-class stream opened";
 
 #[inline]
 fn stream_result<T>(
@@ -882,6 +892,48 @@ impl Write for &SendStream {
     }
 }
 
+/// A write-loop error together with the application bytes that had already been
+/// committed to the send path when it occurred.
+#[derive(Debug)]
+struct PartialWriteError {
+    written: usize,
+    err: Error,
+}
+
+type WriteProgress = std::result::Result<usize, PartialWriteError>;
+
+impl PartialWriteError {
+    #[inline]
+    fn new(written: usize, err: Error) -> Self {
+        Self { written, err }
+    }
+
+    #[inline]
+    fn into_error(self) -> Error {
+        self.err
+    }
+}
+
+impl From<Error> for PartialWriteError {
+    #[inline]
+    fn from(err: Error) -> Self {
+        Self::new(0, err)
+    }
+}
+
+/// Partial-write entry points (`write`, `write_vectored`, `io::Write`) report
+/// committed progress as `Ok(n)`, matching the std contract that an error means
+/// nothing was written; the condition that stopped the write (expired deadline,
+/// terminal stream or session state) is reported by the next call.
+#[inline]
+fn partial_write_result(progress: WriteProgress) -> Result<usize> {
+    match progress {
+        Ok(written) => Ok(written),
+        Err(partial) if partial.written > 0 => Ok(partial.written),
+        Err(partial) => Err(partial.err),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalCommitStatus {
     Committed,
@@ -1455,12 +1507,37 @@ fn tx_fragment_cap_locked(
         priority,
         peer.scheduler_hints,
     );
-    u64_to_usize_saturating(rate_limited_fragment_cap(
+    let cap = u64_to_usize_saturating(rate_limited_fragment_cap(
         base,
         conn_state.send_rate_estimate,
         priority,
         peer.scheduler_hints,
-    ))
+    ));
+    cap.min(queued_data_fragment_room(inner, stream_state, prefix_len))
+}
+
+/// Largest application payload a single DATA frame may carry so the frame (with
+/// its OPEN_METADATA prefix and any PRIORITY_UPDATE riding with it) still fits the
+/// local writer-queue limits on its own. The peer's max_frame_payload may exceed
+/// those limits; an oversized frame could otherwise never be admitted.
+fn queued_data_fragment_room(
+    inner: &Inner,
+    stream_state: &StreamState,
+    prefix_len: usize,
+) -> usize {
+    let priority_cost = stream_state
+        .pending_priority_update
+        .as_ref()
+        .map_or(0, |payload| {
+            payload.len().saturating_add(FRAME_QUEUE_OVERHEAD_BYTES)
+        });
+    inner
+        .write_queue
+        .data_burst_max_bytes()
+        .saturating_sub(FRAME_QUEUE_OVERHEAD_BYTES)
+        .saturating_sub(prefix_len)
+        .saturating_sub(priority_cost)
+        .max(1)
 }
 
 #[inline]
@@ -1566,27 +1643,37 @@ impl StreamInner {
     }
 
     fn metadata(&self) -> StreamMetadata {
-        self.state.lock().unwrap().metadata.clone()
+        // `state.metadata` tracks only the advisory fields; the opener's bytes
+        // live in `state.open_info` (retention-accounted), so the snapshot is
+        // assembled here exactly like the stream event snapshot.
+        let state = self.state.lock().unwrap();
+        StreamMetadata {
+            priority: state.metadata.priority,
+            group: state.metadata.group,
+            open_info: state.open_info.clone(),
+        }
     }
 
-    pub(super) fn try_graceful_finish_after_stop_sending(&self) -> Result<bool> {
+    /// Attempts the graceful DATA|FIN answer to a peer STOP_SENDING. This runs
+    /// on the reader thread, so it never waits: graceful completion must be
+    /// immediate (no application write in progress, queue room for the FIN
+    /// now). Any obstacle or local error abandons the attempt and the caller
+    /// answers with RESET(CANCELLED) instead (SPEC §9.3; the repository-default
+    /// STOP_SENDING profile prefers RESET). A stream-local race, such as a
+    /// concurrent local abort, therefore never fails the session.
+    pub(super) fn try_graceful_finish_after_stop_sending(&self) -> bool {
         if !self.local_send {
-            return Ok(false);
+            return false;
         }
-        let drain_window = {
-            let state = self.conn.state.lock().unwrap();
-            stop_sending_drain_window_locked(&self.conn, &state)
+        let Some(_permit) = self.try_acquire_writer_path_permit() else {
+            return false;
         };
-        let operation_deadline = Instant::now().checked_add(drain_window);
-        let _permit = match self.acquire_writer_path_permit(operation_deadline, false) {
-            Ok(permit) => permit,
-            Err(err) if err.is_timeout() => return Ok(false),
-            Err(err) => return Err(err),
-        };
-
         let prepared = {
             let mut conn_state = self.conn.state.lock().unwrap();
-            ensure_session_not_closed(&conn_state)?;
+            if ensure_session_not_closed(&conn_state).is_err() {
+                return false;
+            }
+            let drain_window = stop_sending_drain_window_locked(&self.conn, &conn_state);
             let stream_id = self.id();
             let queued_data_bytes = self
                 .conn
@@ -1599,7 +1686,7 @@ impl StreamInner {
                 || stream_state.aborted.is_some()
                 || stream_state.recv_reset.is_some()
             {
-                return Ok(false);
+                return false;
             }
             let inflight_queued = conn_state
                 .inflight_data_by_stream
@@ -1621,25 +1708,19 @@ impl StreamInner {
                 drain_window,
             });
             if !decision.attempt {
-                return Ok(false);
+                return false;
             }
-            self.prepare_data_frame_locked(&mut conn_state, &mut stream_state, &[], true)?
+            match self.prepare_data_frame_locked(&mut conn_state, &mut stream_state, &[], true) {
+                Ok(prepared) => prepared,
+                Err(_) => return false,
+            }
         };
-
-        let queued = self.queue_prepared_data_until(
-            prepared,
-            || operation_deadline,
-            || self.ensure_graceful_stop_sending_still_pending(),
-            "write",
-            None,
-        );
-        match queued {
+        match self.try_queue_prepared_data(prepared, "write") {
             Ok(prepared_state) => {
                 self.commit_prepared_data(prepared_state);
-                Ok(true)
+                true
             }
-            Err(err) if err.is_timeout() => Ok(false),
-            Err(err) => Err(err),
+            Err(_) => false,
         }
     }
 
@@ -1664,10 +1745,21 @@ impl StreamInner {
         if !is_head {
             return Ok(LocalCommitStatus::AwaitingTurn);
         }
+        // SPEC §3.1: the previous same-class ID must have its opener queued before
+        // this stream may take the next ID, or the peer could observe a gap.
+        if local_opener_turn_in_progress_locked(conn_state, self.bidi) {
+            return Ok(LocalCommitStatus::AwaitingTurn);
+        }
 
         let now = Instant::now();
         let max_age = provisional_open_max_age(conn_state.last_ping_rtt);
-        if provisional_expired_locked(stream_state, now, max_age) {
+        let turn_released_at = local_opener_turn(conn_state, self.bidi).released_at;
+        let queue = if self.bidi {
+            &mut conn_state.provisional_bidi
+        } else {
+            &mut conn_state.provisional_uni
+        };
+        if provisional_expired_since_locked(stream_state, turn_released_at, now, max_age) {
             queue.pop_front();
             fail_expired_provisional_locked(conn_state, stream_state);
             self.conn.cond.notify_all();
@@ -1691,19 +1783,17 @@ impl StreamInner {
             conn_state.peer_go_away_uni
         };
         if id > MAX_VARINT62 {
-            stream_state.aborted = Some((
-                ErrorCode::Protocol.as_u64(),
-                "stream id overflow".to_owned(),
-            ));
+            queue.pop_front();
+            let err = local_stream_ids_exhausted_locked(&self.conn, conn_state);
+            stream_state.aborted =
+                Some((ErrorCode::StreamLimit.as_u64(), err.message().to_owned()));
             stream_state.abort_source = ErrorSource::Local;
             stream_state.provisional_created_at = None;
-            queue.pop_front();
             clear_stream_open_info_locked(conn_state, stream_state);
             clear_stream_open_prefix_locked(stream_state);
             self.conn.cond.notify_all();
             self.cond.notify_all();
-            return Err(Error::new(ErrorCode::Protocol, "stream id overflow")
-                .with_source(ErrorSource::Local));
+            return Err(err);
         }
         if id > goaway {
             stream_state.aborted = Some((
@@ -1722,6 +1812,12 @@ impl StreamInner {
                     .with_source(ErrorSource::Remote),
             );
         }
+        self.consume_abandoned_local_opener_locked(conn_state);
+        let queue = if self.bidi {
+            &mut conn_state.provisional_bidi
+        } else {
+            &mut conn_state.provisional_uni
+        };
         let (active_local, peer_stream_limit) = if self.bidi {
             (
                 conn_state.active.local_bidi,
@@ -1783,9 +1879,74 @@ impl StreamInner {
         }
         stream_state.active_counted = true;
         conn_state.streams.insert(id, Arc::clone(&stream));
+        local_opener_turn_mut(conn_state, self.bidi).holder = Some(id);
         self.conn.cond.notify_all();
         self.cond.notify_all();
         Ok(LocalCommitStatus::Committed)
+    }
+
+    /// Consumes the class turn holder's ID with an opening ABORT(CANCELLED) when
+    /// that earlier committed stream gave up before queueing its opener (e.g. its
+    /// first write timed out), so this later stream's opener cannot reach the peer
+    /// ahead of a still-unused lower ID (SPEC §3.1).
+    fn consume_abandoned_local_opener_locked(&self, conn_state: &mut ConnState) {
+        let Some(holder_id) = local_opener_turn(conn_state, self.bidi).holder else {
+            return;
+        };
+        let Some(holder) = conn_state.streams.get(&holder_id).cloned() else {
+            release_local_opener_turn_locked(conn_state, holder_id);
+            return;
+        };
+        let mut holder_state = holder.state.lock().unwrap();
+        if holder_state.opened_on_wire {
+            return;
+        }
+        let (code, reason) = match &holder_state.aborted {
+            Some(aborted) => aborted.clone(),
+            None => {
+                let aborted = (
+                    ErrorCode::Cancelled.as_u64(),
+                    ABANDONED_LOCAL_OPENER_REASON.to_owned(),
+                );
+                note_abort_reason_locked(conn_state, aborted.0);
+                holder_state.aborted = Some(aborted.clone());
+                holder_state.abort_source = ErrorSource::Local;
+                aborted
+            }
+        };
+        holder_state.opened_on_wire = true;
+        holder_state.pending_priority_update = None;
+        holder_state.pending_terminal_frames =
+            holder_state.pending_terminal_frames.saturating_add(1);
+        let released = holder_state.recv_buf.clear_detailed();
+        holder_state.recv_pending = 0;
+        release_session_receive_buffered_locked(
+            conn_state,
+            usize_to_u64_saturating(released.bytes),
+            released.released_retained_bytes,
+        );
+        maybe_release_active_count(conn_state, &holder, &mut holder_state);
+        drop(holder_state);
+        let payload = build_code_payload(
+            code,
+            &reason,
+            self.conn.peer_preface.settings.max_control_payload_bytes,
+        )
+        .unwrap_or_default();
+        let queued = self
+            .conn
+            .write_queue
+            .force_push_ordered(WriteJob::Frame(Frame {
+                frame_type: FrameType::Abort,
+                flags: 0,
+                stream_id: holder_id,
+                payload,
+            }));
+        if queued.is_err() {
+            note_written_stream_frames_locked(conn_state, holder_id, 0, 1);
+        }
+        release_local_opener_turn_locked(conn_state, holder_id);
+        holder.cond.notify_all();
     }
 
     fn remove_uncommitted_local_locked(
@@ -1970,6 +2131,7 @@ impl StreamInner {
         operation_deadline: Option<Instant>,
         mut read_from_buffer: impl FnMut(&mut RecvBuffer) -> RecvBufferRead,
     ) -> Result<usize> {
+        let mut exhausted_credit_checked = false;
         let mut state = self.state.lock().unwrap();
         loop {
             if state.read_stopped {
@@ -2028,6 +2190,15 @@ impl StreamInner {
             {
                 continue;
             }
+            if !exhausted_credit_checked {
+                // Before waiting, grant standing credit if the stream or session
+                // window is used up; the peer need not send BLOCKED.
+                exhausted_credit_checked = true;
+                drop(state);
+                grant_exhausted_receive_credit(&self.conn, self);
+                state = self.state.lock().unwrap();
+                continue;
+            }
             let deadline = effective_deadline(state.read_deadline, operation_deadline);
             if let Some(deadline) = deadline {
                 let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
@@ -2043,23 +2214,34 @@ impl StreamInner {
     }
 
     fn write(&self, src: &[u8], fin: bool) -> Result<usize> {
-        self.write_until(src, fin, None)
+        let progress = self.write_until(src, fin, None);
+        if fin {
+            progress.map_err(PartialWriteError::into_error)
+        } else {
+            partial_write_result(progress)
+        }
     }
 
     fn write_timeout(&self, src: &[u8], timeout: Duration) -> Result<usize> {
-        self.write_until(src, false, deadline_after(timeout))
+        partial_write_result(self.write_until(src, false, deadline_after(timeout)))
     }
 
     fn write_vectored(&self, parts: &[IoSlice<'_>], fin: bool) -> Result<usize> {
-        self.write_vectored_until(parts, fin, None)
+        let progress = self.write_vectored_until(parts, fin, None);
+        if fin {
+            progress.map_err(PartialWriteError::into_error)
+        } else {
+            partial_write_result(progress)
+        }
     }
 
     fn write_vectored_timeout(&self, parts: &[IoSlice<'_>], timeout: Duration) -> Result<usize> {
-        self.write_vectored_until(parts, false, deadline_after(timeout))
+        partial_write_result(self.write_vectored_until(parts, false, deadline_after(timeout)))
     }
 
     fn write_vectored_final(&self, parts: &[IoSlice<'_>]) -> Result<usize> {
         self.write_vectored_until(parts, true, None)
+            .map_err(PartialWriteError::into_error)
     }
 
     fn write_vectored_final_timeout(
@@ -2068,6 +2250,7 @@ impl StreamInner {
         timeout: Duration,
     ) -> Result<usize> {
         self.write_vectored_until(parts, true, deadline_after(timeout))
+            .map_err(PartialWriteError::into_error)
     }
 
     fn projected_next_data_queue_cost_locked(
@@ -2131,10 +2314,12 @@ impl StreamInner {
         src: &[u8],
         fin: bool,
         operation_deadline: Option<Instant>,
-    ) -> Result<usize> {
+    ) -> WriteProgress {
         self.write_bytes_until(WriteBytes::borrowed(src), fin, operation_deadline)
     }
 
+    /// Complete-consumption write (write_all / write_final): any error fails the
+    /// call even after partial progress.
     fn write_payload_until(
         &self,
         payload: WritePayload<'_>,
@@ -2152,6 +2337,7 @@ impl StreamInner {
                 self.write_vectored_until(parts, fin, operation_deadline)
             }
         }
+        .map_err(PartialWriteError::into_error)
     }
 
     fn write_bytes_until(
@@ -2159,9 +2345,9 @@ impl StreamInner {
         mut src: WriteBytes<'_>,
         fin: bool,
         operation_deadline: Option<Instant>,
-    ) -> Result<usize> {
+    ) -> WriteProgress {
         if !self.local_send {
-            return Err(Error::local("zmux: stream is not writable"));
+            return Err(Error::local("zmux: stream is not writable").into());
         }
         let src_len = src.len();
         if src_len == 0 && !fin {
@@ -2192,14 +2378,14 @@ impl StreamInner {
                     if let Err(err) = ensure_session_not_closed(&conn_state) {
                         drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(err);
+                        return Err(PartialWriteError::new(written, err));
                     }
                     let mut stream_state = self.state.lock().unwrap();
                     if let Err(err) = check_write_open(&stream_state) {
                         drop(stream_state);
                         drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(err);
+                        return Err(PartialWriteError::new(written, err));
                     }
                     if write_deadline_expired(&stream_state, operation_deadline) {
                         let projected_cost = self.projected_next_data_queue_cost_locked(
@@ -2219,13 +2405,15 @@ impl StreamInner {
                                 drop(conn_state);
                                 self.fail_session_with_close_error(err.clone());
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         } else {
                             drop(stream_state);
                         }
+                        // Rollback re-locks the conn state (std Mutex is not reentrant).
+                        drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(Error::timeout("write"));
+                        return Err(PartialWriteError::new(written, Error::timeout("write")));
                     }
                     if !burst_frame_limit_ready {
                         burst_frame_limit = self.write_burst_frame_limit_for_priority(
@@ -2247,7 +2435,7 @@ impl StreamInner {
                                 drop(stream_state);
                                 drop(conn_state);
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         }
                     } else {
@@ -2256,7 +2444,9 @@ impl StreamInner {
                     if local_commit == LocalCommitStatus::AwaitingTurn {
                         drop(stream_state);
                         if prepared_states.is_empty() {
-                            conn_state = self.wait_conn_write(conn_state, operation_deadline)?;
+                            conn_state = self
+                                .wait_conn_open_turn(conn_state, operation_deadline)
+                                .map_err(|err| PartialWriteError::new(written, err))?;
                             drop(conn_state);
                             continue 'write_loop;
                         }
@@ -2266,6 +2456,8 @@ impl StreamInner {
 
                     if fin && current_written == src_len {
                         if stream_state.send_fin {
+                            drop(stream_state);
+                            drop(conn_state);
                             self.rollback_prepared_states_batch(prepared_states);
                             return Ok(written.saturating_add(batch_progress));
                         }
@@ -2280,7 +2472,7 @@ impl StreamInner {
                                 drop(stream_state);
                                 drop(conn_state);
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         };
                         byte_progress = 0;
@@ -2322,7 +2514,7 @@ impl StreamInner {
                                         drop(stream_state);
                                         drop(conn_state);
                                         self.rollback_prepared_states_batch(prepared_states);
-                                        return Err(err);
+                                        return Err(PartialWriteError::new(written, err));
                                     }
                                 };
                                 byte_progress = 0;
@@ -2338,13 +2530,16 @@ impl StreamInner {
                                 } else {
                                     None
                                 };
+                                self.queue_blocked_signals_locked(
+                                    &mut conn_state,
+                                    &mut stream_state,
+                                    session_blocked,
+                                    stream_blocked,
+                                );
                                 drop(stream_state);
-                                drop(conn_state);
-                                self.queue_blocked_signals(session_blocked, stream_blocked);
-                                conn_state = self.conn.state.lock().unwrap();
-                                ensure_session_not_closed(&conn_state)?;
-                                conn_state =
-                                    self.wait_conn_write(conn_state, operation_deadline)?;
+                                conn_state = self
+                                    .wait_conn_write(conn_state, operation_deadline)
+                                    .map_err(|err| PartialWriteError::new(written, err))?;
                                 drop(conn_state);
                                 continue 'write_loop;
                             } else {
@@ -2367,7 +2562,7 @@ impl StreamInner {
                                     drop(stream_state);
                                     drop(conn_state);
                                     self.rollback_prepared_states_batch(prepared_states);
-                                    return Err(err);
+                                    return Err(PartialWriteError::new(written, err));
                                 }
                             };
                             byte_progress = available;
@@ -2381,7 +2576,7 @@ impl StreamInner {
                     if let Err(err) = src.append_range_to(&mut prepared.frame.payload, start, end) {
                         self.rollback_prepared_data(prepared.state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(err);
+                        return Err(PartialWriteError::new(written, err));
                     }
                 }
 
@@ -2408,19 +2603,23 @@ impl StreamInner {
             }
 
             let completion = WriteCompletion::new();
-            let prepared_states = self.queue_prepared_data_batch_until(
-                prepared_frames,
-                prepared_states,
-                || self.current_write_deadline(operation_deadline),
-                || self.ensure_prepared_write_not_aborted(),
-                "write",
-                completion.clone(),
-            )?;
-            let prepared_states = self.wait_prepared_write_batch_completion(
-                &completion,
-                prepared_states,
-                operation_deadline,
-            )?;
+            let prepared_states = self
+                .queue_prepared_data_batch_until(
+                    prepared_frames,
+                    prepared_states,
+                    || self.current_write_deadline(operation_deadline),
+                    || self.ensure_prepared_write_not_aborted(),
+                    "write",
+                    completion.clone(),
+                )
+                .map_err(|err| PartialWriteError::new(written, err))?;
+            let prepared_states = self
+                .wait_prepared_write_batch_completion(
+                    &completion,
+                    prepared_states,
+                    operation_deadline,
+                )
+                .map_err(|err| PartialWriteError::new(written, err))?;
             self.commit_prepared_data_batch(prepared_states);
             written = written.saturating_add(batch_progress);
             if batch_progress > 0 {
@@ -2437,9 +2636,9 @@ impl StreamInner {
         parts: &[IoSlice<'_>],
         fin: bool,
         operation_deadline: Option<Instant>,
-    ) -> Result<usize> {
+    ) -> WriteProgress {
         if !self.local_send {
-            return Err(Error::local("zmux: stream is not writable"));
+            return Err(Error::local("zmux: stream is not writable").into());
         }
         if let [single] = parts {
             return self.write_until(single.as_ref(), fin, operation_deadline);
@@ -2481,14 +2680,14 @@ impl StreamInner {
                     if let Err(err) = ensure_session_not_closed(&conn_state) {
                         drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(err);
+                        return Err(PartialWriteError::new(written, err));
                     }
                     let mut stream_state = self.state.lock().unwrap();
                     if let Err(err) = check_write_open(&stream_state) {
                         drop(stream_state);
                         drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(err);
+                        return Err(PartialWriteError::new(written, err));
                     }
                     if write_deadline_expired(&stream_state, operation_deadline) {
                         let projected_cost = self.projected_next_data_queue_cost_locked(
@@ -2508,13 +2707,15 @@ impl StreamInner {
                                 drop(conn_state);
                                 self.fail_session_with_close_error(err.clone());
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         } else {
                             drop(stream_state);
                         }
+                        // Rollback re-locks the conn state (std Mutex is not reentrant).
+                        drop(conn_state);
                         self.rollback_prepared_states_batch(prepared_states);
-                        return Err(Error::timeout("write"));
+                        return Err(PartialWriteError::new(written, Error::timeout("write")));
                     }
                     if !burst_frame_limit_ready {
                         burst_frame_limit = self.write_burst_frame_limit_for_priority(
@@ -2536,7 +2737,7 @@ impl StreamInner {
                                 drop(stream_state);
                                 drop(conn_state);
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         }
                     } else {
@@ -2545,7 +2746,9 @@ impl StreamInner {
                     if local_commit == LocalCommitStatus::AwaitingTurn {
                         drop(stream_state);
                         if prepared_states.is_empty() {
-                            conn_state = self.wait_conn_write(conn_state, operation_deadline)?;
+                            conn_state = self
+                                .wait_conn_open_turn(conn_state, operation_deadline)
+                                .map_err(|err| PartialWriteError::new(written, err))?;
                             drop(conn_state);
                             continue 'write_loop;
                         }
@@ -2584,7 +2787,7 @@ impl StreamInner {
                                     drop(stream_state);
                                     drop(conn_state);
                                     self.rollback_prepared_states_batch(prepared_states);
-                                    return Err(err);
+                                    return Err(PartialWriteError::new(written, err));
                                 }
                             };
                             byte_progress = 0;
@@ -2600,12 +2803,16 @@ impl StreamInner {
                             } else {
                                 None
                             };
+                            self.queue_blocked_signals_locked(
+                                &mut conn_state,
+                                &mut stream_state,
+                                session_blocked,
+                                stream_blocked,
+                            );
                             drop(stream_state);
-                            drop(conn_state);
-                            self.queue_blocked_signals(session_blocked, stream_blocked);
-                            conn_state = self.conn.state.lock().unwrap();
-                            ensure_session_not_closed(&conn_state)?;
-                            conn_state = self.wait_conn_write(conn_state, operation_deadline)?;
+                            conn_state = self
+                                .wait_conn_write(conn_state, operation_deadline)
+                                .map_err(|err| PartialWriteError::new(written, err))?;
                             drop(conn_state);
                             continue 'write_loop;
                         } else {
@@ -2628,7 +2835,7 @@ impl StreamInner {
                                 drop(stream_state);
                                 drop(conn_state);
                                 self.rollback_prepared_states_batch(prepared_states);
-                                return Err(err);
+                                return Err(PartialWriteError::new(written, err));
                             }
                         };
                         byte_progress = available;
@@ -2642,7 +2849,10 @@ impl StreamInner {
                         if prepared.frame.payload.try_reserve_exact(copy_len).is_err() {
                             self.rollback_prepared_data(prepared.state);
                             self.rollback_prepared_states_batch(prepared_states);
-                            return Err(Error::local("zmux: DATA payload allocation failed"));
+                            return Err(PartialWriteError::new(
+                                written,
+                                Error::local("zmux: DATA payload allocation failed"),
+                            ));
                         }
                         Some(append_io_slices(
                             &mut prepared.frame.payload,
@@ -2682,19 +2892,23 @@ impl StreamInner {
             }
 
             let completion = WriteCompletion::new();
-            let prepared_states = self.queue_prepared_data_batch_until(
-                prepared_frames,
-                prepared_states,
-                || self.current_write_deadline(operation_deadline),
-                || self.ensure_prepared_write_not_aborted(),
-                "write",
-                completion.clone(),
-            )?;
-            let prepared_states = self.wait_prepared_write_batch_completion(
-                &completion,
-                prepared_states,
-                operation_deadline,
-            )?;
+            let prepared_states = self
+                .queue_prepared_data_batch_until(
+                    prepared_frames,
+                    prepared_states,
+                    || self.current_write_deadline(operation_deadline),
+                    || self.ensure_prepared_write_not_aborted(),
+                    "write",
+                    completion.clone(),
+                )
+                .map_err(|err| PartialWriteError::new(written, err))?;
+            let prepared_states = self
+                .wait_prepared_write_batch_completion(
+                    &completion,
+                    prepared_states,
+                    operation_deadline,
+                )
+                .map_err(|err| PartialWriteError::new(written, err))?;
             self.commit_prepared_data_batch(prepared_states);
             written = written.saturating_add(batch_progress);
             part_idx = batch_part_idx;
@@ -2742,6 +2956,16 @@ impl StreamInner {
         }
     }
 
+    /// Takes the writer-path permit only if it is free right now.
+    fn try_acquire_writer_path_permit(&self) -> Option<WritePermit<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.aborted.is_some() || state.write_in_progress {
+            return None;
+        }
+        state.write_in_progress = true;
+        Some(WritePermit { stream: self })
+    }
+
     fn current_write_deadline(&self, operation_deadline: Option<Instant>) -> Option<Instant> {
         let state = self.state.lock().unwrap();
         effective_deadline(state.write_deadline, operation_deadline)
@@ -2772,7 +2996,13 @@ impl StreamInner {
             if let Some(result) = completion.try_result() {
                 return match result {
                     Ok(()) => Ok(prepared.take().expect("prepared write state already used")),
-                    Err(err) => Err(err),
+                    // A queued write discarded by a terminal stream transition
+                    // (for example the RESET answering a peer STOP_SENDING)
+                    // reports that transition rather than the bare discard.
+                    Err(err) => Err(self
+                        .ensure_prepared_write_not_aborted()
+                        .err()
+                        .unwrap_or(err)),
                 };
             }
 
@@ -2784,17 +3014,31 @@ impl StreamInner {
                     Some(deadline) => {
                         let now = Instant::now();
                         if now >= deadline {
-                            if self
-                                .conn
-                                .write_queue
-                                .cancel_tracked_write(completion)
-                                .is_some()
-                            {
+                            let carries_opener = prepared
+                                .as_ref()
+                                .and_then(|states| states.first())
+                                .is_some_and(|state| !state.opened_on_wire_before);
+                            let canceled = if carries_opener {
+                                self.cancel_queued_opener_write(completion)
+                            } else {
+                                self.conn
+                                    .write_queue
+                                    .cancel_tracked_write(completion)
+                                    .map(|_| OpenerWriteCancel::Removed)
+                            };
+                            if let Some(canceled) = canceled {
                                 let err = Error::timeout("write");
                                 completion.complete_err(err.clone());
-                                self.rollback_prepared_states_batch(
-                                    prepared.take().expect("prepared write state already used"),
-                                );
+                                let states =
+                                    prepared.take().expect("prepared write state already used");
+                                match canceled {
+                                    OpenerWriteCancel::Removed => {
+                                        self.rollback_prepared_states_batch(states);
+                                    }
+                                    OpenerWriteCancel::Stripped => {
+                                        self.rollback_prepared_states_keeping_opener(states);
+                                    }
+                                }
                                 return Err(err);
                             }
                             deadline_canceled = true;
@@ -2831,21 +3075,6 @@ impl StreamInner {
         Ok(())
     }
 
-    fn ensure_graceful_stop_sending_still_pending(&self) -> Result<()> {
-        {
-            let conn_state = self.conn.state.lock().unwrap();
-            ensure_session_not_closed(&conn_state)?;
-        }
-        let state = self.state.lock().unwrap();
-        if let Some((code, reason)) = &state.aborted {
-            return Err(stream_abort_error(&state, *code, reason.clone()));
-        }
-        if state.stopped_by_peer.is_none() || state.send_reset.is_some() {
-            return Err(Error::write_closed());
-        }
-        Ok(())
-    }
-
     fn wait_conn_write<'a>(
         &self,
         conn_state: MutexGuard<'a, ConnState>,
@@ -2870,6 +3099,49 @@ impl StreamInner {
         if timed_out.timed_out() && reaches_deadline {
             return Err(Error::timeout("write"));
         }
+        Ok(conn_state)
+    }
+
+    /// Waits while an uncommitted stream awaits its opener turn. Besides
+    /// `Inner::cond` notifications, the wait also ends once the class
+    /// provisional head expires: an abandoned head (opened, never written) is
+    /// reaped only by a commit attempt, and nothing notifies at that instant on
+    /// an otherwise quiet session. The stream's provisional age does not advance
+    /// during the wait, so it is not expired along with an abandoned opener
+    /// ahead of it.
+    fn wait_conn_open_turn<'a>(
+        &self,
+        conn_state: MutexGuard<'a, ConnState>,
+        operation_deadline: Option<Instant>,
+    ) -> Result<MutexGuard<'a, ConnState>> {
+        begin_provisional_wait_locked(&mut self.state.lock().unwrap(), Instant::now());
+        let waited = self.wait_conn_open_turn_or_head_expiry(conn_state, operation_deadline);
+        end_provisional_wait_locked(&mut self.state.lock().unwrap(), Instant::now());
+        waited
+    }
+
+    fn wait_conn_open_turn_or_head_expiry<'a>(
+        &self,
+        conn_state: MutexGuard<'a, ConnState>,
+        operation_deadline: Option<Instant>,
+    ) -> Result<MutexGuard<'a, ConnState>> {
+        let wake_at = provisional_head_expiry_locked(&conn_state, self.bidi)
+            .and_then(|expiry| expiry.checked_add(PROVISIONAL_EXPIRY_WAKE_SLACK));
+        let Some(wake_at) = wake_at else {
+            return self.wait_conn_write(conn_state, operation_deadline);
+        };
+        if self
+            .current_write_deadline(operation_deadline)
+            .is_some_and(|deadline| deadline <= wake_at)
+        {
+            return self.wait_conn_write(conn_state, operation_deadline);
+        }
+        let blocked_started = Instant::now();
+        let wait = wake_at
+            .saturating_duration_since(blocked_started)
+            .min(MAX_CONDVAR_TIMED_WAIT);
+        let (mut conn_state, _) = self.conn.cond.wait_timeout(conn_state, wait).unwrap();
+        note_blocked_write_locked(&mut conn_state, blocked_started.elapsed());
         Ok(conn_state)
     }
 
@@ -2985,30 +3257,30 @@ impl StreamInner {
         self.conn.wake_writer_queue_waiters();
     }
 
-    fn queue_blocked_signals(&self, session_blocked: Option<u64>, stream_blocked: Option<u64>) {
+    /// Queues BLOCKED for a writer that ran out of credit. The writer keeps the
+    /// conn lock from its credit check until it waits on `Inner::cond`, so a
+    /// MAX_DATA (or terminal transition) handled concurrently cannot notify
+    /// before the writer is waiting.
+    fn queue_blocked_signals_locked(
+        &self,
+        conn_state: &mut ConnState,
+        stream_state: &mut StreamState,
+        session_blocked: Option<u64>,
+        stream_blocked: Option<u64>,
+    ) {
         if let Some(offset) = session_blocked {
-            let should_queue = {
-                let conn_state = self.conn.state.lock().unwrap();
-                conn_state.send_session_blocked_at != Some(offset)
-            };
-            if should_queue
+            if conn_state.send_session_blocked_at != Some(offset)
                 && blocked_frame(0, offset)
                     .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
             {
-                let mut conn_state = self.conn.state.lock().unwrap();
                 conn_state.send_session_blocked_at = Some(offset);
             }
         }
         if let Some(offset) = stream_blocked {
-            let should_queue = {
-                let stream_state = self.state.lock().unwrap();
-                stream_state.send_blocked_at != Some(offset)
-            };
-            if should_queue
+            if stream_state.send_blocked_at != Some(offset)
                 && blocked_frame(self.id(), offset)
                     .is_some_and(|frame| try_queue_bounded_control(&self.conn, frame))
             {
-                let mut stream_state = self.state.lock().unwrap();
                 stream_state.send_blocked_at = Some(offset);
             }
         }
@@ -3134,12 +3406,24 @@ impl StreamInner {
     }
 
     fn rollback_prepared_data(&self, prepared: PreparedDataState) {
+        self.rollback_prepared_data_inner(prepared, false);
+    }
+
+    /// Rolls back a prepared DATA frame. With `opener_kept`, the frame's opener
+    /// stays queued as a zero-length opener: only its application bytes, FIN and
+    /// priority update are undone.
+    fn rollback_prepared_data_inner(&self, prepared: PreparedDataState, opener_kept: bool) {
         let mut conn_state = self.conn.state.lock().unwrap();
         let mut stream_state = self.state.lock().unwrap();
-        stream_state.opened_on_wire = prepared.opened_on_wire_before;
+        // A concurrent local abort already made its ABORT the stream's opener.
+        if !opener_kept && stream_state.aborted.is_none() {
+            stream_state.opened_on_wire = prepared.opened_on_wire_before;
+        }
         stream_state.send_fin = prepared.send_fin_before;
         stream_state.send_used = prepared.send_used_before;
-        stream_state.pending_data_frames = stream_state.pending_data_frames.saturating_sub(1);
+        if !opener_kept {
+            stream_state.pending_data_frames = stream_state.pending_data_frames.saturating_sub(1);
+        }
         if let Some(priority) = prepared.priority_update.into_restore_payload() {
             stream_state.pending_priority_update.get_or_insert(priority);
         }
@@ -3156,6 +3440,41 @@ impl StreamInner {
         for state in states.into_iter().rev() {
             self.rollback_prepared_data(state);
         }
+    }
+
+    /// Rolls back a canceled batch whose opener was kept queued as a zero-length
+    /// opener (see `WriteQueue::cancel_tracked_opener_write`).
+    fn rollback_prepared_states_keeping_opener(&self, states: Vec<PreparedDataState>) {
+        for (index, state) in states.into_iter().enumerate().rev() {
+            self.rollback_prepared_data_inner(state, index == 0);
+        }
+    }
+
+    /// Cancels this stream's still-queued opener batch at its write deadline. The
+    /// batch leaves the queue only while no later same-class ID has been committed
+    /// (the stream then takes the class opener turn back); otherwise a zero-length
+    /// opener keeps the stream's place in the class opening order (SPEC §3.1).
+    fn cancel_queued_opener_write(
+        &self,
+        completion: &WriteCompletion,
+    ) -> Option<OpenerWriteCancel> {
+        let mut conn_state = self.conn.state.lock().unwrap();
+        let stream_id = self.id();
+        let next_local = if self.bidi {
+            conn_state.next_local_bidi
+        } else {
+            conn_state.next_local_uni
+        };
+        let turn = local_opener_turn(&conn_state, self.bidi);
+        let allow_remove = turn.holder.is_none() && next_local == stream_id.saturating_add(4);
+        let canceled =
+            self.conn
+                .write_queue
+                .cancel_tracked_opener_write(completion, stream_id, allow_remove);
+        if canceled == Some(OpenerWriteCancel::Removed) {
+            local_opener_turn_mut(&mut conn_state, self.bidi).holder = Some(stream_id);
+        }
+        canceled
     }
 
     fn commit_prepared_data(&self, prepared: PreparedDataState) {
@@ -3226,6 +3545,7 @@ impl StreamInner {
     {
         let PreparedDataFrame { frame, state } = prepared;
         let stream_id = frame.stream_id;
+        let carries_opener = !state.opened_on_wire_before;
         let queued = match completion {
             Some(completion) => self.conn.queue_tracked_frames_until(
                 prepared_data_frames(stream_id, frame, &state.priority_update),
@@ -3253,7 +3573,37 @@ impl StreamInner {
             },
         };
         match queued {
-            Ok(()) => Ok(state),
+            Ok(()) => {
+                if carries_opener {
+                    release_local_opener_turn(&self.conn, stream_id);
+                }
+                Ok(state)
+            }
+            Err(err) => {
+                self.rollback_prepared_data(state);
+                Err(err)
+            }
+        }
+    }
+
+    /// Non-blocking variant of [`Self::queue_prepared_data_until`]: fails at
+    /// once instead of waiting for writer-queue room.
+    fn try_queue_prepared_data(
+        &self,
+        prepared: PreparedDataFrame,
+        operation: &str,
+    ) -> Result<PreparedDataState> {
+        let PreparedDataFrame { frame, state } = prepared;
+        let stream_id = frame.stream_id;
+        let carries_opener = !state.opened_on_wire_before;
+        let frames = prepared_data_frames(stream_id, frame, &state.priority_update);
+        match self.conn.try_queue_frames(frames, operation) {
+            Ok(()) => {
+                if carries_opener {
+                    release_local_opener_turn(&self.conn, stream_id);
+                }
+                Ok(state)
+            }
             Err(err) => {
                 self.rollback_prepared_data(state);
                 Err(err)
@@ -3278,11 +3628,19 @@ impl StreamInner {
             completion.complete_ok();
             return Ok(Vec::new());
         }
+        let carries_opener = states
+            .first()
+            .is_some_and(|state| !state.opened_on_wire_before);
         match self
             .conn
             .queue_tracked_frames_until(frames, completion, deadline, check, operation)
         {
-            Ok(()) => Ok(states),
+            Ok(()) => {
+                if carries_opener {
+                    release_local_opener_turn(&self.conn, self.id());
+                }
+                Ok(states)
+            }
             Err(err) => {
                 self.rollback_prepared_states_batch(states);
                 Err(err)
@@ -3370,7 +3728,6 @@ impl StreamInner {
         )?;
         let mut opener_permit = None;
         loop {
-            let prepared_opener;
             let released_recv_bytes;
             let released_recv_retained_bytes;
             let mut conn_state = self.conn.state.lock().unwrap();
@@ -3392,7 +3749,20 @@ impl StreamInner {
                     return Err(stream_abort_error(&stream_state, *code, reason.clone()));
                 }
             }
-            if self.opened_locally && !stream_state.opened_on_wire {
+            if opener_permit.is_none()
+                && self.opened_locally
+                && stream_state.opened_on_wire
+                && !stream_state.peer_visible
+                && local_opener_turn(&conn_state, self.bidi).holder == Some(self.id())
+            {
+                // A concurrent write prepared this stream's opener but has not
+                // queued it yet; STOP_SENDING must not reach the peer first.
+                drop(stream_state);
+                conn_state = self.wait_conn_write(conn_state, None)?;
+                drop(conn_state);
+                continue;
+            }
+            let prepared_opener = if self.opened_locally && !stream_state.opened_on_wire {
                 if opener_permit.is_none() {
                     if stream_state.write_in_progress {
                         drop(conn_state);
@@ -3407,19 +3777,19 @@ impl StreamInner {
                     == LocalCommitStatus::AwaitingTurn
                 {
                     drop(stream_state);
-                    conn_state = self.wait_conn_write(conn_state, None)?;
+                    conn_state = self.wait_conn_open_turn(conn_state, None)?;
                     drop(conn_state);
                     continue;
                 }
-                prepared_opener = Some(self.prepare_data_frame_locked(
+                Some(self.prepare_data_frame_locked(
                     &mut conn_state,
                     &mut stream_state,
                     &[],
                     false,
-                )?);
+                )?)
             } else {
-                prepared_opener = None;
-            }
+                None
+            };
             if !stream_state.read_stopped {
                 stream_state.read_stopped = true;
                 stream_state.read_stop_pending_code = Some(code);
@@ -3602,7 +3972,7 @@ impl StreamInner {
     }
 
     fn apply_discarded_queued_frames(&self, stats: StreamDiscardStats, count_superseded: bool) {
-        if stats.removed_frames == 0 {
+        if !stats.removed_any() {
             return;
         }
         let stream_id = self.id();
@@ -3629,6 +3999,7 @@ impl StreamInner {
         )?;
         let frame_type;
         let stream_id;
+        let opener_unwritten;
         {
             let mut conn_state = self.conn.state.lock().unwrap();
             ensure_session_not_closed(&conn_state)?;
@@ -3648,7 +4019,14 @@ impl StreamInner {
                 return Ok(());
             }
             stream_id = self.id();
-            frame_type = if self.opened_locally && !stream_state.opened_on_wire {
+            opener_unwritten = self.opened_locally && !stream_state.peer_visible;
+            // RESET cannot open a stream (SPEC §6.7). Until this stream's opener
+            // has been queued, the opening-eligible ABORT replaces it; once queued,
+            // the opener stays in place (as a zero-length opener) ahead of RESET.
+            let opener_unqueued = self.opened_locally
+                && (!stream_state.opened_on_wire
+                    || local_opener_turn(&conn_state, self.bidi).holder == Some(stream_id));
+            frame_type = if opener_unqueued {
                 note_abort_reason_locked(&mut conn_state, code);
                 stream_state.aborted = Some((code, reason.to_owned()));
                 stream_state.abort_source = ErrorSource::Local;
@@ -3665,15 +4043,27 @@ impl StreamInner {
                 stream_state.pending_terminal_frames.saturating_add(1);
             maybe_release_active_count(&mut conn_state, self, &mut stream_state);
         }
-        let discarded = self.conn.write_queue.discard_stream_send_tail(stream_id);
-        self.apply_discarded_queued_frames(discarded, false);
-        self.conn.write_queue.discard_priority_update(stream_id);
-        if let Err(err) = self.conn.queue_frame(Frame {
+        let frame = Frame {
             frame_type,
             flags: 0,
             stream_id,
             payload,
-        }) {
+        };
+        let queued = if frame_type == FrameType::Abort {
+            self.queue_abort_frame(frame, opener_unwritten, false)
+        } else {
+            let discarded = if opener_unwritten {
+                self.conn
+                    .write_queue
+                    .discard_stream_send_tail_keeping_opener(stream_id)
+            } else {
+                self.conn.write_queue.discard_stream_send_tail(stream_id)
+            };
+            self.apply_discarded_queued_frames(discarded, false);
+            self.conn.write_queue.discard_priority_update(stream_id);
+            self.conn.queue_frame(frame)
+        };
+        if let Err(err) = queued {
             self.rollback_pending_terminal_frame();
             return Err(err);
         }
@@ -3688,6 +4078,7 @@ impl StreamInner {
             self.conn.peer_preface.settings.max_control_payload_bytes,
         )?;
         let stream_id;
+        let opener_unwritten;
         {
             let mut conn_state = self.conn.state.lock().unwrap();
             ensure_session_not_closed(&conn_state)?;
@@ -3709,6 +4100,7 @@ impl StreamInner {
                 return Ok(());
             }
             stream_id = self.id();
+            opener_unwritten = self.opened_locally && !stream_state.peer_visible;
             note_abort_reason_locked(&mut conn_state, code);
             stream_state.aborted = Some((code, reason.to_owned()));
             stream_state.abort_source = ErrorSource::Local;
@@ -3726,19 +4118,76 @@ impl StreamInner {
                 false,
             );
         }
-        let discarded = self.conn.write_queue.discard_stream(stream_id);
-        self.apply_discarded_queued_frames(discarded, true);
-        if let Err(err) = self.conn.queue_frame(Frame {
+        let frame = Frame {
             frame_type: FrameType::Abort,
             flags: 0,
             stream_id,
             payload,
-        }) {
+        };
+        if let Err(err) = self.queue_abort_frame(frame, opener_unwritten, true) {
             self.rollback_pending_terminal_frame();
             return Err(err);
         }
         self.cond.notify_all();
         Ok(())
+    }
+
+    /// Discards the stream's queued frames and queues its ABORT. While the opener
+    /// has not been written, the ABORT takes a queued opener's place (or queues
+    /// behind earlier same-class openers) so it opens the stream in order
+    /// (SPEC §3.1).
+    fn queue_abort_frame(
+        &self,
+        frame: Frame,
+        opener_unwritten: bool,
+        count_superseded: bool,
+    ) -> Result<()> {
+        let stream_id = frame.stream_id;
+        if !opener_unwritten {
+            let discarded = self.conn.write_queue.discard_stream(stream_id);
+            self.apply_discarded_queued_frames(discarded, count_superseded);
+            return self.conn.queue_frame(frame);
+        }
+        let (discarded, unplaced) = self
+            .conn
+            .write_queue
+            .discard_stream_replacing_opener(stream_id, frame);
+        self.apply_discarded_queued_frames(discarded, count_superseded);
+        let queued = match unplaced {
+            Some(frame) => self.queue_unplaced_opening_abort(frame),
+            None => Ok(()),
+        };
+        // The stream is already marked opened, so even a failed push must not
+        // keep the class opener turn held: later same-class opens would wait on
+        // it forever.
+        release_local_opener_turn(&self.conn, stream_id);
+        queued
+    }
+
+    /// Queues an opening ABORT that found no queued opener to replace. If the
+    /// queue refuses it (e.g. an ABORT larger than the pending-control budget)
+    /// while this stream still holds the class opener turn, its committed ID
+    /// would stay unused ahead of later same-class openers (SPEC §3.1), so the
+    /// ABORT is forced in, as `consume_abandoned_local_opener_locked` does; the
+    /// turn bounds this to one frame per stream class.
+    fn queue_unplaced_opening_abort(&self, frame: Frame) -> Result<()> {
+        let stream_id = frame.stream_id;
+        let retry = frame.clone();
+        let err = match self.conn.queue_ordered_frame(frame) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        let holds_turn = {
+            let conn_state = self.conn.state.lock().unwrap();
+            local_opener_turn(&conn_state, self.bidi).holder == Some(stream_id)
+        };
+        if !holds_turn || err.is_session_closed() {
+            return Err(err);
+        }
+        self.conn
+            .write_queue
+            .force_push_ordered(WriteJob::Frame(retry))
+            .map_err(|_| err)
     }
 
     fn ensure_metadata_update_still_allowed(&self) -> Result<()> {

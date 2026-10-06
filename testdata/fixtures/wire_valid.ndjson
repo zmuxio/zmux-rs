@@ -44,6 +44,59 @@
   }
 }
 {
+  "id": "preface_initiator_caps_max_frame_payload_32768",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d555801000001010b06070480008000",
+  "expect": {
+    "preface_ver": 1,
+    "role": "initiator",
+    "tie_breaker_nonce": 0,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 11,
+    "settings_len": 6,
+    "settings": {
+      "max_frame_payload": 32768
+    }
+  },
+  "notes": "max_frame_payload = 32768 needs the 4-byte varint62 80 00 80 00 inside TLV type 7, length 4 (WIRE_EXAMPLES 1.26)"
+}
+{
+  "id": "preface_initiator_with_padding",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d5558010000010100050c03ffc0ff",
+  "expect": {
+    "preface_ver": 1,
+    "role": "initiator",
+    "tie_breaker_nonce": 0,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 0,
+    "settings_len": 5,
+    "settings": {}
+  },
+  "notes": "preface_padding (setting 12) carries ignored bytes ff c0 ff that are not a valid varint62, and every setting keeps its default; settings_len counts the padding TLV, so re-encoding the parsed preface without padding does not reproduce these bytes (WIRE_EXAMPLES 1.28)"
+}
+{
+  "id": "preface_initiator_empty_padding",
+  "source": "wire_corpus",
+  "category": "preface_valid",
+  "hex": "5a4d5558010000010100020c00",
+  "expect": {
+    "preface_ver": 1,
+    "role": "initiator",
+    "tie_breaker_nonce": 0,
+    "min_proto": 1,
+    "max_proto": 1,
+    "capabilities": 0,
+    "settings_len": 2,
+    "settings": {}
+  },
+  "notes": "preface_padding (setting 12) with an empty value is valid and ignored, and every setting keeps its default; settings_len counts the 2-byte padding TLV, so re-encoding the parsed preface without padding does not reproduce these bytes (WIRE_EXAMPLES 1.28a)"
+}
+{
   "id": "frame_data_open_bidi_4_hi",
   "source": "wire_corpus",
   "category": "frame_valid",
@@ -217,4 +270,292 @@
       ]
     }
   }
+}
+{
+  "id": "frame_reset_cancelled",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "03070408",
+  "expect": {
+    "frame_length": 3,
+    "frame_type": "RESET",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 8
+    }
+  }
+}
+{
+  "id": "frame_abort_refused_stream_debug_text",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0708040401026e6f",
+  "expect": {
+    "frame_length": 7,
+    "frame_type": "ABORT",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 4,
+      "debug_text": "no"
+    }
+  }
+}
+{
+  "id": "frame_data_open_metadata_fin_info_ssh",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "086104050303737368",
+  "expect": {
+    "frame_length": 8,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA",
+      "FIN"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "stream_metadata_tlvs": [
+        {
+          "type": "open_info",
+          "value_hex": "737368"
+        }
+      ],
+      "application_payload_hex": ""
+    }
+  }
+}
+{
+  "id": "frame_data_open_metadata_info_ssh_empty",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "082104050303737368",
+  "expect": {
+    "frame_length": 8,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "stream_metadata_tlvs": [
+        {
+          "type": "open_info",
+          "value_hex": "737368"
+        }
+      ],
+      "application_payload_hex": ""
+    }
+  }
+}
+{
+  "id": "frame_data_open_metadata_duplicate_priority_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0b2104060101020101036869",
+  "expect": {
+    "frame_length": 11,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "open_metadata_block_dropped": true,
+      "stream_metadata_tlvs": [],
+      "application_payload_hex": "6869"
+    }
+  },
+  "notes": "the duplicated singleton stream_priority drops the whole metadata block while the DATA still opens stream 4 with payload \"hi\" (WIRE_EXAMPLES 1.20)"
+}
+{
+  "id": "frame_data_open_metadata_duplicate_then_noncanonical_priority_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0c210407010102010240026869",
+  "expect": {
+    "frame_length": 12,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "open_metadata_block_dropped": true,
+      "stream_metadata_tlvs": [],
+      "application_payload_hex": "6869"
+    }
+  },
+  "notes": "the second stream_priority TLV duplicates the first, so the block is dropped before its non-canonical value 40 02 is interpreted; the DATA still opens stream 4 with payload \"hi\" (SPEC 7.2)"
+}
+{
+  "id": "frame_data_open_metadata_priority_group_hi",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0b2104060101020201056869",
+  "expect": {
+    "frame_length": 11,
+    "frame_type": "DATA",
+    "flags": [
+      "OPEN_METADATA"
+    ],
+    "stream_id": 4,
+    "decoded": {
+      "stream_metadata_tlvs": [
+        {
+          "type": "stream_priority",
+          "value": 2
+        },
+        {
+          "type": "stream_group",
+          "value": 5
+        }
+      ],
+      "application_payload_hex": "6869"
+    }
+  }
+}
+{
+  "id": "frame_goaway_bidi_4_no_error",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "050900040000",
+  "expect": {
+    "frame_length": 5,
+    "frame_type": "GOAWAY",
+    "stream_id": 0,
+    "payload_hex": "040000",
+    "decoded": {
+      "goaway": {
+        "last_accepted_bidi_stream_id": 4,
+        "last_accepted_uni_stream_id": 0,
+        "error_code": 0
+      }
+    }
+  }
+}
+{
+  "id": "frame_close_internal_debug_text",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "070a000d01026e6f",
+  "expect": {
+    "frame_length": 7,
+    "frame_type": "CLOSE",
+    "stream_id": 0,
+    "decoded": {
+      "error_code": 13,
+      "debug_text": "no"
+    }
+  }
+}
+{
+  "id": "frame_abort_duplicate_debug_text",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0b08040401026e6f01026f6b",
+  "expect": {
+    "frame_length": 11,
+    "frame_type": "ABORT",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 4,
+      "diag_block_dropped": true
+    }
+  },
+  "notes": "the duplicated singleton debug_text drops only the DIAG block; ABORT(REFUSED_STREAM) keeps its primary semantics (WIRE_EXAMPLES 1.22a)"
+}
+{
+  "id": "frame_abort_noncanonical_retry_after_millis_ignored",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0708040402024001",
+  "expect": {
+    "frame_length": 7,
+    "frame_type": "ABORT",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 4
+    }
+  },
+  "notes": "DIAG-TLV retry_after_millis = 1 encoded non-canonically as 40 01 is ignored as semantically invalid diagnostic metadata; ABORT(REFUSED_STREAM) keeps its primary semantics (SPEC 3.2, 7.1; WIRE_EXAMPLES 1.22b)"
+}
+{
+  "id": "frame_stream_max_data_8192",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0402046000",
+  "expect": {
+    "frame_length": 4,
+    "frame_type": "MAX_DATA",
+    "stream_id": 4,
+    "payload_hex": "6000",
+    "decoded": {
+      "max_offset": 8192
+    }
+  }
+}
+{
+  "id": "frame_stream_blocked_4096",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0406045000",
+  "expect": {
+    "frame_length": 4,
+    "frame_type": "BLOCKED",
+    "stream_id": 4,
+    "decoded": {
+      "blocked_at": 4096
+    }
+  }
+}
+{
+  "id": "frame_reset_cancelled_debug_text",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "0c070408010774696d656f7574",
+  "expect": {
+    "frame_length": 12,
+    "frame_type": "RESET",
+    "stream_id": 4,
+    "decoded": {
+      "error_code": 8,
+      "debug_text": "timeout"
+    }
+  }
+}
+{
+  "id": "frame_ext_unknown_subtype_99",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "060b044063aabb",
+  "expect": {
+    "frame_length": 6,
+    "frame_type": "EXT",
+    "stream_id": 4,
+    "payload_hex": "4063aabb",
+    "decoded": {
+      "ext_type_value": 99
+    }
+  },
+  "notes": "ext_type 99 is unassigned; receivers ignore it without failing the session (WIRE_EXAMPLES 1.27)"
+}
+{
+  "id": "frame_ping_padded_tag",
+  "source": "wire_corpus",
+  "category": "frame_valid",
+  "hex": "1204000102030405060708a7be6ab32fe5286b",
+  "expect": {
+    "frame_length": 18,
+    "frame_type": "PING",
+    "stream_id": 0,
+    "payload_hex": "0102030405060708a7be6ab32fe5286b",
+    "decoded": {
+      "ping_padding_tag": {
+        "ping_padding_key": 81985529216486895,
+        "token_hex": "0102030405060708",
+        "tag_hex": "a7be6ab32fe5286b"
+      }
+    }
+  },
+  "notes": "padded PING whose bytes 8..15 are ping_padding_tag(0x0123456789abcdef, token) (SPEC 6.4, WIRE_EXAMPLES 1.29)"
 }

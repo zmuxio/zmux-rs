@@ -33,6 +33,7 @@ const ADAPTER_UNSUPPORTED_FRAGMENT: &str = "feature not supported by adapter";
 const LOCAL_OPEN_LIMITED_BY_SESSION_MEMORY_CAP_FRAGMENT: &str =
     "local open limited by session memory cap";
 const PROVISIONAL_OPEN_LIMIT_REACHED_FRAGMENT: &str = "provisional open limit reached";
+const LOCAL_STREAM_ID_SPACE_EXHAUSTED_FRAGMENT: &str = "local stream ID space exhausted";
 const PROVISIONAL_LOCAL_OPEN_EXPIRED_FRAGMENT: &str = "provisional local open expired";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -490,6 +491,7 @@ impl Error {
         let message = self.message.as_ref();
         message.contains(LOCAL_OPEN_LIMITED_BY_SESSION_MEMORY_CAP_FRAGMENT)
             || message.contains(PROVISIONAL_OPEN_LIMIT_REACHED_FRAGMENT)
+            || message.contains(LOCAL_STREAM_ID_SPACE_EXHAUSTED_FRAGMENT)
     }
 
     pub fn is_open_expired(&self) -> bool {
@@ -980,6 +982,11 @@ mod tests {
             .is_priority_update_unavailable());
         assert!(Error::local("zmux: provisional open limit reached").is_open_limited());
         assert!(Error::local("zmux: local open limited by session memory cap").is_open_limited());
+        assert!(Error::new(
+            ErrorCode::StreamLimit,
+            "zmux: local stream ID space exhausted"
+        )
+        .is_open_limited());
     }
 
     #[test]

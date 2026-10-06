@@ -2,9 +2,9 @@
   "id": "invalid_noncanonical_varint_stream_id",
   "source": "wire_corpus",
   "category": "frame_invalid",
-  "hex": "044140046869",
+  "hex": "050140046869",
   "expect_error": "PROTOCOL",
-  "notes": "stream_id = 4 is encoded non-canonically"
+  "notes": "DATA(\"hi\") with frame_length = 5 whose stream_id = 4 is encoded non-canonically as 40 04 in the frame header (SPEC 3.2)"
 }
 {
   "id": "invalid_truncated_varint62",
@@ -12,7 +12,7 @@
   "category": "bytes_invalid",
   "hex": "800001",
   "expect_error": "PROTOCOL",
-  "notes": "first byte announces a 4-byte varint62 but only 3 bytes are present"
+  "notes": "first byte announces a 4-byte varint62 but only 3 bytes are present; PROTOCOL applies to frame-header and preface integers (SPEC 3.2), while a truncated mandatory payload field is FRAME_SIZE (see invalid_truncated_mandatory_payload_varint)"
 }
 {
   "id": "invalid_oversized_frame_for_receiver_limit",
@@ -24,4 +24,68 @@
     "max_frame_payload": 16384
   },
   "notes": "frame_length = 16387, code = DATA, stream_id = 4, derived payload length = 16385"
+}
+{
+  "id": "invalid_frame_length_too_small",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "0101",
+  "expect_error": "FRAME_SIZE",
+  "notes": "frame_length = 1 leaves no room for stream_id (SPEC 4.3)"
+}
+{
+  "id": "invalid_frame_length_smaller_than_stream_id",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "020180004000",
+  "expect_error": "FRAME_SIZE",
+  "notes": "frame_length = 2 but stream_id = 16384 announces a 4-byte encoding; frame_length < 1 + encoded_length(stream_id) (SPEC 4.3)"
+}
+{
+  "id": "invalid_noncanonical_mandatory_payload_varint",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "0402004001",
+  "expect_error": "FRAME_SIZE",
+  "notes": "MAX_DATA on stream 0 with max_offset = 1 encoded non-canonically as 40 01; malformed mandatory payload field (SPEC 3.2, 4.3)"
+}
+{
+  "id": "invalid_truncated_mandatory_payload_varint",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "03020040",
+  "expect_error": "FRAME_SIZE",
+  "notes": "MAX_DATA on stream 0 whose max_offset announces 2 bytes but the payload ends after 1 (SPEC 3.2, 4.3)"
+}
+{
+  "id": "invalid_stop_sending_missing_error_code",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "020304",
+  "expect_error": "FRAME_SIZE",
+  "notes": "STOP_SENDING on stream 4 with an empty payload; mandatory error_code missing (SPEC 4.3)"
+}
+{
+  "id": "invalid_max_data_trailing_byte",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "0402000501",
+  "expect_error": "PROTOCOL",
+  "notes": "MAX_DATA on stream 0 with canonical max_offset = 5 followed by one trailing byte (SPEC 4.3)"
+}
+{
+  "id": "invalid_pong_payload_too_short",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "09050001020304050607",
+  "expect_error": "FRAME_SIZE",
+  "notes": "PONG on stream 0 with a 7-byte payload (SPEC 4.3, 6.5)"
+}
+{
+  "id": "invalid_ext_payload_underflow",
+  "source": "wire_corpus",
+  "category": "frame_invalid",
+  "hex": "020b00",
+  "expect_error": "PROTOCOL",
+  "notes": "EXT on stream 0 with an empty payload; derived_payload_length < encoded_length(ext_type) is the frame-specific PROTOCOL exception (SPEC 6.11)"
 }

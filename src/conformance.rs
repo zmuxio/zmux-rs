@@ -678,6 +678,9 @@ mod tests {
             vec![
                 "wire_invalid_fixtures_are_rejected",
                 "direct_frame_read_rejects_invalid_frame_scopes_and_ext_subtypes",
+                "duplicate_metadata_singletons_do_not_skip_later_tlv_structure",
+                "invalid_case_frame_fixtures_match_codec_results",
+                "invalid_case_malformed_frame_fixtures_close_session",
             ],
         );
         evidence.insert(
@@ -685,7 +688,7 @@ mod tests {
             vec![
                 "open_metadata_parser_ignores_unknown_metadata_tlvs",
                 "priority_update_parser_ignores_unknown_advisory_tlvs",
-                "duplicate_metadata_singletons_short_circuit_later_bad_tlvs",
+                "duplicate_metadata_singletons_with_well_formed_tail_drop_block",
             ],
         );
 
@@ -706,6 +709,7 @@ mod tests {
             vec![
                 "unnegotiated_open_metadata_emits_fatal_close",
                 "open_metadata_on_existing_local_stream_fails_session",
+                "invalid_case_open_metadata_fixtures_on_live_session",
             ],
         );
         evidence.insert(
@@ -714,7 +718,7 @@ mod tests {
         );
         evidence.insert(
             open_metadata[5],
-            vec!["duplicate_metadata_singletons_short_circuit_later_bad_tlvs"],
+            vec!["duplicate_metadata_singletons_with_well_formed_tail_drop_block"],
         );
 
         evidence.insert(
@@ -739,7 +743,10 @@ mod tests {
         );
         evidence.insert(
             priority_update[5],
-            vec!["priority_update_parser_ignores_open_info_and_rejects_duplicates"],
+            vec![
+                "priority_update_parser_ignores_open_info_and_rejects_duplicates",
+                "invalid_case_ext_fixtures_on_live_session",
+            ],
         );
 
         evidence.insert(
@@ -750,6 +757,10 @@ mod tests {
                 "stream_application_errors_expose_code_and_reason",
                 "provisional_open_limit_is_enforced_without_consuming_id",
                 "native_stream_direction_queries_match_public_surface",
+                "concurrent_open_and_first_write_keeps_stream_ids_in_wire_order",
+                "cancel_write_with_queued_opener_keeps_opener_ahead_of_reset",
+                "later_open_consumes_abandoned_committed_opener_with_abort",
+                "write_after_peer_abort_of_finished_send_half_reports_abort",
             ],
         );
         evidence.insert(
@@ -801,6 +812,8 @@ mod tests {
             vec![
                 "role_resolution_and_settings_validation",
                 "tcp_constructors_establish_session_with_deadline_control",
+                "establishment_timeout_allows_a_slow_but_compliant_peer",
+                "invalid_case_preface_fixtures_match_codec_results",
             ],
         );
         evidence.insert(
@@ -809,6 +822,13 @@ mod tests {
                 "bidirectional_stream_round_trip_over_memory_transport",
                 "terminal_fin_stream_uses_tombstone_for_late_data",
                 "peer_incoming_stream_limit_counts_uncommitted_local_provisionals",
+                "data_after_peer_fin_on_read_stopped_tombstone_aborts_stream_closed",
+                "late_peer_abort_after_local_fin_and_peer_fin_preserves_unread_data",
+                "goaway_refused_stream_ignores_racing_control_frames",
+                "incoming_limit_refused_stream_ignores_late_data_and_credits_session",
+                "marker_only_used_stream_cap_coarsens_instead_of_failing_session",
+                "invalid_case_first_frame_on_unused_stream_fixtures_close_session",
+                "invalid_case_stream_state_fixtures_on_live_session",
             ],
         );
         evidence.insert(
@@ -816,6 +836,12 @@ mod tests {
             vec![
                 "receive_window_replenishes_after_application_read_not_arrival",
                 "blocked_write_emits_session_and_stream_blocked_signals",
+                "close_read_tolerates_full_stream_window_of_in_flight_data",
+                "zero_initial_bidi_stream_window_is_granted_to_peer",
+                "default_config_bulk_transfer_survives_replenish_and_blocked_rates",
+                "goaway_refused_stream_data_is_credited_back_with_one_abort_per_id",
+                "accept_backlog_refusals_do_not_leak_session_window",
+                "invalid_case_flow_control_fixtures_on_live_session",
             ],
         );
         evidence.insert(
@@ -824,6 +850,10 @@ mod tests {
                 "graceful_close_sends_final_goaway_before_close",
                 "peer_close_error_preserves_code_and_reason",
                 "keepalive_sends_idle_ping_and_records_rtt",
+                "interleaved_stream_classes_keep_marker_retention_bounded",
+                "graceful_close_drain_delivers_peer_response_to_pending_request",
+                "concurrent_go_away_calls_keep_wire_watermarks_non_increasing",
+                "close_with_error_closes_transport_when_writer_stalls",
             ],
         );
         evidence.insert(
@@ -854,6 +884,7 @@ mod tests {
                 "event_handler_reports_stream_and_session_lifecycle",
                 "latency_hint_shrinks_default_write_fragments",
                 "keepalive_sends_idle_ping_and_records_rtt",
+                "keepalive_timeout_fires_while_transport_write_is_stalled",
             ],
         );
 

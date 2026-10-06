@@ -3,7 +3,7 @@ use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2261,7 +2261,7 @@ fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
     loop {
@@ -2343,12 +2343,6 @@ impl Write for SinkWriteHalf {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
 }
 
 struct DummyStream;

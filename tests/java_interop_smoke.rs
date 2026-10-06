@@ -556,6 +556,7 @@ fn java_client_talks_to_rust_server_with_open_metadata() {
         let metadata = stream.metadata();
         assert_eq!(metadata.priority, Some(7));
         assert_eq!(metadata.group, Some(9));
+        assert_eq!(metadata.open_info, b"java-open");
         assert_eq!(read_all_stream(stream.clone()), b"java->rust");
         stream.write_final(b"rust:java->rust").unwrap();
         assert!(session.wait_timeout(Duration::from_secs(5)).unwrap());

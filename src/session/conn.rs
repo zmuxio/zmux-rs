@@ -1,10 +1,11 @@
 use super::egress::spawn_writer;
-use super::ingress::spawn_reader;
+use super::ingress::{grant_exhausted_session_credit_locked, spawn_reader};
 use super::liveness::{
-    build_ping_payload_locked, canceled_ping_payload, configured_keepalive_timeout,
-    effective_keepalive_timeout_locked, init_keepalive_jitter_state,
+    build_ping_payload_locked, canceled_ping_payload, close_frame_send_timeout,
+    configured_keepalive_timeout, effective_keepalive_timeout_locked,
     initialize_keepalive_schedules, next_session_ping_token_locked, note_local_ping_sent_locked,
-    ping_payload_len, ping_payload_limit, reset_keepalive_idle_schedules_locked,
+    ping_payload_len, ping_payload_limit, reset_keepalive_idle_schedules_locked, session_prng_seed,
+    spawn_keepalive,
 };
 use super::queue::{StreamDiscardStats, WriteQueue, WriteQueueLimits};
 use super::state::{
@@ -59,7 +60,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const ESTABLISHMENT_FAILURE_WRITE_WAIT: Duration = Duration::from_millis(250);
-const ESTABLISHMENT_SUCCESS_WRITE_WAIT: Duration = Duration::from_secs(1);
 const ESTABLISHMENT_CLOSE_DRAIN_DELAY: Duration = Duration::from_millis(10);
 const ESTABLISHMENT_EXPEDITE_TIMEOUT: Duration = Duration::from_millis(1);
 const CONN_READ_BUFFER_SIZE: usize = 512;
@@ -180,8 +180,14 @@ fn establishment_read_timeout_error() -> Error {
     establishment_timeout_error("peer preface read stalled during establishment")
 }
 
+/// An armed `SO_RCVTIMEO`/`SO_SNDTIMEO` expires as `WouldBlock` on Unix
+/// sockets, so with an establishment deadline armed it is a timeout too.
+fn is_establishment_timeout(err: &Error) -> bool {
+    err.is_timeout() || err.source_io_error_kind() == Some(io::ErrorKind::WouldBlock)
+}
+
 fn normalize_establishment_read_error(err: Error, read_deadline_armed: bool) -> Error {
-    if read_deadline_armed && err.is_timeout() {
+    if read_deadline_armed && is_establishment_timeout(&err) {
         establishment_read_timeout_error()
             .with_scope(err.scope())
             .with_operation(err.operation())
@@ -192,7 +198,7 @@ fn normalize_establishment_read_error(err: Error, read_deadline_armed: bool) -> 
 }
 
 fn normalize_establishment_write_error(err: Error, write_deadline_armed: bool) -> Error {
-    if write_deadline_armed && err.is_timeout() {
+    if write_deadline_armed && is_establishment_timeout(&err) {
         establishment_write_timeout_error()
     } else {
         err
@@ -245,6 +251,38 @@ fn expedite_establishment_write_timeout(control: Option<&dyn EstablishmentContro
     }
     if let Some(control) = control {
         let _ = control.set_write_timeout(Some(ESTABLISHMENT_EXPEDITE_TIMEOUT));
+    }
+}
+
+/// Reads the peer preface under one absolute establishment deadline: the
+/// transport read timeout is re-armed with the remaining time before every
+/// read, so a preface that trickles in cannot extend establishment past the
+/// configured bound (a plain read timeout would only bound each read).
+struct EstablishmentReader<'a, R> {
+    reader: &'a mut R,
+    control: Option<&'a dyn EstablishmentControl>,
+    deadline: Option<Instant>,
+}
+
+impl<R: Read> Read for EstablishmentReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let (Some(control), Some(deadline)) = (self.control, self.deadline) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            control.set_read_timeout(Some(remaining))?;
+        }
+        self.reader.read(buf)
+    }
+}
+
+/// The configured establishment bound, or `None` when it is disabled.
+fn establishment_bound(timeout: Duration) -> Option<Duration> {
+    if timeout == Duration::MAX {
+        None
+    } else {
+        Some(timeout)
     }
 }
 
@@ -405,13 +443,20 @@ impl Conn {
         let config = config.normalized()?;
         let local_preface = config.local_preface()?;
         let local_preface_payload = config.local_preface_payload(&local_preface)?;
-        let write_deadline_armed =
-            arm_establishment_write_timeout(control, ESTABLISHMENT_SUCCESS_WRITE_WAIT);
-        let read_deadline_armed =
-            arm_establishment_read_timeout(control, ESTABLISHMENT_SUCCESS_WRITE_WAIT);
+        let establishment_timeout = establishment_bound(config.establishment_timeout);
+        let establishment_deadline =
+            establishment_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let write_deadline_armed = establishment_timeout
+            .is_some_and(|timeout| arm_establishment_write_timeout(control, timeout));
+        let read_deadline_armed = establishment_timeout
+            .is_some_and(|timeout| arm_establishment_read_timeout(control, timeout));
         let write_preface = spawn_preface_writer(writer, local_preface_payload);
 
-        let peer_preface = match read_preface(&mut reader) {
+        let peer_preface = match read_preface(&mut EstablishmentReader {
+            reader: &mut reader,
+            control,
+            deadline: establishment_deadline.filter(|_| read_deadline_armed),
+        }) {
             Ok(preface) => preface,
             Err(err) => {
                 let err = normalize_establishment_read_error(err, read_deadline_armed);
@@ -453,10 +498,10 @@ impl Conn {
                 return Err(establishment_error(err));
             }
         };
-        let (writer, write_result) = match wait_preface_writer(
-            write_preface,
-            wait_timeout_for_control(control, ESTABLISHMENT_SUCCESS_WRITE_WAIT),
-        ) {
+        let writer_wait = establishment_deadline.and_then(|deadline| {
+            wait_timeout_for_control(control, deadline.saturating_duration_since(Instant::now()))
+        });
+        let (writer, write_result) = match wait_preface_writer(write_preface, writer_wait) {
             Ok(result) => result,
             Err(err) => {
                 close_establishment_transport(control);
@@ -544,6 +589,7 @@ impl Conn {
         let inner = Arc::new(Inner {
             write_queue,
             transport_control: runtime_control,
+            writer_exit: WriterExit::default(),
             local_addr,
             peer_addr,
             state: Mutex::new(ConnState {
@@ -570,6 +616,7 @@ impl Conn {
                 used_marker_limit: config
                     .marker_only_used_stream_limit
                     .unwrap_or(config.used_marker_limit),
+                used_marker_floors: [0; 4],
                 provisional_bidi: VecDeque::new(),
                 provisional_uni: VecDeque::new(),
                 accept_bidi: VecDeque::new(),
@@ -599,12 +646,16 @@ impl Conn {
                 next_accept_seq: 1,
                 next_local_bidi: first_local_stream_id(local_role, true),
                 next_local_uni: first_local_stream_id(local_role, false),
+                local_opener_turn_bidi: LocalOpenerTurn::default(),
+                local_opener_turn_uni: LocalOpenerTurn::default(),
                 max_provisional_bidi: config.max_provisional_streams_bidi,
                 max_provisional_uni: config.max_provisional_streams_uni,
                 provisional_open_limited_count: 0,
                 provisional_open_expired_count: 0,
                 next_peer_bidi: first_peer_stream_id(local_role, true),
                 next_peer_uni: first_peer_stream_id(local_role, false),
+                highest_refused_peer_bidi: 0,
+                highest_refused_peer_uni: 0,
                 active: ActiveStreamStats::default(),
                 send_session_used: 0,
                 send_session_max: peer_settings.initial_max_data,
@@ -614,6 +665,7 @@ impl Conn {
                 recv_session_retained: 0,
                 recv_session_advertised: local_settings.initial_max_data,
                 recv_session_pending: 0,
+                recv_session_blocked_at: None,
                 recv_replenish_retry: false,
                 late_data_per_stream_cap: config.late_data_per_stream_cap,
                 late_data_aggregate_received: 0,
@@ -698,6 +750,7 @@ impl Conn {
                 last_flush_bytes: 0,
                 last_open_latency: None,
                 last_ping_rtt: None,
+                terminal_close_frame_timeout: close_frame_send_timeout(None),
                 last_control_progress_at: now,
                 last_stream_progress_at: None,
                 last_application_progress_at: None,
@@ -707,10 +760,10 @@ impl Conn {
                 read_idle_ping_due_at: None,
                 write_idle_ping_due_at: None,
                 max_ping_due_at: None,
-                keepalive_jitter_state: init_keepalive_jitter_state(
+                keepalive_jitter_state: session_prng_seed(
                     local_preface.tie_breaker_nonce ^ peer_preface.tie_breaker_nonce,
                 ),
-                ping_nonce_state: init_keepalive_jitter_state(
+                ping_nonce_state: session_prng_seed(
                     (local_preface.tie_breaker_nonce << 1) ^ peer_preface.tie_breaker_nonce,
                 ),
                 last_ping_padding_len: 0,
@@ -721,6 +774,7 @@ impl Conn {
                 accepted_streams: 0,
             }),
             cond: Condvar::new(),
+            keepalive_cond: Condvar::new(),
             local_preface,
             peer_preface,
             negotiated,
@@ -749,6 +803,7 @@ impl Conn {
 
         initialize_keepalive_schedules(&inner, now);
         spawn_writer(Arc::clone(&inner), writer);
+        spawn_keepalive(&inner);
         spawn_reader(
             Arc::clone(&inner),
             io::BufReader::with_capacity(CONN_READ_BUFFER_SIZE, reader),
@@ -903,7 +958,7 @@ impl Conn {
         };
         let projected_id = projected_local_open_id(next_id, queued);
         if projected_id > MAX_VARINT62 {
-            return Err(Error::new(ErrorCode::Protocol, "stream id overflow"));
+            return Err(local_stream_ids_exhausted_locked(&self.inner, &mut state));
         }
         if projected_id > goaway {
             return Err(
@@ -972,6 +1027,7 @@ impl Conn {
                 send_reset_from_stop: false,
                 stopped_by_peer: None,
                 provisional_created_at: Some(Instant::now()),
+                provisional_wait: ProvisionalWait::default(),
                 opened_on_wire: false,
                 peer_visible: false,
                 received_open: false,
@@ -981,6 +1037,7 @@ impl Conn {
                 recv_used: 0,
                 recv_advertised: 0,
                 recv_pending: 0,
+                recv_blocked_at: None,
                 late_data_received: 0,
                 late_data_cap: 0,
                 open_prefix,
@@ -1045,6 +1102,7 @@ impl Conn {
     }
 
     fn accept_inner(&self, bidi: bool, deadline: Option<Instant>) -> Result<Arc<StreamInner>> {
+        let mut exhausted_credit_checked = false;
         let mut state = self.inner.state.lock().unwrap();
         loop {
             let next = if bidi {
@@ -1072,6 +1130,12 @@ impl Conn {
                 return Ok(stream);
             }
             ensure_session_open(&state)?;
+            if !exhausted_credit_checked {
+                // A peer may need session credit before it can open a stream; it
+                // need not send BLOCKED for a used-up (e.g. zero) session window.
+                exhausted_credit_checked = true;
+                grant_exhausted_session_credit_locked(&self.inner, &mut state);
+            }
             state = wait_conn_until(&self.inner, state, deadline, "accept")?;
         }
     }
@@ -1234,7 +1298,7 @@ impl Conn {
         enum GoAwaySend {
             AlreadyComplete,
             Wait(WriteCompletion),
-            Queue(Frame, WriteCompletion),
+            Queued(WriteCompletion),
         }
 
         let send = {
@@ -1273,7 +1337,14 @@ impl Conn {
                     GoAwaySend::AlreadyComplete
                 }
             } else {
+                // Commit and queue under one lock so concurrent GOAWAYs reach
+                // the writer in commit order (SPEC §6.9 non-increasing).
                 let completion = WriteCompletion::new();
+                session_result(
+                    self.inner
+                        .queue_go_away_locked(payload, Some(completion.clone())),
+                    ErrorOperation::Close,
+                )?;
                 state.local_go_away_bidi = last_accepted_bidi;
                 state.local_go_away_uni = last_accepted_uni;
                 state.local_go_away_issued = true;
@@ -1283,15 +1354,7 @@ impl Conn {
                     completion: completion.clone(),
                 });
                 state.state = SessionState::Draining;
-                GoAwaySend::Queue(
-                    Frame {
-                        frame_type: FrameType::GoAway,
-                        flags: 0,
-                        stream_id: 0,
-                        payload,
-                    },
-                    completion,
-                )
+                GoAwaySend::Queued(completion)
             }
         };
         self.inner.cond.notify_all();
@@ -1301,21 +1364,7 @@ impl Conn {
                 self.wait_control_frame_completion(&completion),
                 ErrorOperation::Close,
             ),
-            GoAwaySend::Queue(frame, completion) => {
-                let queued = self.inner.queue_tracked_frames_until(
-                    vec![frame],
-                    completion.clone(),
-                    || None,
-                    || {
-                        let state = self.inner.state.lock().unwrap();
-                        ensure_session_open(&state)
-                    },
-                    "go_away",
-                );
-                if let Err(err) = queued {
-                    self.clear_go_away_in_flight(&completion);
-                    return session_result(Err(err), ErrorOperation::Close);
-                }
+            GoAwaySend::Queued(completion) => {
                 let result = self.wait_control_frame_completion(&completion);
                 self.clear_go_away_in_flight(&completion);
                 session_result(result, ErrorOperation::Close)
@@ -1389,7 +1438,7 @@ impl Conn {
         )?;
         let mut direct_close = false;
         let mut direct_close_event = None;
-        let mut initial_go_away_payload = None;
+        let mut initial_go_away_queued = false;
         {
             let mut state = self.inner.state.lock().unwrap();
             if matches!(state.state, SessionState::Closed | SessionState::Failed) {
@@ -1427,15 +1476,22 @@ impl Conn {
                         false,
                         MAX_VARINT62,
                     );
+                    // Queued together with the commit, like every local
+                    // GOAWAY, so a concurrent go_away() cannot reach the wire
+                    // ahead of this more permissive one (SPEC §6.9).
+                    self.inner.queue_go_away_locked(
+                        build_go_away_payload(
+                            initial_bidi,
+                            initial_uni,
+                            ErrorCode::NoError.as_u64(),
+                            "",
+                        )?,
+                        None,
+                    )?;
                     state.local_go_away_bidi = initial_bidi;
                     state.local_go_away_uni = initial_uni;
                     state.local_go_away_issued = true;
-                    initial_go_away_payload = Some(build_go_away_payload(
-                        initial_bidi,
-                        initial_uni,
-                        ErrorCode::NoError.as_u64(),
-                        "",
-                    )?);
+                    initial_go_away_queued = true;
                 }
                 state.state = SessionState::Draining;
                 state.graceful_close_active = true;
@@ -1455,16 +1511,9 @@ impl Conn {
             self.inner.cond.notify_all();
             return Ok(());
         }
-        if let Some(payload) = initial_go_away_payload {
-            self.queue_graceful_control_frame(Frame {
-                frame_type: FrameType::GoAway,
-                flags: 0,
-                stream_id: 0,
-                payload,
-            })?;
+        if initial_go_away_queued {
             self.wait_for_go_away_drain();
         }
-        let mut final_go_away_payload = None;
         let reclaim_streams;
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -1477,8 +1526,11 @@ impl Conn {
             if state.state == SessionState::Closed {
                 return Ok(());
             }
-            state.state = SessionState::Closing;
-            state.graceful_close_active = false;
+            // The session stays Draining (graceful_close_active) through the
+            // stream drain: peer frames are still processed so existing
+            // streams can finish, and opens above the final watermark are
+            // refused (SPEC §6.9, §10.1; STATE_MACHINE §10). It only becomes
+            // terminal right before CLOSE is queued.
             let final_bidi = state
                 .local_go_away_bidi
                 .min(accepted_peer_go_away_watermark(
@@ -1492,26 +1544,15 @@ impl Conn {
                 state.next_peer_uni,
             ));
             if final_bidi < state.local_go_away_bidi || final_uni < state.local_go_away_uni {
+                self.inner.queue_go_away_locked(
+                    build_go_away_payload(final_bidi, final_uni, ErrorCode::NoError.as_u64(), "")?,
+                    None,
+                )?;
                 state.local_go_away_bidi = final_bidi;
                 state.local_go_away_uni = final_uni;
                 state.local_go_away_issued = true;
-                final_go_away_payload = Some(build_go_away_payload(
-                    final_bidi,
-                    final_uni,
-                    ErrorCode::NoError.as_u64(),
-                    "",
-                )?);
             }
             reclaim_streams = reclaim_graceful_close_local_streams_locked(&self.inner, &mut state);
-            state.ignore_peer_non_close = true;
-        }
-        if let Some(payload) = final_go_away_payload {
-            self.queue_graceful_control_frame(Frame {
-                frame_type: FrameType::GoAway,
-                flags: 0,
-                stream_id: 0,
-                payload,
-            })?;
         }
         for stream in reclaim_streams {
             let stream_id = stream.id.load(Ordering::Acquire);
@@ -1522,7 +1563,7 @@ impl Conn {
         }
         self.inner.cond.notify_all();
         let drain_result = self.wait_for_close_drain();
-        let close_event = {
+        let (close_event, close_frame_wait) = {
             let mut state = self.inner.state.lock().unwrap();
             if matches!(state.state, SessionState::Failed) {
                 return Err(state
@@ -1535,21 +1576,40 @@ impl Conn {
             }
             state.state = SessionState::Closed;
             state.graceful_close_active = false;
+            state.ignore_peer_non_close = true;
             state.close_error = None;
             state.peer_close_error = None;
             state.scheduler.clear();
             fail_pending_pings_locked(&mut state, Error::session_closed());
             release_session_runtime_state_locked(&mut state);
-            take_session_closed_event_locked(&self.inner, &mut state)
+            (
+                take_session_closed_event_locked(&self.inner, &mut state),
+                state.terminal_close_frame_timeout,
+            )
         };
         emit_event(&self.inner, close_event);
-        self.queue_graceful_close_frame(Frame {
+        let close_frame = Frame {
             frame_type: FrameType::Close,
             flags: 0,
             stream_id: 0,
             payload: close_payload,
-        })?;
-        self.inner.drain_shutdown_writer();
+        };
+        match self
+            .inner
+            .queue_graceful_close_frame(close_frame.clone(), deadline_or_now(close_frame_wait))
+        {
+            Ok(()) => self.inner.drain_shutdown_writer(),
+            Err(err) if self.local_close_completed_after_writer_shutdown(&err) => {}
+            Err(err) => {
+                // No room for CLOSE behind the queued tail (a stalled writer):
+                // send CLOSE ahead of the tail instead; the close watchdog
+                // then bounds the wait for the writer.
+                self.inner.shutdown_writer_with_close(close_frame);
+                if !err.is_timeout() {
+                    return Err(err);
+                }
+            }
+        }
         self.inner.cond.notify_all();
         drain_result
     }
@@ -1581,7 +1641,8 @@ impl Conn {
             return Ok(());
         }
         let deadline = deadline_after(timeout);
-        while state.state == SessionState::Closing
+        while state.state == SessionState::Draining
+            && state.graceful_close_active
             && close_has_blocking_streams(&self.inner, &state)
         {
             let Some(poll) = poll_until_deadline(deadline, DRAIN_WAIT_POLL) else {
@@ -1894,22 +1955,6 @@ impl Conn {
 
     fn queue_frame(&self, frame: Frame) -> Result<()> {
         self.inner.queue_frame(frame)
-    }
-
-    fn queue_graceful_control_frame(&self, frame: Frame) -> Result<()> {
-        match self.queue_frame(frame) {
-            Ok(()) => Ok(()),
-            Err(err) if self.local_close_completed_after_writer_shutdown(&err) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn queue_graceful_close_frame(&self, frame: Frame) -> Result<()> {
-        match self.inner.queue_graceful_close_frame(frame) {
-            Ok(()) => Ok(()),
-            Err(err) if self.local_close_completed_after_writer_shutdown(&err) => Ok(()),
-            Err(err) => Err(err),
-        }
     }
 
     fn local_close_completed_after_writer_shutdown(&self, err: &Error) -> bool {
@@ -2237,6 +2282,45 @@ fn accepted_peer_go_away_watermark(local_role: Role, bidi: bool, next_peer_id: u
     }
 }
 
+/// The next local stream ID of a class would exceed 2^62-1 (SPEC §3.1): local
+/// opens of that class stop for good and IDs are never wrapped or reused. On the
+/// first exhaustion the session starts graceful replacement by queueing one
+/// GOAWAY that keeps the current local watermarks, so the peer drains rather
+/// than only seeing local opens fail. Returns the local open error.
+pub(super) fn local_stream_ids_exhausted_locked(inner: &Inner, state: &mut ConnState) -> Error {
+    if !state.local_go_away_issued
+        && matches!(state.state, SessionState::Ready | SessionState::Draining)
+    {
+        let role = inner.negotiated.local_role;
+        let bidi = effective_go_away_send_watermark(role, true, state.local_go_away_bidi);
+        let uni = effective_go_away_send_watermark(role, false, state.local_go_away_uni);
+        let queued =
+            build_go_away_payload(bidi, uni, ErrorCode::NoError.as_u64(), "").and_then(|payload| {
+                inner.try_queue_frame(Frame {
+                    frame_type: FrameType::GoAway,
+                    flags: 0,
+                    stream_id: 0,
+                    payload,
+                })
+            });
+        if queued.is_ok() {
+            state.local_go_away_bidi = bidi;
+            state.local_go_away_uni = uni;
+            state.local_go_away_issued = true;
+            state.state = SessionState::Draining;
+            inner.cond.notify_all();
+        }
+    }
+    Error::new(
+        ErrorCode::StreamLimit,
+        "zmux: local stream ID space exhausted",
+    )
+    .with_scope(ErrorScope::Session)
+    .with_operation(ErrorOperation::Open)
+    .with_source(ErrorSource::Local)
+    .with_direction(ErrorDirection::Both)
+}
+
 fn effective_go_away_send_watermark(local_role: Role, bidi: bool, watermark: u64) -> u64 {
     if watermark == MAX_VARINT62 {
         max_peer_go_away_watermark(local_role, bidi)
@@ -2441,6 +2525,11 @@ fn validate_open_send_progress(n: usize, requested: usize) -> Result<()> {
 
 const DRAIN_WAIT_POLL: Duration = Duration::from_millis(10);
 
+fn deadline_or_now(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
 fn deadline_after(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
@@ -2487,16 +2576,19 @@ fn wait_conn_until<'a>(
 #[cfg(test)]
 mod tests {
     use super::super::state::{
-        late_data_per_stream_cap, marker_only_retained_count_locked,
-        note_written_stream_frames_locked, pop_newest_accept_pending_locked,
+        ensure_projected_session_memory_cap_locked, late_data_per_stream_cap,
+        marker_only_retained_count_locked, note_written_stream_frames_locked,
+        pop_newest_accept_pending_locked, provisional_head_expiry_locked, provisional_open_max_age,
         queue_peer_visible_pending_priority, reap_expired_hidden_tombstones_locked,
         reap_tombstones_for_memory_pressure_locked, reclaim_unseen_local_streams_after_go_away,
         record_tombstone_locked, record_used_marker_locked, retain_stream_open_info_locked,
         retain_stream_recv_reset_reason_locked, shrink_accept_queue_locked,
+        terminal_marker_disposition_locked,
     };
     use super::*;
     use crate::config::{
-        DEFAULT_ACCEPT_BACKLOG_BYTES_FLOOR, DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR,
+        DEFAULT_ACCEPT_BACKLOG_BYTES_FLOOR, DEFAULT_ESTABLISHMENT_TIMEOUT,
+        DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR,
         DEFAULT_PER_STREAM_QUEUED_DATA_HIGH_WATERMARK_FLOOR,
         DEFAULT_SESSION_QUEUED_DATA_HIGH_WATERMARK_FLOOR, DEFAULT_URGENT_QUEUE_MAX_BYTES_FLOOR,
     };
@@ -2860,7 +2952,7 @@ mod tests {
         assert!(control.is_closed());
         assert!(control
             .write_timeouts()
-            .contains(&Some(ESTABLISHMENT_SUCCESS_WRITE_WAIT)));
+            .contains(&Some(DEFAULT_ESTABLISHMENT_TIMEOUT)));
     }
 
     #[test]
@@ -2892,7 +2984,7 @@ mod tests {
         assert!(control.is_closed());
         assert_eq!(*writer_calls.lock().unwrap(), 2);
         let write_timeouts = control.write_timeouts();
-        assert!(write_timeouts.contains(&Some(ESTABLISHMENT_SUCCESS_WRITE_WAIT)));
+        assert!(write_timeouts.contains(&Some(DEFAULT_ESTABLISHMENT_TIMEOUT)));
         assert!(write_timeouts.contains(&Some(ESTABLISHMENT_EXPEDITE_TIMEOUT)));
         assert!(write_timeouts.contains(&Some(ESTABLISHMENT_FAILURE_WRITE_WAIT)));
     }
@@ -2918,6 +3010,7 @@ mod tests {
                 max_batch_frames: config.write_batch_max_frames,
             })),
             transport_control: None,
+            writer_exit: WriterExit::default(),
             local_addr: None,
             peer_addr: None,
             state: Mutex::new(ConnState {
@@ -2942,6 +3035,7 @@ mod tests {
                 used_marker_ranges: Vec::new(),
                 used_marker_range_mode: false,
                 used_marker_limit: config.used_marker_limit,
+                used_marker_floors: [0; 4],
                 provisional_bidi: VecDeque::new(),
                 provisional_uni: VecDeque::new(),
                 accept_bidi: VecDeque::new(),
@@ -2963,12 +3057,16 @@ mod tests {
                 next_accept_seq: 1,
                 next_local_bidi: 4,
                 next_local_uni: 2,
+                local_opener_turn_bidi: LocalOpenerTurn::default(),
+                local_opener_turn_uni: LocalOpenerTurn::default(),
                 max_provisional_bidi: config.max_provisional_streams_bidi,
                 max_provisional_uni: config.max_provisional_streams_uni,
                 provisional_open_limited_count: 0,
                 provisional_open_expired_count: 0,
                 next_peer_bidi: 1,
                 next_peer_uni: 3,
+                highest_refused_peer_bidi: 0,
+                highest_refused_peer_uni: 0,
                 active: ActiveStreamStats::default(),
                 send_session_used: 0,
                 send_session_max: u64::MAX,
@@ -2978,6 +3076,7 @@ mod tests {
                 recv_session_retained: 0,
                 recv_session_advertised: u64::MAX,
                 recv_session_pending: 0,
+                recv_session_blocked_at: None,
                 recv_replenish_retry: false,
                 late_data_per_stream_cap: None,
                 late_data_aggregate_received: 0,
@@ -3063,6 +3162,7 @@ mod tests {
                 last_flush_bytes: 0,
                 last_open_latency: None,
                 last_ping_rtt: None,
+                terminal_close_frame_timeout: close_frame_send_timeout(None),
                 last_control_progress_at: now,
                 last_stream_progress_at: None,
                 last_application_progress_at: None,
@@ -3082,6 +3182,7 @@ mod tests {
                 accepted_streams: 0,
             }),
             cond: Condvar::new(),
+            keepalive_cond: Condvar::new(),
             local_preface,
             peer_preface,
             negotiated,
@@ -3322,6 +3423,112 @@ mod tests {
         assert_eq!(marker_only_retained_count_locked(&state), 2);
     }
 
+    #[test]
+    fn marker_ranges_merge_within_each_interleaved_stream_class() {
+        let inner = test_inner();
+        let disposition = test_disposition(TerminalDataAction::Ignore, LateDataCause::None);
+        let mut state = inner.state.lock().unwrap();
+        state.used_marker_limit = 16;
+
+        for i in 1..=2000u64 {
+            for stream_id in [4 * i, 4 * i + 1, 4 * i + 2] {
+                record_used_marker_locked(&mut state, stream_id, disposition);
+            }
+        }
+
+        assert_eq!(state.used_marker_ranges.len(), 3);
+        assert_eq!(state.used_marker_floors, [0; 4]);
+        for i in 1..=2000u64 {
+            for stream_id in [4 * i, 4 * i + 1, 4 * i + 2] {
+                assert_eq!(
+                    terminal_marker_disposition_locked(&state, stream_id),
+                    Some(disposition)
+                );
+            }
+        }
+        assert_eq!(terminal_marker_disposition_locked(&state, 3), None);
+        assert_eq!(terminal_marker_disposition_locked(&state, 4 * 2001), None);
+    }
+
+    #[test]
+    fn marker_range_lookup_survives_other_class_inside_span() {
+        let inner = test_inner();
+        let disposition = test_disposition(TerminalDataAction::Ignore, LateDataCause::None);
+        let mut state = inner.state.lock().unwrap();
+        state.used_marker_range_mode = true;
+
+        record_used_marker_locked(&mut state, 4, disposition);
+        record_used_marker_locked(&mut state, 8, disposition);
+        record_used_marker_locked(&mut state, 5, disposition);
+
+        for stream_id in [4, 5, 8] {
+            assert_eq!(
+                terminal_marker_disposition_locked(&state, stream_id),
+                Some(disposition)
+            );
+        }
+        assert_eq!(terminal_marker_disposition_locked(&state, 9), None);
+        assert_eq!(state.used_marker_ranges.len(), 2);
+    }
+
+    #[test]
+    fn marker_budget_overflow_coarsens_oldest_ranges_without_failing() {
+        let inner = test_inner();
+        let graceful = test_disposition(
+            TerminalDataAction::Abort(ErrorCode::StreamClosed.as_u64()),
+            LateDataCause::None,
+        );
+        let abortive = test_disposition(TerminalDataAction::Ignore, LateDataCause::Abort);
+        let coarse = test_disposition(TerminalDataAction::Ignore, LateDataCause::None);
+        let mut state = inner.state.lock().unwrap();
+        state.used_marker_limit = 8;
+
+        for i in 1..=200u64 {
+            let disposition = if i % 2 == 0 { graceful } else { abortive };
+            record_used_marker_locked(&mut state, 4 * i, disposition);
+            assert!(marker_only_retained_count_locked(&state) <= 8);
+        }
+
+        let floor = state.used_marker_floors[0];
+        assert!(floor > 0 && floor < 4 * 200);
+        for i in 1..=200u64 {
+            let expected = if 4 * i <= floor {
+                coarse
+            } else if i % 2 == 0 {
+                graceful
+            } else {
+                abortive
+            };
+            assert_eq!(
+                terminal_marker_disposition_locked(&state, 4 * i),
+                Some(expected)
+            );
+        }
+        // A late marker at or below the floor is already covered conservatively.
+        let ranges = state.used_marker_ranges.clone();
+        record_used_marker_locked(&mut state, 4, graceful);
+        assert_eq!(state.used_marker_ranges, ranges);
+        assert_eq!(terminal_marker_disposition_locked(&state, 4), Some(coarse));
+        ensure_projected_session_memory_cap_locked(&inner, &mut state, 0, "test").unwrap();
+    }
+
+    #[test]
+    fn marker_budget_below_class_count_coarsens_every_class() {
+        let inner = test_inner();
+        let disposition = test_disposition(TerminalDataAction::Ignore, LateDataCause::Abort);
+        let mut state = inner.state.lock().unwrap();
+        state.used_marker_limit = 1;
+
+        for stream_id in 1..=64u64 {
+            record_used_marker_locked(&mut state, stream_id, disposition);
+            assert!(marker_only_retained_count_locked(&state) <= 1);
+        }
+        for stream_id in 1..=64u64 {
+            assert!(terminal_marker_disposition_locked(&state, stream_id).is_some());
+        }
+        assert_eq!(terminal_marker_disposition_locked(&state, 65), None);
+    }
+
     fn test_local_opened_bidi(inner: &Arc<Inner>, stream_id: u64) -> Arc<StreamInner> {
         Arc::new(StreamInner {
             conn: inner.clone(),
@@ -3350,6 +3557,7 @@ mod tests {
                 send_reset_from_stop: false,
                 stopped_by_peer: None,
                 provisional_created_at: None,
+                provisional_wait: ProvisionalWait::default(),
                 opened_on_wire: true,
                 peer_visible: false,
                 received_open: false,
@@ -3359,6 +3567,7 @@ mod tests {
                 recv_used: 0,
                 recv_advertised: u64::MAX,
                 recv_pending: 0,
+                recv_blocked_at: None,
                 late_data_received: 0,
                 late_data_cap: 0,
                 open_prefix: Vec::new(),
@@ -3411,6 +3620,7 @@ mod tests {
                 send_reset_from_stop: false,
                 stopped_by_peer: None,
                 provisional_created_at: None,
+                provisional_wait: ProvisionalWait::default(),
                 opened_on_wire: false,
                 peer_visible: true,
                 received_open: true,
@@ -3420,6 +3630,7 @@ mod tests {
                 recv_used: 0,
                 recv_advertised: u64::MAX,
                 recv_pending: 0,
+                recv_blocked_at: None,
                 late_data_received: 0,
                 late_data_cap: 0,
                 open_prefix: Vec::new(),
@@ -3453,6 +3664,188 @@ mod tests {
             poll_until_deadline(None, Duration::from_millis(7)),
             Some(Duration::from_millis(7))
         );
+    }
+
+    fn tcp_conn_pair() -> (Conn, Conn) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            Conn::server(socket).unwrap()
+        });
+        let client = Conn::client(std::net::TcpStream::connect(addr).unwrap()).unwrap();
+        (client, server.join().unwrap())
+    }
+
+    #[test]
+    fn explicit_role_sessions_seed_ping_and_jitter_state_from_secure_random() {
+        // Before per-session seeding, explicit-role sessions (zero preface
+        // nonces) took these states from a process-global counter, k * GAMMA
+        // for a small k, so session N of every process drew the same jitter,
+        // PING tokens and padding. GAMMA is odd and so invertible mod 2^64.
+        const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut gamma_inverse = GAMMA;
+        for _ in 0..6 {
+            gamma_inverse =
+                gamma_inverse.wrapping_mul(2u64.wrapping_sub(GAMMA.wrapping_mul(gamma_inverse)));
+        }
+        assert_eq!(GAMMA.wrapping_mul(gamma_inverse), 1);
+
+        let (client_a, server_a) = tcp_conn_pair();
+        let (client_b, server_b) = tcp_conn_pair();
+        let mut seen = std::collections::HashSet::new();
+        for conn in [&client_a, &server_a, &client_b, &server_b] {
+            assert_eq!(conn.local_preface().tie_breaker_nonce, 0);
+            let state = conn.inner.state.lock().unwrap();
+            for prng_state in [state.ping_nonce_state, state.keepalive_jitter_state] {
+                let counter_steps = prng_state.wrapping_mul(gamma_inverse);
+                assert!(
+                    counter_steps > 1 << 32,
+                    "PRNG state {prng_state:#x} is counter step {counter_steps}"
+                );
+                assert!(seen.insert(prng_state), "PRNG state reused across sessions");
+            }
+        }
+        for conn in [client_a, server_a, client_b, server_b] {
+            conn.close_with_error(0, "").ok();
+        }
+    }
+
+    #[test]
+    fn terminal_release_keeps_rtt_adapted_close_frame_timeout() {
+        let inner = test_inner();
+        let mut state = inner.state.lock().unwrap();
+        assert_eq!(
+            state.terminal_close_frame_timeout,
+            Duration::from_millis(100)
+        );
+        state.last_ping_rtt = Some(Duration::from_millis(100));
+        release_session_runtime_state_locked(&mut state);
+        assert_eq!(state.last_ping_rtt, None);
+        assert_eq!(
+            state.terminal_close_frame_timeout,
+            Duration::from_millis(450)
+        );
+    }
+
+    #[test]
+    fn close_frame_send_timeout_adapts_to_rtt_within_bounds() {
+        assert_eq!(close_frame_send_timeout(None), Duration::from_millis(100));
+        assert_eq!(
+            close_frame_send_timeout(Some(Duration::from_millis(10))),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            close_frame_send_timeout(Some(Duration::from_millis(100))),
+            Duration::from_millis(450)
+        );
+        assert_eq!(
+            close_frame_send_timeout(Some(Duration::from_secs(5))),
+            Duration::from_secs(2)
+        );
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    #[test]
+    fn local_stream_id_exhaustion_is_open_limited_and_starts_one_goaway() {
+        let (client, server) = tcp_conn_pair();
+        let last_bidi = {
+            let mut state = client.inner.state.lock().unwrap();
+            let last = state.next_local_bidi + ((MAX_VARINT62 - state.next_local_bidi) / 4) * 4;
+            state.next_local_bidi = last;
+            last
+        };
+        server.inner.state.lock().unwrap().next_peer_bidi = last_bidi;
+
+        // The last valid ID is still used exactly once.
+        let stream = client.open_stream().unwrap();
+        stream.write_all(b"x").unwrap();
+        assert_eq!(stream.stream_id(), last_bidi);
+        let accepted = server
+            .accept_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(accepted.stream_id(), last_bidi);
+
+        let Err(err) = client.open_stream() else {
+            panic!("open past the last local stream ID succeeded");
+        };
+        assert!(err.is_open_limited(), "{err:?}");
+        assert_eq!(err.code(), Some(ErrorCode::StreamLimit));
+        assert_eq!(err.source(), ErrorSource::Local);
+        assert!(err.message().contains("local stream ID space exhausted"));
+        assert_eq!(client.state(), SessionState::Draining);
+        {
+            let state = client.inner.state.lock().unwrap();
+            assert!(state.local_go_away_issued);
+            assert_eq!(
+                state.local_go_away_bidi,
+                max_peer_go_away_watermark(Role::Initiator, true)
+            );
+            assert_eq!(
+                state.local_go_away_uni,
+                max_peer_go_away_watermark(Role::Initiator, false)
+            );
+            assert_eq!(state.next_local_bidi, last_bidi + 4);
+        }
+        assert!(wait_until(|| server.state() == SessionState::Draining));
+        assert!(server.peer_go_away_error().is_some());
+
+        // A repeated exhaustion queues no second GOAWAY (an unchanged GOAWAY
+        // would count as ignored control at the peer).
+        let ignored_before = server.stats().abuse.ignored_control;
+        let Err(err) = client.open_stream() else {
+            panic!("open past the last local stream ID succeeded");
+        };
+        assert!(err.is_open_limited(), "{err:?}");
+
+        // The GOAWAY did not tighten anything: the peer still opens streams and
+        // the other local stream class still works.
+        let peer_opened = server.open_stream().unwrap();
+        peer_opened.write_all(b"p").unwrap();
+        let from_peer = client
+            .accept_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(from_peer.stream_id(), peer_opened.stream_id());
+        let uni = client.open_uni_stream().unwrap();
+        uni.write_all(b"u").unwrap();
+        let accepted_uni = server
+            .accept_uni_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(accepted_uni.stream_id(), uni.stream_id());
+        assert_eq!(server.stats().abuse.ignored_control, ignored_before);
+
+        client.close_with_error(0, "").ok();
+        server.close_with_error(0, "").ok();
+    }
+
+    #[test]
+    fn local_stream_id_exhaustion_at_commit_is_open_limited() {
+        let (client, server) = tcp_conn_pair();
+        let stream = client.open_stream().unwrap();
+        // Defensive commit-time check: the class ran out after the projection.
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.next_local_bidi =
+                state.next_local_bidi + ((MAX_VARINT62 - state.next_local_bidi) / 4 + 1) * 4;
+        }
+        let err = stream.write_all(b"x").unwrap_err();
+        assert!(err.is_open_limited(), "{err:?}");
+        assert_ne!(err.code(), Some(ErrorCode::Protocol));
+        assert_eq!(client.state(), SessionState::Draining);
+        assert!(wait_until(|| server.peer_go_away_error().is_some()));
+
+        client.close_with_error(0, "").ok();
+        server.close_with_error(0, "").ok();
     }
 
     #[test]
@@ -3769,6 +4162,76 @@ mod tests {
         let state = inner.state.lock().unwrap();
         assert_eq!(state.provisional_bidi.len(), 0);
         assert!(state.provisional_bidi.capacity() < retained_capacity);
+    }
+
+    #[test]
+    fn provisional_head_expiry_tracks_head_age_turn_floor_and_turn_progress() {
+        let inner = test_inner();
+        let head = test_local_opened_bidi(&inner, 0);
+        let created = Instant::now() - Duration::from_secs(1);
+        {
+            let mut stream_state = head.state.lock().unwrap();
+            stream_state.opened_on_wire = false;
+            stream_state.provisional_created_at = Some(created);
+        }
+        let mut state = inner.state.lock().unwrap();
+        assert_eq!(provisional_head_expiry_locked(&state, true), None);
+
+        state.provisional_bidi.push_back(head.clone());
+        let max_age = provisional_open_max_age(state.last_ping_rtt);
+        assert_eq!(
+            provisional_head_expiry_locked(&state, true),
+            Some(created + max_age)
+        );
+        assert_eq!(provisional_head_expiry_locked(&state, false), None);
+
+        // Time spent behind an earlier committed opener does not age the head.
+        let released_at = created + Duration::from_millis(500);
+        state.local_opener_turn_bidi.released_at = Some(released_at);
+        assert_eq!(
+            provisional_head_expiry_locked(&state, true),
+            Some(released_at + max_age)
+        );
+
+        // An opener being queued pauses provisional ages altogether.
+        let holder = test_local_opened_bidi(&inner, 4);
+        state.streams.insert(4, holder);
+        state.local_opener_turn_bidi.holder = Some(4);
+        assert_eq!(provisional_head_expiry_locked(&state, true), None);
+    }
+
+    #[test]
+    fn provisional_waiter_does_not_age_behind_an_abandoned_head() {
+        // Two streams opened at the same instant; the first is abandoned and
+        // about to expire. The second waits behind it to commit: that wait is
+        // not idle provisional time, so it opens once the head expires instead
+        // of expiring with it.
+        let (client, server) = tcp_conn_pair();
+        let abandoned = client.open_stream().unwrap();
+        let writer = client.open_stream().unwrap();
+        let max_age = provisional_open_max_age(client.inner.state.lock().unwrap().last_ping_rtt);
+        let created = Instant::now() - max_age + Duration::from_millis(200);
+        for stream in [&abandoned, &writer] {
+            stream.inner.state.lock().unwrap().provisional_created_at = Some(created);
+        }
+
+        writer.write_all(b"w").unwrap();
+        assert_eq!(writer.stream_id(), 4);
+        let err = abandoned.write(b"late").unwrap_err();
+        assert_eq!(err.numeric_code(), Some(ErrorCode::Cancelled.as_u64()));
+        assert_eq!(abandoned.stream_id(), 0);
+        assert_eq!(client.stats().provisional.expired, 1);
+
+        let mut accepted = server
+            .accept_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(accepted.stream_id(), 4);
+        let mut buf = [0u8; 1];
+        accepted.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"w");
+
+        client.close_with_error(0, "").ok();
+        server.close_with_error(0, "").ok();
     }
 
     #[test]
@@ -4263,6 +4726,7 @@ mod tests {
     fn local_cancel_write_discards_queued_tail_and_releases_send_credit() {
         let inner = test_inner();
         let stream = test_local_opened_bidi(&inner, 4);
+        stream.state.lock().unwrap().peer_visible = true;
         {
             let mut state = inner.state.lock().unwrap();
             state.active.local_bidi = 1;
@@ -4294,6 +4758,69 @@ mod tests {
         assert_eq!(
             stream_state.send_reset.as_ref().map(|(code, _)| *code),
             Some(ErrorCode::Cancelled.as_u64())
+        );
+    }
+
+    #[test]
+    fn local_cancel_write_keeps_unwritten_opener_ahead_of_reset() {
+        let inner = test_inner();
+        let stream = test_local_opened_bidi(&inner, 4);
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.active.local_bidi = 1;
+            state.send_session_used = 6;
+            state.streams.insert(4, stream.clone());
+        }
+        inner
+            .write_queue
+            .force_push(WriteJob::Frame(Frame {
+                frame_type: FrameType::Data,
+                flags: FRAME_FLAG_FIN,
+                stream_id: 4,
+                payload: b"queued".to_vec(),
+            }))
+            .unwrap();
+
+        Stream {
+            inner: stream.clone(),
+        }
+        .cancel_write(ErrorCode::Cancelled.as_u64())
+        .unwrap();
+
+        {
+            let state = inner.state.lock().unwrap();
+            let stream_state = stream.state.lock().unwrap();
+            assert_eq!(stream_state.pending_data_frames, 1);
+            assert_eq!(stream_state.send_used, 0);
+            assert_eq!(state.send_session_used, 0);
+            assert_eq!(
+                stream_state.send_reset.as_ref().map(|(code, _)| *code),
+                Some(ErrorCode::Cancelled.as_u64())
+            );
+        }
+        let frames: Vec<_> = inner
+            .write_queue
+            .pop_batch()
+            .unwrap()
+            .into_iter()
+            .flat_map(|job| match job {
+                WriteJob::Frame(frame) => vec![frame],
+                WriteJob::Frames(frames) => frames,
+                WriteJob::TrackedFrames(tracked) => tracked.frames,
+                _ => Vec::new(),
+            })
+            .map(|frame| (frame.frame_type, frame.flags, frame.payload))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                (FrameType::Data, 0, Vec::new()),
+                (
+                    FrameType::Reset,
+                    0,
+                    build_code_payload(ErrorCode::Cancelled.as_u64(), "", 4096).unwrap()
+                ),
+            ]
         );
     }
 
@@ -4398,6 +4925,98 @@ mod tests {
         assert_eq!(stream_state.pending_data_frames, 0);
         assert_eq!(stream_state.send_used, 0);
         assert_eq!(state.send_session_used, 0);
+    }
+
+    #[test]
+    fn writer_filter_keeps_unwritten_opener_of_reset_stream_as_zero_length_opener() {
+        let inner = test_inner();
+        let stream = test_local_opened_bidi(&inner, 4);
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.active.local_bidi = 1;
+            state.send_session_used = 4;
+            state.streams.insert(4, stream.clone());
+            let mut stream_state = stream.state.lock().unwrap();
+            stream_state.pending_data_frames = 1;
+            stream_state.pending_terminal_frames = 1;
+            stream_state.send_used = 4;
+            stream_state.send_reset = Some((ErrorCode::Cancelled.as_u64(), String::new()));
+        }
+        let completion = WriteCompletion::new();
+        let mut batch = vec![WriteJob::TrackedFrames(TrackedWriteJob {
+            frames: vec![Frame {
+                frame_type: FrameType::Data,
+                flags: FRAME_FLAG_FIN,
+                stream_id: 4,
+                payload: b"body".to_vec(),
+            }],
+            completion: completion.clone(),
+        })];
+        let mut dropped = Vec::new();
+
+        super::super::egress::filter_writable_batch(&inner, &mut batch, &mut dropped);
+
+        match batch.as_slice() {
+            [WriteJob::Frames(frames)] => {
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].frame_type, FrameType::Data);
+                assert_eq!(frames[0].stream_id, 4);
+                assert_eq!(frames[0].flags, 0);
+                assert!(frames[0].payload.is_empty());
+            }
+            _ => panic!("unwritten opener was not kept: {batch:?}"),
+        }
+        assert!(completion.try_result().unwrap().is_err());
+        let state = inner.state.lock().unwrap();
+        let stream_state = stream.state.lock().unwrap();
+        assert_eq!(stream_state.pending_data_frames, 1);
+        assert_eq!(stream_state.send_used, 0);
+        assert_eq!(state.send_session_used, 0);
+    }
+
+    #[test]
+    fn writer_batch_order_keeps_unwritten_local_openers_in_stream_id_order() {
+        fn ordered_stream_ids(inner: &Arc<Inner>) -> Vec<u64> {
+            let mut batch: Vec<_> = [4u64, 8]
+                .into_iter()
+                .map(|stream_id| {
+                    WriteJob::Frame(Frame {
+                        frame_type: FrameType::Data,
+                        flags: 0,
+                        stream_id,
+                        payload: vec![0; 4096],
+                    })
+                })
+                .collect();
+            super::super::egress::order_writer_batch(inner, &mut batch);
+            batch
+                .iter()
+                .map(|job| match job {
+                    WriteJob::Frame(frame) => frame.stream_id,
+                    _ => unreachable!(),
+                })
+                .collect()
+        }
+
+        let inner = test_inner();
+        let earlier = test_local_opened_bidi(&inner, 4);
+        let later = test_local_opened_bidi(&inner, 8);
+        earlier.state.lock().unwrap().metadata.priority = Some(0);
+        later.state.lock().unwrap().metadata.priority = Some(30);
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.streams.insert(4, earlier.clone());
+            state.streams.insert(8, later.clone());
+        }
+
+        // Once both openers were written the scheduler may favor the later stream.
+        earlier.state.lock().unwrap().peer_visible = true;
+        later.state.lock().unwrap().peer_visible = true;
+        assert_eq!(ordered_stream_ids(&inner), vec![8, 4]);
+
+        earlier.state.lock().unwrap().peer_visible = false;
+        later.state.lock().unwrap().peer_visible = false;
+        assert_eq!(ordered_stream_ids(&inner), vec![4, 8]);
     }
 
     #[test]

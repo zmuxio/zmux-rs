@@ -1115,6 +1115,33 @@ struct ActiveGuard {
 struct TerminalErrors {
     read: Option<zmux::Error>,
     write: Option<zmux::Error>,
+    /// The read side closed because the peer's FIN was consumed. It is set
+    /// only when no terminal read error was recorded first, so later reads
+    /// keep reporting EOF like native zmux and the other QUIC adapters.
+    read_eof: bool,
+}
+
+impl TerminalErrors {
+    fn read_error(&self) -> zmux::Error {
+        self.read.clone().unwrap_or_else(local_read_closed_error)
+    }
+
+    /// Result of `read` on an already closed read side: EOF stays EOF, every
+    /// other closure (local stop, reset, abort, session loss) reports its error.
+    fn closed_read_result(&self) -> Result<usize> {
+        match &self.read {
+            None if self.read_eof => Ok(0),
+            _ => Err(self.read_error()),
+        }
+    }
+
+    /// Result of `read_exact` on an already closed read side.
+    fn closed_read_exact_result(&self) -> Result<()> {
+        match &self.read {
+            None if self.read_eof => Err(unexpected_eof_error()),
+            _ => Err(self.read_error()),
+        }
+    }
 }
 
 impl ActiveGuard {
@@ -1565,10 +1592,18 @@ impl QuinnStream {
     }
 
     fn mark_read_closed(&self) {
-        self.mark_read_closed_with(None);
+        self.mark_read_closed_as(None, false);
+    }
+
+    fn mark_read_eof(&self) {
+        self.mark_read_closed_as(None, true);
     }
 
     fn mark_read_closed_with(&self, err: Option<zmux::Error>) {
+        self.mark_read_closed_as(err, false);
+    }
+
+    fn mark_read_closed_as(&self, err: Option<zmux::Error>, eof: bool) {
         if self.read_closed.load(Ordering::Acquire) {
             return;
         }
@@ -1579,6 +1614,8 @@ impl QuinnStream {
             } else {
                 if let Some(err) = err {
                     terminal.read = Some(err);
+                } else {
+                    terminal.read_eof = eof;
                 }
                 self.read_closed.store(true, Ordering::Release);
                 true
@@ -1706,12 +1743,7 @@ impl QuinnStream {
     }
 
     fn read_terminal_error(&self) -> zmux::Error {
-        self.terminal
-            .lock()
-            .unwrap()
-            .read
-            .clone()
-            .unwrap_or_else(local_read_closed_error)
+        self.terminal.lock().unwrap().read_error()
     }
 
     fn write_terminal_error(&self) -> zmux::Error {
@@ -1751,7 +1783,7 @@ impl QuinnStream {
             return Ok(0);
         }
         if self.read_closed.load(Ordering::Acquire) {
-            return Err(self.read_terminal_error());
+            return self.terminal.lock().unwrap().closed_read_result();
         }
         let mut recv = self.recv.lock().await;
         match recv.read(dst).await {
@@ -1760,7 +1792,7 @@ impl QuinnStream {
                 Ok(n)
             }
             Ok(None) => {
-                self.mark_read_closed();
+                self.mark_read_eof();
                 Ok(0)
             }
             Err(err) => {
@@ -1788,7 +1820,7 @@ impl QuinnStream {
             return Ok(());
         }
         if self.read_closed.load(Ordering::Acquire) {
-            return Err(self.read_terminal_error());
+            return self.terminal.lock().unwrap().closed_read_exact_result();
         }
         let mut recv = self.recv.lock().await;
         while !dst.is_empty() {
@@ -1802,7 +1834,7 @@ impl QuinnStream {
                     dst = rest;
                 }
                 Ok(None) => {
-                    self.mark_read_closed();
+                    self.mark_read_eof();
                     return Err(unexpected_eof_error());
                 }
                 Err(err) => {
@@ -2655,10 +2687,18 @@ impl QuinnRecvStream {
     }
 
     fn mark_read_closed(&self) {
-        self.mark_read_closed_with(None);
+        self.mark_read_closed_as(None, false);
+    }
+
+    fn mark_read_eof(&self) {
+        self.mark_read_closed_as(None, true);
     }
 
     fn mark_read_closed_with(&self, err: Option<zmux::Error>) {
+        self.mark_read_closed_as(err, false);
+    }
+
+    fn mark_read_closed_as(&self, err: Option<zmux::Error>, eof: bool) {
         if self.read_closed.load(Ordering::Acquire) {
             return;
         }
@@ -2669,6 +2709,8 @@ impl QuinnRecvStream {
             } else {
                 if let Some(err) = err {
                     terminal.read = Some(err);
+                } else {
+                    terminal.read_eof = eof;
                 }
                 self.read_closed.store(true, Ordering::Release);
                 true
@@ -2747,12 +2789,7 @@ impl QuinnRecvStream {
     }
 
     fn read_terminal_error(&self) -> zmux::Error {
-        self.terminal
-            .lock()
-            .unwrap()
-            .read
-            .clone()
-            .unwrap_or_else(local_read_closed_error)
+        self.terminal.lock().unwrap().read_error()
     }
 
     pub async fn read(&self, dst: &mut [u8]) -> Result<usize> {
@@ -2765,7 +2802,7 @@ impl QuinnRecvStream {
             return Ok(0);
         }
         if self.read_closed.load(Ordering::Acquire) {
-            return Err(self.read_terminal_error());
+            return self.terminal.lock().unwrap().closed_read_result();
         }
         let mut recv = self.recv.lock().await;
         match recv.read(dst).await {
@@ -2774,7 +2811,7 @@ impl QuinnRecvStream {
                 Ok(n)
             }
             Ok(None) => {
-                self.mark_read_closed();
+                self.mark_read_eof();
                 Ok(0)
             }
             Err(err) => {
@@ -2802,7 +2839,7 @@ impl QuinnRecvStream {
             return Ok(());
         }
         if self.read_closed.load(Ordering::Acquire) {
-            return Err(self.read_terminal_error());
+            return self.terminal.lock().unwrap().closed_read_exact_result();
         }
         let mut recv = self.recv.lock().await;
         while !dst.is_empty() {
@@ -2816,7 +2853,7 @@ impl QuinnRecvStream {
                     dst = rest;
                 }
                 Ok(None) => {
-                    self.mark_read_closed();
+                    self.mark_read_eof();
                     return Err(unexpected_eof_error());
                 }
                 Err(err) => {
@@ -3961,6 +3998,17 @@ fn translate_write_error(err: quinn::WriteError) -> zmux::Error {
 
 fn translate_connection_error(err: quinn::ConnectionError) -> zmux::Error {
     match err {
+        // A graceful peer close (code 0, no reason) is a normal session end,
+        // not an application error: report it like native zmux and the other
+        // QUIC adapters do (`is_session_closed()`, no numeric code).
+        quinn::ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == 0 && close.reason.is_empty() =>
+        {
+            zmux::Error::session_closed()
+                .with_source(zmux::ErrorSource::Remote)
+                .with_session_context(zmux::ErrorOperation::Close)
+                .with_termination_kind(zmux::TerminationKind::SessionTermination)
+        }
         quinn::ConnectionError::ApplicationClosed(close) => {
             let reason = String::from_utf8_lossy(&close.reason).into_owned();
             zmux::Error::application(close.error_code.into_inner(), reason)
@@ -4270,5 +4318,77 @@ mod tests {
         assert!(snapshot.progress.inbound_frame_at.is_some());
         assert!(snapshot.progress.ping_sent_at.is_none());
         assert!(snapshot.progress.pong_at.is_none());
+    }
+
+    fn application_close(code: u32, reason: &'static [u8]) -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: bytes::Bytes::from_static(reason),
+        })
+    }
+
+    #[test]
+    fn graceful_peer_application_close_translates_to_session_closed() {
+        let err = translate_connection_error(application_close(0, b""));
+        assert!(err.is_session_closed());
+        assert_eq!(err.numeric_code(), None);
+        assert_eq!(err.application_code(), None);
+        assert_eq!(err.scope(), zmux::ErrorScope::Session);
+        assert_eq!(err.source(), zmux::ErrorSource::Remote);
+        assert_eq!(err.operation(), zmux::ErrorOperation::Close);
+        assert_eq!(
+            err.termination_kind(),
+            zmux::TerminationKind::SessionTermination
+        );
+        assert!(translate_wait_error(application_close(0, b"")).is_ok());
+
+        let err = translate_connection_error(application_close(1234, b"x"));
+        assert!(!err.is_session_closed());
+        assert!(err.is_application_code(1234));
+        assert_eq!(err.reason(), Some("x"));
+        assert_eq!(err.source(), zmux::ErrorSource::Remote);
+
+        // A NO_ERROR close that still carries a reason stays a structured error.
+        let err = translate_connection_error(application_close(0, b"bye"));
+        assert!(!err.is_session_closed());
+        assert_eq!(err.numeric_code(), Some(0));
+        assert_eq!(err.reason(), Some("bye"));
+        assert!(translate_wait_error(application_close(0, b"bye")).is_err());
+    }
+
+    #[test]
+    fn closed_read_side_keeps_eof_only_after_consumed_fin() {
+        let eof = TerminalErrors {
+            read_eof: true,
+            ..TerminalErrors::default()
+        };
+        assert_eq!(eof.closed_read_result().unwrap(), 0);
+        assert_eq!(eof.closed_read_result().unwrap(), 0);
+        let err = eof.closed_read_exact_result().unwrap_err();
+        assert_eq!(err.source_io_error_kind(), Some(ErrorKind::UnexpectedEof));
+
+        let stopped = TerminalErrors::default();
+        let err = stopped.closed_read_result().unwrap_err();
+        assert!(err.is_read_closed());
+        assert_eq!(err.source(), zmux::ErrorSource::Local);
+        assert!(stopped
+            .closed_read_exact_result()
+            .unwrap_err()
+            .is_read_closed());
+
+        let reset = TerminalErrors {
+            read: Some(translate_read_error(quinn::ReadError::Reset(
+                quinn::VarInt::from_u32(9),
+            ))),
+            ..TerminalErrors::default()
+        };
+        assert!(reset
+            .closed_read_result()
+            .unwrap_err()
+            .is_application_code(9));
+        assert!(reset
+            .closed_read_exact_result()
+            .unwrap_err()
+            .is_application_code(9));
     }
 }

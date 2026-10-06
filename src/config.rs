@@ -40,6 +40,9 @@ pub const DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW: Duration = Duration::from_secs(
 pub const DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET: u64 = 128;
 pub const DEFAULT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_GO_AWAY_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+/// Repository-default bound on session establishment (the local preface write
+/// and the peer preface read) for transports with deadline control.
+pub const DEFAULT_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_KEEPALIVE_MAX_PING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(0);
@@ -109,6 +112,12 @@ pub struct Config {
     pub visible_terminal_churn_budget: u64,
     pub close_drain_timeout: Duration,
     pub go_away_drain_interval: Duration,
+    /// Bounds session establishment on transports with deadline control (for
+    /// example `TcpStream`): the whole peer preface must arrive, and the local
+    /// preface must be written, within this time, or establishment fails with
+    /// an INTERNAL timeout error. Zero selects `DEFAULT_ESTABLISHMENT_TIMEOUT`;
+    /// `Duration::MAX` disables the bound.
+    pub establishment_timeout: Duration,
     pub stop_sending_graceful_drain_window: Option<Duration>,
     pub stop_sending_graceful_tail_cap: Option<u64>,
     pub keepalive_interval: Duration,
@@ -221,6 +230,7 @@ impl fmt::Debug for Config {
             )
             .field("close_drain_timeout", &self.close_drain_timeout)
             .field("go_away_drain_interval", &self.go_away_drain_interval)
+            .field("establishment_timeout", &self.establishment_timeout)
             .field(
                 "stop_sending_graceful_drain_window",
                 &self.stop_sending_graceful_drain_window,
@@ -341,6 +351,7 @@ fn builtin_default_config() -> Config {
         visible_terminal_churn_budget: DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET,
         close_drain_timeout: DEFAULT_CLOSE_DRAIN_TIMEOUT,
         go_away_drain_interval: DEFAULT_GO_AWAY_DRAIN_INTERVAL,
+        establishment_timeout: DEFAULT_ESTABLISHMENT_TIMEOUT,
         stop_sending_graceful_drain_window: None,
         stop_sending_graceful_tail_cap: None,
         keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -465,6 +476,14 @@ impl Config {
         self
     }
 
+    /// Sets the establishment timeout (see the `establishment_timeout` field):
+    /// zero selects the default, `Duration::MAX` disables the bound.
+    #[must_use]
+    pub fn establishment_timeout(mut self, timeout: Duration) -> Self {
+        self.establishment_timeout = timeout;
+        self
+    }
+
     #[must_use]
     pub fn event_handler<F>(mut self, handler: F) -> Self
     where
@@ -498,6 +517,9 @@ impl Config {
         }
         if !cfg.ping_padding {
             cfg.settings.ping_padding_key = 0;
+        }
+        if cfg.establishment_timeout.is_zero() {
+            cfg.establishment_timeout = DEFAULT_ESTABLISHMENT_TIMEOUT;
         }
         cfg.settings = normalize_config_settings(cfg.settings)?;
         Ok(cfg)
@@ -636,6 +658,13 @@ fn random_varint62() -> Result<u64> {
             return Ok(value);
         }
     }
+}
+
+/// 64 bits from the secure random source, for per-session PRNG seeds.
+pub(crate) fn random_u64() -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    fill_random(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn random_uint62() -> Result<u64> {
@@ -890,6 +919,7 @@ mod tests {
             visible_terminal_churn_budget: 17,
             close_drain_timeout: Duration::from_millis(333),
             go_away_drain_interval: Duration::from_millis(44),
+            establishment_timeout: Duration::from_millis(4_321),
             stop_sending_graceful_drain_window: Some(Duration::from_millis(444)),
             stop_sending_graceful_tail_cap: Some(6_666),
             keepalive_interval: Duration::from_secs(3),
@@ -1052,6 +1082,7 @@ mod tests {
             expected.go_away_drain_interval,
             actual.go_away_drain_interval
         );
+        assert_eq!(expected.establishment_timeout, actual.establishment_timeout);
         assert_eq!(
             expected.stop_sending_graceful_drain_window,
             actual.stop_sending_graceful_drain_window
@@ -1117,13 +1148,34 @@ mod tests {
         let cfg = Config::default()
             .capabilities(crate::protocol::CAPABILITY_OPEN_METADATA)
             .enable_capabilities(crate::protocol::CAPABILITY_PRIORITY_HINTS)
-            .settings(settings);
+            .settings(settings)
+            .establishment_timeout(Duration::from_secs(3));
 
         assert_eq!(
             cfg.capabilities,
             crate::protocol::CAPABILITY_OPEN_METADATA | crate::protocol::CAPABILITY_PRIORITY_HINTS
         );
         assert_eq!(cfg.settings.max_frame_payload, 32 * 1024);
+        assert_eq!(cfg.establishment_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn establishment_timeout_defaults_to_ten_seconds_and_zero_normalizes_to_default() {
+        assert_eq!(DEFAULT_ESTABLISHMENT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(
+            Config::default().establishment_timeout,
+            DEFAULT_ESTABLISHMENT_TIMEOUT
+        );
+        let zero = Config::default().establishment_timeout(Duration::ZERO);
+        assert_eq!(
+            zero.normalized().unwrap().establishment_timeout,
+            DEFAULT_ESTABLISHMENT_TIMEOUT
+        );
+        let disabled = Config::default().establishment_timeout(Duration::MAX);
+        assert_eq!(
+            disabled.normalized().unwrap().establishment_timeout,
+            Duration::MAX
+        );
     }
 
     #[test]

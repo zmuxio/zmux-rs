@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 use zmux::SchedulerHint;
@@ -211,7 +211,7 @@ fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
     loop {
@@ -220,12 +220,6 @@ where
             Poll::Pending => thread::yield_now(),
         }
     }
-}
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
 }
 
 impl Read for RendezvousConn {
@@ -1024,21 +1018,6 @@ fn wait_for_state(conn: &Conn, expected: SessionState) {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(conn.state(), expected);
-}
-
-fn wait_for_closing_or_closed(conn: &Conn) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        if matches!(conn.state(), SessionState::Closing | SessionState::Closed) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        matches!(conn.state(), SessionState::Closing | SessionState::Closed),
-        "session state = {:?}, want Closing or Closed",
-        conn.state()
-    );
 }
 
 fn wait_for_open_streams(conn: &Conn, expected: usize) {
@@ -2208,11 +2187,15 @@ fn read_deadline_allows_data_before_expiry_and_can_be_cleared() {
 
 #[test]
 fn stream_write_timeout_expires_on_flow_control_wait() {
-    let mut server_config = Config::default();
-    server_config
-        .settings
-        .initial_max_stream_data_bidi_peer_opened = 0;
-    let (client, server) = connected_pair(Config::default(), server_config);
+    // The raw peer grants no stream credit and never replenishes it.
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 0,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(Config::default(), peer_config);
 
     let stream = client.open_stream().unwrap();
     let err = stream
@@ -2221,10 +2204,23 @@ fn stream_write_timeout_expires_on_flow_control_wait() {
     assert!(err.to_string().contains("write timed out"));
     assert!(client.stats().blocked_write_total > Duration::ZERO);
 
-    let accepted = server
-        .accept_stream_timeout(Duration::from_secs(1))
-        .expect("opening frame should still make the stream visible");
-    assert_eq!(accepted.stream_id(), stream.stream_id());
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    let stream_frames: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.stream_id == stream.stream_id())
+        .collect();
+    // The zero-length opener still makes the stream visible, and a stream-scoped
+    // BLOCKED is never the stream's first frame.
+    let opener = stream_frames.first().expect("opening frame");
+    assert_eq!(opener.frame_type, FrameType::Data);
+    assert!(parse_data_payload(&opener.payload, opener.flags)
+        .unwrap()
+        .app_data
+        .is_empty());
+
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
 }
 
 #[test]
@@ -2538,11 +2534,15 @@ fn graceful_close_start_unblocks_blocked_write() {
 
 #[test]
 fn set_write_deadline_wakes_blocked_write() {
-    let mut server_config = Config::default();
-    server_config
-        .settings
-        .initial_max_stream_data_bidi_peer_opened = 0;
-    let (client, _server) = connected_pair(Config::default(), server_config);
+    // The raw peer grants no stream credit and never replenishes it.
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 0,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    let (client, _peer) = client_with_raw_peer_configs(Config::default(), peer_config);
 
     let stream = client.open_stream().unwrap();
     let writer = stream.clone();
@@ -2696,7 +2696,12 @@ fn blocked_write_emits_session_and_stream_blocked_signals() {
     assert!(blocked_offsets.contains(&(0, 1)));
     assert!(blocked_offsets.contains(&(opening.stream_id, 1)));
 
-    let err = write_thread.join().unwrap().unwrap_err();
+    // The first byte was committed before the flow-control wait timed out, so the
+    // partial write reports it; the next write surfaces the timeout.
+    assert_eq!(write_thread.join().unwrap().unwrap(), 1);
+    let err = stream
+        .write_timeout(b"b", Duration::from_millis(20))
+        .unwrap_err();
     assert!(err.to_string().contains("write timed out"));
     assert!(client.stats().blocked_write_total > Duration::ZERO);
     client
@@ -3618,7 +3623,141 @@ fn open_metadata_ignores_unnegotiated_priority_and_group_fields() {
     assert_eq!(metadata.priority, None);
     assert_eq!(metadata.group, None);
     assert_eq!(stream.open_info(), b"ssh".as_slice());
+    assert_eq!(metadata.open_info, b"ssh");
+    assert_eq!(metadata.open_info(), stream.open_info().as_slice());
     client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .ok();
+}
+
+#[test]
+fn accepted_stream_metadata_snapshot_includes_peer_open_info() {
+    let caps = CAPABILITY_OPEN_METADATA
+        | CAPABILITY_PRIORITY_UPDATE
+        | CAPABILITY_PRIORITY_HINTS
+        | CAPABILITY_STREAM_GROUPS;
+    let client_config = Config {
+        capabilities: caps,
+        ..Config::default()
+    };
+    let peer_config = Config {
+        role: zmux::Role::Responder,
+        capabilities: caps,
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    let mut payload = build_open_metadata_prefix(
+        caps,
+        Some(5),
+        Some(7),
+        b"ssh",
+        Settings::default().max_frame_payload,
+    )
+    .unwrap();
+    payload.extend_from_slice(b"body");
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: FRAME_FLAG_OPEN_METADATA,
+        stream_id: 1,
+        payload,
+    });
+
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let metadata = stream.metadata();
+    assert_eq!(metadata.priority, Some(5));
+    assert_eq!(metadata.group, Some(7));
+    assert_eq!(metadata.open_info, b"ssh");
+    assert_eq!(metadata.open_info, stream.open_info());
+
+    let boxed: zmux::BoxDuplexStream = Box::new(stream.clone());
+    assert_eq!(boxed.metadata().open_info, b"ssh");
+    let info: &dyn zmux::StreamHandle = &stream;
+    assert_eq!(info.metadata().open_info, b"ssh");
+
+    assert_eq!(read_once_stream(&stream), b"body");
+
+    // A later advisory update changes only the advisory fields of the snapshot.
+    peer.write_frame(Frame {
+        frame_type: FrameType::Ext,
+        flags: 0,
+        stream_id: 1,
+        payload: build_priority_update_payload(
+            caps,
+            MetadataUpdate {
+                priority: Some(9),
+                group: None,
+            },
+            Settings::default().max_extension_payload_bytes,
+        )
+        .unwrap(),
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while stream.metadata().priority != Some(9) {
+        assert!(Instant::now() < deadline, "priority update was not applied");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let metadata = stream.metadata();
+    assert_eq!(metadata.group, Some(7));
+    assert_eq!(metadata.open_info, b"ssh");
+
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .ok();
+}
+
+#[test]
+fn local_and_accepted_stream_metadata_snapshots_include_open_info() {
+    let caps = CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_HINTS;
+    let client_config = Config {
+        capabilities: caps,
+        ..Config::default()
+    };
+    let server_config = Config {
+        capabilities: caps,
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(client_config, server_config);
+
+    let stream = client
+        .open_stream_with(OpenOptions::new().priority(3).open_info(b"x"))
+        .unwrap();
+    let metadata = stream.metadata();
+    assert_eq!(metadata.priority, Some(3));
+    assert_eq!(metadata.open_info, b"x");
+    stream.write(b"ping").unwrap();
+    assert_eq!(stream.metadata().open_info, b"x");
+    assert_eq!(stream.metadata().open_info, stream.open_info());
+
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(accepted.metadata().priority, Some(3));
+    assert_eq!(accepted.metadata().open_info, b"x");
+    assert_eq!(read_once_stream(&accepted), b"ping");
+
+    let send = client
+        .open_uni_stream_with(OpenOptions::new().open_info(b"uni"))
+        .unwrap();
+    assert_eq!(send.metadata().open_info, b"uni");
+    send.write(b"hello").unwrap();
+    assert_eq!(send.metadata().open_info, send.open_info());
+    let boxed_send: zmux::BoxSendStream = Box::new(send.clone());
+    assert_eq!(boxed_send.metadata().open_info, send.open_info());
+
+    let recv = server
+        .accept_uni_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(recv.metadata().open_info, b"uni");
+    assert_eq!(recv.metadata().open_info, recv.open_info());
+    let boxed_recv: zmux::BoxRecvStream = Box::new(recv.clone());
+    assert_eq!(boxed_recv.metadata().open_info, b"uni");
+
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .ok();
+    server
         .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
         .ok();
 }
@@ -4491,7 +4630,7 @@ fn graceful_close_blocks_new_local_opens_during_drain() {
         let _ = close_tx.send(closer.close());
     });
 
-    wait_for_state(&client, SessionState::Closing);
+    wait_for_state(&client, SessionState::Draining);
     let err = match client.open_stream() {
         Ok(_) => panic!("open_stream unexpectedly succeeded during graceful close"),
         Err(err) => err,
@@ -4545,7 +4684,7 @@ fn graceful_close_blocks_new_local_opens_during_initial_goaway_drain() {
 }
 
 #[test]
-fn local_close_start_rejects_session_ops_and_deadline_updates() {
+fn graceful_close_drain_keeps_session_ops_until_terminal_close() {
     let client_config = Config {
         close_drain_timeout: Duration::from_secs(5),
         ..Config::default()
@@ -4563,10 +4702,36 @@ fn local_close_start_rejects_session_ops_and_deadline_updates() {
         let _ = close_tx.send(closer.close());
     });
 
-    wait_for_state(&client, SessionState::Closing);
+    wait_for_state(&client, SessionState::Draining);
+
+    // During the drain only new local opens stop; the session keeps working
+    // for existing streams and peer-facing operations (SPEC §6.9).
+    let open_err = match client.open_stream() {
+        Ok(_) => panic!("open_stream unexpectedly succeeded during graceful close"),
+        Err(err) => err,
+    };
+    assert!(open_err.is_session_closed());
+    let accept_err = match client.accept_stream_timeout(Duration::from_millis(20)) {
+        Ok(_) => panic!("accept_stream unexpectedly returned a stream"),
+        Err(err) => err,
+    };
+    assert!(accept_err.is_timeout(), "{accept_err:?}");
+    client
+        .ping_timeout(b"probe", Duration::from_secs(1))
+        .unwrap();
+    stream
+        .set_write_deadline(Some(Instant::now() + Duration::from_secs(5)))
+        .unwrap();
+
+    stream.close_write().unwrap();
+    assert!(close_rx
+        .recv_timeout(Duration::from_secs(6))
+        .unwrap()
+        .is_ok());
+    close_thread.join().unwrap();
 
     let accept_err = match client.accept_stream_timeout(Duration::from_millis(20)) {
-        Ok(_) => panic!("accept_stream unexpectedly succeeded during local close"),
+        Ok(_) => panic!("accept_stream unexpectedly succeeded after local close"),
         Err(err) => err,
     };
     assert!(accept_err.is_session_closed());
@@ -4593,13 +4758,6 @@ fn local_close_start_rejects_session_ops_and_deadline_updates() {
     assert_eq!(deadline_err.scope(), ErrorScope::Stream);
     assert_eq!(deadline_err.operation(), ErrorOperation::Write);
     assert_eq!(deadline_err.source(), ErrorSource::Local);
-
-    stream.close_write().unwrap();
-    assert!(close_rx
-        .recv_timeout(Duration::from_secs(6))
-        .unwrap()
-        .is_ok());
-    close_thread.join().unwrap();
     server.close().ok();
 }
 
@@ -4688,7 +4846,7 @@ fn graceful_close_waits_for_peer_bidi_local_send_to_finish() {
         let _ = close_tx.send(closer.close());
     });
 
-    wait_for_state(&client, SessionState::Closing);
+    wait_for_state(&client, SessionState::Draining);
     assert!(close_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
     accepted.close_write().unwrap();
@@ -4718,7 +4876,7 @@ fn local_abort_releases_graceful_close_blocker() {
         let _ = close_tx.send(closer.close());
     });
 
-    wait_for_state(&client, SessionState::Closing);
+    wait_for_state(&client, SessionState::Draining);
     assert!(close_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
     stream.close_with_error(41, "").unwrap();
@@ -4972,6 +5130,265 @@ fn peer_truncated_frame_while_local_close_in_progress_fails_session() {
     assert!(cause.is_error_code(ErrorCode::Protocol));
     assert_eq!(cause.source(), ErrorSource::Remote);
     assert_eq!(cause.direction(), ErrorDirection::Read);
+}
+
+/// Waits for the CLOSE the session sends after a fatal peer error and checks
+/// that it carries `expected` and that the local cause agrees.
+fn assert_peer_receives_fatal_close(
+    client: &Conn,
+    peer: &mut RawPeer,
+    expected: ErrorCode,
+    case: &str,
+) -> String {
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, expected.as_u64(), "{case}: CLOSE reason {reason:?}");
+    wait_for_state(client, SessionState::Failed);
+    let cause = client.close_error().unwrap();
+    assert!(cause.is_error_code(expected), "{case}: local cause {cause}");
+    assert_eq!(cause.source(), ErrorSource::Remote, "{case}");
+    reason
+}
+
+#[test]
+fn frame_read_envelope_errors_emit_close_before_transport_shutdown() {
+    let max_frame_payload = Settings::default().max_frame_payload;
+    let max_control_payload = Settings::default().max_control_payload_bytes;
+    let mut oversized_data = encode_varint(max_frame_payload + 3).unwrap();
+    oversized_data.extend_from_slice(&[FrameType::Data.as_u8(), 0x04]);
+    let mut oversized_ping = encode_varint(max_control_payload + 3).unwrap();
+    oversized_ping.extend_from_slice(&[FrameType::Ping.as_u8(), 0x00]);
+    let mut ping_with_fin = vec![0x0a, FrameType::Ping.as_u8() | FRAME_FLAG_FIN, 0x00];
+    ping_with_fin.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut ping_on_stream = vec![0x0a, FrameType::Ping.as_u8(), 0x04];
+    ping_on_stream.extend_from_slice(&[0; 8]);
+
+    let cases: [(&str, Vec<u8>, ErrorCode); 8] = [
+        ("oversized DATA", oversized_data, ErrorCode::FrameSize),
+        ("oversized PING", oversized_ping, ErrorCode::FrameSize),
+        ("frame_length=1", vec![0x01, 0x04], ErrorCode::FrameSize),
+        (
+            "unknown frame type",
+            vec![0x02, 0x0c, 0x00],
+            ErrorCode::Protocol,
+        ),
+        ("PING with FIN", ping_with_fin, ErrorCode::Protocol),
+        ("PING on stream 4", ping_on_stream, ErrorCode::Protocol),
+        (
+            "non-canonical stream_id",
+            vec![0x04, FrameType::Data.as_u8(), 0x40, 0x04, 0x68],
+            ErrorCode::Protocol,
+        ),
+        (
+            "non-canonical frame_length",
+            vec![0x40, 0x02, FrameType::Data.as_u8(), 0x04],
+            ErrorCode::Protocol,
+        ),
+    ];
+
+    for (case, raw, expected) in cases {
+        let (client, mut peer) = client_with_raw_peer(Config::default());
+        peer.io.write_all(&raw).unwrap();
+        peer.io.flush().unwrap();
+
+        let _ = assert_peer_receives_fatal_close(&client, &mut peer, expected, case);
+        let cause = client.close_error().unwrap();
+        assert_eq!(cause.direction(), ErrorDirection::Read, "{case}");
+    }
+}
+
+#[test]
+fn malformed_mandatory_payload_fields_close_with_frame_size() {
+    let truncated_diag = [ErrorCode::Cancelled.as_u64() as u8, DIAG_DEBUG_TEXT as u8];
+    let overrunning_diag = [
+        ErrorCode::Cancelled.as_u64() as u8,
+        DIAG_DEBUG_TEXT as u8,
+        0x05,
+        0x41,
+    ];
+    let cases: [(&str, FrameType, u8, u64, &[u8]); 21] = [
+        // WIRE_EXAMPLES §2.6: `02 03 04` is a repository-default FRAME_SIZE.
+        ("empty STOP_SENDING", FrameType::StopSending, 0, 4, &[]),
+        ("empty RESET", FrameType::Reset, 0, 4, &[]),
+        ("truncated RESET code", FrameType::Reset, 0, 4, &[0x40]),
+        ("empty ABORT", FrameType::Abort, 0, 4, &[]),
+        (
+            "truncated ABORT DIAG",
+            FrameType::Abort,
+            0,
+            4,
+            &truncated_diag,
+        ),
+        (
+            "overrunning RESET DIAG",
+            FrameType::Reset,
+            0,
+            4,
+            &overrunning_diag,
+        ),
+        ("empty CLOSE", FrameType::Close, 0, 0, &[]),
+        (
+            "truncated CLOSE DIAG",
+            FrameType::Close,
+            0,
+            0,
+            &truncated_diag,
+        ),
+        ("empty MAX_DATA", FrameType::MaxData, 0, 0, &[]),
+        ("truncated MAX_DATA", FrameType::MaxData, 0, 0, &[0x40]),
+        (
+            "non-canonical MAX_DATA",
+            FrameType::MaxData,
+            0,
+            0,
+            &[0x40, 0x01],
+        ),
+        ("empty BLOCKED", FrameType::Blocked, 0, 0, &[]),
+        ("truncated BLOCKED", FrameType::Blocked, 0, 4, &[0x40]),
+        ("GOAWAY missing fields", FrameType::GoAway, 0, 0, &[0x00]),
+        (
+            "non-canonical GOAWAY watermark",
+            FrameType::GoAway,
+            0,
+            0,
+            &[0x40, 0x04, 0x00, 0x00],
+        ),
+        (
+            "GOAWAY truncated DIAG",
+            FrameType::GoAway,
+            0,
+            0,
+            &[0x00, 0x00, 0x00, DIAG_DEBUG_TEXT as u8],
+        ),
+        (
+            "OPEN_METADATA missing metadata_len",
+            FrameType::Data,
+            FRAME_FLAG_OPEN_METADATA,
+            1,
+            &[],
+        ),
+        (
+            "OPEN_METADATA truncated metadata_len",
+            FrameType::Data,
+            FRAME_FLAG_OPEN_METADATA,
+            1,
+            &[0x40],
+        ),
+        (
+            "OPEN_METADATA non-canonical metadata_len",
+            FrameType::Data,
+            FRAME_FLAG_OPEN_METADATA,
+            1,
+            &[0x40, 0x00],
+        ),
+        (
+            "OPEN_METADATA truncated TLV",
+            FrameType::Data,
+            FRAME_FLAG_OPEN_METADATA,
+            1,
+            &[0x01, METADATA_STREAM_PRIORITY as u8, b'h', b'i'],
+        ),
+        (
+            "PRIORITY_UPDATE truncated TLV",
+            FrameType::Ext,
+            0,
+            4,
+            &[EXT_PRIORITY_UPDATE as u8, METADATA_STREAM_PRIORITY as u8],
+        ),
+    ];
+
+    for (case, frame_type, flags, stream_id, payload) in cases {
+        let (client, mut peer) = client_with_raw_peer(Config::default());
+        peer.write_raw_frame_parts(frame_type, flags, stream_id, payload);
+
+        let _ = assert_peer_receives_fatal_close(&client, &mut peer, ErrorCode::FrameSize, case);
+        assert_eq!(
+            client.stats().received_data_bytes,
+            0,
+            "{case}: malformed opener must not deliver application data"
+        );
+    }
+}
+
+#[test]
+fn payload_rules_with_protocol_codes_still_close_with_protocol() {
+    let cases: [(&str, FrameType, u64, &[u8]); 4] = [
+        // SPEC §4.3: exactly one varint; trailing bytes are PROTOCOL.
+        (
+            "MAX_DATA trailing bytes",
+            FrameType::MaxData,
+            0,
+            &[0x05, 0x00],
+        ),
+        (
+            "BLOCKED trailing bytes",
+            FrameType::Blocked,
+            0,
+            &[0x05, 0x00],
+        ),
+        // SPEC §6.11: EXT too short for its ext_type is PROTOCOL.
+        ("empty EXT", FrameType::Ext, 4, &[]),
+        ("truncated ext_type", FrameType::Ext, 4, &[0x40]),
+    ];
+
+    for (case, frame_type, stream_id, payload) in cases {
+        let (client, mut peer) = client_with_raw_peer(Config::default());
+        peer.write_raw_frame_parts(frame_type, 0, stream_id, payload);
+
+        let _ = assert_peer_receives_fatal_close(&client, &mut peer, ErrorCode::Protocol, case);
+    }
+}
+
+#[test]
+fn abort_with_duplicate_then_truncated_diag_fails_session_with_frame_size() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"hi".to_vec(),
+    });
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_once_stream(&stream), b"hi");
+
+    // CANCELLED, debug_text "a", duplicate debug_text "b", truncated TLV.
+    peer.write_raw_frame_parts(
+        FrameType::Abort,
+        0,
+        1,
+        &[0x08, 0x01, 0x01, 0x61, 0x01, 0x01, 0x62, 0x40],
+    );
+
+    let reason =
+        assert_peer_receives_fatal_close(&client, &mut peer, ErrorCode::FrameSize, "ABORT");
+    assert!(reason.contains("truncated tlv"), "{reason}");
+    let err = stream.read(&mut [0u8; 8]).unwrap_err();
+    assert!(
+        !err.is_application_code(ErrorCode::Cancelled.as_u64()),
+        "{err}"
+    );
+}
+
+#[test]
+fn goaway_with_duplicate_then_overrunning_diag_fails_session_without_draining() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    // Duplicate retry_after_millis, then a debug_text overrunning the payload.
+    peer.write_raw_frame_parts(
+        FrameType::GoAway,
+        0,
+        0,
+        &[
+            0x00, 0x00, 0x00, 0x02, 0x01, 0x05, 0x02, 0x01, 0x06, 0x01, 0x09, 0x78,
+        ],
+    );
+
+    let reason =
+        assert_peer_receives_fatal_close(&client, &mut peer, ErrorCode::FrameSize, "GOAWAY");
+    assert!(reason.contains("tlv value overruns"), "{reason}");
+    assert!(client.peer_go_away_error().is_none());
 }
 
 #[test]
@@ -6386,27 +6803,44 @@ fn graceful_close_initial_goaway_allows_inflight_peer_open() {
 }
 
 #[test]
-fn peer_goaway_is_ignored_while_closing() {
+fn peer_goaway_is_processed_during_graceful_close_drain() {
     let client_config = Config {
-        go_away_drain_interval: Duration::from_millis(100),
+        close_drain_timeout: Duration::from_secs(2),
+        go_away_drain_interval: Duration::ZERO,
         ignored_control_budget: 0,
         ..Config::default()
     };
     let (client, mut peer) = client_with_raw_peer(client_config);
     let local_stream = client.open_stream().unwrap();
     local_stream.write(b"hold-open").unwrap();
+    let local_id = local_stream.stream_id();
 
     let closer = client.clone();
     let close_thread = thread::spawn(move || closer.close().unwrap());
-    let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
-    wait_for_closing_or_closed(&client);
+    // The final GOAWAY (no peer stream accepted) starts the stream drain.
+    let _ = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::GoAway
+            && parse_go_away_payload(&frame.payload)
+                .unwrap()
+                .last_accepted_bidi
+                == 0
+    });
+    assert_eq!(client.state(), SessionState::Draining);
 
+    // A GOAWAY that still accepts the open local stream is ordinary drain
+    // traffic: it is applied, not dropped and not charged as ignored control.
     peer.write_frame(Frame {
         frame_type: FrameType::GoAway,
         flags: 0,
         stream_id: 0,
-        payload: build_go_away_payload(MAX_VARINT62, MAX_VARINT62, 0, "").unwrap(),
+        payload: build_go_away_payload(local_id, 0, 0, "peer drain").unwrap(),
     });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while client.peer_go_away_error().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(client.peer_go_away_error().unwrap().reason, "peer drain");
+    assert_eq!(client.state(), SessionState::Draining);
     peer.write_frame(Frame {
         frame_type: FrameType::Close,
         flags: 0,
@@ -6472,7 +6906,7 @@ fn graceful_close_drain_allows_existing_stream_to_finish() {
 
     let closer = client.clone();
     let close_thread = thread::spawn(move || closer.close().unwrap());
-    wait_for_state(&client, SessionState::Closing);
+    wait_for_state(&client, SessionState::Draining);
 
     assert_eq!(stream.write_final(b"suffix").unwrap(), 6);
     close_thread.join().unwrap();
@@ -6743,6 +7177,56 @@ fn provisional_local_cancel_does_not_consume_stream_id() {
     stream.close_read().unwrap();
     client.close().unwrap();
     server.close().unwrap();
+}
+
+#[test]
+fn abandoned_provisional_head_expiry_wakes_waiting_openers() {
+    // An opened but never-written stream heads the provisional queue, so later
+    // same-class streams wait for their opener turn (here without deadlines).
+    // On an otherwise quiet session nothing else notifies them when that head
+    // expires; they must still wake, reap it and open in order. They are opened
+    // right after the head: the time they spend waiting behind it does not age
+    // them, so they do not expire along with it.
+    let (client, server) = connected_pair(Config::default(), Config::default());
+    let abandoned = client.open_stream().unwrap();
+    let writer = client.open_stream().unwrap();
+    let reader = client.open_stream().unwrap();
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    {
+        let tx = tx.clone();
+        let writer = writer.clone();
+        thread::spawn(move || {
+            let _ = tx.send(("write", writer.write(b"w").map(|_| ())));
+        });
+    }
+    {
+        let reader = reader.clone();
+        thread::spawn(move || {
+            let _ = tx.send(("close_read", reader.close_read()));
+        });
+    }
+    for _ in 0..2 {
+        let (op, result) = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("opener waiter was not woken when the provisional head expired");
+        result.unwrap_or_else(|err| panic!("{op} failed: {err:?}"));
+    }
+    assert!(started.elapsed() < Duration::from_secs(15));
+
+    assert_eq!(abandoned.stream_id(), 0);
+    assert_eq!(writer.stream_id(), 4);
+    assert_eq!(reader.stream_id(), 8);
+    let err = abandoned.write(b"late").unwrap_err();
+    assert_eq!(err.numeric_code(), Some(ErrorCode::Cancelled.as_u64()));
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(accepted.stream_id(), 4);
+    assert!(!client.is_closed());
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
 }
 
 #[test]
@@ -7115,7 +7599,7 @@ fn unread_receive_window_still_enforces_session_max_data() {
 }
 
 #[test]
-fn stream_flow_control_rejection_does_not_count_received_data() {
+fn stream_flow_control_rejection_releases_session_credit() {
     let client_config = Config {
         settings: Settings {
             initial_max_data: 8,
@@ -7133,15 +7617,27 @@ fn stream_flow_control_rejection_does_not_count_received_data() {
         payload: b"ab".to_vec(),
     });
 
-    let abort =
-        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let abort = frames
+        .iter()
+        .find(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1)
+        .expect("stream ABORT");
     let (code, _) = parse_error_payload(&abort.payload).unwrap();
     assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    // The sender counted the rejected bytes against the session window, so they
+    // are counted and released here too (SPEC §8), without being buffered.
+    let max_data = frames
+        .iter()
+        .find(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0)
+        .expect("session MAX_DATA");
+    assert_eq!(parse_varint(&max_data.payload).unwrap().0, 10);
 
     let stats = client.stats();
-    assert_eq!(stats.received_data_bytes, 0);
-    assert_eq!(stats.pressure.recv_session_received_bytes, 0);
+    assert_eq!(stats.received_data_bytes, 2);
+    assert_eq!(stats.pressure.recv_session_received_bytes, 2);
+    assert_eq!(stats.pressure.recv_session_advertised_bytes, 10);
     assert_eq!(stats.pressure.buffered_receive_bytes, 0);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 0);
     assert_eq!(stats.accept_backlog.bidi, 0);
     assert!(client
         .accept_stream_timeout(Duration::from_millis(20))
@@ -7223,7 +7719,9 @@ fn rapid_stream_flow_control_aborts_trip_visible_terminal_churn_budget() {
 }
 
 #[test]
-fn close_read_late_data_per_stream_cap_fails_session() {
+fn close_read_late_data_within_stream_credit_ignores_small_per_stream_cap() {
+    // The configured per-stream figure only bounds late data beyond the stream
+    // credit that was outstanding when the read side stopped.
     let client_config = Config {
         late_data_per_stream_cap: Some(3),
         ..Config::default()
@@ -7246,6 +7744,72 @@ fn close_read_late_data_per_stream_cap_fails_session() {
         flags: 0,
         stream_id: 1,
         payload: b"late".to_vec(),
+    });
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert!(frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0));
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame.frame_type, FrameType::Close | FrameType::Abort)),
+        "unexpected frames: {frames:?}"
+    );
+    assert_ne!(client.state(), SessionState::Failed);
+    assert_eq!(client.stats().diagnostics.late_data_after_close_read, 4);
+
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn local_abort_late_data_beyond_outstanding_credit_still_fails_session() {
+    let client_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 8,
+            ..Settings::default()
+        },
+        late_data_per_stream_cap: Some(3),
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"ab".to_vec(),
+    });
+    let stream = client.accept_stream().unwrap();
+    stream
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "")
+        .unwrap();
+    let _ =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+
+    // Six bytes of stream credit were outstanding when the ABORT committed: a
+    // compliant peer's tail stays within them.
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"cdefgh".to_vec(),
+    });
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.frame_type == FrameType::Close),
+        "unexpected frames: {frames:?}"
+    );
+    assert_ne!(client.state(), SessionState::Failed);
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"i".to_vec(),
     });
     let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
     let (code, reason) = parse_error_payload(&close.payload).unwrap();
@@ -7293,12 +7857,20 @@ fn goaway_refused_opening_data_does_not_parse_malformed_open_metadata() {
     client.go_away(0, 0).unwrap();
     let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
 
-    peer.write_raw_frame_parts(FrameType::Data, FRAME_FLAG_OPEN_METADATA, 5, &[]);
+    // metadata_len = 2 covers a truncated TLV; only the length prefix is decoded
+    // for a refused opener, so the TLV error is never seen.
+    peer.write_raw_frame_parts(
+        FrameType::Data,
+        FRAME_FLAG_OPEN_METADATA,
+        5,
+        &[0x02, 0x40, 0xff, b'a', b'p', b'p'],
+    );
     let abort =
         peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 5);
     let (code, _) = parse_error_payload(&abort.payload).unwrap();
     assert_eq!(code, ErrorCode::RefusedStream.as_u64());
     assert_ne!(client.state(), SessionState::Failed);
+    assert_eq!(client.stats().pressure.recv_session_received_bytes, 3);
 
     client.close().ok();
 }
@@ -7482,7 +8054,7 @@ fn late_data_on_reaped_graceful_tombstone_aborts_stream_closed() {
 }
 
 #[test]
-fn late_data_on_reaped_graceful_tombstone_counts_aggregate_cap() {
+fn late_data_on_reaped_graceful_tombstone_does_not_fail_on_aggregate_cap() {
     let client_config = Config {
         tombstone_limit: 1,
         late_data_aggregate_cap: Some(1),
@@ -7491,29 +8063,28 @@ fn late_data_on_reaped_graceful_tombstone_counts_aggregate_cap() {
     let (client, mut peer) = client_with_raw_peer(client_config);
     let marker_stream_id = create_reaped_graceful_bidi_marker(&client, &mut peer);
 
-    peer.write_frame(Frame {
-        frame_type: FrameType::Data,
-        flags: 0,
-        stream_id: marker_stream_id,
-        payload: vec![1],
-    });
-    let abort = peer.wait_for_frame(|frame| {
-        frame.frame_type == FrameType::Abort && frame.stream_id == marker_stream_id
-    });
-    let (code, _) = parse_error_payload(&abort.payload).unwrap();
-    assert_eq!(code, ErrorCode::StreamClosed.as_u64());
-
-    peer.write_frame(Frame {
-        frame_type: FrameType::Data,
-        flags: 0,
-        stream_id: marker_stream_id,
-        payload: vec![2],
-    });
-    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
-    let (code, reason) = parse_error_payload(&close.payload).unwrap();
-    assert_eq!(code, ErrorCode::Protocol.as_u64());
-    assert!(reason.contains("late-data cap"));
-    wait_for_state(&client, SessionState::Failed);
+    for payload in [vec![1], vec![2]] {
+        peer.write_frame(Frame {
+            frame_type: FrameType::Data,
+            flags: 0,
+            stream_id: marker_stream_id,
+            payload,
+        });
+        let abort = peer.wait_for_frame(|frame| {
+            frame.frame_type == FrameType::Abort && frame.stream_id == marker_stream_id
+        });
+        let (code, _) = parse_error_payload(&abort.payload).unwrap();
+        assert_eq!(code, ErrorCode::StreamClosed.as_u64());
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::Close));
+    assert_ne!(client.state(), SessionState::Failed);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 2);
+    // Marker-only IDs retain no late-data accounting.
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 0);
 
     client.close().ok();
 }
@@ -8714,7 +9285,7 @@ fn marker_only_used_streams_compact_to_range() {
 }
 
 #[test]
-fn marker_only_used_stream_cap_fails_instead_of_forgetting_markers() {
+fn marker_only_used_stream_cap_coarsens_instead_of_failing_session() {
     let client_config = Config {
         tombstone_limit: 0,
         marker_only_used_stream_limit: Some(1),
@@ -8734,16 +9305,51 @@ fn marker_only_used_stream_cap_fails_instead_of_forgetting_markers() {
         stream_id: 3,
         payload: Vec::new(),
     });
+    let uni = client.accept_uni_stream().unwrap();
+    assert_eq!(uni.stream_id(), 3);
+    drop(uni);
+    for stream_id in [5, 9, 13] {
+        peer.write_frame(Frame {
+            frame_type: FrameType::Abort,
+            flags: 0,
+            stream_id,
+            payload: encode_varint(ErrorCode::Cancelled.as_u64()).unwrap(),
+        });
+    }
+    let stats = wait_for_stats(&client, |stats| {
+        stats.reasons.abort.get(&ErrorCode::Cancelled.as_u64()) == Some(&4)
+    });
+    assert_eq!(
+        stats.reasons.abort.get(&ErrorCode::Cancelled.as_u64()),
+        Some(&4)
+    );
+    assert!(stats.retention.marker_only_used_streams <= 1);
+    assert!(stats.retention.marker_only_used_stream_ranges <= 1);
+    assert_eq!(stats.retention.marker_only_used_stream_limit, 1);
 
-    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
-    let (code, reason) = parse_error_payload(&close.payload).unwrap();
-    assert_eq!(code, ErrorCode::Internal.as_u64());
-    assert!(reason.contains("marker-only used-stream cap exceeded"));
-    wait_for_state(&client, SessionState::Failed);
+    // Coarsened IDs stay used: late DATA and control are ignored, not treated
+    // as frames on unseen streams, and the session budget is still released.
+    peer.write_frame(data_frame(5, 0, b"late".to_vec()));
+    peer.write_frame(error_frame(
+        FrameType::StopSending,
+        9,
+        ErrorCode::Cancelled.as_u64(),
+    ));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert!(frames
+        .iter()
+        .all(|frame| frame.frame_type != FrameType::Abort));
+    assert!(frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.state(), SessionState::Ready);
+
+    client.close().ok();
 }
 
 #[test]
-fn tombstone_late_data_aggregate_cap_fails_session() {
+fn tombstone_late_data_over_aggregate_cap_is_discarded_without_failing_session() {
     let client_config = Config {
         late_data_aggregate_cap: Some(3),
         ..Config::default()
@@ -8763,10 +9369,18 @@ fn tombstone_late_data_aggregate_cap_fails_session() {
         payload: b"late".to_vec(),
     });
 
-    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
-    let (code, reason) = parse_error_payload(&close.payload).unwrap();
-    assert_eq!(code, ErrorCode::Protocol.as_u64());
-    assert!(reason.contains("late-data cap"));
+    let max_data =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0);
+    assert!(parse_varint(&max_data.payload).unwrap().0 >= 4);
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::Close));
+    assert_ne!(client.state(), SessionState::Failed);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 4);
+    assert!(stats.pressure.aggregate_late_data_at_cap);
+    assert_eq!(stats.diagnostics.late_data_after_abort, 4);
 
     client.close().ok();
 }
@@ -8817,9 +9431,9 @@ fn malformed_pong_before_close_start_fails_session() {
 }
 
 #[test]
-fn ping_after_graceful_close_start_is_ignored() {
+fn ping_during_graceful_close_drain_is_answered() {
     let client_config = Config {
-        close_drain_timeout: Duration::from_millis(300),
+        close_drain_timeout: Duration::from_secs(2),
         go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
@@ -8838,13 +9452,13 @@ fn ping_after_graceful_close_start_is_ignored() {
         stream_id: 0,
         payload: b"closing!".to_vec(),
     });
-    thread::sleep(Duration::from_millis(80));
-
-    assert_ne!(client.state(), SessionState::Failed);
-    assert!(!peer
-        .collect_frames_for(Duration::from_millis(50))
-        .iter()
-        .any(|frame| frame.frame_type == FrameType::Pong));
+    // The drain is still waiting for the open stream: the session keeps
+    // processing peer frames and answers before any CLOSE.
+    let reply =
+        peer.wait_for_frame(|frame| matches!(frame.frame_type, FrameType::Pong | FrameType::Close));
+    assert_eq!(reply.frame_type, FrameType::Pong);
+    assert!(reply.payload.starts_with(b"closing!"));
+    assert_eq!(client.state(), SessionState::Draining);
     peer.write_frame(Frame {
         frame_type: FrameType::Close,
         flags: 0,
@@ -8856,9 +9470,9 @@ fn ping_after_graceful_close_start_is_ignored() {
 }
 
 #[test]
-fn malformed_pong_after_graceful_close_start_is_ignored() {
+fn malformed_pong_during_graceful_close_drain_fails_session() {
     let client_config = Config {
-        close_drain_timeout: Duration::from_millis(300),
+        close_drain_timeout: Duration::from_secs(2),
         go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
@@ -8871,18 +9485,14 @@ fn malformed_pong_after_graceful_close_start_is_ignored() {
     let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
     thread::sleep(Duration::from_millis(50));
 
+    // CLOSE has not been sent yet, so the frame is processed like any other
+    // frame of a draining session (STATE_MACHINE §10) and is fatal.
     peer.write_raw_frame_parts(FrameType::Pong, 0, 0, &[1]);
-    thread::sleep(Duration::from_millis(80));
-
-    assert_ne!(client.state(), SessionState::Failed);
-    peer.write_frame(Frame {
-        frame_type: FrameType::Close,
-        flags: 0,
-        stream_id: 0,
-        payload: error_payload(ErrorCode::NoError.as_u64(), ""),
-    });
-    let _ = closer.join().unwrap();
-    assert_ne!(client.state(), SessionState::Failed);
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, _) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FrameSize.as_u64());
+    assert!(closer.join().unwrap().is_err());
+    assert_eq!(client.state(), SessionState::Failed);
 }
 
 #[test]
@@ -10669,11 +11279,127 @@ fn malformed_ext_subtype_without_priority_capability_fails_session() {
 }
 
 #[test]
-fn priority_update_after_graceful_close_start_is_ignored() {
+fn negotiated_priority_update_on_stream_zero_fails_session() {
     let caps = CAPABILITY_PRIORITY_HINTS | CAPABILITY_PRIORITY_UPDATE;
     let client_config = Config {
         capabilities: caps,
-        close_drain_timeout: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let peer_config = Config {
+        capabilities: caps,
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+
+    peer.write_raw_frame_parts(FrameType::Ext, 0, 0, &[EXT_PRIORITY_UPDATE as u8]);
+
+    let reason = assert_peer_receives_fatal_close(
+        &client,
+        &mut peer,
+        ErrorCode::Protocol,
+        "PRIORITY_UPDATE on stream 0",
+    );
+    assert!(
+        reason.contains("PRIORITY_UPDATE requires non-zero stream_id"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn unnegotiated_priority_update_on_stream_zero_is_ignored() {
+    let (client, mut peer) = client_with_raw_peer_configs(
+        Config::default().disable_capabilities(),
+        Config::responder().disable_capabilities(),
+    );
+
+    peer.write_raw_frame_parts(FrameType::Ext, 0, 0, &[EXT_PRIORITY_UPDATE as u8]);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        payload: vec![7; 8],
+    });
+
+    let pong = peer.wait_for_frame(|frame| {
+        assert_ne!(frame.frame_type, FrameType::Close);
+        frame.frame_type == FrameType::Pong
+    });
+    assert_eq!(pong.payload, vec![7; 8]);
+    assert_eq!(client.state(), SessionState::Ready);
+    client.close().ok();
+}
+
+#[test]
+fn priority_update_duplicate_then_truncated_tlv_fails_session_instead_of_dropping() {
+    let caps = CAPABILITY_PRIORITY_HINTS | CAPABILITY_PRIORITY_UPDATE;
+    let client_config = Config {
+        capabilities: caps,
+        ..Config::default()
+    };
+    let peer_config = Config {
+        capabilities: caps,
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"body".to_vec(),
+    });
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_once_stream(&stream), b"body");
+
+    // Two stream_priority TLVs (a duplicate singleton), then a TLV header
+    // truncated after its type: structurally malformed, not a dropped update.
+    let mut payload = duplicate_priority_update_payload();
+    payload.push(METADATA_STREAM_PRIORITY as u8);
+    peer.write_raw_frame_parts(FrameType::Ext, 0, 1, &payload);
+
+    let reason = assert_peer_receives_fatal_close(
+        &client,
+        &mut peer,
+        ErrorCode::FrameSize,
+        "PRIORITY_UPDATE duplicate then truncated",
+    );
+    assert!(reason.contains("truncated tlv"), "{reason}");
+    assert_eq!(client.stats().abuse.dropped_priority_update, 0);
+}
+
+#[test]
+fn open_metadata_duplicate_then_truncated_tlv_fails_session_without_accepting() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    // metadata_len=7: stream_priority twice (a duplicate singleton), then a
+    // TLV header truncated after its type; "hi" is application data.
+    peer.write_raw_frame_parts(
+        FrameType::Data,
+        FRAME_FLAG_OPEN_METADATA,
+        1,
+        &[0x07, 0x01, 0x01, 0x02, 0x01, 0x01, 0x03, 0x01, b'h', b'i'],
+    );
+
+    let reason = assert_peer_receives_fatal_close(
+        &client,
+        &mut peer,
+        ErrorCode::FrameSize,
+        "OPEN_METADATA duplicate then truncated",
+    );
+    assert!(reason.contains("truncated tlv"), "{reason}");
+    assert_eq!(client.stats().received_data_bytes, 0);
+    assert!(client
+        .accept_stream_timeout(Duration::from_millis(10))
+        .is_err());
+}
+
+#[test]
+fn priority_update_during_graceful_close_drain_is_applied() {
+    let caps = CAPABILITY_PRIORITY_HINTS | CAPABILITY_PRIORITY_UPDATE;
+    let client_config = Config {
+        capabilities: caps,
+        close_drain_timeout: Duration::from_secs(2),
         go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
@@ -10705,10 +11431,14 @@ fn priority_update_after_graceful_close_start_is_ignored() {
         stream_id: stream.stream_id(),
         payload,
     });
-    thread::sleep(Duration::from_millis(80));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while stream.metadata().priority != Some(9) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
 
     let stats = client.stats();
-    assert_ne!(client.state(), SessionState::Failed);
+    assert_eq!(client.state(), SessionState::Draining);
+    assert_eq!(stream.metadata().priority, Some(9));
     assert_eq!(stats.abuse.dropped_priority_update, 0);
     assert_eq!(stats.abuse.no_op_priority_update, 0);
     peer.write_frame(Frame {
@@ -10722,11 +11452,11 @@ fn priority_update_after_graceful_close_start_is_ignored() {
 }
 
 #[test]
-fn malformed_priority_update_after_graceful_close_start_is_ignored() {
+fn malformed_priority_update_during_graceful_close_drain_fails_session() {
     let caps = CAPABILITY_PRIORITY_HINTS | CAPABILITY_PRIORITY_UPDATE;
     let client_config = Config {
         capabilities: caps,
-        close_drain_timeout: Duration::from_millis(300),
+        close_drain_timeout: Duration::from_secs(2),
         go_away_drain_interval: Duration::ZERO,
         ..Config::default()
     };
@@ -10743,20 +11473,17 @@ fn malformed_priority_update_after_graceful_close_start_is_ignored() {
     let _goaway = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
     thread::sleep(Duration::from_millis(50));
 
-    peer.write_raw_frame_parts(FrameType::Ext, 0, 4, &malformed_priority_update_payload());
-    thread::sleep(Duration::from_millis(80));
-
-    let stats = client.stats();
-    assert_ne!(client.state(), SessionState::Failed);
-    assert_eq!(stats.abuse.dropped_priority_update, 0);
-    assert_eq!(stats.abuse.no_op_priority_update, 0);
-    peer.write_frame(Frame {
-        frame_type: FrameType::Close,
-        flags: 0,
-        stream_id: 0,
-        payload: error_payload(ErrorCode::NoError.as_u64(), ""),
-    });
-    let _ = closer.join().unwrap();
+    peer.write_raw_frame_parts(
+        FrameType::Ext,
+        0,
+        stream.stream_id(),
+        &malformed_priority_update_payload(),
+    );
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, _) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FrameSize.as_u64());
+    assert!(closer.join().unwrap().is_err());
+    assert_eq!(client.state(), SessionState::Failed);
     drop(stream);
 }
 
@@ -12105,4 +12832,3892 @@ fn peer_reset_reason_is_trimmed_by_session_memory_cap() {
     assert!(!client.is_closed());
 
     client.close().unwrap();
+}
+
+fn run_concurrent_open_write_round(
+    threads: usize,
+    payload_len: usize,
+    priority: impl Fn(usize) -> Option<u64> + Send + Sync + 'static,
+    client_config: Config,
+    server_config: Config,
+) {
+    // Every worker opens before any commits, so allow them all to be provisional.
+    let client_config = Config {
+        max_provisional_streams_bidi: threads,
+        ..client_config
+    };
+    let (client, server) = connected_pair(client_config, server_config);
+    let client = Arc::new(client);
+    let priority = Arc::new(priority);
+    let start = Arc::new(Barrier::new(threads));
+    let mut workers = Vec::with_capacity(threads);
+    for idx in 0..threads {
+        let client = Arc::clone(&client);
+        let start = Arc::clone(&start);
+        let priority = Arc::clone(&priority);
+        workers.push(thread::spawn(move || {
+            let opts = match priority(idx) {
+                Some(priority) => OpenOptions::new().priority(priority),
+                None => OpenOptions::new(),
+            };
+            start.wait();
+            let stream = client.open_stream_with(opts)?;
+            stream.write_all(vec![idx as u8; payload_len])?;
+            stream.close_write()?;
+            Ok::<_, zmux::Error>(stream)
+        }));
+    }
+
+    let mut accepted_ids = Vec::with_capacity(threads);
+    let mut readers = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let stream = server
+            .accept_stream_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|err| {
+                let worker_errors: Vec<String> = std::mem::take(&mut workers)
+                    .into_iter()
+                    .filter_map(|worker| worker.join().unwrap().err())
+                    .map(|err| err.to_string())
+                    .collect();
+                panic!(
+                    "accept failed: {err}; server closed={} err={:?} worker errors={worker_errors:?}",
+                    server.is_closed(),
+                    server.wait_timeout(Duration::ZERO),
+                )
+            });
+        accepted_ids.push(stream.stream_id());
+        readers.push(thread::spawn(move || read_all_stream(&stream).len()));
+    }
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+    for reader in readers {
+        assert_eq!(reader.join().unwrap(), payload_len);
+    }
+    let mut sorted = accepted_ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        accepted_ids, sorted,
+        "accepted stream IDs must be ascending"
+    );
+    assert!(!server.is_closed());
+    assert!(!client.is_closed());
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn concurrent_open_and_first_write_keeps_stream_ids_in_wire_order() {
+    for _ in 0..10 {
+        run_concurrent_open_write_round(100, 100, |_| None, Config::default(), Config::default());
+    }
+    for _ in 0..100 {
+        run_concurrent_open_write_round(8, 100, |_| None, Config::default(), Config::default());
+    }
+}
+
+#[test]
+fn concurrent_open_with_mixed_priorities_keeps_stream_ids_in_wire_order() {
+    let caps = CAPABILITY_OPEN_METADATA | CAPABILITY_PRIORITY_HINTS;
+    for round in 0..10 {
+        let (client_config, server_config) = if round % 2 == 0 {
+            (Config::default(), Config::default())
+        } else {
+            (
+                Config {
+                    capabilities: caps,
+                    ..Config::default()
+                },
+                Config {
+                    capabilities: caps,
+                    ..Config::default()
+                },
+            )
+        };
+        run_concurrent_open_write_round(
+            64,
+            100,
+            |idx| Some(u64::try_from(idx % 16).unwrap()),
+            client_config,
+            server_config,
+        );
+    }
+}
+
+#[test]
+fn concurrent_open_with_credit_blocked_first_writes_keeps_stream_ids_in_wire_order() {
+    for _ in 0..5 {
+        run_concurrent_open_write_round(
+            32,
+            200_000,
+            |idx| Some(u64::try_from(idx % 4).unwrap()),
+            Config::default(),
+            Config::default(),
+        );
+    }
+}
+
+#[test]
+fn concurrent_uni_open_and_first_write_keeps_stream_ids_in_wire_order() {
+    for _ in 0..10 {
+        let client_config = Config {
+            max_provisional_streams_uni: 48,
+            ..Config::default()
+        };
+        let (client, server) = connected_pair(client_config, Config::default());
+        let client = Arc::new(client);
+        let start = Arc::new(Barrier::new(48));
+        let workers: Vec<_> = (0..48)
+            .map(|idx| {
+                let client = Arc::clone(&client);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    let stream = client.open_uni_stream()?;
+                    stream.write_final(vec![idx as u8; 100])?;
+                    Ok::<_, zmux::Error>(())
+                })
+            })
+            .collect();
+        let mut accepted_ids = Vec::new();
+        for _ in 0..48 {
+            let stream = server
+                .accept_uni_stream_timeout(Duration::from_secs(10))
+                .unwrap();
+            accepted_ids.push(stream.stream_id());
+            assert_eq!(read_all_recv_stream(&stream).len(), 100);
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let mut sorted = accepted_ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(accepted_ids, sorted);
+        assert!(!server.is_closed());
+        client
+            .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+            .unwrap();
+    }
+}
+
+fn gated_client_with_raw_peer(client_config: Config) -> (Conn, RawPeer, Arc<BlockingWriterState>) {
+    let (client_io, mut peer_io) = memory_pair();
+    let client_read = client_io.clone();
+    // The preface write passes; the first frame batch blocks until released.
+    let (client_write, writer_gate) = blocking_writer(client_io, 1);
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
+    });
+    let _client_preface = read_preface(&mut peer_io).unwrap();
+    let server_preface = Config::responder().local_preface().unwrap();
+    peer_io
+        .write_all(&server_preface.marshal().unwrap())
+        .unwrap();
+    peer_io.flush().unwrap();
+    let client = client_thread.join().unwrap();
+    (
+        client,
+        RawPeer {
+            io: peer_io,
+            read_buf: Vec::new(),
+        },
+        writer_gate,
+    )
+}
+
+fn wait_for_queued_data_at_least(conn: &Conn, bytes: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while conn.stats().writer_queue.data_queued_bytes < bytes {
+        assert!(
+            Instant::now() < deadline,
+            "queued data did not reach {bytes} bytes: {:?}",
+            conn.stats().writer_queue
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn spawn_write(stream: &zmux::Stream, payload: &[u8]) -> thread::JoinHandle<zmux::Result<usize>> {
+    let stream = stream.clone();
+    let payload = payload.to_vec();
+    thread::spawn(move || stream.write(&payload))
+}
+
+fn stream_frame_summary(frames: &[Frame], stream_id: u64) -> Vec<(FrameType, Vec<u8>)> {
+    frames
+        .iter()
+        .filter(|frame| frame.stream_id == stream_id)
+        .map(|frame| {
+            let payload = if frame.frame_type == FrameType::Data {
+                parse_data_payload(&frame.payload, frame.flags)
+                    .unwrap()
+                    .app_data
+                    .to_vec()
+            } else {
+                frame.payload.clone()
+            };
+            (frame.frame_type, payload)
+        })
+        .collect()
+}
+
+fn first_frame_index(frames: &[Frame], stream_id: u64) -> usize {
+    frames
+        .iter()
+        .position(|frame| frame.stream_id == stream_id)
+        .unwrap_or_else(|| panic!("no frame for stream {stream_id}: {frames:?}"))
+}
+
+#[test]
+fn cancel_write_with_queued_opener_keeps_opener_ahead_of_reset() {
+    let (client, mut peer, gate) = gated_client_with_raw_peer(Config::default());
+    let first = client.open_stream().unwrap();
+    let second = client.open_stream().unwrap();
+    let first_write = spawn_write(&first, b"x");
+    gate.wait_blocked();
+    let second_write = spawn_write(&second, b"y");
+    wait_for_queued_data_at_least(&client, 1);
+
+    second.cancel_write(77).unwrap();
+    gate.release();
+    assert_eq!(first_write.join().unwrap().unwrap(), 1);
+    assert!(second_write.join().unwrap().is_err());
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        stream_frame_summary(&frames, second.stream_id()),
+        vec![
+            (FrameType::Data, Vec::new()),
+            (FrameType::Reset, error_payload(77, "")),
+        ],
+        "{frames:?}"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn close_with_error_with_queued_opener_opens_with_abort_in_place() {
+    let (client, mut peer, gate) = gated_client_with_raw_peer(Config::default());
+    // Block the writer on a peer-opened stream so both local openers stay queued.
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"p".to_vec(),
+    });
+    let accepted = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let blocker_write = spawn_write(&accepted, b"q");
+    gate.wait_blocked();
+
+    let earlier = client.open_stream().unwrap();
+    let later = client.open_stream().unwrap();
+    let earlier_write = spawn_write(&earlier, b"y");
+    wait_for_queued_data_at_least(&client, 1);
+    let queued = client.stats().writer_queue.data_queued_bytes;
+    let later_write = spawn_write(&later, b"z");
+    wait_for_queued_data_at_least(&client, queued + 1);
+
+    later.close_with_error(9, "").unwrap();
+    gate.release();
+    assert_eq!(blocker_write.join().unwrap().unwrap(), 1);
+    assert_eq!(earlier_write.join().unwrap().unwrap(), 1);
+    assert!(later_write.join().unwrap().is_err());
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        stream_frame_summary(&frames, later.stream_id()),
+        vec![(FrameType::Abort, error_payload(9, ""))],
+        "{frames:?}"
+    );
+    assert!(
+        first_frame_index(&frames, earlier.stream_id())
+            < first_frame_index(&frames, later.stream_id()),
+        "opening ABORT overtook an earlier same-class opener: {frames:?}"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn close_read_with_queued_opener_orders_stop_sending_after_opener() {
+    let (client, mut peer, gate) = gated_client_with_raw_peer(Config::default());
+    let first = client.open_stream().unwrap();
+    let second = client.open_stream().unwrap();
+    let first_write = spawn_write(&first, b"x");
+    gate.wait_blocked();
+    let second_write = spawn_write(&second, b"y");
+    wait_for_queued_data_at_least(&client, 1);
+
+    let closer = second.clone();
+    let close_read = thread::spawn(move || closer.close_read());
+    thread::sleep(Duration::from_millis(20));
+    gate.release();
+    close_read.join().unwrap().unwrap();
+    assert_eq!(first_write.join().unwrap().unwrap(), 1);
+    assert_eq!(second_write.join().unwrap().unwrap(), 1);
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        stream_frame_summary(&frames, second.stream_id()),
+        vec![
+            (FrameType::Data, b"y".to_vec()),
+            (
+                FrameType::StopSending,
+                error_payload(ErrorCode::Cancelled.as_u64(), "")
+            ),
+        ],
+        "{frames:?}"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+struct QueueBlockedOpener {
+    client: Conn,
+    peer: RawPeer,
+    gate: Arc<BlockingWriterState>,
+    target: zmux::Stream,
+    writes: Vec<thread::JoinHandle<zmux::Result<usize>>>,
+}
+
+fn queue_blocked_opener_setup() -> QueueBlockedOpener {
+    queue_blocked_opener_setup_with(Config::default())
+}
+
+fn queue_blocked_opener_setup_with(config: Config) -> QueueBlockedOpener {
+    let config = Config {
+        session_queued_data_high_watermark: Some(4096),
+        ..config
+    };
+    let (client, peer, gate) = gated_client_with_raw_peer(config);
+    let first = client.open_stream().unwrap();
+    let filler = client.open_stream().unwrap();
+    let target = client.open_stream().unwrap();
+    let first_write = spawn_write(&first, b"x");
+    gate.wait_blocked();
+    let filler_write = spawn_write(&filler, &[b'f'; 3500]);
+    wait_for_queued_data_at_least(&client, 3500);
+    // The target's opener (1000 bytes + overhead) exceeds the remaining session
+    // queued-data budget, so it stays prepared but unqueued in the writer queue.
+    let target_write = spawn_write(&target, &[b't'; 1000]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while target.stream_id() == 0 {
+        assert!(Instant::now() < deadline, "target stream did not commit");
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(20));
+    assert!(client.stats().writer_queue.data_queued_bytes < 4096);
+    QueueBlockedOpener {
+        client,
+        peer,
+        gate,
+        target,
+        writes: vec![first_write, filler_write, target_write],
+    }
+}
+
+#[test]
+fn cancel_write_while_opener_waits_for_queue_space_opens_with_abort() {
+    let QueueBlockedOpener {
+        client,
+        mut peer,
+        gate,
+        target,
+        mut writes,
+    } = queue_blocked_opener_setup();
+    target.cancel_write(77).unwrap();
+    gate.release();
+    let target_write = writes.pop().unwrap();
+    assert!(target_write.join().unwrap().is_err());
+    for write in writes {
+        write.join().unwrap().unwrap();
+    }
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let target_frames = stream_frame_summary(&frames, target.stream_id());
+    assert_eq!(
+        target_frames.first(),
+        Some(&(FrameType::Abort, error_payload(77, ""))),
+        "{frames:?}"
+    );
+    assert!(!target_frames
+        .iter()
+        .any(|(frame_type, _)| *frame_type == FrameType::Reset));
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn refused_opening_abort_push_does_not_wedge_the_class_opener_turn() {
+    // The target holds the class opener turn with its opener prepared but not
+    // queued. Its opening ABORT exceeds the whole pending-control budget, so the
+    // ordinary push is refused; the turn must still pass on, and the ABORT must
+    // still open the target ahead of the next same-class opener (SPEC §3.1).
+    let reason = "r".repeat(64);
+    let QueueBlockedOpener {
+        client,
+        mut peer,
+        gate,
+        target,
+        mut writes,
+    } = queue_blocked_opener_setup_with(Config {
+        pending_control_bytes_budget: Some(16),
+        ..Config::default()
+    });
+    target.close_with_error(9, &reason).unwrap();
+    gate.release();
+    let target_write = writes.pop().unwrap();
+    assert!(target_write.join().unwrap().is_err());
+    for write in writes {
+        write.join().unwrap().unwrap();
+    }
+
+    let next = client.open_stream().unwrap();
+    assert_eq!(
+        next.write_timeout(b"n", Duration::from_secs(2)).unwrap(),
+        1,
+        "later same-class open stayed blocked behind the failed ABORT's turn"
+    );
+    assert_eq!(next.stream_id(), target.stream_id() + 4);
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        stream_frame_summary(&frames, target.stream_id()),
+        vec![(FrameType::Abort, error_payload(9, &reason))],
+        "{frames:?}"
+    );
+    assert!(
+        first_frame_index(&frames, target.stream_id())
+            < first_frame_index(&frames, next.stream_id()),
+        "{frames:?}"
+    );
+    assert!(!client.is_closed());
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn close_read_while_opener_waits_for_queue_space_keeps_opener_first() {
+    let QueueBlockedOpener {
+        client,
+        mut peer,
+        gate,
+        target,
+        writes,
+    } = queue_blocked_opener_setup();
+    let closer = target.clone();
+    let close_read = thread::spawn(move || closer.close_read());
+    thread::sleep(Duration::from_millis(20));
+    gate.release();
+    close_read.join().unwrap().unwrap();
+    for write in writes {
+        write.join().unwrap().unwrap();
+    }
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let target_frames = stream_frame_summary(&frames, target.stream_id());
+    assert_eq!(target_frames.len(), 2, "{frames:?}");
+    assert_eq!(target_frames[0], (FrameType::Data, vec![b't'; 1000]));
+    assert_eq!(target_frames[1].0, FrameType::StopSending);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn deadline_cancel_of_queued_opener_keeps_place_before_later_opener() {
+    let (client, mut peer, gate) = gated_client_with_raw_peer(Config::default());
+    let first = client.open_stream().unwrap();
+    let second = client.open_stream().unwrap();
+    let third = client.open_stream().unwrap();
+    let first_write = spawn_write(&first, b"x");
+    gate.wait_blocked();
+    let second_write = spawn_write(&second, b"y");
+    wait_for_queued_data_at_least(&client, 1);
+    let queued = client.stats().writer_queue.data_queued_bytes;
+    let third_write = spawn_write(&third, b"z");
+    wait_for_queued_data_at_least(&client, queued + 1);
+
+    second
+        .set_write_deadline(Some(Instant::now() + Duration::from_millis(20)))
+        .unwrap();
+    assert!(second_write.join().unwrap().unwrap_err().is_timeout());
+    assert!(!second.is_write_closed());
+
+    gate.release();
+    assert_eq!(first_write.join().unwrap().unwrap(), 1);
+    assert_eq!(third_write.join().unwrap().unwrap(), 1);
+    second.set_write_deadline(None).unwrap();
+    assert_eq!(second.write(b"w").unwrap(), 1);
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        stream_frame_summary(&frames, second.stream_id()),
+        vec![
+            (FrameType::Data, Vec::new()),
+            (FrameType::Data, b"w".to_vec())
+        ],
+        "{frames:?}"
+    );
+    assert!(
+        first_frame_index(&frames, second.stream_id())
+            < first_frame_index(&frames, third.stream_id()),
+        "{frames:?}"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn later_open_consumes_abandoned_committed_opener_with_abort() {
+    let (client, mut peer, gate) = gated_client_with_raw_peer(Config::default());
+    let first = client.open_stream().unwrap();
+    let second = client.open_stream().unwrap();
+    let third = client.open_stream().unwrap();
+    let first_write = spawn_write(&first, b"x");
+    gate.wait_blocked();
+    let second_write = spawn_write(&second, b"y");
+    wait_for_queued_data_at_least(&client, 1);
+    second
+        .set_write_deadline(Some(Instant::now() + Duration::from_millis(20)))
+        .unwrap();
+    assert!(second_write.join().unwrap().unwrap_err().is_timeout());
+    let second_id = second.stream_id();
+    assert_ne!(second_id, 0);
+
+    let third_write = spawn_write(&third, b"z");
+    wait_for_queued_data_at_least(&client, 1);
+    gate.release();
+    assert_eq!(first_write.join().unwrap().unwrap(), 1);
+    assert_eq!(third_write.join().unwrap().unwrap(), 1);
+    assert_eq!(third.stream_id(), second_id + 4);
+
+    let err = second.write(b"w").unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::Cancelled));
+    assert_eq!(err.termination_kind(), TerminationKind::Abort);
+    assert_eq!(err.source(), ErrorSource::Local);
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let second_frames = stream_frame_summary(&frames, second_id);
+    assert_eq!(second_frames.len(), 1, "{frames:?}");
+    assert_eq!(second_frames[0].0, FrameType::Abort);
+    assert_eq!(
+        parse_error_payload(&second_frames[0].1).unwrap().0,
+        ErrorCode::Cancelled.as_u64()
+    );
+    assert!(
+        first_frame_index(&frames, second_id) < first_frame_index(&frames, third.stream_id()),
+        "{frames:?}"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+fn wait_for_read_abort(stream: &zmux::Stream, code: u64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; 16];
+    loop {
+        match stream.read_timeout(&mut buf, Duration::from_millis(50)) {
+            Err(err) if err.termination_kind() == TerminationKind::Abort => {
+                assert_eq!(err.numeric_code(), Some(code));
+                return;
+            }
+            Err(err) if err.is_timeout() => {}
+            Ok(_) => {}
+            Err(err) => panic!("unexpected read error while waiting for abort: {err:?}"),
+        }
+        assert!(Instant::now() < deadline, "stream was not aborted");
+    }
+}
+
+#[test]
+fn write_after_peer_abort_of_finished_send_half_reports_abort() {
+    let (client, server) = connected_pair(Config::default(), Config::default());
+    let stream = client.open_stream().unwrap();
+    stream.write_all(&b"hi"[..]).unwrap();
+    stream.close_write().unwrap();
+    let accepted = server.accept_stream().unwrap();
+    assert_eq!(read_all_stream(&accepted), b"hi");
+    accepted.close_with_error(42, "boom").unwrap();
+    wait_for_read_abort(&stream, 42);
+
+    let err = stream.write_all(&b"x"[..]).unwrap_err();
+    assert_eq!(err.numeric_code(), Some(42));
+    assert_eq!(err.reason(), Some("boom"));
+    assert_eq!(err.termination_kind(), TerminationKind::Abort);
+    assert_eq!(err.source(), ErrorSource::Remote);
+    client.close().unwrap();
+}
+
+#[test]
+fn write_after_local_abort_of_finished_send_half_reports_abort() {
+    let (client, server) = connected_pair(Config::default(), Config::default());
+    let stream = client.open_stream().unwrap();
+    stream.write_all(&b"hi"[..]).unwrap();
+    stream.close_write().unwrap();
+    let _accepted = server.accept_stream().unwrap();
+    stream.close_with_error(43, "local").unwrap();
+
+    let err = stream.write(b"x").unwrap_err();
+    assert_eq!(err.numeric_code(), Some(43));
+    assert_eq!(err.reason(), Some("local"));
+    assert_eq!(err.termination_kind(), TerminationKind::Abort);
+    assert_eq!(err.source(), ErrorSource::Local);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn write_after_abort_of_peer_stopped_send_half_reports_abort() {
+    let (client, server) = connected_pair(Config::default(), Config::default());
+    let stream = client.open_stream().unwrap();
+    stream.write_all(&b"hi"[..]).unwrap();
+    let accepted = server.accept_stream().unwrap();
+    accepted.cancel_read(77).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !stream.is_write_closed() {
+        assert!(Instant::now() < deadline, "peer STOP_SENDING not observed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    stream.close_with_error(50, "").unwrap();
+
+    let err = stream.write(b"x").unwrap_err();
+    assert_eq!(err.numeric_code(), Some(50));
+    assert_eq!(err.termination_kind(), TerminationKind::Abort);
+    assert_eq!(err.source(), ErrorSource::Local);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+fn assert_large_write_round_trip(client_config: Config, server_settings: Settings, len: usize) {
+    let server_config = Config {
+        settings: server_settings,
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(client_config, server_config);
+    let payload: Vec<u8> = (0..len).map(|idx| (idx % 251) as u8).collect();
+    let expected = payload.clone();
+    let reader = thread::spawn(move || {
+        let mut stream = server
+            .accept_stream_timeout(Duration::from_secs(5))
+            .unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).unwrap();
+        (server, received)
+    });
+    let stream = client.open_stream().unwrap();
+    stream
+        .write_all_timeout(payload, Duration::from_secs(10))
+        .unwrap();
+    stream.close_write().unwrap();
+    let (server, received) = reader.join().unwrap();
+    assert_eq!(received.len(), expected.len());
+    assert!(received == expected);
+    assert!(!client.is_closed());
+    assert!(!server.is_closed());
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn peer_max_frame_payload_above_queue_watermark_does_not_stall_writes() {
+    let large_windows = Settings {
+        max_frame_payload: 1 << 20,
+        initial_max_data: 64 << 20,
+        initial_max_stream_data_bidi_peer_opened: 16 << 20,
+        ..Settings::default()
+    };
+    assert_large_write_round_trip(Config::default(), large_windows, 300 << 10);
+    assert_large_write_round_trip(Config::default(), large_windows, 1 << 20);
+
+    let default_windows = Settings {
+        max_frame_payload: 1 << 20,
+        ..Settings::default()
+    };
+    assert_large_write_round_trip(Config::default(), default_windows, 1 << 20);
+    assert_large_write_round_trip(Config::default(), default_windows, 4 << 20);
+}
+
+#[test]
+fn write_deadline_expiring_mid_burst_does_not_deadlock_session() {
+    // A write deadline that expires after part of a burst was prepared rolls the
+    // burst back; doing that while still holding the session lock re-locked it
+    // and hung every session thread. The deadlines below land mid-burst.
+    for attempt in 0..600u64 {
+        let (client, server) = connected_pair(Config::default(), Config::default());
+        let stream = client.open_stream().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let timeout = Duration::from_micros(10 + 7 * (attempt % 60));
+        thread::spawn(move || {
+            let payload = vec![7u8; 200 << 10];
+            let result = if attempt % 2 == 0 {
+                stream.write_timeout(&payload, timeout)
+            } else {
+                let (head, tail) = payload.split_at(100 << 10);
+                stream.write_vectored_timeout(&[IoSlice::new(head), IoSlice::new(tail)], timeout)
+            };
+            let _ = tx.send(result.map_err(|err| err.is_timeout()));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(_) | Err(true)) => {}
+            Ok(Err(false)) => panic!("attempt {attempt}: write failed with a non-timeout error"),
+            Err(_) => {
+                // Both sessions are wedged; do not block the test on their drop.
+                std::mem::forget(client);
+                std::mem::forget(server);
+                panic!("attempt {attempt}: write_timeout deadlocked the session");
+            }
+        }
+        assert!(!client.is_closed());
+        client.stats();
+        client
+            .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+            .unwrap();
+    }
+}
+
+#[test]
+fn per_stream_queue_watermark_below_one_frame_still_admits_writes() {
+    let client_config = Config {
+        per_stream_queued_data_high_watermark: Some(4096),
+        ..Config::default()
+    };
+    assert_large_write_round_trip(client_config, Settings::default(), 60_000);
+
+    let client_config = Config {
+        session_queued_data_high_watermark: Some(2048),
+        ..Config::default()
+    };
+    assert_large_write_round_trip(client_config, Settings::default(), 60_000);
+}
+
+fn client_with_tiny_stream_window_peer() -> (Conn, RawPeer) {
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 4,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    client_with_raw_peer_configs(Config::default(), peer_config)
+}
+
+fn peer_stream_app_bytes(frames: &[Frame], stream_id: u64) -> Vec<u8> {
+    stream_frame_summary(frames, stream_id)
+        .into_iter()
+        .filter(|(frame_type, _)| *frame_type == FrameType::Data)
+        .flat_map(|(_, payload)| payload)
+        .collect()
+}
+
+#[test]
+fn credit_granted_while_writer_signals_blocked_is_not_missed() {
+    // The peer grants 4 more bytes of stream credit as soon as it sees each DATA
+    // frame, so grants race with the writer running out of credit and queueing
+    // BLOCKED. A grant handled in between must still wake the writer; otherwise
+    // both sides wait on each other until the write deadline.
+    for round in 0..16 {
+        let (client, mut peer) = client_with_tiny_stream_window_peer();
+        let stream = client.open_stream().unwrap();
+        let payload: Vec<u8> = (0..2048).map(|idx| (idx % 251) as u8).collect();
+        let writer = {
+            let stream = stream.clone();
+            let payload = payload.clone();
+            thread::spawn(move || {
+                if round % 2 == 0 {
+                    stream.write_all_timeout(payload, Duration::from_secs(5))?;
+                } else {
+                    let (head, tail) = payload.split_at(1000);
+                    let parts = [IoSlice::new(head), IoSlice::new(tail)];
+                    stream.write_all_timeout(&parts[..], Duration::from_secs(5))?;
+                }
+                stream.close_write()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut received = Vec::new();
+        let mut granted = 4u64;
+        let mut fin = false;
+        while !fin && Instant::now() < deadline {
+            for frame in peer.drain_frames() {
+                if frame.frame_type != FrameType::Data || frame.stream_id == 0 {
+                    continue;
+                }
+                let data = parse_data_payload(&frame.payload, frame.flags).unwrap();
+                received.extend_from_slice(&data.app_data);
+                fin |= frame.flags & FRAME_FLAG_FIN != 0;
+                if !data.app_data.is_empty() {
+                    granted += 4;
+                    peer.write_frame(Frame {
+                        frame_type: FrameType::MaxData,
+                        flags: 0,
+                        stream_id: frame.stream_id,
+                        payload: encode_varint(granted).unwrap(),
+                    });
+                }
+            }
+            thread::yield_now();
+        }
+        let result = writer.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "round {round}: writer stalled after {} bytes: {result:?}",
+            received.len()
+        );
+        assert!(fin, "round {round}: FIN not observed");
+        assert_eq!(received, payload);
+        client
+            .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+            .unwrap();
+    }
+}
+
+#[test]
+fn write_timeout_after_partial_progress_returns_written_count() {
+    let (client, mut peer) = client_with_tiny_stream_window_peer();
+    let stream = client.open_stream().unwrap();
+
+    let n = stream
+        .write_timeout(b"abcdefgh", Duration::from_millis(200))
+        .unwrap();
+    assert_eq!(n, 4);
+    let err = stream
+        .write_timeout(b"efgh", Duration::from_millis(50))
+        .unwrap_err();
+    assert!(err.is_timeout());
+    let err = stream
+        .write_all_timeout(&b"efgh"[..], Duration::from_millis(50))
+        .unwrap_err();
+    assert!(err.is_timeout());
+
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    assert_eq!(peer_stream_app_bytes(&frames, stream.stream_id()), b"abcd");
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn vectored_and_std_writes_report_partial_progress() {
+    let (client, mut peer) = client_with_tiny_stream_window_peer();
+    let stream = client.open_stream().unwrap();
+    let n = stream
+        .write_vectored_timeout(
+            &[IoSlice::new(b"ABC"), IoSlice::new(b"DEFGH")],
+            Duration::from_millis(200),
+        )
+        .unwrap();
+    assert_eq!(n, 4);
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    assert_eq!(peer_stream_app_bytes(&frames, stream.stream_id()), b"ABCD");
+
+    let other = client.open_stream().unwrap();
+    other
+        .set_write_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert_eq!(Write::write(&mut &other, b"wxyz1234").unwrap(), 4);
+    let err = Write::write(&mut &other, b"1234").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    let frames = peer.collect_frames_for(Duration::from_millis(50));
+    assert_eq!(peer_stream_app_bytes(&frames, other.stream_id()), b"wxyz");
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn buffered_writer_retry_after_write_timeout_does_not_duplicate_bytes() {
+    let (client, mut peer) = client_with_tiny_stream_window_peer();
+    let stream = client.open_stream().unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buffered = std::io::BufWriter::with_capacity(64, &stream);
+    buffered.write_all(b"abcdefgh").unwrap();
+    let err = buffered.flush().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+    let opener = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    peer.write_frame(Frame {
+        frame_type: FrameType::MaxData,
+        flags: 0,
+        stream_id: opener.stream_id,
+        payload: encode_varint(1000).unwrap(),
+    });
+    stream.set_write_timeout(None).unwrap();
+    buffered.flush().unwrap();
+    drop(buffered);
+
+    let mut frames = vec![opener];
+    frames.extend(peer.collect_frames_for(Duration::from_millis(100)));
+    assert_eq!(
+        peer_stream_app_bytes(&frames, stream.stream_id()),
+        b"abcdefgh"
+    );
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+fn transfer_bulk_one_way(client: &Conn, server: &Conn, total: usize, read_chunk: usize) {
+    let stream = client.open_stream().unwrap();
+    let writer = stream.clone();
+    let write_thread = thread::spawn(move || {
+        let chunk = vec![7u8; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < total {
+            let n = chunk.len().min(total - sent);
+            writer.write_all(&chunk[..n])?;
+            sent += n;
+        }
+        writer.close_write()
+    });
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(5))
+        .unwrap();
+    let mut buf = vec![0u8; read_chunk];
+    let mut received = 0usize;
+    loop {
+        let n = accepted
+            .read_timeout(&mut buf, Duration::from_secs(10))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "read failed after {received} bytes: {err}; client={:?} server={:?}",
+                    client.state(),
+                    server.state()
+                )
+            });
+        if n == 0 {
+            break;
+        }
+        received += n;
+    }
+    write_thread
+        .join()
+        .unwrap()
+        .unwrap_or_else(|err| panic!("write failed: {err}"));
+    assert_eq!(received, total);
+    assert_ne!(client.state(), SessionState::Failed);
+    assert_ne!(server.state(), SessionState::Failed);
+}
+
+struct HeldWriter {
+    inner: MemoryConn,
+    hold: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Write for HeldWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (held, cond) = &*self.hold;
+        let mut held = held.lock().unwrap();
+        while *held {
+            held = cond.wait(held).unwrap();
+        }
+        drop(held);
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn data_frame(stream_id: u64, flags: u8, payload: Vec<u8>) -> Frame {
+    Frame {
+        frame_type: FrameType::Data,
+        flags,
+        stream_id,
+        payload,
+    }
+}
+
+fn varint_frame(frame_type: FrameType, stream_id: u64, value: u64) -> Frame {
+    Frame {
+        frame_type,
+        flags: 0,
+        stream_id,
+        payload: encode_varint(value).unwrap(),
+    }
+}
+
+fn assert_peer_stream_round_trips(client: &Conn, peer: &mut RawPeer, stream_id: u64) {
+    peer.write_frame(data_frame(stream_id, FRAME_FLAG_FIN, b"ping".to_vec()));
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(stream.stream_id(), stream_id);
+    assert_eq!(read_all_stream(&stream), b"ping");
+}
+
+fn assert_no_frame_of_type(frames: &[Frame], frame_type: FrameType) {
+    assert!(
+        !frames.iter().any(|frame| frame.frame_type == frame_type),
+        "unexpected {frame_type:?} in {frames:?}"
+    );
+}
+
+fn wait_for_stats(
+    conn: &Conn,
+    mut done: impl FnMut(&zmux::SessionStats) -> bool,
+) -> zmux::SessionStats {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let stats = conn.stats();
+        if done(&stats) || Instant::now() >= deadline {
+            return stats;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn close_read_tolerates_full_stream_window_of_in_flight_data() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let window = Settings::default().initial_max_stream_data_bidi_peer_opened;
+    let frame_payload = usize::try_from(Settings::default().max_frame_payload).unwrap();
+
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+    let stream = client.accept_stream().unwrap();
+    stream.close_read().unwrap();
+    let _ = peer
+        .wait_for_frame(|frame| frame.frame_type == FrameType::StopSending && frame.stream_id == 1);
+    let advertised_before = client.stats().pressure.recv_session_advertised_bytes;
+
+    // The peer may legally have the whole stream window in flight when it sees
+    // STOP_SENDING: four maximum-size frames with the default settings.
+    for _ in 0..window / 16_384 {
+        peer.write_frame(data_frame(1, 0, vec![7; frame_payload]));
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_no_frame_of_type(&frames, FrameType::Abort);
+    assert!(frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0));
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 1));
+    assert_ne!(client.state(), SessionState::Failed);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, window);
+    assert_eq!(
+        stats.pressure.recv_session_advertised_bytes,
+        advertised_before + window
+    );
+    assert_eq!(stats.diagnostics.late_data_after_close_read, window);
+
+    // One byte beyond the stream credit is a stream flow-control violation, not a
+    // session failure.
+    peer.write_frame(data_frame(1, 0, vec![8]));
+    let abort =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+    let (code, _) = parse_error_payload(&abort.payload).unwrap();
+    assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    assert_no_frame_of_type(
+        &peer.collect_frames_for(Duration::from_millis(50)),
+        FrameType::Close,
+    );
+    assert_eq!(
+        client.stats().pressure.recv_session_received_bytes,
+        window + 1
+    );
+
+    assert_peer_stream_round_trips(&client, &mut peer, 5);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn local_abort_tolerates_full_stream_window_of_in_flight_data() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+    let window = Settings::default().initial_max_stream_data_bidi_peer_opened;
+    let frame_payload = usize::try_from(Settings::default().max_frame_payload).unwrap();
+
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+    let stream = client.accept_stream().unwrap();
+    stream
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "")
+        .unwrap();
+    let _ =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+
+    for _ in 0..window / 16_384 {
+        peer.write_frame(data_frame(1, 0, vec![7; frame_payload]));
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert!(frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0));
+    assert_ne!(client.state(), SessionState::Failed);
+    assert_eq!(client.stats().diagnostics.late_data_after_abort, window);
+
+    assert_peer_stream_round_trips(&client, &mut peer, 5);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+fn stop_or_abort_reader_during_in_flight_write(abort: bool) {
+    // Hold the server's outbound frames so that its STOP_SENDING / ABORT cannot
+    // reach the writer before a full stream window of DATA is in flight.
+    let hold = Arc::new((Mutex::new(false), Condvar::new()));
+    let (client_io, server_io) = memory_pair();
+    let server_writer = HeldWriter {
+        inner: server_io.clone(),
+        hold: hold.clone(),
+    };
+    let client_thread =
+        thread::spawn(move || Conn::client((client_io.clone(), client_io)).unwrap());
+    let server_thread = thread::spawn(move || Conn::server((server_io, server_writer)).unwrap());
+    let client = client_thread.join().unwrap();
+    let server = server_thread.join().unwrap();
+
+    let stream = client.open_stream().unwrap();
+    stream.write_all(b"x").unwrap();
+    let accepted = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_once_stream(&accepted), b"x");
+
+    *hold.0.lock().unwrap() = true;
+    let stopper = thread::spawn(move || {
+        if abort {
+            accepted.close_with_error(ErrorCode::Cancelled.as_u64(), "")
+        } else {
+            accepted.close_read()
+        }
+    });
+    let window = Settings::default().initial_max_stream_data_bidi_peer_opened;
+    let tail = vec![5u8; usize::try_from(window - 1).unwrap()];
+    stream
+        .write_all_timeout(&tail[..], Duration::from_secs(1))
+        .unwrap();
+    let stats = wait_for_stats(&server, |stats| {
+        stats.pressure.recv_session_received_bytes == window
+    });
+    assert_eq!(stats.pressure.recv_session_received_bytes, window);
+    *hold.0.lock().unwrap() = false;
+    hold.1.notify_all();
+    stopper.join().unwrap().unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+    assert_ne!(client.state(), SessionState::Failed);
+    assert_ne!(server.state(), SessionState::Failed);
+    let next = client.open_stream().unwrap();
+    next.write_final(b"after").unwrap();
+    let next_accepted = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_all_stream(&next_accepted), b"after");
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn close_read_during_in_flight_write_keeps_same_impl_session() {
+    stop_or_abort_reader_during_in_flight_write(false);
+}
+
+#[test]
+fn local_abort_during_in_flight_write_keeps_same_impl_session() {
+    stop_or_abort_reader_during_in_flight_write(true);
+}
+
+fn close_read_cycle_with_late_tail_and_reset(client: &Conn, peer: &mut RawPeer, stream_id: u64) {
+    peer.write_frame(data_frame(stream_id, 0, b"x".to_vec()));
+    let stream = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(read_once_stream(&stream), b"x");
+    stream.close_write().unwrap();
+    stream.close_read().unwrap();
+    let _ = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::StopSending && frame.stream_id == stream_id
+    });
+    peer.write_frame(data_frame(stream_id, 0, vec![9; 6000]));
+    peer.write_frame(Frame {
+        frame_type: FrameType::Reset,
+        flags: 0,
+        stream_id,
+        payload: error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    });
+}
+
+#[test]
+fn repeated_close_read_late_tails_do_not_exhaust_aggregate_late_data_allowance() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    for i in 0..20u64 {
+        close_read_cycle_with_late_tail_and_reset(&client, &mut peer, 1 + 4 * i);
+        let stats = wait_for_stats(&client, |stats| {
+            stats.diagnostics.late_data_after_close_read == 6000 * (i + 1)
+        });
+        assert_eq!(stats.diagnostics.late_data_after_close_read, 6000 * (i + 1));
+        assert_ne!(client.state(), SessionState::Failed, "cycle {i}");
+    }
+    assert_no_frame_of_type(
+        &peer.collect_frames_for(Duration::from_millis(50)),
+        FrameType::Close,
+    );
+    assert_peer_stream_round_trips(&client, &mut peer, 81);
+    client.close().unwrap();
+}
+
+#[test]
+fn aggregate_late_data_counts_only_retained_late_tail_accounting() {
+    let client_config = Config {
+        tombstone_limit: 1,
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    close_read_cycle_with_late_tail_and_reset(&client, &mut peer, 1);
+    let stats = wait_for_stats(&client, |stats| stats.retention.tombstones == 1);
+    assert_eq!(stats.retention.tombstones, 1);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 6000);
+
+    // Compacting the second stream reaps the first tombstone and its accounting.
+    close_read_cycle_with_late_tail_and_reset(&client, &mut peer, 5);
+    let stats = wait_for_stats(&client, |stats| {
+        stats.diagnostics.late_data_after_close_read == 12_000
+            && stats.retention.marker_only_used_streams >= 1
+    });
+    assert_eq!(stats.diagnostics.late_data_after_close_read, 12_000);
+    assert_eq!(stats.retention.tombstones, 1);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 6000);
+    assert_ne!(client.state(), SessionState::Failed);
+    client.close().unwrap();
+}
+
+#[test]
+fn data_after_peer_fin_on_read_stopped_live_stream_aborts_stream_closed() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    peer.write_frame(data_frame(1, 0, b"a".to_vec()));
+    let stream = client.accept_stream().unwrap();
+    assert_eq!(read_once_stream(&stream), b"a");
+    stream.close_read().unwrap();
+    let _ = peer
+        .wait_for_frame(|frame| frame.frame_type == FrameType::StopSending && frame.stream_id == 1);
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"x".to_vec()));
+    peer.write_frame(data_frame(1, 0, b"late".to_vec()));
+    let abort =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+    let (code, _) = parse_error_payload(&abort.payload).unwrap();
+    assert_eq!(code, ErrorCode::StreamClosed.as_u64());
+
+    client.close().ok();
+}
+
+#[test]
+fn data_after_peer_fin_on_read_stopped_tombstone_aborts_stream_closed() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    peer.write_frame(data_frame(1, 0, b"a".to_vec()));
+    let stream = client.accept_stream().unwrap();
+    assert_eq!(read_once_stream(&stream), b"a");
+    stream.close_write().unwrap();
+    stream.close_read().unwrap();
+    let _ = peer
+        .wait_for_frame(|frame| frame.frame_type == FrameType::StopSending && frame.stream_id == 1);
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"x".to_vec()));
+    let stats = wait_for_stats(&client, |stats| stats.retention.tombstones == 1);
+    assert_eq!(stats.retention.tombstones, 1);
+
+    peer.write_frame(data_frame(1, 0, b"late".to_vec()));
+    let abort =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1);
+    let (code, _) = parse_error_payload(&abort.payload).unwrap();
+    assert_eq!(code, ErrorCode::StreamClosed.as_u64());
+
+    client.close().ok();
+}
+
+#[test]
+fn data_after_fin_on_live_stream_releases_session_credit_without_late_data_caps() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"a".to_vec()));
+    let stream = client.accept_stream().unwrap();
+    assert_eq!(read_all_stream(&stream), b"a");
+
+    // Larger than the 8 KiB repository late-data figure: DATA after FIN is a
+    // stream-state violation answered on the stream, not late data.
+    peer.write_frame(data_frame(1, 0, vec![3; 9000]));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let abort = frames
+        .iter()
+        .find(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == 1)
+        .expect("stream ABORT");
+    let (code, _) = parse_error_payload(&abort.payload).unwrap();
+    assert_eq!(code, ErrorCode::StreamClosed.as_u64());
+    assert!(frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 9001);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 0);
+    assert_ne!(client.state(), SessionState::Failed);
+
+    client.close().ok();
+}
+
+#[test]
+fn data_after_fin_on_live_stream_still_obeys_session_flow_control() {
+    let client_config = Config {
+        settings: Settings {
+            initial_max_data: 100,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"a".to_vec()));
+    // Left unread so that no session credit is released before the violation.
+    let _stream = client.accept_stream().unwrap();
+
+    peer.write_frame(data_frame(1, 0, vec![3; 150]));
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    assert!(reason.contains("session MAX_DATA"));
+}
+
+fn open_local_uni_stream_seen_by_peer(client: &Conn, peer: &mut RawPeer) -> u64 {
+    let stream = client.open_uni_stream().unwrap();
+    stream.write_all(b"x").unwrap();
+    let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    assert_eq!(opened.stream_id, stream.stream_id());
+    opened.stream_id
+}
+
+#[test]
+fn wrong_direction_data_still_obeys_session_flow_control() {
+    let client_config = Config {
+        settings: Settings {
+            initial_max_data: 1000,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let stream_id = open_local_uni_stream_seen_by_peer(&client, &mut peer);
+
+    peer.write_frame(data_frame(stream_id, 0, vec![1; 1500]));
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    assert!(reason.contains("session MAX_DATA"));
+}
+
+#[test]
+fn wrong_direction_data_releases_session_credit() {
+    let client_config = Config {
+        settings: Settings {
+            initial_max_data: 1000,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let stream_id = open_local_uni_stream_seen_by_peer(&client, &mut peer);
+
+    peer.write_frame(data_frame(stream_id, 0, vec![1; 100]));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    let abort = frames
+        .iter()
+        .find(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == stream_id)
+        .expect("stream ABORT");
+    let (code, _) = parse_error_payload(&abort.payload).unwrap();
+    assert_eq!(code, ErrorCode::StreamState.as_u64());
+    let max_data = frames
+        .iter()
+        .find(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0)
+        .expect("session MAX_DATA");
+    assert_eq!(parse_varint(&max_data.payload).unwrap().0, 1100);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 100);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 0);
+
+    // Later DATA on the aborted stream is ignored late data, still released.
+    peer.write_frame(data_frame(stream_id, 0, vec![1; 10]));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == stream_id));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.stats().pressure.recv_session_received_bytes, 110);
+
+    client.close().ok();
+}
+
+#[test]
+fn late_peer_abort_after_local_fin_and_peer_fin_preserves_unread_data() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"hello".to_vec()));
+    let stream = client.accept_stream().unwrap();
+    stream.close_write().unwrap();
+    let _ = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::Data
+            && frame.stream_id == 1
+            && frame.flags & FRAME_FLAG_FIN != 0
+    });
+    let ignored_before = client.stats().abuse.ignored_control;
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::Abort,
+        flags: 0,
+        stream_id: 1,
+        payload: error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    });
+    let stats = wait_for_stats(&client, |stats| {
+        stats.abuse.ignored_control > ignored_before
+    });
+    assert!(stats.abuse.ignored_control > ignored_before);
+    assert!(!stats
+        .reasons
+        .abort
+        .contains_key(&ErrorCode::Cancelled.as_u64()));
+
+    assert_eq!(read_all_stream(&stream), b"hello");
+    let write_err = stream.write(b"x").unwrap_err();
+    assert_ne!(write_err.termination_kind(), TerminationKind::Abort);
+    assert_no_frame_of_type(
+        &peer.collect_frames_for(Duration::from_millis(50)),
+        FrameType::Abort,
+    );
+
+    client.close().ok();
+}
+
+#[test]
+fn late_peer_abort_after_local_reset_and_peer_fin_keeps_terminal_errors() {
+    let (client, mut peer) = client_with_raw_peer(Config::default());
+
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, b"hello".to_vec()));
+    let stream = client.accept_stream().unwrap();
+    stream.cancel_write(ErrorCode::Cancelled.as_u64()).unwrap();
+    let _ =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::Reset && frame.stream_id == 1);
+    let ignored_before = client.stats().abuse.ignored_control;
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::Abort,
+        flags: 0,
+        stream_id: 1,
+        payload: error_payload(ErrorCode::Internal.as_u64(), ""),
+    });
+    let stats = wait_for_stats(&client, |stats| {
+        stats.abuse.ignored_control > ignored_before
+    });
+    assert!(stats.abuse.ignored_control > ignored_before);
+
+    assert_eq!(read_all_stream(&stream), b"hello");
+    let write_err = stream.write(b"x").unwrap_err();
+    assert_eq!(write_err.termination_kind(), TerminationKind::Reset);
+    assert_eq!(write_err.source(), ErrorSource::Local);
+
+    client.close().ok();
+}
+
+#[test]
+fn interleaved_data_does_not_reset_inbound_ping_budget() {
+    let client_config = Config {
+        inbound_ping_budget: 2,
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    peer.write_frame(data_frame(1, 0, b"a".to_vec()));
+    let _stream = client.accept_stream().unwrap();
+    for payload in [b"ping-one".to_vec(), b"ping-two".to_vec()] {
+        peer.write_frame(Frame {
+            frame_type: FrameType::Ping,
+            flags: 0,
+            stream_id: 0,
+            payload,
+        });
+    }
+    peer.write_frame(data_frame(1, 0, b"b".to_vec()));
+    peer.write_frame(Frame {
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        payload: b"ping-thr".to_vec(),
+    });
+
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::Protocol.as_u64());
+    assert!(reason.contains("inbound PING budget"));
+}
+
+#[test]
+fn state_advancing_max_data_is_not_charged_to_inbound_control_budgets() {
+    let client_config = Config {
+        inbound_control_frame_budget: 4,
+        inbound_mixed_frame_budget: Some(4),
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let stream = client.open_stream().unwrap();
+    stream.write_all(b"x").unwrap();
+    let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+
+    let session_base = Settings::default().initial_max_data;
+    let stream_base = Settings::default().initial_max_stream_data_bidi_peer_opened;
+    for i in 1..=64u64 {
+        peer.write_frame(varint_frame(FrameType::MaxData, 0, session_base + i));
+        peer.write_frame(varint_frame(
+            FrameType::MaxData,
+            opened.stream_id,
+            stream_base + i,
+        ));
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_ne!(client.state(), SessionState::Failed);
+    assert_eq!(client.stats().abuse.inbound_control_frames, 0);
+
+    // MAX_DATA that does not raise a limit is still charged.
+    for _ in 0..5 {
+        peer.write_frame(varint_frame(FrameType::MaxData, 0, session_base));
+    }
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::Protocol.as_u64());
+    assert!(reason.contains("inbound control flood"), "{reason}");
+}
+
+#[test]
+fn blocked_for_new_limits_is_not_charged_but_repeats_are() {
+    let client_config = Config {
+        inbound_control_frame_budget: 2,
+        inbound_mixed_frame_budget: Some(2),
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let window = Settings::default().initial_max_stream_data_bidi_peer_opened;
+
+    peer.write_frame(data_frame(1, 0, vec![1; 16_384]));
+    peer.write_frame(data_frame(1, 0, vec![1; 16_384]));
+    let stream = client.accept_stream().unwrap();
+    let mut buf = vec![0u8; 32 * 1024];
+    stream
+        .read_exact_timeout(&mut buf, Duration::from_secs(1))
+        .unwrap();
+    let _ =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 1);
+
+    // The sender reports the limit it was blocked at; this report crossed the
+    // grant above on the wire, so it is stale but still new information.
+    peer.write_frame(varint_frame(FrameType::Blocked, 1, window));
+    peer.write_frame(varint_frame(
+        FrameType::Blocked,
+        0,
+        Settings::default().initial_max_data,
+    ));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    let stats = client.stats();
+    assert_eq!(stats.abuse.inbound_control_frames, 0);
+    assert_eq!(stats.abuse.no_op_blocked, 0);
+
+    for _ in 0..3 {
+        peer.write_frame(varint_frame(FrameType::Blocked, 1, window));
+    }
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::Protocol.as_u64());
+    assert!(reason.contains("inbound control flood"), "{reason}");
+}
+
+#[test]
+fn default_config_bulk_transfer_survives_replenish_and_blocked_rates() {
+    let (client, server) = connected_pair(Config::default(), Config::default());
+    transfer_bulk_one_way(&client, &server, 64 << 20, 16 * 1024);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn small_read_bulk_transfer_does_not_trip_tight_control_budgets() {
+    let config = || Config {
+        inbound_control_frame_budget: 16,
+        inbound_mixed_frame_budget: Some(16),
+        ignored_control_budget: 16,
+        no_op_blocked_budget: 16,
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(config(), config());
+    transfer_bulk_one_way(&client, &server, 8 << 20, 4 * 1024);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+fn zero_window_pair_round_trip(server_settings: Settings, uni: bool) {
+    let server_config = Config {
+        settings: server_settings,
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(Config::default(), server_config);
+    let payload = b"0123456789";
+    if uni {
+        let stream = client.open_uni_stream().unwrap();
+        let writer = thread::spawn(move || {
+            stream.write_all_timeout(&payload[..], Duration::from_secs(2))?;
+            stream.close_write()
+        });
+        let accepted = server
+            .accept_uni_stream_timeout(Duration::from_secs(2))
+            .unwrap();
+        let mut buf = [0u8; 10];
+        accepted
+            .read_exact_timeout(&mut buf, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(&buf, payload);
+        writer.join().unwrap().unwrap();
+    } else {
+        let stream = client.open_stream().unwrap();
+        let writer = thread::spawn(move || {
+            stream.write_all_timeout(&payload[..], Duration::from_secs(2))?;
+            stream.close_write()
+        });
+        let accepted = server
+            .accept_stream_timeout(Duration::from_secs(2))
+            .unwrap();
+        let mut buf = [0u8; 10];
+        accepted
+            .read_exact_timeout(&mut buf, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(&buf, payload);
+        writer.join().unwrap().unwrap();
+    }
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .unwrap();
+}
+
+#[test]
+fn zero_initial_bidi_stream_window_is_granted_to_peer() {
+    zero_window_pair_round_trip(
+        Settings {
+            initial_max_stream_data_bidi_peer_opened: 0,
+            ..Settings::default()
+        },
+        false,
+    );
+}
+
+#[test]
+fn zero_initial_uni_stream_window_is_granted_to_peer() {
+    zero_window_pair_round_trip(
+        Settings {
+            initial_max_stream_data_uni: 0,
+            ..Settings::default()
+        },
+        true,
+    );
+}
+
+#[test]
+fn zero_initial_session_window_is_granted_to_peer() {
+    zero_window_pair_round_trip(
+        Settings {
+            initial_max_data: 0,
+            ..Settings::default()
+        },
+        false,
+    );
+}
+
+fn zero_window_client(settings: Settings) -> (Conn, RawPeer) {
+    client_with_raw_peer(Config {
+        settings,
+        ..Config::default()
+    })
+}
+
+#[test]
+fn peer_blocked_on_zero_stream_window_gets_stream_credit() {
+    let (client, mut peer) = zero_window_client(Settings {
+        initial_max_stream_data_bidi_peer_opened: 0,
+        ..Settings::default()
+    });
+
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+    peer.write_frame(varint_frame(FrameType::Blocked, 1, 0));
+    let max_data =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 1);
+    assert!(parse_varint(&max_data.payload).unwrap().0 > 0);
+    assert_eq!(client.stats().abuse.no_op_blocked, 0);
+
+    client.close().ok();
+}
+
+#[test]
+fn peer_blocked_on_zero_session_window_gets_session_credit() {
+    let (client, mut peer) = zero_window_client(Settings {
+        initial_max_data: 0,
+        ..Settings::default()
+    });
+
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+    peer.write_frame(varint_frame(FrameType::Blocked, 0, 0));
+    let max_data =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0);
+    assert!(parse_varint(&max_data.payload).unwrap().0 > 0);
+    assert_eq!(client.stats().abuse.no_op_blocked, 0);
+
+    client.close().ok();
+}
+
+#[test]
+fn reader_waiting_on_zero_stream_window_grants_credit_without_blocked() {
+    let (client, mut peer) = zero_window_client(Settings {
+        initial_max_stream_data_bidi_peer_opened: 0,
+        ..Settings::default()
+    });
+
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+    let stream = client.accept_stream().unwrap();
+    assert_no_frame_of_type(
+        &peer.collect_frames_for(Duration::from_millis(50)),
+        FrameType::MaxData,
+    );
+    let reader = thread::spawn(move || {
+        let mut buf = [0u8; 4];
+        stream.read_timeout(&mut buf, Duration::from_secs(1))
+    });
+    let max_data =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 1);
+    assert!(parse_varint(&max_data.payload).unwrap().0 > 0);
+    peer.write_frame(data_frame(1, 0, b"data".to_vec()));
+    assert_eq!(reader.join().unwrap().unwrap(), 4);
+
+    client.close().ok();
+}
+
+#[test]
+fn accept_waiting_on_zero_session_window_grants_credit_without_blocked() {
+    let (client, mut peer) = zero_window_client(Settings {
+        initial_max_data: 0,
+        ..Settings::default()
+    });
+
+    let Err(err) = client.accept_stream_timeout(Duration::from_millis(20)) else {
+        panic!("no stream was opened");
+    };
+    assert!(err.is_timeout());
+    let max_data =
+        peer.wait_for_frame(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0);
+    assert!(parse_varint(&max_data.payload).unwrap().0 > 0);
+
+    client.close().ok();
+}
+
+#[test]
+fn unread_full_stream_window_is_not_granted_on_blocked() {
+    let (client, mut peer) = zero_window_client(Settings {
+        initial_max_stream_data_bidi_peer_opened: 4,
+        ..Settings::default()
+    });
+
+    peer.write_frame(data_frame(1, 0, b"abcd".to_vec()));
+    let _stream = client.accept_stream().unwrap();
+    peer.write_frame(varint_frame(FrameType::Blocked, 1, 4));
+    // Unread data is released by the application's next read; until then the
+    // full window is backpressure, not a stall that needs a grant.
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 1));
+
+    client.close().ok();
+}
+
+fn error_frame(frame_type: FrameType, stream_id: u64, code: u64) -> Frame {
+    Frame {
+        frame_type,
+        flags: 0,
+        stream_id,
+        payload: error_payload(code, ""),
+    }
+}
+
+fn abort_codes_for(frames: &[Frame], stream_id: u64) -> Vec<u64> {
+    frames
+        .iter()
+        .filter(|frame| frame.frame_type == FrameType::Abort && frame.stream_id == stream_id)
+        .map(|frame| parse_error_payload(&frame.payload).unwrap().0)
+        .collect()
+}
+
+fn max_session_max_data(frames: &[Frame]) -> Option<u64> {
+    frames
+        .iter()
+        .filter(|frame| frame.frame_type == FrameType::MaxData && frame.stream_id == 0)
+        .map(|frame| parse_varint(&frame.payload).unwrap().0)
+        .max()
+}
+
+fn client_after_local_goaway(client_config: Config, peer_config: Config) -> (Conn, RawPeer) {
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    client.go_away(0, 0).unwrap();
+    let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
+    (client, peer)
+}
+
+#[test]
+fn goaway_refused_stream_ignores_racing_control_frames() {
+    let (client, mut peer) = client_after_local_goaway(Config::default(), Config::responder());
+
+    // The peer opened stream 1 and kept using it before it observed the GOAWAY
+    // or the refusal; none of this is a frame on a previously unseen stream.
+    peer.write_frame(data_frame(1, 0, vec![7; 1000]));
+    peer.write_frame(error_frame(
+        FrameType::StopSending,
+        1,
+        ErrorCode::Cancelled.as_u64(),
+    ));
+    peer.write_frame(varint_frame(
+        FrameType::Blocked,
+        1,
+        Settings::default().initial_max_stream_data_bidi_peer_opened,
+    ));
+    peer.write_frame(varint_frame(FrameType::MaxData, 1, 1 << 20));
+    peer.write_frame(error_frame(
+        FrameType::Reset,
+        1,
+        ErrorCode::Cancelled.as_u64(),
+    ));
+    peer.write_frame(error_frame(
+        FrameType::Abort,
+        1,
+        ErrorCode::Cancelled.as_u64(),
+    ));
+
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.state(), SessionState::Draining);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 1000);
+    assert_eq!(
+        stats.reasons.abort.get(&ErrorCode::RefusedStream.as_u64()),
+        Some(&1)
+    );
+
+    client.close().ok();
+}
+
+#[test]
+fn goaway_refused_stream_data_is_credited_back_with_one_abort_per_id() {
+    let (client, mut peer) = client_after_local_goaway(Config::default(), Config::responder());
+
+    for _ in 0..3 {
+        peer.write_frame(data_frame(1, 0, vec![7; 1000]));
+    }
+    peer.write_frame(data_frame(5, FRAME_FLAG_FIN, vec![7; 500]));
+    peer.write_frame(data_frame(1, FRAME_FLAG_FIN, Vec::new()));
+
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_eq!(
+        abort_codes_for(&frames, 5),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_eq!(
+        max_session_max_data(&frames),
+        Some(Settings::default().initial_max_data + 3500)
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 3500);
+    assert_eq!(stats.pressure.aggregate_late_data_bytes, 0);
+    assert_eq!(client.state(), SessionState::Draining);
+
+    // Refused IDs are tracked per stream class.
+    peer.write_frame(data_frame(3, 0, b"uni".to_vec()));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        abort_codes_for(&frames, 3),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+
+    client.close().ok();
+}
+
+#[test]
+fn goaway_refused_stream_data_still_obeys_session_flow_control() {
+    let client_config = Config {
+        settings: Settings {
+            initial_max_data: 1000,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (_client, mut peer) = client_after_local_goaway(client_config, Config::responder());
+
+    peer.write_frame(data_frame(1, 0, vec![7; 1500]));
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    assert!(reason.contains("session MAX_DATA"));
+}
+
+#[test]
+fn goaway_refused_opening_data_counts_only_application_bytes() {
+    let caps = CAPABILITY_OPEN_METADATA;
+    let (client, mut peer) = client_after_local_goaway(
+        Config {
+            capabilities: caps,
+            ..Config::default()
+        },
+        Config {
+            capabilities: caps,
+            ..Config::responder()
+        },
+    );
+
+    let mut payload = build_open_metadata_prefix(
+        caps,
+        None,
+        None,
+        b"open-info",
+        Settings::default().max_frame_payload,
+    )
+    .unwrap();
+    let prefix_len = payload.len();
+    payload.extend_from_slice(&[9; 100]);
+    peer.write_frame(data_frame(1, FRAME_FLAG_OPEN_METADATA, payload));
+
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert!(prefix_len > 0);
+    assert_eq!(
+        max_session_max_data(&frames),
+        Some(Settings::default().initial_max_data + 100)
+    );
+    assert_eq!(client.stats().pressure.recv_session_received_bytes, 100);
+
+    client.close().ok();
+}
+
+#[test]
+fn goaway_refused_opening_data_with_truncated_metadata_len_fails_with_frame_size() {
+    let caps = CAPABILITY_OPEN_METADATA;
+    let (client, mut peer) = client_after_local_goaway(
+        Config {
+            capabilities: caps,
+            ..Config::default()
+        },
+        Config {
+            capabilities: caps,
+            ..Config::responder()
+        },
+    );
+
+    // The refusal may skip the metadata TLVs, but the metadata_len prefix has to
+    // be decoded to find the application bytes (SPEC §8, §6.1).
+    peer.write_raw_frame_parts(FrameType::Data, FRAME_FLAG_OPEN_METADATA, 5, &[0x40]);
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, _) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FrameSize.as_u64());
+    wait_for_state(&client, SessionState::Failed);
+}
+
+#[test]
+fn incoming_limit_refused_stream_ignores_late_data_and_credits_session() {
+    let client_config = Config {
+        settings: Settings {
+            max_incoming_streams_bidi: 0,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    for _ in 0..3 {
+        peer.write_frame(data_frame(1, 0, vec![7; 1000]));
+    }
+    peer.write_frame(data_frame(1, 0, Vec::new()));
+
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_eq!(
+        max_session_max_data(&frames),
+        Some(Settings::default().initial_max_data + 3000)
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    let stats = client.stats();
+    assert_eq!(stats.pressure.recv_session_received_bytes, 3000);
+    // The opener itself is refused data, not late data; the frames behind it
+    // are late data after the local ABORT.
+    assert_eq!(stats.diagnostics.late_data_after_abort, 2000);
+    assert_eq!(stats.accept_backlog.refused, 1);
+    assert_eq!(client.state(), SessionState::Ready);
+
+    client.close().ok();
+}
+
+#[test]
+fn incoming_limit_refused_stream_with_many_in_flight_frames_aborts_once() {
+    let client_config = Config {
+        settings: Settings {
+            max_incoming_streams_bidi: 0,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    for _ in 0..200 {
+        peer.write_frame(data_frame(1, 0, vec![1]));
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(200));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.stats().pressure.recv_session_received_bytes, 200);
+    assert_eq!(client.state(), SessionState::Ready);
+
+    client.close().ok();
+}
+
+#[test]
+fn accept_backlog_refused_stream_ignores_late_data_and_credits_session() {
+    let client_config = Config {
+        accept_backlog_limit: Some(1),
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    peer.write_frame(data_frame(1, 0, b"queued".to_vec()));
+    let stats = wait_for_stats(&client, |stats| stats.accept_backlog.bidi == 1);
+    assert_eq!(stats.accept_backlog.bidi, 1);
+
+    for _ in 0..3 {
+        peer.write_frame(data_frame(5, 0, vec![7; 1000]));
+    }
+    let frames = peer.collect_frames_for(Duration::from_millis(150));
+    assert_eq!(
+        abort_codes_for(&frames, 5),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert!(abort_codes_for(&frames, 1).is_empty());
+    assert_eq!(
+        max_session_max_data(&frames),
+        Some(Settings::default().initial_max_data + 3000)
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.stats().pressure.recv_session_received_bytes, 3006);
+
+    let stream = client.accept_stream().unwrap();
+    assert_eq!(stream.stream_id(), 1);
+    client.close().ok();
+}
+
+#[test]
+fn incoming_limit_refused_stream_late_data_allowance_covers_initial_window() {
+    let client_config = Config {
+        settings: Settings {
+            max_incoming_streams_bidi: 0,
+            initial_max_stream_data_bidi_peer_opened: 64,
+            ..Settings::default()
+        },
+        late_data_per_stream_cap: Some(16),
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+
+    // The peer may still send its whole initial stream window (64 bytes)
+    // before it sees the refusal, even though the per-stream figure is 16.
+    peer.write_frame(data_frame(1, 0, vec![1; 24]));
+    peer.write_frame(data_frame(1, 0, vec![1; 40]));
+    let frames = peer.collect_frames_for(Duration::from_millis(100));
+    assert_eq!(
+        abort_codes_for(&frames, 1),
+        vec![ErrorCode::RefusedStream.as_u64()]
+    );
+    assert_no_frame_of_type(&frames, FrameType::Close);
+    assert_eq!(client.state(), SessionState::Ready);
+
+    // Beyond what a compliant peer could have in flight.
+    peer.write_frame(data_frame(1, 0, vec![1]));
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::Protocol.as_u64());
+    assert!(reason.contains("late-data cap"));
+}
+
+#[test]
+fn refused_opener_data_still_obeys_session_flow_control() {
+    let client_config = Config {
+        settings: Settings {
+            max_incoming_streams_bidi: 0,
+            initial_max_data: 100,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (_client, mut peer) = client_with_raw_peer(client_config);
+
+    peer.write_frame(data_frame(1, 0, vec![7; 1000]));
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, reason) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::FlowControl.as_u64());
+    assert!(reason.contains("session MAX_DATA"));
+}
+
+#[test]
+fn accept_backlog_refusals_do_not_leak_session_window() {
+    let server_config = Config {
+        accept_backlog_limit: Some(1),
+        session_queued_data_high_watermark: Some(4096),
+        settings: Settings {
+            initial_max_data: 16_384,
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(Config::default(), server_config);
+
+    let first = client.open_stream().unwrap();
+    first.write_all(b"x").unwrap();
+    let stats = wait_for_stats(&server, |stats| stats.accept_backlog.bidi == 1);
+    assert_eq!(stats.accept_backlog.bidi, 1);
+
+    // Each opener is refused by the full accept backlog after the client has
+    // irrevocably spent session credit on its 4 KiB payload.
+    for _ in 0..3 {
+        let refused = client.open_stream().unwrap();
+        refused
+            .write_all_timeout(&[7u8; 4096][..], Duration::from_secs(1))
+            .unwrap();
+    }
+    let stats = wait_for_stats(&server, |stats| stats.accept_backlog.refused == 3);
+    assert_eq!(stats.accept_backlog.refused, 3);
+
+    let accepted = server.accept_stream().unwrap();
+    assert_eq!(accepted.stream_id(), first.stream_id());
+    // Without the refused bytes being released this needs more session credit
+    // than the client has left.
+    first
+        .write_all_timeout(&[1u8; 8192][..], Duration::from_secs(2))
+        .unwrap();
+    let mut received = 0usize;
+    let mut buf = [0u8; 4096];
+    while received < 8193 {
+        let n = accepted
+            .read_timeout(&mut buf, Duration::from_secs(2))
+            .unwrap();
+        assert!(n > 0);
+        received += n;
+    }
+
+    client.close().ok();
+    server.close().ok();
+}
+
+fn finish_request_round_trip(opener: &Conn, acceptor: &Conn, abortive: bool) {
+    let local = opener.open_stream().unwrap();
+    if abortive {
+        local.write_all(b"q").unwrap();
+    } else {
+        local.write_final(&b"q"[..]).unwrap();
+    }
+    let remote = acceptor
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        remote
+            .read_timeout(&mut buf, Duration::from_secs(1))
+            .unwrap(),
+        1
+    );
+    if abortive {
+        local
+            .close_with_error(ErrorCode::Cancelled.as_u64(), "")
+            .unwrap();
+        let err = remote
+            .read_timeout(&mut buf, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(!err.is_timeout(), "{err:?}");
+    } else {
+        assert_eq!(read_all_stream(&remote), b"");
+        remote.write_final(&b"r"[..]).unwrap();
+        assert_eq!(read_all_stream(&local), b"r");
+    }
+}
+
+#[test]
+fn interleaved_stream_classes_keep_marker_retention_bounded() {
+    let config = || Config {
+        tombstone_limit: 4,
+        marker_only_used_stream_limit: Some(16),
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(config(), config());
+
+    // Both sides open bidi streams, so the two classes interleave in ID order,
+    // and graceful and abortive closes alternate within each class.
+    for i in 0..150 {
+        finish_request_round_trip(&client, &server, i % 2 == 0);
+        finish_request_round_trip(&server, &client, i % 3 == 0);
+    }
+
+    for conn in [&client, &server] {
+        let stats = wait_for_stats(conn, |stats| stats.active_streams.total == 0);
+        assert_eq!(conn.state(), SessionState::Ready);
+        assert!(stats.retention.marker_only_used_streams <= 16, "{stats:?}");
+        assert!(
+            stats.retention.marker_only_used_stream_ranges <= 16,
+            "{stats:?}"
+        );
+    }
+    // The session keeps working after coarsening.
+    finish_request_round_trip(&client, &server, false);
+    finish_request_round_trip(&server, &client, false);
+
+    client.close().unwrap();
+    server.close().unwrap();
+}
+
+/// Gate for a client transport writer that can stall like a socket whose peer
+/// stopped reading: a stalled write blocks until the transport is closed
+/// through its control hook, which then fails the write.
+struct StallGate {
+    state: Mutex<StallGateState>,
+    cond: Condvar,
+}
+
+#[derive(Default)]
+struct StallGateState {
+    stalled: bool,
+    blocked: bool,
+    closed: bool,
+}
+
+impl StallGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(StallGateState::default()),
+            cond: Condvar::new(),
+        })
+    }
+
+    fn stall(&self) {
+        self.state.lock().unwrap().stalled = true;
+    }
+
+    fn wait_for(&self, timeout: Duration, mut done: impl FnMut(&StallGateState) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while !done(&state) {
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            state = self.cond.wait_timeout(state, wait).unwrap().0;
+        }
+        true
+    }
+
+    fn wait_blocked(&self, timeout: Duration) -> bool {
+        self.wait_for(timeout, |state| state.blocked)
+    }
+
+    fn wait_closed(&self, timeout: Duration) -> bool {
+        self.wait_for(timeout, |state| state.closed)
+    }
+}
+
+struct StallableWriter {
+    inner: MemoryConn,
+    gate: Arc<StallGate>,
+}
+
+impl Write for StallableWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        {
+            let mut state = self.gate.state.lock().unwrap();
+            if state.stalled && !state.closed {
+                state.blocked = true;
+                self.gate.cond.notify_all();
+                while !state.closed {
+                    state = self.gate.cond.wait(state).unwrap();
+                }
+            }
+            if state.closed {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct StallControl {
+    gate: Arc<StallGate>,
+    inbound: Arc<Queue>,
+}
+
+impl zmux::DuplexTransportControl for StallControl {
+    fn close(&self) -> std::io::Result<()> {
+        {
+            let mut state = self.gate.state.lock().unwrap();
+            state.closed = true;
+            self.gate.cond.notify_all();
+        }
+        let mut inbound = self.inbound.state.lock().unwrap();
+        inbound.closed = true;
+        self.inbound.cond.notify_all();
+        Ok(())
+    }
+}
+
+fn client_with_stallable_raw_peer(client_config: Config) -> (Conn, RawPeer, Arc<StallGate>) {
+    let (client_io, mut peer_io) = memory_pair();
+    let gate = StallGate::new();
+    let control = StallControl {
+        gate: gate.clone(),
+        inbound: client_io.inbound.clone(),
+    };
+    let client_read = client_io.clone();
+    let client_write = StallableWriter {
+        inner: client_io,
+        gate: gate.clone(),
+    };
+    let transport = zmux::DuplexTransport::new(client_read, client_write).with_control(control);
+
+    let client_thread =
+        thread::spawn(move || Conn::client_with_config(transport, client_config).unwrap());
+    let _client_preface = read_preface(&mut peer_io).unwrap();
+    let server_preface = Config::responder().local_preface().unwrap();
+    peer_io
+        .write_all(&server_preface.marshal().unwrap())
+        .unwrap();
+    peer_io.flush().unwrap();
+
+    (
+        client_thread.join().unwrap(),
+        RawPeer {
+            io: peer_io,
+            read_buf: Vec::new(),
+        },
+        gate,
+    )
+}
+
+/// Starts an application write that the stalled transport writer never
+/// completes and returns a receiver for its result.
+fn start_stalled_write(stream: &zmux::Stream, gate: &StallGate) -> Receiver<zmux::Result<usize>> {
+    gate.stall();
+    let (tx, rx) = mpsc::channel();
+    let writer = stream.clone();
+    thread::spawn(move || {
+        let _ = tx.send(writer.write(b"stalled"));
+    });
+    assert!(
+        gate.wait_blocked(Duration::from_secs(1)),
+        "writer did not stall"
+    );
+    rx
+}
+
+#[test]
+fn close_with_error_closes_transport_when_writer_stalls() {
+    let (client, mut peer, gate) = client_with_stallable_raw_peer(Config::default());
+    let stream = client.open_stream().unwrap();
+    stream.write(b"first").unwrap();
+    peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    let write_result = start_stalled_write(&stream, &gate);
+
+    let started = Instant::now();
+    client.close_with_error(5, "x").unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(client.state(), SessionState::Failed);
+
+    // The CLOSE cannot be flushed; after the bounded close-frame wait the
+    // transport is closed, which fails the stuck write and releases the writer.
+    assert!(
+        gate.wait_closed(Duration::from_secs(3)),
+        "transport was never closed while the writer was stalled"
+    );
+    let write_err = write_result
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stalled application write was not released")
+        .unwrap_err();
+    assert!(!write_err.is_timeout(), "{write_err:?}");
+
+    let err = client.close_error().unwrap();
+    assert_eq!(err.numeric_code(), Some(5));
+    assert_eq!(err.source(), ErrorSource::Local);
+    assert_eq!(client.stats().diagnostics.close_completion_timeouts, 1);
+}
+
+#[test]
+fn graceful_close_closes_transport_when_writer_stalls() {
+    let client_config = Config {
+        close_drain_timeout: Duration::from_millis(100),
+        go_away_drain_interval: Duration::ZERO,
+        ..Config::default()
+    };
+    let (client, mut peer, gate) = client_with_stallable_raw_peer(client_config);
+    let stream = client.open_stream().unwrap();
+    stream.write(b"first").unwrap();
+    peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    let write_result = start_stalled_write(&stream, &gate);
+
+    let started = Instant::now();
+    let err = client.close().unwrap_err();
+    assert!(err.to_string().contains("graceful close drain timed out"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(client.state(), SessionState::Closed);
+    assert!(
+        gate.wait_closed(Duration::from_secs(3)),
+        "transport was never closed while the writer was stalled"
+    );
+    assert!(write_result
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stalled application write was not released")
+        .is_err());
+    // A graceful close keeps its graceful outcome despite the forced close.
+    assert!(client.close_error().is_none());
+}
+
+#[test]
+fn keepalive_timeout_fires_while_transport_write_is_stalled() {
+    let client_config = Config {
+        keepalive_interval: Duration::from_millis(200),
+        keepalive_timeout: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let (client, _peer, gate) = client_with_stallable_raw_peer(client_config);
+    let stream = client.open_stream().unwrap();
+    // The writer blocks before the first keepalive PING is due, so the PING
+    // can never reach the transport and the peer never answers anything.
+    let write_result = start_stalled_write(&stream, &gate);
+
+    let err = match client.wait_timeout(Duration::from_secs(3)) {
+        Ok(closed) => panic!("session still open (closed={closed}) after keepalive timeout"),
+        Err(err) => err,
+    };
+    assert_eq!(err.numeric_code(), Some(ErrorCode::IdleTimeout.as_u64()));
+    assert_eq!(client.stats().diagnostics.keepalive_timeouts, 1);
+    assert!(
+        gate.wait_closed(Duration::from_secs(3)),
+        "keepalive timeout did not close the stalled transport"
+    );
+    assert!(write_result
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stalled application write was not released")
+        .is_err());
+}
+
+#[test]
+fn graceful_close_drain_delivers_peer_response_to_pending_request() {
+    let client_config = Config {
+        close_drain_timeout: Duration::from_millis(1500),
+        ..Config::default()
+    };
+    let (client, server) = connected_pair(client_config, Config::default());
+    let stream = client.open_stream().unwrap();
+    stream.write_final(b"req").unwrap();
+    let (response_read_tx, response_read_rx) = mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        let accepted = server
+            .accept_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(read_all_stream(&accepted), b"req");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(accepted.write(b"resp").unwrap(), 4);
+        // Finish only after the client application has the response, so the
+        // drain cannot end (and release the stream) before it is read.
+        response_read_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        accepted.close_write().unwrap();
+        server
+    });
+    let reader_stream = stream.clone();
+    let reader = thread::spawn(move || {
+        let mut response = [0u8; 4];
+        let result = reader_stream.read_exact_timeout(&mut response, Duration::from_secs(2));
+        let _ = response_read_tx.send(());
+        result.map(|()| response)
+    });
+
+    let started = Instant::now();
+    client.close().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "graceful close waited out the drain timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(&reader.join().unwrap().unwrap(), b"resp");
+    assert_eq!(client.state(), SessionState::Closed);
+    server_thread.join().unwrap().close().ok();
+}
+
+#[test]
+fn graceful_close_drain_completes_when_peer_finishes_stream() {
+    let client_config = Config {
+        close_drain_timeout: Duration::from_secs(2),
+        go_away_drain_interval: Duration::ZERO,
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let stream = client.open_stream().unwrap();
+    stream.write_final(b"req").unwrap();
+    let opened = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::Data && frame.flags & FRAME_FLAG_FIN != 0
+    });
+
+    let closer = client.clone();
+    let started = Instant::now();
+    let close_thread = thread::spawn(move || closer.close());
+    let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: opened.stream_id,
+        payload: b"resp".to_vec(),
+    });
+    // Peer data written during the drain reaches the application.
+    let mut response = [0u8; 4];
+    stream
+        .read_exact_timeout(&mut response, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(&response, b"resp");
+    assert_eq!(client.state(), SessionState::Draining);
+
+    // The peer FIN makes the last blocking stream terminal and ends the drain.
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: FRAME_FLAG_FIN,
+        stream_id: opened.stream_id,
+        payload: Vec::new(),
+    });
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, _) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::NoError.as_u64());
+    close_thread.join().unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn graceful_close_drain_refuses_peer_open_above_final_watermark() {
+    let client_config = Config {
+        close_drain_timeout: Duration::from_secs(2),
+        go_away_drain_interval: Duration::ZERO,
+        ..Config::default()
+    };
+    let (client, mut peer) = client_with_raw_peer(client_config);
+    let stream = client.open_stream().unwrap();
+    stream.write(b"hold-open").unwrap();
+    peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+
+    let closer = client.clone();
+    let close_thread = thread::spawn(move || closer.close());
+    // No peer stream was accepted, so the final GOAWAY refuses every peer bidi ID.
+    let _final = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::GoAway
+            && parse_go_away_payload(&frame.payload)
+                .unwrap()
+                .last_accepted_bidi
+                == 0
+    });
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"late open".to_vec(),
+    });
+
+    let reply = peer
+        .wait_for_frame(|frame| matches!(frame.frame_type, FrameType::Abort | FrameType::Close));
+    assert_eq!(reply.frame_type, FrameType::Abort);
+    assert_eq!(reply.stream_id, 1);
+    let (code, _) = parse_error_payload(&reply.payload).unwrap();
+    assert_eq!(code, ErrorCode::RefusedStream.as_u64());
+    assert_eq!(client.state(), SessionState::Draining);
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::Close,
+        flags: 0,
+        stream_id: 0,
+        payload: error_payload(ErrorCode::NoError.as_u64(), ""),
+    });
+    let _ = close_thread.join().unwrap();
+    assert_ne!(client.state(), SessionState::Failed);
+}
+
+#[test]
+fn graceful_close_drain_delivers_peer_credit_to_blocked_writer() {
+    let client_config = Config {
+        close_drain_timeout: Duration::from_secs(2),
+        go_away_drain_interval: Duration::ZERO,
+        ..Config::default()
+    };
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 16,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    let stream = client.open_stream().unwrap();
+    let writer_stream = stream.clone();
+    let writer = thread::spawn(move || writer_stream.write_final(&[7u8; 64][..]));
+    let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    let stream_id = opened.stream_id;
+
+    let closer = client.clone();
+    let started = Instant::now();
+    let close_thread = thread::spawn(move || closer.close());
+    let _ = peer.wait_for_frame(|frame| frame.frame_type == FrameType::GoAway);
+    // Credit granted during the drain reaches the blocked writer.
+    peer.write_frame(Frame {
+        frame_type: FrameType::MaxData,
+        flags: 0,
+        stream_id,
+        payload: encode_varint(1024).unwrap(),
+    });
+    let _fin = peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::Data
+            && frame.stream_id == stream_id
+            && frame.flags & FRAME_FLAG_FIN != 0
+    });
+    assert_eq!(writer.join().unwrap().unwrap(), 64);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: FRAME_FLAG_FIN,
+        stream_id,
+        payload: Vec::new(),
+    });
+
+    let close = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Close);
+    let (code, _) = parse_error_payload(&close.payload).unwrap();
+    assert_eq!(code, ErrorCode::NoError.as_u64());
+    close_thread.join().unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+fn go_away_watermarks(frames: &[Frame]) -> Vec<(u64, u64)> {
+    frames
+        .iter()
+        .filter(|frame| frame.frame_type == FrameType::GoAway)
+        .map(|frame| {
+            let payload = parse_go_away_payload(&frame.payload).unwrap();
+            (payload.last_accepted_bidi, payload.last_accepted_uni)
+        })
+        .collect()
+}
+
+fn assert_non_increasing_go_aways(watermarks: &[(u64, u64)]) {
+    for pair in watermarks.windows(2) {
+        assert!(
+            pair[1].0 <= pair[0].0 && pair[1].1 <= pair[0].1,
+            "GOAWAY watermarks increased on the wire: {watermarks:?}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_go_away_calls_keep_wire_watermarks_non_increasing() {
+    // Watermarks of peer-opened (responder) streams, most permissive first.
+    let requests: Vec<(u64, u64)> = (0..8u64)
+        .map(|i| (4 * (200 - 20 * i) + 1, 4 * (200 - 20 * i) + 3))
+        .chain([(5, 7)])
+        .collect();
+    for _ in 0..200 {
+        let (client, mut peer) = client_with_raw_peer(Config::default());
+        let barrier = Arc::new(Barrier::new(requests.len()));
+        let callers: Vec<_> = requests
+            .iter()
+            .copied()
+            .map(|(bidi, uni)| {
+                let client = client.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    client.go_away(bidi, uni)
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
+
+        // Both calls returned after their GOAWAY (if any) was written.
+        let watermarks = go_away_watermarks(&peer.drain_frames());
+        assert!(!watermarks.is_empty());
+        assert_non_increasing_go_aways(&watermarks);
+        assert_eq!(watermarks.last(), Some(&(5, 7)));
+        client.close_with_error(0, "").ok();
+    }
+}
+
+#[test]
+fn graceful_close_racing_go_away_keeps_wire_watermarks_non_increasing() {
+    for _ in 0..60 {
+        let client_config = Config {
+            close_drain_timeout: Duration::from_millis(20),
+            go_away_drain_interval: Duration::ZERO,
+            ..Config::default()
+        };
+        let (client, mut peer) = client_with_raw_peer(client_config);
+        let stream = client.open_stream().unwrap();
+        stream.write(b"hold-open").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let closer = {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                let _ = client.close();
+            })
+        };
+        let go_away = {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                let _ = client.go_away(5, 7);
+            })
+        };
+        closer.join().unwrap();
+        go_away.join().unwrap();
+
+        let frames = peer.collect_frames_for(Duration::from_millis(20));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.frame_type == FrameType::Close));
+        assert_non_increasing_go_aways(&go_away_watermarks(&frames));
+    }
+}
+
+#[test]
+fn peer_stop_sending_does_not_stall_reader_behind_blocked_local_write() {
+    let client_config = Config {
+        stop_sending_graceful_drain_window: Some(Duration::from_millis(1500)),
+        ..Config::default()
+    };
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 16,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    let stream = client.open_stream().unwrap();
+    let writer_stream = stream.clone();
+    let writer = thread::spawn(move || writer_stream.write_all(&[7u8; 64][..]));
+    let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    thread::sleep(Duration::from_millis(20));
+
+    let started = Instant::now();
+    peer.write_frame(Frame {
+        frame_type: FrameType::StopSending,
+        flags: 0,
+        stream_id: opened.stream_id,
+        payload: error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    });
+    peer.write_frame(Frame {
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        payload: b"liveness".to_vec(),
+    });
+
+    // The reader answers the PING without waiting out the drain window, and
+    // the stopped send half ends at once (RESET, or FIN if it was immediate).
+    let mut saw_pong = false;
+    let mut saw_terminal = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !(saw_pong && saw_terminal) && Instant::now() < deadline {
+        for frame in peer.drain_frames() {
+            if frame.frame_type == FrameType::Pong {
+                saw_pong = true;
+            } else if frame.stream_id == opened.stream_id
+                && (frame.frame_type == FrameType::Reset
+                    || (frame.frame_type == FrameType::Data && frame.flags & FRAME_FLAG_FIN != 0))
+            {
+                saw_terminal = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        saw_pong && saw_terminal,
+        "pong={saw_pong} terminal={saw_terminal}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "reader stalled for {:?}",
+        started.elapsed()
+    );
+    assert!(writer.join().unwrap().is_err());
+    assert_eq!(client.state(), SessionState::Ready);
+}
+
+#[test]
+fn peer_stop_sending_while_write_awaits_transport_does_not_stall_reader() {
+    let (client_io, mut peer_io) = memory_pair();
+    let client_read = client_io.clone();
+    let (client_write, writer_gate) = blocking_writer(client_io, 1);
+    let client_config = Config {
+        stop_sending_graceful_drain_window: Some(Duration::from_millis(1500)),
+        ..Config::default()
+    };
+    let client_thread = thread::spawn(move || {
+        Conn::client_with_config((client_read, client_write), client_config).unwrap()
+    });
+    let _client_preface = read_preface(&mut peer_io).unwrap();
+    let server_preface = Config::responder().local_preface().unwrap();
+    peer_io
+        .write_all(&server_preface.marshal().unwrap())
+        .unwrap();
+    peer_io.flush().unwrap();
+    let client = client_thread.join().unwrap();
+    let mut peer = RawPeer {
+        io: peer_io,
+        read_buf: Vec::new(),
+    };
+
+    // The application write holds the stream's write path while it waits for
+    // the stuck transport write to complete.
+    let stream = client.open_stream().unwrap();
+    let writer_stream = stream.clone();
+    let writer = thread::spawn(move || writer_stream.write(b"x"));
+    writer_gate.wait_blocked();
+
+    let started = Instant::now();
+    peer.write_frame(Frame {
+        frame_type: FrameType::StopSending,
+        flags: 0,
+        stream_id: stream.stream_id(),
+        payload: error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    });
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id: 1,
+        payload: b"next".to_vec(),
+    });
+    // The reader must not wait out the STOP_SENDING drain window for the busy
+    // write path before handling the next frame.
+    let accepted = client
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(accepted.stream_id(), 1);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "reader stalled for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(client.state(), SessionState::Ready);
+
+    writer_gate.release();
+    let _ = writer.join().unwrap();
+    let terminal = peer.wait_for_frame(|frame| {
+        frame.stream_id == stream.stream_id()
+            && (frame.frame_type == FrameType::Reset
+                || (frame.frame_type == FrameType::Data && frame.flags & FRAME_FLAG_FIN != 0))
+    });
+    assert_eq!(terminal.frame_type, FrameType::Reset);
+    client
+        .close_with_error(ErrorCode::Cancelled.as_u64(), "test shutdown")
+        .ok();
+}
+
+#[test]
+fn local_abort_racing_peer_stop_sending_keeps_session_open() {
+    let client_config = Config {
+        stop_sending_graceful_drain_window: Some(Duration::from_millis(1500)),
+        ..Config::default()
+    };
+    let peer_config = Config {
+        settings: Settings {
+            initial_max_stream_data_bidi_peer_opened: 16,
+            ..Settings::default()
+        },
+        ..Config::responder()
+    };
+    let (client, mut peer) = client_with_raw_peer_configs(client_config, peer_config);
+    let stream = client.open_stream().unwrap();
+    let writer_stream = stream.clone();
+    let writer = thread::spawn(move || writer_stream.write_all(&[7u8; 64][..]));
+    let opened = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Data);
+    thread::sleep(Duration::from_millis(20));
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::StopSending,
+        flags: 0,
+        stream_id: opened.stream_id,
+        payload: error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    });
+    thread::sleep(Duration::from_millis(200));
+    stream.close_with_error(0x77, "local abort").unwrap();
+    let _ = writer.join().unwrap();
+
+    // A stream-local race never escalates to a session CLOSE.
+    let frames = peer.collect_frames_for(Duration::from_millis(300));
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.frame_type == FrameType::Close),
+        "{frames:?}"
+    );
+    assert_eq!(client.state(), SessionState::Ready);
+}
+
+/// Accepts one TCP connection, reads the client preface, and sends a responder
+/// preface in `chunk`-byte pieces with `delay` before each piece. The socket is
+/// returned so it stays open until the test ends.
+fn spawn_delayed_preface_server(
+    delay: Duration,
+    chunk: usize,
+) -> (std::net::SocketAddr, thread::JoinHandle<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let _ = read_preface(&mut socket).unwrap();
+        let preface = Config::responder()
+            .local_preface()
+            .unwrap()
+            .marshal()
+            .unwrap();
+        for piece in preface.chunks(chunk) {
+            thread::sleep(delay);
+            if socket.write_all(piece).is_err() {
+                break;
+            }
+        }
+        socket
+    });
+    (addr, server)
+}
+
+#[test]
+fn establishment_timeout_bounds_a_silent_tcp_peer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || listener.accept().unwrap().0);
+
+    let started = Instant::now();
+    let config = Config::default().establishment_timeout(Duration::from_millis(200));
+    let err = match Conn::client_with_config(TcpStream::connect(addr).unwrap(), config) {
+        Ok(_) => panic!("establishment with a silent peer unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    let elapsed = started.elapsed();
+    // A real socket read timeout (WouldBlock on Unix) is reported as the
+    // establishment timeout.
+    assert!(err.is_timeout(), "{err:?}");
+    assert_eq!(err.code(), Some(ErrorCode::Internal));
+    assert_eq!(err.termination_kind(), TerminationKind::Timeout);
+    assert!(err
+        .to_string()
+        .contains("peer preface read stalled during establishment"));
+    assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    drop(server.join().unwrap());
+}
+
+#[test]
+fn establishment_timeout_allows_a_slow_but_compliant_peer() {
+    // Longer than the old fixed 1 s bound, inside the configured timeout.
+    let (addr, server) = spawn_delayed_preface_server(Duration::from_millis(1300), usize::MAX);
+    let config = Config::default().establishment_timeout(Duration::from_secs(3));
+    let client = Conn::client_with_config(TcpStream::connect(addr).unwrap(), config).unwrap();
+    assert_eq!(client.state(), SessionState::Ready);
+    let _socket = server.join().unwrap();
+    client.close_with_error(0, "").ok();
+}
+
+#[test]
+fn establishment_timeout_bounds_the_whole_peer_preface() {
+    // Every piece arrives well inside the timeout, but the whole preface does
+    // not: the deadline covers the preface, not each read.
+    let (addr, server) = spawn_delayed_preface_server(Duration::from_millis(120), 1);
+    let config = Config::default().establishment_timeout(Duration::from_millis(500));
+    let started = Instant::now();
+    let err = match Conn::client_with_config(TcpStream::connect(addr).unwrap(), config) {
+        Ok(_) => panic!("trickled preface unexpectedly established"),
+        Err(err) => err,
+    };
+    assert!(err.is_timeout(), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(server.join().unwrap());
+}
+
+#[test]
+fn write_discarded_by_peer_stop_sending_reports_the_stop() {
+    let (client, mut peer, gate) = client_with_stallable_raw_peer(Config::default());
+    let stopped = client.open_stream().unwrap();
+    stopped.write(b"opened").unwrap();
+    let stopped_id = stopped.stream_id();
+    peer.wait_for_frame(|frame| {
+        frame.frame_type == FrameType::Data && frame.stream_id == stopped_id
+    });
+
+    // Another stream's write wedges the transport writer, so the next write on
+    // `stopped` stays queued while it holds that stream's write path.
+    let other = client.open_stream().unwrap();
+    let _stuck = start_stalled_write(&other, &gate);
+    let (tx, rx) = mpsc::channel();
+    let writer = stopped.clone();
+    thread::spawn(move || {
+        let _ = tx.send(writer.write(b"queued"));
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while client.stats().writer_queue.data_queued_bytes == 0 {
+        assert!(Instant::now() < deadline, "write did not queue");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    peer.write_frame(Frame {
+        frame_type: FrameType::StopSending,
+        flags: 0,
+        stream_id: stopped_id,
+        payload: error_payload(77, "peer stop"),
+    });
+    // The RESET answering the stop discards the queued write; the write reports
+    // the peer's stop, not a bare local discard.
+    let err = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("queued write was not released")
+        .unwrap_err();
+    assert_eq!(err.numeric_code(), Some(77), "{err:?}");
+    assert_eq!(err.source(), ErrorSource::Remote);
+    assert_eq!(err.termination_kind(), TerminationKind::Stopped);
+    assert_eq!(client.state(), SessionState::Ready);
+    client.close_with_error(0, "").ok();
+}
+
+// Spec fixture runners: invalid_cases.ndjson cases driven against a live
+// responder session by a raw initiator peer, asserting the fixture's
+// expected_result (CLOSE / ABORT code or ignore) as it reaches the wire.
+
+const INVALID_CASE_FIXTURES: &str = include_str!("../testdata/fixtures/invalid_cases.ndjson");
+const WIRE_VALID_FIXTURES: &str = include_str!("../testdata/fixtures/wire_valid.ndjson");
+
+fn fixture_cases(name: &str, content: &str) -> Vec<serde_json::Value> {
+    serde_json::Deserializer::from_str(content)
+        .into_iter::<serde_json::Value>()
+        .map(|case| case.unwrap_or_else(|err| panic!("{name}: invalid JSON: {err}")))
+        .collect()
+}
+
+fn fixture_hex(id: &str, hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "{id}: odd hex length");
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn shape_u64(id: &str, shape: &serde_json::Value, key: &str) -> u64 {
+    shape[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{id}: input_shape.{key} missing"))
+}
+
+fn shape_str<'a>(id: &str, shape: &'a serde_json::Value, key: &str) -> &'a str {
+    shape[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("{id}: input_shape.{key} missing"))
+}
+
+fn shape_usize(id: &str, shape: &serde_json::Value, key: &str) -> usize {
+    u64_to_usize(shape_u64(id, shape, key))
+}
+
+fn frame_type_named(id: &str, name: &str) -> FrameType {
+    [
+        FrameType::Data,
+        FrameType::MaxData,
+        FrameType::StopSending,
+        FrameType::Ping,
+        FrameType::Pong,
+        FrameType::Blocked,
+        FrameType::Reset,
+        FrameType::Abort,
+        FrameType::GoAway,
+        FrameType::Close,
+        FrameType::Ext,
+    ]
+    .into_iter()
+    .find(|frame_type| frame_type.to_string() == name)
+    .unwrap_or_else(|| panic!("{id}: unknown frame type {name:?}"))
+}
+
+fn raw_frame_bytes(frame_type: FrameType, flags: u8, stream_id: u64, payload: &[u8]) -> Vec<u8> {
+    let stream_id = encode_varint(stream_id).unwrap();
+    let mut raw = encode_varint(usize_to_u64(1 + stream_id.len() + payload.len())).unwrap();
+    raw.push(frame_type.as_u8() | flags);
+    raw.extend_from_slice(&stream_id);
+    raw.extend_from_slice(payload);
+    raw
+}
+
+/// Encodes `input_shape.stream_metadata_tlvs` ({type, value} or {type, value_hex}).
+fn shape_metadata_tlvs(id: &str, shape: &serde_json::Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    for tlv in shape["stream_metadata_tlvs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{id}: input_shape.stream_metadata_tlvs missing"))
+    {
+        let typ = match shape_str(id, tlv, "type") {
+            "stream_priority" => METADATA_STREAM_PRIORITY,
+            "stream_group" => zmux::METADATA_STREAM_GROUP,
+            "open_info" => zmux::METADATA_OPEN_INFO,
+            other => panic!("{id}: unknown metadata TLV {other:?}"),
+        };
+        let value = match (tlv["value"].as_u64(), tlv["value_hex"].as_str()) {
+            (Some(value), None) => encode_varint(value).unwrap(),
+            (None, Some(hex)) => fixture_hex(id, hex),
+            _ => panic!("{id}: metadata TLV needs exactly one of value or value_hex"),
+        };
+        append_tlv(&mut out, typ, &value).unwrap();
+    }
+    out
+}
+
+/// The raw peer's capabilities for `input_shape.capabilities`: absent keeps the
+/// defaults, `[]` negotiates nothing. A listed priority_update also enables
+/// priority hints so an applied (or ignored) stream_priority is observable.
+fn shape_peer_config(id: &str, shape: &serde_json::Value) -> Config {
+    let Some(names) = shape.get("capabilities") else {
+        return Config::initiator();
+    };
+    let names = names
+        .as_array()
+        .unwrap_or_else(|| panic!("{id}: input_shape.capabilities is not an array"));
+    if names.is_empty() {
+        return Config::initiator().disable_capabilities();
+    }
+    let mut capabilities = 0;
+    for name in names {
+        capabilities |= match name.as_str() {
+            Some("open_metadata") => CAPABILITY_OPEN_METADATA,
+            Some("priority_update") => CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS,
+            Some("priority_hints") => CAPABILITY_PRIORITY_HINTS,
+            Some("stream_groups") => CAPABILITY_STREAM_GROUPS,
+            other => panic!("{id}: unknown capability {other:?}"),
+        };
+    }
+    Config::initiator().capabilities(capabilities)
+}
+
+/// A responder session under test with a raw initiator peer. invalid_cases
+/// fixtures describe peer-opened streams with initiator stream IDs (4, 8, ...),
+/// so those IDs are used verbatim.
+fn server_with_raw_peer(server_config: Config) -> (Conn, RawPeer) {
+    server_with_raw_peer_configs(server_config, Config::initiator())
+}
+
+fn server_with_raw_peer_configs(server_config: Config, peer_config: Config) -> (Conn, RawPeer) {
+    let (server_io, mut peer_io) = memory_pair();
+    let server_read = server_io.clone();
+    let server_write = server_io;
+
+    let server_thread = thread::spawn(move || {
+        Conn::server_with_config((server_read, server_write), server_config).unwrap()
+    });
+    let peer_preface = peer_config.local_preface().unwrap();
+    peer_io.write_all(&peer_preface.marshal().unwrap()).unwrap();
+    peer_io.flush().unwrap();
+    let _server_preface = read_preface(&mut peer_io).unwrap();
+
+    (
+        server_thread.join().unwrap(),
+        RawPeer {
+            io: peer_io,
+            read_buf: Vec::new(),
+        },
+    )
+}
+
+fn open_raw_peer_stream(
+    server: &Conn,
+    peer: &mut RawPeer,
+    stream_id: u64,
+    flags: u8,
+) -> zmux::Stream {
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags,
+        stream_id,
+        payload: b"hi".to_vec(),
+    });
+    let stream = server
+        .accept_stream_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(stream.stream_id(), stream_id);
+    stream
+}
+
+/// What an invalid_cases.ndjson fixture expects from the receiving session.
+#[derive(Debug)]
+enum InvalidCaseExpectation {
+    /// CLOSE(code) on the wire and a failed session.
+    Session(ErrorCode),
+    /// ABORT(code) on the offending stream while the session stays open.
+    Stream(ErrorCode),
+    /// No ABORT or CLOSE: the frame, or its metadata block, is ignored.
+    Ignore,
+    /// A local send policy rejects the operation before anything is written.
+    ForbidSend,
+}
+
+fn invalid_case_expectation(id: &str, case: &serde_json::Value) -> InvalidCaseExpectation {
+    let expected = &case["expected_result"];
+    if let Some(name) = expected["error"].as_str() {
+        let code = (0..=u64::from(u8::MAX))
+            .filter_map(ErrorCode::from_u64)
+            .find(|code| code.as_str() == name)
+            .unwrap_or_else(|| panic!("{id}: unknown error code {name:?}"));
+        return match expected["scope"].as_str() {
+            Some("session") => InvalidCaseExpectation::Session(code),
+            Some("stream") => InvalidCaseExpectation::Stream(code),
+            other => panic!("{id}: unexpected error scope {other:?}"),
+        };
+    }
+    match expected["action"].as_str() {
+        Some("ignore" | "ignore_entire_update_payload" | "ignore_entire_open_metadata_block") => {
+            InvalidCaseExpectation::Ignore
+        }
+        Some("forbid_send") => InvalidCaseExpectation::ForbidSend,
+        other => panic!("{id}: unsupported expected action {other:?}"),
+    }
+}
+
+/// The PONG proves the session handled every earlier frame and is still open;
+/// no ABORT or CLOSE may precede it.
+fn assert_raw_peer_session_survives(id: &str, server: &Conn, peer: &mut RawPeer) {
+    let token = b"fixture!".to_vec();
+    peer.write_frame(Frame {
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        payload: token.clone(),
+    });
+    let frame = peer.wait_for_frame(|frame| {
+        matches!(
+            frame.frame_type,
+            FrameType::Pong | FrameType::Abort | FrameType::Close
+        )
+    });
+    assert_eq!(frame.frame_type, FrameType::Pong, "{id}: {frame:?}");
+    assert_eq!(frame.payload, token, "{id}");
+    assert_eq!(server.state(), SessionState::Ready, "{id}");
+}
+
+fn assert_invalid_case_outcome(
+    id: &str,
+    expected: &InvalidCaseExpectation,
+    server: &Conn,
+    peer: &mut RawPeer,
+    stream_id: u64,
+) {
+    match *expected {
+        InvalidCaseExpectation::Session(code) => {
+            let _ = assert_peer_receives_fatal_close(server, peer, code, id);
+        }
+        InvalidCaseExpectation::Stream(code) => {
+            let frame = peer.wait_for_frame(|frame| {
+                frame.frame_type == FrameType::Close
+                    || (frame.frame_type == FrameType::Abort && frame.stream_id == stream_id)
+            });
+            assert_eq!(frame.frame_type, FrameType::Abort, "{id}: {frame:?}");
+            let (got, reason) = parse_error_payload(&frame.payload).unwrap();
+            assert_eq!(got, code.as_u64(), "{id}: ABORT reason {reason:?}");
+            assert_raw_peer_session_survives(id, server, peer);
+        }
+        InvalidCaseExpectation::Ignore => assert_raw_peer_session_survives(id, server, peer),
+        InvalidCaseExpectation::ForbidSend => {
+            panic!("{id}: a local send policy is not a peer input")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidCaseGroup {
+    /// Malformed frames the reader rejects before any stream state applies.
+    MalformedFrame,
+    /// A non-opening frame is the first frame on a never-opened peer stream.
+    FirstFrameOnUnusedStream,
+    /// PRIORITY_UPDATE and unknown EXT subtypes.
+    Ext,
+    OpenMetadata,
+    FlowControl,
+    /// Wrong-side uni frames, peer stream ID gaps and GOAWAY watermarks.
+    StreamState,
+    LocalSendPolicy,
+}
+
+fn invalid_case_group(id: &str) -> Option<InvalidCaseGroup> {
+    use InvalidCaseGroup::{
+        Ext, FirstFrameOnUnusedStream, FlowControl, LocalSendPolicy, MalformedFrame, OpenMetadata,
+        StreamState,
+    };
+    Some(match id {
+        "frame_length_too_small"
+        | "frame_length_smaller_than_stream_id_prefix"
+        | "frame_ext_payload_underflow"
+        | "frame_ping_with_forbidden_fin_flag"
+        | "frame_pong_too_short"
+        | "frame_abort_on_stream_zero"
+        | "frame_max_data_trailing_garbage"
+        | "frame_blocked_trailing_garbage"
+        | "frame_unknown_core_type" => MalformedFrame,
+        "frame_first_max_data_on_unused_stream"
+        | "frame_first_blocked_on_unused_stream"
+        | "frame_first_stop_sending_on_unused_stream"
+        | "frame_first_reset_on_unused_stream" => FirstFrameOnUnusedStream,
+        "frame_priority_update_duplicate_singleton"
+        | "frame_priority_update_truncated_tlv_header"
+        | "frame_priority_update_tlv_value_overrun"
+        | "frame_priority_update_noncanonical_value"
+        | "frame_priority_update_without_capability"
+        | "frame_priority_update_on_unused_stream"
+        | "frame_priority_update_on_terminal_stream"
+        | "frame_unknown_ext_subtype" => Ext,
+        "frame_data_open_metadata_without_capability"
+        | "frame_data_open_metadata_on_open_stream"
+        | "frame_data_open_metadata_duplicate_singleton" => OpenMetadata,
+        "frame_data_exceeds_stream_max_data" | "frame_data_exceeds_session_max_data" => FlowControl,
+        "frame_peer_stream_id_gap"
+        | "frame_blocked_wrong_side_uni"
+        | "frame_data_wrong_side_uni"
+        | "frame_max_data_wrong_side_uni"
+        | "frame_stop_sending_wrong_side_uni"
+        | "frame_reset_wrong_side_uni"
+        | "session_goaway_last_accepted_increase" => StreamState,
+        "frame_ping_payload_exceeds_local_echoable_limit" => LocalSendPolicy,
+        _ => return None,
+    })
+}
+
+/// invalid_cases fixtures this runner deliberately does not drive: they are
+/// local retention/churn policies rather than one peer input. preface_* cases
+/// are checked by tests/codec_fixtures.rs (parse and negotiation).
+const INVALID_CASES_NOT_DRIVEN_BY_RAW_PEER: &[&str] = &[
+    "local_provisional_open_cancel_must_not_burn_stream_id",
+    "hidden_control_opened_stream_exceeds_hard_cap_without_shedding",
+    "late_data_after_close_read_exceeds_session_aggregate_cap",
+    "rapid_open_abort_churn_without_local_limit",
+];
+
+fn run_invalid_case_group(group: InvalidCaseGroup) {
+    let mut ran = 0usize;
+    for case in fixture_cases("invalid_cases.ndjson", INVALID_CASE_FIXTURES) {
+        let id = case["id"].as_str().unwrap();
+        if invalid_case_group(id) != Some(group) {
+            continue;
+        }
+        let expected = invalid_case_expectation(id, &case);
+        let shape = &case["input_shape"];
+        match group {
+            InvalidCaseGroup::MalformedFrame => run_malformed_frame_case(id, &case, &expected),
+            InvalidCaseGroup::FirstFrameOnUnusedStream => {
+                run_first_frame_on_unused_stream_case(id, shape, &expected);
+            }
+            InvalidCaseGroup::Ext => run_ext_case(id, shape, &expected),
+            InvalidCaseGroup::OpenMetadata => run_open_metadata_case(id, shape, &expected),
+            InvalidCaseGroup::FlowControl => run_flow_control_case(id, shape, &expected),
+            InvalidCaseGroup::StreamState => run_stream_state_case(id, shape, &expected),
+            InvalidCaseGroup::LocalSendPolicy => run_ping_send_policy_case(id, shape, &expected),
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "{group:?}: no invalid_cases fixtures");
+}
+
+fn run_malformed_frame_case(id: &str, case: &serde_json::Value, expected: &InvalidCaseExpectation) {
+    let shape = &case["input_shape"];
+    let raw = if let Some(hex) = case["hex"].as_str() {
+        fixture_hex(id, hex)
+    } else {
+        match id {
+            "frame_length_too_small" => {
+                let mut raw = encode_varint(shape_u64(id, shape, "frame_length")).unwrap();
+                raw.push(FrameType::Data.as_u8());
+                raw
+            }
+            "frame_length_smaller_than_stream_id_prefix" => {
+                let stream_id = match shape_u64(id, shape, "stream_id_encoding_length") {
+                    2 => 1 << 6,
+                    4 => 1 << 14,
+                    8 => 1 << 30,
+                    other => panic!("{id}: unsupported stream_id_encoding_length {other}"),
+                };
+                let mut raw = encode_varint(shape_u64(id, shape, "frame_length")).unwrap();
+                raw.push(FrameType::Data.as_u8());
+                raw.extend(encode_varint(stream_id).unwrap());
+                raw
+            }
+            "frame_ext_payload_underflow" => raw_frame_bytes(FrameType::Ext, 0, 0, &[]),
+            "frame_pong_too_short" => {
+                let payload: Vec<u8> = (1..=shape_usize(id, shape, "payload_len"))
+                    .map(|byte| byte as u8)
+                    .collect();
+                raw_frame_bytes(FrameType::Pong, 0, 0, &payload)
+            }
+            "frame_abort_on_stream_zero" => raw_frame_bytes(
+                FrameType::Abort,
+                0,
+                shape_u64(id, shape, "stream_id"),
+                &encode_varint(ErrorCode::Cancelled.as_u64()).unwrap(),
+            ),
+            "frame_max_data_trailing_garbage" | "frame_blocked_trailing_garbage" => {
+                assert_eq!(
+                    shape_str(id, shape, "payload_shape"),
+                    "canonical_varint_plus_trailing_bytes"
+                );
+                raw_frame_bytes(
+                    frame_type_named(id, shape_str(id, shape, "frame_type")),
+                    0,
+                    shape_u64(id, shape, "stream_id"),
+                    &[0x05, 0x01],
+                )
+            }
+            other => panic!("{other}: no malformed-frame bytes"),
+        }
+    };
+
+    let (server, mut peer) = server_with_raw_peer(Config::default());
+    peer.io.write_all(&raw).unwrap();
+    peer.io.flush().unwrap();
+    assert_invalid_case_outcome(id, expected, &server, &mut peer, 0);
+}
+
+fn run_first_frame_on_unused_stream_case(
+    id: &str,
+    shape: &serde_json::Value,
+    expected: &InvalidCaseExpectation,
+) {
+    assert_eq!(shape_str(id, shape, "initial_stream_state"), "idle");
+    let stream_id = shape_u64(id, shape, "stream_id");
+    let frame_type = frame_type_named(id, shape_str(id, shape, "incoming_frame"));
+    let payload = match frame_type {
+        FrameType::MaxData | FrameType::Blocked => encode_varint(1024).unwrap(),
+        _ => error_payload(ErrorCode::Cancelled.as_u64(), ""),
+    };
+
+    let (server, mut peer) = server_with_raw_peer(Config::default());
+    peer.write_frame(Frame {
+        frame_type,
+        flags: 0,
+        stream_id,
+        payload,
+    });
+    assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+    assert!(server
+        .accept_stream_timeout(Duration::from_millis(10))
+        .is_err());
+}
+
+fn run_ext_case(id: &str, shape: &serde_json::Value, expected: &InvalidCaseExpectation) {
+    let stream_id = shape_u64(id, shape, "stream_id");
+    let (server, mut peer) =
+        server_with_raw_peer_configs(Config::default(), shape_peer_config(id, shape));
+
+    let stream = match id {
+        "frame_unknown_ext_subtype" | "frame_priority_update_on_unused_stream" => None,
+        "frame_priority_update_on_terminal_stream" => {
+            assert_eq!(shape_str(id, shape, "stream_state"), "terminal");
+            let stream = open_raw_peer_stream(&server, &mut peer, stream_id, FRAME_FLAG_FIN);
+            assert_eq!(read_all_stream(&stream), b"hi");
+            stream.close_write().unwrap();
+            peer.wait_for_frame(|frame| {
+                frame.frame_type == FrameType::Data
+                    && frame.stream_id == stream_id
+                    && frame.flags & FRAME_FLAG_FIN != 0
+            });
+            Some(stream)
+        }
+        _ => Some(open_raw_peer_stream(&server, &mut peer, stream_id, 0)),
+    };
+    if id == "frame_priority_update_on_unused_stream" {
+        assert_eq!(shape["stream_exists"].as_bool(), Some(false));
+    }
+
+    let payload = if id == "frame_unknown_ext_subtype" {
+        encode_varint(shape_u64(id, shape, "ext_type")).unwrap()
+    } else {
+        assert_eq!(shape_str(id, shape, "ext_type"), "PRIORITY_UPDATE");
+        let mut payload = encode_varint(EXT_PRIORITY_UPDATE).unwrap();
+        match shape["payload_shape"].as_str() {
+            Some("truncated_stream_hint_tlv_header") => {
+                payload.push(METADATA_STREAM_PRIORITY as u8);
+            }
+            Some("stream_hint_tlv_value_overrun") => {
+                payload.extend_from_slice(&[METADATA_STREAM_PRIORITY as u8, 0x02, 0x01]);
+            }
+            Some(other) => panic!("{id}: unknown payload_shape {other:?}"),
+            None if shape.get("stream_metadata_tlvs").is_some() => {
+                payload.extend(shape_metadata_tlvs(id, shape));
+            }
+            None => append_tlv(&mut payload, METADATA_STREAM_PRIORITY, &[0x07]).unwrap(),
+        }
+        payload
+    };
+    peer.write_raw_frame_parts(FrameType::Ext, 0, stream_id, &payload);
+    assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+
+    if matches!(expected, InvalidCaseExpectation::Ignore) {
+        if let Some(stream) = stream {
+            assert_eq!(
+                stream.metadata().priority,
+                None,
+                "{id}: an ignored PRIORITY_UPDATE must not change the stream"
+            );
+        } else {
+            assert!(
+                server
+                    .accept_stream_timeout(Duration::from_millis(10))
+                    .is_err(),
+                "{id}: an ignored EXT must not open a stream"
+            );
+        }
+    }
+}
+
+fn run_open_metadata_case(id: &str, shape: &serde_json::Value, expected: &InvalidCaseExpectation) {
+    let stream_id = shape_u64(id, shape, "stream_id");
+    let (server, mut peer) =
+        server_with_raw_peer_configs(Config::default(), shape_peer_config(id, shape));
+    let _existing = (shape["stream_exists"].as_bool() == Some(true))
+        .then(|| open_raw_peer_stream(&server, &mut peer, stream_id, 0));
+
+    let (tlvs, app_data) = if shape.get("stream_metadata_tlvs").is_some() {
+        let app_hex = shape_str(id, shape, "application_payload_hex");
+        (shape_metadata_tlvs(id, shape), fixture_hex(id, app_hex))
+    } else {
+        let mut tlvs = Vec::new();
+        append_tlv(&mut tlvs, zmux::METADATA_OPEN_INFO, b"x").unwrap();
+        (tlvs, b"hi".to_vec())
+    };
+    let mut payload = encode_varint(usize_to_u64(tlvs.len())).unwrap();
+    payload.extend(tlvs);
+    payload.extend_from_slice(&app_data);
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: FRAME_FLAG_OPEN_METADATA,
+        stream_id,
+        payload,
+    });
+    assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+
+    if matches!(expected, InvalidCaseExpectation::Ignore) {
+        // The whole metadata block is dropped; the stream still opens and
+        // delivers its application bytes.
+        let stream = server
+            .accept_stream_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(stream.stream_id(), stream_id);
+        assert!(stream.open_info().is_empty(), "{id}");
+        let metadata = stream.metadata();
+        assert_eq!((metadata.priority, metadata.group), (None, None), "{id}");
+        assert_eq!(read_once_stream(&stream), app_data, "{id}");
+    }
+}
+
+fn run_flow_control_case(id: &str, shape: &serde_json::Value, expected: &InvalidCaseExpectation) {
+    let stream_id = shape_u64(id, shape, "stream_id");
+    let mut settings = Settings::default();
+    let received = match id {
+        "frame_data_exceeds_stream_max_data" => {
+            settings.initial_max_stream_data_bidi_peer_opened =
+                shape_u64(id, shape, "peer_stream_max_data");
+            shape_usize(id, shape, "stream_bytes_received")
+        }
+        "frame_data_exceeds_session_max_data" => {
+            settings.initial_max_data = shape_u64(id, shape, "peer_session_max_data");
+            shape_usize(id, shape, "session_bytes_received")
+        }
+        other => panic!("{other}: not a flow-control fixture"),
+    };
+
+    let (server, mut peer) = server_with_raw_peer(Config {
+        settings,
+        ..Config::default()
+    });
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id,
+        payload: vec![b'a'; received],
+    });
+    peer.write_frame(Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id,
+        payload: vec![b'b'; shape_usize(id, shape, "incoming_data_length")],
+    });
+    assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+}
+
+fn run_stream_state_case(id: &str, shape: &serde_json::Value, expected: &InvalidCaseExpectation) {
+    let (server, mut peer) = server_with_raw_peer(Config::default());
+    match id {
+        "frame_peer_stream_id_gap" => {
+            // A fresh responder expects the first initiator-owned bidi ID.
+            assert_eq!(shape_u64(id, shape, "expected_next_stream_id"), 4);
+            let stream_id = shape_u64(id, shape, "incoming_stream_id");
+            peer.write_frame(Frame {
+                frame_type: frame_type_named(id, shape_str(id, shape, "incoming_frame")),
+                flags: 0,
+                stream_id,
+                payload: b"hi".to_vec(),
+            });
+            assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+        }
+        "session_goaway_last_accepted_increase" => {
+            for (bidi, uni) in [
+                (
+                    "prior_last_accepted_bidi_stream_id",
+                    "prior_last_accepted_uni_stream_id",
+                ),
+                (
+                    "incoming_last_accepted_bidi_stream_id",
+                    "incoming_last_accepted_uni_stream_id",
+                ),
+            ] {
+                peer.write_frame(Frame {
+                    frame_type: FrameType::GoAway,
+                    flags: 0,
+                    stream_id: 0,
+                    payload: build_go_away_payload(
+                        shape_u64(id, shape, bidi),
+                        shape_u64(id, shape, uni),
+                        ErrorCode::NoError.as_u64(),
+                        "",
+                    )
+                    .unwrap(),
+                });
+            }
+            assert_invalid_case_outcome(id, expected, &server, &mut peer, 0);
+        }
+        _ => {
+            let frame_type = frame_type_named(id, shape_str(id, shape, "incoming_frame"));
+            let mut _send = None;
+            let mut _recv = None;
+            let stream_id = match shape_str(id, shape, "stream_kind") {
+                "uni_local_send_only" => {
+                    let send = server.open_uni_stream().unwrap();
+                    send.write(b"x").unwrap();
+                    let stream_id = send.stream_id();
+                    peer.wait_for_frame(|frame| {
+                        frame.frame_type == FrameType::Data && frame.stream_id == stream_id
+                    });
+                    _send = Some(send);
+                    stream_id
+                }
+                "uni_local_receive_only" => {
+                    // The first initiator-owned uni stream.
+                    peer.write_frame(Frame {
+                        frame_type: FrameType::Data,
+                        flags: 0,
+                        stream_id: 2,
+                        payload: b"x".to_vec(),
+                    });
+                    let recv = server
+                        .accept_uni_stream_timeout(Duration::from_secs(1))
+                        .unwrap();
+                    let stream_id = recv.stream_id();
+                    _recv = Some(recv);
+                    stream_id
+                }
+                other => panic!("{id}: unknown stream_kind {other:?}"),
+            };
+            let payload = match frame_type {
+                FrameType::MaxData | FrameType::Blocked => encode_varint(1024).unwrap(),
+                FrameType::Data => b"wrong-way".to_vec(),
+                _ => error_payload(ErrorCode::Cancelled.as_u64(), ""),
+            };
+            peer.write_frame(Frame {
+                frame_type,
+                flags: 0,
+                stream_id,
+                payload,
+            });
+            assert_invalid_case_outcome(id, expected, &server, &mut peer, stream_id);
+        }
+    }
+}
+
+fn run_ping_send_policy_case(
+    id: &str,
+    shape: &serde_json::Value,
+    expected: &InvalidCaseExpectation,
+) {
+    assert!(
+        matches!(expected, InvalidCaseExpectation::ForbidSend),
+        "{id}: {expected:?}"
+    );
+    let (server, mut peer) = server_with_raw_peer_configs(
+        config_with_control_limit(
+            Config::default(),
+            shape_u64(id, shape, "local_max_control_payload_bytes"),
+        ),
+        config_with_control_limit(
+            Config::initiator(),
+            shape_u64(id, shape, "peer_max_control_payload_bytes"),
+        ),
+    );
+    // The 8-byte PING nonce counts toward the attempted payload length.
+    let echo = vec![0u8; shape_usize(id, shape, "attempted_ping_payload_len") - 8];
+
+    let err = server
+        .ping_timeout(&echo, Duration::from_millis(20))
+        .unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::FrameSize), "{id}: {err}");
+    assert!(!peer
+        .collect_frames_for(Duration::from_millis(50))
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::Ping));
+    assert_eq!(server.state(), SessionState::Ready);
+}
+
+#[test]
+fn invalid_case_fixtures_are_mapped_by_raw_peer_runner() {
+    for case in fixture_cases("invalid_cases.ndjson", INVALID_CASE_FIXTURES) {
+        let id = case["id"].as_str().unwrap();
+        assert!(
+            id.starts_with("preface_")
+                || invalid_case_group(id).is_some()
+                || INVALID_CASES_NOT_DRIVEN_BY_RAW_PEER.contains(&id),
+            "invalid_cases fixture {id:?} is not mapped by the raw-peer runner"
+        );
+    }
+}
+
+#[test]
+fn invalid_case_malformed_frame_fixtures_close_session() {
+    run_invalid_case_group(InvalidCaseGroup::MalformedFrame);
+}
+
+#[test]
+fn invalid_case_first_frame_on_unused_stream_fixtures_close_session() {
+    run_invalid_case_group(InvalidCaseGroup::FirstFrameOnUnusedStream);
+}
+
+#[test]
+fn invalid_case_ext_fixtures_on_live_session() {
+    run_invalid_case_group(InvalidCaseGroup::Ext);
+}
+
+#[test]
+fn invalid_case_open_metadata_fixtures_on_live_session() {
+    run_invalid_case_group(InvalidCaseGroup::OpenMetadata);
+}
+
+#[test]
+fn invalid_case_flow_control_fixtures_on_live_session() {
+    run_invalid_case_group(InvalidCaseGroup::FlowControl);
+}
+
+#[test]
+fn invalid_case_stream_state_fixtures_on_live_session() {
+    run_invalid_case_group(InvalidCaseGroup::StreamState);
+}
+
+#[test]
+fn invalid_case_local_send_policy_fixtures_on_live_session() {
+    run_invalid_case_group(InvalidCaseGroup::LocalSendPolicy);
+}
+
+#[test]
+fn wire_valid_padded_ping_tag_is_recognized() {
+    let case = fixture_cases("wire_valid.ndjson", WIRE_VALID_FIXTURES)
+        .into_iter()
+        .find(|case| case["id"] == "frame_ping_padded_tag")
+        .expect("frame_ping_padded_tag fixture");
+    let raw = fixture_hex("frame_ping_padded_tag", case["hex"].as_str().unwrap());
+    let key = case["expect"]["decoded"]["ping_padding_tag"]["ping_padding_key"]
+        .as_u64()
+        .unwrap();
+    let (ping, _) = Frame::parse(&raw, Limits::default()).unwrap();
+
+    // The tag is keyed by the PING sender's advertised ping_padding_key: under
+    // that key the responder recognizes it and pads its PONG; under any other
+    // key it is opaque and echoed exactly.
+    for (peer_key, padded) in [(key, true), (key ^ 1, false)] {
+        let server_config = Config {
+            ping_padding: true,
+            ping_padding_min_bytes: 16,
+            ping_padding_max_bytes: 16,
+            keepalive_interval: Duration::ZERO,
+            ..Config::default()
+        };
+        let peer_config = Config {
+            settings: Settings {
+                ping_padding_key: peer_key,
+                ..Settings::default()
+            },
+            ..Config::initiator()
+        };
+        let (server, mut peer) = server_with_raw_peer_configs(server_config, peer_config);
+        peer.io.write_all(&raw).unwrap();
+        peer.io.flush().unwrap();
+
+        let pong = peer.wait_for_frame(|frame| frame.frame_type == FrameType::Pong);
+        assert!(pong.payload.starts_with(&ping.payload));
+        assert_eq!(
+            pong.payload.len() > ping.payload.len(),
+            padded,
+            "key {peer_key:#x}"
+        );
+        server.close().unwrap();
+    }
 }

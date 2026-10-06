@@ -1,8 +1,8 @@
 use super::flow::{
-    negotiated_frame_payload, next_credit_limit, receive_window_exceeded, replenish_min_pending,
-    session_emergency_threshold, session_standing_growth_allowed, session_window_target,
-    should_flush_receive_credit, stream_emergency_threshold, stream_standing_growth_allowed,
-    stream_window_target,
+    negotiated_frame_payload, next_credit_limit, receive_window_exceeded, receive_window_exhausted,
+    replenish_min_pending, session_emergency_threshold, session_standing_growth_allowed,
+    session_window_target, should_flush_receive_credit, stream_emergency_threshold,
+    stream_standing_growth_allowed, stream_window_target,
 };
 use super::liveness::{
     canceled_ping_payload_matches, note_matching_pong_locked, pong_payload_for_ping_locked,
@@ -13,18 +13,19 @@ use super::state::{
     clear_stream_receive_credit_locked, emit_event, enforce_accept_backlog_bytes_locked,
     enforce_retained_open_info_budget_locked, enforce_session_memory_accept_backlog_locked,
     ensure_session_memory_cap, fail_pending_pings_locked, fail_session, fail_session_with_close,
-    has_terminal_marker_locked, late_data_cause_for, late_data_per_stream_cap,
+    has_terminal_marker_locked, late_data_allowance, late_data_cause_for, late_data_per_stream_cap,
     mark_stream_peer_visible_locked, maybe_release_active_count, note_abort_reason_locked,
     note_written_stream_frames_locked, queue_peer_visible_pending_priority,
     reap_expired_hidden_tombstones_locked, reclaim_provisionals_after_go_away,
-    reclaim_unseen_local_streams_after_go_away, refresh_accept_backlog_bytes_locked,
-    release_discarded_queued_stream_frames_locked, release_peer_reason_locked,
-    release_session_receive_buffered_locked, release_session_runtime_state_locked,
-    remove_accept_queue_entry_locked, retain_peer_go_away_error_locked, retain_peer_reason_locked,
-    retain_stream_abort_reason_locked, retain_stream_open_info_locked,
-    retain_stream_recv_reset_reason_locked, retain_stream_stopped_reason_locked,
-    session_memory_pressure_high_fast_locked, stream_fully_terminal,
-    take_session_closed_event_locked, terminal_marker_disposition_locked, PeerVisibleUpdate,
+    reclaim_unseen_local_streams_after_go_away, record_tombstone_locked,
+    refresh_accept_backlog_bytes_locked, release_discarded_queued_stream_frames_locked,
+    release_local_opener_turn, release_peer_reason_locked, release_session_receive_buffered_locked,
+    release_session_runtime_state_locked, remove_accept_queue_entry_locked,
+    retain_peer_go_away_error_locked, retain_peer_reason_locked, retain_stream_abort_reason_locked,
+    retain_stream_open_info_locked, retain_stream_recv_reset_reason_locked,
+    retain_stream_stopped_reason_locked, session_memory_pressure_high_fast_locked,
+    stream_fully_terminal, take_session_closed_event_locked, terminal_marker_disposition_locked,
+    PeerVisibleUpdate,
 };
 use super::types::*;
 use crate::error::{Error, ErrorCode, ErrorOperation, ErrorSource, Result};
@@ -32,8 +33,9 @@ use crate::frame::{
     read_session_frame, Frame, FrameType, Limits, FRAME_FLAG_FIN, FRAME_FLAG_OPEN_METADATA,
 };
 use crate::payload::{
-    build_code_payload, normalize_stream_group, parse_data_payload_metadata_offset,
-    parse_error_payload, parse_go_away_payload, parse_priority_update_metadata, StreamMetadata,
+    build_code_payload, malformed_payload_error, normalize_stream_group,
+    parse_data_payload_app_offset, parse_data_payload_metadata_offset, parse_inbound_error_payload,
+    parse_inbound_go_away_payload, parse_priority_update_metadata, StreamMetadata,
 };
 use crate::protocol::{
     capabilities_can_carry_group_in_update, capabilities_can_carry_group_on_open,
@@ -70,18 +72,7 @@ where
                 Ok(frame) => {
                     if let Err(err) = handle_frame(&inner, frame) {
                         let err = mark_inbound_error_source(err);
-                        let code = err.code().unwrap_or(ErrorCode::Protocol).as_u64();
-                        let close_frame = Frame {
-                            frame_type: FrameType::Close,
-                            flags: 0,
-                            stream_id: 0,
-                            payload: build_code_payload(
-                                code,
-                                &err.to_string(),
-                                inner.peer_preface.settings.max_control_payload_bytes,
-                            )
-                            .unwrap_or_default(),
-                        };
+                        let close_frame = session_close_frame_for(&inner, &err);
                         fail_session_with_close(&inner, err, close_frame);
                         break;
                     }
@@ -94,12 +85,45 @@ where
                         break;
                     }
                     let err = mark_inbound_error_source(err);
-                    fail_session(&inner, err);
+                    if err.source_io_error_kind().is_some() {
+                        // The transport itself failed; there is nothing to
+                        // signal the peer through.
+                        fail_session(&inner, err);
+                    } else {
+                        // Envelope violations found while reading the frame
+                        // (size limits, flags, scope, unknown type, header
+                        // varints) are session errors that SPEC §4.3/§10.2
+                        // signal with CLOSE before the transport is closed,
+                        // exactly like errors found by the frame handlers.
+                        let close_frame = session_close_frame_for(&inner, &err);
+                        fail_session_with_close(&inner, err, close_frame);
+                    }
                     break;
                 }
             }
         }
     });
+}
+
+fn session_close_frame_for(inner: &Inner, err: &Error) -> Frame {
+    let code = match err.code() {
+        Some(code) => code,
+        // Local failures without a wire code (for example allocation
+        // failures) are internal errors, not peer protocol violations.
+        None if err.source() == ErrorSource::Local => ErrorCode::Internal,
+        None => ErrorCode::Protocol,
+    };
+    Frame {
+        frame_type: FrameType::Close,
+        flags: 0,
+        stream_id: 0,
+        payload: build_code_payload(
+            code.as_u64(),
+            &err.to_string(),
+            inner.peer_preface.settings.max_control_payload_bytes,
+        )
+        .unwrap_or_default(),
+    }
 }
 
 fn complete_local_close_after_peer_read_error(inner: &Arc<Inner>, err: &Error) -> bool {
@@ -197,7 +221,7 @@ fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                     received_at,
                 )?;
             }
-            let (code, reason) = match parse_error_payload(&frame.payload) {
+            let (code, reason) = match parse_inbound_error_payload(&frame.payload) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     let state = inner.state.lock().unwrap();
@@ -300,6 +324,10 @@ fn record_inbound_rate_budget_locked(
 ) -> Result<()> {
     match frame_type {
         FrameType::Data => Ok(()),
+        // Flow-control frames that advance state (a MAX_DATA raising a limit, a
+        // BLOCKED answered with credit) are mandatory progress, not abuse; their
+        // handlers charge the control budgets only when they turn out to be no-ops.
+        FrameType::MaxData | FrameType::Blocked => Ok(()),
         FrameType::Ext => {
             record_traffic_budget_locked(
                 TrafficBudgetCounters {
@@ -332,39 +360,52 @@ fn record_inbound_rate_budget_locked(
                 now,
             )
         }
-        _ => {
-            record_traffic_budget_locked(
-                TrafficBudgetCounters {
-                    window_start: &mut state.inbound_control_window_start,
-                    frames: &mut state.inbound_control_frames,
-                    bytes: &mut state.inbound_control_bytes,
-                },
-                TrafficBudgetPolicy {
-                    abuse_window: state.abuse_window,
-                    frame_budget: state.inbound_control_frame_budget,
-                    byte_budget: state.inbound_control_bytes_budget,
-                    message: "high-rate inbound control flood exceeded local threshold",
-                },
-                payload_len,
-                now,
-            )?;
-            record_traffic_budget_locked(
-                TrafficBudgetCounters {
-                    window_start: &mut state.inbound_mixed_window_start,
-                    frames: &mut state.inbound_mixed_frames,
-                    bytes: &mut state.inbound_mixed_bytes,
-                },
-                TrafficBudgetPolicy {
-                    abuse_window: state.abuse_window,
-                    frame_budget: state.inbound_mixed_frame_budget,
-                    byte_budget: state.inbound_mixed_bytes_budget,
-                    message: "high-rate inbound mixed control/EXT flood exceeded local threshold",
-                },
-                payload_len,
-                now,
-            )
-        }
+        _ => record_inbound_control_rate_locked(state, payload_len, now),
     }
+}
+
+fn record_inbound_control_rate_locked(
+    state: &mut ConnState,
+    payload_len: usize,
+    now: Instant,
+) -> Result<()> {
+    record_traffic_budget_locked(
+        TrafficBudgetCounters {
+            window_start: &mut state.inbound_control_window_start,
+            frames: &mut state.inbound_control_frames,
+            bytes: &mut state.inbound_control_bytes,
+        },
+        TrafficBudgetPolicy {
+            abuse_window: state.abuse_window,
+            frame_budget: state.inbound_control_frame_budget,
+            byte_budget: state.inbound_control_bytes_budget,
+            message: "high-rate inbound control flood exceeded local threshold",
+        },
+        payload_len,
+        now,
+    )?;
+    record_traffic_budget_locked(
+        TrafficBudgetCounters {
+            window_start: &mut state.inbound_mixed_window_start,
+            frames: &mut state.inbound_mixed_frames,
+            bytes: &mut state.inbound_mixed_bytes,
+        },
+        TrafficBudgetPolicy {
+            abuse_window: state.abuse_window,
+            frame_budget: state.inbound_mixed_frame_budget,
+            byte_budget: state.inbound_mixed_bytes_budget,
+            message: "high-rate inbound mixed control/EXT flood exceeded local threshold",
+        },
+        payload_len,
+        now,
+    )
+}
+
+/// Charges a MAX_DATA or BLOCKED that did not advance flow-control state to the
+/// inbound control/mixed rate budgets (state-advancing ones are exempt).
+#[inline]
+fn record_inert_flow_control_frame_locked(state: &mut ConnState, payload_len: usize) -> Result<()> {
+    record_inbound_control_rate_locked(state, payload_len, Instant::now())
 }
 
 struct TrafficBudgetCounters<'a> {
@@ -463,6 +504,7 @@ fn finish_peer_visible_update(
     let Some(update) = update else {
         return;
     };
+    release_local_opener_turn(inner, stream_id);
     if let Some(payload) = update.pending_priority {
         queue_peer_visible_pending_priority(inner, stream_id, payload);
     }
@@ -475,7 +517,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     let payload = frame.payload;
     let has_open_metadata = flags & FRAME_FLAG_OPEN_METADATA != 0;
     if has_open_metadata
-        && refuse_opening_data_past_go_away_before_metadata_parse(inner, stream_id)?
+        && refuse_opening_data_past_go_away_before_metadata_parse(inner, stream_id, &payload)?
     {
         return Ok(());
     }
@@ -498,6 +540,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     } else {
         (None, 0)
     };
+    let app_len = usize_to_u64_saturating(payload.len() - app_offset);
     let (stream, refused_accept_ids, peer_visible_update) = {
         let mut state = inner.state.lock().unwrap();
         if ignore_peer_non_close_locked(&state) {
@@ -520,7 +563,12 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             )?;
             return Ok(());
         } else {
-            let Some(stream) = create_peer_stream(inner, &mut state, stream_id, true)? else {
+            let Some(stream) = create_peer_stream(inner, &mut state, stream_id, true, app_len)?
+            else {
+                // A refused opener's application bytes were charged by the
+                // sender, so they are checked, counted and released at the
+                // session level (SPEC §8); they are not late data.
+                discard_rejected_stream_data_locked(inner, &mut state, app_len)?;
                 return Ok(());
             };
             (stream, false)
@@ -530,7 +578,6 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 "OPEN_METADATA is valid only on the first DATA",
             ));
         }
-        let app_len = usize_to_u64_saturating(payload.len() - app_offset);
         let app_chunk = if app_len == 0 {
             None
         } else {
@@ -540,7 +587,8 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         let mut retained_bytes = 0usize;
         {
             let mut ss = stream.state.lock().unwrap();
-            if !stream.local_recv {
+            if !stream.local_recv && ss.aborted.is_none() {
+                discard_rejected_stream_data_locked(inner, &mut state, app_len)?;
                 abort_stream_for_peer_violation_locked(
                     inner,
                     &mut state,
@@ -551,17 +599,13 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            if ss.recv_fin {
+            if ss.recv_fin && ss.recv_reset.is_none() && ss.aborted.is_none() {
+                // DATA after an observed peer FIN is a stream-state violation
+                // (SPEC §9.2/§9.6) even after a local read-stop and even when the
+                // stream is already fully terminal but not yet compacted.
                 peer_visible_update =
                     mark_stream_peer_visible_locked(inner, &stream, &mut ss, state.state);
-                discard_peer_data_locked(
-                    inner,
-                    &mut state,
-                    Some(&mut ss),
-                    app_len,
-                    LateDataCause::None,
-                    !stream.application_visible,
-                )?;
+                discard_rejected_stream_data_locked(inner, &mut state, app_len)?;
                 abort_stream_for_peer_violation_locked(
                     inner,
                     &mut state,
@@ -575,11 +619,34 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 finish_peer_visible_update(inner, stream_id, peer_visible_update);
                 return Ok(());
             }
-            if ss.recv_reset.is_some() || ss.aborted.is_some() || ss.read_stopped {
+            if !stream.local_recv
+                || ss.recv_reset.is_some()
+                || ss.aborted.is_some()
+                || ss.read_stopped
+            {
                 if has_open_metadata {
                     return Err(Error::protocol(
                         "OPEN_METADATA is valid only on the first DATA",
                     ));
+                }
+                if ss.read_stopped
+                    && ss.recv_reset.is_none()
+                    && ss.aborted.is_none()
+                    && receive_window_exceeded(ss.recv_used, ss.recv_advertised, app_len)
+                {
+                    // A read-stopped direction still enforces stream credit
+                    // (SPEC §8): a compliant peer's in-flight tail never exceeds
+                    // the credit it was granted before STOP_SENDING.
+                    discard_rejected_stream_data_locked(inner, &mut state, app_len)?;
+                    abort_stream_for_peer_violation_locked(
+                        inner,
+                        &mut state,
+                        &stream,
+                        &mut ss,
+                        ErrorCode::FlowControl.as_u64(),
+                        "",
+                    )?;
+                    return Ok(());
                 }
                 let stopped_fin = ss.read_stopped && flags & FRAME_FLAG_FIN != 0;
                 let cause = late_data_cause_for(&ss);
@@ -588,7 +655,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 discard_peer_data_locked(
                     inner,
                     &mut state,
-                    Some(&mut ss),
+                    &mut ss,
                     app_len,
                     cause,
                     !stream.application_visible,
@@ -611,6 +678,7 @@ fn handle_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 return Err(Error::flow_control("session MAX_DATA exceeded"));
             }
             if ss.recv_used.saturating_add(app_len) > ss.recv_advertised {
+                discard_rejected_stream_data_locked(inner, &mut state, app_len)?;
                 abort_stream_for_peer_violation_locked(
                     inner,
                     &mut state,
@@ -710,26 +778,97 @@ fn ignore_or_reject_misplaced_open_metadata_before_parse(
 fn refuse_opening_data_past_go_away_before_metadata_parse(
     inner: &Arc<Inner>,
     stream_id: u64,
+    payload: &[u8],
 ) -> Result<bool> {
     let mut state = inner.state.lock().unwrap();
     if ignore_peer_non_close_locked(&state) {
         return Ok(true);
     }
-    if stream_is_local(inner.negotiated.local_role, stream_id)
-        || state.streams.contains_key(&stream_id)
+    if state.streams.contains_key(&stream_id)
         || known_absent_stream_locked(&state, inner, stream_id)
+        || !refused_by_local_go_away_locked(&state, inner, stream_id)
     {
         return Ok(false);
     }
+    // Only the trailing application bytes count against the session window, so
+    // decode just the metadata_len prefix; the refused opener's metadata TLVs
+    // are never interpreted (SPEC §3.1, §8).
+    let app_offset = match parse_data_payload_app_offset(payload, FRAME_FLAG_OPEN_METADATA) {
+        Ok(app_offset) => app_offset,
+        Err(err) => {
+            drop(state);
+            return maybe_ignore_peer_non_close_error(inner, err).map(|()| true);
+        }
+    };
+    discard_rejected_stream_data_locked(
+        inner,
+        &mut state,
+        usize_to_u64_saturating(payload.len() - app_offset),
+    )?;
+    refuse_peer_open_past_local_go_away_locked(inner, &mut state, stream_id)?;
+    Ok(true)
+}
+
+/// A peer-owned ID above the current local GOAWAY watermark of its class, with
+/// no stream state or terminal bookkeeping, can never be opened again in this
+/// session because watermarks are non-increasing. It is not consumed, but it is
+/// known-absent and refused rather than previously unseen (SPEC §3.1). Callers
+/// check live streams and `known_absent_stream_locked` first.
+#[inline]
+fn refused_by_local_go_away_locked(state: &ConnState, inner: &Arc<Inner>, stream_id: u64) -> bool {
     let goaway = if stream_is_bidi(stream_id) {
         state.local_go_away_bidi
     } else {
         state.local_go_away_uni
     };
-    if stream_id <= goaway {
+    !stream_is_local(inner.negotiated.local_role, stream_id) && stream_id > goaway
+}
+
+/// Whether `stream_id` was already answered with ABORT(REFUSED_STREAM) under the
+/// local GOAWAY watermark. Peers open the IDs of one class in increasing order,
+/// so the highest refused ID per class is enough to answer each ID once.
+#[inline]
+fn peer_open_already_refused_locked(state: &ConnState, inner: &Arc<Inner>, stream_id: u64) -> bool {
+    let highest = if stream_is_bidi(stream_id) {
+        state.highest_refused_peer_bidi
+    } else {
+        state.highest_refused_peer_uni
+    };
+    stream_id <= highest && refused_by_local_go_away_locked(state, inner, stream_id)
+}
+
+/// Non-opening frames on a known-absent ID, including one refused under the
+/// local GOAWAY watermark, are ignored rather than treated as frames on a
+/// previously unseen stream.
+#[inline]
+fn known_absent_or_refused_stream_locked(
+    state: &ConnState,
+    inner: &Arc<Inner>,
+    stream_id: u64,
+) -> bool {
+    known_absent_stream_locked(state, inner, stream_id)
+        || refused_by_local_go_away_locked(state, inner, stream_id)
+}
+
+/// Refuses a peer open above the local GOAWAY watermark without consuming the
+/// ID. Only the first refusal of an ID queues ABORT(REFUSED_STREAM); later frames
+/// on it are discarded or ignored by the caller. Returns whether this was the
+/// first refusal.
+fn refuse_peer_open_past_local_go_away_locked(
+    inner: &Arc<Inner>,
+    state: &mut ConnState,
+    stream_id: u64,
+) -> Result<bool> {
+    let highest = if stream_is_bidi(stream_id) {
+        &mut state.highest_refused_peer_bidi
+    } else {
+        &mut state.highest_refused_peer_uni
+    };
+    if stream_id <= *highest {
         return Ok(false);
     }
-    note_abort_reason_locked(&mut state, ErrorCode::RefusedStream.as_u64());
+    *highest = stream_id;
+    note_abort_reason_locked(state, ErrorCode::RefusedStream.as_u64());
     queue_abort(inner, stream_id, ErrorCode::RefusedStream.as_u64(), "")?;
     Ok(true)
 }
@@ -773,7 +912,8 @@ fn clear_ignored_control_budget_locked(state: &mut ConnState) {
     state.ignored_control_count = 0;
 }
 
-fn record_no_op_max_data_locked(state: &mut ConnState) -> Result<()> {
+fn record_no_op_max_data_locked(state: &mut ConnState, payload_len: usize) -> Result<()> {
+    record_inert_flow_control_frame_locked(state, payload_len)?;
     record_ignored_control_locked(state)?;
     let (start, count, result) = advance_windowed_count(
         state.abuse_window,
@@ -791,7 +931,8 @@ fn clear_no_op_max_data_budget_locked(state: &mut ConnState) {
     clear_no_op_control_budgets_locked(state);
 }
 
-fn record_no_op_blocked_locked(state: &mut ConnState) -> Result<()> {
+fn record_no_op_blocked_locked(state: &mut ConnState, payload_len: usize) -> Result<()> {
+    record_inert_flow_control_frame_locked(state, payload_len)?;
     record_ignored_control_locked(state)?;
     let (start, count, result) = advance_windowed_count(
         state.abuse_window,
@@ -857,11 +998,6 @@ fn record_inbound_ping_locked(state: &mut ConnState) -> Result<()> {
     result
 }
 
-fn clear_inbound_ping_budget_locked(state: &mut ConnState) {
-    state.inbound_ping_window_start = None;
-    state.inbound_ping_count = 0;
-}
-
 fn update_no_op_zero_data_locked(
     state: &mut ConnState,
     stream_existed: bool,
@@ -882,9 +1018,10 @@ fn update_no_op_zero_data_locked(
         state.no_op_zero_data_count = count;
         result?;
     } else if app_len > 0 || data_control_flags != 0 {
+        // Progress clears only the zero-length DATA budget; the inbound PING
+        // budget is a rate limit that expires with its window, not on DATA.
         state.no_op_zero_data_window_start = None;
         state.no_op_zero_data_count = 0;
-        clear_inbound_ping_budget_locked(state);
     }
     Ok(())
 }
@@ -912,10 +1049,12 @@ fn advance_windowed_count(
     (start, next_count, result)
 }
 
+/// Discards late DATA on a live stream whose receive direction no longer
+/// accepts data (local read-stop, local or peer ABORT, peer RESET).
 fn discard_peer_data_locked(
     inner: &Arc<Inner>,
     state: &mut ConnState,
-    stream_state: Option<&mut StreamState>,
+    stream_state: &mut StreamState,
     app_len: u64,
     cause: LateDataCause,
     hidden: bool,
@@ -924,18 +1063,19 @@ fn discard_peer_data_locked(
         return Ok(());
     }
     advance_discarded_session_credit_locked(inner, state, app_len)?;
-    let (late_data_received, late_data_cap) = if let Some(stream_state) = stream_state {
-        stream_state.late_data_received = stream_state.late_data_received.saturating_add(app_len);
-        (stream_state.late_data_received, stream_state.late_data_cap)
-    } else {
-        (0, u64::MAX)
-    };
+    // The bytes still count against the stream window the peer sent them under.
+    stream_state.recv_used = stream_state.recv_used.saturating_add(app_len);
+    stream_state.late_data_received = stream_state.late_data_received.saturating_add(app_len);
+    state.late_data_aggregate_received = state.late_data_aggregate_received.saturating_add(app_len);
     record_late_data_discard_locked(state, cause, app_len);
     if hidden {
         state.hidden_unread_bytes_discarded =
             state.hidden_unread_bytes_discarded.saturating_add(app_len);
     }
-    check_late_data_caps_locked(state, late_data_received, late_data_cap)
+    check_late_data_allowance(
+        stream_state.late_data_received,
+        late_data_allowance(stream_state),
+    )
 }
 
 fn discard_absent_peer_data_locked(
@@ -949,23 +1089,39 @@ fn discard_absent_peer_data_locked(
         return Ok(());
     }
     advance_discarded_session_credit_locked(inner, state, app_len)?;
-    let (late_data_received, late_data_cap, hidden) =
-        if let Some(tombstone) = state.tombstones.get_mut(&stream_id) {
-            tombstone.late_data_received = tombstone.late_data_received.saturating_add(app_len);
-            (
-                tombstone.late_data_received,
-                tombstone.late_data_cap,
-                tombstone.hidden,
-            )
-        } else {
-            (0, u64::MAX, false)
-        };
     record_late_data_discard_locked(state, cause, app_len);
+    // Marker-only IDs retain no per-stream accounting: their bytes are discarded
+    // and released without counting toward the retained late-data aggregate.
+    let Some(tombstone) = state.tombstones.get_mut(&stream_id) else {
+        return Ok(());
+    };
+    tombstone.late_data_received = tombstone.late_data_received.saturating_add(app_len);
+    let (late_data_received, late_data_allowance, hidden) = (
+        tombstone.late_data_received,
+        tombstone.late_data_cap,
+        tombstone.hidden,
+    );
+    state.late_data_aggregate_received = state.late_data_aggregate_received.saturating_add(app_len);
     if hidden {
         state.hidden_unread_bytes_discarded =
             state.hidden_unread_bytes_discarded.saturating_add(app_len);
     }
-    check_late_data_caps_locked(state, late_data_received, late_data_cap)
+    check_late_data_allowance(late_data_received, late_data_allowance)
+}
+
+/// Session-level handling of DATA that a live stream rejects with a
+/// stream-local ABORT (DATA after FIN, wrong direction, stream window overrun).
+/// The sender counted the bytes against the session window, so they are checked
+/// against it and released back to it (SPEC §8), but they are not late data.
+fn discard_rejected_stream_data_locked(
+    inner: &Arc<Inner>,
+    state: &mut ConnState,
+    app_len: u64,
+) -> Result<()> {
+    if app_len == 0 {
+        return Ok(());
+    }
+    advance_discarded_session_credit_locked(inner, state, app_len)
 }
 
 fn record_late_data_discard_locked(state: &mut ConnState, cause: LateDataCause, bytes: u64) {
@@ -986,14 +1142,12 @@ fn record_late_data_discard_locked(state: &mut ConnState, cause: LateDataCause, 
     }
 }
 
-fn check_late_data_caps_locked(
-    state: &ConnState,
-    late_data_received: u64,
-    late_data_cap: u64,
-) -> Result<()> {
-    if state.late_data_aggregate_received > state.late_data_aggregate_cap
-        || late_data_received > late_data_cap
-    {
+/// Only the per-direction allowance escalates: it already covers every byte a
+/// compliant peer can have in flight. Exceeding the aggregate allowance keeps
+/// discarding (API_SEMANTICS §3), since discarded bytes are not retained.
+#[inline]
+fn check_late_data_allowance(late_data_received: u64, late_data_allowance: u64) -> Result<()> {
+    if late_data_received > late_data_allowance {
         return Err(Error::protocol("late-data cap exceeded"));
     }
     Ok(())
@@ -1011,7 +1165,6 @@ fn advance_discarded_session_credit_locked(
     ) {
         return Err(Error::flow_control("session MAX_DATA exceeded"));
     }
-    state.late_data_aggregate_received = state.late_data_aggregate_received.saturating_add(app_len);
     state.recv_session_used = state.recv_session_used.saturating_add(app_len);
     state.received_data_bytes = state.received_data_bytes.saturating_add(app_len);
     state.recv_session_advertised = next_credit_limit(
@@ -1057,15 +1210,26 @@ fn flush_pending_session_credit_locked(
         &inner.local_preface.settings,
         inner.session_data_high_watermark,
     );
-    if !should_flush_receive_credit(
-        state.recv_session_advertised,
-        state.recv_session_used,
-        state.recv_session_pending,
-        target,
-        session_emergency_threshold(payload),
-        replenish_min_pending(target, payload),
-        force,
-    ) {
+    // A forced flush (peer BLOCKED, a waiting reader or accept, a retry) also
+    // grants standing credit to an exhausted window with nothing to release.
+    let grant_exhausted = force
+        && receive_window_exhausted(
+            state.recv_session_advertised,
+            state.recv_session_used,
+            state.recv_session_pending,
+            state.recv_session_buffered,
+        );
+    if !grant_exhausted
+        && !should_flush_receive_credit(
+            state.recv_session_advertised,
+            state.recv_session_used,
+            state.recv_session_pending,
+            target,
+            session_emergency_threshold(payload),
+            replenish_min_pending(target, payload),
+            force,
+        )
+    {
         return Ok(false);
     }
     let desired = next_credit_limit(
@@ -1080,6 +1244,10 @@ fn flush_pending_session_credit_locked(
             inner.session_data_high_watermark,
         ),
     );
+    if desired <= state.recv_session_advertised {
+        // Standing growth is not allowed (memory pressure): nothing to grant.
+        return Ok(false);
+    }
     if !try_queue_max_data(inner, 0, desired)? {
         state.recv_replenish_retry = true;
         return Ok(false);
@@ -1091,7 +1259,7 @@ fn flush_pending_session_credit_locked(
 
 fn flush_pending_stream_credit_locked(
     inner: &Arc<Inner>,
-    stream: &Arc<StreamInner>,
+    stream: &StreamInner,
     stream_state: &mut StreamState,
     session_memory_pressure_high: bool,
     force: bool,
@@ -1119,15 +1287,24 @@ fn flush_pending_stream_credit_locked(
         stream_id,
     );
     let target = stream_window_target(initial, inner.per_stream_data_high_watermark);
-    if !should_flush_receive_credit(
-        stream_state.recv_advertised,
-        stream_state.recv_used,
-        stream_state.recv_pending,
-        target,
-        stream_emergency_threshold(target, payload),
-        replenish_min_pending(target, payload),
-        force,
-    ) {
+    let grant_exhausted = force
+        && receive_window_exhausted(
+            stream_state.recv_advertised,
+            stream_state.recv_used,
+            stream_state.recv_pending,
+            usize_to_u64_saturating(stream_state.recv_buf.len()),
+        );
+    if !grant_exhausted
+        && !should_flush_receive_credit(
+            stream_state.recv_advertised,
+            stream_state.recv_used,
+            stream_state.recv_pending,
+            target,
+            stream_emergency_threshold(target, payload),
+            replenish_min_pending(target, payload),
+            force,
+        )
+    {
         return Ok(false);
     }
     let desired = next_credit_limit(
@@ -1142,6 +1319,9 @@ fn flush_pending_stream_credit_locked(
             inner.per_stream_data_high_watermark,
         ),
     );
+    if desired <= stream_state.recv_advertised {
+        return Ok(false);
+    }
     if !try_queue_max_data(inner, stream_id, desired)? {
         *retry_needed = true;
         return Ok(false);
@@ -1149,6 +1329,56 @@ fn flush_pending_stream_credit_locked(
     stream_state.recv_advertised = desired;
     stream_state.recv_pending = 0;
     Ok(true)
+}
+
+/// Grants standing session credit to an application about to wait in accept or
+/// read while the session receive window is used up with nothing pending. Peers
+/// need not send BLOCKED, so a zero initial window would otherwise never grow
+/// (SPEC §8).
+pub(super) fn grant_exhausted_session_credit_locked(inner: &Arc<Inner>, state: &mut ConnState) {
+    if ignore_peer_non_close_locked(state)
+        || !receive_window_exhausted(
+            state.recv_session_advertised,
+            state.recv_session_used,
+            state.recv_session_pending,
+            state.recv_session_buffered,
+        )
+    {
+        return;
+    }
+    let _ = flush_pending_session_credit_locked(inner, state, true);
+}
+
+/// Like [`grant_exhausted_session_credit_locked`], for a reader about to wait on
+/// a stream (and its session) whose receive credit is used up.
+pub(super) fn grant_exhausted_receive_credit(inner: &Arc<Inner>, stream: &StreamInner) {
+    let mut state = inner.state.lock().unwrap();
+    grant_exhausted_session_credit_locked(inner, &mut state);
+    if ignore_peer_non_close_locked(&state) {
+        return;
+    }
+    let session_memory_pressure_high = session_memory_pressure_high_fast_locked(inner, &state);
+    let mut stream_state = stream.state.lock().unwrap();
+    if !receive_window_exhausted(
+        stream_state.recv_advertised,
+        stream_state.recv_used,
+        stream_state.recv_pending,
+        usize_to_u64_saturating(stream_state.recv_buf.len()),
+    ) {
+        return;
+    }
+    let mut retry_needed = false;
+    let _ = flush_pending_stream_credit_locked(
+        inner,
+        stream,
+        &mut stream_state,
+        session_memory_pressure_high,
+        true,
+        &mut retry_needed,
+    );
+    if retry_needed {
+        state.recv_replenish_retry = true;
+    }
 }
 
 fn try_queue_max_data(inner: &Arc<Inner>, stream_id: u64, limit: u64) -> Result<bool> {
@@ -1260,27 +1490,26 @@ fn has_marker_only_terminal_marker_locked(state: &ConnState, stream_id: u64) -> 
         && !state.tombstones.contains_key(&stream_id)
 }
 
+/// Creates the stream a peer opening frame refers to, or refuses it (`None`).
+/// `opening_app_len` is the application payload of an opening DATA frame (0 for
+/// an opening ABORT).
 fn create_peer_stream(
     inner: &Arc<Inner>,
     state: &mut ConnState,
     stream_id: u64,
     application_visible: bool,
+    opening_app_len: u64,
 ) -> Result<Option<Arc<StreamInner>>> {
     if stream_is_local(inner.negotiated.local_role, stream_id) {
         return Err(Error::protocol("peer referenced unopened local stream"));
     }
     let bidi = stream_is_bidi(stream_id);
-    let goaway = if bidi {
-        state.local_go_away_bidi
-    } else {
-        state.local_go_away_uni
-    };
-    if stream_id > goaway {
-        if !application_visible {
+    if refused_by_local_go_away_locked(state, inner, stream_id) {
+        if refuse_peer_open_past_local_go_away_locked(inner, state, stream_id)?
+            && !application_visible
+        {
             state.hidden_streams_refused = state.hidden_streams_refused.saturating_add(1);
         }
-        note_abort_reason_locked(state, ErrorCode::RefusedStream.as_u64());
-        queue_abort(inner, stream_id, ErrorCode::RefusedStream.as_u64(), "")?;
         return Ok(None);
     }
     let expected = if bidi {
@@ -1321,6 +1550,31 @@ fn create_peer_stream(
         }
         note_abort_reason_locked(state, ErrorCode::RefusedStream.as_u64());
         queue_abort(inner, stream_id, ErrorCode::RefusedStream.as_u64(), "")?;
+        // The refused ID is consumed and locally aborted, so in-flight DATA on
+        // it is late data after ABORT: ignored with session credit release, not
+        // treated as DATA after FIN (SPEC §9.5, STATE_MACHINE §8). The peer may
+        // still send its whole initial stream window.
+        let recv_window =
+            initial_receive_window(inner.negotiated.local_role, local_settings, stream_id);
+        record_tombstone_locked(
+            state,
+            stream_id,
+            StreamTombstone {
+                data_disposition: TerminalDataDisposition {
+                    action: TerminalDataAction::Ignore,
+                    cause: LateDataCause::Abort,
+                },
+                late_data_received: 0,
+                late_data_cap: late_data_per_stream_cap(
+                    state.late_data_per_stream_cap,
+                    recv_window,
+                    local_settings.max_frame_payload,
+                )
+                .max(recv_window.saturating_sub(opening_app_len)),
+                hidden: !application_visible,
+                created_at: Instant::now(),
+            },
+        );
         clear_ignored_control_budget_locked(state);
         return Ok(None);
     }
@@ -1368,6 +1622,7 @@ fn create_peer_stream(
             send_reset_from_stop: false,
             stopped_by_peer: None,
             provisional_created_at: None,
+            provisional_wait: ProvisionalWait::default(),
             opened_on_wire: false,
             peer_visible: true,
             received_open: false,
@@ -1377,6 +1632,7 @@ fn create_peer_stream(
             recv_used: 0,
             recv_advertised,
             recv_pending: 0,
+            recv_blocked_at: None,
             late_data_received: 0,
             late_data_cap: late_data_per_stream_cap(
                 state.late_data_per_stream_cap,
@@ -1419,7 +1675,12 @@ fn create_peer_stream(
 fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     let (max, n) = match parse_varint(&frame.payload) {
         Ok(parsed) => parsed,
-        Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
+        Err(err) => {
+            return maybe_ignore_peer_non_close_error(
+                inner,
+                malformed_payload_error("invalid MAX_DATA payload", err),
+            )
+        }
     };
     if n != frame.payload.len() {
         return maybe_ignore_peer_non_close_error(
@@ -1427,6 +1688,7 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             Error::protocol("MAX_DATA payload has trailing bytes"),
         );
     }
+    let payload_len = frame.payload.len();
     let mut state = inner.state.lock().unwrap();
     if ignore_peer_non_close_locked(&state) {
         return Ok(());
@@ -1437,7 +1699,7 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             state.send_session_blocked_at = None;
             clear_no_op_max_data_budget_locked(&mut state);
         } else {
-            record_no_op_max_data_locked(&mut state)?;
+            record_no_op_max_data_locked(&mut state, payload_len)?;
         }
         inner.cond.notify_all();
         return Ok(());
@@ -1446,10 +1708,11 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         let peer_visible_update = {
             let mut ss = stream.state.lock().unwrap();
             if stream_fully_terminal(&stream, &ss) {
-                record_no_op_max_data_locked(&mut state)?;
+                record_no_op_max_data_locked(&mut state, payload_len)?;
                 return Ok(());
             }
             if !stream.local_send {
+                record_inert_flow_control_frame_locked(&mut state, payload_len)?;
                 abort_stream_for_peer_violation_locked(
                     inner,
                     &mut state,
@@ -1467,7 +1730,7 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 ss.send_blocked_at = None;
                 clear_no_op_max_data_budget_locked(&mut state);
             } else {
-                record_no_op_max_data_locked(&mut state)?;
+                record_no_op_max_data_locked(&mut state, payload_len)?;
             }
             stream.cond.notify_all();
             inner.cond.notify_all();
@@ -1477,9 +1740,9 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         finish_peer_visible_update(inner, frame.stream_id, peer_visible_update);
         Ok(())
     } else if has_marker_only_terminal_marker_locked(&state, frame.stream_id) {
-        Ok(())
-    } else if known_absent_stream_locked(&state, inner, frame.stream_id) {
-        record_no_op_max_data_locked(&mut state)?;
+        record_inert_flow_control_frame_locked(&mut state, payload_len)
+    } else if known_absent_or_refused_stream_locked(&state, inner, frame.stream_id) {
+        record_no_op_max_data_locked(&mut state, payload_len)?;
         Ok(())
     } else {
         Err(Error::protocol("MAX_DATA on previously unseen stream"))
@@ -1487,9 +1750,14 @@ fn handle_max_data(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
 }
 
 fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
-    let (_, n) = match parse_varint(&frame.payload) {
+    let (blocked_at, n) = match parse_varint(&frame.payload) {
         Ok(parsed) => parsed,
-        Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
+        Err(err) => {
+            return maybe_ignore_peer_non_close_error(
+                inner,
+                malformed_payload_error("invalid BLOCKED payload", err),
+            )
+        }
     };
     if n != frame.payload.len() {
         return maybe_ignore_peer_non_close_error(
@@ -1497,17 +1765,25 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             Error::protocol("BLOCKED payload has trailing bytes"),
         );
     }
+    let payload_len = frame.payload.len();
     if frame.stream_id == 0 {
         let mut state = inner.state.lock().unwrap();
         if ignore_peer_non_close_locked(&state) {
             return Ok(());
         }
         let has_pending_credit = state.recv_session_pending != 0;
+        let advertised = state.recv_session_advertised;
+        let newly_blocked = note_peer_blocked_at(
+            &mut state.recv_session_blocked_at,
+            blocked_at,
+            inner.local_preface.settings.initial_max_data,
+            advertised,
+        );
         let queued = flush_pending_session_credit_locked(inner, &mut state, true)?;
-        if has_pending_credit || queued {
+        if has_pending_credit || queued || newly_blocked {
             clear_no_op_blocked_budget_locked(&mut state);
         } else {
-            record_no_op_blocked_locked(&mut state)?;
+            record_no_op_blocked_locked(&mut state, payload_len)?;
         }
         return Ok(());
     }
@@ -1521,10 +1797,11 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
                 session_memory_pressure_high_fast_locked(inner, &state);
             let mut ss = stream.state.lock().unwrap();
             if stream_fully_terminal(&stream, &ss) {
-                record_no_op_blocked_locked(&mut state)?;
+                record_no_op_blocked_locked(&mut state, payload_len)?;
                 return Ok(());
             }
             if !stream.local_recv {
+                record_inert_flow_control_frame_locked(&mut state, payload_len)?;
                 abort_stream_for_peer_violation_locked(
                     inner,
                     &mut state,
@@ -1538,9 +1815,17 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             let peer_visible_update =
                 mark_stream_peer_visible_locked(inner, &stream, &mut ss, state.state);
             let has_pending_credit = state.recv_session_pending != 0 || ss.recv_pending != 0;
-            let _ = flush_pending_session_credit_locked(inner, &mut state, true)?;
+            let initial = initial_receive_window(
+                inner.negotiated.local_role,
+                &inner.local_preface.settings,
+                frame.stream_id,
+            );
+            let advertised = ss.recv_advertised;
+            let newly_blocked =
+                note_peer_blocked_at(&mut ss.recv_blocked_at, blocked_at, initial, advertised);
+            let session_queued = flush_pending_session_credit_locked(inner, &mut state, true)?;
             let mut retry_needed = false;
-            let _ = flush_pending_stream_credit_locked(
+            let stream_queued = flush_pending_stream_credit_locked(
                 inner,
                 &stream,
                 &mut ss,
@@ -1551,10 +1836,10 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             if retry_needed {
                 state.recv_replenish_retry = true;
             }
-            if has_pending_credit {
+            if has_pending_credit || session_queued || stream_queued || newly_blocked {
                 clear_no_op_blocked_budget_locked(&mut state);
             } else {
-                record_no_op_blocked_locked(&mut state)?;
+                record_no_op_blocked_locked(&mut state, payload_len)?;
             }
             peer_visible_update
         };
@@ -1563,9 +1848,9 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         Ok(())
     } else {
         if has_marker_only_terminal_marker_locked(&state, frame.stream_id) {
-            Ok(())
-        } else if known_absent_stream_locked(&state, inner, frame.stream_id) {
-            record_no_op_blocked_locked(&mut state)?;
+            record_inert_flow_control_frame_locked(&mut state, payload_len)
+        } else if known_absent_or_refused_stream_locked(&state, inner, frame.stream_id) {
+            record_no_op_blocked_locked(&mut state, payload_len)?;
             Ok(())
         } else {
             Err(Error::protocol("BLOCKED on previously unseen stream"))
@@ -1573,8 +1858,29 @@ fn handle_blocked(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     }
 }
 
+/// Records the limit a peer BLOCKED reports. A compliant sender reports each
+/// limit it was granted at most once and in increasing order, so a BLOCKED for a
+/// new limit within the granted range is not a repeated no-op, even when a later
+/// grant crossed it on the wire.
+#[inline]
+fn note_peer_blocked_at(
+    last_blocked_at: &mut Option<u64>,
+    blocked_at: u64,
+    initial: u64,
+    advertised: u64,
+) -> bool {
+    if blocked_at < initial
+        || blocked_at > advertised
+        || last_blocked_at.is_some_and(|last| blocked_at <= last)
+    {
+        return false;
+    }
+    *last_blocked_at = Some(blocked_at);
+    true
+}
+
 fn handle_stop_sending(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
-    let (code, reason) = match parse_error_payload(&frame.payload) {
+    let (code, reason) = match parse_inbound_error_payload(&frame.payload) {
         Ok(parsed) => parsed,
         Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
     };
@@ -1589,7 +1895,7 @@ fn handle_stop_sending(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             if has_marker_only_terminal_marker_locked(&conn_state, frame.stream_id) {
                 return Ok(());
             }
-            if known_absent_stream_locked(&conn_state, inner, frame.stream_id) {
+            if known_absent_or_refused_stream_locked(&conn_state, inner, frame.stream_id) {
                 record_ignored_control_locked(&mut conn_state)?;
                 return Ok(());
             }
@@ -1643,9 +1949,12 @@ fn handle_stop_sending(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     };
     finish_peer_visible_update(inner, frame.stream_id, peer_visible_update);
     {
+        // Writers parked on stream/session credit wait on the session condvar;
+        // wake them too so they observe the stop and release the write path.
         stream.cond.notify_all();
+        inner.cond.notify_all();
         inner.wake_writer_queue_waiters();
-        if try_graceful_finish && stream.try_graceful_finish_after_stop_sending()? {
+        if try_graceful_finish && stream.try_graceful_finish_after_stop_sending() {
             stream.cond.notify_all();
             return Ok(());
         }
@@ -1709,7 +2018,7 @@ pub(super) fn discard_stop_sending_reset_tail(inner: &Arc<Inner>, stream_id: u64
 }
 
 fn handle_reset(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
-    let (code, reason) = match parse_error_payload(&frame.payload) {
+    let (code, reason) = match parse_inbound_error_payload(&frame.payload) {
         Ok(parsed) => parsed,
         Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
     };
@@ -1768,7 +2077,7 @@ fn handle_reset(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     } else {
         if has_marker_only_terminal_marker_locked(&conn_state, frame.stream_id) {
             Ok(())
-        } else if known_absent_stream_locked(&conn_state, inner, frame.stream_id) {
+        } else if known_absent_or_refused_stream_locked(&conn_state, inner, frame.stream_id) {
             record_ignored_control_locked(&mut conn_state)?;
             Ok(())
         } else {
@@ -1778,7 +2087,7 @@ fn handle_reset(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
 }
 
 fn handle_abort(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
-    let (code, reason) = match parse_error_payload(&frame.payload) {
+    let (code, reason) = match parse_inbound_error_payload(&frame.payload) {
         Ok(parsed) => parsed,
         Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
     };
@@ -1790,11 +2099,13 @@ fn handle_abort(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
         Some(stream)
     } else if has_marker_only_terminal_marker_locked(&conn_state, frame.stream_id) {
         None
-    } else if known_absent_stream_locked(&conn_state, inner, frame.stream_id) {
+    } else if known_absent_stream_locked(&conn_state, inner, frame.stream_id)
+        || peer_open_already_refused_locked(&conn_state, inner, frame.stream_id)
+    {
         record_ignored_control_locked(&mut conn_state)?;
         None
     } else if !stream_is_local(inner.negotiated.local_role, frame.stream_id) {
-        let stream = create_peer_stream(inner, &mut conn_state, frame.stream_id, false)?;
+        let stream = create_peer_stream(inner, &mut conn_state, frame.stream_id, false, 0)?;
         if stream.is_some() {
             record_hidden_abort_churn_locked(&mut conn_state)?;
         }
@@ -1811,6 +2122,16 @@ fn handle_abort(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             }
             let peer_visible_update =
                 mark_stream_peer_visible_locked(inner, &stream, &mut ss, conn_state.state);
+            if stream_fully_terminal(&stream, &ss) {
+                // A late ABORT for a stream that already finished both halves is
+                // ignored (SPEC §6.8/§9.5): unread data stays readable and the
+                // terminal outcomes already reached are kept.
+                record_ignored_control_locked(&mut conn_state)?;
+                drop(ss);
+                drop(conn_state);
+                finish_peer_visible_update(inner, frame.stream_id, peer_visible_update);
+                return Ok(());
+            }
             retain_stream_abort_reason_locked(inner, &mut conn_state, &mut ss, code, reason);
             record_visible_terminal_churn_locked(&mut conn_state, &stream, &mut ss)?;
             clear_accept_backlog_entry_locked(&mut conn_state, &mut ss);
@@ -1941,7 +2262,7 @@ fn handle_go_away(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             return Ok(());
         }
     }
-    let payload = match parse_go_away_payload(&frame.payload) {
+    let payload = match parse_inbound_go_away_payload(&frame.payload) {
         Ok(payload) => payload,
         Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
     };
@@ -2018,9 +2339,22 @@ fn handle_ext(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
     if inner.negotiated.capabilities & CAPABILITY_PRIORITY_UPDATE == 0 {
         return Ok(());
     }
+    if frame.stream_id == 0 {
+        // SPEC §7.6 requires stream_id != 0; stream 0 is not a stream, so
+        // this is an invalid frame scope rather than an unseen target.
+        return maybe_ignore_peer_non_close_error(
+            inner,
+            Error::protocol("PRIORITY_UPDATE requires non-zero stream_id"),
+        );
+    }
     let (metadata, valid) = match parse_priority_update_metadata(&frame.payload[n..]) {
         Ok(parsed) => parsed,
-        Err(err) => return maybe_ignore_peer_non_close_error(inner, err),
+        Err(err) => {
+            return maybe_ignore_peer_non_close_error(
+                inner,
+                malformed_payload_error("malformed PRIORITY_UPDATE payload", err),
+            )
+        }
     };
     if !valid {
         let mut state = inner.state.lock().unwrap();
@@ -2061,7 +2395,7 @@ fn handle_ext(inner: &Arc<Inner>, frame: Frame) -> Result<()> {
             clear_no_op_priority_update_budget_locked(&mut state);
         }
     } else if has_marker_only_terminal_marker_locked(&state, frame.stream_id)
-        || known_absent_stream_locked(&state, inner, frame.stream_id)
+        || known_absent_or_refused_stream_locked(&state, inner, frame.stream_id)
     {
         return Ok(());
     }

@@ -52,6 +52,19 @@ pub(super) fn receive_window_exceeded(received: u64, advertised: u64, amount: u6
     amount > advertised.saturating_sub(received)
 }
 
+/// A receive scope whose advertised credit is used up, with no released credit
+/// pending and no unread data that a later read would release, is stalled until
+/// a standing-credit grant (for example a zero initial window, SPEC §8).
+#[inline]
+pub(super) fn receive_window_exhausted(
+    advertised: u64,
+    received: u64,
+    pending: u64,
+    buffered: u64,
+) -> bool {
+    pending == 0 && buffered == 0 && advertised <= received
+}
+
 #[inline]
 pub(super) fn should_flush_receive_credit(
     advertised: u64,
@@ -174,9 +187,9 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 mod tests {
     use super::{
         negotiated_frame_payload, next_credit_limit, receive_window_exceeded,
-        session_emergency_threshold, session_standing_growth_allowed, session_window_target,
-        should_flush_receive_credit, stream_emergency_threshold, stream_standing_growth_allowed,
-        stream_window_target,
+        receive_window_exhausted, session_emergency_threshold, session_standing_growth_allowed,
+        session_window_target, should_flush_receive_credit, stream_emergency_threshold,
+        stream_standing_growth_allowed, stream_window_target,
     };
     use crate::settings::Settings;
     use crate::varint::MAX_VARINT62;
@@ -226,6 +239,19 @@ mod tests {
         assert!(should_flush_receive_credit(100, 98, 1, 64, 2, 16, false));
         assert!(!should_flush_receive_credit(100, 10, 15, 64, 2, 16, false));
         assert!(should_flush_receive_credit(100, 10, 16, 64, 2, 16, false));
+    }
+
+    #[test]
+    fn exhausted_receive_window_needs_no_pending_or_unread_data() {
+        assert!(receive_window_exhausted(0, 0, 0, 0));
+        assert!(receive_window_exhausted(100, 100, 0, 0));
+        assert!(!receive_window_exhausted(0, 0, 1, 0));
+        assert!(!receive_window_exhausted(100, 99, 0, 0));
+        // Unread data is released by the next read; that is backpressure, not a stall.
+        assert!(!receive_window_exhausted(100, 100, 0, 1));
+        assert!(!should_flush_receive_credit(0, 0, 0, 64, 2, 16, true));
+        assert_eq!(next_credit_limit(0, 0, 0, 64, true), 64);
+        assert_eq!(next_credit_limit(0, 0, 0, 64, false), 0);
     }
 
     #[test]

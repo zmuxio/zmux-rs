@@ -1,9 +1,6 @@
 use super::ingress::retry_pending_receive_credit;
-use super::liveness::{
-    clear_unsent_keepalive_ping, close_for_idle_timeout, poll_keepalive, record_outbound_activity,
-    KeepaliveAction,
-};
-use super::queue::WriteQueuePopStatus;
+use super::liveness::record_outbound_activity;
+use super::queue::{strip_opening_data_frame, WriteQueuePopStatus};
 use super::scheduler::{BatchConfig, BatchItem, GroupKey, RequestMeta, StreamMeta};
 use super::state::{
     emit_event, fail_session, mark_stream_peer_visible_by_id, maybe_release_active_count,
@@ -17,6 +14,7 @@ use crate::frame::{
 use crate::payload::parse_data_payload_metadata_offset;
 use crate::protocol::EXT_PRIORITY_UPDATE;
 use crate::settings::SchedulerHint;
+use crate::stream_id::{stream_is_bidi, stream_is_local};
 use crate::varint::{parse_varint, PackedVarint};
 use std::collections::{hash_map::Entry, HashSet};
 use std::io::{ErrorKind, IoSlice, Write};
@@ -241,42 +239,68 @@ impl Drop for TransportCloseOnExit {
         if let Some(control) = &self.inner.transport_control {
             control.close();
         }
+        self.inner.writer_exit.mark_exited();
     }
 }
 
+/// Bounds the wait for a stalled writer after a terminal close. The terminal
+/// state is already committed and the final frames (normally CLOSE) are with
+/// the writer; if the writer then completes no transport write for the
+/// close-frame send timeout, the transport is closed without waiting for those
+/// frames. Closing the transport fails the blocked write, so the writer exits
+/// and a peer that stops reading cannot pin the socket and the session threads
+/// (SPEC §10.2, API_SEMANTICS §8.1). Transports without a close control cannot
+/// be interrupted and keep the old unbounded behaviour.
+pub(super) fn arm_close_watchdog(inner: &Arc<Inner>) {
+    if inner.transport_control.is_none()
+        || inner.writer_exit.has_exited()
+        || !inner.writer_exit.arm_close_watchdog()
+    {
+        return;
+    }
+    let inner = Arc::clone(inner);
+    thread::spawn(move || run_close_watchdog(&inner));
+}
+
+fn run_close_watchdog(inner: &Arc<Inner>) {
+    let mut progress = writer_flush_count(inner);
+    loop {
+        let timeout = inner.state.lock().unwrap().terminal_close_frame_timeout;
+        if inner.writer_exit.wait_exited(timeout) {
+            return;
+        }
+        // A writer that is still completing batches (for example flushing a
+        // graceful-close tail to a slow but live peer) is not stalled.
+        let current = writer_flush_count(inner);
+        if current != progress {
+            progress = current;
+            continue;
+        }
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.close_completion_timeout_count =
+                state.close_completion_timeout_count.saturating_add(1);
+        }
+        if let Some(control) = &inner.transport_control {
+            control.close();
+        }
+        return;
+    }
+}
+
+fn writer_flush_count(inner: &Inner) -> u64 {
+    inner.state.lock().unwrap().flush_count
+}
+
+/// Keepalive runs on its own thread (see `liveness::spawn_keepalive`), so the
+/// writer only waits for queued work and a stalled transport write cannot
+/// stop keepalive deadlines from being evaluated.
 fn next_writer_batch(inner: &Arc<Inner>, batch: &mut Vec<WriteJob>) -> bool {
     loop {
-        match poll_keepalive(inner, Instant::now()) {
-            Err(err) => {
-                fail_session(inner, err);
-                continue;
-            }
-            Ok(KeepaliveAction::SendPing(payload)) => {
-                if let Err(err) = inner.force_queue_frame(Frame {
-                    frame_type: FrameType::Ping,
-                    flags: 0,
-                    stream_id: 0,
-                    payload,
-                }) {
-                    clear_unsent_keepalive_ping(inner);
-                    if err.is_session_closed() {
-                        return false;
-                    }
-                    fail_session(inner, err);
-                }
-                continue;
-            }
-            Ok(KeepaliveAction::Timeout) => {
-                close_for_idle_timeout(inner);
-                continue;
-            }
-            Ok(KeepaliveAction::Wait(wait)) => {
-                match inner.write_queue.pop_batch_wait_into(batch, wait) {
-                    WriteQueuePopStatus::Batch => return true,
-                    WriteQueuePopStatus::TimedOut => continue,
-                    WriteQueuePopStatus::Closed => return false,
-                }
-            }
+        match inner.write_queue.pop_batch_wait_into(batch, None) {
+            WriteQueuePopStatus::Batch => return true,
+            WriteQueuePopStatus::TimedOut => continue,
+            WriteQueuePopStatus::Closed => return false,
         }
     }
 }
@@ -432,6 +456,9 @@ fn filter_writable_batch_cached(
 struct WritableFrameDecision {
     stream_id: u64,
     data: bool,
+    /// The first unwritable DATA frame of the stream in this batch is its unsent
+    /// opener and must be kept (stripped) rather than dropped.
+    keep_opener: bool,
     priority_update: bool,
     priority_update_before_data: bool,
     priority_update_before_fin: bool,
@@ -443,9 +470,19 @@ impl WritableFrameDecision {
         Self {
             stream_id,
             data: false,
+            keep_opener: false,
             priority_update: false,
             priority_update_before_data: false,
             priority_update_before_fin: false,
+        }
+    }
+}
+
+fn take_keep_opener(writable_cache: &mut [WritableFrameDecision], stream_id: u64) {
+    for decision in writable_cache.iter_mut() {
+        if decision.stream_id == stream_id {
+            decision.keep_opener = false;
+            return;
         }
     }
 }
@@ -456,30 +493,58 @@ fn retain_writable_job(
     dropped: &mut Vec<(u64, usize, u64)>,
     writable_cache: &mut Vec<WritableFrameDecision>,
 ) -> bool {
-    match job {
+    let kept_openers = match job {
         WriteJob::Frame(frame) => {
-            retain_writable_frame(inner, frame, dropped, writable_cache, false)
+            return retain_writable_frame(
+                inner,
+                frame,
+                dropped,
+                writable_cache,
+                false,
+                &mut Vec::new(),
+            );
         }
         WriteJob::Frames(frames) => {
-            retain_writable_frames(inner, frames, dropped, writable_cache);
-            !frames.is_empty()
+            retain_writable_frames(inner, frames, dropped, writable_cache, &mut Vec::new());
+            return !frames.is_empty();
         }
         WriteJob::TrackedFrames(tracked) => {
-            let dropped_data_frame =
-                retain_writable_frames(inner, &mut tracked.frames, dropped, writable_cache);
-            if tracked.frames.is_empty() || dropped_data_frame {
-                if dropped_data_frame {
-                    note_dropped_frame_data(dropped, &tracked.frames);
+            let mut kept_opener_streams = Vec::new();
+            let dropped_data_frame = retain_writable_frames(
+                inner,
+                &mut tracked.frames,
+                dropped,
+                writable_cache,
+                &mut kept_opener_streams,
+            );
+            if !tracked.frames.is_empty() && !dropped_data_frame {
+                return true;
+            }
+            // The tracked write failed, but a stripped opener it carried must still
+            // open the stream ahead of later same-class openers and its terminal
+            // frame (SPEC §3.1, §6.7).
+            let mut kept_openers = Vec::new();
+            for frame in tracked.frames.drain(..) {
+                if frame.frame_type == FrameType::Data
+                    && kept_opener_streams.contains(&frame.stream_id)
+                {
+                    kept_openers.push(frame);
+                } else if dropped_data_frame && frame.frame_type == FrameType::Data {
+                    note_dropped_data(dropped, frame.stream_id, frame_data_bytes(&frame));
                 }
-                tracked
-                    .completion
-                    .complete_err(Error::local("zmux: queued write is no longer writable"));
+            }
+            tracked
+                .completion
+                .complete_err(Error::local("zmux: queued write is no longer writable"));
+            if kept_openers.is_empty() {
                 return false;
             }
-            true
+            kept_openers
         }
-        WriteJob::GracefulClose(_) | WriteJob::Shutdown | WriteJob::DrainShutdown => true,
-    }
+        WriteJob::GracefulClose(_) | WriteJob::Shutdown | WriteJob::DrainShutdown => return true,
+    };
+    *job = WriteJob::Frames(kept_openers);
+    true
 }
 
 fn retain_writable_frames(
@@ -487,6 +552,7 @@ fn retain_writable_frames(
     frames: &mut Vec<Frame>,
     dropped: &mut Vec<(u64, usize, u64)>,
     writable_cache: &mut Vec<WritableFrameDecision>,
+    kept_openers: &mut Vec<u64>,
 ) -> bool {
     let mut dropped_data_frame = false;
     let mut opening_priority_stream = None;
@@ -510,7 +576,8 @@ fn retain_writable_frames(
         Vec::new()
     };
     let mut index = 0usize;
-    frames.retain(|frame| {
+    let kept_before = kept_openers.len();
+    frames.retain_mut(|frame| {
         let allow_opening_priority_update =
             frame_is_priority_update(frame) && opening_priority_stream == Some(frame.stream_id);
         let allow_priority_before_data =
@@ -522,8 +589,10 @@ fn retain_writable_frames(
             dropped,
             writable_cache,
             allow_opening_priority_update || allow_priority_before_data,
+            kept_openers,
         );
         dropped_data_frame |= !keep && frame.frame_type == FrameType::Data;
+        dropped_data_frame |= kept_openers.len() != kept_before;
         opening_priority_stream = next_opening_priority_stream(inner, frame, keep, writable_cache);
         keep
     });
@@ -585,13 +654,25 @@ fn next_opening_priority_stream(
 
 fn retain_writable_frame(
     inner: &Arc<Inner>,
-    frame: &Frame,
+    frame: &mut Frame,
     dropped: &mut Vec<(u64, usize, u64)>,
     writable_cache: &mut Vec<WritableFrameDecision>,
     allow_opening_priority_update: bool,
+    kept_openers: &mut Vec<u64>,
 ) -> bool {
     if frame.frame_type == FrameType::Data {
-        if writable_frame_decision(inner, frame.stream_id, writable_cache).data {
+        let decision = writable_frame_decision(inner, frame.stream_id, writable_cache);
+        if decision.data {
+            return true;
+        }
+        if decision.keep_opener {
+            // The stream's opener has not been written yet and its terminal frame
+            // is pending: keep a zero-length opener so neither that frame nor a
+            // later same-class opener reaches the peer first.
+            take_keep_opener(writable_cache, frame.stream_id);
+            let stripped = strip_opening_data_frame(frame);
+            note_stripped_data(dropped, frame.stream_id, usize_to_u64_saturating(stripped));
+            kept_openers.push(frame.stream_id);
             return true;
         }
         note_dropped_data(dropped, frame.stream_id, frame_data_bytes(frame));
@@ -633,6 +714,13 @@ fn stream_writable_decision(inner: &Arc<Inner>, stream_id: u64) -> WritableFrame
     let stopped_by_peer = state.stopped_by_peer.is_some();
     let send_reset = state.send_reset.is_some();
     let data = !aborted && !send_reset;
+    // A locally opened stream whose opener has not been written yet still needs an
+    // opening frame ahead of the RESET/ABORT/STOP_SENDING it has queued.
+    let keep_opener = !data
+        && stream.opened_locally
+        && state.opened_on_wire
+        && !state.peer_visible
+        && state.pending_terminal_frames != 0;
     let priority_update_non_terminal = stream.local_send && !aborted && !stopped_by_peer;
     let priority_update = priority_update_send_state_allows(
         stream.local_send,
@@ -654,6 +742,7 @@ fn stream_writable_decision(inner: &Arc<Inner>, stream_id: u64) -> WritableFrame
     WritableFrameDecision {
         stream_id,
         data,
+        keep_opener,
         priority_update,
         priority_update_before_data,
         priority_update_before_fin,
@@ -689,12 +778,14 @@ fn note_dropped_data(dropped: &mut Vec<(u64, usize, u64)>, stream_id: u64, bytes
     dropped.push((stream_id, 1, bytes));
 }
 
-fn note_dropped_frame_data(dropped: &mut Vec<(u64, usize, u64)>, frames: &[Frame]) {
-    for frame in frames {
-        if frame.frame_type == FrameType::Data {
-            note_dropped_data(dropped, frame.stream_id, frame_data_bytes(frame));
+fn note_stripped_data(dropped: &mut Vec<(u64, usize, u64)>, stream_id: u64, bytes: u64) {
+    for (id, _, total) in dropped.iter_mut() {
+        if *id == stream_id {
+            *total = total.saturating_add(bytes);
+            return;
         }
     }
+    dropped.push((stream_id, 0, bytes));
 }
 
 fn release_dropped_data(inner: &Arc<Inner>, dropped: &[(u64, usize, u64)]) {
@@ -791,6 +882,18 @@ struct EncodedFrame {
     payload: Vec<u8>,
 }
 
+#[cfg(test)]
+pub(super) fn order_writer_batch(inner: &Arc<Inner>, batch: &mut [WriteJob]) {
+    order_batch(
+        inner,
+        batch,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+}
+
 fn order_batch(
     inner: &Arc<Inner>,
     batch: &mut [WriteJob],
@@ -835,12 +938,12 @@ fn order_batch_frames(
 
     if urgent_len == batch.len() {
         order_with_scheduler(inner, batch, true, scheduler_items, order);
-        apply_order_if_needed(batch, order, inverse_order);
+        apply_order_if_needed(inner, batch, order, inverse_order);
         return;
     }
     if urgent_len == 0 {
         order_with_scheduler(inner, batch, false, scheduler_items, order);
-        apply_order_if_needed(batch, order, inverse_order);
+        apply_order_if_needed(inner, batch, order, inverse_order);
         return;
     }
 
@@ -874,14 +977,87 @@ fn order_batch_frames(
         }
     }
 
-    apply_order_if_needed(batch, order, inverse_order);
+    apply_order_if_needed(inner, batch, order, inverse_order);
 }
 
-fn apply_order_if_needed(batch: &mut [WriteJob], order: &[usize], inverse_order: &mut Vec<usize>) {
+fn apply_order_if_needed(
+    inner: &Arc<Inner>,
+    batch: &mut [WriteJob],
+    order: &[usize],
+    inverse_order: &mut Vec<usize>,
+) {
     if order.len() != batch.len() || order_is_identity(order) {
         return;
     }
+    // Queue order already carries same-class openers in stream-ID order; keep it
+    // whenever the scheduler would put a later local opener ahead of an earlier
+    // one (SPEC §3.1).
+    if !order_keeps_local_opener_order(inner, batch, order) {
+        return;
+    }
     let _ = apply_order_in_place(batch, order, inverse_order);
+}
+
+/// Reports whether `order` keeps the not-yet-written openers of locally opened
+/// streams in ascending stream-ID order within each stream class.
+fn order_keeps_local_opener_order(inner: &Arc<Inner>, batch: &[WriteJob], order: &[usize]) -> bool {
+    let local_role = inner.negotiated.local_role;
+    let mut candidates: Vec<(usize, u64)> = Vec::new();
+    let (mut bidi, mut uni) = (0usize, 0usize);
+    for (index, job) in batch.iter().enumerate() {
+        for frame in job_frames(job) {
+            let stream_id = frame.stream_id;
+            if stream_id == 0
+                || !matches!(frame.frame_type, FrameType::Data | FrameType::Abort)
+                || !stream_is_local(local_role, stream_id)
+                || candidates.iter().any(|&(_, id)| id == stream_id)
+            {
+                continue;
+            }
+            if stream_is_bidi(stream_id) {
+                bidi += 1;
+            } else {
+                uni += 1;
+            }
+            candidates.push((index, stream_id));
+        }
+    }
+    if bidi < 2 && uni < 2 {
+        return true;
+    }
+    {
+        let state = inner.state.lock().unwrap();
+        candidates.retain(|&(_, stream_id)| {
+            state
+                .streams
+                .get(&stream_id)
+                .is_some_and(|stream| !stream.state.lock().unwrap().peer_visible)
+        });
+    }
+    let (mut last_bidi, mut last_uni) = (0u64, 0u64);
+    for &old_index in order {
+        for &(_, stream_id) in candidates.iter().filter(|&&(index, _)| index == old_index) {
+            let last = if stream_is_bidi(stream_id) {
+                &mut last_bidi
+            } else {
+                &mut last_uni
+            };
+            if stream_id < *last {
+                return false;
+            }
+            *last = stream_id;
+        }
+    }
+    true
+}
+
+fn job_frames(job: &WriteJob) -> &[Frame] {
+    match job {
+        WriteJob::Frame(frame) | WriteJob::GracefulClose(frame) => std::slice::from_ref(frame),
+        WriteJob::Frames(frames) => frames,
+        WriteJob::TrackedFrames(tracked) => &tracked.frames,
+        WriteJob::Shutdown | WriteJob::DrainShutdown => &[],
+    }
 }
 
 #[inline]

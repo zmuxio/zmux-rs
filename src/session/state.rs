@@ -1,7 +1,8 @@
+use super::liveness::close_frame_send_timeout;
 use super::queue::StreamDiscardStats;
 use super::types::{
-    ActiveStreamStats, ConnState, Inner, MemoryStats, PeerGoAwayError, SessionState, StreamInner,
-    StreamState, WriterQueueStats,
+    ActiveStreamStats, ConnState, Inner, LocalOpenerTurn, MemoryStats, PeerGoAwayError,
+    SessionState, StreamInner, StreamState, WriterQueueStats,
 };
 use crate::config::{
     DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR, DEFAULT_SESSION_MEMORY_HARD_CAP_FLOOR,
@@ -13,6 +14,7 @@ use crate::error::{
 use crate::event::{dispatch_event, Event, EventType, StreamEventInfo};
 use crate::frame::{Frame, FrameType};
 use crate::payload::StreamMetadata;
+use crate::stream_id::stream_is_bidi;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -163,17 +165,7 @@ pub(super) fn ensure_session_memory_cap(inner: &Arc<Inner>, operation: &str) -> 
         let mut state = inner.state.lock().unwrap();
         let writer = inner.write_queue.stats();
         reap_tombstones_for_memory_pressure_locked(inner, &mut state, &writer);
-        compact_marker_only_ranges_locked(&mut state);
-        let marker_count = marker_only_retained_count_locked(&state);
-        if marker_count > state.used_marker_limit {
-            return Err(Error::new(
-                ErrorCode::Internal,
-                format!(
-                    "{operation}: marker-only used-stream cap exceeded: count={} cap={}",
-                    marker_count, state.used_marker_limit
-                ),
-            ));
-        }
+        bound_marker_only_retention_locked(&mut state);
         memory_stats_locked(inner, &state, &writer)
     };
     if memory.over_cap {
@@ -210,17 +202,7 @@ pub(super) fn ensure_projected_session_memory_cap_locked(
 ) -> Result<()> {
     let writer = inner.write_queue.stats();
     reap_tombstones_for_memory_pressure_locked(inner, state, &writer);
-    compact_marker_only_ranges_locked(state);
-    let marker_count = marker_only_retained_count_locked(state);
-    if marker_count > state.used_marker_limit {
-        return Err(Error::new(
-            ErrorCode::Internal,
-            format!(
-                "{operation}: marker-only used-stream cap exceeded: count={} cap={}",
-                marker_count, state.used_marker_limit
-            ),
-        ));
-    }
+    bound_marker_only_retention_locked(state);
     let tracked = projected_live_stream_memory_locked(inner, state, &writer, 0);
     let hard_cap = session_memory_hard_cap_locked(inner, state, &writer);
     let projected = tracked.saturating_add(additional_writer_bytes);
@@ -603,10 +585,19 @@ pub(super) fn mark_stream_peer_visible_by_id(
     inner: &Arc<Inner>,
     stream_id: u64,
 ) -> Option<PeerVisibleUpdate> {
-    let (stream, session_state) = {
-        let state = inner.state.lock().unwrap();
-        (state.streams.get(&stream_id).cloned()?, state.state)
+    let (stream, session_state, turn_released) = {
+        let mut state = inner.state.lock().unwrap();
+        let turn_released = release_local_opener_turn_locked(&mut state, stream_id);
+        (
+            state.streams.get(&stream_id).cloned(),
+            state.state,
+            turn_released,
+        )
     };
+    if turn_released {
+        inner.cond.notify_all();
+    }
+    let stream = stream?;
     let mut stream_state = stream.state.lock().unwrap();
     if stream_state.aborted.is_some() && stream_state.abort_source == ErrorSource::Remote {
         return None;
@@ -694,10 +685,12 @@ pub(super) fn release_session_runtime_state_locked(state: &mut ConnState) {
     state.tombstone_order = Default::default();
     state.hidden_tombstone_order = Default::default();
     state.hidden_tombstones = 0;
+    state.late_data_aggregate_received = 0;
     state.used_markers = Default::default();
     state.used_marker_order = Default::default();
     state.used_marker_ranges = Default::default();
     state.used_marker_range_mode = false;
+    state.used_marker_floors = [0; 4];
     state.accept_bidi = Default::default();
     state.accept_uni = Default::default();
     state.accept_backlog_bytes = 0;
@@ -724,6 +717,7 @@ pub(super) fn release_session_runtime_state_locked(state: &mut ConnState) {
     }
     state.last_ping_sent_at = None;
     state.last_pong_at = None;
+    state.terminal_close_frame_timeout = close_frame_send_timeout(state.last_ping_rtt);
     state.last_ping_rtt = None;
 }
 
@@ -789,6 +783,64 @@ pub(super) fn provisional_available_count(next_id: u64, goaway: u64) -> usize {
     u64_to_usize_saturating(slots)
 }
 
+#[inline]
+pub(super) fn local_opener_turn(state: &ConnState, bidi: bool) -> LocalOpenerTurn {
+    if bidi {
+        state.local_opener_turn_bidi
+    } else {
+        state.local_opener_turn_uni
+    }
+}
+
+#[inline]
+pub(super) fn local_opener_turn_mut(state: &mut ConnState, bidi: bool) -> &mut LocalOpenerTurn {
+    if bidi {
+        &mut state.local_opener_turn_bidi
+    } else {
+        &mut state.local_opener_turn_uni
+    }
+}
+
+/// Releases the class opener turn held by `stream_id` once its opening frame has
+/// been accepted into the write queue (or reached the peer). The caller wakes
+/// `Inner::cond` waiters when this returns true.
+pub(super) fn release_local_opener_turn_locked(state: &mut ConnState, stream_id: u64) -> bool {
+    if stream_id == 0 {
+        return false;
+    }
+    let turn = local_opener_turn_mut(state, stream_is_bidi(stream_id));
+    if turn.holder != Some(stream_id) {
+        return false;
+    }
+    turn.holder = None;
+    turn.released_at = Some(Instant::now());
+    true
+}
+
+pub(super) fn release_local_opener_turn(inner: &Inner, stream_id: u64) {
+    let released = {
+        let mut state = inner.state.lock().unwrap();
+        release_local_opener_turn_locked(&mut state, stream_id)
+    };
+    if released {
+        inner.cond.notify_all();
+    }
+}
+
+/// Reports whether the class turn is held by a committed stream whose opener is
+/// currently being queued. While that is true no provisional stream of the class
+/// can commit, so provisional ages do not advance against it.
+pub(super) fn local_opener_turn_in_progress_locked(state: &ConnState, bidi: bool) -> bool {
+    let Some(holder_id) = local_opener_turn(state, bidi).holder else {
+        return false;
+    };
+    let Some(holder) = state.streams.get(&holder_id) else {
+        return false;
+    };
+    let in_progress = holder.state.lock().unwrap().opened_on_wire;
+    in_progress
+}
+
 pub(super) fn reap_expired_provisionals_locked(
     state: &mut ConnState,
     bidi: bool,
@@ -798,6 +850,10 @@ pub(super) fn reap_expired_provisionals_locked(
     if max_age.is_zero() {
         return;
     }
+    if local_opener_turn_in_progress_locked(state, bidi) {
+        return;
+    }
+    let floor = local_opener_turn(state, bidi).released_at;
     let now = Instant::now();
     loop {
         let stream = {
@@ -814,7 +870,7 @@ pub(super) fn reap_expired_provisionals_locked(
             }
             let expired = {
                 let stream_state = front.state.lock().unwrap();
-                provisional_expired_locked(&stream_state, now, max_age)
+                provisional_expired_since_locked(&stream_state, floor, now, max_age)
             };
             if expired {
                 queue.pop_front()
@@ -832,20 +888,99 @@ pub(super) fn reap_expired_provisionals_locked(
     }
 }
 
+/// When the head of the class provisional queue will count as expired, or
+/// `None` while it cannot expire (empty queue, no age limit, the class opener
+/// turn in progress, which pauses provisional ages, or the head itself waiting
+/// for its commit turn). The caller must not hold the head stream's state lock.
+pub(super) fn provisional_head_expiry_locked(state: &ConnState, bidi: bool) -> Option<Instant> {
+    let max_age = provisional_open_max_age(state.last_ping_rtt);
+    if max_age.is_zero() || local_opener_turn_in_progress_locked(state, bidi) {
+        return None;
+    }
+    let queue = if bidi {
+        &state.provisional_bidi
+    } else {
+        &state.provisional_uni
+    };
+    let head = queue.front()?.state.lock().unwrap();
+    if head.provisional_wait.waiters > 0 {
+        return None;
+    }
+    let created = head.provisional_created_at?;
+    let floor = local_opener_turn(state, bidi).released_at;
+    provisional_age_origin(&head, created, floor).checked_add(max_age)
+}
+
 #[inline]
 pub(super) fn provisional_open_expired_reason() -> &'static str {
     PROVISIONAL_OPEN_EXPIRED_REASON
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn provisional_expired_locked(
     stream_state: &StreamState,
     now: Instant,
     max_age: Duration,
 ) -> bool {
-    stream_state
-        .provisional_created_at
-        .is_some_and(|created| now.saturating_duration_since(created) > max_age)
+    provisional_expired_since_locked(stream_state, None, now, max_age)
+}
+
+/// Provisional expiry counting only idle provisional time. Ages are measured
+/// from no earlier than `floor` (the last release of the class opener turn),
+/// and time the stream spends blocked waiting for its commit turn does not
+/// count: waiting behind an earlier same-class opener is not idle, whether that
+/// opener then opens or is abandoned.
+#[inline]
+pub(super) fn provisional_expired_since_locked(
+    stream_state: &StreamState,
+    floor: Option<Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> bool {
+    stream_state.provisional_created_at.is_some_and(|created| {
+        let since = provisional_age_origin(stream_state, created, floor);
+        let until = stream_state.provisional_wait.started_at.unwrap_or(now);
+        until.saturating_duration_since(since) > max_age
+    })
+}
+
+/// The instant a provisional stream's idle age is measured from: its creation
+/// shifted past its completed commit-turn waits, but no earlier than `floor`.
+#[inline]
+fn provisional_age_origin(
+    stream_state: &StreamState,
+    created: Instant,
+    floor: Option<Instant>,
+) -> Instant {
+    let origin = created
+        .checked_add(stream_state.provisional_wait.waited)
+        .unwrap_or(created);
+    floor.map_or(origin, |floor| floor.max(origin))
+}
+
+/// Marks the start of a commit-turn wait. While any wait is in progress the
+/// stream's provisional age does not advance.
+pub(super) fn begin_provisional_wait_locked(stream_state: &mut StreamState, now: Instant) {
+    let wait = &mut stream_state.provisional_wait;
+    if wait.waiters == 0 {
+        wait.started_at = Some(now);
+    }
+    wait.waiters = wait.waiters.saturating_add(1);
+}
+
+/// Ends a commit-turn wait started with [`begin_provisional_wait_locked`].
+pub(super) fn end_provisional_wait_locked(stream_state: &mut StreamState, now: Instant) {
+    let wait = &mut stream_state.provisional_wait;
+    wait.waiters = wait.waiters.saturating_sub(1);
+    if wait.waiters > 0 {
+        return;
+    }
+    if let Some(started) = wait.started_at.take() {
+        wait.waited = wait
+            .waited
+            .saturating_add(now.saturating_duration_since(started));
+    }
 }
 
 pub(super) fn provisional_open_max_age(last_ping_rtt: Option<Duration>) -> Duration {
@@ -895,6 +1030,39 @@ pub(super) fn late_data_per_stream_cap(
                 .min(initial_stream_window / 8),
         ),
     }
+}
+
+/// Late-data allowance of one receive direction. Once the local side stopped
+/// reading or aborted the stream, the peer may still have the whole stream credit
+/// that was outstanding at that moment in flight (SPEC §9.3/§9.5), so the
+/// allowance is at least that credit; otherwise it is the repository per-stream
+/// cap.
+#[inline]
+pub(super) fn late_data_allowance(stream_state: &StreamState) -> u64 {
+    let locally_stopped = stream_state.read_stopped
+        || (stream_state.aborted.is_some() && stream_state.abort_source == ErrorSource::Local);
+    if !locally_stopped {
+        return stream_state.late_data_cap;
+    }
+    // Stream credit is never advanced once a direction stops accepting data, and
+    // every byte discarded since then advanced recv_used and late_data_received
+    // together, so this is the credit that was outstanding when the stop committed.
+    let received_at_stop = stream_state
+        .recv_used
+        .saturating_sub(stream_state.late_data_received);
+    stream_state.late_data_cap.max(
+        stream_state
+            .recv_advertised
+            .saturating_sub(received_at_stop),
+    )
+}
+
+/// Drops late-data bytes that are no longer tracked by a live stream or a
+/// tombstone from the session-wide aggregate, which counts only retained
+/// late-tail accounting (not a session-lifetime total).
+#[inline]
+fn forget_retained_late_data_locked(state: &mut ConnState, bytes: u64) {
+    state.late_data_aggregate_received = state.late_data_aggregate_received.saturating_sub(bytes);
 }
 
 pub(super) fn reclaim_provisionals_after_go_away(state: &mut ConnState, bidi: bool) {
@@ -995,6 +1163,9 @@ pub(super) fn reclaim_unseen_local_streams_after_go_away(
         clear_stream_open_info_locked(state, &mut stream_state);
         maybe_release_active_count(state, &stream, &mut stream_state);
         drop(stream_state);
+        // The peer refuses IDs above its GOAWAY watermark, so a reclaimed ID no
+        // longer orders later openers of its class.
+        release_local_opener_turn_locked(state, stream_id);
         stream.cond.notify_all();
         reclaimed.push(stream);
     }
@@ -1411,22 +1582,35 @@ pub(super) fn pop_newest_accept_pending_locked(state: &mut ConnState) -> Option<
 }
 
 #[inline]
+/// Resolves why the send half no longer accepts writes, strongest terminal
+/// condition first (STATE_MACHINE §6.1): a whole-stream ABORT (local or peer)
+/// supersedes an earlier FIN or peer STOP_SENDING, a RESET forced by a peer
+/// STOP_SENDING reports that stop, and a committed FIN wins over a later stop.
 pub(super) fn check_write_open(state: &StreamState) -> Result<()> {
-    if state.send_fin {
-        return Err(Error::write_closed().with_termination_kind(TerminationKind::Graceful));
-    }
-    if let Some((code, reason)) = &state.stopped_by_peer {
-        return Err(Error::application(*code, reason.clone())
-            .with_source(ErrorSource::Remote)
-            .with_termination_kind(TerminationKind::Stopped));
-    }
     if let Some((code, reason)) = &state.aborted {
         return Err(stream_abort_error(state, *code, reason.clone()));
     }
     if let Some((code, reason)) = &state.send_reset {
+        if state.send_reset_from_stop {
+            if let Some((stop_code, stop_reason)) = &state.stopped_by_peer {
+                return Err(peer_stopped_error(*stop_code, stop_reason.clone()));
+            }
+        }
         return Err(local_reset_error(*code, reason.clone()));
     }
+    if state.send_fin {
+        return Err(Error::write_closed().with_termination_kind(TerminationKind::Graceful));
+    }
+    if let Some((code, reason)) = &state.stopped_by_peer {
+        return Err(peer_stopped_error(*code, reason.clone()));
+    }
     Ok(())
+}
+
+fn peer_stopped_error(code: u64, reason: String) -> Error {
+    Error::application(code, reason)
+        .with_source(ErrorSource::Remote)
+        .with_termination_kind(TerminationKind::Stopped)
 }
 
 pub(super) fn stream_abort_error(state: &StreamState, code: u64, reason: String) -> Error {
@@ -1509,7 +1693,7 @@ pub(super) fn maybe_compact_stream_locked(
     let tombstone = super::types::StreamTombstone {
         data_disposition: terminal_data_disposition(stream, stream_state),
         late_data_received: stream_state.late_data_received,
-        late_data_cap: stream_state.late_data_cap,
+        late_data_cap: late_data_allowance(stream_state),
         hidden: !stream.application_visible,
         created_at: Instant::now(),
     };
@@ -1548,7 +1732,7 @@ pub(super) fn release_discarded_queued_stream_frames_locked(
     stream: &Arc<StreamInner>,
     stats: StreamDiscardStats,
 ) {
-    if stats.removed_frames == 0 {
+    if !stats.removed_any() {
         return;
     }
     let mut stream_state = stream.state.lock().unwrap();
@@ -1589,7 +1773,6 @@ fn terminal_data_disposition(
             stream.local_recv,
             state.aborted.is_some(),
             state.recv_reset.is_some(),
-            state.read_stopped,
             state.recv_fin,
         ),
         cause: late_data_cause_for(state),
@@ -1610,15 +1793,17 @@ pub(super) fn late_data_cause_for(state: &StreamState) -> super::types::LateData
     super::types::LateDataCause::None
 }
 
+/// DATA after an observed peer FIN is a stream-state violation answered with
+/// ABORT(STREAM_CLOSED) (SPEC §9.2/§9.6), whether or not the local side had
+/// stopped reading; a local read-stop only selects local read errors (§3.2).
 #[inline]
 fn terminal_data_action_for(
     local_recv: bool,
     aborted: bool,
     recv_reset: bool,
-    read_stopped: bool,
     recv_fin: bool,
 ) -> super::types::TerminalDataAction {
-    if !local_recv || aborted || recv_reset || read_stopped {
+    if !local_recv || aborted || recv_reset {
         return super::types::TerminalDataAction::Ignore;
     }
     if recv_fin {
@@ -1633,11 +1818,13 @@ pub(super) fn record_tombstone_locked(
     tombstone: super::types::StreamTombstone,
 ) {
     if state.tombstone_limit == 0 {
+        forget_retained_late_data_locked(state, tombstone.late_data_received);
         let old = state.tombstones.remove(&stream_id);
         if tombstone.hidden && !old.as_ref().is_some_and(|old| old.hidden) {
             state.hidden_streams_reaped = state.hidden_streams_reaped.saturating_add(1);
         }
         if let Some(old) = old {
+            forget_retained_late_data_locked(state, old.late_data_received);
             if old.hidden {
                 state.hidden_tombstones = state.hidden_tombstones.saturating_sub(1);
             }
@@ -1653,6 +1840,7 @@ pub(super) fn record_tombstone_locked(
     }
     match old {
         Some(old) => {
+            forget_retained_late_data_locked(state, old.late_data_received);
             if old.hidden && !tombstone.hidden {
                 state.hidden_tombstones = state.hidden_tombstones.saturating_sub(1);
             } else if !old.hidden && tombstone.hidden {
@@ -1780,6 +1968,7 @@ fn remove_tombstone_locked(state: &mut ConnState, stream_id: u64) {
     let Some(tombstone) = state.tombstones.remove(&stream_id) else {
         return;
     };
+    forget_retained_late_data_locked(state, tombstone.late_data_received);
     if tombstone.hidden {
         state.hidden_tombstones = state.hidden_tombstones.saturating_sub(1);
     }
@@ -1797,6 +1986,7 @@ pub(super) fn terminal_marker_disposition_locked(
         return Some(disposition);
     }
     marker_range_disposition_locked(state, stream_id)
+        .or_else(|| coarsened_marker_disposition_locked(state, stream_id))
 }
 
 #[inline]
@@ -1843,8 +2033,81 @@ fn marker_only_map_count_locked(state: &ConnState) -> usize {
 }
 
 fn enforce_used_marker_limit_locked(state: &mut ConnState) {
-    compact_marker_only_ranges_locked(state);
+    bound_marker_only_retention_locked(state);
     compact_used_marker_order_locked(state);
+}
+
+/// Keeps marker-only used-stream bookkeeping within `used_marker_limit` without
+/// failing the session: markers are range-compressed first, and only if the
+/// ranges are still over budget are the oldest ones coarsened.
+fn bound_marker_only_retention_locked(state: &mut ConnState) {
+    compact_marker_only_ranges_locked(state);
+    coarsen_marker_ranges_locked(state);
+}
+
+/// Folds the lowest ranges of the classes with the most ranges into a per-class
+/// floor. Every ID at or below a floor was already used (ranges only hold used
+/// IDs below the next-expected cursors), so it is still known and never reused;
+/// only its late-DATA policy collapses to the conservative "ignore with
+/// discard-and-release" (SPEC §9.4/§9.5, STATE_MACHINE §8.1). This gives up only
+/// the recommended ABORT(STREAM_CLOSED) for DATA after FIN on long-reaped IDs.
+fn coarsen_marker_ranges_locked(state: &mut ConnState) {
+    if marker_only_retained_count_locked(state) <= state.used_marker_limit {
+        return;
+    }
+    // Coarsen down to half the budget so the O(n) fold is amortized over many
+    // later reaps instead of running on every one.
+    let target = state.used_marker_limit / 2;
+    while state.used_marker_ranges.len() > target {
+        let Some((first, len)) = largest_marker_range_class_span(&state.used_marker_ranges) else {
+            break;
+        };
+        let remove = (state.used_marker_ranges.len() - target).min(len);
+        let floor = state.used_marker_ranges[first + remove - 1].end;
+        let class = marker_class(floor);
+        state.used_marker_floors[class] = state.used_marker_floors[class].max(floor);
+        state.used_marker_ranges.drain(first..first + remove);
+    }
+    shrink_retention_queues_locked(state);
+}
+
+/// Returns (first index, length) of the class with the most ranges.
+fn largest_marker_range_class_span(
+    ranges: &[super::types::UsedMarkerRange],
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut first = 0usize;
+    while first < ranges.len() {
+        let class = marker_class(ranges[first].start);
+        let len = ranges[first..]
+            .iter()
+            .take_while(|range| marker_class(range.start) == class)
+            .count();
+        if best.is_none_or(|(_, best_len)| len > best_len) {
+            best = Some((first, len));
+        }
+        first += len;
+    }
+    best
+}
+
+#[inline]
+fn marker_class(stream_id: u64) -> usize {
+    (stream_id & 3) as usize
+}
+
+/// Late-DATA policy of an ID folded into its class floor by marker coarsening.
+#[inline]
+fn coarsened_marker_disposition_locked(
+    state: &ConnState,
+    stream_id: u64,
+) -> Option<super::types::TerminalDataDisposition> {
+    (stream_id <= state.used_marker_floors[marker_class(stream_id)]).then_some(
+        super::types::TerminalDataDisposition {
+            action: super::types::TerminalDataAction::Ignore,
+            cause: super::types::LateDataCause::None,
+        },
+    )
 }
 
 fn compact_marker_only_ranges_locked(state: &mut ConnState) {
@@ -1957,6 +2220,10 @@ fn upsert_marker_range_locked(
     stream_id: u64,
     disposition: super::types::TerminalDataDisposition,
 ) {
+    if stream_id <= state.used_marker_floors[marker_class(stream_id)] {
+        // Already covered by the coarsened prefix of its class.
+        return;
+    }
     let index = first_marker_range_starting_after(&state.used_marker_ranges, stream_id);
     if index > 0 && marker_range_contains(state.used_marker_ranges[index - 1], stream_id) {
         set_contained_marker_range_locked(state, index - 1, stream_id, disposition);
@@ -2069,18 +2336,27 @@ fn marker_range_contains(range: super::types::UsedMarkerRange, stream_id: u64) -
         && (stream_id - range.start).is_multiple_of(4)
 }
 
+/// Ranges are ordered by (stream class, start), so the search, splits and
+/// merges only ever see ranges of the ID's own class as neighbours.
 #[inline]
 fn first_marker_range_starting_after(
     ranges: &[super::types::UsedMarkerRange],
     stream_id: u64,
 ) -> usize {
-    ranges.partition_point(|range| range.start <= stream_id)
+    let key = marker_range_key(stream_id);
+    ranges.partition_point(|range| marker_range_key(range.start) <= key)
+}
+
+#[inline]
+fn marker_range_key(stream_id: u64) -> (usize, u64) {
+    (marker_class(stream_id), stream_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::buffer::RecvBuffer;
+    use crate::session::types::ProvisionalWait;
 
     fn stream_state_for_write_check() -> StreamState {
         StreamState {
@@ -2102,6 +2378,7 @@ mod tests {
             send_reset_from_stop: false,
             stopped_by_peer: None,
             provisional_created_at: None,
+            provisional_wait: ProvisionalWait::default(),
             opened_on_wire: true,
             peer_visible: true,
             received_open: true,
@@ -2111,6 +2388,7 @@ mod tests {
             recv_used: 0,
             recv_advertised: 0,
             recv_pending: 0,
+            recv_blocked_at: None,
             late_data_received: 0,
             late_data_cap: 0,
             open_prefix: Vec::new(),
@@ -2136,7 +2414,7 @@ mod tests {
     #[test]
     fn tombstone_late_data_action_ignores_absent_receive_half() {
         assert_eq!(
-            terminal_data_action_for(false, false, false, false, false),
+            terminal_data_action_for(false, false, false, false),
             super::super::types::TerminalDataAction::Ignore
         );
     }
@@ -2144,17 +2422,65 @@ mod tests {
     #[test]
     fn tombstone_late_data_action_aborts_after_recv_fin() {
         assert_eq!(
-            terminal_data_action_for(true, false, false, false, true),
+            terminal_data_action_for(true, false, false, true),
             super::super::types::TerminalDataAction::Abort(ErrorCode::StreamClosed.as_u64())
         );
     }
 
     #[test]
-    fn tombstone_late_data_action_keeps_local_read_stop_dominant_after_recv_fin() {
+    fn tombstone_late_data_action_ignores_after_abort_or_reset_of_finished_half() {
         assert_eq!(
-            terminal_data_action_for(true, false, false, true, true),
+            terminal_data_action_for(true, true, false, true),
             super::super::types::TerminalDataAction::Ignore
         );
+        assert_eq!(
+            terminal_data_action_for(true, false, true, false),
+            super::super::types::TerminalDataAction::Ignore
+        );
+    }
+
+    #[test]
+    fn late_data_allowance_covers_credit_outstanding_at_local_stop() {
+        let mut state = stream_state_for_write_check();
+        state.late_data_cap = 8 * 1024;
+        state.recv_advertised = 64 * 1024;
+        state.recv_used = 1024;
+        assert_eq!(late_data_allowance(&state), 8 * 1024);
+
+        state.read_stopped = true;
+        assert_eq!(late_data_allowance(&state), 63 * 1024);
+
+        // Late bytes discarded after the stop advance both counters together, so
+        // the allowance keeps describing the credit outstanding at the stop.
+        state.recv_used += 16 * 1024;
+        state.late_data_received += 16 * 1024;
+        assert_eq!(late_data_allowance(&state), 63 * 1024);
+
+        state.recv_used = 64 * 1024;
+        state.late_data_received = 63 * 1024;
+        assert_eq!(late_data_allowance(&state), 63 * 1024);
+    }
+
+    #[test]
+    fn late_data_allowance_extends_only_for_local_stop_or_abort() {
+        let mut state = stream_state_for_write_check();
+        state.late_data_cap = 1024;
+        state.recv_advertised = 64 * 1024;
+
+        state.aborted = Some((ErrorCode::Cancelled.as_u64(), String::new()));
+        state.abort_source = ErrorSource::Remote;
+        assert_eq!(late_data_allowance(&state), 1024);
+
+        state.abort_source = ErrorSource::Local;
+        assert_eq!(late_data_allowance(&state), 64 * 1024);
+
+        state.aborted = None;
+        state.recv_reset = Some((ErrorCode::Cancelled.as_u64(), String::new()));
+        assert_eq!(late_data_allowance(&state), 1024);
+
+        state.recv_advertised = 512;
+        state.read_stopped = true;
+        assert_eq!(late_data_allowance(&state), 1024);
     }
 
     #[test]
@@ -2170,6 +2496,37 @@ mod tests {
         assert_eq!(err.reason(), Some("peer stop"));
         assert_eq!(err.source(), ErrorSource::Remote);
         assert_eq!(err.termination_kind(), TerminationKind::Stopped);
+    }
+
+    #[test]
+    fn check_write_open_surfaces_abort_after_graceful_fin() {
+        let mut state = stream_state_for_write_check();
+        state.send_fin = true;
+        state.aborted = Some((42, "boom".to_owned()));
+        state.abort_source = ErrorSource::Remote;
+
+        let err = check_write_open(&state).unwrap_err();
+
+        assert_eq!(err.numeric_code(), Some(42));
+        assert_eq!(err.reason(), Some("boom"));
+        assert_eq!(err.source(), ErrorSource::Remote);
+        assert_eq!(err.termination_kind(), TerminationKind::Abort);
+    }
+
+    #[test]
+    fn check_write_open_surfaces_abort_after_peer_stop_and_stop_driven_reset() {
+        let mut state = stream_state_for_write_check();
+        state.stopped_by_peer = Some((77, "peer stop".to_owned()));
+        state.send_reset = Some((ErrorCode::Cancelled.as_u64(), String::new()));
+        state.send_reset_from_stop = true;
+        state.aborted = Some((42, "boom".to_owned()));
+        state.abort_source = ErrorSource::Local;
+
+        let err = check_write_open(&state).unwrap_err();
+
+        assert_eq!(err.numeric_code(), Some(42));
+        assert_eq!(err.source(), ErrorSource::Local);
+        assert_eq!(err.termination_kind(), TerminationKind::Abort);
     }
 
     #[test]
@@ -2205,6 +2562,74 @@ mod tests {
         let huge_count = (u64::MAX / 4).saturating_add(1);
         let expected = usize::try_from(huge_count).unwrap_or(usize::MAX);
         assert_eq!(provisional_available_count(0, u64::MAX), expected);
+    }
+
+    #[test]
+    fn provisional_expiration_does_not_count_time_behind_an_earlier_opener() {
+        let now = Instant::now();
+        let max_age = Duration::from_secs(5);
+        let mut state = stream_state_for_write_check();
+        state.provisional_created_at = Some(now - Duration::from_secs(10));
+
+        assert!(provisional_expired_since_locked(&state, None, now, max_age));
+        assert!(provisional_expired_since_locked(
+            &state,
+            Some(now - Duration::from_secs(20)),
+            now,
+            max_age
+        ));
+        assert!(!provisional_expired_since_locked(
+            &state,
+            Some(now - Duration::from_secs(1)),
+            now,
+            max_age
+        ));
+    }
+
+    #[test]
+    fn provisional_expiration_does_not_count_commit_turn_waits() {
+        let max_age = Duration::from_secs(5);
+        let created = Instant::now();
+        let mut state = stream_state_for_write_check();
+        state.provisional_created_at = Some(created);
+
+        // Idle for 2s, then waiting for the commit turn: the age stays at 2s
+        // however long the wait lasts, also across overlapping waiters.
+        begin_provisional_wait_locked(&mut state, created + Duration::from_secs(2));
+        begin_provisional_wait_locked(&mut state, created + Duration::from_secs(3));
+        let late = created + Duration::from_secs(60);
+        assert!(!provisional_expired_since_locked(
+            &state, None, late, max_age
+        ));
+        end_provisional_wait_locked(&mut state, created + Duration::from_secs(9));
+        assert!(!provisional_expired_since_locked(
+            &state, None, late, max_age
+        ));
+
+        // The 10s wait ends; idle time resumes counting from 2s.
+        end_provisional_wait_locked(&mut state, created + Duration::from_secs(12));
+        assert_eq!(state.provisional_wait.waiters, 0);
+        assert_eq!(state.provisional_wait.waited, Duration::from_secs(10));
+        let at = |secs| created + Duration::from_secs(secs);
+        assert!(!provisional_expired_since_locked(
+            &state,
+            None,
+            at(15),
+            max_age
+        ));
+        assert!(provisional_expired_since_locked(
+            &state,
+            None,
+            at(16),
+            max_age
+        ));
+        // A later turn release still restarts the age.
+        assert!(!provisional_expired_since_locked(
+            &state,
+            Some(at(14)),
+            at(16),
+            max_age
+        ));
     }
 
     #[test]

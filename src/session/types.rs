@@ -9,7 +9,7 @@ use crate::preface::{Negotiated, Preface};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -757,6 +757,19 @@ pub(super) enum WriteJob {
     DrainShutdown,
 }
 
+/// Per-class local opener serialization state (SPEC §3.1 no peer-observable gaps).
+///
+/// `holder` is the most recently committed local stream ID of the class whose
+/// opening frame has not yet been accepted into the write queue. A later
+/// same-class stream may only commit its ID once the holder's opener is queued
+/// (or the abandoned holder ID has been consumed with an opening ABORT), so
+/// openers enter the queue in stream-ID order.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct LocalOpenerTurn {
+    pub(super) holder: Option<u64>,
+    pub(super) released_at: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub(super) struct TrackedWriteJob {
     pub(super) frames: Vec<Frame>,
@@ -880,13 +893,56 @@ pub(super) trait RuntimeTransportControl: Send + Sync {
     fn close(&self);
 }
 
+/// Tracks the writer thread's exit, which is when the transport is closed on
+/// the normal path, so a terminal close can bound how long it waits for a
+/// stalled writer to flush the final frames.
+#[derive(Default)]
+pub(super) struct WriterExit {
+    exited: Mutex<bool>,
+    cond: Condvar,
+    close_watchdog_armed: AtomicBool,
+}
+
+impl WriterExit {
+    pub(super) fn mark_exited(&self) {
+        *self.exited.lock().unwrap() = true;
+        self.cond.notify_all();
+    }
+
+    pub(super) fn has_exited(&self) -> bool {
+        *self.exited.lock().unwrap()
+    }
+
+    /// Waits up to `timeout` for the writer to exit and reports whether it did.
+    pub(super) fn wait_exited(&self, timeout: Duration) -> bool {
+        let exited = self.exited.lock().unwrap();
+        let (exited, _) = self
+            .cond
+            .wait_timeout_while(exited, timeout.min(MAX_CONDVAR_TIMED_WAIT), |exited| {
+                !*exited
+            })
+            .unwrap();
+        *exited
+    }
+
+    /// Returns true exactly once, for the caller that arms the close watchdog.
+    pub(super) fn arm_close_watchdog(&self) -> bool {
+        !self.close_watchdog_armed.swap(true, Ordering::AcqRel)
+    }
+}
+
 pub(super) struct Inner {
     pub(super) write_queue: Arc<WriteQueue>,
     pub(super) transport_control: Option<Arc<dyn RuntimeTransportControl>>,
+    pub(super) writer_exit: WriterExit,
     pub(super) local_addr: Option<SocketAddr>,
     pub(super) peer_addr: Option<SocketAddr>,
     pub(super) state: Mutex<ConnState>,
     pub(super) cond: Condvar,
+    /// Wakes the keepalive thread (paired with `state`); notified only when
+    /// its schedule can move earlier (a new outstanding PING) or the session
+    /// terminates, so ordinary frame traffic does not wake it.
+    pub(super) keepalive_cond: Condvar,
     pub(super) local_preface: Preface,
     pub(super) peer_preface: Preface,
     pub(super) negotiated: Negotiated,
@@ -931,9 +987,15 @@ pub(super) struct ConnState {
     pub(super) hidden_tombstones: usize,
     pub(super) used_markers: HashMap<u64, TerminalDataDisposition>,
     pub(super) used_marker_order: VecDeque<u64>,
+    /// Used-stream ranges sorted by (stream class, start), so every range of one
+    /// class is contiguous and never interleaves with another class.
     pub(super) used_marker_ranges: Vec<UsedMarkerRange>,
     pub(super) used_marker_range_mode: bool,
     pub(super) used_marker_limit: usize,
+    /// Per stream class (`stream_id & 3`): highest ID coarsened into the
+    /// conservative "used, ignore late DATA" prefix once the marker budget was
+    /// exceeded; 0 when the class was never coarsened.
+    pub(super) used_marker_floors: [u64; 4],
     pub(super) provisional_bidi: VecDeque<Arc<StreamInner>>,
     pub(super) provisional_uni: VecDeque<Arc<StreamInner>>,
     pub(super) accept_bidi: VecDeque<Arc<StreamInner>>,
@@ -955,12 +1017,19 @@ pub(super) struct ConnState {
     pub(super) next_accept_seq: u64,
     pub(super) next_local_bidi: u64,
     pub(super) next_local_uni: u64,
+    pub(super) local_opener_turn_bidi: LocalOpenerTurn,
+    pub(super) local_opener_turn_uni: LocalOpenerTurn,
     pub(super) max_provisional_bidi: usize,
     pub(super) max_provisional_uni: usize,
     pub(super) provisional_open_limited_count: u64,
     pub(super) provisional_open_expired_count: u64,
     pub(super) next_peer_bidi: u64,
     pub(super) next_peer_uni: u64,
+    /// Highest peer-owned ID per class refused above the local GOAWAY watermark
+    /// (0 when none); such IDs are never consumed, so this keeps their
+    /// ABORT(REFUSED_STREAM) to one per ID.
+    pub(super) highest_refused_peer_bidi: u64,
+    pub(super) highest_refused_peer_uni: u64,
     pub(super) active: ActiveStreamStats,
     pub(super) send_session_used: u64,
     pub(super) send_session_max: u64,
@@ -970,6 +1039,8 @@ pub(super) struct ConnState {
     pub(super) recv_session_retained: usize,
     pub(super) recv_session_advertised: u64,
     pub(super) recv_session_pending: u64,
+    /// Highest session limit the peer reported being blocked at.
+    pub(super) recv_session_blocked_at: Option<u64>,
     pub(super) recv_replenish_retry: bool,
     pub(super) late_data_per_stream_cap: Option<u64>,
     pub(super) late_data_aggregate_received: u64,
@@ -1051,6 +1122,9 @@ pub(super) struct ConnState {
     pub(super) last_flush_bytes: usize,
     pub(super) last_open_latency: Option<Duration>,
     pub(super) last_ping_rtt: Option<Duration>,
+    /// Close-frame send timeout captured from the RTT when the session became
+    /// terminal (the runtime RTT sample is released at that point).
+    pub(super) terminal_close_frame_timeout: Duration,
     pub(super) last_control_progress_at: Instant,
     pub(super) last_stream_progress_at: Option<Instant>,
     pub(super) last_application_progress_at: Option<Instant>,
@@ -1126,6 +1200,7 @@ pub(super) struct StreamState {
     pub(super) send_reset_from_stop: bool,
     pub(super) stopped_by_peer: Option<(u64, String)>,
     pub(super) provisional_created_at: Option<Instant>,
+    pub(super) provisional_wait: ProvisionalWait,
     pub(super) opened_on_wire: bool,
     pub(super) peer_visible: bool,
     pub(super) received_open: bool,
@@ -1135,6 +1210,8 @@ pub(super) struct StreamState {
     pub(super) recv_used: u64,
     pub(super) recv_advertised: u64,
     pub(super) recv_pending: u64,
+    /// Highest stream limit the peer reported being blocked at.
+    pub(super) recv_blocked_at: Option<u64>,
     pub(super) late_data_received: u64,
     pub(super) late_data_cap: u64,
     pub(super) open_prefix: Vec<u8>,
@@ -1154,6 +1231,20 @@ pub(super) struct StreamState {
     pub(super) retained_recv_reset_reason_bytes: usize,
     pub(super) retained_abort_reason_bytes: usize,
     pub(super) retained_stopped_reason_bytes: usize,
+}
+
+/// Time a provisional stream spends blocked waiting for its commit turn
+/// (behind an earlier same-class opener). That wait is not idle provisional
+/// time, so it does not count toward provisional-open expiry, even when the
+/// earlier opener is later abandoned.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ProvisionalWait {
+    /// Commit attempts currently waiting on this stream.
+    pub(super) waiters: u32,
+    /// Start of the current waiting stretch, while `waiters > 0`.
+    pub(super) started_at: Option<Instant>,
+    /// Total time of completed waiting stretches.
+    pub(super) waited: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

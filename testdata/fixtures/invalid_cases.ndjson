@@ -4,7 +4,7 @@
   "category": "preface",
   "description": "A preface settings block repeats the same setting ID.",
   "expected_result": {
-    "scope": "session",
+    "scope": "session_establishment",
     "error": "PROTOCOL"
   },
   "input_shape": {
@@ -24,6 +24,7 @@
     "scope": "session_establishment",
     "error": "PROTOCOL"
   },
+  "hex": "5a4d555801070001010000",
   "input_shape": {
     "role": 7
   }
@@ -53,6 +54,7 @@
     "scope": "session_establishment",
     "error": "PROTOCOL"
   },
+  "hex": "5a4d555801020001010000",
   "input_shape": {
     "role": "auto",
     "tie_breaker_nonce": 0
@@ -101,13 +103,153 @@
   }
 }
 {
+  "id": "preface_invalid_magic",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer preface does not start with the ASCII magic ZMUX.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d555901000001010000"
+}
+{
+  "id": "preface_unsupported_preface_ver",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer preface uses an unsupported preface_ver = 2.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "UNSUPPORTED_VERSION"
+  },
+  "hex": "5a4d555802000001010000"
+}
+{
+  "id": "preface_no_protocol_version_overlap",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "The local and peer [min_proto, max_proto] ranges do not overlap.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "UNSUPPORTED_VERSION"
+  },
+  "input_shape": {
+    "local_min_proto": 1,
+    "local_max_proto": 1,
+    "peer_min_proto": 2,
+    "peer_max_proto": 2
+  }
+}
+{
+  "id": "preface_explicit_same_role_conflict",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "Both peers explicitly request the same role (initiator/initiator; responder/responder is symmetric).",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "ROLE_CONFLICT"
+  },
+  "input_shape": {
+    "local_role": "initiator",
+    "peer_role": "initiator"
+  }
+}
+{
+  "id": "preface_settings_len_exceeds_limit",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A peer preface advertises settings_len = 4097; the receiver rejects it from the length field before reading the settings bytes.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "FRAME_SIZE"
+  },
+  "hex": "5a4d55580100000101005001"
+}
+{
+  "id": "preface_duplicate_padding",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A preface settings block repeats preface_padding (setting 12).",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d5558010000010100060c01aa0c01bb"
+}
+{
+  "id": "preface_duplicate_unknown_setting_id",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A preface settings block repeats an unknown setting ID (63).",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d5558010000010100063f01003f0100"
+}
+{
+  "id": "preface_setting_empty_value",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A known varint setting (max_frame_payload) has an empty TLV value.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d5558010000010100020700"
+}
+{
+  "id": "preface_setting_truncated_value",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A known varint setting value 80 00 announces a 4-byte varint62 but its TLV holds 2 bytes (the old WIRE_EXAMPLES 1.26 mistake).",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d555801000001010b0407028000"
+}
+{
+  "id": "preface_setting_noncanonical_value",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A known varint setting carries max_frame_payload = 16384 in a non-canonical 8-byte varint62.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d55580100000101000a0708c000000000004000"
+}
+{
+  "id": "preface_setting_trailing_byte",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A known varint setting value is followed by a trailing byte inside its TLV.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d55580100000101000707058000400000"
+}
+{
+  "id": "preface_settings_tlv_overrun",
+  "source": "invalid_corpus",
+  "category": "preface",
+  "description": "A settings TLV length overruns settings_tlv.",
+  "expected_result": {
+    "scope": "session_establishment",
+    "error": "PROTOCOL"
+  },
+  "hex": "5a4d555801000001010003070580"
+}
+{
   "id": "frame_length_too_small",
   "source": "invalid_corpus",
   "category": "frame",
   "description": "A frame advertises frame_length smaller than the mandatory code plus shortest stream_id encoding.",
   "expected_result": {
     "scope": "session",
-    "error": "PROTOCOL"
+    "error": "FRAME_SIZE"
   },
   "input_shape": {
     "frame_length": 1
@@ -134,7 +276,7 @@
   "description": "A frame_length remains too small for the actual encoded stream_id prefix after stream_id parsing.",
   "expected_result": {
     "scope": "session",
-    "error": "PROTOCOL"
+    "error": "FRAME_SIZE"
   },
   "input_shape": {
     "frame_length": 2,
@@ -159,7 +301,7 @@
   "description": "PONG payload is shorter than the required 8-byte token.",
   "expected_result": {
     "scope": "session",
-    "error": "PROTOCOL"
+    "error": "FRAME_SIZE"
   },
   "input_shape": {
     "frame_type": "PONG",
@@ -258,6 +400,9 @@
         "type": "stream_priority",
         "value": 3
       }
+    ],
+    "capabilities": [
+      "priority_update"
     ]
   }
 }
@@ -268,13 +413,16 @@
   "description": "PRIORITY_UPDATE contains a structurally truncated TLV header.",
   "expected_result": {
     "scope": "session",
-    "error": "PROTOCOL"
+    "error": "FRAME_SIZE"
   },
   "input_shape": {
     "frame_type": "EXT",
     "ext_type": "PRIORITY_UPDATE",
     "stream_id": 4,
-    "payload_shape": "truncated_stream_hint_tlv_header"
+    "payload_shape": "truncated_stream_hint_tlv_header",
+    "capabilities": [
+      "priority_update"
+    ]
   }
 }
 {
@@ -284,13 +432,43 @@
   "description": "PRIORITY_UPDATE contains a TLV value length that overruns the enclosing payload.",
   "expected_result": {
     "scope": "session",
-    "error": "PROTOCOL"
+    "error": "FRAME_SIZE"
   },
   "input_shape": {
     "frame_type": "EXT",
     "ext_type": "PRIORITY_UPDATE",
     "stream_id": 4,
-    "payload_shape": "stream_hint_tlv_value_overrun"
+    "payload_shape": "stream_hint_tlv_value_overrun",
+    "capabilities": [
+      "priority_update"
+    ]
+  }
+}
+{
+  "id": "frame_priority_update_noncanonical_value",
+  "source": "invalid_corpus",
+  "category": "frame",
+  "description": "PRIORITY_UPDATE on an open stream carries stream_priority = 2 encoded non-canonically as 40 02; the malformed standardized value makes the EXT payload malformed.",
+  "expected_result": {
+    "scope": "session",
+    "error": "FRAME_SIZE"
+  },
+  "hex": "070b040101024002",
+  "input_shape": {
+    "frame_type": "EXT",
+    "ext_type": "PRIORITY_UPDATE",
+    "stream_id": 4,
+    "stream_exists": true,
+    "stream_metadata_tlvs": [
+      {
+        "type": "stream_priority",
+        "value_hex": "4002"
+      }
+    ],
+    "capabilities": [
+      "priority_update",
+      "priority_hints"
+    ]
   }
 }
 {
@@ -305,7 +483,8 @@
   "input_shape": {
     "frame_type": "EXT",
     "ext_type": "PRIORITY_UPDATE",
-    "stream_id": 4
+    "stream_id": 4,
+    "capabilities": []
   }
 }
 {
@@ -441,8 +620,8 @@
   "category": "state",
   "description": "A stream-scoped MAX_DATA arrives for a previously unused valid stream ID.",
   "expected_result": {
-    "scope": "stream",
-    "error": "STREAM_STATE"
+    "scope": "session",
+    "error": "PROTOCOL"
   },
   "input_shape": {
     "stream_id": 4,
@@ -456,8 +635,8 @@
   "category": "state",
   "description": "A stream-scoped BLOCKED arrives for a previously unused valid stream ID.",
   "expected_result": {
-    "scope": "stream",
-    "error": "STREAM_STATE"
+    "scope": "session",
+    "error": "PROTOCOL"
   },
   "input_shape": {
     "stream_id": 4,
@@ -471,8 +650,8 @@
   "category": "state",
   "description": "A STOP_SENDING arrives for a previously unused valid stream ID.",
   "expected_result": {
-    "scope": "stream",
-    "error": "STREAM_STATE"
+    "scope": "session",
+    "error": "PROTOCOL"
   },
   "input_shape": {
     "stream_id": 4,
@@ -486,8 +665,8 @@
   "category": "state",
   "description": "A RESET arrives for a previously unused valid stream ID.",
   "expected_result": {
-    "scope": "stream",
-    "error": "STREAM_STATE"
+    "scope": "session",
+    "error": "PROTOCOL"
   },
   "input_shape": {
     "stream_id": 4,
@@ -541,6 +720,20 @@
   }
 }
 {
+  "id": "frame_data_wrong_side_uni",
+  "source": "invalid_corpus",
+  "category": "state",
+  "description": "DATA arrives from the non-sending side of an opened unidirectional stream.",
+  "expected_result": {
+    "scope": "stream",
+    "error": "STREAM_STATE"
+  },
+  "input_shape": {
+    "stream_kind": "uni_local_send_only",
+    "incoming_frame": "DATA"
+  }
+}
+{
   "id": "frame_max_data_wrong_side_uni",
   "source": "invalid_corpus",
   "category": "state",
@@ -586,7 +779,7 @@
   "id": "session_goaway_last_accepted_increase",
   "source": "invalid_corpus",
   "category": "session",
-  "description": "A later GOAWAY increases one of its per-kind acceptance watermarks.",
+  "description": "A later GOAWAY increases one of its per-stream-class acceptance watermarks.",
   "expected_result": {
     "scope": "session",
     "error": "PROTOCOL"
@@ -633,7 +826,7 @@
   "id": "late_data_after_close_read_exceeds_session_aggregate_cap",
   "source": "invalid_corpus",
   "category": "flow_control",
-  "description": "Many stopped directions together exceed the repository-default aggregate late-data allowance without triggering local shedding or termination policy.",
+  "description": "Many stopped directions together exceed the repository-default aggregate late-data allowance while the implementation keeps buffering late tail bytes instead of discarding them with session budget release.",
   "expected_result": {
     "scope": "local_policy",
     "action": "forbid_unbounded_late_tail_buffering"

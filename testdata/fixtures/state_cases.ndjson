@@ -41,7 +41,7 @@
   "steps": [
     {
       "event": "peer_first_RESET",
-      "expect_result": "stream_state_violation"
+      "expect_result": "protocol_violation"
     }
   ]
 }
@@ -1129,7 +1129,7 @@
   "steps": [
     {
       "event": "peer_first_MAX_DATA",
-      "expect_result": "stream_state_violation"
+      "expect_result": "protocol_violation"
     }
   ]
 }
@@ -1144,7 +1144,7 @@
   "steps": [
     {
       "event": "peer_first_BLOCKED",
-      "expect_result": "stream_state_violation"
+      "expect_result": "protocol_violation"
     }
   ]
 }
@@ -1155,11 +1155,14 @@
   "stream_kind": "uni_local_send_only",
   "ownership": "local_owned",
   "scope": null,
-  "initial_state": "idle",
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "absent"
+  },
   "steps": [
     {
       "event": "peer_DATA",
-      "expect_result": "stream_state_violation"
+      "expect_result": "abort_stream_state"
     }
   ]
 }
@@ -1170,11 +1173,44 @@
   "stream_kind": "uni_local_send_only",
   "ownership": "local_owned",
   "scope": null,
+  "initial_state": {
+    "send_half": "send_open",
+    "recv_half": "absent"
+  },
+  "steps": [
+    {
+      "event": "peer_BLOCKED",
+      "expect_result": "abort_stream_state"
+    }
+  ]
+}
+{
+  "id": "peer_data_on_unopened_local_uni_is_protocol_violation",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
+  "initial_state": "idle",
+  "steps": [
+    {
+      "event": "peer_DATA",
+      "expect_result": "protocol_violation"
+    }
+  ]
+}
+{
+  "id": "peer_blocked_on_unopened_local_uni_is_protocol_violation",
+  "source": "state_corpus",
+  "category": "state_scenario",
+  "stream_kind": "uni_local_send_only",
+  "ownership": "local_owned",
+  "scope": null,
   "initial_state": "idle",
   "steps": [
     {
       "event": "peer_BLOCKED",
-      "expect_result": "stream_state_violation"
+      "expect_result": "protocol_violation"
     }
   ]
 }
@@ -1432,7 +1468,7 @@
     },
     {
       "event": "aggregate_cap_is_exceeded",
-      "expect_result": "additional_late_tail_is_discarded_or_local_policy_escalates"
+      "expect_result": "additional_late_tail_is_discarded_with_session_budget_release"
     }
   ]
 }

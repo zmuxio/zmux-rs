@@ -1,9 +1,10 @@
+use super::egress::arm_close_watchdog;
 use super::liveness::note_blocked_write_locked;
 use super::state::{ensure_projected_session_memory_cap, fail_session_with_close};
 use super::types::WriterQueueStats;
 use super::types::{Inner, WriteJob};
 use crate::error::{Error, ErrorCode, Result};
-use crate::frame::{Frame, FrameType, FRAME_FLAG_OPEN_METADATA};
+use crate::frame::{Frame, FrameType, FRAME_FLAG_FIN, FRAME_FLAG_OPEN_METADATA};
 use crate::payload::{
     build_code_payload, parse_data_payload_metadata_offset, parse_priority_update_metadata,
 };
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 const MAX_CONDVAR_TIMED_WAIT: Duration = Duration::from_secs(3600);
 const MAX_WRITE_BATCH_FRAMES: usize = crate::config::DEFAULT_WRITE_BATCH_MAX_FRAMES;
 const MAX_INITIAL_QUEUE_SCRATCH_RESERVE: usize = 64;
-const FRAME_QUEUE_OVERHEAD_BYTES: usize = 1;
+pub(super) const FRAME_QUEUE_OVERHEAD_BYTES: usize = 1;
 const RETAINED_DATA_STREAM_COST_CAP: usize = 64;
 const SHRINK_DATA_STREAM_COST_CAP: usize = 4096;
 const DATA_STREAM_COST_SHRINK_FACTOR: usize = 8;
@@ -112,6 +113,28 @@ pub(super) struct StreamDiscardStats {
     pub(super) data_frames: usize,
     pub(super) data_bytes: usize,
     pub(super) terminal_frames: usize,
+    /// Opening DATA frames that stayed queued with their application bytes and
+    /// FIN stripped (their `data_bytes` are counted, the frames are not).
+    pub(super) stripped_openers: usize,
+}
+
+/// What a stream discard does with the first queued opening DATA frame it meets.
+#[derive(Debug)]
+enum OpenerDisposition {
+    /// Keep it as a zero-length opener.
+    Strip,
+    /// Put this (opening-eligible) frame in its place.
+    Replace(Frame),
+}
+
+/// Outcome of cancelling a tracked write whose job carries a stream opener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpenerWriteCancel {
+    /// The whole job left the queue; no frame of it reaches the peer.
+    Removed,
+    /// The job was replaced by a zero-length opener that keeps the stream's
+    /// place in the class opening order.
+    Stripped,
 }
 
 impl StreamDiscardStats {
@@ -131,17 +154,48 @@ impl StreamDiscardStats {
     }
 
     #[inline]
+    fn add_stripped_opener(&mut self, app_bytes: usize) {
+        self.stripped_openers = self.stripped_openers.saturating_add(1);
+        self.data_bytes = self.data_bytes.saturating_add(app_bytes);
+    }
+
+    #[inline]
     fn add(&mut self, other: Self) {
         self.removed_frames = self.removed_frames.saturating_add(other.removed_frames);
         self.data_frames = self.data_frames.saturating_add(other.data_frames);
         self.data_bytes = self.data_bytes.saturating_add(other.data_bytes);
         self.terminal_frames = self.terminal_frames.saturating_add(other.terminal_frames);
+        self.stripped_openers = self.stripped_openers.saturating_add(other.stripped_openers);
     }
 
     #[inline]
     pub(super) fn removed_any(self) -> bool {
-        self.removed_frames != 0
+        self.removed_frames != 0 || self.stripped_openers != 0
     }
+}
+
+/// Reduces an opening DATA frame to its OPEN_METADATA prefix (dropping the
+/// application bytes and FIN) so it still opens the stream on the wire. Returns
+/// the number of application bytes removed.
+pub(super) fn strip_opening_data_frame(frame: &mut Frame) -> usize {
+    if frame.frame_type != FrameType::Data {
+        return 0;
+    }
+    frame.flags &= !FRAME_FLAG_FIN;
+    let prefix_len = if frame.flags & FRAME_FLAG_OPEN_METADATA == 0 {
+        0
+    } else {
+        match parse_data_payload_metadata_offset(&frame.payload, frame.flags) {
+            Ok((_, _, offset)) => offset,
+            Err(_) => {
+                frame.flags &= !FRAME_FLAG_OPEN_METADATA;
+                0
+            }
+        }
+    };
+    let app_bytes = frame.payload.len().saturating_sub(prefix_len);
+    frame.payload.truncate(prefix_len);
+    app_bytes
 }
 
 #[inline]
@@ -241,7 +295,18 @@ impl WriteQueue {
         self.max_batch_frames
     }
 
-    pub(super) fn push(&self, mut job: WriteJob) -> Result<()> {
+    pub(super) fn push(&self, job: WriteJob) -> Result<()> {
+        self.push_in_lane(job, None)
+    }
+
+    /// Queues a stream's opening frame behind every earlier ordinary job, even when
+    /// the frame type (ABORT) would normally take the urgent lane, so it cannot
+    /// overtake an earlier same-class opener.
+    pub(super) fn push_ordered(&self, job: WriteJob) -> Result<()> {
+        self.push_in_lane(job, Some(QueueLane::Ordinary))
+    }
+
+    fn push_in_lane(&self, mut job: WriteJob, lane_override: Option<QueueLane>) -> Result<()> {
         let mut cost = job.cost_bytes();
         let coalesce_key = job.coalesce_key();
         let bypass_capacity = job.bypasses_capacity()
@@ -298,7 +363,7 @@ impl WriteQueue {
                 self.replace_locked(&mut state, lane, index, job, old_accounting, new_accounting);
                 return Ok(());
             }
-            let lane = state.lane_for(&job);
+            let lane = lane_override.unwrap_or_else(|| state.lane_for(&job));
             let accounting = queue_cost_for(lane, &job, cost);
             if let Some(message) = self.intrinsic_pending_capacity_error(&accounting) {
                 return Err(Error::new(ErrorCode::Internal, message));
@@ -515,7 +580,20 @@ impl WriteQueue {
         self.push_locked(&mut state, job, lane, accounting)
     }
 
-    pub(super) fn force_push(&self, mut job: WriteJob) -> Result<()> {
+    pub(super) fn force_push(&self, job: WriteJob) -> Result<()> {
+        self.force_push_in_lane(job, None)
+    }
+
+    /// Non-blocking variant of [`WriteQueue::push_ordered`].
+    pub(super) fn force_push_ordered(&self, job: WriteJob) -> Result<()> {
+        self.force_push_in_lane(job, Some(QueueLane::Ordinary))
+    }
+
+    fn force_push_in_lane(
+        &self,
+        mut job: WriteJob,
+        lane_override: Option<QueueLane>,
+    ) -> Result<()> {
         let mut cost = job.cost_bytes();
         let coalesce_key = job.coalesce_key();
         let mut state = self.state.lock().unwrap();
@@ -531,7 +609,7 @@ impl WriteQueue {
             self.replace_locked(&mut state, lane, index, job, old_accounting, new_accounting);
             return Ok(());
         }
-        let lane = state.lane_for(&job);
+        let lane = lane_override.unwrap_or_else(|| state.lane_for(&job));
         let accounting = queue_cost_for(lane, &job, cost);
         self.push_locked(&mut state, job, lane, accounting)
     }
@@ -605,30 +683,50 @@ impl WriteQueue {
     }
 
     pub(super) fn discard_stream(&self, stream_id: u64) -> StreamDiscardStats {
-        if stream_id == 0 {
-            return StreamDiscardStats::default();
-        }
-        let mut state = self.state.lock().unwrap();
-        let mut stats = discard_stream_from_lane(
-            &mut state,
-            QueueLane::Urgent,
-            stream_id,
-            frame_belongs_to_stream,
-        );
-        stats.add(discard_stream_from_lane(
-            &mut state,
-            QueueLane::Ordinary,
-            stream_id,
-            frame_belongs_to_stream,
-        ));
-        if stats.removed_any() {
-            drop(state);
-            self.not_full.notify_all();
-        }
-        stats
+        let mut opener = None;
+        self.discard_stream_frames(stream_id, frame_belongs_to_stream, &mut opener)
+    }
+
+    /// Discards a stream's queued frames for a local ABORT while its opener has
+    /// not been written: a queued opening DATA frame is replaced in place by
+    /// `abort`, so the ABORT opens the stream at the opener's position in the
+    /// class opening order. Returns `abort` when no queued opener was found.
+    pub(super) fn discard_stream_replacing_opener(
+        &self,
+        stream_id: u64,
+        abort: Frame,
+    ) -> (StreamDiscardStats, Option<Frame>) {
+        let mut opener = Some(OpenerDisposition::Replace(abort));
+        let stats = self.discard_stream_frames(stream_id, frame_belongs_to_stream, &mut opener);
+        let unplaced = match opener {
+            Some(OpenerDisposition::Replace(abort)) => Some(abort),
+            _ => None,
+        };
+        (stats, unplaced)
     }
 
     pub(super) fn discard_stream_send_tail(&self, stream_id: u64) -> StreamDiscardStats {
+        let mut opener = None;
+        self.discard_stream_frames(stream_id, frame_is_send_tail_for_stream, &mut opener)
+    }
+
+    /// Discards a stream's queued send tail but keeps its queued, not yet written
+    /// opening DATA frame in place as a zero-length opener, so the RESET queued
+    /// behind it never becomes the stream's first frame (SPEC §6.7).
+    pub(super) fn discard_stream_send_tail_keeping_opener(
+        &self,
+        stream_id: u64,
+    ) -> StreamDiscardStats {
+        let mut opener = Some(OpenerDisposition::Strip);
+        self.discard_stream_frames(stream_id, frame_is_send_tail_for_stream, &mut opener)
+    }
+
+    fn discard_stream_frames(
+        &self,
+        stream_id: u64,
+        remove: fn(&Frame, u64) -> bool,
+        keep_opener: &mut Option<OpenerDisposition>,
+    ) -> StreamDiscardStats {
         if stream_id == 0 {
             return StreamDiscardStats::default();
         }
@@ -637,13 +735,15 @@ impl WriteQueue {
             &mut state,
             QueueLane::Urgent,
             stream_id,
-            frame_is_send_tail_for_stream,
+            remove,
+            keep_opener,
         );
         stats.add(discard_stream_from_lane(
             &mut state,
             QueueLane::Ordinary,
             stream_id,
-            frame_is_send_tail_for_stream,
+            remove,
+            keep_opener,
         ));
         if stats.removed_any() {
             drop(state);
@@ -686,6 +786,52 @@ impl WriteQueue {
             WriteJob::TrackedFrames(tracked) => Some(tracked),
             _ => None,
         }
+    }
+
+    /// Cancels a still-queued tracked write that carries `stream_id`'s opening
+    /// DATA frame. The whole job is removed only when `allow_remove` holds and no
+    /// other queued frame of the stream depends on the opener; otherwise the job
+    /// is replaced in place by a zero-length opener. Returns `None` when the job
+    /// already left the queue.
+    pub(super) fn cancel_tracked_opener_write(
+        &self,
+        completion: &super::types::WriteCompletion,
+        stream_id: u64,
+        allow_remove: bool,
+    ) -> Option<OpenerWriteCancel> {
+        let mut state = self.state.lock().unwrap();
+        let (lane, index) = find_tracked_completion(&state, completion)?;
+        let removable =
+            allow_remove && !stream_has_frames_outside_job(&state, lane, index, stream_id);
+        let job = remove_lane_job(&mut state, lane, index)?;
+        let queued = job.cost_bytes();
+        let cost = queue_cost_for(lane, &job, queued);
+        apply_queue_cost_remove(&mut state, &cost);
+        let outcome = if removable {
+            OpenerWriteCancel::Removed
+        } else {
+            let opener = match job {
+                WriteJob::TrackedFrames(tracked) => tracked.frames.into_iter().find(|frame| {
+                    frame.frame_type == FrameType::Data && frame.stream_id == stream_id
+                }),
+                _ => None,
+            };
+            match opener {
+                Some(mut opener) => {
+                    strip_opening_data_frame(&mut opener);
+                    let job = WriteJob::Frame(opener);
+                    let queued = job.cost_bytes();
+                    let cost = queue_cost_for(lane, &job, queued);
+                    apply_queue_cost_add(&mut state, &cost);
+                    insert_lane_job(&mut state, lane, index, job);
+                    OpenerWriteCancel::Stripped
+                }
+                None => OpenerWriteCancel::Removed,
+            }
+        };
+        drop(state);
+        self.not_full.notify_all();
+        Some(outcome)
     }
 
     fn discard_coalesced(&self, key: CoalesceKey) -> bool {
@@ -1114,6 +1260,7 @@ fn discard_stream_from_lane(
     lane: QueueLane,
     stream_id: u64,
     remove: fn(&Frame, u64) -> bool,
+    keep_opener: &mut Option<OpenerDisposition>,
 ) -> StreamDiscardStats {
     if !jobs_have_removable_stream_frame(state.lane(lane), stream_id, remove) {
         return StreamDiscardStats::default();
@@ -1130,7 +1277,7 @@ fn discard_stream_from_lane(
     while let Some(job) = jobs.pop_front() {
         let queued = job.cost_bytes();
         let old_cost = queue_cost_for(lane, &job, queued);
-        let (next, removed) = remove_stream_frames(job, stream_id, remove);
+        let (next, removed) = remove_stream_frames(job, stream_id, remove, keep_opener);
         if removed.removed_any() {
             stats.add(removed);
             apply_queue_cost_remove(state, &old_cost);
@@ -1201,19 +1348,79 @@ fn remove_lane_job(state: &mut WriteQueueState, lane: QueueLane, index: usize) -
     }
 }
 
+fn insert_lane_job(state: &mut WriteQueueState, lane: QueueLane, index: usize, job: WriteJob) {
+    match lane {
+        QueueLane::Urgent => state.urgent_jobs.insert(index, job),
+        QueueLane::Ordinary => state.ordinary_jobs.insert(index, job),
+    }
+}
+
+fn stream_has_frames_outside_job(
+    state: &WriteQueueState,
+    job_lane: QueueLane,
+    job_index: usize,
+    stream_id: u64,
+) -> bool {
+    for (lane, jobs) in [
+        (QueueLane::Urgent, &state.urgent_jobs),
+        (QueueLane::Ordinary, &state.ordinary_jobs),
+    ] {
+        for (index, job) in jobs.iter().enumerate() {
+            if lane == job_lane && index == job_index {
+                continue;
+            }
+            if job_has_removable_stream_frame(job, stream_id, frame_belongs_to_stream) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Applies a discard decision to one frame. The first opening DATA frame met
+/// while `keep_opener` is set is stripped or replaced instead of removed.
+#[inline]
+fn discard_stream_frame(
+    frame: &mut Frame,
+    stream_id: u64,
+    remove: fn(&Frame, u64) -> bool,
+    keep_opener: &mut Option<OpenerDisposition>,
+    stats: &mut StreamDiscardStats,
+) -> bool {
+    if !remove(frame, stream_id) {
+        return true;
+    }
+    if frame.frame_type == FrameType::Data {
+        match keep_opener.take() {
+            Some(OpenerDisposition::Strip) => {
+                stats.add_stripped_opener(strip_opening_data_frame(frame));
+                return true;
+            }
+            Some(OpenerDisposition::Replace(replacement)) => {
+                stats.add_frame(frame);
+                *frame = replacement;
+                return true;
+            }
+            None => {}
+        }
+    }
+    stats.add_frame(frame);
+    false
+}
+
 fn remove_stream_frames(
     job: WriteJob,
     stream_id: u64,
     remove: fn(&Frame, u64) -> bool,
+    keep_opener: &mut Option<OpenerDisposition>,
 ) -> (Option<WriteJob>, StreamDiscardStats) {
     match job {
-        WriteJob::Frame(frame) => {
-            if remove(&frame, stream_id) {
-                let mut stats = StreamDiscardStats::default();
-                stats.add_frame(&frame);
-                (None, stats)
+        WriteJob::Frame(mut frame) => {
+            let mut stats = StreamDiscardStats::default();
+            if discard_stream_frame(&mut frame, stream_id, remove, keep_opener, &mut stats) {
+                (Some(WriteJob::Frame(frame)), stats)
             } else {
-                (Some(WriteJob::Frame(frame)), StreamDiscardStats::default())
+                (None, stats)
             }
         }
         WriteJob::GracefulClose(frame) => {
@@ -1230,13 +1437,8 @@ fn remove_stream_frames(
         }
         WriteJob::Frames(mut frames) => {
             let mut stats = StreamDiscardStats::default();
-            frames.retain(|frame| {
-                if remove(frame, stream_id) {
-                    stats.add_frame(frame);
-                    false
-                } else {
-                    true
-                }
+            frames.retain_mut(|frame| {
+                discard_stream_frame(frame, stream_id, remove, keep_opener, &mut stats)
             });
             if !stats.removed_any() {
                 (Some(WriteJob::Frames(frames)), stats)
@@ -1248,13 +1450,8 @@ fn remove_stream_frames(
         }
         WriteJob::TrackedFrames(mut tracked) => {
             let mut stats = StreamDiscardStats::default();
-            tracked.frames.retain(|frame| {
-                if remove(frame, stream_id) {
-                    stats.add_frame(frame);
-                    false
-                } else {
-                    true
-                }
+            tracked.frames.retain_mut(|frame| {
+                discard_stream_frame(frame, stream_id, remove, keep_opener, &mut stats)
             });
             if !stats.removed_any() {
                 return (Some(WriteJob::TrackedFrames(tracked)), stats);
@@ -1322,6 +1519,9 @@ impl WriteQueueState {
         if let Some(found) = find_coalesced_in_lane(&self.urgent_jobs, QueueLane::Urgent, key) {
             return Some(found);
         }
+        if key == CoalesceKey::GoAway && jobs_contain_go_away(&self.urgent_jobs) {
+            return None;
+        }
         find_coalesced_in_lane(&self.ordinary_jobs, QueueLane::Ordinary, key)
     }
 
@@ -1358,6 +1558,13 @@ fn find_coalesced_in_lane(
     for (index, job) in jobs.iter().enumerate().rev() {
         if job.coalesce_key() == Some(key) {
             return Some((lane, index));
+        }
+        if key == CoalesceKey::GoAway && job.contains_go_away_frame() {
+            // A newer GOAWAY in another job shape (a tracked GOAWAY) sits
+            // between the candidate and the queue tail: replacing the older
+            // frame in place would move the newer, more restrictive watermark
+            // ahead of it and put an increasing GOAWAY on the wire (SPEC §6.9).
+            return None;
         }
     }
     None
@@ -1801,6 +2008,17 @@ impl WriteJob {
         }
     }
 
+    fn contains_go_away_frame(&self) -> bool {
+        match self {
+            Self::Frame(frame) | Self::GracefulClose(frame) => {
+                frame.frame_type == FrameType::GoAway
+            }
+            Self::Frames(frames) => frames_contain_go_away(frames),
+            Self::TrackedFrames(tracked) => frames_contain_go_away(&tracked.frames),
+            Self::Shutdown | Self::DrainShutdown => false,
+        }
+    }
+
     fn tracks_completion(&self, completion: &super::types::WriteCompletion) -> bool {
         match self {
             Self::TrackedFrames(tracked) => tracked.completion.same(completion),
@@ -1853,6 +2071,16 @@ fn frames_bypass_urgent_capacity(frames: &[Frame]) -> bool {
         }
     }
     true
+}
+
+fn frames_contain_go_away(frames: &[Frame]) -> bool {
+    frames
+        .iter()
+        .any(|frame| frame.frame_type == FrameType::GoAway)
+}
+
+fn jobs_contain_go_away(jobs: &VecDeque<WriteJob>) -> bool {
+    jobs.iter().any(WriteJob::contains_go_away_frame)
 }
 
 fn frames_contain_data_frame(frames: &[Frame]) -> bool {
@@ -2008,6 +2236,28 @@ impl Inner {
         result
     }
 
+    /// Queues frames without waiting for writer-queue room; a full queue is
+    /// reported as an error instead.
+    pub(super) fn try_queue_frames(
+        self: &Arc<Self>,
+        mut frames: Vec<Frame>,
+        operation: &str,
+    ) -> Result<()> {
+        let job = match frames.len() {
+            0 => return Ok(()),
+            1 => WriteJob::Frame(frames.pop().expect("one frame")),
+            _ => WriteJob::Frames(frames),
+        };
+        self.ensure_data_job_fits_session_memory(&job, operation)?;
+        self.write_queue.try_push(job)
+    }
+
+    /// Queues a stream's opening ABORT in the ordinary lane (see
+    /// [`WriteQueue::push_ordered`]).
+    pub(super) fn queue_ordered_frame(&self, frame: Frame) -> Result<()> {
+        self.write_queue.push_ordered(WriteJob::Frame(frame))
+    }
+
     pub(super) fn try_queue_frame(&self, frame: Frame) -> Result<()> {
         self.write_queue.try_push(WriteJob::Frame(frame))
     }
@@ -2016,8 +2266,44 @@ impl Inner {
         self.write_queue.force_push(WriteJob::Frame(frame))
     }
 
-    pub(super) fn queue_graceful_close_frame(&self, frame: Frame) -> Result<()> {
-        self.write_queue.push(WriteJob::GracefulClose(frame))
+    /// Queues the graceful-close CLOSE behind already queued work, waiting for
+    /// queue space no longer than `deadline` so a stalled writer cannot block
+    /// `close()` indefinitely.
+    pub(super) fn queue_graceful_close_frame(&self, frame: Frame, deadline: Instant) -> Result<()> {
+        let mut blocked = Duration::ZERO;
+        self.write_queue.push_until(
+            WriteJob::GracefulClose(frame),
+            || Some(deadline),
+            || Ok(()),
+            "close",
+            &mut blocked,
+        )
+    }
+
+    /// Queues a local GOAWAY without blocking. GOAWAY bypasses every writer
+    /// queue limit, so callers commit the new local watermark and queue its
+    /// frame under the session state lock: concurrent GOAWAYs then reach the
+    /// writer in commit order, which keeps the advertised watermarks
+    /// non-increasing on the wire (SPEC §6.9).
+    pub(super) fn queue_go_away_locked(
+        &self,
+        payload: Vec<u8>,
+        completion: Option<super::types::WriteCompletion>,
+    ) -> Result<()> {
+        let frame = Frame {
+            frame_type: FrameType::GoAway,
+            flags: 0,
+            stream_id: 0,
+            payload,
+        };
+        let job = match completion {
+            Some(completion) => WriteJob::TrackedFrames(super::types::TrackedWriteJob {
+                frames: vec![frame],
+                completion,
+            }),
+            None => WriteJob::Frame(frame),
+        };
+        self.write_queue.try_push(job)
     }
 
     pub(super) fn wake_writer_queue_waiters(&self) {
@@ -2061,17 +2347,27 @@ impl Inner {
         Ok(())
     }
 
-    pub(super) fn shutdown_writer(&self) {
+    pub(super) fn shutdown_writer(self: &Arc<Self>) {
         self.write_queue.shutdown();
+        self.after_terminal_writer_shutdown();
     }
 
-    pub(super) fn shutdown_writer_with_close(&self, frame: Frame) {
+    pub(super) fn shutdown_writer_with_close(self: &Arc<Self>, frame: Frame) {
         self.write_queue.shutdown_after_close(frame);
+        self.after_terminal_writer_shutdown();
     }
 
-    pub(super) fn drain_shutdown_writer(&self) {
+    pub(super) fn drain_shutdown_writer(self: &Arc<Self>) {
         let _ = self.write_queue.force_push(WriteJob::DrainShutdown);
         self.write_queue.close_after_draining();
+        self.after_terminal_writer_shutdown();
+    }
+
+    /// Every terminal transition hands its last frames to the writer through
+    /// one of the shutdown helpers above, after the terminal state is committed.
+    fn after_terminal_writer_shutdown(self: &Arc<Self>) {
+        self.keepalive_cond.notify_all();
+        arm_close_watchdog(self);
     }
 }
 
@@ -2830,6 +3126,51 @@ mod tests {
         assert_eq!(payload.last_accepted_bidi, 40);
         assert_eq!(payload.last_accepted_uni, 80);
         assert_eq!(payload.reason, "final");
+    }
+
+    #[test]
+    fn goaway_replacement_never_moves_ahead_of_newer_tracked_goaway() {
+        fn go_away_frame(bidi: u64, uni: u64, reason: &str) -> Frame {
+            Frame {
+                frame_type: FrameType::GoAway,
+                flags: 0,
+                stream_id: 0,
+                payload: build_go_away_payload(bidi, uni, 0, reason).unwrap(),
+            }
+        }
+
+        let queue = queue(1024, 1024, 8);
+        queue
+            .push(WriteJob::Frame(go_away_frame(100, 100, "initial")))
+            .unwrap();
+        let completion = super::super::types::WriteCompletion::new();
+        queue
+            .push(WriteJob::TrackedFrames(
+                super::super::types::TrackedWriteJob {
+                    frames: vec![go_away_frame(40, 80, "application")],
+                    completion,
+                },
+            ))
+            .unwrap();
+        queue
+            .push(WriteJob::Frame(go_away_frame(20, 20, "final")))
+            .unwrap();
+
+        let batch = queue.pop_batch().unwrap();
+        let watermarks: Vec<_> = batch
+            .iter()
+            .flat_map(|job| match job {
+                WriteJob::Frame(frame) => vec![frame],
+                WriteJob::TrackedFrames(tracked) => tracked.frames.iter().collect(),
+                _ => Vec::new(),
+            })
+            .filter(|frame| frame.frame_type == FrameType::GoAway)
+            .map(|frame| {
+                let payload = parse_go_away_payload(&frame.payload).unwrap();
+                (payload.last_accepted_bidi, payload.last_accepted_uni)
+            })
+            .collect();
+        assert_eq!(watermarks, vec![(100, 100), (40, 80), (20, 20)]);
     }
 
     #[test]
