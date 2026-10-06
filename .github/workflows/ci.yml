@@ -117,12 +117,19 @@ jobs:
             interop-rust-${{ runner.os }}-
             rust-${{ runner.os }}-
 
+      - name: Build zmux-java for the interop helper
+        working-directory: zmux-java
+        run: mvn -B -q -pl zmux -am -DskipTests package
+
       - name: Run interop smoke tests
         working-directory: zmux-rs
         env:
           ZMUX_INTEROP: '1'
+          ZMUX_INTEROP_TIMEOUT_SECONDS: '300'
           ZMUX_GO_ROOT: ${{ github.workspace }}/zmux-go
           ZMUX_JAVA_ROOT: ${{ github.workspace }}/zmux-java
         run: |
-          cargo test --locked --test go_interop_smoke --test java_interop_smoke
+          cargo test --locked --test go_interop_smoke
+          # Both Java cases rebuild the same Maven module, so run them one at a time.
+          cargo test --locked --test java_interop_smoke -- --test-threads=1
           cargo test --locked -p zmux-quinn --test go_quic_interop_smoke
