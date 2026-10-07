@@ -88,8 +88,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: zmux-go/go.mod
+          go-version: 'stable'
+          check-latest: true
           cache-dependency-path: zmux-go/adapter/quicmux/go.sum
+
+      - name: Show Go version
+        run: go version
 
       - name: Set up Java
         uses: actions/setup-java@v5
