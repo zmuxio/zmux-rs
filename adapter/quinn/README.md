@@ -112,8 +112,8 @@ When using `zmux::AsyncSendStreamHandle` through generics or trait objects, call
 
 ## Errors
 
-- QUIC connection application closes are normalized to `zmux::Error::application(...)`, except a graceful close
-  (code 0 with an empty reason): `wait()` succeeds and other operations fail with an error whose
+- QUIC connection application closes are normalized to `zmux::Error::application(...)`, except a graceful close (code 0
+  with an empty reason): `wait()` succeeds and other operations fail with an error whose
   `is_session_closed()` is true, as on native zmux sessions.
 - Once a peer FIN has been read (`Ok(0)`), later reads keep returning `Ok(0)`. A read side closed first by a local
   stop, a reset or an abort keeps failing reads with that error.
