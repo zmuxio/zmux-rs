@@ -255,11 +255,12 @@ async fn empty_injector(
     (addr, task)
 }
 
-/// Empty messages are empty records, charged against the non-progress
-/// budget like PADDING-only records: a flood closes the session. (That a
-/// few are no-ops is a trace of the core; here the injected messages would
-/// count in the positions the server acknowledges, which the client never
-/// sent.)
+/// Empty messages are empty records: the server counts each in its pipe
+/// positions and charges it against the non-progress budget like a
+/// PADDING-only record. The injected messages are bytes the client never
+/// sent, so the session ends either way: the server closes it for the load,
+/// or the client first sees a PIPE_ACK above what it sent. (That a few are
+/// no-ops is a trace of the core.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flood_of_empty_messages_is_charged() {
     let (addr, listener, _serving) = server().await;
@@ -279,6 +280,10 @@ async fn a_flood_of_empty_messages_is_charged() {
             &e,
             SessionError::TransportClosed { code, remote: true, .. }
                 if *code == zmux::proto::TransportErrorCode::ZMUX_EXCESSIVE_LOAD
+        ) || matches!(
+            &e,
+            SessionError::TransportClosed { code, remote: false, .. }
+                if *code == zmux::proto::TransportErrorCode::PROTOCOL_VIOLATION
         ),
         "{e:?}"
     );

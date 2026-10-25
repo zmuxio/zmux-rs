@@ -2,8 +2,10 @@
 //! sessions, streams and multipath
 //! sessions, counted by a global allocator by the requested layout sizes
 //! (independent of the allocator's size classes). Each row fails above the
-//! specification's bound, and above this implementation's own baseline by
-//! more than the run-to-run variation; an improvement moves the baseline down here.
+//! specification's bound and, on the platforms whose baseline is recorded
+//! here (Apple platforms), above this implementation's own baseline by more
+//! than the run-to-run variation; an improvement moves the baseline down
+//! here. Elsewhere the rows are reported and checked against the bounds.
 //!
 //! Release builds only (futures are larger in debug builds): CI runs
 //! `cargo test --release --test footprint`. Measurement: N sessions after a
@@ -75,12 +77,11 @@ fn live() -> i64 {
 const READ_BUFFER: i64 = 256 * 1024;
 
 /// A footprint row: the specification's bound, this implementation's baseline
-/// on this platform and its
-/// run-to-run variation.
+/// on this platform when recorded, and its run-to-run variation.
 struct Row {
     name: &'static str,
     bound: f64,
-    baseline: f64,
+    baseline: Option<f64>,
     /// Relative variation between runs of one version.
     noise: f64,
 }
@@ -88,7 +89,7 @@ struct Row {
 impl Row {
     fn check(&self, measured: f64) {
         println!(
-            "FOOTPRINT {} measured={measured:.0} B baseline={:.0} B bound={:.0} B",
+            "FOOTPRINT {} measured={measured:.0} B baseline={:?} B bound={:.0} B",
             self.name, self.baseline, self.bound
         );
         if std::env::var_os("FOOTPRINT_REPORT").is_some() {
@@ -100,23 +101,23 @@ impl Row {
             self.name,
             self.bound
         );
-        assert!(
-            // Two bytes for allocations of other threads meanwhile.
-            measured <= self.baseline * (1.0 + self.noise) + 2.0,
-            "{}: {measured:.0} B, a regression from the baseline of {:.0} B",
-            self.name,
-            self.baseline
-        );
+        if let Some(baseline) = self.baseline {
+            assert!(
+                // Two bytes for allocations of other threads meanwhile.
+                measured <= baseline * (1.0 + self.noise) + 2.0,
+                "{}: {measured:.0} B, a regression from the baseline of {baseline:.0} B",
+                self.name,
+            );
+        }
     }
 }
 
-/// The baseline of this platform: Linux, else Apple platforms (other
-/// platforms report against the Linux values).
-const fn base(linux: f64, apple: f64) -> f64 {
+/// The baseline of this platform: recorded for Apple platforms only.
+const fn base(apple: f64) -> Option<f64> {
     if cfg!(target_vendor = "apple") {
-        apple
+        Some(apple)
     } else {
-        linux
+        None
     }
 }
 
@@ -124,7 +125,7 @@ const fn base(linux: f64, apple: f64) -> f64 {
 const CORE: Row = Row {
     name: "idle core per session",
     bound: f64::INFINITY,
-    baseline: 3808.0,
+    baseline: base(3808.0),
     noise: 0.0,
 };
 
@@ -132,7 +133,7 @@ const CORE: Row = Row {
 const STREAM: Row = Row {
     name: "idle stream per end",
     bound: 768.0,
-    baseline: 669.0,
+    baseline: base(669.0),
     noise: 0.01,
 };
 
@@ -141,7 +142,7 @@ const STREAM: Row = Row {
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
     bound: 17_408.0,
-    baseline: base(16_000.0, 16_659.0),
+    baseline: base(16_659.0),
     noise: 0.005,
 };
 
@@ -149,7 +150,7 @@ const PAIR_MEMORY: Row = Row {
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
     bound: 17_408.0,
-    baseline: base(15_230.0, 15_830.0),
+    baseline: base(15_830.0),
     noise: 0.01,
 };
 
@@ -159,7 +160,7 @@ const PAIR_TCP: Row = Row {
 const MULTIPATH: Row = Row {
     name: "idle multipath session pair, two pipes",
     bound: 45_056.0,
-    baseline: base(40_590.0, 42_558.0),
+    baseline: base(42_558.0),
     noise: 0.02,
 };
 

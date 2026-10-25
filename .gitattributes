@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Specification assets are compared byte for byte (manifest digests)
+testdata/** -text

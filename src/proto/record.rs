@@ -324,17 +324,17 @@ impl RecordReader {
                         };
                         continue;
                     };
-                    match Frame::decode(record, gates) {
+                    return match Frame::decode(record, gates) {
                         Ok((frame, n)) => {
                             *input = &data[n..];
                             self.state = State::Direct {
                                 rest: rest - n as u64,
                                 wire_len,
                             };
-                            return Ok(Some(Event::Frame(frame)));
+                            Ok(Some(Event::Frame(frame)))
                         }
-                        Err(e) => return Err(self.fail(e)),
-                    }
+                        Err(e) => Err(self.fail(e)),
+                    };
                 }
                 State::Buffer { need, wire_len } => {
                     let missing = usize::try_from(need)
