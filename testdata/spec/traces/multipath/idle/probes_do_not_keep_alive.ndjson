@@ -1,0 +1,17 @@
+{"kind": "trace", "id": "multipath.idle.probes_do_not_keep_alive", "title": "With the defaults (30 s idle timeout, 15 s idle-pipe probe), PIPE_PING and PIPE_ACK never keep a multipath session alive", "profile": "zmux-mp", "local_role": "responder", "overrides": {}, "refs": ["SPEC.md#6.4", "MULTIPATH.md#7.1"], "findings": [], "groups": ["multipath", "idle"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "zmux_multipath": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}, "zmux_ack_threshold": 4096}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "00112233445566778899aabbccddeeff", "locator": "50454552"}}, {"id": 58, "raw": "abcd"}]}]], "hex": "4065ff5153300d0a0d0a405b010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb0dc2978160400112233445566778899aabbccddeeff04504545523a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath"]}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 6, "op": "advance", "ms": 14999}
+{"step": 7, "op": "expect_no_frames", "pipe": 0, "types": ["PIPE_PING"]}
+{"step": 8, "op": "advance", "ms": 1}
+{"step": 9, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "PIPE_PING"}]}
+{"step": 10, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}, {"type": "PIPE_PING"}]]}
+{"step": 11, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "PIPE_ACK"}]}
+{"step": 12, "op": "advance", "ms": 14999}
+{"step": 13, "op": "expect_open"}
+{"step": 14, "op": "advance", "ms": 1}
+{"step": 15, "op": "expect_close", "error": {"space": "local", "code": "IDLE_TIMEOUT"}}
+{"step": 16, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": false, "code": 657904988}]}

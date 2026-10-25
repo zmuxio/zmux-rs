@@ -1,0 +1,17 @@
+[package]
+name = "qmux-peer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A scripted plain QMux peer (the `qmux` crate) for interoperability tests over TCP"
+
+# Standalone: not a member of the zmux workspace, and independent of zmux.
+#   cargo build --release --manifest-path interop/qmux-peer/Cargo.toml
+[workspace]
+
+[dependencies]
+bytes = "1"
+qmux = { version = "=0.6.2", default-features = false, features = ["tcp"] }
+tokio = { version = "1.47", features = ["full"] }
+web-transport-trait = "0.5"

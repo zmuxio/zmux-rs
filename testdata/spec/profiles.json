@@ -1,0 +1,273 @@
+{
+  "zmux-default": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 1048576,
+      "initial_max_stream_data_bidi_local": 262144,
+      "initial_max_stream_data_bidi_remote": 262144,
+      "initial_max_stream_data_uni": 262144,
+      "initial_max_streams_bidi": 256,
+      "initial_max_streams_uni": 16,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 4096,
+      "zmux_priority": null,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 258,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      },
+      "max_record_size": 65535
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "max_incoming_uni_streams": null
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+    }
+  },
+  "zmux-small": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 8192,
+      "initial_max_stream_data_bidi_local": 2048,
+      "initial_max_stream_data_bidi_remote": 2048,
+      "initial_max_stream_data_uni": 2048,
+      "initial_max_streams_bidi": 4,
+      "initial_max_streams_uni": 4,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 512,
+      "zmux_priority": null,
+      "max_record_size": 65535,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 4,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      }
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "max_incoming_uni_streams": 4
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+    }
+  },
+  "zmux-small-dgram": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 8192,
+      "initial_max_stream_data_bidi_local": 2048,
+      "initial_max_stream_data_bidi_remote": 2048,
+      "initial_max_stream_data_uni": 2048,
+      "initial_max_streams_bidi": 4,
+      "initial_max_streams_uni": 4,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 512,
+      "zmux_priority": null,
+      "max_record_size": 65535,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 4,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      },
+      "max_datagram_frame_size": 1200,
+      "zmux_datagram_flows": null
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "enable_datagrams": true,
+      "max_incoming_uni_streams": 4
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+    }
+  },
+  "zmux-role-auto": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 8192,
+      "initial_max_stream_data_bidi_local": 2048,
+      "initial_max_stream_data_bidi_remote": 2048,
+      "initial_max_stream_data_uni": 2048,
+      "initial_max_streams_bidi": 4,
+      "initial_max_streams_uni": 4,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 512,
+      "zmux_priority": null,
+      "max_record_size": 65535,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 4,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      },
+      "zmux_role": {
+        "role": "auto",
+        "nonce": 1000
+      }
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "role": "auto",
+      "max_incoming_uni_streams": 4
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c",
+      "role_nonce": 1000
+    }
+  },
+  "zmux-mp": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 8192,
+      "initial_max_stream_data_bidi_local": 2048,
+      "initial_max_stream_data_bidi_remote": 2048,
+      "initial_max_stream_data_uni": 2048,
+      "initial_max_streams_bidi": 4,
+      "initial_max_streams_uni": 4,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 512,
+      "zmux_priority": null,
+      "max_record_size": 65535,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 4,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      },
+      "zmux_multipath": {
+        "flags": 4,
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "locator": "4c4f43414c"
+      },
+      "zmux_ack_threshold": 4096
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "max_pipes": 8,
+      "scheduler": "spread-eta",
+      "pipe_auth": {
+        "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
+      },
+      "max_incoming_uni_streams": 4,
+      "probation": 0,
+      "redundancy": "off",
+      "standby_probe": 0
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c",
+      "session_nonce": "ffeeddccbbaa99887766554433221100",
+      "rtt_ms": 10
+    }
+  },
+  "zmux-mp-resume": {
+    "tp": {
+      "max_idle_timeout": 30000,
+      "initial_max_data": 8192,
+      "initial_max_stream_data_bidi_local": 2048,
+      "initial_max_stream_data_bidi_remote": 2048,
+      "initial_max_stream_data_uni": 2048,
+      "initial_max_streams_bidi": 4,
+      "initial_max_streams_uni": 4,
+      "reset_stream_at": null,
+      "zmux_goaway": null,
+      "zmux_preamble": 512,
+      "zmux_priority": null,
+      "max_record_size": 65535,
+      "zmux_pipe_ack": null,
+      "zmux_max_lanes": {
+        "max_lanes": 4,
+        "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
+      },
+      "zmux_multipath": {
+        "flags": 4,
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "locator": "4c4f43414c"
+      },
+      "zmux_ack_threshold": 4096,
+      "zmux_resume": 30000
+    },
+    "config": {
+      "keep_alive_period": 0,
+      "handshake_timeout": 10000,
+      "max_pipes": 8,
+      "scheduler": "spread-eta",
+      "pipe_auth": {
+        "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
+      },
+      "resume_timeout": 30000,
+      "max_incoming_uni_streams": 4,
+      "probation": 0,
+      "redundancy": "off",
+      "standby_probe": 0
+    },
+    "test": {
+      "grease_tp": {
+        "id": 27,
+        "value": ""
+      },
+      "grease_tlv": {
+        "type": 33,
+        "value": ""
+      },
+      "ping_seq_start": 0,
+      "lane_key": "7a6d75782d6c616e652d6b65792d4c4c",
+      "session_nonce": "ffeeddccbbaa99887766554433221100",
+      "rtt_ms": 10
+    }
+  }
+}

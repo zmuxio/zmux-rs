@@ -1,0 +1,34 @@
+[package]
+name = "zmux-webtransport"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "WebTransport sessions as zmux carriers: pipes on bidirectional streams, lanes on unidirectional ones"
+repository = "https://github.com/zmuxio/zmux-rs"
+readme = "README.md"
+keywords = ["zmux", "webtransport", "http3", "quic", "multipath"]
+categories = ["network-programming"]
+
+[features]
+# The crypto provider of the WebTransport stack: ring (default) or aws-lc-rs.
+default = ["ring"]
+ring = ["web-transport-quinn/ring"]
+aws-lc-rs = ["web-transport-quinn/aws-lc-rs"]
+
+[dependencies]
+url = "2"
+web-transport-quinn = { version = "0.13.5", default-features = false }
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync"] }
+zmux = { version = "1.2.0", path = "../.." }
+
+[dev-dependencies]
+bytes = "1"
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.47", features = ["full"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unreachable_pub = "warn"

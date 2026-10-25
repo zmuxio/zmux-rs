@@ -1,0 +1,1329 @@
+{
+  "protocol": {
+    "name": "zmux",
+    "alpn_default": "qmux-02",
+    "alpn_also_accepted": [
+      "qmux-01"
+    ],
+    "alpn_alias_rule": [
+      "qmux-02 -> qmux-01",
+      "qmux-02.<application> -> qmux-01.<application>",
+      "<name>-02 -> <name>-01",
+      "otherwise no alias"
+    ],
+    "alpn_alias_examples": [
+      {
+        "configured": "qmux-02",
+        "alias": "qmux-01",
+        "not_accepted": [
+          "qmux-00",
+          "qmux-01.x",
+          "qmux"
+        ]
+      },
+      {
+        "configured": "qmux-02.moq-lite-04",
+        "alias": "qmux-01.moq-lite-04",
+        "not_accepted": [
+          "qmux-01.moq-lite-03",
+          "qmux-00.moq-lite-04",
+          "moq-lite-04",
+          "QMUX-01.moq-lite-04"
+        ]
+      },
+      {
+        "configured": "h3qx-02",
+        "alias": "h3qx-01",
+        "not_accepted": [
+          "h3qx-00",
+          "h3qx"
+        ]
+      },
+      {
+        "configured": "myapp-02",
+        "alias": "myapp-01",
+        "not_accepted": [
+          "myapp-1"
+        ]
+      },
+      {
+        "configured": "myapp",
+        "alias": null,
+        "not_accepted": [
+          "myapp-01"
+        ]
+      }
+    ],
+    "qmux_draft": "draft-ietf-quic-qmux-02",
+    "reliable_stream_reset_draft": "draft-ietf-quic-reliable-stream-reset-11"
+  },
+  "frame_types": [
+    {
+      "name": "PADDING",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": false,
+      "retransmit": "never",
+      "first": {
+        "value": 0,
+        "hex": "0x00"
+      },
+      "last": {
+        "value": 0,
+        "hex": "0x00"
+      }
+    },
+    {
+      "name": "PING",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 1,
+        "hex": "0x01"
+      },
+      "last": {
+        "value": 1,
+        "hex": "0x01"
+      }
+    },
+    {
+      "name": "ACK",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 2,
+        "hex": "0x02"
+      },
+      "last": {
+        "value": 3,
+        "hex": "0x03"
+      }
+    },
+    {
+      "name": "RESET_STREAM",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "until-acked-or-stream-terminal",
+      "first": {
+        "value": 4,
+        "hex": "0x04"
+      },
+      "last": {
+        "value": 4,
+        "hex": "0x04"
+      }
+    },
+    {
+      "name": "STOP_SENDING",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "until-recv-terminal",
+      "first": {
+        "value": 5,
+        "hex": "0x05"
+      },
+      "last": {
+        "value": 5,
+        "hex": "0x05"
+      }
+    },
+    {
+      "name": "CRYPTO",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 6,
+        "hex": "0x06"
+      },
+      "last": {
+        "value": 6,
+        "hex": "0x06"
+      }
+    },
+    {
+      "name": "NEW_TOKEN",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 7,
+        "hex": "0x07"
+      },
+      "last": {
+        "value": 7,
+        "hex": "0x07"
+      }
+    },
+    {
+      "name": "STREAM",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "data-unless-reset",
+      "first": {
+        "value": 8,
+        "hex": "0x08"
+      },
+      "last": {
+        "value": 15,
+        "hex": "0x0f"
+      }
+    },
+    {
+      "name": "MAX_DATA",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "current-value",
+      "first": {
+        "value": 16,
+        "hex": "0x10"
+      },
+      "last": {
+        "value": 16,
+        "hex": "0x10"
+      }
+    },
+    {
+      "name": "MAX_STREAM_DATA",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "current-value-while-recv",
+      "first": {
+        "value": 17,
+        "hex": "0x11"
+      },
+      "last": {
+        "value": 17,
+        "hex": "0x11"
+      }
+    },
+    {
+      "name": "MAX_STREAMS",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "current-value",
+      "first": {
+        "value": 18,
+        "hex": "0x12"
+      },
+      "last": {
+        "value": 19,
+        "hex": "0x13"
+      }
+    },
+    {
+      "name": "DATA_BLOCKED",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "while-blocked",
+      "first": {
+        "value": 20,
+        "hex": "0x14"
+      },
+      "last": {
+        "value": 20,
+        "hex": "0x14"
+      }
+    },
+    {
+      "name": "STREAM_DATA_BLOCKED",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "while-blocked",
+      "first": {
+        "value": 21,
+        "hex": "0x15"
+      },
+      "last": {
+        "value": 21,
+        "hex": "0x15"
+      }
+    },
+    {
+      "name": "STREAMS_BLOCKED",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "while-blocked",
+      "first": {
+        "value": 22,
+        "hex": "0x16"
+      },
+      "last": {
+        "value": 23,
+        "hex": "0x17"
+      }
+    },
+    {
+      "name": "NEW_CONNECTION_ID",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 24,
+        "hex": "0x18"
+      },
+      "last": {
+        "value": 24,
+        "hex": "0x18"
+      }
+    },
+    {
+      "name": "RETIRE_CONNECTION_ID",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 25,
+        "hex": "0x19"
+      },
+      "last": {
+        "value": 25,
+        "hex": "0x19"
+      }
+    },
+    {
+      "name": "PATH_CHALLENGE",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 26,
+        "hex": "0x1a"
+      },
+      "last": {
+        "value": 26,
+        "hex": "0x1a"
+      }
+    },
+    {
+      "name": "PATH_RESPONSE",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 27,
+        "hex": "0x1b"
+      },
+      "last": {
+        "value": 27,
+        "hex": "0x1b"
+      }
+    },
+    {
+      "name": "CONNECTION_CLOSE",
+      "kind": "core",
+      "gate": null,
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": false,
+      "retransmit": "never",
+      "first": {
+        "value": 28,
+        "hex": "0x1c"
+      },
+      "last": {
+        "value": 29,
+        "hex": "0x1d"
+      }
+    },
+    {
+      "name": "HANDSHAKE_DONE",
+      "kind": "prohibited",
+      "gate": null,
+      "spec": "SPEC.md#4.4",
+      "first": {
+        "value": 30,
+        "hex": "0x1e"
+      },
+      "last": {
+        "value": 30,
+        "hex": "0x1e"
+      }
+    },
+    {
+      "name": "RESET_STREAM_AT",
+      "kind": "quic-ext",
+      "gate": "reset_stream_at",
+      "spec": "SPEC.md#4.3",
+      "ack_eliciting": true,
+      "retransmit": "until-acked-or-stream-terminal",
+      "first": {
+        "value": 36,
+        "hex": "0x24"
+      },
+      "last": {
+        "value": 36,
+        "hex": "0x24"
+      }
+    },
+    {
+      "name": "DATAGRAM",
+      "kind": "quic-ext",
+      "gate": "max_datagram_frame_size",
+      "spec": "EXTENSIONS.md#6",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 48,
+        "hex": "0x30"
+      },
+      "last": {
+        "value": 49,
+        "hex": "0x31"
+      }
+    },
+    {
+      "name": "QX_TRANSPORT_PARAMETERS",
+      "kind": "qmux",
+      "gate": null,
+      "spec": "SPEC.md#5.1",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 4562519363345321226,
+        "hex": "0x3f5153300d0a0d0a"
+      },
+      "last": {
+        "value": 4562519363345321226,
+        "hex": "0x3f5153300d0a0d0a"
+      }
+    },
+    {
+      "name": "QX_PING",
+      "kind": "qmux",
+      "gate": null,
+      "spec": "SPEC.md#4.5",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 3786514991263827901,
+        "hex": "0x348c67529ef8c7bd"
+      },
+      "last": {
+        "value": 3786514991263827902,
+        "hex": "0x348c67529ef8c7be"
+      }
+    },
+    {
+      "name": "GOAWAY",
+      "kind": "zmux",
+      "gate": "zmux_goaway",
+      "spec": "EXTENSIONS.md#3",
+      "ack_eliciting": true,
+      "retransmit": "current-value",
+      "first": {
+        "value": 420607038,
+        "hex": "0x1911f43e"
+      },
+      "last": {
+        "value": 420607038,
+        "hex": "0x1911f43e"
+      }
+    },
+    {
+      "name": "PRIORITY_UPDATE",
+      "kind": "zmux",
+      "gate": "zmux_priority",
+      "spec": "EXTENSIONS.md#5",
+      "ack_eliciting": true,
+      "retransmit": "latest-per-stream",
+      "first": {
+        "value": 121440463,
+        "hex": "0x073d08cf"
+      },
+      "last": {
+        "value": 121440463,
+        "hex": "0x073d08cf"
+      }
+    },
+    {
+      "name": "PIPE_JOIN",
+      "kind": "zmux",
+      "gate": "zmux_multipath",
+      "spec": "MULTIPATH.md#5",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 438623798,
+        "hex": "0x1a24de36"
+      },
+      "last": {
+        "value": 438623798,
+        "hex": "0x1a24de36"
+      }
+    },
+    {
+      "name": "PIPE_ACK",
+      "kind": "zmux",
+      "gate": [
+        "zmux_multipath",
+        "zmux_pipe_ack"
+      ],
+      "spec": "MULTIPATH.md#6",
+      "ack_eliciting": false,
+      "retransmit": "never",
+      "first": {
+        "value": 187383531,
+        "hex": "0x0b2b3eeb"
+      },
+      "last": {
+        "value": 187383531,
+        "hex": "0x0b2b3eeb"
+      }
+    },
+    {
+      "name": "PIPE_LANE",
+      "kind": "zmux",
+      "gate": "zmux_max_lanes",
+      "spec": "MULTIPATH.md#5.8",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 973447625,
+        "hex": "0x3a05a1c9"
+      },
+      "last": {
+        "value": 973447625,
+        "hex": "0x3a05a1c9"
+      }
+    },
+    {
+      "name": "PIPE_PING",
+      "kind": "zmux",
+      "gate": "zmux_multipath",
+      "spec": "MULTIPATH.md#6.4",
+      "ack_eliciting": true,
+      "retransmit": "never",
+      "first": {
+        "value": 647709670,
+        "hex": "0x269b43e6"
+      },
+      "last": {
+        "value": 647709670,
+        "hex": "0x269b43e6"
+      }
+    },
+    {
+      "name": "PIPE_ABANDON",
+      "kind": "zmux",
+      "gate": "zmux_multipath",
+      "spec": "MULTIPATH.md#8",
+      "ack_eliciting": true,
+      "retransmit": "until-acked",
+      "first": {
+        "value": 598956916,
+        "hex": "0x23b35b74"
+      },
+      "last": {
+        "value": 598956916,
+        "hex": "0x23b35b74"
+      }
+    },
+    {
+      "name": "PIPE_STATUS",
+      "kind": "zmux",
+      "gate": "zmux_multipath",
+      "spec": "MULTIPATH.md#9",
+      "ack_eliciting": true,
+      "retransmit": "latest-per-pipe",
+      "first": {
+        "value": 578496529,
+        "hex": "0x227b2811"
+      },
+      "last": {
+        "value": 578496529,
+        "hex": "0x227b2811"
+      }
+    }
+  ],
+  "transport_parameters": [
+    {
+      "name": "original_destination_connection_id",
+      "scope": "prohibited",
+      "id": {
+        "value": 0,
+        "hex": "0x00"
+      }
+    },
+    {
+      "name": "max_idle_timeout",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "30000",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 1,
+        "hex": "0x01"
+      }
+    },
+    {
+      "name": "stateless_reset_token",
+      "scope": "prohibited",
+      "id": {
+        "value": 2,
+        "hex": "0x02"
+      }
+    },
+    {
+      "name": "max_udp_payload_size",
+      "scope": "prohibited",
+      "id": {
+        "value": 3,
+        "hex": "0x03"
+      }
+    },
+    {
+      "name": "initial_max_data",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "1048576",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 4,
+        "hex": "0x04"
+      }
+    },
+    {
+      "name": "initial_max_stream_data_bidi_local",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "262144",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 5,
+        "hex": "0x05"
+      }
+    },
+    {
+      "name": "initial_max_stream_data_bidi_remote",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "262144",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 6,
+        "hex": "0x06"
+      }
+    },
+    {
+      "name": "initial_max_stream_data_uni",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "262144",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 7,
+        "hex": "0x07"
+      }
+    },
+    {
+      "name": "initial_max_streams_bidi",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "256",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 8,
+        "hex": "0x08"
+      }
+    },
+    {
+      "name": "initial_max_streams_uni",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "16 (raised to 256 by MAX_STREAMS on the first accept), or the configured value",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 9,
+        "hex": "0x09"
+      }
+    },
+    {
+      "name": "ack_delay_exponent",
+      "scope": "prohibited",
+      "id": {
+        "value": 10,
+        "hex": "0x0a"
+      }
+    },
+    {
+      "name": "max_ack_delay",
+      "scope": "prohibited",
+      "id": {
+        "value": 11,
+        "hex": "0x0b"
+      }
+    },
+    {
+      "name": "disable_active_migration",
+      "scope": "prohibited",
+      "id": {
+        "value": 12,
+        "hex": "0x0c"
+      }
+    },
+    {
+      "name": "preferred_address",
+      "scope": "prohibited",
+      "id": {
+        "value": 13,
+        "hex": "0x0d"
+      }
+    },
+    {
+      "name": "active_connection_id_limit",
+      "scope": "prohibited",
+      "id": {
+        "value": 14,
+        "hex": "0x0e"
+      }
+    },
+    {
+      "name": "initial_source_connection_id",
+      "scope": "prohibited",
+      "id": {
+        "value": 15,
+        "hex": "0x0f"
+      }
+    },
+    {
+      "name": "retry_source_connection_id",
+      "scope": "prohibited",
+      "id": {
+        "value": 16,
+        "hex": "0x10"
+      }
+    },
+    {
+      "name": "reset_stream_at",
+      "scope": "qmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "always",
+      "spec": "SPEC.md#5.3",
+      "id": {
+        "value": 29,
+        "hex": "0x1d"
+      }
+    },
+    {
+      "name": "max_datagram_frame_size",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 0,
+      "zmux_sends": "own max_record_size (65535) when datagrams are enabled",
+      "spec": "EXTENSIONS.md#6",
+      "id": {
+        "value": 32,
+        "hex": "0x20"
+      }
+    },
+    {
+      "name": "max_record_size",
+      "scope": "qmux",
+      "format": "varint",
+      "absent_default": 16382,
+      "zmux_sends": "65535",
+      "spec": "SPEC.md#3.2",
+      "id": {
+        "value": 392311882705078341,
+        "hex": "0x0571c59429cd0845"
+      }
+    },
+    {
+      "name": "zmux_role",
+      "scope": "zmux",
+      "format": "role",
+      "absent_default": "transport role",
+      "zmux_sends": "when configured",
+      "spec": "EXTENSIONS.md#2",
+      "id": {
+        "value": 388235783,
+        "hex": "0x17240207"
+      }
+    },
+    {
+      "name": "zmux_goaway",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "always",
+      "spec": "EXTENSIONS.md#3",
+      "id": {
+        "value": 72518239,
+        "hex": "0x04528a5f"
+      }
+    },
+    {
+      "name": "zmux_preamble",
+      "scope": "zmux",
+      "format": "varint",
+      "absent_default": "not supported",
+      "zmux_sends": "4096 (less when the stream windows are smaller)",
+      "spec": "EXTENSIONS.md#4",
+      "id": {
+        "value": 70901882,
+        "hex": "0x0439e07a"
+      }
+    },
+    {
+      "name": "zmux_priority",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "always",
+      "spec": "EXTENSIONS.md#5",
+      "id": {
+        "value": 837227421,
+        "hex": "0x31e7139d"
+      }
+    },
+    {
+      "name": "zmux_datagram_flows",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "when datagrams are enabled",
+      "spec": "EXTENSIONS.md#6",
+      "id": {
+        "value": 183734765,
+        "hex": "0x0af391ed"
+      }
+    },
+    {
+      "name": "zmux_multipath",
+      "scope": "zmux",
+      "format": "multipath",
+      "absent_default": "not supported",
+      "zmux_sends": "when max_pipes > 1 or resume is enabled",
+      "spec": "MULTIPATH.md#3",
+      "id": {
+        "value": 819734904,
+        "hex": "0x30dc2978"
+      }
+    },
+    {
+      "name": "zmux_pipe_ack",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "always",
+      "spec": "MULTIPATH.md#3.5",
+      "id": {
+        "value": 884241953,
+        "hex": "0x34b47621"
+      }
+    },
+    {
+      "name": "zmux_ack_threshold",
+      "scope": "zmux",
+      "format": "varint",
+      "absent_default": 65536,
+      "zmux_sends": "omitted (65536)",
+      "spec": "MULTIPATH.md#3",
+      "id": {
+        "value": 660785125,
+        "hex": "0x2762c7e5"
+      }
+    },
+    {
+      "name": "zmux_max_ack_delay",
+      "scope": "zmux",
+      "format": "varint",
+      "absent_default": 25,
+      "zmux_sends": "omitted (25)",
+      "spec": "MULTIPATH.md#3",
+      "id": {
+        "value": 402267862,
+        "hex": "0x17fa1ed6"
+      }
+    },
+    {
+      "name": "zmux_max_lanes",
+      "scope": "zmux",
+      "format": "lanes",
+      "absent_default": "1 lane (no lanes)",
+      "zmux_sends": "always: Max Lanes 258 (max_lanes) and a random 16-byte Lane Key",
+      "spec": "MULTIPATH.md#3.6",
+      "id": {
+        "value": 663056112,
+        "hex": "0x27856ef0"
+      }
+    },
+    {
+      "name": "zmux_resume",
+      "scope": "zmux",
+      "format": "varint",
+      "absent_default": "not supported",
+      "zmux_sends": "resume_timeout in ms when enabled",
+      "spec": "RESUME.md#3",
+      "id": {
+        "value": 223836366,
+        "hex": "0x0d5778ce"
+      }
+    },
+    {
+      "name": "zmux_record_protection",
+      "scope": "zmux-reserved",
+      "format": "opaque",
+      "absent_default": "not supported",
+      "zmux_sends": "never (reserved)",
+      "spec": "REGISTRY.md#7",
+      "id": {
+        "value": 499001020,
+        "hex": "0x1dbe26bc"
+      }
+    }
+  ],
+  "transport_errors": [
+    {
+      "name": "NO_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 0,
+        "hex": "0x00"
+      }
+    },
+    {
+      "name": "INTERNAL_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 1,
+        "hex": "0x01"
+      }
+    },
+    {
+      "name": "CONNECTION_REFUSED",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 2,
+        "hex": "0x02"
+      }
+    },
+    {
+      "name": "FLOW_CONTROL_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 3,
+        "hex": "0x03"
+      }
+    },
+    {
+      "name": "STREAM_LIMIT_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 4,
+        "hex": "0x04"
+      }
+    },
+    {
+      "name": "STREAM_STATE_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 5,
+        "hex": "0x05"
+      }
+    },
+    {
+      "name": "FINAL_SIZE_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 6,
+        "hex": "0x06"
+      }
+    },
+    {
+      "name": "FRAME_ENCODING_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 7,
+        "hex": "0x07"
+      }
+    },
+    {
+      "name": "TRANSPORT_PARAMETER_ERROR",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 8,
+        "hex": "0x08"
+      }
+    },
+    {
+      "name": "PROTOCOL_VIOLATION",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 10,
+        "hex": "0x0a"
+      }
+    },
+    {
+      "name": "NO_VIABLE_PATH",
+      "source": "RFC 9000",
+      "wire": true,
+      "code": {
+        "value": 16,
+        "hex": "0x10"
+      }
+    },
+    {
+      "name": "ZMUX_EXCESSIVE_LOAD",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 637498863,
+        "hex": "0x25ff75ef"
+      }
+    },
+    {
+      "name": "ZMUX_ROLE_CONFLICT",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 662549187,
+        "hex": "0x277db2c3"
+      }
+    },
+    {
+      "name": "ZMUX_RESUME_TIMEOUT",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 246968679,
+        "hex": "0x0eb87167"
+      }
+    },
+    {
+      "name": "ZMUX_RESUME_FAILED",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 252049230,
+        "hex": "0x0f05f74e"
+      }
+    },
+    {
+      "name": "ZMUX_PIPE_FAILED",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 694836213,
+        "hex": "0x296a5bf5"
+      }
+    },
+    {
+      "name": "ZMUX_PIPE_RESOURCE_LIMIT",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 189767955,
+        "hex": "0x0b4fa113"
+      }
+    },
+    {
+      "name": "ZMUX_PIPE_AUTH_FAILED",
+      "source": "zmux",
+      "wire": false,
+      "code": {
+        "value": 157366584,
+        "hex": "0x09613938"
+      }
+    },
+    {
+      "name": "ZMUX_IDLE_TIMEOUT",
+      "source": "zmux",
+      "wire": true,
+      "code": {
+        "value": 657904988,
+        "hex": "0x2736d55c"
+      }
+    }
+  ],
+  "application_errors": [
+    {
+      "name": "NO_ERROR",
+      "socks5_rep": null,
+      "code": {
+        "value": 0,
+        "hex": "0x00"
+      }
+    },
+    {
+      "name": "ZMUX_CANCELLED",
+      "socks5_rep": null,
+      "code": {
+        "value": 1514995713,
+        "hex": "0x5a4d0001"
+      }
+    },
+    {
+      "name": "ZMUX_REJECTED",
+      "socks5_rep": null,
+      "code": {
+        "value": 1514995714,
+        "hex": "0x5a4d0002"
+      }
+    },
+    {
+      "name": "ZMUX_CARRIER_FAILED",
+      "socks5_rep": null,
+      "code": {
+        "value": 1514995715,
+        "hex": "0x5a4d0003"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_GENERAL_FAILURE",
+      "socks5_rep": 1,
+      "code": {
+        "value": 1514995969,
+        "hex": "0x5a4d0101"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_NOT_ALLOWED",
+      "socks5_rep": 2,
+      "code": {
+        "value": 1514995970,
+        "hex": "0x5a4d0102"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_NETWORK_UNREACHABLE",
+      "socks5_rep": 3,
+      "code": {
+        "value": 1514995971,
+        "hex": "0x5a4d0103"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_HOST_UNREACHABLE",
+      "socks5_rep": 4,
+      "code": {
+        "value": 1514995972,
+        "hex": "0x5a4d0104"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_CONNECTION_REFUSED",
+      "socks5_rep": 5,
+      "code": {
+        "value": 1514995973,
+        "hex": "0x5a4d0105"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_TTL_EXPIRED",
+      "socks5_rep": 6,
+      "code": {
+        "value": 1514995974,
+        "hex": "0x5a4d0106"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_COMMAND_NOT_SUPPORTED",
+      "socks5_rep": 7,
+      "code": {
+        "value": 1514995975,
+        "hex": "0x5a4d0107"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_ADDRESS_TYPE_NOT_SUPPORTED",
+      "socks5_rep": 8,
+      "code": {
+        "value": 1514995976,
+        "hex": "0x5a4d0108"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_DNS_FAILURE",
+      "socks5_rep": 4,
+      "code": {
+        "value": 1514995984,
+        "hex": "0x5a4d0110"
+      }
+    },
+    {
+      "name": "ZMUX_PROXY_CONNECT_TIMEOUT",
+      "socks5_rep": 6,
+      "code": {
+        "value": 1514995985,
+        "hex": "0x5a4d0111"
+      }
+    }
+  ],
+  "application_error_block": {
+    "first": "0x5a4d0000",
+    "last": "0x5a4d0fff"
+  },
+  "preamble_tlvs": [
+    {
+      "name": "OPEN_INFO",
+      "status": "active",
+      "value": "opaque bytes, 0..(limit) bytes",
+      "spec": "EXTENSIONS.md#4.3",
+      "type": {
+        "value": 1,
+        "hex": "0x01"
+      }
+    },
+    {
+      "name": "PRIORITY",
+      "status": "active",
+      "value": "1 byte: urgency (3 bits) | incremental (1 bit) | 0000",
+      "spec": "EXTENSIONS.md#4.3",
+      "type": {
+        "value": 2,
+        "hex": "0x02"
+      }
+    },
+    {
+      "name": "DEADLINE",
+      "status": "reserved",
+      "value": "reserved: relative deadline in ms (varint); MUST NOT be sent",
+      "spec": "EXTENSIONS.md#4.3",
+      "type": {
+        "value": 3,
+        "hex": "0x03"
+      }
+    },
+    {
+      "name": "PIPE_CARRIER",
+      "status": "active",
+      "value": "empty: the stream carries a pipe pair of a nested session",
+      "spec": "EXTENSIONS.md#4.3",
+      "type": {
+        "value": 5,
+        "hex": "0x05"
+      }
+    }
+  ],
+  "preamble_tlv_application_range": {
+    "first": "0x1000",
+    "last": "0x3fff"
+  },
+  "grease": {
+    "transport_parameter": "31*N+27",
+    "preamble_tlv": "0x1f*N+0x21"
+  },
+  "fixed_values": {
+    "zmux_role": {
+      "0": "initiator",
+      "1": "responder",
+      "2": "auto"
+    },
+    "pipe_join_direction": {
+      "0": "up",
+      "1": "down",
+      "2": "bidi"
+    },
+    "pipe_join_carrier_bound": "0x04",
+    "pipe_join_standby": "0x08",
+    "pipe_join_reserved_mask": "0xf0",
+    "multipath_secret_flags": {
+      "0x01": "E (TLS exporter)",
+      "0x04": "P (pre-shared key)",
+      "0x08": "I (insecure join allowed)"
+    },
+    "pipe_status": {
+      "0": "available",
+      "1": "standby"
+    },
+    "pipe_priority": {
+      "min": 0,
+      "max": 4611686018427387903,
+      "default": 0,
+      "order": "lower preferred; every value valid"
+    }
+  },
+  "labels": {
+    "tls_exporter_session": "EXPORTER-zmux-session",
+    "tls_exporter_pipe": "EXPORTER-zmux-pipe",
+    "hkdf_salt_prefix": "zmux session",
+    "hkdf_join_initiator": "zmux join i",
+    "hkdf_join_responder": "zmux join r",
+    "http_join_header": "Zmux-Pipe-Join",
+    "http_pair_header": "Zmux-Pipe-Pair"
+  },
+  "limits": {
+    "max_join_frame_bytes": 64,
+    "max_locator_bytes": 16,
+    "join_token_bytes": 16,
+    "lane_key_bytes": 16,
+    "default_max_record_size": 16382,
+    "zmux_max_record_size": 65535,
+    "max_preamble_tp_overhead": 32,
+    "pairing_token_bytes": 16,
+    "max_unpaired_carriers": 64,
+    "budget_capacity": 4096,
+    "budget_refill_per_second": 32,
+    "sender_probe_rate_per_second": 16,
+    "pipe_ping_rate_per_second": 8,
+    "suspect_floor_ms": 250,
+    "fail_floor_ms": 2000,
+    "first_record_timeout_ms": 2000,
+    "unauthenticated_carriers_per_source": 8,
+    "stream_datagram_queue": 32,
+    "datagram_receive_bytes": 1048576,
+    "suspect_floor_min_ms": 50,
+    "probe_interval_ms": 15000,
+    "busy_window_ms": 15000,
+    "ack_redundancy_ms": 50,
+    "unretired_attachments_extra": 8,
+    "replay_window_floor_ids": 64,
+    "join_refusal_backoff_min_ms": 1000,
+    "join_refusal_backoff_max_ms": 60000,
+    "unilateral_retirement_floor_ms": 2000,
+    "inbound_silence_margin_floor_ms": 2000,
+    "dead_timeout_min_ms": 1000,
+    "write_call_min_bytes": 4096,
+    "write_call_rate_ms": 50,
+    "early_data_max_data": 16384,
+    "early_data_max_streams_bidi": 4,
+    "early_data_max_stream_data": 4096,
+    "early_data_max_preamble": 1024
+  },
+  "allocation": {
+    "method": "v = 2^14 + (SHA-256('zmux <kind> <name>[#i]')[0:8] as big-endian) mod (2^30 - 2^14)",
+    "suffix": {
+      "transport_error:ZMUX_PIPE_AUTH_FAILED": 1
+    }
+  }
+}

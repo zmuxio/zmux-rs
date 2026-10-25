@@ -1,0 +1,62 @@
+{"kind": "trace", "id": "core.robustness.bounded_responses_while_blocked", "title": "While the outbound pipe is blocked, response state stays bounded", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["SPEC.md#9.2"], "findings": [], "groups": ["core", "robustness"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": 58, "raw": "abcd"}]}]], "hex": "404aff5153300d0a0d0a4040010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffff3a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {}}
+{"step": 5, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
+{"step": 6, "op": "api", "call": "write", "args": {"stream": "a", "data": "78", "fin": false}, "expect": {"accepted": 1}}
+{"step": 7, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "02210078"}]}
+{"step": 8, "op": "set_writable", "pipe": 0, "writable": false}
+{"step": 9, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 0}]], "hex": "09f48c67529ef8c7bd00"}
+{"step": 10, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 1}]], "hex": "09f48c67529ef8c7bd01"}
+{"step": 11, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 2}]], "hex": "09f48c67529ef8c7bd02"}
+{"step": 12, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 3}]], "hex": "09f48c67529ef8c7bd03"}
+{"step": 13, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 4}]], "hex": "09f48c67529ef8c7bd04"}
+{"step": 14, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 5}]], "hex": "09f48c67529ef8c7bd05"}
+{"step": 15, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 6}]], "hex": "09f48c67529ef8c7bd06"}
+{"step": 16, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 7}]], "hex": "09f48c67529ef8c7bd07"}
+{"step": 17, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 8}]], "hex": "09f48c67529ef8c7bd08"}
+{"step": 18, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 9}]], "hex": "09f48c67529ef8c7bd09"}
+{"step": 19, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 10}]], "hex": "09f48c67529ef8c7bd0a"}
+{"step": 20, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 11}]], "hex": "09f48c67529ef8c7bd0b"}
+{"step": 21, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 12}]], "hex": "09f48c67529ef8c7bd0c"}
+{"step": 22, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 13}]], "hex": "09f48c67529ef8c7bd0d"}
+{"step": 23, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 14}]], "hex": "09f48c67529ef8c7bd0e"}
+{"step": 24, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 15}]], "hex": "09f48c67529ef8c7bd0f"}
+{"step": 25, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 16}]], "hex": "09f48c67529ef8c7bd10"}
+{"step": 26, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 17}]], "hex": "09f48c67529ef8c7bd11"}
+{"step": 27, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 18}]], "hex": "09f48c67529ef8c7bd12"}
+{"step": 28, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 19}]], "hex": "09f48c67529ef8c7bd13"}
+{"step": 29, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 20}]], "hex": "09f48c67529ef8c7bd14"}
+{"step": 30, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 21}]], "hex": "09f48c67529ef8c7bd15"}
+{"step": 31, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 22}]], "hex": "09f48c67529ef8c7bd16"}
+{"step": 32, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 23}]], "hex": "09f48c67529ef8c7bd17"}
+{"step": 33, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 24}]], "hex": "09f48c67529ef8c7bd18"}
+{"step": 34, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 25}]], "hex": "09f48c67529ef8c7bd19"}
+{"step": 35, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 26}]], "hex": "09f48c67529ef8c7bd1a"}
+{"step": 36, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 27}]], "hex": "09f48c67529ef8c7bd1b"}
+{"step": 37, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 28}]], "hex": "09f48c67529ef8c7bd1c"}
+{"step": 38, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 29}]], "hex": "09f48c67529ef8c7bd1d"}
+{"step": 39, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 30}]], "hex": "09f48c67529ef8c7bd1e"}
+{"step": 40, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 31}]], "hex": "09f48c67529ef8c7bd1f"}
+{"step": 41, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 32}]], "hex": "09f48c67529ef8c7bd20"}
+{"step": 42, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 33}]], "hex": "09f48c67529ef8c7bd21"}
+{"step": 43, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 34}]], "hex": "09f48c67529ef8c7bd22"}
+{"step": 44, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 35}]], "hex": "09f48c67529ef8c7bd23"}
+{"step": 45, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 36}]], "hex": "09f48c67529ef8c7bd24"}
+{"step": 46, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 37}]], "hex": "09f48c67529ef8c7bd25"}
+{"step": 47, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 38}]], "hex": "09f48c67529ef8c7bd26"}
+{"step": 48, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 39}]], "hex": "09f48c67529ef8c7bd27"}
+{"step": 49, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 40}]], "hex": "09f48c67529ef8c7bd28"}
+{"step": 50, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 41}]], "hex": "09f48c67529ef8c7bd29"}
+{"step": 51, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 42}]], "hex": "09f48c67529ef8c7bd2a"}
+{"step": 52, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 43}]], "hex": "09f48c67529ef8c7bd2b"}
+{"step": 53, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 44}]], "hex": "09f48c67529ef8c7bd2c"}
+{"step": 54, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 45}]], "hex": "09f48c67529ef8c7bd2d"}
+{"step": 55, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 46}]], "hex": "09f48c67529ef8c7bd2e"}
+{"step": 56, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 47}]], "hex": "09f48c67529ef8c7bd2f"}
+{"step": 57, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 48}]], "hex": "09f48c67529ef8c7bd30"}
+{"step": 58, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 49}]], "hex": "09f48c67529ef8c7bd31"}
+{"step": 59, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 1, "code": 3}], [{"type": "STOP_SENDING", "id": 1, "code": 3}], [{"type": "STOP_SENDING", "id": 1, "code": 3}]], "hex": "030501030305010303050103"}
+{"step": 60, "op": "set_writable", "pipe": 0, "writable": true}
+{"step": 61, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "QX_PING", "response": true, "count": 1}, {"type": "QX_PING", "response": true, "seq": 49}, {"type": {"oneof": ["RESET_STREAM", "RESET_STREAM_AT"]}, "id": 1, "count": 1}]}

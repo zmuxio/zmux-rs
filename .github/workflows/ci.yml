@@ -19,121 +19,152 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: Check
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
+      - uses: actions/checkout@v5
       - name: Install Rust
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
-          rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
+  clippy:
+    name: Clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: workspace, all features
+            args: --workspace --all-targets --all-features
+          - name: core without drivers
+            args: -p zmux --no-default-features
+          - name: core, std driver only
+            args: -p zmux --no-default-features --features blocking
+          - name: QUIC adapter without a crypto provider
+            args: -p zmux-quinn --no-default-features
+          - name: HTTP/3 adapter without a crypto provider
+            args: -p zmux-h3 --no-default-features
+          - name: WebTransport adapter with aws-lc-rs
+            args: -p zmux-webtransport --no-default-features --features aws-lc-rs
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            rust-${{ runner.os }}-
+          key: clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: clippy-${{ runner.os }}-
+      - run: cargo clippy --locked ${{ matrix.args }} -- -D warnings
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Run clippy with optional async I/O features
-        run: cargo clippy --locked -p zmux --features tokio-io,futures-io --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked --workspace --all-features
-
-      - name: Build docs
-        run: cargo doc --locked --workspace --all-features --no-deps
-
-      - name: Package core crate
-        run: cargo package --locked -p zmux
-
-  interop:
-    name: Interop (Go, Java)
+  doc:
+    name: Docs
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - name: Checkout zmux-rs
-        uses: actions/checkout@v5
-        with:
-          path: zmux-rs
-
-      - name: Checkout zmux-go
-        uses: actions/checkout@v5
-        with:
-          repository: zmuxio/zmux-go
-          path: zmux-go
-
-      - name: Checkout zmux-java
-        uses: actions/checkout@v5
-        with:
-          repository: zmuxio/zmux-java
-          path: zmux-java
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          check-latest: true
-          cache-dependency-path: zmux-go/adapter/quicmux/go.sum
-
-      - name: Show Go version
-        run: go version
-
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: zulu
-          java-version: 21
-          cache: maven
-          cache-dependency-path: zmux-java/**/pom.xml
-
+      - uses: actions/checkout@v5
       - name: Install Rust
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            zmux-rs/target
-          key: interop-rust-${{ runner.os }}-${{ hashFiles('zmux-rs/**/Cargo.lock') }}
-          restore-keys: |
-            interop-rust-${{ runner.os }}-
-            rust-${{ runner.os }}-
-
-      - name: Build zmux-java for the interop helper
-        working-directory: zmux-java
-        run: mvn -B -q -pl zmux -am -DskipTests package
-
-      - name: Run interop smoke tests
-        working-directory: zmux-rs
+            target
+          key: doc-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: doc-${{ runner.os }}-
+      - run: cargo doc --locked --workspace --all-features --no-deps
         env:
-          ZMUX_INTEROP: '1'
-          ZMUX_INTEROP_TIMEOUT_SECONDS: '300'
-          ZMUX_GO_ROOT: ${{ github.workspace }}/zmux-go
-          ZMUX_JAVA_ROOT: ${{ github.workspace }}/zmux-java
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        shell: bash
         run: |
-          cargo test --locked --test go_interop_smoke
-          # Both Java cases rebuild the same Maven module, so run them one at a time.
-          cargo test --locked --test java_interop_smoke -- --test-threads=1
-          cargo test --locked -p zmux-quinn --test go_quic_interop_smoke
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+      - name: Core, TLS and QUIC adapters
+        run: cargo test --locked --all-features
+      - name: Std driver only
+        run: cargo test --locked -p zmux --no-default-features --features blocking --lib
+      - name: Other adapters
+        run: cargo test --locked -p zmux-websocket -p zmux-http -p zmux-h3 -p zmux-webtransport
+
+  release-checks:
+    name: Allocation, footprint and write calls (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-checks-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-checks-${{ runner.os }}-
+      - run: cargo test --locked --release --all-features --test zero_alloc --test footprint --test input_pending
+      - name: Build benchmarks
+        run: cargo bench --locked --workspace --no-run
+
+  msrv:
+    name: Minimum Rust version (1.95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.95
+        shell: bash
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: msrv-${{ runner.os }}-
+      - name: Check every crate and target
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: Library tests
+        run: cargo test --locked --lib --all-features

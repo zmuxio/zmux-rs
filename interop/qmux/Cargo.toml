@@ -1,0 +1,21 @@
+[package]
+name = "zmux-interop-qmux"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Interoperability tests between zmux and the `qmux` crate over TCP"
+
+# Standalone: not a member of the zmux workspace, so the interop
+# dependencies are only fetched when these tests are run:
+#   cargo test --manifest-path interop/qmux/Cargo.toml
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+bytes = "1"
+qmux = { version = "=0.6.2", default-features = false, features = ["tcp"] }
+tokio = { version = "1.47", features = ["full"] }
+web-transport-trait = "0.5"
+zmux = { path = "../.." }

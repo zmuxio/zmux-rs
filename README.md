@@ -1,406 +1,129 @@
 # zmux
 
-Rust implementation of the ZMux v1 single-link stream multiplexing protocol.
+Rust implementation of zmux: multiplexed, flow-controlled streams and
+datagrams over one or many reliable byte pipes.
 
-The workspace publishes two crates:
+zmux is wire-compatible with QMux (draft-ietf-quic-qmux-02): QUIC version 1
+frames in size-prefixed records over TCP, TLS, WebSocket or any other
+reliable carrier. With a plain QMux peer a session is a plain single-pipe
+QMux session. Between zmux endpoints, transport parameters negotiate
+multipath (many unidirectional pipes, per-frame spreading, failover with
+reinjection), resumption after every pipe is lost, and the base extensions:
+roles, GOAWAY, stream preambles, priorities and datagram flows.
 
-- `zmux`: native blocking ZMux sessions, runtime-neutral async traits, stable stream/session trait objects, wire codec
-  helpers, and conformance helpers.
-- `zmux-quinn`: optional async `quinn` adapter that implements the same async session/stream traits.
-
-`zmux` does not depend on Tokio, Quinn, rustls, or any QUIC stack.
-
-## Installation
-
-```toml
-[dependencies]
-zmux = "VERSION"
-```
-
-Optional core features:
-
-```toml
-[dependencies]
-zmux = { version = "VERSION", features = ["tokio-io", "futures-io"] }
-```
-
-For QUIC support, add the adapter crate:
-
-```toml
-[dependencies]
-zmux = "VERSION"
-zmux-quinn = "VERSION"
-quinn = "QUINN_VERSION"
-```
-
-Adapter usage is documented in [`adapter/quinn/README.md`](adapter/quinn/README.md).
-
-## Start A Session
-
-Use `zmux::Conn::new(...)` when both peers can use auto role negotiation on an already established reliable connection.
+## Usage
 
 ```rust
-use std::net::TcpStream;
-
-fn main() -> zmux::Result<()> {
-    let socket = TcpStream::connect("127.0.0.1:9000")?;
-    let session = zmux::Conn::new(socket)?;
-
-    let stream = session.open_stream()?;
-    stream.write_final(b"hello")?;
-
-    let mut reply = [0u8; 1024];
-    let _n = stream.read(&mut reply)?;
-
-    session.close()?;
-    Ok(())
-}
+let tcp = tokio::net::TcpStream::connect("127.0.0.1:4433").await?;
+let session = zmux::Session::connect(zmux::PipeIo::tcp(tcp), zmux::Config::default()).await?;
+let (mut send, mut recv) = session.open_bi().await?;
+send.write_all(b"hello").await?;
+send.finish()?;
+let reply = recv.read_to_end(1 << 20).await?;
 ```
 
-Constructor choice:
+The accepting side calls `Session::accept`, then `accept_bi` / `accept_uni`.
+Streams implement `AsyncRead` / `AsyncWrite`; dropping a stream that was not
+finished resets it (and stops reading) with code 0. A bidirectional stream
+can itself carry a pipe of another session (`Session::open_pipe_stream`,
+`PipeIo::from_stream`): a nested session whose pipes cross relays.
 
-- `Conn::new(transport)`: auto role negotiation with the default config.
-- `Conn::client(transport)`: fixed initiator/client role with the default config.
-- `Conn::server(transport)`: fixed responder/server role with the default config.
-- `Conn::with_config(transport, config)`, `Conn::client_with_config(...)`, and `Conn::server_with_config(...)`: same
-  constructors with an explicit `Config`.
+Errors are one type per kind of operation, the same for both drivers and
+the sans-IO core: `SessionError` (why a session ended), `StreamError` (every
+stream operation), `OpenError`, `DatagramError`, `PipeError`, and
+`ConnectError`, `ReadExactError`, `ReadToEndError` for the compound calls.
+Each tells whether the operation may be retried (`is_retryable`) and
+converts into `std::io::Error`.
 
-`transport` is any `DuplexConnection`. Built-in implementations cover `TcpStream`, `duplex_io(...)` wrappers for
-cloneable full-duplex I/O, `(reader, writer)` pairs, boxed `DuplexConnection` values, native bidirectional `Stream`s,
-joined stream halves, and `DuplexTransport`. It is not limited to TCP: TLS streams, pipes, in-memory links, and custom
-reliable byte streams are supported when they can expose independent read/write handles. Attach a close hook when
-dropping those handles is not enough to close the whole underlying resource.
+## Memory and allocators
 
-Use the stable trait surfaces when application code should not depend on one concrete session type:
+zmux gives memory back as load goes away: idle pipes return their read and
+write buffers after a second, a process-wide pool keeps a bounded number of
+read buffers, and closed streams and sessions free their state. Whether the
+freed memory also leaves the process is up to the global allocator, which
+the crate never sets: the choice belongs to the application.
 
-- `Conn` plus `Session`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, `StreamHandle`: blocking API.
-  Prefer concrete `Conn` when you own the transport; use the traits when type erasure or generic code is useful.
-- `AsyncSession`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`, `AsyncRecvStreamHandle`, `AsyncStreamHandle`:
-  runtime-neutral async API shared by native ZMux and adapters.
+After a burst of many sessions and large transfers on several runtime
+threads, the live heap returns to its quiet level, but the resident set
+usually stays near its peak: glibc's malloc keeps freed pages in its
+per-thread arenas, and jemalloc and mimalloc keep theirs for reuse unless
+they are told to purge them while the process is quiet. Under sustained
+churn the resident set stays bounded with glibc's malloc and with
+jemalloc; mimalloc's kept growing in a long churn on many threads unless
+it purges freed pages at once (`MIMALLOC_PURGE_DELAY=0`). Applications
+that serve such bursts and want the memory back between them can use
+jemalloc as the global allocator with background purging
+(`background_thread:true` in its configuration, through `MALLOC_CONF` or
+the allocator crate's options), which returns most of it within seconds of
+the burst. With glibc, `MALLOC_ARENA_MAX` lowers the plateau but does not
+return it. Measure with the application's own load: the `soak` scenario of
+`benches/session.rs` runs a bounded churn and prints the live heap next to
+the resident set, under any allocator given by `LD_PRELOAD`.
 
-## Streams
+## Layout
 
-Bidirectional streams can both read and write:
+| Part | Content | Feature |
+|---|---|---|
+| `zmux::proto` | the sans-IO layer: wire format (`varint`, `frame`, `record`, `params`, `ident`, `payload`, `keys`, `oob`, `error`) and the session state machine `proto::session` | always |
+| crate root | `Session`, `SendStream`, `RecvStream`, `PipeIo`, `Listener`: one tokio task per session | `tokio` (default) |
+| `zmux::blocking` | the same handles for threads: the calls that wait block instead of returning a future; streams implement `std::io::Read` / `Write` | `blocking` |
+| `zmux::helpers` | helpers above the public API: `maintain_pipes` (keeping pipes up), `splice` (relaying a stream into another), `resolve_duplicate` (two sessions between the same endpoints) | `tokio`; `resolve_duplicate` either driver |
+| `zmux::carrier` | items for carrier authors: connection identities, lane handling, memory charges | `tokio` |
 
-```rust
-let stream = session.open_stream()?;
-stream.write(b"request")?;
-stream.close_write()?;
+The session core has no I/O and no clock: drivers feed it bytes, timer
+events and application commands, and pull records, events and deadlines
+from it.
 
-let mut response = Vec::new();
-let mut buf = [0u8; 4096];
-loop {
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
-        break;
-    }
-    response.extend_from_slice(&buf[..n]);
-}
+The carrier crates of the workspace turn connections into pipes, each with
+`dial` (a pipe), `connect` (a session) and `serve` (into a `Listener`):
+
+| Crate | Carrier | Lanes |
+|---|---|---|
+| `zmux-rustls` (`adapter/rustls`) | TLS 1.3 over TCP (tokio-rustls), with the exporter for carrier-bound joins | no |
+| `zmux-quinn` (`adapter/quinn`) | QUIC (quinn): pipes on streams of a connection | further streams |
+| `zmux-websocket` (`adapter/websocket`) | WebSocket (tokio-tungstenite), `ws` and `wss` | no |
+| `zmux-http` (`adapter/http`) | HTTP/1.1 and HTTP/2 exchanges (hyper), over TCP or TLS | HTTP/2, off by default |
+| `zmux-h3` (`adapter/h3`) | HTTP/3 requests (h3 over quinn) | further requests |
+| `zmux-webtransport` (`adapter/webtransport`) | WebTransport sessions (web-transport-quinn) | further streams |
+
+The crate documentation compares them and describes multipath, resumption,
+relays and nesting.
+
+## Minimum Rust version
+
+Rust 1.95, edition 2024.
+
+## Development
+
+```sh
+cargo test --workspace
+cargo clippy --all-targets --all-features -- -D warnings
+cargo bench --bench codec
+cargo bench --bench session
 ```
 
-Unidirectional streams split send and receive sides:
+Interoperability tests against the `qmux` crate over TCP live in a separate
+crate, so that its dependencies are fetched only when they run:
 
-```rust
-let send = session.open_uni_stream()?;
-send.write_final(b"event")?;
-
-let recv = session.accept_uni_stream()?;
-let mut buf = [0u8; 4096];
-let _n = recv.read(&mut buf)?;
+```sh
+cargo test --manifest-path interop/qmux/Cargo.toml
 ```
 
-Open a stream and send the first payload in one call:
+The heap of an idle connection of each carrier (TCP, TLS 1.3, QUIC) next
+to that of a zmux session over it is measured by another separate crate:
 
-```rust
-let stream = session.open_and_send(b"\x01hello")?;
-let send = session.open_uni_and_send(b"\x02event")?;
-
-let buf = vec![0x01, 0x02, 0x03];
-let stream = session.open_and_send(&buf)?;
+```sh
+cargo run --release --manifest-path interop/carrier-mem/Cargo.toml
 ```
 
-`open_and_send(...)` opens a bidirectional stream and writes the whole first payload before returning; the stream
-remains open. `open_uni_and_send(...)` writes the final payload and closes the send side. If the stream opens but the
-payload write fails, ZMux best-effort closes the opened stream before returning the error.
+`testdata/spec` holds the conformance assets of the zmux specification:
+the codepoint registry, the wire corpus, the wire examples and the
+executable traces. Refresh them from a specification checkout with:
 
-## Metadata And Priority
-
-Default sessions advertise the standard metadata capabilities. Open metadata is
-sent only when the open options need it:
-
-```rust
-use zmux::{MetadataUpdate, OpenOptions};
-
-let options = OpenOptions::new()
-    .open_info(b"\x01\x00\x00\x2a")
-    .priority(7)
-    .group(2);
-
-let stream = session.open_stream_with(options)?;
-stream.update_metadata(MetadataUpdate::new().priority(3))?;
-stream.write_final(b"hello")?;
+```sh
+ZMUX_SPEC_DIR=../zmux-spec tools/sync-spec-fixtures.sh
 ```
 
-Open info is opaque binary metadata. Pass a byte slice such as `&[u8]` / `&buf`, or pass an owned `Vec<u8>` to move it
-into the options without another caller-side copy. ZMux stores its own copy for borrowed metadata and owns the bytes
-once the stream is opened. Concrete sessions accept `OpenOptions` directly for open calls; trait-object and generic
-`Session` / `AsyncSession` code uses `OpenRequest` when timeout must travel with the options. The peer reads opener
-metadata through `stream.open_info()` or `stream.metadata()`. Use `append_open_info_to(&mut Vec<u8>)` to append the
-bytes into a reusable buffer without allocating a fresh `Vec`.
+## License
 
-Stream payloads are binary bytes, not text. Reads follow the standard Rust I/O
-shape: `read(&mut [u8])` fills caller-owned memory, while async callers can use
-`read_to_end(&mut Vec<u8>)` / `read_to_end_limited(...)` when they want an owned
-result buffer. Writes keep the TCP-style partial-write entry point as
-`write(&[u8])` (and `write_vectored`, `write_timeout`, `std::io::Write`): when a
-deadline, flow-control wait, or stream/session error stops a write after some
-bytes were already committed to the send path, the call returns `Ok(n)` with that
-count and the next call reports the error, so `Err` always means no bytes of that
-call were written. Because partial writes must leave the caller owning any unwritten
-bytes, owned buffers are accepted by complete-consumption APIs instead:
-`write_all(Vec<u8>)`, `write_final(Vec<u8>)`, and `open_uni_and_send(Vec<u8>)`.
-These fail with the error even when part of the payload was already committed.
-For erased or generic send handles, pass `WritePayload::from(vec)` to
-`SendStreamHandle::write_all(...)`, `SendStreamHandle::write_final(...)`, or
-their async `AsyncSendStreamHandle` equivalents when ownership should travel
-through the trait object.
-
-Borrowed payloads are copied into native queued frames when ZMux must own data
-past the call boundary. Owned payloads move into the operation and let native
-ZMux avoid that queue copy when a whole frame can use the buffer directly; if
-open metadata or fragmentation requires a combined frame payload, only that
-fragment is copied.
-
-## Custom Transports
-
-ZMux accepts native transports through `DuplexConnection`. A transport must be a
-reliable byte stream that can provide independent blocking read and write paths.
-Built-in implementations cover `TcpStream`, `duplex_io(...)` wrappers for
-cloneable full-duplex I/O, split `Read` / `Write` halves, boxed
-`DuplexConnection` values, native bidirectional `Stream`s, joined stream halves,
-and `DuplexTransport`.
-
-For normal full-duplex connections, pass the connection object directly when it
-already implements `DuplexConnection`:
-
-```rust
-let session = zmux::Conn::client(tcp_stream)?;
-```
-
-For TLS or other reliable byte streams that can create an independent cloned
-handle, wrap the full-duplex object with `duplex_io(...)`:
-
-```rust
-let session = zmux::Conn::client(zmux::duplex_io(tls_stream))?;
-```
-
-When the type exposes a `try_clone`-style API instead of `Clone`, build the
-transport from that operation:
-
-```rust
-let transport = zmux::try_duplex_io(tls_stream, |stream| stream.try_clone())?;
-let session = zmux::Conn::client(transport)?;
-```
-
-If the original object needs an explicit full-resource shutdown, attach that
-operation with `DuplexTransport::with_close_fn(...)` after building a transport
-or from a custom `DuplexConnection` implementation.
-`with_close_fn(...)` preserves any timeout control installed earlier with
-`with_control(...)` and replaces only the transport close action.
-
-Use split halves only when the transport naturally provides independent read and
-write sides:
-
-```rust
-let session = zmux::Conn::client((tls_read_half, tls_write_half))?;
-```
-
-Use `DuplexTransport` when the transport can expose addresses, timeouts, or a
-close hook:
-
-```rust
-let transport = zmux::DuplexTransport::new(reader, writer)
-    .with_local_addr(local_addr)
-    .with_peer_addr(peer_addr)
-    .with_close_fn(close_transport);
-
-let session = zmux::Conn::new(transport)?;
-```
-
-When addresses are discovered as optional values, use
-`with_addresses(local_addr, peer_addr)`. `DuplexTransportControl` hooks default
-to no-ops, so a custom control can provide only read/write timeout integration
-and leave full close to `with_close_fn(...)`.
-
-Avoid hiding one blocking duplex object behind a single `Mutex`: a blocking read
-can hold the lock and prevent writes or close progress.
-
-`Conn::close`, `Conn::close_with_error`, establishment failure, and runtime
-shutdown call the transport close hook when one is present. Neither close call
-waits indefinitely on a transport writer that a peer has stopped draining: once
-the session is terminal, the hook is called if the writer makes no progress for
-the close-frame send timeout (100 ms, up to 2 s on high-RTT sessions), even if
-the final `CLOSE` was not flushed. The same applies when the keepalive timeout
-fails a session whose transport writes are stalled. Without a close hook a
-blocked writer cannot be interrupted.
-
-Session establishment is bounded by `Config::establishment_timeout` (default
-10 s; zero selects the default and `Duration::MAX` disables the bound) on
-transports with read/write timeout control, such as `TcpStream`: the whole peer
-preface must arrive, and the local preface must be written, within that time. Passing only split
-halves drops/closes those halves according to their own types; attach
-`with_close_fn(...)` or implement `DuplexConnection` when the original
-underlying connection needs an explicit whole-resource shutdown.
-
-Custom connection types can implement `DuplexConnection` directly:
-
-```rust
-struct MyTlsConnection {
-    // user-owned TLS stream state
-}
-
-impl zmux::DuplexConnection for MyTlsConnection {
-    type Reader = MyTlsReadHalf;
-    type Writer = MyTlsWriteHalf;
-
-    fn into_transport(self) -> zmux::Result<zmux::DuplexTransport<Self::Reader, Self::Writer>> {
-        let (reader, writer, close_handle) = self.into_split_with_close_handle()?;
-        Ok(zmux::DuplexTransport::new(reader, writer)
-            .with_close_fn(move || close_handle.close()))
-    }
-}
-
-let session = zmux::Conn::client(my_tls_connection)?;
-```
-
-Join existing stream halves when an API expects a duplex object. `join_streams`
-is for already-separated directions, including ordinary `Read` / `Write` halves,
-two unidirectional connections, or unidirectional ZMux streams; it is not the
-normal wrapper for one full-duplex connection object:
-
-```rust
-let duplex = zmux::join_streams(recv_half, send_half);
-let optional = zmux::DuplexStream::from_parts(Some(recv_half), Some(send_half));
-```
-
-Joined halves are also `DuplexConnection` values when both halves are present
-and the read side implements `Read` while the write side implements `Write`, so
-they can back another zmux session over an already established outer reliable
-stream or pair of directional halves. When the supplied halves also implement
-ZMux stream handle traits, the joined value exposes the stable ZMux stream
-traits too:
-
-```rust
-let nested = zmux::Conn::client(outer_bidi_stream)?;
-
-let paired = zmux::join_streams(recv_from_peer, send_to_peer);
-let nested_from_halves = zmux::Conn::client(paired)?;
-```
-
-Calling the ZMux stream-handle close methods on joined ZMux halves closes both
-original halves and skips the second close when both halves report the same
-close identity. When a joined value is used as a `Conn` transport, ZMux closes
-known native ZMux stream halves with their own close methods; other generic
-`Read` / `Write` halves are detached and dropped. Attach an explicit
-`with_close_fn(...)` if another original resource needs a protocol-level
-shutdown.
-
-Async equivalent is `join_async_streams(...)`; use
-`AsyncDuplexStream::from_parts(...)` when one side is optional.
-
-## Closing And Errors
-
-```rust
-stream.close_write()?;                // graceful local send-half close
-stream.close_read()?;                 // local read cancellation
-stream.close_with_error(0x100, "bye")?;
-
-session.close()?;                     // graceful session close
-session.close_with_error(0x100, "bye")?;
-session.wait()?;
-```
-
-Use `Error` helpers instead of matching error text:
-
-```rust
-match stream.write(payload) {
-    Ok(_) => {}
-    Err(err) if err.is_session_closed() => {}
-    Err(err) if err.is_timeout() => {}
-    Err(err) => return Err(err),
-}
-```
-
-Common helpers include `is_session_closed()`, `is_read_closed()`, `is_write_closed()`, `is_timeout()`,
-`is_interrupted()`, `is_open_limited()`, `is_open_expired()`, `is_open_info_unavailable()`,
-`is_priority_update_unavailable()`, and `is_adapter_unsupported()`.
-
-## Configuration
-
-```rust
-let config = Config::default()
-    .event_handler(|event| {
-        let _ = event;
-    });
-```
-
-`Settings` controls negotiated stream windows, incoming stream limits, frame payload limits, scheduler hints, and
-padding keys.
-
-The built-in default advertises open metadata, priority hints, stream groups,
-and priority updates. Use `Config::default().disable_capabilities()` when a
-session must advertise no optional protocol capabilities.
-
-`Config::default()` returns a copy of the process-wide default template. Use
-`Config::configure_default(...)` during startup when every new session should
-inherit the same changes. Constructors without a `Config` argument use that
-template; use `Conn::with_config(...)` or `Conn::*_with_config(...)` when one
-session needs an explicit override:
-
-```rust
-zmux::Config::configure_default(|config| {
-    config.keepalive_interval = std::time::Duration::from_secs(30);
-});
-```
-
-`Config::reset_default()` restores the built-in template. Existing sessions keep
-the config they were created with.
-
-## API Overview
-
-Use concrete types when you own the transport and want the full API:
-
-- `Conn`, `Stream`, `SendStream`, and `RecvStream` for native blocking sessions.
-- `QuinnSession`, `QuinnStream`, `QuinnSendStream`, and `QuinnRecvStream` when using the Quinn adapter.
-
-Use trait objects when an upper layer should not care which concrete session or
-stream implementation is underneath:
-
-- Blocking: `Session`, `StreamHandle`, `DuplexStreamHandle`, `SendStreamHandle`, `RecvStreamHandle`, and `BoxSession`.
-- Async: `AsyncSession`, `AsyncStreamHandle`, `AsyncDuplexStreamHandle`, `AsyncSendStreamHandle`,
-  `AsyncRecvStreamHandle`, and `BoxAsyncSession`.
-
-Use request/value helpers only when the simple call needs extra data:
-
-- `OpenOptions` for open metadata, initial priority, and initial group.
-- `OpenRequest` when open options and timeout must travel together through a trait object.
-- `OpenSend` when an initial payload, open options, and timeout must travel together.
-- `WritePayload` when an owned or vectored payload must travel through a trait object.
-
-Transport helpers are intentionally small:
-
-- `duplex_io(io)` for cloneable full-duplex reliable byte streams.
-- `try_duplex_io(io, clone)` for streams with a `try_clone`-style operation.
-- `(reader, writer)` or `DuplexTransport::new(reader, writer)` for already split halves.
-- `join_streams(recv, send)` and `join_async_streams(recv, send)` for already separated directions.
-
-## Semantics
-
-- Successful native ZMux complete-write calls wait for the local writer path to flush the framed data to its backend.
-  Adapter writes wait for the adapter's backend future. Neither form is a peer application acknowledgement.
-- Borrowed buffers passed to write/open-and-send methods are not retained after the call returns. Owned buffers are
-  consumed by the operation.
-- `close_write()` finishes only the local send half.
-- `close_read()` cancels local interest in inbound bytes.
-- Open metadata is sent only when negotiated; required but unavailable metadata fails instead of being silently
-  discarded.
+Apache-2.0.

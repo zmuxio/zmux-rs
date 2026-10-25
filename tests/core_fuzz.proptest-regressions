@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b7e024a50ca58be10fa3cbccf620b49db7d01af22a6b2aa146e226572f630d51 # shrinks to ops = [Open(false), Write { h: 0, len: 1 }, Transmit, Release(0), Peer([Stop { s: 242, code: 0 }])], preamble = true, datagrams = false, role = true

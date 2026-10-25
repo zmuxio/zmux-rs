@@ -1,0 +1,73 @@
+{"kind": "trace", "id": "ext.datagram.send_queue_drops_oldest", "title": "Datagrams wait in a 64-entry send queue while the pipe is not writable; the oldest is dropped, and sending never blocks", "profile": "zmux-small-dgram", "local_role": "responder", "overrides": {}, "refs": ["EXTENSIONS.md#6.5"], "findings": [], "groups": ["ext", "datagram"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "max_datagram_frame_size": 1200, "zmux_datagram_flows": null}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "max_datagram_frame_size", "value": 1200}, {"id": 58, "raw": "abcd"}]}]], "hex": "404eff5153300d0a0d0a4044010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffff200244b03a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority"]}}
+{"step": 5, "op": "set_writable", "pipe": 0, "writable": false}
+{"step": 6, "op": "api", "call": "send_datagram", "args": {"data": "3030"}, "expect": {"ok": true}}
+{"step": 7, "op": "api", "call": "send_datagram", "args": {"data": "3031"}, "expect": {"ok": true}}
+{"step": 8, "op": "api", "call": "send_datagram", "args": {"data": "3032"}, "expect": {"ok": true}}
+{"step": 9, "op": "api", "call": "send_datagram", "args": {"data": "3033"}, "expect": {"ok": true}}
+{"step": 10, "op": "api", "call": "send_datagram", "args": {"data": "3034"}, "expect": {"ok": true}}
+{"step": 11, "op": "api", "call": "send_datagram", "args": {"data": "3035"}, "expect": {"ok": true}}
+{"step": 12, "op": "api", "call": "send_datagram", "args": {"data": "3036"}, "expect": {"ok": true}}
+{"step": 13, "op": "api", "call": "send_datagram", "args": {"data": "3037"}, "expect": {"ok": true}}
+{"step": 14, "op": "api", "call": "send_datagram", "args": {"data": "3038"}, "expect": {"ok": true}}
+{"step": 15, "op": "api", "call": "send_datagram", "args": {"data": "3039"}, "expect": {"ok": true}}
+{"step": 16, "op": "api", "call": "send_datagram", "args": {"data": "3130"}, "expect": {"ok": true}}
+{"step": 17, "op": "api", "call": "send_datagram", "args": {"data": "3131"}, "expect": {"ok": true}}
+{"step": 18, "op": "api", "call": "send_datagram", "args": {"data": "3132"}, "expect": {"ok": true}}
+{"step": 19, "op": "api", "call": "send_datagram", "args": {"data": "3133"}, "expect": {"ok": true}}
+{"step": 20, "op": "api", "call": "send_datagram", "args": {"data": "3134"}, "expect": {"ok": true}}
+{"step": 21, "op": "api", "call": "send_datagram", "args": {"data": "3135"}, "expect": {"ok": true}}
+{"step": 22, "op": "api", "call": "send_datagram", "args": {"data": "3136"}, "expect": {"ok": true}}
+{"step": 23, "op": "api", "call": "send_datagram", "args": {"data": "3137"}, "expect": {"ok": true}}
+{"step": 24, "op": "api", "call": "send_datagram", "args": {"data": "3138"}, "expect": {"ok": true}}
+{"step": 25, "op": "api", "call": "send_datagram", "args": {"data": "3139"}, "expect": {"ok": true}}
+{"step": 26, "op": "api", "call": "send_datagram", "args": {"data": "3230"}, "expect": {"ok": true}}
+{"step": 27, "op": "api", "call": "send_datagram", "args": {"data": "3231"}, "expect": {"ok": true}}
+{"step": 28, "op": "api", "call": "send_datagram", "args": {"data": "3232"}, "expect": {"ok": true}}
+{"step": 29, "op": "api", "call": "send_datagram", "args": {"data": "3233"}, "expect": {"ok": true}}
+{"step": 30, "op": "api", "call": "send_datagram", "args": {"data": "3234"}, "expect": {"ok": true}}
+{"step": 31, "op": "api", "call": "send_datagram", "args": {"data": "3235"}, "expect": {"ok": true}}
+{"step": 32, "op": "api", "call": "send_datagram", "args": {"data": "3236"}, "expect": {"ok": true}}
+{"step": 33, "op": "api", "call": "send_datagram", "args": {"data": "3237"}, "expect": {"ok": true}}
+{"step": 34, "op": "api", "call": "send_datagram", "args": {"data": "3238"}, "expect": {"ok": true}}
+{"step": 35, "op": "api", "call": "send_datagram", "args": {"data": "3239"}, "expect": {"ok": true}}
+{"step": 36, "op": "api", "call": "send_datagram", "args": {"data": "3330"}, "expect": {"ok": true}}
+{"step": 37, "op": "api", "call": "send_datagram", "args": {"data": "3331"}, "expect": {"ok": true}}
+{"step": 38, "op": "api", "call": "send_datagram", "args": {"data": "3332"}, "expect": {"ok": true}}
+{"step": 39, "op": "api", "call": "send_datagram", "args": {"data": "3333"}, "expect": {"ok": true}}
+{"step": 40, "op": "api", "call": "send_datagram", "args": {"data": "3334"}, "expect": {"ok": true}}
+{"step": 41, "op": "api", "call": "send_datagram", "args": {"data": "3335"}, "expect": {"ok": true}}
+{"step": 42, "op": "api", "call": "send_datagram", "args": {"data": "3336"}, "expect": {"ok": true}}
+{"step": 43, "op": "api", "call": "send_datagram", "args": {"data": "3337"}, "expect": {"ok": true}}
+{"step": 44, "op": "api", "call": "send_datagram", "args": {"data": "3338"}, "expect": {"ok": true}}
+{"step": 45, "op": "api", "call": "send_datagram", "args": {"data": "3339"}, "expect": {"ok": true}}
+{"step": 46, "op": "api", "call": "send_datagram", "args": {"data": "3430"}, "expect": {"ok": true}}
+{"step": 47, "op": "api", "call": "send_datagram", "args": {"data": "3431"}, "expect": {"ok": true}}
+{"step": 48, "op": "api", "call": "send_datagram", "args": {"data": "3432"}, "expect": {"ok": true}}
+{"step": 49, "op": "api", "call": "send_datagram", "args": {"data": "3433"}, "expect": {"ok": true}}
+{"step": 50, "op": "api", "call": "send_datagram", "args": {"data": "3434"}, "expect": {"ok": true}}
+{"step": 51, "op": "api", "call": "send_datagram", "args": {"data": "3435"}, "expect": {"ok": true}}
+{"step": 52, "op": "api", "call": "send_datagram", "args": {"data": "3436"}, "expect": {"ok": true}}
+{"step": 53, "op": "api", "call": "send_datagram", "args": {"data": "3437"}, "expect": {"ok": true}}
+{"step": 54, "op": "api", "call": "send_datagram", "args": {"data": "3438"}, "expect": {"ok": true}}
+{"step": 55, "op": "api", "call": "send_datagram", "args": {"data": "3439"}, "expect": {"ok": true}}
+{"step": 56, "op": "api", "call": "send_datagram", "args": {"data": "3530"}, "expect": {"ok": true}}
+{"step": 57, "op": "api", "call": "send_datagram", "args": {"data": "3531"}, "expect": {"ok": true}}
+{"step": 58, "op": "api", "call": "send_datagram", "args": {"data": "3532"}, "expect": {"ok": true}}
+{"step": 59, "op": "api", "call": "send_datagram", "args": {"data": "3533"}, "expect": {"ok": true}}
+{"step": 60, "op": "api", "call": "send_datagram", "args": {"data": "3534"}, "expect": {"ok": true}}
+{"step": 61, "op": "api", "call": "send_datagram", "args": {"data": "3535"}, "expect": {"ok": true}}
+{"step": 62, "op": "api", "call": "send_datagram", "args": {"data": "3536"}, "expect": {"ok": true}}
+{"step": 63, "op": "api", "call": "send_datagram", "args": {"data": "3537"}, "expect": {"ok": true}}
+{"step": 64, "op": "api", "call": "send_datagram", "args": {"data": "3538"}, "expect": {"ok": true}}
+{"step": 65, "op": "api", "call": "send_datagram", "args": {"data": "3539"}, "expect": {"ok": true}}
+{"step": 66, "op": "api", "call": "send_datagram", "args": {"data": "3630"}, "expect": {"ok": true}}
+{"step": 67, "op": "api", "call": "send_datagram", "args": {"data": "3631"}, "expect": {"ok": true}}
+{"step": 68, "op": "api", "call": "send_datagram", "args": {"data": "3632"}, "expect": {"ok": true}}
+{"step": 69, "op": "api", "call": "send_datagram", "args": {"data": "3633"}, "expect": {"ok": true}}
+{"step": 70, "op": "api", "call": "send_datagram", "args": {"data": "3634"}, "expect": {"ok": true}}
+{"step": 71, "op": "set_writable", "pipe": 0, "writable": true}
+{"step": 72, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "DATAGRAM", "count": 64}, {"type": "DATAGRAM", "data": "3030", "count": 0}, {"type": "DATAGRAM", "data": "3031"}, {"type": "DATAGRAM", "data": "3634"}]}

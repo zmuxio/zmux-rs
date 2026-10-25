@@ -1,0 +1,9 @@
+{"kind": "trace", "id": "core.handshake.http1_rejected", "title": "An HTTP/1.1 request fails at its third byte", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["SPEC.md#6.2"], "findings": [], "groups": ["core", "handshake"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "hex": "47"}
+{"step": 4, "op": "expect_open"}
+{"step": 5, "op": "peer_send", "pipe": 0, "hex": "45"}
+{"step": 6, "op": "expect_open"}
+{"step": 7, "op": "peer_send", "pipe": 0, "hex": "54"}
+{"step": 8, "op": "expect_close", "error": {"space": "transport", "code": "PROTOCOL_VIOLATION"}, "wire": true}

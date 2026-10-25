@@ -1,25 +1,100 @@
 [package]
 name = "zmux"
-version = "1.1.1"
-edition = "2021"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.95"
 license = "Apache-2.0"
-description = "Rust implementation of the ZMux v1 stream multiplexing protocol"
+description = "QMux-compatible multiplexing of streams and datagrams over one or many reliable byte pipes"
 repository = "https://github.com/zmuxio/zmux-rs"
+readme = "README.md"
+keywords = ["multiplexing", "qmux", "quic", "streams", "multipath"]
+categories = ["network-programming"]
 
 [workspace]
-members = [".", "adapter/quinn"]
-default-members = ["."]
-resolver = "2"
+members = [
+    ".",
+    "adapter/rustls",
+    "adapter/quinn",
+    "adapter/http",
+    "adapter/websocket",
+    "adapter/webtransport",
+    "adapter/h3",
+]
+# The default gate: the core and the TLS and QUIC adapters; `--workspace`
+# builds the other adapters too.
+default-members = [".", "adapter/rustls", "adapter/quinn"]
+exclude = ["interop/qmux", "interop/carrier-mem"]
+resolver = "3"
 
 [features]
-default = []
-futures-io = ["dep:futures-io"]
-tokio-io = ["dep:tokio"]
+default = ["tokio"]
+# The tokio driver: `Session`, `SendStream`, `RecvStream` at the crate root.
+tokio = ["dep:tokio", "dep:libc", "dep:atomic-waker"]
+# The std driver: `zmux::blocking`.
+blocking = ["dep:libc"]
+# Deterministic values for the conformance trace runner (TRACES.md Section
+# 3.3). Never enable this in production builds.
+test-hooks = []
 
 [dependencies]
-futures-io = { version = "0.3", optional = true }
-getrandom = "0.4.2"
-tokio = { version = "1.28.1", optional = true, default-features = false, features = ["io-util"] }
+# The tokio driver's single-waker slots (a pipe's read waker, a maintainer's stop).
+atomic-waker = { version = "1.1", optional = true }
+bytes = "1.10"
+getrandom = "0.4"
+hmac = "0.13"
+sha2 = "0.11"
+tokio = { version = "1.47", optional = true, features = ["rt", "net", "io-util", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# getsockopt(TCP_INFO) and the low-water mark of TCP carriers (src/driver/tcp.rs).
+libc = { version = "0.2.170", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1.47", features = ["full", "test-util"] }
+zmux = { path = ".", features = ["test-hooks", "blocking"] }
+# TLS-over-TCP carrier of the benches only; the library has no TLS dependency.
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Model checking of the drivers' synchronization units (src/driver/loom.rs):
+# LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
+#     cargo test --lib --release loom
+[target.'cfg(loom)'.dev-dependencies]
+loom = { version = "0.7.2", features = ["futures"] }
+
+# Randomized schedules of the std driver's thread protocol
+# (src/driver/shuttle.rs, CONFORMANCE.md Section 4.7 item 2):
+# RUSTFLAGS="--cfg shuttle" CARGO_TARGET_DIR=target/shuttle \
+#     cargo test --lib --release --features blocking shuttle
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9.7"
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "mpsched"
+harness = false
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }
+
+[profile.bench]
+debug = 1
+
+[[bench]]
+name = "session"
+harness = false
+
+[[bench]]
+name = "autotune"
+harness = false

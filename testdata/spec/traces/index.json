@@ -1,0 +1,4285 @@
+{
+  "traces": [
+    {
+      "id": "core.handshake.basic",
+      "file": "fixtures/traces/core/handshake/basic.ndjson",
+      "title": "Parameters are the first frame in both directions; zmux features are in use between zmux endpoints",
+      "refs": [
+        "SPEC.md#5.1",
+        "SPEC.md#5.2",
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "core.handshake.legacy_zmux_rejected",
+      "file": "fixtures/traces/core/handshake/legacy_zmux_rejected.ndjson",
+      "title": "A legacy zmux preface fails at its third byte",
+      "refs": [
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.handshake.http1_rejected",
+      "file": "fixtures/traces/core/handshake/http1_rejected.ndjson",
+      "title": "An HTTP/1.1 request fails at its third byte",
+      "refs": [
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.handshake.first_record_too_small",
+      "file": "fixtures/traces/core/handshake/first_record_too_small.ndjson",
+      "title": "A first record whose Size is below 9 fails at its first byte",
+      "refs": [
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.first_record_too_large",
+      "file": "fixtures/traces/core/handshake/first_record_too_large.ndjson",
+      "title": "A first record whose Size exceeds the local max_record_size fails once the Size is complete",
+      "refs": [
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.handshake.first_frame_not_parameters",
+      "file": "fixtures/traces/core/handshake/first_frame_not_parameters.ndjson",
+      "title": "A first record that does not start with QX_TRANSPORT_PARAMETERS is rejected",
+      "refs": [
+        "SPEC.md#5.1",
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.second_parameters_frame",
+      "file": "fixtures/traces/core/handshake/second_parameters_frame.ndjson",
+      "title": "QX_TRANSPORT_PARAMETERS after the first frame is a PROTOCOL_VIOLATION",
+      "refs": [
+        "SPEC.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.handshake.tp_duplicate",
+      "file": "fixtures/traces/core/handshake/tp_duplicate.ndjson",
+      "title": "A duplicate transport parameter is fatal",
+      "refs": [
+        "SPEC.md#5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_prohibited",
+      "file": "fixtures/traces/core/handshake/tp_prohibited.ndjson",
+      "title": "QUIC max_ack_delay (0x0b) is prohibited",
+      "refs": [
+        "SPEC.md#5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_max_record_size_small",
+      "file": "fixtures/traces/core/handshake/tp_max_record_size_small.ndjson",
+      "title": "max_record_size below 16382 is fatal",
+      "refs": [
+        "SPEC.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_unknown_and_grease_ignored",
+      "file": "fixtures/traces/core/handshake/tp_unknown_and_grease_ignored.ndjson",
+      "title": "GREASE and unknown parameters, including the qmux crate's application_protocols, are ignored",
+      "refs": [
+        "SPEC.md#5.2",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "core.handshake.tp_preamble_without_reset_stream_at",
+      "file": "fixtures/traces/core/handshake/tp_preamble_without_reset_stream_at.ndjson",
+      "title": "zmux_preamble requires reset_stream_at from the same endpoint",
+      "refs": [
+        "EXTENSIONS.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_preamble_above_window",
+      "file": "fixtures/traces/core/handshake/tp_preamble_above_window.ndjson",
+      "title": "zmux_preamble may not exceed the sender's own stream windows",
+      "refs": [
+        "EXTENSIONS.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_companion_alone",
+      "file": "fixtures/traces/core/handshake/tp_companion_alone.ndjson",
+      "title": "zmux_ack_threshold without zmux_multipath or zmux_pipe_ack is fatal",
+      "refs": [
+        "MULTIPATH.md#3.2",
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_max_lanes_alone",
+      "file": "fixtures/traces/core/handshake/tp_max_lanes_alone.ndjson",
+      "title": "zmux_max_lanes without zmux_multipath or zmux_pipe_ack is fatal",
+      "refs": [
+        "MULTIPATH.md#3.6",
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_max_lanes_zero",
+      "file": "fixtures/traces/core/handshake/tp_max_lanes_zero.ndjson",
+      "title": "A zmux_max_lanes with Max Lanes 0 is fatal",
+      "refs": [
+        "MULTIPATH.md#3.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.tp_max_lanes_short_key",
+      "file": "fixtures/traces/core/handshake/tp_max_lanes_short_key.ndjson",
+      "title": "A zmux_max_lanes whose Lane Key is not 16 bytes is fatal",
+      "refs": [
+        "MULTIPATH.md#3.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.no_stream_data_before_peer_parameters",
+      "file": "fixtures/traces/core/handshake/no_stream_data_before_peer_parameters.ndjson",
+      "title": "Stream data waits for the peer's parameters",
+      "refs": [
+        "SPEC.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.handshake.early_data_floor",
+      "file": "fixtures/traces/core/handshake/early_data_floor.ndjson",
+      "title": "With the peer declared a zmux endpoint, stream data goes out before the peer's parameters, behind the PIPE_ACK fence and within the floor (4096 bytes a stream)",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "SPEC.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.handshake.early_data_floor_limits",
+      "file": "fixtures/traces/core/handshake/early_data_floor_limits.ndjson",
+      "title": "Under the floor at most four bidirectional streams carry early data, 4096 bytes each and 16384 in all; the rest waits for the peer's parameters",
+      "refs": [
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 15
+    },
+    {
+      "id": "core.handshake.early_data_plain_peer_rejected",
+      "file": "fixtures/traces/core/handshake/early_data_plain_peer_rejected.ndjson",
+      "title": "A peer declared zmux that turns out to be a plain QMux peer has rejected the early data at the fence: the endpoint closes with NO_ERROR and reports early data rejected",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "SPEC.md#13.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.handshake.early_data_no_streams_rejected",
+      "file": "fixtures/traces/core/handshake/early_data_no_streams_rejected.ndjson",
+      "title": "A zmux peer that accepts no bidirectional streams has rejected early data at the first STREAM frame",
+      "refs": [
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.handshake.early_data_peer_below_floor",
+      "file": "fixtures/traces/core/handshake/early_data_peer_below_floor.ndjson",
+      "title": "After sending early data, a zmux peer whose parameters are below the floor is a TRANSPORT_PARAMETER_ERROR",
+      "refs": [
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.handshake.early_data_not_with_role_auto",
+      "file": "fixtures/traces/core/handshake/early_data_not_with_role_auto.ndjson",
+      "title": "An endpoint whose role depends on the peer (role auto) sends no early data",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-role-auto",
+      "steps": 5
+    },
+    {
+      "id": "core.handshake.early_data_received",
+      "file": "fixtures/traces/core/handshake/early_data_received.ndjson",
+      "title": "Early data from a zmux peer, behind its fence in the record of its parameters, is processed like any data; the fence's Position 0 is ignored",
+      "refs": [
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.handshake.early_fence_stops_peer_without_pipe_ack",
+      "file": "fixtures/traces/core/handshake/early_fence_stops_peer_without_pipe_ack.ndjson",
+      "title": "Where PIPE_ACK is not in use the fence is an unknown frame: the session closes before the early STREAM frame after it is processed",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.handshake.timeout",
+      "file": "fixtures/traces/core/handshake/timeout.ndjson",
+      "title": "Establishment is abandoned after the handshake timeout",
+      "refs": [
+        "SPEC.md#6.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.zero_size",
+      "file": "fixtures/traces/core/records/zero_size.ndjson",
+      "title": "A record with Size 0 is fatal",
+      "refs": [
+        "SPEC.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.oversize",
+      "file": "fixtures/traces/core/records/oversize.ndjson",
+      "title": "A Size above the local max_record_size (65535) is fatal before the body arrives",
+      "refs": [
+        "SPEC.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.stream_offset_overflow",
+      "file": "fixtures/traces/core/records/stream_offset_overflow.ndjson",
+      "title": "A STREAM frame ending beyond 2^62 - 1 is fatal",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.truncated_frame",
+      "file": "fixtures/traces/core/records/truncated_frame.ndjson",
+      "title": "A frame truncated at the end of a record is fatal",
+      "refs": [
+        "SPEC.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.type_not_minimal",
+      "file": "fixtures/traces/core/records/type_not_minimal.ndjson",
+      "title": "A frame type in a longer encoding than necessary is fatal",
+      "refs": [
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.prohibited_ping",
+      "file": "fixtures/traces/core/records/prohibited_ping.ndjson",
+      "title": "QUIC PING (0x01) is prohibited",
+      "refs": [
+        "SPEC.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.prohibited_ack",
+      "file": "fixtures/traces/core/records/prohibited_ack.ndjson",
+      "title": "QUIC ACK (0x02) is prohibited",
+      "refs": [
+        "SPEC.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.unknown_type",
+      "file": "fixtures/traces/core/records/unknown_type.ndjson",
+      "title": "An unknown frame type is fatal",
+      "refs": [
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.unknown_ack_frequency",
+      "file": "fixtures/traces/core/records/unknown_ack_frequency.ndjson",
+      "title": "ACK_FREQUENCY (0xaf) is unknown to zmux",
+      "refs": [
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.feature_frame_not_in_use",
+      "file": "fixtures/traces/core/records/feature_frame_not_in_use.ndjson",
+      "title": "A GOAWAY from a peer that did not announce zmux_goaway is an unknown frame",
+      "refs": [
+        "SPEC.md#4.1",
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.padding_and_byte_by_byte",
+      "file": "fixtures/traces/core/records/padding_and_byte_by_byte.ndjson",
+      "title": "PADDING anywhere, several frames per record, and one-byte reads are handled",
+      "refs": [
+        "SPEC.md#3.1",
+        "SPEC.md#9.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.records.message_framed_session",
+      "file": "fixtures/traces/core/records/message_framed_session.ndjson",
+      "title": "On a message-framed carrier each message is one record's Frames field, without Size",
+      "refs": [
+        "SPEC.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.records.message_empty",
+      "file": "fixtures/traces/core/records/message_empty.ndjson",
+      "title": "An empty message is a record without frames, accepted as a no-op",
+      "refs": [
+        "SPEC.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.records.message_empty_charged",
+      "file": "fixtures/traces/core/records/message_empty_charged.ndjson",
+      "title": "An empty message is charged like a PADDING-only record: with the budget exhausted, one more closes the session",
+      "refs": [
+        "SPEC.md#3.4",
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.records.message_empty_first",
+      "file": "fixtures/traces/core/records/message_empty_first.ndjson",
+      "title": "An empty first message fails the first-record check (Size below 9)",
+      "refs": [
+        "SPEC.md#3.4",
+        "SPEC.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "core.records.message_oversize",
+      "file": "fixtures/traces/core/records/message_oversize.ndjson",
+      "title": "A message longer than the receiver's max_record_size is fatal",
+      "refs": [
+        "SPEC.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.records.pipe_ends_mid_record",
+      "file": "fixtures/traces/core/records/pipe_ends_mid_record.ndjson",
+      "title": "Outside multipath a pipe that ends inside a record, even gracefully, ends the session and the partial record is never processed",
+      "refs": [
+        "SPEC.md#3.2",
+        "SPEC.md#6.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.streams.peer_open_read",
+      "file": "fixtures/traces/core/streams/peer_open_read.ndjson",
+      "title": "A peer stream with preamble, data and FIN",
+      "refs": [
+        "SPEC.md#7.2",
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.streams.local_open_write",
+      "file": "fixtures/traces/core/streams/local_open_write.ndjson",
+      "title": "A local stream carries its preamble at offset 0, with GREASE in the first preamble",
+      "refs": [
+        "EXTENSIONS.md#4.2",
+        "EXTENSIONS.md#4.3"
+      ],
+      "findings": [
+        "Go-1"
+      ],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.streams.implicit_open_and_accept_order",
+      "file": "fixtures/traces/core/streams/implicit_open_and_accept_order.ndjson",
+      "title": "Higher streams open lower ones; each stream is offered once its own preamble arrives, without waiting for lower-numbered streams",
+      "refs": [
+        "SPEC.md#7.2",
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 13
+    },
+    {
+      "id": "core.streams.stream_limit_exceeded",
+      "file": "fixtures/traces/core/streams/stream_limit_exceeded.ndjson",
+      "title": "Opening stream index 4 with a limit of 4 is fatal",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.out_of_order_single_pipe",
+      "file": "fixtures/traces/core/streams/out_of_order_single_pipe.ndjson",
+      "title": "Outside multipath a gap in stream data is fatal",
+      "refs": [
+        "SPEC.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.duplicate_single_pipe",
+      "file": "fixtures/traces/core/streams/duplicate_single_pipe.ndjson",
+      "title": "Outside multipath repeated stream data is fatal",
+      "refs": [
+        "SPEC.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.frame_for_unopened_local_stream",
+      "file": "fixtures/traces/core/streams/frame_for_unopened_local_stream.ndjson",
+      "title": "STREAM on a locally initiated stream that does not exist is fatal",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.max_stream_data_on_receive_only",
+      "file": "fixtures/traces/core/streams/max_stream_data_on_receive_only.ndjson",
+      "title": "MAX_STREAM_DATA for a peer unidirectional stream is fatal",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.final_size_changed",
+      "file": "fixtures/traces/core/streams/final_size_changed.ndjson",
+      "title": "A reset that changes the final size is fatal",
+      "refs": [
+        "SPEC.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.data_beyond_final_size",
+      "file": "fixtures/traces/core/streams/data_beyond_final_size.ndjson",
+      "title": "Data beyond the final size is fatal",
+      "refs": [
+        "SPEC.md#7.5"
+      ],
+      "findings": [
+        "Rust-5"
+      ],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.streams.frame_on_local_unidirectional",
+      "file": "fixtures/traces/core/streams/frame_on_local_unidirectional.ndjson",
+      "title": "STREAM sent by the peer on a local unidirectional stream is fatal",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.streams.stop_sending_elicits_reset",
+      "file": "fixtures/traces/core/streams/stop_sending_elicits_reset.ndjson",
+      "title": "STOP_SENDING on a sending stream elicits a reset with the same code, and later writes report the peer's code",
+      "refs": [
+        "SPEC.md#4.3",
+        "STATE_MACHINE.md#2.5"
+      ],
+      "findings": [
+        "Java-12",
+        "Go-5"
+      ],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.streams.stop_sending_after_fin",
+      "file": "fixtures/traces/core/streams/stop_sending_after_fin.ndjson",
+      "title": "STOP_SENDING that crosses a FIN changes nothing and is not an error",
+      "refs": [
+        "SPEC.md#4.3",
+        "SPEC.md#9.4"
+      ],
+      "findings": [
+        "X1"
+      ],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.streams.no_data_after_stop_sending",
+      "file": "fixtures/traces/core/streams/no_data_after_stop_sending.ndjson",
+      "title": "After STOP_SENDING no further data or FIN is sent, even for a write in progress",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [
+        "Java-9"
+      ],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.streams.reject_by_application",
+      "file": "fixtures/traces/core/streams/reject_by_application.ndjson",
+      "title": "An application that declines a stream before reading sends REJECTED both ways",
+      "refs": [
+        "EXTENSIONS.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.streams.no_identifier_gap",
+      "file": "fixtures/traces/core/streams/no_identifier_gap.ndjson",
+      "title": "A stream cancelled before its first frame consumes no identifier",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [
+        "Rust-1"
+      ],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.streams.release_without_finish_resets",
+      "file": "fixtures/traces/core/streams/release_without_finish_resets.ndjson",
+      "title": "Dropping an unfinished send handle resets with code 0; dropping an unread receive handle stops with code 0",
+      "refs": [
+        "EXTENSIONS.md#7.4",
+        "SPEC.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 13
+    },
+    {
+      "id": "core.streams.reset_is_never_complete",
+      "file": "fixtures/traces/core/streams/reset_is_never_complete.ndjson",
+      "title": "A stream reset after its FIN is reported as reset, not as a clean end",
+      "refs": [
+        "SPEC.md#7.5",
+        "STATE_MACHINE.md#2.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.streams.open_info_after_terminal",
+      "file": "fixtures/traces/core/streams/open_info_after_terminal.ndjson",
+      "title": "A stream that became terminal before accept still offers its open info",
+      "refs": [
+        "EXTENSIONS.md#4.4",
+        "SPEC.md#7.6"
+      ],
+      "findings": [
+        "open_info-lost"
+      ],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.streams.pinned_id_cancel",
+      "file": "fixtures/traces/core/streams/pinned_id_cancel.ndjson",
+      "title": "A stream whose identifier the application read is announced and reset when it is cancelled before sending anything",
+      "refs": [
+        "SPEC.md#7.2",
+        "EXTENSIONS.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.streams.local_stop_outcome",
+      "file": "fixtures/traces/core/streams/local_stop_outcome.ndjson",
+      "title": "After a local stop, reads report the local stop and the peer's reset is no error",
+      "refs": [
+        "STATE_MACHINE.md#2.5",
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.streams.reliable_data_before_reset",
+      "file": "fixtures/traces/core/streams/reliable_data_before_reset.ndjson",
+      "title": "Outside multipath the data below the Reliable Size is sent before RESET_STREAM_AT",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.streams.pinned_id_opens_stream",
+      "file": "fixtures/traces/core/streams/pinned_id_opens_stream.ndjson",
+      "title": "Reading a stream ID before the first write sends the stream's preamble at once, so later streams are never held back",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.flow.stream_credit_quarter",
+      "file": "fixtures/traces/core/flow/stream_credit_quarter.ndjson",
+      "title": "MAX_STREAM_DATA is sent once a quarter of the window is consumed",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.flow.zero_window_liveness",
+      "file": "fixtures/traces/core/flow/zero_window_liveness.ndjson",
+      "title": "A drained stream window is reopened without any BLOCKED frame",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [
+        "zero-window-deadlock"
+      ],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.flow.credit_when_peer_blocked",
+      "file": "fixtures/traces/core/flow/credit_when_peer_blocked.ndjson",
+      "title": "Released credit is sent at once when the peer has no credit left, even below the quarter-window update threshold and with unread data buffered",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.flow.uni_credit_staged",
+      "file": "fixtures/traces/core/flow/uni_credit_staged.ndjson",
+      "title": "With max_incoming_uni_streams unset, 16 unidirectional streams are advertised at once; the first accept of a unidirectional stream raises the limit to 256",
+      "refs": [
+        "SPEC.md#8.5",
+        "SPEC.md#5.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.flow.uni_credit_eager_when_configured",
+      "file": "fixtures/traces/core/flow/uni_credit_eager_when_configured.ndjson",
+      "title": "An explicitly configured max_incoming_uni_streams is advertised in the transport parameters: the peer may open unidirectional streams before any accept",
+      "refs": [
+        "SPEC.md#8.5",
+        "SPEC.md#5.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.flow.uni_credit_explicit_zero",
+      "file": "fixtures/traces/core/flow/uni_credit_explicit_zero.ndjson",
+      "title": "max_incoming_uni_streams explicitly set to 0 is eager too: nothing is granted on accept, and a peer unidirectional stream exceeds the limit",
+      "refs": [
+        "SPEC.md#8.5",
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.flow.preamble_blocked_sends_data_blocked",
+      "file": "fixtures/traces/core/flow/preamble_blocked_sends_data_blocked.ndjson",
+      "title": "A stream whose preamble does not fit in the remaining session credit sends DATA_BLOCKED at the current limit, although some credit remains",
+      "refs": [
+        "SPEC.md#8.4",
+        "EXTENSIONS.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 13
+    },
+    {
+      "id": "core.flow.session_liveness",
+      "file": "fixtures/traces/core/flow/session_liveness.ndjson",
+      "title": "When the peer used the whole session window and everything is read, MAX_DATA rises",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 14
+    },
+    {
+      "id": "core.flow.stream_limit_violation",
+      "file": "fixtures/traces/core/flow/stream_limit_violation.ndjson",
+      "title": "Exceeding a stream window is fatal",
+      "refs": [
+        "SPEC.md#8.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.flow.session_limit_violation",
+      "file": "fixtures/traces/core/flow/session_limit_violation.ndjson",
+      "title": "Exceeding the session window is fatal",
+      "refs": [
+        "SPEC.md#8.1",
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.flow.final_size_counts_for_session",
+      "file": "fixtures/traces/core/flow/final_size_counts_for_session.ndjson",
+      "title": "A reset's final size counts against the session window",
+      "refs": [
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.flow.blocked_above_advertised",
+      "file": "fixtures/traces/core/flow/blocked_above_advertised.ndjson",
+      "title": "A BLOCKED frame reporting a limit never advertised is fatal",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [
+        "Rust-6"
+      ],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.flow.data_blocked_above_advertised",
+      "file": "fixtures/traces/core/flow/data_blocked_above_advertised.ndjson",
+      "title": "DATA_BLOCKED above the advertised session limit is fatal",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.flow.backpressure_not_error",
+      "file": "fixtures/traces/core/flow/backpressure_not_error.ndjson",
+      "title": "Writes beyond the peer's credit wait for credit instead of failing the session",
+      "refs": [
+        "SPEC.md#8.1"
+      ],
+      "findings": [
+        "Rust-7"
+      ],
+      "profile": "zmux-small",
+      "steps": 14
+    },
+    {
+      "id": "core.flow.fin_only_at_session_limit",
+      "file": "fixtures/traces/core/flow/fin_only_at_session_limit.ndjson",
+      "title": "A FIN-only STREAM frame adds nothing to the session sum: it is sent at once when the session credit is used up",
+      "refs": [
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.flow.fin_only_at_stream_limit",
+      "file": "fixtures/traces/core/flow/fin_only_at_stream_limit.ndjson",
+      "title": "A FIN-only STREAM frame at the stream's credit limit is sent at once",
+      "refs": [
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.flow.stream_credit_after_release",
+      "file": "fixtures/traces/core/flow/stream_credit_after_release.ndjson",
+      "title": "Stream credit returns only after the application releases streams",
+      "refs": [
+        "SPEC.md#8.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 22
+    },
+    {
+      "id": "core.flow.reset_before_accept_keeps_credit",
+      "file": "fixtures/traces/core/flow/reset_before_accept_keeps_credit.ndjson",
+      "title": "A stream reset before accept keeps its credit until the application releases it",
+      "refs": [
+        "SPEC.md#8.5"
+      ],
+      "findings": [
+        "rapid-reset"
+      ],
+      "profile": "zmux-small",
+      "steps": 17
+    },
+    {
+      "id": "core.flow.rapid_reset_bounded",
+      "file": "fixtures/traces/core/flow/rapid_reset_bounded.ndjson",
+      "title": "Open-and-reset churn cannot exceed the stream limit without application release",
+      "refs": [
+        "SPEC.md#8.5",
+        "SPEC.md#14.1"
+      ],
+      "findings": [
+        "rapid-reset"
+      ],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.flow.one_credit_frame_per_record",
+      "file": "fixtures/traces/core/flow/one_credit_frame_per_record.ndjson",
+      "title": "Credit updates are coalesced: no record carries two MAX_STREAM_DATA frames for one stream",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.robustness.ping_responses_coalesced",
+      "file": "fixtures/traces/core/robustness/ping_responses_coalesced.ndjson",
+      "title": "Many QX_PING requests produce one response with the largest sequence number",
+      "refs": [
+        "SPEC.md#4.5",
+        "SPEC.md#9.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.robustness.ping_sequence_not_increasing",
+      "file": "fixtures/traces/core/robustness/ping_sequence_not_increasing.ndjson",
+      "title": "A QX_PING request that does not increase the sequence number is fatal",
+      "refs": [
+        "SPEC.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.robustness.ping_response_unsolicited",
+      "file": "fixtures/traces/core/robustness/ping_response_unsolicited.ndjson",
+      "title": "A QX_PING response for a request never sent is fatal",
+      "refs": [
+        "SPEC.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.robustness.local_ping_numbering",
+      "file": "fixtures/traces/core/robustness/local_ping_numbering.ndjson",
+      "title": "Local QX_PING requests are numbered from the test hook and answered",
+      "refs": [
+        "SPEC.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.robustness.bounded_responses_while_blocked",
+      "file": "fixtures/traces/core/robustness/bounded_responses_while_blocked.ndjson",
+      "title": "While the outbound pipe is blocked, response state stays bounded",
+      "refs": [
+        "SPEC.md#9.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 61
+    },
+    {
+      "id": "core.robustness.budget_stale_limits_trip",
+      "file": "fixtures/traces/core/robustness/budget_stale_limits_trip.ndjson",
+      "title": "4096 no-effect frames exhaust the budget exactly; the next one closes the session",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.budget_ping_flood_trips",
+      "file": "fixtures/traces/core/robustness/budget_ping_flood_trips.ndjson",
+      "title": "A QX_PING request that arrives while an earlier one is still unanswered is chargeable (only the largest is answered); a flood trips the budget",
+      "refs": [
+        "SPEC.md#4.5",
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.robustness.budget_answered_pings_free",
+      "file": "fixtures/traces/core/robustness/budget_answered_pings_free.ndjson",
+      "title": "QX_PING requests that are each answered before the next one arrives are not chargeable, even with the budget exhausted (a plain QMux peer that measures RTT every 20 ms)",
+      "refs": [
+        "SPEC.md#4.5",
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 29
+    },
+    {
+      "id": "core.robustness.budget_padding_records_trip",
+      "file": "fixtures/traces/core/robustness/budget_padding_records_trip.ndjson",
+      "title": "Records of PADDING only are chargeable",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.budget_refills_with_time",
+      "file": "fixtures/traces/core/robustness/budget_refills_with_time.ndjson",
+      "title": "The budget refills at 32 tokens per second",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.robustness.budget_churn_never_trips",
+      "file": "fixtures/traces/core/robustness/budget_churn_never_trips.ndjson",
+      "title": "Stream churn with crossing STOP_SENDING never drains the budget (X1): frames for terminal or discarded streams are not chargeable",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [
+        "X1"
+      ],
+      "profile": "zmux-small",
+      "steps": 709
+    },
+    {
+      "id": "core.robustness.budget_blocked_repeats_trip",
+      "file": "fixtures/traces/core/robustness/budget_blocked_repeats_trip.ndjson",
+      "title": "The first BLOCKED frame for a limit is free; repeats are chargeable",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.discarded_stream_frames_not_charged",
+      "file": "fixtures/traces/core/robustness/discarded_stream_frames_not_charged.ndjson",
+      "title": "Frames for a discarded stream are ignored and never chargeable",
+      "refs": [
+        "SPEC.md#7.6",
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 13
+    },
+    {
+      "id": "core.robustness.no_acknowledgements_without_multipath",
+      "file": "fixtures/traces/core/robustness/no_acknowledgements_without_multipath.ndjson",
+      "title": "Without multipath, and with a peer that did not send zmux_pipe_ack, no PIPE_ACK is ever sent",
+      "refs": [
+        "SPEC.md#9.6",
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.one_local_ping_in_flight",
+      "file": "fixtures/traces/core/robustness/one_local_ping_in_flight.ndjson",
+      "title": "The endpoint has at most one QX_PING request outstanding; a ping while one is outstanding joins it",
+      "refs": [
+        "SPEC.md#4.5",
+        "SPEC.md#9.4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.robustness.budget_empty_stream_frames_trip",
+      "file": "fixtures/traces/core/robustness/budget_empty_stream_frames_trip.ndjson",
+      "title": "NE-5: STREAM frames that carry neither new data nor new final-size information are chargeable",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.budget_stale_priority_updates_trip",
+      "file": "fixtures/traces/core/robustness/budget_stale_priority_updates_trip.ndjson",
+      "title": "NE-7: PRIORITY_UPDATE frames that do not increase the sequence number are chargeable; the first update is not",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.budget_goaway_repeats_trip",
+      "file": "fixtures/traces/core/robustness/budget_goaway_repeats_trip.ndjson",
+      "title": "NE-8: a GOAWAY that lowers no watermark is chargeable; the first one is not",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.robustness.budget_stale_ping_responses_trip",
+      "file": "fixtures/traces/core/robustness/budget_stale_ping_responses_trip.ndjson",
+      "title": "NE-8: a QX_PING response that does not exceed every earlier response is chargeable; the first response is not",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.close.half_close_then_linger",
+      "file": "fixtures/traces/core/close/half_close_then_linger.ndjson",
+      "title": "Close sends CONNECTION_CLOSE, shuts down writing gracefully, and keeps reading until the peer ends",
+      "refs": [
+        "SPEC.md#6.5"
+      ],
+      "findings": [
+        "Rust-closer-no-CLOSE"
+      ],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.close.linger_timeout",
+      "file": "fixtures/traces/core/close/linger_timeout.ndjson",
+      "title": "Lingering ends after min(2 s, max(250 ms, 3 x SRTT)), with SRTT 333 ms by default",
+      "refs": [
+        "SPEC.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.close.peer_code_survives_carrier_reset",
+      "file": "fixtures/traces/core/close/peer_code_survives_carrier_reset.ndjson",
+      "title": "A peer CONNECTION_CLOSE followed by a carrier reset reports the peer's code",
+      "refs": [
+        "SPEC.md#6.5"
+      ],
+      "findings": [
+        "peer-close-code-lost",
+        "Java-10"
+      ],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.close.respond_to_peer_close",
+      "file": "fixtures/traces/core/close/respond_to_peer_close.ndjson",
+      "title": "On a peer CONNECTION_CLOSE the endpoint shuts down writing gracefully",
+      "refs": [
+        "SPEC.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.close.idle_timeout",
+      "file": "fixtures/traces/core/close/idle_timeout.ndjson",
+      "title": "The effective idle timeout is the smaller value",
+      "refs": [
+        "SPEC.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.close.keep_alive_unanswered_idles_out",
+      "file": "fixtures/traces/core/close/keep_alive_unanswered_idles_out.ndjson",
+      "title": "In a session without acknowledgement, sending a keep-alive QX_PING does not restart the idle timer: a peer that never answers is closed at the idle timeout",
+      "refs": [
+        "SPEC.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.close.keep_alive",
+      "file": "fixtures/traces/core/close/keep_alive.ndjson",
+      "title": "Keep-alive sends QX_PING after the configured period",
+      "refs": [
+        "SPEC.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.close.pending_read_fails_with_session_error",
+      "file": "fixtures/traces/core/close/pending_read_fails_with_session_error.ndjson",
+      "title": "A pending read fails with the peer's close code",
+      "refs": [
+        "STATE_MACHINE.md#2.5"
+      ],
+      "findings": [
+        "Java-10",
+        "Rust-3"
+      ],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.close.carrier_failure",
+      "file": "fixtures/traces/core/close/carrier_failure.ndjson",
+      "title": "Outside multipath a carrier error ends the session",
+      "refs": [
+        "SPEC.md#6.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.close.peer_shutdown_is_idle_close",
+      "file": "fixtures/traces/core/close/peer_shutdown_is_idle_close.ndjson",
+      "title": "In a session without acknowledgement, a graceful end of the peer's pipe without CONNECTION_CLOSE is the peer's idle close: the endpoint shuts down gracefully without frames",
+      "refs": [
+        "SPEC.md#6.4",
+        "SPEC.md#6.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.reset_stream_at.reliable_above_final",
+      "file": "fixtures/traces/core/reset_stream_at/reliable_above_final.ndjson",
+      "title": "RESET_STREAM_AT with Reliable Size above Final Size is fatal",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.reset_stream_at.code_change",
+      "file": "fixtures/traces/core/reset_stream_at/code_change.ndjson",
+      "title": "A second reset with a different error code is fatal",
+      "refs": [
+        "SPEC.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.reset_stream_at.reliable_size_reduction",
+      "file": "fixtures/traces/core/reset_stream_at/reliable_size_reduction.ndjson",
+      "title": "Reducing the Reliable Size is allowed",
+      "refs": [
+        "SPEC.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.pipe_ack.delay",
+      "file": "fixtures/traces/core/pipe_ack/delay.ndjson",
+      "title": "With pipe acknowledgement, received ack-eliciting bytes are acknowledged within zmux_max_ack_delay (25 ms)",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.pipe_ack.threshold",
+      "file": "fixtures/traces/core/pipe_ack/threshold.ndjson",
+      "title": "With pipe acknowledgement, the endpoint's own zmux_ack_threshold of ack-eliciting bytes triggers a PIPE_ACK at once",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "core.pipe_ack.peer_acks",
+      "file": "fixtures/traces/core/pipe_ack/peer_acks.ndjson",
+      "title": "A PIPE_ACK for pipe 0 up to the bytes sent is accepted and changes nothing visible; nothing is retained or re-sent",
+      "refs": [
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.pipe_ack.other_pipe",
+      "file": "fixtures/traces/core/pipe_ack/other_pipe.ndjson",
+      "title": "With pipe acknowledgement, a PIPE_ACK entry for any pipe but 0 is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.pipe_ack.ahead_of_sent",
+      "file": "fixtures/traces/core/pipe_ack/ahead_of_sent.ndjson",
+      "title": "With pipe acknowledgement, acknowledging bytes that were never sent is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.pipe_ack.companion_parameters",
+      "file": "fixtures/traces/core/pipe_ack/companion_parameters.ndjson",
+      "title": "zmux_ack_threshold and zmux_max_ack_delay may accompany zmux_pipe_ack alone",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "core.pipe_ack.peer_without_parameter",
+      "file": "fixtures/traces/core/pipe_ack/peer_without_parameter.ndjson",
+      "title": "When the peer did not send zmux_pipe_ack, a PIPE_ACK from it is a frame of a feature not in use",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.pipe_ack.idle_timeout_sends_close",
+      "file": "fixtures/traces/core/pipe_ack/idle_timeout_sends_close.ndjson",
+      "title": "With pipe acknowledgement, the idle timeout sends CONNECTION_CLOSE(ZMUX_IDLE_TIMEOUT) before the graceful shutdown",
+      "refs": [
+        "SPEC.md#6.4",
+        "MULTIPATH.md#3.5",
+        "SPEC.md#10.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "core.pipe_ack.peer_idle_close",
+      "file": "fixtures/traces/core/pipe_ack/peer_idle_close.ndjson",
+      "title": "With pipe acknowledgement, CONNECTION_CLOSE with ZMUX_IDLE_TIMEOUT is reported as the peer's idle timeout",
+      "refs": [
+        "SPEC.md#6.4",
+        "MULTIPATH.md#3.5",
+        "SPEC.md#10.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.pipe_ack.peer_shutdown_is_failure",
+      "file": "fixtures/traces/core/pipe_ack/peer_shutdown_is_failure.ndjson",
+      "title": "With pipe acknowledgement, a graceful end of the peer's pipe without CONNECTION_CLOSE is a pipe failure, not the peer's idle close",
+      "refs": [
+        "SPEC.md#6.4",
+        "SPEC.md#6.6",
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.pipe_ack.idle_counts_acknowledged_activity",
+      "file": "fixtures/traces/core/pipe_ack/idle_counts_acknowledged_activity.ndjson",
+      "title": "With pipe acknowledgement, the PIPE_ACK of a keep-alive's record restarts the idle and keep-alive timers, and a received record without application activity does not",
+      "refs": [
+        "SPEC.md#6.4",
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 20
+    },
+    {
+      "id": "core.pipe_ack.not_with_multipath",
+      "file": "fixtures/traces/core/pipe_ack/not_with_multipath.ndjson",
+      "title": "When multipath is in use, pipe acknowledgement is not: the session acknowledges by MULTIPATH.md Section 6",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 4
+    },
+    {
+      "id": "core.lanes.peer_opens_lane",
+      "file": "fixtures/traces/core/lanes/peer_opens_lane.ndjson",
+      "title": "The peer opens lane 1 of pipe 0 with a record holding only PIPE_LANE, which is acknowledged; the lane's records are then processed as the pipe's, and every PIPE_ACK lists lanes 0 and 1 with their own positions",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#3.6",
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 17
+    },
+    {
+      "id": "core.lanes.head_of_line",
+      "file": "fixtures/traces/core/lanes/head_of_line.ndjson",
+      "title": "A record held incomplete on lane 1 does not hold back lane 2: lane 2's records are processed and acknowledged, and lane 1's position stays at its last complete record until the rest arrives",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#6.1",
+        "SPEC.md#4.1",
+        "IMPLEMENTATION.md#13.8"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 26
+    },
+    {
+      "id": "core.lanes.local_opens_after_ack",
+      "file": "fixtures/traces/core/lanes/local_opens_after_ack.ndjson",
+      "title": "The local endpoint opens a lane only once a PIPE_ACK has acknowledged a position above 0 on lane 0; the lane's first record holds only PIPE_LANE with the peer's Lane Key, and stream data moves to the lane only once a PIPE_ACK confirms it and covers the data on lane 0",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.6",
+        "SCHEDULER.md#9.2",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 19
+    },
+    {
+      "id": "core.lanes.local_lane_refused",
+      "file": "fixtures/traces/core/lanes/local_lane_refused.ndjson",
+      "title": "A lane that the peer closes before it is confirmed is refused: the pipe does not fail, data stays on lane 0, and no further lane is opened on the pipe",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 22
+    },
+    {
+      "id": "core.lanes.late_ack_after_refusal",
+      "file": "fixtures/traces/core/lanes/late_ack_after_refusal.ndjson",
+      "title": "An acknowledgement that arrives for a lane after it was refused is ignored: no error, and the lane stays unused",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 21
+    },
+    {
+      "id": "core.lanes.local_lane_unconfirmed_timeout",
+      "file": "fixtures/traces/core/lanes/local_lane_unconfirmed_timeout.ndjson",
+      "title": "A lane that is not confirmed within the handshake timeout (10 s) is reset by the local endpoint and refused: the pipe does not fail and no further lane is opened",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 23
+    },
+    {
+      "id": "core.lanes.local_lane_failure_ends_session",
+      "file": "fixtures/traces/core/lanes/local_lane_failure_ends_session.ndjson",
+      "title": "An error on a confirmed lane of the local endpoint fails the pipe, which without multipath ends the session",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "SPEC.md#6.6",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 19
+    },
+    {
+      "id": "core.lanes.ack_unopened_lane",
+      "file": "fixtures/traces/core/lanes/ack_unopened_lane.ndjson",
+      "title": "A PIPE_ACK entry for a lane the receiver never opened is ignored with Position 0 and a protocol violation otherwise",
+      "refs": [
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "core.lanes.ack_lanes_decreasing",
+      "file": "fixtures/traces/core/lanes/ack_lanes_decreasing.ndjson",
+      "title": "PIPE_ACK entries for lanes 1 then 0 of a pipe are out of order: a FRAME_ENCODING_ERROR",
+      "refs": [
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.lanes.ack_lane_repeated",
+      "file": "fixtures/traces/core/lanes/ack_lane_repeated.ndjson",
+      "title": "A PIPE_ACK entry repeating (Pipe ID, Lane) is out of order: a FRAME_ENCODING_ERROR",
+      "refs": [
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.lanes.lane_zero",
+      "file": "fixtures/traces/core/lanes/lane_zero.ndjson",
+      "title": "A PIPE_LANE opening lane 0 is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.lanes.lane_beyond_max",
+      "file": "fixtures/traces/core/lanes/lane_beyond_max.ndjson",
+      "title": "A PIPE_LANE whose Lane is the receiver's Max Lanes (4) or more is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.lanes.lane_repeated",
+      "file": "fixtures/traces/core/lanes/lane_repeated.ndjson",
+      "title": "A second PIPE_LANE for a lane already open on the pipe is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "core.lanes.not_available",
+      "file": "fixtures/traces/core/lanes/not_available.ndjson",
+      "title": "A lane toward an endpoint that announced Max Lanes 1 is a frame of a feature not in use",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#3.6",
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.lanes.first_record_extra_frame",
+      "file": "fixtures/traces/core/lanes/first_record_extra_frame.ndjson",
+      "title": "A lane whose first record holds a frame other than PIPE_LANE and PADDING is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "SPEC.md#4.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "core.lanes.peer_lane_ends_unused",
+      "file": "fixtures/traces/core/lanes/peer_lane_ends_unused.ndjson",
+      "title": "A peer's lane that ends, even with an error, before any record after its first has arrived is no event of the pipe: the session goes on",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 17
+    },
+    {
+      "id": "core.lanes.pipe_lane_on_lane_zero",
+      "file": "fixtures/traces/core/lanes/pipe_lane_on_lane_zero.ndjson",
+      "title": "PIPE_LANE on a pipe's lane 0 is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.lanes.pipe_lane_not_first",
+      "file": "fixtures/traces/core/lanes/pipe_lane_not_first.ndjson",
+      "title": "PIPE_LANE after the first frame of a lane is a protocol violation",
+      "refs": [
+        "MULTIPATH.md#5.8"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "core.lanes.pipe_lane_truncated",
+      "file": "fixtures/traces/core/lanes/pipe_lane_truncated.ndjson",
+      "title": "A PIPE_LANE that does not decode is a FRAME_ENCODING_ERROR, which takes precedence over its placement on lane 0",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "core.lanes.unknown_lane_key",
+      "file": "fixtures/traces/core/lanes/unknown_lane_key.ndjson",
+      "title": "A lane whose Lane Key is not the session's, or that names a pipe the session does not have, is closed and nothing else happens",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#5.5",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 18
+    },
+    {
+      "id": "core.lanes.lane_failure_ends_session",
+      "file": "fixtures/traces/core/lanes/lane_failure_ends_session.ndjson",
+      "title": "An error on a confirmed lane of the peer fails the pipe, which without multipath ends the session",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "SPEC.md#6.6",
+        "STATE_MACHINE.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 13
+    },
+    {
+      "id": "core.lanes.graceful_end_every_lane",
+      "file": "fixtures/traces/core/lanes/graceful_end_every_lane.ndjson",
+      "title": "Without multipath, the peer's pipe ends only when every lane has ended at a record boundary, in any order; with pipe acknowledgement and no CONNECTION_CLOSE, that end is a pipe failure, not an idle close",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "SPEC.md#6.4",
+        "SPEC.md#6.6"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 15
+    },
+    {
+      "id": "core.lanes.close_waits_for_lane_ack",
+      "file": "fixtures/traces/core/lanes/close_waits_for_lane_ack.ndjson",
+      "title": "Without multipath, an application close goes on lane 0 only once a PIPE_ACK covers every record written on the other lanes",
+      "refs": [
+        "SPEC.md#6.5",
+        "MULTIPATH.md#5.8"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 24
+    },
+    {
+      "id": "core.lanes.close_after_linger_without_lane_ack",
+      "file": "fixtures/traces/core/lanes/close_after_linger_without_lane_ack.ndjson",
+      "title": "Without multipath, a close waiting for the acknowledgement of the other lanes goes on lane 0 when the linger timeout (250 ms) has passed",
+      "refs": [
+        "SPEC.md#6.5",
+        "MULTIPATH.md#5.8"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 24
+    },
+    {
+      "id": "ext.role.auto_larger_nonce_initiates",
+      "file": "fixtures/traces/ext/role/auto_larger_nonce_initiates.ndjson",
+      "title": "With both auto, the larger nonce becomes the initiator",
+      "refs": [
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-role-auto",
+      "steps": 7
+    },
+    {
+      "id": "ext.role.auto_equal_nonce_conflict",
+      "file": "fixtures/traces/ext/role/auto_equal_nonce_conflict.ndjson",
+      "title": "Equal nonces are a role conflict",
+      "refs": [
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-role-auto",
+      "steps": 4
+    },
+    {
+      "id": "ext.role.explicit_conflict",
+      "file": "fixtures/traces/ext/role/explicit_conflict.ndjson",
+      "title": "Two explicit initiators conflict",
+      "refs": [
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "ext.role.explicit_contradicts_transport",
+      "file": "fixtures/traces/ext/role/explicit_contradicts_transport.ndjson",
+      "title": "An explicit role that contradicts the transport role, with a peer that sent no zmux_role, is a role conflict",
+      "refs": [
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 4
+    },
+    {
+      "id": "ext.role.auto_with_plain_peer",
+      "file": "fixtures/traces/ext/role/auto_with_plain_peer.ndjson",
+      "title": "Without the peer's zmux_role the transport role applies",
+      "refs": [
+        "EXTENSIONS.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-role-auto",
+      "steps": 4
+    },
+    {
+      "id": "ext.goaway.receive_watermark",
+      "file": "fixtures/traces/ext/goaway/receive_watermark.ndjson",
+      "title": "Streams at or above the watermark are rejected locally; no new streams open",
+      "refs": [
+        "EXTENSIONS.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 16
+    },
+    {
+      "id": "ext.goaway.unemitted_stream_fails",
+      "file": "fixtures/traces/ext/goaway/unemitted_stream_fails.ndjson",
+      "title": "After any GOAWAY no new stream opens: a stream that was opened but has not emitted its first frame fails with going away, even below the watermark",
+      "refs": [
+        "EXTENSIONS.md#3.5",
+        "STATE_MACHINE.md#2.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 16
+    },
+    {
+      "id": "ext.goaway.minimum_watermark",
+      "file": "fixtures/traces/ext/goaway/minimum_watermark.ndjson",
+      "title": "Receivers keep the minimum watermark; a larger one has no effect",
+      "refs": [
+        "EXTENSIONS.md#3.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "ext.goaway.two_phase_with_fence",
+      "file": "fixtures/traces/ext/goaway/two_phase_with_fence.ndjson",
+      "title": "Phase 1 keeps credit, the PING fence completes, phase 2 rejects higher streams",
+      "refs": [
+        "EXTENSIONS.md#3.3",
+        "EXTENSIONS.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 18
+    },
+    {
+      "id": "ext.goaway.rejected_late_preamble",
+      "file": "fixtures/traces/ext/goaway/rejected_late_preamble.ndjson",
+      "title": "Streams opened implicitly above the watermark are rejected; their late preamble is discarded and they are never offered",
+      "refs": [
+        "EXTENSIONS.md#3.4",
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 15
+    },
+    {
+      "id": "ext.goaway.hole_below_watermark_offered",
+      "file": "fixtures/traces/ext/goaway/hole_below_watermark_offered.ndjson",
+      "title": "A stream below the final watermark whose preamble arrives after a higher stream was offered is offered, not rejected",
+      "refs": [
+        "EXTENSIONS.md#3.3",
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 15
+    },
+    {
+      "id": "ext.goaway.no_credit_after_goaway",
+      "file": "fixtures/traces/ext/goaway/no_credit_after_goaway.ndjson",
+      "title": "After its first GOAWAY an endpoint raises no MAX_STREAMS",
+      "refs": [
+        "EXTENSIONS.md#3.3",
+        "SPEC.md#8.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 17
+    },
+    {
+      "id": "ext.preamble.split_across_frames",
+      "file": "fixtures/traces/ext/preamble/split_across_frames.ndjson",
+      "title": "A preamble not contained in the frame at offset 0 is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.above_limit",
+      "file": "fixtures/traces/ext/preamble/above_limit.ndjson",
+      "title": "A preamble larger than the receiver's limit is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.plain_reset",
+      "file": "fixtures/traces/ext/preamble/plain_reset.ndjson",
+      "title": "RESET_STREAM on an opener's direction with the preamble in use is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4",
+        "EXTENSIONS.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.reliable_size_too_small",
+      "file": "fixtures/traces/ext/preamble/reliable_size_too_small.ndjson",
+      "title": "A Reliable Size smaller than the preamble is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4",
+        "EXTENSIONS.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.zero_final_size",
+      "file": "fixtures/traces/ext/preamble/zero_final_size.ndjson",
+      "title": "A stream ending at offset 0 has no preamble and is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.reset_before_any_data",
+      "file": "fixtures/traces/ext/preamble/reset_before_any_data.ndjson",
+      "title": "A plain reset with final size 0 is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.duplicate_open_info",
+      "file": "fixtures/traces/ext/preamble/duplicate_open_info.ndjson",
+      "title": "A second OPEN_INFO TLV is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.bad_priority_tlv",
+      "file": "fixtures/traces/ext/preamble/bad_priority_tlv.ndjson",
+      "title": "A PRIORITY TLV with reserved bits set is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.tlv_overrun",
+      "file": "fixtures/traces/ext/preamble/tlv_overrun.ndjson",
+      "title": "A TLV that overruns the preamble is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.pipe_carrier_with_value",
+      "file": "fixtures/traces/ext/preamble/pipe_carrier_with_value.ndjson",
+      "title": "A PIPE_CARRIER TLV with a value is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.duplicate_pipe_carrier",
+      "file": "fixtures/traces/ext/preamble/duplicate_pipe_carrier.ndjson",
+      "title": "A second PIPE_CARRIER TLV is fatal",
+      "refs": [
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.reset_at_protects_open_info",
+      "file": "fixtures/traces/ext/preamble/reset_at_protects_open_info.ndjson",
+      "title": "RESET_STREAM_AT covering the preamble delivers open info, then the reset",
+      "refs": [
+        "EXTENSIONS.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "ext.preamble.unknown_reserved_and_grease_ignored",
+      "file": "fixtures/traces/ext/preamble/unknown_reserved_and_grease_ignored.ndjson",
+      "title": "Unknown, DEADLINE and GREASE TLVs are ignored",
+      "refs": [
+        "EXTENSIONS.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "ext.preamble.application_tlvs_delivered",
+      "file": "fixtures/traces/ext/preamble/application_tlvs_delivered.ndjson",
+      "title": "Application TLVs (0x1000 to 0x3fff) are offered with the stream in the order received, repeated types included; GREASE values inside the range and types outside it are not; PIPE_CARRIER is reported",
+      "refs": [
+        "EXTENSIONS.md#4.3",
+        "EXTENSIONS.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "ext.preamble.priority_delivered",
+      "file": "fixtures/traces/ext/preamble/priority_delivered.ndjson",
+      "title": "The PRIORITY TLV is offered with the stream",
+      "refs": [
+        "EXTENSIONS.md#4.3",
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.preamble.grease_only_in_first",
+      "file": "fixtures/traces/ext/preamble/grease_only_in_first.ndjson",
+      "title": "GREASE appears in the first local preamble of the session",
+      "refs": [
+        "EXTENSIONS.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "ext.preamble.counts_against_flow_control",
+      "file": "fixtures/traces/ext/preamble/counts_against_flow_control.ndjson",
+      "title": "Preamble bytes count against the stream window",
+      "refs": [
+        "EXTENSIONS.md#4.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.priority.reserved_bits",
+      "file": "fixtures/traces/ext/priority/reserved_bits.ndjson",
+      "title": "PRIORITY_UPDATE with reserved bits set is fatal",
+      "refs": [
+        "EXTENSIONS.md#5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.priority.unopened_local_stream",
+      "file": "fixtures/traces/ext/priority/unopened_local_stream.ndjson",
+      "title": "PRIORITY_UPDATE for an unopened local stream is fatal",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.priority.peer_unidirectional",
+      "file": "fixtures/traces/ext/priority/peer_unidirectional.ndjson",
+      "title": "PRIORITY_UPDATE for the peer's own unidirectional stream is fatal",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.priority.opens_beyond_limit",
+      "file": "fixtures/traces/ext/priority/opens_beyond_limit.ndjson",
+      "title": "PRIORITY_UPDATE opening a stream beyond the limit is fatal",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.priority.opens_peer_stream",
+      "file": "fixtures/traces/ext/priority/opens_peer_stream.ndjson",
+      "title": "PRIORITY_UPDATE may arrive before the stream's data",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 7
+    },
+    {
+      "id": "ext.priority.send_update_sequence",
+      "file": "fixtures/traces/ext/priority/send_update_sequence.ndjson",
+      "title": "Local PRIORITY_UPDATE sequence numbers start at 1 and increase",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "ext.priority.not_in_use",
+      "file": "fixtures/traces/ext/priority/not_in_use.ndjson",
+      "title": "Without both zmux_priority parameters, PRIORITY_UPDATE is an unknown frame",
+      "refs": [
+        "SPEC.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "ext.priority.stale_ignored",
+      "file": "fixtures/traces/ext/priority/stale_ignored.ndjson",
+      "title": "A PRIORITY_UPDATE with an old sequence number is ignored, not an error",
+      "refs": [
+        "EXTENSIONS.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "ext.datagram.opaque_without_flows",
+      "file": "fixtures/traces/ext/datagram/opaque_without_flows.ndjson",
+      "title": "Without flows, datagram data is opaque",
+      "refs": [
+        "EXTENSIONS.md#6.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.not_advertised",
+      "file": "fixtures/traces/ext/datagram/not_advertised.ndjson",
+      "title": "A DATAGRAM without local support is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.too_large",
+      "file": "fixtures/traces/ext/datagram/too_large.ndjson",
+      "title": "A DATAGRAM larger than advertised is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.flow_associated",
+      "file": "fixtures/traces/ext/datagram/flow_associated.ndjson",
+      "title": "A flow prefix associates a datagram with a stream",
+      "refs": [
+        "EXTENSIONS.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 12
+    },
+    {
+      "id": "ext.datagram.flow_unidirectional",
+      "file": "fixtures/traces/ext/datagram/flow_unidirectional.ndjson",
+      "title": "A flow naming a unidirectional stream is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.flow_unopened_local",
+      "file": "fixtures/traces/ext/datagram/flow_unopened_local.ndjson",
+      "title": "A flow naming an unopened local stream is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.flow_beyond_limit",
+      "file": "fixtures/traces/ext/datagram/flow_beyond_limit.ndjson",
+      "title": "A flow naming a stream beyond the limit is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.flow_prefix_truncated",
+      "file": "fixtures/traces/ext/datagram/flow_prefix_truncated.ndjson",
+      "title": "A datagram without a complete flow prefix is fatal",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.flow_closed_stream_dropped",
+      "file": "fixtures/traces/ext/datagram/flow_closed_stream_dropped.ndjson",
+      "title": "Datagrams for a finished stream are dropped silently",
+      "refs": [
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 13
+    },
+    {
+      "id": "ext.datagram.send_too_large",
+      "file": "fixtures/traces/ext/datagram/send_too_large.ndjson",
+      "title": "A datagram that does not fit is refused locally",
+      "refs": [
+        "EXTENSIONS.md#6.1"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.send_with_flow",
+      "file": "fixtures/traces/ext/datagram/send_with_flow.ndjson",
+      "title": "Sent datagrams carry the flow prefix",
+      "refs": [
+        "EXTENSIONS.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 8
+    },
+    {
+      "id": "ext.datagram.send_queue_drops_oldest",
+      "file": "fixtures/traces/ext/datagram/send_queue_drops_oldest.ndjson",
+      "title": "Datagrams wait in a 64-entry send queue while the pipe is not writable; the oldest is dropped, and sending never blocks",
+      "refs": [
+        "EXTENSIONS.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 72
+    },
+    {
+      "id": "ext.datagram.receive_queue_overflow",
+      "file": "fixtures/traces/ext/datagram/receive_queue_overflow.ndjson",
+      "title": "A full 128-entry session receive queue drops its oldest datagram and counts it, never an error",
+      "refs": [
+        "EXTENSIONS.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 136
+    },
+    {
+      "id": "ext.datagram.stream_queue_overflow",
+      "file": "fixtures/traces/ext/datagram/stream_queue_overflow.ndjson",
+      "title": "A stream's 32-entry datagram queue drops its oldest datagram; stream datagrams never spill into the session queue",
+      "refs": [
+        "EXTENSIONS.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 42
+    },
+    {
+      "id": "compat.qmux.plain_peer_basic",
+      "file": "fixtures/traces/compat/qmux/plain_peer_basic.ndjson",
+      "title": "Towards a plain QMux peer: no preamble, no zmux frames, QMux STREAM forms accepted",
+      "refs": [
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 11
+    },
+    {
+      "id": "compat.qmux.open_info_unsupported",
+      "file": "fixtures/traces/compat/qmux/open_info_unsupported.ndjson",
+      "title": "Open info needs the preamble, which a plain QMux peer does not support",
+      "refs": [
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "compat.qmux.shutdown_without_goaway",
+      "file": "fixtures/traces/compat/qmux/shutdown_without_goaway.ndjson",
+      "title": "Graceful shutdown towards a plain QMux peer closes without GOAWAY",
+      "refs": [
+        "SPEC.md#13.2",
+        "SPEC.md#6.7"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 9
+    },
+    {
+      "id": "compat.qmux.close_with_frame_type_zero",
+      "file": "fixtures/traces/compat/qmux/close_with_frame_type_zero.ndjson",
+      "title": "CONNECTION_CLOSE 0x1c with Frame Type 0, as the qmux crate sends it",
+      "refs": [
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "compat.qmux.no_pipe_ack",
+      "file": "fixtures/traces/compat/qmux/no_pipe_ack.ndjson",
+      "title": "A plain QMux peer ignores zmux_pipe_ack and never receives a PIPE_ACK",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "compat.qmux.close_reason_with_details",
+      "file": "fixtures/traces/compat/qmux/close_reason_with_details.ndjson",
+      "title": "A Reason Phrase with a diagnostic line, well-formed or not, is only reported: the close is processed as any other",
+      "refs": [
+        "SPEC.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "compat.qmux.in_order_enforced",
+      "file": "fixtures/traces/compat/qmux/in_order_enforced.ndjson",
+      "title": "QMux-02 Section 4.1 applies to plain peers",
+      "refs": [
+        "SPEC.md#7.3",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 6
+    },
+    {
+      "id": "compat.qmux.reset_without_reset_stream_at",
+      "file": "fixtures/traces/compat/qmux/reset_without_reset_stream_at.ndjson",
+      "title": "Without the peer's reset_stream_at, resets are plain RESET_STREAM",
+      "refs": [
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "compat.qmux.implicit_stream_offered_at_once",
+      "file": "fixtures/traces/compat/qmux/implicit_stream_offered_at_once.ndjson",
+      "title": "Without the preamble a stream opened implicitly by a higher one is offered at once, as in QUIC",
+      "refs": [
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 10
+    },
+    {
+      "id": "compat.qmux.no_multipath_with_plain_peer",
+      "file": "fixtures/traces/compat/qmux/no_multipath_with_plain_peer.ndjson",
+      "title": "A multipath-enabled endpoint stays single-pipe with a plain QMux peer",
+      "refs": [
+        "SPEC.md#13.2",
+        "SPEC.md#9.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.negotiation.ack_within_max_ack_delay",
+      "file": "fixtures/traces/multipath/negotiation/ack_within_max_ack_delay.ndjson",
+      "title": "Multipath is in use and data is acknowledged within max_ack_delay",
+      "refs": [
+        "MULTIPATH.md#3.3",
+        "MULTIPATH.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.negotiation.one_sided",
+      "file": "fixtures/traces/multipath/negotiation/one_sided.ndjson",
+      "title": "With only one zmux_multipath parameter, PIPE_ACK is an unknown frame",
+      "refs": [
+        "MULTIPATH.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.negotiation.no_secret_source",
+      "file": "fixtures/traces/multipath/negotiation/no_secret_source.ndjson",
+      "title": "Without a common secret source multipath is not in use",
+      "refs": [
+        "MULTIPATH.md#10.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.negotiation.max_lanes_feature_not_in_use",
+      "file": "fixtures/traces/multipath/negotiation/max_lanes_feature_not_in_use.ndjson",
+      "title": "zmux_max_lanes sent with zmux_multipath is valid although multipath ends up not in use (no common secret source) and pipe acknowledgement is not announced; lanes are then not available and a PIPE_LANE is a frame of a feature not in use",
+      "refs": [
+        "SPEC.md#5.5",
+        "MULTIPATH.md#3.6",
+        "MULTIPATH.md#5.8",
+        "SPEC.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.join.inband_up_with_zero_rtt_data",
+      "file": "fixtures/traces/multipath/join/inband_up_with_zero_rtt_data.ndjson",
+      "title": "An authenticated in-band join carries data in its first record",
+      "refs": [
+        "MULTIPATH.md#5.2",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.join.bad_token",
+      "file": "fixtures/traces/multipath/join/bad_token.ndjson",
+      "title": "A join with a wrong token is closed silently",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#10.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 9
+    },
+    {
+      "id": "multipath.join.replay",
+      "file": "fixtures/traces/multipath/join/replay.ndjson",
+      "title": "A replayed join for a used pipe ID is closed",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#10.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.join.wrong_parity",
+      "file": "fixtures/traces/multipath/join/wrong_parity.ndjson",
+      "title": "An authenticated join with the other role's parity is fatal",
+      "refs": [
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.join.unknown_locator",
+      "file": "fixtures/traces/multipath/join/unknown_locator.ndjson",
+      "title": "A join for an unknown locator is closed",
+      "refs": [
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.join.listener_rejects_garbage",
+      "file": "fixtures/traces/multipath/join/listener_rejects_garbage.ndjson",
+      "title": "The listener rejects a carrier that is neither a session nor a join",
+      "refs": [
+        "MULTIPATH.md#5.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.join.held_until_established",
+      "file": "fixtures/traces/multipath/join/held_until_established.ndjson",
+      "title": "A join that arrives before the joiner's parameters is held, then verified",
+      "refs": [
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.join.out_of_band_down",
+      "file": "fixtures/traces/multipath/join/out_of_band_down.ndjson",
+      "title": "An out-of-band join for a downlink makes it usable at once",
+      "refs": [
+        "MULTIPATH.md#5.3",
+        "SCHEDULER.md#5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 9
+    },
+    {
+      "id": "multipath.join.join_not_first",
+      "file": "fixtures/traces/multipath/join/join_not_first.ndjson",
+      "title": "PIPE_JOIN anywhere but first on a joined pipe is fatal",
+      "refs": [
+        "MULTIPATH.md#5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.join.parameters_on_joined_pipe",
+      "file": "fixtures/traces/multipath/join/parameters_on_joined_pipe.ndjson",
+      "title": "QX_TRANSPORT_PARAMETERS on a joined pipe is fatal",
+      "refs": [
+        "SPEC.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.bootstrap.split_pairing",
+      "file": "fixtures/traces/multipath/bootstrap/split_pairing.ndjson",
+      "title": "A split bootstrap is paired by its token; a third carrier with the token is closed",
+      "refs": [
+        "SPEC.md#6.1.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.bootstrap.split_fails_as_unit",
+      "file": "fixtures/traces/multipath/bootstrap/split_fails_as_unit.ndjson",
+      "title": "When one carrier of a split bootstrap fails, the attachment fails as a unit and the other carrier is closed too",
+      "refs": [
+        "MULTIPATH.md#4.2",
+        "MULTIPATH.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.join.local_inband",
+      "file": "fixtures/traces/multipath/join/local_inband.ndjson",
+      "title": "A local join carries a token keyed with the local role",
+      "refs": [
+        "MULTIPATH.md#5.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.join.local_out_of_band",
+      "file": "fixtures/traces/multipath/join/local_out_of_band.ndjson",
+      "title": "A local out-of-band join is handed to the adapter",
+      "refs": [
+        "MULTIPATH.md#5.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.join.local_join_becomes_active",
+      "file": "fixtures/traces/multipath/join/local_join_becomes_active.ndjson",
+      "title": "A local join is JOINING until the peer acknowledges bytes on it",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "STATE_MACHINE.md#3.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 9
+    },
+    {
+      "id": "multipath.join.leading_parameters_discarded",
+      "file": "fixtures/traces/multipath/join/leading_parameters_discarded.ndjson",
+      "title": "A shared listener may send its transport parameters before it sees the join: the joiner discards that leading record, which confirms nothing and does not count in the pipe's position",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.failover.joining_sole_path_carries_data",
+      "file": "fixtures/traces/multipath/failover/joining_sole_path_carries_data.ndjson",
+      "title": "While no outbound pipe is usable, a JOINING pipe carries stream data as an ACTIVE pipe would, not just one chunk",
+      "refs": [
+        "MULTIPATH.md#11.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.join.acceptor_confirms_downlink",
+      "file": "fixtures/traces/multipath/join/acceptor_confirms_downlink.ndjson",
+      "title": "The acceptor writes a record carrying PIPE_PING on a joined bidirectional pipe within its max_ack_delay, and the acknowledgement gives the pipe its first RTT sample",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "SCHEDULER.md#2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.join.direction_mismatch",
+      "file": "fixtures/traces/multipath/join/direction_mismatch.ndjson",
+      "title": "An authenticated join whose direction the carrier cannot provide is abandoned, not fatal",
+      "refs": [
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.join.abandoned_id_is_used",
+      "file": "fixtures/traces/multipath/join/abandoned_id_is_used.ndjson",
+      "title": "PIPE_ABANDON for a pipe ID never seen, within the replay window, sets its bit and is answered; a later join with it is a replay",
+      "refs": [
+        "MULTIPATH.md#8.1",
+        "MULTIPATH.md#4.3",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.spread.reorder_across_pipes",
+      "file": "fixtures/traces/multipath/spread/reorder_across_pipes.ndjson",
+      "title": "Frames of one stream arrive interleaved on two pipes, the preamble last",
+      "refs": [
+        "MULTIPATH.md#13",
+        "SPEC.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.spread.duplicates_are_harmless",
+      "file": "fixtures/traces/multipath/spread/duplicates_are_harmless.ndjson",
+      "title": "Duplicate data on two pipes is delivered once",
+      "refs": [
+        "MULTIPATH.md#7.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.spread.beyond_window",
+      "file": "fixtures/traces/multipath/spread/beyond_window.ndjson",
+      "title": "Reordered data beyond the window is fatal",
+      "refs": [
+        "MULTIPATH.md#13"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.redundancy.urgent_on_two_pipes",
+      "file": "fixtures/traces/multipath/redundancy/urgent_on_two_pipes.ndjson",
+      "title": "A chunk of an urgent stream direction goes to the two pipes of its tier with the earliest arrival estimate; a stream of the default urgency is sent once",
+      "refs": [
+        "SCHEDULER.md#4.1",
+        "MULTIPATH.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
+    },
+    {
+      "id": "multipath.redundancy.first_chunk_after_idle",
+      "file": "fixtures/traces/multipath/redundancy/first_chunk_after_idle.ndjson",
+      "title": "New data on a pipe that has been idle without acknowledgement progress for max(1 s, T_suspect) is sent at once, without a probe first, and its first chunk is also sent on the next pipe in control order",
+      "refs": [
+        "SCHEDULER.md#4.1",
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.revalidate.pipes_await_acknowledgement",
+      "file": "fixtures/traces/multipath/revalidate/pipes_await_acknowledgement.ndjson",
+      "title": "After a revalidation request every live outbound pipe gets a PIPE_PING at once and takes no new stream data until it is acknowledged, while another pipe is",
+      "refs": [
+        "SCHEDULER.md#11.1",
+        "API.md#4.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 23
+    },
+    {
+      "id": "multipath.redundancy.byte_bound",
+      "file": "fixtures/traces/multipath/redundancy/byte_bound.ndjson",
+      "title": "Redundant copies whose data is unacknowledged stay within max(spread_chunk, retransmit budget / 64); a chunk beyond it is sent once, and acknowledgements free the bound",
+      "refs": [
+        "SCHEDULER.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 22
+    },
+    {
+      "id": "multipath.redundancy.set_redundant",
+      "file": "fixtures/traces/multipath/redundancy/set_redundant.ndjson",
+      "title": "SetRedundant turns redundancy on for a stream direction of the default urgency while the session's redundancy is off, and off again",
+      "refs": [
+        "SCHEDULER.md#4.1",
+        "API.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.ack.pipe_ping_answered_on_its_pair",
+      "file": "fixtures/traces/multipath/ack/pipe_ping_answered_on_its_pair.ndjson",
+      "title": "A PIPE_PING that arrives on a backup pipe is answered on that pipe pair too, not only on the pipes of the control order",
+      "refs": [
+        "MULTIPATH.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.credit.reset_lowering_reliable_size_releases",
+      "file": "fixtures/traces/multipath/credit/reset_lowering_reliable_size_releases.ndjson",
+      "title": "A reset that lowers the Reliable Size releases the session credit of the lost bytes between the old and the new Reliable Size",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.credit.reset_releases_lost_bytes",
+      "file": "fixtures/traces/multipath/credit/reset_releases_lost_bytes.ndjson",
+      "title": "Bytes lost with a failed pipe and then covered by a reset release session credit at once; a late copy of them releases nothing",
+      "refs": [
+        "SPEC.md#8.3",
+        "MULTIPATH.md#7.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
+    },
+    {
+      "id": "multipath.ping.out_of_order_request_ignored",
+      "file": "fixtures/traces/multipath/ping/out_of_order_request_ignored.ndjson",
+      "title": "In a multipath session a QX_PING request that does not exceed an earlier one arrived over another pipe and is ignored, not fatal",
+      "refs": [
+        "SPEC.md#4.5",
+        "SPEC.md#9.4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.ack.threshold",
+      "file": "fixtures/traces/multipath/ack/threshold.ndjson",
+      "title": "Reaching zmux_ack_threshold triggers PIPE_ACK at once",
+      "refs": [
+        "MULTIPATH.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.ack.pipe_ping",
+      "file": "fixtures/traces/multipath/ack/pipe_ping.ndjson",
+      "title": "PIPE_PING elicits an immediate PIPE_ACK",
+      "refs": [
+        "MULTIPATH.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.ack.ahead_of_sent",
+      "file": "fixtures/traces/multipath/ack/ahead_of_sent.ndjson",
+      "title": "Acknowledging bytes that were never sent is fatal",
+      "refs": [
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.ack.pipe_without_outbound",
+      "file": "fixtures/traces/multipath/ack/pipe_without_outbound.ndjson",
+      "title": "Acknowledging bytes on a pipe the receiver does not send on is fatal; a zero position for it is ignored",
+      "refs": [
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.ack.outdated_ignored",
+      "file": "fixtures/traces/multipath/ack/outdated_ignored.ndjson",
+      "title": "A PIPE_ACK with an older position is ignored",
+      "refs": [
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.ack.pipe_ends_mid_record",
+      "file": "fixtures/traces/multipath/ack/pipe_ends_mid_record.ndjson",
+      "title": "A pipe that ends inside a record fails; the partial record is discarded and not counted, and the final position is acknowledged promptly",
+      "refs": [
+        "MULTIPATH.md#6.1",
+        "MULTIPATH.md#6.3",
+        "MULTIPATH.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.failover.carrier_error_reinjects",
+      "file": "fixtures/traces/multipath/failover/carrier_error_reinjects.ndjson",
+      "title": "A failed pipe's unacknowledged data is re-sent on another pipe",
+      "refs": [
+        "MULTIPATH.md#7.2",
+        "MULTIPATH.md#7.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.failover.suspect_reinjects_and_probes",
+      "file": "fixtures/traces/multipath/failover/suspect_reinjects_and_probes.ndjson",
+      "title": "No acknowledgement progress for T_suspect makes the pipe suspect",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 23
+    },
+    {
+      "id": "multipath.failover.suspect_then_failed",
+      "file": "fixtures/traces/multipath/failover/suspect_then_failed.ndjson",
+      "title": "Without progress a suspect pipe fails after T_fail when another pipe is ACTIVE",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 26
+    },
+    {
+      "id": "multipath.failover.last_pipe_survives_pause",
+      "file": "fixtures/traces/multipath/failover/last_pipe_survives_pause.ndjson",
+      "title": "A single pipe pair in a multipath session survives a mutual pause: acknowledgements keep flowing on the suspect pipe and the last usable pipe does not fail on T_fail",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#11.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 21
+    },
+    {
+      "id": "multipath.failover.both_pipes_suspect_recover",
+      "file": "fixtures/traces/multipath/failover/both_pipes_suspect_recover.ndjson",
+      "title": "When every outbound pipe is suspect none fails on T_fail; acknowledgements bring both back",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 29
+    },
+    {
+      "id": "multipath.failover.last_pipe_without_resume_dead_timeout",
+      "file": "fixtures/traces/multipath/failover/last_pipe_without_resume_dead_timeout.ndjson",
+      "title": "Without resume the last pipe fails from a stall only after T_dead (its default dead_timeout, half the 30 s idle timeout), and the session then ends",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#8.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.failover.write_stall_suspect",
+      "file": "fixtures/traces/multipath/failover/write_stall_suspect.ndjson",
+      "title": "A pipe whose carrier accepts no bytes for T_suspect becomes suspect, like one without acknowledgements",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.failover.no_reinjection_while_acknowledged",
+      "file": "fixtures/traces/multipath/failover/no_reinjection_while_acknowledged.ndjson",
+      "title": "A pipe whose data is acknowledged in time is never suspected and nothing is re-sent",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.failover.fate_group_suspect",
+      "file": "fixtures/traces/multipath/failover/fate_group_suspect.ndjson",
+      "title": "When an attachment fails abruptly, attachments in the same fate group become suspect at once",
+      "refs": [
+        "MULTIPATH.md#2.2",
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 24
+    },
+    {
+      "id": "multipath.failover.fate_group_drain_exempt",
+      "file": "fixtures/traces/multipath/failover/fate_group_drain_exempt.ndjson",
+      "title": "An attachment whose graceful removal has started affects no other attachment of its fate group when its carrier then fails",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 27
+    },
+    {
+      "id": "multipath.failover.fate_group_resource_limit_exempt",
+      "file": "fixtures/traces/multipath/failover/fate_group_resource_limit_exempt.ndjson",
+      "title": "An attachment the peer abandons with ZMUX_PIPE_RESOURCE_LIMIT affects no other attachment of its fate group",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#8.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 26
+    },
+    {
+      "id": "multipath.remove.graceful_local",
+      "file": "fixtures/traces/multipath/remove/graceful_local.ndjson",
+      "title": "Graceful removal drains, closes and retires the attachment",
+      "refs": [
+        "MULTIPATH.md#8.2",
+        "MULTIPATH.md#8.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 23
+    },
+    {
+      "id": "multipath.remove.drain_deadline_fails_pipe",
+      "file": "fixtures/traces/multipath/remove/drain_deadline_fails_pipe.ndjson",
+      "title": "A draining pipe that stalls has its unacknowledged stream data reinjected once it is marked suspect, and fails T_fail after the removal without a second PIPE_ABANDON",
+      "refs": [
+        "MULTIPATH.md#8.2",
+        "STATE_MACHINE.md#3.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 33
+    },
+    {
+      "id": "multipath.remove.draining_never_returns_active",
+      "file": "fixtures/traces/multipath/remove/draining_never_returns_active.ndjson",
+      "title": "A draining pipe that stalls and recovers stays DRAINING and takes no new stream data; it closes once the PIPE_ABANDON exchange is complete and its data is acknowledged",
+      "refs": [
+        "MULTIPATH.md#8.2",
+        "MULTIPATH.md#11.1",
+        "STATE_MACHINE.md#3.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 26
+    },
+    {
+      "id": "multipath.remove.linger_after_exchange_is_graceful",
+      "file": "fixtures/traces/multipath/remove/linger_after_exchange_is_graceful.ndjson",
+      "title": "After both PIPE_ABANDON frames, a peer that never ends its direction is cut off at the linger timeout as a graceful end, not a failure",
+      "refs": [
+        "MULTIPATH.md#8.2",
+        "MULTIPATH.md#8.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 21
+    },
+    {
+      "id": "multipath.remove.peer_graceful",
+      "file": "fixtures/traces/multipath/remove/peer_graceful.ndjson",
+      "title": "On a peer's graceful PIPE_ABANDON the endpoint stops using the pipe and answers",
+      "refs": [
+        "MULTIPATH.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "multipath.remove.abrupt_local",
+      "file": "fixtures/traces/multipath/remove/abrupt_local.ndjson",
+      "title": "Abrupt removal reinjects and abandons with ZMUX_PIPE_FAILED",
+      "refs": [
+        "MULTIPATH.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.remove.last_outbound_without_resume",
+      "file": "fixtures/traces/multipath/remove/last_outbound_without_resume.ndjson",
+      "title": "Losing the last outbound pipe without resume ends the session locally (pipes lost); no pipe is left for CONNECTION_CLOSE",
+      "refs": [
+        "MULTIPATH.md#8.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.remove.last_inbound_without_resume",
+      "file": "fixtures/traces/multipath/remove/last_inbound_without_resume.ndjson",
+      "title": "Losing the last inbound pipe without resume sends CONNECTION_CLOSE(NO_VIABLE_PATH)",
+      "refs": [
+        "MULTIPATH.md#8.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.status.local_standby",
+      "file": "fixtures/traces/multipath/status/local_standby.ndjson",
+      "title": "A pipe marked standby locally carries no new stream data while another pipe works, and the peer is asked to treat its direction as standby too",
+      "refs": [
+        "MULTIPATH.md#9",
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "multipath.status.stale_ignored",
+      "file": "fixtures/traces/multipath/status/stale_ignored.ndjson",
+      "title": "An older PIPE_STATUS is ignored, not an error",
+      "refs": [
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "multipath.status.invalid_value",
+      "file": "fixtures/traces/multipath/status/invalid_value.ndjson",
+      "title": "A PIPE_STATUS value other than 0 or 1 is fatal",
+      "refs": [
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.close.on_every_pipe",
+      "file": "fixtures/traces/multipath/close/on_every_pipe.ndjson",
+      "title": "CONNECTION_CLOSE goes on every live outbound pipe",
+      "refs": [
+        "SPEC.md#6.5",
+        "MULTIPATH.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.idle.received_records_only",
+      "file": "fixtures/traces/multipath/idle/received_records_only.ndjson",
+      "title": "In multipath sessions only received records restart the idle timer",
+      "refs": [
+        "SPEC.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.idle.keep_alive_counts_activity",
+      "file": "fixtures/traces/multipath/idle/keep_alive_counts_activity.ndjson",
+      "title": "In a multipath session the keep-alive timer counts the same activity as the idle timer: probes and their acknowledgements do not postpone it",
+      "refs": [
+        "SPEC.md#6.4",
+        "MULTIPATH.md#3.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 27
+    },
+    {
+      "id": "multipath.idle.probes_do_not_keep_alive",
+      "file": "fixtures/traces/multipath/idle/probes_do_not_keep_alive.ndjson",
+      "title": "With the defaults (30 s idle timeout, 15 s idle-pipe probe), PIPE_PING and PIPE_ACK never keep a multipath session alive",
+      "refs": [
+        "SPEC.md#6.4",
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.idle.peer_idle_close",
+      "file": "fixtures/traces/multipath/idle/peer_idle_close.ndjson",
+      "title": "CONNECTION_CLOSE with ZMUX_IDLE_TIMEOUT is reported as the peer's idle timeout",
+      "refs": [
+        "SPEC.md#6.4",
+        "SPEC.md#10.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.budget.duplicates_not_charged",
+      "file": "fixtures/traces/multipath/budget/duplicates_not_charged.ndjson",
+      "title": "In multipath sessions duplicates and outdated copies are never chargeable, while the budget still counts PADDING-only records",
+      "refs": [
+        "SPEC.md#9.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 132
+    },
+    {
+      "id": "multipath.join.refusal_backoff",
+      "file": "fixtures/traces/multipath/join/refusal_backoff.ndjson",
+      "title": "After a join is refused with ZMUX_PIPE_RESOURCE_LIMIT, the joiner joins again only after a backoff of 1 s (or an own retirement); pipe IDs are not credit",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "MULTIPATH.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "multipath.join.local_join_timeout",
+      "file": "fixtures/traces/multipath/join/local_join_timeout.ndjson",
+      "title": "A local join that is not confirmed within the handshake timeout fails and is abandoned",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "STATE_MACHINE.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.ack.retired_entry_ignored",
+      "file": "fixtures/traces/multipath/ack/retired_entry_ignored.ndjson",
+      "title": "After retirement, PIPE_ACK entries for the retired pipe are ignored",
+      "refs": [
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#8.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.remove.failed_attachment_retired",
+      "file": "fixtures/traces/multipath/remove/failed_attachment_retired.ndjson",
+      "title": "A failed attachment is retired once both PIPE_ABANDON frames are exchanged and acknowledged; a join that reuses its pipe ID is then a replay",
+      "refs": [
+        "MULTIPATH.md#8.3",
+        "MULTIPATH.md#8.4",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.remove.abandon_answered_once",
+      "file": "fixtures/traces/multipath/remove/abandon_answered_once.ndjson",
+      "title": "A peer's PIPE_ABANDON is answered once: a copy that arrives again gets no second answer, since the own PIPE_ABANDON is retained until acknowledged",
+      "refs": [
+        "MULTIPATH.md#8.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.remove.abandon_unseen_above_window_ignored",
+      "file": "fixtures/traces/multipath/remove/abandon_unseen_above_window_ignored.ndjson",
+      "title": "PIPE_ABANDON for a peer pipe ID above the replay window is ignored, not answered, and does not block a later join with that ID",
+      "refs": [
+        "MULTIPATH.md#8.1",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "multipath.join.replay_window",
+      "file": "fixtures/traces/multipath/join/replay_window.ndjson",
+      "title": "Only verified joins move the replay window; a join more than W IDs below the highest is stale, one within the window is accepted, and an attachment keeps working however far below the window its ID falls",
+      "refs": [
+        "MULTIPATH.md#4.3",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 24
+    },
+    {
+      "id": "multipath.ack.unknown_peer_id_nonzero_position",
+      "file": "fixtures/traces/multipath/ack/unknown_peer_id_nonzero_position.ndjson",
+      "title": "A PIPE_ACK position above 0 for a peer pipe ID without attachment state claims data never sent",
+      "refs": [
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.ack.untaken_own_parity",
+      "file": "fixtures/traces/multipath/ack/untaken_own_parity.ndjson",
+      "title": "A PIPE_ACK entry for a pipe ID of the receiver's own parity that it has not taken is fatal",
+      "refs": [
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.remove.peer_resource_limit",
+      "file": "fixtures/traces/multipath/remove/peer_resource_limit.ndjson",
+      "title": "PIPE_ABANDON with ZMUX_PIPE_RESOURCE_LIMIT fails the local attachment: its data is re-sent elsewhere and the abandon is answered",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.join.abandon_backoff",
+      "file": "fixtures/traces/multipath/join/abandon_backoff.ndjson",
+      "title": "After an attached pipe is abandoned with ZMUX_PIPE_RESOURCE_LIMIT, the joiner joins again only after the refusal backoff of 1 s",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.failover.resource_limit_abandon_keeps_fate_group",
+      "file": "fixtures/traces/multipath/failover/resource_limit_abandon_keeps_fate_group.ndjson",
+      "title": "When the acceptor abandons one of the joiner's attachments with ZMUX_PIPE_RESOURCE_LIMIT, the joiner's other attachments of the same fate group stay ACTIVE",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 24
+    },
+    {
+      "id": "multipath.join.message_framed_positions",
+      "file": "fixtures/traces/multipath/join/message_framed_positions.ndjson",
+      "title": "On a message-framed pipe each message counts as its byte-stream form in positions",
+      "refs": [
+        "SPEC.md#3.4",
+        "MULTIPATH.md#2.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 9
+    },
+    {
+      "id": "multipath.failover.control_frames_reinjected",
+      "file": "fixtures/traces/multipath/failover/control_frames_reinjected.ndjson",
+      "title": "When a pipe fails, its control information is re-sent with current values: credit, STOP_SENDING, RESET_STREAM_AT with the preamble only, PRIORITY_UPDATE, GOAWAY, and a new fence request",
+      "refs": [
+        "MULTIPATH.md#7.4",
+        "SPEC.md#4.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 25
+    },
+    {
+      "id": "multipath.ack.lowest_delay_pipe_and_copy",
+      "file": "fixtures/traces/multipath/ack/lowest_delay_pipe_and_copy.ndjson",
+      "title": "PIPE_ACK and credit frames use the pipe with the lowest one-way delay, and the snapshot is copied to a second pipe within 50 ms",
+      "refs": [
+        "MULTIPATH.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.credit.copy_with_redundant_snapshot",
+      "file": "fixtures/traces/multipath/credit/copy_with_redundant_snapshot.ndjson",
+      "title": "While the window is the bottleneck, the latest limit is copied to the second pipe in the record of the redundant PIPE_ACK snapshot, not at once",
+      "refs": [
+        "MULTIPATH.md#6.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.ack.suspect_primary_moves_to_active",
+      "file": "fixtures/traces/multipath/ack/suspect_primary_moves_to_active.ndjson",
+      "title": "When the lowest-delay pipe becomes suspect, PIPE_ACK and credit frames go to an ACTIVE pipe",
+      "refs": [
+        "MULTIPATH.md#6.5",
+        "MULTIPATH.md#11.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 22
+    },
+    {
+      "id": "multipath.failover.inbound_silence",
+      "file": "fixtures/traces/multipath/failover/inbound_silence.ndjson",
+      "title": "An inbound pipe that stays open but receives nothing for longer than the inbound silence limit fails, although the sender side never reported anything",
+      "refs": [
+        "MULTIPATH.md#7.3",
+        "STATE_MACHINE.md#3.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
+    },
+    {
+      "id": "multipath.failover.pair_outage_waits_dead_timeout",
+      "file": "fixtures/traces/multipath/failover/pair_outage_waits_dead_timeout.ndjson",
+      "title": "Without resume and with a 120 s idle timeout, a single pipe pair survives a 30 s outage: its outbound direction waits for T_dead (by default half the idle timeout, 60 s), and the inbound silence rule does not apply to a pair",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.join.carrier_bound_token",
+      "file": "fixtures/traces/multipath/join/carrier_bound_token.ndjson",
+      "title": "A carrier-bound token verifies only on its own carrier; a copy on another carrier is a join authentication failure",
+      "refs": [
+        "MULTIPATH.md#10.5",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.budget.retransmit_floor",
+      "file": "fixtures/traces/multipath/budget/retransmit_floor.ndjson",
+      "title": "Before any rate estimate the retransmit budget is its 1 MiB floor: retained stream data stops there until acknowledgements arrive",
+      "refs": [
+        "SCHEDULER.md#13.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "multipath.budget.fin_only_duplicates_not_charged",
+      "file": "fixtures/traces/multipath/budget/fin_only_duplicates_not_charged.ndjson",
+      "title": "5000 short streams whose FIN-only frames are reinjected on a second pipe: the duplicates are never chargeable",
+      "refs": [
+        "SPEC.md#9.4",
+        "MULTIPATH.md#7.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.remove.abandon_unknown_code",
+      "file": "fixtures/traces/multipath/remove/abandon_unknown_code.ndjson",
+      "title": "PIPE_ABANDON with an unknown code is treated as ZMUX_PIPE_FAILED",
+      "refs": [
+        "SPEC.md#10.2",
+        "MULTIPATH.md#8.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.ack.pipe_ping_rate_limit",
+      "file": "fixtures/traces/multipath/ack/pipe_ping_rate_limit.ndjson",
+      "title": "Fifteen joins accepted at once: the first records of at most 8 carry their PIPE_PING in the first second, the rest as soon as the limit allows",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 43
+    },
+    {
+      "id": "multipath.status.standby_takeover",
+      "file": "fixtures/traces/multipath/status/standby_takeover.ndjson",
+      "title": "When every non-standby pipe has failed, the standby pipe carries the traffic and the endpoint announces it with PIPE_STATUS",
+      "refs": [
+        "MULTIPATH.md#9",
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.status.standby_restore",
+      "file": "fixtures/traces/multipath/status/standby_restore.ndjson",
+      "title": "A standby takeover is temporary: a JOINING pipe does not end it, and once a non-standby pipe is usable again the endpoint restores its standby request",
+      "refs": [
+        "MULTIPATH.md#9",
+        "SCHEDULER.md#10",
+        "MULTIPATH.md#5.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 31
+    },
+    {
+      "id": "multipath.status.untaken_own_parity",
+      "file": "fixtures/traces/multipath/status/untaken_own_parity.ndjson",
+      "title": "PIPE_STATUS for a pipe ID of the receiver's own parity that the receiver has not taken is fatal, as for PIPE_ABANDON",
+      "refs": [
+        "MULTIPATH.md#9",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.status.request_without_attachment_ignored",
+      "file": "fixtures/traces/multipath/status/request_without_attachment_ignored.ndjson",
+      "title": "A PIPE_STATUS for a peer pipe ID that has no attachment is ignored and not stored; the joined pipe starts from the request in its PIPE_JOIN",
+      "refs": [
+        "MULTIPATH.md#9",
+        "MULTIPATH.md#5.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.status.change_while_joining_sent_on_active",
+      "file": "fixtures/traces/multipath/status/change_while_joining_sent_on_active.ndjson",
+      "title": "A joiner states its initial request in PIPE_JOIN; a change made while the attachment is JOINING is sent as PIPE_STATUS once it is ACTIVE",
+      "refs": [
+        "MULTIPATH.md#5.7",
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.tier.lower_tier_idle",
+      "file": "fixtures/traces/multipath/tier/lower_tier_idle.ndjson",
+      "title": "While a pipe of the preferred tier has room, a less-preferred pipe carries no stream data, even with the lower delay",
+      "refs": [
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
+      "id": "multipath.tier.overflow_and_return",
+      "file": "fixtures/traces/multipath/tier/overflow_and_return.ndjson",
+      "title": "A pipe that is not writable does not make its tier overflow. A less-preferred tier takes only what the preferred tier cannot send within the overflow delay (drain test) or data that has waited for it that long (age test), and traffic returns as soon as the backlog fits",
+      "refs": [
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 36
+    },
+    {
+      "id": "multipath.tier.failover_to_lower_tier",
+      "file": "fixtures/traces/multipath/tier/failover_to_lower_tier.ndjson",
+      "title": "When every pipe of the preferred tier has failed, the less-preferred tier carries the traffic",
+      "refs": [
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.tier.return_after_probation",
+      "file": "fixtures/traces/multipath/tier/return_after_probation.ndjson",
+      "title": "A new pipe, and a pipe back from SUSPECT, take stream data only after probation; a second suspicion right after probation doubles it",
+      "refs": [
+        "SCHEDULER.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 136
+    },
+    {
+      "id": "multipath.tier.short_suspicion_enters_probation",
+      "file": "fixtures/traces/multipath/tier/short_suspicion_enters_probation.ndjson",
+      "title": "A pipe that returns from SUSPECT enters probation however short the suspicion, with k raised when it was suspect soon after its last probation",
+      "refs": [
+        "SCHEDULER.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 97
+    },
+    {
+      "id": "multipath.tier.suspicion_during_probation",
+      "file": "fixtures/traces/multipath/tier/suspicion_during_probation.ndjson",
+      "title": "A pipe that becomes suspect while in probation starts a new probation with k raised when it returns, however short the suspicion",
+      "refs": [
+        "SCHEDULER.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 90
+    },
+    {
+      "id": "multipath.tier.probation_capped_by_uptime",
+      "file": "fixtures/traces/multipath/tier/probation_capped_by_uptime.ndjson",
+      "title": "After a short up period, probation is capped at max(base, 2 x the longest uptime) instead of base x 2^k",
+      "refs": [
+        "SCHEDULER.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 87
+    },
+    {
+      "id": "multipath.probe.backup_pipe_every_second",
+      "file": "fixtures/traces/multipath/probe/backup_pipe_every_second.ndjson",
+      "title": "A pipe of a less-preferred tier that carries nothing is probed every standby_probe (1 s), not every 15 s",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 37
+    },
+    {
+      "id": "multipath.probe.backup_pipe_quiet_session",
+      "file": "fixtures/traces/multipath/probe/backup_pipe_quiet_session.ndjson",
+      "title": "In a quiet session (no traffic frame for the 15 s busy window) a less-preferred pipe falls back to the probe interval, and is probed at once when traffic resumes",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 102
+    },
+    {
+      "id": "multipath.tier.first_join_probation_without_history",
+      "file": "fixtures/traces/multipath/tier/first_join_probation_without_history.ndjson",
+      "title": "A pipe that joins a path without history is in probation for 4 x SRTT only, without the 1 s floor",
+      "refs": [
+        "SCHEDULER.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 30
+    },
+    {
+      "id": "multipath.tier.peer_request_and_local_override",
+      "file": "fixtures/traces/multipath/tier/peer_request_and_local_override.ndjson",
+      "title": "Without a local setting the peer's PIPE_STATUS priority request is honoured; an explicit local send priority wins over it",
+      "refs": [
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 24
+    },
+    {
+      "id": "multipath.tier.asymmetric_directions",
+      "file": "fixtures/traces/multipath/tier/asymmetric_directions.ndjson",
+      "title": "Send and receive priorities are separate: the local outbound direction of pipe 2 is preferred, while the peer is asked to use its own outbound direction of pipe 2 as a less-preferred tier",
+      "refs": [
+        "MULTIPATH.md#9",
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.tier.standby_not_used_for_overflow",
+      "file": "fixtures/traces/multipath/tier/standby_not_used_for_overflow.ndjson",
+      "title": "Overflow goes to a less-preferred tier, never to a standby pipe; the standby pipe takes over only when every other pipe has failed",
+      "refs": [
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 29
+    },
+    {
+      "id": "multipath.tier.online_local_changes",
+      "file": "fixtures/traces/multipath/tier/online_local_changes.ndjson",
+      "title": "Send priorities, receive priorities and standby change online; every request change is sent at once as a PIPE_STATUS with the next sequence number",
+      "refs": [
+        "MULTIPATH.md#9",
+        "SCHEDULER.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 29
+    },
+    {
+      "id": "multipath.tier.online_peer_requests",
+      "file": "fixtures/traces/multipath/tier/online_peer_requests.ndjson",
+      "title": "Without local settings, the peer's latest PIPE_STATUS requests decide; a request reordered behind a newer one is ignored",
+      "refs": [
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 25
+    },
+    {
+      "id": "multipath.policy.round_robin_weights",
+      "file": "fixtures/traces/multipath/policy/round_robin_weights.ndjson",
+      "title": "spread-round-robin assigns chunks in smooth weighted round-robin order by the configured weights; a pipe that is not writable is skipped and builds up no claim",
+      "refs": [
+        "SCHEDULER.md#6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 45
+    },
+    {
+      "id": "multipath.policy.switch_online",
+      "file": "fixtures/traces/multipath/policy/switch_online.ndjson",
+      "title": "A policy change takes effect at the next chunk; data already placed is not moved",
+      "refs": [
+        "SCHEDULER.md#6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 21
+    },
+    {
+      "id": "multipath.tier.join_with_priority_local",
+      "file": "fixtures/traces/multipath/tier/join_with_priority_local.ndjson",
+      "title": "A local join carries the requested priority for the peer's outbound direction in its PIPE_JOIN; no PIPE_STATUS is needed",
+      "refs": [
+        "MULTIPATH.md#5.1",
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 7
+    },
+    {
+      "id": "multipath.tier.join_with_priority_peer",
+      "file": "fixtures/traces/multipath/tier/join_with_priority_peer.ndjson",
+      "title": "The priority in the peer's PIPE_JOIN applies to the local outbound direction of the new pipe from its first frame",
+      "refs": [
+        "MULTIPATH.md#5.1",
+        "MULTIPATH.md#9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "multipath.join.out_of_band_with_priority",
+      "file": "fixtures/traces/multipath/join/out_of_band_with_priority.ndjson",
+      "title": "An out-of-band join states the acceptor's priority in the PIPE_JOIN it carries out of band, before any byte flows",
+      "refs": [
+        "MULTIPATH.md#5.1",
+        "MULTIPATH.md#5.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 9
+    },
+    {
+      "id": "multipath.join.local_resource_limit",
+      "file": "fixtures/traces/multipath/join/local_resource_limit.ndjson",
+      "title": "An authenticated join beyond the acceptor's pipe capacity is refused with PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT), not a session error",
+      "refs": [
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "multipath.listener.per_source_limit",
+      "file": "fixtures/traces/multipath/listener/per_source_limit.ndjson",
+      "title": "A listener holds at most 8 unauthenticated carriers per source and closes those that send no first record within 2 s",
+      "refs": [
+        "MULTIPATH.md#5.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
+    },
+    {
+      "id": "multipath.streams.reset_stream_at_waits_for_credit",
+      "file": "fixtures/traces/multipath/streams/reset_stream_at_waits_for_credit.ndjson",
+      "title": "A RESET_STREAM_AT whose Reliable Size exceeds the stream credit waits until the credit covers it; its Final Size never exceeds the peer's limit",
+      "refs": [
+        "SPEC.md#4.3",
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.streams.stop_sending_reduces_reliable_size",
+      "file": "fixtures/traces/multipath/streams/stop_sending_reduces_reliable_size.ndjson",
+      "title": "STOP_SENDING while a reset waits for credit to cover its Reliable Size is answered with a reset that owes no data and stays within the stream limit",
+      "refs": [
+        "SPEC.md#4.3",
+        "SPEC.md#8.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "multipath.remove.abandon_own_untaken_id",
+      "file": "fixtures/traces/multipath/remove/abandon_own_untaken_id.ndjson",
+      "title": "PIPE_ABANDON for a pipe ID of the receiver's own parity that it has not taken is fatal",
+      "refs": [
+        "MULTIPATH.md#8.1",
+        "MULTIPATH.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 6
+    },
+    {
+      "id": "multipath.lanes.peer_lane_acknowledged",
+      "file": "fixtures/traces/multipath/lanes/peer_lane_acknowledged.ndjson",
+      "title": "In a multipath session the peer's lane is confirmed by an acknowledgement of its PIPE_LANE record, its records are processed (streams offered in the order their preambles arrive), and its position is acknowledged next to lane 0's",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#6.3",
+        "SPEC.md#7.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.lanes.ack_releases_own_lane",
+      "file": "fixtures/traces/multipath/lanes/ack_releases_own_lane.ndjson",
+      "title": "Data written while a lane is unconfirmed stays on lane 0, a stream direction binds to the lane once it is confirmed, and an acknowledgement of a lane releases only that lane's frames: when the pipe fails, what lane 0 carried is reinjected",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#6.2",
+        "MULTIPATH.md#7.4",
+        "SCHEDULER.md#9.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 25
+    },
+    {
+      "id": "multipath.lanes.refused_lane_no_stall",
+      "file": "fixtures/traces/multipath/lanes/refused_lane_no_stall.ndjson",
+      "title": "The PIPE_LANE record of a refused lane is outside the pipe's send order: while lane 0 keeps being acknowledged the pipe stays ACTIVE well past T_suspect and T_fail, and no further lane is opened",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#7.1",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 63
+    },
+    {
+      "id": "multipath.lanes.other_connection",
+      "file": "fixtures/traces/multipath/lanes/other_connection.ndjson",
+      "title": "A lane with the session's Lane Key that names a pipe whose lane 0 is on another carrier connection is closed and nothing else happens",
+      "refs": [
+        "MULTIPATH.md#5.8",
+        "MULTIPATH.md#17"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.lanes.graceful_end_every_lane",
+      "file": "fixtures/traces/multipath/lanes/graceful_end_every_lane.ndjson",
+      "title": "After the peer's PIPE_ABANDON, an inbound pipe ends gracefully only once every lane has ended at a record boundary",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#7.3",
+        "MULTIPATH.md#8.2",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 22
+    },
+    {
+      "id": "multipath.lanes.lane_end_fails_pipe",
+      "file": "fixtures/traces/multipath/lanes/lane_end_fails_pipe.ndjson",
+      "title": "An end of a confirmed lane inside a record, without a graceful removal, fails the whole pipe: the incomplete record is discarded and the attachment is abandoned",
+      "refs": [
+        "MULTIPATH.md#2.5",
+        "MULTIPATH.md#7.3",
+        "STATE_MACHINE.md#3.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 22
+    },
+    {
+      "id": "resume.suspend.on_last_pipe_loss",
+      "file": "fixtures/traces/resume/suspend/on_last_pipe_loss.ndjson",
+      "title": "Losing every pipe suspends the session; writes are buffered",
+      "refs": [
+        "RESUME.md#4.1",
+        "RESUME.md#4.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 12
+    },
+    {
+      "id": "resume.rejoin.first_record_complete_snapshot",
+      "file": "fixtures/traces/resume/rejoin/first_record_complete_snapshot.ndjson",
+      "title": "After a suspension the joiner's first record reports its positions in a complete PIPE_ACK snapshot, so only what the peer lacks is re-sent, and the acceptor's first record carries its own complete snapshot",
+      "refs": [
+        "RESUME.md#5",
+        "RESUME.md#6",
+        "MULTIPATH.md#5.2",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 17
+    },
+    {
+      "id": "resume.rejoin.up_only_ping_answered_complete",
+      "file": "fixtures/traces/resume/rejoin/up_only_ping_answered_complete.ndjson",
+      "title": "A PIPE_PING in the first record of a rejoined uplink is answered with a complete snapshot, on whichever outbound pipe the acceptor has",
+      "refs": [
+        "MULTIPATH.md#6.3",
+        "RESUME.md#5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 13
+    },
+    {
+      "id": "resume.fail_closed.peer_ahead",
+      "file": "fixtures/traces/resume/fail_closed/peer_ahead.ndjson",
+      "title": "With resume in use, a PIPE_ACK position beyond what was sent fails closed",
+      "refs": [
+        "RESUME.md#7",
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 15
+    },
+    {
+      "id": "resume.fail_closed.unknown_pipe",
+      "file": "fixtures/traces/resume/fail_closed/unknown_pipe.ndjson",
+      "title": "With resume in use, a PIPE_ACK position on a pipe the receiver never sent on fails closed",
+      "refs": [
+        "RESUME.md#7",
+        "MULTIPATH.md#6.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 15
+    },
+    {
+      "id": "resume.grace.expiry",
+      "file": "fixtures/traces/resume/grace/expiry.ndjson",
+      "title": "The grace period is the smaller of the two values; the idle timer is stopped while suspended; expiry closes locally",
+      "refs": [
+        "RESUME.md#3",
+        "RESUME.md#4.1",
+        "RESUME.md#8"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 18
+    },
+    {
+      "id": "resume.credit.unretired_cap",
+      "file": "fixtures/traces/resume/credit/unretired_cap.ndjson",
+      "title": "A peer that joins and drops attachments without ever answering PIPE_ABANDON is held to max_pipes + 8 unretired attachments, the bootstrap pair included: further joins are refused with ZMUX_PIPE_RESOURCE_LIMIT, and unilateral retirement frees the state",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#8.4",
+        "RESUME.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 79
+    },
+    {
+      "id": "resume.rejoin.cut_off_rejoins_still_resume",
+      "file": "fixtures/traces/resume/rejoin/cut_off_rejoins_still_resume.ndjson",
+      "title": "While suspended at the cap of unretired attachments, a rejoin is not refused: the oldest failed attachment is retired locally, so nine rejoins that are cut off right after they connect do not stop the tenth from resuming the session",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "RESUME.md#4.3",
+        "RESUME.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 93
+    },
+    {
+      "id": "resume.rejoin.live_one_way_attachment_displaced",
+      "file": "fixtures/traces/resume/rejoin/live_one_way_attachment_displaced.ndjson",
+      "title": "While suspended at the cap of unretired attachments with none failed, a rejoin that provides the missing direction displaces the live one-way attachment with the oldest last progress instead of being refused",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "RESUME.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 32
+    },
+    {
+      "id": "resume.rejoin.silent_downlink_replaced",
+      "file": "fixtures/traces/resume/rejoin/silent_downlink_replaced.ndjson",
+      "title": "A downlink that stays open but silent is failed by the inbound silence rule, also while suspended; a new downlink then confirms the rejoined uplink and the session leaves suspension",
+      "refs": [
+        "MULTIPATH.md#7.3",
+        "RESUME.md#4.3",
+        "RESUME.md#4.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 29
+    },
+    {
+      "id": "resume.suspend.dead_timeout_respected",
+      "file": "fixtures/traces/resume/suspend/dead_timeout_respected.ndjson",
+      "title": "With resume and DeadTimeout = 60 s, a single pipe pair survives a 25 s outage: neither T_fail nor the inbound silence limit (17.25 s for other pipes) cuts it; the outage stays below the 30 s idle timeout, which fires at 30 s (SPEC.md 1.3)",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "MULTIPATH.md#7.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 17
+    },
+    {
+      "id": "resume.suspend.last_pipe_fails_on_t_fail",
+      "file": "fixtures/traces/resume/suspend/last_pipe_fails_on_t_fail.ndjson",
+      "title": "With resume in use the last usable pipe fails on T_fail like any other, and the session suspends",
+      "refs": [
+        "MULTIPATH.md#7.1",
+        "RESUME.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 14
+    },
+    {
+      "id": "resume.suspend.draining_survives_suspension",
+      "file": "fixtures/traces/resume/suspend/draining_survives_suspension.ndjson",
+      "title": "A session that was DRAINING returns to DRAINING after resumption",
+      "refs": [
+        "RESUME.md#4.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 12
+    },
+    {
+      "id": "resume.rejoin.old_pipe_id_replay_rejected",
+      "file": "fixtures/traces/resume/rejoin/old_pipe_id_replay_rejected.ndjson",
+      "title": "Pipe IDs used before the suspension are never accepted again",
+      "refs": [
+        "RESUME.md#10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 13
+    },
+    {
+      "id": "resume.suspend.half_suspended_keeps_reading",
+      "file": "fixtures/traces/resume/suspend/half_suspended_keeps_reading.ndjson",
+      "title": "An endpoint that lost its outbound pipes but kept an inbound one suspends and keeps delivering what arrives",
+      "refs": [
+        "RESUME.md#4.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 14
+    },
+    {
+      "id": "resume.suspend.half_suspended_keeps_sending",
+      "file": "fixtures/traces/resume/suspend/half_suspended_keeps_sending.ndjson",
+      "title": "An endpoint that lost its inbound pipes but kept an outbound one suspends, reports the final positions at once, keeps sending, and does not fail the pipe for lack of acknowledgements",
+      "refs": [
+        "RESUME.md#4.2",
+        "MULTIPATH.md#6.3",
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 15
+    },
+    {
+      "id": "resume.suspend.application_close",
+      "file": "fixtures/traces/resume/suspend/application_close.ndjson",
+      "title": "An application close while suspended without pipes ends the session locally",
+      "refs": [
+        "RESUME.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 14
+    },
+    {
+      "id": "findings.stop_race_is_stream_error",
+      "file": "fixtures/traces/findings/stop_race_is_stream_error.ndjson",
+      "title": "STOP_SENDING racing a local finish is a stream error, never a session error",
+      "refs": [
+        "SPEC.md#9.3"
+      ],
+      "findings": [
+        "Go-2",
+        "Go-5"
+      ],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "findings.reset_does_not_refund_session_credit",
+      "file": "fixtures/traces/findings/reset_does_not_refund_session_credit.ndjson",
+      "title": "Bytes of a reset stream stay counted against the peer's session limit",
+      "refs": [
+        "SPEC.md#8.2"
+      ],
+      "findings": [
+        "Go-4"
+      ],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
+      "id": "findings.peer_reset_code_zero",
+      "file": "fixtures/traces/findings/peer_reset_code_zero.ndjson",
+      "title": "A peer reset with code 0 is a stream reset, not a session close",
+      "refs": [
+        "STATE_MACHINE.md#2.5"
+      ],
+      "findings": [
+        "Go-5"
+      ],
+      "profile": "zmux-small",
+      "steps": 9
+    }
+  ]
+}

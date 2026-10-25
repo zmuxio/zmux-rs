@@ -1,0 +1,23 @@
+{"kind": "trace", "id": "multipath.lanes.lane_end_fails_pipe", "title": "An end of a confirmed lane inside a record, without a graceful removal, fails the whole pipe: the incomplete record is discarded and the attachment is abandoned", "profile": "zmux-mp", "local_role": "responder", "overrides": {}, "refs": ["MULTIPATH.md#2.5", "MULTIPATH.md#7.3", "STATE_MACHINE.md#3.3"], "findings": [], "groups": ["multipath", "lanes"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap", "conn": "q"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "zmux_multipath": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}, "zmux_ack_threshold": 4096}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "00112233445566778899aabbccddeeff", "locator": "50454552"}}, {"id": 58, "raw": "abcd"}]}]], "hex": "4065ff5153300d0a0d0a405b010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb0dc2978160400112233445566778899aabbccddeeff04504545523a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath"]}}
+{"step": 5, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c2", "conn": "q"}
+{"step": 6, "op": "peer_send", "carrier": "c2", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 2, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "3094f01ceb752456ab1b330c8e5c2b6b"}]], "hex": "1e9a24de36054c4f43414c020200003094f01ceb752456ab1b330c8e5c2b6b"}
+{"step": 7, "op": "advance", "ms": 25}
+{"step": 8, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "PIPE_PING"}]}
+{"step": 9, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 10, "op": "pipe_up", "carrier": "l1", "dir": "in", "via": "lane", "conn": "q"}
+{"step": 11, "op": "peer_send", "carrier": "l1", "records": [[{"type": "PIPE_LANE", "lane_key": "7a6d75782d6c616e652d6b65792d4c4c", "pipe": 2, "lane": 1}]], "hex": "16ba05a1c97a6d75782d6c616e652d6b65792d4c4c0201"}
+{"step": 12, "op": "advance", "ms": 25}
+{"step": 13, "op": "expect_frames", "pipe": "*", "match": "unordered", "frames": [{"type": "PIPE_ACK"}]}
+{"step": 14, "op": "peer_send", "carrier": "l1", "records": [[{"type": "STREAM", "id": 0, "off": 0, "data": "006162", "fin": false}]], "hex": "060a0003006162"}
+{"step": 15, "op": "peer_send", "carrier": "l1", "hex": "060f00030263"}
+{"step": 16, "op": "pipe_down", "carrier": "l1", "dir": "in", "how": "eof"}
+{"step": 17, "op": "expect_frames", "pipe": "*", "match": "unordered", "frames": [{"type": "PIPE_ABANDON", "pipe": 2, "code": 694836213}]}
+{"step": 18, "op": "expect_state", "pipe": 2, "dir": "out", "state": {"oneof": ["FAILED", "RETIRED"]}}
+{"step": 19, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 0}}
+{"step": 20, "op": "api", "call": "read", "args": {"stream": "s", "max": 10}, "expect": {"data": "6162", "fin": false}}
+{"step": 21, "op": "api", "call": "read", "args": {"stream": "s", "max": 10}, "expect": {"pending": true}}
+{"step": 22, "op": "expect_open"}

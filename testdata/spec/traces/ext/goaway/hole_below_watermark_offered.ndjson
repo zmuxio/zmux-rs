@@ -1,0 +1,16 @@
+{"kind": "trace", "id": "ext.goaway.hole_below_watermark_offered", "title": "A stream below the final watermark whose preamble arrives after a higher stream was offered is offered, not rejected", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["EXTENSIONS.md#3.3", "SPEC.md#7.2"], "findings": [], "groups": ["ext", "goaway"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": 58, "raw": "abcd"}]}]], "hex": "404aff5153300d0a0d0a4040010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffff3a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {}}
+{"step": 5, "op": "note", "text": "Stream 4 opens stream 0 implicitly; stream 0's preamble arrives only after the final GOAWAY, as it can across pipes or lanes."}
+{"step": 6, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 4, "off": 0, "data": "0062", "fin": false}]], "hex": "050a04020062"}
+{"step": 7, "op": "api", "call": "accept_bidi", "args": {}, "expect": {"stream": 4}}
+{"step": 8, "op": "api", "call": "shutdown", "args": {"code": 0}, "expect": {"ok": true}}
+{"step": 9, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "GOAWAY", "max_bidi": 4, "max_uni": 4, "code": 0}, {"type": "QX_PING", "response": false, "seq": 0}]}
+{"step": 10, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": true, "seq": 0}]], "hex": "09f48c67529ef8c7be00"}
+{"step": 11, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "GOAWAY", "max_bidi": 2, "max_uni": 0, "code": 0}]}
+{"step": 12, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 0, "off": 0, "data": "0061", "fin": false}]], "hex": "050a00020061"}
+{"step": 13, "op": "api", "call": "accept_bidi", "args": {}, "expect": {"stream": 0}}
+{"step": 14, "op": "expect_no_frames", "pipe": 0, "types": ["RESET_STREAM", "STOP_SENDING"]}
+{"step": 15, "op": "expect_open"}

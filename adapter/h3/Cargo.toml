@@ -1,0 +1,39 @@
+[package]
+name = "zmux-h3"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "HTTP/3 request streams as zmux carriers over h3 and quinn: pipes on requests, client lanes on further requests"
+repository = "https://github.com/zmuxio/zmux-rs"
+readme = "README.md"
+keywords = ["zmux", "http3", "quic", "multipath"]
+categories = ["network-programming"]
+
+[features]
+# `client_config` and `server_config` from rustls configurations, with
+# quinn's ring provider (quinn's default) or its aws-lc-rs one. Without
+# either, no crypto provider is chosen here.
+default = ["rustls-ring"]
+rustls-ring = ["quinn/rustls-ring"]
+rustls-aws-lc-rs = ["quinn/rustls-aws-lc-rs"]
+
+[dependencies]
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio"] }
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync"] }
+zmux = { version = "1.2.0", path = "../.." }
+
+[dev-dependencies]
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.47", features = ["full"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unreachable_pub = "warn"

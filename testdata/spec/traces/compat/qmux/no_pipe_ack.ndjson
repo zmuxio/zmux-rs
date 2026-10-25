@@ -1,0 +1,9 @@
+{"kind": "trace", "id": "compat.qmux.no_pipe_ack", "title": "A plain QMux peer ignores zmux_pipe_ack and never receives a PIPE_ACK", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["MULTIPATH.md#3.5", "SPEC.md#13.2"], "findings": [], "groups": ["compat", "qmux"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}]}]], "hex": "1fff5153300d0a0d0a1604026000050248000602480007024800080104090104"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": []}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 0, "off": 0, "data": "68656c6c6f", "fin": false, "has_off": true, "has_len": true}]], "hex": "090e00000568656c6c6f"}
+{"step": 6, "op": "advance", "ms": 100}
+{"step": 7, "op": "expect_no_frames", "pipe": "*", "types": ["PIPE_ACK"]}
+{"step": 8, "op": "expect_open"}

@@ -1,0 +1,18 @@
+{"kind": "trace", "id": "ext.goaway.no_credit_after_goaway", "title": "After its first GOAWAY an endpoint raises no MAX_STREAMS", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["EXTENSIONS.md#3.3", "SPEC.md#8.5"], "findings": [], "groups": ["ext", "goaway"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": 58, "raw": "abcd"}]}]], "hex": "404aff5153300d0a0d0a4040010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffff3a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 0, "off": 0, "data": "0071", "fin": true}, {"type": "STREAM", "id": 4, "off": 0, "data": "0071", "fin": true}]], "hex": "0a0b000200710b04020071"}
+{"step": 6, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s0", "expect": {"stream": 0}}
+{"step": 7, "op": "api", "call": "read", "args": {"stream": "s0", "max": 10}, "expect": {"data": "71", "fin": true}}
+{"step": 8, "op": "api", "call": "finish", "args": {"stream": "s0"}, "expect": {"ok": true}}
+{"step": 9, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s4", "expect": {"stream": 4}}
+{"step": 10, "op": "api", "call": "read", "args": {"stream": "s4", "max": 10}, "expect": {"data": "71", "fin": true}}
+{"step": 11, "op": "api", "call": "finish", "args": {"stream": "s4"}, "expect": {"ok": true}}
+{"step": 12, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "STREAM", "id": 0, "off": 0, "data": "", "fin": true}, {"type": "STREAM", "id": 4, "off": 0, "data": "", "fin": true}]}
+{"step": 13, "op": "api", "call": "shutdown", "args": {"code": 0}, "expect": {"ok": true}}
+{"step": 14, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "GOAWAY", "max_bidi": 4, "max_uni": 4, "code": 0}, {"type": "QX_PING", "response": false, "seq": 0}]}
+{"step": 15, "op": "api", "call": "release", "args": {"stream": "s0"}, "expect": {"ok": true}}
+{"step": 16, "op": "api", "call": "release", "args": {"stream": "s4"}, "expect": {"ok": true}}
+{"step": 17, "op": "expect_no_frames", "pipe": 0, "types": ["MAX_STREAMS"]}

@@ -1,0 +1,21 @@
+{"kind": "trace", "id": "core.pipe_ack.idle_counts_acknowledged_activity", "title": "With pipe acknowledgement, the PIPE_ACK of a keep-alive's record restarts the idle and keep-alive timers, and a received record without application activity does not", "profile": "zmux-small", "local_role": "responder", "overrides": {"config": {"keep_alive_period": 5000}}, "refs": ["SPEC.md#6.4", "MULTIPATH.md#3.5"], "findings": [], "groups": ["core", "pipe_ack"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 10000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_pipe_ack", "value": null}, {"id": 58, "raw": "abcd"}]}]], "hex": "404dff5153300d0a0d0a404301026710040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb4b47621003a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "pipe_ack"]}}
+{"step": 5, "op": "advance", "ms": 5000}
+{"step": 6, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "QX_PING", "response": false, "seq": 0}]}
+{"step": 7, "op": "note", "text": "The peer acknowledges the record that carried the request instead of answering it: the timers restart at 5000 ms."}
+{"step": 8, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 9, "op": "advance", "ms": 4999}
+{"step": 10, "op": "expect_no_frames", "pipe": 0, "types": ["QX_PING"]}
+{"step": 11, "op": "expect_open"}
+{"step": 12, "op": "advance", "ms": 1}
+{"step": 13, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "QX_PING", "response": false, "seq": 1}]}
+{"step": 14, "op": "note", "text": "A record that carries only a credit update restarts nothing; without acknowledgement any received record would."}
+{"step": 15, "op": "peer_send", "pipe": 0, "records": [[{"type": "MAX_DATA", "max": 16384}]], "hex": "051080004000"}
+{"step": 16, "op": "advance", "ms": 4999}
+{"step": 17, "op": "expect_open"}
+{"step": 18, "op": "advance", "ms": 1}
+{"step": 19, "op": "expect_close", "error": {"space": "local", "code": "IDLE_TIMEOUT"}}
+{"step": 20, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": false, "code": 657904988, "reason": "", "frame_type": 0}]}

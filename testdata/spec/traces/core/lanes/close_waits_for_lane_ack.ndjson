@@ -1,0 +1,25 @@
+{"kind": "trace", "id": "core.lanes.close_waits_for_lane_ack", "title": "Without multipath, an application close goes on lane 0 only once a PIPE_ACK covers every record written on the other lanes", "profile": "zmux-small", "local_role": "responder", "overrides": {"test": {"rtt_ms": 50}}, "refs": ["SPEC.md#6.5", "MULTIPATH.md#5.8"], "findings": [], "groups": ["core", "lanes"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap", "conn": "q"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_pipe_ack", "value": null}, {"id": "zmux_max_lanes", "value": {"max_lanes": 2, "lane_key": "7a6d75782d6c616e652d6b65792d5050"}}, {"id": 58, "raw": "abcd"}]}]], "hex": "4065ff5153300d0a0d0a405b010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb4b4762100a7856ef011027a6d75782d6c616e652d6b65792d50503a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "pipe_ack"]}}
+{"step": 5, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
+{"step": 6, "op": "api", "call": "write", "args": {"stream": "a", "data": "6669727374", "fin": false}, "expect": {"accepted": 5}}
+{"step": 7, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "0221006669727374"}]}
+{"step": 8, "op": "expect_no_frames", "pipe": "*", "types": ["PIPE_LANE"]}
+{"step": 9, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 10, "op": "api", "call": "write", "args": {"stream": "a", "data": "7365636f6e64", "fin": false}, "expect": {"accepted": 6}}
+{"step": 11, "op": "expect_frames", "pipe": 0, "lane": 1, "match": "first", "frames": [{"type": "PIPE_LANE", "lane_key": "7a6d75782d6c616e652d6b65792d5050", "pipe": 0, "lane": 1}]}
+{"step": 12, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "7365636f6e64", "off": 8}]}
+{"step": 13, "op": "expect_no_frames", "pipe": 0, "lane": 1}
+{"step": 14, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 0, "lane": 1, "position": {"$sent": 0, "lane": 1}, "delay": 0}]}]]}
+{"step": 15, "op": "api", "call": "write", "args": {"stream": "a", "data": "7468697264", "fin": false}, "expect": {"accepted": 5}}
+{"step": 16, "op": "expect_frames", "pipe": 0, "lane": 1, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "7468697264", "off": 14}]}
+{"step": 17, "op": "expect_no_frames", "pipe": 0, "types": ["STREAM"]}
+{"step": 18, "op": "api", "call": "close", "args": {"code": 0, "reason": "", "app": true}, "expect": {"ok": true}}
+{"step": 19, "op": "expect_no_frames", "pipe": "*", "types": ["CONNECTION_CLOSE"]}
+{"step": 20, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 0, "lane": 1, "position": {"$sent": 0, "lane": 1}, "delay": 0}]}]]}
+{"step": 21, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": true, "code": 0, "reason": ""}]}
+{"step": 22, "op": "expect_no_frames", "pipe": 0, "lane": 1, "types": ["CONNECTION_CLOSE"]}
+{"step": 23, "op": "expect_pipe_closed", "pipe": 0, "dir": "out", "how": "graceful"}
+{"step": 24, "op": "expect_close", "error": {"space": "application", "code": 0, "remote": false}, "wire": true}

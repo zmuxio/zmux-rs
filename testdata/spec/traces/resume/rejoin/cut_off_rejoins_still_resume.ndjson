@@ -1,0 +1,94 @@
+{"kind": "trace", "id": "resume.rejoin.cut_off_rejoins_still_resume", "title": "While suspended at the cap of unretired attachments, a rejoin is not refused: the oldest failed attachment is retired locally, so nine rejoins that are cut off right after they connect do not stop the tenth from resuming the session", "profile": "zmux-mp-resume", "local_role": "responder", "overrides": {"config": {"max_pipes": 1}}, "refs": ["MULTIPATH.md#5.4", "RESUME.md#4.3", "RESUME.md#4.4"], "findings": [], "groups": ["resume", "rejoin"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "zmux_multipath": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}, "zmux_ack_threshold": 4096, "zmux_resume": 30000}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "00112233445566778899aabbccddeeff", "locator": "50454552"}}, {"id": "zmux_resume", "value": 60000}, {"id": 58, "raw": "abcd"}]}]], "hex": "406eff5153300d0a0d0a4064010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb0dc2978160400112233445566778899aabbccddeeff04504545528d5778ce048000ea603a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath", "resume"]}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 6, "op": "pipe_down", "pipe": 0, "dir": "bidi", "how": "error"}
+{"step": 7, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 8, "op": "note", "text": "max_pipes = 1: the cap is 9 unretired attachments of the peer, and the failed bootstrap pair is the first. Each rejoin briefly gives the acceptor a pipe, so it leaves SUSPENDED, writes its first record (its complete PIPE_ACK snapshot, a PIPE_PING and its pending PIPE_ABANDON frames) and suspends again when the carrier is cut. No PIPE_ABANDON is ever acknowledged."}
+{"step": 9, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c2"}
+{"step": 10, "op": "peer_send", "carrier": "c2", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 2, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "3094f01ceb752456ab1b330c8e5c2b6b"}]], "hex": "1e9a24de36054c4f43414c020200003094f01ceb752456ab1b330c8e5c2b6b"}
+{"step": 11, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 12, "op": "advance", "ms": 25}
+{"step": 13, "op": "expect_frames", "pipe": 2, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 14, "op": "pipe_down", "pipe": 2, "dir": "bidi", "how": "error"}
+{"step": 15, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 16, "op": "advance", "ms": 125}
+{"step": 17, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c4"}
+{"step": 18, "op": "peer_send", "carrier": "c4", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 4, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "24ce90fe6a4f305bbd15d3ac2497dd97"}]], "hex": "1e9a24de36054c4f43414c0402000024ce90fe6a4f305bbd15d3ac2497dd97"}
+{"step": 19, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 20, "op": "advance", "ms": 25}
+{"step": 21, "op": "expect_frames", "pipe": 4, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 22, "op": "pipe_down", "pipe": 4, "dir": "bidi", "how": "error"}
+{"step": 23, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 24, "op": "advance", "ms": 125}
+{"step": 25, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c6"}
+{"step": 26, "op": "peer_send", "carrier": "c6", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 6, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "62b9b2187c6d5847e999b222ef1e497f"}]], "hex": "1e9a24de36054c4f43414c0602000062b9b2187c6d5847e999b222ef1e497f"}
+{"step": 27, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 28, "op": "advance", "ms": 25}
+{"step": 29, "op": "expect_frames", "pipe": 6, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 30, "op": "pipe_down", "pipe": 6, "dir": "bidi", "how": "error"}
+{"step": 31, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 32, "op": "advance", "ms": 125}
+{"step": 33, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c8"}
+{"step": 34, "op": "peer_send", "carrier": "c8", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 8, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "fca5cc71052aa5fdedc371ea39de7014"}]], "hex": "1e9a24de36054c4f43414c08020000fca5cc71052aa5fdedc371ea39de7014"}
+{"step": 35, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 36, "op": "advance", "ms": 25}
+{"step": 37, "op": "expect_frames", "pipe": 8, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 38, "op": "pipe_down", "pipe": 8, "dir": "bidi", "how": "error"}
+{"step": 39, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 40, "op": "advance", "ms": 125}
+{"step": 41, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c10"}
+{"step": 42, "op": "peer_send", "carrier": "c10", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 10, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "12db7fb76db105ef105fb269c3d9d1b2"}]], "hex": "1e9a24de36054c4f43414c0a02000012db7fb76db105ef105fb269c3d9d1b2"}
+{"step": 43, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 44, "op": "advance", "ms": 25}
+{"step": 45, "op": "expect_frames", "pipe": 10, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 46, "op": "pipe_down", "pipe": 10, "dir": "bidi", "how": "error"}
+{"step": 47, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 48, "op": "advance", "ms": 125}
+{"step": 49, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c12"}
+{"step": 50, "op": "peer_send", "carrier": "c12", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 12, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "6d6316a4c128c3ca76a4116a709c80aa"}]], "hex": "1e9a24de36054c4f43414c0c0200006d6316a4c128c3ca76a4116a709c80aa"}
+{"step": 51, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 52, "op": "advance", "ms": 25}
+{"step": 53, "op": "expect_frames", "pipe": 12, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 54, "op": "pipe_down", "pipe": 12, "dir": "bidi", "how": "error"}
+{"step": 55, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 56, "op": "advance", "ms": 125}
+{"step": 57, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c14"}
+{"step": 58, "op": "peer_send", "carrier": "c14", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 14, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "aaa53dfba6ef18ce2d66eb48c48482f4"}]], "hex": "1e9a24de36054c4f43414c0e020000aaa53dfba6ef18ce2d66eb48c48482f4"}
+{"step": 59, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 60, "op": "advance", "ms": 25}
+{"step": 61, "op": "expect_frames", "pipe": 14, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 62, "op": "pipe_down", "pipe": 14, "dir": "bidi", "how": "error"}
+{"step": 63, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 64, "op": "advance", "ms": 125}
+{"step": 65, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c16"}
+{"step": 66, "op": "peer_send", "carrier": "c16", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 16, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "ccfd28cb2148931a217efca9a881921e"}]], "hex": "1e9a24de36054c4f43414c10020000ccfd28cb2148931a217efca9a881921e"}
+{"step": 67, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 68, "op": "advance", "ms": 25}
+{"step": 69, "op": "expect_frames", "pipe": 16, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 70, "op": "pipe_down", "pipe": 16, "dir": "bidi", "how": "error"}
+{"step": 71, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 72, "op": "advance", "ms": 125}
+{"step": 73, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c18"}
+{"step": 74, "op": "peer_send", "carrier": "c18", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 18, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "f1eaf9abe7987eee541082b60804a8e7"}]], "hex": "1e9a24de36054c4f43414c12020000f1eaf9abe7987eee541082b60804a8e7"}
+{"step": 75, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 76, "op": "advance", "ms": 25}
+{"step": 77, "op": "note", "text": "Rejoin 9 arrives at the cap: the oldest failed attachment (the bootstrap pair) is retired locally and the join is accepted."}
+{"step": 78, "op": "expect_frames", "pipe": 18, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 79, "op": "pipe_down", "pipe": 18, "dir": "bidi", "how": "error"}
+{"step": 80, "op": "expect_event", "event": "suspended", "fields": {}}
+{"step": 81, "op": "advance", "ms": 125}
+{"step": 82, "op": "note", "text": "Rejoins come 150 ms apart, so the first record of each can carry its PIPE_PING within the limit of 8 per second (MULTIPATH.md 6.4). The tenth rejoin stays up: it retires pipe 2 locally, and the peer acknowledges."}
+{"step": 83, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c20"}
+{"step": 84, "op": "peer_send", "carrier": "c20", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 20, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "1139441b8075594b5298845a11ff2b16"}]], "hex": "1e9a24de36054c4f43414c140200001139441b8075594b5298845a11ff2b16"}
+{"step": 85, "op": "expect_event", "event": "resumed", "fields": {}}
+{"step": 86, "op": "advance", "ms": 25}
+{"step": 87, "op": "expect_frames", "pipe": 20, "match": "unordered", "frames": [{"type": "PIPE_ACK"}, {"type": "PIPE_PING"}, {"type": "PIPE_ABANDON", "code": 189767955, "count": 0}]}
+{"step": 88, "op": "peer_send", "pipe": 20, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 20, "lane": 0, "position": {"$sent": 20}, "delay": 0}]}]]}
+{"step": 89, "op": "advance", "ms": 1000}
+{"step": 90, "op": "peer_send", "pipe": 20, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 20, "lane": 0, "position": {"$sent": 20}, "delay": 0}]}]]}
+{"step": 91, "op": "expect_state", "session": "ACTIVE"}
+{"step": 92, "op": "expect_state", "pipe": 20, "dir": "out", "state": "ACTIVE"}
+{"step": 93, "op": "expect_open"}

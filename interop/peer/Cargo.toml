@@ -1,0 +1,16 @@
+[package]
+name = "zmux-interop-peer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A scripted zmux peer for cross-implementation interoperability tests over TCP"
+
+# Standalone: not a member of the zmux workspace.
+#   cargo build --release --manifest-path interop/peer/Cargo.toml
+[workspace]
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1.47", features = ["full"] }
+zmux = { path = "../.." }

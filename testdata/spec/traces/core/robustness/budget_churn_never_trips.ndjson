@@ -1,0 +1,710 @@
+{"kind": "trace", "id": "core.robustness.budget_churn_never_trips", "title": "Stream churn with crossing STOP_SENDING never drains the budget (X1): frames for terminal or discarded streams are not chargeable", "profile": "zmux-small", "local_role": "responder", "overrides": {}, "refs": ["SPEC.md#9.4"], "findings": ["X1"], "groups": ["core", "robustness"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": 58, "raw": "abcd"}]}]], "hex": "404aff5153300d0a0d0a4040010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffff3a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 0, "off": 0, "data": "00726571756573742d303030", "fin": true}]], "hex": "0f0b000c00726571756573742d303030"}
+{"step": 6, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 0}}
+{"step": 7, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303030", "fin": true}}
+{"step": 8, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 9, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 0, "data": "6f6b", "fin": true}]}
+{"step": 10, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 11, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 0, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 0, "max": 9000}]], "hex": "0e0500c00000005a4d000111006328"}
+{"step": 12, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 4, "off": 0, "data": "00726571756573742d303031", "fin": true}]], "hex": "0f0b040c00726571756573742d303031"}
+{"step": 13, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 4}}
+{"step": 14, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303031", "fin": true}}
+{"step": 15, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 16, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 4, "data": "6f6b", "fin": true}]}
+{"step": 17, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 18, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 4, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 4, "max": 9000}]], "hex": "0e0504c00000005a4d000111046328"}
+{"step": 19, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 8, "off": 0, "data": "00726571756573742d303032", "fin": true}]], "hex": "0f0b080c00726571756573742d303032"}
+{"step": 20, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 8}}
+{"step": 21, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303032", "fin": true}}
+{"step": 22, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 23, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 8, "data": "6f6b", "fin": true}]}
+{"step": 24, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 25, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 8, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 8, "max": 9000}]], "hex": "0e0508c00000005a4d000111086328"}
+{"step": 26, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 12, "off": 0, "data": "00726571756573742d303033", "fin": true}]], "hex": "0f0b0c0c00726571756573742d303033"}
+{"step": 27, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 12}}
+{"step": 28, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303033", "fin": true}}
+{"step": 29, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 30, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 12, "data": "6f6b", "fin": true}]}
+{"step": 31, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 32, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 12, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 12, "max": 9000}]], "hex": "0e050cc00000005a4d0001110c6328"}
+{"step": 33, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 16, "off": 0, "data": "00726571756573742d303034", "fin": true}]], "hex": "0f0b100c00726571756573742d303034"}
+{"step": 34, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 16}}
+{"step": 35, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303034", "fin": true}}
+{"step": 36, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 37, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 16, "data": "6f6b", "fin": true}]}
+{"step": 38, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 39, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 16, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 16, "max": 9000}]], "hex": "0e0510c00000005a4d000111106328"}
+{"step": 40, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 20, "off": 0, "data": "00726571756573742d303035", "fin": true}]], "hex": "0f0b140c00726571756573742d303035"}
+{"step": 41, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 20}}
+{"step": 42, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303035", "fin": true}}
+{"step": 43, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 44, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 20, "data": "6f6b", "fin": true}]}
+{"step": 45, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 46, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 20, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 20, "max": 9000}]], "hex": "0e0514c00000005a4d000111146328"}
+{"step": 47, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 24, "off": 0, "data": "00726571756573742d303036", "fin": true}]], "hex": "0f0b180c00726571756573742d303036"}
+{"step": 48, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 24}}
+{"step": 49, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303036", "fin": true}}
+{"step": 50, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 51, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 24, "data": "6f6b", "fin": true}]}
+{"step": 52, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 53, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 24, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 24, "max": 9000}]], "hex": "0e0518c00000005a4d000111186328"}
+{"step": 54, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 28, "off": 0, "data": "00726571756573742d303037", "fin": true}]], "hex": "0f0b1c0c00726571756573742d303037"}
+{"step": 55, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 28}}
+{"step": 56, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303037", "fin": true}}
+{"step": 57, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 58, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 28, "data": "6f6b", "fin": true}]}
+{"step": 59, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 60, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 28, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 28, "max": 9000}]], "hex": "0e051cc00000005a4d0001111c6328"}
+{"step": 61, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 32, "off": 0, "data": "00726571756573742d303038", "fin": true}]], "hex": "0f0b200c00726571756573742d303038"}
+{"step": 62, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 32}}
+{"step": 63, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303038", "fin": true}}
+{"step": 64, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 65, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 32, "data": "6f6b", "fin": true}]}
+{"step": 66, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 67, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 32, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 32, "max": 9000}]], "hex": "0e0520c00000005a4d000111206328"}
+{"step": 68, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 36, "off": 0, "data": "00726571756573742d303039", "fin": true}]], "hex": "0f0b240c00726571756573742d303039"}
+{"step": 69, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 36}}
+{"step": 70, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303039", "fin": true}}
+{"step": 71, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 72, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 36, "data": "6f6b", "fin": true}]}
+{"step": 73, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 74, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 36, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 36, "max": 9000}]], "hex": "0e0524c00000005a4d000111246328"}
+{"step": 75, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 40, "off": 0, "data": "00726571756573742d303130", "fin": true}]], "hex": "0f0b280c00726571756573742d303130"}
+{"step": 76, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 40}}
+{"step": 77, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303130", "fin": true}}
+{"step": 78, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 79, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 40, "data": "6f6b", "fin": true}]}
+{"step": 80, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 81, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 40, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 40, "max": 9000}]], "hex": "0e0528c00000005a4d000111286328"}
+{"step": 82, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 44, "off": 0, "data": "00726571756573742d303131", "fin": true}]], "hex": "0f0b2c0c00726571756573742d303131"}
+{"step": 83, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 44}}
+{"step": 84, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303131", "fin": true}}
+{"step": 85, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 86, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 44, "data": "6f6b", "fin": true}]}
+{"step": 87, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 88, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 44, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 44, "max": 9000}]], "hex": "0e052cc00000005a4d0001112c6328"}
+{"step": 89, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 48, "off": 0, "data": "00726571756573742d303132", "fin": true}]], "hex": "0f0b300c00726571756573742d303132"}
+{"step": 90, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 48}}
+{"step": 91, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303132", "fin": true}}
+{"step": 92, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 93, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 48, "data": "6f6b", "fin": true}]}
+{"step": 94, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 95, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 48, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 48, "max": 9000}]], "hex": "0e0530c00000005a4d000111306328"}
+{"step": 96, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 52, "off": 0, "data": "00726571756573742d303133", "fin": true}]], "hex": "0f0b340c00726571756573742d303133"}
+{"step": 97, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 52}}
+{"step": 98, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303133", "fin": true}}
+{"step": 99, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 100, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 52, "data": "6f6b", "fin": true}]}
+{"step": 101, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 102, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 52, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 52, "max": 9000}]], "hex": "0e0534c00000005a4d000111346328"}
+{"step": 103, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 56, "off": 0, "data": "00726571756573742d303134", "fin": true}]], "hex": "0f0b380c00726571756573742d303134"}
+{"step": 104, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 56}}
+{"step": 105, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303134", "fin": true}}
+{"step": 106, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 107, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 56, "data": "6f6b", "fin": true}]}
+{"step": 108, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 109, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 56, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 56, "max": 9000}]], "hex": "0e0538c00000005a4d000111386328"}
+{"step": 110, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 60, "off": 0, "data": "00726571756573742d303135", "fin": true}]], "hex": "0f0b3c0c00726571756573742d303135"}
+{"step": 111, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 60}}
+{"step": 112, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303135", "fin": true}}
+{"step": 113, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 114, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 60, "data": "6f6b", "fin": true}]}
+{"step": 115, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 116, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 60, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 60, "max": 9000}]], "hex": "0e053cc00000005a4d0001113c6328"}
+{"step": 117, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 64, "off": 0, "data": "00726571756573742d303136", "fin": true}]], "hex": "100b40400c00726571756573742d303136"}
+{"step": 118, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 64}}
+{"step": 119, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303136", "fin": true}}
+{"step": 120, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 121, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 64, "data": "6f6b", "fin": true}]}
+{"step": 122, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 123, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 64, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 64, "max": 9000}]], "hex": "10054040c00000005a4d00011140406328"}
+{"step": 124, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 68, "off": 0, "data": "00726571756573742d303137", "fin": true}]], "hex": "100b40440c00726571756573742d303137"}
+{"step": 125, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 68}}
+{"step": 126, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303137", "fin": true}}
+{"step": 127, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 128, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 68, "data": "6f6b", "fin": true}]}
+{"step": 129, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 130, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 68, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 68, "max": 9000}]], "hex": "10054044c00000005a4d00011140446328"}
+{"step": 131, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 72, "off": 0, "data": "00726571756573742d303138", "fin": true}]], "hex": "100b40480c00726571756573742d303138"}
+{"step": 132, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 72}}
+{"step": 133, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303138", "fin": true}}
+{"step": 134, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 135, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 72, "data": "6f6b", "fin": true}]}
+{"step": 136, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 137, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 72, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 72, "max": 9000}]], "hex": "10054048c00000005a4d00011140486328"}
+{"step": 138, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 76, "off": 0, "data": "00726571756573742d303139", "fin": true}]], "hex": "100b404c0c00726571756573742d303139"}
+{"step": 139, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 76}}
+{"step": 140, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303139", "fin": true}}
+{"step": 141, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 142, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 76, "data": "6f6b", "fin": true}]}
+{"step": 143, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 144, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 76, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 76, "max": 9000}]], "hex": "1005404cc00000005a4d000111404c6328"}
+{"step": 145, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 80, "off": 0, "data": "00726571756573742d303230", "fin": true}]], "hex": "100b40500c00726571756573742d303230"}
+{"step": 146, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 80}}
+{"step": 147, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303230", "fin": true}}
+{"step": 148, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 149, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 80, "data": "6f6b", "fin": true}]}
+{"step": 150, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 151, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 80, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 80, "max": 9000}]], "hex": "10054050c00000005a4d00011140506328"}
+{"step": 152, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 84, "off": 0, "data": "00726571756573742d303231", "fin": true}]], "hex": "100b40540c00726571756573742d303231"}
+{"step": 153, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 84}}
+{"step": 154, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303231", "fin": true}}
+{"step": 155, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 156, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 84, "data": "6f6b", "fin": true}]}
+{"step": 157, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 158, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 84, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 84, "max": 9000}]], "hex": "10054054c00000005a4d00011140546328"}
+{"step": 159, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 88, "off": 0, "data": "00726571756573742d303232", "fin": true}]], "hex": "100b40580c00726571756573742d303232"}
+{"step": 160, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 88}}
+{"step": 161, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303232", "fin": true}}
+{"step": 162, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 163, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 88, "data": "6f6b", "fin": true}]}
+{"step": 164, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 165, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 88, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 88, "max": 9000}]], "hex": "10054058c00000005a4d00011140586328"}
+{"step": 166, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 92, "off": 0, "data": "00726571756573742d303233", "fin": true}]], "hex": "100b405c0c00726571756573742d303233"}
+{"step": 167, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 92}}
+{"step": 168, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303233", "fin": true}}
+{"step": 169, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 170, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 92, "data": "6f6b", "fin": true}]}
+{"step": 171, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 172, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 92, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 92, "max": 9000}]], "hex": "1005405cc00000005a4d000111405c6328"}
+{"step": 173, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 96, "off": 0, "data": "00726571756573742d303234", "fin": true}]], "hex": "100b40600c00726571756573742d303234"}
+{"step": 174, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 96}}
+{"step": 175, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303234", "fin": true}}
+{"step": 176, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 177, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 96, "data": "6f6b", "fin": true}]}
+{"step": 178, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 179, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 96, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 96, "max": 9000}]], "hex": "10054060c00000005a4d00011140606328"}
+{"step": 180, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 100, "off": 0, "data": "00726571756573742d303235", "fin": true}]], "hex": "100b40640c00726571756573742d303235"}
+{"step": 181, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 100}}
+{"step": 182, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303235", "fin": true}}
+{"step": 183, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 184, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 100, "data": "6f6b", "fin": true}]}
+{"step": 185, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 186, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 100, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 100, "max": 9000}]], "hex": "10054064c00000005a4d00011140646328"}
+{"step": 187, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 104, "off": 0, "data": "00726571756573742d303236", "fin": true}]], "hex": "100b40680c00726571756573742d303236"}
+{"step": 188, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 104}}
+{"step": 189, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303236", "fin": true}}
+{"step": 190, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 191, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 104, "data": "6f6b", "fin": true}]}
+{"step": 192, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 193, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 104, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 104, "max": 9000}]], "hex": "10054068c00000005a4d00011140686328"}
+{"step": 194, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 108, "off": 0, "data": "00726571756573742d303237", "fin": true}]], "hex": "100b406c0c00726571756573742d303237"}
+{"step": 195, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 108}}
+{"step": 196, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303237", "fin": true}}
+{"step": 197, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 198, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 108, "data": "6f6b", "fin": true}]}
+{"step": 199, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 200, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 108, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 108, "max": 9000}]], "hex": "1005406cc00000005a4d000111406c6328"}
+{"step": 201, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 112, "off": 0, "data": "00726571756573742d303238", "fin": true}]], "hex": "100b40700c00726571756573742d303238"}
+{"step": 202, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 112}}
+{"step": 203, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303238", "fin": true}}
+{"step": 204, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 205, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 112, "data": "6f6b", "fin": true}]}
+{"step": 206, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 207, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 112, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 112, "max": 9000}]], "hex": "10054070c00000005a4d00011140706328"}
+{"step": 208, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 116, "off": 0, "data": "00726571756573742d303239", "fin": true}]], "hex": "100b40740c00726571756573742d303239"}
+{"step": 209, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 116}}
+{"step": 210, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303239", "fin": true}}
+{"step": 211, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 212, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 116, "data": "6f6b", "fin": true}]}
+{"step": 213, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 214, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 116, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 116, "max": 9000}]], "hex": "10054074c00000005a4d00011140746328"}
+{"step": 215, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 120, "off": 0, "data": "00726571756573742d303330", "fin": true}]], "hex": "100b40780c00726571756573742d303330"}
+{"step": 216, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 120}}
+{"step": 217, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303330", "fin": true}}
+{"step": 218, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 219, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 120, "data": "6f6b", "fin": true}]}
+{"step": 220, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 221, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 120, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 120, "max": 9000}]], "hex": "10054078c00000005a4d00011140786328"}
+{"step": 222, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 124, "off": 0, "data": "00726571756573742d303331", "fin": true}]], "hex": "100b407c0c00726571756573742d303331"}
+{"step": 223, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 124}}
+{"step": 224, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303331", "fin": true}}
+{"step": 225, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 226, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 124, "data": "6f6b", "fin": true}]}
+{"step": 227, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 228, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 124, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 124, "max": 9000}]], "hex": "1005407cc00000005a4d000111407c6328"}
+{"step": 229, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 128, "off": 0, "data": "00726571756573742d303332", "fin": true}]], "hex": "100b40800c00726571756573742d303332"}
+{"step": 230, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 128}}
+{"step": 231, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303332", "fin": true}}
+{"step": 232, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 233, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 128, "data": "6f6b", "fin": true}]}
+{"step": 234, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 235, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 128, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 128, "max": 9000}]], "hex": "10054080c00000005a4d00011140806328"}
+{"step": 236, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 132, "off": 0, "data": "00726571756573742d303333", "fin": true}]], "hex": "100b40840c00726571756573742d303333"}
+{"step": 237, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 132}}
+{"step": 238, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303333", "fin": true}}
+{"step": 239, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 240, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 132, "data": "6f6b", "fin": true}]}
+{"step": 241, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 242, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 132, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 132, "max": 9000}]], "hex": "10054084c00000005a4d00011140846328"}
+{"step": 243, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 136, "off": 0, "data": "00726571756573742d303334", "fin": true}]], "hex": "100b40880c00726571756573742d303334"}
+{"step": 244, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 136}}
+{"step": 245, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303334", "fin": true}}
+{"step": 246, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 247, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 136, "data": "6f6b", "fin": true}]}
+{"step": 248, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 249, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 136, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 136, "max": 9000}]], "hex": "10054088c00000005a4d00011140886328"}
+{"step": 250, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 140, "off": 0, "data": "00726571756573742d303335", "fin": true}]], "hex": "100b408c0c00726571756573742d303335"}
+{"step": 251, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 140}}
+{"step": 252, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303335", "fin": true}}
+{"step": 253, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 254, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 140, "data": "6f6b", "fin": true}]}
+{"step": 255, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 256, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 140, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 140, "max": 9000}]], "hex": "1005408cc00000005a4d000111408c6328"}
+{"step": 257, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 144, "off": 0, "data": "00726571756573742d303336", "fin": true}]], "hex": "100b40900c00726571756573742d303336"}
+{"step": 258, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 144}}
+{"step": 259, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303336", "fin": true}}
+{"step": 260, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 261, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 144, "data": "6f6b", "fin": true}]}
+{"step": 262, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 263, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 144, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 144, "max": 9000}]], "hex": "10054090c00000005a4d00011140906328"}
+{"step": 264, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 148, "off": 0, "data": "00726571756573742d303337", "fin": true}]], "hex": "100b40940c00726571756573742d303337"}
+{"step": 265, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 148}}
+{"step": 266, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303337", "fin": true}}
+{"step": 267, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 268, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 148, "data": "6f6b", "fin": true}]}
+{"step": 269, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 270, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 148, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 148, "max": 9000}]], "hex": "10054094c00000005a4d00011140946328"}
+{"step": 271, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 152, "off": 0, "data": "00726571756573742d303338", "fin": true}]], "hex": "100b40980c00726571756573742d303338"}
+{"step": 272, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 152}}
+{"step": 273, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303338", "fin": true}}
+{"step": 274, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 275, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 152, "data": "6f6b", "fin": true}]}
+{"step": 276, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 277, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 152, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 152, "max": 9000}]], "hex": "10054098c00000005a4d00011140986328"}
+{"step": 278, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 156, "off": 0, "data": "00726571756573742d303339", "fin": true}]], "hex": "100b409c0c00726571756573742d303339"}
+{"step": 279, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 156}}
+{"step": 280, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303339", "fin": true}}
+{"step": 281, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 282, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 156, "data": "6f6b", "fin": true}]}
+{"step": 283, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 284, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 156, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 156, "max": 9000}]], "hex": "1005409cc00000005a4d000111409c6328"}
+{"step": 285, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 160, "off": 0, "data": "00726571756573742d303430", "fin": true}]], "hex": "100b40a00c00726571756573742d303430"}
+{"step": 286, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 160}}
+{"step": 287, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303430", "fin": true}}
+{"step": 288, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 289, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 160, "data": "6f6b", "fin": true}]}
+{"step": 290, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 291, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 160, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 160, "max": 9000}]], "hex": "100540a0c00000005a4d00011140a06328"}
+{"step": 292, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 164, "off": 0, "data": "00726571756573742d303431", "fin": true}]], "hex": "100b40a40c00726571756573742d303431"}
+{"step": 293, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 164}}
+{"step": 294, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303431", "fin": true}}
+{"step": 295, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 296, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 164, "data": "6f6b", "fin": true}]}
+{"step": 297, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 298, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 164, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 164, "max": 9000}]], "hex": "100540a4c00000005a4d00011140a46328"}
+{"step": 299, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 168, "off": 0, "data": "00726571756573742d303432", "fin": true}]], "hex": "100b40a80c00726571756573742d303432"}
+{"step": 300, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 168}}
+{"step": 301, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303432", "fin": true}}
+{"step": 302, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 303, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 168, "data": "6f6b", "fin": true}]}
+{"step": 304, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 305, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 168, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 168, "max": 9000}]], "hex": "100540a8c00000005a4d00011140a86328"}
+{"step": 306, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 172, "off": 0, "data": "00726571756573742d303433", "fin": true}]], "hex": "100b40ac0c00726571756573742d303433"}
+{"step": 307, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 172}}
+{"step": 308, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303433", "fin": true}}
+{"step": 309, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 310, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 172, "data": "6f6b", "fin": true}]}
+{"step": 311, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 312, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 172, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 172, "max": 9000}]], "hex": "100540acc00000005a4d00011140ac6328"}
+{"step": 313, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 176, "off": 0, "data": "00726571756573742d303434", "fin": true}]], "hex": "100b40b00c00726571756573742d303434"}
+{"step": 314, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 176}}
+{"step": 315, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303434", "fin": true}}
+{"step": 316, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 317, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 176, "data": "6f6b", "fin": true}]}
+{"step": 318, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 319, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 176, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 176, "max": 9000}]], "hex": "100540b0c00000005a4d00011140b06328"}
+{"step": 320, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 180, "off": 0, "data": "00726571756573742d303435", "fin": true}]], "hex": "100b40b40c00726571756573742d303435"}
+{"step": 321, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 180}}
+{"step": 322, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303435", "fin": true}}
+{"step": 323, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 324, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 180, "data": "6f6b", "fin": true}]}
+{"step": 325, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 326, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 180, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 180, "max": 9000}]], "hex": "100540b4c00000005a4d00011140b46328"}
+{"step": 327, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 184, "off": 0, "data": "00726571756573742d303436", "fin": true}]], "hex": "100b40b80c00726571756573742d303436"}
+{"step": 328, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 184}}
+{"step": 329, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303436", "fin": true}}
+{"step": 330, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 331, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 184, "data": "6f6b", "fin": true}]}
+{"step": 332, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 333, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 184, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 184, "max": 9000}]], "hex": "100540b8c00000005a4d00011140b86328"}
+{"step": 334, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 188, "off": 0, "data": "00726571756573742d303437", "fin": true}]], "hex": "100b40bc0c00726571756573742d303437"}
+{"step": 335, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 188}}
+{"step": 336, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303437", "fin": true}}
+{"step": 337, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 338, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 188, "data": "6f6b", "fin": true}]}
+{"step": 339, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 340, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 188, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 188, "max": 9000}]], "hex": "100540bcc00000005a4d00011140bc6328"}
+{"step": 341, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 192, "off": 0, "data": "00726571756573742d303438", "fin": true}]], "hex": "100b40c00c00726571756573742d303438"}
+{"step": 342, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 192}}
+{"step": 343, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303438", "fin": true}}
+{"step": 344, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 345, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 192, "data": "6f6b", "fin": true}]}
+{"step": 346, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 347, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 192, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 192, "max": 9000}]], "hex": "100540c0c00000005a4d00011140c06328"}
+{"step": 348, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 196, "off": 0, "data": "00726571756573742d303439", "fin": true}]], "hex": "100b40c40c00726571756573742d303439"}
+{"step": 349, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 196}}
+{"step": 350, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303439", "fin": true}}
+{"step": 351, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 352, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 196, "data": "6f6b", "fin": true}]}
+{"step": 353, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 354, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 196, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 196, "max": 9000}]], "hex": "100540c4c00000005a4d00011140c46328"}
+{"step": 355, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 200, "off": 0, "data": "00726571756573742d303530", "fin": true}]], "hex": "100b40c80c00726571756573742d303530"}
+{"step": 356, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 200}}
+{"step": 357, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303530", "fin": true}}
+{"step": 358, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 359, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 200, "data": "6f6b", "fin": true}]}
+{"step": 360, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 361, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 200, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 200, "max": 9000}]], "hex": "100540c8c00000005a4d00011140c86328"}
+{"step": 362, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 204, "off": 0, "data": "00726571756573742d303531", "fin": true}]], "hex": "100b40cc0c00726571756573742d303531"}
+{"step": 363, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 204}}
+{"step": 364, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303531", "fin": true}}
+{"step": 365, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 366, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 204, "data": "6f6b", "fin": true}]}
+{"step": 367, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 368, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 204, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 204, "max": 9000}]], "hex": "100540ccc00000005a4d00011140cc6328"}
+{"step": 369, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 208, "off": 0, "data": "00726571756573742d303532", "fin": true}]], "hex": "100b40d00c00726571756573742d303532"}
+{"step": 370, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 208}}
+{"step": 371, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303532", "fin": true}}
+{"step": 372, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 373, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 208, "data": "6f6b", "fin": true}]}
+{"step": 374, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 375, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 208, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 208, "max": 9000}]], "hex": "100540d0c00000005a4d00011140d06328"}
+{"step": 376, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 212, "off": 0, "data": "00726571756573742d303533", "fin": true}]], "hex": "100b40d40c00726571756573742d303533"}
+{"step": 377, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 212}}
+{"step": 378, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303533", "fin": true}}
+{"step": 379, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 380, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 212, "data": "6f6b", "fin": true}]}
+{"step": 381, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 382, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 212, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 212, "max": 9000}]], "hex": "100540d4c00000005a4d00011140d46328"}
+{"step": 383, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 216, "off": 0, "data": "00726571756573742d303534", "fin": true}]], "hex": "100b40d80c00726571756573742d303534"}
+{"step": 384, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 216}}
+{"step": 385, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303534", "fin": true}}
+{"step": 386, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 387, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 216, "data": "6f6b", "fin": true}]}
+{"step": 388, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 389, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 216, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 216, "max": 9000}]], "hex": "100540d8c00000005a4d00011140d86328"}
+{"step": 390, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 220, "off": 0, "data": "00726571756573742d303535", "fin": true}]], "hex": "100b40dc0c00726571756573742d303535"}
+{"step": 391, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 220}}
+{"step": 392, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303535", "fin": true}}
+{"step": 393, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 394, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 220, "data": "6f6b", "fin": true}]}
+{"step": 395, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 396, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 220, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 220, "max": 9000}]], "hex": "100540dcc00000005a4d00011140dc6328"}
+{"step": 397, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 224, "off": 0, "data": "00726571756573742d303536", "fin": true}]], "hex": "100b40e00c00726571756573742d303536"}
+{"step": 398, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 224}}
+{"step": 399, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303536", "fin": true}}
+{"step": 400, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 401, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 224, "data": "6f6b", "fin": true}]}
+{"step": 402, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 403, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 224, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 224, "max": 9000}]], "hex": "100540e0c00000005a4d00011140e06328"}
+{"step": 404, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 228, "off": 0, "data": "00726571756573742d303537", "fin": true}]], "hex": "100b40e40c00726571756573742d303537"}
+{"step": 405, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 228}}
+{"step": 406, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303537", "fin": true}}
+{"step": 407, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 408, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 228, "data": "6f6b", "fin": true}]}
+{"step": 409, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 410, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 228, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 228, "max": 9000}]], "hex": "100540e4c00000005a4d00011140e46328"}
+{"step": 411, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 232, "off": 0, "data": "00726571756573742d303538", "fin": true}]], "hex": "100b40e80c00726571756573742d303538"}
+{"step": 412, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 232}}
+{"step": 413, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303538", "fin": true}}
+{"step": 414, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 415, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 232, "data": "6f6b", "fin": true}]}
+{"step": 416, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 417, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 232, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 232, "max": 9000}]], "hex": "100540e8c00000005a4d00011140e86328"}
+{"step": 418, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 236, "off": 0, "data": "00726571756573742d303539", "fin": true}]], "hex": "100b40ec0c00726571756573742d303539"}
+{"step": 419, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 236}}
+{"step": 420, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303539", "fin": true}}
+{"step": 421, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 422, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 236, "data": "6f6b", "fin": true}]}
+{"step": 423, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 424, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 236, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 236, "max": 9000}]], "hex": "100540ecc00000005a4d00011140ec6328"}
+{"step": 425, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 240, "off": 0, "data": "00726571756573742d303630", "fin": true}]], "hex": "100b40f00c00726571756573742d303630"}
+{"step": 426, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 240}}
+{"step": 427, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303630", "fin": true}}
+{"step": 428, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 429, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 240, "data": "6f6b", "fin": true}]}
+{"step": 430, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 431, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 240, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 240, "max": 9000}]], "hex": "100540f0c00000005a4d00011140f06328"}
+{"step": 432, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 244, "off": 0, "data": "00726571756573742d303631", "fin": true}]], "hex": "100b40f40c00726571756573742d303631"}
+{"step": 433, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 244}}
+{"step": 434, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303631", "fin": true}}
+{"step": 435, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 436, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 244, "data": "6f6b", "fin": true}]}
+{"step": 437, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 438, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 244, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 244, "max": 9000}]], "hex": "100540f4c00000005a4d00011140f46328"}
+{"step": 439, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 248, "off": 0, "data": "00726571756573742d303632", "fin": true}]], "hex": "100b40f80c00726571756573742d303632"}
+{"step": 440, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 248}}
+{"step": 441, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303632", "fin": true}}
+{"step": 442, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 443, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 248, "data": "6f6b", "fin": true}]}
+{"step": 444, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 445, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 248, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 248, "max": 9000}]], "hex": "100540f8c00000005a4d00011140f86328"}
+{"step": 446, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 252, "off": 0, "data": "00726571756573742d303633", "fin": true}]], "hex": "100b40fc0c00726571756573742d303633"}
+{"step": 447, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 252}}
+{"step": 448, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303633", "fin": true}}
+{"step": 449, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 450, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 252, "data": "6f6b", "fin": true}]}
+{"step": 451, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 452, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 252, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 252, "max": 9000}]], "hex": "100540fcc00000005a4d00011140fc6328"}
+{"step": 453, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 256, "off": 0, "data": "00726571756573742d303634", "fin": true}]], "hex": "100b41000c00726571756573742d303634"}
+{"step": 454, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 256}}
+{"step": 455, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303634", "fin": true}}
+{"step": 456, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 457, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 256, "data": "6f6b", "fin": true}]}
+{"step": 458, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 459, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 256, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 256, "max": 9000}]], "hex": "10054100c00000005a4d00011141006328"}
+{"step": 460, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 260, "off": 0, "data": "00726571756573742d303635", "fin": true}]], "hex": "100b41040c00726571756573742d303635"}
+{"step": 461, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 260}}
+{"step": 462, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303635", "fin": true}}
+{"step": 463, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 464, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 260, "data": "6f6b", "fin": true}]}
+{"step": 465, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 466, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 260, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 260, "max": 9000}]], "hex": "10054104c00000005a4d00011141046328"}
+{"step": 467, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 264, "off": 0, "data": "00726571756573742d303636", "fin": true}]], "hex": "100b41080c00726571756573742d303636"}
+{"step": 468, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 264}}
+{"step": 469, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303636", "fin": true}}
+{"step": 470, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 471, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 264, "data": "6f6b", "fin": true}]}
+{"step": 472, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 473, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 264, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 264, "max": 9000}]], "hex": "10054108c00000005a4d00011141086328"}
+{"step": 474, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 268, "off": 0, "data": "00726571756573742d303637", "fin": true}]], "hex": "100b410c0c00726571756573742d303637"}
+{"step": 475, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 268}}
+{"step": 476, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303637", "fin": true}}
+{"step": 477, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 478, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 268, "data": "6f6b", "fin": true}]}
+{"step": 479, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 480, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 268, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 268, "max": 9000}]], "hex": "1005410cc00000005a4d000111410c6328"}
+{"step": 481, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 272, "off": 0, "data": "00726571756573742d303638", "fin": true}]], "hex": "100b41100c00726571756573742d303638"}
+{"step": 482, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 272}}
+{"step": 483, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303638", "fin": true}}
+{"step": 484, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 485, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 272, "data": "6f6b", "fin": true}]}
+{"step": 486, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 487, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 272, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 272, "max": 9000}]], "hex": "10054110c00000005a4d00011141106328"}
+{"step": 488, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 276, "off": 0, "data": "00726571756573742d303639", "fin": true}]], "hex": "100b41140c00726571756573742d303639"}
+{"step": 489, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 276}}
+{"step": 490, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303639", "fin": true}}
+{"step": 491, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 492, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 276, "data": "6f6b", "fin": true}]}
+{"step": 493, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 494, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 276, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 276, "max": 9000}]], "hex": "10054114c00000005a4d00011141146328"}
+{"step": 495, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 280, "off": 0, "data": "00726571756573742d303730", "fin": true}]], "hex": "100b41180c00726571756573742d303730"}
+{"step": 496, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 280}}
+{"step": 497, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303730", "fin": true}}
+{"step": 498, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 499, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 280, "data": "6f6b", "fin": true}]}
+{"step": 500, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 501, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 280, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 280, "max": 9000}]], "hex": "10054118c00000005a4d00011141186328"}
+{"step": 502, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 284, "off": 0, "data": "00726571756573742d303731", "fin": true}]], "hex": "100b411c0c00726571756573742d303731"}
+{"step": 503, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 284}}
+{"step": 504, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303731", "fin": true}}
+{"step": 505, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 506, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 284, "data": "6f6b", "fin": true}]}
+{"step": 507, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 508, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 284, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 284, "max": 9000}]], "hex": "1005411cc00000005a4d000111411c6328"}
+{"step": 509, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 288, "off": 0, "data": "00726571756573742d303732", "fin": true}]], "hex": "100b41200c00726571756573742d303732"}
+{"step": 510, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 288}}
+{"step": 511, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303732", "fin": true}}
+{"step": 512, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 513, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 288, "data": "6f6b", "fin": true}]}
+{"step": 514, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 515, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 288, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 288, "max": 9000}]], "hex": "10054120c00000005a4d00011141206328"}
+{"step": 516, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 292, "off": 0, "data": "00726571756573742d303733", "fin": true}]], "hex": "100b41240c00726571756573742d303733"}
+{"step": 517, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 292}}
+{"step": 518, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303733", "fin": true}}
+{"step": 519, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 520, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 292, "data": "6f6b", "fin": true}]}
+{"step": 521, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 522, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 292, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 292, "max": 9000}]], "hex": "10054124c00000005a4d00011141246328"}
+{"step": 523, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 296, "off": 0, "data": "00726571756573742d303734", "fin": true}]], "hex": "100b41280c00726571756573742d303734"}
+{"step": 524, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 296}}
+{"step": 525, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303734", "fin": true}}
+{"step": 526, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 527, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 296, "data": "6f6b", "fin": true}]}
+{"step": 528, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 529, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 296, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 296, "max": 9000}]], "hex": "10054128c00000005a4d00011141286328"}
+{"step": 530, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 300, "off": 0, "data": "00726571756573742d303735", "fin": true}]], "hex": "100b412c0c00726571756573742d303735"}
+{"step": 531, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 300}}
+{"step": 532, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303735", "fin": true}}
+{"step": 533, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 534, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 300, "data": "6f6b", "fin": true}]}
+{"step": 535, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 536, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 300, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 300, "max": 9000}]], "hex": "1005412cc00000005a4d000111412c6328"}
+{"step": 537, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 304, "off": 0, "data": "00726571756573742d303736", "fin": true}]], "hex": "100b41300c00726571756573742d303736"}
+{"step": 538, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 304}}
+{"step": 539, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303736", "fin": true}}
+{"step": 540, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 541, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 304, "data": "6f6b", "fin": true}]}
+{"step": 542, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 543, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 304, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 304, "max": 9000}]], "hex": "10054130c00000005a4d00011141306328"}
+{"step": 544, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 308, "off": 0, "data": "00726571756573742d303737", "fin": true}]], "hex": "100b41340c00726571756573742d303737"}
+{"step": 545, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 308}}
+{"step": 546, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303737", "fin": true}}
+{"step": 547, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 548, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 308, "data": "6f6b", "fin": true}]}
+{"step": 549, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 550, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 308, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 308, "max": 9000}]], "hex": "10054134c00000005a4d00011141346328"}
+{"step": 551, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 312, "off": 0, "data": "00726571756573742d303738", "fin": true}]], "hex": "100b41380c00726571756573742d303738"}
+{"step": 552, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 312}}
+{"step": 553, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303738", "fin": true}}
+{"step": 554, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 555, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 312, "data": "6f6b", "fin": true}]}
+{"step": 556, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 557, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 312, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 312, "max": 9000}]], "hex": "10054138c00000005a4d00011141386328"}
+{"step": 558, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 316, "off": 0, "data": "00726571756573742d303739", "fin": true}]], "hex": "100b413c0c00726571756573742d303739"}
+{"step": 559, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 316}}
+{"step": 560, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303739", "fin": true}}
+{"step": 561, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 562, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 316, "data": "6f6b", "fin": true}]}
+{"step": 563, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 564, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 316, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 316, "max": 9000}]], "hex": "1005413cc00000005a4d000111413c6328"}
+{"step": 565, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 320, "off": 0, "data": "00726571756573742d303830", "fin": true}]], "hex": "100b41400c00726571756573742d303830"}
+{"step": 566, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 320}}
+{"step": 567, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303830", "fin": true}}
+{"step": 568, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 569, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 320, "data": "6f6b", "fin": true}]}
+{"step": 570, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 571, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 320, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 320, "max": 9000}]], "hex": "10054140c00000005a4d00011141406328"}
+{"step": 572, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 324, "off": 0, "data": "00726571756573742d303831", "fin": true}]], "hex": "100b41440c00726571756573742d303831"}
+{"step": 573, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 324}}
+{"step": 574, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303831", "fin": true}}
+{"step": 575, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 576, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 324, "data": "6f6b", "fin": true}]}
+{"step": 577, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 578, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 324, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 324, "max": 9000}]], "hex": "10054144c00000005a4d00011141446328"}
+{"step": 579, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 328, "off": 0, "data": "00726571756573742d303832", "fin": true}]], "hex": "100b41480c00726571756573742d303832"}
+{"step": 580, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 328}}
+{"step": 581, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303832", "fin": true}}
+{"step": 582, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 583, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 328, "data": "6f6b", "fin": true}]}
+{"step": 584, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 585, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 328, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 328, "max": 9000}]], "hex": "10054148c00000005a4d00011141486328"}
+{"step": 586, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 332, "off": 0, "data": "00726571756573742d303833", "fin": true}]], "hex": "100b414c0c00726571756573742d303833"}
+{"step": 587, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 332}}
+{"step": 588, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303833", "fin": true}}
+{"step": 589, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 590, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 332, "data": "6f6b", "fin": true}]}
+{"step": 591, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 592, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 332, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 332, "max": 9000}]], "hex": "1005414cc00000005a4d000111414c6328"}
+{"step": 593, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 336, "off": 0, "data": "00726571756573742d303834", "fin": true}]], "hex": "100b41500c00726571756573742d303834"}
+{"step": 594, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 336}}
+{"step": 595, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303834", "fin": true}}
+{"step": 596, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 597, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 336, "data": "6f6b", "fin": true}]}
+{"step": 598, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 599, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 336, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 336, "max": 9000}]], "hex": "10054150c00000005a4d00011141506328"}
+{"step": 600, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 340, "off": 0, "data": "00726571756573742d303835", "fin": true}]], "hex": "100b41540c00726571756573742d303835"}
+{"step": 601, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 340}}
+{"step": 602, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303835", "fin": true}}
+{"step": 603, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 604, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 340, "data": "6f6b", "fin": true}]}
+{"step": 605, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 606, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 340, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 340, "max": 9000}]], "hex": "10054154c00000005a4d00011141546328"}
+{"step": 607, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 344, "off": 0, "data": "00726571756573742d303836", "fin": true}]], "hex": "100b41580c00726571756573742d303836"}
+{"step": 608, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 344}}
+{"step": 609, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303836", "fin": true}}
+{"step": 610, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 611, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 344, "data": "6f6b", "fin": true}]}
+{"step": 612, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 613, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 344, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 344, "max": 9000}]], "hex": "10054158c00000005a4d00011141586328"}
+{"step": 614, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 348, "off": 0, "data": "00726571756573742d303837", "fin": true}]], "hex": "100b415c0c00726571756573742d303837"}
+{"step": 615, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 348}}
+{"step": 616, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303837", "fin": true}}
+{"step": 617, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 618, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 348, "data": "6f6b", "fin": true}]}
+{"step": 619, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 620, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 348, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 348, "max": 9000}]], "hex": "1005415cc00000005a4d000111415c6328"}
+{"step": 621, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 352, "off": 0, "data": "00726571756573742d303838", "fin": true}]], "hex": "100b41600c00726571756573742d303838"}
+{"step": 622, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 352}}
+{"step": 623, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303838", "fin": true}}
+{"step": 624, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 625, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 352, "data": "6f6b", "fin": true}]}
+{"step": 626, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 627, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 352, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 352, "max": 9000}]], "hex": "10054160c00000005a4d00011141606328"}
+{"step": 628, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 356, "off": 0, "data": "00726571756573742d303839", "fin": true}]], "hex": "100b41640c00726571756573742d303839"}
+{"step": 629, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 356}}
+{"step": 630, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303839", "fin": true}}
+{"step": 631, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 632, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 356, "data": "6f6b", "fin": true}]}
+{"step": 633, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 634, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 356, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 356, "max": 9000}]], "hex": "10054164c00000005a4d00011141646328"}
+{"step": 635, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 360, "off": 0, "data": "00726571756573742d303930", "fin": true}]], "hex": "100b41680c00726571756573742d303930"}
+{"step": 636, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 360}}
+{"step": 637, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303930", "fin": true}}
+{"step": 638, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 639, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 360, "data": "6f6b", "fin": true}]}
+{"step": 640, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 641, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 360, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 360, "max": 9000}]], "hex": "10054168c00000005a4d00011141686328"}
+{"step": 642, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 364, "off": 0, "data": "00726571756573742d303931", "fin": true}]], "hex": "100b416c0c00726571756573742d303931"}
+{"step": 643, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 364}}
+{"step": 644, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303931", "fin": true}}
+{"step": 645, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 646, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 364, "data": "6f6b", "fin": true}]}
+{"step": 647, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 648, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 364, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 364, "max": 9000}]], "hex": "1005416cc00000005a4d000111416c6328"}
+{"step": 649, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 368, "off": 0, "data": "00726571756573742d303932", "fin": true}]], "hex": "100b41700c00726571756573742d303932"}
+{"step": 650, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 368}}
+{"step": 651, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303932", "fin": true}}
+{"step": 652, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 653, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 368, "data": "6f6b", "fin": true}]}
+{"step": 654, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 655, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 368, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 368, "max": 9000}]], "hex": "10054170c00000005a4d00011141706328"}
+{"step": 656, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 372, "off": 0, "data": "00726571756573742d303933", "fin": true}]], "hex": "100b41740c00726571756573742d303933"}
+{"step": 657, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 372}}
+{"step": 658, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303933", "fin": true}}
+{"step": 659, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 660, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 372, "data": "6f6b", "fin": true}]}
+{"step": 661, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 662, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 372, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 372, "max": 9000}]], "hex": "10054174c00000005a4d00011141746328"}
+{"step": 663, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 376, "off": 0, "data": "00726571756573742d303934", "fin": true}]], "hex": "100b41780c00726571756573742d303934"}
+{"step": 664, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 376}}
+{"step": 665, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303934", "fin": true}}
+{"step": 666, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 667, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 376, "data": "6f6b", "fin": true}]}
+{"step": 668, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 669, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 376, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 376, "max": 9000}]], "hex": "10054178c00000005a4d00011141786328"}
+{"step": 670, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 380, "off": 0, "data": "00726571756573742d303935", "fin": true}]], "hex": "100b417c0c00726571756573742d303935"}
+{"step": 671, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 380}}
+{"step": 672, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303935", "fin": true}}
+{"step": 673, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 674, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 380, "data": "6f6b", "fin": true}]}
+{"step": 675, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 676, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 380, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 380, "max": 9000}]], "hex": "1005417cc00000005a4d000111417c6328"}
+{"step": 677, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 384, "off": 0, "data": "00726571756573742d303936", "fin": true}]], "hex": "100b41800c00726571756573742d303936"}
+{"step": 678, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 384}}
+{"step": 679, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303936", "fin": true}}
+{"step": 680, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 681, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 384, "data": "6f6b", "fin": true}]}
+{"step": 682, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 683, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 384, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 384, "max": 9000}]], "hex": "10054180c00000005a4d00011141806328"}
+{"step": 684, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 388, "off": 0, "data": "00726571756573742d303937", "fin": true}]], "hex": "100b41840c00726571756573742d303937"}
+{"step": 685, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 388}}
+{"step": 686, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303937", "fin": true}}
+{"step": 687, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 688, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 388, "data": "6f6b", "fin": true}]}
+{"step": 689, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 690, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 388, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 388, "max": 9000}]], "hex": "10054184c00000005a4d00011141846328"}
+{"step": 691, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 392, "off": 0, "data": "00726571756573742d303938", "fin": true}]], "hex": "100b41880c00726571756573742d303938"}
+{"step": 692, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 392}}
+{"step": 693, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303938", "fin": true}}
+{"step": 694, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 695, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 392, "data": "6f6b", "fin": true}]}
+{"step": 696, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 697, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 392, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 392, "max": 9000}]], "hex": "10054188c00000005a4d00011141886328"}
+{"step": 698, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 396, "off": 0, "data": "00726571756573742d303939", "fin": true}]], "hex": "100b418c0c00726571756573742d303939"}
+{"step": 699, "op": "api", "call": "accept_bidi", "args": {}, "bind": "s", "expect": {"stream": 396}}
+{"step": 700, "op": "api", "call": "read", "args": {"stream": "s", "max": 100}, "expect": {"data": "726571756573742d303939", "fin": true}}
+{"step": 701, "op": "api", "call": "write", "args": {"stream": "s", "data": "6f6b", "fin": true}, "expect": {"accepted": 2}}
+{"step": 702, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 396, "data": "6f6b", "fin": true}]}
+{"step": 703, "op": "api", "call": "release", "args": {"stream": "s"}, "expect": {"ok": true}}
+{"step": 704, "op": "peer_send", "pipe": 0, "records": [[{"type": "STOP_SENDING", "id": 396, "code": 1514995713}, {"type": "MAX_STREAM_DATA", "id": 396, "max": 9000}]], "hex": "1005418cc00000005a4d000111418c6328"}
+{"step": 705, "op": "expect_open"}
+{"step": 706, "op": "peer_send", "pipe": 0, "records": [[{"type": "REPEAT", "count": 4096, "frame": {"type": "MAX_DATA", "max": 8192}}]], "hex": "7000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000106000"}
+{"step": 707, "op": "expect_open"}
+{"step": 708, "op": "peer_send", "pipe": 0, "records": [[{"type": "MAX_DATA", "max": 8192}]], "hex": "03106000"}
+{"step": 709, "op": "expect_close", "error": {"space": "transport", "code": "ZMUX_EXCESSIVE_LOAD"}, "wire": true}

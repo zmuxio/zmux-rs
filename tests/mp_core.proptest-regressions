@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 71ab1987532b251a6bf4afdba65fb6854702c2481c3e56d36bf4e943ed3e2566 # shrinks to resume = true, policy = SpreadWeightedRandom, ops = [Add, Add, Open(1), Open(1)]
+cc 0f389f0262efa85619aa56f6d2e8e139e2233024732bbf2752bd172db9f6f4a3 # shrinks to resume = false, policy = Affinity, ops = [Add, Add, Open(1), Add, Remove(128, false), Open(1), Add, Open(4975), Fail(237), Step(5070), Add, Add, Fail(235), Fail(194), Add, Add, Fail(100), Fail(111)]
+cc 8acdf4df22e53b7fc6a366bd756bd63753c6b7c96c2de1ab76790fe2a5897ee4 # shrinks to resume = true, policy = Affinity, ops = [Add, Fail(74), Remove(19, false)]
+cc de488a564d92c4996609eb04dad3654962a648584bf4f4b888daa8b8297319ff # shrinks to resume = false, policy = Affinity, ops = [Open(1), Add, Write(0, 1), Add, Add, Add, Add, Write(0, 1), Step(32), Step(13), Open(1), Fail(18), Step(40), Open(7161), Advance(146), Advance(76), Open(8971), Advance(99), Step(1852)]
+cc 2119be7ac90d0fae0156bf1326ec60b8282e6b64abaaab21ef344ee19f4d8760 # shrinks to resume = false, policy = SpreadRateWeighted, ops = [Add, Add, Add, Add, Fail(1), Step(32), Write(0, 1), Fail(32), Add, Open(1), Advance(1), Step(21), Open(16333), Advance(60), Open(14888), Step(43), Open(4320), Advance(88), Advance(1), Open(13465), Step(36), Open(1), Advance(161)]
