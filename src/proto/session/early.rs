@@ -51,6 +51,32 @@ pub(super) struct EarlyState {
     starts: u32,
     /// The peer's parameters stored for a later carrier's early data.
     remember: Option<TransportParameters>,
+    /// What became of the early data, as far as the peer's parameters
+    /// tell (the carrier's verdict is applied on reading).
+    outcome: EarlyDataState,
+}
+
+/// What became of a session's early data
+/// ([`Session::early_data`](crate::Session#method.early_data)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EarlyDataState {
+    /// No early stream data went out: early data is not configured, or
+    /// nothing was written before the peer's parameters arrived.
+    #[default]
+    NotSent,
+    /// Early stream data went out and its outcome is not known yet: the
+    /// peer's parameters have not arrived, or the carrier has not settled
+    /// its own early data.
+    Pending,
+    /// The peer processed the early data.
+    Accepted,
+    /// The peer processed none of it. After a carrier's rejection (TLS 1.3
+    /// early data, QUIC 0-RTT) the session wrote the data again once the
+    /// handshake completed and the streams go on; after a zmux peer's
+    /// rejection the session ended with
+    /// [`SessionError::EarlyDataRejected`](crate::SessionError::EarlyDataRejected).
+    Rejected,
 }
 
 /// Carrier early data a client sent, until the carrier tells whether it
@@ -245,7 +271,11 @@ impl SessionCore {
             }
             return;
         }
-        self.early_state().sending = None;
+        let st = self.early_state();
+        if st.outcome != EarlyDataState::NotSent {
+            st.outcome = EarlyDataState::Rejected;
+        }
+        st.sending = None;
         // Everything written was never sent.
         let mut rewound = 0;
         let keys: Vec<_> = self.streams.keys().collect();
@@ -359,6 +389,21 @@ impl SessionCore {
         self.early_open()
     }
 
+    /// What became of the early data: not sent, pending, accepted or
+    /// rejected. Accepted is reported only once the carrier settled its own
+    /// early data as well.
+    pub fn early_data_state(&self) -> EarlyDataState {
+        let Some(e) = self.early.as_deref() else {
+            return EarlyDataState::NotSent;
+        };
+        match e.outcome {
+            EarlyDataState::Accepted if e.carrier == CarrierEarly::Pending => {
+                EarlyDataState::Pending
+            }
+            o => o,
+        }
+    }
+
     /// Whether early data may be sent now: before the peer's parameters.
     pub(super) fn early_open(&self) -> bool {
         self.early.as_deref().is_some_and(|e| e.sending.is_some())
@@ -376,7 +421,10 @@ impl SessionCore {
     /// Writes the fence before the first early STREAM frame (SPEC.md
     /// Section 6.1.2, Sending rule 3); `false` when it does not fit.
     pub(super) fn write_fence(&mut self, w: &mut Records<'_>) -> bool {
-        let Some(e) = self.early.as_deref_mut().and_then(|e| e.sending.as_mut()) else {
+        let Some(es) = self.early.as_deref_mut() else {
+            return true;
+        };
+        let Some(e) = es.sending.as_mut() else {
             return true;
         };
         if e.sent {
@@ -384,6 +432,7 @@ impl SessionCore {
         }
         if !e.fence {
             e.sent = true;
+            es.outcome = EarlyDataState::Pending;
             return true;
         }
         let entry = [PipeAckEntry {
@@ -396,6 +445,7 @@ impl SessionCore {
             return false;
         }
         e.sent = true;
+        es.outcome = EarlyDataState::Pending;
         true
     }
 
@@ -419,6 +469,7 @@ impl SessionCore {
         if (e.fence && !acks) || no_streams {
             // The peer stopped at the fence or at the first early STREAM
             // frame: it processed none of the early data.
+            self.early_state().outcome = EarlyDataState::Rejected;
             self.set_error(SessionError::EarlyDataRejected);
             self.enter_closing(
                 Some(CloseFrame::Transport {
@@ -455,10 +506,12 @@ impl SessionCore {
             || (a.zmux_pipe_ack && !tp.zmux_pipe_ack)
             || (a.reset_stream_at && !tp.reset_stream_at);
         if below {
+            self.early_state().outcome = EarlyDataState::Rejected;
             return Err(Error::transport_parameter(
                 "parameters below those early data assumed",
             ));
         }
+        self.early_state().outcome = EarlyDataState::Accepted;
         Ok(true)
     }
 }

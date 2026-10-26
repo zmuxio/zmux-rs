@@ -1091,6 +1091,23 @@ impl<D: Driver> Pipe<D> {
     }
 }
 
+impl<D: Driver> Pipe<D> {
+    /// Waits until the pipe ended (see the core's `pipe_closed`).
+    pub(crate) fn closed_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
+        let id = self.id;
+        Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
+            st.core.pipe_closed(id)
+        })
+    }
+
+    /// The session the pipe belongs to.
+    pub(crate) fn session_handle(&self) -> Session<D> {
+        Session {
+            conn: self.conn.clone(),
+        }
+    }
+}
+
 /// A pipe reserved for an out-of-band join (MULTIPATH.md Section 5.3).
 /// Dropping it gives the reservation up: the pipe fails (its ID stays
 /// used).
@@ -1951,6 +1968,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn protocol(&self) -> Option<String>;
     fn parameters_to_remember(&self) -> Option<crate::proto::params::TransportParameters>;
     fn state(&self) -> CoreState;
+    fn early_data(&self) -> crate::EarlyDataState;
     fn multipath(&self) -> Multipath;
     fn is_dialer(&self) -> Option<bool>;
     fn set_dialer(&self, dialer: bool);
@@ -2053,6 +2071,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn state(&self) -> CoreState {
         self.conn.lock().core.state()
+    }
+
+    fn early_data(&self) -> crate::EarlyDataState {
+        self.conn.lock().core.early_data_state()
     }
 
     fn multipath(&self) -> Multipath {
@@ -2302,6 +2324,13 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::state(self)
         }
 
+        /// What became of the session's early data (SPEC.md Section
+        /// 6.1.2): not sent, pending until the peer's parameters arrive and
+        /// the carrier settles its own early data, accepted or rejected.
+        pub fn early_data(&self) -> crate::EarlyDataState {
+            <Self as crate::driver::handle::SessionApi<$d>>::early_data(self)
+        }
+
         /// Whether multipath is in use, and why not (MULTIPATH.md Section 3.3).
         pub fn multipath(&self) -> crate::Multipath {
             <Self as crate::driver::handle::SessionApi<$d>>::multipath(self)
@@ -2523,6 +2552,12 @@ macro_rules! pipe_api {
         pub fn set_standby(&self, standby: bool) -> Result<(), crate::PipeError> {
             self.set_send_standby(standby)?;
             self.set_receive_standby(standby)
+        }
+
+        /// The session the pipe belongs to. The handle keeps the session
+        /// in use as the pipe's does.
+        pub fn session(&self) -> crate::driver::handle::Session<$d> {
+            self.session_handle()
         }
 
         /// The pipe ID.

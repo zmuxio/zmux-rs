@@ -304,6 +304,8 @@ pub struct Config {
     pub role: Option<RoleName>,
     pub max_pipes: Option<u32>,
     pub scheduler: Option<String>,
+    /// `test-mode`: the test-mode sender (TRACES.md Section 3.4).
+    pub sender: Option<String>,
     pub pipe_auth: Option<PipeAuth>,
     pub resume_timeout: Option<u64>,
     /// Absent: not set by this entry; `null`: unset (staged credit).
@@ -399,6 +401,7 @@ pub struct Header {
     pub local_role: TransportRole,
     pub overrides: Overrides,
     pub refs: Vec<String>,
+    #[serde(default)]
     pub findings: Vec<String>,
     pub groups: Vec<String>,
 }

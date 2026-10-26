@@ -538,40 +538,14 @@ pub struct TestHooks {
     /// No QX_PING request in the first record (the traces predate that
     /// optional sample).
     pub no_first_ping: bool,
-    /// Tier saturation by the wait test alone, without the drain test
-    /// (an ablation).
-    pub sojourn_only: bool,
     /// The carrier queue limiter paces no carrier: the traces' in-memory
-    /// carriers take bytes as the trace says; also an ablation without
-    /// the limiter.
+    /// carriers take bytes as the trace says.
     pub unpaced: bool,
     /// The phase of the idle-pipe probes as a fraction of the probe
     /// interval, instead of a random one.
     pub probe_phase: Option<f64>,
-    /// Ablations, each turning one rule off. The carrier queue limiter also on
-    /// carriers that have a low-water mark or report their unsent bytes.
-    pub limiter_all: bool,
-    /// The limiter's in-flight cap without its pacing.
-    pub limiter_no_pacing: bool,
-    /// The limiter without its rate bound R_lo.
-    pub limiter_no_rate_bound: bool,
-    /// The limiter's probe only by the 10 s rule: the span without a
-    /// sample the in-flight cap explains that starts one, instead of
-    /// max(1 s, 8 x RTT_base_p) (in effect max(this, 8 x RTT_base_p)).
-    pub limiter_explained_span: Option<Duration>,
-    /// The base-refresh tolerance without its relative term: B + A / R_p
-    /// instead of B + A / R_p + RTT_base_p / 8.
-    pub limiter_absolute_tolerance: bool,
-    /// A base refresh may end at max(200 ms, smoothed_rtt_p) unmeasured
-    /// when the old queue drained before then.
-    pub limiter_probe_end_due: bool,
-    /// The drain ends at in flight <= R_p x RTT_base_p + A instead of
-    /// max(R_p x RTT_base_p, A).
-    pub limiter_drain_plus_slack: bool,
-    /// Start-up counts every round trip towards the three without growth,
-    /// not only those with a bottleneck sample.
-    pub limiter_startup_counts_all: bool,
-    /// The spreading policies place data at R_p alone, without the
+    /// Ablations for the scheduler's unit tests, each turning one rule
+    /// off. The spreading policies place data at R_p alone, without the
     /// placement rate.
     pub no_placement_rate: bool,
     /// `spread-eta`'s ECF backlog with all ready data of the level for
@@ -580,11 +554,6 @@ pub struct TestHooks {
     /// `spread-eta`'s BLEST checks all of F against the stream's credit,
     /// not F / n.
     pub no_blest_share: bool,
-    /// The PIPE_ACK a PIPE_PING elicits goes on the primary return pipe
-    /// only, not also on the probed pipe pair (MULTIPATH.md Section 6.5).
-    pub no_ping_pair: bool,
-    /// Probation without the uptime cap: base_p x 2^k_p alone.
-    pub no_probation_cap: bool,
 }
 
 impl Config {

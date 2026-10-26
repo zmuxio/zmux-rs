@@ -190,14 +190,11 @@
       "keep_alive_period": 0,
       "handshake_timeout": 10000,
       "max_pipes": 8,
-      "scheduler": "spread-eta",
+      "sender": "test-mode",
       "pipe_auth": {
         "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
       },
-      "max_incoming_uni_streams": 4,
-      "probation": 0,
-      "redundancy": "off",
-      "standby_probe": 0
+      "max_incoming_uni_streams": 4
     },
     "test": {
       "grease_tp": {
@@ -245,15 +242,12 @@
       "keep_alive_period": 0,
       "handshake_timeout": 10000,
       "max_pipes": 8,
-      "scheduler": "spread-eta",
+      "sender": "test-mode",
       "pipe_auth": {
         "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
       },
       "resume_timeout": 30000,
-      "max_incoming_uni_streams": 4,
-      "probation": 0,
-      "redundancy": "off",
-      "standby_probe": 0
+      "max_incoming_uni_streams": 4
     },
     "test": {
       "grease_tp": {

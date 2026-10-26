@@ -35,6 +35,29 @@ pub fn load_all() -> Vec<(String, Trace)> {
         .collect()
 }
 
+/// The traces of local behaviour in `testdata/local` that the
+/// specification leaves to implementations, when that directory exists.
+pub fn load_local() -> Vec<(String, Trace)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local");
+    let Ok(index) = std::fs::read_to_string(dir.join("traces/index.json")) else {
+        return Vec::new();
+    };
+    let index: Value = serde_json::from_str(&index).expect("local index.json");
+    index["traces"]
+        .as_array()
+        .expect("traces")
+        .iter()
+        .map(|t| {
+            let file = t["file"].as_str().unwrap();
+            let rel = file.strip_prefix("fixtures/").expect("fixtures/ path");
+            let text =
+                std::fs::read_to_string(dir.join(rel)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let trace = parse_trace(&text).unwrap_or_else(|e| panic!("{file}: {e}"));
+            (format!("local/{rel}"), trace)
+        })
+        .collect()
+}
+
 fn collect_files(dir: &Path, out: &mut BTreeSet<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();

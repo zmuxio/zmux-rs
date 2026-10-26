@@ -118,10 +118,11 @@ pub use proto::meter::{AppBytes, Meter};
 pub use proto::oob::JOIN_HEADER;
 pub use proto::params::Role;
 pub use proto::session::{
-    Cap, CapacityFloor, Config, DatagramError, EarlyData, GoAway, LaneStats, Multipath, OpenError,
-    PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeOptions, PipeState, PipeStats, Policy,
-    Preamble, PrioritySource, QualityBand, Redundancy, RttSource, SessionError, SessionEvent,
-    SessionStats, State as SessionState, StreamError, StreamStats, Tracer,
+    Cap, CapacityFloor, Config, DatagramError, EarlyData, EarlyDataState, GoAway, LaneStats,
+    Multipath, OpenError, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeOptions,
+    PipeState, PipeStats, Policy, Preamble, PrioritySource, QualityBand, Redundancy, RttSource,
+    SessionError, SessionEvent, SessionStats, State as SessionState, StreamError, StreamStats,
+    Tracer,
 };
 pub use proto::{DetailKey, VarInt};
 

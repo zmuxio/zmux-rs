@@ -170,7 +170,6 @@ struct Cascade {
     oldest: Option<Instant>,
     now: Instant,
     d: Duration,
-    drain_test: bool,
     /// The next tier is the most-preferred one.
     first: bool,
 }
@@ -178,7 +177,7 @@ struct Cascade {
 impl Cascade {
     fn next(&mut self, t: &TierLoad) -> Tier {
         let drain = Duration::from_secs_f64((t.queued + self.offered) as f64 / t.rate as f64);
-        let drained_late = self.drain_test && drain > self.d;
+        let drained_late = drain > self.d;
         // The age test: the oldest waiting data has waited D or longer,
         // counted for a tier other than the most-preferred one from when
         // it last became eligible.
@@ -533,7 +532,6 @@ impl SessionCore {
             oldest: backlog.oldest,
             now: self.now,
             d: self.overflow_delay(),
-            drain_test: !self.config.hooks.sojourn_only,
             first: true,
         }
     }
@@ -1113,13 +1111,10 @@ impl SessionCore {
         let (started, k) = a.out()?.probation()?;
         let base = self.probation_base(a)?;
         let backoff = base.checked_mul(1 << k);
-        let cap = (!self.config.hooks.no_probation_cap)
-            .then(|| {
-                self.history(a)
-                    .u_max()
-                    .map(|u| base.max(u.saturating_mul(2)))
-            })
-            .flatten();
+        let cap = self
+            .history(a)
+            .u_max()
+            .map(|u| base.max(u.saturating_mul(2)));
         let length = match (backoff, cap) {
             (Some(b), Some(c)) => Some(b.min(c)),
             (b, c) => b.or(c),

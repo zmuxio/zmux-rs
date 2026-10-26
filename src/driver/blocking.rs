@@ -1188,6 +1188,17 @@ impl Pipe {
         let deadline = timeout.map(|t| Instant::now() + t);
         run(self.joined_op(), deadline).unwrap_or(Err(PipeError::TimedOut))
     }
+
+    /// Waits until the pipe ended (see `zmux::Pipe::closed`), up to
+    /// `timeout` (`None`: as long as it takes; [`PipeError::TimedOut`]
+    /// when it expires).
+    pub fn closed(&self, timeout: Option<Duration>) -> Result<(), PipeError> {
+        if timeout != Some(Duration::ZERO) && on_driver_thread() {
+            return Err(PipeError::OnDriverThread);
+        }
+        let deadline = timeout.map(|t| Instant::now() + t);
+        run(self.closed_op(), deadline).unwrap_or(Err(PipeError::TimedOut))
+    }
 }
 
 impl SendStream {

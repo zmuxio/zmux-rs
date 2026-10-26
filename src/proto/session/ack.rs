@@ -146,7 +146,7 @@ impl SessionCore {
         acks.snapshot_dirty = true;
         acks.ack_now |= rec.immediate;
         acks.complete_owed |= first_ping;
-        let pair = rec.ping && !self.config.hooks.no_ping_pair;
+        let pair = rec.ping;
         if pair
             && let Some(o) = self
                 .out_mut(id)

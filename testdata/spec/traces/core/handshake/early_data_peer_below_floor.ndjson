@@ -1,4 +1,4 @@
-{"kind": "trace", "id": "core.handshake.early_data_peer_below_floor", "title": "After sending early data, a zmux peer whose parameters are below the floor is a TRANSPORT_PARAMETER_ERROR", "profile": "zmux-small", "local_role": "initiator", "overrides": {"config": {"early_data": {"zmux_peer": true, "replayable": false}}}, "refs": ["SPEC.md#6.1.2"], "findings": [], "groups": ["core", "handshake"]}
+{"kind": "trace", "id": "core.handshake.early_data_peer_below_floor", "title": "After sending early data, a zmux peer whose parameters are below the floor is a TRANSPORT_PARAMETER_ERROR", "profile": "zmux-small", "local_role": "initiator", "overrides": {"config": {"early_data": {"zmux_peer": true, "replayable": false}}}, "refs": ["SPEC.md#6.1.2"], "groups": ["core", "handshake"]}
 {"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
 {"step": 2, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
 {"step": 3, "op": "api", "call": "write", "args": {"stream": "a", "data": "6869", "fin": true}, "expect": {"accepted": 2}}

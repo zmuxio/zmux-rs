@@ -2166,6 +2166,32 @@ impl SessionCore {
         }
     }
 
+    /// Whether the pipe ended: `Ok` once none of its halves is live any
+    /// more (closed or ended) or the session no longer knows it,
+    /// [`PipeError::Failed`](super::PipeError::Failed) when it failed,
+    /// [`PipeError::SessionLost`](super::PipeError::SessionLost) when the
+    /// session ended while a half was live; `None` while a half is live.
+    /// A pipe that failed and was retired since reads as `Ok`.
+    pub fn pipe_closed(&self, pipe: PipeId) -> Option<Result<(), super::PipeError>> {
+        use super::PipeError;
+        let Some(a) = self.att(pipe.0).filter(|a| !a.unattached()) else {
+            return Some(Ok(()));
+        };
+        if a.failed() {
+            return Some(Err(PipeError::Failed(
+                a.failure().unwrap_or(PipeFailure::Aborted),
+            )));
+        }
+        let out_live = a
+            .out()
+            .is_some_and(|o| !matches!(o.state(), OutState::Failed | OutState::Closed));
+        let in_live = a.inp().is_some_and(|i| i.state() != InState::Ended);
+        if !out_live && !in_live {
+            return Some(Ok(()));
+        }
+        self.lost().map(|e| Err(PipeError::SessionLost(e)))
+    }
+
     /// One attachment's quality, `None` when unknown.
     pub fn pipe_info(&self, pipe: PipeId) -> Option<PipeStats> {
         let a = self.att(pipe.0).filter(|a| !a.unattached())?;

@@ -22,13 +22,13 @@
         ]
       },
       {
-        "configured": "qmux-02.moq-lite-04",
-        "alias": "qmux-01.moq-lite-04",
+        "configured": "qmux-02.myapp-v4",
+        "alias": "qmux-01.myapp-v4",
         "not_accepted": [
-          "qmux-01.moq-lite-03",
-          "qmux-00.moq-lite-04",
-          "moq-lite-04",
-          "QMUX-01.moq-lite-04"
+          "qmux-01.myapp-v3",
+          "qmux-00.myapp-v4",
+          "myapp-v4",
+          "QMUX-01.myapp-v4"
         ]
       },
       {
@@ -822,7 +822,7 @@
       "scope": "zmux",
       "format": "multipath",
       "absent_default": "not supported",
-      "zmux_sends": "when max_pipes > 1 or resume is enabled",
+      "zmux_sends": "when more than one pipe or resume is enabled",
       "spec": "MULTIPATH.md#3",
       "id": {
         "value": 819734904,
@@ -847,7 +847,7 @@
       "format": "varint",
       "absent_default": 65536,
       "zmux_sends": "omitted (65536)",
-      "spec": "MULTIPATH.md#3",
+      "spec": "MULTIPATH.md#3.2",
       "id": {
         "value": 660785125,
         "hex": "0x2762c7e5"
@@ -859,7 +859,7 @@
       "format": "varint",
       "absent_default": 25,
       "zmux_sends": "omitted (25)",
-      "spec": "MULTIPATH.md#3",
+      "spec": "MULTIPATH.md#3.2",
       "id": {
         "value": 402267862,
         "hex": "0x17fa1ed6"
@@ -870,7 +870,7 @@
       "scope": "zmux",
       "format": "lanes",
       "absent_default": "1 lane (no lanes)",
-      "zmux_sends": "always: Max Lanes 258 (max_lanes) and a random 16-byte Lane Key",
+      "zmux_sends": "always: Max Lanes 258 and a random 16-byte Lane Key",
       "spec": "MULTIPATH.md#3.6",
       "id": {
         "value": 663056112,
@@ -882,7 +882,7 @@
       "scope": "zmux",
       "format": "varint",
       "absent_default": "not supported",
-      "zmux_sends": "resume_timeout in ms when enabled",
+      "zmux_sends": "the resume grace in ms when resume is enabled",
       "spec": "RESUME.md#3",
       "id": {
         "value": 223836366,
@@ -1296,25 +1296,15 @@
     "budget_refill_per_second": 32,
     "sender_probe_rate_per_second": 16,
     "pipe_ping_rate_per_second": 8,
-    "suspect_floor_ms": 250,
-    "fail_floor_ms": 2000,
     "first_record_timeout_ms": 2000,
     "unauthenticated_carriers_per_source": 8,
-    "stream_datagram_queue": 32,
-    "datagram_receive_bytes": 1048576,
-    "suspect_floor_min_ms": 50,
     "probe_interval_ms": 15000,
-    "busy_window_ms": 15000,
     "ack_redundancy_ms": 50,
     "unretired_attachments_extra": 8,
     "replay_window_floor_ids": 64,
     "join_refusal_backoff_min_ms": 1000,
     "join_refusal_backoff_max_ms": 60000,
     "unilateral_retirement_floor_ms": 2000,
-    "inbound_silence_margin_floor_ms": 2000,
-    "dead_timeout_min_ms": 1000,
-    "write_call_min_bytes": 4096,
-    "write_call_rate_ms": 50,
     "early_data_max_data": 16384,
     "early_data_max_streams_bidi": 4,
     "early_data_max_stream_data": 4096,

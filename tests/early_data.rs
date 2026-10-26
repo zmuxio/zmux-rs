@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use common::{duplex, multi_thread, watchdog};
-use zmux::{Config, ConnectError, EarlyData, Session, SessionError};
+use zmux::{Config, ConnectError, EarlyData, EarlyDataState, Session, SessionError};
 
 fn early() -> Config {
     let mut c = Config::default();
@@ -36,6 +36,8 @@ fn early_streams_carry_data_within_and_beyond_the_floor() {
         let (_s, mut r) = watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
         let got = watchdog(5, "read", r.read_to_end(1 << 20)).await.unwrap();
         assert_eq!(got, data);
+        assert_eq!(client.early_data(), EarlyDataState::Accepted);
+        assert_eq!(server.early_data(), EarlyDataState::NotSent);
         client.close(0u32.into(), b"");
     });
 }
@@ -55,6 +57,7 @@ fn a_peer_without_bidirectional_streams_rejects_early_data_unprocessed() {
         let e = watchdog(5, "closed", client.closed()).await;
         assert!(e.is_early_data_rejected(), "{e:?}");
         assert_eq!(e, SessionError::EarlyDataRejected);
+        assert_eq!(client.early_data(), EarlyDataState::Rejected);
         if let Ok(s) = server {
             assert!(
                 tokio::time::timeout(Duration::from_millis(200), s.accept_bi())

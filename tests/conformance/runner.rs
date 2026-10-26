@@ -32,7 +32,7 @@ use crate::support::{read_json, to_hex};
 use crate::wire;
 
 /// The groups this version runs.
-const RUN_GROUPS: &[&str] = &["core", "ext", "compat", "findings", "multipath", "resume"];
+const RUN_GROUPS: &[&str] = &["core", "ext", "compat", "regression", "multipath", "resume"];
 
 /// What the local endpoint wrote on one outbound lane of a pipe (lane 0
 /// is the pipe's own carrier, TRACES.md Section 5.1.1).
@@ -215,6 +215,7 @@ impl Runner {
             role,
             max_pipes,
             scheduler,
+            sender,
             resume_timeout,
             max_incoming_uni_streams,
             suspect_floor,
@@ -259,6 +260,18 @@ impl Runner {
         };
         if let Some(m) = cfg.max_pipes {
             config.max_pipes = m;
+        }
+        // The test-mode sender (TRACES.md Section 3.4): the ETA choice,
+        // no probation, no redundant copies, standby pipes probed at 15 s.
+        match cfg.sender.as_deref() {
+            None => {}
+            Some("test-mode") => {
+                cfg.scheduler.get_or_insert_with(|| "spread-eta".into());
+                cfg.probation.get_or_insert(Some(0));
+                cfg.redundancy.get_or_insert_with(|| "off".into());
+                cfg.standby_probe.get_or_insert(0);
+            }
+            Some(other) => return Err(format!("unknown sender {other}")),
         }
         if let Some(s) = &cfg.scheduler {
             config.scheduler = policy(s)?;
@@ -2492,7 +2505,10 @@ fn traces_run_against_the_core() {
     let mut passed: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = Vec::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (_rel, trace) in crate::traces::load_all() {
+    let all = crate::traces::load_all()
+        .into_iter()
+        .chain(crate::traces::load_local());
+    for (_rel, trace) in all {
         let group = trace.header.groups.first().cloned().unwrap_or_default();
         if !RUN_GROUPS.contains(&group.as_str()) {
             skipped

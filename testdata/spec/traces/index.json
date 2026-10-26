@@ -9,7 +9,6 @@
         "SPEC.md#5.2",
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 5
     },
@@ -20,7 +19,6 @@
       "refs": [
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -31,7 +29,6 @@
       "refs": [
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -42,7 +39,6 @@
       "refs": [
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -53,7 +49,6 @@
       "refs": [
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -65,7 +60,6 @@
         "SPEC.md#5.1",
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -76,7 +70,6 @@
       "refs": [
         "SPEC.md#5.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -87,7 +80,6 @@
       "refs": [
         "SPEC.md#5.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -98,7 +90,6 @@
       "refs": [
         "SPEC.md#5.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -109,19 +100,17 @@
       "refs": [
         "SPEC.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
     {
       "id": "core.handshake.tp_unknown_and_grease_ignored",
       "file": "fixtures/traces/core/handshake/tp_unknown_and_grease_ignored.ndjson",
-      "title": "GREASE and unknown parameters, including the qmux crate's application_protocols, are ignored",
+      "title": "GREASE and unknown parameters, including the application_protocols parameter of some QMux implementations, are ignored",
       "refs": [
         "SPEC.md#5.2",
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 5
     },
@@ -132,7 +121,6 @@
       "refs": [
         "EXTENSIONS.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -143,7 +131,6 @@
       "refs": [
         "EXTENSIONS.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -155,7 +142,6 @@
         "MULTIPATH.md#3.2",
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -167,7 +153,6 @@
         "MULTIPATH.md#3.6",
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -178,7 +163,6 @@
       "refs": [
         "MULTIPATH.md#3.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -189,7 +173,6 @@
       "refs": [
         "MULTIPATH.md#3.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -200,7 +183,6 @@
       "refs": [
         "SPEC.md#5.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -212,7 +194,6 @@
         "SPEC.md#6.1.2",
         "SPEC.md#5.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -223,7 +204,6 @@
       "refs": [
         "SPEC.md#6.1.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 15
     },
@@ -235,7 +215,6 @@
         "SPEC.md#6.1.2",
         "SPEC.md#13.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -246,7 +225,6 @@
       "refs": [
         "SPEC.md#6.1.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -257,7 +235,6 @@
       "refs": [
         "SPEC.md#6.1.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -269,7 +246,6 @@
         "SPEC.md#6.1.2",
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-role-auto",
       "steps": 5
     },
@@ -280,7 +256,6 @@
       "refs": [
         "SPEC.md#6.1.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -292,7 +267,6 @@
         "SPEC.md#6.1.2",
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -303,7 +277,6 @@
       "refs": [
         "SPEC.md#6.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -314,7 +287,6 @@
       "refs": [
         "SPEC.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -325,7 +297,6 @@
       "refs": [
         "SPEC.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -336,7 +307,6 @@
       "refs": [
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -347,7 +317,6 @@
       "refs": [
         "SPEC.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -358,7 +327,6 @@
       "refs": [
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -369,7 +337,6 @@
       "refs": [
         "SPEC.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -380,7 +347,6 @@
       "refs": [
         "SPEC.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -391,7 +357,6 @@
       "refs": [
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -402,7 +367,6 @@
       "refs": [
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -414,7 +378,6 @@
         "SPEC.md#4.1",
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -426,7 +389,6 @@
         "SPEC.md#3.1",
         "SPEC.md#9.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -437,7 +399,6 @@
       "refs": [
         "SPEC.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -448,7 +409,6 @@
       "refs": [
         "SPEC.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -460,7 +420,6 @@
         "SPEC.md#3.4",
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -472,7 +431,6 @@
         "SPEC.md#3.4",
         "SPEC.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -483,7 +441,6 @@
       "refs": [
         "SPEC.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -495,7 +452,6 @@
         "SPEC.md#3.2",
         "SPEC.md#6.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -507,7 +463,6 @@
         "SPEC.md#7.2",
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -518,9 +473,6 @@
       "refs": [
         "EXTENSIONS.md#4.2",
         "EXTENSIONS.md#4.3"
-      ],
-      "findings": [
-        "Go-1"
       ],
       "profile": "zmux-small",
       "steps": 7
@@ -533,7 +485,6 @@
         "SPEC.md#7.2",
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 13
     },
@@ -544,7 +495,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -555,7 +505,6 @@
       "refs": [
         "SPEC.md#7.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -566,7 +515,6 @@
       "refs": [
         "SPEC.md#7.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -577,7 +525,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -588,7 +535,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -599,7 +545,6 @@
       "refs": [
         "SPEC.md#7.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -609,9 +554,6 @@
       "title": "Data beyond the final size is fatal",
       "refs": [
         "SPEC.md#7.5"
-      ],
-      "findings": [
-        "Rust-5"
       ],
       "profile": "zmux-small",
       "steps": 6
@@ -623,7 +565,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -634,10 +575,6 @@
       "refs": [
         "SPEC.md#4.3",
         "STATE_MACHINE.md#2.5"
-      ],
-      "findings": [
-        "Java-12",
-        "Go-5"
       ],
       "profile": "zmux-small",
       "steps": 11
@@ -650,9 +587,6 @@
         "SPEC.md#4.3",
         "SPEC.md#9.4"
       ],
-      "findings": [
-        "X1"
-      ],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -662,9 +596,6 @@
       "title": "After STOP_SENDING no further data or FIN is sent, even for a write in progress",
       "refs": [
         "SPEC.md#4.3"
-      ],
-      "findings": [
-        "Java-9"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -676,7 +607,6 @@
       "refs": [
         "EXTENSIONS.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -686,9 +616,6 @@
       "title": "A stream cancelled before its first frame consumes no identifier",
       "refs": [
         "SPEC.md#7.2"
-      ],
-      "findings": [
-        "Rust-1"
       ],
       "profile": "zmux-small",
       "steps": 10
@@ -701,7 +628,6 @@
         "EXTENSIONS.md#7.4",
         "SPEC.md#7.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 13
     },
@@ -713,7 +639,6 @@
         "SPEC.md#7.5",
         "STATE_MACHINE.md#2.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -724,9 +649,6 @@
       "refs": [
         "EXTENSIONS.md#4.4",
         "SPEC.md#7.6"
-      ],
-      "findings": [
-        "open_info-lost"
       ],
       "profile": "zmux-small",
       "steps": 9
@@ -739,7 +661,6 @@
         "SPEC.md#7.2",
         "EXTENSIONS.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -751,7 +672,6 @@
         "STATE_MACHINE.md#2.5",
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -762,7 +682,6 @@
       "refs": [
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -773,7 +692,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 12
     },
@@ -784,7 +702,6 @@
       "refs": [
         "SPEC.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -794,9 +711,6 @@
       "title": "A drained stream window is reopened without any BLOCKED frame",
       "refs": [
         "SPEC.md#8.3"
-      ],
-      "findings": [
-        "zero-window-deadlock"
       ],
       "profile": "zmux-small",
       "steps": 8
@@ -808,7 +722,6 @@
       "refs": [
         "SPEC.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -820,7 +733,6 @@
         "SPEC.md#8.5",
         "SPEC.md#5.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -832,7 +744,6 @@
         "SPEC.md#8.5",
         "SPEC.md#5.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -844,7 +755,6 @@
         "SPEC.md#8.5",
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -856,7 +766,6 @@
         "SPEC.md#8.4",
         "EXTENSIONS.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 13
     },
@@ -867,7 +776,6 @@
       "refs": [
         "SPEC.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 14
     },
@@ -878,7 +786,6 @@
       "refs": [
         "SPEC.md#8.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -890,7 +797,6 @@
         "SPEC.md#8.1",
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -901,7 +807,6 @@
       "refs": [
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -911,9 +816,6 @@
       "title": "A BLOCKED frame reporting a limit never advertised is fatal",
       "refs": [
         "SPEC.md#4.3"
-      ],
-      "findings": [
-        "Rust-6"
       ],
       "profile": "zmux-small",
       "steps": 6
@@ -925,7 +827,6 @@
       "refs": [
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -935,9 +836,6 @@
       "title": "Writes beyond the peer's credit wait for credit instead of failing the session",
       "refs": [
         "SPEC.md#8.1"
-      ],
-      "findings": [
-        "Rust-7"
       ],
       "profile": "zmux-small",
       "steps": 14
@@ -949,7 +847,6 @@
       "refs": [
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -960,7 +857,6 @@
       "refs": [
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -971,7 +867,6 @@
       "refs": [
         "SPEC.md#8.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 22
     },
@@ -981,9 +876,6 @@
       "title": "A stream reset before accept keeps its credit until the application releases it",
       "refs": [
         "SPEC.md#8.5"
-      ],
-      "findings": [
-        "rapid-reset"
       ],
       "profile": "zmux-small",
       "steps": 17
@@ -996,9 +888,6 @@
         "SPEC.md#8.5",
         "SPEC.md#14.1"
       ],
-      "findings": [
-        "rapid-reset"
-      ],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -1009,7 +898,6 @@
       "refs": [
         "SPEC.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1021,7 +909,6 @@
         "SPEC.md#4.5",
         "SPEC.md#9.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1032,7 +919,6 @@
       "refs": [
         "SPEC.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1043,7 +929,6 @@
       "refs": [
         "SPEC.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1054,7 +939,6 @@
       "refs": [
         "SPEC.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1065,7 +949,6 @@
       "refs": [
         "SPEC.md#9.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 61
     },
@@ -1076,7 +959,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1088,7 +970,6 @@
         "SPEC.md#4.5",
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1100,7 +981,6 @@
         "SPEC.md#4.5",
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 29
     },
@@ -1111,7 +991,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1122,7 +1001,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1132,9 +1010,6 @@
       "title": "Stream churn with crossing STOP_SENDING never drains the budget (X1): frames for terminal or discarded streams are not chargeable",
       "refs": [
         "SPEC.md#9.4"
-      ],
-      "findings": [
-        "X1"
       ],
       "profile": "zmux-small",
       "steps": 709
@@ -1146,7 +1021,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1158,7 +1032,6 @@
         "SPEC.md#7.6",
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 13
     },
@@ -1170,7 +1043,6 @@
         "SPEC.md#9.6",
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1182,7 +1054,6 @@
         "SPEC.md#4.5",
         "SPEC.md#9.4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 12
     },
@@ -1193,7 +1064,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1204,7 +1074,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1215,7 +1084,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1226,7 +1094,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1236,9 +1103,6 @@
       "title": "Close sends CONNECTION_CLOSE, shuts down writing gracefully, and keeps reading until the peer ends",
       "refs": [
         "SPEC.md#6.5"
-      ],
-      "findings": [
-        "Rust-closer-no-CLOSE"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -1250,7 +1114,6 @@
       "refs": [
         "SPEC.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -1260,10 +1123,6 @@
       "title": "A peer CONNECTION_CLOSE followed by a carrier reset reports the peer's code",
       "refs": [
         "SPEC.md#6.5"
-      ],
-      "findings": [
-        "peer-close-code-lost",
-        "Java-10"
       ],
       "profile": "zmux-small",
       "steps": 10
@@ -1275,7 +1134,6 @@
       "refs": [
         "SPEC.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -1286,7 +1144,6 @@
       "refs": [
         "SPEC.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -1297,7 +1154,6 @@
       "refs": [
         "SPEC.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 12
     },
@@ -1308,7 +1164,6 @@
       "refs": [
         "SPEC.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1318,10 +1173,6 @@
       "title": "A pending read fails with the peer's close code",
       "refs": [
         "STATE_MACHINE.md#2.5"
-      ],
-      "findings": [
-        "Java-10",
-        "Rust-3"
       ],
       "profile": "zmux-small",
       "steps": 11
@@ -1333,7 +1184,6 @@
       "refs": [
         "SPEC.md#6.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1345,7 +1195,6 @@
         "SPEC.md#6.4",
         "SPEC.md#6.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -1356,7 +1205,6 @@
       "refs": [
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1367,7 +1215,6 @@
       "refs": [
         "SPEC.md#7.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1378,7 +1225,6 @@
       "refs": [
         "SPEC.md#7.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -1390,7 +1236,6 @@
         "MULTIPATH.md#3.5",
         "MULTIPATH.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -1402,7 +1247,6 @@
         "MULTIPATH.md#3.5",
         "MULTIPATH.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -1413,7 +1257,6 @@
       "refs": [
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 12
     },
@@ -1424,7 +1267,6 @@
       "refs": [
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1436,7 +1278,6 @@
         "MULTIPATH.md#3.5",
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1448,7 +1289,6 @@
         "MULTIPATH.md#3.5",
         "MULTIPATH.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 5
     },
@@ -1460,7 +1300,6 @@
         "MULTIPATH.md#3.5",
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1473,7 +1312,6 @@
         "MULTIPATH.md#3.5",
         "SPEC.md#10.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -1486,7 +1324,6 @@
         "MULTIPATH.md#3.5",
         "SPEC.md#10.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1499,7 +1336,6 @@
         "SPEC.md#6.6",
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1511,7 +1347,6 @@
         "SPEC.md#6.4",
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 20
     },
@@ -1523,7 +1358,6 @@
         "MULTIPATH.md#3.5",
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 4
     },
@@ -1538,7 +1372,6 @@
         "MULTIPATH.md#3.6",
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 17
     },
@@ -1549,10 +1382,8 @@
       "refs": [
         "MULTIPATH.md#2.5",
         "MULTIPATH.md#6.1",
-        "SPEC.md#4.1",
-        "IMPLEMENTATION.md#13.8"
+        "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 26
     },
@@ -1563,10 +1394,8 @@
       "refs": [
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#3.6",
-        "SCHEDULER.md#9.2",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 19
     },
@@ -1578,7 +1407,6 @@
         "MULTIPATH.md#5.8",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 22
     },
@@ -1590,7 +1418,6 @@
         "MULTIPATH.md#5.8",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 21
     },
@@ -1602,7 +1429,6 @@
         "MULTIPATH.md#5.8",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 23
     },
@@ -1615,7 +1441,6 @@
         "SPEC.md#6.6",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 19
     },
@@ -1627,7 +1452,6 @@
         "MULTIPATH.md#6.2",
         "MULTIPATH.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -1638,7 +1462,6 @@
       "refs": [
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1649,7 +1472,6 @@
       "refs": [
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1661,7 +1483,6 @@
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#3.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -1673,7 +1494,6 @@
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#3.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -1685,7 +1505,6 @@
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#3.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -1698,7 +1517,6 @@
         "MULTIPATH.md#3.6",
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -1710,7 +1528,6 @@
         "MULTIPATH.md#5.8",
         "SPEC.md#4.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -1722,7 +1539,6 @@
         "MULTIPATH.md#5.8",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 17
     },
@@ -1733,7 +1549,6 @@
       "refs": [
         "MULTIPATH.md#5.8"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1744,7 +1559,6 @@
       "refs": [
         "MULTIPATH.md#5.8"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 12
     },
@@ -1756,7 +1570,6 @@
         "MULTIPATH.md#5.8",
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1769,7 +1582,6 @@
         "MULTIPATH.md#5.5",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 18
     },
@@ -1782,7 +1594,6 @@
         "SPEC.md#6.6",
         "STATE_MACHINE.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 13
     },
@@ -1795,7 +1606,6 @@
         "SPEC.md#6.4",
         "SPEC.md#6.6"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 15
     },
@@ -1807,7 +1617,6 @@
         "SPEC.md#6.5",
         "MULTIPATH.md#5.8"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 24
     },
@@ -1819,7 +1628,6 @@
         "SPEC.md#6.5",
         "MULTIPATH.md#5.8"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 24
     },
@@ -1830,7 +1638,6 @@
       "refs": [
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-role-auto",
       "steps": 7
     },
@@ -1841,7 +1648,6 @@
       "refs": [
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-role-auto",
       "steps": 4
     },
@@ -1852,7 +1658,6 @@
       "refs": [
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -1863,7 +1668,6 @@
       "refs": [
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 4
     },
@@ -1874,7 +1678,6 @@
       "refs": [
         "EXTENSIONS.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-role-auto",
       "steps": 4
     },
@@ -1885,7 +1688,6 @@
       "refs": [
         "EXTENSIONS.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 16
     },
@@ -1897,7 +1699,6 @@
         "EXTENSIONS.md#3.5",
         "STATE_MACHINE.md#2.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 16
     },
@@ -1908,7 +1709,6 @@
       "refs": [
         "EXTENSIONS.md#3.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -1920,7 +1720,6 @@
         "EXTENSIONS.md#3.3",
         "EXTENSIONS.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 18
     },
@@ -1932,7 +1731,6 @@
         "EXTENSIONS.md#3.4",
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 15
     },
@@ -1944,7 +1742,6 @@
         "EXTENSIONS.md#3.3",
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 15
     },
@@ -1956,7 +1753,6 @@
         "EXTENSIONS.md#3.3",
         "SPEC.md#8.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 17
     },
@@ -1967,7 +1763,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1978,7 +1773,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -1990,7 +1784,6 @@
         "EXTENSIONS.md#4.4",
         "EXTENSIONS.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2002,7 +1795,6 @@
         "EXTENSIONS.md#4.4",
         "EXTENSIONS.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2013,7 +1805,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2024,7 +1815,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2035,7 +1825,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2046,7 +1835,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2057,7 +1845,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2068,7 +1855,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2079,7 +1865,6 @@
       "refs": [
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2090,7 +1875,6 @@
       "refs": [
         "EXTENSIONS.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -2101,7 +1885,6 @@
       "refs": [
         "EXTENSIONS.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -2113,7 +1896,6 @@
         "EXTENSIONS.md#4.3",
         "EXTENSIONS.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -2125,7 +1907,6 @@
         "EXTENSIONS.md#4.3",
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2136,7 +1917,6 @@
       "refs": [
         "EXTENSIONS.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -2147,7 +1927,6 @@
       "refs": [
         "EXTENSIONS.md#4.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2158,7 +1937,6 @@
       "refs": [
         "EXTENSIONS.md#5.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2169,7 +1947,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2180,7 +1957,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2191,7 +1967,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2202,7 +1977,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 7
     },
@@ -2213,7 +1987,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -2224,7 +1997,6 @@
       "refs": [
         "SPEC.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
@@ -2235,7 +2007,6 @@
       "refs": [
         "EXTENSIONS.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -2246,7 +2017,6 @@
       "refs": [
         "EXTENSIONS.md#6.1"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2257,7 +2027,6 @@
       "refs": [
         "EXTENSIONS.md#6.1"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2268,7 +2037,6 @@
       "refs": [
         "EXTENSIONS.md#6.1"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2279,7 +2047,6 @@
       "refs": [
         "EXTENSIONS.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 12
     },
@@ -2291,7 +2058,6 @@
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2303,7 +2069,6 @@
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2315,7 +2080,6 @@
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2327,7 +2091,6 @@
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2338,7 +2101,6 @@
       "refs": [
         "EXTENSIONS.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 13
     },
@@ -2349,7 +2111,6 @@
       "refs": [
         "EXTENSIONS.md#6.1"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 6
     },
@@ -2360,7 +2121,6 @@
       "refs": [
         "EXTENSIONS.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 8
     },
@@ -2371,7 +2131,6 @@
       "refs": [
         "EXTENSIONS.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 72
     },
@@ -2382,7 +2141,6 @@
       "refs": [
         "EXTENSIONS.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 136
     },
@@ -2393,7 +2151,6 @@
       "refs": [
         "EXTENSIONS.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 42
     },
@@ -2404,7 +2161,6 @@
       "refs": [
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 11
     },
@@ -2415,7 +2171,6 @@
       "refs": [
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 5
     },
@@ -2427,18 +2182,16 @@
         "SPEC.md#13.2",
         "SPEC.md#6.7"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 9
     },
     {
       "id": "compat.qmux.close_with_frame_type_zero",
       "file": "fixtures/traces/compat/qmux/close_with_frame_type_zero.ndjson",
-      "title": "CONNECTION_CLOSE 0x1c with Frame Type 0, as the qmux crate sends it",
+      "title": "CONNECTION_CLOSE 0x1c with Frame Type 0, as some QMux implementations send it",
       "refs": [
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2450,7 +2203,6 @@
         "MULTIPATH.md#3.5",
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
@@ -2461,7 +2213,6 @@
       "refs": [
         "SPEC.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2473,7 +2224,6 @@
         "SPEC.md#7.3",
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 6
     },
@@ -2484,7 +2234,6 @@
       "refs": [
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -2495,7 +2244,6 @@
       "refs": [
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-small",
       "steps": 10
     },
@@ -2507,7 +2255,6 @@
         "SPEC.md#13.2",
         "SPEC.md#9.6"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2519,7 +2266,6 @@
         "MULTIPATH.md#3.3",
         "MULTIPATH.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2530,7 +2276,6 @@
       "refs": [
         "MULTIPATH.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2541,7 +2286,6 @@
       "refs": [
         "MULTIPATH.md#10.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2555,7 +2299,6 @@
         "MULTIPATH.md#5.8",
         "SPEC.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2567,7 +2310,6 @@
         "MULTIPATH.md#5.2",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2579,7 +2321,6 @@
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#10.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
@@ -2591,7 +2332,6 @@
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#10.6"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2602,7 +2342,6 @@
       "refs": [
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2613,7 +2352,6 @@
       "refs": [
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2624,7 +2362,6 @@
       "refs": [
         "MULTIPATH.md#5.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2635,7 +2372,6 @@
       "refs": [
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2644,10 +2380,8 @@
       "file": "fixtures/traces/multipath/join/out_of_band_down.ndjson",
       "title": "An out-of-band join for a downlink makes it usable at once",
       "refs": [
-        "MULTIPATH.md#5.3",
-        "SCHEDULER.md#5"
+        "MULTIPATH.md#5.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
@@ -2658,7 +2392,6 @@
       "refs": [
         "MULTIPATH.md#5.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2669,7 +2402,6 @@
       "refs": [
         "SPEC.md#5.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2680,7 +2412,6 @@
       "refs": [
         "SPEC.md#6.1.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2692,7 +2423,6 @@
         "MULTIPATH.md#4.2",
         "MULTIPATH.md#7.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 14
     },
@@ -2703,7 +2433,6 @@
       "refs": [
         "MULTIPATH.md#5.7"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2714,7 +2443,6 @@
       "refs": [
         "MULTIPATH.md#5.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2726,7 +2454,6 @@
         "MULTIPATH.md#5.7",
         "STATE_MACHINE.md#3.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
@@ -2738,30 +2465,16 @@
         "MULTIPATH.md#5.7",
         "SPEC.md#13.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
-    },
-    {
-      "id": "multipath.failover.joining_sole_path_carries_data",
-      "file": "fixtures/traces/multipath/failover/joining_sole_path_carries_data.ndjson",
-      "title": "While no outbound pipe is usable, a JOINING pipe carries stream data as an ACTIVE pipe would, not just one chunk",
-      "refs": [
-        "MULTIPATH.md#11.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 16
     },
     {
       "id": "multipath.join.acceptor_confirms_downlink",
       "file": "fixtures/traces/multipath/join/acceptor_confirms_downlink.ndjson",
       "title": "The acceptor writes a record carrying PIPE_PING on a joined bidirectional pipe within its max_ack_delay, and the acknowledgement gives the pipe its first RTT sample",
       "refs": [
-        "MULTIPATH.md#5.4",
-        "SCHEDULER.md#2"
+        "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2772,7 +2485,6 @@
       "refs": [
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -2785,7 +2497,6 @@
         "MULTIPATH.md#4.3",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2797,7 +2508,6 @@
         "MULTIPATH.md#13",
         "SPEC.md#7.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2808,7 +2518,6 @@
       "refs": [
         "MULTIPATH.md#7.6"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2819,68 +2528,8 @@
       "refs": [
         "MULTIPATH.md#13"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
-    },
-    {
-      "id": "multipath.redundancy.urgent_on_two_pipes",
-      "file": "fixtures/traces/multipath/redundancy/urgent_on_two_pipes.ndjson",
-      "title": "A chunk of an urgent stream direction goes to the two pipes of its tier with the earliest arrival estimate; a stream of the default urgency is sent once",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "MULTIPATH.md#7.5"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 20
-    },
-    {
-      "id": "multipath.redundancy.first_chunk_after_idle",
-      "file": "fixtures/traces/multipath/redundancy/first_chunk_after_idle.ndjson",
-      "title": "New data on a pipe that has been idle without acknowledgement progress for max(1 s, T_suspect) is sent at once, without a probe first, and its first chunk is also sent on the next pipe in control order",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 19
-    },
-    {
-      "id": "multipath.revalidate.pipes_await_acknowledgement",
-      "file": "fixtures/traces/multipath/revalidate/pipes_await_acknowledgement.ndjson",
-      "title": "After a revalidation request every live outbound pipe gets a PIPE_PING at once and takes no new stream data until it is acknowledged, while another pipe is",
-      "refs": [
-        "SCHEDULER.md#11.1",
-        "API.md#4.2"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 23
-    },
-    {
-      "id": "multipath.redundancy.byte_bound",
-      "file": "fixtures/traces/multipath/redundancy/byte_bound.ndjson",
-      "title": "Redundant copies whose data is unacknowledged stay within max(spread_chunk, retransmit budget / 64); a chunk beyond it is sent once, and acknowledgements free the bound",
-      "refs": [
-        "SCHEDULER.md#4.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 22
-    },
-    {
-      "id": "multipath.redundancy.set_redundant",
-      "file": "fixtures/traces/multipath/redundancy/set_redundant.ndjson",
-      "title": "SetRedundant turns redundancy on for a stream direction of the default urgency while the session's redundancy is off, and off again",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "API.md#5.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
     },
     {
       "id": "multipath.ack.pipe_ping_answered_on_its_pair",
@@ -2889,7 +2538,6 @@
       "refs": [
         "MULTIPATH.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 18
     },
@@ -2900,7 +2548,6 @@
       "refs": [
         "SPEC.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 19
     },
@@ -2912,7 +2559,6 @@
         "SPEC.md#8.3",
         "MULTIPATH.md#7.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 20
     },
@@ -2924,7 +2570,6 @@
         "SPEC.md#4.5",
         "SPEC.md#9.4.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 14
     },
@@ -2935,7 +2580,6 @@
       "refs": [
         "MULTIPATH.md#6.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2946,7 +2590,6 @@
       "refs": [
         "MULTIPATH.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2957,7 +2600,6 @@
       "refs": [
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -2968,7 +2610,6 @@
       "refs": [
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 10
     },
@@ -2979,7 +2620,6 @@
       "refs": [
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
     },
@@ -2992,7 +2632,6 @@
         "MULTIPATH.md#6.3",
         "MULTIPATH.md#7.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
     },
@@ -3004,126 +2643,8 @@
         "MULTIPATH.md#7.2",
         "MULTIPATH.md#7.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
-    },
-    {
-      "id": "multipath.failover.suspect_reinjects_and_probes",
-      "file": "fixtures/traces/multipath/failover/suspect_reinjects_and_probes.ndjson",
-      "title": "No acknowledgement progress for T_suspect makes the pipe suspect",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#7.2"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 23
-    },
-    {
-      "id": "multipath.failover.suspect_then_failed",
-      "file": "fixtures/traces/multipath/failover/suspect_then_failed.ndjson",
-      "title": "Without progress a suspect pipe fails after T_fail when another pipe is ACTIVE",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 26
-    },
-    {
-      "id": "multipath.failover.last_pipe_survives_pause",
-      "file": "fixtures/traces/multipath/failover/last_pipe_survives_pause.ndjson",
-      "title": "A single pipe pair in a multipath session survives a mutual pause: acknowledgements keep flowing on the suspect pipe and the last usable pipe does not fail on T_fail",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#11.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 21
-    },
-    {
-      "id": "multipath.failover.both_pipes_suspect_recover",
-      "file": "fixtures/traces/multipath/failover/both_pipes_suspect_recover.ndjson",
-      "title": "When every outbound pipe is suspect none fails on T_fail; acknowledgements bring both back",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 29
-    },
-    {
-      "id": "multipath.failover.last_pipe_without_resume_dead_timeout",
-      "file": "fixtures/traces/multipath/failover/last_pipe_without_resume_dead_timeout.ndjson",
-      "title": "Without resume the last pipe fails from a stall only after T_dead (its default dead_timeout, half the 30 s idle timeout), and the session then ends",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.5"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 14
-    },
-    {
-      "id": "multipath.failover.write_stall_suspect",
-      "file": "fixtures/traces/multipath/failover/write_stall_suspect.ndjson",
-      "title": "A pipe whose carrier accepts no bytes for T_suspect becomes suspect, like one without acknowledgements",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
-    },
-    {
-      "id": "multipath.failover.no_reinjection_while_acknowledged",
-      "file": "fixtures/traces/multipath/failover/no_reinjection_while_acknowledged.ndjson",
-      "title": "A pipe whose data is acknowledged in time is never suspected and nothing is re-sent",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#7.5"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 19
-    },
-    {
-      "id": "multipath.failover.fate_group_suspect",
-      "file": "fixtures/traces/multipath/failover/fate_group_suspect.ndjson",
-      "title": "When an attachment fails abruptly, attachments in the same fate group become suspect at once",
-      "refs": [
-        "MULTIPATH.md#2.2",
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 24
-    },
-    {
-      "id": "multipath.failover.fate_group_drain_exempt",
-      "file": "fixtures/traces/multipath/failover/fate_group_drain_exempt.ndjson",
-      "title": "An attachment whose graceful removal has started affects no other attachment of its fate group when its carrier then fails",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.2"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 27
-    },
-    {
-      "id": "multipath.failover.fate_group_resource_limit_exempt",
-      "file": "fixtures/traces/multipath/failover/fate_group_resource_limit_exempt.ndjson",
-      "title": "An attachment the peer abandons with ZMUX_PIPE_RESOURCE_LIMIT affects no other attachment of its fate group",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 26
     },
     {
       "id": "multipath.remove.graceful_local",
@@ -3133,34 +2654,8 @@
         "MULTIPATH.md#8.2",
         "MULTIPATH.md#8.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 23
-    },
-    {
-      "id": "multipath.remove.drain_deadline_fails_pipe",
-      "file": "fixtures/traces/multipath/remove/drain_deadline_fails_pipe.ndjson",
-      "title": "A draining pipe that stalls has its unacknowledged stream data reinjected once it is marked suspect, and fails T_fail after the removal without a second PIPE_ABANDON",
-      "refs": [
-        "MULTIPATH.md#8.2",
-        "STATE_MACHINE.md#3.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 33
-    },
-    {
-      "id": "multipath.remove.draining_never_returns_active",
-      "file": "fixtures/traces/multipath/remove/draining_never_returns_active.ndjson",
-      "title": "A draining pipe that stalls and recovers stays DRAINING and takes no new stream data; it closes once the PIPE_ABANDON exchange is complete and its data is acknowledged",
-      "refs": [
-        "MULTIPATH.md#8.2",
-        "MULTIPATH.md#11.1",
-        "STATE_MACHINE.md#3.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 26
     },
     {
       "id": "multipath.remove.linger_after_exchange_is_graceful",
@@ -3170,7 +2665,6 @@
         "MULTIPATH.md#8.2",
         "MULTIPATH.md#8.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 21
     },
@@ -3181,7 +2675,6 @@
       "refs": [
         "MULTIPATH.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 15
     },
@@ -3192,7 +2685,6 @@
       "refs": [
         "MULTIPATH.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3203,7 +2695,6 @@
       "refs": [
         "MULTIPATH.md#8.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -3214,7 +2705,6 @@
       "refs": [
         "MULTIPATH.md#8.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 8
     },
@@ -3223,10 +2713,8 @@
       "file": "fixtures/traces/multipath/status/local_standby.ndjson",
       "title": "A pipe marked standby locally carries no new stream data while another pipe works, and the peer is asked to treat its direction as standby too",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 15
     },
@@ -3237,7 +2725,6 @@
       "refs": [
         "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 11
     },
@@ -3248,7 +2735,6 @@
       "refs": [
         "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3260,7 +2746,6 @@
         "SPEC.md#6.5",
         "MULTIPATH.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
     },
@@ -3271,7 +2756,6 @@
       "refs": [
         "SPEC.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3283,19 +2767,17 @@
         "SPEC.md#6.4",
         "MULTIPATH.md#3.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 27
     },
     {
       "id": "multipath.idle.probes_do_not_keep_alive",
       "file": "fixtures/traces/multipath/idle/probes_do_not_keep_alive.ndjson",
-      "title": "With the defaults (30 s idle timeout, 15 s idle-pipe probe), PIPE_PING and PIPE_ACK never keep a multipath session alive",
+      "title": "With a 30 s idle timeout and the 15 s test-mode probe, PIPE_PING and PIPE_ACK never keep a multipath session alive",
       "refs": [
         "SPEC.md#6.4",
         "MULTIPATH.md#7.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 16
     },
@@ -3307,7 +2789,6 @@
         "SPEC.md#6.4",
         "SPEC.md#10.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3318,7 +2799,6 @@
       "refs": [
         "SPEC.md#9.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 132
     },
@@ -3330,7 +2810,6 @@
         "MULTIPATH.md#5.7",
         "MULTIPATH.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 15
     },
@@ -3342,7 +2821,6 @@
         "MULTIPATH.md#5.7",
         "STATE_MACHINE.md#3.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
     },
@@ -3354,7 +2832,6 @@
         "MULTIPATH.md#6.2",
         "MULTIPATH.md#8.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3367,7 +2844,6 @@
         "MULTIPATH.md#8.4",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 14
     },
@@ -3378,7 +2854,6 @@
       "refs": [
         "MULTIPATH.md#8.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3390,7 +2865,6 @@
         "MULTIPATH.md#8.1",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 11
     },
@@ -3402,7 +2876,6 @@
         "MULTIPATH.md#4.3",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 24
     },
@@ -3414,7 +2887,6 @@
         "MULTIPATH.md#6.2",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3426,7 +2898,6 @@
         "MULTIPATH.md#6.2",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3438,7 +2909,6 @@
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#8.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 19
     },
@@ -3450,21 +2920,8 @@
         "MULTIPATH.md#5.7",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 19
-    },
-    {
-      "id": "multipath.failover.resource_limit_abandon_keeps_fate_group",
-      "file": "fixtures/traces/multipath/failover/resource_limit_abandon_keeps_fate_group.ndjson",
-      "title": "When the acceptor abandons one of the joiner's attachments with ZMUX_PIPE_RESOURCE_LIMIT, the joiner's other attachments of the same fate group stay ACTIVE",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 24
     },
     {
       "id": "multipath.join.message_framed_positions",
@@ -3474,7 +2931,6 @@
         "SPEC.md#3.4",
         "MULTIPATH.md#2.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
@@ -3486,7 +2942,6 @@
         "MULTIPATH.md#7.4",
         "SPEC.md#4.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 25
     },
@@ -3497,7 +2952,6 @@
       "refs": [
         "MULTIPATH.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 16
     },
@@ -3508,45 +2962,8 @@
       "refs": [
         "MULTIPATH.md#6.5"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
-    },
-    {
-      "id": "multipath.ack.suspect_primary_moves_to_active",
-      "file": "fixtures/traces/multipath/ack/suspect_primary_moves_to_active.ndjson",
-      "title": "When the lowest-delay pipe becomes suspect, PIPE_ACK and credit frames go to an ACTIVE pipe",
-      "refs": [
-        "MULTIPATH.md#6.5",
-        "MULTIPATH.md#11.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 22
-    },
-    {
-      "id": "multipath.failover.inbound_silence",
-      "file": "fixtures/traces/multipath/failover/inbound_silence.ndjson",
-      "title": "An inbound pipe that stays open but receives nothing for longer than the inbound silence limit fails, although the sender side never reported anything",
-      "refs": [
-        "MULTIPATH.md#7.3",
-        "STATE_MACHINE.md#3.2"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 20
-    },
-    {
-      "id": "multipath.failover.pair_outage_waits_dead_timeout",
-      "file": "fixtures/traces/multipath/failover/pair_outage_waits_dead_timeout.ndjson",
-      "title": "Without resume and with a 120 s idle timeout, a single pipe pair survives a 30 s outage: its outbound direction waits for T_dead (by default half the idle timeout, 60 s), and the inbound silence rule does not apply to a pair",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#7.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
     },
     {
       "id": "multipath.join.carrier_bound_token",
@@ -3556,20 +2973,8 @@
         "MULTIPATH.md#10.5",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
-    },
-    {
-      "id": "multipath.budget.retransmit_floor",
-      "file": "fixtures/traces/multipath/budget/retransmit_floor.ndjson",
-      "title": "Before any rate estimate the retransmit budget is its 1 MiB floor: retained stream data stops there until acknowledgements arrive",
-      "refs": [
-        "SCHEDULER.md#13.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 10
     },
     {
       "id": "multipath.budget.fin_only_duplicates_not_charged",
@@ -3579,7 +2984,6 @@
         "SPEC.md#9.4",
         "MULTIPATH.md#7.6"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3591,7 +2995,6 @@
         "SPEC.md#10.2",
         "MULTIPATH.md#8.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 13
     },
@@ -3603,7 +3006,6 @@
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#6.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 43
     },
@@ -3612,10 +3014,8 @@
       "file": "fixtures/traces/multipath/status/standby_takeover.ndjson",
       "title": "When every non-standby pipe has failed, the standby pipe carries the traffic and the endpoint announces it with PIPE_STATUS",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 18
     },
@@ -3625,10 +3025,8 @@
       "title": "A standby takeover is temporary: a JOINING pipe does not end it, and once a non-standby pipe is usable again the endpoint restores its standby request",
       "refs": [
         "MULTIPATH.md#9",
-        "SCHEDULER.md#10",
         "MULTIPATH.md#5.7"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 31
     },
@@ -3640,7 +3038,6 @@
         "MULTIPATH.md#9",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3652,7 +3049,6 @@
         "MULTIPATH.md#9",
         "MULTIPATH.md#5.1"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 17
     },
@@ -3664,198 +3060,8 @@
         "MULTIPATH.md#5.7",
         "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 12
-    },
-    {
-      "id": "multipath.tier.lower_tier_idle",
-      "file": "fixtures/traces/multipath/tier/lower_tier_idle.ndjson",
-      "title": "While a pipe of the preferred tier has room, a less-preferred pipe carries no stream data, even with the lower delay",
-      "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
-    },
-    {
-      "id": "multipath.tier.overflow_and_return",
-      "file": "fixtures/traces/multipath/tier/overflow_and_return.ndjson",
-      "title": "A pipe that is not writable does not make its tier overflow. A less-preferred tier takes only what the preferred tier cannot send within the overflow delay (drain test) or data that has waited for it that long (age test), and traffic returns as soon as the backlog fits",
-      "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 36
-    },
-    {
-      "id": "multipath.tier.failover_to_lower_tier",
-      "file": "fixtures/traces/multipath/tier/failover_to_lower_tier.ndjson",
-      "title": "When every pipe of the preferred tier has failed, the less-preferred tier carries the traffic",
-      "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 19
-    },
-    {
-      "id": "multipath.tier.return_after_probation",
-      "file": "fixtures/traces/multipath/tier/return_after_probation.ndjson",
-      "title": "A new pipe, and a pipe back from SUSPECT, take stream data only after probation; a second suspicion right after probation doubles it",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 136
-    },
-    {
-      "id": "multipath.tier.short_suspicion_enters_probation",
-      "file": "fixtures/traces/multipath/tier/short_suspicion_enters_probation.ndjson",
-      "title": "A pipe that returns from SUSPECT enters probation however short the suspicion, with k raised when it was suspect soon after its last probation",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 97
-    },
-    {
-      "id": "multipath.tier.suspicion_during_probation",
-      "file": "fixtures/traces/multipath/tier/suspicion_during_probation.ndjson",
-      "title": "A pipe that becomes suspect while in probation starts a new probation with k raised when it returns, however short the suspicion",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 90
-    },
-    {
-      "id": "multipath.tier.probation_capped_by_uptime",
-      "file": "fixtures/traces/multipath/tier/probation_capped_by_uptime.ndjson",
-      "title": "After a short up period, probation is capped at max(base, 2 x the longest uptime) instead of base x 2^k",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 87
-    },
-    {
-      "id": "multipath.probe.backup_pipe_every_second",
-      "file": "fixtures/traces/multipath/probe/backup_pipe_every_second.ndjson",
-      "title": "A pipe of a less-preferred tier that carries nothing is probed every standby_probe (1 s), not every 15 s",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 37
-    },
-    {
-      "id": "multipath.probe.backup_pipe_quiet_session",
-      "file": "fixtures/traces/multipath/probe/backup_pipe_quiet_session.ndjson",
-      "title": "In a quiet session (no traffic frame for the 15 s busy window) a less-preferred pipe falls back to the probe interval, and is probed at once when traffic resumes",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 102
-    },
-    {
-      "id": "multipath.tier.first_join_probation_without_history",
-      "file": "fixtures/traces/multipath/tier/first_join_probation_without_history.ndjson",
-      "title": "A pipe that joins a path without history is in probation for 4 x SRTT only, without the 1 s floor",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 30
-    },
-    {
-      "id": "multipath.tier.peer_request_and_local_override",
-      "file": "fixtures/traces/multipath/tier/peer_request_and_local_override.ndjson",
-      "title": "Without a local setting the peer's PIPE_STATUS priority request is honoured; an explicit local send priority wins over it",
-      "refs": [
-        "MULTIPATH.md#9"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 24
-    },
-    {
-      "id": "multipath.tier.asymmetric_directions",
-      "file": "fixtures/traces/multipath/tier/asymmetric_directions.ndjson",
-      "title": "Send and receive priorities are separate: the local outbound direction of pipe 2 is preferred, while the peer is asked to use its own outbound direction of pipe 2 as a less-preferred tier",
-      "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 16
-    },
-    {
-      "id": "multipath.tier.standby_not_used_for_overflow",
-      "file": "fixtures/traces/multipath/tier/standby_not_used_for_overflow.ndjson",
-      "title": "Overflow goes to a less-preferred tier, never to a standby pipe; the standby pipe takes over only when every other pipe has failed",
-      "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 29
-    },
-    {
-      "id": "multipath.tier.online_local_changes",
-      "file": "fixtures/traces/multipath/tier/online_local_changes.ndjson",
-      "title": "Send priorities, receive priorities and standby change online; every request change is sent at once as a PIPE_STATUS with the next sequence number",
-      "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 29
-    },
-    {
-      "id": "multipath.tier.online_peer_requests",
-      "file": "fixtures/traces/multipath/tier/online_peer_requests.ndjson",
-      "title": "Without local settings, the peer's latest PIPE_STATUS requests decide; a request reordered behind a newer one is ignored",
-      "refs": [
-        "MULTIPATH.md#9"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 25
-    },
-    {
-      "id": "multipath.policy.round_robin_weights",
-      "file": "fixtures/traces/multipath/policy/round_robin_weights.ndjson",
-      "title": "spread-round-robin assigns chunks in smooth weighted round-robin order by the configured weights; a pipe that is not writable is skipped and builds up no claim",
-      "refs": [
-        "SCHEDULER.md#6"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 45
-    },
-    {
-      "id": "multipath.policy.switch_online",
-      "file": "fixtures/traces/multipath/policy/switch_online.ndjson",
-      "title": "A policy change takes effect at the next chunk; data already placed is not moved",
-      "refs": [
-        "SCHEDULER.md#6"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 21
     },
     {
       "id": "multipath.tier.join_with_priority_local",
@@ -3865,21 +3071,8 @@
         "MULTIPATH.md#5.1",
         "MULTIPATH.md#9"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 7
-    },
-    {
-      "id": "multipath.tier.join_with_priority_peer",
-      "file": "fixtures/traces/multipath/tier/join_with_priority_peer.ndjson",
-      "title": "The priority in the peer's PIPE_JOIN applies to the local outbound direction of the new pipe from its first frame",
-      "refs": [
-        "MULTIPATH.md#5.1",
-        "MULTIPATH.md#9"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 13
     },
     {
       "id": "multipath.join.out_of_band_with_priority",
@@ -3889,7 +3082,6 @@
         "MULTIPATH.md#5.1",
         "MULTIPATH.md#5.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
@@ -3900,7 +3092,6 @@
       "refs": [
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 11
     },
@@ -3911,7 +3102,6 @@
       "refs": [
         "MULTIPATH.md#5.6"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 20
     },
@@ -3923,7 +3113,6 @@
         "SPEC.md#4.3",
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 12
     },
@@ -3935,7 +3124,6 @@
         "SPEC.md#4.3",
         "SPEC.md#8.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 15
     },
@@ -3947,7 +3135,6 @@
         "MULTIPATH.md#8.1",
         "MULTIPATH.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 6
     },
@@ -3962,7 +3149,6 @@
         "MULTIPATH.md#6.3",
         "SPEC.md#7.2"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 19
     },
@@ -3974,26 +3160,10 @@
         "MULTIPATH.md#2.5",
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#6.2",
-        "MULTIPATH.md#7.4",
-        "SCHEDULER.md#9.2"
+        "MULTIPATH.md#7.4"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 25
-    },
-    {
-      "id": "multipath.lanes.refused_lane_no_stall",
-      "file": "fixtures/traces/multipath/lanes/refused_lane_no_stall.ndjson",
-      "title": "The PIPE_LANE record of a refused lane is outside the pipe's send order: while lane 0 keeps being acknowledged the pipe stays ACTIVE well past T_suspect and T_fail, and no further lane is opened",
-      "refs": [
-        "MULTIPATH.md#2.5",
-        "MULTIPATH.md#5.8",
-        "MULTIPATH.md#7.1",
-        "STATE_MACHINE.md#3.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 63
     },
     {
       "id": "multipath.lanes.other_connection",
@@ -4003,7 +3173,6 @@
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#17"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 16
     },
@@ -4017,7 +3186,6 @@
         "MULTIPATH.md#8.2",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 22
     },
@@ -4030,7 +3198,6 @@
         "MULTIPATH.md#7.3",
         "STATE_MACHINE.md#3.3"
       ],
-      "findings": [],
       "profile": "zmux-mp",
       "steps": 22
     },
@@ -4042,7 +3209,6 @@
         "RESUME.md#4.1",
         "RESUME.md#4.2"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 12
     },
@@ -4056,7 +3222,6 @@
         "MULTIPATH.md#5.2",
         "MULTIPATH.md#5.4"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 17
     },
@@ -4068,7 +3233,6 @@
         "MULTIPATH.md#6.3",
         "RESUME.md#5"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 13
     },
@@ -4080,7 +3244,6 @@
         "RESUME.md#7",
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 15
     },
@@ -4092,7 +3255,6 @@
         "RESUME.md#7",
         "MULTIPATH.md#6.2"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 15
     },
@@ -4105,7 +3267,6 @@
         "RESUME.md#4.1",
         "RESUME.md#8"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 18
     },
@@ -4118,7 +3279,6 @@
         "MULTIPATH.md#8.4",
         "RESUME.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 79
     },
@@ -4131,7 +3291,6 @@
         "RESUME.md#4.3",
         "RESUME.md#4.4"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 93
     },
@@ -4143,46 +3302,8 @@
         "MULTIPATH.md#5.4",
         "RESUME.md#4.3"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 32
-    },
-    {
-      "id": "resume.rejoin.silent_downlink_replaced",
-      "file": "fixtures/traces/resume/rejoin/silent_downlink_replaced.ndjson",
-      "title": "A downlink that stays open but silent is failed by the inbound silence rule, also while suspended; a new downlink then confirms the rejoined uplink and the session leaves suspension",
-      "refs": [
-        "MULTIPATH.md#7.3",
-        "RESUME.md#4.3",
-        "RESUME.md#4.4"
-      ],
-      "findings": [],
-      "profile": "zmux-mp-resume",
-      "steps": 29
-    },
-    {
-      "id": "resume.suspend.dead_timeout_respected",
-      "file": "fixtures/traces/resume/suspend/dead_timeout_respected.ndjson",
-      "title": "With resume and DeadTimeout = 60 s, a single pipe pair survives a 25 s outage: neither T_fail nor the inbound silence limit (17.25 s for other pipes) cuts it; the outage stays below the 30 s idle timeout, which fires at 30 s (SPEC.md 1.3)",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#7.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp-resume",
-      "steps": 17
-    },
-    {
-      "id": "resume.suspend.last_pipe_fails_on_t_fail",
-      "file": "fixtures/traces/resume/suspend/last_pipe_fails_on_t_fail.ndjson",
-      "title": "With resume in use the last usable pipe fails on T_fail like any other, and the session suspends",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "RESUME.md#4.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp-resume",
-      "steps": 14
     },
     {
       "id": "resume.suspend.draining_survives_suspension",
@@ -4191,7 +3312,6 @@
       "refs": [
         "RESUME.md#4.1"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 12
     },
@@ -4202,7 +3322,6 @@
       "refs": [
         "RESUME.md#10"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 13
     },
@@ -4213,7 +3332,6 @@
       "refs": [
         "RESUME.md#4.2"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 14
     },
@@ -4226,7 +3344,6 @@
         "MULTIPATH.md#6.3",
         "MULTIPATH.md#7.1"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 15
     },
@@ -4237,46 +3354,35 @@
       "refs": [
         "RESUME.md#11"
       ],
-      "findings": [],
       "profile": "zmux-mp-resume",
       "steps": 14
     },
     {
-      "id": "findings.stop_race_is_stream_error",
-      "file": "fixtures/traces/findings/stop_race_is_stream_error.ndjson",
+      "id": "regression.stop_race_is_stream_error",
+      "file": "fixtures/traces/regression/stop_race_is_stream_error.ndjson",
       "title": "STOP_SENDING racing a local finish is a stream error, never a session error",
       "refs": [
         "SPEC.md#9.3"
       ],
-      "findings": [
-        "Go-2",
-        "Go-5"
-      ],
       "profile": "zmux-small",
       "steps": 12
     },
     {
-      "id": "findings.reset_does_not_refund_session_credit",
-      "file": "fixtures/traces/findings/reset_does_not_refund_session_credit.ndjson",
+      "id": "regression.reset_does_not_refund_session_credit",
+      "file": "fixtures/traces/regression/reset_does_not_refund_session_credit.ndjson",
       "title": "Bytes of a reset stream stay counted against the peer's session limit",
       "refs": [
         "SPEC.md#8.2"
       ],
-      "findings": [
-        "Go-4"
-      ],
       "profile": "zmux-small",
       "steps": 12
     },
     {
-      "id": "findings.peer_reset_code_zero",
-      "file": "fixtures/traces/findings/peer_reset_code_zero.ndjson",
+      "id": "regression.peer_reset_code_zero",
+      "file": "fixtures/traces/regression/peer_reset_code_zero.ndjson",
       "title": "A peer reset with code 0 is a stream reset, not a session close",
       "refs": [
         "STATE_MACHINE.md#2.5"
-      ],
-      "findings": [
-        "Go-5"
       ],
       "profile": "zmux-small",
       "steps": 9

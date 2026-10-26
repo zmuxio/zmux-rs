@@ -3221,6 +3221,15 @@ impl Pipe {
     pub async fn joined(&self) -> Result<(), PipeError> {
         self.joined_op().await
     }
+
+    /// Resolves when the pipe ended: `Ok` once every half of it closed
+    /// (after [`Pipe::close`](crate::Pipe#method.close) or the peer's
+    /// graceful removal) or the session forgot it, [`PipeError::Failed`]
+    /// when it failed, [`PipeError::SessionLost`] when the session ended
+    /// first. Cancel-safe.
+    pub async fn closed(&self) -> Result<(), PipeError> {
+        self.closed_op().await
+    }
 }
 
 /// Refuses a configuration that offers multipath to a session without a

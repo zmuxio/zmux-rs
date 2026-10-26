@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::SessionCore;
 use super::estimator::AckSample;
-use super::limiter::{AckEvent, EXPLAINED_SPAN, Params};
+use super::limiter::{AckEvent, Params};
 use super::pipes::OutPipe;
 use crate::proto::params::{DEFAULT_ACK_THRESHOLD, DEFAULT_MAX_ACK_DELAY_MS};
 
@@ -22,19 +22,11 @@ impl SessionCore {
                 Duration::from_millis(DEFAULT_MAX_ACK_DELAY_MS),
             ),
         };
-        let hooks = &self.config.hooks;
         Params {
             budget: self.config.latency_budget,
             threshold,
             max_ack_delay,
             chunk: self.config.spread_chunk as u64,
-            pacing: !hooks.limiter_no_pacing,
-            rate_bound: !hooks.limiter_no_rate_bound,
-            explained_span: hooks.limiter_explained_span.unwrap_or(EXPLAINED_SPAN),
-            relative_tolerance: !hooks.limiter_absolute_tolerance,
-            probe_end_due: hooks.limiter_probe_end_due,
-            drain_plus_slack: hooks.limiter_drain_plus_slack,
-            startup_counts_all: hooks.limiter_startup_counts_all,
         }
     }
 
@@ -42,10 +34,9 @@ impl SessionCore {
     /// single pipe with pipe acknowledgement (MULTIPATH.md Section 3.5),
     /// when its carrier has neither a low-water mark nor an unsent count.
     pub(super) fn paced(&self, o: &OutPipe) -> bool {
-        let hooks = &self.config.hooks;
         (self.mp.is_some() || self.pipe_ack.is_some())
-            && (hooks.limiter_all || !o.carrier_signals_queue())
-            && !hooks.unpaced
+            && !o.carrier_signals_queue()
+            && !self.config.hooks.unpaced
     }
 
     /// The bytes of stream data, reinjection and copies the limiter lets

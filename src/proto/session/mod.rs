@@ -91,6 +91,7 @@ pub use config::{
     DEFAULT_SEND_BUFFER_MAX, EarlyData, PipeAuth, Redundancy, RoleConfig, SESSION_WINDOW_FLOOR,
     STREAM_WINDOW_FLOOR, WindowIncrease,
 };
+pub use early::EarlyDataState;
 pub(crate) use error::ON_DRIVER_THREAD;
 pub use error::{DatagramError, OpenError, PipeError, PipeFailure, SessionError, StreamError};
 pub use event::CoreEvent;

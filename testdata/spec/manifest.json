@@ -1,26 +1,26 @@
 {
   "protocol": "zmux",
   "counts": {
-    "traces": 366,
-    "trace_steps": 6028,
+    "traces": 321,
+    "trace_steps": 4553,
     "traces_by_group": {
       "compat": 10,
       "core": 155,
       "ext": 51,
-      "findings": 3,
-      "multipath": 130,
-      "resume": 17
+      "multipath": 88,
+      "regression": 3,
+      "resume": 14
     },
     "wire_valid": 59,
     "wire_invalid": 92
   },
   "sha256": {
-    "assets/registry.json": "bb49ab9944d7d50db3932e87f034d5063565f15248e34f5684c14de6968288f4",
-    "fixtures/profiles.json": "5065bf24685f5b3f31362d2ded02eb9be02734b9b8dd50907a03177c7df1dec4",
-    "fixtures/wire/valid.ndjson": "939ba6ed6eec030ceec4b4c77030eea82396edc9c8490570839ac4837f2890c7",
-    "fixtures/wire/invalid.ndjson": "41479aba13b4d23daa5b149dee1c120035c67452b6311de94d2dbc7cad08ac84",
-    "fixtures/traces/index.json": "899eca7adb1a092c62793364f04d6dd6619ee91b000edadc79a755e7148606a5",
-    "WIRE_EXAMPLES.md": "ab79ecf00258bf719f1221da34aa2ce92a770b521b684500441d01abe2784fcd"
+    "assets/registry.json": "f20ce14d82cea29b33d7b61f237ac7b2c310a06208578c029b40dc310061d656",
+    "fixtures/profiles.json": "960c9ed3e770165b36120cf4a4e24ea3fe7b07f4f95e0067db51ccf17773276a",
+    "fixtures/wire/valid.ndjson": "6920e1f886b0b6d456c081ae597879c0248e7c4603d565f10cbfaf379e5f1486",
+    "fixtures/wire/invalid.ndjson": "374908a5405fc5d218ae27c7b3e089c7eab198c5949ab87ea5215fa7e09fc40c",
+    "fixtures/traces/index.json": "f525b78dd8a47334586289b8f431d7a261ebd850beb0a5a9dc4a01b4d69a763e",
+    "WIRE_EXAMPLES.md": "9610091008529bcbcefccdef7a805a10f2e53e9bb8ed5ff46e289e622f2cdb8f"
   },
-  "traces_sha256": "8fd54dfdf0c6954b7ae2a39ab3f03e57fd3a67d38f9b51e3d5006cb0fdc6e769"
+  "traces_sha256": "200bf51ab3d375e223bb88dc3c3b1f50b636b45856886fdd5649f68c9b3566a3"
 }

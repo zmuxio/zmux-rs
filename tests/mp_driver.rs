@@ -119,6 +119,29 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         "{e:?}"
     );
     assert!(client.close_reason().is_none());
+    // `closed` reports how a pipe ended: the failed join's failure, a
+    // graceful removal at both ends, the session's end for pipe 0.
+    assert!(matches!(
+        lost.closed().await,
+        Err(zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_)))
+    ));
+    assert_eq!(pipe.session().stable_id(), client.stable_id());
+    pipe.close().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.closed())
+        .await
+        .expect("closed in time")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), joined.closed())
+        .await
+        .expect("the peer's half closed in time")
+        .unwrap();
+    let zero = client.pipe(zmux::PipeId(0)).unwrap();
+    client.close(0u32.into(), b"");
+    let e = tokio::time::timeout(Duration::from_secs(10), zero.closed())
+        .await
+        .expect("pipe 0 ended with the session")
+        .unwrap_err();
+    assert!(matches!(e, zmux::PipeError::SessionLost(_)), "{e:?}");
     listener.close();
     serving.await.unwrap();
 }

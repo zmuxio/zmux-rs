@@ -71,18 +71,6 @@ pub(crate) struct Params {
     pub(crate) max_ack_delay: Duration,
     /// `spread_chunk`.
     pub(crate) chunk: u64,
-    /// Ablation switches (test hooks only): pacing, the rate bound, the
-    /// span without an explained sample that starts a probe, the relative
-    /// term of the base-refresh tolerance, a probe that ends unmeasured,
-    /// the drain exit at R_p x RTT_base_p + A, and start-up counting
-    /// application-limited round trips.
-    pub(crate) pacing: bool,
-    pub(crate) rate_bound: bool,
-    pub(crate) explained_span: Duration,
-    pub(crate) relative_tolerance: bool,
-    pub(crate) probe_end_due: bool,
-    pub(crate) drain_plus_slack: bool,
-    pub(crate) startup_counts_all: bool,
 }
 
 impl Params {
@@ -434,11 +422,7 @@ impl Limiter {
     /// be overrun by less than a chunk or a frame, a debt the bucket pays
     /// before the pipe is let go again.
     pub(crate) fn room(&self, now: Instant, in_flight: u64, est: &Estimator, p: &Params) -> u64 {
-        let tokens = if p.pacing {
-            self.tokens(now, est, p)
-        } else {
-            f64::MAX
-        };
+        let tokens = { self.tokens(now, est, p) };
         let cap = self.cap(est, p);
         if tokens < 1.0 || in_flight >= cap {
             return 0;
@@ -466,7 +450,7 @@ impl Limiter {
         self.held = self.room(now, in_flight, est, p) == 0;
         self.release = None;
         let tokens = self.tokens(now, est, p);
-        if self.held && p.pacing && tokens < 1.0 {
+        if self.held && tokens < 1.0 {
             let (rate, _) = self.pace(now, est, p);
             // Rounded up, so that the bucket holds a byte then.
             let wait = (1.0 - tokens) / rate + 1e-6;
@@ -508,7 +492,7 @@ impl Limiter {
         // acknowledgement starts now, not only if this one's samples, too,
         // stay away from the base.
         if matches!(self.mode, Mode::Drain | Mode::Cruise(_)) {
-            self.maybe_probe(now, ev, est, p);
+            self.maybe_probe(now, ev, est);
         }
         let rate = est.rate.max(1);
         let a_time = Params::at(p.slack(rate), rate);
@@ -552,11 +536,7 @@ impl Limiter {
                 // every pipe, which then needs a probe.
                 let bdp = (est.rate as f64 * base.as_secs_f64()) as u64;
                 let a = p.slack(est.rate);
-                let exit = if p.drain_plus_slack {
-                    bdp.saturating_add(a)
-                } else {
-                    bdp.max(a)
-                };
+                let exit = bdp.max(a);
                 if self.standing(est) <= p.budget || in_flight <= exit {
                     self.mode = Mode::Cruise(Cycle::start(now));
                 }
@@ -574,10 +554,7 @@ impl Limiter {
                 // to find.
                 let end = probe.since + probe.length;
                 let measured = probe.after_drain.is_some() || ev.acked >= ev.sent;
-                let over = now >= end
-                    && probe
-                        .drained_at
-                        .is_some_and(|d| measured || (p.probe_end_due && d <= end));
+                let over = now >= end && measured && probe.drained_at.is_some();
                 if over {
                     let probe = *probe;
                     self.end_probe(now, &probe, est, p);
@@ -627,11 +604,7 @@ impl Limiter {
             self.base = Some(u);
         }
         let base = self.base(est);
-        let relative = if p.relative_tolerance {
-            base / BASE_TOLERANCE
-        } else {
-            Duration::ZERO
-        };
+        let relative = base / BASE_TOLERANCE;
         if u <= base + p.budget + a_time + relative {
             self.near_at = now;
         }
@@ -645,7 +618,7 @@ impl Limiter {
     fn round_ended(&mut self, est: &mut Estimator, p: &Params, a_time: Duration) {
         let sampled = std::mem::take(&mut self.round_max);
         if let Mode::Startup { full, flat } = &mut self.mode
-            && (sampled > 0 || p.startup_counts_all)
+            && sampled > 0
         {
             // As in BBR, rounds without a bottleneck sample (limited by
             // the application) say nothing of the path.
@@ -669,11 +642,11 @@ impl Limiter {
 
     /// Starts a probe when no sample was near the base for 10 s, or none
     /// within what the cap can queue for max(1 s, 8 x RTT_base).
-    fn maybe_probe(&mut self, now: Instant, ev: &AckEvent<'_>, est: &Estimator, p: &Params) {
+    fn maybe_probe(&mut self, now: Instant, ev: &AckEvent<'_>, est: &Estimator) {
         let base = self.base(est);
         let far = now.saturating_duration_since(self.near_at) >= BASE_SPAN;
         let unexplained = now.saturating_duration_since(self.explained_at)
-            >= p.explained_span.max(base * EXPLAINED_BASES);
+            >= EXPLAINED_SPAN.max(base * EXPLAINED_BASES);
         if !far && !unexplained {
             return;
         }
@@ -702,10 +675,7 @@ impl Limiter {
         // The base is what the probe measured: older samples, from before
         // the path's delay may have changed, no longer count; when the
         // probe found the path slower, not longer, the old base stays.
-        let base = match probe
-            .r_q
-            .filter(|&r| unchanged && r < est.rate && p.rate_bound)
-        {
+        let base = match probe.r_q.filter(|&r| unchanged && r < est.rate) {
             Some(r_q) => {
                 est.set_rate_lo(Some(r_q));
                 self.bound_set = Some(now);
@@ -734,13 +704,6 @@ mod tests {
             threshold: 64 * 1024,
             max_ack_delay: 25 * MS,
             chunk: 16 * 1024,
-            pacing: true,
-            rate_bound: true,
-            explained_span: EXPLAINED_SPAN,
-            relative_tolerance: true,
-            probe_end_due: false,
-            drain_plus_slack: false,
-            startup_counts_all: false,
         }
     }
 
@@ -1209,13 +1172,6 @@ mod tests {
             None
         };
         assert_eq!(run(&params()), None);
-        // Without the relative term every 10 s holds the pipe at A in a
-        // probe.
-        let absolute = Params {
-            relative_tolerance: false,
-            ..params()
-        };
-        assert!(run(&absolute).is_some_and(|t| t <= BASE_SPAN + 250 * MS));
     }
 
     #[test]
@@ -1248,11 +1204,6 @@ mod tests {
         let bdp = 1_250_000;
         assert!(!drain(12_500_000, 100 * MS, bdp, &p));
         assert!(drain(12_500_000, 100 * MS, bdp + a / 2, &p));
-        let plus = Params {
-            drain_plus_slack: true,
-            ..params()
-        };
-        assert!(!drain(12_500_000, 100 * MS, bdp + a / 2, &plus));
     }
 
     #[test]
@@ -1344,10 +1295,5 @@ mod tests {
         assert!(rounds(&params(), true, 20));
         // Four with bottleneck samples and no growth end it.
         assert!(!rounds(&params(), false, 4));
-        let all = Params {
-            startup_counts_all: true,
-            ..params()
-        };
-        assert!(!rounds(&all, true, 4));
     }
 }
