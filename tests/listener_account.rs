@@ -75,7 +75,14 @@ async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
     client.close(zmux::VarInt::from_u32(0), b"");
     watchdog(10, "server closed", server.closed()).await;
     drop((client, server));
-    // The ended session's charge left the account.
+    // The ended session's charge left the account: the end of the
+    // pressure is reported once, after its start (wait for it before a
+    // new session charges again, which the hook may see coalesced).
+    eventually(10, "pressure end reported", || {
+        seen.lock().unwrap().len() >= 2
+    })
+    .await;
+    assert_eq!(seen.lock().unwrap()[..2], [true, false]);
     let accepted = async {
         loop {
             let (io, _ctl, _) = dial(&listener);
@@ -90,14 +97,6 @@ async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
         }
     };
     let c = watchdog(10, "accepted again", accepted).await;
-    // Pressure ended before the new session was accepted, and was
-    // reported once each way, in order (the new session may start it
-    // again).
-    eventually(10, "pressure end reported", || {
-        seen.lock().unwrap().len() >= 2
-    })
-    .await;
-    assert_eq!(seen.lock().unwrap()[..2], [true, false]);
     drop(c);
     listener.close();
 }
