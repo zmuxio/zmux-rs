@@ -31,6 +31,13 @@ async fn race(c1: Config, c2: Config) -> (End, End) {
     let (dialed_by_1, accepted_by_2) = connect(a, b, c1.clone(), c2.clone()).await;
     let ((a, _), (b, _)) = duplex(1 << 20);
     let (dialed_by_2, accepted_by_1) = connect(a, b, c2, c1).await;
+    // `connect` returns once one end is established; both must be.
+    let all = [&dialed_by_1, &accepted_by_2, &dialed_by_2, &accepted_by_1];
+    eventually(10, "every end established", || {
+        all.iter()
+            .all(|s| s.state() != zmux::SessionState::Establishing)
+    })
+    .await;
     (
         End {
             mine: dialed_by_1,

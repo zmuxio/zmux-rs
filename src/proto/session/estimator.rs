@@ -128,8 +128,8 @@ impl Estimator {
         self.last_sample = Some(now);
         self.min_rtt.sample(now, latest, super::filter::LOOP_SPAN);
         let min_rtt = self.min_rtt.get().unwrap_or(latest);
-        let adjusted = if latest >= min_rtt + ack_delay {
-            latest - ack_delay
+        let adjusted = if latest >= min_rtt.saturating_add(ack_delay) {
+            latest.saturating_sub(ack_delay)
         } else {
             latest
         };

@@ -643,7 +643,7 @@ impl std::fmt::Debug for PipeIo {
             .field("reader", &self.reader.is_some())
             .field("writer", &self.writer.is_some())
             .field("framing", &self.framing)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1740,9 +1740,8 @@ impl ReadSide {
         self.active = now;
         self.large = match &outcome {
             ReadOutcome::Data(n) => *n >= IDLE_READ,
-            ReadOutcome::Idle(_) => false,
             ReadOutcome::Chunk(c) => c.len() >= IDLE_READ,
-            ReadOutcome::Eof | ReadOutcome::Error(_) => false,
+            ReadOutcome::Idle(_) | ReadOutcome::Eof | ReadOutcome::Error(_) => false,
         };
         self.left_more = match &outcome {
             ReadOutcome::Data(_) | ReadOutcome::Chunk(_) => self.filled || self.partial,
@@ -2994,6 +2993,11 @@ impl Future for Task {
 impl Session {
     /// Establishes a session as the dialling side of `pipe`. Returns once
     /// the peer's transport parameters were processed.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError`] when the configuration is invalid, the carrier fails
+    /// or the handshake does not complete (the peer closed, refused or timed out).
     pub async fn connect(
         pipe: PipeIo,
         config: impl Into<Arc<Config>>,
@@ -3006,6 +3010,11 @@ impl Session {
     /// that offers multipath (`max_pipes` above 1, or resume) is refused
     /// ([`ConnectError::InvalidConfig`]). Accept
     /// multipath sessions with a [`crate::Listener`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError`] when the configuration is invalid, the carrier fails
+    /// or the handshake does not complete.
     pub async fn accept(
         pipe: PipeIo,
         config: impl Into<Arc<Config>>,
@@ -3017,6 +3026,11 @@ impl Session {
 
     /// Establishes a session over a symmetric carrier: the roles are
     /// negotiated with `zmux_role` (EXTENSIONS.md Section 2).
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError`] when the configuration is invalid, the carrier fails
+    /// or the handshake does not complete.
     pub async fn peer(
         pipe: PipeIo,
         config: impl Into<Arc<Config>>,
@@ -3045,10 +3059,17 @@ impl Session {
     /// The two parts are one connection for tokio's I/O traits:
     /// `tokio::io::join(recv, send)` is an `AsyncRead + AsyncWrite` whose
     /// shutdown finishes the stream.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::SessionLost`] when the session ended, and the other
+    /// [`OpenError`] variants when no stream can be opened (GOAWAY, limits).
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), OpenError> {
         self.open_bi_wait(None).await
     }
 
+    // Public through the `Session` and `Pipe` aliases; the example runs.
+    #[allow(rustdoc::private_doc_tests)]
     /// Opens a bidirectional stream with `preamble` (open info,
     /// application TLVs, PIPE_CARRIER; EXTENSIONS.md Section 4), waiting
     /// for stream credit as [`Session::open_bi`](crate::Session#method.open_bi) does. The preamble goes
@@ -3082,6 +3103,11 @@ impl Session {
 
     /// Opens a unidirectional stream, waiting for stream credit (see
     /// [`Session::open_bi`](crate::Session#method.open_bi)). Cancel-safe.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::SessionLost`] when the session ended, and the other
+    /// [`OpenError`] variants when no stream can be opened (GOAWAY, limits).
     pub async fn open_uni(&self) -> Result<SendStream, OpenError> {
         self.open_uni_wait(None).await
     }
@@ -3094,11 +3120,21 @@ impl Session {
 
     /// Accepts the next bidirectional stream the peer opened, in
     /// identifier order. Cancel-safe.
+    ///
+    /// # Errors
+    ///
+    /// The [`SessionError`] that ended the session, once no stream is left
+    /// to accept.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         self.accept_bi_wait().await
     }
 
     /// Accepts the next unidirectional stream the peer opened. Cancel-safe.
+    ///
+    /// # Errors
+    ///
+    /// The [`SessionError`] that ended the session, once no stream is left
+    /// to accept.
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         self.accept_uni_wait().await
     }
@@ -3204,6 +3240,8 @@ pub(crate) fn pipe_stream(send: SendStream, recv: RecvStream, preamble: &Preambl
 }
 
 impl Pipe {
+    // Public through the `Session` and `Pipe` aliases; the example runs.
+    #[allow(rustdoc::private_doc_tests)]
     /// Waits until the pipe's join is confirmed: its outbound pipe ACTIVE
     /// (an inbound-only pipe: open; pipe 0: established). Fails when the
     /// join failed or was not confirmed in time ([`PipeError::Failed`]),

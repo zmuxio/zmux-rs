@@ -772,7 +772,7 @@ impl std::fmt::Debug for MemoryCharge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryCharge")
             .field("bytes", &self.bytes)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

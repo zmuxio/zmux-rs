@@ -1070,7 +1070,9 @@ impl<D: Driver> Clone for Pipe<D> {
 
 impl<D: Driver> std::fmt::Debug for Pipe<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pipe").field("id", &self.id).finish()
+        f.debug_struct("Pipe")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1122,7 +1124,7 @@ impl<D: Driver> std::fmt::Debug for PipeReservation<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipeReservation")
             .field("id", &self.id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1214,7 +1216,7 @@ impl<D: Driver> std::fmt::Debug for SendStream<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SendStream")
             .field("key", &self.key)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1573,7 +1575,7 @@ impl<D: Driver> std::fmt::Debug for RecvStream<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecvStream")
             .field("key", &self.key)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1766,9 +1768,8 @@ impl<D: Driver> RecvStream<D> {
                         }
                     }
                     Ok(Some((_, true))) if n == 0 => return Some(Ok(None)),
-                    Ok(_) => break,
                     Err(e) if n == 0 => return Some(Err(e)),
-                    Err(_) => break,
+                    Ok(_) | Err(_) => break,
                 }
             }
             (n > 0 || bufs.is_empty()).then_some(Ok(Some(n)))

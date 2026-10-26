@@ -551,7 +551,6 @@ impl SessionCore {
                     s.extra_mut().priority_resend = false;
                 }
             }
-            SentFrame::PipeStatus { .. } => {}
             _ => {}
         }
     }

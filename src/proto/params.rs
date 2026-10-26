@@ -854,8 +854,7 @@ pub fn resolve_role(
             _ => Err(conflict),
         },
         (Some(l), None) => match (l, transport) {
-            (_, None) => Err(conflict),
-            (I, Some(Role::Responder)) | (R, Some(Role::Initiator)) => Err(conflict),
+            (_, None) | (I, Some(Role::Responder)) | (R, Some(Role::Initiator)) => Err(conflict),
             (_, Some(t)) => Ok(t),
         },
         (None, _) => transport.ok_or(conflict),

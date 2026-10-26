@@ -168,3 +168,14 @@ jobs:
         run: cargo check --locked --workspace --all-targets --all-features
       - name: Library tests
         run: cargo test --locked --lib --all-features
+
+  audit:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

@@ -227,6 +227,6 @@ impl fmt::Debug for Preamble {
             .field("info", &self.info)
             .field("tlvs", &self.tlvs().collect::<Vec<_>>())
             .field("pipe_carrier", &self.pipe_carrier)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

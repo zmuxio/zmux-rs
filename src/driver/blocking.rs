@@ -279,7 +279,7 @@ impl std::fmt::Debug for PipeIo {
         f.debug_struct("PipeIo")
             .field("reader", &self.reader.is_some())
             .field("writer", &self.writer.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

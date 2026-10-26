@@ -507,6 +507,7 @@ impl Default for Config {
 
 /// Deterministic values for the conformance trace runner (TRACES.md Section
 /// 3.3). Only reachable with the `test-hooks` feature.
+#[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 #[cfg_attr(not(feature = "test-hooks"), allow(unreachable_pub))]
@@ -587,6 +588,7 @@ impl Config {
 
     /// The trace-runner hooks.
     #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub fn test_hooks(&mut self) -> &mut TestHooks {
         &mut self.hooks
     }

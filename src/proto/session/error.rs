@@ -655,13 +655,12 @@ impl From<PipeError> for io::Error {
             PipeError::NotEstablished => io::ErrorKind::NotConnected,
             PipeError::Deferred => io::ErrorKind::WouldBlock,
             PipeError::UnknownPipe => io::ErrorKind::NotFound,
-            PipeError::InvalidArgument => io::ErrorKind::InvalidInput,
+            PipeError::InvalidArgument | PipeError::CarrierLoop => io::ErrorKind::InvalidInput,
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
             PipeError::OnDriverThread => io::ErrorKind::Deadlock,
             PipeError::TimedOut => io::ErrorKind::TimedOut,
             PipeError::SessionLost(s) => s.kind(),
             PipeError::Io(kind) => *kind,
-            PipeError::CarrierLoop => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, e)
     }
@@ -686,7 +685,7 @@ mod tests {
             io::Error::from(rejected.clone()),
             io::Error::from(StreamError::SessionLost(rejected.clone())),
             io::Error::from(OpenError::SessionLost(rejected.clone())),
-            io::Error::from(crate::ConnectError::Closed(rejected.clone())),
+            io::Error::from(crate::ConnectError::Closed(rejected)),
         ] {
             assert!(SessionError::in_io(&e).is_some_and(SessionError::is_early_data_rejected));
         }
