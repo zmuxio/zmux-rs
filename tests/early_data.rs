@@ -74,3 +74,32 @@ fn role_auto_cannot_send_early_data() {
         assert!(matches!(e, ConnectError::InvalidConfig(_)), "{e:?}");
     });
 }
+
+#[test]
+fn early_streams_carry_preamble_and_priority() {
+    multi_thread(async {
+        let ((a, _), (b, _)) = duplex(1 << 20);
+        let client = watchdog(5, "connect", Session::connect(a, early()))
+            .await
+            .unwrap();
+        let pre = zmux::Preamble::new()
+            .with_info("GET /")
+            .with_tlv(0x1000, b"dest");
+        let (mut send, recv) = client.open_bi_with(&pre).await.unwrap();
+        let prio = zmux::Priority::new(1, true).unwrap();
+        recv.set_peer_priority(prio).unwrap();
+        send.write_all(b"early").await.unwrap();
+        send.finish().unwrap();
+        let server = watchdog(5, "accept", Session::accept(b, Config::default()))
+            .await
+            .unwrap();
+        let (_s, mut r) = watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
+        let got = r.preamble();
+        assert_eq!(got.info().map(|b| &b[..]), Some(&b"GET /"[..]));
+        assert_eq!(got.tlv(0x1000).as_deref(), Some(&b"dest"[..]));
+        assert_eq!(r.requested_priority(), Some(prio));
+        let data = watchdog(5, "read", r.read_to_end(1 << 10)).await.unwrap();
+        assert_eq!(data, b"early");
+        client.close(0u32.into(), b"");
+    });
+}

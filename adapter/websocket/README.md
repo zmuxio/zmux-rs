@@ -19,8 +19,9 @@ join to a listener.
 
 A Close frame is the graceful end of a pipe; a connection that ends
 without one is a failure. Over plain TCP a failed pipe is aborted without a
-Close frame. No TLS is chosen here: enable a TLS feature of
-`tokio-tungstenite` for `wss://`, or upgrade an established TLS stream.
+Close frame. For `wss://`, `dial_tls` and `connect_tls` take the
+application's `tokio_rustls::TlsConnector`; `dial_over` upgrades an
+established TLS stream.
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {

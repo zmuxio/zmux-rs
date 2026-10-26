@@ -948,10 +948,13 @@ impl SessionCore {
         key: StreamKey,
         priority: Priority,
     ) -> Result<(), StreamError> {
-        if !self.features.priority {
+        let preamble = self.features.preamble;
+        // Before the peer's parameters only the preamble's PRIORITY TLV of
+        // an early stream can carry the request (SPEC.md Section 6.1.2).
+        let early = self.early_open();
+        if !self.features.priority && !(early && preamble) {
             return Err(StreamError::NotNegotiated);
         }
-        let preamble = self.features.preamble;
         let s = self
             .streams
             .get_mut(key)
@@ -963,6 +966,11 @@ impl SessionCore {
             s.extra_mut().peer_priority = Some(priority);
             return Ok(());
         }
+        if !self.features.priority {
+            // An early stream past its first frame: no PRIORITY_UPDATE yet.
+            return Err(StreamError::NotNegotiated);
+        }
+        let s = self.streams.get_mut(key).expect("checked above");
         s.extra_mut().priority_update = Some(priority);
         self.streams.queue_ctrl(key);
         Ok(())
@@ -973,7 +981,8 @@ impl SessionCore {
     /// peer's Maximum Preamble Size and one of our records, with room for a
     /// PRIORITY TLV set later ([`OpenError::TooLarge`]), and needs the
     /// peer's `zmux_preamble` ([`OpenError::NotNegotiated`]; before
-    /// establishment [`OpenError::NotEstablished`]).
+    /// establishment [`OpenError::NotEstablished`], unless the stream is
+    /// an early one, whose preamble counts within the assumed set).
     pub fn open_with(
         &mut self,
         dir: Dir,
@@ -985,7 +994,9 @@ impl SessionCore {
         if let Some(e) = self.lost() {
             return Err(OpenError::SessionLost(e));
         }
-        if !self.is_established() {
+        // Early streams carry their preamble within the assumed set
+        // (SPEC.md Section 6.1.2).
+        if !self.is_established() && !self.early_open() {
             return Err(OpenError::NotEstablished);
         }
         if !self.features.preamble {

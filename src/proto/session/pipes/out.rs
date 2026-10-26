@@ -914,6 +914,12 @@ impl OutPipe {
         self.framing
     }
 
+    /// The carrier's framing, known only once a reserved pipe's carrier
+    /// is attached (before any byte was written).
+    pub(crate) fn set_framing(&mut self, framing: Framing) {
+        self.framing = framing;
+    }
+
     pub(crate) fn sent(&self) -> u64 {
         self.sent
     }

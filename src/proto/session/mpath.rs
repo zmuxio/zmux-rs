@@ -1141,6 +1141,24 @@ impl SessionCore {
 
     // ---- joining (joiner side, MULTIPATH.md Section 5.7) ------------------------
 
+    /// The framing of a reserved pipe's carrier, set when it is attached
+    /// (an out-of-band join, before the pipe read or wrote a byte).
+    pub fn set_reserved_framing(
+        &mut self,
+        id: PipeId,
+        inbound: Option<Framing>,
+        outbound: Option<Framing>,
+        now: Instant,
+    ) {
+        let max = self.local_tp().max_record_size();
+        if let (Some(f), Some(p)) = (inbound, self.inp_mut(id.0)) {
+            p.set_framing(f, max, now);
+        }
+        if let (Some(f), Some(p)) = (outbound, self.out_mut(id.0)) {
+            p.set_framing(f);
+        }
+    }
+
     /// Adds a pipe that the local endpoint joins. `inbound`/`outbound` name
     /// the carrier's halves: the outbound pipe is joined in band unless
     /// `oob`, in which case (and always for an inbound-only carrier) the

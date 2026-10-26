@@ -2642,17 +2642,21 @@ impl<D: Driver> PipeReservationApi<D> for PipeReservation<D> {
         crate::proto::oob::encode_string(&self.frame)
     }
 
-    fn attach(mut self, pipe: D::Carrier) -> Result<Pipe<D>, PipeError> {
+    fn attach(mut self, mut pipe: D::Carrier) -> Result<Pipe<D>, PipeError> {
         if let Some(conn) = &self.conn {
             // Refused, the reservation is given up (dropped).
             D::check_carrier(&conn.0, &pipe)?;
         }
         let conn = self.conn.take().expect("a reservation holds its session");
         let id = self.id;
+        // The carrier's framing (message framing on WebSocket, for
+        // example), unknown when the pipe was reserved.
+        let c = D::carrier_info(&mut pipe);
         conn.command(|st| {
             // An out-of-band frame no one took is nobody's now.
             st.take_oob(id.0);
             let now = D::now();
+            st.core.set_reserved_framing(id, c.inbound, c.outbound, now);
             st.core
                 .pipe_write(id, PipeWrite::returned(now, now, 0, 0, false), now);
         });

@@ -35,9 +35,9 @@
 //!   connection that ends without a Close frame is a carrier error, never a
 //!   clean end. Text messages are a protocol error of the carrier.
 //!
-//! No TLS is chosen here: for `wss://` enable a TLS feature of
-//! tokio-tungstenite in the application (its `connect` then uses it), or
-//! upgrade an established TLS stream with [`pipe`].
+//! - `wss://`: [`dial_tls`] and [`connect_tls`] with the application's
+//!   `tokio_rustls::TlsConnector`, or [`dial_over`] on a TLS stream the
+//!   application established; [`dial`] and [`connect`] are for `ws://`.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,7 +74,11 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::{
+    Request as ClientRequest, Response as ClientResponse,
+};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -115,21 +119,12 @@ pub async fn dial(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
 ) -> io::Result<PipeIo> {
-    let mut request = request.into_client_request().map_err(io::Error::other)?;
-    if !request.headers().contains_key(PROTOCOL_HEADER) {
-        let offer = options.offer().join(", ");
-        let value = HeaderValue::from_str(&offer).map_err(io::Error::other)?;
-        request.headers_mut().insert(PROTOCOL_HEADER, value);
-    }
+    let request = offer(request, options)?;
     let (ws, response) =
         tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), true)
             .await
             .map_err(io::Error::other)?;
-    let protocol = response
-        .headers()
-        .get(PROTOCOL_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let protocol = negotiated(&response);
     let socket = match ws.get_ref() {
         MaybeTlsStream::Plain(tcp) => {
             let _ = tcp.set_nodelay(true);
@@ -138,14 +133,117 @@ pub async fn dial(
         #[allow(unreachable_patterns)]
         _ => None,
     };
-    let io = pipe(ws, protocol);
+    Ok(with_socket(pipe(ws, protocol), socket))
+}
+
+/// A carrier over a new WebSocket on `io`, an established byte stream such
+/// as a TLS stream: the client handshake for `request` (a `ws://` or
+/// `wss://` URL, or a request with headers), the subprotocols as in
+/// [`dial`]. Give the carrier the TCP socket underneath
+/// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without a
+/// Close frame, as [`dial_tls`] does.
+///
+/// ```no_run
+/// # async fn example(tls: tokio_rustls::TlsConnector,
+/// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> std::io::Result<()> {
+/// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
+/// let conn = tls.connect(name, tcp).await?;
+/// let pipe = zmux_websocket::dial_over(conn, "wss://example.com/zmux", &Default::default()).await?;
+/// # drop(pipe);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn dial_over<S>(
+    io: S,
+    request: impl IntoClientRequest + Unpin,
+    options: &Options,
+) -> io::Result<PipeIo>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let request = offer(request, options)?;
+    let (ws, response) =
+        tokio_tungstenite::client_async_with_config(request, io, Some(ws_config()))
+            .await
+            .map_err(io::Error::other)?;
+    Ok(pipe(ws, negotiated(&response)))
+}
+
+/// A carrier over a new WebSocket over TLS to a `wss://` `request`: TCP to
+/// the URL's host and port (443 by default), TLS with `tls` for the host's
+/// name (the application's client configuration chooses roots, ALPN and
+/// early data, as with the other adapters), then [`dial_over`]. A pipe
+/// that zmux fails is aborted without a Close frame.
+pub async fn dial_tls(
+    request: impl IntoClientRequest + Unpin,
+    tls: &tokio_rustls::TlsConnector,
+    options: &Options,
+) -> io::Result<PipeIo> {
+    let request = request.into_client_request().map_err(io::Error::other)?;
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL without a host"))?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(443);
+    let name = ServerName::try_from(host.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let _ = tcp.set_nodelay(true);
+    let socket = tcp_dup(&tcp);
+    let conn = tls.connect(name, tcp).await?;
+    Ok(with_socket(
+        dial_over(conn, request, options).await?,
+        socket,
+    ))
+}
+
+/// Establishes a session over a new WebSocket over TLS ([`dial_tls`], then
+/// [`zmux::Session::connect`]).
+pub async fn connect_tls(
+    request: impl IntoClientRequest + Unpin,
+    tls: &tokio_rustls::TlsConnector,
+    options: &Options,
+    config: impl Into<Arc<zmux::Config>>,
+) -> Result<Session, ConnectError> {
+    let io = dial_tls(request, tls, options)
+        .await
+        .map_err(|e| ConnectError::Io(Arc::new(e)))?;
+    Session::connect(io, config).await
+}
+
+/// The request with the offered subprotocols unless it names its own.
+fn offer(request: impl IntoClientRequest + Unpin, options: &Options) -> io::Result<ClientRequest> {
+    let mut request = request.into_client_request().map_err(io::Error::other)?;
+    if !request.headers().contains_key(PROTOCOL_HEADER) {
+        let offer = options.offer().join(", ");
+        let value = HeaderValue::from_str(&offer).map_err(io::Error::other)?;
+        request.headers_mut().insert(PROTOCOL_HEADER, value);
+    }
+    Ok(request)
+}
+
+/// The subprotocol the server selected.
+fn negotiated(response: &ClientResponse) -> Option<String> {
+    response
+        .headers()
+        .get(PROTOCOL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The carrier with the TCP socket underneath, for aborts.
+fn with_socket(io: PipeIo, socket: Option<SocketDup>) -> PipeIo {
     #[cfg(any(unix, windows))]
     if let Some(s) = socket {
-        return Ok(io.with_tcp_socket(&s));
+        return io.with_tcp_socket(&s);
     }
     #[cfg(not(any(unix, windows)))]
     let _ = socket;
-    Ok(io)
+    io
 }
 
 /// Establishes a session over a new WebSocket ([`dial`], then

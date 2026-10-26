@@ -290,3 +290,101 @@ async fn a_flood_of_empty_messages_is_charged() {
     relay.abort();
     listener.close();
 }
+
+/// wss://: `connect_tls` against a server that terminates TLS and upgrades
+/// with `accept` inside the listener's `serve_with`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_over_tls() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = CertificateDer::from(cert.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+
+    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let l = listener.clone();
+    let serving = tokio::spawn(async move {
+        l.serve_with(
+            || tcp.accept(),
+            move |conn, peer| {
+                let tls = acceptor.clone();
+                async move {
+                    let conn = tls.accept(conn).await?;
+                    zmux_websocket::accept(conn, Some(peer.ip()), &Default::default()).await
+                }
+            },
+        )
+        .await
+    });
+    let client = zmux_websocket::connect_tls(
+        format!("wss://localhost:{port}/zmux"),
+        &connector,
+        &Default::default(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let server = listener.accept().await.unwrap();
+    assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
+    round_trip(&client, &server).await;
+    client.close(0u32.into(), b"bye");
+    serving.abort();
+}
+
+/// An out-of-band join: the reservation's header on the upgrade request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_band_join() {
+    let mut config = Config::default();
+    config.pipe_auth = zmux::PipeAuth::psk(vec![7u8; 32]);
+    config.max_pipes = 8;
+    let listener = Listener::new(config.clone(), ListenerConfig::default());
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        Default::default(),
+    ));
+    let client = zmux_websocket::connect(format!("ws://{addr}/zmux"), &Default::default(), config)
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    let r = client
+        .reserve_pipe(zmux::PipeDirection::Bidi, zmux::PipeOptions::new())
+        .unwrap();
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("ws://{addr}/zmux"),
+    )
+    .unwrap();
+    req.headers_mut()
+        .insert(zmux::JOIN_HEADER, r.header().parse().unwrap());
+    let io = zmux_websocket::dial(req, &Default::default())
+        .await
+        .unwrap();
+    let pipe = r.attach(io).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pipe.joined())
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&client, &server).await;
+    client.close(0u32.into(), b"bye");
+    serving.abort();
+}

@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.1
+
+All crates of the workspace are released together at this version.
+
+### Fixes
+
+- Streams opened during early data accept a preamble and a requested
+  priority: the preamble, with its PRIORITY TLV, is part of the assumed
+  parameter set (SPEC.md Section 6.1.2), no longer "session not
+  established".
+- A pipe reserved for an out-of-band join takes its carrier's framing when
+  the carrier is attached: over WebSocket (message framing) it no longer
+  sends Size-prefixed records, which the peer rejected.
+
+### Additions
+
+- zmux-websocket: `wss://` with `dial_tls` and `connect_tls`, which take
+  the application's `tokio_rustls::TlsConnector`, and `dial_over` for a
+  WebSocket client handshake on an established stream.
+
 ## 1.2.0
 
 All crates of the workspace are released together at this version.

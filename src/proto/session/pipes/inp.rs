@@ -255,6 +255,13 @@ impl InPipe {
         }
     }
 
+    /// The carrier's framing, known only once a reserved pipe's carrier
+    /// is attached (before any byte was read).
+    pub(crate) fn set_framing(&mut self, framing: Framing, max_record: u64, now: Instant) {
+        self.framing = framing;
+        self.zero = RecvLane::new(framing, max_record, now);
+    }
+
     /// With the first-record check of a bootstrap pipe.
     pub(crate) fn with_classifier(mut self, classifier: Classifier) -> Self {
         self.classifier = Some(classifier);

@@ -1,6 +1,6 @@
 [package]
 name = "zmux-http"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ http-body = "1"
 hyper = { version = "1.6", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.10", default-features = false, features = ["tokio", "server-auto"] }
 tokio = { version = "1.47", default-features = false, features = ["net", "rt", "io-util", "time"] }
-zmux = { version = "1.2.0", path = "../.." }
+zmux = { version = "1.2.1", path = "../.." }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
