@@ -77,12 +77,15 @@ async fn drained(e1: &End, e2: &End, kept_1s: bool) {
             "{e:?}"
         );
     }
+    // Both ends of the survivor first: closing one closes the other.
     for s in keep {
         assert!(
             s.close_reason().is_none(),
             "the survivor stays: {:?}",
             s.close_reason()
         );
+    }
+    for s in keep {
         s.close(VarInt::ZERO, b"");
     }
 }
