@@ -60,6 +60,7 @@
 use std::future::{Future, poll_fn};
 use std::io::{self, IoSlice};
 use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 
@@ -289,22 +290,23 @@ impl H3Client {
         let inner = &self.inner;
         let (send, recv) = inner.request().await?;
         let opener = inner.clone();
-        let io = PipeIo::from_halves(
+        let (r, w) = paired(
             BodyReader::client(recv, inner.clone()),
             BodyWriter::new(SendHalf::Client(send), Some(inner.clone())),
-        )
-        .with_connection_memory(inner.window)
-        .with_lane_opener(move || {
-            let inner = opener.clone();
-            async move {
-                let (send, recv) = inner.request().await?;
-                // The response stays open, unread: stopping it would make
-                // the server drop the request before the lane is routed.
-                let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner));
-                lane.response = Some(recv);
-                Ok(lane)
-            }
-        });
+        );
+        let io = PipeIo::from_halves(r, w)
+            .with_connection_memory(inner.window)
+            .with_lane_opener(move || {
+                let inner = opener.clone();
+                async move {
+                    let (send, recv) = inner.request().await?;
+                    // The response stays open, unread: stopping it would make
+                    // the server drop the request before the lane is routed.
+                    let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner));
+                    lane.response = Some(recv);
+                    Ok(lane)
+                }
+            });
         Ok(with_connection(io, inner.id(), &inner.exported))
     }
 }
@@ -428,10 +430,11 @@ pub async fn serve_connection(
                 return;
             }
             let (send, recv) = stream.split();
-            let io = PipeIo::from_halves(
+            let (r, w) = paired(
                 BodyReader::server(recv),
                 BodyWriter::new(SendHalf::Server(send), None),
             );
+            let io = PipeIo::from_halves(r, w);
             let _ = listener
                 .handle_pipe(with_connection(io, id, &exported), hint)
                 .await;
@@ -482,6 +485,9 @@ struct BodyWriter {
     half: Arc<Mutex<SendHalf>>,
     op: Option<Op>,
     finished: bool,
+    /// Set once the body ended gracefully, for the reader of the same
+    /// pipe (see `paired`).
+    ended_gracefully: Arc<AtomicBool>,
     /// The client a pipe's body keeps alive.
     _keep: Option<Arc<ClientInner>>,
     /// A lane's response, held unread while the lane lives.
@@ -494,6 +500,7 @@ impl BodyWriter {
             half: Arc::new(Mutex::new(half)),
             op: None,
             finished: false,
+            ended_gracefully: Arc::default(),
             _keep: keep,
             response: None,
         }
@@ -583,8 +590,16 @@ impl AsyncWrite for BodyWriter {
         }
         ready!(self.poll_op(cx))?;
         self.finished = true;
+        self.ended_gracefully.store(true, Ordering::Release);
         Poll::Ready(Ok(()))
     }
+}
+
+/// The two bodies of one pipe: a graceful end of the sent body keeps the
+/// reader from stopping the received one when it is dropped.
+fn paired(mut r: BodyReader, w: BodyWriter) -> (BodyReader, BodyWriter) {
+    r.peer_may_finish = w.ended_gracefully.clone();
+    (r, w)
 }
 
 /// A body being received.
@@ -606,6 +621,10 @@ struct BodyReader {
     /// A read of the body is in progress: the stack holds the stream, and
     /// stopping it now would panic in h3-quinn (dropping it stops it).
     reading: bool,
+    /// The pipe's request or response body this endpoint sends ended
+    /// gracefully: the carrier closes cleanly, and the peer's body is not
+    /// stopped, or its sender could fail before it reads what was sent.
+    peer_may_finish: Arc<AtomicBool>,
     _keep: Option<Arc<ClientInner>>,
 }
 
@@ -628,6 +647,7 @@ impl BodyReader {
             held: Bytes::new(),
             ended: false,
             reading: false,
+            peer_may_finish: Arc::default(),
             _keep: Some(keep),
         }
     }
@@ -639,6 +659,7 @@ impl BodyReader {
             held: Bytes::new(),
             ended: false,
             reading: false,
+            peer_may_finish: Arc::default(),
             _keep: None,
         }
     }
@@ -646,7 +667,7 @@ impl BodyReader {
 
 impl Drop for BodyReader {
     fn drop(&mut self) {
-        if self.ended || self.reading {
+        if self.ended || self.reading || self.peer_may_finish.load(Ordering::Acquire) {
             return;
         }
         match self.half.as_mut() {
