@@ -73,6 +73,7 @@ use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

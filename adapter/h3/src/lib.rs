@@ -66,6 +66,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
