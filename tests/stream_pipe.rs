@@ -396,9 +396,7 @@ fn stream_events_map_to_pipe_events() {
             assert_eq!(
                 e,
                 zmux::SessionError::PipesLost {
-                    last: Some(zmux::PipeFailure::Carrier(
-                        std::io::ErrorKind::ConnectionReset
-                    ))
+                    last: Some(zmux::PipeFailure::Carrier(io::ErrorKind::ConnectionReset))
                 }
             );
 
@@ -415,9 +413,7 @@ fn stream_events_map_to_pipe_events() {
             assert_eq!(
                 e,
                 zmux::SessionError::PipesLost {
-                    last: Some(zmux::PipeFailure::Carrier(
-                        std::io::ErrorKind::ConnectionReset
-                    ))
+                    last: Some(zmux::PipeFailure::Carrier(io::ErrorKind::ConnectionReset))
                 }
             );
             assert!(oc.close_reason().is_none() && os.close_reason().is_none());

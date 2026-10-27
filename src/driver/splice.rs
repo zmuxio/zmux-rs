@@ -5,7 +5,7 @@
 //!
 //! Each direction, from a receiving part `r` to a sending part `w`, waits
 //! for `w`'s send capacity with `min` = m = min(chunk, the bytes readable
-//! on `r`, 16 KiB) ([`crate::SendStream::poll_send_capacity`]: woken once
+//! on `r`, 16 KiB) ([`SendStream::poll_send_capacity`]: woken once
 //! per chunk, not on every credit change, and never stalled by a peer
 //! window smaller than m); asks the
 //! direction's limiter, if any, for `ready(min(m, capacity), min(capacity,
@@ -163,7 +163,7 @@ impl std::error::Error for SpliceError {}
 /// sending and receiving part.
 ///
 /// The application opens the outbound stream with the inbound stream's
-/// preamble ([`RecvStream::preamble`](crate::RecvStream#method.preamble), [`Session::open_bi_with`](crate::Session#method.open_bi_with)),
+/// preamble ([`RecvStream::preamble`](RecvStream#method.preamble), [`Session::open_bi_with`](crate::Session#method.open_bi_with)),
 /// adjusted as its conventions say (PIPE_CARRIER and the application TLVs
 /// come with it). Ends and errors propagate per direction, codes
 /// unchanged:

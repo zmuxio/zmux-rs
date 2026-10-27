@@ -1,6 +1,6 @@
 //! Keeping pipes up (non-normative): a helper above the
-//! session that uses only its public API ([`Session::add_pipe`](crate::Session#method.add_pipe),
-//! [`Session::pipes`](crate::Session#method.pipes), [`Pipe::stats`](crate::Pipe#method.stats), [`Pipe::close`](crate::Pipe#method.close)) and
+//! session that uses only its public API ([`Session::add_pipe`](Session#method.add_pipe),
+//! [`Session::pipes`](Session#method.pipes), [`Pipe::stats`](Pipe#method.stats), [`Pipe::close`](Pipe#method.close)) and
 //! the pool's `dial`; it changes nothing on the wire and keeps no state in
 //! the session.
 //!
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use ::tokio::time::Instant;
+use tokio::time::Instant;
 
 use crate::driver::resources::{Kind, Live};
 use crate::proto::session::{PipeError, PipeId, PipeOptions, PipeState, PipeStats, State};
@@ -293,7 +293,7 @@ pub fn maintain_pipes(session: &Session, pool: PipePool) -> MaintainHandle {
         redial_at: Some(Instant::now()),
         rotate_at: Some(Instant::now()),
     };
-    ::tokio::spawn(task.run());
+    tokio::spawn(task.run());
     MaintainHandle { stop }
 }
 
@@ -389,7 +389,7 @@ impl Maintainer {
             self.observe(now);
             self.start_dials(now);
             let next = self.next_check(now);
-            let sleep = ::tokio::time::sleep_until(next);
+            let sleep = tokio::time::sleep_until(next);
             let mut sleep = std::pin::pin!(sleep);
             let session = self.session.clone();
             let mut closed = std::pin::pin!(session.closed());

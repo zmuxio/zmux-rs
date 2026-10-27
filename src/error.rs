@@ -1,6 +1,6 @@
 //! The errors of the drivers' compound operations. Every other operation
-//! returns the session's errors unchanged ([`crate::SessionError`],
-//! [`crate::StreamError`], [`crate::OpenError`], [`crate::DatagramError`],
+//! returns the session's errors unchanged ([`SessionError`],
+//! [`StreamError`], [`OpenError`], [`DatagramError`],
 //! [`crate::PipeError`]; see `proto::session::error`); these add only what
 //! the compound operation itself can fail with.
 

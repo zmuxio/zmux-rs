@@ -5,17 +5,17 @@
 //!
 //! - [`connect`] dials TCP, runs the TLS handshake and establishes a
 //!   session; [`dial`] makes the carrier alone, for further pipes
-//!   ([`zmux::Session::add_pipe`], `maintain_pipes`);
+//!   ([`Session::add_pipe`], `maintain_pipes`);
 //! - [`serve`] accepts TCP connections, runs each handshake in a task of
 //!   its own within the listener's `handshake_timeout`, and hands the
-//!   carriers to a [`zmux::Listener`].
+//!   carriers to a [`Listener`].
 //!
 //! Both fill in the ALPN identifiers when the rustls configuration has none
 //! ([`zmux::alpn_protocols`]: a client offers `qmux-02` then `qmux-01`, a
 //! server accepts both); configured identifiers are left as they are.
 //!
 //! [`pipe`] turns an established tokio-rustls stream, client or server,
-//! into a [`zmux::PipeIo`] with what the TLS connection can tell zmux:
+//! into a [`PipeIo`] with what the TLS connection can tell zmux:
 //!
 //! - its TLS 1.3 exporter (RFC 8446 Section 7.5) for both labels zmux uses
 //!   (MULTIPATH.md Sections 10.2 and 10.5): the session secret of a
@@ -26,14 +26,14 @@
 //!   its joins are not carrier-bound;
 //! - its reads, which return one TLS record's plaintext each: zmux reads
 //!   again before it decides that no input is pending
-//!   ([`zmux::PipeIo::with_partial_reads`]);
+//!   ([`PipeIo::with_partial_reads`]);
 //! - the negotiated ALPN identifier, as the session's protocol.
 //!
 //! [`over_tcp`] does the same for TLS over TCP, and adds the TCP socket
 //! below it: its minimum RTT, unsent bytes and low-water mark are used as
 //! for a plain TCP carrier, and a pipe that zmux fails is aborted by
 //! shutting the socket down without TLS close_notify, so that the peer sees
-//! a failure rather than a graceful end ([`zmux::PipeIo::with_tcp_socket`];
+//! a failure rather than a graceful end ([`PipeIo::with_tcp_socket`];
 //! one duplicate of the socket serves both).
 //!
 //! The adapter takes the configuration as it is otherwise: no crypto
@@ -83,7 +83,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ProtocolVersion, ServerConfig};
+use tokio_rustls::rustls::{
+    ClientConfig, ClientConnection, ProtocolVersion, ServerConfig, ServerConnection,
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
 use zmux::{ConnectError, Listener, PipeHint, PipeIo, Session};
@@ -144,7 +146,7 @@ pub fn over_tcp(stream: impl Into<TlsStream<TcpStream>>) -> PipeIo {
 }
 
 /// A TLS carrier over a new TCP connection to `addr`, verified for
-/// `server_name`: for [`zmux::Session::connect`], or as a further pipe of a
+/// `server_name`: for [`Session::connect`], or as a further pipe of a
 /// session. The ALPN identifiers default as the crate documentation says.
 pub async fn dial(
     addr: impl ToSocketAddrs,
@@ -161,7 +163,7 @@ pub async fn dial(
 }
 
 /// Establishes a session over a new TLS connection to `addr` ([`dial`],
-/// then [`zmux::Session::connect`]).
+/// then [`Session::connect`]).
 pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
@@ -214,8 +216,8 @@ fn server_alpn(tls: Arc<ServerConfig>) -> Arc<ServerConfig> {
 
 /// The exporter of a TLS 1.3 connection whose handshake completed.
 enum Exporter<'a> {
-    Client(&'a tokio_rustls::rustls::ClientConnection),
-    Server(&'a tokio_rustls::rustls::ServerConnection),
+    Client(&'a ClientConnection),
+    Server(&'a ServerConnection),
     None,
 }
 

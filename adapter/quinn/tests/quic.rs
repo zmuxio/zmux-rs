@@ -163,7 +163,7 @@ async fn a_carrier_bound_join_over_a_second_connection() {
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
-    assert!(client.multipath() == zmux::Multipath::InUse);
+    assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let pipe = client
         .add_pipe(q2.open_pipe().await.unwrap(), PipeOptions::default())
         .unwrap();

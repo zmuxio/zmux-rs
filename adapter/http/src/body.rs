@@ -89,6 +89,15 @@ impl AsyncWrite for BodyWriter {
         self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
     }
 
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.end(End::Finish);
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -122,15 +131,6 @@ impl AsyncWrite for BodyWriter {
 
     fn is_write_vectored(&self) -> bool {
         true
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.end(End::Finish);
-        Poll::Ready(Ok(()))
     }
 }
 

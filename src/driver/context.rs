@@ -12,7 +12,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-std::thread_local! {
+thread_local! {
     /// Nesting depth of [`DriverThread`] guards on this thread.
     static DRIVER: Cell<usize> = const { Cell::new(0) };
 }
@@ -27,7 +27,7 @@ pub(crate) struct DriverThread {
 
 impl DriverThread {
     pub(crate) fn enter() -> Self {
-        DRIVER.with(|d| d.set(d.get() + 1));
+        DRIVER.set(DRIVER.get() + 1);
         Self {
             _live: super::resources::Live::new(super::resources::Kind::Thread),
             _not_send: PhantomData,
@@ -48,7 +48,7 @@ pub(crate) fn on_driver_thread() -> bool {
         return true;
     }
     #[cfg(feature = "tokio")]
-    if ::tokio::runtime::Handle::try_current().is_ok() {
+    if tokio::runtime::Handle::try_current().is_ok() {
         return true;
     }
     false
@@ -78,7 +78,7 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[test]
     fn inside_a_tokio_runtime() {
-        let rt = ::tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         rt.block_on(async { assert!(on_driver_thread()) });

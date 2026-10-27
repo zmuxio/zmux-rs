@@ -119,7 +119,7 @@ impl SlidingMax {
 
     /// Heap bytes held.
     pub(crate) fn memory(&self) -> usize {
-        self.s.capacity() * std::mem::size_of::<(Instant, u64)>()
+        self.s.capacity() * size_of::<(Instant, u64)>()
     }
 }
 

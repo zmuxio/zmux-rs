@@ -135,7 +135,7 @@ impl LaneTx {
     }
 
     fn heap_bytes(&self) -> usize {
-        self.segs.capacity() * std::mem::size_of::<Seg>()
+        self.segs.capacity() * size_of::<Seg>()
     }
 
     /// The pipe failed: nothing waits for acknowledgement any more.

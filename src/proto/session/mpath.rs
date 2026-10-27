@@ -657,7 +657,7 @@ impl ReplayWindow {
 impl Mp {
     /// Heap bytes the multipath state holds besides the attachments.
     pub(crate) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.batch.heap_bytes() + self.acks.heap_bytes()
+        size_of::<Self>() + self.batch.heap_bytes() + self.acks.heap_bytes()
     }
 
     /// The session is closing: no more pipe-layer state changes matter.
@@ -994,7 +994,7 @@ impl SessionCore {
         if self.exporter.is_none()
             && let Some(mp) = self.local.multipath.as_mut()
         {
-            mp.secret_flags &= !crate::proto::keys::secret_flags::EXPORTER;
+            mp.secret_flags &= !keys::secret_flags::EXPORTER;
         }
     }
 

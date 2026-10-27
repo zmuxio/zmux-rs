@@ -114,7 +114,7 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
     let deadline = Duration::from_micros(rng.below(3000));
     let wait: JoinHandle<String> = {
         let s = local.clone();
-        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>> = match kind {
+        let fut: std::pin::Pin<Box<dyn Future<Output = String> + Send>> = match kind {
             Kind::Read => {
                 let mut r = l_recv.take().unwrap();
                 Box::pin(async move {

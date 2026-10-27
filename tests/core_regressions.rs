@@ -326,7 +326,7 @@ fn config_out_of_varint_range_is_rejected() {
     cfg.max_idle_timeout = Duration::MAX;
     assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
     let mut cfg = Config::default();
-    cfg.max_connection_receive_window = zmux::Cap::Fixed(1 << 62);
+    cfg.max_connection_receive_window = Cap::Fixed(1 << 62);
     assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
     let mut cfg = Config::default();
     cfg.send_buffer = 0;

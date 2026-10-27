@@ -125,7 +125,7 @@ pub struct PipeIo {
     closer: Option<Closer>,
     framing: Framing,
     abort: Option<Box<dyn FnOnce() + Send>>,
-    exporter: Option<Box<super::handle::Exporters>>,
+    exporter: Option<Box<handle::Exporters>>,
     protocol: Option<String>,
     /// The TCP socket under the carrier: its minimum RTT, unsent bytes and
     /// low-water mark ([`Probe`]).
@@ -261,7 +261,7 @@ impl PipeIo {
     /// 10.5).
     #[must_use]
     pub fn with_tls_exporter(mut self, export: impl FnMut(&str) -> Option<Vec<u8>>) -> Self {
-        self.exporter = super::handle::Exporters::take(export);
+        self.exporter = handle::Exporters::take(export);
         self
     }
 
@@ -1151,7 +1151,7 @@ impl Session {
 
     /// Sends a QX_PING request, or joins the one outstanding, and waits
     /// for the round-trip time it measured; the sample
-    /// also updates [`Session::rtt`](crate::blocking::Session#method.rtt) and the statistics. Works with every
+    /// also updates [`Session::rtt`](blocking::Session#method.rtt) and the statistics. Works with every
     /// peer, plain QMux peers included. On a thread that drives sessions
     /// it fails at once.
     pub fn ping(&self) -> Result<Duration, WaitError> {

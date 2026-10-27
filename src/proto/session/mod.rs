@@ -727,7 +727,7 @@ pub struct SessionCore {
     /// The read buffer the bytes being processed came in, when the driver
     /// handed it over ([`SessionCore::receive_shared`]), and the streams whose
     /// received data references read buffers.
-    rx_src: Option<(Bytes, recv_buf::Backing)>,
+    rx_src: Option<(Bytes, Backing)>,
     recv_refs: RecvRefs,
     /// The outbound pipe whose batch is being built.
     tx: u64,
@@ -1245,26 +1245,20 @@ impl SessionCore {
     pub fn memory_usage(&self) -> usize {
         // The configuration counts in equal parts for the sessions that
         // share it.
-        let config = (std::mem::size_of::<Config>() + 2 * std::mem::size_of::<usize>())
-            / Arc::strong_count(&self.config);
-        let mut n = std::mem::size_of::<Self>() + config + self.streams.heap_bytes();
-        n += self.events.capacity() * std::mem::size_of::<CoreEvent>();
+        let config =
+            (size_of::<Config>() + 2 * size_of::<usize>()) / Arc::strong_count(&self.config);
+        let mut n = size_of::<Self>() + config + self.streams.heap_bytes();
+        n += self.events.capacity() * size_of::<CoreEvent>();
         // Attachments (with their pipe halves) live inline in `atts`.
         n += self.atts.heap_bytes();
         n += self.mp.as_deref().map_or(0, mpath::Mp::heap_bytes);
         n += self.grease.1.capacity() + self.exporter.as_ref().map_or(0, Vec::capacity);
-        n += self
-            .error
-            .as_ref()
-            .map_or(0, |_| std::mem::size_of::<SessionError>());
-        n += self
-            .close
-            .as_ref()
-            .map_or(0, |_| std::mem::size_of::<CloseFrame>());
+        n += self.error.as_ref().map_or(0, |_| size_of::<SessionError>());
+        n += self.close.as_ref().map_or(0, |_| size_of::<CloseFrame>());
         n += self
             .goaway
             .as_deref()
-            .map_or(0, |g| std::mem::size_of::<GoAwayState>() + g.reason.len());
+            .map_or(0, |g| size_of::<GoAwayState>() + g.reason.len());
         n += self.dgram.as_deref().map_or(0, DatagramState::heap_bytes);
         n += self
             .quality

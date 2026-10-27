@@ -267,7 +267,7 @@ async fn pairs(n: usize, tcp: Option<&tokio::net::TcpListener>) -> Vec<(Session,
 async fn per_pair<F, Fut, T>(n: usize, settle: Duration, make: F) -> f64
 where
     F: Fn(usize) -> Fut,
-    Fut: std::future::Future<Output = Vec<T>>,
+    Fut: Future<Output = Vec<T>>,
 {
     let warm = make(n).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;

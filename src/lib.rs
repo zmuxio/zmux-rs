@@ -70,15 +70,15 @@
 //! Both ends opt in with [`Config::multipath`] and a [`PipeAuth`]. The
 //! server takes every carrier through one [`Listener`], which starts new
 //! sessions ([`Listener::accept`]) and routes joins to existing ones; the
-//! client adds pipes with [`Session::add_pipe`](crate::Session#method.add_pipe), or keeps a
+//! client adds pipes with [`Session::add_pipe`](Session#method.add_pipe), or keeps a
 //! pool of them up with [`helpers::maintain_pipes`] and a
 //! [`helpers::PipePool`] whose dial function is a carrier crate's `dial`.
 //! The session spreads frames over its pipes and fails over and reinjects
 //! when one is lost; with `resume_timeout` set ([`Config`]) it also
 //! survives losing all of them, resuming on the next pipe that joins in
 //! time. [`SessionEvent`]s
-//! ([`Session::next_event`](crate::Session#method.next_event)) report pipes joining, failing
-//! ([`PipeFailure`]) and changing quality; [`Session::pipe_stats`](crate::Session#method.pipe_stats) and
+//! ([`Session::next_event`](Session#method.next_event)) report pipes joining, failing
+//! ([`PipeFailure`]) and changing quality; [`Session::pipe_stats`](Session#method.pipe_stats) and
 //! [`Listener::stats`] give the counters.
 //!
 //! # Relays and nesting
@@ -88,7 +88,7 @@
 //! two into each other with [`helpers::splice`], which forwards data only
 //! as the next hop's flow control allows and forwards resets with their
 //! Reliable Size. A session can also run inside another one: a stream
-//! opened with [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream) is a pipe of a
+//! opened with [`Session::open_pipe_stream`](Session#method.open_pipe_stream) is a pipe of a
 //! nested session (on the accepting side, a stream whose preamble
 //! [`is a pipe carrier`](Preamble::is_pipe_carrier) becomes one with
 //! [`PipeIo::from_stream`]), for

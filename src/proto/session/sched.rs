@@ -769,7 +769,7 @@ impl SessionCore {
 
     /// Whether a stream direction counts as bulk for `affinity`: expected
     /// bytes of at least 256 KiB, and not urgent.
-    fn is_bulk(&self, send: &super::stream::SendPart) -> bool {
+    fn is_bulk(&self, send: &SendPart) -> bool {
         self.expected_bytes(send) >= SMALL_STREAM && send.priority.urgency() > 2
     }
 
@@ -903,7 +903,7 @@ impl SessionCore {
     /// session buffer gives it less (with 16 bulk streams each holds a
     /// sixteenth, which would make every one look small and bind all of
     /// them to the lowest-delay pipe).
-    fn expected_bytes(&self, send: &super::stream::SendPart) -> u64 {
+    fn expected_bytes(&self, send: &SendPart) -> u64 {
         Expected::of(send).bytes(self.session_send_buffer())
     }
 

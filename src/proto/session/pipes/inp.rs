@@ -279,8 +279,8 @@ impl InPipe {
     pub(super) fn heap_bytes(&self) -> usize {
         self.zero.heap_bytes()
             + self.lanes.as_deref().map_or(0, |l| {
-                std::mem::size_of::<InLanes>()
-                    + l.capacity() * std::mem::size_of::<InLane>()
+                size_of::<InLanes>()
+                    + l.capacity() * size_of::<InLane>()
                     + l.iter().map(|x| x.recv.heap_bytes()).sum::<usize>()
             })
     }

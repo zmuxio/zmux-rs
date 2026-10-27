@@ -399,17 +399,17 @@ impl OutPipe {
 
     /// Heap bytes the pipe holds.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.batches.capacity() * std::mem::size_of::<Batch>()
+        self.batches.capacity() * size_of::<Batch>()
             + self.lanes.as_deref().map_or(0, OutLanes::heap_bytes)
             + self
                 .limiter
                 .as_ref()
-                .map_or(0, |l| std::mem::size_of::<Limiter>() + l.memory())
+                .map_or(0, |l| size_of::<Limiter>() + l.memory())
             + self.mp.as_deref().map_or(0, |m| {
-                std::mem::size_of::<OutMp>()
-                    + m.log.capacity() * std::mem::size_of::<(u64, SentFrame)>()
-                    + m.activity_ends.capacity() * std::mem::size_of::<u64>()
-                    + m.copies.capacity() * std::mem::size_of::<QueuedCopy>()
+                size_of::<OutMp>()
+                    + m.log.capacity() * size_of::<(u64, SentFrame)>()
+                    + m.activity_ends.capacity() * size_of::<u64>()
+                    + m.copies.capacity() * size_of::<QueuedCopy>()
             })
     }
 

@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::Tracer;
 use super::policy::Policy;
 use crate::proto::keys::secret_flags;
 use crate::proto::limit::DatagramLimiter;
@@ -204,7 +205,7 @@ pub struct Config {
     /// keep-alive (the default).
     pub keep_alive_period: Option<Duration>,
     /// Initial stream receive window (default 256 KiB; at least 4 KiB,
-    /// the early-data floor of [`crate::proto::params::floor`]).
+    /// the early-data floor of [`params::floor`](floor)).
     pub initial_stream_receive_window: u64,
     /// Cap of auto-tuned stream windows (default [`Cap::Auto`]: at least
     /// [`STREAM_WINDOW_FLOOR`], 64 MiB, K x the BDP of the 1 Gbit/s x
@@ -216,7 +217,7 @@ pub struct Config {
     /// arrival rate times max(4 x RTT_min, B).
     pub latency_budget: Duration,
     /// Initial session receive window (default 1 MiB; at least 16 KiB,
-    /// the early-data floor of [`crate::proto::params::floor`]).
+    /// the early-data floor of [`params::floor`](floor)).
     pub initial_connection_receive_window: u64,
     /// Cap of the auto-tuned session window (default [`Cap::Auto`]: at
     /// least [`SESSION_WINDOW_FLOOR`], 96 MiB, and beyond it within the
@@ -232,7 +233,7 @@ pub struct Config {
     /// above the floors of [`Cap::Auto`] stops at it.
     pub memory_budget: u64,
     /// Concurrent bidirectional streams the peer may open (default 256; 0,
-    /// or at least 4, the early-data floor of [`crate::proto::params::floor`]). An
+    /// or at least 4, the early-data floor of [`params::floor`](floor)). An
     /// application that never accepts peer streams sets 0; a peer's early
     /// data then fails with `EarlyDataRejected` at the peer.
     pub max_incoming_streams: u64,
@@ -348,7 +349,7 @@ pub struct Config {
     /// `tracer`: observes the session's events, called
     /// in order outside every lock on the session's hook context. `None` (the default) costs
     /// nothing.
-    pub tracer: Option<std::sync::Arc<dyn super::Tracer>>,
+    pub tracer: Option<Arc<dyn Tracer>>,
     /// `early_data` (default off): stream data before the peer's
     /// parameters arrive; see [`EarlyData`].
     pub early_data: EarlyData,
@@ -365,7 +366,7 @@ pub struct Config {
 ///
 /// With [`EarlyData::zmux_peer`] the application declares the peer a zmux
 /// endpoint. Every zmux endpoint advertises at least the floor of
-/// [`crate::proto::params::floor`], so data within it needs no
+/// [`params::floor`](floor), so data within it needs no
 /// parameters: at most the first 4 bidirectional streams, 4096 bytes of
 /// each (preamble included) and 16384 bytes in all. Opening more streams
 /// and writing more is allowed; what lies beyond the floor simply waits

@@ -64,7 +64,7 @@ impl TierState {
 
     /// Heap bytes held.
     pub(super) fn heap_bytes(&self) -> usize {
-        self.owed.capacity() * std::mem::size_of::<(u64, bool, u64)>()
+        self.owed.capacity() * size_of::<(u64, bool, u64)>()
     }
 
     // ---- reading -------------------------------------------------------------------

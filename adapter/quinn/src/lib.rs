@@ -37,7 +37,7 @@
 //!   back at the connection level. The window is charged to the memory
 //!   budget for as long as the carrier lives: the listener's
 //!   ([`QuicCarrier::with_listener`]), or else the session's own
-//!   ([`zmux::PipeIo::with_connection_memory`]). The stream window has one
+//!   ([`PipeIo::with_connection_memory`]). The stream window has one
 //!   source, [`Options::stream_window`]: build the endpoint's transport
 //!   configuration with [`Options::transport_config`]. Opening a lane waits
 //!   for the peer's stream credit, which zmux counts as the pipe's one lane
@@ -73,6 +73,7 @@ use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 
+use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
@@ -316,7 +317,7 @@ impl Options {
 /// `options` ([`Options::transport_config`]).
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn client_config(
-    mut tls: quinn::rustls::ClientConfig,
+    mut tls: rustls::ClientConfig,
     options: &Options,
 ) -> Result<quinn::ClientConfig, quinn::crypto::rustls::NoInitialCipherSuite> {
     if tls.alpn_protocols.is_empty() {
@@ -348,7 +349,7 @@ pub fn client_config(
 /// no longer honours. Raising a value needs nothing.
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn server_config(
-    mut tls: quinn::rustls::ServerConfig,
+    mut tls: rustls::ServerConfig,
     options: &Options,
 ) -> Result<quinn::ServerConfig, quinn::crypto::rustls::NoInitialCipherSuite> {
     if tls.alpn_protocols.is_empty() {
@@ -385,7 +386,7 @@ pub async fn dial(
 }
 
 /// Establishes a session over a new connection ([`dial`], then
-/// [`zmux::Session::connect`]). With [`Options::with_zero_rtt`] and carrier
+/// [`Session::connect`]). With [`Options::with_zero_rtt`] and carrier
 /// early data allowed in `config`, a connection that resumes a TLS session
 /// with a server whose parameters the memory holds sends the session's
 /// first records as 0-RTT data and returns at once; if the server rejects
@@ -712,7 +713,7 @@ impl QuicCarrier {
     }
 
     /// The next pipe the peer opened, on a carrier without a listener (for
-    /// [`zmux::Session::accept`]); `None` once the connection is closed.
+    /// [`Session::accept`]); `None` once the connection is closed.
     /// With a listener, the listener takes them. Pipes nobody takes wait,
     /// as many as the connection lets the peer open bidirectional streams
     /// (QUIC MAX_STREAMS): an endpoint that never accepts pipes sets that
@@ -1038,6 +1039,18 @@ impl AsyncWrite for Send {
         self.write_one(cx, buf)
     }
 
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
+        if r.is_ready() {
+            self.finished = true;
+        }
+        r
+    }
+
     /// Each slice in turn until the stream takes less (one lock of the
     /// connection per slice; quinn copies them anyway).
     fn poll_write_vectored(
@@ -1064,18 +1077,6 @@ impl AsyncWrite for Send {
 
     fn is_write_vectored(&self) -> bool {
         true
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
-        if r.is_ready() {
-            self.finished = true;
-        }
-        r
     }
 }
 

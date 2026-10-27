@@ -667,10 +667,10 @@ impl Streams {
         self.slab.memory()
             + self.spare.heap_bytes()
             + self.chunks.memory()
-            + self.ids.capacity() * (std::mem::size_of::<(u64, StreamKey)>() + 1)
+            + self.ids.capacity() * (size_of::<(u64, StreamKey)>() + 1)
             + self.queues_heap_bytes()
-            + self.wake_scratch.capacity() * std::mem::size_of::<u32>()
-            + keys * std::mem::size_of::<StreamKey>()
+            + self.wake_scratch.capacity() * size_of::<u32>()
+            + keys * size_of::<StreamKey>()
     }
 }
 
@@ -744,9 +744,9 @@ impl SendQueue {
     /// Heap bytes held.
     fn heap_bytes(&self) -> usize {
         self.levels.as_ref().map_or(0, |l| {
-            std::mem::size_of::<[VecDeque<StreamKey>; 8]>()
+            size_of::<[VecDeque<StreamKey>; 8]>()
                 + l.iter()
-                    .map(|q| q.capacity() * std::mem::size_of::<StreamKey>())
+                    .map(|q| q.capacity() * size_of::<StreamKey>())
                     .sum::<usize>()
         })
     }
@@ -867,7 +867,7 @@ impl Streams {
 
     /// Heap bytes of the queues.
     fn queues_heap_bytes(&self) -> usize {
-        self.ctrl.capacity() * std::mem::size_of::<StreamKey>() + self.sched.heap_bytes()
+        self.ctrl.capacity() * size_of::<StreamKey>() + self.sched.heap_bytes()
     }
 
     /// Every queued part waits for session credit, when any is queued.

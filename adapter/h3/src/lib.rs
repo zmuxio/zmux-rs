@@ -13,7 +13,7 @@
 //! server cannot open request streams, so the server's outbound directions
 //! stay on their pipes' own streams (lanes in both directions need
 //! WebTransport). On the server ([`serve`], [`serve_connection`]) every
-//! request of a connection is a carrier handed to a [`zmux::Listener`]
+//! request of a connection is a carrier handed to a [`Listener`]
 //! with the connection's identity, which tells a new session, a join and a
 //! client lane apart by its first record.
 //!
@@ -66,6 +66,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
+use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
@@ -151,7 +152,7 @@ impl Options {
 /// ([`Options::transport_config`]).
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn client_config(
-    mut tls: quinn::rustls::ClientConfig,
+    mut tls: rustls::ClientConfig,
     options: &Options,
 ) -> Result<quinn::ClientConfig, quinn::crypto::rustls::NoInitialCipherSuite> {
     if !tls.alpn_protocols.iter().any(|a| a == ALPN) {
@@ -168,7 +169,7 @@ pub fn client_config(
 /// ([`Options::transport_config`]).
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn server_config(
-    mut tls: quinn::rustls::ServerConfig,
+    mut tls: rustls::ServerConfig,
     options: &Options,
 ) -> Result<quinn::ServerConfig, quinn::crypto::rustls::NoInitialCipherSuite> {
     if !tls.alpn_protocols.iter().any(|a| a == ALPN) {
@@ -352,7 +353,7 @@ pub async fn dial(
 }
 
 /// Establishes a session over a new HTTP/3 connection ([`dial`], then
-/// [`zmux::Session::connect`]).
+/// [`Session::connect`]).
 pub async fn connect(
     endpoint: &Endpoint,
     addr: std::net::SocketAddr,
@@ -555,24 +556,6 @@ impl AsyncWrite for BodyWriter {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        // One frame for all of them: a copy is made anyway.
-        let total: usize = bufs.iter().map(|b| b.len()).sum();
-        let mut data = Vec::with_capacity(total);
-        for b in bufs {
-            data.extend_from_slice(b);
-        }
-        self.poll_write(cx, &data)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        true
-    }
-
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_op(cx)
     }
@@ -592,6 +575,24 @@ impl AsyncWrite for BodyWriter {
         self.finished = true;
         self.ended_gracefully.store(true, Ordering::Release);
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        // One frame for all of them: a copy is made anyway.
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut data = Vec::with_capacity(total);
+        for b in bufs {
+            data.extend_from_slice(b);
+        }
+        self.poll_write(cx, &data)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 }
 

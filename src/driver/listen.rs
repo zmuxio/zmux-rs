@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use ::tokio::io::AsyncReadExt;
+use tokio::io::AsyncReadExt;
 
 use super::account::{Account, AccountLink};
 use super::handle::Shared;
@@ -344,7 +344,7 @@ impl Listener {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn serve(self, tcp: ::tokio::net::TcpListener) {
+    pub async fn serve(self, tcp: tokio::net::TcpListener) {
         self.serve_with(
             || tcp.accept(),
             |stream, peer| {
@@ -381,8 +381,8 @@ impl Listener {
                 // Each task holds a clone of `pending` while it sets up.
                 Ok((conn, peer)) if Arc::strong_count(&pending) <= most => {
                     let (l, made, token) = (self.clone(), carrier(conn, peer), pending.clone());
-                    ::tokio::spawn(async move {
-                        let made = ::tokio::time::timeout(limit, made).await;
+                    tokio::spawn(async move {
+                        let made = tokio::time::timeout(limit, made).await;
                         drop(token);
                         match made {
                             Ok(Ok((io, hint))) => {
@@ -517,7 +517,7 @@ impl Listener {
         let classified = if let Some(frame) = &hint.join {
             shared.lock().core.oob(id, frame, now)
         } else {
-            let first = ::tokio::time::timeout(
+            let first = tokio::time::timeout(
                 limits.first_record_timeout,
                 Self::first_record(shared, id, &mut pipe),
             );
@@ -766,7 +766,7 @@ impl Listener {
                     return Ok(());
                 }
                 JoinVerdict::Wait if deadline.is_none_or(|d| now() < d) => {
-                    ::tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 _ => return Err(HandleError::Rejected),
             }
@@ -906,7 +906,7 @@ async fn accept_failed(e: &std::io::Error) {
         e.kind(),
         K::ConnectionAborted | K::ConnectionReset | K::Interrupted | K::WouldBlock
     ) {
-        ::tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

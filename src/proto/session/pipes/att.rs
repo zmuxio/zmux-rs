@@ -235,7 +235,7 @@ impl Attachment {
             + self
                 .mp
                 .as_deref()
-                .map_or(0, |m| std::mem::size_of::<AttMp>() + m.tier.heap_bytes())
+                .map_or(0, |m| size_of::<AttMp>() + m.tier.heap_bytes())
     }
 
     // ---- fate group, join and failure ---------------------------------------

@@ -23,7 +23,7 @@ members = [
 # The default gate: the core and the TLS and QUIC adapters; `--workspace`
 # builds the other adapters too.
 default-members = [".", "adapter/rustls", "adapter/quinn"]
-exclude = ["interop/qmux", "interop/carrier-mem"]
+exclude = ["interop/carrier-mem", "interop/peer", "interop/qmux", "interop/qmux-peer"]
 resolver = "3"
 
 [features]

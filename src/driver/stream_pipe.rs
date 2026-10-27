@@ -128,7 +128,7 @@ impl StreamWriter {
         self.send.watch(cx.waker()).map_err(io::Error::from)
     }
 
-    /// One write call of a batch (see [`SendStream::poll_write_batch`](crate::SendStream#method.poll_write_batch)).
+    /// One write call of a batch (see [`SendStream::poll_write_batch`](SendStream#method.poll_write_batch)).
     pub(crate) fn poll_write_batch(
         &mut self,
         cx: &mut Context<'_>,

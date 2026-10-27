@@ -404,7 +404,7 @@ impl SendBuf {
 
     /// Heap bytes the buffers hold.
     pub(crate) fn capacity(&self) -> usize {
-        self.tail.capacity() + self.segs.capacity() * std::mem::size_of::<Seg>()
+        self.tail.capacity() + self.segs.capacity() * size_of::<Seg>()
     }
 
     /// Drops the unsent data; sent bytes stay held.
@@ -500,7 +500,7 @@ pub(crate) struct Waits {
 pub(crate) struct Age {
     /// Write marks of uncommitted bytes: (end, in application bytes
     /// written; when the bytes started to wait). Oldest first.
-    pub(crate) marks: std::collections::VecDeque<(u64, Instant)>,
+    pub(crate) marks: VecDeque<(u64, Instant)>,
     /// Since when the current (or last) write waited for space.
     pub(crate) wait_start: Option<Instant>,
     /// When the last waiting write completed.
@@ -1308,7 +1308,7 @@ impl RecvPart {
         self.buf.memory()
             + self.tuner.memory()
             + self.gaps.as_ref().map_or(0, |g| {
-                std::mem::size_of::<Gaps>() + g.held.memory() + g.arrived.memory()
+                size_of::<Gaps>() + g.held.memory() + g.arrived.memory()
             })
     }
 
@@ -1434,7 +1434,7 @@ pub(crate) struct Stream {
     pub(crate) notified_writable: bool,
     /// The sending direction waits for a custom scheduling decision: in
     /// the multipath pick queue or in the call under way.
-    pub(crate) pick_queued: std::cell::Cell<bool>,
+    pub(crate) pick_queued: Cell<bool>,
     /// The preamble's contents and the PRIORITY_UPDATE state: most streams have none.
     extra: Option<Box<StreamExtra>>,
 }
@@ -1539,7 +1539,7 @@ impl Stream {
             ctrl_queued: false,
             notified_readable: false,
             notified_writable: false,
-            pick_queued: std::cell::Cell::new(false),
+            pick_queued: Cell::new(false),
         }
     }
 
@@ -1727,10 +1727,10 @@ impl Slab {
     }
 
     pub(crate) fn memory(&self) -> usize {
-        self.pages.len() * PAGE * std::mem::size_of::<Entry>()
-            + self.pages.capacity() * std::mem::size_of::<Box<[Entry]>>()
+        self.pages.len() * PAGE * size_of::<Entry>()
+            + self.pages.capacity() * size_of::<Box<[Entry]>>()
             + self.free.capacity() * 4
-            + self.touched.borrow().capacity() * std::mem::size_of::<StreamKey>()
+            + self.touched.borrow().capacity() * size_of::<StreamKey>()
     }
 }
 

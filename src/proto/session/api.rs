@@ -334,7 +334,7 @@ impl SessionCore {
     /// count; 0 means wait for [`super::CoreEvent::StreamWritable`].
     pub fn write(&mut self, key: StreamKey, data: &[u8]) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
-        let n = (room.min(data.len() as u64)) as usize;
+        let n = room.min(data.len() as u64) as usize;
         if n == 0 {
             if !data.is_empty() {
                 self.wait_writable(key);
@@ -352,7 +352,7 @@ impl SessionCore {
     /// `data`, a prefix when the buffers are nearly full, or 0.
     pub fn write_chunk(&mut self, key: StreamKey, data: Bytes) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
-        let n = (room.min(data.len() as u64)) as usize;
+        let n = room.min(data.len() as u64) as usize;
         if n == 0 {
             if !data.is_empty() {
                 self.wait_writable(key);

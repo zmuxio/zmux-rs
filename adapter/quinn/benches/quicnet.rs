@@ -205,7 +205,7 @@ async fn udp_relay(
 async fn deliver<F, Fut>(mut rx: tokio::sync::mpsc::UnboundedReceiver<(Instant, Bytes)>, send: F)
 where
     F: Fn(Bytes) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
 {
     while let Some((at, p)) = rx.recv().await {
         tokio::time::sleep_until(at).await;

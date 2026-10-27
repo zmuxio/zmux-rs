@@ -193,7 +193,7 @@ impl Probe {
     /// Step 2, under the core lock: the carrier's minimum RTT and unsent
     /// bytes go to the core (per pipe in a multipath session), and the
     /// wanted low-water mark is read. Nothing when no query is pending.
-    pub(crate) fn feed(&mut self, core: &mut Core, pipe: PipeId, now: std::time::Instant) {
+    pub(crate) fn feed(&mut self, core: &mut Core, pipe: PipeId, now: Instant) {
         let Some(info) = self.info.take() else {
             return;
         };
@@ -261,7 +261,7 @@ const NOTSENT_LOWAT: libc::c_int = 0x201;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn setsockopt(fd: std::os::fd::RawFd, name: libc::c_int, value: u64) -> bool {
     let value = libc::c_int::try_from(value).unwrap_or(libc::c_int::MAX);
-    let Ok(len) = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()) else {
+    let Ok(len) = libc::socklen_t::try_from(size_of::<libc::c_int>()) else {
         return false;
     };
     // SAFETY: the option value is a valid c_int of `len` bytes that the

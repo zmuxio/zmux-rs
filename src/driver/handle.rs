@@ -1927,7 +1927,7 @@ impl<D: Driver> Drop for RecvStream<D> {
 /// core refused, so that the session's datagram bytes do not keep them.
 struct Policed<'a, D: Driver> {
     shared: &'a Shared<D>,
-    batch: Vec<core::ReceivedDatagram>,
+    batch: Vec<ReceivedDatagram>,
 }
 
 impl<D: Driver> Drop for Policed<'_, D> {
@@ -2540,7 +2540,7 @@ macro_rules! pipe_api {
         /// direction ([`set_send_priority`](Self::set_send_priority)) and
         /// the one requested of the peer
         /// ([`set_receive_priority`](Self::set_receive_priority)), as
-        /// [`PipeOptions::with_priority`](crate::PipeOptions::with_priority)
+        /// [`PipeOptions::with_priority`](PipeOptions::with_priority)
         /// does when the pipe is added.
         pub fn set_priority(&self, priority: u64) -> Result<(), crate::PipeError> {
             self.set_send_priority(priority)?;
@@ -2857,7 +2857,7 @@ macro_rules! sendstream_api {
         /// preamble) is sent as soon as flow control allows, ahead of any
         /// later stream's (SPEC.md Section 7.2); a reset after it is seen
         /// by the peer. Before establishment the identifier is not known
-        /// yet ([`StreamError::NotEstablished`](crate::StreamError::NotEstablished)).
+        /// yet ([`StreamError::NotEstablished`](StreamError::NotEstablished)).
         pub fn pin_id(&self) -> Result<crate::StreamId, crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::pin_id(self)
         }

@@ -329,8 +329,8 @@ pub(crate) fn check_peer(config: &crate::Config) -> Result<(), crate::ConnectErr
 #[derive(Debug)]
 struct EmptyMessage;
 
-impl std::fmt::Display for EmptyMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for EmptyMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("an empty message")
     }
 }

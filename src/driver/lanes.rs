@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use ::tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 use super::handle::Shared;
 use super::listen::HandleError;
@@ -360,7 +360,7 @@ pub async fn handle_lane(mut io: PipeIo) -> Result<(), HandleError> {
             }
         }
     };
-    match ::tokio::time::timeout(FIRST_RECORD, first).await {
+    match tokio::time::timeout(FIRST_RECORD, first).await {
         Ok(Classified::Lane {
             lane_key,
             pipe,
@@ -414,9 +414,9 @@ pub(crate) fn finish_reverse(writer: Option<Writer>) {
     match writer {
         Some(Writer::Stream(w)) => finish_stream(w),
         Some(mut w) => {
-            if let Ok(rt) = ::tokio::runtime::Handle::try_current() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
-                    let _ = ::tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
                 });
             }
         }

@@ -20,7 +20,7 @@
 //!   server cannot open requests).
 //! - The server: [`serve`] accepts TCP connections and serves both
 //!   protocols (HTTP/2 with prior knowledge), handing every exchange on
-//!   [`Options::path`] to a [`zmux::Listener`]; [`serve_with`] sets each
+//!   [`Options::path`] to a [`Listener`]; [`serve_with`] sets each
 //!   connection up first (TLS), [`serve_connection`] serves one
 //!   established connection, and [`handle_request`] hands over one request
 //!   inside an existing HTTP server.

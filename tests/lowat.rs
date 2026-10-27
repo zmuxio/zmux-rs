@@ -19,7 +19,7 @@ const NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
 /// The socket's TCP_NOTSENT_LOWAT.
 fn lowat(socket: &impl AsRawFd) -> u32 {
     let mut value: libc::c_int = 0;
-    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+    let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
     // SAFETY: `value` is a valid c_int of `len` bytes for the kernel to
     // write, and the descriptor is open for the call.
     let r = unsafe {

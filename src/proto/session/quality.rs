@@ -165,9 +165,9 @@ impl Quality {
     }
 
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.pipes.capacity() * (std::mem::size_of::<(u64, PipeQuality)>() + 1)
-            + self.scratch.capacity() * std::mem::size_of::<(u64, u64)>()
+        size_of::<Self>()
+            + self.pipes.capacity() * (size_of::<(u64, PipeQuality)>() + 1)
+            + self.scratch.capacity() * size_of::<(u64, u64)>()
     }
 }
 

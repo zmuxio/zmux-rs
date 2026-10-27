@@ -224,8 +224,8 @@ impl TransmitBuf {
     /// Heap bytes held by the batch's buffers.
     pub fn capacity(&self) -> usize {
         self.buf.capacity()
-            + self.parts.capacity() * std::mem::size_of::<Part>()
-            + self.messages.capacity() * std::mem::size_of::<usize>()
+            + self.parts.capacity() * size_of::<Part>()
+            + self.messages.capacity() * size_of::<usize>()
     }
 
     /// Whether the batch's storage is that of a small batch, which

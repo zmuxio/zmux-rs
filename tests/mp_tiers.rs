@@ -386,7 +386,7 @@ impl zmux::proto::session::Pick for Newest {
 fn a_custom_policy_never_puts_new_data_on_a_joining_pipe() {
     let mut n = net(|c| {
         c.resume_timeout = Some(Duration::from_secs(30));
-        c.scheduler = zmux::proto::session::Policy::Custom(std::sync::Arc::new(Newest));
+        c.scheduler = Policy::Custom(std::sync::Arc::new(Newest));
     });
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     // The join never reaches B: the pipe stays JOINING.

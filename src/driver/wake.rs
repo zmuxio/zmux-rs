@@ -139,7 +139,7 @@ impl<T: Defer> std::ops::DerefMut for Locked<'_, T> {
 /// that holds a core lock. Counts the core locks the current thread holds.
 mod held {
     #[cfg(all(debug_assertions, not(all(test, loom)), not(all(test, shuttle))))]
-    std::thread_local! {
+    thread_local! {
         static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 

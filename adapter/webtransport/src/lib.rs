@@ -20,7 +20,7 @@
 //! [`WebTransportCarrier::accept_pipe`]), and the pipe's lanes are further
 //! unidirectional streams, which zmux opens itself as it needs them. The
 //! carrier runs the session's accept loop: every stream the peer opens is a
-//! carrier, handed to the [`zmux::Listener`] given, or else a lane to
+//! carrier, handed to the [`Listener`] given, or else a lane to
 //! [`zmux::carrier::handle_lane`] and a pipe to [`WebTransportCarrier::accept_pipe`];
 //! zmux routes lanes by their Lane Key and checks that they are on the
 //! session of their pipe, whose identity is the carrier. One WebTransport
@@ -511,6 +511,18 @@ impl AsyncWrite for Send {
         AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf)
     }
 
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
+        if r.is_ready() {
+            self.finished = true;
+        }
+        r
+    }
+
     /// Each slice in turn until the stream takes less (one lock of the
     /// connection per slice; quinn copies them anyway).
     fn poll_write_vectored(
@@ -537,18 +549,6 @@ impl AsyncWrite for Send {
 
     fn is_write_vectored(&self) -> bool {
         true
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
-        if r.is_ready() {
-            self.finished = true;
-        }
-        r
     }
 }
 

@@ -1,7 +1,7 @@
 //! WebSocket pipe carriers for zmux over tokio-tungstenite.
 //!
 //! A WebSocket carries zmux records with message framing (SPEC.md Section
-//! 3.4, [`zmux::PipeIo::records`]): every binary message is one record's
+//! 3.4, [`PipeIo::records`]): every binary message is one record's
 //! Frames field, without the Size, byte-compatible with other QMux
 //! implementations over WebSocket. A message never splits a record and a
 //! record never spans messages, so intermediaries that re-chunk the byte
@@ -9,7 +9,7 @@
 //!
 //! - [`connect`] and [`dial`] open a WebSocket to a URL and make a session
 //!   or a carrier of it; [`serve`] accepts WebSocket upgrades on a TCP
-//!   listener for a [`zmux::Listener`], and [`accept`] upgrades one
+//!   listener for a [`Listener`], and [`accept`] upgrades one
 //!   connection inside the application's own server.
 //! - The subprotocol (`Sec-WebSocket-Protocol`) is the ALPN identifier, as
 //!   with TLS ([`Options`]): `qmux-02` or `qmux-02.<application>`, or an
@@ -202,7 +202,7 @@ pub async fn dial_tls(
 }
 
 /// Establishes a session over a new WebSocket over TLS ([`dial_tls`], then
-/// [`zmux::Session::connect`]).
+/// [`Session::connect`]).
 pub async fn connect_tls(
     request: impl IntoClientRequest + Unpin,
     tls: &tokio_rustls::TlsConnector,
@@ -247,7 +247,7 @@ fn with_socket(io: PipeIo, socket: Option<SocketDup>) -> PipeIo {
 }
 
 /// Establishes a session over a new WebSocket ([`dial`], then
-/// [`zmux::Session::connect`]).
+/// [`Session::connect`]).
 pub async fn connect(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
@@ -577,6 +577,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Writer<S> {
             .poll_message(cx, || Bytes::copy_from_slice(buf))
     }
 
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.sink)
+            .poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
+    }
+
+    /// Sends a Close frame: the graceful end.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.sink)
+            .poll_close(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
+    }
+
     /// The slices as one message.
     fn poll_write_vectored(
         self: Pin<&mut Self>,
@@ -594,18 +607,5 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Writer<S> {
 
     fn is_write_vectored(&self) -> bool {
         true
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.sink)
-            .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
-    }
-
-    /// Sends a Close frame: the graceful end.
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.sink)
-            .poll_close(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
     }
 }

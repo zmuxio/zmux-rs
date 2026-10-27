@@ -195,7 +195,7 @@ fn auth_failures(server: &Session) -> Vec<bool> {
 }
 
 /// Polls `f` once.
-fn futures_now<F: std::future::Future>(f: F) -> Option<F::Output> {
+fn futures_now<F: Future>(f: F) -> Option<F::Output> {
     let mut f = std::pin::pin!(f);
     match f
         .as_mut()

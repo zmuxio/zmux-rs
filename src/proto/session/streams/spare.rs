@@ -81,6 +81,6 @@ impl Spare {
         self.send.iter().map(SendBuf::capacity).sum::<usize>()
             + self.recv.iter().map(BytesMut::capacity).sum::<usize>()
             + self.drained.as_ref().map_or(0, BytesMut::capacity)
-            + self.tuners.len() * std::mem::size_of::<Tuner>()
+            + self.tuners.len() * size_of::<Tuner>()
     }
 }

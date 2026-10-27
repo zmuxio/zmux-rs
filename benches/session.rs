@@ -215,10 +215,10 @@ fn core_bulk(zero_copy: bool) {
 
 // ---- drivers ---------------------------------------------------------------------------
 
-async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+    let (a, b) = tokio::join!(TcpStream::connect(addr), l.accept());
     (a.unwrap(), b.unwrap().0)
 }
 
@@ -342,7 +342,7 @@ async fn delay_line(
 /// [`shape`] (both directions): a long fat path where `tc netem` is not
 /// available. The endpoints see plain byte streams: no kernel RTT of the
 /// path and no low-water mark that would reflect the shaper's queue.
-async fn shaped_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+async fn shaped_pair() -> (TcpStream, TcpStream) {
     let (rate, owd, queue) = shape();
     let (a, ra) = tcp_pair().await;
     let (rb, b) = tcp_pair().await;
@@ -818,7 +818,7 @@ async fn rr_under_bulk(secs: f64) {
         // Split timing (ZMUX_BENCH_SPLIT): the request carries its send
         // time, the echo records the forward delay and stamps the reply.
         let base = *BASE;
-        let fwd = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+        let fwd = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
         let fwd2 = fwd.clone();
         let echo = tokio::spawn(async move {
             let Ok((mut s, mut r)) = srv.accept_bi().await else {
@@ -841,7 +841,7 @@ async fn rr_under_bulk(secs: f64) {
         });
         let mut s = client.open_uni().await.unwrap();
         let chunk = Bytes::from(vec![1u8; 64 * 1024]);
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let writer = tokio::spawn(async move {
             let mut sent = 0u64;
@@ -1103,7 +1103,7 @@ fn live() -> i64 {
 fn core_memory() {
     let n = 1000;
     // Sessions share their configuration, as a listener's do.
-    let config = std::sync::Arc::new(Config::default());
+    let config = Arc::new(Config::default());
     let before = live();
     let now = Instant::now();
     let mut v = Vec::with_capacity(n);
@@ -1147,7 +1147,7 @@ fn core_memory() {
     let per_stream = (live() - before) as f64 / (keys.len() + accepted.len()) as f64;
     println!(
         "RESULT scen=idle-core heap_B_per_session={per_session:.0} core_B_per_session={inline} size_of_session={} heap_B_per_stream_end={per_stream:.0} streams={}",
-        std::mem::size_of::<core::SessionCore>(),
+        size_of::<core::SessionCore>(),
         keys.len()
     );
     drop(v);

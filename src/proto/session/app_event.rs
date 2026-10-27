@@ -32,9 +32,9 @@ pub struct GoAway {
 /// session ended, the queued events are still delivered before the end of
 /// the stream.
 ///
-/// [`PipeState::Failed`]: crate::PipeState::Failed
-/// [`PipeState::Closed`]: crate::PipeState::Closed
-/// [`PipeState::Ended`]: crate::PipeState::Ended
+/// [`PipeState::Failed`]: PipeState::Failed
+/// [`PipeState::Closed`]: PipeState::Closed
+/// [`PipeState::Ended`]: PipeState::Ended
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
@@ -48,7 +48,7 @@ pub enum SessionEvent {
         half: PipeHalf,
         /// The new state.
         state: PipeState,
-        /// Why the pipe failed, with [`crate::PipeState::Failed`].
+        /// Why the pipe failed, with [`PipeState::Failed`].
         failure: Option<PipeFailure>,
     },
     /// A join's token did not verify at this endpoint (a secret mismatch,

@@ -301,7 +301,7 @@ impl Attachments {
 
     /// Heap bytes held by the list and the attachments.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.list.capacity() * std::mem::size_of::<Attachment>()
+        self.list.capacity() * size_of::<Attachment>()
             + self.list.iter().map(Attachment::heap_bytes).sum::<usize>()
     }
 }

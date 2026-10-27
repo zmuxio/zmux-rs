@@ -79,11 +79,11 @@ impl FrameType {
     pub const DATAGRAM: Self = Self(0x30);
     /// DATAGRAM with a Length field.
     pub const DATAGRAM_LEN: Self = Self(0x31);
-    /// QX_TRANSPORT_PARAMETERS ([`crate::proto::draft`]).
+    /// QX_TRANSPORT_PARAMETERS ([`draft`]).
     pub const QX_TRANSPORT_PARAMETERS: Self = Self(draft::CURRENT.transport_parameters);
-    /// QX_PING request ([`crate::proto::draft`]).
+    /// QX_PING request ([`draft`]).
     pub const QX_PING_REQUEST: Self = Self(draft::CURRENT.ping_request);
-    /// QX_PING response ([`crate::proto::draft`]).
+    /// QX_PING response ([`draft`]).
     pub const QX_PING_RESPONSE: Self = Self(draft::CURRENT.ping_response);
     /// GOAWAY.
     pub const GOAWAY: Self = Self(0x1911_f43e);

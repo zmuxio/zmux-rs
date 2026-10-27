@@ -65,8 +65,8 @@ impl AckState {
 
     /// Heap bytes held.
     pub(super) fn heap_bytes(&self) -> usize {
-        self.frames.capacity() * std::mem::size_of::<SentFrame>()
-            + self.scratch.capacity() * std::mem::size_of::<PipeAckEntry>()
+        self.frames.capacity() * size_of::<SentFrame>()
+            + self.scratch.capacity() * size_of::<PipeAckEntry>()
     }
 
     /// A PIPE_ACK is owed now (a pipe ended).

@@ -113,7 +113,7 @@ impl<S> Account<S> {
                 waker: AtomicWaker::new(),
                 closed: AtomicBool::new(false),
             });
-            ::tokio::spawn(run_pressure_hook(signal.clone(), hook));
+            tokio::spawn(run_pressure_hook(signal.clone(), hook));
             signal
         });
         Arc::new(Self {

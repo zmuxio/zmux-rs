@@ -340,7 +340,7 @@ impl RecvBuf {
     pub(crate) fn memory(&self) -> usize {
         self.tail.capacity()
             + self.spill.as_ref().map_or(0, |s| s.capacity())
-            + self.pieces.capacity() * std::mem::size_of::<Piece>()
+            + self.pieces.capacity() * size_of::<Piece>()
             + 2 * self.referenced
             + self
                 .pieces

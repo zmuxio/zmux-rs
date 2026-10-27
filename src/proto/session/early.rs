@@ -75,7 +75,7 @@ pub enum EarlyDataState {
     /// early data, QUIC 0-RTT) the session wrote the data again once the
     /// handshake completed and the streams go on; after a zmux peer's
     /// rejection the session ended with
-    /// [`SessionError::EarlyDataRejected`](crate::SessionError::EarlyDataRejected).
+    /// [`SessionError::EarlyDataRejected`](SessionError::EarlyDataRejected).
     Rejected,
 }
 

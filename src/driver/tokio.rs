@@ -12,10 +12,10 @@ use super::account::AccountLink;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use ::tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use ::tokio::net::TcpStream;
-use ::tokio::time::Sleep;
 use bytes::{BufMut, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio::time::Sleep;
 
 use super::engine::{self, Calls, Outbound, Progress};
 use super::handle::{self, CarrierInfo, Driver, Lock, Shared, State, Written};
@@ -79,6 +79,20 @@ impl AsyncWrite for Writer {
         }
     }
 
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Io(w) => w.as_mut().poll_flush(cx),
+            Self::Stream(w) => Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Io(w) => w.as_mut().poll_shutdown(cx),
+            Self::Stream(w) => Pin::new(w).poll_shutdown(cx),
+        }
+    }
+
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -96,20 +110,6 @@ impl AsyncWrite for Writer {
             Self::Stream(w) => w.is_write_vectored(),
         }
     }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Io(w) => w.as_mut().poll_flush(cx),
-            Self::Stream(w) => Pin::new(w).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Io(w) => w.as_mut().poll_shutdown(cx),
-            Self::Stream(w) => Pin::new(w).poll_shutdown(cx),
-        }
-    }
 }
 
 /// The session clock: tokio's, so that a paused runtime clock (the
@@ -117,7 +117,7 @@ impl AsyncWrite for Writer {
 /// timers as it drives the session task's sleep. Without tokio's `test-util`
 /// feature this is `Instant::now()`.
 pub(crate) fn now() -> Instant {
-    ::tokio::time::Instant::now().into_std()
+    tokio::time::Instant::now().into_std()
 }
 
 /// A zmux session, driven by a tokio task.
@@ -165,7 +165,7 @@ pub struct PipeIo {
     pub(crate) writer: Option<Writer>,
     pub(crate) framing: Framing,
     pub(crate) abort: Option<Box<dyn FnOnce() + Send>>,
-    pub(crate) exporter: Option<Box<super::handle::Exporters>>,
+    pub(crate) exporter: Option<Box<handle::Exporters>>,
     pub(crate) protocol: Option<String>,
     /// Bytes already read from the carrier (by a listener).
     pub(crate) prefix: Vec<u8>,
@@ -228,7 +228,7 @@ impl PipeIo {
     where
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
-        let (r, w) = ::tokio::io::split(io);
+        let (r, w) = tokio::io::split(io);
         Self::from_halves(r, w)
     }
 
@@ -350,10 +350,10 @@ impl PipeIo {
     /// A carrier from a bidirectional stream of another session, the two
     /// parts of one stream (EXTENSIONS.md Section 10.2):
     /// an accepted stream that carries PIPE_CARRIER
-    /// ([`crate::Preamble::is_pipe_carrier`]), or any the application knows to
-    /// be a carrier; [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream) opens one. It is used
+    /// ([`Preamble::is_pipe_carrier`]), or any the application knows to
+    /// be a carrier; [`Session::open_pipe_stream`](Session#method.open_pipe_stream) opens one. It is used
     /// like any carrier: to bootstrap a nested session, to join one
-    /// ([`Session::add_pipe`](crate::Session#method.add_pipe)), or with the nested session's
+    /// ([`Session::add_pipe`](Session#method.add_pipe)), or with the nested session's
     /// [`crate::Listener::handle_pipe`].
     ///
     /// The pipe's records pass as owned buffers in both directions, without
@@ -371,7 +371,7 @@ impl PipeIo {
     /// paces it with its carrier queue limiter.
     /// A session refuses a stream carrier whose session runs over it,
     /// directly or through other sessions of the process: adding it fails
-    /// ([`crate::PipeError::CarrierLoop`]), and a listener refuses such a
+    /// ([`PipeError::CarrierLoop`]), and a listener refuses such a
     /// join with PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT).
     ///
     /// # Panics
@@ -487,7 +487,7 @@ impl PipeIo {
     where
         R: AsyncRead + Send + 'static,
     {
-        let mut p = Self::from_halves(reader, ::tokio::io::sink());
+        let mut p = Self::from_halves(reader, tokio::io::sink());
         p.writer = None;
         p
     }
@@ -497,7 +497,7 @@ impl PipeIo {
     where
         W: AsyncWrite + Send + 'static,
     {
-        let mut p = Self::from_halves(::tokio::io::empty(), writer);
+        let mut p = Self::from_halves(tokio::io::empty(), writer);
         p.reader = None;
         p
     }
@@ -548,7 +548,7 @@ impl PipeIo {
     #[must_use]
     pub fn with_tls_exporter(mut self, export: impl FnMut(&str) -> Option<Vec<u8>>) -> Self {
         if self.outer.is_none() {
-            self.exporter = super::handle::Exporters::take(export);
+            self.exporter = handle::Exporters::take(export);
         }
         self
     }
@@ -571,7 +571,7 @@ impl PipeIo {
     /// resolves with the carrier's verdict, true when the server accepted
     /// it. The session's first records then assume `remembered`, the
     /// server's parameters kept for the server's verified identity
-    /// ([`Session::parameters_to_remember`](crate::Session#method.parameters_to_remember)).
+    /// ([`Session::parameters_to_remember`](Session#method.parameters_to_remember)).
     /// Every send before the verdict (data, FIN, resets) is not final:
     /// after a rejection nothing written reached the server, and the
     /// session writes everything again from its first record once the
@@ -616,7 +616,7 @@ impl PipeIo {
     /// For carrier adapters, on a server that accepted carrier early data:
     /// what arrives before `handshake_done` resolves may have been
     /// replayed, and the streams it opens report so
-    /// ([`RecvStream::is_replayable`](crate::RecvStream#method.is_replayable)).
+    /// ([`RecvStream::is_replayable`](RecvStream#method.is_replayable)).
     #[must_use]
     pub fn with_early_data_in(
         mut self,
@@ -1013,7 +1013,7 @@ impl Driver for Tokio {
     }
 
     fn start_rejoin(session: handle::WeakSession<Self>, dial: Dial) -> bool {
-        let Ok(rt) = ::tokio::runtime::Handle::try_current() else {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return false;
         };
         rt.spawn(async move {
@@ -1239,10 +1239,10 @@ impl Shared<Tokio> {
         }
         // A new session: no carrier can run over it yet.
         let _ = claim_carrier(&shared, 0, outer);
-        ::tokio::spawn(Task::new(shared.clone(), first));
+        tokio::spawn(Task::new(shared.clone(), first));
         if let Some((settled, done)) = early {
             let weak = Arc::downgrade(&shared);
-            ::tokio::spawn(async move {
+            tokio::spawn(async move {
                 let accepted = match (settled, done) {
                     (Some(s), _) => Some(s.await),
                     (None, Some(d)) => {
@@ -1702,7 +1702,7 @@ impl ReadSide {
         let before = self.buf.len();
         let result = {
             let mut limited = (&mut self.buf).limit(limit);
-            let read = ::tokio::io::AsyncReadExt::read_buf(reader, &mut limited);
+            let read = tokio::io::AsyncReadExt::read_buf(reader, &mut limited);
             match std::pin::pin!(read).poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(r) => r,
@@ -2573,7 +2573,7 @@ impl Task {
             shared,
             pipes: vec![first],
             closes: Vec::new(),
-            timer: Box::pin(::tokio::time::sleep(Duration::from_secs(86_400))),
+            timer: Box::pin(tokio::time::sleep(Duration::from_secs(86_400))),
             deadline: None,
             final_deadline: None,
             pick: PickRequest::default(),
@@ -2605,7 +2605,7 @@ fn lanes_after_lock(shared: &Arc<Shared<Tokio>>, pipes: &mut [PipeTask], work: &
         };
         let shared = Arc::downgrade(shared);
         let fut = open();
-        ::tokio::spawn(async move {
+        tokio::spawn(async move {
             // Given up with its pipe: an opener that waits on its carrier
             // (an outer session's stream credit) keeps nothing alive after.
             let mut fut = fut;
@@ -2940,7 +2940,7 @@ impl Future for Task {
                 }
             }
             if let Some(hooks) = start_hook {
-                ::tokio::spawn(handle::run_hook(this.shared.clone(), hooks));
+                tokio::spawn(handle::run_hook(this.shared.clone(), hooks));
             }
             apply_closes(&mut this.pipes, &mut this.closes);
             if let Some(w) = this.lane_work.as_deref_mut()
@@ -2978,7 +2978,7 @@ impl Future for Task {
                 let at = deadline.unwrap_or(now + Duration::from_secs(86_400));
                 this.timer
                     .as_mut()
-                    .reset(::tokio::time::Instant::from_std(at));
+                    .reset(tokio::time::Instant::from_std(at));
             }
             if this.timer.as_mut().poll(cx).is_ready() {
                 continue;
@@ -3053,7 +3053,7 @@ impl Session {
 
     /// Opens a bidirectional stream, waiting for stream credit; waiting
     /// openers get credit first come, first served. Nothing is sent until
-    /// the first write or [`SendStream::pin_id`](crate::SendStream#method.pin_id). Cancel-safe: a cancelled
+    /// the first write or [`SendStream::pin_id`](SendStream#method.pin_id). Cancel-safe: a cancelled
     /// opener gives up its place.
     ///
     /// The two parts are one connection for tokio's I/O traits:
@@ -3072,7 +3072,7 @@ impl Session {
     #[allow(rustdoc::private_doc_tests)]
     /// Opens a bidirectional stream with `preamble` (open info,
     /// application TLVs, PIPE_CARRIER; EXTENSIONS.md Section 4), waiting
-    /// for stream credit as [`Session::open_bi`](crate::Session#method.open_bi) does. The preamble goes
+    /// for stream credit as [`Session::open_bi`](Session#method.open_bi) does. The preamble goes
     /// out with the stream's first frame; it is checked here
     /// ([`OpenError::InvalidArgument`], [`OpenError::TooLarge`],
     /// [`OpenError::NotNegotiated`] with a plain QMux peer). Cancel-safe.
@@ -3102,7 +3102,7 @@ impl Session {
     }
 
     /// Opens a unidirectional stream, waiting for stream credit (see
-    /// [`Session::open_bi`](crate::Session#method.open_bi)). Cancel-safe.
+    /// [`Session::open_bi`](Session#method.open_bi)). Cancel-safe.
     ///
     /// # Errors
     ///
@@ -3113,7 +3113,7 @@ impl Session {
     }
 
     /// Opens a unidirectional stream with `preamble` (see
-    /// [`Session::open_bi_with`](crate::Session#method.open_bi_with)). Cancel-safe.
+    /// [`Session::open_bi_with`](Session#method.open_bi_with)). Cancel-safe.
     pub async fn open_uni_with(&self, preamble: &Preamble) -> Result<SendStream, OpenError> {
         self.open_uni_wait(Some(preamble)).await
     }
@@ -3167,7 +3167,7 @@ impl Session {
 
     /// Sends a QX_PING request, or joins the one outstanding, and returns
     /// the round-trip time it measured; the sample
-    /// also updates [`Session::rtt`](crate::Session#method.rtt) and the statistics. Works with every
+    /// also updates [`Session::rtt`](Session#method.rtt) and the statistics. Works with every
     /// peer, plain QMux peers included: it is how a session whose peer
     /// gives no acknowledgements refreshes its RTT. Cancel-safe.
     pub async fn ping(&self) -> Result<Duration, SessionError> {
@@ -3195,9 +3195,9 @@ impl Session {
     /// 10.2) runs where the carrier meets the session it is for, not here:
     /// opening does not know which session the carrier is for. The nested
     /// session refuses the carrier when this session runs over it, directly
-    /// or through other sessions of the process: [`Session::add_pipe`](crate::Session#method.add_pipe) and
-    /// [`PipeReservation::attach`](crate::PipeReservation#method.attach) fail
-    /// ([`crate::PipeError::CarrierLoop`]), and
+    /// or through other sessions of the process: [`Session::add_pipe`](Session#method.add_pipe) and
+    /// [`PipeReservation::attach`](PipeReservation#method.attach) fail
+    /// ([`PipeError::CarrierLoop`]), and
     /// [`crate::Listener::handle_pipe`] refuses the join with
     /// PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT) (MULTIPATH.md Section 5.4 step
     /// 7), so that a joiner that cannot see the loop backs off. A session
@@ -3225,7 +3225,7 @@ impl Session {
     }
 }
 
-/// A stream just opened as a pipe's carrier ([`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream)):
+/// A stream just opened as a pipe's carrier ([`Session::open_pipe_stream`](Session#method.open_pipe_stream)):
 /// its lanes are opened with the same preamble.
 pub(crate) fn pipe_stream(send: SendStream, recv: RecvStream, preamble: &Preamble) -> PipeIo {
     let outer = Arc::downgrade(send.shared());
@@ -3245,7 +3245,7 @@ impl Pipe {
     /// Waits until the pipe's join is confirmed: its outbound pipe ACTIVE
     /// (an inbound-only pipe: open; pipe 0: established). Fails when the
     /// join failed or was not confirmed in time ([`PipeError::Failed`]),
-    /// the pipe is gone or the session ended. [`Session::add_pipe`](crate::Session#method.add_pipe) never
+    /// the pipe is gone or the session ended. [`Session::add_pipe`](Session#method.add_pipe) never
     /// waits; this does. Cancel-safe.
     ///
     /// ```no_run
@@ -3261,7 +3261,7 @@ impl Pipe {
     }
 
     /// Resolves when the pipe ended: `Ok` once every half of it closed
-    /// (after [`Pipe::close`](crate::Pipe#method.close) or the peer's
+    /// (after [`Pipe::close`](Pipe#method.close) or the peer's
     /// graceful removal) or the session forgot it, [`PipeError::Failed`]
     /// when it failed, [`PipeError::SessionLost`] when the session ended
     /// first. Cancel-safe.

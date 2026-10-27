@@ -495,7 +495,7 @@ impl Range {
                 Chunk::Ref(b, _) => 2 * b.len(),
             })
             .sum::<usize>()
-            + self.chunks.capacity() * std::mem::size_of::<Chunk>()
+            + self.chunks.capacity() * size_of::<Chunk>()
     }
 }
 
@@ -628,7 +628,7 @@ impl Flat {
         while at < end {
             let i = ((at - self.first) / page) as usize;
             let o = ((at - self.first) % page) as usize;
-            let k = ((page - o as u64).min(end - at)) as usize;
+            let k = (page - o as u64).min(end - at) as usize;
             if let Some(Some(p)) = self.pages.get(i) {
                 out.push_copy(&p[o..o + k]);
             }
@@ -658,7 +658,7 @@ impl Flat {
 
     fn memory(&self) -> usize {
         self.present.memory()
-            + self.pages.capacity() * std::mem::size_of::<Option<Box<[u8; PAGE]>>>()
+            + self.pages.capacity() * size_of::<Option<Box<[u8; PAGE]>>>()
             + self.pages.iter().flatten().count() * PAGE
     }
 }
@@ -901,7 +901,7 @@ impl Held {
                     .sum::<usize>()
                     + m.chunks * CHUNK_COST as usize
             }
-            Mode::Flat(f) => std::mem::size_of::<Flat>() + f.memory(),
+            Mode::Flat(f) => size_of::<Flat>() + f.memory(),
         }
     }
 }

@@ -98,7 +98,7 @@ impl StreamTuner {
     /// Heap bytes held.
     pub(super) fn memory(&self) -> usize {
         self.0.as_ref().map_or(0, |t| {
-            std::mem::size_of::<Tuner>() + t.pending.capacity() * std::mem::size_of::<Loop>()
+            size_of::<Tuner>() + t.pending.capacity() * size_of::<Loop>()
         })
     }
 }

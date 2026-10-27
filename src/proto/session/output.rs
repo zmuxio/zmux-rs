@@ -245,8 +245,11 @@ impl SessionCore {
         } else {
             self.carrier_rtt.or(self.loop_min.get())
         };
-        let window =
-            (self.config.latency_budget.saturating_mul(10)).max(rtt_min.unwrap_or_default());
+        let window = self
+            .config
+            .latency_budget
+            .saturating_mul(10)
+            .max(rtt_min.unwrap_or_default());
         now.saturating_duration_since(at) < window
     }
 
@@ -707,7 +710,7 @@ impl SessionCore {
             if self.pipe_ack.is_some() {
                 // With acknowledgement only acknowledged activity counts:
                 // the batch's end waits for the PIPE_ACK that covers it.
-                if acked_activity && let Some(end) = self.out_ref(id).map(pipes::OutPipe::sent) {
+                if acked_activity && let Some(end) = self.out_ref(id).map(OutPipe::sent) {
                     self.note_acked_activity(end);
                 }
             } else if activity {
@@ -2221,7 +2224,7 @@ impl SessionCore {
         else {
             return Err(Full);
         };
-        let n = (want.min(room)) as u64;
+        let n = want.min(room) as u64;
         if let Some(left) = &mut self.pace_left {
             *left = left.saturating_sub(n);
         }

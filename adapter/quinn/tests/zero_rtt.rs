@@ -53,7 +53,7 @@ fn server(t: &Tls, addr: std::net::SocketAddr, opts: &Options) -> (quinn::Endpoi
             Ok(ep) => break ep,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => {
                 tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => panic!("bind {addr}: {e}"),
         }
@@ -168,7 +168,7 @@ async fn a_rejected_0rtt_is_sent_again_and_no_stream_fails() {
 #[test]
 fn parameter_memory_capacity_forgets_the_oldest_name() {
     let tp = zmux::proto::session::SessionCore::new(
-        zmux::Config::default(),
+        Config::default(),
         zmux::proto::session::RoleConfig::Initiator,
         None,
         std::time::Instant::now(),

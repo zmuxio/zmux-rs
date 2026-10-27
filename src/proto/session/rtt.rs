@@ -130,7 +130,7 @@ impl SessionCore {
     /// The configured latency budget: how long a driver may reuse a
     /// [`SessionCore::write_call_limit`] for the calls of a batch that follow.
     #[cfg(any(feature = "tokio", feature = "blocking"))]
-    pub(crate) fn latency_budget(&self) -> std::time::Duration {
+    pub(crate) fn latency_budget(&self) -> Duration {
         self.config.latency_budget
     }
 

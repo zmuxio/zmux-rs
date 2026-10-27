@@ -1,7 +1,7 @@
 //! Credit of the stream layer: stream counts per type (SPEC.md Section
 //! 8.5) and session flow control (Sections 8.2 to 8.4).
 //!
-//! The types are read through [`super::Streams`] and changed only by it:
+//! The types are read through [`Streams`] and changed only by it:
 //! their fields are visible to the session for reading, and no mutable
 //! reference to them leaves the stream layer.
 
