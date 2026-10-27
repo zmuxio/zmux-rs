@@ -105,6 +105,14 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TapWrite<W> {
         r
     }
 
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -127,14 +135,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TapWrite<W> {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -332,7 +332,7 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
             send.finish().unwrap();
         };
         let (_, back) = tokio::join!(writer, recv.read_to_end(2 * BULK));
-        assert!(back.unwrap() == data, "bidirectional echo differs");
+        assert_eq!(back.unwrap(), data, "bidirectional echo differs");
     };
     let qmux_side = async {
         let (mut send, mut recv) = q.accept_bi().await.unwrap();
@@ -351,7 +351,7 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
         send.write_chunk(data.clone()).await.unwrap();
         send.finish().unwrap();
         let mut back = z.accept_uni().await.unwrap();
-        assert!(back.read_to_end(2 * UNI_BULK).await.unwrap() == data);
+        assert_eq!(back.read_to_end(2 * UNI_BULK).await.unwrap(), data);
     };
     let qmux_side = async {
         let mut recv = q.accept_uni().await.unwrap();
@@ -421,7 +421,7 @@ async fn qmux_drives(z: &zmux::Session, q: &qmux::Session) {
             send.finish().unwrap();
         };
         let (_, back) = tokio::join!(writer, recv.read_all());
-        assert!(back.unwrap() == data, "bidirectional echo differs");
+        assert_eq!(back.unwrap(), data, "bidirectional echo differs");
     };
     let zmux_side = async {
         let (mut send, mut recv) = z.accept_bi().await.unwrap();
@@ -439,7 +439,7 @@ async fn qmux_drives(z: &zmux::Session, q: &qmux::Session) {
         send.write_chunk(data.clone()).await.unwrap();
         send.finish().unwrap();
         let mut back = q.accept_uni().await.unwrap();
-        assert!(back.read_all().await.unwrap() == data);
+        assert_eq!(back.read_all().await.unwrap(), data);
     };
     let zmux_side = async {
         let mut recv = z.accept_uni().await.unwrap();
@@ -920,7 +920,7 @@ async fn early_data_wrongly_declared() {
     let e = tokio::time::timeout(Duration::from_secs(10), client.closed())
         .await
         .expect("closed in time");
-    assert_eq!(e, zmux::SessionError::EarlyDataRejected, "{e:?}");
+    assert_eq!(e, SessionError::EarlyDataRejected, "{e:?}");
     if let Ok(target) = target {
         let accepted = tokio::time::timeout(Duration::from_millis(500), target.accept_bi()).await;
         assert!(

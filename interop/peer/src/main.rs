@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
-use zmux::{Config, ReadError, RecvStream, SendStream, Session, VarInt, WriteError};
+use zmux::{Config, Preamble, RecvStream, SendStream, Session, StreamError, VarInt};
 
 fn config() -> Config {
     let mut c = Config::default();
@@ -46,12 +46,16 @@ async fn main() {
             let listener = TcpListener::bind(addr).await.expect("bind");
             println!("LISTEN {}", listener.local_addr().expect("addr"));
             let (tcp, _) = listener.accept().await.expect("accept");
-            Session::accept(zmux::PipeIo::tcp(tcp), config()).await.expect("establish")
+            Session::accept(zmux::PipeIo::tcp(tcp), config())
+                .await
+                .expect("establish")
         }
         "client" => {
             let addr = args.get(2).expect("address");
             let tcp = TcpStream::connect(addr).await.expect("connect");
-            Session::connect(zmux::PipeIo::tcp(tcp), config()).await.expect("establish")
+            Session::connect(zmux::PipeIo::tcp(tcp), config())
+                .await
+                .expect("establish")
         }
         other => panic!("unknown mode {other}"),
     };
@@ -103,7 +107,8 @@ async fn reply(send: &mut SendStream, text: &str) {
 async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
     let cmd = recv
         .preamble()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .info()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
     let (name, arg) = cmd.split_once(':').unwrap_or((cmd.as_str(), ""));
     match name {
@@ -137,7 +142,7 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
                 match recv.read(&mut buf).await {
                     Ok(Some(_)) => continue,
                     Ok(None) => break "fin".to_string(),
-                    Err(ReadError::Reset { code, .. }) => break format!("reset={code}"),
+                    Err(StreamError::Reset { code, .. }) => break format!("reset={code}"),
                     Err(e) => break format!("error={e}"),
                 }
             };
@@ -156,9 +161,11 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let _ = recv.read_to_end(1 << 20).await;
         }
         "open-bidi" => {
-            let text = match session.open_bi().await {
+            let text = match session
+                .open_bi_with(&Preamble::new().with_info(Bytes::from_static(b"back")))
+                .await
+            {
                 Ok((mut s2, mut r2)) => {
-                    let _ = s2.set_preamble(Bytes::from_static(b"back"));
                     let _ = s2.write_all(arg.as_bytes()).await;
                     let _ = s2.finish();
                     match r2.read_to_end(1 << 20).await {
@@ -221,6 +228,4 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             reply(&mut send, &format!("unknown={other}")).await;
         }
     }
-    let _ = WriteError::ClosedStream;
 }
-
