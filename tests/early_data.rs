@@ -106,3 +106,41 @@ fn early_streams_carry_preamble_and_priority() {
         client.close(0u32.into(), b"");
     });
 }
+
+/// Gate the carrier handshake independently of application scheduling.
+#[test]
+fn carrier_streams_are_replayable_until_the_handshake_completes() {
+    multi_thread(watchdog(5, "carrier handshake replayability", async {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (done, handshake) = tokio::sync::oneshot::channel();
+        let mut config = Config::default();
+        config.early_data = EarlyData::default().with_carrier_early_data(true);
+        let (client, server) = tokio::join!(
+            Session::connect(zmux::PipeIo::new(a), config.clone()),
+            Session::accept(
+                zmux::PipeIo::new(b).with_early_data_in(async { handshake.await.unwrap() }),
+                config,
+            ),
+        );
+        let (client, server) = (client.unwrap(), server.unwrap());
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"before handshake").await.unwrap();
+        let mut recv = watchdog(5, "accept early stream", server.accept_uni())
+            .await
+            .unwrap();
+        let mut buf = [0; 16];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"before handshake");
+        assert!(recv.is_replayable());
+        done.send(()).unwrap();
+        common::eventually(5, "handshake settled", || !recv.is_replayable()).await;
+        let mut later = client.open_uni().await.unwrap();
+        later.write_all(b"after handshake").await.unwrap();
+        let recv = watchdog(5, "accept settled stream", server.accept_uni())
+            .await
+            .unwrap();
+        assert!(!recv.is_replayable());
+        client.close(0u32.into(), b"");
+        server.close(0u32.into(), b"");
+    }));
+}
