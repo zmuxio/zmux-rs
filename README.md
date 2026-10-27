@@ -1,5 +1,11 @@
 # zmux
 
+[![CI](https://github.com/zmuxio/zmux-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/zmuxio/zmux-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/zmux.svg)](https://crates.io/crates/zmux)
+[![docs.rs](https://img.shields.io/docsrs/zmux)](https://docs.rs/zmux)
+[![MSRV](https://img.shields.io/crates/msrv/zmux)](Cargo.toml)
+[![License](https://img.shields.io/crates/l/zmux.svg)](LICENSE)
+
 Rust implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
 
