@@ -27,8 +27,9 @@
 //!   charged to the memory budget: the client's to the zmux session its
 //!   pipes carry, the server's to the listener's while the connection is
 //!   served;
-//! - failure signalling: a body that zmux drops without ending it is reset
-//!   (or its reading stopped) with `ZMUX_CARRIER_FAILED`; a request, its
+//! - failure signalling: a sent body dropped without ending it is reset
+//!   with `ZMUX_CARRIER_FAILED`; a dropped received body is cancelled by
+//!   the transport with STOP_SENDING(0). Either signals a failure; a request, its
 //!   response or the connection that fails under a pipe is a failure of
 //!   the pipe, and only the end of a body is its graceful end.
 //!
@@ -618,17 +619,14 @@ enum RecvHalf {
 
 type Response = Pin<Box<dyn Future<Output = (ClientRecv, io::Result<()>)> + Send>>;
 
-/// A body as the receiving half of a carrier; dropped before its end, its
-/// reading is stopped with `ZMUX_CARRIER_FAILED`.
+/// A body as the receiving half of a carrier. Dropping it cancels the
+/// transport read, including a pending read held inside the HTTP decoder.
 struct BodyReader {
     half: Option<RecvHalf>,
     /// The client's wait for the response head.
     response: Option<Response>,
     held: Bytes,
     ended: bool,
-    /// A read of the body is in progress: the stack holds the stream, and
-    /// stopping it now would panic in h3-quinn (dropping it stops it).
-    reading: bool,
     /// The pipe's request or response body this endpoint sends ended
     /// gracefully: the carrier closes cleanly, and the peer's body is not
     /// stopped, or its sender could fail before it reads what was sent.
@@ -654,7 +652,6 @@ impl BodyReader {
             response: Some(response),
             held: Bytes::new(),
             ended: false,
-            reading: false,
             peer_may_finish: Arc::default(),
             keep: Some(keep),
         }
@@ -666,7 +663,6 @@ impl BodyReader {
             response: None,
             held: Bytes::new(),
             ended: false,
-            reading: false,
             peer_may_finish: Arc::default(),
             keep: None,
         }
@@ -678,20 +674,15 @@ impl Drop for BodyReader {
         if self.ended {
             return;
         }
-        if self.peer_may_finish.load(Ordering::Acquire) {
-            if let Some(keep) = self.keep.take() {
-                linger(self.response.take(), self.half.take(), keep);
-            }
-            return;
+        if self.peer_may_finish.load(Ordering::Acquire)
+            && let Some(keep) = self.keep.take()
+        {
+            linger(self.response.take(), self.half.take(), keep);
         }
-        if self.reading {
-            return;
-        }
-        match self.half.as_mut() {
-            Some(RecvHalf::Client(r)) => r.stop_sending(carrier_failed()),
-            Some(RecvHalf::Server(r)) => r.stop_sending(carrier_failed()),
-            None => {}
-        }
+        // The HTTP decoder may return buffered data while its transport
+        // read is still pending. Its outer Poll cannot tell us whether an
+        // explicit stop is safe. Dropping the receive half cancels both
+        // the buffered decoder and its pending transport read together.
     }
 }
 
@@ -746,7 +737,6 @@ impl AsyncRead for BodyReader {
                     .map(|p| p.map(|d| d.map(|mut d| d.copy_to_bytes(d.remaining())))),
                 None => return Poll::Ready(Ok(())),
             };
-            this.reading = polled.is_pending();
             let polled = ready!(polled);
             match polled.map_err(h3_error)? {
                 Some(data) => this.held = data,
@@ -756,5 +746,93 @@ impl AsyncRead for BodyReader {
         let n = this.held.len().min(buf.remaining());
         buf.put_slice(&this.held.split_to(n));
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn drop_reader_after_buffered_data_with_a_pending_transport_read() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let der = cert.cert.der().clone();
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![der.clone()], key.into())
+                .unwrap();
+            let server = Endpoint::server(
+                server_config(tls, &Options::default()).unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(der).unwrap();
+            let tls = rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client.set_default_client_config(client_config(tls, &Options::default()).unwrap());
+            let (c, s) = tokio::join!(
+                client
+                    .connect(server.local_addr().unwrap(), "localhost")
+                    .unwrap(),
+                async { server.accept().await.unwrap().await },
+            );
+            let (c, s) = (c.unwrap(), s.unwrap());
+            let client = H3Client::new(
+                c.clone(),
+                "https://localhost/".parse().unwrap(),
+                &Options::default(),
+            )
+            .await
+            .unwrap();
+            let mut server =
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(s.clone()))
+                    .await
+                    .unwrap();
+            // Put an entire request header and DATA frame in one QUIC write.
+            // Resolving the header buffers the DATA before the body's first poll.
+            let (mut send, _recv) = c.open_bi().await.unwrap();
+            // QPACK prefix, static :method POST, :scheme https, :path /,
+            // and a literal :authority using its static name index.
+            send.write_all(&[
+                1, 16, 0, 0, 0xd4, 0xd7, 0xc1, 0x50, 9, b'l', b'o', b'c', b'a', b'l', b'h', b'o',
+                b's', b't', 0, 3, b'a', b'b', b'c',
+            ])
+            .await
+            .unwrap();
+            let (_, request) = server
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            let (_send, recv) = request.split();
+            let mut reader = BodyReader::server(recv);
+            let mut byte = [0];
+            reader.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [b'a']);
+            // The HTTP decoder just returned buffered data despite a pending
+            // transport read. Dropping used to call stop_sending and panic.
+            drop(reader);
+            assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
+            drop(client);
+            c.close(0u32.into(), b"");
+            s.close(0u32.into(), b"");
+        })
+        .await
+        .unwrap();
     }
 }

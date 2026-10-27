@@ -23,8 +23,9 @@ proxies and load balancers that forward HTTP/3 requests.
 The carriers wire the TLS 1.3 exporter of the QUIC connection (for
 `PipeAuth::tls()` and carrier-bound joins; behind a front end that
 terminates TLS, use a PSK), a connection receive window sized for the lanes
-and charged to the memory budget, and failure signalling: a body dropped
-without its end is reset with `ZMUX_CARRIER_FAILED`, and a request or
+and charged to the memory budget, and failure signalling: a sent body dropped
+without its end is reset with `ZMUX_CARRIER_FAILED`; dropping a received
+body cancels it with the transport's STOP_SENDING(0). A request or
 connection that fails under a pipe is a failure of the pipe. At most one
 body write is in flight at a time.
 
