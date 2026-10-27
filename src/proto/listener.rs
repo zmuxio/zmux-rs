@@ -69,7 +69,15 @@ pub struct ListenerConfig {
     pub memory_budget: u64,
     /// Called when memory pressure starts and ends (unset by default).
     pub on_memory_pressure: Option<OnMemoryPressure>,
+    /// Bytes at the start of every session locator, for load-balancer
+    /// stickiness; random bytes fill the rest of the 16-byte locator. At
+    /// most [`MAX_INSTANCE_ID_LEN`] bytes (empty by default).
+    pub instance_id: Vec<u8>,
 }
+
+/// The longest [`ListenerConfig::instance_id`], so that at least 8 random
+/// bytes remain in the 16-byte session locator.
+pub const MAX_INSTANCE_ID_LEN: usize = 8;
 
 impl Default for ListenerConfig {
     fn default() -> Self {
@@ -84,6 +92,7 @@ impl Default for ListenerConfig {
             max_suspended: 1024,
             memory_budget: 1 << 30,
             on_memory_pressure: None,
+            instance_id: Vec::new(),
         }
     }
 }

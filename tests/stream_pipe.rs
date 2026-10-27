@@ -232,7 +232,10 @@ struct Nested {
 impl Nested {
     async fn new() -> Self {
         let (oc, os) = outer(Config::default(), Config::default()).await;
-        let listener = Listener::new(multipath(), ListenerConfig::default());
+        // An instance id exercises the locator prefix on every join.
+        let mut limits = ListenerConfig::default();
+        limits.instance_id = b"instance".to_vec();
+        let listener = Listener::new(multipath(), limits);
         let ((a, _), (b, _)) = duplex(1 << 20);
         {
             let l = listener.clone();

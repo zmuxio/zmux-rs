@@ -113,7 +113,7 @@ pub use error::{ConnectError, ReadExactError, ReadToEndError};
 pub use proto::frame::{Dir, Priority};
 pub use proto::ident::alpn_protocols;
 pub use proto::limit::{DatagramLimiter, Limiter};
-pub use proto::listener::{ListenerConfig, MemoryPressure, OnMemoryPressure};
+pub use proto::listener::{ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure};
 pub use proto::meter::{AppBytes, Meter};
 pub use proto::oob::JOIN_HEADER;
 pub use proto::params::Role;

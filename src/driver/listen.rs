@@ -23,7 +23,8 @@ use super::tokio::{JoinOffer, PipeIo, Session, Tokio, now};
 use super::wait::{Ticket, WaitList};
 use super::wake::WakeList;
 use crate::proto::listener::{
-    CarrierId, Classified, ListenerConfig, ListenerCore as Core, Opened, source_key,
+    CarrierId, Classified, ListenerConfig, ListenerCore as Core, MAX_INSTANCE_ID_LEN, Opened,
+    source_key,
 };
 use crate::proto::params::Role;
 use crate::proto::record::Framing;
@@ -151,6 +152,8 @@ struct ListenShared {
     /// keep up to date (`super::account`).
     account: Arc<Account<Shared<Tokio>>>,
     config: Arc<Config>,
+    /// The prefix of every session locator.
+    instance_id: Vec<u8>,
     _live: Live,
 }
 
@@ -232,8 +235,17 @@ impl std::fmt::Debug for Listener {
 impl Listener {
     /// A listener that starts sessions with `config` and applies `limits`.
     /// Must be created inside a tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// If `limits.instance_id` is longer than [`MAX_INSTANCE_ID_LEN`].
     pub fn new(config: impl Into<Arc<Config>>, limits: ListenerConfig) -> Self {
+        assert!(
+            limits.instance_id.len() <= MAX_INSTANCE_ID_LEN,
+            "ListenerConfig::instance_id longer than MAX_INSTANCE_ID_LEN"
+        );
         let config = config.into();
+        let instance_id = limits.instance_id.clone();
         let account = Account::new(
             limits.memory_budget,
             limits.max_suspended,
@@ -253,6 +265,7 @@ impl Listener {
                 closed: false,
             }),
             config,
+            instance_id,
             _live: Live::new(Kind::Listener),
         });
         Self { shared }
@@ -616,8 +629,8 @@ impl Listener {
         let config = self.shared.config.clone();
         // Each session of the listener has its own locator unless one is
         // configured.
-        let own =
-            (config.offers_multipath() && config.own_locator().is_empty()).then(random_locator);
+        let own = (config.offers_multipath() && config.own_locator().is_empty())
+            .then(|| random_locator(&self.shared.instance_id));
         if self.shared.account.pressure() {
             // Under memory pressure new sessions are refused.
             return Err(HandleError::Refused);
@@ -897,13 +910,18 @@ async fn accept_failed(e: &std::io::Error) {
     }
 }
 
-/// A random session locator.
-fn random_locator() -> Vec<u8> {
-    let mut l = vec![0u8; 8];
-    if getrandom::fill(&mut l).is_err() {
+/// A 16-byte session locator: `prefix`, then random bytes.
+fn random_locator(prefix: &[u8]) -> Vec<u8> {
+    let mut l = vec![0u8; 16];
+    l[..prefix.len()].copy_from_slice(prefix);
+    let rest = &mut l[prefix.len()..];
+    if getrandom::fill(rest).is_err() {
         use std::hash::BuildHasher;
-        let t = std::collections::hash_map::RandomState::new().hash_one(0x006c_6f63_6174_6f72_u64);
-        l.copy_from_slice(&t.to_le_bytes());
+        let s = std::collections::hash_map::RandomState::new();
+        for (i, c) in rest.chunks_mut(8).enumerate() {
+            let t = s.hash_one((0x006c_6f63_6174_6f72_u64, i));
+            c.copy_from_slice(&t.to_le_bytes()[..c.len()]);
+        }
     }
     l
 }
