@@ -2701,7 +2701,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zmux"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-h3"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "bytes",
  "h3",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-http"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "bytes",
  "http",
@@ -2755,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-quinn"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "bytes",
  "quinn",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-rustls"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "rcgen",
  "rustls",
@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-websocket"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "futures-util",
  "rcgen",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-webtransport"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "bytes",
  "rcgen",

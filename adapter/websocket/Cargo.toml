@@ -1,6 +1,6 @@
 [package]
 name = "zmux-websocket"
-version = "1.2.3"
+version = "1.2.4"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tokio = { version = "1.47", default-features = false, features = ["net", "time", "rt"] }
 tokio-rustls = { version = "0.26", default-features = false }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
-zmux = { version = "1.2.3", path = "../.." }
+zmux = { version = "1.2.4", path = "../.." }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
