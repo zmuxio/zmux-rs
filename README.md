@@ -6,6 +6,13 @@
 [![MSRV](https://img.shields.io/crates/msrv/zmux)](Cargo.toml)
 [![License](https://img.shields.io/crates/l/zmux.svg)](LICENSE)
 
+[![zmux-rustls](https://img.shields.io/crates/v/zmux-rustls.svg?label=zmux-rustls)](https://crates.io/crates/zmux-rustls)
+[![zmux-quinn](https://img.shields.io/crates/v/zmux-quinn.svg?label=zmux-quinn)](https://crates.io/crates/zmux-quinn)
+[![zmux-websocket](https://img.shields.io/crates/v/zmux-websocket.svg?label=zmux-websocket)](https://crates.io/crates/zmux-websocket)
+[![zmux-http](https://img.shields.io/crates/v/zmux-http.svg?label=zmux-http)](https://crates.io/crates/zmux-http)
+[![zmux-h3](https://img.shields.io/crates/v/zmux-h3.svg?label=zmux-h3)](https://crates.io/crates/zmux-h3)
+[![zmux-webtransport](https://img.shields.io/crates/v/zmux-webtransport.svg?label=zmux-webtransport)](https://crates.io/crates/zmux-webtransport)
+
 Rust implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
 
