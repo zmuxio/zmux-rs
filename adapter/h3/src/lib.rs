@@ -335,7 +335,7 @@ impl ClientInner {
 /// A carrier over a new HTTP/3 connection of `endpoint` (its default
 /// client configuration, with the ALPN identifier `h3`: [`client_config`])
 /// to `addr`, verified for the host of `uri`: a request to `uri`. For
-/// [`zmux::helpers::PipePool`] and [`zmux::Session::add_pipe`]; to open more pipes
+/// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to open more pipes
 /// on one connection, make an [`H3Client`] instead.
 pub async fn dial(
     endpoint: &Endpoint,

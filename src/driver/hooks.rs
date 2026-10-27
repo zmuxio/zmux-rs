@@ -167,5 +167,5 @@ impl WindowHook {
 
 /// Asks the predicate (with no zmux lock held); a panic is a refusal.
 pub(crate) fn ask(predicate: &WindowIncrease, delta: u64) -> bool {
-    catch_unwind(AssertUnwindSafe(|| (predicate.0)(delta))).unwrap_or(false)
+    catch_unwind(AssertUnwindSafe(|| predicate.0.as_ref()(delta))).unwrap_or(false)
 }

@@ -79,7 +79,7 @@ async fn run_pressure_hook(signal: Arc<PressureSignal>, hook: OnMemoryPressure) 
             continue;
         }
         last = p.active;
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook.0)(p)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook.0.as_ref()(p)));
     }
 }
 

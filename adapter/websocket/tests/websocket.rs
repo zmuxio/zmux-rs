@@ -36,10 +36,10 @@ async fn round_trip(client: &Session, server: &Session) {
     };
     let (mut s, mut r) = server.accept_bi().await.unwrap();
     let got = r.read_to_end(1 << 20).await.unwrap();
-    assert!(got == data);
+    assert_eq!(got, data);
     s.write_all(&got).await.unwrap();
     s.finish().unwrap();
-    assert!(recv.read_to_end(1 << 20).await.unwrap() == data);
+    assert_eq!(recv.read_to_end(1 << 20).await.unwrap(), data);
     drop(writer.await.unwrap());
 }
 

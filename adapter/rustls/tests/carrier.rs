@@ -177,7 +177,7 @@ async fn transfer(client: &Session, server: &Session) {
         send.finish().unwrap();
         send
     });
-    assert!(recv.read_to_end(4 << 20).await.unwrap() == data);
+    assert_eq!(recv.read_to_end(4 << 20).await.unwrap(), data);
     drop(writer.await.unwrap());
     echo.await.unwrap();
 }

@@ -1,7 +1,7 @@
 //! QUIC connections as zmux carriers over quinn: zmux
 //! sessions whose pipes and lanes are streams of QUIC connections. The
 //! connection's own features (datagrams, statistics, path, close) stay the
-//! application's, through the raw [`quinn::Connection`]
+//! application's, through the raw [`Connection`]
 //! ([`QuicCarrier::connection`]).
 //!
 //! One step from an endpoint to a session, and from an endpoint to the
@@ -19,7 +19,7 @@
 //! unidirectional streams (MULTIPATH.md Sections 2.5 and 5.8), which zmux
 //! opens itself as it needs them. The carrier runs the connection's accept
 //! loop: every stream the peer opens is a carrier, handed to the
-//! [`zmux::Listener`] given, or else a lane to [`zmux::carrier::handle_lane`] and a
+//! [`Listener`] given, or else a lane to [`zmux::carrier::handle_lane`] and a
 //! pipe to [`QuicCarrier::accept_pipe`]; zmux routes lanes by their Lane Key
 //! and checks that they are on the connection of their pipe, whose identity
 //! is the carrier. The connection's streams therefore belong to zmux.
@@ -368,7 +368,7 @@ pub fn server_config(
 /// A carrier over a new connection of `endpoint` (its default client
 /// configuration) to `addr`, verified for `server_name`: a stream of the
 /// connection, which carries the pipe's lanes and stays open while the
-/// pipe is used. For [`zmux::helpers::PipePool`] and [`zmux::Session::add_pipe`];
+/// pipe is used. For [`zmux::helpers::PipePool`] and [`Session::add_pipe`];
 /// to reach the connection itself, make it and its carrier
 /// ([`QuicCarrier::new`]) instead.
 pub async fn dial(

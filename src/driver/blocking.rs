@@ -365,7 +365,7 @@ impl Dial {
 
     /// Dials a carrier for `req`.
     pub fn dial(&self, req: super::DialRequest) -> io::Result<PipeIo> {
-        (self.0)(req)
+        self.0.as_ref()(req)
     }
 }
 

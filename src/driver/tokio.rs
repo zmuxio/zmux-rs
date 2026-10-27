@@ -846,12 +846,12 @@ impl Dial {
         &self,
         req: super::DialRequest,
     ) -> impl Future<Output = io::Result<PipeIo>> + Send + use<> {
-        (self.0)(req)
+        self.0.as_ref()(req)
     }
 
     /// Dials a carrier for `req`, the future boxed.
     pub(crate) fn boxed(&self, req: super::DialRequest) -> Dialing {
-        (self.0)(req)
+        self.0.as_ref()(req)
     }
 }
 
