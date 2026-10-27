@@ -486,6 +486,8 @@ type Op = tokio::task::JoinHandle<Result<(), h3::error::StreamError>>;
 struct BodyWriter {
     half: Arc<Mutex<SendHalf>>,
     op: Option<Op>,
+    /// The end of the body is in flight (in `op`).
+    finishing: bool,
     finished: bool,
     /// Set once the body ended gracefully, for the reader of the same
     /// pipe (see `paired`).
@@ -501,6 +503,7 @@ impl BodyWriter {
         Self {
             half: Arc::new(Mutex::new(half)),
             op: None,
+            finishing: false,
             finished: false,
             ended_gracefully: Arc::default(),
             _keep: keep,
@@ -565,12 +568,15 @@ impl AsyncWrite for BodyWriter {
         if self.finished {
             return Poll::Ready(Ok(()));
         }
-        ready!(self.poll_op(cx))?;
-        if self.op.is_none() {
+        // The end is taken once: a second one fails on the ended stream,
+        // and the body would then be reset, discarding its last records.
+        if !self.finishing {
+            ready!(self.poll_op(cx))?;
             let half = self.half.clone();
             self.op = Some(tokio::spawn(
                 async move { half.lock().await.finish().await },
             ));
+            self.finishing = true;
         }
         ready!(self.poll_op(cx))?;
         self.finished = true;
