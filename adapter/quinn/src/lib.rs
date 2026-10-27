@@ -886,7 +886,10 @@ fn carrier_failed() -> VarInt {
 
 /// A stream's sending part: ended gracefully by `poll_shutdown` (FIN),
 /// reset with `ZMUX_CARRIER_FAILED` when dropped otherwise; a pipe's keeps
-/// its carrier alive.
+/// its carrier alive. A finished one keeps the connection until the peer
+/// acknowledged all of it: QUIC closes a connection whose last handle is
+/// dropped, and discards the data still in flight, so a carrier's last
+/// records (a CONNECTION_CLOSE) would be lost with it.
 struct Send {
     stream: quinn::SendStream,
     finished: bool,
@@ -1078,6 +1081,22 @@ impl AsyncWrite for Send {
 
     fn is_write_vectored(&self) -> bool {
         true
+    }
+}
+
+impl Drop for Send {
+    fn drop(&mut self) {
+        if !self.finished {
+            return;
+        }
+        // Resolves once the peer acknowledged the stream, stopped it, or
+        // the connection ended; it holds the connection until then.
+        let stopped = self.stream.stopped();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = stopped.await;
+            });
+        }
     }
 }
 

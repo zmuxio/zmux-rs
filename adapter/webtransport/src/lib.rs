@@ -477,9 +477,11 @@ fn carrier_failed() -> u32 {
 
 /// A stream's sending part: ended gracefully by `poll_shutdown` (FIN),
 /// reset with `ZMUX_CARRIER_FAILED` when dropped otherwise; a pipe's keeps
-/// its carrier alive.
+/// its carrier alive. A finished one is held until the peer acknowledged
+/// all of it (see [`linger`]).
 struct Send {
-    stream: wt::SendStream,
+    /// Taken only when dropped.
+    stream: Option<wt::SendStream>,
     finished: bool,
     keep: Option<Arc<Inner>>,
 }
@@ -487,18 +489,40 @@ struct Send {
 impl Send {
     fn new(stream: wt::SendStream) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
             finished: false,
             keep: None,
         }
+    }
+
+    fn stream(&mut self) -> &mut wt::SendStream {
+        self.stream.as_mut().expect("taken only when dropped")
     }
 }
 
 impl Drop for Send {
     fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.stream.reset(carrier_failed());
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        if self.finished {
+            linger(stream);
+        } else {
+            let _ = stream.reset(carrier_failed());
         }
+    }
+}
+
+/// Keeps a finished stream, and with it the QUIC connection, until the
+/// peer acknowledged all of it, stopped it, or the connection ended: QUIC
+/// closes a connection whose last handle is dropped, and discards the data
+/// still in flight, so a carrier's last records (a CONNECTION_CLOSE) would
+/// be lost with it.
+fn linger(stream: wt::SendStream) {
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            let _ = stream.stopped().await;
+        });
     }
 }
 
@@ -508,15 +532,15 @@ impl AsyncWrite for Send {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf)
+        AsyncWrite::poll_write(Pin::new(self.stream()), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
+        AsyncWrite::poll_flush(Pin::new(self.stream()), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
+        let r = AsyncWrite::poll_shutdown(Pin::new(self.stream()), cx);
         if r.is_ready() {
             self.finished = true;
         }
@@ -532,7 +556,7 @@ impl AsyncWrite for Send {
     ) -> Poll<io::Result<usize>> {
         let mut written = 0;
         for b in bufs.iter().filter(|b| !b.is_empty()) {
-            match AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, b) {
+            match AsyncWrite::poll_write(Pin::new(self.stream()), cx, b) {
                 Poll::Ready(Ok(n)) => {
                     written += n;
                     if n < b.len() {

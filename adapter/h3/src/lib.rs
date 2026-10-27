@@ -633,7 +633,7 @@ struct BodyReader {
     /// gracefully: the carrier closes cleanly, and the peer's body is not
     /// stopped, or its sender could fail before it reads what was sent.
     peer_may_finish: Arc<AtomicBool>,
-    _keep: Option<Arc<ClientInner>>,
+    keep: Option<Arc<ClientInner>>,
 }
 
 impl BodyReader {
@@ -656,7 +656,7 @@ impl BodyReader {
             ended: false,
             reading: false,
             peer_may_finish: Arc::default(),
-            _keep: Some(keep),
+            keep: Some(keep),
         }
     }
 
@@ -668,14 +668,23 @@ impl BodyReader {
             ended: false,
             reading: false,
             peer_may_finish: Arc::default(),
-            _keep: None,
+            keep: None,
         }
     }
 }
 
 impl Drop for BodyReader {
     fn drop(&mut self) {
-        if self.ended || self.reading || self.peer_may_finish.load(Ordering::Acquire) {
+        if self.ended {
+            return;
+        }
+        if self.peer_may_finish.load(Ordering::Acquire) {
+            if let Some(keep) = self.keep.take() {
+                linger(self.response.take(), self.half.take(), keep);
+            }
+            return;
+        }
+        if self.reading {
             return;
         }
         match self.half.as_mut() {
@@ -684,6 +693,31 @@ impl Drop for BodyReader {
             None => {}
         }
     }
+}
+
+/// Keeps a client's connection after its pipe's request body ended
+/// gracefully, until the response body ends (or fails): QUIC closes a
+/// connection whose last handle is dropped, and discards the data still in
+/// flight, so the request body's last records (a CONNECTION_CLOSE) would be
+/// lost with it. The server ends the response once it read the request
+/// body to its end, or its session ended on its own; what it still sends
+/// is discarded.
+fn linger(response: Option<Response>, half: Option<RecvHalf>, keep: Arc<ClientInner>) {
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    rt.spawn(async move {
+        let mut recv = match (response, half) {
+            (Some(response), _) => match response.await {
+                (recv, Ok(())) => recv,
+                (_, Err(_)) => return,
+            },
+            (None, Some(RecvHalf::Client(recv))) => recv,
+            _ => return,
+        };
+        while let Ok(Some(_)) = poll_fn(|cx| recv.poll_recv_data(cx)).await {}
+        drop(keep);
+    });
 }
 
 impl AsyncRead for BodyReader {
