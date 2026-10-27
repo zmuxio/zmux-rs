@@ -142,18 +142,36 @@ async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
 /// A debug build's task is slow enough that reads often find their room
 /// full, which is pending input indeed: the share is measured on release
 /// builds (`cargo test --release --test input_pending`, as CI does).
+///
+/// A transfer takes some milliseconds, so one preemption of a session
+/// task while its carrier fills makes the reads after it take their whole
+/// room, pending input indeed, and cuts the calls of that run: on a small
+/// runner a run now and then goes to 10-40 %. Interference only adds
+/// pending input, it never removes any, so the least share of a few runs
+/// is the measure: input taken as pending after every read cuts most of
+/// the bytes of every run (40-80 %).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release builds only")]
 fn a_bulk_sender_writes_whole_batches_while_acknowledgements_flow_back() {
+    const RUNS: usize = 5;
     common::multi_thread(async {
         for tcp in [true, false] {
             for pipes in [2, 4] {
-                let share = bounded_share(pipes, tcp).await;
+                let mut shares = Vec::with_capacity(RUNS);
+                while shares.len() < RUNS {
+                    let share = bounded_share(pipes, tcp).await;
+                    shares.push(share);
+                    if share <= 0.10 {
+                        break;
+                    }
+                }
+                let least = shares.iter().copied().fold(f64::INFINITY, f64::min);
                 assert!(
-                    share <= 0.10,
-                    "{pipes} pipes over {}: {:.1} % of the bytes in calls cut at the bound",
+                    least <= 0.10,
+                    "{pipes} pipes over {}: {:.1} % of the bytes in calls cut at the bound \
+                     (least of {RUNS} runs: {shares:.3?})",
                     if tcp { "TCP" } else { "chunked memory" },
-                    share * 100.0
+                    least * 100.0
                 );
             }
         }
