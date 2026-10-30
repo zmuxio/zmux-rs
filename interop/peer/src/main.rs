@@ -17,7 +17,7 @@
 //! - `open-uni:<text>`: open a unidirectional stream carrying `<text>`;
 //! - `dgram`: echo the stream's datagrams (context + 1) until FIN;
 //! - `goaway:<code>`: start a graceful shutdown with `code`; reply `draining`;
-//! - `close:<code>:<reason>`: reply `closing`, then close the session.
+//! - `close:<code>:<reason>`: consume FIN, then close without a stream reply.
 //!
 //! Unidirectional streams are echoed on a new unidirectional stream, and
 //! session datagrams are echoed. The process exits when the session ends and
@@ -27,35 +27,90 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
-use zmux::{Config, Preamble, RecvStream, SendStream, Session, StreamError, VarInt};
+use zmux::{
+    Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Policy, Preamble, RecvStream,
+    SendStream, Session, StreamError, VarInt,
+};
 
-fn config() -> Config {
+fn config(multipath: bool) -> Config {
     let mut c = Config::default();
     c.enable_datagrams = true;
     c.max_incoming_uni_streams = Some(16);
+    if multipath {
+        c.max_pipes = 4;
+        c.pipe_auth = PipeAuth::psk(b"zmux interop pre-shared key 0123".to_vec());
+    }
     c
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    tokio::time::timeout(Duration::from_secs(90), run())
+        .await
+        .expect("interop peer deadline");
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("server");
+    let mut endpoint = None;
+    let mut serving = None;
     let session = match mode {
         "server" => {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:0");
             let listener = TcpListener::bind(addr).await.expect("bind");
             println!("LISTEN {}", listener.local_addr().expect("addr"));
             let (tcp, _) = listener.accept().await.expect("accept");
-            Session::accept(zmux::PipeIo::tcp(tcp), config())
+            Session::accept(zmux::PipeIo::tcp(tcp), config(false))
                 .await
                 .expect("establish")
         }
         "client" => {
             let addr = args.get(2).expect("address");
             let tcp = TcpStream::connect(addr).await.expect("connect");
-            Session::connect(zmux::PipeIo::tcp(tcp), config())
+            Session::connect(zmux::PipeIo::tcp(tcp), config(false))
                 .await
                 .expect("establish")
+        }
+        "mp-server" => {
+            let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:0");
+            let tcp = TcpListener::bind(addr).await.expect("bind");
+            println!("LISTEN {}", tcp.local_addr().expect("addr"));
+            let listener = Listener::new(config(true), ListenerConfig::default());
+            let task = tokio::spawn(listener.clone().serve(tcp));
+            let session = listener.accept().await.expect("accept session");
+            endpoint = Some(listener);
+            serving = Some(task);
+            session
+        }
+        "mp-client" => {
+            let addr = args.get(2).expect("address");
+            let tcp = TcpStream::connect(addr).await.expect("connect");
+            let session = Session::connect(zmux::PipeIo::tcp(tcp), config(true))
+                .await
+                .expect("establish");
+            let joined = TcpStream::connect(addr).await.expect("connect joined pipe");
+            let pipe = session
+                .add_pipe(zmux::PipeIo::tcp(joined), PipeOptions::default())
+                .expect("add pipe");
+            let ready = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if pipe
+                        .stats()
+                        .is_some_and(|p| p.outbound == Some(zmux::PipeState::Active))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                ready.is_ok(),
+                "joined pipe not active: {:?}",
+                session.pipe_stats()
+            );
+            session
         }
         other => panic!("unknown mode {other}"),
     };
@@ -96,6 +151,12 @@ async fn main() {
     }
     let reason = session.closed().await;
     println!("CLOSED {reason}");
+    if let Some(listener) = endpoint {
+        listener.close();
+    }
+    if let Some(task) = serving {
+        task.await.expect("listener task");
+    }
 }
 
 async fn reply(send: &mut SendStream, text: &str) {
@@ -201,6 +262,20 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let _ = recv.read_to_end(1 << 20).await;
             reply(&mut send, "dgram-done").await;
         }
+        "schedule" => {
+            assert_eq!(arg, "round-robin", "unknown scheduler");
+            session.set_scheduler(Policy::SpreadRoundRobin);
+            reply(&mut send, "scheduled").await;
+        }
+        "drop-bootstrap" => {
+            let pipe = session
+                .pipes()
+                .into_iter()
+                .find(|pipe| pipe.id().0 == 0)
+                .expect("bootstrap pipe");
+            pipe.abort().expect("abort bootstrap");
+            reply(&mut send, "dropped").await;
+        }
         "goaway" => {
             let code: u64 = arg.parse().unwrap_or(0);
             let s = session.clone();
@@ -216,9 +291,6 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let (code, reason) = arg.split_once(':').unwrap_or((arg, ""));
             let code: u64 = code.parse().unwrap_or(0);
             let _ = recv.read_to_end(1 << 20).await;
-            let _ = send.write_all(b"closing").await;
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(50)).await;
             session.close(
                 VarInt::from_u64(code).unwrap_or(VarInt::ZERO),
                 reason.as_bytes(),

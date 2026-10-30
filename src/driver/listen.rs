@@ -641,21 +641,10 @@ impl Listener {
             RoleConfig::Responder,
             Some(Role::Responder),
             own.as_deref(),
+            |shared| self.register_session(shared),
         )
         .map_err(|_| HandleError::Rejected)?;
-        let locator = shared.lock().core.local_locator().to_vec();
         let done = shared.lock_pipe_done(0);
-        shared.lock().io.account = Some(Box::new(AccountLink::new(self.shared.account.clone())));
-        if !locator.is_empty() {
-            let mut st = self.shared.lock();
-            st.sessions.insert(locator, Arc::downgrade(&shared));
-            // Ended sessions leave the table once it doubled since the last
-            // pruning: amortized constant work per session.
-            if st.sessions.len() > 2 * st.pruned.max(16) {
-                st.sessions.retain(|_, w| w.strong_count() > 0);
-                st.pruned = st.sessions.len();
-            }
-        }
         match shared.established().await {
             Ok(s) => {
                 let mut wakes = WakeList::default();
@@ -679,6 +668,22 @@ impl Listener {
             d.wait().await;
         }
         Ok(())
+    }
+
+    // Called synchronously by Shared::create before any bootstrap I/O.
+    fn register_session(&self, shared: &Arc<Shared<Tokio>>) {
+        let locator = shared.lock().core.local_locator().to_vec();
+        shared.lock().io.account = Some(Box::new(AccountLink::new(self.shared.account.clone())));
+        if !locator.is_empty() {
+            let mut st = self.shared.lock();
+            st.sessions.insert(locator, Arc::downgrade(shared));
+            // Ended sessions leave the table once it doubled since the last
+            // pruning: amortized constant work per session.
+            if st.sessions.len() > 2 * st.pruned.max(16) {
+                st.sessions.retain(|_, w| w.strong_count() > 0);
+                st.pruned = st.sessions.len();
+            }
+        }
     }
 
     /// Offers a join to its session and, once accepted, hands it the
@@ -924,4 +929,110 @@ fn random_locator(prefix: &[u8]) -> Vec<u8> {
         }
     }
     l
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use std::io;
+    use std::sync::mpsc;
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    struct FirstWrite {
+        io: DuplexStream,
+        listener: Listener,
+        observed: Option<mpsc::Sender<bool>>,
+    }
+    impl AsyncRead for FirstWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            dst: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, dst)
+        }
+    }
+    impl AsyncWrite for FirstWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            src: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(observed) = self.observed.take() {
+                let routed = self
+                    .listener
+                    .shared
+                    .lock()
+                    .sessions
+                    .values()
+                    .find_map(Weak::upgrade);
+                let ready = routed.is_some_and(|shared| shared.lock().io.account.is_some());
+                let _ = observed.send(ready);
+            }
+            Pin::new(&mut self.io).poll_write(cx, src)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_and_accounting_precede_bootstrap_io() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let config = Config {
+                max_pipes: 4,
+                pipe_auth: crate::PipeAuth::psk(vec![7; 32]),
+                ..Config::default()
+            };
+            let config = Arc::new(config);
+            let listener = Listener::new(config.clone(), ListenerConfig::default());
+            let (a, b) = tokio::io::duplex(65536);
+            let client = tokio::spawn(Session::connect(PipeIo::new(a), config.clone()));
+            let (observed, seen) = mpsc::channel();
+            let carrier = FirstWrite {
+                io: b,
+                listener: listener.clone(),
+                observed: Some(observed),
+            };
+            let shared = Shared::create(
+                PipeIo::new(carrier),
+                config,
+                RoleConfig::Responder,
+                Some(Role::Responder),
+                Some(&[9; 16]),
+                |shared| {
+                    // Give another runtime worker a chance to expose any
+                    // mistakenly started driver before registration.
+                    assert!(
+                        matches!(
+                            seen.recv_timeout(Duration::from_millis(100)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        ),
+                        "bootstrap I/O started before the registration callback"
+                    );
+                    listener.register_session(shared);
+                },
+            )
+            .expect("create session");
+            assert!(
+                seen.recv_timeout(Duration::from_secs(1))
+                    .expect("first bootstrap write"),
+                "bootstrap write lacked a live locator route or memory account"
+            );
+            let server = shared.established().await.expect("server established");
+            let client = client
+                .await
+                .expect("client task")
+                .expect("client established");
+            server.close(crate::VarInt::ZERO, b"done");
+            server.closed().await;
+            client.closed().await;
+            listener.close();
+        })
+        .await
+        .expect("registration test deadline");
+    }
 }

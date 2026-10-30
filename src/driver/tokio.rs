@@ -1167,6 +1167,7 @@ impl Shared<Tokio> {
         role: RoleConfig,
         transport: Option<Role>,
         locator: Option<&[u8]>,
+        before_start: impl FnOnce(&Arc<Self>),
     ) -> Result<Arc<Self>, ConnectError> {
         let carrier = Tokio::carrier_info(&mut pipe);
         let low_water = pipe.low_water;
@@ -1239,6 +1240,9 @@ impl Shared<Tokio> {
         }
         // A new session: no carrier can run over it yet.
         let _ = claim_carrier(&shared, 0, outer);
+        // Publish listener routing and accounting before bootstrap parameters
+        // can make the locator usable by a peer on another carrier.
+        before_start(&shared);
         tokio::spawn(Task::new(shared.clone(), first));
         if let Some((settled, done)) = early {
             let weak = Arc::downgrade(&shared);
@@ -3046,7 +3050,7 @@ impl Session {
         role: RoleConfig,
         transport: Option<Role>,
     ) -> Result<Session, ConnectError> {
-        Shared::create(pipe, config.into(), role, transport, None)?
+        Shared::create(pipe, config.into(), role, transport, None, |_| {})?
             .established()
             .await
     }

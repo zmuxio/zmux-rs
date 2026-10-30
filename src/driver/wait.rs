@@ -48,8 +48,8 @@ impl WaitList {
         self.waiters.is_empty()
     }
 
-    /// Waits registered (for the leak tests).
-    #[cfg(feature = "test-hooks")]
+    /// Waits registered (for the leak tests of the std driver).
+    #[cfg(all(feature = "test-hooks", feature = "blocking"))]
     pub(crate) fn len(&self) -> usize {
         self.waiters.len()
     }

@@ -49,6 +49,7 @@
 //! ```
 
 mod body;
+mod exchange;
 
 use std::convert::Infallible;
 use std::io;
@@ -69,6 +70,10 @@ use zmux::{ConnectError, Listener, PipeHint, PipeIo, Session};
 
 pub use body::PipeBody;
 use body::{BodyReader, body};
+pub use exchange::{
+    Backoff, BodyEncoding, ExchangeEndpoint, ExchangeOptions, ExchangeServer, connect_exchange,
+    dial_exchange, dial_exchange_split, dial_exchange_with,
+};
 
 /// The adapter's options.
 #[derive(Debug, Clone)]
@@ -87,6 +92,11 @@ pub struct Options {
     /// HTTP handshake (HTTP/1.1) to the response head (default 10 s); an
     /// exchange not answered within it fails with `TimedOut`.
     pub timeout: Duration,
+    /// Server: the exchange carrier's server, which answers the POST
+    /// requests whose path starts with the fixed part of its
+    /// [`ExchangeOptions::path`] (none by default). Its carriers go to the
+    /// listener it was made with.
+    pub exchange: Option<ExchangeServer>,
 }
 
 impl Default for Options {
@@ -96,6 +106,7 @@ impl Default for Options {
             lanes: false,
             join_header: None,
             timeout: Duration::from_secs(10),
+            exchange: None,
         }
     }
 }
@@ -131,6 +142,13 @@ impl Options {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Serves the exchange carrier's requests with `server`.
+    #[must_use]
+    pub fn with_exchange(mut self, server: ExchangeServer) -> Self {
+        self.exchange = Some(server);
         self
     }
 
@@ -547,17 +565,26 @@ pub async fn serve_connection<IO>(
     let conn = CarrierConnId::new(&tag);
     let used = Arc::new(AtomicBool::new(false));
     let (seen, l) = (used.clone(), listener.clone());
+    let exchange = options.exchange.clone();
     let service = service_fn(move |req: Request<Incoming>| {
-        let resp = if req.method() == Method::POST && req.uri().path() == &*path {
+        let post = req.method() == Method::POST;
+        if post && req.uri().path() == &*path {
             seen.store(true, Ordering::Relaxed);
             let h2 = (req.version() == Version::HTTP_2).then(|| conn.clone());
-            handle_request(&l, req, peer, h2)
-        } else {
-            let mut r = Response::new(PipeBody::empty());
-            *r.status_mut() = StatusCode::NOT_FOUND;
-            r
-        };
-        std::future::ready(Ok::<_, Infallible>(resp))
+            let resp = handle_request(&l, req, peer, h2);
+            return Either::Left(std::future::ready(Ok::<_, Infallible>(resp)));
+        }
+        if let Some(x) = exchange
+            .as_ref()
+            .filter(|x| post && x.matches(req.uri().path()))
+        {
+            seen.store(true, Ordering::Relaxed);
+            let x = x.clone();
+            return Either::Right(Box::pin(async move { Ok(x.handle(req, peer).await) }));
+        }
+        let mut r = Response::new(PipeBody::empty());
+        *r.status_mut() = StatusCode::NOT_FOUND;
+        Either::Left(std::future::ready(Ok(r)))
     });
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     builder
@@ -584,6 +611,32 @@ pub async fn serve_connection<IO>(
 
 /// The identity of a served connection.
 struct ConnTag;
+
+/// A response at once, or one an exchange request waits for.
+type ExchangeFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<Response<PipeBody>, Infallible>> + Send>>;
+
+enum Either<A> {
+    Left(A),
+    Right(ExchangeFuture),
+}
+
+impl<A> Future for Either<A>
+where
+    A: Future<Output = Result<Response<PipeBody>, Infallible>> + Unpin,
+{
+    type Output = A::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            Either::Left(a) => std::pin::Pin::new(a).poll(cx),
+            Either::Right(b) => b.as_mut().poll(cx),
+        }
+    }
+}
 
 /// After a failed accept: a connection gone before it was accepted is no
 /// reason to wait; anything else is retried after 100 ms.

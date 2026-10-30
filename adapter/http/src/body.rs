@@ -59,7 +59,7 @@ pub(crate) fn body() -> (BodyWriter, PipeBody, Abort) {
     let shared = Arc::new(Shared::default());
     (
         BodyWriter(shared.clone()),
-        PipeBody(Some(shared.clone())),
+        PipeBody(Inner::Fed(shared.clone())),
         Abort(shared),
     )
 }
@@ -141,15 +141,30 @@ impl Drop for BodyWriter {
     }
 }
 
-/// A request or response body that a pipe's sending half feeds (the body
-/// of [`crate::handle_request`]'s responses): its data, then its clean
-/// end, or an error when zmux aborts the pipe.
-pub struct PipeBody(Option<Arc<Shared>>);
+/// A request or response body of the adapter: one that a pipe's sending
+/// half feeds (the body of [`crate::handle_request`]'s responses), its
+/// data, then its clean end, or an error when zmux aborts the pipe; or a
+/// body of a known length (an exchange carrier's request or response,
+/// sent with a `Content-Length`).
+pub struct PipeBody(Inner);
+
+enum Inner {
+    Fed(Arc<Shared>),
+    /// Up to two chunks, sent in order: a header and the data it precedes,
+    /// without copying either.
+    Fixed([Option<Bytes>; 2]),
+}
 
 impl PipeBody {
     /// A body without data.
     pub fn empty() -> Self {
-        Self(None)
+        Self(Inner::Fixed([None, None]))
+    }
+
+    /// A body of `head` then `tail`, of known length.
+    pub(crate) fn fixed(head: Bytes, tail: Bytes) -> Self {
+        let keep = |b: Bytes| (!b.is_empty()).then_some(b);
+        Self(Inner::Fixed([keep(head), keep(tail)]))
     }
 }
 
@@ -167,8 +182,16 @@ impl Body for PipeBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        let Some(shared) = &self.0 else {
-            return Poll::Ready(None);
+        let shared = match &mut self.get_mut().0 {
+            Inner::Fed(shared) => shared,
+            Inner::Fixed(chunks) => {
+                return Poll::Ready(
+                    chunks
+                        .iter_mut()
+                        .find_map(Option::take)
+                        .map(|c| Ok(Frame::data(c))),
+                );
+            }
         };
         let (r, waker) = {
             let mut s = shared.lock();
@@ -198,16 +221,28 @@ impl Body for PipeBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.0.as_ref().is_none_or(|s| {
-            let s = s.lock();
-            s.chunk.is_none() && s.end == Some(End::Finish)
-        })
+        match &self.0 {
+            Inner::Fed(s) => {
+                let s = s.lock();
+                s.chunk.is_none() && s.end == Some(End::Finish)
+            }
+            Inner::Fixed(chunks) => chunks.iter().all(Option::is_none),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match &self.0 {
+            Inner::Fed(_) => http_body::SizeHint::default(),
+            Inner::Fixed(chunks) => http_body::SizeHint::with_exact(
+                chunks.iter().flatten().map(|c| c.len() as u64).sum(),
+            ),
+        }
     }
 }
 
 impl Drop for PipeBody {
     fn drop(&mut self) {
-        if let Some(shared) = &self.0 {
+        if let Inner::Fed(shared) = &self.0 {
             let waker = {
                 let mut s = shared.lock();
                 s.gone = true;
@@ -269,6 +304,47 @@ where
             }
         }
     }
+}
+
+/// The whole of `body`, at most `limit` bytes: one data frame is taken as
+/// it is, several are joined. A body beyond the limit is `Ok(Err(start))`,
+/// with its first bytes (up to the limit); one that fails is an error.
+pub(crate) async fn collect<B>(body: B, limit: usize) -> io::Result<Result<Bytes, Bytes>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let mut body = body;
+    let mut first = Bytes::new();
+    let mut rest: Option<bytes::BytesMut> = None;
+    while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        let frame = frame.map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+        let Ok(mut data) = frame.into_data() else {
+            continue;
+        };
+        let have = first.len() + rest.as_ref().map_or(0, |r| r.len());
+        let over = have + data.len() > limit;
+        if over {
+            data.truncate(limit - have);
+        }
+        if let Some(r) = &mut rest {
+            r.extend_from_slice(&data);
+        } else if first.is_empty() {
+            first = data;
+        } else if !data.is_empty() {
+            // Room for what the body says is left.
+            let left = usize::try_from(body.size_hint().upper().unwrap_or(0)).unwrap_or(limit);
+            let mut r =
+                bytes::BytesMut::with_capacity((have + data.len()).saturating_add(left).min(limit));
+            r.extend_from_slice(&first);
+            r.extend_from_slice(&data);
+            rest = Some(r);
+        }
+        if over {
+            return Ok(Err(rest.map_or(first, bytes::BytesMut::freeze)));
+        }
+    }
+    Ok(Ok(rest.map_or(first, bytes::BytesMut::freeze)))
 }
 
 #[cfg(test)]

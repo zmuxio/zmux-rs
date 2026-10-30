@@ -2741,13 +2741,17 @@ dependencies = [
 name = "zmux-http"
 version = "1.2.4"
 dependencies = [
+ "base64",
  "bytes",
+ "getrandom 0.4.3",
+ "hmac",
  "http",
  "http-body",
  "hyper",
  "hyper-util",
  "rcgen",
  "rustls",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "zmux",
