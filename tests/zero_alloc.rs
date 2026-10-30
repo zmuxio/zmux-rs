@@ -819,9 +819,16 @@ mod driver {
     /// outer sessions) or directly, over a nested session whose pipe is the
     /// stream or on the stream itself; returns the allocations of the
     /// transfer on this thread (the whole runtime).
+    ///
+    /// The clock is paused (it moves only when every task waits): a pipe
+    /// whose reads paused for a burst's gap gives its read buffers back,
+    /// and the next read takes fresh ones, an allocation per pause, not per
+    /// frame. On a loaded host the thread stalls past that gap at random;
+    /// on the paused clock the count does not depend on the host.
     fn relayed(mib: usize, relay: bool, nested: bool) -> u64 {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         rt.block_on(async {

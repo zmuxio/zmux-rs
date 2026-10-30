@@ -271,11 +271,22 @@ async fn tables_at_rest(client: &Session, server: &Session, what: &str) -> (Tabl
     );
 }
 
+/// The send buffer of the churned sessions: small, so that the chunk
+/// pool's bound below stays well under the tables' own capacity.
+const SEND_BUFFER: u64 = 256 * 1024;
+
+/// The most the pool of released send chunks keeps: the send buffer's
+/// 64 KiB chunks and those a 256 KiB write batch may still reference, and
+/// one more.
+const CHUNK_POOL: usize = SEND_BUFFER as usize + (256 / 64 + 1) * 64 * 1024;
+
 async fn stream_churn(tcp_carrier: bool, seed: u64) {
     let base = snapshot();
     let mut server_cfg = small_windows(Config::default());
     server_cfg.max_incoming_streams = 8;
-    let client_cfg = small_windows(Config::default());
+    server_cfg.send_buffer = SEND_BUFFER;
+    let mut client_cfg = small_windows(Config::default());
+    client_cfg.send_buffer = SEND_BUFFER;
     let (client, server, _ctl) = pair(tcp_carrier, client_cfg, server_cfg).await;
     let served = serve(server.clone());
     let mut rng = Rng::new(seed);
@@ -303,13 +314,16 @@ async fn stream_churn(tcp_carrier: bool, seed: u64) {
         }
         // The tables keep some capacity; they must not grow with the
         // phases (the soak run checks this over many).
-        // Capacity settles in the first two phases (buffer pools and
-        // tables grow in steps); after them it must not keep growing.
+        // Capacity settles in the first two phases (tables grow in steps);
+        // after them it must not keep growing. The session's pool of
+        // released send chunks fills as fast as the scheduling lets writes
+        // overlap, not by phase: it is bounded by the send buffer and
+        // allowed on top.
         let warm = memory.get_or_insert((0, 0));
         if phase < 2 {
             *warm = (warm.0.max(now.0), warm.1.max(now.1));
         } else {
-            let bound = |w: usize| 2 * w + 64 * 1024;
+            let bound = |w: usize| 2 * w + 64 * 1024 + CHUNK_POOL;
             assert!(
                 now.0 <= bound(warm.0) && now.1 <= bound(warm.1),
                 "{what}: memory grew from {warm:?} to {now:?}"

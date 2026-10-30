@@ -219,7 +219,7 @@ fn sessions_over_the_carrier() {
             for s in streams {
                 s.await.unwrap();
             }
-            assert!(srv.exchange.carriers() == 1);
+            assert_eq!(srv.exchange.carriers(), 1);
             finish(client, srv, None, base).await;
         }
     });

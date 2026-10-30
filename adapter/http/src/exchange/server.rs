@@ -261,10 +261,10 @@ impl Shared {
             Lookup::Live(c) => c,
             Lookup::Gone => {
                 let key = Key::new(&o.psk, &req.cid);
-                match req.verify(&key) {
-                    Ok(_) | Err(Malformed::Invalid) => return Ok((key, Answer::flags(GONE))),
-                    Err(e) => return Err(e),
-                }
+                return match req.verify(&key) {
+                    Ok(_) | Err(Malformed::Invalid) => Ok((key, Answer::flags(GONE))),
+                    Err(e) => Err(e),
+                };
             }
             Lookup::New => {
                 let key = Key::new(&o.psk, &req.cid);
