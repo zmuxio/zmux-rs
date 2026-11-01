@@ -168,7 +168,6 @@ impl SessionCore {
     /// `reset_stream_at`.
     pub fn assume_remembered(&mut self, remembered: &TransportParameters) -> bool {
         if !self.config.early_data.carrier_early_data
-            || self.config.offers_multipath()
             || self.state != State::Establishing
             || self.stats.bytes_sent > 0
         {
@@ -240,8 +239,6 @@ impl SessionCore {
             return;
         }
         self.early_state().carrier = CarrierEarly::Off;
-        let mp = self.mp.is_some();
-        let _ = mp;
         if accepted {
             // The held bytes are not needed any more, and what was written
             // is final, as on any single pipe (SPEC.md Section 7.4).

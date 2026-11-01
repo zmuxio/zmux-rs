@@ -95,8 +95,7 @@ impl TpValues {
             window_bidi_remote: window,
             window_uni: window,
             streams_bidi: config.max_incoming_streams,
-            max_idle_timeout: u64::try_from(config.max_idle_timeout.as_millis())
-                .unwrap_or(u64::MAX),
+            max_idle_timeout: config.idle_millis(),
             role_nonce: own.role_nonce,
             multipath: own.multipath,
             lane_key: Some(own.lane_key),
@@ -158,6 +157,9 @@ pub(super) struct LocalTp {
     pub(super) role_nonce: Option<u64>,
     /// The Lane Key of zmux_max_lanes.
     pub(super) lane_key: [u8; 16],
+    /// zmux_carrier_datagrams is sent although the configuration alone
+    /// does not send it: the bootstrap carrier has a datagram channel.
+    pub(super) carrier_datagrams: bool,
 }
 
 impl LocalTp {
@@ -168,6 +170,7 @@ impl LocalTp {
             multipath: v.multipath,
             role_nonce: v.role_nonce,
             lane_key: v.lane_key.unwrap_or_default(),
+            carrier_datagrams: false,
         }
     }
 }

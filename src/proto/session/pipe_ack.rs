@@ -236,7 +236,7 @@ impl SessionCore {
             let (moved, cum) = o.ack_lane(e.lane, e.position, now);
             if let Some(cum) = cum {
                 let delay = Duration::from_micros(e.ack_delay.min(u64::MAX >> 2));
-                let sample = o.sample_ack(cum, delay, peer_mad, true, |_| true, now);
+                let sample = o.sample_ack(cum, delay, peer_mad, true, false, |_| true, now);
                 self.single_pipe_acked(sample, now);
                 self.activity_acked(cum, now);
             }

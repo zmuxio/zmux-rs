@@ -373,8 +373,10 @@ const ENDS: [End; 7] = [
 ];
 
 fn timeouts(mut c: Config) -> Config {
-    c.max_idle_timeout = Duration::from_millis(400);
-    c.handshake_timeout = Duration::from_millis(300);
+    // The idle timeout ends idle sessions only without keep-alive.
+    c.keep_alive_period = None;
+    c.max_idle_timeout = Some(Duration::from_millis(400));
+    c.handshake_timeout = Some(Duration::from_millis(300));
     c
 }
 

@@ -452,7 +452,7 @@ async fn multipath_pipe_loss_under_concurrency() {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_addr(peer.ip()))
+                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -600,7 +600,6 @@ async fn application_bytes_read_concurrently_are_monotonic_and_exact() {
                     let now = meter.get();
                     assert!(now.bytes_written >= last.bytes_written);
                     assert!(now.bytes_read >= last.bytes_read);
-                    let _ = meter.rate(std::time::Instant::now());
                     last = now;
                 }
             })

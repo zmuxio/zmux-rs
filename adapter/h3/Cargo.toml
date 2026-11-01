@@ -15,17 +15,20 @@ categories = ["network-programming"]
 # quinn's ring provider (quinn's default) or its aws-lc-rs one. Without
 # either, no crypto provider is chosen here.
 default = ["rustls-ring"]
-rustls-ring = ["quinn/rustls-ring"]
-rustls-aws-lc-rs = ["quinn/rustls-aws-lc-rs"]
+rustls-ring = ["quinn/rustls-ring", "zmux-quinn/rustls-ring"]
+rustls-aws-lc-rs = ["quinn/rustls-aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
 
 [dependencies]
 bytes = "1"
-h3 = "0.0.8"
+# The opt-in feature exposes the peer's SETTINGS (`ConnectionState`), which
+# tell whether it enabled HTTP Datagrams; the version is pinned.
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "0.0.10"
 http = "1"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio"] }
 tokio = { version = "1.47", default-features = false, features = ["rt", "sync"] }
 zmux = { version = "1.2.4", path = "../.." }
+zmux-quinn = { version = "1.2.4", path = "../quinn", default-features = false }
 
 [dev-dependencies]
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -37,3 +40,7 @@ tokio = { version = "1.47", features = ["full"] }
 missing_docs = "warn"
 unsafe_code = "forbid"
 unreachable_pub = "warn"
+
+[[bench]]
+name = "bulk"
+harness = false

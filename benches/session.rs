@@ -23,8 +23,8 @@ use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, RoleConfig};
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, PipeState, Policy,
-    Session, SessionStats,
+    Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
+    Policy, Session, SessionStats,
 };
 
 static BASE: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
@@ -67,7 +67,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-const P0: PipeId = PipeId(0);
+const P0: PipeId = PipeId::new(0);
 
 fn gbps(bytes: u64, d: Duration) -> f64 {
     bytes as f64 / d.as_secs_f64() / 1e9
@@ -573,7 +573,7 @@ async fn scale(multipath: bool) {
         } else {
             Config::default()
         };
-        c.max_idle_timeout = Duration::ZERO;
+        c.max_idle_timeout = None;
         c.keep_alive_period = keep_alive;
         c
     };
@@ -638,7 +638,7 @@ async fn scale(multipath: bool) {
             let active = |x: &Session| {
                 x.pipe_stats()
                     .iter()
-                    .filter(|i| i.outbound == Some(PipeState::Active))
+                    .filter(|i| i.outbound == Some(OutboundState::Active))
                     .count()
             };
             while active(c) < 2 || active(s) < 2 {
@@ -978,7 +978,7 @@ async fn rr_under_bulk(secs: f64) {
         .ok()
         .and_then(|l| l.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| "-".into());
-    let cores = std::thread::available_parallelism().map_or(0, |n| n.get());
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
     let workers = std::env::var("ZMUX_BENCH_WORKERS").unwrap_or_else(|_| "-".into());
     println!(
         "RESULT scen=at1 carrier={carrier} p99_us={:.1} p99_idle_us={idle:.1} p99_tcp_us={tcp:.1} w_us={w:.1} q_us={q_us:.0} target_us={:.1} gate_us={:.1} pass_target={} pass_gate={} load={load} cores={cores} workers={workers}",
@@ -1465,9 +1465,9 @@ async fn soak() {
         })
         .unwrap_or_else(|| "system".into());
     let mut single = Config::default();
-    single.max_idle_timeout = Duration::ZERO;
+    single.max_idle_timeout = None;
     let mut mp = mp_config(&Policy::SpreadEta);
-    mp.max_idle_timeout = Duration::ZERO;
+    mp.max_idle_timeout = None;
     let (single, mp) = (Arc::new(single), Arc::new(mp));
     let soak = Arc::new(Soak {
         active: AtomicBool::new(true),
@@ -1699,7 +1699,7 @@ impl Pair {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_addr(peer.ip()))
+                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -1735,7 +1735,7 @@ impl Pair {
         let active = |s: &Session| {
             s.pipe_stats()
                 .iter()
-                .filter(|i| i.outbound == Some(PipeState::Active))
+                .filter(|i| i.outbound == Some(OutboundState::Active))
                 .count()
         };
         let deadline = Instant::now() + Duration::from_secs(5);

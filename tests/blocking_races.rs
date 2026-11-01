@@ -100,7 +100,7 @@ fn carrier_ends_mid_batch(eof: bool) {
     let (a, b) = tcp();
     let shut = a.try_clone().unwrap();
     let client_pipe = if eof {
-        PipeIo::tcp(a).unwrap()
+        PipeIo::tcp(a)
     } else {
         let reader = a.try_clone().unwrap();
         PipeIo::from_halves(
@@ -111,8 +111,7 @@ fn carrier_ends_mid_batch(eof: bool) {
             },
         )
     };
-    let server =
-        thread::spawn(move || Session::accept(PipeIo::tcp(b).unwrap(), Config::default()).unwrap());
+    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), Config::default()).unwrap());
     let client = Session::connect(client_pipe, Config::default()).unwrap();
     let server = server.join().unwrap();
     let server_task = serve(server.clone());
@@ -140,12 +139,12 @@ fn carrier_ends_mid_batch(eof: bool) {
     for j in jobs {
         j.join().expect("no panic");
     }
-    client.closed().unwrap();
+    client.closed(None).unwrap();
     // A failed carrier from halves keeps its reader until the peer ends it
     // (nothing interrupts a generic read): the server closes rather than
     // waiting for its idle timeout.
     server.close(VarInt::from_u32(0), b"");
-    server.closed().unwrap();
+    server.closed(None).unwrap();
     let _ = server_task.join();
 }
 
@@ -226,7 +225,7 @@ fn mp_server(rt: &tokio::runtime::Runtime) -> SocketAddr {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(zmux::PipeIo::tcp(c), zmux::PipeHint::from_addr(peer.ip()))
+                        .handle_pipe(zmux::PipeIo::tcp(c), zmux::PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -263,16 +262,13 @@ fn multipath_pipe_loss_during_traffic() {
             .build()
             .unwrap();
         let addr = mp_server(&rt);
-        let client = Session::connect(
-            PipeIo::tcp(TcpStream::connect(addr).unwrap()).unwrap(),
-            mp_config(),
-        )
-        .unwrap();
+        let client =
+            Session::connect(PipeIo::tcp(TcpStream::connect(addr).unwrap()), mp_config()).unwrap();
         assert!(client.multipath() == zmux::Multipath::InUse);
         let (raddr, cut) = relay(addr);
         let pipe = client
             .add_pipe(
-                PipeIo::tcp(TcpStream::connect(raddr).unwrap()).unwrap(),
+                PipeIo::tcp(TcpStream::connect(raddr).unwrap()),
                 PipeOptions::default(),
             )
             .unwrap();
@@ -300,7 +296,7 @@ fn multipath_pipe_loss_during_traffic() {
         let echoes: usize = jobs.into_iter().map(|j| j.join().expect("echo")).sum();
         assert!(echoes > 0);
         client.close(VarInt::from_u32(0), b"");
-        client.closed().unwrap();
+        client.closed(None).unwrap();
         rt.shutdown_timeout(Duration::from_secs(5));
     });
 }
@@ -313,10 +309,9 @@ fn multipath_pipe_loss_during_traffic() {
 fn idle_readers_resume_with_a_new_buffer() {
     watchdog(30, "idle readers", || {
         let (a, b) = tcp();
-        let server = thread::spawn(move || {
-            Session::accept(PipeIo::tcp(b).unwrap(), Config::default()).unwrap()
-        });
-        let client = Session::connect(PipeIo::tcp(a).unwrap(), Config::default()).unwrap();
+        let server =
+            thread::spawn(move || Session::accept(PipeIo::tcp(b), Config::default()).unwrap());
+        let client = Session::connect(PipeIo::tcp(a), Config::default()).unwrap();
         let server = server.join().unwrap();
         let task = serve(server.clone());
         assert!(echo_once(&client, 64 * 1024, 1));
@@ -326,7 +321,7 @@ fn idle_readers_resume_with_a_new_buffer() {
             assert!(echo_once(&client, 300 * 1024 + 7, seed));
         }
         client.close(VarInt::from_u32(0), b"");
-        let _ = server.closed();
+        let _ = server.closed(None);
         task.join().unwrap();
     });
 }

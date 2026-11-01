@@ -1,7 +1,7 @@
 //! Receive-side flow control: releasing and issuing credit (SPEC.md
 //! Section 8.3) and window auto-tuning.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::SessionCore;
 use super::config::{Cap, DEFAULT_SEND_BUFFER_MAX, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR};
@@ -97,7 +97,7 @@ impl SessionCore {
     /// time: buffered receive data, retained data (which includes what a
     /// suspended session keeps) and the session window's growth.
     pub(super) fn budget_used(&self) -> u64 {
-        let retained = self.mp.as_deref().map_or(0, super::mpath::Mp::retained);
+        let retained = self.retained();
         self.streams.recv_flow().buffered + retained + self.window_growth() + self.carrier_memory
     }
 
@@ -108,8 +108,7 @@ impl SessionCore {
         let used = self.budget_used();
         match self.memory_allowance {
             Some((left, at)) => left.map(|l| l.saturating_sub(used.saturating_sub(at))),
-            None => (self.config.memory_budget > 0)
-                .then(|| self.config.memory_budget.saturating_sub(used)),
+            None => self.config.memory_budget().map(|b| b.saturating_sub(used)),
         }
     }
 
@@ -244,7 +243,7 @@ impl SessionCore {
         match self.config.send_buffer_max {
             Cap::Fixed(v) => v,
             Cap::Auto => {
-                let retained = self.mp.as_deref().map_or(0, super::mpath::Mp::retained);
+                let retained = self.retained();
                 let grant = self
                     .budget_left()
                     .map_or(u64::MAX, |l| retained.saturating_add(l));
@@ -260,43 +259,6 @@ impl SessionCore {
             .recv_flow()
             .window
             .saturating_sub(self.config.initial_connection_receive_window)
-    }
-
-    /// The RTT input of auto-tuning for a scope (`key` a stream, `None` the
-    /// session): on a single pipe the
-    /// carrier's minimum RTT, else the credit-loop minimum (300 s, QX_PING
-    /// samples included); in a multipath session the largest pipe_min_rtt
-    /// of the pipes the scope's data arrived on in the last 4 intervals.
-    pub(super) fn autotune_rtt(&self, key: Option<StreamKey>) -> Option<Duration> {
-        if let Some(r) = self.config.hooks.rtt {
-            return Some(r);
-        }
-        if self.mp.is_some() {
-            return match key {
-                Some(k) => self.streams.recv(k).and_then(|r| r.tuner.rtt_seen()),
-                None => self.streams.recv_flow().tuner.rtt_seen(),
-            };
-        }
-        self.carrier_rtt.or(self.loop_min.get())
-    }
-
-    /// Stream data arrived: the arrival rates and credit-loop samples of
-    /// the stream (whose highest received offset is `off`) and of the
-    /// session.
-    pub(super) fn autotune_data(&mut self, key: StreamKey, off: u64, now: Instant) {
-        let pipe_rtt = if self.mp.is_some() {
-            self.pipe_min_rtt(self.rx)
-        } else {
-            None
-        };
-        let rtt = self.autotune_rtt(Some(key));
-        let session_rtt = self.autotune_rtt(None);
-        let samples = self
-            .streams
-            .autotune_data(key, off, now, (rtt, session_rtt), pipe_rtt);
-        for s in samples.into_iter().flatten() {
-            self.loop_min.sample(now, s, super::filter::LOOP_SPAN);
-        }
     }
 
     /// The MAX_STREAM_DATA value to send now for a stream, after
@@ -420,7 +382,7 @@ mod tests {
     fn automatic_caps_grow_beyond_the_floors_within_the_budget() {
         const MIB: u64 = 1 << 20;
         let mut c = super::super::Config {
-            memory_budget: 256 * MIB,
+            memory_budget: Some(crate::proto::session::Budget::Bytes(256 * MIB)),
             ..Default::default()
         };
         let mut s = session(c.clone());
@@ -432,7 +394,7 @@ mod tests {
         // grow with the window.
         assert_eq!(s.buffer_cap(), 96 * MIB);
         // A budget below the floors leaves the floors.
-        c.memory_budget = MIB;
+        c.memory_budget = Some(crate::proto::session::Budget::Bytes(MIB));
         let mut s = session(c.clone());
         s.grow_session_window(1 << 40);
         assert_eq!(s.streams.recv_flow().window, 96 * MIB);
@@ -444,7 +406,7 @@ mod tests {
         // The window took what the listener had left.
         assert_eq!(s.send_buffer_limit(), 64 * MIB);
         // Fixed caps are fixed, whatever the budget.
-        c.memory_budget = 0;
+        c.memory_budget = Some(crate::proto::session::Budget::Unlimited);
         c.max_connection_receive_window = Cap::Fixed(8 * MIB);
         c.send_buffer_max = Cap::Fixed(2 * MIB);
         let mut s = session(c);

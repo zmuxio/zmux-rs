@@ -228,6 +228,9 @@ pub(crate) enum List<K> {
     Ping,
     /// The session's hook task (a hook's input arrived).
     Hook,
+    /// The tasks of the pipes' datagram channels (datagrams for a channel
+    /// were queued, or a pipe changed).
+    Channel,
     Stopped(K),
     StreamDatagrams(K),
 }
@@ -405,7 +408,7 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
             + self
                 .session
                 .iter()
-                .filter(|(l, _)| *l != List::Hook)
+                .filter(|(l, _)| !matches!(l, List::Hook | List::Channel))
                 .map(|(_, w)| w.waiters.len())
                 .sum::<usize>()
             + self

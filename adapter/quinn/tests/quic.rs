@@ -8,7 +8,7 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeOptions, PipeState, Session, SessionEvent,
+    Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeOptions, Session, SessionEvent,
 };
 use zmux_quinn::{Options, QuicCarrier};
 
@@ -168,11 +168,16 @@ async fn a_carrier_bound_join_over_a_second_connection() {
         .add_pipe(q2.open_pipe().await.unwrap(), PipeOptions::default())
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while pipe.stats().and_then(|i| i.outbound) != Some(PipeState::Active) {
+    while pipe.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
         assert!(tokio::time::Instant::now() < deadline, "the join failed");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     transfer(&client, &server, 4, 1 << 20).await;
+    assert_kind([&client, &server], zmux::CarrierKind::Quic);
+    for s in [&client, &server] {
+        let joined = s.pipe(pipe.id()).unwrap().stats().unwrap();
+        assert_eq!(joined.carrier, Some(zmux::CarrierKind::Quic));
+    }
     while let Ok(Some(e)) = tokio::time::timeout(Duration::ZERO, server.next_event()).await {
         assert!(!matches!(e, SessionEvent::JoinAuthFailed { .. }), "{e:?}");
     }
@@ -202,12 +207,14 @@ fn plain_tls() -> (rustls::ClientConfig, rustls::ServerConfig) {
 }
 
 /// One step from an endpoint to a session and from an endpoint to its
-/// sessions: the configurations get zmux's ALPN identifiers and the
-/// carrier's transport parameters, the session reports the negotiated
-/// identifier, and streams go both ways (with lanes).
+/// sessions: the configurations keep the ALPN identifiers configured and
+/// get the carrier's transport parameters, the session reports the
+/// negotiated identifier, and streams go both ways (with lanes).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connect_and_serve_with_the_default_alpn() {
-    let (client_tls, server_tls) = plain_tls();
+async fn connect_and_serve_with_zmux_alpn() {
+    let (mut client_tls, mut server_tls) = plain_tls();
+    client_tls.alpn_protocols = zmux::alpn_protocols(&[]);
+    server_tls.alpn_protocols = zmux::alpn_protocols(&[]);
     let opts = Options::default();
     let server_ep = quinn::Endpoint::server(
         zmux_quinn::server_config(server_tls, &opts).unwrap(),
@@ -216,7 +223,12 @@ async fn connect_and_serve_with_the_default_alpn() {
     .unwrap();
     let addr = server_ep.local_addr().unwrap();
     let listener = Listener::new(Config::default(), ListenerConfig::default());
-    let serving = tokio::spawn(zmux_quinn::serve(listener.clone(), server_ep, opts.clone()));
+    let serving = tokio::spawn(zmux_quinn::serve(
+        listener.clone(),
+        server_ep,
+        opts.clone(),
+        None,
+    ));
     let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client_ep.set_default_client_config(zmux_quinn::client_config(client_tls, &opts).unwrap());
     let client = zmux_quinn::connect(&client_ep, addr, "localhost", &opts, Config::default())
@@ -271,5 +283,13 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
             ),
             "{e:?}"
         );
+    }
+}
+
+/// Pipe 0 of each session is of carrier kind `kind`.
+fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+    for s in sessions {
+        let p = s.pipe(zmux::PipeId::new(0)).unwrap();
+        assert_eq!(p.stats().unwrap().carrier, Some(kind));
     }
 }

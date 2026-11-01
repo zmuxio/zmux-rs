@@ -39,7 +39,7 @@ fn pair(hook: Option<Hook>) -> (Session, Session) {
     let addr = l.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        Session::accept(PipeIo::tcp(c).unwrap(), Config::default()).unwrap()
+        Session::accept(PipeIo::tcp(c), Config::default()).unwrap()
     });
     let c = TcpStream::connect(addr).unwrap();
     let pipe = match hook {
@@ -50,7 +50,7 @@ fn pair(hook: Option<Hook>) -> (Session, Session) {
             },
             c,
         ),
-        None => PipeIo::tcp(c).unwrap(),
+        None => PipeIo::tcp(c),
     };
     let client = Session::connect(pipe, Config::default()).unwrap();
     (client, server.join().unwrap())
@@ -86,7 +86,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
             send.write(b"x").err(),
             send.write_all(b"x").err(),
             send.stopped().err(),
-            c.closed().err(),
+            c.closed(None).err(),
             c.next_event(None).err(),
             c.shutdown(0u32.into(), b"").err(),
         );
@@ -135,7 +135,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
         io::ErrorKind::Deadlock
     );
     client.close(0u32.into(), b"");
-    server.closed().unwrap();
+    server.closed(None).unwrap();
 }
 
 #[test]
@@ -161,14 +161,17 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
         );
         assert_eq!(recv.read(&mut buf), Err(StreamError::OnDriverThread));
         assert_eq!(send.write(b"x"), Err(StreamError::OnDriverThread));
-        assert_eq!(c.closed(), Err(zmux::blocking::WaitError::OnDriverThread));
+        assert_eq!(
+            c.closed(None),
+            Err(zmux::blocking::WaitError::OnDriverThread)
+        );
         assert_eq!(
             c.shutdown(0u32.into(), b""),
             Err(zmux::blocking::WaitError::OnDriverThread)
         );
         let tcp = TcpStream::connect(spare_addr).unwrap();
         assert!(matches!(
-            Session::connect(PipeIo::tcp(tcp).unwrap(), Config::default()),
+            Session::connect(PipeIo::tcp(tcp), Config::default()),
             Err(ConnectError::OnDriverThread)
         ));
     };
@@ -180,7 +183,10 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
         c2();
         tokio::spawn(async move { check() }).await.unwrap();
         tokio::task::spawn_blocking(move || {
-            assert_eq!(c3.closed(), Err(zmux::blocking::WaitError::OnDriverThread));
+            assert_eq!(
+                c3.closed(None),
+                Err(zmux::blocking::WaitError::OnDriverThread)
+            );
         })
         .await
         .unwrap();

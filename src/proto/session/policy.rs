@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::pipes::PipeState;
+use super::pipes::OutboundState;
 use super::{PipeId, StreamKey};
 
 /// A scheduling policy.
@@ -217,14 +217,16 @@ pub struct PipeSnapshot {
     /// The pipe.
     pub pipe: PipeId,
     /// Its state.
-    pub state: PipeState,
+    pub state: OutboundState,
     /// Smoothed RTT.
     pub srtt: Duration,
     /// RTT variation.
     pub rttvar: Duration,
     /// Delivery rate in bytes per second.
     pub rate: u64,
-    /// Bytes the carrier has not transmitted yet.
+    /// Q_p: bytes committed to the pipe and not yet transmitted, those of
+    /// the write calls in progress plus the carrier's unsent count where
+    /// the adapter reports one (SCHEDULER.md Section 4).
     pub unsent: u64,
     /// Unacknowledged bytes.
     pub in_flight: u64,
@@ -243,6 +245,22 @@ pub struct PipeSnapshot {
     pub eligible: bool,
     /// The weight.
     pub weight: u64,
+    /// The pipe's shaper, when one is active: the weight it set, as bits.
+    pub(crate) shaping: Option<Option<u64>>,
+}
+
+impl PipeSnapshot {
+    /// A shaper is active on the pipe.
+    #[must_use]
+    pub fn shaping_active(&self) -> bool {
+        self.shaping.is_some()
+    }
+
+    /// The weight the pipe's shaper set; `None`: none.
+    #[must_use]
+    pub fn shaping_weight(&self) -> Option<f64> {
+        self.shaping.flatten().map(f64::from_bits)
+    }
 }
 
 /// The pipe an `affinity` stream direction is bound to.

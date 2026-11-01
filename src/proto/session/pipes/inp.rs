@@ -17,12 +17,13 @@ pub(crate) struct RecvLane {
     /// The driver holds bytes of an incomplete record (in-place receiving).
     partial: bool,
     frames_in: u64,
-    /// The record being received: PADDING only so far, ack-eliciting,
-    /// carries an activity frame, carries PIPE_PING.
-    rec_padding_only: bool,
+    /// The record being received: ack-eliciting, carries an activity
+    /// frame, carries PIPE_PING, carries an ack-eliciting frame other than
+    /// PIPE_PING.
     rec_eliciting: bool,
     rec_activity: bool,
     rec_ping: bool,
+    rec_other: bool,
     /// Receive position (MULTIPATH.md Section 6.1).
     position: u64,
     /// When the record that brought the position to its value was
@@ -38,10 +39,10 @@ impl RecvLane {
             reader: Some(RecordReader::with_framing(max_record, framing)),
             partial: false,
             frames_in: 0,
-            rec_padding_only: true,
             rec_eliciting: false,
             rec_activity: false,
             rec_ping: false,
+            rec_other: false,
             position: 0,
             position_at: now,
             complete_reported: 0,
@@ -74,13 +75,14 @@ impl RecvLane {
         }
     }
 
-    /// The record ended: its marks are taken.
-    fn take_marks(&mut self) -> (bool, bool, bool) {
-        self.rec_padding_only = true;
+    /// The record ended: its marks are taken (ack-eliciting, activity,
+    /// PIPE_PING, ack-eliciting beyond PIPE_PING).
+    fn take_marks(&mut self) -> (bool, bool, bool, bool) {
         (
             std::mem::replace(&mut self.rec_eliciting, false),
             std::mem::replace(&mut self.rec_activity, false),
             std::mem::replace(&mut self.rec_ping, false),
+            std::mem::replace(&mut self.rec_other, false),
         )
     }
 }
@@ -150,9 +152,11 @@ pub(crate) struct InPipe {
     /// The first record ended: no record is a leading one any more.
     leading_seen: bool,
     /// Ack-eliciting bytes since the last PIPE_ACK that listed the pipe,
-    /// summed over its lanes, and when the first of them arrived.
+    /// summed over its lanes, and when the first of them arrived; and
+    /// whether frames other than PIPE_PING were among them.
     elicit: u64,
     elicit_since: Option<Instant>,
+    elicit_other: bool,
     last_record: Instant,
     /// G_p: the longest interval between two complete records.
     gap: Duration,
@@ -244,6 +248,7 @@ impl InPipe {
             leading_seen: false,
             elicit: 0,
             elicit_since: None,
+            elicit_other: false,
             last_record: now,
             gap: Duration::ZERO,
             records: 0,
@@ -536,14 +541,14 @@ impl InPipe {
     /// A frame of the current record of lane `li`: `leading_tp`, a
     /// QX_TRANSPORT_PARAMETERS frame that leads the first record of a pipe
     /// this endpoint joined, discards the record; the frame's kind marks
-    /// the record (not PADDING, ack-eliciting, an activity frame).
+    /// the record (ack-eliciting, an activity frame, PIPE_PING: `ping`).
     pub(crate) fn frame_in(
         &mut self,
         li: usize,
         leading_tp: bool,
-        padding: bool,
         eliciting: bool,
         activity: bool,
+        ping: bool,
     ) -> FrameIn {
         if li == 0 {
             if self.discard {
@@ -558,9 +563,9 @@ impl InPipe {
         let skip_join = li == 0 && std::mem::replace(&mut self.skip_join, false);
         let r = self.recv_mut(li);
         r.frames_in += 1;
-        r.rec_padding_only &= padding;
         r.rec_eliciting |= eliciting;
         r.rec_activity |= activity;
+        r.rec_other |= eliciting && !ping;
         FrameIn::Process {
             first: r.frames_in == 1,
             skip_join,
@@ -572,21 +577,18 @@ impl InPipe {
         self.recv_mut(li).rec_ping = true;
     }
 
-    /// The current record of lane `li` ended: `None` for a discarded
+    /// The current record of lane `li` ended: `false` for a discarded
     /// leading record (which counts for nothing, MULTIPATH.md Section 5.7
-    /// step 3), else whether it held PADDING only.
-    pub(crate) fn record_closed(&mut self, li: usize) -> Option<bool> {
+    /// step 3).
+    pub(crate) fn record_closed(&mut self, li: usize) -> bool {
         if li == 0 {
             self.leading_seen = true;
             if std::mem::replace(&mut self.discard, false) {
                 self.zero.take_marks();
-                return None;
+                return false;
             }
         }
-        Some(std::mem::replace(
-            &mut self.recv_mut(li).rec_padding_only,
-            true,
-        ))
+        true
     }
 
     /// A record of `len` bytes ended on lane `li` of a pipe outside
@@ -596,7 +598,7 @@ impl InPipe {
         self.lane_record(li);
         let r = self.recv_mut(li);
         r.position += len;
-        let (eliciting, activity, _) = r.take_marks();
+        let (eliciting, activity, ..) = r.take_marks();
         (eliciting, activity)
     }
 
@@ -653,7 +655,8 @@ impl InPipe {
         self.last_record = now;
         let r = self.recv_mut(li);
         r.position += len;
-        let (eliciting, activity, ping) = r.take_marks();
+        let (eliciting, activity, ping, other) = r.take_marks();
+        self.elicit_other |= eliciting && other;
         let joined = self.state == InState::Joining;
         if joined {
             self.state = InState::Open;
@@ -728,6 +731,14 @@ impl InPipe {
     pub(crate) fn ack_sent(&mut self) {
         self.elicit = 0;
         self.elicit_since = None;
+        self.elicit_other = false;
+    }
+
+    /// Whether ack-eliciting frames other than PIPE_PING wait for a
+    /// PIPE_ACK.
+    #[inline]
+    pub(crate) fn unacked_other(&self) -> bool {
+        self.elicit_other
     }
 
     /// Whether the PIPE_ACK of a pipe with lanes outside multipath must be

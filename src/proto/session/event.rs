@@ -5,7 +5,7 @@ use bytes::Bytes;
 use crate::proto::frame::Dir;
 use crate::proto::params::{Features, Role};
 
-use super::pipes::{PipeHalf, PipeState, PrioritySource};
+use super::pipes::{DirectionState, PipeHalf, PrioritySource};
 use super::stream::StreamKey;
 use super::{LaneId, PipeId, SessionError};
 
@@ -45,6 +45,10 @@ pub enum CoreEvent {
     DatagramReceived,
     /// The datagram send queue has room again.
     DatagramsUnblocked,
+    /// Datagrams were queued that may go on a pipe's datagram channel, or a
+    /// channel's pipe changed: the driver polls the channels
+    /// ([`super::SessionCore::poll_channel`]).
+    ChannelDatagrams,
     /// Received datagrams were dropped from full queues since the last
     /// event of this kind.
     DatagramsDropped {
@@ -60,14 +64,18 @@ pub enum CoreEvent {
         /// The peer's application error code.
         code: u64,
     },
-    /// A pipe changed state (STATE_MACHINE.md Section 3).
+    /// A pipe direction changed state (STATE_MACHINE.md Section 3).
     PipeState {
         /// The attachment.
         pipe: PipeId,
-        /// Which of its pipes.
-        half: PipeHalf,
-        /// The new state.
-        state: PipeState,
+        /// The direction and its new state.
+        state: DirectionState,
+    },
+    /// The attachment was retired and its state freed (STATE_MACHINE.md
+    /// Section 3.3): it has no state any more.
+    PipeRetired {
+        /// The attachment.
+        pipe: PipeId,
     },
     /// The effective priority, standby flag or weight of a pipe's outbound
     /// direction changed (MULTIPATH.md Section 9).

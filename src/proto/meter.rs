@@ -9,19 +9,13 @@
 //! own. Any thread reads the counters at any time without a lock, through
 //! a shared handle (`Arc<Meter>`) that outlives the stream or session.
 //!
-//! Rates are computed on the reading side only: the meter keeps one
-//! reference sample, and [`Meter::rate`] returns the increase since it
-//! divided by the time since it, moving the reference to the current
-//! reading once it is more than one second old. Counting costs nothing
-//! for rates.
+//! zmux keeps no rates and no reference sample: a reader that wants a
+//! rate divides the increase between two of its own reads by the time
+//! between them, so that readers never disturb each other.
 
-use std::sync::atomic::{AtomicU64, Ordering, fence};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// How old the reference sample may grow before a rate read replaces it.
-const REFERENCE_AGE: Duration = Duration::from_secs(1);
-
-/// The counters of a [`Meter`], or their rates in bytes per second.
+/// The counters of a [`Meter`].
 ///
 /// On a stream, `bytes_written` and `datagram_bytes_sent` belong to its
 /// sending part, `bytes_read` and `datagram_bytes_received` to its
@@ -55,16 +49,6 @@ pub(crate) enum Count {
 
 const COUNTS: usize = 4;
 
-/// One reference sample: the counters and when they were read, in
-/// nanoseconds since the meter's epoch. `seq` is odd while a reader
-/// replaces it (a sequence lock whose data are atomics).
-#[derive(Debug, Default)]
-struct Sample {
-    seq: AtomicU64,
-    at: AtomicU64,
-    counts: [AtomicU64; COUNTS],
-}
-
 /// The application byte counters of a stream or a session: unsigned 64-bit
 /// counts that zmux never decreases or resets.
 ///
@@ -74,29 +58,16 @@ struct Sample {
 /// read one after the other are not a consistent snapshot. A stream's
 /// meter is final once its parts are terminal; a session's stays readable
 /// after the session closed.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Meter {
     counts: [AtomicU64; COUNTS],
-    epoch: Instant,
-    /// The reference sample of the rates: two slots, the current one named
-    /// by `current` (its generation; the slot is the generation's low bit),
-    /// so that a reader replacing it writes the other slot and readers
-    /// never wait for it. `CLAIMED` is set while a reader replaces it.
-    slots: [Sample; 2],
-    current: AtomicU64,
 }
 
-const CLAIMED: u64 = 1 << 63;
-
 impl Meter {
-    /// A meter at zero, its reference sample taken at `now`.
-    pub fn new(now: Instant) -> Self {
-        Self {
-            counts: Default::default(),
-            epoch: now,
-            slots: Default::default(),
-            current: AtomicU64::new(0),
-        }
+    /// A meter at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Adds `n` to a counter.
@@ -134,87 +105,6 @@ impl Meter {
     pub fn datagram_bytes_received(&self) -> u64 {
         self.counts[Count::DatagramReceived as usize].load(Ordering::Relaxed)
     }
-
-    /// The counters' rates in bytes per second at `now` (the clock the
-    /// meter was created with): the increase since the reference sample
-    /// divided by the time since it. A reference more than one second old
-    /// is replaced by the current reading, so a reader that reads at least
-    /// once a second sees the average of the last one to two seconds, and
-    /// a rare reader the average since its previous read (since the start
-    /// before the first). Concurrent readers may each read; one of them
-    /// replaces the reference, and the others keep their result.
-    pub fn rate(&self, now: Instant) -> AppBytes {
-        let at_now = nanos(now.saturating_duration_since(self.epoch));
-        let (generation, at, reference) = self.reference();
-        let counts = self.load();
-        let elapsed = at_now.saturating_sub(at);
-        let rate = if elapsed == 0 {
-            [0; COUNTS]
-        } else {
-            std::array::from_fn(|i| {
-                let delta = u128::from(counts[i].saturating_sub(reference[i]));
-                u64::try_from(delta * 1_000_000_000 / u128::from(elapsed)).unwrap_or(u64::MAX)
-            })
-        };
-        if elapsed > nanos(REFERENCE_AGE) {
-            self.replace(generation, at_now, &counts);
-        }
-        to_bytes(rate)
-    }
-
-    /// The current reference sample, read consistently: its generation,
-    /// time and counters.
-    fn reference(&self) -> (u64, u64, [u64; COUNTS]) {
-        loop {
-            let generation = self.current.load(Ordering::Acquire) & !CLAIMED;
-            let slot = &self.slots[(generation & 1) as usize];
-            let seq = slot.seq.load(Ordering::Acquire);
-            if seq & 1 == 0 {
-                let at = slot.at.load(Ordering::Relaxed);
-                let counts = std::array::from_fn(|i| slot.counts[i].load(Ordering::Relaxed));
-                fence(Ordering::Acquire);
-                if slot.seq.load(Ordering::Relaxed) == seq {
-                    return (generation, at, counts);
-                }
-            }
-            // The slot was being rewritten: two replacements happened
-            // since `current` was read, and the next read names the slot
-            // that is stable now.
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Replaces the reference of `generation` by a reading at `at`, unless
-    /// another reader replaces it or did already.
-    fn replace(&self, generation: u64, at: u64, counts: &[u64; COUNTS]) {
-        if self
-            .current
-            .compare_exchange(
-                generation,
-                generation | CLAIMED,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return;
-        }
-        let next = generation.wrapping_add(1) & !CLAIMED;
-        let slot = &self.slots[(next & 1) as usize];
-        let seq = slot.seq.load(Ordering::Relaxed);
-        slot.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
-        fence(Ordering::Release);
-        slot.at.store(at, Ordering::Relaxed);
-        for (c, &v) in slot.counts.iter().zip(counts) {
-            c.store(v, Ordering::Relaxed);
-        }
-        slot.seq.store(seq.wrapping_add(2), Ordering::Release);
-        self.current.store(next, Ordering::Release);
-    }
-}
-
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn to_bytes(c: [u64; COUNTS]) -> AppBytes {
@@ -231,42 +121,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rates_are_averages_since_a_reference_at_most_two_seconds_old() {
-        let t0 = Instant::now();
-        let m = Meter::new(t0);
+    fn counters_only_increase() {
+        let m = Meter::new();
         m.add(Count::Written, 1000);
-        // Since the start: 1000 bytes in 0.5 s.
-        assert_eq!(m.rate(t0 + Duration::from_millis(500)).bytes_written, 2000);
-        m.add(Count::Written, 1000);
-        // 2000 bytes in 1.5 s; the reference moves to this reading.
-        assert_eq!(m.rate(t0 + Duration::from_millis(1500)).bytes_written, 1333);
-        m.add(Count::Read, 300);
-        let r = m.rate(t0 + Duration::from_millis(1800));
-        assert_eq!((r.bytes_written, r.bytes_read), (0, 1000));
-        // The counters themselves never move back.
-        assert_eq!(m.get().bytes_written, 2000);
-        // A clock behind the reference reads 0, not a spike.
-        assert_eq!(m.rate(t0).bytes_read, 0);
-    }
-
-    #[test]
-    fn concurrent_readers_replace_the_reference_once_and_keep_their_results() {
-        let t0 = Instant::now();
-        let m = std::sync::Arc::new(Meter::new(t0));
-        m.add(Count::DatagramSent, 4000);
-        let at = t0 + Duration::from_secs(2);
-        let readers: Vec<_> = (0..4)
-            .map(|_| {
-                let m = m.clone();
-                std::thread::spawn(move || m.rate(at).datagram_bytes_sent)
-            })
-            .collect();
-        for r in readers {
-            // Each reader computed against a consistent reference: the
-            // start (2000 B/s), or the reading at `at` (an instant ago).
-            let v = r.join().unwrap();
-            assert!(v == 2000 || v == 0, "{v}");
-        }
-        assert_eq!(m.current.load(Ordering::Relaxed), 1);
+        m.add(Count::Written, 500);
+        m.add(Count::DatagramReceived, 7);
+        let b = m.get();
+        assert_eq!((b.bytes_written, b.bytes_read), (1500, 0));
+        assert_eq!((b.datagram_bytes_sent, b.datagram_bytes_received), (0, 7));
+        assert_eq!(m.bytes_written(), 1500);
     }
 }

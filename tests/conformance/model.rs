@@ -322,6 +322,8 @@ pub struct Config {
     pub redundancy: Option<String>,
     /// Milliseconds; 0 is the 15 s probe interval.
     pub standby_probe: Option<u64>,
+    /// The probe jitter; the multipath profiles set 0, a fixed schedule.
+    pub probe_jitter: Option<f64>,
     /// The `early_data` configuration.
     pub early_data: Option<EarlyData>,
 }

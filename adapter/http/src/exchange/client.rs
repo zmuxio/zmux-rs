@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
+use zmux::util::{hex, random_u64};
 use zmux::{ConnectError, PipeIo, Session};
 
 use super::ExchangeOptions;
@@ -30,8 +31,9 @@ use crate::body::{PipeBody, collect};
 /// for both directions).
 ///
 /// Returns at once, without a round trip; must be called inside a tokio
-/// runtime.
-pub fn dial_exchange(addr: &str, options: &ExchangeOptions) -> PipeIo {
+/// runtime. Fails only on options without authentication that do not
+/// choose it ([`ExchangeOptions::unauthenticated`]).
+pub fn dial_exchange(addr: &str, options: &ExchangeOptions) -> io::Result<PipeIo> {
     let e = ExchangeEndpoint::tcp(addr);
     dial_exchange_split(e.clone(), e, options)
 }
@@ -55,7 +57,7 @@ pub fn dial_exchange(addr: &str, options: &ExchangeOptions) -> PipeIo {
 ///     },
 ///     "example.com",
 ///     &options,
-/// );
+/// )?;
 /// let session = zmux::Session::connect(pipe, zmux::Config::default()).await?;
 /// # drop(session);
 /// # Ok(())
@@ -65,7 +67,7 @@ pub fn dial_exchange_with<C, F, IO>(
     connect: C,
     authority: &str,
     options: &ExchangeOptions,
-) -> PipeIo
+) -> io::Result<PipeIo>
 where
     C: Fn() -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<IO>> + Send + 'static,
@@ -138,12 +140,15 @@ impl ExchangeEndpoint {
 /// writes its first record into the first UP request. It fails when a
 /// request has had no result for [`ExchangeOptions::deadline`], or the
 /// server answers GONE; zmux then sees a carrier failure. Must be called
-/// inside a tokio runtime.
+/// inside a tokio runtime. Fails ([`io::ErrorKind::InvalidInput`]) on
+/// options without a PSK that do not choose to run unauthenticated
+/// ([`ExchangeOptions::unauthenticated`]), or that set both.
 pub fn dial_exchange_split(
     up: ExchangeEndpoint,
     down: ExchangeEndpoint,
     options: &ExchangeOptions,
-) -> PipeIo {
+) -> io::Result<PipeIo> {
+    let psk = options.mac_psk()?;
     let mut cid: CarrierId = [0; 16];
     getrandom::fill(&mut cid).expect("the system's random source");
     let o = options;
@@ -163,12 +168,16 @@ pub fn dial_exchange_split(
     let mut token = [0u8; 8];
     getrandom::fill(&mut token).expect("the system's random source");
     let ctx = Arc::new(Ctx {
-        key: Key::new(&o.psk, &cid),
+        key: Key::new(psk, &cid),
         cid,
         instance: hex(&token),
         options: o.clone(),
     });
     let shared = Arc::new(Halves::default());
+    if let Some(c) = &o.credential {
+        let prefix = c.prefix(&zmux::CarrierInfo::new())?;
+        shared.lock().up.extend_from_slice(&prefix);
+    }
     let driver = Driver {
         halves: shared.clone(),
         ctx,
@@ -187,11 +196,13 @@ pub fn dial_exchange_split(
     };
     tokio::spawn(driver.run());
     let abort = shared.clone();
-    PipeIo::from_halves(Reader(shared.clone()), Writer(shared, o.up_piece.max(1))).with_abort(
-        move || {
-            abort.lock().aborted = true;
-            abort.driver.notify_one();
-        },
+    Ok(
+        PipeIo::from_halves(Reader(shared.clone()), Writer(shared, o.up_piece_size()))
+            .with_abort(move || {
+                abort.lock().aborted = true;
+                abort.driver.notify_one();
+            })
+            .with_carrier(zmux::CarrierKind::Exchange),
     )
 }
 
@@ -202,7 +213,8 @@ pub async fn connect_exchange(
     options: &ExchangeOptions,
     config: impl Into<Arc<zmux::Config>>,
 ) -> Result<Session, ConnectError> {
-    Session::connect(dial_exchange(addr, options), config).await
+    let pipe = dial_exchange(addr, options).map_err(|e| ConnectError::Io(Arc::new(e)))?;
+    Session::connect(pipe, config).await
 }
 
 // ---- the halves ------------------------------------------------------------------------
@@ -452,18 +464,11 @@ struct Ctx {
 enum Outcome {
     /// A verified response: its flags and data.
     Answer(u8, Bytes),
-    /// No result (Section 6.2).
+    /// No result: the attempt failed, or its response could not be
+    /// verified.
     NoResult,
     /// A verified response that fails the carrier.
     Invalid,
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn random_u64() -> u64 {
-    getrandom::u64().expect("the system's random source")
 }
 
 /// One attempt of a request, after `delay`.
@@ -483,10 +488,20 @@ async fn attempt(
     }
     let o = &ctx.options;
     let nonce = random_u64().to_be_bytes();
-    let out = Outgoing::new(&ctx.key, &ctx.cid, kind, flags, seq, ack, nonce, &data);
+    let out = Outgoing::new(
+        &ctx.key,
+        &ctx.cid,
+        kind,
+        flags,
+        seq,
+        ack,
+        wire::unix_time(),
+        nonce,
+        &data,
+    );
     let (head, tail) = wire::encode_body(o.encoding, out.prefix.clone(), data);
     let target = o.target(kind == Kind::Down, &ctx.instance, &hex(&nonce));
-    let limit = wire::encoded_len(o.encoding, RESPONSE_HEAD + o.max_down_piece);
+    let limit = wire::encoded_len(o.encoding, RESPONSE_HEAD + o.max_down_piece_size());
     let sent = tokio::time::timeout(o.request_timeout, http.send(&target, head, tail, limit)).await;
     let body = match sent {
         Ok(Ok(body)) => body,
@@ -636,7 +651,7 @@ impl Driver {
     }
 
     fn backoff(&self, attempts: u32) -> Duration {
-        self.ctx.options.backoff.delay(attempts, random_u64())
+        self.ctx.options.backoff.delay(attempts)
     }
 
     /// Starts the requests the state calls for; the end of the carrier
@@ -652,7 +667,7 @@ impl Driver {
             let mut fin = false;
             if !self.up_fin_sent && self.up.len() < self.up_limit {
                 if !st.up.is_empty() {
-                    let n = st.up.len().min(o.up_piece.max(1));
+                    let n = st.up.len().min(o.up_piece_size());
                     piece = Some(st.up.split_to(n).freeze());
                     fin = st.up_closed && st.up.is_empty();
                 } else if st.up_closed {

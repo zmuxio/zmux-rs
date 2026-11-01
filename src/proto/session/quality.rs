@@ -27,9 +27,9 @@ use super::{CoreEvent, PipeError, PipeId, SessionCore};
 pub struct QualityBand {
     /// The half-width of the RTT band; zero turns the RTT half off.
     pub rtt: Duration,
-    /// The ratio of the rate band; zero (or a value that is not a number)
-    /// turns the rate half off, and a ratio of 1 or less reports every
-    /// change of the rate.
+    /// The ratio of the rate band; zero turns the rate half off, and a
+    /// ratio of 1 or less reports every change of the rate. A negative one,
+    /// or one that is not a number, is not valid.
     pub rate_ratio: f64,
     /// At most one event per pipe in this interval, the latest values
     /// winning (default 1 s); zero sets no minimum.
@@ -48,6 +48,14 @@ impl QualityBand {
             rate_ratio,
             min_interval: Self::DEFAULT_MIN_INTERVAL,
         }
+    }
+
+    /// Whether the band is valid: `rate_ratio` a number of at least 0.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rate_ratio.is_nan() || self.rate_ratio < 0.0 {
+            return Err("QualityBand rate_ratio negative or not a number");
+        }
+        Ok(())
     }
 
     /// Whether the band reports anything.
@@ -79,13 +87,22 @@ pub struct CapacityFloor {
     /// The floor in bytes per second.
     pub rate: u64,
     /// The ratio above the floor that restores it (default 1.25); a ratio
-    /// below 1, or one that is not a number, counts as 1.
+    /// below 1 counts as 1, and a negative one, or one that is not a
+    /// number, is not valid.
     pub rate_ratio: f64,
 }
 
 impl CapacityFloor {
     /// The default ratio that restores the floor.
     pub const DEFAULT_RATE_RATIO: f64 = 1.25;
+
+    /// Whether the floor is valid: `rate_ratio` a number of at least 0.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rate_ratio.is_nan() || self.rate_ratio < 0.0 {
+            return Err("CapacityFloor rate_ratio negative or not a number");
+        }
+        Ok(())
+    }
 
     /// A floor of `rate` bytes per second with the default ratio.
     pub fn new(rate: u64) -> Self {
@@ -142,10 +159,10 @@ struct Floor {
     /// `CapacityBelow` was reported last.
     below: bool,
     /// The sum of the counted pipes' rates.
-    sum: u64,
+    pub(super) sum: u64,
     /// The pipe-view generation the counted pipes were taken at (a
     /// multipath session), or `None` before.
-    generation: Option<u64>,
+    pub(super) generation: Option<u64>,
 }
 
 impl Quality {
@@ -172,6 +189,13 @@ impl Quality {
 }
 
 /// `k` as a ratio of at least 1.
+fn check_band(band: Option<QualityBand>) -> Result<(), PipeError> {
+    match band {
+        Some(b) if b.validate().is_err() => Err(PipeError::InvalidOptions),
+        _ => Ok(()),
+    }
+}
+
 fn at_least_one(k: f64) -> f64 {
     if k >= 1.0 { k } else { 1.0 }
 }
@@ -182,24 +206,30 @@ impl SessionCore {
     /// multipath included: see [`QualityBand`] and
     /// [`CoreEvent::PipeQualityChanged`]. Off until set; inbound directions
     /// have no sender estimates (the peer reports its own), and the rate
-    /// of a session without multipath needs pipe acknowledgement.
-    pub fn set_quality_band(&mut self, band: Option<QualityBand>) {
+    /// of a session without multipath needs pipe acknowledgement. A band
+    /// that is not [valid](QualityBand::validate) changes nothing:
+    /// [`PipeError::InvalidOptions`].
+    pub fn set_quality_band(&mut self, band: Option<QualityBand>) -> Result<(), PipeError> {
+        check_band(band)?;
         let q = self.quality.get_or_insert_default();
         q.default = band;
         for p in q.pipes.values_mut().filter(|p| p.own.is_none()) {
             p.recentre();
         }
         self.quality_settled();
+        Ok(())
     }
 
     /// Sets the quality band of one pipe; `None` returns it to the
     /// session's default (a band with both halves off turns its reports
-    /// off).
+    /// off). A band that is not [valid](QualityBand::validate) changes
+    /// nothing: [`PipeError::InvalidOptions`].
     pub fn set_pipe_quality_band(
         &mut self,
         pipe: PipeId,
         band: Option<QualityBand>,
     ) -> Result<(), PipeError> {
+        check_band(band)?;
         if self.att(pipe.0).is_none() {
             return Err(PipeError::UnknownPipe);
         }
@@ -218,8 +248,13 @@ impl SessionCore {
     /// Sets the floor under the session's outbound capacity (`None`:
     /// none): see [`CapacityFloor`], [`CoreEvent::CapacityBelow`] and
     /// [`CoreEvent::CapacityRestored`]. A capacity already below the floor is
-    /// reported at once.
-    pub fn set_capacity_floor(&mut self, floor: Option<CapacityFloor>) {
+    /// reported at once. A floor that is not
+    /// [valid](CapacityFloor::validate) changes nothing:
+    /// [`PipeError::InvalidOptions`].
+    pub fn set_capacity_floor(&mut self, floor: Option<CapacityFloor>) -> Result<(), PipeError> {
+        if floor.is_some_and(|f| f.validate().is_err()) {
+            return Err(PipeError::InvalidOptions);
+        }
         let q = self.quality.get_or_insert_default();
         q.floor = floor.map(|floor| Floor {
             floor,
@@ -232,6 +267,7 @@ impl SessionCore {
         }
         self.quality_settled();
         self.floor_rebuild();
+        Ok(())
     }
 
     /// Drops the state once nothing is set, and the entries of pipes that
@@ -270,7 +306,7 @@ impl SessionCore {
     /// pipe, as its statistics report them.
     fn quality_estimates(&self, o: &OutPipe) -> (Option<Duration>, Option<u64>) {
         let rtt = self.rtt_of(Some(o)).srtt;
-        let acked = self.mp.is_some() || self.pipe_ack.is_some();
+        let acked = self.acknowledged();
         let est = o.est();
         (rtt, (acked && est.rate_sampled).then_some(est.rate))
     }
@@ -329,53 +365,15 @@ impl SessionCore {
         }
     }
 
-    /// The pipe-view generation of a multipath session.
-    fn view_generation(&self) -> Option<u64> {
-        self.mp.as_deref().map(|m| m.tiers().view_generation())
-    }
-
     /// What an outbound pipe adds to the floor's sum: its rate once
     /// measured.
-    fn floor_rate(&self, o: &OutPipe) -> u64 {
+    pub(super) fn floor_rate(&self, o: &OutPipe) -> u64 {
         let est = o.est();
-        let acked = self.mp.is_some() || self.pipe_ack.is_some();
+        let acked = self.acknowledged();
         if acked && est.rate_sampled {
             est.rate
         } else {
             0
-        }
-    }
-
-    /// Pipe `id`'s rate may have changed: the sum takes the difference
-    /// while the counted pipes are current, else they are taken again.
-    fn floor_update(&mut self, id: u64) {
-        let Some(f) = self.quality.as_deref().and_then(|q| q.floor.as_ref()) else {
-            return;
-        };
-        if self.mp.is_none() {
-            self.floor_rebuild();
-            return;
-        }
-        if f.generation != self.view_generation() {
-            // The usable pipes changed: they are taken again at the next
-            // timer, which is due at once ([`SessionCore::quality_deadline`]),
-            // where the pipe views are current.
-            return;
-        }
-        let rate = self.out_ref(id).map_or(0, |o| self.floor_rate(o));
-        let Some(q) = self.quality.as_deref_mut() else {
-            return;
-        };
-        let (Some(counted), Some(f)) = (
-            q.pipes.get_mut(&id).and_then(|p| p.counted.as_mut()),
-            q.floor.as_mut(),
-        ) else {
-            return;
-        };
-        let old = std::mem::replace(counted, rate);
-        if old != rate {
-            f.sum = f.sum.saturating_sub(old).saturating_add(rate);
-            self.floor_report();
         }
     }
 
@@ -385,7 +383,7 @@ impl SessionCore {
     /// multipath session it reads the pipe views, so it runs only where
     /// they are current: at a command or a timer, never while an input is
     /// being processed.
-    fn floor_rebuild(&mut self) {
+    pub(super) fn floor_rebuild(&mut self) {
         if self.state >= super::State::Closing {
             return;
         }
@@ -430,7 +428,7 @@ impl SessionCore {
     }
 
     /// Reports a crossing of the floor.
-    fn floor_report(&mut self) {
+    pub(super) fn floor_report(&mut self) {
         let Some(f) = self.quality.as_deref_mut().and_then(|q| q.floor.as_mut()) else {
             return;
         };
@@ -455,16 +453,6 @@ impl SessionCore {
         } else {
             q.due
         }
-    }
-
-    /// The usable pipes may have changed since the floor took them.
-    fn floor_stale(&self) -> bool {
-        self.state < super::State::Closing
-            && self
-                .quality
-                .as_deref()
-                .and_then(|q| q.floor.as_ref())
-                .is_some_and(|f| self.mp.is_some() && f.generation != self.view_generation())
     }
 
     /// Timers: held-back reports that are due are judged again with the
@@ -501,6 +489,51 @@ impl SessionCore {
         if self.floor_stale() {
             self.floor_rebuild();
         }
+    }
+}
+
+impl SessionCore {
+    /// Pipe `id`'s rate may have changed: the sum takes the difference
+    /// while the counted pipes are current, else they are taken again.
+    pub(super) fn floor_update(&mut self, id: u64) {
+        let Some(f) = self.quality.as_deref().and_then(|q| q.floor.as_ref()) else {
+            return;
+        };
+        if !self.per_pipe() {
+            self.floor_rebuild();
+            return;
+        }
+        if f.generation != self.view_generation() {
+            // The usable pipes changed: they are taken again at the next
+            // timer, which is due at once ([`SessionCore::quality_deadline`]),
+            // where the pipe views are current.
+            return;
+        }
+        let rate = self.out_ref(id).map_or(0, |o| self.floor_rate(o));
+        let Some(q) = self.quality.as_deref_mut() else {
+            return;
+        };
+        let (Some(counted), Some(f)) = (
+            q.pipes.get_mut(&id).and_then(|p| p.counted.as_mut()),
+            q.floor.as_mut(),
+        ) else {
+            return;
+        };
+        let old = std::mem::replace(counted, rate);
+        if old != rate {
+            f.sum = f.sum.saturating_sub(old).saturating_add(rate);
+            self.floor_report();
+        }
+    }
+
+    /// The usable pipes may have changed since the floor took them.
+    pub(super) fn floor_stale(&self) -> bool {
+        self.state < super::State::Closing
+            && self
+                .quality
+                .as_deref()
+                .and_then(|q| q.floor.as_ref())
+                .is_some_and(|f| self.per_pipe() && f.generation != self.view_generation())
     }
 }
 
@@ -555,14 +588,14 @@ mod tests {
         let now = a.now;
         a.quality_sample(0, now);
         assert!(a.quality.is_none() && events(&mut a).is_empty());
-        a.set_quality_band(Some(QualityBand::new(MS, 1.5)));
+        a.set_quality_band(Some(QualityBand::new(MS, 1.5))).unwrap();
         a.set_pipe_quality_band(PipeId(2), Some(QualityBand::default()))
             .unwrap();
-        a.set_capacity_floor(Some(CapacityFloor::new(1)));
+        a.set_capacity_floor(Some(CapacityFloor::new(1))).unwrap();
         a.quality_sample(0, now);
         assert!(a.quality.is_some());
-        a.set_quality_band(None);
-        a.set_capacity_floor(None);
+        a.set_quality_band(None).unwrap();
+        a.set_capacity_floor(None).unwrap();
         assert!(a.quality.is_some(), "pipe 2 still has its own band");
         a.set_pipe_quality_band(PipeId(2), None).unwrap();
         assert!(a.quality.is_none());
@@ -582,7 +615,8 @@ mod tests {
         a.set_quality_band(Some(QualityBand {
             min_interval: Duration::ZERO,
             ..QualityBand::new(5 * MS, 2.0)
-        }));
+        }))
+        .unwrap();
         a.quality_sample(0, now);
         a.quality_sample(2, now);
         assert!(events(&mut a).is_empty(), "the first report has no event");
@@ -617,7 +651,8 @@ mod tests {
     fn min_interval_holds_reports_back_with_the_latest_values() {
         let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
         let t0 = a.now;
-        a.set_quality_band(Some(QualityBand::new(5 * MS, 0.0)));
+        a.set_quality_band(Some(QualityBand::new(5 * MS, 0.0)))
+            .unwrap();
         a.quality_sample(0, t0);
         set_srtt(&mut a, 0, 30 * MS);
         a.quality_sample(0, t0);
@@ -650,7 +685,8 @@ mod tests {
     fn the_capacity_floor_reports_crossings_once() {
         // Pipe 2 has not measured its rate: only pipe 0 counts.
         let (mut a, _) = two_pipes(Policy::SpreadEta, None, 0);
-        a.set_capacity_floor(Some(CapacityFloor::new(FAST + 1)));
+        a.set_capacity_floor(Some(CapacityFloor::new(FAST + 1)))
+            .unwrap();
         assert_eq!(events(&mut a), [CoreEvent::CapacityBelow { rate: FAST }]);
         let now = a.now;
         // Measured, but not 1.25 x the floor yet: no event, and none again
@@ -671,7 +707,8 @@ mod tests {
         // Above the floor when set: nothing; a pipe becoming standby
         // leaves the sum, reported at the next timer, which is due at once.
         let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
-        a.set_capacity_floor(Some(CapacityFloor::new(FAST + FAST / 2)));
+        a.set_capacity_floor(Some(CapacityFloor::new(FAST + FAST / 2)))
+            .unwrap();
         assert!(events(&mut a).is_empty());
         a.set_pipe_send_standby(PipeId(2), Some(true)).unwrap();
         let now = a.now;

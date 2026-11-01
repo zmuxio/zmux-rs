@@ -113,7 +113,9 @@ fn rtt(session: &Session) -> String {
 
 fn describe(err: &qmux::Error) -> String {
     match err {
-        qmux::Error::ConnectionClosed { code, reason } => format!("app {} {}", code.into_inner(), reason),
+        qmux::Error::ConnectionClosed { code, reason } => {
+            format!("app {} {}", code.into_inner(), reason)
+        }
         qmux::Error::ConnectionReset { code, reason } => {
             format!("transport {} {}", code.into_inner(), reason)
         }
@@ -125,17 +127,20 @@ fn describe(err: &qmux::Error) -> String {
 /// narrow to u32.
 fn stream_code(err: &qmux::Error) -> String {
     match err {
-        qmux::Error::StreamReset(code) | qmux::Error::StreamStop(code) => code.into_inner().to_string(),
+        qmux::Error::StreamReset(code) | qmux::Error::StreamStop(code) => {
+            code.into_inner().to_string()
+        }
         other => format!("error({other})"),
     }
 }
 
 /// Sends `text` on a new unidirectional stream.
 async fn report(session: &Session, text: String) {
-    if let Ok(mut s) = session.open_uni().await {
-        if s.write_all(text.as_bytes()).await.is_ok() && s.finish().is_ok() {
-            let _ = s.closed().await;
-        }
+    if let Ok(mut s) = session.open_uni().await
+        && s.write_all(text.as_bytes()).await.is_ok()
+        && s.finish().is_ok()
+    {
+        let _ = s.closed().await;
     }
 }
 
@@ -185,7 +190,10 @@ async fn bidi(session: Session, mut send: Send, mut recv: Recv) {
         }
     };
     let (command, rest) = match newline {
-        Some(p) => (String::from_utf8_lossy(&acc[..p]).to_string(), acc[p + 1..].to_vec()),
+        Some(p) => (
+            String::from_utf8_lossy(&acc[..p]).to_string(),
+            acc[p + 1..].to_vec(),
+        ),
         None => (String::from_utf8_lossy(&acc).to_string(), Vec::new()),
     };
     let (verb, arg) = match command.split_once(':') {
@@ -274,7 +282,13 @@ async fn bidi(session: Session, mut send: Send, mut recv: Recv) {
             }
             .await;
             match answer {
-                Some(a) => reply(&mut send, &format!("opened={}", String::from_utf8_lossy(&a))).await,
+                Some(a) => {
+                    reply(
+                        &mut send,
+                        &format!("opened={}", String::from_utf8_lossy(&a)),
+                    )
+                    .await
+                }
                 None => reply(&mut send, "opened-failed").await,
             }
         }
@@ -300,10 +314,11 @@ async fn bidi(session: Session, mut send: Send, mut recv: Recv) {
 async fn uni(session: Session, mut recv: Recv) {
     match recv.read_all().await {
         Ok(data) => {
-            if let Ok(mut s) = session.open_uni().await {
-                if s.write_chunk(Bytes::from(data.to_vec())).await.is_ok() && s.finish().is_ok() {
-                    let _ = s.closed().await;
-                }
+            if let Ok(mut s) = session.open_uni().await
+                && s.write_chunk(Bytes::from(data.to_vec())).await.is_ok()
+                && s.finish().is_ok()
+            {
+                let _ = s.closed().await;
             }
         }
         Err(e) => report(&session, format!("reset:{}", stream_code(&e))).await,

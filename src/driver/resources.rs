@@ -134,7 +134,7 @@ static WRITE_CALLS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Counts a write call of `bytes` that `bounded` cut short.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "tokio"))]
 pub(crate) fn count_write_call(bytes: usize, bounded: bool) {
     WRITE_CALLS[0].fetch_add(bytes as u64, Ordering::Relaxed);
     if bounded {

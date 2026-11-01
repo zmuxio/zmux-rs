@@ -241,10 +241,10 @@ impl<X: Observe, S> MpNet<X, S> {
         let now = Instant::now();
         let mut a = SessionCore::new(a, RoleConfig::Initiator, None, now).unwrap();
         let mut b = SessionCore::new(b, RoleConfig::Responder, None, now).unwrap();
-        a.attach_pipe(PipeId(0), BS, now);
-        b.attach_pipe(PipeId(0), BS, now);
+        a.attach_pipe(PipeId::new(0), BS, now);
+        b.attach_pipe(PipeId::new(0), BS, now);
         let mut links = BTreeMap::new();
-        links.insert(0, Link::new(Joined::Attached(PipeId(0))));
+        links.insert(0, Link::new(Joined::Attached(PipeId::new(0))));
         Self {
             ends: [a, b],
             now,
@@ -281,7 +281,7 @@ impl<X: Observe, S> MpNet<X, S> {
 
     /// End `w` writes what it wants on link `id`.
     fn transmit(&mut self, id: u64, w: usize) {
-        let pipe = PipeId(id);
+        let pipe = PipeId::new(id);
         let now = self.now;
         let Some(l) = self.links.get_mut(&id) else {
             return;
@@ -325,6 +325,7 @@ impl<X: Observe, S> MpNet<X, S> {
                 let t = core.poll_transmit(pipe, now, &mut self.out);
                 self.wire.clear();
                 self.out.copy_to_vec(&mut self.wire);
+                core.pipe_written(pipe, self.wire.len() as u64);
                 if !self.wire.is_empty() {
                     if w == A {
                         l.x.a_batch(&self.wire);
@@ -395,7 +396,7 @@ impl<X: Observe, S> MpNet<X, S> {
     /// the join is accepted.
     pub(crate) fn feed(&mut self, id: u64, r: usize, bytes: &[u8]) {
         let now = self.now;
-        let pipe = PipeId(id);
+        let pipe = PipeId::new(id);
         let l = self.links.get_mut(&id).expect("link");
         if r == A || l.attached() {
             self.ends[r].receive(pipe, bytes, now);
@@ -439,7 +440,7 @@ impl<X: Observe, S> MpNet<X, S> {
             self.listener_close(id, Joined::Dropped);
             return;
         }
-        self.ends[r].pipe_ended(PipeId(id), end, self.now);
+        self.ends[r].pipe_ended(PipeId::new(id), end, self.now);
     }
 
     /// B's listener closes a carrier it has not handed to the session
@@ -483,7 +484,7 @@ impl<X: Observe, S> MpNet<X, S> {
                 }
                 f.writable = writable;
                 self.ends[w].pipe_write(
-                    PipeId(id),
+                    PipeId::new(id),
                     PipeWrite::returned(now, now, 0, 0, !writable),
                     now,
                 );
@@ -497,7 +498,7 @@ impl<X: Observe, S> MpNet<X, S> {
         for side in [A, B] {
             while let Some(e) = self.ends[side].poll_event() {
                 if let CoreEvent::ClosePipe { pipe, half, abort } = e {
-                    self.close_half(side, pipe.0, half, abort);
+                    self.close_half(side, pipe.get(), half, abort);
                 }
                 self.events[side].push(e);
             }
@@ -577,7 +578,7 @@ impl<X: Observe, S> MpNet<X, S> {
             let inbound = &mut l.flows[1 - side];
             if !std::mem::replace(&mut inbound.end_reported, true) {
                 self.ends[side].pipe_ended(
-                    PipeId(id),
+                    PipeId::new(id),
                     PipeEnd::Error(std::io::ErrorKind::ConnectionReset),
                     now,
                 );
@@ -586,7 +587,7 @@ impl<X: Observe, S> MpNet<X, S> {
             if !outbound.writer_closed && !std::mem::replace(&mut outbound.write_err_reported, true)
             {
                 outbound.write_err = true;
-                self.ends[side].write_failed(PipeId(id), std::io::ErrorKind::BrokenPipe, now);
+                self.ends[side].write_failed(PipeId::new(id), std::io::ErrorKind::BrokenPipe, now);
             }
         }
         self.handle_events();
@@ -598,7 +599,7 @@ impl<X: Observe, S> MpNet<X, S> {
         let id = self.ends[A]
             .add_pipe(Some(BS), Some(BS), opts, false, None, self.now)
             .ok()?
-            .0;
+            .get();
         assert!(!self.links.contains_key(&id), "pipe ID {id} reused");
         self.links.insert(id, Link::new(Joined::Pending));
         Some(id)

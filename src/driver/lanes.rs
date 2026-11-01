@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use super::handle::Shared;
 use super::listen::HandleError;
 use super::stream_pipe::{StreamReader, StreamWriter};
-use super::tokio::{PipeIo, Tokio, Writer};
+use super::tokio::{ChunkWrite, PipeIo, Tokio, Writer};
 use crate::proto::keys::lane_key_eq;
 use crate::proto::listener::{Classified, LaneProbe};
 use crate::proto::record::ZMUX_MAX_RECORD_SIZE;
@@ -186,6 +186,8 @@ pub(crate) struct LaneWriter {
     pub(crate) writer: Writer,
     pub(crate) keep: Option<StreamReader>,
     pub(crate) outer: Option<OuterLane>,
+    /// The lane's unsent query ([`PipeIo::with_unsent`]).
+    pub(crate) unsent: Option<super::unsent::Unsent>,
 }
 
 /// A lane that is a stream of an outer session, counted there while it
@@ -238,6 +240,29 @@ where
                 writer: Writer::Io(Box::pin(w)),
                 keep: None,
                 outer: None,
+                unsent: None,
+            })
+        })
+    })
+}
+
+/// An opener from an application's function returning a writer of owned
+/// buffers.
+pub(crate) fn chunk_opener<F, Fut, W>(f: F) -> LaneOpener
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = io::Result<W>> + Send + 'static,
+    W: ChunkWrite + 'static,
+{
+    Arc::new(move || {
+        let fut = f();
+        Box::pin(async move {
+            let w = fut.await?;
+            Ok(LaneWriter {
+                writer: Writer::Chunks(Box::pin(w)),
+                keep: None,
+                outer: None,
+                unsent: None,
             })
         })
     })
@@ -404,6 +429,7 @@ impl PipeIo {
             writer,
             keep,
             outer: None,
+            unsent: self.unsent.take(),
         })
     }
 }
@@ -416,7 +442,7 @@ pub(crate) fn finish_reverse(writer: Option<Writer>) {
         Some(mut w) => {
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
-                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                    let _ = std::future::poll_fn(|cx| w.poll_shutdown(cx)).await;
                 });
             }
         }

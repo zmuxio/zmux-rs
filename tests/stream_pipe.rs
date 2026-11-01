@@ -19,8 +19,8 @@ use common::{connect, duplex, eventually, multi_thread, settle, snapshot, watchd
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use zmux::proto::{ApplicationErrorCode, TransportParameters};
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeError, PipeHint, PipeIo, PipeOptions,
-    PipeState, RecvStream, RttSource, SendStream, Session, VarInt,
+    Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeError, PipeHint,
+    PipeIo, PipeOptions, RecvStream, RttSource, SendStream, Session, VarInt,
 };
 
 fn carrier_failed() -> VarInt {
@@ -298,13 +298,13 @@ impl Nested {
     async fn until_active(&self, p: &zmux::Pipe) {
         eventually(10, "pipe active", || {
             p.stats()
-                .is_some_and(|i| i.outbound == Some(PipeState::Active) && !i.in_probation)
+                .is_some_and(|i| i.outbound == Some(OutboundState::Active) && !i.in_probation)
         })
         .await;
     }
 }
 
-fn state(p: &zmux::Pipe) -> (Option<PipeState>, Option<PipeState>, u64) {
+fn state(p: &zmux::Pipe) -> (Option<InboundState>, Option<OutboundState>, u64) {
     p.stats().map_or((None, None, 0), |i| {
         (i.inbound, i.outbound, i.failure_count)
     })
@@ -439,10 +439,7 @@ fn stream_events_map_to_pipe_events() {
             let p = n.join_stream().await;
             n.os.close(VarInt::from_u32(3), b"");
             eventually(10, "the stream pipe failed", || {
-                matches!(
-                    state(&p).1,
-                    Some(PipeState::Failed | PipeState::Retired) | None
-                )
+                matches!(state(&p).1, Some(OutboundState::Failed) | None)
             })
             .await;
             watchdog(30, "echo on the direct carrier", echo(&n.x, &n.y, 64 << 10)).await;
@@ -578,7 +575,10 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
             let hidden = PipeIo::from_halves(Raw::new(recv), Raw::new(send));
             let p = n.x.add_pipe(hidden, PipeOptions::default()).unwrap();
             let handled = watchdog(10, "the join handled", handled).await.unwrap();
-            assert_eq!(handled.err(), Some(zmux::HandleError::Rejected));
+            assert_eq!(handled.err(), Some(zmux::HandleError::Refused));
+            // ZMUX_PIPE_RESOURCE_LIMIT: a limit of the session.
+            let st = n.listener.stats();
+            assert_eq!((st.refused, st.rejected, st.joins), (1, 0, 0));
             eventually(10, "the refusal reached the joiner", || {
                 n.x.stats().join_refusals == 1
             })
@@ -831,7 +831,11 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
             assert!(out.lanes_out >= 2, "the client opened a lane: {out:?}");
             assert_eq!(out.lanes_refused, 0);
             assert_eq!(inp.lanes_in, out.lanes_out, "the server took every lane");
-            let lane1 = out.lanes.iter().find(|l| l.lane.0 == 1).expect("lane 1");
+            let lane1 = out
+                .lanes
+                .iter()
+                .find(|l| l.lane.get() == 1)
+                .expect("lane 1");
             assert!(
                 lane1.position_acked.unwrap_or(0) > 23,
                 "data went on lane 1: {lane1:?}"
@@ -846,6 +850,53 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
             lanes.await.unwrap();
         }
         settle(base, 10, "nested lanes").await;
+    });
+}
+
+/// A listener that takes the streams of an outer session counts the
+/// nested session's bootstrap once and each lane it accepts into its pipe
+/// as a join (API.md Section 7.2).
+#[test]
+fn a_listener_counts_accepted_lanes_as_joins() {
+    multi_thread(async {
+        let base = snapshot();
+        {
+            let (oc, os) = outer(Config::default(), Config::default()).await;
+            let listener = Listener::new(Config::default(), ListenerConfig::default());
+            let router = {
+                let (os, l) = (os.clone(), listener.clone());
+                tokio::spawn(async move {
+                    while let Ok((send, recv)) = os.accept_bi().await {
+                        let l = l.clone();
+                        let io = PipeIo::from_stream(send, recv).with_lanes(true);
+                        tokio::spawn(async move { l.handle_pipe(io, PipeHint::default()).await });
+                    }
+                })
+            };
+            let pipe = oc
+                .open_pipe_stream(&zmux::Preamble::new())
+                .await
+                .unwrap()
+                .with_lanes(true);
+            let nc = Session::connect(pipe, Config::default()).await.unwrap();
+            let ns = watchdog(10, "accepted", listener.accept()).await.unwrap();
+            watchdog(30, "echo", echo(&nc, &ns, 1 << 20)).await;
+            let lanes_in = ns.pipe_stats().remove(0).lanes_in;
+            assert!(lanes_in >= 2, "a lane besides lane 0");
+            eventually(10, "lanes counted", || {
+                listener.stats().joins == lanes_in - 1
+            })
+            .await;
+            let st = listener.stats();
+            assert_eq!((st.sessions, st.rejected, st.refused), (1, 0, 0));
+            nc.close(VarInt::ZERO, b"");
+            watchdog(10, "nested closed", ns.closed()).await;
+            oc.close(VarInt::ZERO, b"");
+            watchdog(10, "outer closed", os.closed()).await;
+            router.await.unwrap();
+            listener.close();
+        }
+        settle(base, 10, "listener lanes").await;
     });
 }
 

@@ -132,6 +132,11 @@ pub enum PipeFailure {
     /// The carrier broke the protocol for its state (MULTIPATH.md Section
     /// 5.4).
     Protocol,
+    /// The acceptor closed the carrier of this endpoint's join before
+    /// confirming it, with a CONNECTION_CLOSE of this error code
+    /// (MULTIPATH.md Section 5.7 step 6); ZMUX_RESUME_FAILED: it has no
+    /// session for the locator.
+    JoinClosed(VarInt),
 }
 
 impl fmt::Display for PipeFailure {
@@ -143,6 +148,7 @@ impl fmt::Display for PipeFailure {
             Self::Abandoned(code) => write!(f, "abandoned by the peer with code {code}"),
             Self::Aborted => f.write_str("aborted locally"),
             Self::Protocol => f.write_str("protocol violation on the carrier"),
+            Self::JoinClosed(code) => write!(f, "join closed by the peer with code {code}"),
         }
     }
 }
@@ -350,6 +356,11 @@ pub enum StreamError {
     /// never opened and may be retried on another session (EXTENSIONS.md
     /// Section 3.5).
     GoingAway,
+    /// The stream's preamble did not fit the peer's Maximum Preamble Size
+    /// known when its identifier was due (the peer's parameters arrived
+    /// after the open, below the limit assumed then): nothing was sent and
+    /// the stream never opened; the session is unaffected.
+    PreambleTooLarge,
     /// This direction was already closed locally (finished, reset or
     /// stopped).
     ClosedLocally,
@@ -391,6 +402,7 @@ impl StreamError {
             Self::Rejected | Self::GoingAway => io::ErrorKind::ConnectionRefused,
             Self::ClosedLocally | Self::NotEstablished => io::ErrorKind::NotConnected,
             Self::NotNegotiated => io::ErrorKind::Unsupported,
+            Self::PreambleTooLarge => io::ErrorKind::InvalidInput,
             Self::Blocked => io::ErrorKind::WouldBlock,
             Self::SessionLost(e) => e.kind(),
             Self::TimedOut => io::ErrorKind::TimedOut,
@@ -406,6 +418,7 @@ impl fmt::Display for StreamError {
             Self::Stopped(code) => write!(f, "stream stopped by peer with code {code}"),
             Self::Rejected => f.write_str("stream rejected; retryable"),
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
+            Self::PreambleTooLarge => f.write_str("preamble too large for the peer"),
             Self::ClosedLocally => f.write_str("stream direction closed locally"),
             Self::NotNegotiated => f.write_str("not negotiated with the peer"),
             Self::NotEstablished => f.write_str("session not established"),
@@ -447,9 +460,11 @@ pub enum OpenError {
     /// The preamble needs the peer's `zmux_preamble`, which a plain QMux
     /// peer does not send (EXTENSIONS.md Section 4).
     NotNegotiated,
-    /// The preamble is larger than the peer accepts (its Maximum Preamble
-    /// Size) or than one record.
-    TooLarge,
+    /// The preamble, with room for a PRIORITY and a GREASE TLV, is larger
+    /// than the limit known now: the peer's Maximum Preamble Size (before
+    /// its parameters, the remembered one or the 1024-byte floor), at most
+    /// 4096 bytes and one record.
+    PreambleTooLarge,
     /// The preamble is not valid for the stream: a TLV type outside the
     /// application range (0x1000 to 0x3fff) or a GREASE value, or
     /// PIPE_CARRIER on a unidirectional stream.
@@ -481,7 +496,7 @@ impl fmt::Display for OpenError {
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::NotNegotiated => f.write_str("preambles not negotiated with the peer"),
-            Self::TooLarge => f.write_str("preamble too large for the peer"),
+            Self::PreambleTooLarge => f.write_str("preamble too large for the peer"),
             Self::InvalidArgument => f.write_str("preamble not valid for this stream"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
@@ -505,7 +520,7 @@ impl From<OpenError> for io::Error {
             OpenError::GoingAway => io::ErrorKind::ConnectionRefused,
             OpenError::NotEstablished => io::ErrorKind::NotConnected,
             OpenError::NotNegotiated => io::ErrorKind::Unsupported,
-            OpenError::TooLarge | OpenError::InvalidArgument => io::ErrorKind::InvalidInput,
+            OpenError::PreambleTooLarge | OpenError::InvalidArgument => io::ErrorKind::InvalidInput,
             OpenError::SessionLost(s) => s.kind(),
             OpenError::OnDriverThread => io::ErrorKind::Deadlock,
         };
@@ -595,6 +610,11 @@ pub enum PipeError {
     /// The carrier cannot be used so: a pipe added in band needs an
     /// outbound half.
     InvalidArgument,
+    /// The [`PipeOptions`](crate::PipeOptions) are not valid: an idle-probe
+    /// interval above 0 and below 1 s or a jitter outside \[0, 1); or a
+    /// [`QualityBand`](crate::QualityBand) or
+    /// [`CapacityFloor`](crate::CapacityFloor) is not valid.
+    InvalidOptions,
     /// The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined)).
     Failed(PipeFailure),
     /// A blocking call was refused on a thread that drives sessions
@@ -629,6 +649,7 @@ impl fmt::Display for PipeError {
             Self::Deferred => f.write_str("joining is deferred"),
             Self::UnknownPipe => f.write_str("unknown pipe"),
             Self::InvalidArgument => f.write_str("carrier not usable as this pipe"),
+            Self::InvalidOptions => f.write_str("pipe options not valid"),
             Self::Failed(e) => write!(f, "pipe failed: {e}"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
             Self::TimedOut => f.write_str("pipe wait timed out"),
@@ -655,7 +676,9 @@ impl From<PipeError> for io::Error {
             PipeError::NotEstablished => io::ErrorKind::NotConnected,
             PipeError::Deferred => io::ErrorKind::WouldBlock,
             PipeError::UnknownPipe => io::ErrorKind::NotFound,
-            PipeError::InvalidArgument | PipeError::CarrierLoop => io::ErrorKind::InvalidInput,
+            PipeError::InvalidArgument | PipeError::InvalidOptions | PipeError::CarrierLoop => {
+                io::ErrorKind::InvalidInput
+            }
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
             PipeError::OnDriverThread => io::ErrorKind::Deadlock,
             PipeError::TimedOut => io::ErrorKind::TimedOut,

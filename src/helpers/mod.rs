@@ -7,9 +7,10 @@
 //! - `splice` forwards two streams into each other, how a relay connects
 //!   them (tokio driver);
 //! - `resolve_duplicate` keeps one of two sessions that connect the same
-//!   two endpoints (tokio here, `zmux::blocking::resolve_duplicate` for the
+//!   two endpoints (tokio here, `zmux::blocking::helpers::resolve_duplicate` for the
 //!   std driver).
 
+mod backoff;
 mod duplicate;
 #[cfg(feature = "tokio")]
 mod maintain;
@@ -20,10 +21,16 @@ mod maintain;
 pub use crate::driver::splice::{
     Forwarded, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice,
 };
+pub use backoff::{Backoff, DEFAULT_BACKOFF_MAX};
 pub use duplicate::{DuplicateError, DuplicateRule};
 pub(crate) use duplicate::{duplicate_api, resolve};
 
 #[cfg(feature = "tokio")]
 duplicate_api!(crate::driver::tokio::Tokio, crate::Session, crate::Dial);
 #[cfg(feature = "tokio")]
-pub use maintain::{BackoffPolicy, MaintainHandle, PipePool, RotatePolicy, maintain_pipes};
+pub(crate) use maintain::maintain_mode;
+#[cfg(feature = "tokio")]
+pub use maintain::{
+    MaintainHandle, PipePool, PoolDecision, PoolMember, PoolPolicy, PoolView, RECHECK_FLOOR,
+    RotatePolicy, maintain_pipes,
+};

@@ -32,7 +32,7 @@ use crate::support::{read_json, to_hex};
 use crate::wire;
 
 /// The groups this version runs.
-const RUN_GROUPS: &[&str] = &["core", "ext", "compat", "regression", "multipath", "resume"];
+const RUN_GROUPS: &[&str] = &["core", "ext", "compat", "findings", "multipath", "resume"];
 
 /// What the local endpoint wrote on one outbound lane of a pipe (lane 0
 /// is the pipe's own carrier, TRACES.md Section 5.1.1).
@@ -155,18 +155,17 @@ fn policy(name: &str) -> Result<Policy, String> {
     })
 }
 
-fn state_name(s: zmux::proto::session::PipeState) -> PipeStateName {
-    use zmux::proto::session::PipeState as P;
+fn state_name(s: zmux::proto::session::DirectionState) -> PipeStateName {
+    use zmux::proto::session::{DirectionState as D, InboundState as I, OutboundState as O};
     match s {
-        P::Joining => PipeStateName::Joining,
-        P::Active => PipeStateName::Active,
-        P::Suspect => PipeStateName::Suspect,
-        P::Draining => PipeStateName::Draining,
-        P::Failed => PipeStateName::Failed,
-        P::Closed => PipeStateName::Closed,
-        P::Open => PipeStateName::Open,
-        P::Ended => PipeStateName::Ended,
-        P::Retired => PipeStateName::Retired,
+        D::Outbound(O::Joining) | D::Inbound(I::Joining) => PipeStateName::Joining,
+        D::Outbound(O::Active) => PipeStateName::Active,
+        D::Outbound(O::Suspect) => PipeStateName::Suspect,
+        D::Outbound(O::Draining) => PipeStateName::Draining,
+        D::Outbound(O::Failed) => PipeStateName::Failed,
+        D::Outbound(O::Closed) => PipeStateName::Closed,
+        D::Inbound(I::Open) => PipeStateName::Open,
+        D::Inbound(I::Ended) => PipeStateName::Ended,
     }
 }
 
@@ -224,6 +223,7 @@ impl Runner {
             overflow_delay,
             redundancy,
             standby_probe,
+            probe_jitter,
             pipe_auth,
             early_data
         );
@@ -245,12 +245,13 @@ impl Runner {
         );
 
         let mut config = Config::default();
-        config.handshake_timeout = Duration::from_millis(cfg.handshake_timeout.unwrap_or(10_000));
-        config.keep_alive_period = cfg
-            .keep_alive_period
-            .filter(|&k| k > 0)
-            .map(Duration::from_millis);
-        config.max_idle_timeout = Duration::from_millis(tp.max_idle_timeout.unwrap_or(0));
+        // A trace's 0 (and an absent keep-alive or idle timeout) is off.
+        let period = |ms: u64| (ms != 0).then(|| Duration::from_millis(ms));
+        if let Some(ms) = cfg.handshake_timeout {
+            config.handshake_timeout = Some(Duration::from_millis(ms));
+        }
+        config.keep_alive_period = period(cfg.keep_alive_period.unwrap_or(0));
+        config.max_idle_timeout = period(tp.max_idle_timeout.unwrap_or(0));
         config.enable_datagrams = cfg.enable_datagrams.unwrap_or(false);
         // Absent from the profile means configured eagerly (the traces of
         // earlier revisions); `null` means unset, lazy.
@@ -296,7 +297,10 @@ impl Runner {
             };
         }
         if let Some(p) = cfg.standby_probe {
-            config.standby_probe = Duration::from_millis(p);
+            config.standby_probe = period(p);
+        }
+        if let Some(j) = cfg.probe_jitter {
+            config.probe_jitter = j;
         }
         if let Some(e) = &cfg.early_data {
             config.early_data =
@@ -316,8 +320,6 @@ impl Runner {
         th.rtt = hooks.rtt_ms.map(Duration::from_millis);
         th.no_first_ping = true;
         th.unpaced = true;
-        // Probes at the specified intervals, without a random phase.
-        th.probe_phase = Some(0.0);
         th.session_nonce = hooks
             .session_nonce
             .map(|n| n.0.try_into().map_err(|_| "session_nonce length"))
@@ -383,7 +385,7 @@ impl Runner {
                     } else {
                         ClosedHow::Graceful
                     };
-                    if let Some(p) = self.pipes.get_mut(&pipe.0) {
+                    if let Some(p) = self.pipes.get_mut(&pipe.get()) {
                         match half {
                             PipeHalf::Inbound => {
                                 p.in_closed.get_or_insert(how);
@@ -402,15 +404,15 @@ impl Runner {
                     let now = self.now();
                     let framing = self
                         .pipes
-                        .get(&lane.pipe.0)
+                        .get(&lane.pipe.get())
                         .and_then(|p| p.out_framing)
                         .unwrap_or(Framing::ByteStream);
-                    self.pipe_mut(lane.pipe.0).lane_mut(lane.lane.0);
+                    self.pipe_mut(lane.pipe.get()).lane_mut(lane.lane.get());
                     self.session.lane_opened(*lane, framing, now);
                 }
                 CoreEvent::ResetLane(lane) => {
-                    self.pipe_mut(lane.pipe.0)
-                        .lane_mut(lane.lane.0)
+                    self.pipe_mut(lane.pipe.get())
+                        .lane_mut(lane.lane.get())
                         .closed
                         .get_or_insert(ClosedHow::Abort);
                 }
@@ -442,7 +444,7 @@ impl Runner {
                 })
                 .collect();
             for (id, lane) in ids {
-                let at = PipeId(id).lane(lane);
+                let at = PipeId::new(id).lane(lane);
                 loop {
                     rounds += 1;
                     if rounds > 100_000 {
@@ -529,7 +531,7 @@ impl Runner {
             .filter(|f| f["type"] == "STREAM")
             .map(|f| f["data"].as_str().map_or(0, |d| d.len() / 2))
             .sum();
-        let Some(me) = infos.iter().find(|i| i.pipe.0 == id) else {
+        let Some(me) = infos.iter().find(|i| i.pipe.get() == id) else {
             return Ok(());
         };
         if stream_bytes == 0 {
@@ -537,15 +539,16 @@ impl Runner {
         }
         let others = || {
             infos.iter().filter(move |i| {
-                i.pipe.0 != id && i.outbound == Some(zmux::proto::session::PipeState::Active)
+                i.pipe.get() != id
+                    && i.outbound == Some(zmux::proto::session::OutboundState::Active)
             })
         };
-        if me.outbound == Some(zmux::proto::session::PipeState::Joining)
+        if me.outbound == Some(zmux::proto::session::OutboundState::Joining)
             && let Some(o) = others().next()
         {
             return Err(format!(
                 "oracle (S1): stream data on JOINING pipe {id} while pipe {} is usable",
-                o.pipe.0
+                o.pipe.get()
             ));
         }
         if me.in_probation
@@ -553,7 +556,7 @@ impl Runner {
         {
             return Err(format!(
                 "oracle (11.9): stream data on pipe {id} in probation while pipe {} is out of probation",
-                o.pipe.0
+                o.pipe.get()
             ));
         }
         Ok(())
@@ -684,7 +687,7 @@ impl Runner {
                     reject(self);
                     return;
                 }
-                let at = PipeId(pipe).lane(lane);
+                let at = PipeId::new(pipe).lane(lane);
                 match self.session.accept_lane(at, framing, now) {
                     LaneAccept::Accepted => {
                         if let Some(c) = self.carriers.get_mut(name) {
@@ -723,12 +726,12 @@ impl Runner {
     fn read(&mut self, id: u64, data: &[u8]) {
         let now = self.now();
         if self.copy {
-            self.session.receive(PipeId(id), data, now);
+            self.session.receive(PipeId::new(id), data, now);
         } else {
             let p = self.pipe_mut(id);
             p.inbuf.extend_from_slice(data);
             let buf = std::mem::take(&mut p.inbuf);
-            let used = self.session.receive_in_place(PipeId(id), &buf, now);
+            let used = self.session.receive_in_place(PipeId::new(id), &buf, now);
             let p = self.pipe_mut(id);
             p.inbuf = buf;
             p.inbuf.drain(..used.min(p.inbuf.len()));
@@ -738,7 +741,7 @@ impl Runner {
 
     fn message(&mut self, id: u64, m: &[u8]) {
         let now = self.now();
-        self.session.receive_message(PipeId(id), m, now);
+        self.session.receive_message(PipeId::new(id), m, now);
         self.drain_events();
     }
 
@@ -833,7 +836,7 @@ impl Runner {
         if write && p.conn.is_some() {
             // A stream of a multi-stream connection offers lanes (TRACES.md
             // Section 3.3).
-            self.session.set_pipe_lanes(PipeId(pipe), true);
+            self.session.set_pipe_lanes(PipeId::new(pipe), true);
         }
     }
 
@@ -858,16 +861,16 @@ impl Runner {
             }
             JoinVerdict::Accepted(pipe) => {
                 c.waiting = None;
-                c.pipe = Some(pipe.0);
+                c.pipe = Some(pipe.get());
                 if let Some(id) = c.id.take() {
                     self.listener.done(id);
                 }
                 let (read, write) = (c.can_read, c.can_write);
-                self.attach(pipe.0, Some(name), read, write, framing);
+                self.attach(pipe.get(), Some(name), read, write, framing);
                 if !bytes.is_empty() {
                     match framing {
-                        Framing::ByteStream => self.deliver(pipe.0, bytes, None),
-                        Framing::Records => self.message(pipe.0, bytes),
+                        Framing::ByteStream => self.deliver(pipe.get(), bytes, None),
+                        Framing::Records => self.message(pipe.get(), bytes),
                     }
                 }
             }
@@ -1176,7 +1179,7 @@ impl Runner {
                     DownHow::Error => PipeEnd::Error(std::io::ErrorKind::ConnectionReset),
                 };
                 let at = match (pipe, carrier) {
-                    (Some(p), _) => PipeId(*p).lane(lane.unwrap_or(0)),
+                    (Some(p), _) => PipeId::new(*p).lane(lane.unwrap_or(0)),
                     (None, Some(c)) => {
                         // A stream of a connection: the lane it is, if any.
                         let c = self
@@ -1196,8 +1199,8 @@ impl Runner {
                 if matches!(dir, Direction::Out | Direction::Bidi) && *how == DownHow::Error {
                     self.session
                         .write_failed(at, std::io::ErrorKind::BrokenPipe, now);
-                    self.pipe_mut(at.pipe.0)
-                        .lane_mut(at.lane.0)
+                    self.pipe_mut(at.pipe.get())
+                        .lane_mut(at.lane.get())
                         .closed
                         .get_or_insert(ClosedHow::Abort);
                 }
@@ -1212,7 +1215,7 @@ impl Runner {
                     .collect();
                 for lane in lanes {
                     self.session.pipe_write(
-                        PipeId(*pipe).lane(lane),
+                        PipeId::new(*pipe).lane(lane),
                         PipeWrite::returned(now, now, 0, 0, !*writable),
                         now,
                     );
@@ -1412,11 +1415,12 @@ impl Runner {
                         Direction::In => PipeHalf::Inbound,
                         _ => PipeHalf::Outbound,
                     };
-                    let have = self
-                        .session
-                        .pipe_state(PipeId(*pipe), half)
-                        .map(state_name)
-                        .ok_or_else(|| format!("pipe {pipe} {dir:?} has no state"))?;
+                    let id = PipeId::new(*pipe);
+                    let have = match self.session.pipe_state(id, half) {
+                        Some(s) => state_name(s),
+                        None if self.session.pipe_retired(id) => PipeStateName::Retired,
+                        None => return Err(format!("pipe {pipe} {dir:?} has no state")),
+                    };
                     if !state_matches(state, have) {
                         return Err(format!(
                             "pipe {pipe} {dir:?} is {have:?}, expected {state:?}"
@@ -1783,14 +1787,15 @@ impl Runner {
                     now,
                 ) {
                     Ok(id) => {
-                        if id.0 != a.pipe {
+                        if id.get() != a.pipe {
                             return Err(format!(
                                 "add_pipe gave pipe {}, expected {}",
-                                id.0, a.pipe
+                                id.get(),
+                                a.pipe
                             ));
                         }
                         let waiting = s.join_deferred(id);
-                        self.attach(id.0, None, read, write, framing);
+                        self.attach(id.get(), None, read, write, framing);
                         if waiting {
                             json!({"pending": true})
                         } else {
@@ -1800,12 +1805,12 @@ impl Runner {
                     Err(e) => pipe_error(&e),
                 }
             }
-            Call::RemovePipe(a) => match s.remove_pipe(PipeId(a.pipe), a.graceful, now) {
+            Call::RemovePipe(a) => match s.remove_pipe(PipeId::new(a.pipe), a.graceful, now) {
                 Ok(()) => ok,
                 Err(e) => pipe_error(&e),
             },
             Call::SetPipeStatus(a) => {
-                let p = PipeId(a.pipe);
+                let p = PipeId::new(a.pipe);
                 let r = (|| {
                     if let Some(v) = a.send_priority {
                         s.set_pipe_send_priority(p, v)?;
@@ -1852,14 +1857,14 @@ impl Runner {
             }
             Call::SetRedundant(a) => {
                 let key = self.key(&a.stream)?;
-                match self.session.set_redundant(key, a.redundant) {
+                match self.session.set_redundant(key, Some(a.redundant)) {
                     Ok(()) => ok,
                     Err(e) => stream_error(&e),
                 }
             }
             Call::RevalidatePipes(a) => {
                 let now = self.now();
-                match self.session.revalidate_pipes(a.pipe.map(PipeId), now) {
+                match self.session.revalidate_pipes(a.pipe.map(PipeId::new), now) {
                     Ok(()) => ok,
                     Err(e) => pipe_error(&e),
                 }
@@ -1909,7 +1914,7 @@ fn open_error(e: &OpenError) -> Value {
         OpenError::Blocked => json!({"pending": true}),
         OpenError::GoingAway => json!({"error": {"kind": "going_away"}}),
         OpenError::NotNegotiated => json!({"error": {"kind": "unsupported"}}),
-        OpenError::TooLarge => json!({"error": {"kind": "too_large"}}),
+        OpenError::PreambleTooLarge => json!({"error": {"kind": "too_large"}}),
         OpenError::SessionLost(s) => session_error(s),
         other => json!({"error": {"kind": format!("{other:?}")}}),
     }
@@ -2041,7 +2046,7 @@ fn event_name(e: &CoreEvent) -> Option<EventName> {
         CoreEvent::JoinAuthFailed { .. } => EventName::JoinAuthFailed,
         CoreEvent::Suspended => EventName::Suspended,
         CoreEvent::Resumed => EventName::Resumed,
-        CoreEvent::PipeState { .. } => EventName::PipeState,
+        CoreEvent::PipeState { .. } | CoreEvent::PipeRetired { .. } => EventName::PipeState,
         _ => return None,
     })
 }
@@ -2114,8 +2119,8 @@ fn match_event(
             None => Ok(()),
         },
         CoreEvent::OobJoin { pipe, frame } => {
-            if fields.pipe.is_some_and(|p| p != pipe.0) {
-                return Err(format!("oob_join pipe {}", pipe.0));
+            if fields.pipe.is_some_and(|p| p != pipe.get()) {
+                return Err(format!("oob_join pipe {}", pipe.get()));
             }
             if let Some(f) = &fields.frame
                 && f.0 != frame[..]
@@ -2134,9 +2139,21 @@ fn match_event(
             _ => Ok(()),
         },
         CoreEvent::Suspended | CoreEvent::Resumed => Ok(()),
-        CoreEvent::PipeState { pipe, half, state } => {
-            if fields.pipe.is_some_and(|p| p != pipe.0) {
-                return Err(format!("pipe_state pipe {}", pipe.0));
+        CoreEvent::PipeRetired { pipe } => {
+            if fields.pipe.is_some_and(|p| p != pipe.get()) {
+                return Err(format!("pipe_state pipe {}", pipe.get()));
+            }
+            if let Some(p) = &fields.state
+                && !state_matches(p, PipeStateName::Retired)
+            {
+                return Err("pipe_state retired".into());
+            }
+            Ok(())
+        }
+        CoreEvent::PipeState { pipe, state } => {
+            let half = &state.half();
+            if fields.pipe.is_some_and(|p| p != pipe.get()) {
+                return Err(format!("pipe_state pipe {}", pipe.get()));
             }
             if let Some(d) = fields.dir {
                 let want = match d {

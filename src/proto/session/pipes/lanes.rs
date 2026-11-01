@@ -159,6 +159,8 @@ pub(crate) struct OutLane {
     /// The carrier stream takes bytes, and what it holds unsent.
     writable: bool,
     unsent: u64,
+    /// Bytes of its batch that the carrier stream has not taken yet.
+    writing: u64,
     /// Since when the carrier stream refuses bytes it was given (its write
     /// stall, MULTIPATH.md Section 7.1).
     refused_since: Option<Instant>,
@@ -415,6 +417,7 @@ impl OutLanes {
             log: VecDeque::new(),
             writable: true,
             unsent: 0,
+            writing: 0,
             refused_since: None,
             shutdown_reported: false,
             out_closed: false,
@@ -469,6 +472,7 @@ impl OutLanes {
         }
         l.state = LaneState::Refused;
         l.out_closed = true;
+        l.writing = 0;
         l.first_owed = false;
         self.closed = true;
         self.refused += 1;
@@ -625,6 +629,25 @@ impl OutLanes {
         self.zero_unsent + self.lanes.iter().map(|l| l.unsent).sum::<u64>()
     }
 
+    /// Lane `n` (not 0) was handed a batch of `bytes`.
+    pub(crate) fn set_writing(&mut self, n: u64, bytes: u64) {
+        if let Some(l) = self.get_mut(n) {
+            l.writing = bytes;
+        }
+    }
+
+    /// The carrier stream of lane `n` (not 0) took `bytes` of its batch.
+    pub(crate) fn took(&mut self, n: u64, bytes: u64) {
+        if let Some(l) = self.get_mut(n) {
+            l.writing = l.writing.saturating_sub(bytes);
+        }
+    }
+
+    /// Bytes of the lanes' batches (lane 0's aside) not taken yet.
+    pub(crate) fn writing(&self) -> u64 {
+        self.lanes.iter().map(|l| l.writing).sum()
+    }
+
     /// A write to lane `n` (not 0) ended at `now`: the carrier stream
     /// took bytes, or refused them.
     pub(crate) fn set_writable(&mut self, n: u64, writable: bool, now: Instant) {
@@ -667,6 +690,7 @@ impl OutLanes {
     pub(crate) fn lane_closed(&mut self, n: u64) {
         if let Some(l) = self.get_mut(n) {
             l.out_closed = true;
+            l.writing = 0;
         }
     }
 

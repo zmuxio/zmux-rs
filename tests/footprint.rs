@@ -28,8 +28,8 @@ use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, RoleConfig};
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, PipeState, Policy,
-    Session,
+    Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
+    Policy, Session,
 };
 
 struct Counting;
@@ -169,7 +169,7 @@ const MULTIPATH: Row = Row {
 fn config() -> Arc<Config> {
     static C: std::sync::LazyLock<Arc<Config>> = std::sync::LazyLock::new(|| {
         let mut c = Config::default();
-        c.max_idle_timeout = Duration::ZERO;
+        c.max_idle_timeout = None;
         c.keep_alive_period = None;
         Arc::new(c)
     });
@@ -179,7 +179,7 @@ fn config() -> Arc<Config> {
 fn mp_config() -> Arc<Config> {
     static C: std::sync::LazyLock<Arc<Config>> = std::sync::LazyLock::new(|| {
         let mut c = Config::default();
-        c.max_idle_timeout = Duration::ZERO;
+        c.max_idle_timeout = None;
         c.keep_alive_period = None;
         c.max_pipes = 8;
         c.pipe_auth = PipeAuth::psk(*b"footprint-psk---0123456789abcdef");
@@ -201,7 +201,7 @@ fn core_rows() {
     for _ in 0..n {
         let mut s =
             core::SessionCore::new(config.clone(), RoleConfig::Initiator, None, now).unwrap();
-        s.attach_pipe(PipeId(0), Framing::ByteStream, now);
+        s.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
         v.push(s);
     }
     CORE.check((live() - before) as f64 / n as f64);
@@ -351,7 +351,7 @@ async fn mp_pairs(
     let active = |x: &Session| {
         x.pipe_stats()
             .iter()
-            .filter(|i| i.outbound == Some(PipeState::Active))
+            .filter(|i| i.outbound == Some(OutboundState::Active))
             .count()
     };
     let deadline = Instant::now() + Duration::from_secs(30);

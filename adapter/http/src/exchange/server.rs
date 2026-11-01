@@ -3,16 +3,15 @@
 //! share under one lock.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::error::Error as StdError;
 use std::io;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
-use http::{Method, Request, Response, StatusCode, header};
+use http::{Request, Response, header};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -20,10 +19,11 @@ use zmux::carrier::MemoryCharge;
 use zmux::{Listener, PipeHint, PipeIo};
 
 use super::ExchangeOptions;
+use super::record::Record;
 use super::wire::{
-    self, BUSY, CarrierId, FIN, GONE, Key, Kind, MAX_PREFIX, MAX_REASON, Malformed, REQ_FIN,
+    self, BUSY, CarrierId, FIN, GONE, Key, Kind, MAX_PREFIX, MAX_REASON, REQ_FIN, unix_seconds,
 };
-use crate::body::{PipeBody, collect};
+use crate::body::{PipeBody, ReplayBody, read_len};
 
 /// The granularity of the memory charged to the listener, so that small
 /// changes do not touch its account.
@@ -35,9 +35,9 @@ const CHARGE_UNIT: u64 = 64 << 10;
 ///
 /// Serve it with [`crate::serve`] and the other serve functions
 /// ([`Options::with_exchange`](crate::Options::with_exchange)), which
-/// route POST requests whose path starts with the fixed part of
-/// [`ExchangeOptions::path`] or [`ExchangeOptions::down_path`] here, or call [`ExchangeServer::handle`] from
-/// an HTTP server of the application's own. A carrier's requests may
+/// route requests whose path starts with the fixed part of
+/// [`ExchangeOptions::path`] or [`ExchangeOptions::down_path`] here, or call
+/// [`ExchangeServer::handle`] from an HTTP server of the application's own. A carrier's requests may
 /// arrive on any connection.
 ///
 /// The bytes a carrier holds (uplink pieces for zmux, downlink bytes not
@@ -60,6 +60,9 @@ impl std::fmt::Debug for ExchangeServer {
 struct Shared {
     listener: Listener,
     options: ExchangeOptions,
+    /// The time window in seconds.
+    window: i64,
+    record: Record,
     table: Mutex<Table>,
 }
 
@@ -97,13 +100,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A response without a result.
-fn status(code: StatusCode) -> Response<PipeBody> {
-    let mut r = Response::new(PipeBody::empty());
-    *r.status_mut() = code;
-    r
-}
-
 /// What a request gets: flags and data, MAC'd for the request.
 struct Answer {
     flags: u8,
@@ -120,15 +116,26 @@ impl Answer {
 }
 
 impl ExchangeServer {
-    /// A server whose carriers are handed to `listener`.
-    pub fn new(listener: &Listener, options: ExchangeOptions) -> Self {
-        Self {
+    /// A server whose carriers are handed to `listener`. Fails
+    /// ([`std::io::ErrorKind::InvalidInput`]) on options without a PSK
+    /// that do not choose to run unauthenticated
+    /// ([`ExchangeOptions::unauthenticated`]), or that set both.
+    pub fn new(listener: &Listener, options: ExchangeOptions) -> std::io::Result<Self> {
+        options.mac_psk()?;
+        // A difference of Times is a signed 32-bit value: a wider window
+        // takes every Time.
+        let window = i64::try_from(options.time_window.as_secs())
+            .unwrap_or(i64::MAX)
+            .min(i64::from(i32::MAX) + 1);
+        Ok(Self {
             inner: Arc::new(Shared {
                 listener: listener.clone(),
+                window,
+                record: Record::new(window, options.max_recorded),
                 options,
                 table: Mutex::default(),
             }),
-        }
+        })
     }
 
     /// The options.
@@ -150,60 +157,89 @@ impl ExchangeServer {
             .any(|p| path.starts_with(p))
     }
 
-    /// Answers one exchange request: a request of the application's own
-    /// HTTP server routed here (any method but POST is answered with 405).
-    /// `peer` is the client's address, which the listener's per-source
-    /// limits use. The response has a fixed length; a held DOWN request
-    /// resolves within [`ExchangeOptions::hold`]. Must be called inside a
-    /// tokio runtime.
-    pub async fn handle<B>(&self, req: Request<B>, peer: Option<IpAddr>) -> Response<PipeBody>
+    /// Serves one request routed here by an HTTP server of the
+    /// application's own. A request that is not an exchange request as
+    /// [`crate::classify`] tells is given back at once. One that the
+    /// server authenticates (a `Content-Length` within the body limit, a
+    /// body that is a
+    /// request, whose MAC verifies, whose Time is within
+    /// [`ExchangeOptions::time_window`] of the clock and whose (Carrier ID,
+    /// Nonce) pair was not recorded before) is answered; the response has
+    /// a fixed length, and a held DOWN request resolves within
+    /// [`ExchangeOptions::hold`]. Every other request changes nothing and
+    /// is given back as `Err`, the body bytes read replayed in front of the
+    /// rest, for the host server's fallback. An exchange request that an intermediary
+    /// forwarded from TLS early data is answered `425 (Too Early)`
+    /// ([`crate::too_early`]). `peer` is the connection's remote address;
+    /// the carrier's source is the client a trusted intermediary reports in
+    /// a forwarding header field on top ([`crate::request_source`]), which
+    /// the listener's per-source limits use. A new carrier goes through the
+    /// listener's admission like any ([`Listener::handle_pipe`]). Must be
+    /// called inside a tokio runtime.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the request is handed back by value, as a host server routes it"
+    )]
+    pub async fn handle<B>(
+        &self,
+        req: Request<B>,
+        peer: Option<SocketAddr>,
+    ) -> Result<Response<PipeBody>, Request<ReplayBody<B>>>
     where
-        B: http_body::Body<Data = Bytes> + Unpin,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Unpin,
+        B::Data: bytes::Buf,
     {
-        if req.method() != Method::POST {
-            return status(StatusCode::METHOD_NOT_ALLOWED);
+        let (parts, mut body) = req.into_parts();
+        // The one classification: any other
+        // request is the host's, before anything else.
+        if crate::classify(&parts) != Some(crate::RequestClass::Exchange) {
+            return Err(Request::from_parts(
+                parts,
+                ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
+            ));
+        }
+        if crate::forwarded_early_data(&parts.headers) {
+            // Forwarded from TLS early data: no carrier is taken from it.
+            self.inner.listener.count_setup_failure();
+            return Ok(crate::too_early());
         }
         let o = &self.inner.options;
-        let limit = wire::encoded_len(o.encoding, MAX_PREFIX + o.max_up_piece.max(MAX_REASON));
-        let body = match tokio::time::timeout(o.idle_timeout, collect(req.into_body(), limit)).await
-        {
-            Ok(Ok(Ok(b))) => b,
-            Ok(Ok(Err(start))) => return self.over_limit(start),
-            _ => return status(StatusCode::BAD_REQUEST),
+        let limit = wire::encoded_len(
+            o.encoding,
+            MAX_PREFIX + o.max_up_piece_size().max(MAX_REASON),
+        );
+        let len = content_length(&parts.headers).filter(|&n| n <= limit);
+        let Some(len) = len else {
+            return Err(Request::from_parts(
+                parts,
+                ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
+            ));
         };
-        let Some(request) =
-            wire::decode_body(o.encoding, body).and_then(|b| wire::Request::parse(b).ok())
-        else {
-            return status(StatusCode::BAD_REQUEST);
+        let deadline = Instant::now() + o.idle_timeout;
+        let (raw, complete) = read_len(&mut body, len, deadline).await;
+        let request = complete
+            .then(|| wire::decode_body(o.encoding, raw.clone()))
+            .flatten()
+            .and_then(wire::Request::parse);
+        let authenticated = request.and_then(|r| {
+            let (lookup, key) = self.inner.authenticate(&r)?;
+            Some((r, lookup, key))
+        });
+        let Some((request, lookup, key)) = authenticated else {
+            return Err(Request::from_parts(
+                parts,
+                ReplayBody::new([raw, Bytes::new()], Some(body)),
+            ));
         };
-        let (key, answer) = match self.inner.process(&request, peer).await {
-            Ok(r) => r,
-            // Unauthenticated requests look like any unknown target.
-            Err(Malformed::Mac) => return status(StatusCode::NOT_FOUND),
-            Err(_) => return status(StatusCode::BAD_REQUEST),
-        };
-        self.respond(&key, &request.answering(), answer)
-    }
-
-    /// The answer to an UP request over the local limit: GONE, never
-    /// retried. Its data is not read, so its MAC is not checked; the
-    /// carrier's state does not change.
-    fn over_limit(&self, start: Bytes) -> Response<PipeBody> {
-        let o = &self.inner.options;
-        let start = match o.encoding {
-            super::BodyEncoding::Base64 => start.slice(..start.len() / 4 * 4),
-            _ => start,
-        };
-        let parsed =
-            wire::decode_body(o.encoding, start).and_then(|b| wire::Request::parse(b).ok());
-        match parsed {
-            Some(r) if r.kind_byte() == Kind::Up as u8 => {
-                let key = Key::new(&o.psk, &r.cid);
-                self.respond(&key, &r.answering(), Answer::flags(GONE))
-            }
-            _ => status(StatusCode::PAYLOAD_TOO_LARGE),
-        }
+        let peer = peer.map(|p| {
+            let fields = parts
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_bytes()));
+            (p, self.inner.listener.trusted_proxies().source(p, fields))
+        });
+        let answer = self.inner.process(&request, lookup, &key, peer).await;
+        Ok(self.respond(&key, &request.answering(), answer))
     }
 
     fn respond(&self, key: &Key, to: &wire::Answering<'_>, answer: Answer) -> Response<PipeBody> {
@@ -227,12 +263,30 @@ impl ExchangeServer {
     }
 }
 
-/// The answer to an authentic request that breaks Section 3: GONE, bound
-/// like every response to the Kind byte as sent.
-fn invalid(key: Key) -> (Key, Answer) {
-    (key, Answer::flags(GONE))
+/// The value of a request's `Content-Length`, when it has exactly one that
+/// is a number.
+fn content_length(h: &http::HeaderMap) -> Option<usize> {
+    let mut values = h.get_all(header::CONTENT_LENGTH).iter();
+    let v = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let v = v.as_bytes();
+    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(v).ok()?.parse().ok()
 }
 
+/// The time in seconds that the Time `time` stands for when the clock is
+/// `now`, or `None` when the two differ by more than `window`: the
+/// difference is taken modulo 2^32 as a signed 32-bit value.
+fn within_window(time: u32, now: i64, window: i64) -> Option<i64> {
+    let d = i64::from(time.wrapping_sub(now as u32) as i32);
+    (d.abs() <= window).then_some(now + d)
+}
+
+/// What the server holds for a request's Carrier ID.
 enum Lookup {
     Live(Arc<Carrier>),
     Gone,
@@ -240,13 +294,10 @@ enum Lookup {
 }
 
 impl Shared {
-    /// Processes an authentic request; returns the key and kind it is
-    /// answered with, and the answer.
-    async fn process(
-        self: &Arc<Self>,
-        req: &wire::Request,
-        peer: Option<IpAddr>,
-    ) -> Result<(Key, Answer), Malformed> {
+    /// Authenticates a parsed request: its MAC, its Time
+    /// within the window, and its (Carrier ID, Nonce) pair, which it
+    /// records. `None` when it is not authenticated.
+    fn authenticate(&self, req: &wire::Request) -> Option<(Lookup, Key)> {
         let o = &self.options;
         let lookup = {
             let mut t = lock(&self.table);
@@ -257,53 +308,65 @@ impl Shared {
                 None => Lookup::New,
             }
         };
+        let key = match &lookup {
+            Lookup::Live(c) => c.key.clone(),
+            _ => Key::new(&o.psk, &req.cid),
+        };
+        if !req.authentic(&key) {
+            return None;
+        }
+        let now = i64::try_from(unix_seconds()).ok()?;
+        let time = within_window(req.time, now, self.window)?;
+        let mut pair = [0; 24];
+        pair[..16].copy_from_slice(&req.cid);
+        pair[16..].copy_from_slice(&req.nonce);
+        self.record
+            .insert(pair, time, now - self.window)
+            .then_some((lookup, key))
+    }
+
+    /// Processes an authenticated request; returns its answer.
+    async fn process(
+        self: &Arc<Self>,
+        req: &wire::Request,
+        lookup: Lookup,
+        key: &Key,
+        peer: Option<(SocketAddr, SocketAddr)>,
+    ) -> Answer {
+        let o = &self.options;
+        let Some(kind) = req.valid_kind() else {
+            // Authenticated, but its fields break the request rules.
+            if let Lookup::Live(c) = lookup {
+                c.fail();
+            }
+            return Answer::flags(GONE);
+        };
         let carrier = match lookup {
             Lookup::Live(c) => c,
-            Lookup::Gone => {
-                let key = Key::new(&o.psk, &req.cid);
-                return match req.verify(&key) {
-                    Ok(_) | Err(Malformed::Invalid) => Ok((key, Answer::flags(GONE))),
-                    Err(e) => Err(e),
-                };
+            Lookup::Gone => return Answer::flags(GONE),
+            Lookup::New if kind == Kind::Close => {
+                // Created and closed at once.
+                let until = Instant::now() + o.gone_memory;
+                lock(&self.table).remember(req.cid, until, o.max_carriers);
+                return Answer::flags(0);
             }
-            Lookup::New => {
-                let key = Key::new(&o.psk, &req.cid);
-                let kind = match req.verify(&key) {
-                    Ok(k) => k,
-                    Err(Malformed::Invalid) => return Ok(invalid(key)),
-                    Err(e) => return Err(e),
-                };
-                if kind == Kind::Close {
-                    // Created and closed at once.
-                    let until = Instant::now() + o.gone_memory;
-                    lock(&self.table).remember(req.cid, until, o.max_carriers);
-                    return Ok((key, Answer::flags(0)));
-                }
-                match self.create(req.cid, key.clone(), peer) {
-                    Some(c) => c,
-                    None => return Ok((key, Answer::flags(BUSY))),
-                }
-            }
+            Lookup::New => match self.create(req.cid, key.clone(), peer) {
+                Some(c) => c,
+                None => return Answer::flags(BUSY),
+            },
         };
-        let kind = match req.verify(&carrier.key) {
-            Ok(k) => k,
-            Err(Malformed::Invalid) => {
-                carrier.fail();
-                return Ok(invalid(carrier.key.clone()));
-            }
-            Err(e) => return Err(e),
-        };
-        let answer = carrier.request(kind, req).await;
-        Ok((carrier.key.clone(), answer))
+        carrier.request(kind, req).await
     }
 
     /// The carrier `cid`: a new one handed to the listener, or the one
-    /// another request just made; `None` beyond the limit.
+    /// another request just made; `None` beyond the limit, or when the
+    /// listener refuses it (its source has its share of pending carriers,
+    /// [`zmux::ListenerConfig::max_pending_per_source`]).
     fn create(
         self: &Arc<Self>,
         cid: CarrierId,
         key: Key,
-        peer: Option<IpAddr>,
+        peer: Option<(SocketAddr, SocketAddr)>,
     ) -> Option<Arc<Carrier>> {
         let o = &self.options;
         let carrier = {
@@ -328,16 +391,45 @@ impl Shared {
             .with_abort({
                 let c = carrier.clone();
                 move || c.fail()
-            });
-        let hint = peer.map(PipeHint::from_addr).unwrap_or_default();
+            })
+            .with_carrier(zmux::CarrierKind::Exchange);
+        let hint = match peer {
+            Some((peer, source)) => PipeHint::from_peer(peer).with_source(source),
+            None => PipeHint::default(),
+        };
         let l = self.listener.clone();
-        tokio::spawn(async move {
-            let _ = l.handle_pipe(io, hint).await;
-        });
+        let mut handle = Box::pin(async move { l.handle_pipe(io, hint).await });
+        // The listener takes or refuses the carrier on the first poll,
+        // before it waits for anything: a carrier beyond the source's share
+        // of pending carriers (or of a closed listener) is refused now, so
+        // that it holds no state and the request is answered BUSY.
+        let refused = matches!(
+            handle
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(zmux::HandleError::Refused))
+        );
+        if refused {
+            // Not remembered as ended either (the dropped pipe may have
+            // retired it): a refused request consumed nothing.
+            let mut t = lock(&self.table);
+            if t.live.get(&cid).is_some_and(|c| Arc::ptr_eq(c, &carrier)) {
+                t.live.remove(&cid);
+            }
+            if t.gone.remove(&cid).is_some() && t.order.back().is_some_and(|e| e.0 == cid) {
+                t.order.pop_back();
+            }
+            return None;
+        }
+        tokio::spawn(handle);
         tokio::spawn(carrier.clone().watch_idle());
         Some(carrier)
     }
 }
+
+/// What an out-of-order UP piece counts against the uplink store limit
+/// besides its bytes; it bounds how many pieces are held, empty ones too.
+pub(crate) const PIECE_COST: usize = 64;
 
 /// The local parameters a carrier uses.
 #[derive(Clone, Copy)]
@@ -385,6 +477,7 @@ struct State {
     up_next: u64,
     /// Pieces received above `up_next`.
     up_ooo: BTreeMap<u64, Bytes>,
+    /// Their bytes, and PIECE_COST for each.
     up_ooo_bytes: usize,
     up_fin: Option<u64>,
     /// The highest uplink number received.
@@ -501,7 +594,7 @@ impl State {
         let room = if n == self.up_next {
             self.reader_gone || self.queue_bytes < l.up_store
         } else {
-            self.up_ooo_bytes + data.len() <= l.up_store
+            self.up_ooo_bytes + data.len() + PIECE_COST <= l.up_store
         };
         if !room {
             return Ok((Answer::flags(BUSY), Effects::default()));
@@ -515,13 +608,13 @@ impl State {
             self.deliver(data.clone());
             self.up_next += 1;
             while let Some(d) = self.up_ooo.remove(&self.up_next) {
-                self.up_ooo_bytes -= d.len();
+                self.up_ooo_bytes -= d.len() + PIECE_COST;
                 self.deliver(d);
                 self.up_next += 1;
             }
             fx.reader = self.reader.take();
         } else {
-            self.up_ooo_bytes += data.len();
+            self.up_ooo_bytes += data.len() + PIECE_COST;
             self.up_ooo.insert(n, data.clone());
         }
         Ok((Answer::flags(0), fx))
@@ -581,7 +674,7 @@ impl State {
         (Step::Wait(at), none())
     }
 
-    /// Assigns piece `n` (Section 7.3).
+    /// Assigns downlink piece `n`.
     fn assign(&mut self, n: u64, now: Instant, l: &Limits) -> (Piece, Effects) {
         let mut fx = Effects {
             changed: true,
@@ -662,7 +755,7 @@ impl Carrier {
             limits: Limits {
                 hold: o.hold,
                 coalesce: o.coalesce,
-                down_piece: o.down_piece.max(1),
+                down_piece: o.down_piece_size(),
                 down_window: o.down_window.max(1),
                 up_store: o.up_store,
                 idle: o.idle_timeout,
@@ -1004,7 +1097,39 @@ impl Drop for DownWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::collect;
+    use http::StatusCode;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use wire::{Outgoing, Response};
+
+    static NONCES: AtomicU64 = AtomicU64::new(1);
+
+    fn server(o: ExchangeOptions) -> (Listener, ExchangeServer) {
+        let listener = Listener::new(zmux::Config::default(), zmux::ListenerConfig::default());
+        let server = ExchangeServer::new(&listener, o.with_unauthenticated()).unwrap();
+        (listener, server)
+    }
+
+    /// A request of carrier `cid` with this Time and Nonce, and its body.
+    fn request(
+        cid: &CarrierId,
+        kind: Kind,
+        flags: u8,
+        seq: u64,
+        time: u32,
+        nonce: [u8; 8],
+        data: &[u8],
+    ) -> (Outgoing, Request<PipeBody>) {
+        let key = Key::new(b"", cid);
+        let out = Outgoing::new(&key, cid, kind, flags, seq, 0, time, nonce, data);
+        let mut body = BytesMut::from(&out.prefix[..]);
+        body.extend_from_slice(data);
+        let req = Request::post("/zmux/exchange")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(PipeBody::full(body.freeze()))
+            .unwrap();
+        (out, req)
+    }
 
     /// Sends one request of carrier `cid` and returns its verified
     /// response.
@@ -1016,28 +1141,48 @@ mod tests {
         seq: u64,
         data: &'static [u8],
     ) -> Response {
-        let key = Key::new(b"", cid);
-        let out = Outgoing::new(&key, cid, kind, flags, seq, 0, [seq as u8; 8], data);
-        let mut body = BytesMut::from(&out.prefix[..]);
-        body.extend_from_slice(data);
-        let req = Request::post("/zmux/exchange")
-            .body(PipeBody::fixed(body.freeze(), Bytes::new()))
-            .unwrap();
-        let resp = server.handle(req, None).await;
+        let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        let (out, req) = request(cid, kind, flags, seq, wire::unix_time(), nonce, data);
+        let resp = server.handle(req, None).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = collect(resp.into_body(), 1 << 20).await.unwrap().unwrap();
         let r = Response::parse(body).unwrap();
-        assert!(out.verifies(&key, cid, kind, &r));
+        assert!(out.verifies(&Key::new(b"", cid), cid, kind, &r));
         r
     }
 
-    /// An authentic request that breaks Section 3 fails its carrier and is
-    /// answered GONE, as is every later request of that carrier; one of an
-    /// unknown carrier creates nothing.
+    /// The bytes of a body handed back.
+    async fn replayed(req: Request<ReplayBody<PipeBody>>) -> Bytes {
+        collect(req.into_body(), 4 << 20).await.unwrap().unwrap()
+    }
+
+    /// Only an exchange request as the endpoint classifies it is served: a
+    /// POST with a pairing token is an uplink, not an exchange request,
+    /// and goes back to the host with its body untouched.
+    #[tokio::test]
+    async fn requests_of_another_class_go_back_to_the_host() {
+        let (listener, server) = server(ExchangeOptions::default());
+        let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        let (_, req) = request(&[9; 16], Kind::Up, 0, 0, wire::unix_time(), nonce, b"x");
+        let (mut parts, body) = req.into_parts();
+        parts
+            .headers
+            .insert(zmux::PAIR_HEADER, http::HeaderValue::from_static("x"));
+        let back = server
+            .handle(Request::from_parts(parts, body), None)
+            .await
+            .expect_err("not an exchange request");
+        assert!(!replayed(back).await.is_empty());
+        assert_eq!(server.carriers(), 0);
+        listener.close();
+    }
+
+    /// An authentic request that breaks the request rules fails its
+    /// carrier and is answered GONE, as is every later request of that
+    /// carrier; one of an unknown carrier creates nothing.
     #[tokio::test]
     async fn invalid_authentic_requests_fail_the_carrier() {
-        let listener = Listener::new(zmux::Config::default(), zmux::ListenerConfig::default());
-        let server = ExchangeServer::new(&listener, ExchangeOptions::default());
+        let (listener, server) = server(ExchangeOptions::default());
         let cid = [7; 16];
         assert_eq!(send(&server, &cid, Kind::Up, 0, 0, b"x").await.flags, 0);
         assert_eq!(server.carriers(), 1);
@@ -1053,6 +1198,183 @@ mod tests {
         assert_eq!(
             send(&server, &other, Kind::Up, 0x02, 0, b"x").await.flags,
             GONE
+        );
+        assert_eq!(server.carriers(), 0);
+        listener.close();
+    }
+
+    /// Out-of-order UP pieces count PIECE_COST each against the uplink
+    /// store, so empty ones are bounded too; the piece the carrier waits for
+    /// is still taken.
+    #[tokio::test]
+    async fn empty_out_of_order_pieces_are_bounded() {
+        let (listener, server) = server(ExchangeOptions {
+            up_store: 3 * PIECE_COST + 1,
+            ..ExchangeOptions::default()
+        });
+        let cid = [5; 16];
+        for n in 1..=3 {
+            assert_eq!(send(&server, &cid, Kind::Up, 0, n, b"").await.flags, 0);
+        }
+        assert_eq!(send(&server, &cid, Kind::Up, 0, 4, b"").await.flags, BUSY);
+        assert_eq!(send(&server, &cid, Kind::Up, 0, 0, b"").await.flags, 0);
+        assert_eq!(send(&server, &cid, Kind::Up, 0, 4, b"").await.flags, 0);
+        listener.close();
+    }
+
+    /// A new carrier goes through the listener's per-source limit of
+    /// pending carriers: one beyond it is answered BUSY and holds nothing.
+    #[tokio::test]
+    async fn new_carriers_take_the_sources_pending_share() {
+        let mut limits = zmux::ListenerConfig::default();
+        limits.max_pending_per_source = 1;
+        let listener = Listener::new(zmux::Config::default(), limits);
+        let server =
+            ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
+                .unwrap();
+        assert_eq!(send(&server, &[1; 16], Kind::Up, 0, 1, b"").await.flags, 0);
+        assert_eq!(server.carriers(), 1);
+        assert_eq!(
+            send(&server, &[2; 16], Kind::Up, 0, 1, b"").await.flags,
+            BUSY
+        );
+        assert_eq!(server.carriers(), 1);
+        // Not remembered as ended: once the share is free it is served.
+        assert_eq!(
+            send(&server, &[1; 16], Kind::Close, 0, 0, b"").await.flags,
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while send(&server, &[2; 16], Kind::Up, 0, 1, b"").await.flags != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        listener.close();
+    }
+
+    #[test]
+    fn time_window_arithmetic() {
+        let now = 1_000_000;
+        assert_eq!(within_window(now as u32, now, 60), Some(now));
+        assert_eq!(within_window(now as u32 + 60, now, 60), Some(now + 60));
+        assert_eq!(within_window(now as u32 - 60, now, 60), Some(now - 60));
+        assert_eq!(within_window(now as u32 + 61, now, 60), None);
+        assert_eq!(within_window(now as u32 - 61, now, 60), None);
+        // Across 2^32: the clock just past it, the Time just before, and
+        // the reverse.
+        let now = 1 << 32;
+        assert_eq!(within_window(u32::MAX - 9, now, 60), Some(now - 10));
+        assert_eq!(within_window(u32::MAX - 60, now, 60), None);
+        let now = (1 << 32) - 5;
+        assert_eq!(within_window(20, now, 60), Some(now + 25));
+        assert_eq!(within_window(56, now, 60), None);
+        // A Time 2^31 away in either direction.
+        assert_eq!(within_window(0x8000_0000, 0, 0x7fff_ffff), None);
+        assert_eq!(
+            within_window(0x8000_0000, 0, 0x8000_0000),
+            Some(-0x8000_0000)
+        );
+    }
+
+    /// A request whose Time is outside the window, ahead or behind, is
+    /// handed back with its body and creates nothing.
+    #[tokio::test]
+    async fn requests_outside_the_window_are_handed_back() {
+        let (listener, server) =
+            server(ExchangeOptions::default().with_time_window(Duration::from_secs(30)));
+        let now = wire::unix_time();
+        for time in [now.wrapping_add(40), now.wrapping_sub(40)] {
+            let (_, req) = request(&[1; 16], Kind::Up, 0, 0, time, [time as u8; 8], b"hi");
+            let body = http_body::Body::size_hint(req.body()).exact().unwrap();
+            let back = server.handle(req, None).await.unwrap_err();
+            assert_eq!(replayed(back).await.len() as u64, body);
+        }
+        assert_eq!(server.carriers(), 0);
+        let (_, req) = request(&[1; 16], Kind::Up, 0, 0, now.wrapping_add(5), [1; 8], b"hi");
+        assert!(server.handle(req, None).await.is_ok());
+        listener.close();
+    }
+
+    /// A request repeated with the same (Carrier ID, Nonce) is handed back.
+    #[tokio::test]
+    async fn a_repeated_nonce_is_handed_back() {
+        let (listener, server) = server(ExchangeOptions::default());
+        let now = wire::unix_time();
+        let (_, req) = request(&[2; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
+        assert!(server.handle(req, None).await.is_ok());
+        let (_, req) = request(&[2; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
+        let back = server.handle(req, None).await.unwrap_err();
+        assert!(replayed(back).await.ends_with(b"a"));
+        // The same Nonce with another carrier is another pair.
+        let (_, req) = request(&[3; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
+        assert!(server.handle(req, None).await.is_ok());
+        listener.close();
+    }
+
+    /// A request that finds the record full is handed back.
+    #[tokio::test]
+    async fn a_full_record_hands_requests_back() {
+        let (listener, server) = server(ExchangeOptions::default().with_max_recorded(2));
+        let now = wire::unix_time();
+        for n in 0..3u8 {
+            let (_, req) = request(&[4; 16], Kind::Up, 0, n.into(), now, [n; 8], b"a");
+            assert_eq!(server.handle(req, None).await.is_ok(), n < 2, "{n}");
+        }
+        listener.close();
+    }
+
+    /// Requests that are not authenticated are all handed back the same
+    /// way, with what was read of their bodies.
+    #[tokio::test]
+    async fn requests_not_authenticated_are_handed_back() {
+        let (listener, server) = server(ExchangeOptions::default());
+        // Not POST.
+        let req = Request::get("/zmux/exchange")
+            .body(PipeBody::empty())
+            .unwrap();
+        let back = server.handle(req, None).await.unwrap_err();
+        assert_eq!(back.method(), http::Method::GET);
+        assert!(replayed(back).await.is_empty());
+        // Without a Content-Length: nothing read.
+        let req = Request::post("/zmux/exchange")
+            .body(PipeBody::full(Bytes::from_static(b"body")))
+            .unwrap();
+        assert_eq!(
+            &replayed(server.handle(req, None).await.unwrap_err()).await[..],
+            b"body"
+        );
+        // Not a request, read whole.
+        let req = Request::post("/zmux/exchange")
+            .header(header::CONTENT_LENGTH, 4)
+            .body(PipeBody::full(Bytes::from_static(b"body")))
+            .unwrap();
+        assert_eq!(
+            &replayed(server.handle(req, None).await.unwrap_err()).await[..],
+            b"body"
+        );
+        // A MAC that does not verify.
+        let (_, req) = request(&[5; 16], Kind::Up, 0, 0, wire::unix_time(), [1; 8], b"a");
+        let (parts, body) = req.into_parts();
+        let mut bytes = BytesMut::from(&collect(body, 1 << 10).await.unwrap().unwrap()[..]);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        let sent = bytes.freeze();
+        let req = Request::from_parts(parts, PipeBody::full(sent.clone()));
+        assert_eq!(
+            replayed(server.handle(req, None).await.unwrap_err()).await,
+            sent
+        );
+        // Over the body limit: nothing read.
+        let big = Bytes::from(vec![0; MAX_PREFIX + (1 << 20) + 1]);
+        let req = Request::post("/zmux/exchange")
+            .header(header::CONTENT_LENGTH, big.len())
+            .body(PipeBody::full(big.clone()))
+            .unwrap();
+        assert_eq!(
+            replayed(server.handle(req, None).await.unwrap_err()).await,
+            big
         );
         assert_eq!(server.carriers(), 0);
         listener.close();

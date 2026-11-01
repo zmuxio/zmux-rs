@@ -7,9 +7,8 @@ use bytes::Bytes;
 use super::pipes::{Attachment, Classified, FrameIn};
 use super::stream::{self, Offer, RecvPart, RecvState, SendOutcome, SendState, Stream, StreamKey};
 use super::{
-    BIDI, CloseFrame, CoreEvent, DATAGRAM_RECV_BYTES, InState, LaneId, RECV_DATAGRAM_QUEUE,
-    STREAM_DATAGRAM_QUEUE, SessionCore, SessionError, State, UNI, di, dir_of_index, varint,
-    violation,
+    BIDI, CloseFrame, CoreEvent, InState, LaneId, SessionCore, SessionError, State, UNI, di,
+    dir_of_index, varint, violation,
 };
 use crate::proto::frame::{
     ConnectionClose, Dir, Frame, GoAwayFrame, PriorityUpdate, QxPing, ResetStreamAt, StopSending,
@@ -300,6 +299,8 @@ impl SessionCore {
     ) {
         self.budget.refill(now);
         let (pipe, lane) = (self.rx, self.rx_lane);
+        // A frame other than PADDING in the record being read (shaping).
+        let mut framed = false;
         loop {
             let gates = self.receive_gates();
             let event = if retain {
@@ -312,8 +313,18 @@ impl SessionCore {
             self.rx = pipe;
             self.rx_lane = lane;
             let result = match event {
-                Ok(Some(RecordEvent::Frame(f))) => self.on_frame(f, now),
-                Ok(Some(RecordEvent::RecordEnd { len })) => self.on_record_end(len, now),
+                Ok(Some(RecordEvent::Frame(f))) => {
+                    framed |= !matches!(f, Frame::Padding(_));
+                    self.on_frame(f, now)
+                }
+                Ok(Some(RecordEvent::RecordEnd { len })) => {
+                    let r = self.on_record_end(len, now);
+                    if self.shape.is_some() {
+                        self.shape_record_in(pipe, lane as u64, len as usize, !framed);
+                    }
+                    framed = false;
+                    r
+                }
                 Ok(None) => return,
                 Err(e) => Err(e),
             };
@@ -339,7 +350,7 @@ impl SessionCore {
     }
 
     /// The frames the local endpoint accepts now.
-    fn receive_gates(&self) -> Gates {
+    pub(super) fn receive_gates(&self) -> Gates {
         if self.peer_tp.is_some() {
             self.features.receive_gates(
                 self.local_tp().reset_stream_at,
@@ -354,7 +365,7 @@ impl SessionCore {
         }
     }
 
-    fn charge(&mut self) -> Result<(), Error> {
+    pub(super) fn charge(&mut self) -> Result<(), Error> {
         if self.budget.charge() {
             Ok(())
         } else {
@@ -367,46 +378,13 @@ impl SessionCore {
     }
 
     /// Charges a duplicate or outdated frame (NE-3, NE-4, NE-6 to NE-8),
-    /// which multipath sessions never charge (SPEC.md Section 9.4.1).
+    /// which multipath sessions never charge (SPEC.md Section 9.4.1; a
+    /// protocol rule of the mode, kept here).
     fn charge_dup(&mut self) -> Result<(), Error> {
-        if self.mp.is_some() {
+        if self.is_multipath() {
             return Ok(());
         }
         self.charge()
-    }
-
-    fn on_record_end(&mut self, len: u64, now: Instant) -> Result<(), Error> {
-        self.stats.records_received += 1;
-        let (id, li) = (self.rx, self.rx_lane);
-        let Some(p) = self.inp_mut(id) else {
-            return Ok(());
-        };
-        // A leading QX_TRANSPORT_PARAMETERS record on a pipe we joined
-        // confirms nothing, is not counted and is not acknowledged
-        // (MULTIPATH.md Section 5.7 step 3).
-        let Some(padding_only) = p.record_closed(li) else {
-            return Ok(());
-        };
-        if padding_only {
-            // NE-1: a record of PADDING only.
-            self.charge()?;
-        }
-        if self.mp.is_some() {
-            self.mp_record_end(len, now);
-        } else {
-            let mut activity = false;
-            if let Some(p) = self.inp_mut(id) {
-                let (eliciting, act) = p.single_record(li, len);
-                activity = act;
-                self.single_record_end(len, eliciting, now);
-            }
-            // With acknowledgement only a record with an activity frame
-            // counts; without it, every record (SPEC.md Section 6.4).
-            if activity || !self.acknowledged() {
-                self.restart_idle(now);
-            }
-        }
-        Ok(())
     }
 
     fn on_frame(&mut self, frame: Frame<'_>, now: Instant) -> Result<(), Error> {
@@ -440,12 +418,23 @@ impl SessionCore {
             // while.
             self.exchange_at = Some(now);
         }
+        // A CONNECTION_CLOSE on our unconfirmed join answers the join, not
+        // the session (MULTIPATH.md Section 5.7 step 6).
+        if let Frame::ConnectionClose(f) = &frame
+            && id != 0
+            && li == 0
+            && self
+                .att(id)
+                .is_some_and(|a| a.joiner_local() && !a.joined())
+        {
+            self.join_closed(id, f.application, f.error_code, now);
+            return Ok(());
+        }
         let (first, skip) = {
             let Some(p) = self.inp_mut(id) else {
                 return Ok(());
             };
             let leading_tp = leading && matches!(frame, Frame::TransportParameters(_));
-            let padding = matches!(frame, Frame::Padding(_));
             let eliciting = !matches!(
                 frame,
                 Frame::Padding(_) | Frame::PipeAck(_) | Frame::ConnectionClose(_)
@@ -459,7 +448,13 @@ impl SessionCore {
                     | Frame::Datagram(_)
                     | Frame::QxPing(_)
             );
-            match p.frame_in(li, leading_tp, padding, eliciting, activity) {
+            match p.frame_in(
+                li,
+                leading_tp,
+                eliciting,
+                activity,
+                matches!(frame, Frame::PipePing),
+            ) {
                 FrameIn::Discarded => return Ok(()),
                 FrameIn::Process { first, skip_join } => (first && id == 0 && li == 0, skip_join),
             }
@@ -478,7 +473,7 @@ impl SessionCore {
                 | Frame::StopSending(_)
                 | Frame::Datagram(_)
         ) {
-            self.note_traffic(now);
+            self.note_traffic(id, now);
         }
         let ty = frame.frame_type().0;
         if skip && matches!(frame, Frame::PipeJoin(_)) {
@@ -600,19 +595,21 @@ impl SessionCore {
                 ty,
                 "PIPE_LANE not first on a new lane",
             )),
-            Frame::PipeAck(f) if self.mp.is_some() => self.on_pipe_ack(&f, now),
+            // Protocol rule: the pipe layer's frames are those of a feature
+            // not in use outside multipath.
+            Frame::PipeAck(f) if self.is_multipath() => self.on_pipe_ack(&f, now),
             Frame::PipeAck(f) if self.pipe_ack.is_some() => self.on_single_pipe_ack(&f, now),
-            Frame::PipePing if self.mp.is_some() => {
+            Frame::PipePing if self.is_multipath() => {
                 if let Some(p) = self.inp_mut(id) {
                     p.ping_in(li);
                 }
                 // NE-2.
                 self.charge()
             }
-            Frame::PipeAbandon(f) if self.mp.is_some() => {
+            Frame::PipeAbandon(f) if self.is_multipath() => {
                 self.on_pipe_abandon(f.pipe_id, f.error_code, now)
             }
-            Frame::PipeStatus(f) if self.mp.is_some() => self.on_pipe_status(
+            Frame::PipeStatus(f) if self.is_multipath() => self.on_pipe_status(
                 f.pipe_id,
                 f.sequence,
                 f.status == crate::proto::frame::PipeStatusValue::Standby,
@@ -695,6 +692,10 @@ impl SessionCore {
                 }
             }
         }
+        if dir == Dir::Bidi {
+            // Datagrams that overtook the opening frames.
+            self.release_waiting();
+        }
         Ok(Lookup::Stream {
             key: key.unwrap_or(StreamKey {
                 slot: 0,
@@ -724,6 +725,9 @@ impl SessionCore {
             }
         }
         self.stats.streams_opened_remote += 1;
+        if self.shape.is_some() || self.shape_pending.is_some() {
+            self.shape_stream(super::shaping::EventKind::StreamOpen, id);
+        }
         self.streams.insert_peer(id, di(dir), s)
     }
 
@@ -760,6 +764,7 @@ impl SessionCore {
         let mp = self.mp.is_some();
         // Single pipe: data arrives in order, without gaps or repeats
         // (SPEC.md Section 7.3). Multipath: any order, duplicates allowed.
+        // Protocol rule.
         if !mp && offset != r.received && (len > 0 || offset > r.received) {
             return Err(
                 violation(T::PROTOCOL_VIOLATION, ty, "STREAM data out of order")
@@ -942,7 +947,7 @@ impl SessionCore {
                 self.recv_refs.holders.push(key);
             }
             let dup = keep as u64 - buffered;
-            self.stats.bytes_duplicate += dup;
+            self.stats.bytes_duplicate_received += dup;
             if dup > 0
                 && let Some(p) = self.atts.get_mut(self.rx).and_then(Attachment::inp_mut)
             {
@@ -1178,9 +1183,7 @@ impl SessionCore {
                 }
                 let freed = before - send.unacked();
                 self.streams.drop_unsent(unsent);
-                if let Some(mp) = self.mp.as_deref_mut() {
-                    mp.release(freed);
-                }
+                self.release_retained(freed);
                 self.unschedule(key);
                 self.streams.queue_ctrl(key);
             }
@@ -1195,7 +1198,7 @@ impl SessionCore {
             Lookup::Stream { key, .. } => key,
             Lookup::Discarded => return Ok(()),
         };
-        let mp = self.mp.is_some();
+        let mp = self.per_pipe();
         let Some(send) = self.streams.send_mut(key) else {
             return Ok(());
         };
@@ -1338,9 +1341,7 @@ impl SessionCore {
                 self.ping.rttvar = Some(rttvar);
                 self.single_ping_sample(sample, now);
                 self.srtt = Some(srtt);
-                if self.mp.is_none() {
-                    self.quality_sample(0, now);
-                }
+                self.session_rtt_sampled(now);
                 self.ping.answered += 1;
                 self.ping.latest = Some(sample);
                 self.events
@@ -1358,7 +1359,7 @@ impl SessionCore {
             return Ok(());
         }
         if self.ping.peer_request.is_some_and(|r| p.sequence <= r) {
-            if self.mp.is_some() {
+            if self.is_multipath() {
                 // Stale: it crossed a later request on another pipe. Ignored,
                 // neither answered nor charged (SPEC.md Sections 4.5, 9.4.1).
                 return Ok(());
@@ -1389,10 +1390,8 @@ impl SessionCore {
         }
         if self.state == State::Active {
             self.state = State::Draining;
-        } else if self.state == State::Suspended
-            && let Some(mp) = self.mp.as_deref_mut()
-        {
-            mp.suspension_mut().drain_after();
+        } else if self.state == State::Suspended {
+            self.drain_after_suspension();
         }
         self.events.push_back(CoreEvent::GoAway {
             max_bidi: self.streams.local_dir(BIDI).goaway.unwrap_or(g.max_bidi),
@@ -1440,24 +1439,22 @@ impl SessionCore {
                 };
                 // Never processed by the peer (EXTENSIONS.md Section 3.4).
                 s.goaway = Some(stream::GoAwayFail::Rejected);
-                let mut unsent = 0;
+                let (mut unsent, mut freed) = (0, 0);
                 if let Some(send) = s.send.as_mut() {
                     unsent = send.buf.len();
-                    let freed = send.unacked();
+                    freed = send.unacked();
                     send.buf.clear();
                     if let Some(m) = send.mp.as_deref_mut() {
                         m.lost.clear();
                         m.fin_lost = false;
                     }
                     send.state = SendState::ResetRecvd;
-                    if let Some(mp) = self.mp.as_deref_mut() {
-                        mp.release(freed);
-                    }
                 }
                 if let Some(r) = s.recv.as_mut() {
                     r.state = RecvState::ResetRead;
                 }
                 self.streams.drop_unsent(unsent);
+                self.release_retained(freed);
                 self.unschedule(k);
                 self.notify_readable(k);
                 self.notify_writable(k);
@@ -1475,17 +1472,21 @@ impl SessionCore {
         Ok(())
     }
 
-    fn on_datagram(&mut self, d: crate::proto::frame::Datagram<'_>, ty: u64) -> Result<(), Error> {
+    pub(super) fn on_datagram(
+        &mut self,
+        d: crate::proto::frame::Datagram<'_>,
+        ty: u64,
+    ) -> Result<(), Error> {
         self.stats.datagrams_received += 1;
         if !self.features.datagram_flows {
-            self.datagram_arrived(None, d.data);
+            self.datagram_arrived(None, Bytes::copy_from_slice(d.data));
             return Ok(());
         }
         let (flow, payload) =
             Flow::parse(d.data).map_err(|e| Error::new(e.code(), ty, e.reason()))?;
         match flow {
             Flow::Session => {
-                self.datagram_arrived(None, payload);
+                self.datagram_arrived(None, Bytes::copy_from_slice(payload));
                 Ok(())
             }
             Flow::Stream { stream_id, context } => {
@@ -1506,22 +1507,140 @@ impl SessionCore {
                         ty,
                         "datagram for a stream beyond the limit",
                     ));
+                } else if index >= self.streams.remote_dir(BIDI).opened {
+                    // It overtook the stream's opening frame (EXTENSIONS.md
+                    // Sections 6.4 and 6.8): held for at most one smoothed
+                    // RTT.
+                    // Counted as received once delivered.
+                    self.stats.datagrams_received -= 1;
+                    self.hold_datagram(stream_id, context, Bytes::copy_from_slice(payload));
+                    return Ok(());
                 }
-                let key = self.streams.key_of(stream_id);
-                let usable = key.and_then(|k| self.streams.get(k)).is_some_and(|s| {
-                    !s.released && !s.parts_terminal() && s.offer != Offer::Rejected
-                });
-                match key {
-                    Some(k) if usable => {
-                        if let Some(s) = self.streams.get_mut(k) {
-                            s.datagrams_mut().counts.received += 1;
-                        }
-                        self.datagram_arrived(Some((k, context)), payload);
-                    }
-                    _ => self.count_dropped(1),
-                }
+                self.stream_datagram_arrived(stream_id, context, Bytes::copy_from_slice(payload));
                 Ok(())
             }
+        }
+    }
+
+    /// A datagram for the opened stream `stream_id`: to its queue when the
+    /// stream is usable, else dropped and counted.
+    fn stream_datagram_arrived(&mut self, stream_id: u64, context: u64, data: Bytes) {
+        let key = self.streams.key_of(stream_id);
+        let usable = key
+            .and_then(|k| self.streams.get(k))
+            .is_some_and(|s| !s.released && !s.parts_terminal() && s.offer != Offer::Rejected);
+        match key {
+            Some(k) if usable => {
+                if let Some(s) = self.streams.get_mut(k) {
+                    s.datagrams_mut().counts.received += 1;
+                }
+                self.datagram_arrived(Some((k, context)), data);
+            }
+            _ => self.count_dropped(1),
+        }
+    }
+
+    /// Holds a datagram for the peer stream `stream_id`, within the limit
+    /// and not opened yet, until it opens or one smoothed RTT passed; it
+    /// counts in the session's datagram bytes, where the oldest held ones
+    /// make room first.
+    fn hold_datagram(&mut self, stream_id: u64, context: u64, data: Bytes) {
+        let recv_bytes_cap = self.config.datagram_receive_bytes;
+        let cost = data.len() + super::WAITING_COST;
+        self.trim_waiting(cost);
+        let d = self.dgram_mut();
+        if d.recv_bytes + d.held_bytes + cost > recv_bytes_cap {
+            self.count_dropped(1);
+            return;
+        }
+        let channel = self.rx_channel;
+        let mut until = self.now + self.rtt_or_default();
+        let d = self.dgram_mut();
+        d.recv_bytes += cost;
+        // Not past the one held before it: they expire in arrival order,
+        // so that the deadline and the expiry take the oldest only.
+        if let Some(last) = d.waiting.back() {
+            until = until.max(last.until);
+        }
+        d.waiting.push_back(super::WaitingDatagram {
+            stream_id,
+            context,
+            data,
+            until,
+            channel,
+        });
+    }
+
+    /// Drops the oldest datagrams held for streams not opened yet until
+    /// `len` more bytes fit in the session's datagram bytes.
+    fn trim_waiting(&mut self, len: usize) {
+        let recv_bytes_cap = self.config.datagram_receive_bytes;
+        let mut dropped = 0;
+        let d = self.dgram_mut();
+        while d.recv_bytes + d.held_bytes + len > recv_bytes_cap
+            && let Some(old) = d.waiting.pop_front()
+        {
+            d.recv_bytes -= old.cost();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            self.count_dropped(dropped);
+        }
+    }
+
+    /// Delivers the datagrams held for peer streams that opened, in
+    /// arrival order.
+    fn release_waiting(&mut self) {
+        let opened = self.streams.remote_dir(BIDI).opened;
+        let Some(d) = self.dgram.as_deref_mut() else {
+            return;
+        };
+        if !d
+            .waiting
+            .iter()
+            .any(|w| stream::index(w.stream_id) < opened)
+        {
+            return;
+        }
+        let all = std::mem::take(&mut d.waiting);
+        let mut ready = Vec::new();
+        for w in all {
+            if stream::index(w.stream_id) < opened {
+                d.recv_bytes -= w.cost();
+                ready.push(w);
+            } else {
+                d.waiting.push_back(w);
+            }
+        }
+        for w in ready {
+            self.stats.datagrams_received += 1;
+            if w.channel {
+                self.stats.datagrams_received_channel += 1;
+            }
+            self.stream_datagram_arrived(w.stream_id, w.context, w.data);
+        }
+    }
+
+    /// When the first datagram held for a stream not opened yet expires.
+    pub(super) fn waiting_deadline(&self) -> Option<Instant> {
+        self.dgram().waiting.front().map(|w| w.until)
+    }
+
+    /// Drops the held datagrams whose stream did not open within one
+    /// smoothed RTT.
+    pub(super) fn expire_waiting(&mut self, now: Instant) {
+        let mut dropped = 0;
+        if let Some(d) = self.dgram.as_deref_mut() {
+            while let Some(w) = d.waiting.front()
+                && w.until <= now
+            {
+                d.recv_bytes -= w.cost();
+                d.waiting.pop_front();
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            self.count_dropped(dropped);
         }
     }
 
@@ -1533,8 +1652,9 @@ impl SessionCore {
     /// or queued, counts in the session's datagram bytes (EXTENSIONS.md
     /// Section 6.5): the oldest waiting ones make room, and one that still
     /// does not fit is dropped.
-    fn datagram_arrived(&mut self, stream: Option<(StreamKey, u64)>, payload: &[u8]) {
-        let data = Bytes::copy_from_slice(payload);
+    fn datagram_arrived(&mut self, stream: Option<(StreamKey, u64)>, data: Bytes) {
+        let recv_bytes_cap = self.config.datagram_receive_bytes;
+        self.trim_waiting(data.len());
         if self.config.datagram_limiter.receive.is_none() {
             self.queue_received_datagram(stream, data);
             return;
@@ -1543,7 +1663,7 @@ impl SessionCore {
         let mut dropped = Vec::new();
         {
             let d = self.dgram_mut();
-            while d.held_bytes + d.recv_bytes + len > DATAGRAM_RECV_BYTES
+            while d.held_bytes + d.recv_bytes + len > recv_bytes_cap
                 && let Some(old) = d.held.pop_front()
             {
                 d.held_bytes -= old.data.len();
@@ -1554,7 +1674,7 @@ impl SessionCore {
             self.drop_received_datagram(old);
         }
         let d = self.dgram_mut();
-        if d.held_bytes + d.recv_bytes + len > DATAGRAM_RECV_BYTES {
+        if d.held_bytes + d.recv_bytes + len > recv_bytes_cap {
             self.drop_received_datagram(stream);
             return;
         }
@@ -1590,16 +1710,18 @@ impl SessionCore {
     /// (128 at most); one that still does not fit within the session's
     /// datagram bytes is dropped.
     fn queue_session_datagram(&mut self, data: Bytes) {
+        let recv_queue = self.config.datagram_receive_queue;
+        let recv_bytes_cap = self.config.datagram_receive_bytes;
         let mut dropped = 0;
         let held = self.dgram_mut().held_bytes;
-        while (self.dgram_mut().recv.len() >= RECV_DATAGRAM_QUEUE
-            || self.dgram_mut().recv_bytes + held + data.len() > DATAGRAM_RECV_BYTES)
+        while (self.dgram_mut().recv.len() >= recv_queue
+            || self.dgram_mut().recv_bytes + held + data.len() > recv_bytes_cap)
             && let Some(old) = self.dgram_mut().recv.pop_front()
         {
             self.dgram_mut().recv_bytes -= old.len();
             dropped += 1;
         }
-        if self.dgram_mut().recv_bytes + held + data.len() > DATAGRAM_RECV_BYTES {
+        if self.dgram_mut().recv_bytes + held + data.len() > recv_bytes_cap {
             // Stream queues hold the bytes: drop the new one.
             self.count_dropped(dropped + 1);
             return;
@@ -1619,6 +1741,8 @@ impl SessionCore {
     /// (32 at most); one that still does not fit within the session's
     /// datagram bytes is dropped, so every queue together stays bounded.
     fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) {
+        let stream_queue = self.config.datagram_stream_queue;
+        let recv_bytes_cap = self.config.datagram_receive_bytes;
         let mut dropped = 0;
         let len = data.len();
         let Some(s) = self.streams.get_mut(key) else {
@@ -1627,14 +1751,13 @@ impl SessionCore {
         let s = s.datagrams_mut();
         let dgram = self.dgram.get_or_insert_with(Box::default);
         let held = dgram.held_bytes;
-        while (s.queue.len() >= STREAM_DATAGRAM_QUEUE
-            || dgram.recv_bytes + held + len > DATAGRAM_RECV_BYTES)
+        while (s.queue.len() >= stream_queue || dgram.recv_bytes + held + len > recv_bytes_cap)
             && let Some((_, old)) = s.queue.pop_front()
         {
             dgram.recv_bytes -= old.len();
             dropped += 1;
         }
-        if dgram.recv_bytes + held + len > DATAGRAM_RECV_BYTES {
+        if dgram.recv_bytes + held + len > recv_bytes_cap {
             s.counts.dropped_recv += dropped + 1;
             self.count_dropped(dropped + 1);
             return;

@@ -824,13 +824,6 @@ impl Streams {
         self.clear_queued(key);
     }
 
-    /// Takes `key`, the first part of level `u` (just picked), out of the
-    /// queue.
-    pub(super) fn dequeue_first(&mut self, u: usize, key: StreamKey) {
-        debug_assert_eq!(self.sched.level(u).front(), Some(&key));
-        self.dequeue_at(u, 0);
-    }
-
     /// Queues a stream for its control frames.
     pub(super) fn queue_ctrl(&mut self, key: StreamKey) {
         if let Some(s) = self.slab.get_mut(key)

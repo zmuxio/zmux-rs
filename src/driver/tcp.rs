@@ -7,8 +7,9 @@
 //!   Darwin reports only a smoothed RTT in milliseconds, which the spec
 //!   forbids: none there, and the core measures the credit loop instead;
 //! - the carrier's unsent bytes (Linux `tcpi_notsent_bytes`, from the same
-//!   query), which the multipath write-stall rule uses (MULTIPATH.md
-//!   Section 7.1);
+//!   query), reported through the carrier's unsent query
+//!   ([`TcpSocket::unsent_query`], [`super::unsent::UnsentQuery`]) like any
+//!   adapter's;
 //! - `TCP_NOTSENT_LOWAT` (Linux, Android, Apple platforms), set from the
 //!   core's wanted value by a [`Probe`].
 //!
@@ -109,6 +110,87 @@ impl TcpSocket {
         None
     }
 
+    /// The carrier's unsent-count query of this socket, where the platform
+    /// reports one (Linux, Android: `tcpi_notsent_bytes`).
+    pub(crate) fn unsent_query(&self) -> Option<super::unsent::Unsent> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let s = self.clone();
+            Some(Box::new(move || s.info().unsent))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        None
+    }
+
+    /// The carrier's retransmission-count query of this socket, where the
+    /// platform reports one: Linux and Android `tcpi_bytes_retrans` (Linux
+    /// 4.19 and later), Apple platforms `tcpi_txretransmitbytes`, Windows
+    /// `BytesRetrans` of `SIO_TCP_INFO` (32 bits, widened here: a count
+    /// queried less than 4 GiB of retransmissions apart).
+    pub(crate) fn retransmitted_query(&self) -> Option<super::unsent::Unsent> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            let s = self.clone();
+            Some(Box::new(move || s.retransmitted()))
+        }
+        #[cfg(windows)]
+        {
+            let s = self.clone();
+            let widened = std::sync::atomic::AtomicU64::new(0);
+            Some(Box::new(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let n = s.retransmitted()?;
+                let prev = widened.load(Relaxed);
+                let mut v = (prev & !0xffff_ffff) | n;
+                if v < prev {
+                    v += 1 << 32;
+                }
+                widened.store(v, Relaxed);
+                Some(v)
+            }))
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )))]
+        None
+    }
+
+    /// The bytes the socket retransmitted (one system call), where the
+    /// platform reports them.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    fn retransmitted(&self) -> Option<u64> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+            linux::retransmitted(self.socket.as_raw_fd())
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut buf = [0u8; APPLE_TXRETRANSMITBYTES + 8];
+            let len = getsockopt(
+                self.socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                APPLE_TCP_CONNECTION_INFO,
+                &mut buf,
+            )?;
+            field64(&buf, len, APPLE_TXRETRANSMITBYTES)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            windows::retransmitted(self.socket.as_raw_socket())
+        }
+    }
+
     /// Limits the unsent bytes the kernel queues for the socket: it is
     /// writable only below `bytes`. Whether it was set.
     pub(crate) fn set_notsent_lowat(&self, bytes: u64) -> bool {
@@ -173,12 +255,6 @@ impl Probe {
         }
     }
 
-    /// When the next query is due.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
-    pub(crate) fn next_query(&self) -> Instant {
-        self.next
-    }
-
     /// Step 1, without any lock: queries the socket when due; whether it
     /// did.
     pub(crate) fn query(&mut self, now: Instant) -> bool {
@@ -190,19 +266,17 @@ impl Probe {
         true
     }
 
-    /// Step 2, under the core lock: the carrier's minimum RTT and unsent
-    /// bytes go to the core (per pipe in a multipath session), and the
-    /// wanted low-water mark is read. Nothing when no query is pending.
-    pub(crate) fn feed(&mut self, core: &mut Core, pipe: PipeId, now: Instant) {
+    /// Step 2, under the core lock: the carrier's minimum RTT goes to the
+    /// core (per pipe in a multipath session), and the wanted low-water
+    /// mark is read. Nothing when no query is pending. (The unsent bytes
+    /// go through the carrier's unsent query.)
+    pub(crate) fn feed(&mut self, core: &mut Core, pipe: PipeId) {
         let Some(info) = self.info.take() else {
             return;
         };
         if core.is_multipath() {
             if let Some(rtt) = info.min_rtt {
                 core.set_pipe_carrier_rtt(pipe, Some(rtt));
-            }
-            if let Some(unsent) = info.unsent {
-                core.set_pipe_unsent(pipe, unsent, now);
             }
         } else if let Some(rtt) = info.min_rtt {
             core.set_carrier_rtt(Some(rtt));
@@ -278,6 +352,20 @@ fn field(buf: &[u8], len: usize, off: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(b.try_into().ok()?))
 }
 
+/// A native-endian u64 at `off`, when the kernel wrote all of it.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn field64(buf: &[u8], len: usize, off: usize) -> Option<u64> {
+    let b = buf.get(off..off + 8).filter(|_| len >= off + 8)?;
+    Some(u64::from_ne_bytes(b.try_into().ok()?))
+}
+
+/// `TCP_CONNECTION_INFO` (`<netinet/tcp.h>`), and the offset of
+/// `tcpi_txretransmitbytes` in its `struct tcp_connection_info`.
+#[cfg(target_vendor = "apple")]
+const APPLE_TCP_CONNECTION_INFO: libc::c_int = 0x106;
+#[cfg(target_vendor = "apple")]
+const APPLE_TXRETRANSMITBYTES: usize = 72;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use std::time::Duration;
@@ -301,6 +389,15 @@ mod linux {
             .map(|us| Duration::from_micros(u64::from(us)));
         let unsent = field(&buf, len, NOTSENT_BYTES).map(u64::from);
         TcpInfo { min_rtt, unsent }
+    }
+
+    /// The offset of `tcpi_bytes_retrans` (u64, Linux 4.19 and later).
+    pub(super) const BYTES_RETRANS: usize = 208;
+
+    pub(super) fn retransmitted(fd: std::os::fd::RawFd) -> Option<u64> {
+        let mut buf = [0u8; BYTES_RETRANS + 8];
+        let len = getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut buf)?;
+        super::field64(&buf, len, BYTES_RETRANS)
     }
 }
 
@@ -370,16 +467,34 @@ mod windows {
         ) -> i32;
     }
 
+    pub(super) fn retransmitted(socket: std::os::windows::io::RawSocket) -> Option<u64> {
+        let (out, returned) = query(socket)?;
+        let end = std::mem::offset_of!(TcpInfoV0, bytes_retrans) + 4;
+        ((returned as usize) >= end).then_some(u64::from(out.bytes_retrans))
+    }
+
     pub(super) fn info(socket: std::os::windows::io::RawSocket) -> TcpInfo {
-        let Ok(s) = usize::try_from(socket) else {
+        let Some((out, returned)) = query(socket) else {
             return TcpInfo::default();
         };
+        let min_rtt_end = std::mem::offset_of!(TcpInfoV0, min_rtt_us) + 4;
+        if (returned as usize) < min_rtt_end {
+            return TcpInfo::default();
+        }
+        let us = out.min_rtt_us;
+        TcpInfo {
+            min_rtt: (us > 0 && us != u32::MAX).then(|| Duration::from_micros(u64::from(us))),
+            unsent: None,
+        }
+    }
+
+    /// `SIO_TCP_INFO` version 0, and the bytes it wrote.
+    fn query(socket: std::os::windows::io::RawSocket) -> Option<(TcpInfoV0, u32)> {
+        let s = usize::try_from(socket).ok()?;
         let version: u32 = 0;
         let mut out = TcpInfoV0::default();
         let mut returned: u32 = 0;
-        let Ok(out_len) = u32::try_from(std::mem::size_of::<TcpInfoV0>()) else {
-            return TcpInfo::default();
-        };
+        let out_len = u32::try_from(std::mem::size_of::<TcpInfoV0>()).ok()?;
         // SAFETY: the input is a valid u32 of 4 bytes that the call only
         // reads; the output is a valid, writable `TCP_INFO_v0` of `out_len`
         // bytes (every bit pattern is valid for its integer fields), which
@@ -399,15 +514,7 @@ mod windows {
                 std::ptr::null_mut(),
             )
         };
-        let min_rtt_end = std::mem::offset_of!(TcpInfoV0, min_rtt_us) + 4;
-        if r != 0 || (returned as usize) < min_rtt_end {
-            return TcpInfo::default();
-        }
-        let us = out.min_rtt_us;
-        TcpInfo {
-            min_rtt: (us > 0 && us != u32::MAX).then(|| Duration::from_micros(u64::from(us))),
-            unsent: None,
-        }
+        (r == 0).then_some((out, returned))
     }
 
     #[cfg(test)]
@@ -416,6 +523,7 @@ mod windows {
         assert_eq!(std::mem::offset_of!(TcpInfoV0, rtt_us), 20);
         assert_eq!(std::mem::offset_of!(TcpInfoV0, min_rtt_us), 24);
         assert_eq!(std::mem::offset_of!(TcpInfoV0, bytes_out), 48);
+        assert_eq!(std::mem::offset_of!(TcpInfoV0, bytes_retrans), 68);
         assert_eq!(std::mem::size_of::<TcpInfoV0>(), 88);
     }
 }
@@ -458,6 +566,14 @@ mod tests {
             assert_eq!(info.unsent, Some(0));
         } else {
             assert_eq!(info.unsent, None);
+        }
+        // Loopback retransmits nothing.
+        let retrans = s.retransmitted_query().and_then(|q| q());
+        if cfg!(any(target_vendor = "apple", windows)) {
+            assert_eq!(retrans, Some(0));
+        } else if cfg!(any(target_os = "linux", target_os = "android")) {
+            // Older kernels (before 4.19) have no count.
+            assert!(retrans.is_none_or(|n| n == 0), "{retrans:?}");
         }
     }
 

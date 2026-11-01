@@ -63,7 +63,7 @@ struct Sim {
 fn config(multipath: bool, rng: &mut Rng) -> Config {
     let mut c = Config::default();
     c.enable_datagrams = true;
-    c.max_idle_timeout = Duration::from_secs(5);
+    c.max_idle_timeout = Some(Duration::from_secs(5));
     c.max_incoming_streams = 4 + rng.below(5);
     c.max_incoming_uni_streams = Some(1 + rng.below(8));
     if rng.below(2) == 0 {

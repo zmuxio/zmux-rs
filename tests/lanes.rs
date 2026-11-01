@@ -19,7 +19,7 @@ use zmux::proto::session::{
     TransmitBuf,
 };
 
-const P0: PipeId = PipeId(0);
+const P0: PipeId = PipeId::new(0);
 
 /// Two cores on pipe 0, each opening lanes toward the other as its core
 /// asks; the "driver" here hands every lane to the other side at once and
@@ -35,6 +35,8 @@ struct LanePair {
     lanes_a: Vec<u64>,
     lanes_b: Vec<u64>,
     reverse: bool,
+    /// The length of the first batch A wrote on each lane but lane 0.
+    first_a: std::collections::HashMap<u64, usize>,
     /// Refuse every lane the sides open (an intermediary that splits the
     /// connection).
     refuse: bool,
@@ -59,6 +61,7 @@ impl LanePair {
             lanes_a: Vec::new(),
             lanes_b: Vec::new(),
             reverse: true,
+            first_a: std::collections::HashMap::new(),
             refuse: false,
         };
         p.run(Duration::from_millis(100));
@@ -85,7 +88,7 @@ impl LanePair {
                         to.accept_lane(l, Framing::ByteStream, self.now),
                         LaneAccept::Accepted
                     );
-                    lanes.push(l.lane.0);
+                    lanes.push(l.lane.get());
                 }
             }
         }
@@ -98,6 +101,7 @@ impl LanePair {
         } else {
             (&mut self.b, &mut self.a, &self.lanes_b)
         };
+        let first_a = &mut self.first_a;
         let mut order: Vec<u64> = std::iter::once(0).chain(lanes.iter().copied()).collect();
         if self.reverse {
             order.reverse();
@@ -112,6 +116,9 @@ impl LanePair {
                 }
                 self.wire.clear();
                 self.out.copy_to_vec(&mut self.wire);
+                if a_to_b && lane != 0 {
+                    first_a.entry(lane).or_insert(self.wire.len());
+                }
                 let used = to.receive_in_place(at, &self.wire, self.now);
                 assert_eq!(used, self.wire.len(), "a batch is whole records");
                 moved += self.wire.len();
@@ -271,11 +278,14 @@ fn the_unsent_count_of_a_pipe_is_the_sum_of_its_lanes() {
     }
     assert_eq!(p.lanes_a.len(), 1, "a lane opened");
     let now = p.now;
+    // No count reported: absent, and so is the queue delay.
+    let info = p.a.pipe_info(P0).unwrap();
+    assert_eq!((info.queued_bytes, info.queue_delay), (None, None));
     p.a.set_pipe_unsent(P0, 3000, now);
     p.a.set_pipe_unsent(P0.lane(1), 4000, now);
-    assert_eq!(p.a.pipe_info(P0).unwrap().queued_bytes, 7000);
+    assert_eq!(p.a.pipe_info(P0).unwrap().queued_bytes, Some(7000));
     p.a.set_pipe_unsent(P0.lane(1), 0, now);
-    assert_eq!(p.a.pipe_info(P0).unwrap().queued_bytes, 3000);
+    assert_eq!(p.a.pipe_info(P0).unwrap().queued_bytes, Some(3000));
 }
 
 /// A lane holds no record buffer of its own until a record spans reads:
@@ -341,7 +351,85 @@ fn urgent_data_of_a_single_pipe_tier_is_copied_on_the_copy_lane() {
     assert!(
         info.lanes
             .iter()
-            .any(|l| l.lane.0 > 0 && l.position_acked > Some(23)),
+            .any(|l| l.lane.get() > 0 && l.position_acked > Some(23)),
         "the copies went on a lane: {info:?}"
     );
+}
+
+/// A shaper that delays every record of its pipe and pads it to 400
+/// bytes.
+struct DelayAll;
+
+impl zmux::shaping::Shaper for DelayAll {
+    fn capabilities(&self) -> zmux::shaping::Caps {
+        zmux::shaping::Caps::PLAN
+    }
+
+    fn plan(&mut self, view: &zmux::shaping::RecordView, plan: &mut zmux::shaping::RecordPlan) {
+        let _ = view;
+        plan.delay = Duration::from_millis(5);
+        plan.pad_to = 400;
+    }
+
+    fn on_event(&mut self, _: &zmux::shaping::Event, _: &mut zmux::shaping::Reply) {}
+}
+
+/// MULTIPATH.md Section 5.8: the first record of a lane, PIPE_LANE, is a
+/// record of its pipe: it is planned by the pipe's shaper and waits for
+/// the delay of the pipe's planned record like every other record: it
+/// carries the plan's PADDING.
+#[test]
+fn a_lane_first_record_is_shaped_and_held_with_its_pipe() {
+    let mut p = LanePair::new(Config::default(), Config::default());
+    p.a.set_shaper(Some(std::sync::Arc::new(
+        |_: &zmux::shaping::ShapedPipe| Some(Box::new(DelayAll) as Box<dyn zmux::shaping::Shaper>),
+    )));
+    const STREAMS: usize = 4;
+    const LEN: usize = 128 * 1024;
+    let keys: Vec<StreamKey> = (0..STREAMS).map(|_| p.a.open(Dir::Uni).unwrap()).collect();
+    let data: Vec<Vec<u8>> = (0..STREAMS).map(|i| pattern(i, LEN)).collect();
+    let mut written = [0usize; STREAMS];
+    let mut got: Vec<Vec<u8>> = vec![Vec::new(); STREAMS];
+    let mut peers: [Option<StreamKey>; STREAMS] = [None; STREAMS];
+    let mut done = 0;
+    for _ in 0..40_000 {
+        for i in 0..STREAMS {
+            if written[i] < LEN {
+                let end = (written[i] + 8192).min(LEN);
+                if let Ok(n) = p.a.write(keys[i], &data[i][written[i]..end]) {
+                    written[i] += n;
+                    if written[i] == LEN {
+                        p.a.finish(keys[i]).unwrap();
+                    }
+                }
+            }
+        }
+        p.run(Duration::from_millis(1));
+        while let Ok(Some(k)) = p.b.accept(Dir::Uni) {
+            let id = p.b.peek_stream_id(k).unwrap();
+            peers[(id >> 2) as usize] = Some(k);
+        }
+        for i in 0..STREAMS {
+            if let Some(k) = peers[i]
+                && got[i].len() < LEN
+                && LanePair::read_all(&mut p.b, k, &mut got[i])
+            {
+                done += 1;
+            }
+        }
+        if done == STREAMS {
+            break;
+        }
+    }
+    for i in 0..STREAMS {
+        assert!(got[i] == data[i], "stream {i} arrived whole and in order");
+    }
+    assert!(!p.lanes_a.is_empty(), "no lane opened");
+    for lane in &p.lanes_a {
+        let n = p.first_a[lane];
+        assert!(
+            n >= 400,
+            "lane {lane}'s first record of {n} bytes was not shaped"
+        );
+    }
 }

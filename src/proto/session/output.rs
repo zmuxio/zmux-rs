@@ -1,30 +1,28 @@
 //! The transmit path: control state and stream data become records when a
 //! pipe can take bytes (late binding).
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 
 use super::ledger::Tag;
-use super::pipes::{Attachment, BatchStart, OutPipe};
+use super::pipes::{BatchStart, OutPipe};
 use super::sched::Decision;
-use super::stream::{self, Offer, RecvState, SendPart, SendState, StreamKey};
+use super::stream::{self, RecvState, SendPart, SendState, StreamKey};
 use super::tier::GateInputs;
 use super::transmit::{COPY_THRESHOLD, TransmitBuf};
 use super::{
-    BIDI, CloseFrame, LaneId, SEND_DATAGRAM_QUEUE, SessionCore, State, Transmit, UNI, config, di,
-    dir_of_index, mpath, pipes,
+    BIDI, CloseFrame, LaneId, SessionCore, State, Transmit, UNI, config, di, dir_of_index, mpath,
+    pipes,
 };
 use crate::proto::frame::{
     ConnectionClose, DataBlocked, Frame, GoAwayFrame, MAX_COUNT, MaxData, MaxStreamData,
     MaxStreams, PipeAbandon, PipeLane, PriorityUpdate, QxPing, ResetStream, ResetStreamAt,
     StopSending, StreamDataBlocked, StreamHeader, StreamsBlocked,
 };
-use crate::proto::meter::Count;
 use crate::proto::params::{DEFAULT_MAX_RECORD_SIZE, Role};
-use crate::proto::payload::{AppTlvs, Flow, GreaseTlv, WirePreamble};
+use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
 use crate::proto::record::Framing;
-use crate::proto::varint;
 
 /// The deficit round robin quantum.
 const QUANTUM: i64 = 16 * 1024;
@@ -62,6 +60,149 @@ enum Step {
 /// The batch is full.
 pub(super) struct Full;
 
+/// What a batch's stream data does next ([`Pick::next`]).
+pub(super) enum Next {
+    /// A frame of the direction at this level and index of the queues.
+    Write(usize, usize),
+    /// Nothing more to write: the directions passed over for session credit
+    /// still send what needs none.
+    End,
+    /// The batch's stream data ends here.
+    Stop,
+}
+
+/// How a batch's stream data chooses its directions: the one place where
+/// a single pipe, a lane of it and a multipath pipe differ
+/// ([`SessionCore::write_streams`] writes the frames and handles their
+/// outcome for all three).
+pub(super) trait Pick {
+    /// The next direction to write; may write what goes before its data.
+    fn next(&mut self, c: &mut SessionCore, pipe: u64, w: &mut Records<'_>) -> Next;
+
+    /// The multipath decision the frames are written under.
+    fn decision(&self) -> Option<&Decision> {
+        None
+    }
+
+    /// The direction at `u`, `i` (`key`) is passed over: what is left of
+    /// the session credit is too little for its preamble.
+    fn pass(&mut self, c: &mut SessionCore, u: usize, i: usize, key: StreamKey);
+
+    /// Whether a direction was passed over.
+    fn passed_any(&self) -> bool;
+}
+
+/// A single pipe: the scheduler's turn, round robin within each urgency.
+pub(super) struct SinglePick {
+    /// The pipe may open lanes.
+    pub(super) offered: bool,
+    /// Directions passed over in this round.
+    pub(super) passed: usize,
+}
+
+impl Pick for SinglePick {
+    #[inline]
+    fn next(&mut self, c: &mut SessionCore, pipe: u64, _w: &mut Records<'_>) -> Next {
+        if c.streams.queue().len() <= self.passed {
+            return Next::End;
+        }
+        let Some((u, key)) = c.streams.pick() else {
+            return Next::Stop;
+        };
+        debug_assert_eq!(c.streams.queue().level(u).front(), Some(&key));
+        if self.offered {
+            c.maybe_open_lane(pipe, key);
+        }
+        Next::Write(u, 0)
+    }
+
+    fn pass(&mut self, c: &mut SessionCore, u: usize, _i: usize, _key: StreamKey) {
+        c.streams.move_back(u, 0);
+        self.passed += 1;
+    }
+
+    fn passed_any(&self) -> bool {
+        self.passed > 0
+    }
+}
+
+/// The lane of a single pipe that the batch is for: the directions placed
+/// on it, by urgency and round robin within each.
+pub(super) struct LanePick {
+    pub(super) lane: u64,
+    pub(super) skipped: Vec<StreamKey>,
+}
+
+impl Pick for LanePick {
+    fn next(&mut self, c: &mut SessionCore, pipe: u64, _w: &mut Records<'_>) -> Next {
+        let Some(o) = c.out_ref(pipe) else {
+            return Next::Stop;
+        };
+        let found = (0..8).find_map(|u| {
+            c.streams
+                .queue()
+                .level(u)
+                .iter()
+                .position(|&k| !self.skipped.contains(&k) && c.lane_for(o, k) == self.lane)
+                .map(|i| (u, i))
+        });
+        let Some((u, i)) = found else {
+            return Next::End;
+        };
+        let key = c.streams.queue().level(u)[i];
+        c.maybe_open_lane(pipe, key);
+        Next::Write(u, i)
+    }
+
+    fn pass(&mut self, _c: &mut SessionCore, _u: usize, _i: usize, key: StreamKey) {
+        self.skipped.push(key);
+    }
+
+    fn passed_any(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+}
+
+/// A pipe of a multipath session: the scheduler's decisions, one per chunk
+/// of new data (MULTIPATH.md Section 11). A decision is worked out again
+/// only when its gate or the pipe views changed: the same inputs give the
+/// same decision. The scan of the queues goes on where the last chunk was
+/// taken while nothing before that place was passed over by the decision
+/// (a direction passed over may go after a chunk of another changed what
+/// it depends on, the bindings' loads, the backlog or a round-robin turn).
+struct MpPick<'a> {
+    inputs: &'a mut GateInputs,
+    /// Directions passed over in this batch because what is left of the
+    /// session credit is too little for their preamble: rare, and few.
+    skipped: Vec<StreamKey>,
+    /// The decision of the last chunk, and the pipe views it saw.
+    kept: Option<(Decision, u64)>,
+    /// Where the scan goes on: (level, index).
+    at: (usize, usize),
+}
+
+impl Pick for MpPick<'_> {
+    fn next(&mut self, c: &mut SessionCore, pipe: u64, w: &mut Records<'_>) -> Next {
+        c.next_mp(pipe, self, w)
+    }
+
+    fn decision(&self) -> Option<&Decision> {
+        self.kept.as_ref().map(|(d, _)| d)
+    }
+
+    fn pass(&mut self, _c: &mut SessionCore, u: usize, i: usize, key: StreamKey) {
+        self.skipped.push(key);
+        if self.at == (u, i) {
+            self.at.1 += 1;
+        }
+    }
+
+    // The batch's stream data ends where the decision says.
+    fn passed_any(&self) -> bool {
+        false
+    }
+}
+
 /// What the batch being written logs in a multipath session: the retained
 /// frames with the index of their record in the batch, the records that
 /// carry an activity frame, the PIPE_ABANDON frames it carries; and the
@@ -70,21 +211,21 @@ pub(super) struct Full;
 pub(crate) struct BatchLog {
     /// Frames written in the current batch that are retained, with the
     /// index of their record in the batch.
-    txlog: Vec<(u32, pipes::SentFrame)>,
+    pub(super) txlog: Vec<(u32, pipes::SentFrame)>,
     /// The last entry of `txlog` is new stream data, which a frame that
     /// continues it may extend.
-    txlog_new: bool,
+    pub(super) txlog_new: bool,
     /// The records of the batch that carry an activity frame.
-    txactivity: Vec<u32>,
+    pub(super) txactivity: Vec<u32>,
     /// The current batch holds new stream data: later new data in it is
     /// not the first after an idle period.
-    new_data: bool,
+    pub(super) new_data: bool,
     /// Pipes whose PIPE_ABANDON the current batch carries.
     abandons_sent: Vec<u64>,
     /// Credit frames sent while the window was the bottleneck, with the
     /// pipe that carried them: a copy goes on a second pipe (MULTIPATH.md
     /// Section 6.5).
-    credit_copies: Vec<(mpath::CreditCopy, u64)>,
+    pub(super) credit_copies: Vec<(mpath::CreditCopy, u64)>,
     /// The tier loads of the gates of the batch being written.
     gate_inputs: GateInputs,
 }
@@ -105,77 +246,6 @@ impl BatchLog {
 }
 
 impl SessionCore {
-    /// Whether the driver should write to the pipe (the lane of it) when
-    /// it can.
-    pub fn wants_write(&self, at: impl Into<LaneId>) -> bool {
-        let at = at.into();
-        if at.lane.0 != 0 {
-            return self.lane_wants_write(at.pipe.0, at.lane.0);
-        }
-        let id = at.pipe.0;
-        let Some(a) = self.att(id) else {
-            return false;
-        };
-        let Some(o) = a.out() else {
-            return false;
-        };
-        if o.writes_ended() || self.state == State::Closed {
-            return false;
-        }
-        if o.leading_frames_owed() {
-            return true;
-        }
-        if self.state == State::Closing {
-            // An orderly close that waits for the other lanes writes only
-            // the PIPE_ACK due meanwhile.
-            return !self.close_waiting() || self.single_pipe_ack_due(self.now);
-        }
-        if o.shutdown_pending() {
-            // Drained, or failed: the write side is to be closed.
-            return true;
-        }
-        if self.state == State::Establishing {
-            // Early data under the floor (SPEC.md Section 6.1.2).
-            return self.early_open() && id == 0 && (self.opening_ready() || self.data_pending());
-        }
-        if self.mp.is_none() {
-            return self.control_pending()
-                || self.opening_ready()
-                || self.data_pending()
-                || self.single_pipe_ack_due(self.now);
-        }
-        if !o.is_live() {
-            return false;
-        }
-        let now = self.now;
-        if a.abandon_owed(true) || self.wants_pipe_ack(id, now) || self.ping_due(id, now) {
-            return true;
-        }
-        let control = self.control_pipe(None) == Some(id);
-        if control && (self.control_pending() || self.mp_control_pending()) {
-            return true;
-        }
-        if control && o.takes_new_data() && self.opening_ready() {
-            return true;
-        }
-        if o.state() == pipes::OutState::Active
-            && self
-                .dgram()
-                .send
-                .iter()
-                .any(|(f, _)| self.datagram_pipe(*f) == Some(id))
-        {
-            return true;
-        }
-        // Stream data before the opportunistic copies, which cost more to
-        // look for and matter only while flow control holds data back.
-        // Both are paced: a held pipe waits for
-        // its release.
-        self.data_for_pipe(id)
-            || (!o.limiter_held()
-                && (self.copies_queued(id, 0) || self.opp_due(id, now, None).is_some()))
-    }
-
     /// Whether any pipe has something to write (drivers wake their writers
     /// on it).
     pub fn wants_write_any(&self) -> bool {
@@ -190,7 +260,7 @@ impl SessionCore {
     }
 
     /// Control frames of the session or its streams are pending.
-    fn control_pending(&self) -> bool {
+    pub(super) fn control_pending(&self) -> bool {
         self.ping.response_pending.is_some()
             || (self.ping.request_pending && self.ping.outstanding.is_none())
             || self.streams.control_pending()
@@ -200,22 +270,13 @@ impl SessionCore {
                 .dgram()
                 .send
                 .iter()
-                .any(|(f, _)| self.datagram_pipe(*f).is_none())
+                .any(|(f, d)| self.datagram_pipe(*f).is_none() && !self.channel_takes(*f, d.len()))
     }
 
     /// A credit update (MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA) waits:
     /// a PIPE_ACK goes in the same batch (MULTIPATH.md Section 6.3).
     pub(super) fn credit_update_pending(&self) -> bool {
         self.streams.credit_update_pending()
-    }
-
-    /// Pipe-layer control frames are pending (PIPE_ABANDON, PIPE_STATUS).
-    fn mp_control_pending(&self) -> bool {
-        self.mp.is_some()
-            && self
-                .atts
-                .iter()
-                .any(|a| a.abandon_owed(false) || (a.tier().status_owed() && !a.joining_local()))
     }
 
     /// Whether latency-sensitive work waits for pipe `id`'s next write
@@ -240,11 +301,7 @@ impl SessionCore {
         let Some(at) = self.exchange_at else {
             return false;
         };
-        let rtt_min = if self.mp.is_some() {
-            self.pipe_min_rtt(id)
-        } else {
-            self.carrier_rtt.or(self.loop_min.get())
-        };
+        let rtt_min = self.rtt_min(id);
         let window = self
             .config
             .latency_budget
@@ -281,7 +338,7 @@ impl SessionCore {
 
     /// Stream data is ready for lane 0 of the single pipe, and the limiter
     /// lets it go.
-    fn data_pending(&self) -> bool {
+    pub(super) fn data_pending(&self) -> bool {
         self.data_waiting()
             && self.out_ref(0).is_none_or(|o| {
                 !o.limiter_held() && (o.lanes().is_none() || self.data_for_lane(o, 0, 0))
@@ -295,7 +352,7 @@ impl SessionCore {
 
     /// Whether a scheduled stream has data for pipe `id` (its lane 0) that
     /// the pipe may take now (multipath).
-    fn data_for_pipe(&self, id: u64) -> bool {
+    pub(super) fn data_for_pipe(&self, id: u64) -> bool {
         let Some(o) = self.out_ref(id) else {
             return false;
         };
@@ -308,41 +365,9 @@ impl SessionCore {
         self.data_for_pipe_unpaced(id)
     }
 
-    /// Whether a scheduled stream has data for lane `lane` of pipe `id`,
-    /// whatever the limiter holds back: one that goes on the pipe (in a
-    /// multipath session) and on that lane.
-    pub(super) fn data_for_lane(&self, o: &OutPipe, id: u64, lane: u64) -> bool {
-        if self.streams.queue().is_empty() {
-            return false;
-        }
-        if self.mp.is_none() {
-            let stalled = self.streams.session_stalled();
-            return self
-                .streams
-                .queue()
-                .keys()
-                .any(|key| (!stalled || self.fin_only(key)) && self.lane_for(o, key) == lane);
-        }
-        if !o.takes_new_data() || !o.writable() {
-            return false;
-        }
-        let budget_left = self.mp().retained() < self.retransmit_budget();
-        let d = self.decision(id, self.gate());
-        let fresh = !self.streams.session_stalled() && budget_left;
-        self.streams.queue().keys().any(|key| {
-            (self
-                .streams
-                .send(key)
-                .is_some_and(|send| send.has_lost() || fresh)
-                || self.fin_only(key))
-                && self.stream_on_pipe(&d, key)
-                && self.lane_for(o, key) == lane
-        })
-    }
-
     /// Whether the driver should write to lane `n` (not 0) of pipe `id`:
     /// its first record, its shutdown, or the stream data placed on it.
-    fn lane_wants_write(&self, id: u64, n: u64) -> bool {
+    pub(super) fn lane_wants_write(&self, id: u64, n: u64) -> bool {
         let Some(o) = self.out_ref(id) else {
             return false;
         };
@@ -352,7 +377,15 @@ impl SessionCore {
         if !l.attached() || l.writes_ended() || self.state == State::Closed {
             return false;
         }
-        if l.first_owed() || self.lane_shutdown(o) {
+        if self.lane_shutdown(o) {
+            return true;
+        }
+        // A delayed record of the pipe holds back every lane of it, the
+        // first record of a new one included (MULTIPATH.md Section 5.8).
+        if self.shape.is_some() && self.shape_delayed(id) {
+            return false;
+        }
+        if l.first_owed() {
             return true;
         }
         if self.state == State::Establishing || !Self::lane_open(o, n) || !l.writable() {
@@ -369,7 +402,7 @@ impl SessionCore {
 
     /// Whether a scheduled stream has data for pipe `id`, whatever the
     /// limiter holds back (multipath).
-    fn data_for_pipe_unpaced(&self, id: u64) -> bool {
+    pub(super) fn data_for_pipe_unpaced(&self, id: u64) -> bool {
         if self.streams.queue().is_empty() {
             return false;
         }
@@ -408,42 +441,9 @@ impl SessionCore {
         found
     }
 
-    /// A PIPE_PING is owed on `id` and the limit of 8 per second lets it go
-    /// now: pipes that have waited longest first (MULTIPATH.md 6.4).
-    pub(super) fn ping_due(&self, id: u64, now: Instant) -> bool {
-        let Some(mp) = self.mp.as_deref() else {
-            return false;
-        };
-        let Some(o) = self.out_ref(id) else {
-            return false;
-        };
-        let Some(since) = o.ping_wanted() else {
-            return false;
-        };
-        if !o.is_live() || o.shutdown_pending() {
-            return false;
-        }
-        let slots = mp.ping_slots(now).min(self.requests.available(now));
-        if slots == 0 {
-            return false;
-        }
-        let ahead = self
-            .atts
-            .iter()
-            .filter(|a| a.id() != id)
-            .filter_map(|a| {
-                let x = a.out()?;
-                let t = x.ping_wanted()?;
-                (x.is_live() && x.writable() && !x.shutdown_pending() && (t, a.id()) < (since, id))
-                    .then_some(())
-            })
-            .count();
-        ahead < slots
-    }
-
     /// Whether the first pinned stream of a type can write its opening
     /// frame (or must leave the queue).
-    fn opening_ready(&self) -> bool {
+    pub(super) fn opening_ready(&self) -> bool {
         let session_room = self.streams.send_flow().room();
         self.streams.pinned_fronts().any(|key| {
             let Some(s) = self.streams.get(key) else {
@@ -469,7 +469,9 @@ impl SessionCore {
 
     /// Fills `out` with the next batch for a pipe (a lane of it) that can
     /// take bytes. The driver writes the whole batch before calling this
-    /// again for the lane; on [`Transmit::Shutdown`] it then shuts the
+    /// again for the lane, telling the bytes the carrier took with
+    /// [`SessionCore::pipe_written`] (until then they count in Q_p, the
+    /// write calls in progress); on [`Transmit::Shutdown`] it then shuts the
     /// lane's write side down.
     pub fn poll_transmit(
         &mut self,
@@ -507,6 +509,24 @@ impl SessionCore {
             Framing::Records => self.max_record().min(out.max_message().max(MIN_MESSAGE)),
         };
         let mut w = Records::new(out, max_record);
+        if self.shape.is_some() {
+            w.shape = self.shape_lend(id, 0, max_record, now);
+        }
+        if w.shape.is_some() {
+            if self.state == State::Closing && !self.close_waiting() {
+                // Shaping never holds CONNECTION_CLOSE, nor pads its
+                // record.
+                self.shape_return(&mut w);
+            } else if !shutdown && w.blocked() {
+                // The planned record waits for its delay, and everything
+                // the pipe owes with it.
+                if let Some(o) = self.out_mut(id) {
+                    o.unbegin_batch(parameters, join);
+                }
+                self.shape_return(&mut w);
+                return Transmit::Idle;
+            }
+        }
         if parameters {
             self.offer_exporter_only_with_one();
             // QX_TRANSPORT_PARAMETERS opens the first record (SPEC.md 5.1).
@@ -547,7 +567,7 @@ impl SessionCore {
             // 1); the acknowledgements the peer waits for meanwhile go.
             self.write_single_pipe_ack(&mut w, now);
             w.end_record();
-            let records = w.finish();
+            let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
             return if out.is_empty() {
@@ -583,7 +603,7 @@ impl SessionCore {
                 w.force(frame.encoded_len());
                 let _ = w.out.push_frame(&frame);
             }
-            let records = w.finish();
+            let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
             if let Some(p) = self.out_mut(id) {
@@ -596,7 +616,7 @@ impl SessionCore {
         }
         if shutdown {
             // A drained pipe (MULTIPATH.md Section 8.2) or a failed one.
-            let records = w.finish();
+            let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
             if let Some(p) = self.out_mut(id) {
@@ -612,14 +632,9 @@ impl SessionCore {
                 self.write_stream_data(id, &mut w);
             }
         } else if self.state != State::Establishing {
-            let mp = self.mp.is_some();
-            if mp {
-                self.write_pipe_frames(id, &mut w, now);
-            } else if self.pipe_ack.is_some() {
-                self.write_single_pipe_ack(&mut w, now);
-            }
+            self.write_path_frames(id, &mut w, now);
             let control = self.is_control_pipe(id);
-            let data = self.out_ref(id).is_some_and(|o| o.takes_new_data() || !mp);
+            let data = self.pipe_takes_data(id);
             if control {
                 self.write_control(&mut w, now);
                 if data {
@@ -644,6 +659,9 @@ impl SessionCore {
                 self.write_control(&mut w, now);
                 self.write_stream_controls(&mut w, now);
             }
+            if w.shape.is_some() {
+                self.shape_inject(&mut w);
+            }
         }
         let activity = w.activity;
         let traffic = w.traffic;
@@ -653,11 +671,11 @@ impl SessionCore {
         }
         w.end_record();
         let eliciting = w.eliciting_end();
-        let records = w.finish();
+        let records = self.shape_finish(w);
         self.count_sent(out.len(), records);
         self.after_batch(id, out, eliciting, now);
         if traffic {
-            self.note_traffic(now);
+            self.note_traffic(id, now);
         }
         // The bucket pays for the whole batch as the carrier takes it,
         // framing and control frames included: R_p measures those bytes,
@@ -685,16 +703,7 @@ impl SessionCore {
         // A write opportunity that leaves the pipe writable with nothing
         // for it is an application-limited moment; one that the limiter
         // ends while data waits makes the pipe the bottleneck.
-        if self.mp.is_some()
-            && self
-                .out_ref(id)
-                .is_some_and(|o| o.writable() && o.is_live())
-        {
-            let waiting = self.data_for_pipe_unpaced(id);
-            if let Some(o) = self.out_mut(id) {
-                o.opportunity_ended(waiting);
-            }
-        }
+        self.opportunity_ended(id);
         if self.pipe_ack.is_some() {
             self.single_pipe_bubble();
         }
@@ -705,8 +714,8 @@ impl SessionCore {
         // multipath, unless it carries only a QX_PING request (SPEC.md
         // Section 6.4): an unanswered keep-alive must not keep a dead
         // session open. In a multipath session only acknowledged activity
-        // counts.
-        if self.mp.is_none() {
+        // counts. Protocol rule.
+        if !self.is_multipath() {
             if self.pipe_ack.is_some() {
                 // With acknowledgement only acknowledged activity counts:
                 // the batch's end waits for the PIPE_ACK that covers it.
@@ -749,17 +758,26 @@ impl SessionCore {
             let Some(lane_key) = self.peer_lane_key() else {
                 return Transmit::Idle;
             };
-            // The first record holds PIPE_LANE alone (MULTIPATH.md
-            // Section 5.8); its bytes are outside the pipe's send order.
+            // The first record holds PIPE_LANE and the PADDING shaping
+            // adds (MULTIPATH.md Section 5.8), and waits for the delay of
+            // the pipe's planned record; its bytes are outside the pipe's
+            // send order.
             let frame = Frame::PipeLane(PipeLane {
                 lane_key,
                 pipe_id: id,
                 lane: n,
             });
             let mut w = Records::new(out, max_record);
+            if self.shape.is_some() {
+                w.shape = self.shape_lend(id, n, max_record, now);
+            }
+            if w.blocked() {
+                self.shape_return(&mut w);
+                return Transmit::Idle;
+            }
             w.force(frame.encoded_len());
             let _ = w.out.push_frame(&frame);
-            let records = w.finish();
+            let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
             let len = out.stream_len();
             if let Some(l) = self.out_mut(id).and_then(OutPipe::lanes_mut) {
@@ -777,6 +795,14 @@ impl SessionCore {
             return Transmit::Idle;
         }
         let mut w = Records::new(out, max_record);
+        if self.shape.is_some() {
+            w.shape = self.shape_lend(id, n, max_record, now);
+        }
+        if w.blocked() {
+            // The pipe's planned record waits for its delay.
+            self.shape_return(&mut w);
+            return Transmit::Idle;
+        }
         self.pace_left = self.pacing_room(id, now);
         self.write_stream_data(id, &mut w);
         self.pace_left = None;
@@ -786,11 +812,11 @@ impl SessionCore {
         let traffic = w.traffic;
         w.end_record();
         let eliciting = w.eliciting_end();
-        let records = w.finish();
+        let records = self.shape_finish(w);
         self.count_sent(out.len(), records);
         self.after_batch(id, out, eliciting, now);
         if traffic {
-            self.note_traffic(now);
+            self.note_traffic(id, now);
         }
         self.pace_sent(id, out.len() as u64, now);
         if out.is_empty() {
@@ -798,100 +824,6 @@ impl SessionCore {
         } else {
             Transmit::Data
         }
-    }
-
-    /// Accounts a batch handed to pipe `id`: its position, the retained
-    /// frames and the batch log (MULTIPATH.md Sections 6 and 7);
-    /// `eliciting` is where its last ack-eliciting byte ends, if any.
-    fn after_batch(&mut self, id: u64, out: &TransmitBuf, eliciting: Option<u64>, now: Instant) {
-        let lane = self.tx_lane;
-        let total = out.stream_len();
-        let mp = self.mp.is_some();
-        let peer_mad = self
-            .mp
-            .as_deref()
-            .map_or(Duration::ZERO, mpath::Mp::peer_mad);
-        let Some(o) = self.atts.get_mut(id).and_then(Attachment::out_mut) else {
-            return;
-        };
-        let base = o.sent();
-        if let Some(m) = self.mp.as_deref_mut().map(mpath::Mp::batch_mut) {
-            m.new_data = false;
-            m.txlog_new = false;
-            let ends = out.record_ends();
-            for (idx, f) in m.txlog.drain(..) {
-                let end = ends.get(idx as usize).copied().unwrap_or(total);
-                o.retain_frame(lane, base + end, f);
-                if let pipes::SentFrame::Stream { key, off, len, .. } = f
-                    && let Some(send) = self.streams.send_mut(key)
-                {
-                    send.mp_mut().carry(stream::Carry {
-                        off,
-                        end: off + len,
-                        pipe: id,
-                        pos: base + end,
-                    });
-                }
-            }
-            for idx in m.txactivity.drain(..) {
-                let end = ends.get(idx as usize).copied().unwrap_or(total);
-                o.activity_at(base + end);
-            }
-        }
-        if total == 0 {
-            return;
-        }
-        o.batch_sent(lane, total, out.record_ends().len() as u64, eliciting);
-        if let Some(l) = o.lanes_mut() {
-            l.bind_batch(lane, base + total);
-        }
-        let eliciting = eliciting.is_some();
-        if !mp {
-            // Pipe acknowledgement keeps the sample state of each batch
-            // (MULTIPATH.md Section 3.5); so does the first batch, sent
-            // before the peer's parameters tell whether it is in use.
-            self.single_batch_sent(eliciting, now);
-            return;
-        }
-        if let Some(o) = self.out_mut(id) {
-            o.mp_batch_sent(lane, eliciting, peer_mad, now);
-        }
-        self.batch_stream_bytes = 0;
-    }
-
-    fn count_sent(&mut self, bytes: usize, records: u64) {
-        self.stats.bytes_sent += bytes as u64;
-        self.stats.records_sent += records;
-        if self.mp.is_none() {
-            let rtt = self.carrier_rtt.or(self.loop_min.get());
-            self.send_rate.update(self.now, self.stats.bytes_sent, rtt);
-        }
-    }
-
-    /// Owes a copy of a credit frame just written, when the window is the
-    /// bottleneck: the latest value rides with the next redundant snapshot
-    /// on the second pipe, due at most 50 ms later (MULTIPATH.md Section
-    /// 6.5).
-    fn copy_credit(&mut self, kind: mpath::CreditCopy) {
-        if self.mp.is_none() {
-            return;
-        }
-        let tx = self.tx;
-        let now = self.now;
-        let second = self
-            .atts
-            .iter()
-            .any(|a| a.id() != tx && a.out().and_then(OutPipe::control_rank).is_some());
-        let Some(mp) = self.mp.as_deref_mut().filter(|_| second) else {
-            return;
-        };
-        let copies = &mut mp.batch_mut().credit_copies;
-        if let Some(c) = copies.iter_mut().find(|c| c.0 == kind) {
-            c.1 = tx;
-        } else {
-            copies.push((kind, tx));
-        }
-        mp.acks_mut().copy_by(now + mpath::ACK_COPY_INTERVAL);
     }
 
     /// Writes the credit copies owed by frames another pipe carried, with
@@ -948,7 +880,7 @@ impl SessionCore {
 
     /// Records a retained frame of the current batch (multipath only).
     pub(super) fn log(&mut self, w: &Records<'_>, f: pipes::SentFrame) {
-        if let Some(m) = self.mp.as_deref_mut().map(mpath::Mp::batch_mut) {
+        if let Some(m) = self.batch_log() {
             m.txlog.push((w.record_index(), f));
             m.txlog_new = false;
         }
@@ -960,7 +892,7 @@ impl SessionCore {
     /// direction's carried frames and the acknowledgements walk one entry
     /// per run of a stream in a batch rather than one per record.
     fn log_new_data(&mut self, w: &Records<'_>, key: StreamKey, off: u64, len: u64, fin: bool) {
-        let Some(m) = self.mp.as_deref_mut().map(mpath::Mp::batch_mut) else {
+        let Some(m) = self.batch_log() else {
             return;
         };
         let idx = w.record_index();
@@ -990,8 +922,8 @@ impl SessionCore {
 
     /// The current record carries an activity frame (multipath idle
     /// timer, SPEC.md Section 6.4).
-    fn note_activity(&mut self, w: &Records<'_>) {
-        if let Some(m) = self.mp.as_deref_mut().map(mpath::Mp::batch_mut) {
+    pub(super) fn note_activity(&mut self, w: &Records<'_>) {
+        if let Some(m) = self.batch_log() {
             let idx = w.record_index();
             if m.txactivity.last() != Some(&idx) {
                 m.txactivity.push(idx);
@@ -1002,7 +934,7 @@ impl SessionCore {
     // ---- pipe-layer frames (multipath) -------------------------------------------
 
     /// PIPE_PING, PIPE_ACK, PIPE_ABANDON and PIPE_STATUS for pipe `id`.
-    fn write_pipe_frames(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {
+    pub(super) fn write_pipe_frames(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {
         self.write_pipe_ping(id, w, now);
         if self.write_pipe_ack(id, w, now) && !self.write_credit_copies(id, w) {
             return;
@@ -1426,7 +1358,7 @@ impl SessionCore {
     fn write_opening(&mut self, key: StreamKey, w: &mut Records<'_>) -> Result<bool, Full> {
         let session_room = self.streams.send_flow().room();
         let tx = self.tx;
-        let mp = self.mp.is_some();
+        let mp = self.retains();
         let s = self.stream_mut(key);
         let (Some(id), Some(send)) = (s.id, s.send.as_mut()) else {
             return Ok(true);
@@ -1464,7 +1396,7 @@ impl SessionCore {
         }
         self.streams.spend(len);
         self.note_lane_frame(key);
-        if self.mp.is_some() {
+        if self.retains() {
             self.mp_mut().retain(len);
             self.log(
                 w,
@@ -1485,7 +1417,7 @@ impl SessionCore {
     /// again when it was lost with a pipe (MULTIPATH.md Section 7.4).
     fn write_reset(&mut self, key: StreamKey, id: u64, w: &mut Records<'_>) -> Result<(), Full> {
         let peer_rsa = self.send_tp().is_some_and(|t| t.reset_stream_at);
-        let mp = self.mp.is_some();
+        let mp = self.retains();
         // Carrier early data may still be rejected: nothing is final yet.
         let held = self.early_retains();
         let s = self.stream_mut(key);
@@ -1548,8 +1480,10 @@ impl SessionCore {
             // Data at or beyond the Reliable Size is never sent again.
             let limit = m.reliable_sent.unwrap_or(0);
             m.lost.remove(limit, u64::MAX);
-            if limit == 0 || limit <= m.buf_floor {
-                m.lost.clear();
+            // The bytes held from `buf_floor` on are past the Reliable
+            // Size; lost bytes below it stay owed, the preamble's among
+            // them while it is unacknowledged (it lies below `buf_floor`).
+            if limit <= m.buf_floor {
                 send.buf.clear();
             }
             send.state = SendState::ResetSent;
@@ -1567,6 +1501,10 @@ impl SessionCore {
             self.note_activity(w);
         }
         self.unschedule(key);
+        if self.streams.send(key).is_some_and(SendPart::has_lost) {
+            // Lost bytes below the Reliable Size are still owed.
+            self.schedule(key);
+        }
         self.wake_send_waiters();
         self.notify_writable(key);
         Ok(())
@@ -1574,155 +1512,7 @@ impl SessionCore {
 
     // ---- datagrams -----------------------------------------------------------
 
-    /// The pipe a stream datagram must follow (multipath): the pipe of the
-    /// stream's opening frame while that is unacknowledged and the pipe is
-    /// live (EXTENSIONS.md Section 6.4, MULTIPATH.md Section 11).
-    fn datagram_pipe(&self, flow: Option<(u64, u64)>) -> Option<u64> {
-        self.mp.as_ref()?;
-        let (stream_id, _) = flow?;
-        let send = self.streams.send(self.streams.key_of(stream_id)?)?;
-        let opened = send.mp().acked.contains(0, 1)
-            || send.mp().buf_floor > 0
-            || (send.base > 0 && send.mp().preamble_acked);
-        let pipe = send.mp().open_pipe.filter(|_| !opened)?;
-        self.out_ref(pipe).filter(|o| o.is_live()).map(|_| pipe)
-    }
-
-    /// Writes queued datagrams that may go on pipe `pipe`: on the control
-    /// pipe every datagram except the stream datagrams that follow their
-    /// opening frame on another pipe; on another pipe only those that
-    /// follow it there, and only while it may carry DATAGRAM (ACTIVE).
-    fn write_datagrams(&mut self, pipe: u64, control: bool, w: &mut Records<'_>) {
-        let flows = self.features.datagram_flows;
-        let max_frame = self.max_datagram_frame().unwrap_or(0);
-        let carries = self.mp.is_none()
-            || self
-                .out_ref(pipe)
-                .is_some_and(|o| o.state() == pipes::OutState::Active);
-        let mut i = 0;
-        loop {
-            let Some((flow, data)) = self.dgram().send.get(i) else {
-                return;
-            };
-            let follow = self.datagram_pipe(*flow);
-            let here = match follow {
-                Some(p) => p == pipe && carries,
-                None => control,
-            };
-            if !here {
-                i += 1;
-                continue;
-            }
-            let flow = match (flows, *flow) {
-                (false, _) => None,
-                (true, None) => Some(Flow::Session),
-                (true, Some((stream_id, context))) => Some(Flow::Stream { stream_id, context }),
-            };
-            let prefix = flow.map_or(0, |f| f.encoded_len());
-            let total = prefix + data.len();
-            // With a Length field when it fits the peer's frame limit and
-            // our records; otherwise last in its record, in one of its own
-            // when it exceeds our record size (EXTENSIONS.md Section 6.6).
-            let with_len = 1 + varint::len(total as u64) + total;
-            let last = with_len > max_frame.min(w.max_record());
-            let frame_len = if last { 1 + total } else { with_len };
-            let room = if frame_len <= w.max_record() {
-                w.ensure(frame_len)
-            } else {
-                w.own_record(frame_len)
-            };
-            if !room {
-                return;
-            }
-            let was_full = self.dgram().send.len() >= SEND_DATAGRAM_QUEUE;
-            let Some((_, data)) = self.dgram_mut().send.remove(i) else {
-                return;
-            };
-            let mut header = [0u8; 9 + 16];
-            let mut n = 1;
-            if last {
-                header[0] = 0x30;
-            } else {
-                header[0] = 0x31;
-                n += varint::encode(total as u64, &mut header[1..]).unwrap_or(0);
-            }
-            if let Some(f) = flow {
-                n += f.encode(&mut header[n..]).unwrap_or(0);
-            }
-            w.out.push_bytes(&header[..n]);
-            let len = data.len() as u64;
-            w.payload(data);
-            w.activity = true;
-            w.traffic = true;
-            w.elicit();
-            self.note_activity(w);
-            if last {
-                w.end_record();
-            }
-            self.stats.datagrams_sent += 1;
-            // Handed to the carrier with this batch: application bytes.
-            self.meter.add(Count::DatagramSent, len);
-            if let Some(Flow::Stream { stream_id, .. }) = flow
-                && let Some(s) = self
-                    .streams
-                    .key_of(stream_id)
-                    .and_then(|k| self.streams.get_mut(k))
-            {
-                let d = &mut s.datagrams_mut().counts;
-                d.sent += 1;
-                d.bytes_sent += len;
-                s.count(Count::DatagramSent, len);
-            }
-            if was_full {
-                self.events.push_back(super::CoreEvent::DatagramsUnblocked);
-            }
-        }
-    }
-
     // ---- stream data -----------------------------------------------------------
-
-    /// Queues a stream in the scheduler when it has something to send.
-    pub(super) fn schedule(&mut self, key: StreamKey) {
-        self.pick_input();
-        if !self.is_established() && !self.early_open() {
-            return;
-        }
-        let Some(s) = self.streams.get_mut(key) else {
-            return;
-        };
-        if s.goaway.is_some() || s.open_pending {
-            return;
-        }
-        let Some(send) = s.send.as_mut() else {
-            return;
-        };
-        if send.queued.is_some() || !send.has_pending() {
-            return;
-        }
-        // A stream without an identifier is scheduled even without credit:
-        // its first frame gives it one (STREAM_DATA_BLOCKED at a zero
-        // window opens it at the peer).
-        if send.credit_blocked()
-            && send.cold().reset.is_none()
-            && s.id.is_some()
-            && !send.has_lost()
-        {
-            // Wait for MAX_STREAM_DATA; report the block once.
-            if send.blocked_reported != Some(send.max_data) {
-                send.blocked_at = Some(send.max_data);
-                self.streams.queue_ctrl(key);
-            }
-            return;
-        }
-        let u = send.priority.urgency();
-        if let Some(mp) = self.mp.as_deref_mut()
-            && let Some(b) = send.mp().bound
-        {
-            // Re-evaluated with the next batch.
-            mp.affinity_mut().queued(b.epoch);
-        }
-        self.streams.enqueue(key, u);
-    }
 
     /// Moves a stream to the queue of its current urgency.
     pub(super) fn reschedule(&mut self, key: StreamKey) {
@@ -1760,93 +1550,19 @@ impl SessionCore {
         }
     }
 
-    fn write_stream_data(&mut self, pipe: u64, w: &mut Records<'_>) {
-        if self.mp.is_some() {
-            self.write_stream_data_mp(pipe, w);
-            return;
-        }
-        if self.out_ref(pipe).is_some_and(|o| o.lanes().is_some()) {
-            self.write_stream_data_lanes(pipe, w);
-            return;
-        }
-        let offered = self.out_ref(pipe).is_some_and(OutPipe::lanes_offered);
-        // Streams passed over in this round because session credit is out.
-        let mut passed = 0;
-        while self.streams.queue().len() > passed {
-            let Some((u, key)) = self.streams.pick() else {
-                return;
-            };
-            if offered {
-                self.maybe_open_lane(pipe, key);
-            }
-            match self.write_stream_frame(pipe, key, None, w) {
-                Step::Done => {
-                    self.streams.dequeue_first(u, key);
-                    self.after_stream_frame(key);
-                }
-                Step::More { rotate } => {
-                    if rotate {
-                        self.streams.move_back(u, 0);
-                    }
-                }
-                Step::Blocked => {
-                    self.streams.dequeue_first(u, key);
-                }
-                Step::SessionBlocked => {
-                    // Blocked by session credit, at the limit or by a
-                    // preamble that does not fit in what is left: report it
-                    // once per limit (SPEC.md Section 8.4).
-                    if let Some(limit) = self.streams.report_data_blocked()
-                        && w.try_frame(&Frame::DataBlocked(DataBlocked { limit }))
-                    {
-                        self.streams.data_blocked_written(limit);
-                    }
-                    if self.streams.send_flow().exhausted() {
-                        // Send what needs no credit and wait for MAX_DATA.
-                        if self.write_credit_free(w, None) {
-                            self.streams.stall_if_queued();
-                        }
-                        return;
-                    }
-                    // Some credit is left, too little for this stream's
-                    // preamble: others may use it.
-                    self.streams.move_back(u, 0);
-                    passed += 1;
-                }
-                Step::Full | Step::Budget => return,
-            }
-        }
-        if passed > 0 && self.write_credit_free(w, None) {
-            self.streams.stall_if_queued();
-        }
-    }
-
-    /// Stream data for the lane of the single pipe that the batch is for: the
-    /// directions placed on it, by urgency
-    /// and round robin within each.
-    fn write_stream_data_lanes(&mut self, pipe: u64, w: &mut Records<'_>) {
-        let lane = self.tx_lane;
-        // Directions passed over because what is left of the session
-        // credit is too little for their preamble.
-        let mut skipped: Vec<StreamKey> = Vec::new();
+    /// The stream data of a batch: frames of the directions `pick` chooses
+    /// in turn, until the batch is full, the directions it may take have
+    /// nothing more, or session credit runs out.
+    pub(super) fn write_streams<P: Pick>(&mut self, pipe: u64, pick: &mut P, w: &mut Records<'_>) {
         loop {
-            let Some(o) = self.out_ref(pipe) else {
-                return;
-            };
-            let found = (0..8).find_map(|u| {
-                self.streams
-                    .queue()
-                    .level(u)
-                    .iter()
-                    .position(|&k| !skipped.contains(&k) && self.lane_for(o, k) == lane)
-                    .map(|i| (u, i))
-            });
-            let Some((u, i)) = found else {
-                break;
+            let (u, i) = match pick.next(self, pipe, w) {
+                Next::Write(u, i) => (u, i),
+                Next::End => break,
+                Next::Stop => return,
             };
             let key = self.streams.queue().level(u)[i];
-            self.maybe_open_lane(pipe, key);
-            match self.write_stream_frame(pipe, key, None, w) {
+            let gate = pick.decision().and_then(|d| d.gate.as_ref());
+            match self.write_stream_frame(pipe, key, gate, w) {
                 Step::Done => {
                     self.streams.dequeue_at(u, i);
                     self.after_stream_frame(key);
@@ -1858,25 +1574,33 @@ impl SessionCore {
                 }
                 Step::Blocked => {
                     self.streams.dequeue_at(u, i);
+                    self.note_credit_blocked(key);
                 }
                 Step::SessionBlocked => {
+                    // Blocked by session credit, at the limit or by a
+                    // preamble that does not fit in what is left: report it
+                    // once per limit (SPEC.md Section 8.4).
                     if let Some(limit) = self.streams.report_data_blocked()
                         && w.try_frame(&Frame::DataBlocked(DataBlocked { limit }))
                     {
+                        self.log(w, pipes::SentFrame::DataBlocked);
                         self.streams.data_blocked_written(limit);
                     }
                     if self.streams.send_flow().exhausted() {
-                        if self.write_credit_free(w, None) {
+                        // Send what needs no credit and wait for MAX_DATA.
+                        if self.write_credit_free(w, pick.decision()) {
                             self.streams.stall_if_queued();
                         }
                         return;
                     }
-                    skipped.push(key);
+                    // Some credit is left, too little for this stream's
+                    // preamble: others may use it.
+                    pick.pass(self, u, i, key);
                 }
                 Step::Full | Step::Budget => return,
             }
         }
-        if !skipped.is_empty() && self.write_credit_free(w, None) {
+        if pick.passed_any() && self.write_credit_free(w, pick.decision()) {
             self.streams.stall_if_queued();
         }
     }
@@ -1895,7 +1619,7 @@ impl SessionCore {
     /// Stream data for pipe `pipe` in a multipath session: reinjected data
     /// first, then new data of the streams the scheduler places on the pipe
     /// (MULTIPATH.md Section 11), by urgency and round robin.
-    fn write_stream_data_mp(&mut self, pipe: u64, w: &mut Records<'_>) {
+    pub(super) fn write_stream_data_mp(&mut self, pipe: u64, w: &mut Records<'_>) {
         // Redundant copies queued for the pipe go first.
         if !self.write_copies(pipe, w) {
             return;
@@ -1906,29 +1630,32 @@ impl SessionCore {
         self.mp_mut().batch_mut().gate_inputs = inputs;
     }
 
-    /// The chunks of [`Self::write_stream_data_mp`], one decision each.
-    /// A decision is worked out again only when its gate or the pipe views
-    /// changed: the same inputs give the same decision. The scan of the
-    /// queues goes on where the last chunk was taken while nothing before
-    /// that place was passed over by the decision (a direction passed over
-    /// may go after a chunk of another changed what it depends on, the
-    /// bindings' loads, the backlog or a round-robin turn).
+    /// The chunks of [`Self::write_stream_data_mp`], one decision each
+    /// ([`MpPick`]).
     fn write_new_data_mp(&mut self, pipe: u64, inputs: &mut GateInputs, w: &mut Records<'_>) {
-        // Directions passed over in this batch because what is left of the
-        // session credit is too little for their preamble: rare, and few.
-        let mut skipped: Vec<StreamKey> = Vec::new();
         // Bindings are re-evaluated once per batch.
         let gate = self.gate_from(inputs);
         self.refresh_bindings(gate.as_ref());
         self.prune_credit_blocked();
-        let mut kept: Option<(Decision, u64)> = None;
-        // Where the scan goes on: (level, index).
-        let mut at = (0, 0);
+        let mut pick = MpPick {
+            inputs,
+            skipped: Vec::new(),
+            kept: None,
+            at: (0, 0),
+        };
+        self.write_streams(pipe, &mut pick, w);
+    }
+
+    /// The next decision of a multipath batch, and what goes before new
+    /// data under it (reinjected information, opportunistic copies); the
+    /// next direction for new data on the pipe, or how the batch's stream
+    /// data ends.
+    fn next_mp(&mut self, pipe: u64, p: &mut MpPick<'_>, w: &mut Records<'_>) -> Next {
         loop {
             // The gate of this decision: one per chunk.
-            let gate = self.gate_from(inputs);
+            let gate = self.gate_from(p.inputs);
             let generation = self.mp().tiers().view_generation();
-            let mut d = match kept.take() {
+            let mut d = match p.kept.take() {
                 Some((mut d, g)) if g == generation && d.gate == gate => {
                     d.renew();
                     #[cfg(debug_assertions)]
@@ -1936,7 +1663,7 @@ impl SessionCore {
                     d
                 }
                 _ => {
-                    at = (0, 0);
+                    p.at = (0, 0);
                     self.decision(pipe, gate)
                 }
             };
@@ -1951,7 +1678,7 @@ impl SessionCore {
                         .is_none_or(|o| self.lane_for(o, k) == self.tx_lane)
             }) {
                 if let Step::Full = self.write_lost_frame(key, w) {
-                    return;
+                    return Next::Stop;
                 }
                 let pending = self.streams.send(key).is_some_and(|x| x.has_pending());
                 if !pending {
@@ -1959,79 +1686,44 @@ impl SessionCore {
                     self.after_stream_frame(key);
                 }
                 // Queues and holds moved: the scan starts over.
-                kept = Some((d, generation));
-                at = (0, 0);
+                p.kept = Some((d, generation));
+                p.at = (0, 0);
                 continue;
             }
             // Opportunistic copies of the data that blocks the window
             // (Section 7.5.1).
             let copied = self.stats.bytes_opportunistic;
             if !self.write_opportunistic(pipe, self.now, d.gate, w) {
-                return;
+                return Next::Stop;
             }
             if self.stats.bytes_opportunistic != copied {
                 // The copies penalized a pipe: the new data goes by the
                 // pipes as they are now, under the same gate.
                 d = self.decision(pipe, d.gate);
-                at = (0, 0);
+                p.at = (0, 0);
             }
             if self.streams.session_stalled() {
                 // Only FIN-only frames go (SPEC.md Section 8.2).
                 self.write_credit_free(w, Some(&d));
-                return;
+                return Next::Stop;
             }
             if !self.any_stream_on(&d, true) {
                 // No direction goes on the pipe: the ledger tells without
                 // a pass over the queues.
-                return;
+                return Next::Stop;
             }
-            let Some((u, i, step)) = self.scan_mp(pipe, &d, &skipped, &mut at, w) else {
-                return;
+            let found = self.scan_mp(pipe, &d, &p.skipped, &mut p.at);
+            p.kept = Some((d, generation));
+            return match found {
+                Some((u, i)) => Next::Write(u, i),
+                None => Next::Stop,
             };
-            let key = self.streams.queue().level(u)[i];
-            match step {
-                Step::Done => {
-                    self.streams.dequeue_at(u, i);
-                    self.after_stream_frame(key);
-                }
-                Step::More { rotate } => {
-                    if rotate {
-                        self.streams.move_back(u, i);
-                    }
-                }
-                Step::Blocked => {
-                    self.streams.dequeue_at(u, i);
-                    self.note_credit_blocked(key);
-                }
-                Step::SessionBlocked => {
-                    if let Some(limit) = self.streams.report_data_blocked()
-                        && w.try_frame(&Frame::DataBlocked(DataBlocked { limit }))
-                    {
-                        self.log(w, pipes::SentFrame::DataBlocked);
-                        self.streams.data_blocked_written(limit);
-                    }
-                    if self.streams.send_flow().exhausted() {
-                        if self.write_credit_free(w, Some(&d)) {
-                            self.streams.stall_if_queued();
-                        }
-                        return;
-                    }
-                    // Too little credit for this stream's preamble:
-                    // others may use it.
-                    skipped.push(key);
-                    if at == (u, i) {
-                        at.1 += 1;
-                    }
-                }
-                Step::Full | Step::Budget => return,
-            }
-            kept = Some((d, generation));
         }
     }
 
     /// Finds the next direction from `at` on that goes on the decision's
-    /// pipe and writes a frame of it: its level, its index and the outcome.
-    /// `at` is left where the scan goes on next time: there while every
+    /// pipe: its level and index. `at` is left where the scan goes on next
+    /// time: there while every
     /// direction before it was skipped or passed over for good (bound to
     /// another usable pipe, which no chunk of another direction changes),
     /// else at the start.
@@ -2041,8 +1733,7 @@ impl SessionCore {
         d: &Decision,
         skipped: &[StreamKey],
         at: &mut (usize, usize),
-        w: &mut Records<'_>,
-    ) -> Option<(usize, usize, Step)> {
+    ) -> Option<(usize, usize)> {
         let mut passed = false;
         let (mut u, mut i) = *at;
         let lanes = self
@@ -2072,9 +1763,8 @@ impl SessionCore {
                         continue;
                     }
                 }
-                let step = self.write_stream_frame(pipe, key, d.gate.as_ref(), w);
                 *at = if passed { (0, 0) } else { (u, i) };
-                return Some((u, i, step));
+                return Some((u, i));
             }
             u += 1;
             i = 0;
@@ -2207,27 +1897,27 @@ impl SessionCore {
         if end <= start && !(fin_ok && start == final_off) {
             return Ok((0, false));
         }
-        let min = if start == 0 && base > 0 {
-            (base as usize).min(w.max_data())
-        } else {
-            1.min((end - start) as usize)
+        let min_of = |max_data: usize| {
+            if start == 0 && base > 0 {
+                (base as usize).min(max_data)
+            } else {
+                1.min((end - start) as usize)
+            }
         };
         let want = (end - start) as usize;
-        if self.pace_left == Some(0) && want > 0 {
+        if (self.pace_left == Some(0) || w.gate_out()) && want > 0 {
             // The carrier queue limiter's room,
             // which lets whole frames go.
             return Err(Full);
         }
-        let Some(room) = w
-            .stream_room(MAX_STREAM_HEADER + min, MAX_STREAM_HEADER + want)
-            .filter(|&r| r >= min)
-        else {
+        let Some((room, _)) = w.stream_room(min_of, want).filter(|&(r, least)| r >= least) else {
             return Err(Full);
         };
         let n = want.min(room) as u64;
         if let Some(left) = &mut self.pace_left {
             *left = left.saturating_sub(n);
         }
+        w.spend(n);
         let fin = fin_ok && start + n == final_off;
         let header = StreamHeader {
             stream_id: id,
@@ -2350,22 +2040,26 @@ impl SessionCore {
                 self.streams.report_streams_blocked(d);
                 return Step::Blocked;
             }
-            let need = MAX_STREAM_HEADER + self.preamble_len(key);
-            if w.stream_room(need, need)
-                .is_none_or(|r| r < need - MAX_STREAM_HEADER)
-            {
+            let need = self.preamble_len(key);
+            if need as u64 > self.preamble_limit() {
+                // The peer's parameters arrived below the limit the open
+                // assumed: only this stream fails, nothing is sent.
+                self.reject_unopened(key, stream::GoAwayFail::PreambleTooLarge);
+                return Step::Done;
+            }
+            if w.stream_room(|_| need, need).is_none_or(|(r, _)| r < need) {
                 return Step::Full;
             }
             // The identifier goes with the first frame (SPEC.md Section
             // 7.2): not assigned while the limiter holds back the bytes
             // that frame would carry.
-            if self.pace_left == Some(0) && self.opening_paced(key) {
+            if (self.pace_left == Some(0) || w.gate_out()) && self.opening_paced(key) {
                 return Step::Full;
             }
             self.assign_id(key);
         }
         let session_room = self.streams.send_flow().room();
-        let mp = self.mp.is_some();
+        let mp = self.retains();
         // Sent bytes stay held for a retransmission, or while carrier early
         // data may still be rejected (SPEC.md Section 6.1.2).
         let retain = mp || self.early_retains();
@@ -2379,7 +2073,7 @@ impl SessionCore {
         // lets whole frames go and never cuts one: the bucket pays for the
         // overrun before the pipe is let go again, where a cut would leave
         // a fragment to wait for the stream's next turn.
-        let paced_out = self.pace_left == Some(0);
+        let paced_out = self.pace_left == Some(0) || w.gate_out();
         if mp {
             let budget = self.retransmit_budget();
             let retained = self.mp().retained();
@@ -2451,11 +2145,15 @@ impl SessionCore {
         }
         if credit == 0 && !(fin_owed && available == 0) {
             if stream_room == 0 {
+                let lost = send.has_lost();
                 if send.blocked_reported != Some(send.max_data) {
                     send.blocked_at = Some(send.max_data);
                     self.streams.queue_ctrl(key);
                 }
-                return Step::Blocked;
+                // Reinjected information owes no credit and keeps the
+                // direction queued: it goes elsewhere or later, and the
+                // peer may give no credit until it arrives.
+                return if lost { Step::Budget } else { Step::Blocked };
             }
             return Step::SessionBlocked;
         }
@@ -2484,10 +2182,11 @@ impl SessionCore {
         }
         // At least the whole preamble, and no tiny fragment when a larger
         // one fits in the next record; never more than a record holds.
-        let min = pre.max((credit.min(MIN_FRAGMENT as u64) as usize).min(w.max_data()));
-        let Some(room) = w
-            .stream_room(MAX_STREAM_HEADER + min, MAX_STREAM_HEADER + credit as usize)
-            .filter(|&r| r >= min)
+        let min_of =
+            |max_data: usize| pre.max((credit.min(MIN_FRAGMENT as u64) as usize).min(max_data));
+        let Some((room, _)) = w
+            .stream_room(min_of, credit as usize)
+            .filter(|&(r, least)| r >= least)
         else {
             return Step::Full;
         };
@@ -2495,6 +2194,7 @@ impl SessionCore {
         if let Some(left) = &mut self.pace_left {
             *left = left.saturating_sub(n);
         }
+        w.spend(n);
         let fin = fin_owed && n == available;
         let header = StreamHeader {
             stream_id: id,
@@ -2584,23 +2284,29 @@ impl SessionCore {
         if rotate {
             send.deficit += QUANTUM;
         }
-        let reset_owed = send.cold().reset.is_some_and(|r| !r.written);
+        // The reset goes once the data below its Reliable Size is out,
+        // reinjected information still owed or not (that goes on the lost
+        // path, which never queues the reset).
+        let reset_owed = send.cold().reset.is_some_and(|r| !r.written)
+            && (!more || send.reset_reliable().is_some_and(|r| send.offset >= r));
         self.streams.sent(n, app);
         if app > 0 {
             self.after_send_progress(key);
         }
-        if reset_owed && !more {
+        if reset_owed {
             self.streams.queue_ctrl(key);
         }
         if !more {
             Step::Done
         } else if blocked {
             let send = self.stream_mut(key).send.as_mut().expect("sending part");
+            let lost = send.has_lost();
             if send.blocked_reported != Some(send.max_data) {
                 send.blocked_at = Some(send.max_data);
                 self.streams.queue_ctrl(key);
             }
-            Step::Blocked
+            // Reinjected information keeps the direction queued.
+            if lost { Step::Budget } else { Step::Blocked }
         } else {
             Step::More {
                 rotate: rotate && incremental,
@@ -2655,7 +2361,7 @@ impl SessionCore {
 
     /// The preamble length a local stream will send (0 without the
     /// preamble feature).
-    fn preamble_len(&self, key: StreamKey) -> usize {
+    pub(super) fn preamble_len(&self, key: StreamKey) -> usize {
         if !self.features.preamble {
             return 0;
         }
@@ -2679,7 +2385,7 @@ impl SessionCore {
     /// its preamble (SPEC.md Section 7.2, EXTENSIONS.md Section 4).
     pub(super) fn assign_id(&mut self, key: StreamKey) {
         let client = matches!(self.role, Role::Initiator);
-        let mp = self.mp.is_some();
+        let mp = self.retains();
         let preamble = self.features.preamble;
         let grease = (preamble && !self.grease_tlv_used).then(|| self.grease_tlv());
         let Some(s) = self.streams.assign_id(key, client) else {
@@ -2726,6 +2432,11 @@ impl SessionCore {
         // Control state set before the identifier existed (a receive
         // window, STOP_SENDING, PRIORITY_UPDATE) goes out now.
         self.streams.queue_ctrl(key);
+        if (self.shape.is_some() || self.shape_pending.is_some())
+            && let Some(id) = self.streams.get(key).and_then(|s| s.id)
+        {
+            self.shape_stream(super::shaping::EventKind::StreamOpen, id);
+        }
     }
 
     /// The GREASE TLV of the session's first preamble: the test hook's, or
@@ -2773,60 +2484,6 @@ impl SessionCore {
     }
 
     // ---- discarding -------------------------------------------------------------
-
-    /// Discards a stream once both parts are terminal, its control frames
-    /// are out, and the application released it or the stack rejected it
-    /// (SPEC.md Section 7.6). A peer stream returns its credit (Section
-    /// 8.5).
-    pub(super) fn try_discard(&mut self, key: StreamKey) {
-        if self.early_retains() {
-            // Carrier early data may still be rejected and sent again.
-            return;
-        }
-        self.streams.settle_local_recv(key);
-        let Some(s) = self.streams.get(key) else {
-            return;
-        };
-        if !s.parts_terminal() || !(s.released || s.offer == Offer::Rejected) || s.ctrl_queued {
-            return;
-        }
-        if s.send.as_ref().is_some_and(|x| x.queued.is_some()) {
-            return;
-        }
-        let Some(s) = self.streams.remove(key) else {
-            return;
-        };
-        if let Some(mp) = self.mp.as_deref_mut() {
-            mp.picks_mut().forget(key);
-            mp.blocked_mut().forget(key);
-        }
-        if let Some(r) = &s.recv
-            && r.held() > 0
-        {
-            self.credit_consumed(r.held());
-        }
-        if let Some(owed) = s.recv.as_ref().map(stream::RecvPart::credit_owed)
-            && owed > 0
-        {
-            // Bytes below a Reliable Size that never arrived would be
-            // discarded on arrival (SPEC.md Section 8.3).
-            self.credit_received(0, 0, owed);
-        }
-        if let Some(send) = &s.send
-            && let Some(mp) = self.mp.as_deref_mut()
-        {
-            mp.release(send.unacked());
-        }
-        for (_, d) in s.datagrams.iter().flat_map(|d| &d.queue) {
-            self.dgram_mut().recv_bytes -= d.len();
-        }
-        if !s.local {
-            self.stream_count_credit(di(s.dir));
-        }
-        self.streams.recycle(s);
-        let now = self.now;
-        self.check_shutdown_done(now);
-    }
 }
 
 /// Builds records in a batch: frames go into records of at most
@@ -2837,7 +2494,7 @@ pub(super) struct Records<'a> {
     records: u64,
     /// A frame other than a QX_PING request (or PADDING) was written: the
     /// batch restarts the idle timer (SPEC.md Section 6.4).
-    activity: bool,
+    pub(super) activity: bool,
     /// The record of the last ack-eliciting frame written (SPEC.md
     /// Section 1.4), by its index in the batch: the bytes in flight end
     /// with it.
@@ -2848,10 +2505,12 @@ pub(super) struct Records<'a> {
     /// A traffic frame was written: STREAM, RESET_STREAM,
     /// RESET_STREAM_AT, STOP_SENDING or DATAGRAM (MULTIPATH.md Section
     /// 7.1, the busy window).
-    traffic: bool,
+    pub(super) traffic: bool,
     /// A QX_PING was written: with `traffic`, the activity a PIPE_ACK
     /// confirms in a session with acknowledgement (SPEC.md Section 6.4).
     ping: bool,
+    /// The pipe's shaping state, lent for the batch.
+    pub(super) shape: Option<super::shape::ShapeTx>,
 }
 
 impl<'a> Records<'a> {
@@ -2865,6 +2524,54 @@ impl<'a> Records<'a> {
             exchange: false,
             traffic: false,
             ping: false,
+            shape: None,
+        }
+    }
+
+    /// The largest frames length of the open record, or of the next one
+    /// (planned now when shaped).
+    fn cap(&mut self) -> usize {
+        match &mut self.shape {
+            // Each message is a write call; a byte stream's batch is one.
+            Some(t) if !self.out.in_record() => {
+                t.prep(self.max_record, self.records == 0 || self.out.is_records())
+            }
+            Some(t) => t.cut_or(self.max_record),
+            None => self.max_record,
+        }
+    }
+
+    /// The batch takes no further record: one ended it (`flush`), or the
+    /// next waits for its plan's delay.
+    fn closed(&self) -> bool {
+        self.shape.as_ref().is_some_and(|t| t.closed || t.delayed)
+    }
+
+    /// Whether the record that opens next waits for its plan's delay
+    /// (planned now when no record is open).
+    pub(super) fn blocked(&mut self) -> bool {
+        if self.shape.is_some() && !self.out.in_record() {
+            self.cap();
+        }
+        self.shape.as_ref().is_some_and(|t| t.delayed)
+    }
+
+    /// The shaping gate's stream data room is used up: like the carrier
+    /// queue limiter's, it lets whole frames go and holds the next. Read
+    /// live, as a gate a plan applies during the batch changes it.
+    fn gate_out(&self) -> bool {
+        self.shape.as_ref().is_some_and(|t| t.room == Some(0))
+    }
+
+    /// Stream data waits for the rest of the batch.
+    fn data_held(&self) -> bool {
+        self.shape.as_ref().is_some_and(|t| t.data_held)
+    }
+
+    /// Ends the open record without a plan.
+    pub(super) fn end_plain(&mut self) {
+        if self.out.end_record() {
+            self.records += 1;
         }
     }
 
@@ -2901,35 +2608,82 @@ impl<'a> Records<'a> {
         self.out.size_width(self.max_record)
     }
 
-    /// The most STREAM data one record holds.
-    fn max_data(&self) -> usize {
-        self.max_record - MAX_STREAM_HEADER
+    /// Stream data bytes written: the gate's room shrinks.
+    fn spend(&mut self, n: u64) {
+        if let Some(t) = self.shape.as_mut() {
+            t.spent += n;
+            if let Some(r) = t.room.as_mut() {
+                *r = r.saturating_sub(n);
+            }
+        }
     }
 
     /// Ends the open record, if any; the next frame starts a new one.
     pub(super) fn end_record(&mut self) {
-        if self.out.end_record() {
-            self.records += 1;
+        if let Some(t) = &mut self.shape
+            && self.out.in_record()
+        {
+            let len = self.out.record_len();
+            let avail = (self.max_record.saturating_sub(len)).min(self.out.room());
+            let pad = t.end_record(len, avail);
+            self.padding(pad);
         }
+        self.end_plain();
     }
 
     /// Makes room for `n` frame bytes in one record, closing the open one
     /// if they do not fit. `false` when the batch is full.
     pub(super) fn ensure(&mut self, n: usize) -> bool {
-        if n > self.max_record {
+        if n > self.max_record || self.closed() {
             return false;
         }
         if self.out.in_record() {
-            if self.out.record_len() + n <= self.max_record && self.out.room() >= n {
+            let len = self.out.record_len() + n;
+            if len <= self.cap() && self.out.room() >= n && len <= self.frames_bound(true) {
                 return true;
             }
             self.end_record();
+            if self.closed() {
+                return false;
+            }
+        }
+        if self.blocked() {
+            return false;
         }
         if self.out.room() < self.size_width() + n {
             return false;
         }
+        // A planned record opens only where the batch holds its target
+        // size: cut short by the batch's end, its PADDING would be
+        // clamped. The first record of a batch opens anyway (a batch
+        // smaller than the target could never send it).
+        if n > self.frames_bound(false) {
+            return false;
+        }
         self.out.begin_record(self.max_record);
         true
+    }
+
+    /// The most frames bytes the open record (`open`) or the next one may
+    /// hold so that its plan's padded target fits the batch's room:
+    /// 0 when the next record's target does not fit, so
+    /// that it opens in the next batch; unbounded unshaped, and in an
+    /// empty batch (one smaller than the target could never send it).
+    fn frames_bound(&self, open: bool) -> usize {
+        let Some(t) = &self.shape else {
+            return usize::MAX;
+        };
+        if self.out.is_empty() && !open {
+            return usize::MAX;
+        }
+        let total = match open {
+            true => self.out.record_len() + self.out.room(),
+            false => self.out.room().saturating_sub(self.size_width()),
+        };
+        // An open record whose target never fitted (the batch's first)
+        // takes what the batch holds.
+        t.frames_bound(total)
+            .unwrap_or(if open { usize::MAX } else { 0 })
     }
 
     /// Opens a record of its own for one frame of `n` bytes, more than
@@ -2937,8 +2691,11 @@ impl<'a> Records<'a> {
     /// 6.6): the record may exceed the write-call bound by what the frame
     /// needs. `false` when the batch already holds records and has no
     /// room left for it.
-    fn own_record(&mut self, n: usize) -> bool {
+    pub(super) fn own_record(&mut self, n: usize) -> bool {
         self.end_record();
+        if self.closed() || self.blocked() {
+            return false;
+        }
         if !self.out.is_empty() && self.out.room() < self.out.size_width(n) + n {
             return false;
         }
@@ -3006,28 +2763,63 @@ impl<'a> Records<'a> {
         true
     }
 
-    /// Data room for a STREAM frame. The frame stays in the open record
-    /// when at least `min` bytes (header included) fit there, or `want`
-    /// bytes do; otherwise it starts a new record. Returns the data bytes
-    /// that fit after a header of [`MAX_STREAM_HEADER`] bytes; `None` when
-    /// the batch is full and no record is open.
-    fn stream_room(&mut self, min: usize, want: usize) -> Option<usize> {
+    /// Data room for a STREAM frame. `min_of` gives the least data the
+    /// frame takes in a record that holds at most the data bytes it is
+    /// given (the cut of that record, which a shaper may set lower for the
+    /// next record than for the open one); `want` is the data the frame
+    /// would take. The frame stays in the open record when at least its
+    /// least data fit there, or `want` bytes do; otherwise it starts a new
+    /// record, its least data taken anew for that record. Returns the data
+    /// bytes that fit after a header of [`MAX_STREAM_HEADER`] bytes, and the
+    /// least data of the record they go in; `None` when the batch is full
+    /// and no record is open.
+    fn stream_room(
+        &mut self,
+        min_of: impl Fn(usize) -> usize,
+        want: usize,
+    ) -> Option<(usize, usize)> {
+        let want = MAX_STREAM_HEADER + want;
+        let mut cap = self.cap();
+        if self.data_held() || self.closed() {
+            return None;
+        }
+        let mut least = min_of(cap.min(self.max_record) - MAX_STREAM_HEADER);
+        let mut min = MAX_STREAM_HEADER + least;
         if self.out.in_record() {
-            let left = (self.max_record - self.out.record_len()).min(self.out.room());
+            let mut left = (cap.saturating_sub(self.out.record_len()))
+                .min(self.out.room())
+                .min(
+                    self.frames_bound(true)
+                        .saturating_sub(self.out.record_len()),
+                );
+            if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
+                left = left.min((r as usize).saturating_add(MAX_STREAM_HEADER).max(min));
+            }
             if left >= min.max(want.min(MAX_STREAM_HEADER + MIN_FRAGMENT)) {
-                return Some(left - MAX_STREAM_HEADER);
+                return Some((left - MAX_STREAM_HEADER, least));
             }
             self.end_record();
+            cap = self.cap();
+            if self.data_held() || self.closed() {
+                return None;
+            }
+            least = min_of(cap.min(self.max_record) - MAX_STREAM_HEADER);
+            min = MAX_STREAM_HEADER + least;
         }
         let room = self.out.room().saturating_sub(self.size_width());
-        let fits = room.min(self.max_record);
+        let mut fits = room
+            .min(cap.max(min).min(self.max_record))
+            .min(self.frames_bound(false));
+        if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
+            fits = fits.min((r as usize).saturating_add(MAX_STREAM_HEADER).max(min));
+        }
         if fits < min {
             // The batch is full: no record is open, so nothing may be
             // written (even a frame without data, such as a lone FIN).
             return None;
         }
         self.out.begin_record(self.max_record);
-        Some(fits - MAX_STREAM_HEADER)
+        Some((fits - MAX_STREAM_HEADER, least))
     }
 
     fn stream_header(&mut self, h: &StreamHeader) {
@@ -3040,7 +2832,7 @@ impl<'a> Records<'a> {
 
     /// A datagram or stream payload: copied when small, referenced
     /// otherwise.
-    fn payload(&mut self, b: Bytes) {
+    pub(super) fn payload(&mut self, b: Bytes) {
         if b.len() < COPY_THRESHOLD {
             self.out.push_bytes(&b);
         } else {

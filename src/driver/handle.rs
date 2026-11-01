@@ -15,9 +15,10 @@
 //! threads), the tokio driver's write-through and read-through fast paths
 //! (`super::through`), and how a carrier is attached.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,7 @@ use crate::proto::session::{
     ReceivedDatagram, RoleConfig, SendOutcomeKind, SessionError, SessionStats, State as CoreState,
     StreamError, StreamKey, StreamStats,
 };
+use crate::proto::session::{DirectionState, OutboundState};
 #[cfg(feature = "tokio")]
 use crate::proto::session::{Piece, PieceCursor, TransmitBuf};
 
@@ -177,6 +179,18 @@ pub struct CarrierInfo {
     pub(crate) outbound: Option<Framing>,
     pub(crate) exporter: Option<Box<Exporters>>,
     pub(crate) protocol: Option<String>,
+    pub(crate) kind: Option<crate::CarrierKind>,
+    pub(crate) write_overhead: u16,
+    pub(crate) admitted: Option<crate::AdmittedValue>,
+}
+
+impl CarrierInfo {
+    /// Records what the core keeps of the carrier on pipe `id`.
+    pub(crate) fn describe(&self, core: &mut core::SessionCore, id: core::PipeId) {
+        core.set_pipe_carrier(id, self.kind);
+        core.set_pipe_write_overhead(id, self.write_overhead);
+        core.set_pipe_admitted(id, self.admitted.clone());
+    }
 }
 
 /// A carrier's TLS 1.3 exporter values for the labels zmux uses
@@ -226,8 +240,14 @@ pub struct State<D: Driver> {
     /// Section 11), when known.
     dialer: Option<bool>,
     goaway: Option<GoAway>,
+    /// The carrier kind a carrier mode chose, and its tries
+    /// ([`State::report_carrier`]).
+    carrier: Option<crate::CarrierKind>,
+    carrier_tries: VecDeque<crate::CandidateResult>,
     /// Session events for the application.
     events: EventQueue,
+    /// Pipe state changes and suspensions seen so far ([`Session::pipes_changed_op`]).
+    pipe_changes: u64,
     /// Out-of-band join frames the core handed out, by pipe, until their
     /// reservation takes or gives them up.
     oob: Vec<(u64, Bytes)>,
@@ -241,10 +261,17 @@ pub struct State<D: Driver> {
     start_hook: bool,
     /// The datagram limiters, until [`Shared::new`] takes them.
     datagram_limiter: DatagramLimiter,
+    /// The value of the admission that accepted the bootstrap carrier.
+    admitted: Option<crate::AdmittedValue>,
     /// Received datagrams on their way past the receive limiter (reused).
     datagram_batch: Vec<ReceivedDatagram>,
     pub(super) io: D::Io,
 }
+
+/// The tries of carrier candidates a session's statistics keep, the
+/// latest: a session that retries a kind for hours keeps a bounded
+/// history.
+pub(crate) const CARRIER_TRIES_KEPT: usize = 64;
 
 /// The core lock of a session.
 pub(crate) type Lock<'a, D> = Locked<'a, State<D>>;
@@ -307,6 +334,8 @@ impl<D: Driver> State<D> {
             core.set_bootstrap_exporter(&e.session);
         }
         core.attach_bootstrap(carrier.inbound, carrier.outbound, now);
+        carrier.describe(&mut core, core::PipeId(0));
+        let admitted = carrier.admitted.clone();
         Ok(Self {
             core,
             waiters: Waiters::default(),
@@ -317,13 +346,17 @@ impl<D: Driver> State<D> {
             closed_seen: false,
             dialer: transport.map(|r| r == Role::Initiator),
             goaway: None,
+            carrier: None,
+            carrier_tries: VecDeque::new(),
             events,
+            pipe_changes: 0,
             oob: Vec::new(),
             protocol: carrier.protocol,
             window_hook,
             traces,
             start_hook,
             datagram_limiter,
+            admitted,
             datagram_batch: Vec::new(),
             io,
         })
@@ -342,6 +375,9 @@ impl<D: Driver> State<D> {
                         self.protocol = protocol.map(String::from);
                     }
                     w.wake_list(List::State, wakes);
+                    // The channels' tasks end when the peer did not
+                    // negotiate them.
+                    w.wake_list(List::Channel, wakes);
                     self.trace(Trace::Established);
                 }
                 CoreEvent::StreamOpened(d) => w.wake_list(List::Accept(di(d)), wakes),
@@ -351,6 +387,7 @@ impl<D: Driver> State<D> {
                 CoreEvent::StreamsAvailable(d) => w.open[di(d)].credit(wakes),
                 CoreEvent::DatagramReceived => w.wake_list(List::DatagramRecv, wakes),
                 CoreEvent::DatagramsUnblocked => w.wake_list(List::DatagramSend, wakes),
+                CoreEvent::ChannelDatagrams => w.wake_list(List::Channel, wakes),
                 CoreEvent::GoAway {
                     max_bidi,
                     max_uni,
@@ -371,17 +408,36 @@ impl<D: Driver> State<D> {
                 CoreEvent::OpenLane(lane) => D::open_lane(self, lane),
                 CoreEvent::ResetLane(lane) => D::reset_lane(self, lane),
                 CoreEvent::OobJoin { pipe, frame } => self.oob.push((pipe.0, frame)),
-                CoreEvent::PipeState { pipe, half, state } => {
-                    let failure = (state == core::PipeState::Failed)
+                CoreEvent::PipeState { pipe, state } => {
+                    let failure = (state == DirectionState::Outbound(OutboundState::Failed))
                         .then(|| self.core.pipe_failure(pipe))
                         .flatten();
+                    self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
+                    self.waiters.wake_list(List::Channel, &mut self.wakes);
+                    let carrier = self.core.pipe_carrier(pipe);
                     self.app_event(AppEvent::PipeState {
                         pipe,
-                        half,
                         state,
                         failure,
+                        carrier,
                     });
+                }
+                CoreEvent::PipeRetired { pipe } => {
+                    self.pipe_changes += 1;
+                    self.waiters.wake_list(List::Pipes, &mut self.wakes);
+                    self.waiters.wake_list(List::Channel, &mut self.wakes);
+                    if self.traces.is_some() {
+                        self.trace(Trace::Event(AppEvent::PipesRetired {
+                            retired: 1,
+                            failed: 0,
+                            closed: 0,
+                            dropped: 0,
+                            last: vec![pipe],
+                        }));
+                    }
+                    self.events.retire(pipe.0);
+                    self.waiters.wake_list(List::Events, &mut self.wakes);
                 }
                 CoreEvent::JoinAuthFailed { carrier_bound } => {
                     self.app_event(AppEvent::JoinAuthFailed {
@@ -436,8 +492,16 @@ impl<D: Driver> State<D> {
                 CoreEvent::CapacityRestored { rate } => {
                     self.app_event(AppEvent::CapacityRestored { rate });
                 }
-                CoreEvent::Suspended => self.app_event(AppEvent::Suspended),
-                CoreEvent::Resumed => self.app_event(AppEvent::Resumed),
+                CoreEvent::Suspended => {
+                    self.pipe_changes += 1;
+                    w.wake_list(List::Pipes, wakes);
+                    self.app_event(AppEvent::Suspended);
+                }
+                CoreEvent::Resumed => {
+                    self.pipe_changes += 1;
+                    w.wake_list(List::Pipes, wakes);
+                    self.app_event(AppEvent::Resumed);
+                }
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
                     w.close(wakes);
@@ -449,6 +513,31 @@ impl<D: Driver> State<D> {
         if !self.closed_seen && self.core.state() == core::State::Closed {
             self.closed_seen = true;
             D::session_closed(self);
+        }
+    }
+
+    /// Records the tries of a carrier mode's candidates and, with
+    /// `chosen`, its choice of kind (API.md Section 4.8): events, and the
+    /// statistics, which keep the latest [`CARRIER_TRIES_KEPT`] tries.
+    pub(crate) fn report_carrier(
+        &mut self,
+        results: &[crate::CandidateResult],
+        chosen: Option<crate::CarrierKind>,
+    ) {
+        for r in results {
+            if self.carrier_tries.len() == CARRIER_TRIES_KEPT {
+                self.carrier_tries.pop_front();
+            }
+            self.carrier_tries.push_back(r.clone());
+            self.app_event(AppEvent::CarrierCandidate {
+                kind: r.kind,
+                outcome: r.outcome,
+                joined: r.joined,
+            });
+        }
+        if let Some(kind) = chosen {
+            self.carrier = Some(kind);
+            self.app_event(AppEvent::CarrierChosen(kind));
         }
     }
 
@@ -490,16 +579,32 @@ impl<D: Driver> State<D> {
     }
 }
 
-/// A stream the core opened or offered, with its meter.
-type Opened = (StreamKey, Arc<Meter>);
+/// A stream the core opened or offered, with its meter and the slot of
+/// its final statistics.
+type Opened = (StreamKey, Arc<Meter>, FinalStats);
 
-/// The meter of a stream the core holds (a stream it just opened or
-/// offered always is).
+/// The statistics a stream had when the session released it, kept for the
+/// handles that outlive it (API.md Section 7.2).
+type FinalStats = Arc<OnceLock<StreamStats>>;
+
+/// The meter and the final-statistics slot of a stream the core holds (a
+/// stream it just opened or offered always is).
 fn with_meter<D: Driver>(core: &mut core::SessionCore, key: StreamKey) -> Opened {
     let meter = core
         .stream_meter(key)
-        .unwrap_or_else(|| Arc::new(Meter::new(D::now())));
-    (key, meter)
+        .unwrap_or_else(|| Arc::new(Meter::new()));
+    let last = core.stream_final_stats(key).unwrap_or_default();
+    (key, meter, last)
+}
+
+/// A stream's statistics: the core's while it holds the stream, else the
+/// final ones it kept (read under the lock it sets them under).
+fn stream_stats<D: Driver>(conn: &ConnRef<D>, key: StreamKey, last: &FinalStats) -> StreamStats {
+    let st = conn.lock();
+    st.core
+        .stream_stats(key)
+        .or_else(|| last.get().cloned())
+        .unwrap_or_default()
 }
 
 /// The core's answer to opening a stream, for the openers' queue.
@@ -608,6 +713,12 @@ impl<D: Driver> Shared<D> {
         let r = f(&mut st);
         st.after_command();
         r
+    }
+
+    /// Abandons the session if it is not established yet: closed without
+    /// CONNECTION_CLOSE (the core's `abandon`).
+    pub(crate) fn abandon(&self) {
+        self.command(|st| st.core.abandon(D::now()));
     }
 
     /// Waits until the session is established. The handle is counted at
@@ -732,6 +843,13 @@ impl<D: Driver> WeakSession<D> {
         Self(shared)
     }
 
+    /// The shared state, while it exists: held, it does not keep the
+    /// session open.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn shared(&self) -> Option<Arc<Shared<D>>> {
+        self.0.upgrade()
+    }
+
     /// A handle, while the application still holds one.
     pub(crate) fn upgrade(&self) -> Option<Session<D>> {
         let shared = self.0.upgrade()?;
@@ -745,6 +863,28 @@ impl<D: Driver> WeakSession<D> {
             conn: ConnRef(shared),
         })
     }
+}
+
+/// Ready once the session is closing or the application dropped its last
+/// handle.
+#[cfg(feature = "tokio")]
+pub(crate) fn closed_wait<D: Driver>(shared: &Shared<D>) -> impl Future<Output = ()> + '_ {
+    Wait::new(&shared.inner, List::State, |st: &mut State<D>| {
+        (st.handles == 0 || st.core.error().is_some()).then_some(())
+    })
+}
+
+/// Ready once a pipe changed state or the session was suspended or resumed
+/// after `seen` changes, or the session is closing or the application
+/// dropped its last handle. Holds no handle.
+#[cfg(feature = "tokio")]
+pub(crate) fn pipes_changed_wait<D: Driver>(
+    shared: &Shared<D>,
+    seen: u64,
+) -> impl Future<Output = ()> + '_ {
+    Wait::new(&shared.inner, List::Pipes, move |st: &mut State<D>| {
+        (st.pipe_changes != seen || st.handles == 0 || st.core.error().is_some()).then_some(())
+    })
 }
 
 /// Closes the session when dropped: a graceful shutdown cancelled before
@@ -807,28 +947,30 @@ impl<D: Driver> Session<D> {
         self.conn.command(f)
     }
 
-    fn send_stream(&self, (key, meter): Opened) -> SendStream<D> {
+    fn send_stream(&self, (key, meter, last): Opened) -> SendStream<D> {
         SendStream {
             conn: self.conn.clone(),
             key,
             meter,
+            last,
             timeout: D::Timeout::default(),
         }
     }
 
-    fn recv_stream(&self, (key, meter): Opened) -> RecvStream<D> {
+    fn recv_stream(&self, (key, meter, last): Opened) -> RecvStream<D> {
         RecvStream {
             conn: self.conn.clone(),
             key,
             meter,
+            last,
             timeout: D::Timeout::default(),
         }
     }
 
-    fn bidi(&self, (key, meter): Opened) -> (SendStream<D>, RecvStream<D>) {
+    fn bidi(&self, (key, meter, last): Opened) -> (SendStream<D>, RecvStream<D>) {
         (
-            self.send_stream((key, meter.clone())),
-            self.recv_stream((key, meter)),
+            self.send_stream((key, meter.clone(), last.clone())),
+            self.recv_stream((key, meter, last)),
         )
     }
 
@@ -898,7 +1040,10 @@ impl<D: Driver> Session<D> {
         Ok(self.recv_stream(self.accept_key(Dir::Uni).await?))
     }
 
-    pub(crate) async fn send_datagram_wait_op(&self, data: Bytes) -> Result<(), DatagramError> {
+    pub(crate) async fn send_datagram_with_backpressure_op(
+        &self,
+        data: Bytes,
+    ) -> Result<(), DatagramError> {
         let len = data.len();
         let allowed = self.conn.datagram_allowed(len);
         let mut data = Some(data);
@@ -951,10 +1096,24 @@ impl<D: Driver> Session<D> {
         r
     }
 
+    pub(crate) fn established_op(&self) -> impl Future<Output = Result<(), SessionError>> + '_ {
+        Wait::new(&self.conn.inner, List::State, |st: &mut State<D>| {
+            if st.established {
+                return Some(Ok(()));
+            }
+            st.core.error().cloned().map(Err)
+        })
+    }
+
     pub(crate) fn closed_op(&self) -> impl Future<Output = SessionError> + '_ {
         Wait::new(&self.conn.inner, List::State, |st: &mut State<D>| {
             st.core.error().cloned()
         })
+    }
+
+    /// The count of pipe state changes and suspensions so far.
+    pub(crate) fn pipe_changes(&self) -> u64 {
+        self.conn.lock().pipe_changes
     }
 
     pub(crate) async fn ping_op(&self) -> Result<Duration, SessionError> {
@@ -979,6 +1138,20 @@ impl<D: Driver> Session<D> {
     /// core's `join_wanted`).
     pub(crate) fn join_wanted(&self) -> bool {
         self.conn.lock().core.join_wanted(D::now())
+    }
+
+    /// Records carrier tries and a choice of kind (`State::report_carrier`).
+    pub(crate) fn report_carrier(
+        &self,
+        results: &[crate::CandidateResult],
+        chosen: Option<crate::CarrierKind>,
+    ) {
+        self.command(|st| st.report_carrier(results, chosen));
+    }
+
+    /// The carrier kind a carrier mode chose last, if any.
+    pub(crate) fn carrier(&self) -> Option<crate::CarrierKind> {
+        self.conn.lock().carrier
     }
 
     /// A reference that does not keep the session in use.
@@ -1207,6 +1380,7 @@ pub struct SendStream<D: Driver> {
     conn: ConnRef<D>,
     key: StreamKey,
     meter: Arc<Meter>,
+    last: FinalStats,
     /// The tokio driver keeps none.
     #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
     pub(crate) timeout: D::Timeout,
@@ -1566,6 +1740,7 @@ pub struct RecvStream<D: Driver> {
     conn: ConnRef<D>,
     key: StreamKey,
     meter: Arc<Meter>,
+    last: FinalStats,
     /// The tokio driver keeps none.
     #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
     pub(crate) timeout: D::Timeout,
@@ -1961,6 +2136,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn role(&self) -> Role;
     fn rtt(&self) -> Option<Duration>;
     fn goaway(&self) -> Option<GoAway>;
+    fn admitted(&self) -> Option<crate::AdmittedValue>;
     fn is_plain_qmux_peer(&self) -> bool;
     fn stats(&self) -> SessionStats;
     fn meter(&self) -> &Arc<Meter>;
@@ -1976,8 +2152,12 @@ pub(crate) trait SessionApi<D: Driver> {
     fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])>;
     fn role_nonces(&self) -> Option<(u64, u64)>;
     fn set_scheduler(&self, policy: Policy);
-    fn set_quality_band(&self, band: Option<QualityBand>);
-    fn set_capacity_floor(&self, floor: Option<CapacityFloor>);
+    fn set_shaper(&self, factory: Option<std::sync::Arc<dyn core::shaping::Factory>>);
+    fn set_pipe_shaper(&self, pipe: PipeId, shaper: Option<Box<dyn core::shaping::Shaper>>)
+    -> bool;
+    fn shaping_stats(&self) -> core::shaping::Stats;
+    fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError>;
+    fn set_capacity_floor(&self, floor: Option<CapacityFloor>) -> Result<(), PipeError>;
     fn add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError>;
     fn join_ready(&self) -> bool;
     fn reserve_pipe(
@@ -2042,12 +2222,22 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().goaway
     }
 
+    fn admitted(&self) -> Option<crate::AdmittedValue> {
+        self.conn.lock().admitted.clone()
+    }
+
     fn is_plain_qmux_peer(&self) -> bool {
         self.conn.lock().core.is_plain_qmux_peer()
     }
 
     fn stats(&self) -> SessionStats {
-        self.conn.lock().core.stats()
+        let mut st = self.conn.lock();
+        // The durations since an event are current.
+        st.core.tick(D::now());
+        let mut stats = st.core.stats();
+        stats.carrier = st.carrier;
+        stats.carrier_candidates = st.carrier_tries.iter().cloned().collect();
+        stats
     }
 
     fn meter(&self) -> &Arc<Meter> {
@@ -2102,12 +2292,28 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.command(|st| st.core.set_scheduler(policy));
     }
 
-    fn set_quality_band(&self, band: Option<QualityBand>) {
-        self.command(|st| st.core.set_quality_band(band));
+    fn set_shaper(&self, factory: Option<std::sync::Arc<dyn core::shaping::Factory>>) {
+        self.command(|st| st.core.set_shaper(factory));
     }
 
-    fn set_capacity_floor(&self, floor: Option<CapacityFloor>) {
-        self.command(|st| st.core.set_capacity_floor(floor));
+    fn set_pipe_shaper(
+        &self,
+        pipe: PipeId,
+        shaper: Option<Box<dyn core::shaping::Shaper>>,
+    ) -> bool {
+        self.command(|st| st.core.set_pipe_shaper(pipe, shaper))
+    }
+
+    fn shaping_stats(&self) -> core::shaping::Stats {
+        self.conn.lock().core.shaping_stats()
+    }
+
+    fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError> {
+        self.command(|st| st.core.set_quality_band(band))
+    }
+
+    fn set_capacity_floor(&self, floor: Option<CapacityFloor>) -> Result<(), PipeError> {
+        self.command(|st| st.core.set_capacity_floor(floor))
     }
 
     fn add_pipe(&self, mut pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError> {
@@ -2117,14 +2323,16 @@ impl<D: Driver> SessionApi<D> for Session<D> {
             return Err(PipeError::InvalidArgument);
         }
         let id = self.command(|st| {
-            st.core.add_pipe(
-                c.inbound,
-                c.outbound,
-                &opts,
-                false,
-                c.exporter.as_deref().map(|e| e.pipe.as_slice()),
-                D::now(),
-            )
+            st.core
+                .add_pipe(
+                    c.inbound,
+                    c.outbound,
+                    &opts,
+                    false,
+                    c.exporter.as_deref().map(|e| e.pipe.as_slice()),
+                    D::now(),
+                )
+                .inspect(|&id| c.describe(&mut st.core, id))
         })?;
         self.attach(id, pipe)
     }
@@ -2190,7 +2398,9 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn pipe_stats(&self) -> Vec<PipeStats> {
-        self.conn.lock().core.pipes()
+        let mut st = self.conn.lock();
+        st.core.tick(D::now());
+        st.core.pipes()
     }
 
     fn revalidate_pipes(&self) -> Result<(), PipeError> {
@@ -2272,6 +2482,15 @@ macro_rules! session_api {
         /// The peer's GOAWAY, if it sent one.
         pub fn goaway(&self) -> Option<crate::GoAway> {
             <Self as crate::driver::handle::SessionApi<$d>>::goaway(self)
+        }
+
+        /// The value of the admission that accepted the carrier that
+        /// started the session ([`crate::AdmittedValue`]; the uplink's of a
+        /// split bootstrap), for the session's lifetime, resumptions
+        /// included; `None` without an admission, without a value, and on
+        /// a client.
+        pub fn admitted(&self) -> Option<crate::AdmittedValue> {
+            <Self as crate::driver::handle::SessionApi<$d>>::admitted(self)
         }
 
         /// Whether the peer is a plain QMux implementation.
@@ -2373,14 +2592,41 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::set_scheduler(self, policy)
         }
 
+        /// Installs `factory` on every outbound pipe of the session,
+        /// replacing earlier instances; `None`: no shaping.
+        pub fn set_shaper(&self, factory: Option<std::sync::Arc<dyn crate::shaping::Factory>>) {
+            <Self as crate::driver::handle::SessionApi<$d>>::set_shaper(self, factory)
+        }
+
+        /// Installs `shaper` on one outbound pipe until the next
+        /// [`set_shaper`](Self::set_shaper); `None`: the pipe is not
+        /// shaped. `false` when the pipe has no outbound direction.
+        pub fn set_pipe_shaper(
+            &self,
+            pipe: crate::PipeId,
+            shaper: Option<Box<dyn crate::shaping::Shaper>>,
+        ) -> bool {
+            <Self as crate::driver::handle::SessionApi<$d>>::set_pipe_shaper(self, pipe, shaper)
+        }
+
+        /// The shaping counters.
+        pub fn shaping_stats(&self) -> crate::shaping::Stats {
+            <Self as crate::driver::handle::SessionApi<$d>>::shaping_stats(self)
+        }
+
         /// Sets the quality band of the session's outbound pipes that have
         /// none of their own (`None`: none), pipe 0 of a session without
         /// multipath included: [`SessionEvent::PipeQualityChanged`](crate::SessionEvent::PipeQualityChanged) reports a pipe
         /// whose smoothed RTT or delivery rate leaves the band around its last
         /// report. Off until set, and free then; it never
         /// influences scheduling. The rate of a session without multipath
-        /// needs pipe acknowledgement.
-        pub fn set_quality_band(&self, band: Option<crate::QualityBand>) {
+        /// needs pipe acknowledgement. A band that is not
+        /// [valid](crate::QualityBand::validate) changes nothing:
+        /// [`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions).
+        pub fn set_quality_band(
+            &self,
+            band: Option<crate::QualityBand>,
+        ) -> Result<(), crate::PipeError> {
             <Self as crate::driver::handle::SessionApi<$d>>::set_quality_band(self, band)
         }
 
@@ -2390,8 +2636,13 @@ macro_rules! session_api {
         /// floor, at once if it is below when set, and
         /// [`SessionEvent::CapacityRestored`](crate::SessionEvent::CapacityRestored) once when it rises to the floor
         /// times its ratio again. zmux only reports; the
-        /// application decides, for example to dial another pipe.
-        pub fn set_capacity_floor(&self, floor: Option<crate::CapacityFloor>) {
+        /// application decides, for example to dial another pipe. A floor
+        /// that is not [valid](crate::CapacityFloor::validate) changes
+        /// nothing: [`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions).
+        pub fn set_capacity_floor(
+            &self,
+            floor: Option<crate::CapacityFloor>,
+        ) -> Result<(), crate::PipeError> {
             <Self as crate::driver::handle::SessionApi<$d>>::set_capacity_floor(self, floor)
         }
 
@@ -2460,16 +2711,21 @@ pub(crate) use session_api;
 pub(crate) trait PipeApi<D: Driver> {
     fn id(&self) -> PipeId;
     fn stats(&self) -> Option<PipeStats>;
+    fn admitted(&self) -> Option<crate::AdmittedValue>;
     fn close(&self) -> Result<(), PipeError>;
     fn abort(&self) -> Result<(), PipeError>;
     fn set_send_priority(&self, priority: u64) -> Result<(), PipeError>;
     fn clear_send_priority(&self) -> Result<(), PipeError>;
     fn set_receive_priority(&self, priority: u64) -> Result<(), PipeError>;
     fn set_send_standby(&self, standby: bool) -> Result<(), PipeError>;
+    fn set_priority(&self, priority: u64) -> Result<(), PipeError>;
+    fn set_standby(&self, standby: bool) -> Result<(), PipeError>;
     fn clear_send_standby(&self) -> Result<(), PipeError>;
     fn set_receive_standby(&self, standby: bool) -> Result<(), PipeError>;
     fn set_weight(&self, weight: u64) -> Result<(), PipeError>;
     fn set_probation(&self, probation: Option<Duration>) -> Result<(), PipeError>;
+    fn update(&self, update: &crate::proto::session::PipeUpdate) -> Result<(), PipeError>;
+    fn options(&self) -> Option<PipeOptions>;
     fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError>;
     fn revalidate(&self) -> Result<(), PipeError>;
 }
@@ -2480,7 +2736,13 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
     }
 
     fn stats(&self) -> Option<PipeStats> {
-        self.conn.lock().core.pipe_info(self.id)
+        let mut st = self.conn.lock();
+        st.core.tick(D::now());
+        st.core.pipe_info(self.id)
+    }
+
+    fn admitted(&self) -> Option<crate::AdmittedValue> {
+        self.conn.lock().core.pipe_admitted(self.id)
     }
 
     fn close(&self) -> Result<(), PipeError> {
@@ -2515,12 +2777,28 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
         self.command(|c, p| c.set_pipe_receive_standby(p, standby))
     }
 
+    fn set_priority(&self, priority: u64) -> Result<(), PipeError> {
+        self.command(|c, p| c.set_pipe_priority(p, priority))
+    }
+
+    fn set_standby(&self, standby: bool) -> Result<(), PipeError> {
+        self.command(|c, p| c.set_pipe_standby(p, standby))
+    }
+
     fn set_weight(&self, weight: u64) -> Result<(), PipeError> {
         self.command(|c, p| c.set_pipe_weight(p, weight))
     }
 
     fn set_probation(&self, probation: Option<Duration>) -> Result<(), PipeError> {
         self.command(|c, p| c.set_pipe_probation(p, probation))
+    }
+
+    fn update(&self, update: &crate::proto::session::PipeUpdate) -> Result<(), PipeError> {
+        self.command(|c, p| c.update_pipe(p, update))
+    }
+
+    fn options(&self) -> Option<PipeOptions> {
+        self.conn.lock().core.pipe_options(self.id)
     }
 
     fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError> {
@@ -2541,18 +2819,16 @@ macro_rules! pipe_api {
         /// the one requested of the peer
         /// ([`set_receive_priority`](Self::set_receive_priority)), as
         /// [`PipeOptions::with_priority`](PipeOptions::with_priority)
-        /// does when the pipe is added.
+        /// does when the pipe is added. Both change in one step.
         pub fn set_priority(&self, priority: u64) -> Result<(), crate::PipeError> {
-            self.set_send_priority(priority)?;
-            self.set_receive_priority(priority)
+            <Self as crate::driver::handle::PipeApi<$d>>::set_priority(self, priority)
         }
 
         /// Makes both directions standby (data only on failover) or
         /// available, as [`set_priority`](Self::set_priority) does for the
         /// tier.
         pub fn set_standby(&self, standby: bool) -> Result<(), crate::PipeError> {
-            self.set_send_standby(standby)?;
-            self.set_receive_standby(standby)
+            <Self as crate::driver::handle::PipeApi<$d>>::set_standby(self, standby)
         }
 
         /// The session the pipe belongs to. The handle keeps the session
@@ -2570,6 +2846,15 @@ macro_rules! pipe_api {
         /// session keeps its state.
         pub fn stats(&self) -> Option<crate::PipeStats> {
             <Self as crate::driver::handle::PipeApi<$d>>::stats(self)
+        }
+
+        /// The value of the admission that accepted the carrier that
+        /// brought the pipe ([`crate::AdmittedValue`]): its join's carrier
+        /// (the half with the join of a split one); the session's for
+        /// pipe 0. `None` without one, and once the session forgot the
+        /// pipe.
+        pub fn admitted(&self) -> Option<crate::AdmittedValue> {
+            <Self as crate::driver::handle::PipeApi<$d>>::admitted(self)
         }
 
         /// Removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain
@@ -2635,6 +2920,21 @@ macro_rules! pipe_api {
             <Self as crate::driver::handle::PipeApi<$d>>::set_probation(self, probation)
         }
 
+        /// Applies several setting changes together ([`PipeUpdate`](crate::PipeUpdate)):
+        /// a change of both receive fields sends one PIPE_STATUS.
+        pub fn update(&self, update: &crate::PipeUpdate) -> Result<(), crate::PipeError> {
+            <Self as crate::driver::handle::PipeApi<$d>>::update(self, update)
+        }
+
+        /// The options the pipe is in use with: those it was added with
+        /// (the defaults for a pipe the peer joined) and the settings
+        /// changed since; the effective values, which may follow the peer's
+        /// request, are in [`stats`](Self::stats). `None` once the session
+        /// released the pipe's state.
+        pub fn options(&self) -> Option<crate::PipeOptions> {
+            <Self as crate::driver::handle::PipeApi<$d>>::options(self)
+        }
+
         /// Sets the quality band of this pipe's outbound direction (`None`:
         /// the session's, [`Session::set_quality_band`](crate::Session#method.set_quality_band); a band with both
         /// halves off turns its reports off).
@@ -2693,6 +2993,7 @@ impl<D: Driver> PipeReservationApi<D> for PipeReservation<D> {
             st.take_oob(id.0);
             let now = D::now();
             st.core.set_reserved_framing(id, c.inbound, c.outbound, now);
+            c.describe(&mut st.core, id);
             st.core
                 .pipe_write(id, PipeWrite::returned(now, now, 0, 0, false), now);
         });
@@ -2744,7 +3045,7 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn id(&self) -> Option<StreamId>;
     fn pin_id(&self) -> Result<StreamId, StreamError>;
     fn set_scheduler(&self, policy: Option<Policy>) -> Result<(), StreamError>;
-    fn set_redundant(&self, on: bool) -> Result<(), StreamError>;
+    fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError>;
     fn finish(&mut self) -> Result<(), StreamError>;
     fn reset(&mut self, code: VarInt) -> Result<(), StreamError>;
     fn set_reliable_boundary(&mut self) -> Result<(), StreamError>;
@@ -2754,7 +3055,7 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn max_datagram_size(&self, context: u64) -> Option<usize>;
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError>;
     fn meter(&self) -> &Arc<Meter>;
-    fn stats(&self) -> Option<StreamStats>;
+    fn stats(&self) -> StreamStats;
     fn send_capacity(&self) -> u64;
     fn poll_send_capacity(&self, cx: &mut Context<'_>, min: u64) -> Poll<Result<u64, StreamError>>;
 }
@@ -2772,7 +3073,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
         self.command(|c, k| c.set_stream_scheduler(k, policy))
     }
 
-    fn set_redundant(&self, on: bool) -> Result<(), StreamError> {
+    fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError> {
         self.command(|c, k| c.set_redundant(k, on))
     }
 
@@ -2822,8 +3123,8 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
         &self.meter
     }
 
-    fn stats(&self) -> Option<StreamStats> {
-        self.conn.lock().core.stream_stats(self.key)
+    fn stats(&self) -> StreamStats {
+        stream_stats(&self.conn, self.key, &self.last)
     }
 
     fn send_capacity(&self) -> u64 {
@@ -2871,11 +3172,11 @@ macro_rules! sendstream_api {
             <Self as crate::driver::handle::SendStreamApi<$d>>::set_scheduler(self, policy)
         }
 
-        /// Turns redundancy on or off for this stream direction: copies of its
-        /// chunks on a second pipe of the tier, within the session's copy
-        /// bound. Until called,
-        /// the session's `redundancy` parameter applies.
-        pub fn set_redundant(&self, on: bool) -> Result<(), crate::StreamError> {
+        /// Turns redundancy on (`Some(true)`) or off (`Some(false)`) for this
+        /// stream direction: copies of its chunks on a second pipe of the
+        /// tier, within the session's copy bound. `None`, as before the
+        /// first call, has it follow the session's `redundancy` parameter.
+        pub fn set_redundant(&self, on: Option<bool>) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::set_redundant(self, on)
         }
 
@@ -2944,9 +3245,10 @@ macro_rules! sendstream_api {
             <Self as crate::driver::handle::SendStreamApi<$d>>::meter(self)
         }
 
-        /// A snapshot of the stream's statistics; `None`
-        /// once the session no longer holds the stream.
-        pub fn stats(&self) -> Option<crate::StreamStats> {
+        /// A snapshot of the stream's statistics (both parts of a
+        /// bidirectional stream return the same one); once the session
+        /// released the stream, its final values.
+        pub fn stats(&self) -> crate::StreamStats {
             <Self as crate::driver::handle::SendStreamApi<$d>>::stats(self)
         }
 
@@ -2988,7 +3290,7 @@ pub(crate) trait RecvStreamApi<D: Driver> {
     fn is_replayable(&self) -> bool;
     fn requested_priority(&self) -> Option<Priority>;
     fn meter(&self) -> &Arc<Meter>;
-    fn stats(&self) -> Option<StreamStats>;
+    fn stats(&self) -> StreamStats;
 }
 
 impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
@@ -3032,8 +3334,8 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
         &self.meter
     }
 
-    fn stats(&self) -> Option<StreamStats> {
-        self.conn.lock().core.stream_stats(self.key)
+    fn stats(&self) -> StreamStats {
+        stream_stats(&self.conn, self.key, &self.last)
     }
 }
 
@@ -3114,9 +3416,10 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::meter(self)
         }
 
-        /// A snapshot of the stream's statistics; `None`
-        /// once the session no longer holds the stream.
-        pub fn stats(&self) -> Option<crate::StreamStats> {
+        /// A snapshot of the stream's statistics (both parts of a
+        /// bidirectional stream return the same one); once the session
+        /// released the stream, its final values.
+        pub fn stats(&self) -> crate::StreamStats {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::stats(self)
         }
     };

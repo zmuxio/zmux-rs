@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
 use zmux::proto::ApplicationErrorCode;
 use zmux::{
-    Cap, Config, Limiter, Listener, ListenerConfig, Pipe, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    PipeState, Policy, Session, VarInt,
+    Cap, Config, Limiter, Listener, ListenerConfig, OutboundState, Pipe, PipeAuth, PipeHint,
+    PipeIo, PipeOptions, Policy, Session, VarInt,
 };
 
 fn carrier_failed() -> VarInt {
@@ -85,7 +85,8 @@ struct Gate {
 impl Gate {
     fn set(&self, shut: bool) {
         self.shut.store(shut, Ordering::SeqCst);
-        if let Some(w) = self.waker.lock().unwrap().take() {
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(w) = waker {
             w.wake();
         }
     }
@@ -193,7 +194,7 @@ impl Relay {
         let p = x.add_pipe(pipe, PipeOptions::default()).unwrap();
         eventually(10, "relayed pipe active", || {
             p.stats()
-                .is_some_and(|i| i.outbound == Some(PipeState::Active) && !i.in_probation)
+                .is_some_and(|i| i.outbound == Some(OutboundState::Active) && !i.in_probation)
         })
         .await;
         p
@@ -222,7 +223,7 @@ fn failed(p: &Pipe) -> bool {
     p.stats().is_none_or(|i| {
         matches!(
             i.outbound,
-            Some(PipeState::Failed | PipeState::Retired | PipeState::Closed) | None
+            Some(OutboundState::Failed | OutboundState::Closed) | None
         )
     })
 }

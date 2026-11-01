@@ -37,8 +37,9 @@ use mp_net::{A, B, Joined, MpNet, Observe};
 use proptest::prelude::*;
 use zmux::proto::frame::{Dir, Frame, Frames, Gates};
 use zmux::proto::session::{
-    Config, CoreEvent, FrameInfo, Pick, PickAnswer, PipeAuth, PipeId, PipeOptions, PipeSnapshot,
-    PipeState, Policy, SessionCore, SessionError, SessionStats, State, StreamError, StreamKey,
+    Config, CoreEvent, FrameInfo, InboundState, OutboundState, Pick, PickAnswer, PipeAuth, PipeId,
+    PipeOptions, PipeSnapshot, Policy, SessionCore, SessionError, SessionStats, State, StreamError,
+    StreamKey,
 };
 use zmux::proto::{TransportErrorCode, VarInt, varint};
 
@@ -191,20 +192,29 @@ fn stop_code(tag: usize) -> u64 {
 
 /// A custom policy: a stable hash of the stream and chunk picks a pipe, and
 /// one value in `n + 1` is out of range (the core falls back to affinity).
-#[derive(Debug)]
-struct HashPick;
+/// Now and then it waits, but never on two calls in a row: a wait holds only
+/// until the next input, and a direction whose request does not change (its
+/// data all written, nothing else in flight) would be asked the same thing
+/// on every keep-alive timer and wait for ever.
+#[derive(Debug, Default)]
+struct HashPick {
+    calls: std::sync::atomic::AtomicU64,
+}
 
 impl Pick for HashPick {
     fn pick(&self, reqs: &[FrameInfo], pipes: &[PipeSnapshot], out: &mut [PickAnswer]) {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for (frame, answer) in reqs.iter().zip(out) {
             let h = mix(frame.stream.unwrap_or(u64::MAX) ^ frame.len << 32);
             // Sticky for a few chunks, or until invalidated; now and then
             // a wait.
             *answer = match h % 7 {
-                0 => PickAnswer::Wait,
+                0 if call.is_multiple_of(2) => PickAnswer::Wait,
                 k => PickAnswer::Pipe {
                     index: (h >> 8) as usize % (pipes.len() + 1),
-                    bytes: (k - 1) * 16 * 1024,
+                    bytes: k.saturating_sub(1) * 16 * 1024,
                 },
             };
         }
@@ -218,7 +228,7 @@ fn policy() -> impl Strategy<Value = Policy> {
         Just(Policy::SpreadRateWeighted),
         Just(Policy::SpreadRoundRobin),
         Just(Policy::SessionAffinity),
-        Just(Policy::Custom(Arc::new(HashPick))),
+        Just(Policy::Custom(Arc::new(HashPick::default()))),
     ]
 }
 
@@ -265,7 +275,7 @@ impl Setup {
         c.max_pipes = self.max_pipes;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
         c.scheduler = self.policies[side].clone();
-        c.max_idle_timeout = Duration::from_secs(60);
+        c.max_idle_timeout = Some(Duration::from_secs(60));
         c.suspect_floor = self.suspect_floor;
         c.probation = self.probation;
         c.spread_chunk = self.spread_chunk;
@@ -354,7 +364,13 @@ fn net(setup: &Setup) -> Net {
         // An automatic cap grows within the memory budget.
         let window = match c.max_connection_receive_window {
             zmux::Cap::Fixed(w) => w,
-            _ => c.memory_budget,
+            _ => c
+                .memory_budget
+                .unwrap_or(zmux::Budget::Bytes(
+                    zmux::proto::session::DEFAULT_MEMORY_BUDGET,
+                ))
+                .bytes()
+                .unwrap_or(u64::MAX),
         };
         (c.send_buffer, window)
     });
@@ -431,7 +447,7 @@ impl Net {
         let local = self.ends[A]
             .pipes()
             .iter()
-            .filter(|i| i.local && i.pipe != PipeId(0))
+            .filter(|i| i.local && i.pipe != PipeId::new(0))
             .count();
         if !force && local + 1 >= self.s.max_pipes {
             return false;
@@ -737,7 +753,8 @@ impl Net {
                 "end {side}: held {held}, {st:?}"
             );
             let p = &mut self.s.peak[side];
-            p.bytes_duplicate = p.bytes_duplicate.max(st.bytes_duplicate);
+            p.bytes_duplicate_received =
+                p.bytes_duplicate_received.max(st.bytes_duplicate_received);
             p.bytes_reinjected = p.bytes_reinjected.max(st.bytes_reinjected);
             p.bytes_opportunistic = p.bytes_opportunistic.max(st.bytes_opportunistic);
             p.reinjections = p.reinjections.max(st.reinjections);
@@ -813,17 +830,18 @@ impl Net {
 
     /// A pipe pair both ends use.
     fn live_pair(&self) -> bool {
-        let usable = |st: Option<PipeState>| {
+        let usable = |st: Option<OutboundState>| {
             matches!(
                 st,
-                Some(PipeState::Active | PipeState::Joining | PipeState::Suspect)
+                Some(OutboundState::Active | OutboundState::Joining | OutboundState::Suspect)
             )
         };
         self.links.iter().any(|(&id, l)| {
             l.healthy()
                 && self.ends.iter().all(|s| {
-                    s.pipe_info(PipeId(id))
-                        .is_some_and(|i| usable(i.outbound) && i.inbound == Some(PipeState::Open))
+                    s.pipe_info(PipeId::new(id)).is_some_and(|i| {
+                        usable(i.outbound) && i.inbound == Some(InboundState::Open)
+                    })
                 })
         })
     }
@@ -888,13 +906,13 @@ impl Net {
                     !matches!(
                         i.outbound,
                         Some(
-                            PipeState::Active
-                                | PipeState::Joining
-                                | PipeState::Suspect
-                                | PipeState::Draining
+                            OutboundState::Active
+                                | OutboundState::Joining
+                                | OutboundState::Suspect
+                                | OutboundState::Draining
                         )
-                    ) && i.inbound != Some(PipeState::Open)
-                        && i.inbound != Some(PipeState::Joining)
+                    ) && i.inbound != Some(InboundState::Open)
+                        && i.inbound != Some(InboundState::Joining)
                 })
                 // `abandon_after_a_failed_drain_is_sent`.
                 .filter(|i| !self.s.drained[side].contains(&i.pipe))
@@ -922,7 +940,7 @@ impl Net {
         eprintln!(
             "MPFUZZ {label} streams={} bytes={bytes} dup={} reinj={} opp={} episodes={} fail={} penal={} fallback={} retained_max={} susp={} resumed={} joins={} refused={} late={}",
             self.s.streams.len(),
-            a.bytes_duplicate + b.bytes_duplicate,
+            a.bytes_duplicate_received + b.bytes_duplicate_received,
             a.bytes_reinjected + b.bytes_reinjected,
             a.bytes_opportunistic + b.bytes_opportunistic,
             a.reinjections + b.reinjections,
@@ -1281,7 +1299,7 @@ impl Net {
                 graceful,
             } => {
                 if let Some(id) = self.link_at(sel) {
-                    let pipe = PipeId(id);
+                    let pipe = PipeId::new(id);
                     if self.ends[side]
                         .remove_pipe(pipe, graceful, self.now)
                         .is_ok()
@@ -1363,7 +1381,7 @@ impl Net {
                 ref change,
             } => {
                 if let Some(id) = self.link_at(sel) {
-                    let pipe = PipeId(id);
+                    let pipe = PipeId::new(id);
                     let now = self.now;
                     let s = &mut self.ends[side];
                     let _ = match *change {
@@ -1460,6 +1478,164 @@ proptest! {
     }
 }
 
+/// A direction at its stream credit limit whose first bytes (preamble
+/// included) wait for reinjection stays scheduled: the peer gives no credit
+/// before they arrive, so dropping it from the queue as credit-blocked
+/// stalled it for good. Found by `exactly_once_under_churn` (minimized).
+#[test]
+fn lost_data_at_the_credit_limit_stays_scheduled() {
+    let setup = Setup {
+        resume: true,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: true,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 2,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let open = |len| Op::Open {
+        side: A,
+        bidi: false,
+        len,
+        commit: false,
+    };
+    let read = Op::Read {
+        side: A,
+        sel: 0,
+        max: 1,
+    };
+    let ops = [
+        Op::Break {
+            sel: 0,
+            how: Break::Error(1),
+        },
+        open(40000),
+        open(1),
+        Op::Run { ms: 1, per_tick: 1 },
+        Op::Write {
+            side: A,
+            sel: 43,
+            len: 16383,
+            chunk: false,
+        },
+        read.clone(),
+        read,
+    ];
+    run_case(&setup, &ops);
+}
+
+/// A reset whose Reliable Size the last fresh byte reaches is queued with
+/// that byte although reinjected data of the stream is still owed: the lost
+/// path never queues it, so it was never written and the reader never saw
+/// the reset. Found by `exactly_once_under_churn` (minimized).
+#[test]
+fn reset_after_reliable_data_with_data_lost_is_sent() {
+    let setup = Setup {
+        resume: true,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: false,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 4096,
+        max_pipes: 2,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let open = |side, len| Op::Open {
+        side,
+        bidi: false,
+        len,
+        commit: false,
+    };
+    let stop = Op::Stop { side: A, sel: 0 };
+    let ops = [
+        open(B, 27299),
+        open(B, 0),
+        Op::Stall { sel: 0, which: 0 },
+        Op::Delay {
+            sel: 0,
+            which: 0,
+            ms: 0,
+        },
+        open(A, 4088),
+        Op::Run {
+            ms: 71,
+            per_tick: 2046,
+        },
+        stop.clone(),
+        Op::Remove {
+            side: A,
+            sel: 0,
+            graceful: false,
+        },
+        Op::Write {
+            side: A,
+            sel: 0,
+            len: 1,
+            chunk: false,
+        },
+        open(A, 0),
+        open(A, 0),
+        stop,
+        open(A, 0),
+        Op::Reset {
+            side: A,
+            sel: 72,
+            boundary: true,
+        },
+    ];
+    run_case(&setup, &ops);
+}
+
+/// A stream reset while its preamble waits for reinjection (the pipe that
+/// carried it stopped answering) keeps the preamble as its Reliable Size: the
+/// lost preamble is still owed after the reset is written, so the stream
+/// stays scheduled and the preamble goes again. Found by
+/// `exactly_once_under_churn` (minimized; it hid behind the idle timeout
+/// before keep-alive was on by default).
+#[test]
+fn preamble_lost_before_a_reset_is_sent_again() {
+    let setup = Setup {
+        resume: true,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: false,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 2,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let open = |commit| Op::Open {
+        side: A,
+        bidi: false,
+        len: 0,
+        commit,
+    };
+    let ops = [
+        open(false),
+        open(true),
+        Op::Finish { side: B, sel: 0 },
+        open(false),
+        Op::Step(14),
+        Op::Advance(2000),
+        Op::Reset {
+            side: A,
+            sel: 10,
+            boundary: false,
+        },
+    ];
+    run_case(&setup, &ops);
+}
+
 /// BUG (`mpath.rs` `remove_pipe` and `fail_attachment`, `output.rs`
 /// `write_abandon`): a graceful removal of a writable pipe queues its
 /// PIPE_ABANDON(NO_ERROR) as the pipe's own last frame (`abandon_on_self`).
@@ -1492,10 +1668,10 @@ fn abandon_after_a_failed_drain_is_sent() {
         let mut n = net(&setup);
         assert!(n.join_pipe(&PipeOptions::default(), 64 * 1024, false, true));
         n.run(2_000, usize::MAX);
-        let pipe = PipeId(2);
+        let pipe = PipeId::new(2);
         n.ends[A].remove_pipe(pipe, true, n.now).unwrap();
         if carrier_error {
-            for f in &mut n.links.get_mut(&pipe.0).unwrap().flows {
+            for f in &mut n.links.get_mut(&pipe.get()).unwrap().flows {
                 f.reset = true;
                 f.write_err = true;
             }

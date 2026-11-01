@@ -38,8 +38,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, PipeState, Policy,
-    Priority, Session,
+    Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
+    Policy, Priority, Session,
 };
 use zmux_quinn::{Options, QuicCarrier};
 
@@ -352,7 +352,7 @@ fn transport() -> Arc<quinn::TransportConfig> {
 fn options() -> Options {
     let mut o = Options::default();
     // As the simulated rows (16 lanes).
-    o.lanes = 16;
+    o.windows.lanes = 16;
     o
 }
 
@@ -667,9 +667,9 @@ async fn run_bulk(loss: f64, lanes: bool, seed: u64, secs: f64) {
                 }
                 for p in cs.pipe_stats() {
                     eprintln!(
-                        "TRACE t={:.1} pipe={} queued={} qdelay={:?} rate={:?} srtt={:?} inflight={:?} writable={}",
+                        "TRACE t={:.1} pipe={} queued={:?} qdelay={:?} rate={:?} srtt={:?} inflight={:?} writable={}",
                         t0.elapsed().as_secs_f64(),
-                        p.pipe.0,
+                        p.pipe.get(),
                         p.queued_bytes,
                         p.queue_delay,
                         p.delivery_rate,
@@ -756,7 +756,7 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while pipe.stats().and_then(|i| i.outbound) != Some(PipeState::Active) {
+    while pipe.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
         assert!(
             Instant::now() < deadline,
             "the carrier-bound QUIC join failed"

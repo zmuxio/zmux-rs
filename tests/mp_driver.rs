@@ -92,7 +92,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         .expect("joined in time")
         .unwrap();
     let ids = |s: &Session| s.pipes().iter().map(zmux::Pipe::id).collect::<Vec<_>>();
-    assert_eq!(ids(&client), [zmux::PipeId(0), pipe.id()]);
+    assert_eq!(ids(&client), [zmux::PipeId::new(0), pipe.id()]);
     let stats = pipe.stats().unwrap();
     assert_eq!(stats.label.as_deref(), Some("second"));
     assert_eq!((stats.send_priority, stats.receive_priority), (5, 5));
@@ -102,7 +102,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let joined = server.pipe(pipe.id()).expect("the peer's pipe");
     joined.set_send_priority(1).unwrap();
     assert_eq!(joined.stats().unwrap().send_priority, 1);
-    assert!(server.pipe(zmux::PipeId(0)).is_some());
+    assert!(server.pipe(zmux::PipeId::new(0)).is_some());
     // A join over a carrier that is gone fails, and says why; the session
     // goes on.
     let (dead, far) = tokio::io::duplex(1024);
@@ -135,7 +135,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         .await
         .expect("the peer's half closed in time")
         .unwrap();
-    let zero = client.pipe(zmux::PipeId(0)).unwrap();
+    let zero = client.pipe(zmux::PipeId::new(0)).unwrap();
     client.close(0u32.into(), b"");
     let e = tokio::time::timeout(Duration::from_secs(10), zero.closed())
         .await
@@ -204,17 +204,14 @@ async fn blocking_client_two_pipes() {
     std::thread::spawn(move || {
         let c = std::net::TcpStream::connect(addr).unwrap();
         let s = zmux::blocking::Session::connect(
-            zmux::blocking::PipeIo::tcp(c).unwrap(),
+            zmux::blocking::PipeIo::tcp(c),
             config(Policy::SpreadEta),
         )
         .unwrap();
         assert!(s.multipath() == zmux::Multipath::InUse);
         let c2 = std::net::TcpStream::connect(addr).unwrap();
-        s.add_pipe(
-            zmux::blocking::PipeIo::tcp(c2).unwrap(),
-            PipeOptions::default(),
-        )
-        .unwrap();
+        s.add_pipe(zmux::blocking::PipeIo::tcp(c2), PipeOptions::default())
+            .unwrap();
         let (mut send, mut recv) = s.open_bi().unwrap();
         let len = 2 << 20;
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -232,4 +229,30 @@ async fn blocking_client_two_pipes() {
         let _ = done.send(());
     });
     finished.await.expect("the blocking client finished");
+}
+
+/// An adapter's unsent count (`PipeIo::with_unsent`) is queried by the
+/// driver and becomes the pipe's `queued_bytes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
+    let (addr, _l) = server(Policy::SpreadEta).await;
+    let c = TcpStream::connect(addr).await.unwrap();
+    let s = Session::connect(PipeIo::tcp(c), config(Policy::SpreadEta))
+        .await
+        .unwrap();
+    let c2 = TcpStream::connect(addr).await.unwrap();
+    let io = PipeIo::tcp(c2).with_unsent(|| Some(4321));
+    let pipe = s.add_pipe(io, PipeOptions::default()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+        .await
+        .expect("joined in time")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pipe.stats().and_then(|p| p.queued_bytes) != Some(4321) {
+            echo(&s, 1024).await;
+        }
+    })
+    .await
+    .expect("the count reported");
+    s.close(0u32.into(), b"");
 }

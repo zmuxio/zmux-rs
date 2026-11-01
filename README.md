@@ -12,6 +12,7 @@
 [![zmux-http](https://img.shields.io/crates/v/zmux-http.svg?label=zmux-http)](https://crates.io/crates/zmux-http)
 [![zmux-h3](https://img.shields.io/crates/v/zmux-h3.svg?label=zmux-h3)](https://crates.io/crates/zmux-h3)
 [![zmux-webtransport](https://img.shields.io/crates/v/zmux-webtransport.svg?label=zmux-webtransport)](https://crates.io/crates/zmux-webtransport)
+[![zmux-shaping](https://img.shields.io/crates/v/zmux-shaping.svg?label=zmux-shaping)](https://crates.io/crates/zmux-shaping)
 
 Rust implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
@@ -47,6 +48,30 @@ stream operation), `OpenError`, `DatagramError`, `PipeError`, and
 `ConnectError`, `ReadExactError`, `ReadToEndError` for the compound calls.
 Each tells whether the operation may be retried (`is_retryable`) and
 converts into `std::io::Error`.
+
+## Servers, carrier choice and shaping
+
+- **Admission.** `ListenerConfig::admission` (an `Admission`) decides on
+  every carrier of a `Listener`, whatever adapter took it, before anything
+  is sent on it: from its first bytes and its metadata (`CarrierInfo`) it
+  accepts the carrier, hands it to the fallback of its kind with the bytes
+  read replayed (`ListenerConfig::fallback`), stalls it, or closes it
+  (`Verdict`). `PrefixAuth` is a ready-made credential check, bound to the
+  TLS connection where the carrier has an exporter; a client presents it
+  as a `Credential`. `TrustedProxies` names the intermediaries whose report
+  of the client address (PROXY protocol, a forwarding header field) is
+  believed.
+- **Choosing a carrier.** `dial_mode` takes a `Mode`: `Mode::explicit` uses
+  one `Candidate`, `Mode::auto` tries several in order of preference and,
+  with `Config::max_pipes` above 1, moves the session to preferred kinds by
+  joining them as further pipes. A `CarrierCache` in the `ModePolicy`
+  remembers which kinds worked per server and network; `snapshot` and
+  `restore` carry it across restarts.
+- **Shaping.** `zmux::shaping` lets a `Factory` (set as `Config::shaper` or
+  with `Session::set_shaper`) plan each record's length, padding and delay,
+  inject padding records and gate the sending rate, bounded by the session's
+  `shaping::Limits`. The `zmux-shaping` crate (`shaping`) is such a factory,
+  driven by state machines read from a versioned JSON definition.
 
 ## Memory and allocators
 
@@ -98,6 +123,11 @@ The carrier crates of the workspace turn connections into pipes, each with
 | `zmux-http` (`adapter/http`) | HTTP/1.1 and HTTP/2 exchanges (hyper), over TCP or TLS | HTTP/2, off by default |
 | `zmux-h3` (`adapter/h3`) | HTTP/3 requests (h3 over quinn) | further requests |
 | `zmux-webtransport` (`adapter/webtransport`) | WebTransport sessions (web-transport-quinn) | further streams |
+
+`zmux-http` also serves every HTTP carrier kind on one request target:
+streamed bidirectional requests, split uplink and downlink requests, and
+the exchange carrier of bounded requests for paths that buffer whole
+bodies.
 
 The crate documentation compares them and describes multipath, resumption,
 relays and nesting.

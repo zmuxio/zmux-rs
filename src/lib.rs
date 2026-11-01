@@ -107,48 +107,76 @@ mod error;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub mod helpers;
 pub mod proto;
+pub mod util;
 
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
+pub use proto::admission::{
+    Admission, AdmittedValue, CarrierInfo, Credential, Decide, DecideFuture, PEEK_TIMEOUT_DRAWN,
+    STALL_MAX_DRAWN, Verdict,
+};
 pub use proto::frame::{Dir, Priority};
-pub use proto::ident::alpn_protocols;
+pub use proto::ident::{alpn_protocols, default_alpn};
 pub use proto::limit::{DatagramLimiter, Limiter};
 pub use proto::listener::{ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure};
 pub use proto::meter::{AppBytes, Meter};
-pub use proto::oob::JOIN_HEADER;
+pub use proto::oob::{JOIN_HEADER, PAIR_HEADER, PAIRING_TOKEN_LEN};
 pub use proto::params::Role;
-pub use proto::session::{
-    Cap, CapacityFloor, Config, DatagramError, EarlyData, EarlyDataState, GoAway, LaneStats,
-    Multipath, OpenError, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeOptions,
-    PipeState, PipeStats, Policy, Preamble, PrioritySource, QualityBand, Redundancy, RttSource,
-    SessionError, SessionEvent, SessionStats, State as SessionState, StreamError, StreamStats,
-    Tracer,
+pub use proto::prefix_auth::{
+    InvalidPrefixAuth, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL, PREFIX_AUTH_HEADER,
+    PREFIX_TOKEN_LEN, PrefixAuth, PrefixAuthVerifier,
 };
+pub use proto::session::shaping;
+pub use proto::session::{
+    Budget, CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierKind, Config,
+    DatagramError, DirectionState, EarlyData, EarlyDataState, GoAway, InboundState, LaneStats,
+    Multipath, OpenError, OutboundState, Period, PipeAuth, PipeError, PipeFailure, PipeHalf,
+    PipeId, PipeOptions, PipeStats, PipeUpdate, Policy, Preamble, PrioritySource, QualityBand,
+    Redundancy, RttSource, SessionError, SessionEvent, SessionStats, State as SessionState,
+    StreamError, StreamStats, Tracer,
+};
+pub use proto::trusted::{InvalidNet, IpNet, TrustedProxies, forwarded_early_data};
 pub use proto::{DetailKey, VarInt};
 
 // The drivers are left out of loom builds, which check their
 // synchronization units only (src/driver/loom.rs).
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::cache::{CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError};
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub use driver::handle::Written;
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::listen::{HandleError, Listener, ListenerStats, PipeHint};
+pub use driver::listen::{
+    AdmissionStats, Admit, Admitted, Entry, HandleError, Listener, ListenerStats, PipeHint,
+    SetupGuard,
+};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::mode::{Candidate, Mode, ModeError, ModePolicy, dial_mode, join_split};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::tokio::{Dial, Pipe, PipeIo, PipeReservation, RecvStream, SendStream, Session};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::transform::{InboundTransform, PipeStream};
 
 /// What carrier adapters use beyond [`PipeIo`]'s builder methods: the identity
 /// of a multi-stream carrier connection, the
 /// router of its incoming lanes, and the memory charge of a connection
 /// held for a listener's sessions. Applications that only use carriers
 /// need none of it. The [`PipeIo`] methods for carrier authors are
-/// `with_carrier_conn`, `with_lane_opener`, `with_lanes`,
-/// `with_connection_memory`, `with_tcp_socket`, `with_low_water`,
-/// `with_partial_reads`, `with_tls_exporter`, `with_abort` and
-/// `with_protocol`.
+/// `from_chunk_halves`, `with_carrier_conn`, `with_lane_opener`,
+/// `with_chunk_lane_opener`, `with_lanes`,
+/// `with_connection_memory`, `with_tcp_socket`, `with_unsent`, `with_low_water`,
+/// `with_partial_reads`, `with_tls_exporter`, `with_abort`,
+/// `with_datagram_channel` and `with_protocol`.
 #[cfg(all(feature = "tokio", not(loom)))]
 pub mod carrier {
+    pub use crate::driver::channel::{
+        ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
+    };
     pub use crate::driver::empty_message;
     pub use crate::driver::lanes::{CarrierConnId, handle_lane};
     pub use crate::driver::listen::MemoryCharge;
+    pub use crate::driver::tokio::{ChunkBuf, ChunkWrite};
 }
 
 /// Resource accounting for leak tests (feature `test-hooks`; never enable
@@ -212,7 +240,7 @@ pub mod test_hooks {
 /// use zmux::blocking::{PipeIo, Session};
 ///
 /// let tcp = std::net::TcpStream::connect("127.0.0.1:4433")?;
-/// let session = Session::connect(PipeIo::tcp(tcp)?, zmux::Config::default())?;
+/// let session = Session::connect(PipeIo::tcp(tcp), zmux::Config::default())?;
 /// let (mut send, mut recv) = session.open_bi()?;
 /// send.write_all(b"hello")?;
 /// send.finish()?;
@@ -224,8 +252,14 @@ pub mod test_hooks {
 #[cfg(all(feature = "blocking", not(loom)))]
 pub mod blocking {
     pub use crate::driver::blocking::{
-        Dial, DuplicateOptions, Pipe, PipeIo, PipeReservation, RecvStream, Resolved, SendStream,
-        Session, WaitError, resolve_duplicate,
+        Dial, Pipe, PipeIo, PipeReservation, RecvStream, SendStream, Session, WaitError,
     };
     pub use crate::driver::empty_message;
+
+    /// The helpers of the std driver, as `zmux::helpers` has them for the
+    /// tokio one.
+    pub mod helpers {
+        pub use crate::driver::blocking::{DuplicateOptions, Resolved, resolve_duplicate};
+        pub use crate::helpers::{DuplicateError, DuplicateRule};
+    }
 }

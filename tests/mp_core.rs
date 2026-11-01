@@ -14,8 +14,8 @@ use proptest::prelude::*;
 use zmux::proto::frame::{Dir, Frame, Padding, Priority, Stream};
 use zmux::proto::record::RecordBuilder;
 use zmux::proto::session::{
-    Config, CoreEvent, PipeAuth, PipeEnd, PipeHalf, PipeId, PipeOptions, PipeState, Policy,
-    QualityBand, State, StreamKey,
+    Config, CoreEvent, DirectionState, OutboundState, PipeAuth, PipeEnd, PipeHalf, PipeId,
+    PipeOptions, Policy, QualityBand, State, StreamKey,
 };
 
 /// The streams A wrote, with their data, and what B read of them.
@@ -36,7 +36,7 @@ fn config(policy: Policy, resume: bool) -> Config {
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
     c.scheduler = policy;
-    c.max_idle_timeout = Duration::from_secs(60);
+    c.max_idle_timeout = Some(Duration::from_secs(60));
     if resume {
         c.resume_timeout = Some(Duration::from_secs(30));
     }
@@ -327,10 +327,12 @@ fn acknowledgements_drive_quality_events() {
     n.pump(10);
     n.advance(5);
     n.pump(10);
-    n.ends[A].set_quality_band(Some(QualityBand {
-        min_interval: Duration::ZERO,
-        ..QualityBand::new(Duration::from_millis(2), 0.0)
-    }));
+    n.ends[A]
+        .set_quality_band(Some(QualityBand {
+            min_interval: Duration::ZERO,
+            ..QualityBand::new(Duration::from_millis(2), 0.0)
+        }))
+        .unwrap();
     n.open_and_write(50_000, false);
     n.pump(10);
     let quality = |n: &Net| {
@@ -339,7 +341,7 @@ fn acknowledgements_drive_quality_events() {
             .filter_map(|e| match e {
                 CoreEvent::PipeQualityChanged {
                     pipe, smoothed_rtt, ..
-                } => Some((pipe.0, *smoothed_rtt)),
+                } => Some((pipe.get(), *smoothed_rtt)),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -377,13 +379,13 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
     let reports: [fn(&mut Net, u64); 3] = [
         |n, id| {
             n.ends[A].pipe_ended(
-                PipeId(id),
+                PipeId::new(id),
                 PipeEnd::Error(std::io::ErrorKind::ConnectionReset),
                 n.now,
             )
         },
-        |n, id| n.ends[A].pipe_ended(PipeId(id), PipeEnd::Eof, n.now),
-        |n, id| n.ends[A].write_failed(PipeId(id), std::io::ErrorKind::BrokenPipe, n.now),
+        |n, id| n.ends[A].pipe_ended(PipeId::new(id), PipeEnd::Eof, n.now),
+        |n, id| n.ends[A].write_failed(PipeId::new(id), std::io::ErrorKind::BrokenPipe, n.now),
     ];
     for (i, report) in reports.into_iter().enumerate() {
         let mut n = net(Policy::SpreadEta, false);
@@ -392,13 +394,13 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
         n.advance(5);
         n.pump(10);
         assert_eq!(
-            n.ends[A].pipe_state(PipeId(id), PipeHalf::Outbound),
-            Some(PipeState::Active)
+            n.ends[A].pipe_state(PipeId::new(id), PipeHalf::Outbound),
+            Some(DirectionState::Outbound(OutboundState::Active))
         );
         report(&mut n, id);
         assert_eq!(
-            n.ends[A].pipe_state(PipeId(id), PipeHalf::Outbound),
-            Some(PipeState::Failed),
+            n.ends[A].pipe_state(PipeId::new(id), PipeHalf::Outbound),
+            Some(DirectionState::Outbound(OutboundState::Failed)),
             "report {i}"
         );
         assert!(n.ends[A].state() < State::Closing, "report {i}");
@@ -444,7 +446,7 @@ fn affinity_and_graceful_removal() {
     n.pump(10);
     n.open_and_write(50_000, false);
     n.pump(5);
-    n.ends[A].remove_pipe(PipeId(id), true, n.now).unwrap();
+    n.ends[A].remove_pipe(PipeId::new(id), true, n.now).unwrap();
     n.write_more(0, 50_000);
     n.settle();
     n.check_prefix();
@@ -463,12 +465,17 @@ fn an_aborted_pipe_is_never_shut_down_gracefully() {
     n.pump(10);
     n.open_and_write(50_000, false);
     n.pump(2);
-    n.ends[A].remove_pipe(PipeId(id), false, n.now).unwrap();
-    assert!(!n.ends[A].wants_write(PipeId(id)), "nothing more to write");
+    n.ends[A]
+        .remove_pipe(PipeId::new(id), false, n.now)
+        .unwrap();
+    assert!(
+        !n.ends[A].wants_write(PipeId::new(id)),
+        "nothing more to write"
+    );
     n.handle_events();
     assert!(n.events[A].iter().any(|e| matches!(
         e,
-        CoreEvent::ClosePipe { pipe, half: PipeHalf::Outbound, abort: true } if pipe.0 == id
+        CoreEvent::ClosePipe { pipe, half: PipeHalf::Outbound, abort: true } if pipe.get() == id
     )));
     n.write_more(0, 50_000);
     n.settle();
@@ -547,56 +554,127 @@ proptest! {
         policy in policy(),
         ops in prop::collection::vec(op(), 1..60),
     ) {
-        let mut n = net(policy, resume);
-        for op in ops {
-            match op {
-                Op::Open(len) => n.open_and_write(len as usize, false),
-                Op::Write(s, len) => {
-                    let i = s as usize % n.s.a_streams.len().max(1);
-                    n.write_more(i, len as usize);
-                }
-                Op::Step(limit) => {
-                    n.step(limit as usize);
-                    n.read_b();
-                }
-                Op::Advance(ms) => n.advance(u64::from(ms)),
-                Op::Fail(p) => {
-                    let ids: Vec<u64> = n.links.iter().filter(|(_, l)| l.alive()).map(|(k, _)| *k).collect();
-                    if let Some(&id) = ids.get(p as usize % ids.len().max(1)) {
-                        n.fail(id);
-                    }
-                }
-                Op::Add => {
-                    let _ = n.add_pipe(&PipeOptions::default());
-                }
-                Op::Remove(p, g) => {
-                    let ids: Vec<u64> = n.links.keys().copied().collect();
-                    if let Some(&id) = ids.get(p as usize % ids.len().max(1)) {
-                        let _ = n.ends[A].remove_pipe(PipeId(id), g, n.now);
-                    }
+        run_churn(policy, resume, ops);
+    }
+}
+
+/// Applies `ops` to a fresh pair, heals it with a new pipe and checks that
+/// every stream completed exactly once, in order.
+fn run_churn(policy: Policy, resume: bool, ops: Vec<Op>) {
+    let mut n = net(policy, resume);
+    for op in ops {
+        n.apply(op);
+        n.check_prefix();
+    }
+    // Heal: a fresh pipe, then run to completion.
+    if n.ends[A].state() < State::Closing && n.ends[B].state() < State::Closing {
+        let _ = n.add_pipe(&PipeOptions::default());
+        n.settle();
+        n.check_prefix();
+        if n.ends[A].state() < State::Closing && n.ends[B].state() < State::Closing {
+            COMPLETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var("MP_STATS").is_ok() {
+                eprintln!(
+                    "completed: {} streams, {} bytes, reinjected {}",
+                    n.s.sent.len(),
+                    n.s.sent.values().map(Vec::len).sum::<usize>(),
+                    n.ends[A].stats().bytes_reinjected
+                );
+            }
+            for (tag, sent) in &n.s.sent {
+                let got = n.s.recv.get(tag).map_or(0, Vec::len);
+                assert_eq!(got, sent.len(), "stream {tag} incomplete");
+            }
+            n.check_application_bytes();
+        }
+    }
+}
+
+impl Net {
+    fn apply(&mut self, op: Op) {
+        match op {
+            Op::Open(len) => self.open_and_write(len as usize, false),
+            Op::Write(s, len) => {
+                let i = s as usize % self.s.a_streams.len().max(1);
+                self.write_more(i, len as usize);
+            }
+            Op::Step(limit) => {
+                self.step(limit as usize);
+                self.read_b();
+            }
+            Op::Advance(ms) => self.advance(u64::from(ms)),
+            Op::Fail(p) => {
+                let ids: Vec<u64> = self
+                    .links
+                    .iter()
+                    .filter(|(_, l)| l.alive())
+                    .map(|(k, _)| *k)
+                    .collect();
+                if let Some(&id) = ids.get(p as usize % ids.len().max(1)) {
+                    self.fail(id);
                 }
             }
-            n.check_prefix();
-        }
-        // Heal: a fresh pipe, then run to completion.
-        if n.ends[A].state() < State::Closing && n.ends[B].state() < State::Closing {
-            let _ = n.add_pipe(&PipeOptions::default());
-            n.settle();
-            n.check_prefix();
-            if n.ends[A].state() < State::Closing && n.ends[B].state() < State::Closing {
-                COMPLETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("MP_STATS").is_ok() {
-                    eprintln!("completed: {} streams, {} bytes, reinjected {}",
-                        n.s.sent.len(), n.s.sent.values().map(Vec::len).sum::<usize>(), n.ends[A].stats().bytes_reinjected);
+            Op::Add => {
+                let _ = self.add_pipe(&PipeOptions::default());
+            }
+            Op::Remove(p, g) => {
+                let ids: Vec<u64> = self.links.keys().copied().collect();
+                if let Some(&id) = ids.get(p as usize % ids.len().max(1)) {
+                    let _ = self.ends[A].remove_pipe(PipeId::new(id), g, self.now);
                 }
-                for (tag, sent) in &n.s.sent {
-                    let got = n.s.recv.get(tag).map_or(0, Vec::len);
-                    prop_assert_eq!(got, sent.len(), "stream {} incomplete", tag);
-                }
-                n.check_application_bytes();
             }
         }
     }
+}
+
+/// A churn under session affinity with resume (found by
+/// `exactly_once_under_pipe_churn`): a record of PIPE_ACK alone,
+/// acknowledged late with the next acknowledgement, gave a delivery-rate
+/// sample of a few hundred bytes a second, and the limiter then held the
+/// active pipe past the end of the run.
+#[test]
+fn session_affinity_churn_with_removals_completes() {
+    use Op::*;
+    let ops = vec![
+        Open(7518),
+        Fail(189),
+        Add,
+        Add,
+        Fail(245),
+        Add,
+        Step(4452),
+        Write(80, 18608),
+        Add,
+        Open(14161),
+        Add,
+        Step(5414),
+        Advance(5),
+        Write(194, 14420),
+        Add,
+        Fail(159),
+        Step(2459),
+        Fail(144),
+        Add,
+        Write(214, 13776),
+        Step(5427),
+        Open(10797),
+        Write(52, 13957),
+        Add,
+        Add,
+        Add,
+        Fail(244),
+        Advance(133),
+        Remove(161, false),
+        Fail(12),
+        Remove(228, false),
+        Advance(73),
+        Step(3465),
+        Step(4498),
+        Remove(135, true),
+        Fail(221),
+        Write(91, 1385),
+    ];
+    run_churn(Policy::SessionAffinity, true, ops);
 }
 
 /// A stream that never completed after a churn of joins and failures
@@ -648,7 +726,7 @@ fn churn_with_failures_completes() {
             Op::Remove(p, g) => {
                 let ids: Vec<u64> = n.links.keys().copied().collect();
                 if let Some(&id) = ids.get(p as usize % ids.len().max(1)) {
-                    let _ = n.ends[A].remove_pipe(PipeId(id), g, n.now);
+                    let _ = n.ends[A].remove_pipe(PipeId::new(id), g, n.now);
                 }
             }
             _ => unreachable!(),
@@ -700,10 +778,10 @@ fn paced_writes(
         }
         for &id in &ids {
             for _ in 0..64 {
-                if !n.ends[A].wants_write(PipeId(id)) {
+                if !n.ends[A].wants_write(PipeId::new(id)) {
                     break;
                 }
-                n.ends[A].poll_transmit(PipeId(id), n.now, &mut n.out);
+                n.ends[A].poll_transmit(PipeId::new(id), n.now, &mut n.out);
                 let mut v = Vec::new();
                 n.out.copy_to_vec(&mut v);
                 assert!(
@@ -728,16 +806,16 @@ fn paced_writes(
             n.read_b();
             for &id in &ids {
                 for _ in 0..64 {
-                    if !n.ends[B].wants_write(PipeId(id)) {
+                    if !n.ends[B].wants_write(PipeId::new(id)) {
                         break;
                     }
-                    n.ends[B].poll_transmit(PipeId(id), n.now, &mut n.out);
+                    n.ends[B].poll_transmit(PipeId::new(id), n.now, &mut n.out);
                     let mut v = Vec::new();
                     n.out.copy_to_vec(&mut v);
                     if v.is_empty() {
                         break;
                     }
-                    n.ends[A].receive(PipeId(id), &v, n.now);
+                    n.ends[A].receive(PipeId::new(id), &v, n.now);
                 }
             }
         }
@@ -826,7 +904,7 @@ fn deliberate_fragmentation_is_bounded_by_the_span() {
             }
             for (i, r) in records.iter_mut().enumerate() {
                 let r = std::mem::take(r);
-                n.ends[B].receive(PipeId(pipes[i]), &r, n.now);
+                n.ends[B].receive(PipeId::new(pipes[i]), &r, n.now);
             }
         };
         // Offset 0 holds an empty stream preamble (EXTENSIONS.md Section

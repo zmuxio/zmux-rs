@@ -117,6 +117,7 @@ fn transport_parameters_match() {
         ("zmux_preamble", id::ZMUX_PREAMBLE),
         ("zmux_priority", id::ZMUX_PRIORITY),
         ("zmux_datagram_flows", id::ZMUX_DATAGRAM_FLOWS),
+        ("zmux_carrier_datagrams", id::ZMUX_CARRIER_DATAGRAMS),
         ("zmux_multipath", id::ZMUX_MULTIPATH),
         ("zmux_ack_threshold", id::ZMUX_ACK_THRESHOLD),
         ("zmux_pipe_ack", id::ZMUX_PIPE_ACK),
@@ -284,8 +285,7 @@ fn fixed_values_labels_and_limits_match() {
         bytes_label("hkdf_join_responder"),
         keys::JOIN_RESPONDER_LABEL
     );
-    assert_eq!(labels["http_join_header"], oob::JOIN_HEADER);
-    assert_eq!(labels["http_pair_header"], oob::PAIR_HEADER);
+    assert_eq!(labels.as_object().unwrap().len(), 5);
 
     // The limits that belong to the wire layer; the others are session
     // timers and budgets.

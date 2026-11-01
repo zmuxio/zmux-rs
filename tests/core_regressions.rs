@@ -323,7 +323,7 @@ fn stop_before_first_frame_is_sent_with_it() {
 fn config_out_of_varint_range_is_rejected() {
     let now = Instant::now();
     let mut cfg = Config::default();
-    cfg.max_idle_timeout = Duration::MAX;
+    cfg.max_idle_timeout = Some(Duration::MAX);
     assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
     let mut cfg = Config::default();
     cfg.max_connection_receive_window = Cap::Fixed(1 << 62);
@@ -776,4 +776,77 @@ fn rejected_carrier_early_data_is_sent_again_whole() {
     assert_eq!(got[1], (b"bidi data".to_vec(), "fin".to_owned()));
     assert_eq!(got[2].0, b"reliable".to_vec());
     assert!(got[2].1.contains("Reset"), "{:?}", got[2].1);
+}
+
+/// A preamble is checked when it is set, against the limit known then
+/// (the remembered Maximum Preamble Size during early data), and again
+/// when the stream's identifier is due: once the peer's smaller limit
+/// arrived, only that stream fails, nothing of it is sent, and the
+/// session goes on (N8).
+#[test]
+fn a_preamble_beyond_the_peer_limit_fails_only_its_stream() {
+    let mut a_cfg = Config::default();
+    a_cfg.early_data = zmux::EarlyData::default().with_carrier_early_data(true);
+    // The server remembered with the largest limit now announces 1500.
+    let remembered = Pair::attached(Config::default(), Config::default())
+        .b
+        .local_parameters();
+    assert_eq!(remembered.zmux_preamble, Some(4096));
+    let mut b_cfg = Config::default();
+    let mut smaller = remembered.clone();
+    smaller.zmux_preamble = Some(1500);
+    b_cfg.test_hooks().transport_parameters = Some(smaller);
+    let mut p = Pair::attached(a_cfg, b_cfg);
+    assert!(p.a.assume_remembered(&remembered));
+    let big = Preamble::new().with_info(vec![b'x'; 2000]);
+    // Beyond the local limit of 4096: refused at once.
+    assert_eq!(
+        p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 5000]))
+            .err(),
+        Some(OpenError::PreambleTooLarge)
+    );
+    let k = p.a.open_with(Dir::Bidi, &big).unwrap();
+    // The peer's parameters arrive before the stream's first frame.
+    p.send(false);
+    assert!(p.a.is_established());
+    if let Err(e) = p.a.write(k, b"data") {
+        assert_eq!(e, zmux::proto::session::StreamError::PreambleTooLarge);
+    }
+    p.pump();
+    assert_eq!(
+        p.a.write(k, b"more").err(),
+        Some(zmux::proto::session::StreamError::PreambleTooLarge)
+    );
+    assert!(p.b.accept(Dir::Bidi).unwrap().is_none(), "nothing was sent");
+    // Now the peer's limit applies at once.
+    assert_eq!(
+        p.a.open_with(Dir::Bidi, &big).err(),
+        Some(OpenError::PreambleTooLarge)
+    );
+    let ok =
+        p.a.open_with(Dir::Bidi, &Preamble::new().with_info("small"))
+            .unwrap();
+    p.a.write(ok, b"x").unwrap();
+    p.pump();
+    assert_eq!(p.a.state(), State::Active);
+    assert!(p.b.accept(Dir::Bidi).unwrap().is_some());
+}
+
+/// During early data without remembered parameters, the limit is the
+/// 1024-byte floor.
+#[test]
+fn early_preambles_are_bounded_by_the_floor() {
+    let mut a_cfg = Config::default();
+    a_cfg.early_data = zmux::EarlyData::for_zmux_peer();
+    let p = Pair::attached(a_cfg, Config::default());
+    let mut a = p.a;
+    assert!(
+        a.open_with(Dir::Bidi, &Preamble::new().with_info("x"))
+            .is_ok()
+    );
+    assert_eq!(
+        a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 1100]))
+            .err(),
+        Some(OpenError::PreambleTooLarge)
+    );
 }

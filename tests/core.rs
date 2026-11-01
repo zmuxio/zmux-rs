@@ -70,7 +70,7 @@ fn memory_pressure_rejects_new_streams_and_keeps_credit_flowing() {
 #[test]
 fn keep_alive_counts_sent_records_as_activity() {
     let mut cfg = Config::default();
-    cfg.max_idle_timeout = Duration::from_secs(10);
+    cfg.max_idle_timeout = Some(Duration::from_secs(10));
     cfg.keep_alive_period = Some(Duration::from_secs(4));
     cfg.max_incoming_uni_streams = Some(4);
     let mut p = Pair::with_events(cfg.clone(), cfg);
@@ -90,10 +90,85 @@ fn keep_alive_counts_sent_records_as_activity() {
     assert_eq!(p.a.stats().records_sent, p.b.stats().records_received);
 }
 
+/// The default keep-alive is 15 s; None turns it off.
+#[test]
+fn keep_alive_default_and_off() {
+    let default = Config::default().keep_alive_period;
+    assert_eq!(default, Some(Duration::from_secs(15)));
+    for (period, pings) in [(default, true), (None, false)] {
+        let mut cfg = Config::default();
+        cfg.max_idle_timeout = Some(Duration::from_secs(60));
+        cfg.probe_jitter = 0.0;
+        let mut b = cfg.clone();
+        b.keep_alive_period = None;
+        cfg.keep_alive_period = period;
+        let mut p = Pair::with_events(cfg, b);
+        let step = |p: &mut Pair, s| {
+            p.now += Duration::from_secs(s);
+            p.a.handle_timeout(p.now);
+            p.b.handle_timeout(p.now);
+            p.pump();
+        };
+        for _ in 0..10 {
+            step(&mut p, 1);
+        }
+        let before = p.a.stats().records_sent;
+        for _ in 0..8 {
+            step(&mut p, 1);
+        }
+        assert_eq!(p.a.stats().records_sent > before, pings, "{period:?}");
+    }
+}
+
+/// Keep-alive sends at most one QX_PING after each activity: with its
+/// answers lost, no further request follows each period; the answer that
+/// arrives (activity) arms the next one.
+#[test]
+fn keep_alive_pings_once_per_activity() {
+    let mut cfg = Config::default();
+    cfg.max_idle_timeout = Some(Duration::from_secs(60));
+    cfg.keep_alive_period = Some(Duration::from_secs(4));
+    cfg.probe_jitter = 0.0;
+    let mut b = cfg.clone();
+    b.keep_alive_period = None;
+    let mut p = Pair::with_events(cfg, b);
+    let sent = |p: &Pair| p.a.stats().records_sent;
+    let t0 = p.now;
+    p.now += Duration::from_secs(1);
+    p.a.handle_timeout(p.now);
+    p.b.handle_timeout(p.now);
+    p.pump();
+    let start = (t0, sent(&p));
+    for i in 2..=20 {
+        p.now = start.0 + Duration::from_secs(i);
+        p.a.handle_timeout(p.now);
+        p.b.handle_timeout(p.now);
+        // A's records reach B; B's answers are lost.
+        p.send(true);
+        p.drain_events();
+    }
+    assert_eq!(sent(&p) - start.1, 1, "one QX_PING in 20 s");
+    // B's answer arrives at 20 s (activity): one request follows a period
+    // later, at 24 s, and no other while its answer is lost too.
+    p.send(false);
+    let mut at = Vec::new();
+    for i in 21..=32 {
+        p.now = start.0 + Duration::from_secs(i);
+        p.a.handle_timeout(p.now);
+        p.b.handle_timeout(p.now);
+        p.send(true);
+        p.drain_events();
+        at.push(sent(&p));
+    }
+    // at[2] is 23 s, at[3] 24 s.
+    assert_eq!(at[3] - at[2], 1, "{at:?}");
+    assert_eq!(at[11] - at[3], 0, "{at:?}");
+}
+
 #[test]
 fn idle_sessions_time_out_without_keep_alive() {
     let mut cfg = Config::default();
-    cfg.max_idle_timeout = Duration::from_secs(5);
+    cfg.max_idle_timeout = Some(Duration::from_secs(5));
     let mut p = Pair::with_events(cfg.clone(), cfg);
     p.now += Duration::from_secs(6);
     p.a.handle_timeout(p.now);
@@ -419,13 +494,13 @@ fn a_ping_whose_response_is_late_asks_again() {
 #[test]
 fn single_pipe_sessions_report_pipe_zero() {
     use zmux::proto::params::TransportParameters;
-    use zmux::proto::session::{PipeState, RttSource};
+    use zmux::proto::session::{OutboundState, RttSource};
     let p = Pair::with_events(Config::default(), Config::default());
     let pipes = p.a.pipes();
     assert_eq!(pipes.len(), 1);
     let i = &pipes[0];
     assert_eq!(i.pipe, P0);
-    assert_eq!(i.outbound, Some(PipeState::Active));
+    assert_eq!(i.outbound, Some(OutboundState::Active));
     assert!(i.eligible && !i.saturated);
     assert_eq!((i.send_priority, i.standby, i.weight), (0, false, 1));
     assert_eq!((i.bytes_reinjected, i.bytes_opportunistic), (0, 0));
@@ -474,4 +549,53 @@ fn single_pipe_sessions_report_pipe_zero() {
     p.a.receive(P0, &wire, p.now);
     assert_eq!(p.a.ping_rtt(ticket), Some(Duration::from_millis(20)));
     assert_eq!(p.a.stats().latest_rtt, Some(Duration::from_millis(20)));
+}
+
+/// The settings that are not values: no handshake timeout leaves an
+/// unanswered session establishing; no idle timeout with keep-alive off
+/// keeps a quiet session open; a set idle timeout below the 1 ms unit of
+/// its transport parameter is not valid, since 0 there means none, and so
+/// is a keep-alive period below 1 s.
+#[test]
+fn no_timeout_and_off_settings() {
+    use std::time::Instant;
+    use zmux::Budget;
+    use zmux::proto::session::RoleConfig;
+    let far = Duration::from_secs(1 << 30);
+    for (timeout, establishing) in [(Config::default().handshake_timeout, false), (None, true)] {
+        let mut c = Config::default();
+        c.handshake_timeout = timeout;
+        let t0 = Instant::now();
+        let mut s = SessionCore::new(c, RoleConfig::Initiator, None, t0).unwrap();
+        s.handle_timeout(t0 + far);
+        assert_eq!(
+            s.state() == State::Establishing,
+            establishing,
+            "{timeout:?}"
+        );
+    }
+    let mut cfg = Config::default();
+    cfg.max_idle_timeout = None;
+    cfg.keep_alive_period = None;
+    cfg.memory_budget = Some(Budget::Unlimited);
+    let mut p = Pair::with_events(cfg.clone(), cfg);
+    p.pump();
+    p.now += far;
+    p.a.handle_timeout(p.now);
+    p.b.handle_timeout(p.now);
+    p.pump();
+    assert_eq!((p.a.state(), p.b.state()), (State::Active, State::Active));
+    for (d, ok) in [(0, false), (999, false), (1000, true)] {
+        let mut c = Config::default();
+        c.max_idle_timeout = Some(Duration::from_micros(d));
+        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        assert_eq!(r.is_ok(), ok, "{d} us");
+    }
+    // A keep-alive period is at least 1 s; zero has no meaning.
+    for (ms, ok) in [(0, false), (999, false), (1000, true)] {
+        let mut c = Config::default();
+        c.keep_alive_period = Some(Duration::from_millis(ms));
+        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        assert_eq!(r.is_ok(), ok, "{ms} ms");
+    }
 }

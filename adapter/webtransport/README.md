@@ -14,8 +14,17 @@ over HTTP/3, the carrier reaches servers through HTTP/3 front ends that
 forward WebTransport.
 
 `connect(&client, url, &options, config)` establishes a zmux session over a
-new WebTransport session; `serve(listener, server, options)` accepts
-WebTransport sessions and hands their streams to a listener.
+new WebTransport session; `serve(listener, endpoint, options)` accepts
+WebTransport sessions on a QUIC endpoint, within the listener's setup
+limits, and hands their streams to a listener. With the listener's
+admission (`ListenerConfig::admission`), each session request is decided on before it is
+answered (`admit`, without a prefix): accepted requests get 200, the
+others go to `Options::fallback` (`WebTransportFallback`) or get 404, or
+are stalled or closed without a response. A client's `zmux::Credential`
+(`Options::with_credential`) travels in a request header field, such as a
+`zmux::PrefixAuth` token in `Zmux-Prefix-Auth`; `dial_over` makes the
+session on a QUIC connection of the application's, whose exporter binds
+the token.
 
 The carrier wires:
 

@@ -18,7 +18,7 @@ use zmux::proto::session::{
 };
 use zmux::proto::{VarInt, varint};
 
-const P0: PipeId = PipeId(0);
+const P0: PipeId = PipeId::new(0);
 
 #[derive(Debug, Clone)]
 enum PeerFrame {

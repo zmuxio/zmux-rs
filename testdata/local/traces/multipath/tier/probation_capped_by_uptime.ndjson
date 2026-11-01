@@ -1,0 +1,88 @@
+{"kind": "trace", "id": "multipath.tier.probation_capped_by_uptime", "title": "After a short up period, probation is capped at max(base, 2 x the longest uptime) instead of base x 2^k", "profile": "zmux-mp", "local_role": "responder", "overrides": {"config": {"probation": 1000}}, "refs": ["SCHEDULER.md#11"], "findings": [], "groups": ["multipath", "tier"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "zmux_multipath": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}, "zmux_ack_threshold": 4096}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "00112233445566778899aabbccddeeff", "locator": "50454552"}}, {"id": 58, "raw": "abcd"}]}]], "hex": "4065ff5153300d0a0d0a405b010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb0dc2978160400112233445566778899aabbccddeeff04504545523a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath"]}}
+{"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 6, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c2"}
+{"step": 7, "op": "peer_send", "carrier": "c2", "records": [[{"type": "PIPE_JOIN", "locator": "4c4f43414c", "pipe": 2, "direction": "bidi", "carrier_bound": false, "standby": false, "fate_group": 0, "priority": 0, "token": "3094f01ceb752456ab1b330c8e5c2b6b"}]], "hex": "1e9a24de36054c4f43414c020200003094f01ceb752456ab1b330c8e5c2b6b"}
+{"step": 8, "op": "advance", "ms": 25}
+{"step": 9, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "PIPE_PING"}]}
+{"step": 10, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 11, "op": "api", "call": "set_pipe_status", "args": {"pipe": 0, "send_priority": 5}, "expect": {"ok": true}}
+{"step": 12, "op": "api", "call": "set_pipe_status", "args": {"pipe": 2, "send_priority": 2}, "expect": {"ok": true}}
+{"step": 13, "op": "expect_no_frames", "pipe": "*", "types": ["PIPE_STATUS"]}
+{"step": 14, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
+{"step": 15, "op": "api", "call": "write", "args": {"stream": "a", "data": "61", "fin": false}, "expect": {"accepted": 1}}
+{"step": 16, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "02210061"}]}
+{"step": 17, "op": "advance", "ms": 100}
+{"step": 18, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 19, "op": "advance", "ms": 100}
+{"step": 20, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 21, "op": "advance", "ms": 75}
+{"step": 22, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 23, "op": "note", "text": "Pipe 2 stops being acknowledged at 300 ms, in its join probation: suspect by 900 ms, which gives the path history (that first up period does not count)."}
+{"step": 24, "op": "advance", "ms": 100}
+{"step": 25, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 26, "op": "advance", "ms": 100}
+{"step": 27, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 28, "op": "advance", "ms": 100}
+{"step": 29, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 30, "op": "advance", "ms": 100}
+{"step": 31, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 32, "op": "advance", "ms": 100}
+{"step": 33, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 34, "op": "advance", "ms": 100}
+{"step": 35, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 36, "op": "expect_state", "pipe": 2, "dir": "out", "state": "SUSPECT"}
+{"step": 37, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 38, "op": "expect_state", "pipe": 2, "dir": "out", "state": "ACTIVE"}
+{"step": 39, "op": "note", "text": "Back at 900 ms (k = 1). It is acknowledged no more: suspect again within 600 ms, so this up period, U_max, is at most 0.6 s."}
+{"step": 40, "op": "advance", "ms": 100}
+{"step": 41, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 42, "op": "advance", "ms": 100}
+{"step": 43, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 44, "op": "advance", "ms": 100}
+{"step": 45, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 46, "op": "advance", "ms": 100}
+{"step": 47, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 48, "op": "advance", "ms": 100}
+{"step": 49, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 50, "op": "advance", "ms": 100}
+{"step": 51, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 52, "op": "expect_state", "pipe": 2, "dir": "out", "state": "SUSPECT"}
+{"step": 53, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 54, "op": "expect_state", "pipe": 2, "dir": "out", "state": "ACTIVE"}
+{"step": 55, "op": "note", "text": "Back at 1500 ms, suspect during its probation: k = 2, base x 2^k = 4 s, but the cap is max(1 s, 2 x U_max), at most 1.2 s: data still goes to pipe 0 after 900 ms and to pipe 2 after 1300 ms."}
+{"step": 56, "op": "advance", "ms": 100}
+{"step": 57, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 58, "op": "advance", "ms": 100}
+{"step": 59, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 60, "op": "advance", "ms": 100}
+{"step": 61, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 62, "op": "advance", "ms": 100}
+{"step": 63, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 64, "op": "advance", "ms": 100}
+{"step": 65, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 66, "op": "advance", "ms": 100}
+{"step": 67, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 68, "op": "advance", "ms": 100}
+{"step": 69, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 70, "op": "advance", "ms": 100}
+{"step": 71, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 72, "op": "advance", "ms": 100}
+{"step": 73, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 74, "op": "api", "call": "write", "args": {"stream": "a", "data": "62", "fin": false}, "expect": {"accepted": 1}}
+{"step": 75, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "62", "off": 4}]}
+{"step": 76, "op": "expect_frames", "pipe": 2, "match": "unordered", "frames": [{"type": "STREAM", "count": 0}]}
+{"step": 77, "op": "advance", "ms": 100}
+{"step": 78, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 79, "op": "advance", "ms": 100}
+{"step": 80, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 81, "op": "advance", "ms": 100}
+{"step": 82, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 83, "op": "advance", "ms": 100}
+{"step": 84, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 85, "op": "api", "call": "write", "args": {"stream": "a", "data": "63", "fin": false}, "expect": {"accepted": 1}}
+{"step": 86, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "63", "off": 5}]}
+{"step": 87, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "STREAM", "count": 0}]}

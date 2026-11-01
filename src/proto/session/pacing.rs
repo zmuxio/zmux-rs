@@ -34,9 +34,7 @@ impl SessionCore {
     /// single pipe with pipe acknowledgement (MULTIPATH.md Section 3.5),
     /// when its carrier has neither a low-water mark nor an unsent count.
     pub(super) fn paced(&self, o: &OutPipe) -> bool {
-        (self.mp.is_some() || self.pipe_ack.is_some())
-            && !o.carrier_signals_queue()
-            && !self.config.hooks.unpaced
+        self.acknowledged() && !o.carrier_signals_queue() && !self.config.hooks.unpaced
     }
 
     /// The bytes of stream data, reinjection and copies the limiter lets

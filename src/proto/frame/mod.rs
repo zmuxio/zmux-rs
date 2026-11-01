@@ -7,6 +7,7 @@
 //! copied or allocated. Every frame type has an exact `encoded_len` and an
 //! `encode` that writes into a caller-provided buffer.
 
+pub mod channel;
 mod entries;
 mod ext;
 mod pipe;

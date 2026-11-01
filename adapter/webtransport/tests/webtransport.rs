@@ -2,7 +2,8 @@
 //! with streams both ways and a close the peer sees, lanes on further
 //! unidirectional streams without a listener (`accept_pipe`,
 //! `handle_lane`) and through a listener in a multipath session, and a
-//! lost session that is a failure of its pipes, never their clean end.
+//! lost session that is a failure of its pipes, never their clean end;
+//! and a request forwarded from early data, answered 425.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,10 @@ struct Wt {
     server: Option<web_transport_quinn::Server>,
     client: web_transport_quinn::Client,
     url: Url,
+    /// The client's endpoint and configuration, for connections made
+    /// outside `client`.
+    client_ep: quinn::Endpoint,
+    client_config: quinn::ClientConfig,
 }
 
 impl Wt {
@@ -55,8 +60,10 @@ impl Wt {
         let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         Self {
             server: Some(web_transport_quinn::Server::new(endpoint)),
-            client: web_transport_quinn::Client::new(client_ep, client_config),
+            client: web_transport_quinn::Client::new(client_ep.clone(), client_config.clone()),
             url: format!("https://{addr}/zmux").parse().unwrap(),
+            client_ep,
+            client_config,
         }
     }
 
@@ -116,13 +123,14 @@ async fn connect_and_serve() {
     let listener = Listener::new(Config::default(), ListenerConfig::default());
     let serving = tokio::spawn(zmux_webtransport::serve(
         listener.clone(),
-        wt.server.take().unwrap(),
+        (*wt.server.take().unwrap()).clone(),
         opts.clone(),
     ));
     let client = zmux_webtransport::connect(&wt.client, wt.url.clone(), &opts, Config::default())
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
+    assert_kind([&client, &server], zmux::CarrierKind::WebTransport);
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
     client.close(0u32.into(), b"bye");
@@ -224,5 +232,204 @@ async fn a_lost_session_is_a_failure_not_a_clean_end() {
             ),
             "{e:?}"
         );
+    }
+}
+
+/// An admission decides on the session request before it is answered: a
+/// request to the path it accepts carries a session; one to another path
+/// goes to the fallback handler, unanswered before, which rejects it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_decides_on_the_session_request() {
+    let admission = zmux::Admission::new(0, |info, prefix| {
+        assert!(prefix.is_empty());
+        let req = info
+            .request
+            .and_then(|r| r.downcast_ref::<web_transport_quinn::proto::ConnectRequest>())
+            .expect("the request");
+        assert!(info.has_exporter());
+        match req.url.path() {
+            "/zmux" => zmux::Verdict::accept(0),
+            _ => zmux::Verdict::Fallback,
+        }
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let fallback = zmux_webtransport::WebTransportFallback::new(move |req| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(req.url.path().to_owned());
+            let _ = req
+                .reject(web_transport_quinn::http::StatusCode::FORBIDDEN)
+                .await;
+        }
+    });
+    let opts = Options::default().with_fallback(fallback);
+    let mut wt = Wt::new(&opts);
+    let listener = Listener::new(Config::default(), admitted(Some(admission)));
+    let serving = tokio::spawn(zmux_webtransport::serve(
+        listener.clone(),
+        (*wt.server.take().unwrap()).clone(),
+        opts.clone(),
+    ));
+    let client = zmux_webtransport::connect(&wt.client, wt.url.clone(), &opts, Config::default())
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    transfer(&client, &server, 1, 64 << 10).await;
+    let mut other = wt.url.clone();
+    other.set_path("/other");
+    assert!(wt.client.connect(other).await.is_err());
+    assert_eq!(rx.recv().await.unwrap(), "/other");
+    client.close(0u32.into(), b"");
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// A prefix authentication token bound to the QUIC connection travels in
+/// the `Zmux-Prefix-Auth` field of the session request: `dial_over` gives
+/// the credential the connection's exporter and is admitted; `dial`, whose
+/// client makes the connection itself, has none for a bound credential,
+/// and a request without the field is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_token_in_the_session_request() {
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let opts = Options::default();
+    let mut wt = Wt::new(&opts);
+    let listener = Listener::new(
+        Config::default(),
+        admitted(Some(zmux::Admission::prefix_auth(verifier))),
+    );
+    let serving = tokio::spawn(zmux_webtransport::serve(
+        listener.clone(),
+        (*wt.server.take().unwrap()).clone(),
+        opts.clone(),
+    ));
+    let limit = Duration::from_secs(10);
+    let body = async {
+        assert!(wt.client.connect(wt.url.clone()).await.is_err(), "no token");
+        let client_opts = Options::default().with_credential(Arc::new(auth));
+        let e = zmux_webtransport::dial(&wt.client, wt.url.clone(), &client_opts)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let addr = (wt.url.host_str().unwrap(), wt.url.port().unwrap());
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+            .unwrap()
+            .next()
+            .unwrap();
+        let conn = wt
+            .client_ep
+            .connect_with(wt.client_config.clone(), addr, "127.0.0.1")
+            .unwrap()
+            .await
+            .unwrap();
+        let pipe = zmux_webtransport::dial_over(conn, wt.url.clone(), &client_opts)
+            .await
+            .unwrap();
+        let client = Session::connect(pipe, Config::default()).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        transfer(&client, &server, 1, 64 << 10).await;
+        client.close(0u32.into(), b"");
+    };
+    tokio::time::timeout(limit, body).await.unwrap();
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// A session request that an intermediary forwarded from TLS early data
+/// (`Early-Data: 1`) is answered 425 before any admission, with an
+/// admission and without one, and gives the listener nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_forwarded_from_early_data_is_answered_425() {
+    let decided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = decided.clone();
+    let admission = zmux::Admission::new(0, move |_, _| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        zmux::Verdict::accept(0)
+    });
+    for admission in [None, Some(admission)] {
+        let opts = Options::default();
+        let mut wt = Wt::new(&opts);
+        let listener = Listener::new(Config::default(), admitted(admission));
+        let serving = tokio::spawn(zmux_webtransport::serve(
+            listener.clone(),
+            (*wt.server.take().unwrap()).clone(),
+            opts.clone(),
+        ));
+        let mut request = web_transport_quinn::proto::ConnectRequest::new(wt.url.clone());
+        request.headers.insert(
+            "early-data",
+            web_transport_quinn::http::HeaderValue::from_static("1"),
+        );
+        let e = tokio::time::timeout(Duration::from_secs(10), wt.client.connect(request))
+            .await
+            .expect("answered")
+            .expect_err("refused");
+        assert!(e.to_string().contains("425"), "{e}");
+        assert_eq!(listener.stats().sessions, 0);
+        listener.close();
+        serving.await.unwrap();
+    }
+    assert_eq!(decided.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// A session with datagrams enabled sends them as datagrams of the
+/// WebTransport session (EXTENSIONS.md Section 6.8), both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn datagrams_ride_webtransport_datagrams() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut config = Config::default();
+        config.enable_datagrams = true;
+        let opts = Options::default();
+        let mut wt = Wt::new(&opts);
+        let listener = Listener::new(config.clone(), ListenerConfig::default());
+        let serving = tokio::spawn(zmux_webtransport::serve(
+            listener.clone(),
+            (*wt.server.take().unwrap()).clone(),
+            opts.clone(),
+        ));
+        let client = zmux_webtransport::connect(&wt.client, wt.url.clone(), &opts, config)
+            .await
+            .unwrap();
+        let server = listener.accept().await.unwrap();
+        for i in 0..20u8 {
+            client
+                .send_datagram(bytes::Bytes::from(vec![i; 300]))
+                .unwrap();
+            assert_eq!(server.read_datagram().await.unwrap()[..], [i; 300]);
+            server
+                .send_datagram(bytes::Bytes::from(vec![i; 30]))
+                .unwrap();
+            assert_eq!(client.read_datagram().await.unwrap()[..], [i; 30]);
+        }
+        let (c, s) = (client.stats(), server.stats());
+        assert_eq!(
+            (c.datagrams_sent_channel, s.datagrams_sent_channel),
+            (20, 20)
+        );
+        assert_eq!(
+            (c.datagrams_received_channel, s.datagrams_received_channel),
+            (20, 20)
+        );
+        client.close(0u32.into(), b"bye");
+        let _ = server.closed().await;
+        listener.close();
+        serving.await.unwrap();
+    })
+    .await
+    .expect("deadline");
+}
+
+fn admitted(admission: Option<zmux::Admission>) -> ListenerConfig {
+    let mut lc = ListenerConfig::default();
+    lc.admission = admission;
+    lc
+}
+
+/// Pipe 0 of each session is of carrier kind `kind`.
+fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+    for s in sessions {
+        let p = s.pipe(zmux::PipeId::new(0)).unwrap();
+        assert_eq!(p.stats().unwrap().carrier, Some(kind));
     }
 }

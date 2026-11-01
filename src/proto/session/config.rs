@@ -106,6 +106,91 @@ pub enum RoleConfig {
     Auto,
 }
 
+/// A per-pipe override of the session's probe interval: a period, or off.
+///
+/// The override fields (`Option<Period>` of
+/// [`PipeOptions`](crate::proto::session::PipeOptions) and of the pool
+/// decision) keep the session's setting when `None`, which is why off needs
+/// a variant of its own here; [`Config`]'s own periods are plain
+/// `Option<Duration>`, `None` being off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Period {
+    /// Run with this period.
+    Every(Duration),
+    /// Turned off.
+    Off,
+}
+
+impl Period {
+    /// The period; `None` when off.
+    #[must_use]
+    pub const fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Every(d) => Some(d),
+            Self::Off => None,
+        }
+    }
+
+    /// Whether this is off or a period of at least 1 s, the range of the
+    /// probe intervals.
+    pub(crate) fn off_or_seconds(self) -> bool {
+        self.duration().is_none_or(|d| d >= Duration::from_secs(1))
+    }
+}
+
+impl From<Duration> for Period {
+    fn from(d: Duration) -> Self {
+        Self::Every(d)
+    }
+}
+
+/// A memory budget: a number of bytes, or unlimited.
+///
+/// A budget of `Bytes(0)` is a budget of no byte: nothing grows beyond the
+/// floors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Budget {
+    /// At most this many bytes.
+    Bytes(u64),
+    /// No limit.
+    Unlimited,
+}
+
+impl Budget {
+    /// The bytes; `None` when unlimited.
+    #[must_use]
+    pub const fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Bytes(b) => Some(b),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl From<u64> for Budget {
+    fn from(b: u64) -> Self {
+        Self::Bytes(b)
+    }
+}
+
+/// The default handshake timeout ([`Config::handshake_timeout`]).
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The default probe interval of idle pipe pairs ([`Config::probe_interval`]).
+pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The default keep-alive period ([`Config::keep_alive_period`]).
+pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
+
+/// The default standby probe interval ([`Config::standby_probe`]).
+pub const DEFAULT_STANDBY_PROBE: Duration = Duration::from_secs(1);
+
+/// The default idle timeout ([`Config::max_idle_timeout`]).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default probe jitter j ([`Config::probe_jitter`]).
+pub const DEFAULT_PROBE_JITTER: f64 = 0.25;
+
 /// The default overflow delay D of tier gating.
 pub const DEFAULT_OVERFLOW_DELAY: Duration = Duration::from_secs(1);
 
@@ -197,12 +282,22 @@ pub enum Redundancy {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
-    /// Abandon establishment after this long (default 10 s).
-    pub handshake_timeout: Duration,
-    /// `max_idle_timeout`; zero disables the local limit (default 30 s).
-    pub max_idle_timeout: Duration,
-    /// Send QX_PING after this much inbound silence; `None` disables
-    /// keep-alive (the default).
+    /// Abandon establishment and unconfirmed joins and lanes after this
+    /// long (default [`DEFAULT_HANDSHAKE_TIMEOUT`], 10 s; `None` is no
+    /// timeout).
+    pub handshake_timeout: Option<Duration>,
+    /// `max_idle_timeout` (default [`DEFAULT_IDLE_TIMEOUT`], 30 s; `None`
+    /// is no local limit and announces none). A set duration is at least
+    /// 1 ms, the unit of the transport parameter, whose 0 means none.
+    pub max_idle_timeout: Option<Duration>,
+    /// Send QX_PING after this much silence (default
+    /// [`DEFAULT_KEEP_ALIVE_PERIOD`], 15 s; `None` turns keep-alive off; a
+    /// period below 1 s, zero included, is not valid).
+    /// The period in effect is capped at half the effective idle timeout, and each wait is drawn from \[k (1 - j), k\]
+    /// with j the [`probe_jitter`](Self::probe_jitter) (SPEC.md Section
+    /// 6.4). On, an idle session stays open while the peer answers and
+    /// closes within the idle timeout once its carrier dies; off, the idle
+    /// timeout ends any session without application activity.
     pub keep_alive_period: Option<Duration>,
     /// Initial stream receive window (default 256 KiB; at least 4 KiB,
     /// the early-data floor of [`params::floor`](floor)).
@@ -226,12 +321,13 @@ pub struct Config {
     /// Section 8.3 rule 4).
     pub max_connection_receive_window: Cap,
     /// The `memory_budget` parameter of `max_connection_receive_window`
-    /// (default 1 GiB; 0 is unlimited): the memory budget of a session
+    /// (`None`, the default, is [`DEFAULT_MEMORY_BUDGET`], 1 GiB;
+    /// [`Budget::Unlimited`] lifts it): the memory budget of a session
     /// without a listener, a listener's `MemoryBudget` otherwise. Buffered,
     /// retained and unread bytes and the session
     /// window's growth count against it; window and send-buffer growth
     /// above the floors of [`Cap::Auto`] stops at it.
-    pub memory_budget: u64,
+    pub memory_budget: Option<Budget>,
     /// Concurrent bidirectional streams the peer may open (default 256; 0,
     /// or at least 4, the early-data floor of [`params::floor`](floor)). An
     /// application that never accepts peer streams sets 0; a peer's early
@@ -245,6 +341,18 @@ pub struct Config {
     pub max_incoming_uni_streams: Option<u64>,
     /// Announce datagram support (default false).
     pub enable_datagrams: bool,
+    /// Datagrams waiting for a pipe (default 64, at least 1); when the
+    /// queue is full the oldest is dropped (EXTENSIONS.md Section 6.5).
+    pub datagram_send_queue: usize,
+    /// Received session datagrams (flow 0) waiting for the application
+    /// (default 128, at least 1); the oldest make room.
+    pub datagram_receive_queue: usize,
+    /// Received datagrams waiting per stream (default 32, at least 1); the
+    /// stream's oldest make room.
+    pub datagram_stream_queue: usize,
+    /// Bytes of every received datagram queue together, those held for
+    /// streams not opened yet included (default 1 MiB, at least 1).
+    pub datagram_receive_bytes: usize,
     /// Written-but-unreleased bytes per session before writes wait
     /// (default 4 MiB): unsent on a single pipe, unacknowledged in a
     /// multipath session. Shared fairly between stream directions, each of
@@ -285,6 +393,13 @@ pub struct Config {
     pub resume_timeout: Option<Duration>,
     /// The session's default scheduling policy (default `affinity`).
     pub scheduler: Policy,
+    /// Upper bounds of what the session's shapers add (default: none).
+    pub shaping_limits: super::shaping::Limits,
+    /// The shaper factory installed when the session is created (default:
+    /// none), as if by `set_shaper`: every pipe of the session, the
+    /// bootstrap pipe of an accepted session and joined pipes included, is
+    /// shaped from its first record. `set_shaper` replaces it.
+    pub shaper: Option<Arc<dyn super::shaping::Factory>>,
     /// The `spread-eta` chunk size (default 16 KiB).
     pub spread_chunk: usize,
     /// The floor of T_suspect for every pipe (default 250 ms, at least
@@ -310,21 +425,43 @@ pub struct Config {
     /// [`Redundancy::Urgent`]): which stream directions have copies of
     /// their chunks sent on a second pipe of the tier; a stream's `set_redundant` overrides it.
     pub redundancy: Redundancy,
-    /// The `standby_probe` parameter of `scheduler` (default 1 s; zero is
-    /// the probe interval): how often standby pipes and pipes of a
+    /// The `standby_probe` parameter of `scheduler` (default
+    /// [`DEFAULT_STANDBY_PROBE`], 1 s; `None` turns these
+    /// faster probes off, leaving such pipes at the probe interval; a
+    /// period below 1 s is not valid): how often standby pipes and pipes of a
     /// less-preferred tier get a PIPE_PING while the session is busy, a
     /// traffic frame having been sent or received within the last 15 s
     /// (MULTIPATH.md Section 7.1). A quiet session probes them at the
     /// probe interval, and once more when traffic resumes.
-    pub standby_probe: Duration,
-    /// The `probe_interval` parameter of `scheduler` (default 15 s, any
-    /// value; zero turns these probes off): how long an outbound pipe of a
-    /// pipe pair stays without an ack-eliciting byte before it gets a
-    /// PIPE_PING (MULTIPATH.md Section 7.1). A longer interval only delays
-    /// the detection of a pipe pair that dies while idle. Pipes whose
-    /// attachment has no outbound direction at the peer keep the 15 s
-    /// protocol constant, on which the peer's inbound silence rule relies.
-    pub probe_interval: Duration,
+    pub standby_probe: Option<Duration>,
+    /// The `probe_interval` parameter of `scheduler` (default
+    /// [`DEFAULT_PROBE_INTERVAL`], 15 s; `None` turns these
+    /// idle probes off, and a period below 1 s is not valid): how long an outbound pipe
+    /// of a pipe pair stays without an ack-eliciting byte handed to its
+    /// carrier before it gets a PIPE_PING (MULTIPATH.md Section 7.1). A
+    /// longer interval only delays the detection of a pipe pair that dies
+    /// while idle. Off turns off only these probes: the PIPE_PING that
+    /// goes with the answer to the peer's, the standby probes and the
+    /// probes of attachments without an outbound direction at the peer
+    /// stay, and a pipe pair with them off at both ends is not judged while the
+    /// session is quiet. The deadline is measured to the carrier: records
+    /// that shaping may hold for up to `max_delay` are built that much
+    /// earlier (but not more often than every second). A pipe's
+    /// [`PipeOptions::probe_interval`](crate::PipeOptions::probe_interval)
+    /// replaces it. Pipes whose attachment has no outbound direction at the
+    /// peer are always probed, at most every 15 s (the protocol constant
+    /// on which the peer's inbound silence rule relies).
+    pub probe_interval: Option<Duration>,
+    /// The `probe_jitter` parameter of `scheduler` (default 0.25, at least
+    /// 0 and below 1): each wait for an idle probe is drawn once, when it
+    /// starts (the pipe becomes ACTIVE, or a PIPE_PING was sent), uniformly
+    /// from \[k (1 - j), k\] for the probe interval k (MULTIPATH.md Section
+    /// 7.1), and the first wait of the bootstrap pipe from \[0, k\];
+    /// ack-eliciting bytes sent meanwhile move its start without a new
+    /// draw. The interval stays the upper bound. Zero gives the fixed
+    /// schedule of tests; the standby probes are never jittered. The draws
+    /// come from a generator seeded by the operating system's.
+    pub probe_jitter: f64,
     /// `allow_connection_window_increase`: when set,
     /// the session receive window grows only by increases the predicate
     /// approves. The core keeps at most one proposal outstanding; the
@@ -465,35 +602,42 @@ impl EarlyData {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(10),
-            max_idle_timeout: Duration::from_secs(30),
-            keep_alive_period: None,
+            handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
+            max_idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            keep_alive_period: Some(DEFAULT_KEEP_ALIVE_PERIOD),
             initial_stream_receive_window: 256 * 1024,
             max_stream_receive_window: Cap::Auto,
             latency_budget: DEFAULT_LATENCY_BUDGET,
             initial_connection_receive_window: 1024 * 1024,
             max_connection_receive_window: Cap::Auto,
-            memory_budget: DEFAULT_MEMORY_BUDGET,
+            memory_budget: None,
             max_incoming_streams: 256,
             max_incoming_uni_streams: None,
             enable_datagrams: false,
+            datagram_send_queue: 64,
+            datagram_receive_queue: 128,
+            datagram_stream_queue: 32,
+            datagram_receive_bytes: 1024 * 1024,
             send_buffer: 4 * 1024 * 1024,
             send_buffer_max: Cap::Auto,
-            max_send_record: 16382,
+            max_send_record: crate::proto::params::DEFAULT_MAX_RECORD_SIZE as usize,
             max_pipes: 1,
             pipe_headroom: 8,
             replay_window: None,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
             scheduler: Policy::Affinity,
+            shaping_limits: super::shaping::Limits::default(),
+            shaper: None,
             spread_chunk: 16 * 1024,
             suspect_floor: Duration::from_millis(250),
             dead_timeout: None,
             probation: None,
             overflow_delay: DEFAULT_OVERFLOW_DELAY,
             redundancy: Redundancy::Urgent,
-            standby_probe: Duration::from_secs(1),
-            probe_interval: Duration::from_secs(15),
+            standby_probe: Some(DEFAULT_STANDBY_PROBE),
+            probe_interval: Some(DEFAULT_PROBE_INTERVAL),
+            probe_jitter: DEFAULT_PROBE_JITTER,
             allow_connection_window_increase: None,
             datagram_limiter: DatagramLimiter::default(),
             pipe_auth: PipeAuth::default(),
@@ -543,9 +687,9 @@ pub struct TestHooks {
     /// The carrier queue limiter paces no carrier: the traces' in-memory
     /// carriers take bytes as the trace says.
     pub unpaced: bool,
-    /// The phase of the idle-pipe probes as a fraction of the probe
-    /// interval, instead of a random one.
-    pub probe_phase: Option<f64>,
+    /// The seed of the idle-probe and keep-alive waits' draws instead of
+    /// a random one (each pipe's draws follow from it and the pipe ID).
+    pub probe_seed: Option<u64>,
     /// Ablations for the scheduler's unit tests, each turning one rule
     /// off. The spreading policies place data at R_p alone, without the
     /// placement rate.
@@ -645,7 +789,7 @@ impl Config {
         if let Some(tp) = &self.hooks.transport_parameters {
             return tp.clone();
         }
-        let idle = u64::try_from(self.max_idle_timeout.as_millis()).unwrap_or(u64::MAX);
+        let idle = self.idle_millis();
         let window = self.initial_stream_receive_window;
         let mp = self.offers_multipath();
         let resume = self
@@ -681,6 +825,10 @@ impl Config {
                 lane_key,
             }),
             zmux_datagram_flows: self.enable_datagrams,
+            // A pipe that a multipath session joins may have a datagram
+            // channel; a single-pipe session announces it only when its
+            // bootstrap carrier has one ([`super::SessionCore::set_pipe_channel`]).
+            zmux_carrier_datagrams: self.enable_datagrams && mp,
             application_protocols: self
                 .protocols
                 .as_ref()
@@ -700,6 +848,43 @@ impl Config {
         let len = ((random >> 32) % 17) as usize;
         let value = (0..len).map(|i| (random >> (i % 8 * 8)) as u8).collect();
         (id, value)
+    }
+
+    /// The handshake timeout in effect: [`Config::handshake_timeout`], or
+    /// its default; `Duration::MAX`, a deadline that never comes, for no
+    /// timeout.
+    #[must_use]
+    pub fn handshake_wait(&self) -> Duration {
+        self.handshake_timeout.unwrap_or(Duration::MAX)
+    }
+
+    /// The `max_idle_timeout` this endpoint announces, in milliseconds
+    /// (0: none).
+    pub(crate) fn idle_millis(&self) -> u64 {
+        self.max_idle_timeout
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// The keep-alive period in effect; `None` when off.
+    pub(crate) fn keep_alive(&self) -> Option<Duration> {
+        self.keep_alive_period
+    }
+
+    /// The memory budget in effect; `None` when unlimited.
+    pub(crate) fn memory_budget(&self) -> Option<u64> {
+        self.memory_budget
+            .unwrap_or(Budget::Bytes(DEFAULT_MEMORY_BUDGET))
+            .bytes()
+    }
+
+    /// The standby probe interval in effect; `None` when off.
+    pub(crate) fn standby_probe(&self) -> Option<Duration> {
+        self.standby_probe
+    }
+
+    /// The probe interval of idle pipe pairs in effect.
+    pub(crate) fn probe_interval(&self) -> Option<Duration> {
+        self.probe_interval
     }
 
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
@@ -740,7 +925,7 @@ impl Config {
             .any(|c| matches!(c, Cap::Fixed(v) if v > varint_max))
             || self.initial_stream_receive_window > varint_max
             || self.initial_connection_receive_window > varint_max
-            || self.max_idle_timeout.as_millis() > u128::from(varint_max)
+            || self.idle_millis() > varint_max
         {
             return Err("a window or timeout is too large to encode");
         }
@@ -750,11 +935,12 @@ impl Config {
         if self.send_buffer == 0 {
             return Err("send_buffer is zero");
         }
-        if let Some(k) = self.keep_alive_period
-            && !self.max_idle_timeout.is_zero()
-            && k >= self.max_idle_timeout
+        if self.datagram_send_queue == 0
+            || self.datagram_receive_queue == 0
+            || self.datagram_stream_queue == 0
+            || self.datagram_receive_bytes == 0
         {
-            return Err("keep_alive_period must be below max_idle_timeout");
+            return Err("a datagram queue or the datagram receive bytes is zero");
         }
         if self.max_pipes == 0 {
             return Err("max_pipes is zero");
@@ -774,6 +960,23 @@ impl Config {
         {
             return Err("dead_timeout below 1 s");
         }
+        if !(0.0..1.0).contains(&self.probe_jitter) {
+            return Err("probe_jitter outside [0, 1)");
+        }
+        let below = |d: Option<Duration>, min| d.is_some_and(|d| d < min);
+        if below(self.max_idle_timeout, Duration::from_millis(1)) {
+            return Err("max_idle_timeout below 1 ms");
+        }
+        if below(self.keep_alive_period, Duration::from_secs(1)) {
+            return Err("keep_alive_period below 1 s");
+        }
+        if below(self.standby_probe, Duration::from_secs(1)) {
+            return Err("standby_probe below 1 s");
+        }
+        if below(self.probe_interval, Duration::from_secs(1)) {
+            return Err("probe_interval below 1 s");
+        }
+        self.shaping_limits.validate()?;
         if !(1024..=65535).contains(&self.spread_chunk) {
             return Err("spread_chunk outside 1024..=65535");
         }

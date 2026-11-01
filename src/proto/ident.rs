@@ -284,6 +284,25 @@ pub fn alpn_protocols(applications: &[&str]) -> Vec<Vec<u8>> {
     configured.into_iter().chain(aliases).collect()
 }
 
+/// The ALPN list of a carrier's TLS configuration as zmux's adapters set
+/// it: `protocols` kept when it names any (the application chose), else
+/// `defaults` ([`alpn_protocols`] for a zmux carrier, `h3` for one over
+/// HTTP/3).
+///
+/// ```
+/// let mut alpn = Vec::new();
+/// zmux::default_alpn(&mut alpn, || zmux::alpn_protocols(&[]));
+/// assert_eq!(alpn, zmux::alpn_protocols(&[]));
+/// let mut own = vec![b"x".to_vec()];
+/// zmux::default_alpn(&mut own, || zmux::alpn_protocols(&[]));
+/// assert_eq!(own, [b"x".to_vec()]);
+/// ```
+pub fn default_alpn(protocols: &mut Vec<Vec<u8>>, defaults: impl FnOnce() -> Vec<Vec<u8>>) {
+    if protocols.is_empty() {
+        *protocols = defaults();
+    }
+}
+
 /// Whether a protocol identifier offered by the peer matches a configured
 /// one: the same identifier or its draft-01 alias ([`alpn_alias`]),
 /// compared byte for byte.

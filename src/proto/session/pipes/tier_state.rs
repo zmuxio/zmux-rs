@@ -119,6 +119,19 @@ impl TierState {
         self.seq
     }
 
+    /// The local settings: send priority and standby (`None`: follow the
+    /// peer), the receive request, weight and probation base.
+    pub(crate) fn settings(&self) -> (Option<u64>, Option<bool>, u64, bool, u64, Option<Duration>) {
+        (
+            self.send_priority,
+            self.send_standby,
+            self.receive_priority,
+            self.receive_standby,
+            self.weight,
+            self.probation,
+        )
+    }
+
     /// The outbound direction's weight.
     #[inline]
     pub(crate) fn weight(&self) -> u64 {

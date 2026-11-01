@@ -22,10 +22,14 @@
 //! terminates TLS reads the carrier.
 
 mod client;
+mod record;
 mod server;
 mod wire;
 
+use std::io;
+
 use std::time::Duration;
+pub use zmux::helpers::Backoff;
 
 pub use client::{
     ExchangeEndpoint, connect_exchange, dial_exchange, dial_exchange_split, dial_exchange_with,
@@ -45,50 +49,46 @@ pub enum BodyEncoding {
     Base64,
 }
 
-/// The delays between repetitions of a request that had no result:
-/// doubling from `initial` up to `max`, each drawn at random between half
-/// and all of its value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Backoff {
-    /// The first delay (default 20 ms).
-    pub initial: Duration,
-    /// The longest delay (default 2 s).
-    pub max: Duration,
-}
-
-impl Default for Backoff {
-    fn default() -> Self {
-        Self {
-            initial: Duration::from_millis(20),
-            max: Duration::from_secs(2),
-        }
+/// The default piece size of both directions for `encoding`: the largest
+/// that keeps every request and response body, with the longest request
+/// header, at most 1,000,000 bytes after the encoding (999,938 bytes in
+/// binary, 749,938 in base64), below the request body limit of 1 MiB that
+/// reverse proxies commonly apply.
+pub const fn default_piece_size(encoding: BodyEncoding) -> usize {
+    const BODY: usize = 1_000_000;
+    match encoding {
+        BodyEncoding::Binary => BODY - wire::MAX_PREFIX,
+        BodyEncoding::Base64 => BODY / 4 * 3 - wire::MAX_PREFIX,
     }
 }
 
-impl Backoff {
-    /// The delay before repetition `attempt` (1 for the first), with
-    /// `random` the jitter source.
-    pub(crate) fn delay(&self, attempt: u32, random: u64) -> Duration {
-        let base = self
-            .initial
-            .saturating_mul(1u32 << attempt.saturating_sub(1).min(20))
-            .min(self.max);
-        // Between half and all of it.
-        let half = base / 2;
-        let nanos = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
-        half + Duration::from_nanos(if nanos == 0 { 0 } else { random % nanos })
-    }
-}
+/// The default acceptance limit of a piece: 1 MiB, or the piece size if
+/// larger.
+const MIN_PIECE_LIMIT: usize = 1 << 20;
 
 /// The exchange carrier's options (both ends; each uses its own). The two
 /// ends must agree on [`psk`](Self::psk) and [`encoding`](Self::encoding);
-/// everything else is local.
+/// everything else is local. A carrier is authenticated unless
+/// [`unauthenticated`](Self::unauthenticated) says otherwise: without a
+/// PSK and without that choice, [`dial_exchange`](crate::dial_exchange)
+/// and the other dials, and [`ExchangeServer::new`](crate::ExchangeServer::new),
+/// fail.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ExchangeOptions {
-    /// The pre-shared key that authenticates requests and responses (empty
-    /// by default: the MACs then only bind responses to requests).
+    /// The pre-shared key that authenticates requests and responses (none
+    /// by default, which must be set unless
+    /// [`unauthenticated`](Self::unauthenticated) is).
     pub psk: Vec<u8>,
+    /// Client: the credential whose prefix ([`zmux::Credential::prefix`],
+    /// given no metadata) the uplink starts with, for a server's admission
+    /// ([`zmux::ListenerConfig::admission`]; none by default).
+    pub credential: Option<std::sync::Arc<dyn zmux::Credential>>,
+    /// Runs without a PSK, explicitly (false by default): the MACs then
+    /// only bind responses to requests, and the carrier ID is a bearer
+    /// secret. On the wire it is the empty PSK. Set with a PSK, it is an
+    /// error.
+    pub unauthenticated: bool,
     /// The body encoding (default binary).
     pub encoding: BodyEncoding,
     /// Client: the request path. `{instance}` is replaced by a random
@@ -110,13 +110,16 @@ pub struct ExchangeOptions {
     pub down_requests: usize,
     /// Client: UP requests outstanding at most (default 2, at least 1).
     pub up_requests: usize,
-    /// Client: the largest UP piece (default 1 MiB).
-    pub up_piece: usize,
-    /// Client: the largest DOWN piece accepted (default 1 MiB); a larger
-    /// response fails the carrier. At least the server's
-    /// [`down_piece`](Self::down_piece).
-    pub max_down_piece: usize,
-    /// Client: the delays between repetitions.
+    /// Client: the largest UP piece (`None`: [`default_piece_size`] of the
+    /// encoding; [`up_piece_size`](Self::up_piece_size)).
+    pub up_piece: Option<usize>,
+    /// Client: the largest DOWN piece accepted (`None`: the larger of 1 MiB
+    /// and the default piece size); a larger response fails the carrier. At
+    /// least the server's [`down_piece`](Self::down_piece).
+    pub max_down_piece: Option<usize>,
+    /// Client: the delays between repetitions of a request that had no
+    /// result (default from 20 ms to at most 2 s, each between half and
+    /// all of its value).
     pub backoff: Backoff,
     /// Client: one attempt of a request, from connecting to its whole
     /// response, has no result after this (default 25 s). It must exceed
@@ -132,17 +135,20 @@ pub struct ExchangeOptions {
     /// Server: a DOWN piece is closed this long after its first byte
     /// (default 2 ms).
     pub coalesce: Duration,
-    /// Server: the largest DOWN piece (default 1 MiB); also the bytes zmux
-    /// may write ahead of the pieces.
-    pub down_piece: usize,
+    /// Server: the largest DOWN piece (`None`: [`default_piece_size`] of the
+    /// encoding); also the bytes zmux may write ahead of the pieces.
+    pub down_piece: Option<usize>,
     /// Server: DOWN pieces assigned beyond the client's acknowledgement at
     /// most (default 32).
     pub down_window: u64,
-    /// Server: the largest UP piece accepted (default 1 MiB); a larger one
-    /// is answered GONE. At least the client's [`up_piece`](Self::up_piece).
-    pub max_up_piece: usize,
+    /// Server: the largest UP piece accepted (`None`: the larger of 1 MiB
+    /// and the default piece size); a request with a larger one is not
+    /// authenticated. At least the client's [`up_piece`](Self::up_piece).
+    pub max_up_piece: Option<usize>,
     /// Server: uplink bytes held for zmux, and out of order, each at most
-    /// (default 4 MiB); a piece beyond it is answered BUSY.
+    /// (default 4 MiB); a piece beyond it is answered BUSY. Each piece held
+    /// out of order also counts a fixed 64 bytes, which bounds how many are
+    /// held.
     pub up_store: usize,
     /// Server: a carrier without a request for this long has failed
     /// (default 60 s); above the hold time.
@@ -155,12 +161,24 @@ pub struct ExchangeOptions {
     /// carriers hold); a request that would create one beyond it is
     /// answered BUSY.
     pub max_carriers: Option<usize>,
+    /// Server: the time window W (default 60 s, whole seconds): a request
+    /// whose Time differs from the server's clock by more than this, the
+    /// difference taken modulo 2^32 as a signed 32-bit value, is not
+    /// authenticated. A window of 2^31 s or more takes every Time.
+    pub time_window: Duration,
+    /// Server: the (Carrier ID, Nonce) pairs recorded at most (default
+    /// 262144). A pair stays recorded while its request's Time is within
+    /// the window, and up to one window longer; a request that finds the
+    /// record full is not authenticated.
+    pub max_recorded: usize,
 }
 
 impl std::fmt::Debug for ExchangeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExchangeOptions")
             .field("psk", &if self.psk.is_empty() { "none" } else { "set" })
+            .field("credential", &self.credential.is_some())
+            .field("unauthenticated", &self.unauthenticated)
             .field("encoding", &self.encoding)
             .field("path", &self.path)
             .field("query", &self.query)
@@ -172,40 +190,117 @@ impl Default for ExchangeOptions {
     fn default() -> Self {
         Self {
             psk: Vec::new(),
+            credential: None,
+            unauthenticated: false,
             encoding: BodyEncoding::Binary,
             path: "/zmux/exchange".into(),
             down_path: None,
             query: "n".into(),
             down_requests: 2,
             up_requests: 2,
-            up_piece: 1 << 20,
-            max_down_piece: 1 << 20,
-            backoff: Backoff::default(),
+            up_piece: None,
+            max_down_piece: None,
+            backoff: Backoff::new(Duration::from_millis(20), Duration::from_secs(2))
+                .with_jitter(0.5),
             request_timeout: Duration::from_secs(25),
             deadline: Duration::from_secs(30),
             hold: Duration::from_secs(20),
             coalesce: Duration::from_millis(2),
-            down_piece: 1 << 20,
+            down_piece: None,
             down_window: 32,
-            max_up_piece: 1 << 20,
+            max_up_piece: None,
             up_store: 4 << 20,
             idle_timeout: Duration::from_secs(60),
             gone_memory: Duration::from_secs(60),
             max_carriers: None,
+            time_window: Duration::from_secs(60),
+            max_recorded: 1 << 18,
         }
     }
 }
 
 impl ExchangeOptions {
+    /// Client: starts the uplink with the prefix of `credential`.
+    #[must_use]
+    pub fn with_credential(mut self, credential: std::sync::Arc<dyn zmux::Credential>) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
     /// The defaults.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The UP piece size in use.
+    pub fn up_piece_size(&self) -> usize {
+        self.up_piece
+            .unwrap_or(default_piece_size(self.encoding))
+            .max(1)
+    }
+
+    /// The DOWN piece size in use.
+    pub fn down_piece_size(&self) -> usize {
+        self.down_piece
+            .unwrap_or(default_piece_size(self.encoding))
+            .max(1)
+    }
+
+    /// The largest UP piece a server accepts.
+    pub fn max_up_piece_size(&self) -> usize {
+        self.max_up_piece
+            .unwrap_or_else(|| MIN_PIECE_LIMIT.max(self.up_piece_size()))
+    }
+
+    /// The largest DOWN piece a client accepts.
+    pub fn max_down_piece_size(&self) -> usize {
+        self.max_down_piece
+            .unwrap_or_else(|| MIN_PIECE_LIMIT.max(self.down_piece_size()))
     }
 
     /// With this pre-shared key.
     #[must_use]
     pub fn with_psk(mut self, psk: impl Into<Vec<u8>>) -> Self {
         self.psk = psk.into();
+        self
+    }
+
+    /// Without authentication ([`unauthenticated`](Self::unauthenticated)).
+    #[must_use]
+    pub fn with_unauthenticated(mut self) -> Self {
+        self.unauthenticated = true;
+        self
+    }
+
+    /// The PSK the MACs are keyed with (empty when unauthenticated), or an
+    /// error ([`io::ErrorKind::InvalidInput`]) when the options neither set
+    /// one nor explicitly run without one, or do both.
+    pub(crate) fn mac_psk(&self) -> io::Result<&[u8]> {
+        match (self.psk.is_empty(), self.unauthenticated) {
+            (false, false) | (true, true) => Ok(&self.psk),
+            (true, false) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exchange carrier without a PSK: set one, or choose unauthenticated",
+            )),
+            (false, true) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exchange carrier both with a PSK and unauthenticated",
+            )),
+        }
+    }
+
+    /// With this time window ([`time_window`](Self::time_window)).
+    #[must_use]
+    pub fn with_time_window(mut self, window: Duration) -> Self {
+        self.time_window = window;
+        self
+    }
+
+    /// With this bound on recorded pairs
+    /// ([`max_recorded`](Self::max_recorded)).
+    #[must_use]
+    pub fn with_max_recorded(mut self, max: usize) -> Self {
+        self.max_recorded = max;
         self
     }
 
@@ -291,12 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn default_bodies_fit_common_proxy_limits() {
+        for e in [BodyEncoding::Binary, BodyEncoding::Base64] {
+            let piece = default_piece_size(e);
+            let request = wire::encoded_len(e, wire::MAX_PREFIX + piece);
+            let response = wire::encoded_len(e, wire::RESPONSE_HEAD + piece);
+            assert!(request <= 1_000_000 && response <= 1_000_000, "{e:?}");
+            // The largest such piece.
+            assert!(wire::encoded_len(e, wire::MAX_PREFIX + piece + 1) > 1_000_000);
+        }
+        assert_eq!(default_piece_size(BodyEncoding::Binary), 999_938);
+        assert_eq!(default_piece_size(BodyEncoding::Base64), 749_938);
+        {}
+    }
+
+    #[test]
     fn backoff_doubles_with_jitter() {
-        let b = Backoff::default();
+        let b = ExchangeOptions::default().backoff;
         for (attempt, base) in [(1, 20), (2, 40), (3, 80), (10, 2000), (40, 2000)] {
             let base = Duration::from_millis(base);
-            for r in [0, 1, u64::MAX / 3, u64::MAX] {
-                let d = b.delay(attempt, r);
+            for _ in 0..20 {
+                let d = b.delay(attempt);
                 assert!(d >= base / 2 && d <= base, "{attempt} {d:?}");
             }
         }

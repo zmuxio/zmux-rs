@@ -6,20 +6,32 @@
 use std::io::IoSlice;
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
+
 use super::CallLimit;
 use crate::proto::record::Framing;
 use crate::proto::session::{
-    DEFAULT_BATCH, LaneId, PipeWrite, SessionCore as Core, Transmit, TransmitBuf, WRITE_CALL_MIN,
+    DEFAULT_BATCH, LaneId, PieceCursor, PipeWrite, SessionCore as Core, Transmit, TransmitBuf,
+    WRITE_CALL_MIN,
 };
 
 /// How long the last batches of a closed session may take to be written
 /// before the carriers are ended.
 pub(crate) const FINAL_WRITE: Duration = Duration::from_secs(1);
 
-/// A deadline as a timer is armed for it: never in the past, which would
-/// fire at once forever.
+/// A deadline as a timer is armed for it: as it is when it is ahead, so
+/// that a timer whose resolution is a millisecond (tokio's rounds up to its
+/// next tick) is not a tick later still; one that is due already (the
+/// core keeps it while nothing changed) a millisecond ahead, which would
+/// otherwise fire at once forever.
 pub(crate) fn timer_deadline(deadline: Option<Instant>, now: Instant) -> Option<Instant> {
-    deadline.map(|d| d.max(now + Duration::from_millis(1)))
+    deadline.map(|d| {
+        if d > now {
+            d
+        } else {
+            now + Duration::from_millis(1)
+        }
+    })
 }
 
 /// Fires the core's timers when due; returns whether that changed the next
@@ -171,6 +183,9 @@ pub(crate) struct Outbound {
     out: TransmitBuf,
     /// Bytes of the batch already written.
     pos: usize,
+    /// Bytes written that the core has not been told of
+    /// ([`Outbound::tell`]).
+    untold: u64,
     /// The batch ends with a shutdown of the write side.
     shutdown: bool,
     /// The most bytes one write call hands the carrier.
@@ -178,8 +193,23 @@ pub(crate) struct Outbound {
     /// `call_limit` as computed under the core lock, reused within the
     /// latency budget.
     cached: CallLimit,
-    /// One message of a message-framed carrier, reused.
+    /// The next message of a message-framed carrier: its index among the
+    /// batch's messages (written ones are whole).
+    msg_index: usize,
+    /// A message of more than one piece for a carrier that takes slices,
+    /// copied, reused.
     msg: Vec<u8>,
+    /// Where the last walk of the batch ended.
+    cursor: PieceCursor,
+    /// The batch from `pos` on as owned buffers, for a carrier that takes
+    /// them (`ChunkWrite`): built up to byte `owned_end` as
+    /// write calls need them, taken from `owned_head` on (the carrier
+    /// leaves what it took empty).
+    owned: Vec<Bytes>,
+    owned_head: usize,
+    owned_end: usize,
+    /// The copies of built bytes in `owned`, split off as they are made.
+    scratch: BytesMut,
 }
 
 impl Outbound {
@@ -189,10 +219,17 @@ impl Outbound {
             calls,
             out: TransmitBuf::default(),
             pos: 0,
+            untold: 0,
             shutdown: false,
             call_limit: WRITE_CALL_MIN,
             cached: CallLimit::default(),
+            msg_index: 0,
             msg: Vec::new(),
+            cursor: PieceCursor::default(),
+            owned: Vec::new(),
+            owned_head: 0,
+            owned_end: 0,
+            scratch: BytesMut::new(),
         }
     }
 
@@ -236,8 +273,18 @@ impl Outbound {
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.out.clear();
-        self.pos = 0;
+        self.restart();
         self.shutdown = false;
+    }
+
+    /// Writes start at the batch's beginning, and owned buffers made for
+    /// the last one are released.
+    fn restart(&mut self) {
+        self.pos = 0;
+        self.msg_index = 0;
+        self.owned.clear();
+        self.owned_head = 0;
+        self.owned_end = 0;
     }
 
     /// The batch's buffers go while the pipe is idle.
@@ -245,6 +292,8 @@ impl Outbound {
     pub(crate) fn release(&mut self) {
         self.out.shrink();
         self.msg = Vec::new();
+        self.owned = Vec::new();
+        self.scratch = BytesMut::new();
     }
 
     /// The batch's storage is that of a small batch.
@@ -256,7 +305,10 @@ impl Outbound {
     /// Heap bytes held.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn capacity(&self) -> usize {
-        self.out.capacity() + self.msg.capacity()
+        self.out.capacity()
+            + self.msg.capacity()
+            + self.owned.capacity() * size_of::<Bytes>()
+            + self.scratch.capacity()
     }
 
     /// Takes the next batch of pipe `id` from the core, under its lock,
@@ -271,6 +323,7 @@ impl Outbound {
         input: bool,
     ) -> bool {
         let id = id.into();
+        self.tell(core, id);
         if !self.out.is_empty() || self.shutdown || !core.wants_write(id) {
             return false;
         }
@@ -289,7 +342,7 @@ impl Outbound {
             self.out.set_max_message(limit);
         }
         let t = core.poll_transmit(id, now, &mut self.out);
-        self.pos = 0;
+        self.restart();
         self.shutdown = t == Transmit::Shutdown;
         let left = self.out.len();
         let limit = core.write_call_limit(id.pipe, left, blocking, input, now);
@@ -339,41 +392,101 @@ impl Outbound {
         self.out.io_slices_from(self.pos, limit, slices)
     }
 
-    /// The next message of a message-framed carrier, whole.
+    /// The length of the next message of a message-framed carrier.
+    fn message_len(&self) -> usize {
+        self.out
+            .message_lens()
+            .get(self.msg_index)
+            .copied()
+            .unwrap_or(self.out.len() - self.pos)
+    }
+
+    /// The next message of a message-framed carrier, whole: borrowed from
+    /// the batch when it is one piece, else copied once.
     pub(crate) fn message(&mut self) -> &[u8] {
-        let mut at = 0;
-        let mut len = self.out.len() - self.pos;
-        for &l in self.out.message_lens() {
-            if at == self.pos {
-                len = l;
+        let len = self.message_len();
+        self.out
+            .contiguous(&mut self.cursor, self.pos, len, &mut self.msg)
+    }
+
+    /// The next call's bytes for a carrier that takes owned buffers: at
+    /// most `limit` bytes of the rest of the batch (the next message,
+    /// whole, on a message-framed carrier), referenced payloads shared and
+    /// built bytes copied once. The carrier leaves what it takes empty.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn chunks(&mut self, limit: usize) -> &mut [Bytes] {
+        let head = self.owned_head;
+        if self.framing == Framing::Records {
+            if head == self.owned.len() {
+                let len = self.message_len();
+                self.owned_end += self.out.owned_pieces(
+                    &mut self.cursor,
+                    self.pos,
+                    len,
+                    true,
+                    &mut self.owned,
+                    &mut self.scratch,
+                );
+            }
+            let end = (head + 1).min(self.owned.len());
+            return &mut self.owned[head..end];
+        }
+        let want = (self.pos + limit).min(self.out.len());
+        if self.owned_end < want {
+            self.owned_end += self.out.owned_pieces(
+                &mut self.cursor,
+                self.owned_end,
+                want - self.owned_end,
+                false,
+                &mut self.owned,
+                &mut self.scratch,
+            );
+        }
+        let mut sum = 0;
+        let mut end = head;
+        while end < self.owned.len() && sum < limit {
+            let len = self.owned[end].len();
+            if sum + len > limit {
+                // The call ends inside this buffer: split there.
+                let tail = self.owned[end].split_off(limit - sum);
+                self.owned.insert(end + 1, tail);
+                end += 1;
                 break;
             }
-            at += l;
+            sum += len;
+            end += 1;
         }
-        self.msg.clear();
-        let mut skip = self.pos;
-        for c in self.out.chunks() {
-            if skip >= c.len() {
-                skip -= c.len();
-                continue;
-            }
-            let take = (c.len() - skip).min(len - self.msg.len());
-            self.msg.extend_from_slice(&c[skip..skip + take]);
-            skip = 0;
-            if self.msg.len() == len {
-                break;
-            }
+        &mut self.owned[head..end]
+    }
+
+    /// Tells the core, under its lock, the bytes the carrier took since
+    /// it was last told: what is left of the batch counts in Q_p
+    /// ([`Core::pipe_written`]). [`Outbound::take_batch`] does it first.
+    pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>) {
+        let n = std::mem::take(&mut self.untold);
+        if n > 0 {
+            core.pipe_written(id, n);
         }
-        &self.msg
     }
 
     /// A write call took `n` bytes; returns whether the batch is done.
     pub(crate) fn written(&mut self, n: usize) -> bool {
         self.pos += n;
+        self.untold += n as u64;
         if self.pos >= self.out.len() {
             self.out.clear();
-            self.pos = 0;
+            self.restart();
             return true;
+        }
+        if n > 0 && self.framing == Framing::Records {
+            self.msg_index += 1;
+        }
+        while self.owned.get(self.owned_head).is_some_and(Bytes::is_empty) {
+            self.owned_head += 1;
+        }
+        if self.owned_head == self.owned.len() {
+            self.owned.clear();
+            self.owned_head = 0;
         }
         false
     }
@@ -383,6 +496,111 @@ impl Outbound {
 mod tests {
     use super::*;
     use crate::proto::session::{Config, PipeId, RoleConfig};
+
+    /// A batch of `n` records, each of a built part and a referenced
+    /// payload (or, on a message-framed pipe with `alone`, the first
+    /// message a payload only).
+    fn records(framing: Framing, n: u8, alone: bool) -> (TransmitBuf, Vec<Bytes>) {
+        let mut b = TransmitBuf::default();
+        b.set_framing(framing);
+        let mut payloads = Vec::new();
+        for i in 0..n {
+            b.begin_record(1 << 20);
+            if !(alone && i == 0) {
+                b.push_bytes(&[i; 7]);
+            }
+            let p = Bytes::from(vec![i.wrapping_mul(31); 5000 + usize::from(i)]);
+            b.push_shared(p.clone());
+            payloads.push(p);
+            assert!(b.end_record());
+        }
+        (b, payloads)
+    }
+
+    /// Owned buffers for a carrier that takes them: written in calls of
+    /// any limit, taken in part or whole, they are the batch's bytes in
+    /// order, payloads shared and built bytes copied once.
+    #[test]
+    fn chunks_cover_the_batch_and_share_its_payloads() {
+        let (b, payloads) = records(Framing::ByteStream, 20, false);
+        let mut whole = Vec::new();
+        b.copy_to_vec(&mut whole);
+        let mut o = Outbound::new(Framing::ByteStream, Calls::NonBlocking);
+        o.out = b;
+        let mut got = Vec::new();
+        let mut shared = 0;
+        let mut step = 0usize;
+        loop {
+            step += 1;
+            let limit = [3000, 100, 9000, 1, 70000][step % 5];
+            let chunks = o.chunks(limit);
+            assert!(chunks.iter().map(Bytes::len).sum::<usize>() <= limit);
+            // Take all but a few bytes now and then.
+            let mut want = chunks.iter().map(Bytes::len).sum::<usize>();
+            if step.is_multiple_of(3) {
+                want = want.saturating_sub(5);
+            }
+            let mut n = 0;
+            for c in chunks.iter_mut() {
+                let take = c.len().min(want - n);
+                if payloads
+                    .iter()
+                    .any(|p| p.as_ptr_range().contains(&c.as_ptr()))
+                {
+                    shared += 1;
+                }
+                got.extend_from_slice(&c.split_to(take));
+                n += take;
+                if n == want {
+                    break;
+                }
+            }
+            if o.written(n) {
+                break;
+            }
+        }
+        assert_eq!(got, whole);
+        assert!(shared >= payloads.len());
+        assert!(o.owned.is_empty());
+    }
+
+    /// A message-framed carrier gets one message per call: a message of
+    /// one referenced payload as that payload, any other copied once.
+    #[test]
+    fn messages_are_whole_and_borrowed_when_one_piece() {
+        let (b, payloads) = records(Framing::Records, 3, true);
+        let lens = b.message_lens().to_vec();
+        let mut o = Outbound::new(Framing::Records, Calls::NonBlocking);
+        o.out = b;
+        // Slices: the first message borrowed from its payload.
+        assert_eq!(o.message().as_ptr(), payloads[0].as_ptr());
+        let (b, _) = records(Framing::Records, 3, true);
+        let mut o2 = Outbound::new(Framing::Records, Calls::NonBlocking);
+        o2.out = b;
+        for (i, len) in lens.iter().enumerate() {
+            let m = o2.message();
+            assert_eq!(m.len(), *len);
+            if i > 0 {
+                assert_eq!(&m[..7], &[i as u8; 7]);
+            }
+            o2.written(*len);
+        }
+        assert!(o2.is_empty());
+        // Owned buffers: the first message is the payload itself.
+        for (i, len) in lens.iter().enumerate() {
+            let chunks = o.chunks(1);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].len(), *len);
+            if i == 0 {
+                assert_eq!(chunks[0].as_ptr(), payloads[0].as_ptr());
+            } else {
+                assert_eq!(&chunks[0][7..], &payloads[i][..]);
+            }
+            chunks[0] = Bytes::new();
+            o.written(*len);
+        }
+        assert!(o.is_empty());
+    }
 
     #[test]
     fn progress_reports_what_changes_the_cores_write_state() {

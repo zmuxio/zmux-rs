@@ -23,7 +23,8 @@ use basics::{Rng, seeds};
 use mp_net::{A, B, MpNet};
 use zmux::proto::frame::Dir;
 use zmux::proto::session::{
-    Config, CoreEvent, PipeAuth, PipeHalf, PipeId, PipeOptions, PipeState, StreamKey,
+    Config, CoreEvent, InboundState, OutboundState, PipeAuth, PipeHalf, PipeId, PipeOptions,
+    StreamKey,
 };
 
 /// What the test saw besides the carriers.
@@ -32,6 +33,8 @@ struct Seen {
     in_closed: [BTreeSet<u64>; 2],
     /// Halves each end reported retired: (pipe, outbound).
     retired: [BTreeSet<(u64, bool)>; 2],
+    /// Halves each end reported a state of: (pipe, outbound).
+    seen: [BTreeSet<(u64, bool)>; 2],
     streams: Vec<StreamKey>,
     rng: Rng,
     log: Vec<String>,
@@ -43,7 +46,7 @@ fn config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
-    c.max_idle_timeout = Duration::from_secs(60);
+    c.max_idle_timeout = Some(Duration::from_secs(60));
     c.suspect_floor = Duration::from_millis(100);
     c
 }
@@ -54,6 +57,7 @@ fn net(seed: u64) -> Net {
     let seen = Seen {
         in_closed: Default::default(),
         retired: Default::default(),
+        seen: Default::default(),
         streams: Vec::new(),
         rng: Rng::new(seed),
         log: Vec::new(),
@@ -76,7 +80,7 @@ impl Net {
             for e in self.events[side].drain(..) {
                 match e {
                     CoreEvent::ClosePipe { pipe, half, abort } => {
-                        let id = pipe.0;
+                        let id = pipe.get();
                         self.s
                             .log
                             .push(format!("{end} {id} ClosePipe {half:?} abort={abort}"));
@@ -84,12 +88,17 @@ impl Net {
                             self.s.in_closed[side].insert(id);
                         }
                     }
-                    CoreEvent::PipeState { pipe, half, state } => {
-                        self.s
-                            .log
-                            .push(format!("{end} {} {half:?} {state:?}", pipe.0));
-                        if state == PipeState::Retired {
-                            self.s.retired[side].insert((pipe.0, half == PipeHalf::Outbound));
+                    CoreEvent::PipeState { pipe, state } => {
+                        self.s.log.push(format!("{end} {} {state:?}", pipe.get()));
+                        let outbound = state.half() == PipeHalf::Outbound;
+                        self.s.seen[side].insert((pipe.get(), outbound));
+                    }
+                    CoreEvent::PipeRetired { pipe } => {
+                        self.s.log.push(format!("{end} {} Retired", pipe.get()));
+                        for outbound in [false, true] {
+                            if self.s.seen[side].contains(&(pipe.get(), outbound)) {
+                                self.s.retired[side].insert((pipe.get(), outbound));
+                            }
                         }
                     }
                     _ => {}
@@ -120,7 +129,7 @@ impl Net {
             .copied()
             .filter(|&id| {
                 self.ends[A]
-                    .pipe_info(PipeId(id))
+                    .pipe_info(PipeId::new(id))
                     .is_some_and(|p| p.outbound.is_some())
             })
             .collect();
@@ -138,7 +147,7 @@ impl Net {
                 self.s
                     .log
                     .push(format!("remove {id} side {side} graceful {graceful}"));
-                let _ = self.ends[side].remove_pipe(PipeId(id), graceful, self.now);
+                let _ = self.ends[side].remove_pipe(PipeId::new(id), graceful, self.now);
             }
             3 if live.len() > 1 && self.s.rng.below(3) == 0 => {
                 let id = pick(&mut self.s.rng, &live);
@@ -240,19 +249,14 @@ impl Net {
             }
         }
         self.check(seed);
-        let ended = |s: Option<PipeState>| {
-            matches!(
-                s,
-                Some(PipeState::Failed | PipeState::Closed | PipeState::Ended)
-            )
-        };
         for side in [A, B] {
             for p in self.ends[side].pipes() {
                 assert!(
-                    !ended(p.outbound) && !ended(p.inbound),
+                    !p.outbound.is_some_and(OutboundState::is_terminal)
+                        && !p.inbound.is_some_and(InboundState::is_terminal),
                     "seed {seed}: {} keeps pipe {} ({:?} / {:?}) after the churn",
                     ["A", "B"][side],
-                    p.pipe.0,
+                    p.pipe.get(),
                     p.outbound,
                     p.inbound,
                 );

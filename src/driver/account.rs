@@ -26,8 +26,8 @@ const CHARGE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The listener's side.
 pub(crate) struct Account<S> {
-    /// The memory budget in bytes (0: unlimited).
-    budget_bytes: u64,
+    /// The memory budget in bytes (`None`: unlimited).
+    budget_bytes: Option<u64>,
     max_suspended: usize,
     /// The sessions' charges, summed.
     used: AtomicU64,
@@ -57,12 +57,12 @@ async fn run_pressure_hook(signal: Arc<PressureSignal>, hook: OnMemoryPressure) 
     loop {
         let next = std::future::poll_fn(|cx| {
             signal.waker.register(cx.waker());
-            if let Some(p) = signal
+            let latest = signal
                 .latest
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
+                .take();
+            if let Some(p) = latest {
                 return Poll::Ready(Some(p));
             }
             if signal.closed.load(Ordering::Acquire) {
@@ -103,7 +103,7 @@ impl<S> Account<S> {
     /// An account; with a hook, its task is started (inside a tokio
     /// runtime).
     pub(crate) fn new(
-        budget_bytes: u64,
+        budget_bytes: Option<u64>,
         max_suspended: usize,
         hook: Option<OnMemoryPressure>,
     ) -> Arc<Self> {
@@ -151,9 +151,9 @@ impl<S> Account<S> {
         } else {
             self.used.fetch_sub(old - new, Ordering::AcqRel);
         }
-        if self.budget_bytes == 0 {
+        let Some(budget) = self.budget_bytes else {
             return;
-        }
+        };
         // The sum read under the lock: the last update decides.
         let mut st = self.lock();
         let used = self.used.load(Ordering::Acquire);
@@ -168,7 +168,7 @@ impl<S> Account<S> {
         };
         *s.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(MemoryPressure {
             used,
-            budget: self.budget_bytes,
+            budget,
             active: on,
         });
         drop(st);
@@ -251,12 +251,12 @@ impl<S> AccountLink<S> {
             }
             self.growing = grew;
         }
-        if a.budget_bytes > 0 {
+        if let Some(budget) = a.budget_bytes {
             // What is left is shared between the sessions that grew, so
             // that sessions growing at once do not each take all of it.
             let used = a.used.load(Ordering::Acquire);
             let growing = a.growing.load(Ordering::Acquire).max(1);
-            core.set_memory_allowance(Some(a.budget_bytes.saturating_sub(used) / growing));
+            core.set_memory_allowance(Some(budget.saturating_sub(used) / growing));
         }
         let pressure = a.pressure();
         let pressure_on = pressure && !self.pressure;
@@ -331,7 +331,7 @@ mod tests {
     fn a_report_held_back_by_the_interval_is_due_after_it() {
         let t0 = Instant::now();
         let mut core = Core::new(Config::default(), RoleConfig::Initiator, None, t0).unwrap();
-        let account = Account::<()>::new(1 << 20, 4, None);
+        let account = Account::<()>::new(Some(1 << 20), 4, None);
         let me = Arc::new(());
         let mut link = AccountLink::new(account.clone());
         let mut close = Vec::new();

@@ -43,7 +43,12 @@ fn options() -> Result<ExchangeOptions, Error> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&psk[i..i + 2], 16))
         .collect::<Result<Vec<u8>, _>>()?;
-    let mut o = ExchangeOptions::default().with_psk(psk);
+    // No PSK: the interop runs unauthenticated, explicitly.
+    let mut o = if psk.is_empty() {
+        ExchangeOptions::default().with_unauthenticated()
+    } else {
+        ExchangeOptions::default().with_psk(psk)
+    };
     if env("ZMUX_EXCHANGE_BASE64").as_deref() == Some("1") {
         o = o.with_encoding(BodyEncoding::Base64);
     }
@@ -72,7 +77,7 @@ async fn server(o: ExchangeOptions) -> Result<(), Error> {
     let secs: u64 = env("ZMUX_EXCHANGE_FOR").map_or(Ok(60), |s| s.trim_end_matches('s').parse())?;
     let listener = Listener::new(Config::default(), ListenerConfig::default());
     // Every path is an exchange path.
-    let exchange = ExchangeServer::new(&listener, o.with_path("/"));
+    let exchange = ExchangeServer::new(&listener, o.with_path("/"))?;
     let tcp = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("serving exchanges on {addr} for {secs} s");
     let serving = tokio::spawn(zmux_http::serve(
@@ -118,7 +123,7 @@ async fn client(o: ExchangeOptions) -> Result<(), Error> {
         ExchangeEndpoint::tcp(&up_host),
         ExchangeEndpoint::tcp(&down_host),
         &o,
-    );
+    )?;
     let session = Session::connect(pipe, Config::default()).await?;
     let mut msg = vec![0u8; n];
     getrandom::fill(&mut msg)?;

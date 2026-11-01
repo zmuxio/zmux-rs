@@ -10,7 +10,7 @@ use std::time::Instant;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{Config, CoreEvent, PipeId, RoleConfig, SessionCore, TransmitBuf};
 
-pub(crate) const P0: PipeId = PipeId(0);
+pub(crate) const P0: PipeId = PipeId::new(0);
 
 pub(crate) struct CorePair {
     pub(crate) a: SessionCore,
@@ -86,6 +86,7 @@ impl CorePair {
             }
             self.wire.clear();
             self.out.copy_to_vec(&mut self.wire);
+            from.pipe_written(P0, self.wire.len() as u64);
             inspect(&self.wire);
             let used = to.receive_in_place(P0, &self.wire, self.now);
             assert_eq!(used, self.wire.len(), "a batch is whole records");

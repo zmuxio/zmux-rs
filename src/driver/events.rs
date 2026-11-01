@@ -11,10 +11,12 @@
 //! - Only pipes that are not retired hold slots: when a pipe is retired,
 //!   its unread events leave the queue and fold into one session-level
 //!   [`SessionEvent::PipesRetired`] (pipes retired, unread failures and ends, the
-//!   last few IDs), which every retirement updates.
+//!   last few IDs). It is queued at the first retirement after the
+//!   previous one was read, and every later retirement updates it.
 //! - A slot limit derived from `max_pipes` guards against more live pipes
-//!   than the core allows: past it a terminal state folds into the summary
-//!   and other events are dropped and counted in it.
+//!   than the core allows: past it non-terminal events are dropped and
+//!   counted in the summary unread or, when none is queued, the next one;
+//!   terminal states and the summary are never dropped.
 //!
 //! The queue therefore holds at most the session's unretired pipes (at most
 //! `max_pipes` + H per joiner, MULTIPATH.md Section 5.4) plus a constant,
@@ -23,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use super::Event as SessionEvent;
-use crate::proto::session::{Config, PipeHalf, PipeId, PipeState};
+use crate::proto::session::{Config, DirectionState, OutboundState, PipeHalf, PipeId};
 
 /// The retired pipe IDs a summary names, at most.
 pub(crate) const SUMMARY_IDS: usize = 4;
@@ -46,6 +48,10 @@ enum Key {
     Capacity,
     /// Failed join authentications, counted.
     JoinAuth(bool),
+    /// The latest try of a carrier kind, as the session or as a pipe.
+    Candidate(crate::CarrierKind, bool),
+    /// The latest choice of carrier kind.
+    Chosen,
     JoinSecurity,
     Summary,
 }
@@ -56,14 +62,11 @@ struct Summary {
     retired: u64,
     failed: u64,
     closed: u64,
+    /// Counted also while no summary is queued: the next one reports them.
     dropped: u64,
     last: Vec<u64>,
-}
-
-impl Summary {
-    fn is_empty(&self) -> bool {
-        self.retired == 0 && self.failed == 0 && self.closed == 0 && self.dropped == 0
-    }
+    /// The summary is queued (a pipe was retired since the last was read).
+    queued: bool,
 }
 
 /// The bounded, coalescing pipe-event queue of a session.
@@ -74,20 +77,12 @@ pub(crate) struct EventQueue {
     /// The events of the queued slots (all keys but `Summary`).
     slots: HashMap<Key, SessionEvent>,
     summary: Summary,
-    /// The pipe whose retirement was folded last (a retired attachment
-    /// reports each of its directions).
-    last_retired: Option<u64>,
     /// Slots for pipes and tiers, at most.
     limit: usize,
 }
 
-/// Whether a pipe state is terminal for its direction.
-fn terminal(state: PipeState) -> bool {
-    matches!(
-        state,
-        PipeState::Failed | PipeState::Closed | PipeState::Ended
-    )
-}
+/// An outbound direction that failed.
+const FAILED: DirectionState = DirectionState::Outbound(OutboundState::Failed);
 
 impl EventQueue {
     /// A queue for a session with `config`.
@@ -107,7 +102,6 @@ impl EventQueue {
             order: VecDeque::new(),
             slots: HashMap::new(),
             summary: Summary::default(),
-            last_retired: None,
             limit,
         }
     }
@@ -121,11 +115,7 @@ impl EventQueue {
     /// Queues an event, coalescing it with an unread one of its kind.
     pub(crate) fn push(&mut self, event: SessionEvent) {
         let key = match &event {
-            SessionEvent::PipeState { pipe, state, .. } if *state == PipeState::Retired => {
-                self.retire(pipe.0);
-                return;
-            }
-            SessionEvent::PipeState { pipe, half, .. } => Key::State(pipe.0, *half),
+            SessionEvent::PipeState { pipe, state, .. } => Key::State(pipe.0, state.half()),
             SessionEvent::PipePriorityChanged { pipe, .. } => Key::Priority(pipe.0),
             SessionEvent::PipeQualityChanged { pipe, .. } => Key::Quality(pipe.0),
             SessionEvent::TierSaturation { priority, .. } => Key::Tier(*priority),
@@ -136,6 +126,8 @@ impl EventQueue {
             }
             SessionEvent::JoinAuthFailed { carrier_bound, .. } => Key::JoinAuth(*carrier_bound),
             SessionEvent::JoinSecurityUnavailable => Key::JoinSecurity,
+            SessionEvent::CarrierCandidate { kind, joined, .. } => Key::Candidate(*kind, *joined),
+            SessionEvent::CarrierChosen(_) => Key::Chosen,
             // Made by the queue only.
             SessionEvent::PipesRetired { .. } => return,
         };
@@ -148,7 +140,7 @@ impl EventQueue {
                     *count = count.saturating_add(1);
                 }
                 // A terminal state stays.
-                (SessionEvent::PipeState { state, .. }, _) if terminal(*state) => {}
+                (SessionEvent::PipeState { state, .. }, _) if state.is_terminal() => {}
                 (old, event) => *old = event,
             }
             return;
@@ -157,42 +149,21 @@ impl EventQueue {
             key,
             Key::State(..) | Key::Priority(_) | Key::Quality(_) | Key::Tier(_)
         );
-        if limited && self.slots.len() >= self.limit {
+        let terminal =
+            matches!(&event, SessionEvent::PipeState { state, .. } if state.is_terminal());
+        if limited && !terminal && self.slots.len() >= self.limit {
             // More live pipes than the core allows: nothing is lost
-            // silently.
-            match event {
-                SessionEvent::PipeState {
-                    state: PipeState::Failed,
-                    ..
-                } => {
-                    self.fold(|s| s.failed += 1);
-                }
-                SessionEvent::PipeState { state, .. } if terminal(state) => {
-                    self.fold(|s| s.closed += 1);
-                }
-                _ => self.fold(|s| s.dropped += 1),
-            }
+            // silently, and a terminal state is kept.
+            self.summary.dropped = self.summary.dropped.saturating_add(1);
             return;
         }
         self.slots.insert(key, event);
         self.order.push_back(key);
     }
 
-    /// Updates the summary, queueing it when it was not.
-    fn fold(&mut self, f: impl FnOnce(&mut Summary)) {
-        if self.summary.is_empty() {
-            self.order.push_back(Key::Summary);
-        }
-        f(&mut self.summary);
-    }
-
     /// A pipe was retired: its unread events leave the queue; its unread
     /// terminal states and its retirement go to the summary.
-    fn retire(&mut self, pipe: u64) {
-        if self.last_retired == Some(pipe) {
-            return;
-        }
-        self.last_retired = Some(pipe);
+    pub(crate) fn retire(&mut self, pipe: u64) {
         let mut failed = 0;
         let mut closed = 0;
         let mut gone = false;
@@ -203,11 +174,8 @@ impl EventQueue {
             Key::Quality(pipe),
         ] {
             match self.slots.remove(&key) {
-                Some(SessionEvent::PipeState {
-                    state: PipeState::Failed,
-                    ..
-                }) => failed += 1,
-                Some(SessionEvent::PipeState { state, .. }) if terminal(state) => closed += 1,
+                Some(SessionEvent::PipeState { state: FAILED, .. }) => failed += 1,
+                Some(SessionEvent::PipeState { state, .. }) if state.is_terminal() => closed += 1,
                 Some(_) => {}
                 None => continue,
             }
@@ -217,20 +185,23 @@ impl EventQueue {
             self.order
                 .retain(|k| !matches!(k, Key::State(p, _) | Key::Priority(p) | Key::Quality(p) if *p == pipe));
         }
-        self.fold(|s| {
-            s.retired += 1;
-            // A pipe whose direction failed counts as failed, else as
-            // closed when one ended.
-            if failed > 0 {
-                s.failed += 1;
-            } else if closed > 0 {
-                s.closed += 1;
-            }
-            if s.last.len() == SUMMARY_IDS {
-                s.last.remove(0);
-            }
-            s.last.push(pipe);
-        });
+        let s = &mut self.summary;
+        if !s.queued {
+            s.queued = true;
+            self.order.push_back(Key::Summary);
+        }
+        s.retired = s.retired.saturating_add(1);
+        // A pipe one of whose unread directions failed counts as failed,
+        // else as closed when one ended unread.
+        if failed > 0 {
+            s.failed += 1;
+        } else if closed > 0 {
+            s.closed += 1;
+        }
+        if s.last.len() == SUMMARY_IDS {
+            s.last.remove(0);
+        }
+        s.last.push(pipe);
     }
 
     /// The next event, oldest slot first.
@@ -238,6 +209,7 @@ impl EventQueue {
         let key = self.order.pop_front()?;
         if key == Key::Summary {
             let s = std::mem::take(&mut self.summary);
+            debug_assert!(s.retired >= 1);
             return Some(SessionEvent::PipesRetired {
                 retired: s.retired,
                 failed: s.failed,
@@ -253,13 +225,14 @@ impl EventQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::session::InboundState;
 
-    fn state(pipe: u64, half: PipeHalf, state: PipeState) -> SessionEvent {
+    fn state(pipe: u64, state: DirectionState) -> SessionEvent {
         SessionEvent::PipeState {
             pipe: PipeId(pipe),
-            half,
             state,
             failure: None,
+            carrier: None,
         }
     }
 
@@ -270,16 +243,16 @@ mod tests {
     #[test]
     fn latest_state_wins_and_terminal_stays() {
         let mut q = EventQueue::with_limit(100);
-        q.push(state(2, PipeHalf::Outbound, PipeState::Joining));
-        q.push(state(4, PipeHalf::Outbound, PipeState::Joining));
-        q.push(state(2, PipeHalf::Outbound, PipeState::Active));
-        q.push(state(2, PipeHalf::Outbound, PipeState::Failed));
-        q.push(state(2, PipeHalf::Outbound, PipeState::Active));
+        q.push(state(2, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(4, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(2, DirectionState::Outbound(OutboundState::Active)));
+        q.push(state(2, DirectionState::Outbound(OutboundState::Failed)));
+        q.push(state(2, DirectionState::Outbound(OutboundState::Active)));
         assert_eq!(
             drain(&mut q),
             [
-                state(2, PipeHalf::Outbound, PipeState::Failed),
-                state(4, PipeHalf::Outbound, PipeState::Joining),
+                state(2, DirectionState::Outbound(OutboundState::Failed)),
+                state(4, DirectionState::Outbound(OutboundState::Joining)),
             ]
         );
     }
@@ -289,15 +262,14 @@ mod tests {
         let mut q = EventQueue::with_limit(100);
         for pipe in 0..10u64 {
             let p = pipe * 2 + 1;
-            q.push(state(p, PipeHalf::Outbound, PipeState::Joining));
-            q.push(state(p, PipeHalf::Inbound, PipeState::Open));
+            q.push(state(p, DirectionState::Outbound(OutboundState::Joining)));
+            q.push(state(p, DirectionState::Inbound(InboundState::Open)));
             if pipe % 2 == 0 {
-                q.push(state(p, PipeHalf::Outbound, PipeState::Failed));
+                q.push(state(p, DirectionState::Outbound(OutboundState::Failed)));
             } else {
-                q.push(state(p, PipeHalf::Inbound, PipeState::Ended));
+                q.push(state(p, DirectionState::Inbound(InboundState::Ended)));
             }
-            q.push(state(p, PipeHalf::Outbound, PipeState::Retired));
-            q.push(state(p, PipeHalf::Inbound, PipeState::Retired));
+            q.retire(p);
         }
         assert_eq!(q.len(), 1);
         assert_eq!(
@@ -311,7 +283,7 @@ mod tests {
             }]
         );
         // A retirement after the summary was read starts a new one.
-        q.push(state(21, PipeHalf::Outbound, PipeState::Retired));
+        q.retire(21);
         assert_eq!(
             drain(&mut q),
             [SessionEvent::PipesRetired {
@@ -374,7 +346,7 @@ mod tests {
         q.push(quality(4, 10));
         q.push(quality(2, 30));
         q.push(SessionEvent::CapacityRestored { rate: 9 });
-        q.push(state(4, PipeHalf::Outbound, PipeState::Retired));
+        q.retire(4);
         assert_eq!(
             drain(&mut q),
             [
@@ -391,30 +363,78 @@ mod tests {
         );
     }
 
+    /// Past the limit terminal states are still queued and other events
+    /// are dropped; the drops are counted in the next summary, which only
+    /// a retirement queues (never with `retired` 0), or in the one unread.
     #[test]
-    fn past_the_limit_terminal_outcomes_fold_and_others_count() {
+    fn past_the_limit_terminal_states_stay_and_others_count() {
         let mut q = EventQueue::with_limit(2);
-        q.push(state(1, PipeHalf::Outbound, PipeState::Joining));
-        q.push(state(3, PipeHalf::Outbound, PipeState::Joining));
-        q.push(state(5, PipeHalf::Outbound, PipeState::Joining));
-        q.push(state(7, PipeHalf::Outbound, PipeState::Failed));
-        q.push(state(9, PipeHalf::Outbound, PipeState::Closed));
+        q.push(state(1, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(3, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(5, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(7, DirectionState::Outbound(OutboundState::Failed)));
+        q.push(state(9, DirectionState::Outbound(OutboundState::Closed)));
         // An existing slot still coalesces.
-        q.push(state(1, PipeHalf::Outbound, PipeState::Failed));
-        assert_eq!(q.len(), 3);
+        q.push(state(1, DirectionState::Outbound(OutboundState::Failed)));
+        assert_eq!(q.len(), 4);
         assert_eq!(
             drain(&mut q),
             [
-                state(1, PipeHalf::Outbound, PipeState::Failed),
-                state(3, PipeHalf::Outbound, PipeState::Joining),
-                SessionEvent::PipesRetired {
-                    retired: 0,
-                    failed: 1,
-                    closed: 1,
-                    dropped: 1,
-                    last: Vec::new(),
-                },
+                state(1, DirectionState::Outbound(OutboundState::Failed)),
+                state(3, DirectionState::Outbound(OutboundState::Joining)),
+                state(7, DirectionState::Outbound(OutboundState::Failed)),
+                state(9, DirectionState::Outbound(OutboundState::Closed)),
             ]
+        );
+        q.retire(7);
+        q.push(state(11, DirectionState::Outbound(OutboundState::Joining)));
+        q.push(state(13, DirectionState::Outbound(OutboundState::Joining)));
+        // Dropped while the summary is unread: counted in it.
+        q.push(state(15, DirectionState::Outbound(OutboundState::Joining)));
+        assert_eq!(
+            drain(&mut q),
+            [
+                SessionEvent::PipesRetired {
+                    retired: 1,
+                    failed: 0,
+                    closed: 0,
+                    dropped: 2,
+                    last: vec![PipeId(7)],
+                },
+                state(11, DirectionState::Outbound(OutboundState::Joining)),
+                state(13, DirectionState::Outbound(OutboundState::Joining)),
+            ]
+        );
+    }
+
+    /// Retirement counts a pipe's unread terminal states by direction: a
+    /// FAILED direction makes it failed, else an ended one closed; its
+    /// unread non-terminal events leave uncounted, and read ones count
+    /// nowhere.
+    #[test]
+    fn retirement_counts_unread_outcomes_by_direction() {
+        let mut q = EventQueue::with_limit(100);
+        q.push(state(7, DirectionState::Outbound(OutboundState::Failed)));
+        let _ = drain(&mut q);
+        // Inbound ENDED and outbound FAILED: failed.
+        q.push(state(1, DirectionState::Inbound(InboundState::Ended)));
+        q.push(state(1, DirectionState::Outbound(OutboundState::Failed)));
+        // Outbound CLOSED alone: closed.
+        q.push(state(3, DirectionState::Outbound(OutboundState::Closed)));
+        // Non-terminal only: neither.
+        q.push(state(5, DirectionState::Outbound(OutboundState::Active)));
+        for p in [1, 3, 5, 7] {
+            q.retire(p);
+        }
+        assert_eq!(
+            drain(&mut q),
+            [SessionEvent::PipesRetired {
+                retired: 4,
+                failed: 1,
+                closed: 1,
+                dropped: 0,
+                last: vec![PipeId(1), PipeId(3), PipeId(5), PipeId(7)],
+            }]
         );
     }
 
@@ -424,14 +444,13 @@ mod tests {
         let mut most = 0;
         for i in 0..100_000u64 {
             let p = 2 * i + 1;
-            q.push(state(p, PipeHalf::Outbound, PipeState::Joining));
-            q.push(state(p, PipeHalf::Inbound, PipeState::Open));
-            q.push(state(p, PipeHalf::Outbound, PipeState::Failed));
-            q.push(state(p, PipeHalf::Inbound, PipeState::Ended));
+            q.push(state(p, DirectionState::Outbound(OutboundState::Joining)));
+            q.push(state(p, DirectionState::Inbound(InboundState::Open)));
+            q.push(state(p, DirectionState::Outbound(OutboundState::Failed)));
+            q.push(state(p, DirectionState::Inbound(InboundState::Ended)));
             // Two directions of the pipe and the summary.
             most = most.max(q.len());
-            q.push(state(p, PipeHalf::Outbound, PipeState::Retired));
-            q.push(state(p, PipeHalf::Inbound, PipeState::Retired));
+            q.retire(p);
         }
         assert_eq!(most, 3);
         assert_eq!(q.len(), 1);

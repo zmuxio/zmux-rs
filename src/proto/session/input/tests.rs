@@ -21,7 +21,7 @@ fn config() -> Config {
     Config {
         max_pipes: 4,
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef"),
-        max_idle_timeout: Duration::from_secs(600),
+        max_idle_timeout: Some(Duration::from_secs(600)),
         max_incoming_uni_streams: Some(4),
         ..Config::default()
     }

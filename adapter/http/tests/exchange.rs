@@ -20,7 +20,9 @@ use zmux_http::{BodyEncoding, ExchangeOptions, ExchangeServer, Options};
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Runs `f` on a fresh runtime under a watchdog of `secs` seconds.
@@ -40,16 +42,18 @@ fn run<F: Future<Output = ()>>(secs: u64, f: F) {
 
 /// Options with short timers, so that faults cost little time.
 fn quick() -> ExchangeOptions {
-    let mut o = ExchangeOptions::default();
+    let mut o = ExchangeOptions::default().with_psk(*b"exchange test psk");
     o.hold = Duration::from_millis(400);
     o.idle_timeout = Duration::from_secs(2);
-    o.gone_memory = Duration::from_secs(5);
+    // At least the deadline: a request the client repeats up to its
+    // deadline is answered GONE rather than taken for a new carrier.
+    o.gone_memory = Duration::from_secs(20);
     o.request_timeout = Duration::from_secs(2);
     o.deadline = Duration::from_secs(20);
     o.backoff.initial = Duration::from_millis(5);
     o.backoff.max = Duration::from_millis(100);
-    o.up_piece = 64 << 10;
-    o.down_piece = 64 << 10;
+    o.up_piece = Some(64 << 10);
+    o.down_piece = Some(64 << 10);
     o
 }
 
@@ -65,7 +69,7 @@ struct Server {
 /// echoes its bidirectional streams.
 async fn server(options: ExchangeOptions) -> Server {
     let listener = Listener::new(Config::default(), ListenerConfig::default());
-    let exchange = ExchangeServer::new(&listener, options);
+    let exchange = ExchangeServer::new(&listener, options).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     let serving = tokio::spawn(zmux_http::serve(
@@ -159,7 +163,18 @@ async fn shut_down(srv: Server) {
 }
 
 /// Closes both ends and waits until every resource is back at `base`.
-async fn finish(client: Session, srv: Server, proxy: Option<Proxy>, base: Snapshot) {
+/// `ready` is the snapshot with the server and `proxies` up and no client
+/// yet: the client's exchange requests go on until each has its result
+/// (an answer, or GONE once the server ended the carrier), so the path
+/// stays up until the client is gone; torn down earlier, its last request
+/// would be repeated until the client's deadline.
+async fn finish(
+    client: Session,
+    srv: Server,
+    proxies: Vec<Proxy>,
+    base: Snapshot,
+    ready: Snapshot,
+) {
     client.close(0u32.into(), b"done");
     let _ = tokio::time::timeout(Duration::from_secs(5), client.closed()).await;
     drop(client);
@@ -173,7 +188,19 @@ async fn finish(client: Session, srv: Server, proxy: Option<Proxy>, base: Snapsh
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    drop(proxy);
+    // The client's requests have their results.
+    loop {
+        let now = snapshot();
+        if now == ready {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client tasks left\n  ready {ready:?}\n  now   {now:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(proxies);
     shut_down(srv).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -195,7 +222,7 @@ async fn finish(client: Session, srv: Server, proxy: Option<Proxy>, base: Snapsh
 fn sessions_over_the_carrier() {
     run(60, async {
         for options in [
-            ExchangeOptions::default(),
+            ExchangeOptions::default().with_unauthenticated(),
             ExchangeOptions::default()
                 .with_psk(*b"a shared secret")
                 .with_encoding(BodyEncoding::Base64)
@@ -207,6 +234,7 @@ fn sessions_over_the_carrier() {
             server_options.idle_timeout = Duration::from_secs(2);
             server_options.hold = Duration::from_millis(500);
             let srv = server(server_options).await;
+            let ready = snapshot();
             let client = zmux_http::connect_exchange(&srv.addr, &options, Config::default())
                 .await
                 .unwrap();
@@ -220,7 +248,7 @@ fn sessions_over_the_carrier() {
                 s.await.unwrap();
             }
             assert_eq!(srv.exchange.carriers(), 1);
-            finish(client, srv, None, base).await;
+            finish(client, srv, Vec::new(), base, ready).await;
         }
     });
 }
@@ -237,17 +265,18 @@ fn split_up_and_down_targets() {
         let srv = server(o.clone()).await;
         let up = Proxy::start(&srv.addr, Faults::default(), 1).await;
         let down = Proxy::start(&srv.addr, Faults::default(), 2).await;
+        let ready = snapshot();
         let pipe = zmux_http::dial_exchange_split(
             zmux_http::ExchangeEndpoint::tcp(&up.addr),
             zmux_http::ExchangeEndpoint::tcp(&down.addr),
             &o,
-        );
+        )
+        .unwrap();
         let client = Session::connect(pipe, Config::default()).await.unwrap();
         echo(&client, 2 << 20, 7).await;
         let (u, d) = (up.stats.clone(), down.stats.clone());
         assert!(Stats::get(&u.requests) > 0 && Stats::get(&d.requests) > 0);
-        drop(down);
-        finish(client, srv, Some(up), base).await;
+        finish(client, srv, vec![up, down], base, ready).await;
     });
 }
 
@@ -257,6 +286,7 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
     let o = quick();
     let srv = server(o.clone()).await;
     let proxy = Proxy::start(&srv.addr, faults, seed).await;
+    let ready = snapshot();
     let client = zmux_http::connect_exchange(&proxy.addr, &o, Config::default())
         .await
         .unwrap();
@@ -265,7 +295,7 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
     tokio::time::sleep(Duration::from_millis(900)).await;
     echo(&client, len / 4, seed + 1).await;
     let stats = proxy.stats.clone();
-    finish(client, srv, Some(proxy), base).await;
+    finish(client, srv, vec![proxy], base, ready).await;
     stats
 }
 
@@ -371,8 +401,32 @@ fn seeded_fault_mix() {
     });
 }
 
-/// A client with another PSK gets no result: its requests are refused
-/// (404) and the carrier fails at the deadline, with nothing left behind
+/// Without a PSK the carrier must be chosen unauthenticated, and not both.
+#[test]
+fn authentication_is_required_unless_declined() {
+    let _g = serial();
+    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let e = zmux_http::ExchangeEndpoint::tcp("127.0.0.1:1");
+    for o in [
+        ExchangeOptions::default(),
+        ExchangeOptions::default()
+            .with_psk(*b"k")
+            .with_unauthenticated(),
+    ] {
+        let kind = |r: std::io::Result<()>| r.unwrap_err().kind();
+        assert_eq!(
+            kind(ExchangeServer::new(&listener, o.clone()).map(drop)),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            kind(zmux_http::dial_exchange_split(e.clone(), e.clone(), &o).map(drop)),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+/// A client with another PSK gets no result: its requests go to the
+/// fallback (404 without one) and the carrier fails at the deadline, with nothing left behind
 /// on either side.
 #[test]
 fn wrong_psk_fails_the_carrier() {
@@ -397,17 +451,19 @@ fn wrong_psk_fails_the_carrier() {
     });
 }
 
-/// An UP piece over the server's limit is answered GONE: the carrier fails
-/// at once, without repetitions up to the deadline.
+/// An UP piece over the server's limit is not authenticated: the carrier
+/// fails at the client's deadline.
 #[test]
-fn oversized_piece_fails_at_once() {
+fn oversized_piece_fails_at_the_deadline() {
     run(30, async {
         let base = snapshot();
         let mut so = quick();
-        so.max_up_piece = 16 << 10;
+        so.max_up_piece = Some(16 << 10);
         let srv = server(so).await;
+        let ready = snapshot();
         let mut o = quick();
-        o.up_piece = 1 << 20;
+        o.up_piece = Some(1 << 20);
+        o.deadline = Duration::from_secs(1);
         let client = zmux_http::connect_exchange(&srv.addr, &o, Config::default())
             .await
             .unwrap();
@@ -418,11 +474,95 @@ fn oversized_piece_fails_at_once() {
             .await
             .expect("the session ends with its only carrier");
         assert!(
-            started.elapsed() < o.deadline / 2,
+            started.elapsed() >= o.deadline / 2 && started.elapsed() < o.deadline * 5,
             "{e:?} after {:?}",
             started.elapsed()
         );
         drop((send, recv));
-        finish(client, srv, None, base).await;
+        finish(client, srv, Vec::new(), base, ready).await;
+    });
+}
+
+/// The serve loop hands every request it does not take to the fallback,
+/// with the body bytes it read replayed: other paths, other methods and
+/// exchange requests that are not authenticated alike.
+#[test]
+fn fallback_gets_requests_with_their_bodies() {
+    use http_body::Body as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    run(30, async {
+        let listener = Listener::new(Config::default(), ListenerConfig::default());
+        let exchange = ExchangeServer::new(&listener, quick()).unwrap();
+        let fallback =
+            zmux_http::HttpFallback::new(|req: zmux_http::FallbackRequest, _| async move {
+                let line = format!("{} {} ", req.method(), req.uri().path());
+                let mut body = req.into_body();
+                let mut got = line.into_bytes();
+                while let Some(Ok(f)) =
+                    std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+                {
+                    if let Ok(d) = f.into_data() {
+                        got.extend_from_slice(&d);
+                    }
+                }
+                http::Response::new(zmux_http::PipeBody::full(got))
+            });
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let serving = tokio::spawn(zmux_http::serve(
+            listener.clone(),
+            tcp,
+            Options::default()
+                .with_exchange(exchange)
+                .with_fallback(fallback),
+        ));
+        for (req, want) in [
+            (
+                "POST /zmux/exchange?n=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                "POST /zmux/exchange hello",
+            ),
+            (
+                "GET /zmux/exchange HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                "GET /zmux/exchange ",
+            ),
+            (
+                "PUT /other HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+                "PUT /other abc",
+            ),
+        ] {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).await.unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            assert!(resp.ends_with(want), "{resp}");
+        }
+        listener.close();
+        let _ = serving.await;
+    });
+}
+
+/// An exchange request forwarded from TLS early data is answered 425 and
+/// counted once as a setup failure, its connection not again.
+#[test]
+fn early_data_is_too_early_and_a_setup_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    run(30, async {
+        let srv = server(quick()).await;
+        let mut c = tokio::net::TcpStream::connect(&srv.addr).await.unwrap();
+        c.write_all(
+            b"POST /zmux/exchange HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\n\
+              Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .await
+        .unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 425"), "{resp}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(srv.listener.stats().setup_failures, 1);
+        shut_down(srv).await;
     });
 }

@@ -31,9 +31,9 @@
 //! lane ([`LaneId`]; a [`PipeId`] is the pipe's lane 0), and everything
 //! else sees one pipe.
 
-mod ack;
 mod api;
 mod app_event;
+mod channel;
 mod config;
 mod credit;
 mod early;
@@ -43,12 +43,12 @@ mod event;
 mod filter;
 mod input;
 mod lanes;
-mod ledger;
 mod limiter;
-mod mpath;
-mod opp;
 mod output;
 mod pacing;
+mod path;
+use path::{ack, ledger, mpath, opp, redundancy, resume, sched, tier};
+pub use tier::PipeUpdate;
 mod pipe_ack;
 mod pipes;
 mod policy;
@@ -57,14 +57,12 @@ mod quality;
 mod ranges;
 mod reasm;
 mod recv_buf;
-mod redundancy;
-mod resume;
 mod rtt;
-mod sched;
+mod shape;
+pub mod shaping;
 mod share;
 mod stream;
 mod streams;
-mod tier;
 mod tp;
 mod transmit;
 mod tuner;
@@ -83,13 +81,15 @@ use crate::proto::record::Framing;
 use crate::proto::{ApplicationErrorCode, Error, TransportErrorCode, VarInt};
 
 pub use api::{SendCapacity, SendOutcomeKind};
-pub use app_event::{GoAway, SessionEvent, Tracer};
+pub use app_event::{CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, Tracer};
 #[cfg(feature = "test-hooks")]
 pub use config::TestHooks;
 pub use config::{
-    Cap, Config, DEFAULT_LATENCY_BUDGET, DEFAULT_MEMORY_BUDGET, DEFAULT_OVERFLOW_DELAY,
-    DEFAULT_SEND_BUFFER_MAX, EarlyData, PipeAuth, Redundancy, RoleConfig, SESSION_WINDOW_FLOOR,
-    STREAM_WINDOW_FLOOR, WindowIncrease,
+    Budget, Cap, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MEMORY_BUDGET,
+    DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_SEND_BUFFER_MAX,
+    DEFAULT_STANDBY_PROBE, EarlyData, Period, PipeAuth, Redundancy, RoleConfig,
+    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, WindowIncrease,
 };
 pub use early::EarlyDataState;
 pub(crate) use error::ON_DRIVER_THREAD;
@@ -97,14 +97,15 @@ pub use error::{DatagramError, OpenError, PipeError, PipeFailure, SessionError, 
 pub use event::CoreEvent;
 pub use lanes::LaneAccept;
 pub use mpath::{JoinVerdict, LaneStats, Multipath, PipeOptions, PipeStats, PipeWrite, RttSource};
-pub use pipes::{PipeHalf, PipeState, PrioritySource};
+pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
 pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Policy};
 pub use preamble::Preamble;
 pub use quality::{CapacityFloor, QualityBand};
 pub use recv_buf::Backing;
-pub use rtt::WRITE_CALL_MIN;
+pub(crate) use rtt::WRITE_CALL_MIN;
 pub use stream::StreamKey;
-pub use transmit::{COPY_THRESHOLD, DEFAULT_BATCH, Piece, PieceCursor, TransmitBuf};
+pub(crate) use transmit::DEFAULT_BATCH;
+pub use transmit::{Piece, PieceCursor, TransmitBuf};
 
 use pipes::{Attachment, Attachments, InPipe, InState, OutPipe, OutState};
 use streams::Streams;
@@ -112,7 +113,7 @@ use streams::Streams;
 /// Identifies a pipe attachment (MULTIPATH.md Section 4.1). Pipe 0 is the
 /// bootstrap pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PipeId(pub u64);
+pub struct PipeId(pub(crate) u64);
 
 impl std::fmt::Display for PipeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,6 +122,18 @@ impl std::fmt::Display for PipeId {
 }
 
 impl PipeId {
+    /// The pipe with ID `id` (pipe 0 is the bootstrap pair).
+    #[inline]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// The ID's value.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
     /// Lane `lane` of the pipe's directions.
     #[inline]
     pub const fn lane(self, lane: u64) -> LaneId {
@@ -135,11 +148,23 @@ impl PipeId {
 /// lane 0 is the carrier the pipe started on; lanes 1, 2, ... are further
 /// streams of the same carrier connection, each a record stream of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lane(pub u64);
+pub struct Lane(pub(crate) u64);
 
 impl Lane {
     /// Lane 0: the pipe's own carrier.
     pub const ZERO: Self = Self(0);
+
+    /// Lane `n` of a pipe.
+    #[inline]
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The lane's number.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// A lane of a pipe: what each carrier stream the driver reads or writes
@@ -236,6 +261,11 @@ pub enum State {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SessionStats {
+    /// The carrier kind a carrier mode chose (API.md Section 4.8), the
+    /// latest after a switch; `None` for a session not dialed in a mode.
+    pub carrier: Option<CarrierKind>,
+    /// The tries of the mode's candidates, in order (the latest 64).
+    pub carrier_candidates: Vec<CandidateResult>,
     /// Bytes passed to the carrier.
     pub bytes_sent: u64,
     /// Bytes received from the carrier.
@@ -244,6 +274,18 @@ pub struct SessionStats {
     pub records_sent: u64,
     /// Records received.
     pub records_received: u64,
+    /// Payload bytes the application wrote to the session's streams: the
+    /// session [`Meter`]'s counter, not a second count (Section 7.1).
+    pub bytes_written: u64,
+    /// Payload bytes returned to the application from the session's
+    /// streams (the [`Meter`]'s).
+    pub bytes_read: u64,
+    /// Payload bytes of session and stream datagrams handed to a carrier
+    /// (the [`Meter`]'s).
+    pub datagram_bytes_sent: u64,
+    /// Payload bytes of session and stream datagrams returned to the
+    /// application (the [`Meter`]'s).
+    pub datagram_bytes_received: u64,
     /// Streams opened locally.
     pub streams_opened_local: u64,
     /// Streams opened by the peer.
@@ -260,6 +302,12 @@ pub struct SessionStats {
     pub datagrams_dropped_recv: u64,
     /// Datagrams dropped by a datagram limiter, sent or received.
     pub datagrams_dropped_limit: u64,
+    /// The datagrams of `datagrams_sent` that went on a carrier's datagram
+    /// channel rather than in a record (EXTENSIONS.md Section 6.8).
+    pub datagrams_sent_channel: u64,
+    /// The datagrams of `datagrams_received` that arrived on a carrier's
+    /// datagram channel.
+    pub datagrams_received_channel: u64,
     /// Current no-effect budget in tokens (SPEC.md Section 9.4).
     pub no_effect_budget: u64,
     /// Smoothed RTT, when sampled: pipe 0's outside multipath (its
@@ -285,7 +333,7 @@ pub struct SessionStats {
     /// Pipes penalized for slowing down.
     pub penalties: u64,
     /// Stream bytes received that had been received already (multipath).
-    pub bytes_duplicate: u64,
+    pub bytes_duplicate_received: u64,
     /// Reinjection episodes (a pipe's information reinjected).
     pub reinjections: u64,
     /// Opens that waited for stream credit.
@@ -466,6 +514,37 @@ pub(super) struct DatagramState {
     /// the driver took and has not handed back yet. With `recv_bytes` they
     /// stay within the session's datagram bytes (EXTENSIONS.md Section 6.5).
     held_bytes: usize,
+    /// Received datagrams of peer streams within the limit that have not
+    /// been opened yet, in arrival order (EXTENSIONS.md Sections 6.4 and
+    /// 6.8), until the stream opens or their deadline. Their bytes, with
+    /// an entry cost each, are in `recv_bytes`.
+    waiting: VecDeque<WaitingDatagram>,
+    /// [`SessionCore::channel_generation`].
+    channel_gen: u64,
+}
+
+/// A received datagram held for a peer stream not opened yet.
+#[derive(Debug)]
+struct WaitingDatagram {
+    stream_id: u64,
+    context: u64,
+    data: Bytes,
+    /// Dropped at this time: one smoothed RTT after its arrival, or the
+    /// deadline of the one held before it when that is later.
+    until: Instant,
+    /// It arrived on a carrier's datagram channel.
+    channel: bool,
+}
+
+/// What a datagram held for a stream not opened yet counts in the
+/// session's datagram bytes besides its payload: its entry, so that the
+/// byte limit bounds the number of tiny ones too.
+const WAITING_COST: usize = 64;
+
+impl WaitingDatagram {
+    fn cost(&self) -> usize {
+        self.data.len() + WAITING_COST
+    }
 }
 
 impl DatagramState {
@@ -477,6 +556,7 @@ impl DatagramState {
             + self.early.capacity() * size_of::<(Option<(StreamKey, u64)>, Bytes)>()
             + self.recv.capacity() * size_of::<Bytes>()
             + self.held.capacity() * size_of::<ReceivedDatagram>()
+            + self.waiting.capacity() * size_of::<WaitingDatagram>()
             + self.send.iter().map(|(_, b)| b.len()).sum::<usize>()
             + self.early.iter().map(|(_, b)| b.len()).sum::<usize>()
             + self.recv_bytes
@@ -492,6 +572,8 @@ static NO_DGRAM: DatagramState = DatagramState {
     recv_bytes: 0,
     held: VecDeque::new(),
     held_bytes: 0,
+    waiting: VecDeque::new(),
+    channel_gen: 0,
 };
 
 impl SessionCore {
@@ -532,14 +614,9 @@ impl ReceivedDatagram {
     }
 }
 
-const SEND_DATAGRAM_QUEUE: usize = 64;
-const RECV_DATAGRAM_QUEUE: usize = 128;
-const STREAM_DATAGRAM_QUEUE: usize = 32;
-const DATAGRAM_RECV_BYTES: usize = 1024 * 1024;
-
 /// The no-effect budget (SPEC.md Section 9.4.2), in thousandths of a token.
 #[derive(Debug)]
-struct Budget {
+struct NoEffectBudget {
     milli: i64,
     last: Option<Instant>,
 }
@@ -548,7 +625,7 @@ const BUDGET_CAPACITY: i64 = 4096 * 1000;
 /// 32 tokens per second is 32 thousandths per millisecond.
 const BUDGET_REFILL_PER_MS: i64 = 32;
 
-impl Budget {
+impl NoEffectBudget {
     fn new() -> Self {
         Self {
             milli: BUDGET_CAPACITY,
@@ -570,7 +647,7 @@ impl Budget {
     }
 
     /// Charges one frame; `false` when the budget is exhausted.
-    fn charge(&mut self) -> bool {
+    pub(super) fn charge(&mut self) -> bool {
         self.milli -= 1000;
         self.milli >= 0
     }
@@ -655,22 +732,22 @@ enum CloseFrame {
 ///
 /// /// Moves what `from` has to write on pipe 0 to `to`.
 /// fn pump(from: &mut SessionCore, to: &mut SessionCore, buf: &mut TransmitBuf, now: Instant) {
-///     while from.wants_write(PipeId(0)) {
-///         from.poll_transmit(PipeId(0), now, buf);
+///     while from.wants_write(PipeId::new(0)) {
+///         from.poll_transmit(PipeId::new(0), now, buf);
 ///         let mut bytes = Vec::new();
 ///         buf.copy_to_vec(&mut bytes);
 ///         if bytes.is_empty() {
 ///             break;
 ///         }
-///         to.receive(PipeId(0), &bytes, now);
+///         to.receive(PipeId::new(0), &bytes, now);
 ///     }
 /// }
 ///
 /// let now = Instant::now();
 /// let mut client = SessionCore::new(Config::default(), RoleConfig::Initiator, None, now)?;
 /// let mut server = SessionCore::new(Config::default(), RoleConfig::Responder, None, now)?;
-/// client.attach_pipe(PipeId(0), Framing::ByteStream, now);
-/// server.attach_pipe(PipeId(0), Framing::ByteStream, now);
+/// client.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
+/// server.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
 ///
 /// // Streams may be opened and written before establishment: the data
 /// // goes out with the handshake.
@@ -724,6 +801,9 @@ pub struct SessionCore {
     /// The index of the lane of `rx` whose records are being processed
     /// (0: lane 0).
     rx_lane: usize,
+    /// The datagram being processed arrived on a carrier's datagram
+    /// channel.
+    rx_channel: bool,
     /// The read buffer the bytes being processed came in, when the driver
     /// handed it over ([`SessionCore::receive_shared`]), and the streams whose
     /// received data references read buffers.
@@ -755,7 +835,7 @@ pub struct SessionCore {
     /// Quality bands and the capacity floor, boxed
     /// once the application sets one: a session without holds none.
     quality: Option<Box<quality::Quality>>,
-    budget: Budget,
+    budget: NoEffectBudget,
     events: VecDeque<CoreEvent>,
     /// Boxed: an open session has neither.
     error: Option<Box<SessionError>>,
@@ -790,6 +870,8 @@ pub struct SessionCore {
     handshake_deadline: Option<Instant>,
     idle_deadline: Option<Instant>,
     keep_alive_deadline: Option<Instant>,
+    /// The generator of the keep-alive waits' draws.
+    keep_alive_rng: u64,
     linger_deadline: Option<Instant>,
     stats: SessionStats,
     /// The linger deadline was extended once because the close was not
@@ -800,6 +882,10 @@ pub struct SessionCore {
     /// The stream layer: the streams, their flow control and scheduling
     /// queues (`streams/`).
     streams: Streams,
+    /// Shaping, once a shaper is set (`shape.rs`).
+    shape: Option<Box<shape::Shaping>>,
+    /// Stream events for the shapers while a batch holds their state.
+    shape_pending: Option<Vec<(shaping::EventKind, u64)>>,
 }
 
 const BIDI: usize = 0;
@@ -816,13 +902,7 @@ const fn dir_of_index(i: usize) -> Dir {
     if i == BIDI { Dir::Bidi } else { Dir::Uni }
 }
 
-fn random_u64() -> u64 {
-    getrandom::u64().unwrap_or_else(|_| {
-        // A process-local fallback: RandomState is seeded randomly.
-        use std::hash::BuildHasher;
-        std::collections::hash_map::RandomState::new().hash_one(0x5a4d_u64)
-    })
-}
+use crate::util::random_u64;
 
 /// A Lane Key chosen uniformly at random (MULTIPATH.md Section 3.6).
 fn random_key() -> [u8; 16] {
@@ -849,6 +929,10 @@ impl SessionCore {
         now: Instant,
     ) -> Result<Self, &'static str> {
         let config: Arc<Config> = config.into();
+        let keep_alive_rng = config
+            .hooks
+            .probe_seed
+            .map_or_else(random_u64, |s| s ^ 0x6b65_6570_616c_6976);
         config.validate()?;
         let role_nonce =
             (role == RoleConfig::Auto).then(|| config.hooks.role_nonce.unwrap_or_else(random_u64));
@@ -884,7 +968,7 @@ impl SessionCore {
         let srtt = config.hooks.rtt;
         let mut session = Self {
             early: None,
-            handshake_deadline: now.checked_add(config.handshake_timeout),
+            handshake_deadline: now.checked_add(config.handshake_wait()),
             config,
             transport_role,
             role: transport_role.unwrap_or(Role::Initiator),
@@ -898,6 +982,7 @@ impl SessionCore {
             pipe_ack: None,
             rx: 0,
             rx_lane: 0,
+            rx_channel: false,
             rx_src: None,
             recv_refs: RecvRefs::default(),
             tx: 0,
@@ -915,7 +1000,7 @@ impl SessionCore {
             goaway: None,
             dgram: None,
             quality: None,
-            budget: Budget::new(),
+            budget: NoEffectBudget::new(),
             events: VecDeque::new(),
             error: None,
             close: None,
@@ -932,18 +1017,26 @@ impl SessionCore {
             now,
             idle_deadline: None,
             keep_alive_deadline: None,
+            keep_alive_rng,
             linger_deadline: None,
             stats: SessionStats::default(),
             linger_extended: false,
-            meter: Arc::new(Meter::new(now)),
+            meter: Arc::new(Meter::new()),
             streams,
+            shape: None,
+            shape_pending: None,
         };
         session.early_setup(transport_role);
+        if let Some(f) = session.config.shaper.clone() {
+            session.set_shaper(Some(f));
+        }
         Ok(session)
     }
 
     /// Moves the session clock forward (inputs may carry the same time).
-    fn tick(&mut self, now: Instant) {
+    /// A driver also calls it before a statistics snapshot, so that the
+    /// durations since an event are current.
+    pub(crate) fn tick(&mut self, now: Instant) {
         if now > self.now {
             self.now = now;
         }
@@ -980,19 +1073,8 @@ impl SessionCore {
             .config
             .transport_parameters(l.role_nonce, nonce, l.lane_key);
         tp.zmux_multipath = l.multipath;
+        tp.zmux_carrier_datagrams |= l.carrier_datagrams && tp.max_datagram_frame_size.is_some();
         tp
-    }
-
-    /// The Session Nonces both endpoints sent in `zmux_multipath`
-    /// (MULTIPATH.md Section 3.1), this endpoint's first, while multipath
-    /// is in use.
-    pub fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])> {
-        if !self.is_multipath() {
-            return None;
-        }
-        let local = self.local_tp().multipath?;
-        let peer = self.peer_tp.as_ref()?.multipath?;
-        Some((local.session_nonce, peer.session_nonce))
     }
 
     /// The `zmux_role` nonces (EXTENSIONS.md Section 2), this endpoint's
@@ -1013,6 +1095,11 @@ impl SessionCore {
     /// transport parameter), once its parameters were processed.
     pub fn peer_accepts_reset_stream_at(&self) -> bool {
         self.peer_tp.as_ref().is_some_and(|t| t.reset_stream_at)
+    }
+
+    /// The session's configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// The error that ended the session, once it is closing.
@@ -1042,23 +1129,6 @@ impl SessionCore {
     /// The latest QX_PING sample.
     pub(super) fn ping_latest(&self) -> Option<Duration> {
         self.ping.latest
-    }
-
-    /// The RTT estimate rules use: the smoothed RTT or 333 ms (SPEC.md
-    /// Section 1.3). In a multipath session it is the largest smoothed RTT
-    /// of the live outbound pipes.
-    fn rtt_or_default(&self) -> Duration {
-        if self.mp.is_some()
-            && let Some(r) = self
-                .atts
-                .outs()
-                .filter(|o| o.is_live())
-                .map(|o| o.est().srtt)
-                .max()
-        {
-            return r;
-        }
-        self.srtt.unwrap_or(Duration::from_millis(333))
     }
 
     /// The initial smoothed RTT of a pipe: a test hook, or 333 ms.
@@ -1097,7 +1167,7 @@ impl SessionCore {
     /// the core no longer holds the stream.
     pub fn stream_stats(&self, key: StreamKey) -> Option<StreamStats> {
         let s = self.streams.get(key)?;
-        let mp = self.mp.is_some();
+        let mp = self.retains();
         let d = s.datagram_counts();
         let mut st = StreamStats {
             datagrams_sent: d.sent,
@@ -1146,10 +1216,9 @@ impl SessionCore {
     /// stream. The meter counts from the stream's start whenever it is
     /// first asked for, and keeps counting until the stream is discarded.
     pub fn stream_meter(&mut self, key: StreamKey) -> Option<Arc<Meter>> {
-        let now = self.now;
         let s = self.streams.get_mut(key)?;
         let m = s.meter.get_or_insert_with(|| {
-            let m = Meter::new(now);
+            let m = Meter::new();
             let written = s.send.as_ref().map_or(0, |x| x.written);
             let read = s.recv.as_ref().map_or(0, |r| r.app_read);
             let d = s.datagrams.as_ref().map(|d| d.counts).unwrap_or_default();
@@ -1162,72 +1231,16 @@ impl SessionCore {
         Some(m.clone())
     }
 
-    /// A snapshot of the statistics.
-    pub fn stats(&self) -> SessionStats {
-        let mut s = self.stats.clone();
-        s.no_effect_budget = self.budget.tokens();
-        if let Some(mp) = self.mp.as_deref() {
-            let (fallbacks, applied) = mp.picks().counts();
-            s.scheduler_fallbacks += fallbacks;
-            s.scheduler_answers += applied;
-        }
-        s.streams_active = self.streams.len() as u64;
-        s.smoothed_rtt = self.srtt;
-        s.send_buffered = self.streams.send_flow().buffered;
-        s.recv_buffered = self.streams.recv_flow().buffered;
-        if self.mp.is_none() {
-            // Those of pipe 0.
-            let r = self.rtt_of(self.out_ref(0));
-            s.smoothed_rtt = r.srtt;
-            s.min_rtt = r.min;
-            s.latest_rtt = r.latest;
-            s.mean_deviation = r.rttvar;
-        }
-        if let Some(mp) = self.mp.as_deref() {
-            s.retained = mp.retained();
-            s.pipes_active = self
-                .atts
-                .outs()
-                .filter(|o| o.state() == OutState::Active)
-                .count() as u64;
-            // The primary pipe's estimates (MULTIPATH.md Section 6.5).
-            let primary = mp
-                .acks()
-                .primary()
-                .and_then(|p| self.out_ref(p))
-                .or_else(|| self.atts.outs().next());
-            if let Some(est) = primary.map(OutPipe::est).filter(|e| e.sampled) {
-                s.smoothed_rtt = Some(est.srtt);
-                s.min_rtt = est.min_rtt.get();
-                s.latest_rtt = est.latest;
-                s.mean_deviation = Some(est.rttvar);
-            }
-            if let Some(t) = mp.suspension().since() {
-                s.suspended_time += self.now.saturating_duration_since(t);
-            }
-        }
-        s
-    }
-
-    /// Data bytes the session holds: unread received data (reassembly
-    /// included), written data not yet sent, retained unacknowledged data
-    /// and queued datagrams (the listener's memory budget).
-    pub fn held_bytes(&self) -> u64 {
-        // Sent bytes held for reinjection, the acknowledged ones behind a
-        // gap included.
-        let kept: u64 = if self.mp.is_some() {
-            self.streams
-                .keys()
-                .filter_map(|k| self.streams.get(k)?.send.as_ref())
-                .map(|s| s.buf.kept())
-                .sum()
-        } else {
-            0
-        };
-        self.streams.recv_flow().buffered
-            + self.streams.send_flow().buffered
-            + kept
-            + (self.dgram().recv_bytes + self.dgram().held_bytes) as u64
+    /// The slot that receives a stream's statistics as they are when the
+    /// stream is discarded, created on the first call; `None` once the core
+    /// no longer holds the stream. A handle that outlives the stream reads
+    /// its final statistics there.
+    pub fn stream_final_stats(
+        &mut self,
+        key: StreamKey,
+    ) -> Option<Arc<std::sync::OnceLock<StreamStats>>> {
+        let s = self.streams.get_mut(key)?;
+        Some(s.final_stats.get_or_insert_with(Default::default).clone())
     }
 
     /// Heap bytes of received stream data held for the application, with
@@ -1239,32 +1252,6 @@ impl SessionCore {
             .filter_map(|k| self.streams.get(k)?.recv.as_ref())
             .map(stream::RecvPart::memory)
             .sum()
-    }
-
-    /// Heap and inline bytes the core holds, for memory accounting.
-    pub fn memory_usage(&self) -> usize {
-        // The configuration counts in equal parts for the sessions that
-        // share it.
-        let config =
-            (size_of::<Config>() + 2 * size_of::<usize>()) / Arc::strong_count(&self.config);
-        let mut n = size_of::<Self>() + config + self.streams.heap_bytes();
-        n += self.events.capacity() * size_of::<CoreEvent>();
-        // Attachments (with their pipe halves) live inline in `atts`.
-        n += self.atts.heap_bytes();
-        n += self.mp.as_deref().map_or(0, mpath::Mp::heap_bytes);
-        n += self.grease.1.capacity() + self.exporter.as_ref().map_or(0, Vec::capacity);
-        n += self.error.as_ref().map_or(0, |_| size_of::<SessionError>());
-        n += self.close.as_ref().map_or(0, |_| size_of::<CloseFrame>());
-        n += self
-            .goaway
-            .as_deref()
-            .map_or(0, |g| size_of::<GoAwayState>() + g.reason.len());
-        n += self.dgram.as_deref().map_or(0, DatagramState::heap_bytes);
-        n += self
-            .quality
-            .as_deref()
-            .map_or(0, quality::Quality::heap_bytes);
-        n
     }
 
     // ---- pipes ---------------------------------------------------------
@@ -1292,8 +1279,7 @@ impl SessionCore {
         self.tick(now);
         let max = self.local_tp().max_record_size();
         let rtt = self.initial_rtt(0);
-        let floor = self.config.suspect_floor;
-        let dead = self.config.dead_timeout;
+        let detection = self.detection(0, None);
         if self.atts.first().is_none_or(|a| a.id() != 0) {
             let joiner = self.transport_role != Some(Role::Responder);
             // Room for this one alone: a single-pipe session has no other.
@@ -1301,7 +1287,7 @@ impl SessionCore {
             self.views_changed();
             self.stats.pipes_added += 1;
         }
-        let mp = self.mp.is_some();
+        let mp = self.per_pipe();
         let a = self.atts.at_mut(0);
         if let Some(framing) = inbound {
             a.attach_inp(|| {
@@ -1312,7 +1298,7 @@ impl SessionCore {
         if let Some(framing) = outbound {
             a.attach_out(|| {
                 let o = OutPipe::new(framing, OutState::Active, rtt, now);
-                let o = if mp { o.with_mp(floor, dead, now) } else { o };
+                let o = if mp { o.with_mp(detection, now) } else { o };
                 o.with_parameters_first()
             });
         }
@@ -1382,13 +1368,14 @@ impl SessionCore {
         self.recv_lane_gone(pipe);
     }
 
-    /// Inbound pipe `pipe` ended (`end` of the carrier that ended last): at
-    /// a record boundary of every lane (`clean`), or otherwise.
-    pub(super) fn inbound_ended(&mut self, pipe: u64, end: PipeEnd, clean: bool, now: Instant) {
-        if self.mp.is_some() {
-            self.mp_inbound_ended(pipe, end, clean, now);
-            return;
-        }
+    /// The single pipe's inbound side ended ([`Self::inbound_ended`]).
+    pub(super) fn single_inbound_ended(
+        &mut self,
+        pipe: u64,
+        end: PipeEnd,
+        clean: bool,
+        now: Instant,
+    ) {
         let Some(p) = self.inp_mut(pipe) else {
             return;
         };
@@ -1439,26 +1426,6 @@ impl SessionCore {
         self.outbound_failed(at.pipe.0, PipeFailure::Carrier(kind), now);
     }
 
-    /// Outbound pipe `pipe` failed under us.
-    pub(super) fn outbound_failed(&mut self, pipe: u64, cause: PipeFailure, now: Instant) {
-        if !self.out_mut(pipe).is_some_and(OutPipe::write_failed) {
-            return;
-        }
-        self.views_changed();
-        if self.mp.is_some() && self.state < State::Closing {
-            self.mp_outbound_failed(pipe, cause, now);
-            return;
-        }
-        if self.state == State::Closing {
-            self.maybe_closed(now);
-            return;
-        }
-        if self.state != State::Closed {
-            self.set_error(SessionError::PipesLost { last: Some(cause) });
-            self.closed_now();
-        }
-    }
-
     // ---- events and timers ---------------------------------------------
 
     /// The next event.
@@ -1497,11 +1464,7 @@ impl SessionCore {
                     .flatten()
                     .filter(|&t| t > self.now)
             });
-        let mp = if self.mp.is_some() {
-            self.mp_deadline()
-        } else {
-            self.single_pipe_ack_timer()
-        };
+        let mp = self.path_deadline();
         [
             self.handshake_deadline,
             self.idle_deadline,
@@ -1513,6 +1476,8 @@ impl SessionCore {
             self.goaway().phase_two_at,
             self.pacing_deadline(),
             self.quality_deadline(),
+            self.shape_deadline(),
+            self.waiting_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1522,6 +1487,9 @@ impl SessionCore {
     /// Fires every timer due at `now`.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.fire_timers(now);
+        if self.shape.is_some() && self.state != State::Closed {
+            self.shape_timeout(now);
+        }
         // Last: the quality reports read the estimates and pipe views as
         // the other timers left them.
         self.quality_timeout(now);
@@ -1536,6 +1504,7 @@ impl SessionCore {
         if self.state == State::Closed {
             return;
         }
+        self.expire_waiting(now);
         if self.close_wait_deadline().is_some_and(|d| now >= d) {
             // The close waited for the other lanes long enough.
             self.end_close_wait();
@@ -1597,18 +1566,20 @@ impl SessionCore {
             }
         }
         if self.keep_alive_deadline.is_some_and(|d| now >= d) {
-            self.keep_alive_deadline = self
-                .config
-                .keep_alive_period
-                .and_then(|p| now.checked_add(p));
             if self.is_established() && self.ping.outstanding.is_none() {
+                // At most one QX_PING after each activity (SPEC.md Section
+                // 6.4): the next activity, such as its answer, restarts
+                // the timer; an unanswered one lets the idle timeout run.
+                self.keep_alive_deadline = None;
                 self.ping.request_pending = true;
+            } else {
+                // A request is outstanding already: it probes in place of
+                // this one.
+                self.keep_alive_deadline = self.keep_alive_wait().and_then(|p| now.checked_add(p));
             }
         }
         self.lanes_timeouts(now);
-        if self.mp.is_some() {
-            self.mp_timeout(now);
-        }
+        self.path_timeout(now);
     }
 
     /// The outstanding request stopped being outstanding without its
@@ -1633,17 +1604,14 @@ impl SessionCore {
     }
 
     fn push_event(&mut self, e: CoreEvent) {
-        if let CoreEvent::PipeState {
-            pipe,
-            state: PipeState::Retired,
-            ..
-        } = e
-        {
+        if let CoreEvent::PipeRetired { pipe } = e {
             self.quality_retired(pipe.0);
         }
         if matches!(
             e,
-            CoreEvent::PipeState { .. } | CoreEvent::PipePriorityChanged { .. }
+            CoreEvent::PipeState { .. }
+                | CoreEvent::PipeRetired { .. }
+                | CoreEvent::PipePriorityChanged { .. }
         ) {
             // A custom decision made before no longer applies.
             self.advance_pick_generation();
@@ -1741,7 +1709,9 @@ impl SessionCore {
         if self.state != State::Closing {
             return;
         }
-        let single = self.mp.is_none();
+        // Protocol rule: a single pipe's inbound side ends with its
+        // outbound one (SPEC.md Section 5); a multipath pipe's are apart.
+        let single = !self.is_multipath();
         let done = self.atts.iter().all(|a| {
             let out_closed = a.out().is_some_and(OutPipe::out_closed);
             let in_done =
@@ -1789,6 +1759,18 @@ impl SessionCore {
                 self.events
                     .push_back(CoreEvent::StreamsAvailable(dir_of_index(d)));
             }
+        }
+    }
+
+    /// Abandons a session that is not established yet, as its handshake
+    /// timeout does (SPEC.md Section 6.1): it is closed without
+    /// CONNECTION_CLOSE, its carrier closed. Nothing happens to an
+    /// established session.
+    pub fn abandon(&mut self, now: Instant) {
+        self.tick(now);
+        if self.state == State::Establishing {
+            self.set_error(SessionError::HandshakeTimeout);
+            self.closed_now();
         }
     }
 
@@ -1870,10 +1852,7 @@ impl SessionCore {
         if let Some(idle) = self.idle_timeout() {
             self.idle_deadline = now.checked_add(idle);
         }
-        self.keep_alive_deadline = self
-            .config
-            .keep_alive_period
-            .and_then(|p| now.checked_add(p));
+        self.keep_alive_deadline = self.keep_alive_wait().and_then(|p| now.checked_add(p));
         self.push_event(CoreEvent::Established {
             role,
             features: self.features,
@@ -1902,12 +1881,6 @@ impl SessionCore {
         Ok(())
     }
 
-    /// A session with acknowledgement: multipath or pipe acknowledgement
-    /// in use, as between zmux endpoints always (SPEC.md Section 6.4).
-    pub(super) fn acknowledged(&self) -> bool {
-        self.mp.is_some() || self.pipe_ack.is_some()
-    }
-
     /// The effective idle timeout, once established.
     fn idle_timeout(&self) -> Option<Duration> {
         let peer = self.peer_tp.as_ref()?.max_idle_timeout;
@@ -1930,9 +1903,26 @@ impl SessionCore {
         if let Some(t) = self.idle_timeout() {
             self.idle_deadline = now.checked_add(t);
         }
-        if let Some(period) = self.config.keep_alive_period {
-            self.keep_alive_deadline = now.checked_add(period);
+        if let Some(wait) = self.keep_alive_wait() {
+            self.keep_alive_deadline = now.checked_add(wait);
         }
+    }
+
+    /// The next keep-alive wait, drawn when the timer restarts (SPEC.md
+    /// Section 6.4): the period k, capped at half the effective idle
+    /// timeout, reduced by a uniform fraction of up to the probe jitter
+    /// j, from \[k (1 - j), k\]; `None` with keep-alive off.
+    fn keep_alive_wait(&mut self) -> Option<Duration> {
+        let mut k = self.config.keep_alive()?;
+        if let Some(idle) = self.idle_timeout() {
+            k = k.min(idle / 2);
+        }
+        let j = self.config.probe_jitter;
+        if j <= 0.0 {
+            return Some(k);
+        }
+        let u = (pipes::splitmix(&mut self.keep_alive_rng) >> 11) as f64 / (1u64 << 53) as f64;
+        Some(Duration::try_from_secs_f64(k.as_secs_f64() * (1.0 - j * u)).unwrap_or(k))
     }
 
     // ---- shutdown --------------------------------------------------------
@@ -1959,9 +1949,7 @@ impl SessionCore {
     fn start_drain(&mut self, code: u64) {
         if self.state == State::Suspended {
             // Draining after resumption (RESUME.md Section 4.1).
-            if let Some(mp) = self.mp.as_deref_mut() {
-                mp.suspension_mut().drain_after();
-            }
+            self.drain_after_suspension();
         } else {
             self.state = State::Draining;
         }
@@ -1983,26 +1971,6 @@ impl SessionCore {
         {
             let reason = std::mem::take(&mut self.goaway_mut().reason);
             self.close(VarInt::from_u64(code).unwrap_or(VarInt::ZERO), &reason, now);
-        }
-    }
-
-    /// The fence completed (EXTENSIONS.md Section 3.3): phase 2 follows
-    /// at once, or one SRTT later in a multipath session and in a session
-    /// whose pipe toward this endpoint has lanes, as the response may have
-    /// overtaken stream frames on a slower pipe or lane.
-    fn fence_completed(&mut self, now: Instant) {
-        let lanes = self.mp.is_none()
-            && self
-                .atts
-                .first()
-                .and_then(Attachment::inp)
-                .is_some_and(|p| p.lane_count() > 1);
-        if self.mp.is_some() || lanes {
-            let at = now + self.rtt_or_default();
-            self.goaway_mut().fence = None;
-            self.goaway_mut().phase_two_at = Some(at);
-        } else {
-            self.goaway_phase_two(now);
         }
     }
 

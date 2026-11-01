@@ -133,7 +133,7 @@ fn config(policy: &Policy) -> Config {
     c.max_pipes = 8;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
     c.scheduler = policy.clone();
-    c.max_idle_timeout = Duration::from_secs(600);
+    c.max_idle_timeout = Some(Duration::from_secs(600));
     c.max_incoming_streams = 1 << 16;
     c
 }
@@ -145,10 +145,10 @@ impl Net {
         b_cfg.test_hooks().locator = b"server".to_vec();
         let mut a = SessionCore::new(config(policy), RoleConfig::Initiator, None, start).unwrap();
         let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, start).unwrap();
-        a.attach_pipe(PipeId(0), BS, start);
-        b.attach_pipe(PipeId(0), BS, start);
-        a.set_pipe_low_water(PipeId(0), true);
-        b.set_pipe_low_water(PipeId(0), true);
+        a.attach_pipe(PipeId::new(0), BS, start);
+        b.attach_pipe(PipeId::new(0), BS, start);
+        a.set_pipe_low_water(PipeId::new(0), true);
+        b.set_pipe_low_water(PipeId::new(0), true);
         let pipe = |id, (mbit, delay): (usize, u32), b_attached| Pipe {
             id,
             fwd: Line::new(mbit, delay),
@@ -189,7 +189,7 @@ impl Net {
                 )
                 .unwrap();
             n.a.set_pipe_low_water(id, true);
-            n.pipes.push(pipe(id.0, spec, false));
+            n.pipes.push(pipe(id.get(), spec, false));
         }
         n.run(2000);
         for _ in 0..streams {
@@ -219,7 +219,7 @@ impl Net {
             }
         }
         for i in 0..self.pipes.len() {
-            let id = PipeId(self.pipes[i].id);
+            let id = PipeId::new(self.pipes[i].id);
             // A's writes, timed.
             loop {
                 let unsent = self.pipes[i].fwd.queue.len();
@@ -242,6 +242,7 @@ impl Net {
                 }
                 let mut v = Vec::new();
                 self.out.copy_to_vec(&mut v);
+                self.a.pipe_written(id, v.len() as u64);
                 let p = &mut self.pipes[i];
                 let mut input = &v[..];
                 while let Ok(Some(ev)) = p.reader.read(&mut input, &Gates::ALL) {
@@ -264,6 +265,7 @@ impl Net {
                     }
                     let mut v = Vec::new();
                     self.out.copy_to_vec(&mut v);
+                    self.b.pipe_written(id, v.len() as u64);
                     self.pipes[i].rev.queue.extend(v);
                 }
             }
@@ -300,7 +302,7 @@ impl Net {
         if p.b_attached {
             let t = cpu();
             if self.copy {
-                self.b.receive(PipeId(p.id), bytes, now);
+                self.b.receive(PipeId::new(p.id), bytes, now);
             } else {
                 // Reads of at most 64 KiB into the pipe's read buffer, a
                 // fresh one when it has no room; an incomplete record stays
@@ -319,7 +321,9 @@ impl Net {
                         id: p.rid,
                         size: READ_BUFFER,
                     };
-                    let used = self.b.receive_shared(PipeId(p.id), &data, backing, now);
+                    let used = self
+                        .b
+                        .receive_shared(PipeId::new(p.id), &data, backing, now);
                     p.rbuf.extend_from_slice(&data[used..]);
                 }
             }

@@ -769,7 +769,7 @@ mod tests {
             if let Some(pos) = ack.filter(|&p| p > self.acked) {
                 let &(t_sent, ..) = self.flight.iter().find(|f| f.1 >= pos).unwrap();
                 let rtt = now - t_sent;
-                self.est.rtt_sample(rtt, Duration::ZERO, now);
+                self.est.rtt_sample(rtt, Duration::ZERO, false, now);
                 // Over the flight of the last batch covered.
                 let &(_, _, delivered, at) = self
                     .flight

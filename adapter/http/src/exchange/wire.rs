@@ -4,13 +4,10 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::{BufMut, Bytes, BytesMut};
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
 use zmux::proto::varint;
+use zmux::util::HmacSha256;
 
 use super::BodyEncoding;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// The label of the carrier key.
 const KEY_LABEL: &[u8] = b"zmux-http-exchange/1";
@@ -19,9 +16,21 @@ pub(crate) const MAC_LEN: usize = 16;
 /// The length of a response's MAC and flags.
 pub(crate) const RESPONSE_HEAD: usize = MAC_LEN + 1;
 /// The longest request prefix: two 8-byte variable-length integers.
-pub(crate) const MAX_PREFIX: usize = 16 + 1 + 1 + 8 + 8 + 8 + MAC_LEN;
+pub(crate) const MAX_PREFIX: usize = 16 + 1 + 1 + 8 + 8 + 4 + 8 + MAC_LEN;
 /// The longest CLOSE reason.
 pub(crate) const MAX_REASON: usize = 256;
+
+/// The clock in seconds since 1970-01-01T00:00:00Z.
+pub(crate) fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The clock as a request's Time: [`unix_seconds`] modulo 2^32.
+pub(crate) fn unix_time() -> u32 {
+    unix_seconds() as u32
+}
 
 /// A Carrier ID.
 pub(crate) type CarrierId = [u8; 16];
@@ -60,24 +69,12 @@ pub(crate) struct Key(HmacSha256);
 
 impl Key {
     pub(crate) fn new(psk: &[u8], cid: &CarrierId) -> Self {
-        let mut mac = HmacSha256::new_from_slice(psk).expect("HMAC takes any key length");
-        mac.update(KEY_LABEL);
-        mac.update(cid);
-        let k = mac.finalize().into_bytes();
-        Self(HmacSha256::new_from_slice(&k).expect("HMAC takes any key length"))
-    }
-
-    /// A MAC over the concatenation of `parts`.
-    fn mac(&self, parts: &[&[u8]]) -> HmacSha256 {
-        let mut mac = self.0.clone();
-        for p in parts {
-            mac.update(p);
-        }
-        mac
+        let k = HmacSha256::new(psk).mac(&[KEY_LABEL, cid]);
+        Self(HmacSha256::new(&k))
     }
 
     fn tag(&self, parts: &[&[u8]]) -> [u8; MAC_LEN] {
-        let full = self.mac(parts).finalize().into_bytes();
+        let full = self.0.mac(parts);
         let mut out = [0; MAC_LEN];
         out.copy_from_slice(&full[..MAC_LEN]);
         out
@@ -85,7 +82,7 @@ impl Key {
 
     /// Whether `tag` is the truncated MAC over `parts` (constant time).
     fn check(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
-        self.mac(parts).verify_truncated_left(tag).is_ok()
+        self.0.verify(parts, tag)
     }
 
     /// The MAC of a response to the request `to`.
@@ -123,6 +120,7 @@ impl Outgoing {
         flags: u8,
         seq: u64,
         ack: u64,
+        time: u32,
         nonce: [u8; 8],
         data: &[u8],
     ) -> Self {
@@ -136,6 +134,7 @@ impl Outgoing {
         p.put_u8(flags);
         p.put_slice(&s[..seq_len]);
         p.put_slice(&a[..ack_len]);
+        p.put_u32(time);
         p.put_slice(&nonce);
         let tag = key.tag(&[b"Q", &p, data]);
         p.put_slice(&tag);
@@ -179,6 +178,8 @@ pub(crate) struct Request {
     pub(crate) flags: u8,
     pub(crate) seq: u64,
     pub(crate) ack: u64,
+    /// The client's clock in seconds modulo 2^32.
+    pub(crate) time: u32,
     pub(crate) nonce: [u8; 8],
     /// The body up to the MAC, as received.
     signed: Bytes,
@@ -188,47 +189,36 @@ pub(crate) struct Request {
     pub(crate) data: Bytes,
 }
 
-/// Why a request is not valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Malformed {
-    /// The body is not a request.
-    Body,
-    /// The MAC does not verify.
-    Mac,
-    /// The request is authentic but breaks the binding's rules.
-    Invalid,
-}
-
 impl Request {
-    /// Parses the binary body of a request.
-    pub(crate) fn parse(body: Bytes) -> Result<Self, Malformed> {
+    /// Parses the binary body of a request; `None` when it does not hold a
+    /// complete request header.
+    pub(crate) fn parse(body: Bytes) -> Option<Self> {
         let mut at = 16 + 2;
         if body.len() < at {
-            return Err(Malformed::Body);
+            return None;
         }
         let mut cid = [0; 16];
         cid.copy_from_slice(&body[..16]);
         let (kind, flags) = (body[16], body[17]);
-        let (seq, n) = varint::decode(&body[at..]).ok_or(Malformed::Body)?;
+        let (seq, n) = varint::decode(&body[at..])?;
         let seq_at = (at, n);
         at += n;
-        let (ack, n) = varint::decode(&body[at..]).ok_or(Malformed::Body)?;
+        let (ack, n) = varint::decode(&body[at..])?;
         at += n;
-        let nonce: [u8; 8] = body
-            .get(at..at + 8)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Malformed::Body)?;
+        let time = body
+            .get(at..at + 4)
+            .map(|s| u32::from_be_bytes(s.try_into().expect("4 bytes")))?;
+        at += 4;
+        let nonce: [u8; 8] = body.get(at..at + 8).and_then(|s| s.try_into().ok())?;
         at += 8;
-        let mac: [u8; MAC_LEN] = body
-            .get(at..at + MAC_LEN)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Malformed::Body)?;
-        Ok(Self {
+        let mac: [u8; MAC_LEN] = body.get(at..at + MAC_LEN).and_then(|s| s.try_into().ok())?;
+        Some(Self {
             cid,
             kind,
             flags,
             seq,
             ack,
+            time,
             nonce,
             signed: body.slice(..at),
             seq_at,
@@ -237,13 +227,15 @@ impl Request {
         })
     }
 
-    /// Checks the MAC with `key`, then the rules of the binding; returns
-    /// the request's kind.
-    pub(crate) fn verify(&self, key: &Key) -> Result<Kind, Malformed> {
-        if !key.check(&[b"Q", &self.signed, &self.data], &self.mac) {
-            return Err(Malformed::Mac);
-        }
-        let kind = Kind::from_byte(self.kind).ok_or(Malformed::Invalid)?;
+    /// Whether the request MAC verifies with `key` (constant time).
+    pub(crate) fn authentic(&self, key: &Key) -> bool {
+        key.check(&[b"Q", &self.signed, &self.data], &self.mac)
+    }
+
+    /// The request's kind, or `None` when its Kind, Flags, Sequence or
+    /// Data break the rules of the binding.
+    pub(crate) fn valid_kind(&self) -> Option<Kind> {
+        let kind = Kind::from_byte(self.kind)?;
         let valid = match kind {
             Kind::Up => self.flags & !REQ_FIN == 0,
             Kind::Down => self.flags == 0 && self.data.is_empty(),
@@ -254,16 +246,7 @@ impl Request {
                     && std::str::from_utf8(&self.data).is_ok()
             }
         };
-        if valid {
-            Ok(kind)
-        } else {
-            Err(Malformed::Invalid)
-        }
-    }
-
-    /// The Kind byte as received.
-    pub(crate) fn kind_byte(&self) -> u8 {
-        self.kind
+        valid.then_some(kind)
     }
 
     /// What a response to this request is bound to.
@@ -307,7 +290,7 @@ impl Response {
     }
 
     /// Whether the flags and data of this verified response to a request
-    /// of `kind` are valid (Section 4); a response that is not fails the
+    /// of `kind` are valid; a response that is not fails the
     /// carrier.
     pub(crate) fn valid_for(&self, kind: Kind) -> bool {
         match self.flags {
@@ -360,14 +343,28 @@ mod tests {
             .collect()
     }
 
-    fn to_hex(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
+    use zmux::util::hex as to_hex;
+
+    #[derive(Debug, PartialEq)]
+    enum Verdict {
+        Mac,
+        Invalid,
+    }
+
+    impl Request {
+        fn verify(&self, key: &Key) -> Result<Kind, Verdict> {
+            if !self.authentic(key) {
+                return Err(Verdict::Mac);
+            }
+            self.valid_kind().ok_or(Verdict::Invalid)
+        }
     }
 
     const CID: CarrierId = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const NONCE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const TIME: u32 = 1_767_225_600;
 
-    /// The test vectors of the binding (Section 9): both requests and both
+    /// The test vectors of the binding: both requests and both
     /// responses as each side builds them, and as the other parses and
     /// verifies them.
     #[test]
@@ -376,32 +373,29 @@ mod tests {
             (
                 Vec::new(),
                 "8e08f7810b828921459c8d8c4f1be67963269408f5e7179f7f0df94d417723ef",
-                "000102030405060708090a0b0c0d0e0f0100000001020304050607083a03565a66d053fcaa22184304620da468656c6c6f",
+                "000102030405060708090a0b0c0d0e0f010000006955b9000102030405060708507a0b4c9f35406fc018ecb298ac332068656c6c6f",
                 "477e5b04a29e7fc80fd53eb36fd0715400",
-                "000102030405060708090a0b0c0d0e0f0200412c412b01020304050607088897fdc82804aa8d78f2c52a8e9a9f4c",
+                "000102030405060708090a0b0c0d0e0f0200412c412b6955b9000102030405060708e285ca274bac052e7c0a98cf3174ee5b",
                 "0ccf05f246c40f075271dd7e52d2420401776f726c64",
             ),
             (
                 vec![0x6b; 32],
                 "68489b10ee27b348be274432395cb2107dcfc8cf3f9f69f2cd4cf7cd7a0f8c95",
-                "000102030405060708090a0b0c0d0e0f010000000102030405060708bace4bcb910362f6efd873612d5cfbbe68656c6c6f",
+                "000102030405060708090a0b0c0d0e0f010000006955b90001020304050607089b83951cb9d54b75d8d0785f3eb2d3d668656c6c6f",
                 "c5b18d1988c3d46dbfee70883026026000",
-                "000102030405060708090a0b0c0d0e0f0200412c412b0102030405060708f5da46bda25a34468f71ad8de3505f08",
+                "000102030405060708090a0b0c0d0e0f0200412c412b6955b9000102030405060708d48a0293326ba2533431172737bc96a7",
                 "f900c6512f2edcc31275640df468edf201776f726c64",
             ),
         ];
         for (psk, k, up, up_r, down, down_r) in cases {
             // The carrier key.
-            let mut mac = HmacSha256::new_from_slice(&psk).unwrap();
-            mac.update(KEY_LABEL);
-            mac.update(&CID);
-            assert_eq!(to_hex(&mac.finalize().into_bytes()), k);
+            assert_eq!(to_hex(&HmacSha256::new(&psk).mac(&[KEY_LABEL, &CID])), k);
             let key = Key::new(&psk, &CID);
 
             // The client's requests.
-            let up_out = Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, NONCE, b"hello");
+            let up_out = Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, NONCE, b"hello");
             assert_eq!(to_hex(&up_out.prefix) + &to_hex(b"hello"), up);
-            let down_out = Outgoing::new(&key, &CID, Kind::Down, 0, 300, 299, NONCE, b"");
+            let down_out = Outgoing::new(&key, &CID, Kind::Down, 0, 300, 299, TIME, NONCE, b"");
             assert_eq!(to_hex(&down_out.prefix), down);
 
             // The server parses them and answers.
@@ -415,7 +409,10 @@ mod tests {
             assert_eq!(to_hex(&head), up_r);
             let down_req = Request::parse(Bytes::from(hex(down))).unwrap();
             assert_eq!(down_req.verify(&key), Ok(Kind::Down));
-            assert_eq!((down_req.seq, down_req.ack), (300, 299));
+            assert_eq!(
+                (down_req.seq, down_req.ack, down_req.time),
+                (300, 299, TIME)
+            );
             let head = response_head(&key, &down_req.answering(), FIN, b"world");
             assert_eq!(to_hex(&head) + &to_hex(b"world"), down_r);
 
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn mac_catches_replayed_responses() {
         let key = Key::new(b"", &CID);
-        let first = Outgoing::new(&key, &CID, Kind::Down, 0, 7, 7, NONCE, b"");
+        let first = Outgoing::new(&key, &CID, Kind::Down, 0, 7, 7, TIME, NONCE, b"");
         let req = Request::parse(first.prefix.clone()).unwrap();
         let mut cached = BytesMut::new();
         cached.put(response_head(&key, &req.answering(), 0, b"stale"));
@@ -445,8 +442,8 @@ mod tests {
         assert!(first.verifies(&key, &CID, Kind::Down, &cached));
         // Replayed to a repetition of the same piece (new nonce), or to
         // another piece: valid in form, rejected by the MAC.
-        let again = Outgoing::new(&key, &CID, Kind::Down, 0, 7, 7, [9; 8], b"");
-        let other = Outgoing::new(&key, &CID, Kind::Down, 0, 8, 7, NONCE, b"");
+        let again = Outgoing::new(&key, &CID, Kind::Down, 0, 7, 7, TIME, [9; 8], b"");
+        let other = Outgoing::new(&key, &CID, Kind::Down, 0, 8, 7, TIME, NONCE, b"");
         assert!(cached.valid_for(Kind::Down));
         assert!(!again.verifies(&key, &CID, Kind::Down, &cached));
         assert!(!other.verifies(&key, &CID, Kind::Down, &cached));
@@ -456,11 +453,12 @@ mod tests {
         assert!(!first.verifies(&Key::new(b"", &cid2), &cid2, Kind::Down, &cached));
         assert!(!first.verifies(&Key::new(b"x", &CID), &CID, Kind::Down, &cached));
         // A request whose data was rewritten.
-        let mut forged =
-            BytesMut::from(&Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, NONCE, b"a").prefix[..]);
+        let mut forged = BytesMut::from(
+            &Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, NONCE, b"a").prefix[..],
+        );
         forged.put_slice(b"b");
         let forged = Request::parse(forged.freeze()).unwrap();
-        assert_eq!(forged.verify(&key), Err(Malformed::Mac));
+        assert_eq!(forged.verify(&key), Err(Verdict::Mac));
     }
 
     /// Requests that verify but break the rules, and response flags.
@@ -476,6 +474,7 @@ mod tests {
             let len = varint::encode(seq, &mut s).unwrap();
             p.put_slice(&s[..len]);
             p.put_u8(0);
+            p.put_u32(TIME);
             p.put_slice(&NONCE);
             let tag = key.tag(&[b"Q", &p, data]);
             p.put_slice(&tag);
@@ -483,26 +482,24 @@ mod tests {
             Request::parse(p.freeze()).unwrap().verify(&key)
         };
         assert_eq!(req(1, 1, 3, b"x"), Ok(Kind::Up));
-        assert_eq!(req(1, 2, 3, b"x"), Err(Malformed::Invalid));
+        assert_eq!(req(1, 2, 3, b"x"), Err(Verdict::Invalid));
         assert_eq!(req(2, 0, 3, b""), Ok(Kind::Down));
-        assert_eq!(req(2, 1, 3, b""), Err(Malformed::Invalid));
-        assert_eq!(req(2, 0, 3, b"x"), Err(Malformed::Invalid));
+        assert_eq!(req(2, 1, 3, b""), Err(Verdict::Invalid));
+        assert_eq!(req(2, 0, 3, b"x"), Err(Verdict::Invalid));
         assert_eq!(req(3, 0, 0, b"bye"), Ok(Kind::Close));
-        assert_eq!(req(3, 0, 0, &[0xff]), Err(Malformed::Invalid));
+        assert_eq!(req(3, 0, 0, &[0xff]), Err(Verdict::Invalid));
+        assert_eq!(req(3, 0, 0, &[b'a'; MAX_REASON + 1]), Err(Verdict::Invalid));
+        assert_eq!(req(4, 0, 0, b""), Err(Verdict::Invalid));
         assert_eq!(
-            req(3, 0, 0, &[b'a'; MAX_REASON + 1]),
-            Err(Malformed::Invalid)
-        );
-        assert_eq!(req(4, 0, 0, b""), Err(Malformed::Invalid));
-        assert_eq!(
-            Request::parse(Bytes::from_static(&[0; 40])).err(),
-            Some(Malformed::Body)
+            Request::parse(Bytes::from_static(&[0; 40])).map(|_| ()),
+            None
         );
 
         // A non-minimal Sequence encoding is bound as sent.
         let mut p = BytesMut::new();
         p.put_slice(&CID);
         p.put_slice(&[2, 0, 0x40, 0x05, 0]);
+        p.put_u32(TIME);
         p.put_slice(&NONCE);
         let tag = key.tag(&[b"Q", &p]);
         p.put_slice(&tag);

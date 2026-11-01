@@ -5,6 +5,8 @@
 use std::io::IoSlice;
 
 use bytes::Bytes;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+use bytes::BytesMut;
 
 use crate::proto::codec::Writer;
 use crate::proto::error::EncodeError;
@@ -14,10 +16,10 @@ use crate::proto::varint;
 
 /// Payloads shorter than this are copied into the batch; longer ones are
 /// referenced.
-pub const COPY_THRESHOLD: usize = 4096;
+pub(crate) const COPY_THRESHOLD: usize = 4096;
 
 /// The default batch limit.
-pub const DEFAULT_BATCH: usize = 256 * 1024;
+pub(crate) const DEFAULT_BATCH: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 enum Part {
@@ -207,6 +209,11 @@ impl TransmitBuf {
         &self.messages
     }
 
+    /// Whether the batch is built for a carrier with message framing.
+    pub(crate) fn is_records(&self) -> bool {
+        self.framing == Framing::Records
+    }
+
     /// The framing the batch is built for.
     pub(crate) fn set_framing(&mut self, framing: Framing) {
         self.framing = framing;
@@ -354,12 +361,138 @@ impl TransmitBuf {
     /// Returns the bytes taken. The walk starts where `cursor` says the
     /// last one ended, when that is at or before `offset` in this batch,
     /// and leaves `cursor` where it ended.
-    pub fn take_pieces(
+    pub fn take_pieces<'a>(
+        &'a self,
+        cursor: &mut PieceCursor,
+        offset: usize,
+        max: usize,
+        mut take: impl FnMut(Piece<'a>) -> usize,
+    ) -> usize {
+        self.walk(cursor, offset, max, |p, skip, n| {
+            take(match p {
+                Part::Copied { start, .. } => {
+                    Piece::Copied(&self.buf[start + skip..start + skip + n])
+                }
+                Part::Shared(b) => Piece::Shared(b.slice(skip..skip + n)),
+            })
+        })
+    }
+
+    /// The `len` bytes from byte `offset` on as one slice: borrowed when
+    /// one part holds them (a message of a single piece), else copied into
+    /// `scratch`. `cursor` as for [`TransmitBuf::take_pieces`].
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn contiguous<'a>(
+        &'a self,
+        cursor: &mut PieceCursor,
+        offset: usize,
+        len: usize,
+        scratch: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        let mut single: Option<&'a [u8]> = None;
+        scratch.clear();
+        self.walk(cursor, offset, len, |p, skip, n| {
+            let s = &self.part_bytes(p)[skip..skip + n];
+            if n == len {
+                single = Some(s);
+            } else {
+                scratch.extend_from_slice(s);
+            }
+            n
+        });
+        match single {
+            Some(s) => s,
+            None => scratch,
+        }
+    }
+
+    /// At most `max` bytes of the batch from byte `offset` on as owned
+    /// buffers appended to `out`, `whole`: as one buffer, else piece by
+    /// piece. A referenced payload is shared without copying; built bytes,
+    /// and a whole range of more than one piece, are copied into `scratch`
+    /// and split off it, so that buffers released by the carrier make room
+    /// in it again. `cursor` as for [`TransmitBuf::take_pieces`]. Returns
+    /// the bytes appended.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn owned_pieces(
         &self,
         cursor: &mut PieceCursor,
         offset: usize,
         max: usize,
-        mut take: impl FnMut(Piece<'_>) -> usize,
+        whole: bool,
+        out: &mut Vec<Bytes>,
+        scratch: &mut BytesMut,
+    ) -> usize {
+        // The bytes this call copies, reserved at once: the buffer's own
+        // room when what the carriers took from it was released, else one
+        // allocation of just that size, so that a carrier holding buffers
+        // (until acknowledged) holds no more than the bytes it was given.
+        let start = *cursor;
+        let mut probe = start;
+        let (mut copied, mut pieces, mut single) = (0, 0, None);
+        let n = self.walk(&mut probe, offset, max, |p, skip, n| {
+            pieces += 1;
+            match p {
+                // A message of one referenced payload is shared.
+                Part::Shared(b) if whole && n == max => single = Some(b.slice(skip..skip + n)),
+                Part::Shared(_) if !whole => {}
+                _ => copied += n,
+            }
+            n
+        });
+        if let Some(b) = single.filter(|_| pieces == 1) {
+            *cursor = probe;
+            out.push(b);
+            return n;
+        }
+        if whole {
+            copied = n;
+        }
+        *cursor = start;
+        debug_assert!(scratch.is_empty());
+        if !scratch.try_reclaim(copied) {
+            // Still referenced: a new buffer of this call's size (reserve
+            // would keep the size of the first one).
+            *scratch = BytesMut::with_capacity(copied);
+        }
+        let n = self.walk(cursor, offset, max, |p, skip, n| {
+            match p {
+                Part::Shared(b) if !whole => out.push(b.slice(skip..skip + n)),
+                _ => {
+                    scratch.extend_from_slice(&self.part_bytes(p)[skip..skip + n]);
+                    if !whole {
+                        out.push(scratch.split().freeze());
+                    }
+                }
+            }
+            n
+        });
+        if whole && !scratch.is_empty() {
+            out.push(scratch.split().freeze());
+        }
+        n
+    }
+
+    /// The bytes of part `p`.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    fn part_bytes<'a>(&'a self, p: &'a Part) -> &'a [u8] {
+        match p {
+            Part::Copied { start, end } => &self.buf[*start..*end],
+            Part::Shared(b) => b,
+        }
+    }
+
+    /// Walks at most `max` bytes from byte `offset` on, handing `f` each
+    /// part with the offset and length of its bytes in range; `f` returns
+    /// the bytes it took, and taking less ends the walk. Starts at
+    /// `cursor` when it is current and at or before `offset`, and leaves
+    /// it where the walk ended.
+    fn walk<'a>(
+        &'a self,
+        cursor: &mut PieceCursor,
+        offset: usize,
+        max: usize,
+        mut f: impl FnMut(&'a Part, usize, usize) -> usize,
     ) -> usize {
         let (first, mut at) = if cursor.version == self.version && cursor.at <= offset {
             (cursor.part, cursor.at)
@@ -385,13 +518,7 @@ impl TransmitBuf {
             }
             let skip = pos - at;
             let n = (len - skip).min(left);
-            let piece = match p {
-                Part::Copied { start, .. } => {
-                    Piece::Copied(&self.buf[start + skip..start + skip + n])
-                }
-                Part::Shared(b) => Piece::Shared(b.slice(skip..skip + n)),
-            };
-            let t = take(piece).min(n);
+            let t = f(p, skip, n).min(n);
             taken += t;
             left -= t;
             if t < n {

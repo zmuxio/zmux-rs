@@ -83,6 +83,7 @@ async fn a_session_over_http1() {
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
+    assert_kind([&client, &server], zmux::CarrierKind::Streaming);
     round_trip_and_close(client, server).await;
     listener.close();
     serving.await.unwrap();
@@ -116,8 +117,12 @@ async fn one_exchange_carries_both_directions() {
             let (stream, peer) = tcp.accept().await.unwrap();
             let service = hyper::service::service_fn(move |req| {
                 requests.fetch_add(1, Ordering::SeqCst);
-                let resp = zmux_http::handle_request(&listener, req, Some(peer.ip()), None);
-                std::future::ready(Ok::<_, std::convert::Infallible>(resp))
+                let listener = listener.clone();
+                async move {
+                    zmux_http::handle_request(&listener, req, Some(peer), None)
+                        .await
+                        .map_err(|_| std::io::Error::other("not handled"))
+                }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
@@ -313,5 +318,311 @@ async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
         assert_eq!((stats.sessions, stats.setup_failures), (1, 1), "{stats:?}");
         listener.close();
         serving.await.unwrap();
+    }
+}
+
+/// A full setup limit ends the oldest handshake rather than refusing the
+/// new client (MULTIPATH.md Section 5.6).
+#[tokio::test]
+async fn a_stalled_handshake_yields_its_setup_slot() {
+    let (connector, acceptor) = tls(b"http/1.1");
+    let mut limits = ListenerConfig::default();
+    limits.max_pending = 1;
+    let listener = Listener::new(Config::default(), limits);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let l = listener.clone();
+    let serving = tokio::spawn(async move {
+        zmux_http::serve_with(
+            l,
+            || tcp.accept(),
+            move |conn, _| acceptor.accept(conn),
+            Options::default(),
+        )
+        .await
+    });
+    // Connected, silent: its TLS handshake holds the only setup slot.
+    let stalled = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = connector
+        .connect(name, TcpStream::connect(addr).await.unwrap())
+        .await
+        .unwrap();
+    let io = zmux_http::dial_http1_over(conn, "localhost", &Options::default())
+        .await
+        .unwrap();
+    let client = Session::connect(io, Config::default()).await.unwrap();
+    let server = listener.accept().await.unwrap();
+    round_trip_and_close(client, server).await;
+    assert_eq!(listener.stats().setup_failures, 1);
+    drop(stalled);
+    listener.close();
+    serving.await.unwrap();
+}
+
+// ---- admission -----------------------------------------------------------------------
+
+/// A listener served on loopback with `options`.
+async fn server_with(options: Options) -> (String, Listener) {
+    serve_admitted(options, None).await
+}
+
+async fn serve_admitted(
+    options: Options,
+    admission: Option<zmux::Admission>,
+) -> (String, Listener) {
+    let mut limits = ListenerConfig::default();
+    limits.admission = admission;
+    let listener = Listener::new(Config::default(), limits);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap().to_string();
+    tokio::spawn(zmux_http::serve(listener.clone(), tcp, options));
+    (addr, listener)
+}
+
+/// A request body read from a byte stream.
+struct StreamBody<R>(R);
+
+impl<R: tokio::io::AsyncRead + Unpin> http_body::Body for StreamBody<R> {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, std::io::Error>>> {
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut rb = tokio::io::ReadBuf::new(&mut buf);
+        match std::task::ready!(std::pin::Pin::new(&mut self.0).poll_read(cx, &mut rb)) {
+            Err(e) => std::task::Poll::Ready(Some(Err(e))),
+            Ok(()) if rb.filled().is_empty() => std::task::Poll::Ready(None),
+            Ok(()) => {
+                let n = rb.filled().len();
+                buf.truncate(n);
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(buf.into()))))
+            }
+        }
+    }
+}
+
+/// A response body as a byte stream.
+struct IncomingReader(hyper::body::Incoming, bytes::Bytes);
+
+impl tokio::io::AsyncRead for IncomingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use http_body::Body;
+        loop {
+            if !self.1.is_empty() {
+                let n = self.1.len().min(buf.remaining());
+                buf.put_slice(&self.1.split_to(n));
+                return std::task::Poll::Ready(Ok(()));
+            }
+            match std::task::ready!(std::pin::Pin::new(&mut self.0).poll_frame(cx)) {
+                None => return std::task::Poll::Ready(Ok(())),
+                Some(Err(e)) => return std::task::Poll::Ready(Err(std::io::Error::other(e))),
+                Some(Ok(f)) => {
+                    if let Ok(d) = f.into_data() {
+                        self.1 = d;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One HTTP/1.1 POST to `path` of `addr` with `body`: the response, or the
+/// error of an exchange that ended without one.
+async fn post<B>(
+    addr: &str,
+    path: &str,
+    body: B,
+) -> hyper::Result<http::Response<hyper::body::Incoming>>
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::post(path)
+        .header(http::header::HOST, addr)
+        .body(body)
+        .unwrap();
+    sender.send_request(req).await
+}
+
+fn fixed(data: &'static [u8]) -> StreamBody<&'static [u8]> {
+    StreamBody(data)
+}
+
+const BODY: &[u8] = b"0123456789abcdef0123456789abcdef-and-the-rest-of-the-request-body";
+
+/// A fallback handler that answers with the body it was given.
+fn echo() -> zmux_http::HttpFallback {
+    zmux_http::HttpFallback::new(|req: zmux_http::FallbackRequest, _| async move {
+        http::Response::new(zmux_http::PipeBody::full(collect(req.into_body()).await))
+    })
+}
+
+/// The data of a replayed request body.
+async fn collect(mut body: zmux_http::ReplayBody<hyper::body::Incoming>) -> Vec<u8> {
+    use http_body::Body;
+    let mut out = Vec::new();
+    while let Some(f) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        if let Ok(d) = f.unwrap().into_data() {
+            out.extend_from_slice(&d);
+        }
+    }
+    out
+}
+
+async fn read_all(resp: http::Response<hyper::body::Incoming>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut r = IncomingReader(resp.into_body(), bytes::Bytes::new());
+    tokio::io::AsyncReadExt::read_to_end(&mut r, &mut out)
+        .await
+        .unwrap();
+    out
+}
+
+/// A prefix authentication token as the first bytes of the request body
+/// is accepted: the response is 200 at once, and a session runs over the
+/// rest of the body and the response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admitted_request_carries_a_session() {
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let admission = zmux::Admission::prefix_auth(verifier);
+    let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
+    let (mut ours, theirs) = tokio::io::duplex(64 << 10);
+    tokio::io::AsyncWriteExt::write_all(&mut ours, &auth.token(None).unwrap())
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        post(&addr, "/zmux", StreamBody(theirs)),
+    )
+    .await
+    .expect("answered at the decision")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let io = zmux::PipeIo::from_halves(IncomingReader(resp.into_body(), bytes::Bytes::new()), ours);
+    let client = Session::connect(io, Config::default()).await.unwrap();
+    let server = listener.accept().await.unwrap();
+    transfer(&client, &server, 1, 64 << 10).await;
+    transfer(&server, &client, 1, 64 << 10).await;
+    client.close(0u32.into(), b"");
+}
+
+/// A fallback decision hands the request to the fallback handler with
+/// every body byte, those read for the decision first; without a handler
+/// it is answered with 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fallback_request_reaches_the_handler_with_its_whole_body() {
+    let admission = || zmux::Admission::new(32, |_, _| zmux::Verdict::Fallback);
+    let (addr, _l) =
+        serve_admitted(Options::default().with_fallback(echo()), Some(admission())).await;
+    let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(read_all(resp).await, BODY);
+    // Other paths go to the handler as well.
+    let resp = post(&addr, "/other", fixed(BODY)).await.unwrap();
+    assert_eq!(read_all(resp).await, BODY);
+
+    let (addr, _l) = serve_admitted(Options::default(), Some(admission())).await;
+    let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// A stall answers nothing: the request ends without a response once the
+/// stall is over, and a close at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_or_closed_request_gets_no_response() {
+    for (verdict, at_least) in [
+        (zmux::Verdict::Stall, Duration::from_millis(300)),
+        (zmux::Verdict::Close, Duration::ZERO),
+    ] {
+        let v = verdict.clone();
+        let admission = zmux::Admission::new(32, move |_, _| v.clone())
+            .with_stall_interval(Duration::from_millis(300), Duration::from_millis(400));
+        let (addr, _l) =
+            serve_admitted(Options::default().with_fallback(echo()), Some(admission)).await;
+        // A body that does not end: the stall lasts its drawn duration.
+        let (_ours, theirs) = tokio::io::duplex(1024);
+        let body = StreamBody(tokio::io::AsyncReadExt::chain(BODY, theirs));
+        let start = tokio::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(5), post(&addr, "/zmux", body))
+            .await
+            .expect("ended in time");
+        assert!(
+            r.is_err(),
+            "{verdict:?}: answered {:?}",
+            r.map(|r| r.status())
+        );
+        assert!(start.elapsed() >= at_least, "{verdict:?}: ended early");
+    }
+}
+
+/// Without an admission, a request the listener does not take, nothing
+/// written, goes to the fallback handler without its body, and is
+/// answered with 404 without a handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_the_listener_does_not_take_falls_back() {
+    let (addr, _l) = server_with(Options::default().with_fallback(echo())).await;
+    let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(read_all(resp).await.is_empty());
+
+    let (addr, l) = server_with(Options::default()).await;
+    let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(l.stats().rejected, 1);
+}
+
+/// A client with a prefix authentication credential writes an unbound
+/// token first on its request body, which the server's admission accepts;
+/// tokens that bind TLS are refused by the client, which has no exporter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_writes_its_token_first_on_the_request_body() {
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let admission = zmux::Admission::prefix_auth(verifier);
+    let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
+    let client_opts = Options::default().with_credential(Arc::new(auth));
+    for client in [
+        zmux_http::connect_http1(&addr, &client_opts, Config::default())
+            .await
+            .unwrap(),
+        zmux_http::connect_http2(&addr, &client_opts, Config::default())
+            .await
+            .unwrap(),
+    ] {
+        let server = listener.accept().await.unwrap();
+        transfer(&client, &server, 1, 64 << 10).await;
+        transfer(&server, &client, 1, 64 << 10).await;
+        client.close(0u32.into(), b"");
+    }
+    let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+    let e = zmux_http::dial_http1(&addr, &Options::default().with_credential(Arc::new(bound)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// Pipe 0 of each session is of carrier kind `kind`.
+fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+    for s in sessions {
+        let p = s.pipe(zmux::PipeId::new(0)).unwrap();
+        assert_eq!(p.stats().unwrap().carrier, Some(kind));
     }
 }

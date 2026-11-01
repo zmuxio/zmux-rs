@@ -42,7 +42,7 @@ impl Pick for LeastUnsent {
                 // A blocking zmux call on the driver's task fails at once.
                 let tcp = std::net::TcpStream::connect(self.spare).unwrap();
                 let r = zmux::blocking::Session::connect(
-                    zmux::blocking::PipeIo::tcp(tcp).unwrap(),
+                    zmux::blocking::PipeIo::tcp(tcp),
                     Config::default(),
                 );
                 self.refused.store(
@@ -89,7 +89,7 @@ async fn sink() -> (SocketAddr, Listener) {
             let l = l.clone();
             tokio::spawn(async move {
                 let _ = l
-                    .handle_pipe(PipeIo::tcp(c), PipeHint::from_addr(peer.ip()))
+                    .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
                     .await;
             });
         }
@@ -299,13 +299,13 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     let mut config = mp_config();
     config.scheduler = Policy::Custom(policy.clone());
     let client = zmux::blocking::Session::connect(
-        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()).unwrap(),
+        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
         config,
     )
     .unwrap();
     client
         .add_pipe(
-            zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()).unwrap(),
+            zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
@@ -339,7 +339,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
             let s = slot.lock().unwrap().clone();
             if let Some(s) = s {
                 blocked.store(
-                    s.closed() == Err(zmux::blocking::WaitError::OnDriverThread),
+                    s.closed(None) == Err(zmux::blocking::WaitError::OnDriverThread),
                     Ordering::SeqCst,
                 );
             }
@@ -348,10 +348,10 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     }
     let receiver = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c).unwrap(), config).unwrap()
+        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), config).unwrap()
     });
     let sender = zmux::blocking::Session::connect(
-        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()).unwrap(),
+        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
         Config::default(),
     )
     .unwrap();
@@ -374,6 +374,6 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     assert!(blocked.load(Ordering::SeqCst));
     slot.lock().unwrap().take();
     sender.close(0u32.into(), b"");
-    receiver.closed().unwrap();
+    receiver.closed(None).unwrap();
     drop(rt);
 }

@@ -20,6 +20,17 @@ use zmux::proto::{Frames, Gates, keys};
 
 struct Counting;
 
+/// The tests of this program one at a time: process-wide pools (small
+/// transmit storages, read buffers) pass memory between threads, so a test
+/// running beside another would count what it takes from or gives to them
+/// in its thread's live bytes and allocations.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     /// Bytes allocated minus bytes freed on this thread.
@@ -130,6 +141,7 @@ fn sample_frames(payload: &[u8]) -> Vec<Frame<'_>> {
 
 #[test]
 fn encoding_does_not_allocate() {
+    let _serial = crate::serial();
     let payload = vec![0x5a; 16 * 1024];
     let frames = sample_frames(&payload);
     let mut buf = vec![0u8; 64 * 1024];
@@ -157,6 +169,7 @@ fn encoding_does_not_allocate() {
 
 #[test]
 fn decoding_does_not_allocate() {
+    let _serial = crate::serial();
     let payload = vec![0x5a; 16 * 1024];
     let mut encoded = Vec::new();
     for f in sample_frames(&payload) {
@@ -258,6 +271,7 @@ fn parse_in_place(
 
 #[test]
 fn record_parsing_does_not_allocate() {
+    let _serial = crate::serial();
     let bytes = batch();
     // Reads of 1000 bytes split frames and headers everywhere; 64 KiB
     // reads are what a driver's read buffer delivers.
@@ -292,6 +306,7 @@ fn record_parsing_does_not_allocate() {
 
 #[test]
 fn the_counter_sees_allocations() {
+    let _serial = crate::serial();
     let (v, n) = allocations(|| vec![1u8; 100]);
     assert_eq!(v.len(), 100);
     assert!(n >= 1);
@@ -299,6 +314,7 @@ fn the_counter_sees_allocations() {
 
 #[test]
 fn key_schedule_does_not_allocate() {
+    let _serial = crate::serial();
     let (ok, n) = allocations(|| {
         let secret = keys::session_secret(&[1; 16], &[2; 16], &[3; 32], &[]);
         let k = keys::SessionKeys::derive(&secret);
@@ -327,12 +343,13 @@ mod core_bulk {
     use zmux::proto::record::Framing;
     use zmux::proto::session::{Config, PipeId, RoleConfig, SessionCore, StreamKey};
 
-    const P0: PipeId = PipeId(0);
+    const P0: PipeId = PipeId::new(0);
 
     /// `memory_usage` feeds the memory budgets: it counts what an idle
     /// session really holds (its inline state and heap), not more.
     #[test]
     fn memory_usage_matches_the_heap_of_an_idle_session() {
+        let _serial = crate::serial();
         let now = Instant::now();
         let (s, held) = crate::live_bytes(|| {
             let mut s = Box::new(
@@ -444,6 +461,7 @@ mod core_bulk {
 
     #[test]
     fn a_request_on_a_new_stream_does_not_allocate() {
+        let _serial = crate::serial();
         let mut p = pair();
         // Warm up: the stream table and the spare buffers reach their size.
         request_on_new_stream(&mut p, 1000);
@@ -455,6 +473,7 @@ mod core_bulk {
 
     #[test]
     fn bulk_transfer_does_not_allocate_per_frame() {
+        let _serial = crate::serial();
         let mut p = pair();
         let send = p.a.open(Dir::Uni).unwrap();
         let mut recv = None;
@@ -472,6 +491,7 @@ mod core_bulk {
 
     #[test]
     fn zero_copy_transfer_does_not_allocate_per_frame() {
+        let _serial = crate::serial();
         let mut p = pair();
         let send = p.a.open(Dir::Uni).unwrap();
         let chunk = Bytes::from(vec![9u8; 256 * 1024]);
@@ -512,6 +532,7 @@ mod core_bulk {
 
     #[test]
     fn acknowledged_transfer_does_not_allocate_per_acknowledgement() {
+        let _serial = crate::serial();
         let mut p = pair();
         assert!(p.a.features().pipe_ack && p.b.features().pipe_ack);
         let send = p.a.open(Dir::Uni).unwrap();
@@ -560,7 +581,7 @@ mod core_multipath {
         c.max_pipes = 4;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
         c.scheduler = policy.clone();
-        c.max_idle_timeout = Duration::from_secs(600);
+        c.max_idle_timeout = Some(Duration::from_secs(600));
         c.max_incoming_uni_streams = Some(4);
         c
     }
@@ -575,12 +596,12 @@ mod core_multipath {
             let mut a =
                 SessionCore::new(config(&policy), RoleConfig::Initiator, None, now).unwrap();
             let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, now).unwrap();
-            a.attach_pipe(PipeId(0), BS, now);
-            b.attach_pipe(PipeId(0), BS, now);
+            a.attach_pipe(PipeId::new(0), BS, now);
+            b.attach_pipe(PipeId::new(0), BS, now);
             let mut p = Self {
                 a,
                 b,
-                pipes: vec![PipeId(0)],
+                pipes: vec![PipeId::new(0)],
                 out: TransmitBuf::default(),
                 wire: Vec::with_capacity(512 * 1024),
                 now,
@@ -607,7 +628,7 @@ mod core_multipath {
                 }
                 p.out.copy_to_vec(&mut first);
             }
-            let fed = feed_join(&mut listener, &mut p.b, &mut None, id.0, &first, now);
+            let fed = feed_join(&mut listener, &mut p.b, &mut None, id.get(), &first, now);
             assert_eq!(fed.joined, Joined::Attached(id));
             p.pipes.push(id);
             // The pump hands everything over at once, as a carrier with a
@@ -739,6 +760,7 @@ mod core_multipath {
         ignore = "debug builds recount the multipath ledger, which allocates: run with --release"
     )]
     fn spread_eta_does_not_allocate_per_chunk_or_ack() {
+        let _serial = crate::serial();
         bulk_over_two_pipes(Policy::SpreadEta);
     }
 
@@ -748,6 +770,7 @@ mod core_multipath {
         ignore = "debug builds recount the multipath ledger, which allocates: run with --release"
     )]
     fn round_robin_does_not_allocate_per_chunk_or_ack() {
+        let _serial = crate::serial();
         bulk_over_two_pipes(Policy::SpreadRoundRobin);
         bulk_over_two_pipes(Policy::SpreadRateWeighted);
     }
@@ -756,13 +779,7 @@ mod core_multipath {
 // ---- the tokio driver ------------------------------------------------------------
 
 mod driver {
-    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
-
-    /// The driver's read buffers come from a pool of the process: one test
-    /// at a time uses it, so that a buffer another test takes from the pool
-    /// or gives back is not counted in this thread's live bytes.
-    static POOL: Mutex<()> = Mutex::new(());
 
     use zmux::{Config, PipeIo, Session, VarInt};
 
@@ -775,6 +792,13 @@ mod driver {
             .build()
             .unwrap();
         rt.block_on(async {
+            // Ahead of the system clock, the paused clock is told apart from
+            // it at once, so short waits stay tokio's: the driver's timer
+            // thread would otherwise serve the waits of a lifecycle that
+            // starts within 100 us of the system clock and free their
+            // entries on its own thread, which this thread would count as
+            // left behind.
+            tokio::time::advance(Duration::from_secs(1)).await;
             let (a, b) = tokio::io::duplex(64 * 1024);
             let server = tokio::spawn(Session::accept(PipeIo::new(b), Config::default()));
             let client = Session::connect(PipeIo::new(a), Config::default())
@@ -906,7 +930,7 @@ mod driver {
     /// queued downstream (zero copy: the bytes are never copied instead).
     #[test]
     fn relaying_and_nesting_allocate_nothing_per_frame() {
-        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let _serial = crate::serial();
         for (relay, nested) in [(false, false), (true, false), (false, true), (true, true)] {
             let small = relayed(8, relay, nested);
             let large = relayed(40, relay, nested);
@@ -919,7 +943,7 @@ mod driver {
 
     #[test]
     fn a_driver_lifecycle_gives_back_every_byte() {
-        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let _serial = crate::serial();
         // Warm up: the runtime's and the process's lazily created state.
         lifecycle();
         lifecycle();

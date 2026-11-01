@@ -71,14 +71,16 @@ fn settle(base: Snapshot, secs: u64, what: &str) {
 }
 
 fn timeouts(mut c: Config) -> Config {
-    c.max_idle_timeout = Duration::from_millis(400);
-    c.handshake_timeout = Duration::from_millis(300);
+    // The idle timeout ends idle sessions only without keep-alive.
+    c.keep_alive_period = None;
+    c.max_idle_timeout = Some(Duration::from_millis(400));
+    c.handshake_timeout = Some(Duration::from_millis(300));
     c
 }
 
 fn connect(a: TcpStream, b: TcpStream, client: Config, server: Config) -> (Session, Session) {
-    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b).unwrap(), server).unwrap());
-    let client = Session::connect(PipeIo::tcp(a).unwrap(), client).unwrap();
+    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), server).unwrap());
+    let client = Session::connect(PipeIo::tcp(a), client).unwrap();
     (client, server.join().unwrap())
 }
 
@@ -284,11 +286,11 @@ fn session_life(end: End) {
     let scfg = cfg.clone();
     let server = thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        Session::accept(PipeIo::tcp(c).unwrap(), scfg).unwrap()
+        Session::accept(PipeIo::tcp(c), scfg).unwrap()
     });
     let carrier = TcpStream::connect(relay.addr).unwrap();
     let control = carrier.try_clone().unwrap();
-    let client = Session::connect(PipeIo::tcp(carrier).unwrap(), cfg).unwrap();
+    let client = Session::connect(PipeIo::tcp(carrier), cfg).unwrap();
     let server = server.join().unwrap();
     let served = serve(server.clone());
     let (mut send, mut recv) = open_cmd(&client, ECHO).unwrap();
@@ -332,7 +334,7 @@ fn session_life(end: End) {
     }
     drop(send);
     if matches!(end, End::IdleTimeout) {
-        let e = client.closed().unwrap();
+        let e = client.closed(None).unwrap();
         assert!(
             matches!(
                 e,
@@ -342,8 +344,8 @@ fn session_life(end: End) {
         );
     }
     if !matches!(end, End::DropAll) {
-        client.closed().unwrap();
-        server.closed().unwrap();
+        client.closed(None).unwrap();
+        server.closed(None).unwrap();
     } else {
         drop((client.clone(), server.clone()));
     }
@@ -357,7 +359,7 @@ fn session_life(end: End) {
 fn failed_handshakes() {
     // A silent peer.
     let (a, b) = tcp();
-    let r = Session::connect(PipeIo::tcp(a).unwrap(), timeouts(Config::default()));
+    let r = Session::connect(PipeIo::tcp(a), timeouts(Config::default()));
     assert!(
         matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
         "{r:?}"
@@ -366,12 +368,12 @@ fn failed_handshakes() {
     // The peer's carrier ends.
     let (a, b) = tcp();
     drop(b);
-    let r = Session::accept(PipeIo::tcp(a).unwrap(), timeouts(Config::default()));
+    let r = Session::accept(PipeIo::tcp(a), timeouts(Config::default()));
     assert!(r.is_err(), "{r:?}");
     // Garbage.
     let (a, mut b) = tcp();
     b.write_all(&[0xff; 64]).unwrap();
-    let r = Session::accept(PipeIo::tcp(a).unwrap(), timeouts(Config::default()));
+    let r = Session::accept(PipeIo::tcp(a), timeouts(Config::default()));
     assert!(r.is_err(), "{r:?}");
     drop(b);
 }
@@ -428,10 +430,7 @@ fn stuck_carrier(how: Stuck) {
     if let Stuck::HandshakeTimeout = how {
         relay.stall.store(true, Ordering::SeqCst);
         let peer = thread::spawn(move || l.accept().map(|(c, _)| c));
-        let r = Session::connect(
-            PipeIo::tcp(TcpStream::connect(relay.addr).unwrap()).unwrap(),
-            cfg,
-        );
+        let r = Session::connect(PipeIo::tcp(TcpStream::connect(relay.addr).unwrap()), cfg);
         assert!(
             matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
             "{r:?}"
@@ -441,11 +440,11 @@ fn stuck_carrier(how: Stuck) {
     } else {
         let server = thread::spawn(move || {
             let (c, _) = l.accept().unwrap();
-            Session::accept(PipeIo::tcp(c).unwrap(), scfg).unwrap()
+            Session::accept(PipeIo::tcp(c), scfg).unwrap()
         });
         let carrier = TcpStream::connect(relay.addr).unwrap();
         let control = carrier.try_clone().unwrap();
-        let client = Session::connect(PipeIo::tcp(carrier).unwrap(), cfg).unwrap();
+        let client = Session::connect(PipeIo::tcp(carrier), cfg).unwrap();
         let server = server.join().unwrap();
         relay.stall.store(true, Ordering::SeqCst);
         // Writes the relay never takes: the writer thread blocks in
@@ -466,11 +465,11 @@ fn stuck_carrier(how: Stuck) {
             }
             Stuck::HandshakeTimeout => unreachable!(),
         }
-        let e = client.closed().unwrap();
+        let e = client.closed(None).unwrap();
         if matches!(how, Stuck::IdleTimeout) {
             assert!(matches!(e, SessionError::IdleTimeout { .. }), "{e:?}");
         }
-        server.closed().unwrap();
+        server.closed(None).unwrap();
         drop((send, client, server, control));
     }
     let deadline = start + RELEASE_BOUND;
@@ -572,7 +571,7 @@ fn race_config() -> Config {
     c.enable_datagrams = true;
     c.max_incoming_streams = 4;
     c.max_incoming_uni_streams = Some(1);
-    c.max_idle_timeout = Duration::from_secs(5);
+    c.max_idle_timeout = Some(Duration::from_secs(5));
     c
 }
 
@@ -620,10 +619,13 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
             for _ in 0..2000 {
                 let _ = s.send_datagram(Bytes::from_static(b"d"));
             }
-            format!("{:?}", s.send_datagram_wait(Bytes::from_static(b"w")))
+            format!(
+                "{:?}",
+                s.send_datagram_with_backpressure(Bytes::from_static(b"w"))
+            )
         }),
         Kind::SessionEvent => thread::spawn(move || format!("{:?}", s.next_event(deadline))),
-        Kind::Closed => thread::spawn(move || format!("{:?}", s.closed())),
+        Kind::Closed => thread::spawn(move || format!("{:?}", s.closed(None))),
         Kind::Shutdown => {
             thread::spawn(move || format!("{:?}", s.shutdown(VarInt::from_u32(0), b"")))
         }
@@ -690,8 +692,8 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
     }
     local.close(VarInt::from_u32(0), b"");
     peer.close(VarInt::from_u32(0), b"");
-    local.closed().unwrap();
-    peer.closed().unwrap();
+    local.closed(None).unwrap();
+    peer.closed(None).unwrap();
     drop((l_send, l_recv, p_send, p_recv, control));
 }
 

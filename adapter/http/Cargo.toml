@@ -14,14 +14,17 @@ categories = ["network-programming"]
 base64 = "0.23"
 bytes = "1"
 getrandom = "0.4"
-hmac = "0.13"
 http = "1"
 http-body = "1"
 hyper = { version = "1.6", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.10", default-features = false, features = ["tokio", "server-auto"] }
-sha2 = "0.11"
 tokio = { version = "1.47", default-features = false, features = ["net", "rt", "io-util", "time", "sync", "macros"] }
 zmux = { version = "1.2.4", path = "../.." }
+zmux-websocket = { version = "1.2.4", path = "../websocket", optional = true, features = ["hyper"] }
+
+[features]
+# The unified Endpoint also serves WebSocket upgrades.
+websocket = ["dep:zmux-websocket"]
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
@@ -35,3 +38,11 @@ zmux = { version = "1.2.4", path = "../..", features = ["test-hooks"] }
 missing_docs = "warn"
 unsafe_code = "forbid"
 unreachable_pub = "warn"
+
+[[bench]]
+name = "bulk"
+harness = false
+
+[[test]]
+name = "modes"
+required-features = ["websocket"]

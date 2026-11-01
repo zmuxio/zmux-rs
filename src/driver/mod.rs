@@ -39,8 +39,14 @@
 
 #[cfg(all(feature = "tokio", not(loom)))]
 mod account;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod admission;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod cache;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod channel;
 #[cfg(all(feature = "blocking", not(loom)))]
 mod context;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -57,6 +63,10 @@ pub(crate) mod lanes;
 pub(crate) mod listen;
 #[cfg(all(test, loom))]
 mod loom;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod mode;
+#[cfg(all(feature = "tokio", not(loom)))]
+mod precise;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod resources;
 #[cfg(all(test, shuttle, feature = "blocking", not(loom)))]
@@ -72,6 +82,10 @@ mod tcp;
 mod through;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod tokio;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod transform;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod unsent;
 mod wait;
 mod wake;
 
@@ -305,11 +319,17 @@ pub struct DialRequest {
 
 impl DialRequest {
     /// A request for a carrier with both halves, joined in band (a rejoin,
-    /// a pool that is not split).
+    /// a pool's dial).
     pub fn bidi() -> Self {
+        Self::new(PipeDirection::Bidi, None)
+    }
+
+    /// A request for a carrier of `direction`, with the `Zmux-Pipe-Join`
+    /// value of an out-of-band join ([`crate::PipeReservation::header`]).
+    pub fn new(direction: PipeDirection, join_header: Option<String>) -> Self {
         Self {
-            direction: PipeDirection::Bidi,
-            join_header: None,
+            direction,
+            join_header,
         }
     }
 }
@@ -341,7 +361,7 @@ impl std::error::Error for EmptyMessage {}
 /// the read result that reports an empty message. A read that returns
 /// nothing is the end of the carrier, so a carrier's reader returns this
 /// error for a message without bytes instead; the session takes it as an
-/// empty record, a no-op charged like a record of PADDING only.
+/// empty record, a no-op that is not chargeable (SPEC.md Section 3.4).
 pub fn empty_message() -> std::io::Error {
     std::io::Error::other(EmptyMessage)
 }

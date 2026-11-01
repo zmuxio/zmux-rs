@@ -63,6 +63,8 @@ pub mod id {
     pub const ZMUX_PRIORITY: u64 = 0x31e7_139d;
     /// zmux_datagram_flows.
     pub const ZMUX_DATAGRAM_FLOWS: u64 = 0x0af3_91ed;
+    /// zmux_carrier_datagrams.
+    pub const ZMUX_CARRIER_DATAGRAMS: u64 = 0x3d27_4c5f;
     /// zmux_multipath.
     pub const ZMUX_MULTIPATH: u64 = 0x30dc_2978;
     /// zmux_ack_threshold.
@@ -305,7 +307,7 @@ pub mod floor {
     /// `zmux_preamble` (Maximum Preamble Size).
     pub const MAX_PREAMBLE: u64 = 1024;
     /// `max_record_size` under the floor.
-    pub const MAX_RECORD_SIZE: u64 = 16382;
+    pub const MAX_RECORD_SIZE: u64 = super::DEFAULT_MAX_RECORD_SIZE;
 }
 
 /// The `max_lanes` zmux endpoints announce by default:
@@ -415,6 +417,10 @@ pub struct TransportParameters {
     pub zmux_priority: bool,
     /// zmux_datagram_flows.
     pub zmux_datagram_flows: bool,
+    /// zmux_carrier_datagrams: the sender accepts DATAGRAM frames on the
+    /// datagram channels of its pipes' carriers (EXTENSIONS.md Section
+    /// 6.8).
+    pub zmux_carrier_datagrams: bool,
     /// zmux_multipath.
     pub zmux_multipath: Option<MultipathParameter>,
     /// zmux_ack_threshold in bytes (1024 to 2^30).
@@ -504,6 +510,7 @@ impl TransportParameters {
             && self.zmux_preamble.is_none()
             && !self.zmux_priority
             && !self.zmux_datagram_flows
+            && !self.zmux_carrier_datagrams
             && self.zmux_multipath.is_none()
             && !self.zmux_pipe_ack
             && self.zmux_ack_threshold.is_none()
@@ -565,6 +572,9 @@ impl TransportParameters {
         }
         if self.zmux_datagram_flows {
             f(id::ZMUX_DATAGRAM_FLOWS, Value::Empty)?;
+        }
+        if self.zmux_carrier_datagrams {
+            f(id::ZMUX_CARRIER_DATAGRAMS, Value::Empty)?;
         }
         if self.zmux_pipe_ack {
             f(id::ZMUX_PIPE_ACK, Value::Empty)?;
@@ -709,6 +719,7 @@ impl TransportParameters {
             id::ZMUX_PREAMBLE => self.zmux_preamble = Some(varint()?),
             id::ZMUX_PRIORITY => self.zmux_priority = empty()?,
             id::ZMUX_DATAGRAM_FLOWS => self.zmux_datagram_flows = empty()?,
+            id::ZMUX_CARRIER_DATAGRAMS => self.zmux_carrier_datagrams = empty()?,
             id::ZMUX_MULTIPATH => self.zmux_multipath = Some(MultipathParameter::parse(value)?),
             id::ZMUX_ACK_THRESHOLD => self.zmux_ack_threshold = Some(varint()?),
             id::ZMUX_PIPE_ACK => self.zmux_pipe_ack = empty()?,
@@ -874,6 +885,10 @@ pub struct Features {
     pub priority: bool,
     /// Datagram flows.
     pub datagram_flows: bool,
+    /// DATAGRAM frames may go on the datagram channels of pipe carriers
+    /// (EXTENSIONS.md Section 6.8): both endpoints sent
+    /// `zmux_carrier_datagrams` and this one announced datagram support.
+    pub carrier_datagrams: bool,
     /// Multipath.
     pub multipath: bool,
     /// Pipe acknowledgement without multipath (MULTIPATH.md Section 3.5).
@@ -915,6 +930,9 @@ impl Features {
             preamble: local.zmux_preamble.is_some() && peer.zmux_preamble.is_some(),
             priority: local.zmux_priority && peer.zmux_priority,
             datagram_flows: local.zmux_datagram_flows && peer.zmux_datagram_flows,
+            carrier_datagrams: local.zmux_carrier_datagrams
+                && peer.zmux_carrier_datagrams
+                && local.max_datagram_frame_size.is_some_and(|m| m > 0),
             multipath,
             pipe_ack,
             resume,
@@ -1016,6 +1034,35 @@ mod tests {
             ok(None, Some(Initiator), Some(Role::Responder)),
             Some(Role::Responder)
         );
+    }
+
+    #[test]
+    fn carrier_datagrams_parameter() {
+        let tp = TransportParameters {
+            max_datagram_frame_size: Some(65535),
+            zmux_carrier_datagrams: true,
+            ..Default::default()
+        };
+        let mut buf = [0u8; 64];
+        let n = tp.encode(None, &mut buf).unwrap();
+        let got = TransportParameters::decode(&buf[..n]).unwrap();
+        assert!(got.zmux_carrier_datagrams && !got.is_plain_qmux());
+        // An empty flag: a value is an error.
+        assert!(TransportParameters::decode(&[0xbd, 0x27, 0x4c, 0x5f, 0x01, 0x00]).is_err());
+        assert!(
+            TransportParameters::decode(&[0xbd, 0x27, 0x4c, 0x5f, 0x00])
+                .unwrap()
+                .zmux_carrier_datagrams
+        );
+        // In use when both sent it and the local endpoint takes datagrams.
+        let none = TransportParameters::default();
+        assert!(Features::negotiate(&tp, &tp).carrier_datagrams);
+        assert!(!Features::negotiate(&tp, &none).carrier_datagrams);
+        let no_dgram = TransportParameters {
+            zmux_carrier_datagrams: true,
+            ..Default::default()
+        };
+        assert!(!Features::negotiate(&no_dgram, &tp).carrier_datagrams);
     }
 
     #[test]

@@ -1386,6 +1386,10 @@ pub(crate) enum GoAwayFail {
     /// Neither emitted nor pinned when the GOAWAY arrived: it never opens
     /// ("going away").
     GoingAway,
+    /// Its preamble no longer fits the peer's limit when its identifier
+    /// was due (the peer's parameters arrived after the open): it never
+    /// opens.
+    PreambleTooLarge,
 }
 
 impl GoAwayFail {
@@ -1394,6 +1398,7 @@ impl GoAwayFail {
         match self {
             Self::Rejected => super::StreamError::Rejected,
             Self::GoingAway => super::StreamError::GoingAway,
+            Self::PreambleTooLarge => super::StreamError::PreambleTooLarge,
         }
     }
 }
@@ -1427,6 +1432,9 @@ pub(crate) struct Stream {
     /// The application byte counters, once a driver or the application
     /// asked for them ([`super::SessionCore::stream_meter`]).
     pub(crate) meter: Option<Arc<Meter>>,
+    /// Where the statistics go when the stream is discarded, once a driver
+    /// asked for it ([`super::SessionCore::stream_final_stats`]).
+    pub(crate) final_stats: Option<Arc<std::sync::OnceLock<super::StreamStats>>>,
     /// Queued for a control frame.
     pub(crate) ctrl_queued: bool,
     /// Pending readiness notifications.
@@ -1536,6 +1544,7 @@ impl Stream {
             extra: None,
             datagrams: None,
             meter: None,
+            final_stats: None,
             ctrl_queued: false,
             notified_readable: false,
             notified_writable: false,

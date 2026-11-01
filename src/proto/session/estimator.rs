@@ -35,8 +35,13 @@ pub(crate) struct Batch {
     /// Sent while an application-limited bubble was in flight (BBR's
     /// `app_limited` mark).
     pub(crate) in_bubble: bool,
-    /// Bytes queued ahead of the batch in the carrier (queue_p).
+    /// unsent_ahead (MULTIPATH.md Section 7.1): Q_p when the batch was
+    /// handed over, without the batch itself: the bytes of the write calls
+    /// in progress on the pipe's lanes plus the carrier's unsent count.
     pub(crate) unsent_ahead: u64,
+    /// queue_p (MULTIPATH.md Section 7.1), min(1 s, unsent_ahead / R_p),
+    /// with R_p taken with unsent_ahead, when the batch was handed over.
+    pub(crate) queue: Duration,
     /// The lane of the pipe it went on (MULTIPATH.md Section 2.5); its
     /// positions are the pipe's send order.
     pub(crate) lane: u32,
@@ -117,16 +122,21 @@ impl Estimator {
     }
 
     /// An RTT sample (RFC 9002 Section 5.3) with the peer's ACK Delay,
-    /// already capped; returns the adjusted RTT.
+    /// already capped; returns the adjusted RTT. A `quiet` sample (taken
+    /// while a multipath session is quiet, SCHEDULER.md Section 2.1)
+    /// enters min_rtt only while it has no value.
     pub(crate) fn rtt_sample(
         &mut self,
         latest: Duration,
         ack_delay: Duration,
+        quiet: bool,
         now: Instant,
     ) -> Duration {
         self.latest = Some(latest);
         self.last_sample = Some(now);
-        self.min_rtt.sample(now, latest, super::filter::LOOP_SPAN);
+        if !quiet || self.min_rtt.get().is_none() {
+            self.min_rtt.sample(now, latest, super::filter::LOOP_SPAN);
+        }
         let min_rtt = self.min_rtt.get().unwrap_or(latest);
         let adjusted = if latest >= min_rtt.saturating_add(ack_delay) {
             latest.saturating_sub(ack_delay)
@@ -216,8 +226,9 @@ pub(crate) struct RttSample {
     /// latest_rtt minus the capped ACK Delay, when that stays at or above
     /// min_rtt.
     pub(crate) adjusted: Duration,
-    /// The bytes the carrier held ahead of the batch when it was handed on
-    /// (unsent_ahead, zero on a carrier that does not report them).
+    /// The bytes queued ahead of the batch when it was handed on
+    /// (unsent_ahead: write calls in progress and the carrier's unsent
+    /// count).
     pub(crate) unsent_ahead: u64,
     /// When the sampled byte was handed to the carrier.
     pub(crate) sent_at: Instant,
@@ -263,5 +274,21 @@ mod tests {
         // Then the window empties: the last R_p is kept.
         est.expire_rates(t0 + Duration::from_secs(13));
         assert_eq!(est.rate, 2_500_000);
+    }
+
+    /// §21.7.7 item 10: a sample taken while the session is quiet enters
+    /// min_rtt only while it has none; smoothed_rtt takes it.
+    #[test]
+    fn quiet_samples_keep_out_of_min_rtt() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut est = Estimator::new(INITIAL_RTT, t0);
+        est.rtt_sample(ms(40), Duration::ZERO, true, t0);
+        assert_eq!(est.min_rtt.get(), Some(ms(40)));
+        est.rtt_sample(ms(20), Duration::ZERO, true, t0 + ms(10));
+        assert_eq!(est.min_rtt.get(), Some(ms(40)));
+        assert!(est.srtt < ms(40), "{:?}", est.srtt);
+        est.rtt_sample(ms(30), Duration::ZERO, false, t0 + ms(20));
+        assert_eq!(est.min_rtt.get(), Some(ms(30)));
     }
 }

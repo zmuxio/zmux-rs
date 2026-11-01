@@ -148,8 +148,8 @@ fn blocking_datagram_limiters_run_outside_the_session_lock() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
     let (b, _) = l.accept().unwrap();
-    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b).unwrap(), s).unwrap());
-    let client = Session::connect(PipeIo::tcp(a).unwrap(), c).unwrap();
+    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), s).unwrap());
+    let client = Session::connect(PipeIo::tcp(a), c).unwrap();
     let server = server.join().unwrap();
     let helpers = [
         send.attach({

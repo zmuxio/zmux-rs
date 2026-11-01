@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use zmux::{
-    CapacityFloor, Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    PipeState, QualityBand, Session, SessionEvent,
+    CapacityFloor, Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo,
+    PipeOptions, QualityBand, Session, SessionEvent,
 };
 
 fn config() -> Config {
@@ -22,7 +22,10 @@ fn carrier(listener: &Listener) -> PipeIo {
     let l = listener.clone();
     tokio::spawn(async move {
         let _ = l
-            .handle_pipe(PipeIo::new(b), PipeHint::from_addr([127, 0, 0, 1].into()))
+            .handle_pipe(
+                PipeIo::new(b),
+                PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+            )
             .await;
     });
     PipeIo::new(a)
@@ -57,7 +60,7 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
             .unwrap();
         until("pipe active", || {
             pipe.stats()
-                .is_some_and(|i| i.outbound == Some(PipeState::Active))
+                .is_some_and(|i| i.outbound == Some(OutboundState::Active))
         })
         .await;
         if round.is_multiple_of(2) {
@@ -120,8 +123,28 @@ async fn quality_events_reach_the_application() {
         .unwrap();
     pipe.set_quality_band(Some(QualityBand::new(Duration::from_millis(5), 1.5)))
         .unwrap();
-    client.set_quality_band(None);
-    client.set_capacity_floor(Some(CapacityFloor::new(u64::MAX)));
+    client.set_quality_band(None).unwrap();
+    // A rate ratio that is not a number, or a negative one, is rejected.
+    for bad in [f64::NAN, -1.0] {
+        let band = Some(QualityBand::new(Duration::from_millis(5), bad));
+        assert_eq!(
+            client.set_quality_band(band),
+            Err(zmux::PipeError::InvalidOptions)
+        );
+        assert_eq!(
+            pipe.set_quality_band(band),
+            Err(zmux::PipeError::InvalidOptions)
+        );
+    }
+    let mut nan = CapacityFloor::new(1);
+    nan.rate_ratio = f64::NAN;
+    assert_eq!(
+        client.set_capacity_floor(Some(nan)),
+        Err(zmux::PipeError::InvalidOptions)
+    );
+    client
+        .set_capacity_floor(Some(CapacityFloor::new(u64::MAX)))
+        .unwrap();
     let event = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client.next_event().await {
@@ -137,5 +160,5 @@ async fn quality_events_reach_the_application() {
         matches!(event, Some(SessionEvent::CapacityBelow { rate }) if rate < u64::MAX),
         "{event:?}"
     );
-    client.set_capacity_floor(None);
+    client.set_capacity_floor(None).unwrap();
 }

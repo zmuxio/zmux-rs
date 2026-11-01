@@ -22,7 +22,7 @@ use super::stream::StreamKey;
 pub(crate) use att::Attachment;
 pub(crate) use inp::{Classified, FrameIn, InPipe, LaneEnd};
 pub(crate) use lanes::{LaneState, OutLanes};
-pub(crate) use out::{BatchStart, OutPipe, QueuedCopy};
+pub(crate) use out::{BatchStart, Channel, Detection, OutPipe, QueuedCopy, splitmix};
 pub(crate) use probation::History;
 pub(crate) use rate::{RateLimiter, TokenBucket};
 pub(crate) use tier_state::TierState;
@@ -36,27 +36,81 @@ pub enum PipeHalf {
     Outbound,
 }
 
-/// Pipe states (STATE_MACHINE.md Section 3).
+/// The state of an outbound pipe direction (STATE_MACHINE.md Section 3.1;
+/// a retired attachment has no state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PipeState {
-    /// Outbound or inbound: the join is not confirmed yet.
+pub enum OutboundState {
+    /// The join is not confirmed yet.
     Joining,
-    /// Outbound: in use.
+    /// In use.
     Active,
-    /// Outbound: no acknowledgement or write progress for T_suspect.
+    /// No acknowledgement or write progress for T_suspect.
     Suspect,
-    /// Outbound: removed gracefully, draining.
+    /// Removed gracefully, draining.
     Draining,
-    /// Outbound: failed.
+    /// Failed.
     Failed,
-    /// Outbound: drained and shut down.
+    /// Drained and shut down.
     Closed,
-    /// Inbound: receiving.
+}
+
+impl OutboundState {
+    /// Whether the direction reached its end ([`Self::Failed`] or
+    /// [`Self::Closed`]).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Failed | Self::Closed)
+    }
+}
+
+/// The state of an inbound pipe direction (STATE_MACHINE.md Section 3.2;
+/// a retired attachment has no state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboundState {
+    /// The join is not confirmed yet.
+    Joining,
+    /// Receiving.
     Open,
-    /// Inbound: ended.
+    /// Ended.
     Ended,
-    /// Either: the attachment is retired and its state freed.
-    Retired,
+}
+
+impl InboundState {
+    /// Whether the direction reached its end ([`Self::Ended`]).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Ended)
+    }
+}
+
+/// The state of one direction of an attachment, as a state change reports
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirectionState {
+    /// The outbound direction's state.
+    Outbound(OutboundState),
+    /// The inbound direction's state.
+    Inbound(InboundState),
+}
+
+impl DirectionState {
+    /// Which direction.
+    #[must_use]
+    pub const fn half(self) -> PipeHalf {
+        match self {
+            Self::Outbound(_) => PipeHalf::Outbound,
+            Self::Inbound(_) => PipeHalf::Inbound,
+        }
+    }
+
+    /// Whether the direction reached its end.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::Outbound(s) => s.is_terminal(),
+            Self::Inbound(s) => s.is_terminal(),
+        }
+    }
 }
 
 /// Outbound pipe states (STATE_MACHINE.md Section 3.1).
@@ -83,14 +137,14 @@ impl OutState {
         )
     }
 
-    pub(crate) fn public(self) -> PipeState {
+    pub(crate) fn public(self) -> OutboundState {
         match self {
-            Self::Deferred | Self::Joining => PipeState::Joining,
-            Self::Active => PipeState::Active,
-            Self::Suspect => PipeState::Suspect,
-            Self::Draining => PipeState::Draining,
-            Self::Failed => PipeState::Failed,
-            Self::Closed => PipeState::Closed,
+            Self::Deferred | Self::Joining => OutboundState::Joining,
+            Self::Active => OutboundState::Active,
+            Self::Suspect => OutboundState::Suspect,
+            Self::Draining => OutboundState::Draining,
+            Self::Failed => OutboundState::Failed,
+            Self::Closed => OutboundState::Closed,
         }
     }
 }
@@ -106,11 +160,11 @@ pub(crate) enum InState {
 }
 
 impl InState {
-    pub(crate) fn public(self) -> PipeState {
+    pub(crate) fn public(self) -> InboundState {
         match self {
-            Self::Deferred | Self::Joining => PipeState::Joining,
-            Self::Open => PipeState::Open,
-            Self::Ended => PipeState::Ended,
+            Self::Deferred | Self::Joining => InboundState::Joining,
+            Self::Open => InboundState::Open,
+            Self::Ended => InboundState::Ended,
         }
     }
 }
@@ -312,5 +366,26 @@ impl<'a> IntoIterator for &'a Attachments {
 
     fn into_iter(self) -> Self::IntoIter {
         self.list.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direction_states_are_typed_per_direction() {
+        // A deferred join reports joining in both directions.
+        assert_eq!(OutState::Deferred.public(), OutboundState::Joining);
+        assert_eq!(InState::Deferred.public(), InboundState::Joining);
+        let out = DirectionState::Outbound(OutState::Failed.public());
+        assert_eq!(out.half(), PipeHalf::Outbound);
+        assert!(out.is_terminal());
+        assert!(OutboundState::Closed.is_terminal());
+        assert!(!OutboundState::Draining.is_terminal());
+        let inb = DirectionState::Inbound(InState::Ended.public());
+        assert_eq!(inb.half(), PipeHalf::Inbound);
+        assert!(inb.is_terminal());
+        assert!(!InboundState::Open.is_terminal());
     }
 }

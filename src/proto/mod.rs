@@ -11,6 +11,9 @@
 //! - [`payload`]: the stream preamble and the datagram flow prefix.
 //! - [`keys`]: the join and resume key schedule.
 //! - [`oob`]: out-of-band join and pairing header values.
+//! - [`admission`]: the inputs and outcome of a carrier admission.
+//! - [`prefix_auth`]: prefix authentication tokens, an admission function.
+//! - [`trusted`]: trusted intermediaries and the sources they report.
 //! - [`listener`]: classification and limits of new carriers, join routing.
 //! - [`meter`]: the application byte counters of streams and sessions.
 //! - [`limit`]: the limiter interface of datagrams and the relay helper.
@@ -21,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 mod codec;
 pub mod draft;
 pub mod error;
@@ -33,7 +37,9 @@ pub mod meter;
 pub mod oob;
 pub mod params;
 pub mod payload;
+pub mod prefix_auth;
 pub mod record;
+pub mod trusted;
 pub mod varint;
 
 pub mod session;

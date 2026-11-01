@@ -78,7 +78,7 @@ async fn multipath_pipes_get_32_kib() {
             let l = l.clone();
             tokio::spawn(async move {
                 let _ = l
-                    .handle_pipe(PipeIo::tcp(c), PipeHint::from_addr(peer.ip()))
+                    .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
                     .await;
             });
         }
@@ -135,7 +135,7 @@ fn blocking_multipath_pipes_get_32_kib() {
                 let l = listener.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_addr(peer.ip()))
+                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -145,8 +145,7 @@ fn blocking_multipath_pipes_get_32_kib() {
     let stream = std::net::TcpStream::connect(addr).unwrap();
     let bootstrap = stream.try_clone().unwrap();
     let session =
-        zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(stream).unwrap(), mp_config())
-            .unwrap();
+        zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(stream), mp_config()).unwrap();
     assert!(session.multipath() == zmux::Multipath::InUse);
     let start = Instant::now();
     // The writer thread lowers it when it next writes, at most every 20 ms: make it write.
@@ -162,10 +161,7 @@ fn blocking_multipath_pipes_get_32_kib() {
     let stream = std::net::TcpStream::connect(addr).unwrap();
     let added = stream.try_clone().unwrap();
     session
-        .add_pipe(
-            zmux::blocking::PipeIo::tcp(stream).unwrap(),
-            PipeOptions::default(),
-        )
+        .add_pipe(zmux::blocking::PipeIo::tcp(stream), PipeOptions::default())
         .unwrap();
     assert_eq!(lowat(&added), 32 * 1024);
     session.close(0u32.into(), b"");

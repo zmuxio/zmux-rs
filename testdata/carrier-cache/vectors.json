@@ -1,0 +1,227 @@
+{
+  "about": [
+    "Carrier cache snapshots (API.md Section 4.8), shared by every implementation.",
+    "Each case restores its steps in order into a new cache with the default bounds",
+    "(success TTL 6 h, backoff 1 min to 6 h). In a step, a string \"@+N\" or \"@-N\"",
+    "is the RFC 3339 UTC time N seconds after or before now, substituted before parsing.",
+    "A step with error true must be rejected whole, leaving the cache as it was.",
+    "expect lists every entry the cache's snapshot then holds: usable (good_until",
+    "ahead), failed (fail_until ahead), backoff_ms and url.",
+    "exact lists snapshots in the canonical form (fields in this order, absent when empty; strings escape only quote, backslash and control characters) that parse and encode back to the same text."
+  ],
+  "cases": [
+    {
+      "name": "lenient",
+      "steps": [
+        {
+          "snapshot": "{\"version\":1,\"extra\":{\"a\":[1,2.5,null,true]},\"entries\":[{\"key\":\"k\",\"kind\":\"split\",\"good_until\":\"@+3600\",\"fail_until\":\"\",\"new_field\":3},{\"key\":\"k\",\"kind\":\"carrier-of-the-future\",\"good_until\":\"@+3600\"},{\"key\":\"k\",\"kind\":\"exchange\",\"fail_until\":\"@-3600\",\"backoff_ms\":60000},{\"key\":\"k\",\"kind\":\"quic\",\"fail_until\":\"@-25200\",\"backoff_ms\":60000},{\"key\":\"d\",\"kind\":\"quic\",\"fail_until\":\"@+7200\",\"backoff_ms\":1},{\"key\":\"d\",\"kind\":\"quic\",\"fail_until\":\"@+3600\",\"backoff_ms\":999999999999}]}"
+        }
+      ],
+      "expect": [
+        {
+          "key": "d",
+          "kind": "quic",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 60000,
+          "url": ""
+        },
+        {
+          "key": "k",
+          "kind": "exchange",
+          "usable": false,
+          "failed": false,
+          "backoff_ms": 60000,
+          "url": ""
+        },
+        {
+          "key": "k",
+          "kind": "split",
+          "usable": true,
+          "failed": false,
+          "backoff_ms": 0,
+          "url": ""
+        }
+      ]
+    },
+    {
+      "name": "merge_keeps_the_newer",
+      "steps": [
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"k\",\"kind\":\"split\",\"good_until\":\"@+3600\"},{\"key\":\"d\",\"kind\":\"quic\",\"fail_until\":\"@+7200\",\"backoff_ms\":120000}]}"
+        },
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"k\",\"kind\":\"split\",\"fail_until\":\"@+1800\",\"backoff_ms\":60000},{\"key\":\"d\",\"kind\":\"quic\",\"good_until\":\"@+3600\"},{\"key\":\"n\",\"kind\":\"websocket\",\"good_until\":\"@+3600\",\"url\":\"https://b.example/z\"}]}"
+        },
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"k\",\"kind\":\"split\",\"fail_until\":\"@+7200\",\"backoff_ms\":60000}]}"
+        }
+      ],
+      "expect": [
+        {
+          "key": "d",
+          "kind": "quic",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 120000,
+          "url": ""
+        },
+        {
+          "key": "k",
+          "kind": "split",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 60000,
+          "url": ""
+        },
+        {
+          "key": "n",
+          "kind": "websocket",
+          "usable": true,
+          "failed": false,
+          "backoff_ms": 0,
+          "url": "https://b.example/z"
+        }
+      ]
+    },
+    {
+      "name": "backoff_within_the_bounds",
+      "steps": [
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"a\",\"kind\":\"http3\",\"fail_until\":\"@+60\",\"backoff_ms\":5},{\"key\":\"b\",\"kind\":\"http3\",\"fail_until\":\"@+60\",\"backoff_ms\":86400000},{\"key\":\"c\",\"kind\":\"http3\",\"fail_until\":\"@+60\"}]}"
+        }
+      ],
+      "expect": [
+        {
+          "key": "a",
+          "kind": "http3",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 60000,
+          "url": ""
+        },
+        {
+          "key": "b",
+          "kind": "http3",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 21600000,
+          "url": ""
+        },
+        {
+          "key": "c",
+          "kind": "http3",
+          "usable": false,
+          "failed": true,
+          "backoff_ms": 0,
+          "url": ""
+        }
+      ]
+    },
+    {
+      "name": "offsets_and_fractions",
+      "steps": [
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"t\",\"kind\":\"webtransport\",\"good_until\":\"2999-01-01T10:00:00.123456789+10:00\"},{\"key\":\"t\",\"kind\":\"streaming\",\"good_until\":\"2000-01-01T00:00:00Z\"}],\"version\":1}"
+        }
+      ],
+      "expect": [
+        {
+          "key": "t",
+          "kind": "webtransport",
+          "usable": true,
+          "failed": false,
+          "backoff_ms": 0,
+          "url": ""
+        }
+      ]
+    },
+    {
+      "name": "rejected_whole",
+      "steps": [
+        {
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"k\",\"kind\":\"split\",\"good_until\":\"@+3600\"}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":2,\"entries\":[]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"entries\":[]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":\"1\",\"entries\":[]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1.0,\"entries\":[]}"
+        },
+        {
+          "error": true,
+          "snapshot": "not json"
+        },
+        {
+          "error": true,
+          "snapshot": "[]"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[]} trailing"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":{}}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"good_until\":\"@+3600\"},{\"key\":\"k\",\"kind\":\"split\",\"backoff_ms\":-1}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"backoff_ms\":1.5}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"backoff_ms\":\"60000\"}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"good_until\":3}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"good_until\":\"tomorrow\"}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"fail_until\":\"2026-11-01T12:00:00\"}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":7,\"kind\":\"split\"}]}"
+        },
+        {
+          "error": true,
+          "snapshot": "{\"version\":1,\"entries\":[{\"key\":\"z\",\"kind\":\"split\",\"url\":false}]}"
+        }
+      ],
+      "expect": [
+        {
+          "key": "k",
+          "kind": "split",
+          "usable": true,
+          "failed": false,
+          "backoff_ms": 0,
+          "url": ""
+        }
+      ]
+    }
+  ],
+  "exact": [
+    "{\"version\":1,\"entries\":[{\"key\":\"k\",\"kind\":\"streaming\",\"fail_until\":\"2999-11-01T12:00:00.123456789Z\",\"backoff_ms\":120000},{\"key\":\"k2\",\"kind\":\"split\",\"good_until\":\"2999-11-01T12:00:00.5Z\",\"url\":\"https://b.example/z\"}]}",
+    "{\"version\":1,\"entries\":[]}",
+    "{\"version\":1,\"entries\":[{\"key\":\"hé \\\"q\\\"\\\\\",\"kind\":\"webtransport\",\"good_until\":\"2999-01-01T00:00:00Z\",\"fail_until\":\"2999-01-02T00:00:00.001Z\",\"backoff_ms\":60000}]}"
+  ]
+}

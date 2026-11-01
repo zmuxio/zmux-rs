@@ -6,6 +6,7 @@ Published crates, all with one version (major 1, in lockstep):
 
 - `zmux` (the core)
 - `zmux-rustls`, `zmux-quinn`, `zmux-websocket`, `zmux-http`, `zmux-h3`, `zmux-webtransport` (carrier adapters)
+- `zmux-shaping` (the state-machine shaper)
 
 Releases are automated from tag `vX.Y.Z` (`.github/workflows/release.yml`). The workflow:
 
@@ -21,8 +22,24 @@ crates.io versions are immutable after publication. The repository secret `CARGO
 ## Version rules
 
 - every `Cargo.toml` package version under the workspace: `X.Y.Z`
-- every adapter's dependency on `zmux`: `{ version = "X.Y.Z", path = "../.." }`
+- every adapter's dependency on `zmux`: `{ version = "X.Y.Z", path = "../.." }` (`zmux-shaping`'s: `path = ".."`)
 - git tag: `vX.Y.Z`
+
+## Dependency update
+
+Before every release, update every dependency to its latest release: raise the version requirements in every
+`Cargo.toml` (including major versions; `cargo upgrade --incompatible` from cargo-edit does this), then refresh the
+lockfile, review the changes and run the full checks:
+
+```bash
+cargo upgrade --incompatible
+cargo update
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Commit the updates on their own before the release commit. Keep `rust-version` unchanged unless raising it is an
+intentional release decision.
 
 ## Release
 
@@ -37,7 +54,7 @@ The ahead/behind count should be `0 0`. Update the versions above, then:
 ```bash
 cargo metadata --locked --no-deps --format-version 1 > /dev/null
 cargo publish --dry-run --locked --workspace
-git add Cargo.toml Cargo.lock adapter/*/Cargo.toml
+git add Cargo.toml Cargo.lock adapter/*/Cargo.toml shaping/Cargo.toml
 git commit -m "release: prepare vX.Y.Z"
 git push origin main
 git tag -a vX.Y.Z -m "vX.Y.Z"

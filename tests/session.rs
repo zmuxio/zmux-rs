@@ -178,7 +178,7 @@ async fn preamble_and_priority_reach_the_peer() {
             .open_bi_with(&zmux::Preamble::new().with_info(vec![b'x'; 5000]))
             .await
             .err(),
-        Some(OpenError::TooLarge)
+        Some(OpenError::PreambleTooLarge)
     );
     let (mut send, _recv) = client.open_bi_with(&pre).await.unwrap();
     // Reading the identifier pins the stream; the preamble was given at
@@ -371,8 +371,7 @@ fn blocking_echo_over_tcp() {
     let srv = std::thread::spawn(move || {
         let (tcp, _) = listener.accept().unwrap();
         let session =
-            blocking::Session::accept(blocking::PipeIo::tcp(tcp).unwrap(), Config::default())
-                .unwrap();
+            blocking::Session::accept(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
         let (mut s, mut r) = session.accept_bi().unwrap();
         let mut data = Vec::new();
         Read::read_to_end(&mut r, &mut data).unwrap();
@@ -382,8 +381,7 @@ fn blocking_echo_over_tcp() {
         session
     });
     let tcp = std::net::TcpStream::connect(addr).unwrap();
-    let client =
-        blocking::Session::connect(blocking::PipeIo::tcp(tcp).unwrap(), Config::default()).unwrap();
+    let client = blocking::Session::connect(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
     let (mut s, mut r) = client.open_bi().unwrap();
     let data: Vec<u8> = (0..2_000_000u32).map(|i| (i * 7) as u8).collect();
     Write::write_all(&mut s, &data).unwrap();
@@ -394,7 +392,7 @@ fn blocking_echo_over_tcp() {
     let session = srv.join().unwrap();
     client.close(VarInt::from_u32(3), b"");
     assert!(matches!(
-        session.closed(),
+        session.closed(None),
         Ok(SessionError::ApplicationClosed { remote: true, .. })
     ));
 }
@@ -406,11 +404,10 @@ fn blocking_read_timeout() {
     let addr = listener.local_addr().unwrap();
     let srv = std::thread::spawn(move || {
         let (tcp, _) = listener.accept().unwrap();
-        blocking::Session::accept(blocking::PipeIo::tcp(tcp).unwrap(), Config::default()).unwrap()
+        blocking::Session::accept(blocking::PipeIo::tcp(tcp), Config::default()).unwrap()
     });
     let tcp = std::net::TcpStream::connect(addr).unwrap();
-    let client =
-        blocking::Session::connect(blocking::PipeIo::tcp(tcp).unwrap(), Config::default()).unwrap();
+    let client = blocking::Session::connect(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
     let server = srv.join().unwrap();
     let (mut s, _r) = client.open_bi().unwrap();
     s.write_all(b"x").unwrap();
@@ -577,4 +574,205 @@ async fn protocols_negotiate_the_accepting_sides_preference() {
     assert_eq!(server.protocol().as_deref(), Some("a"));
     let (c, s) = pair().await;
     assert_eq!((c.protocol(), s.protocol()), (None, None));
+}
+
+#[tokio::test]
+async fn a_shaper_pads_the_records_of_a_session() {
+    use std::sync::Arc;
+    use zmux::shaping::{Caps, Factory, RecordPlan, RecordView, Shaper};
+    struct Pad;
+    impl Shaper for Pad {
+        fn capabilities(&self) -> Caps {
+            Caps::PLAN
+        }
+        fn plan(&mut self, _: &RecordView, plan: &mut RecordPlan) {
+            plan.pad_to = 1000;
+        }
+    }
+    struct F;
+    impl Factory for F {
+        fn shaper(&self, _: &zmux::shaping::ShapedPipe) -> Option<Box<dyn Shaper>> {
+            Some(Box::new(Pad))
+        }
+    }
+    let (client, server) = pair().await;
+    client.set_shaper(Some(Arc::new(F)));
+    let (mut send, _recv) = client.open_bi().await.unwrap();
+    send.write_all(b"0123456789").await.unwrap();
+    send.finish().unwrap();
+    let (_s, mut recv) = server.accept_bi().await.unwrap();
+    assert_eq!(recv.read_to_end(100).await.unwrap(), b"0123456789");
+    let st = client.shaping_stats();
+    assert!(st.padding_bytes >= 900, "{st:?}");
+}
+
+/// Delays the first record of each pipe it shapes, or every record.
+fn first_delay(all: bool) -> std::sync::Arc<dyn zmux::shaping::Factory> {
+    use zmux::shaping::{Caps, RecordPlan, RecordView, Shaper};
+    struct D {
+        all: bool,
+        n: u64,
+    }
+    impl Shaper for D {
+        fn capabilities(&self) -> Caps {
+            Caps::PLAN
+        }
+        fn plan(&mut self, _: &RecordView, plan: &mut RecordPlan) {
+            if self.n == 0 || self.all {
+                plan.delay = Duration::from_millis(20);
+            }
+            self.n += 1;
+        }
+    }
+    std::sync::Arc::new(move |_: &zmux::shaping::ShapedPipe| {
+        Some(Box::new(D { all, n: 0 }) as Box<dyn Shaper>)
+    })
+}
+
+fn first_delay_config(all: bool) -> Config {
+    let mut c = Config::default();
+    c.shaper = Some(first_delay(all));
+    c
+}
+
+/// A shaping delay of the first record of the bootstrap pipe, from the
+/// session's creation (`Config::shaper`), holds the transport parameters,
+/// which still lead the pipe once it ends: both ends establish and echo.
+#[tokio::test]
+async fn a_delayed_first_record_keeps_the_parameters_first() {
+    for all in [false, true] {
+        let run = async {
+            let (client, server) =
+                pair_with(first_delay_config(all), first_delay_config(all)).await;
+            let echo = tokio::spawn(async move {
+                let (mut send, mut recv) = server.accept_bi().await.unwrap();
+                let data = recv.read_to_end(1 << 20).await.unwrap();
+                send.write_all(&data).await.unwrap();
+                send.finish().unwrap();
+                send.stopped().await.unwrap();
+                server
+            });
+            let (mut send, mut recv) = client.open_bi().await.unwrap();
+            send.write_all(b"hello").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(1 << 20).await.unwrap(), b"hello");
+            let _server = echo.await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap_or_else(|_| panic!("all={all}: timed out"));
+    }
+}
+
+/// [`a_delayed_first_record_keeps_the_parameters_first`] on the blocking
+/// driver.
+#[test]
+fn blocking_a_delayed_first_record_keeps_the_parameters_first() {
+    use std::io::{Read, Write};
+    use zmux::blocking;
+    for all in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let session =
+                blocking::Session::accept(blocking::PipeIo::tcp(tcp), first_delay_config(all))
+                    .unwrap();
+            let (mut s, mut r) = session.accept_bi().unwrap();
+            let mut data = Vec::new();
+            Read::read_to_end(&mut r, &mut data).unwrap();
+            Write::write_all(&mut s, &data).unwrap();
+            s.finish().unwrap();
+            s.stopped().unwrap();
+            session
+        });
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let client =
+            blocking::Session::connect(blocking::PipeIo::tcp(tcp), first_delay_config(all))
+                .unwrap();
+        let (mut s, mut r) = client.open_bi().unwrap();
+        r.set_read_timeout(Some(Duration::from_secs(10)));
+        Write::write_all(&mut s, b"hello").unwrap();
+        s.finish().unwrap();
+        let mut back = Vec::new();
+        Read::read_to_end(&mut r, &mut back).unwrap();
+        assert_eq!(back, b"hello", "all={all}");
+        let _session = srv.join().unwrap();
+        client.close(VarInt::from_u32(0), b"");
+    }
+}
+
+/// API.md Section 7.2: the session's application byte counts are those of
+/// its meter, streams and datagrams together.
+#[tokio::test]
+async fn session_stats_report_the_meter() {
+    let (client, server) = pair_with(datagram_config(), datagram_config()).await;
+    let (mut send, _recv) = client.open_bi().await.unwrap();
+    send.write_all(b"hello").await.unwrap();
+    send.finish().unwrap();
+    let (_s, mut r) = server.accept_bi().await.unwrap();
+    assert_eq!(r.read_to_end(1 << 10).await.unwrap(), b"hello");
+    client.send_datagram(Bytes::from_static(b"dgram")).unwrap();
+    assert_eq!(server.read_datagram().await.unwrap(), &b"dgram"[..]);
+    let (c, s) = (client.stats(), server.stats());
+    assert_eq!((c.bytes_written, c.datagram_bytes_sent), (5, 5));
+    assert_eq!((s.bytes_read, s.datagram_bytes_received), (5, 5));
+    let m = server.meter().get();
+    assert_eq!(
+        (
+            s.bytes_written,
+            s.bytes_read,
+            s.datagram_bytes_sent,
+            s.datagram_bytes_received
+        ),
+        (
+            m.bytes_written,
+            m.bytes_read,
+            m.datagram_bytes_sent,
+            m.datagram_bytes_received
+        )
+    );
+}
+
+/// API.md Section 7.2: a handle that outlives its stream (the sending part
+/// of a rejected stream) keeps reading the final statistics.
+#[tokio::test]
+async fn stream_stats_stay_after_release() {
+    let (client, server) = pair().await;
+    let (mut send, _recv) = client.open_bi().await.unwrap();
+    send.write_all(b"abc").await.unwrap();
+    send.finish().unwrap();
+    let (keep, recv) = server.accept_bi().await.unwrap();
+    while keep.stats().bytes_received < 3 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    recv.reject().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.stats().streams_active != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the session released the stream");
+    let st = keep.stats();
+    assert_eq!(st.bytes_received, 3);
+    assert_eq!(st.bytes_read, 0);
+}
+
+/// API.md Section 7.2: the durations since an event are measured at the
+/// time of the snapshot, not at the session's latest input.
+#[tokio::test]
+async fn pipe_stats_are_taken_at_the_current_time() {
+    let (client, _server) = pair().await;
+    let (mut send, _recv) = client.open_bi().await.unwrap();
+    send.write_all(b"x").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let wait = Duration::from_millis(200);
+    tokio::time::sleep(wait).await;
+    let st = client.pipe_stats();
+    let since = st[0].since_last_traffic.expect("a live pipe");
+    assert!(since >= wait, "{since:?}");
+    let one = client.pipes()[0].stats().unwrap();
+    assert!(one.since_last_traffic.unwrap() >= wait);
 }

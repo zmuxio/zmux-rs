@@ -1,13 +1,15 @@
 //! WebSocket carriers end to end over loopback TCP: one-step `connect` and
 //! `serve` with the subprotocol negotiated, one record per binary message
-//! on the wire, and a connection lost without a Close frame is a failure,
-//! never a clean end.
+//! on the wire, a connection lost without a Close frame is a failure,
+//! never a clean end, and the source trusted intermediaries report.
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http;
 use zmux::{Config, Listener, ListenerConfig, PipeFailure, Session, SessionError};
 
 async fn server() -> (std::net::SocketAddr, Listener, tokio::task::JoinHandle<()>) {
@@ -54,6 +56,7 @@ async fn connect_and_serve() {
     .await
     .unwrap();
     let server = listener.accept().await.unwrap();
+    assert_kind([&client, &server], zmux::CarrierKind::WebSocket);
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     assert_eq!(server.protocol().as_deref(), Some("qmux-02"));
     round_trip(&client, &server).await;
@@ -99,7 +102,7 @@ async fn every_record_is_one_message() {
     // out as one message.
     let client = tokio::spawn(async move {
         let mut c = Config::default();
-        c.handshake_timeout = Duration::from_millis(500);
+        c.handshake_timeout = Some(Duration::from_millis(500));
         Session::connect(io, c).await
     });
     let first = raw.await.unwrap();
@@ -256,13 +259,11 @@ async fn empty_injector(
 }
 
 /// Empty messages are empty records: the server counts each in its pipe
-/// positions and charges it against the non-progress budget like a
-/// PADDING-only record. The injected messages are bytes the client never
-/// sent, so the session ends either way: the server closes it for the load,
-/// or the client first sees a PIPE_ACK above what it sent. (That a few are
-/// no-ops is a trace of the core.)
+/// positions and does not charge it against the no-effect budget. The
+/// injected messages are bytes the client never sent, so the client sees a
+/// PIPE_ACK above what it sent and closes the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_flood_of_empty_messages_is_charged() {
+async fn empty_messages_count_in_pipe_positions() {
     let (addr, listener, _serving) = server().await;
     let (front, relay) = empty_injector(addr, 100_000).await;
     let client = zmux_websocket::connect(
@@ -274,13 +275,9 @@ async fn a_flood_of_empty_messages_is_charged() {
     .unwrap();
     let e = tokio::time::timeout(Duration::from_secs(10), client.closed())
         .await
-        .expect("closed by the server");
+        .expect("closed");
     assert!(
         matches!(
-            &e,
-            SessionError::TransportClosed { code, remote: true, .. }
-                if *code == zmux::proto::TransportErrorCode::ZMUX_EXCESSIVE_LOAD
-        ) || matches!(
             &e,
             SessionError::TransportClosed { code, remote: false, .. }
                 if *code == zmux::proto::TransportErrorCode::PROTOCOL_VIOLATION
@@ -291,8 +288,10 @@ async fn a_flood_of_empty_messages_is_charged() {
     listener.close();
 }
 
-/// wss://: `connect_tls` against a server that terminates TLS and upgrades
-/// with `accept` inside the listener's `serve_with`.
+/// wss://: `connect_tls` against `serve_tls`, admitted by a prefix
+/// authentication token in the request header, bound to the TLS
+/// connection: the client's credential takes the binding from its
+/// connection, the server's admission from the connection's exporter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_over_tls() {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -317,36 +316,41 @@ async fn connect_over_tls() {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
 
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+    let listener = Listener::new(Config::default(), limits);
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = tcp.local_addr().unwrap().port();
-    let l = listener.clone();
-    let serving = tokio::spawn(async move {
-        l.serve_with(
-            || tcp.accept(),
-            move |conn, peer| {
-                let tls = acceptor.clone();
-                async move {
-                    let conn = tls.accept(conn).await?;
-                    zmux_websocket::accept(conn, Some(peer.ip()), &Default::default()).await
-                }
-            },
-        )
+    let serving = tokio::spawn(zmux_websocket::serve_tls(
+        listener.clone(),
+        tcp,
+        acceptor,
+        Default::default(),
+    ));
+    let url = format!("wss://localhost:{port}/zmux");
+    // Without the token: refused.
+    let refused = zmux_websocket::dial_tls(url.as_str(), &connector, &Default::default()).await;
+    assert!(refused.is_err());
+    // Unbound tokens do not verify where bound ones are configured.
+    let unbound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
+    let options = zmux_websocket::Options::default().with_credential(Arc::new(unbound));
+    assert!(
+        zmux_websocket::dial_tls(url.as_str(), &connector, &options)
+            .await
+            .is_err()
+    );
+    let options = zmux_websocket::Options::default().with_credential(Arc::new(auth));
+    let client = zmux_websocket::connect_tls(url.as_str(), &connector, &options, Config::default())
         .await
-    });
-    let client = zmux_websocket::connect_tls(
-        format!("wss://localhost:{port}/zmux"),
-        &connector,
-        &Default::default(),
-        Config::default(),
-    )
-    .await
-    .unwrap();
+        .unwrap();
     let server = listener.accept().await.unwrap();
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     round_trip(&client, &server).await;
     client.close(0u32.into(), b"bye");
-    serving.abort();
+    listener.close();
+    serving.await.unwrap();
 }
 
 /// An out-of-band join: the reservation's header on the upgrade request.
@@ -387,4 +391,286 @@ async fn out_of_band_join() {
     round_trip(&client, &server).await;
     client.close(0u32.into(), b"bye");
     serving.abort();
+}
+
+/// A raw request on `addr`: the response the server writes until it ends
+/// the connection.
+async fn raw_request(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(request).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    out
+}
+
+fn upgrade_request(protocol: Option<&str>) -> Vec<u8> {
+    let mut r = String::from(
+        "GET /zmux HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+    );
+    if let Some(p) = protocol {
+        r.push_str(&format!("Sec-WebSocket-Protocol: {p}\r\n"));
+    }
+    r.push_str("\r\n");
+    r.into_bytes()
+}
+
+/// A client offering no accepted subprotocol, or none, is refused: without
+/// a fallback it gets a 404 and no session starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unaccepted_subprotocol_is_refused_with_not_found() {
+    let (addr, listener, serving) = server().await;
+    for protocol in [Some("other-1"), None] {
+        let response = raw_request(addr, &upgrade_request(protocol)).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 404 Not Found\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    let response = raw_request(addr, &upgrade_request(Some("qmux-03, x"))).await;
+    assert!(response.starts_with(b"HTTP/1.1 404"));
+    // Failed upgrades: setup failures, no pipe input.
+    let st = listener.stats();
+    assert_eq!((st.sessions, st.rejected, st.setup_failures), (0, 0, 3));
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// A refused request, an unaccepted subprotocol or a request that is not
+/// an upgrade, reaches the fallback with every byte the server read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_request_reaches_the_fallback_with_every_byte() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fallback = zmux::Fallback::new(|mut conn, _source| async move {
+        // Echo the request as the body of a 200, then end.
+        let mut got = vec![0u8; 4096];
+        let mut n = 0;
+        while !got[..n].ends_with(b"\r\n\r\nbody") {
+            let m = conn.read(&mut got[n..]).await.unwrap();
+            assert_ne!(m, 0);
+            n += m;
+        }
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
+        conn.write_all(head.as_bytes()).await.unwrap();
+        conn.write_all(&got[..n]).await.unwrap();
+        conn.shutdown().await.unwrap();
+    });
+    let mut limits = ListenerConfig::default();
+    limits.fallback = Some(fallback);
+    let listener = Listener::new(Config::default(), limits);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        Default::default(),
+    ));
+    let plain = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nbody".to_vec();
+    let mut other = upgrade_request(Some("other-1"));
+    other.extend_from_slice(b"body");
+    for request in [plain, other] {
+        let response = raw_request(addr, &request).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(&request), "the request replayed in full");
+    }
+    // An accepted upgrade still makes a session.
+    let client = zmux_websocket::connect(
+        format!("ws://{addr}/zmux"),
+        &Default::default(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let server = listener.accept().await.unwrap();
+    round_trip(&client, &server).await;
+    client.close(0u32.into(), b"");
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// An admission decides on the request head: its metadata carries the
+/// request's parts, its header fields and the client's address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_decides_on_the_request_head() {
+    use zmux::{Admission, Verdict};
+    let admission = Admission::new(0, |info, prefix| {
+        assert!(prefix.is_empty());
+        assert!(info.source.is_some());
+        assert!(info.head);
+        let mut upgrade = false;
+        info.for_each_header(|n, v| upgrade |= n == "upgrade" && v == b"websocket");
+        assert!(upgrade);
+        let parts = info
+            .request
+            .and_then(|r| r.downcast_ref::<http::request::Parts>())
+            .expect("the request head");
+        if parts.headers.contains_key("x-pass") {
+            Verdict::accept(0)
+        } else {
+            Verdict::Fallback
+        }
+    });
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(admission);
+    let listener = Listener::new(Config::default(), limits);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        Default::default(),
+    ));
+    let response = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
+    assert!(response.starts_with(b"HTTP/1.1 404"));
+    let mut request = format!("ws://{addr}/zmux").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-pass", http::HeaderValue::from_static("1"));
+    let client = zmux_websocket::connect(request, &Default::default(), Config::default())
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    round_trip(&client, &server).await;
+    client.close(0u32.into(), b"");
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// A `ws://` client with a prefix authentication credential sends its
+/// token in the `Zmux-Prefix-Auth` field, which the server's admission
+/// verifies once; without it, or with the token replayed, the request is
+/// refused. A bound credential has no exporter on `ws://` and fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_auth_in_the_request_header() {
+    use std::sync::Arc;
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+    let listener = Listener::new(Config::default(), limits);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        Default::default(),
+    ));
+    let url = format!("ws://{addr}/zmux");
+    let refused = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
+    assert!(refused.starts_with(b"HTTP/1.1 404"));
+
+    let options = zmux_websocket::Options::default().with_credential(Arc::new(auth.clone()));
+    let client = zmux_websocket::connect(url.as_str(), &options, Config::default())
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    round_trip(&client, &server).await;
+    client.close(0u32.into(), b"");
+
+    let (name, value) = zmux::Credential::header(&auth, &zmux::CarrierInfo::new()).unwrap();
+    assert_eq!(name, zmux::PREFIX_AUTH_HEADER);
+    let mut request = format!("ws://{addr}/zmux").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(zmux::PREFIX_AUTH_HEADER, value.parse().unwrap());
+    zmux_websocket::dial(request.clone(), &Default::default())
+        .await
+        .unwrap();
+    assert!(
+        zmux_websocket::dial(request, &Default::default())
+            .await
+            .is_err(),
+        "a replayed token"
+    );
+
+    let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+    let options = zmux_websocket::Options::default().with_credential(Arc::new(bound));
+    let e = zmux_websocket::dial(url.as_str(), &options)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// Behind intermediaries the listener trusts: `serve` reads the PROXY
+/// protocol header of a trusted peer first, and the request's forwarding
+/// header field applies only when the client that header reports is
+/// itself trusted. Without an admission the upgrade goes on after the
+/// header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_intermediaries_report_the_source() {
+    use std::sync::Mutex;
+    use zmux::{Admission, TrustedProxies, Verdict};
+    let forwarded = |proxy: &str| {
+        let mut r = format!("PROXY TCP4 {proxy} 10.0.0.1 4000 443\r\n").into_bytes();
+        let up = upgrade_request(Some("qmux-02"));
+        let at = up.len() - 2;
+        r.extend_from_slice(&up[..at]);
+        r.extend_from_slice(b"X-Forwarded-For: 1.2.3.4\r\n\r\n");
+        r
+    };
+    let proxies = TrustedProxies::new()
+        .with_net("127.0.0.0/8".parse().unwrap())
+        .with_proxy_protocol(true)
+        .with_forwarded_header("X-Forwarded-For");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let tx = Mutex::new(tx);
+    let admission = Admission::new(0, move |info, _| {
+        let _ = tx.lock().unwrap().send(info.source.unwrap());
+        Verdict::Close
+    });
+    let serve = async |admission| {
+        let mut limits = ListenerConfig::default();
+        limits.trusted_proxies = proxies.clone();
+        limits.admission = admission;
+        let listener = Listener::new(Config::default(), limits);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let task = tokio::spawn(zmux_websocket::serve(
+            listener.clone(),
+            tcp,
+            Default::default(),
+        ));
+        (addr, listener, task)
+    };
+    let (admitted, admitted_listener, a) = serve(Some(admission)).await;
+    let (plain, plain_listener, p) = serve(None).await;
+    for (proxy, expect) in [
+        ("198.51.100.7", "198.51.100.7:4000"),
+        ("127.0.0.2", "1.2.3.4:0"),
+    ] {
+        let response = raw_request(admitted, &forwarded(proxy)).await;
+        assert!(response.is_empty(), "{response:?}");
+        assert_eq!(rx.recv().await.unwrap().to_string(), expect);
+    }
+    let mut tcp = TcpStream::connect(plain).await.unwrap();
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tcp.write_all(&forwarded("198.51.100.7")).await.unwrap();
+        let mut head = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(10), tcp.read_exact(&mut head))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&head, b"HTTP/1.1 101");
+    }
+    admitted_listener.close();
+    plain_listener.close();
+    drop(tcp);
+    a.await.unwrap();
+    p.await.unwrap();
+}
+
+/// Pipe 0 of each session is of carrier kind `kind`.
+fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+    for s in sessions {
+        let p = s.pipe(zmux::PipeId::new(0)).unwrap();
+        assert_eq!(p.stats().unwrap().carrier, Some(kind));
+    }
 }

@@ -17,6 +17,17 @@ pub(crate) struct Attachment {
     /// The multipath part, allocated for the attachments of a multipath
     /// session (and on the first write to it otherwise).
     mp: Option<Box<AttMp>>,
+    /// The carrier's kind ([`SessionCore::set_pipe_carrier`]).
+    ///
+    /// [`SessionCore::set_pipe_carrier`]: crate::proto::session::SessionCore::set_pipe_carrier
+    carrier: Option<crate::proto::session::CarrierKind>,
+    /// The carrier's write overhead
+    /// ([`SessionCore::set_pipe_write_overhead`]).
+    ///
+    /// [`SessionCore::set_pipe_write_overhead`]: crate::proto::session::SessionCore::set_pipe_write_overhead
+    write_overhead: u16,
+    /// When a traffic frame was last sent or received on it.
+    traffic_at: Option<Instant>,
 }
 
 /// The multipath part of an attachment: its fate group, join and failure
@@ -57,8 +68,14 @@ struct AttMp {
     tier: TierState,
     /// Why it failed, once it did.
     failure: Option<crate::proto::session::PipeFailure>,
-    /// The application's label of a pipe it added.
-    label: Option<std::sync::Arc<str>>,
+    /// The options of a pipe the application added (its fields that the
+    /// tier state does not hold: label, fate group, detection settings).
+    options: Option<Box<crate::proto::session::PipeOptions>>,
+    /// The host's value of the admission that accepted the carrier
+    /// ([`SessionCore::set_pipe_admitted`]).
+    ///
+    /// [`SessionCore::set_pipe_admitted`]: crate::proto::session::SessionCore::set_pipe_admitted
+    admitted: Option<crate::proto::admission::AdmittedValue>,
 }
 
 impl AttMp {
@@ -79,7 +96,8 @@ impl AttMp {
             retire_at: None,
             tier: TierState::new(),
             failure: None,
-            label: None,
+            options: None,
+            admitted: None,
         }
     }
 }
@@ -96,6 +114,9 @@ impl Attachment {
             inp: None,
             out: None,
             mp: Some(Box::new(AttMp::new(fate_group, seq))),
+            carrier: None,
+            write_overhead: 0,
+            traffic_at: None,
         }
     }
 
@@ -121,6 +142,16 @@ impl Attachment {
         a
     }
 
+    /// A traffic frame was sent or received on it.
+    pub(crate) fn note_traffic(&mut self, now: Instant) {
+        self.traffic_at = Some(now);
+    }
+
+    /// When a traffic frame was last sent or received on it.
+    pub(crate) fn traffic_at(&self) -> Option<Instant> {
+        self.traffic_at
+    }
+
     /// The bootstrap pair of a session without multipath (yet).
     pub(crate) fn bootstrap(joiner_local: bool) -> Self {
         Self {
@@ -129,6 +160,9 @@ impl Attachment {
             inp: None,
             out: None,
             mp: None,
+            carrier: None,
+            write_overhead: 0,
+            traffic_at: None,
         }
     }
 
@@ -138,8 +172,7 @@ impl Attachment {
     pub(crate) fn start_multipath(
         &mut self,
         joiner_local: bool,
-        suspect_floor: Duration,
-        dead_timeout: Option<Duration>,
+        detection: super::Detection,
         now: Instant,
     ) {
         self.joiner_local = joiner_local;
@@ -147,7 +180,7 @@ impl Attachment {
             self.mp = Some(Box::new(AttMp::new(0, 0)));
         }
         if let Some(o) = self.out.take() {
-            self.out = Some(o.start_multipath(suspect_floor, dead_timeout, now));
+            self.out = Some(o.start_multipath(detection, now));
         }
         if let Some(p) = &mut self.inp {
             p.restart(now);
@@ -315,14 +348,55 @@ impl Attachment {
         self.mp().failure
     }
 
-    /// The application's label.
-    pub(crate) fn label(&self) -> Option<&std::sync::Arc<str>> {
-        self.mp().label.as_ref()
+    /// The carrier's kind.
+    pub(crate) fn carrier(&self) -> Option<crate::proto::session::CarrierKind> {
+        self.carrier
     }
 
-    /// Sets the application's label.
-    pub(crate) fn set_label(&mut self, label: Option<std::sync::Arc<str>>) {
-        self.mp_mut().label = label;
+    /// Sets the carrier's kind.
+    pub(crate) fn set_carrier(&mut self, kind: Option<crate::proto::session::CarrierKind>) {
+        self.carrier = kind;
+    }
+
+    /// Sets the carrier's write overhead.
+    pub(crate) fn set_write_overhead(&mut self, bytes: u16) {
+        self.write_overhead = bytes;
+    }
+
+    /// The outbound pipe as a shaper factory sees it.
+    pub(crate) fn shaped(&self) -> crate::proto::session::shaping::ShapedPipe {
+        crate::proto::session::shaping::ShapedPipe::new(
+            crate::proto::session::PipeId(self.id),
+            self.carrier,
+        )
+        .with_write_overhead(self.write_overhead)
+    }
+
+    /// The host's admission value of the carrier.
+    pub(crate) fn admitted(&self) -> Option<&crate::proto::admission::AdmittedValue> {
+        self.mp().admitted.as_ref()
+    }
+
+    /// Keeps the host's admission value of the carrier.
+    pub(crate) fn set_admitted(&mut self, value: Option<crate::proto::admission::AdmittedValue>) {
+        if value.is_some() || self.mp.is_some() {
+            self.mp_mut().admitted = value;
+        }
+    }
+
+    /// The application's label.
+    pub(crate) fn label(&self) -> Option<&std::sync::Arc<str>> {
+        self.mp().options.as_ref()?.label.as_ref()
+    }
+
+    /// The options the application added the pipe with.
+    pub(crate) fn options(&self) -> Option<&crate::proto::session::PipeOptions> {
+        self.mp().options.as_deref()
+    }
+
+    /// Keeps the options the application adds the pipe with.
+    pub(crate) fn set_options(&mut self, options: &crate::proto::session::PipeOptions) {
+        self.mp_mut().options = Some(Box::new(options.clone()));
     }
 
     // ---- the PIPE_ABANDON exchange (MULTIPATH.md Section 8) -------------------

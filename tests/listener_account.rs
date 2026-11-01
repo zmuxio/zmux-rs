@@ -36,7 +36,7 @@ fn dial(
 async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
     let mut limits = ListenerConfig::default();
     // Below one idle session's charge.
-    limits.memory_budget = 1024;
+    limits.memory_budget = zmux::Budget::Bytes(1024);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     limits.on_memory_pressure = Some(zmux::OnMemoryPressure(std::sync::Arc::new(

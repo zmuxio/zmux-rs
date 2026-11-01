@@ -14,9 +14,19 @@ proxies and load balancers that forward HTTP/3 requests.
   an HTTP/3 server cannot open requests, so lanes in both directions need
   WebTransport.
 - `serve(listener, endpoint, options)` (or `serve_connection` for one
-  connection) answers every request with 200 and hands it to a
-  `zmux::Listener` as a carrier of its connection, which tells new
-  sessions, joins and client lanes apart.
+  connection) hands every request to a `zmux::Listener` as a carrier of
+  its connection, which tells new sessions, joins and client lanes apart,
+  and answers 200 only once the carrier is accepted: with the listener's admission
+  (`ListenerConfig::admission`, a `zmux::Admission` deciding on the first
+  bytes of the request body), when it accepts; without, when the listener first
+  writes on the carrier or has taken it. Requests that carry no pipe go to
+  `Options::fallback` (`H3Fallback`, given the request with the body bytes
+  read) or are answered with 404; a stalled or closed request is reset
+  without a response.
+- `Options::credential` makes the client write the prefix of a
+  `zmux::Credential`, such as a `zmux::PrefixAuth` token, first on every
+  request body, its pipes' and its lanes', given the QUIC connection's
+  exporter for bound tokens.
 - `connect(&endpoint, addr, uri, &options, config)` establishes a session
   over a new connection.
 

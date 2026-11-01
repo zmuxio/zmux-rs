@@ -10,7 +10,11 @@
 //! - [`connect`] and [`dial`] open a WebSocket to a URL and make a session
 //!   or a carrier of it; [`serve`] accepts WebSocket upgrades on a TCP
 //!   listener for a [`Listener`], and [`accept`] upgrades one
-//!   connection inside the application's own server.
+//!   connection inside the application's own server ([`Upgrade`]). With
+//!   the `hyper` feature, `accept_request` upgrades one request a hyper
+//!   server received (the HTTP/1.1 Upgrade, or HTTP/2's extended
+//!   `CONNECT`), for endpoints that serve WebSocket next to other
+//!   requests.
 //! - The subprotocol (`Sec-WebSocket-Protocol`) is the ALPN identifier, as
 //!   with TLS ([`Options`]): `qmux-02` or `qmux-02.<application>`, or an
 //!   application's own identifier (such as `moq-transport-18`, whose
@@ -19,13 +23,21 @@
 //!   own, a server selects the first offered one it accepts, and the
 //!   negotiated one is the session's protocol.
 //! - An empty message is a record without frames, a no-op that the
-//!   session counts like a record of PADDING only; zmux never sends one.
-//! - A server accepts a client whose offered subprotocols include none it
-//!   accepts, or that offers none, as other QMux implementations may not
-//!   offer one: it answers without a subprotocol and the session has no
-//!   negotiated protocol. The handshake that follows still has to succeed,
-//!   so this admits nothing a client could not reach by offering the
-//!   default identifier.
+//!   session counts in its pipe positions and does not charge; zmux never
+//!   sends one.
+//! - A server upgrades only a client that offers a subprotocol it
+//!   accepts. Any other request, one offering none, one that is not a
+//!   valid upgrade, or one the listener's admission does not accept
+//!   ([`zmux::ListenerConfig::admission`]), is refused
+//!   before anything is written: [`serve`] hands it to the listener's
+//!   fallback ([`zmux::ListenerConfig::fallback`]), with the bytes read replayed, or answers
+//!   it with `404 Not Found` ([`not_found`]).
+//! - An admission decides on the request head, so a client's credential
+//!   travels in a request header field ([`Options::with_credential`],
+//!   [`zmux::Credential::header`]): a prefix authentication token in
+//!   `Zmux-Prefix-Auth`, bound to the TLS connection under it where the
+//!   adapter holds that ([`dial_tls`], and [`accept`] with the
+//!   connection's exporter).
 //! - The `Zmux-Pipe-Join` request header ([`zmux::JOIN_HEADER`]) carries an
 //!   out-of-band join (MULTIPATH.md Section 5.3): [`serve`] and [`accept`]
 //!   hand it to the listener.
@@ -64,29 +76,40 @@
 //! # }
 //! ```
 
-use std::io::{self, IoSlice};
-use std::net::{IpAddr, SocketAddr};
+#![forbid(unsafe_code)]
+
+#[cfg(feature = "hyper")]
+mod hyper_upgrade;
+#[cfg(feature = "hyper")]
+pub use hyper_upgrade::{RequestUpgrade, UpgradedCarrier, accept_request};
+
+use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, Stream, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::{
     Request as ClientRequest, Response as ClientResponse,
 };
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::http::{self, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use zmux::{ConnectError, Listener, PipeHint, PipeIo, Session};
+use zmux::carrier::ChunkWrite;
+use zmux::{
+    Admit, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo, Prefixed,
+    Session,
+};
 
-const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
+pub(crate) const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 /// A pipe carrier from an established WebSocket, client or server:
 /// message framing, the subprotocol `protocol` as the session's protocol.
@@ -97,14 +120,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (sink, stream) = ws.split();
-    let io = PipeIo::from_halves(
+    let io = PipeIo::from_chunk_halves(
         Reader { stream },
         Writer {
             sink,
             started: None,
         },
     )
-    .records();
+    .records()
+    .with_carrier(zmux::CarrierKind::WebSocket);
     match protocol {
         Some(p) => io.with_protocol(p),
         None => io,
@@ -113,13 +137,15 @@ where
 
 /// A carrier over a new WebSocket to `request` (a `ws://` URL, or a request
 /// with headers such as [`zmux::JOIN_HEADER`]): the subprotocols default to
-/// [`zmux::alpn_protocols`]. Over plain TCP, a pipe that zmux fails is
-/// aborted without a Close frame.
+/// [`zmux::alpn_protocols`], and the header field of
+/// [`Options::with_credential`] is added (given no exporter: there is no TLS).
+/// Over plain TCP, a pipe that zmux fails is aborted without a Close
+/// frame.
 pub async fn dial(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
 ) -> io::Result<PipeIo> {
-    let request = offer(request, options)?;
+    let request = offer(request, options, &CarrierInfo::new())?;
     let (ws, response) =
         tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), true)
             .await
@@ -138,8 +164,10 @@ pub async fn dial(
 
 /// A carrier over a new WebSocket on `io`, an established byte stream such
 /// as a TLS stream: the client handshake for `request` (a `ws://` or
-/// `wss://` URL, or a request with headers), the subprotocols as in
-/// [`dial`]. Give the carrier the TCP socket underneath
+/// `wss://` URL, or a request with headers), the subprotocols and the
+/// credential's header field as in [`dial`] (the credential is given no
+/// exporter: a bound one needs [`dial_tls`]). Give the carrier the TCP
+/// socket underneath
 /// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without a
 /// Close frame, as [`dial_tls`] does.
 ///
@@ -161,19 +189,36 @@ pub async fn dial_over<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let request = offer(request, options)?;
+    let request = offer(request, options, &CarrierInfo::new())?;
+    upgrade_over(io, request).await
+}
+
+/// The client handshake of `request` on `io`.
+async fn upgrade_over<S>(io: S, request: ClientRequest) -> io::Result<PipeIo>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (ws, response) =
         tokio_tungstenite::client_async_with_config(request, io, Some(ws_config()))
             .await
-            .map_err(io::Error::other)?;
+            .map_err(|e| match e {
+                // The server or an intermediary answered without upgrading.
+                tokio_tungstenite::tungstenite::Error::Http(r) => io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("the server answered {}", r.status()),
+                ),
+                e => io::Error::other(e),
+            })?;
     Ok(pipe(ws, negotiated(&response)))
 }
 
 /// A carrier over a new WebSocket over TLS to a `wss://` `request`: TCP to
 /// the URL's host and port (443 by default), TLS with `tls` for the host's
 /// name (the application's client configuration chooses roots, ALPN and
-/// early data, as with the other adapters), then [`dial_over`]. A pipe
-/// that zmux fails is aborted without a Close frame.
+/// early data, as with the other adapters), then [`dial_over`], with the
+/// credential given the server's address, the negotiated ALPN identifier,
+/// the host's name and the TLS exporter. A pipe that zmux fails is aborted
+/// without a Close frame.
 pub async fn dial_tls(
     request: impl IntoClientRequest + Unpin,
     tls: &tokio_rustls::TlsConnector,
@@ -194,11 +239,22 @@ pub async fn dial_tls(
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
     let _ = tcp.set_nodelay(true);
     let socket = tcp_dup(&tcp);
+    let peer = tcp.peer_addr().ok();
     let conn = tls.connect(name, tcp).await?;
-    Ok(with_socket(
-        dial_over(conn, request, options).await?,
-        socket,
-    ))
+    let request = {
+        let c = conn.get_ref().1;
+        let mut info = CarrierInfo::new()
+            .with_alpn(c.alpn_protocol())
+            .with_server_name(Some(&host))
+            .with_exporter(|label, context, out| {
+                c.export_keying_material(out, label, Some(context)).is_ok()
+            });
+        if let Some(p) = peer {
+            info = info.with_source(p).with_peer(p);
+        }
+        offer(request, options, &info)?
+    };
+    Ok(with_socket(upgrade_over(conn, request).await?, socket))
 }
 
 /// Establishes a session over a new WebSocket over TLS ([`dial_tls`], then
@@ -215,13 +271,27 @@ pub async fn connect_tls(
     Session::connect(io, config).await
 }
 
-/// The request with the offered subprotocols unless it names its own.
-fn offer(request: impl IntoClientRequest + Unpin, options: &Options) -> io::Result<ClientRequest> {
+/// The request with the offered subprotocols unless it names its own, and
+/// the header field of [`Options::with_credential`] for a carrier with metadata
+/// `info`.
+fn offer(
+    request: impl IntoClientRequest + Unpin,
+    options: &Options,
+    info: &CarrierInfo<'_>,
+) -> io::Result<ClientRequest> {
     let mut request = request.into_client_request().map_err(io::Error::other)?;
     if !request.headers().contains_key(PROTOCOL_HEADER) {
         let offer = options.offer().join(", ");
         let value = HeaderValue::from_str(&offer).map_err(io::Error::other)?;
         request.headers_mut().insert(PROTOCOL_HEADER, value);
+    }
+    if let Some(c) = &options.credential {
+        let (name, value) = c.header(info)?;
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        request.headers_mut().insert(name, value);
     }
     Ok(request)
 }
@@ -259,124 +329,364 @@ pub async fn connect(
     Session::connect(io, config).await
 }
 
+/// What became of an upgrade request ([`accept`]).
+#[derive(Debug)]
+// Returned once per connection and taken apart at once.
+#[allow(clippy::large_enum_variant)]
+pub enum Upgrade<S> {
+    /// Upgraded: the carrier and its hint, for [`Listener::handle_pipe`].
+    Accepted(PipeIo, PipeHint),
+    /// Not upgraded: the connection, every byte read from it replayed in
+    /// front, for the application's HTTP handler; without one, answer it
+    /// with [`not_found`].
+    Refused(Prefixed<S>),
+    /// Stalled or closed by the admission; nothing more to do.
+    Ended,
+}
+
 /// Upgrades one accepted connection, any byte stream such as a TLS
-/// stream, to a WebSocket carrier (messages of at most one record): the
-/// subprotocol is the first the client offers that `options` accepts (an
-/// identifier of it or its draft-01 alias; none when the client offers
-/// none of them, which is accepted), and the hint carries `peer`
-/// (the client's address) and the [`zmux::JOIN_HEADER`] of the request,
-/// for [`Listener::handle_pipe`]. Over TLS, give the carrier the TCP
-/// socket underneath ([`PipeIo::with_tcp_socket`]) so that a failed pipe is
-/// aborted without a Close frame.
+/// stream, to a WebSocket carrier (messages of at most one record), or
+/// refuses it. `entry` is the connection's entry into the listener
+/// ([`Listener::enter`], taken before its TLS handshake). Nothing is
+/// written on the connection before the upgrade is decided.
+///
+/// The request head is read first, up to [`Options::max_request_head`]
+/// bytes (bound the call: [`serve`] bounds it with the listener's
+/// handshake timeout); with the TLS handshake before, it is the carrier's
+/// outer handshake. It is upgraded when it is a WebSocket upgrade request
+/// (`GET`, HTTP/1.1, `Connection: upgrade`, `Upgrade: websocket`, version
+/// 13 and a key), the client offers a subprotocol that `options` accepts
+/// (an identifier of it or its draft-01 alias; the first offered one is
+/// selected), and the listener's admission
+/// ([`zmux::ListenerConfig::admission`]) accepts it. The admission decides
+/// on the request head, which the metadata carries
+/// ([`CarrierInfo::request`], an `http::request::Parts`, and its header
+/// fields, [`CarrierInfo::for_each_header`]; [`CarrierInfo::head`] is
+/// set), without a prefix ([`zmux::Admission::prefix_auth`] takes its
+/// token from the request header field), together with what `info` gives
+/// of the connection (over TLS its exporter, ALPN identifier and server
+/// name: `zmux_rustls::carrier_info`). Every other request, a malformed
+/// or oversized head included, is [`Upgrade::Refused`], the bytes read
+/// replayed, as is one the admission decides on with `Fallback`; `Stall`
+/// reads and discards for a stall's duration and then closes, and `Close`
+/// closes, without a response ([`Upgrade::Ended`]). When the entry's peer
+/// is an intermediary the listener trusts to report its client in a
+/// forwarding header field, the client it reports is the carrier's source
+/// instead ([`zmux::TrustedProxies::source`], [`Entry::set_source`]). The
+/// hint carries the entry and the [`zmux::JOIN_HEADER`] of the request,
+/// for [`Listener::handle_pipe`]. An upgrade that an intermediary
+/// forwarded from TLS early data (`Early-Data: 1`) is answered
+/// `425 Too Early` before any admission and is [`Upgrade::Ended`]. A
+/// refused or too-early request counts in the listener's statistics as a
+/// failed handshake. Over TLS, give the carrier the TCP socket underneath
+/// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without
+/// a Close frame.
 ///
 /// ```no_run
 /// # async fn example(listener: zmux::Listener, tcp: tokio::net::TcpListener,
-/// #     tls: tokio_rustls::TlsAcceptor) {
-/// // wss://: TLS, then the upgrade, within the listener's limits.
-/// listener
-///     .serve_with(
-///         || tcp.accept(),
-///         move |conn, peer| {
-///             let tls = tls.clone();
-///             async move {
-///                 let conn = tls.accept(conn).await?;
-///                 zmux_websocket::accept(conn, Some(peer.ip()), &Default::default()).await
-///             }
-///         },
-///     )
-///     .await;
+/// #     tls: tokio_rustls::TlsAcceptor) -> std::io::Result<()> {
+/// use zmux_websocket::Upgrade;
+///
+/// // wss://: the source slot, TLS, then the upgrade.
+/// let (conn, peer) = tcp.accept().await?;
+/// let Some(entry) = listener.enter(peer, None) else {
+///     return Ok(());
+/// };
+/// let conn = tls.accept(conn).await?;
+/// // zmux_rustls::carrier_info(c) also gives the TLS exporter, for bound
+/// // tokens.
+/// let options = zmux_websocket::Options::default();
+/// let upgraded = zmux_websocket::accept(conn, entry, |_| zmux::CarrierInfo::new(), &listener, &options);
+/// match upgraded.await? {
+///     Upgrade::Accepted(pipe, hint) => {
+///         let _ = listener.handle_pipe(pipe, hint).await;
+///     }
+///     Upgrade::Refused(mut conn) => zmux_websocket::not_found(&mut conn).await?,
+///     Upgrade::Ended => {}
+/// }
+/// # Ok(())
 /// # }
 /// ```
-// The handshake callback's error type is tungstenite's.
-#[allow(clippy::result_large_err)]
-pub async fn accept<S>(
-    io: S,
-    peer: Option<IpAddr>,
+pub async fn accept<S, I>(
+    mut io: S,
+    mut entry: Entry,
+    info: I,
+    listener: &Listener,
     options: &Options,
-) -> io::Result<(PipeIo, PipeHint)>
+) -> io::Result<Upgrade<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    I: for<'a> FnOnce(&'a S) -> CarrierInfo<'a>,
 {
-    let mut chosen = None;
-    let mut join = None;
-    let ws = tokio_tungstenite::accept_hdr_async_with_config(
-        io,
-        |req: &Request, mut resp: Response| {
-            handshake(options, req, &mut resp, &mut chosen, &mut join);
-            Ok(resp)
-        },
-        Some(ws_config()),
-    )
-    .await
-    .map_err(io::Error::other)?;
-    let mut hint = peer.map(PipeHint::from_addr).unwrap_or_default();
-    if let Some(j) = &join {
-        hint = hint.with_join_header(j);
+    let (buf, head_len) = read_head(&mut io, options.max_request_head).await?;
+    // Not an upgrade this server takes: a failed upgrade (the entry
+    // dropped counts it).
+    let Some(head_len) = head_len else {
+        return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+    };
+    let Some(upgrade) = parse_upgrade(&buf[..head_len], options) else {
+        return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+    };
+    let fields = || {
+        upgrade
+            .parts
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_bytes()))
+    };
+    if zmux::forwarded_early_data(fields()) {
+        // Forwarded from TLS early data: no carrier is taken from it, and
+        // the intermediary repeats it after its handshake.
+        io.write_all(b"HTTP/1.1 425 Too Early\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        let _ = io.shutdown().await;
+        return Ok(Upgrade::Ended);
     }
-    Ok((pipe(ws, chosen), hint))
+    // Behind a PROXY protocol header, the client it reported is the hop
+    // whose forwarding header field counts.
+    let source = listener.trusted_proxies().source(entry.source(), fields());
+    if !entry.set_source(source) {
+        return Ok(Upgrade::Ended);
+    }
+    let admit = {
+        let info = info(&io)
+            .with_head()
+            .with_request(&upgrade.parts)
+            .with_headers(fields);
+        entry.decide(info, Vec::new()).await
+    };
+    match admit {
+        Admit::Accept(_) => {}
+        Admit::Fallback(_) => return Ok(Upgrade::Refused(Prefixed::new(io, buf))),
+        Admit::Stall => {
+            entry.stall(Some(&mut io)).await;
+            let _ = io.shutdown().await;
+            return Ok(Upgrade::Ended);
+        }
+        _ => return Ok(Upgrade::Ended),
+    }
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Accept: {}\r\n{PROTOCOL_HEADER}: {}\r\n\r\n",
+        upgrade.accept_key, upgrade.protocol
+    );
+    io.write_all(response.as_bytes()).await?;
+    io.flush().await?;
+    let rest = buf[head_len..].to_vec();
+    let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
+    let mut hint = PipeHint::from_entry(entry);
+    if let Some(j) = upgrade.join {
+        hint = hint.with_join_header(&j);
+    }
+    Ok(Upgrade::Accepted(pipe(ws, Some(upgrade.protocol)), hint))
 }
 
-/// [`accept`] on a TCP connection, which also aborts a failed pipe.
-async fn accept_tcp(
-    tcp: TcpStream,
-    peer: SocketAddr,
-    options: Arc<Options>,
-) -> io::Result<(PipeIo, PipeHint)> {
-    let _ = tcp.set_nodelay(true);
-    let socket = tcp_dup(&tcp);
-    let (io, hint) = accept(tcp, Some(peer.ip()), &options).await?;
-    #[cfg(any(unix, windows))]
-    if let Some(s) = socket {
-        return Ok((io.with_tcp_socket(&s), hint));
-    }
-    #[cfg(not(any(unix, windows)))]
-    let _ = socket;
-    Ok((io, hint))
+/// Answers a refused request with `404 Not Found` and ends the
+/// connection's write side: the answer of a server without an HTTP
+/// handler for requests it does not upgrade.
+pub async fn not_found<S: AsyncWrite + Unpin + ?Sized>(io: &mut S) -> io::Result<()> {
+    io.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await?;
+    io.shutdown().await
 }
 
-/// The server side of the upgrade: the subprotocol and the join header.
-fn handshake(
-    options: &Options,
-    req: &Request,
-    resp: &mut Response,
-    chosen: &mut Option<String>,
-    join: &mut Option<String>,
-) {
-    let offered = req
-        .headers()
-        .get_all(PROTOCOL_HEADER)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim);
-    for o in offered {
-        if options.accepts(o) {
-            if let Ok(v) = HeaderValue::from_str(o) {
-                resp.headers_mut().insert(PROTOCOL_HEADER, v);
-                *chosen = Some(o.to_owned());
-            }
-            break;
+/// Reads until the end of the request head: the bytes read, and the
+/// head's length once its end is among them within `limit` bytes (`None`
+/// when the connection ended, or the limit passed, before it).
+async fn read_head<S: AsyncRead + Unpin>(
+    io: &mut S,
+    limit: usize,
+) -> io::Result<(Vec<u8>, Option<usize>)> {
+    let mut buf = Vec::with_capacity(limit.min(1024));
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = io
+            .read(&mut chunk[..(limit - buf.len()).clamp(1, 1024)])
+            .await?;
+        if n == 0 {
+            return Ok((buf, None));
+        }
+        let from = buf.len().saturating_sub(3);
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok((buf, Some(from + i + 4)));
+        }
+        if buf.len() >= limit {
+            return Ok((buf, None));
         }
     }
-    *join = req
-        .headers()
+}
+
+/// A request head that upgrades.
+struct UpgradeRequest {
+    parts: http::request::Parts,
+    protocol: String,
+    accept_key: String,
+    join: Option<String>,
+}
+
+/// The upgrade of `head` (a complete request head), when it is a
+/// WebSocket upgrade request offering a subprotocol `options` accepts.
+fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
+    let lines = head.windows(2).filter(|w| w == b"\r\n").count();
+    let mut headers = vec![httparse::EMPTY_HEADER; lines];
+    let mut req = httparse::Request::new(&mut headers);
+    if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) || req.version != Some(1) {
+        return None;
+    }
+    let mut builder = http::Request::builder()
+        .method(req.method?)
+        .uri(req.path?)
+        .version(http::Version::HTTP_11);
+    for h in req.headers.iter() {
+        builder = builder.header(h.name, h.value);
+    }
+    let (parts, ()) = builder.body(()).ok()?.into_parts();
+    let headers = &parts.headers;
+    let tokens = |name: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let upgrade = parts.method == http::Method::GET
+        && tokens("Connection")
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("upgrade"))
+        && tokens("Upgrade")
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("websocket"))
+        && headers
+            .get("Sec-WebSocket-Version")
+            .is_some_and(|v| v.as_bytes() == b"13");
+    if !upgrade {
+        return None;
+    }
+    let key = headers.get("Sec-WebSocket-Key")?;
+    let protocol = options.select(&tokens(PROTOCOL_HEADER))?;
+    let join = headers
         .get(zmux::JOIN_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    Some(UpgradeRequest {
+        accept_key: derive_accept_key(key.as_bytes()),
+        protocol,
+        join,
+        parts,
+    })
 }
 
 /// Serves WebSocket upgrades on a TCP listener until `listener` is
-/// closed ([`Listener::serve_with`]): each connection's upgrade runs in a
-/// task of its own within the listener's `handshake_timeout`, and its
-/// carrier goes to [`Listener::handle_pipe`] (new sessions to
-/// [`Listener::accept`]).
+/// closed: each connection, in a task of its own and as a setup of
+/// [`Listener::serve_connections`] (within the listener's
+/// `handshake_timeout` and `max_pending`), has the PROXY protocol header
+/// of an intermediary the listener trusts to send it read first
+/// ([`zmux::proxied_source`]: the client it reports is the source, a
+/// forwarding header field then applies on top), takes its source slot
+/// ([`Listener::enter`]) and is upgraded by [`accept`], the listener's
+/// admission deciding. An upgraded carrier goes to
+/// [`Listener::handle_pipe`] (new sessions to [`Listener::accept`]), and
+/// a refused request to the listener's byte-stream fallback
+/// ([`zmux::ListenerConfig::fallback`]), given the connection with every
+/// byte read replayed and the source, or else is answered with
+/// [`not_found`]. [`serve_tls`] serves `wss://`.
 pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
-    let options = Arc::new(options);
+    serve_over(
+        listener,
+        tcp,
+        options,
+        |conn| std::future::ready(Ok(conn)),
+        |_| CarrierInfo::new(),
+    )
+    .await;
+}
+
+/// Serves WebSocket upgrades over TLS (`wss://`) on a TCP listener until
+/// `listener` is closed, as [`serve`] does: the PROXY protocol header of a
+/// trusted intermediary is read and the source slot taken before the
+/// handshake, the handshake and the upgrade run within the listener's
+/// `handshake_timeout`, and the admission decides with the connection's
+/// exporter, ALPN identifier and server name
+/// ([`zmux_rustls::carrier_info`]). `tls` should offer the ALPN
+/// identifier `http/1.1`.
+pub async fn serve_tls(
+    listener: Listener,
+    tcp: TcpListener,
+    tls: tokio_rustls::TlsAcceptor,
+    options: Options,
+) {
+    serve_over(
+        listener,
+        tcp,
+        options,
+        move |conn| tls.accept(conn),
+        zmux_rustls::carrier_info::<TcpStream>,
+    )
+    .await;
+}
+
+/// [`serve`] with `setup` (a TLS handshake) between the PROXY protocol
+/// header and the upgrade, and `info` the metadata of a set-up connection.
+async fn serve_over<C, S, SF>(
+    listener: Listener,
+    tcp: TcpListener,
+    options: Options,
+    setup: S,
+    info: fn(&C) -> CarrierInfo<'_>,
+) where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: Fn(TcpStream) -> SF + Send + Sync + 'static,
+    SF: Future<Output = io::Result<C>> + Send,
+{
+    let trusted = listener.trusted_proxies().clone();
+    let shared = Arc::new((options, trusted, setup));
+    let upgrade = {
+        let listener = listener.clone();
+        move |(mut conn, peer): (TcpStream, SocketAddr)| {
+            let (shared, listener) = (shared.clone(), listener.clone());
+            async move {
+                let (options, trusted, setup) = &*shared;
+                let _ = conn.set_nodelay(true);
+                let socket = tcp_dup(&conn);
+                let Ok(source) = zmux::proxied_source(&mut conn, peer, trusted).await else {
+                    listener.count_setup_failure();
+                    return Err(());
+                };
+                let entry = listener.enter(peer, Some(source)).ok_or(())?;
+                // A failed handshake or upgrade counts with the entry.
+                let conn = setup(conn).await.map_err(drop)?;
+                let upgraded = accept(conn, entry, info, &listener, options)
+                    .await
+                    .map_err(drop)?;
+                Ok((upgraded, socket, source))
+            }
+        }
+    };
+    let served = move |l: Listener, (upgraded, socket, source)| async move {
+        match upgraded {
+            Upgrade::Accepted(io, hint) => {
+                let _ = l.handle_pipe(with_socket(io, socket), hint).await;
+            }
+            Upgrade::Refused(conn) => match l.limits().fallback {
+                Some(f) => {
+                    let (conn, prefix) = conn.into_parts();
+                    let conn: Box<dyn zmux::FallbackStream> = Box::new(conn);
+                    f.serve(Prefixed::new(conn, prefix), source).await;
+                }
+                None => {
+                    let mut conn = conn;
+                    let _ = not_found(&mut conn).await;
+                }
+            },
+            Upgrade::Ended => {}
+        }
+    };
     listener
-        .serve_with(
-            || tcp.accept(),
-            |conn, peer| accept_tcp(conn, peer, options.clone()),
-        )
+        .serve_connections(|| async { Some(tcp.accept().await) }, upgrade, served)
         .await;
 }
 
@@ -396,14 +706,17 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
 #[derive(Debug, Clone)]
 pub struct Options {
     protocols: Vec<String>,
+    credential: Option<Arc<dyn Credential>>,
+    max_request_head: usize,
 }
 
+/// The default of [`Options::max_request_head`].
+pub const DEFAULT_MAX_REQUEST_HEAD: usize = 16 << 10;
+
 impl Default for Options {
-    /// `qmux-02`, with its alias `qmux-01`.
+    /// `qmux-02`, with its alias `qmux-01`; no admission.
     fn default() -> Self {
-        Self {
-            protocols: vec![String::from_utf8_lossy(zmux::proto::ident::DEFAULT_ALPN).into_owned()],
-        }
+        Self::for_protocol(String::from_utf8_lossy(zmux::proto::ident::DEFAULT_ALPN).into_owned())
     }
 }
 
@@ -421,7 +734,30 @@ impl Options {
     pub fn for_protocol(id: impl Into<String>) -> Self {
         Self {
             protocols: vec![id.into()],
+            credential: None,
+            max_request_head: DEFAULT_MAX_REQUEST_HEAD,
         }
+    }
+
+    /// With the credential a client presents in a request header field
+    /// ([`Credential::header`]), such as a prefix authentication token.
+    #[must_use]
+    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
+    /// With this bound on a request head a server reads (default
+    /// [`DEFAULT_MAX_REQUEST_HEAD`], at least 1): a longer one is refused.
+    #[must_use]
+    pub fn with_max_request_head(mut self, bytes: usize) -> Self {
+        self.max_request_head = bytes.max(1);
+        self
+    }
+
+    /// The bound on a request head a server reads.
+    pub fn max_request_head(&self) -> usize {
+        self.max_request_head
     }
 
     /// With one more identifier, after the others in preference.
@@ -441,11 +777,21 @@ impl Options {
         self.protocols.iter().cloned().chain(aliases).collect()
     }
 
-    /// Whether an offered identifier is one of these or an alias of one.
-    fn accepts(&self, offered: &str) -> bool {
-        self.protocols
-            .iter()
-            .any(|p| zmux::proto::ident::alpn_matches(p.as_bytes(), offered.as_bytes()))
+    /// The offered identifier selected (SPEC.md Section 6.2): the first of
+    /// these, in order, that the client offered as it is or as its alias;
+    /// the identifier as it is when both were offered.
+    pub(crate) fn select(&self, offered: &[String]) -> Option<String> {
+        self.protocols.iter().find_map(|p| {
+            offered
+                .iter()
+                .find(|o| o.as_str() == p.as_str())
+                .or_else(|| {
+                    offered
+                        .iter()
+                        .find(|o| zmux::proto::ident::alpn_matches(p.as_bytes(), o.as_bytes()))
+                })
+                .cloned()
+        })
     }
 }
 
@@ -455,7 +801,7 @@ impl Options {
 /// `max_record_size` reaches it as the record above the limit that it is
 /// (FRAME_ENCODING_ERROR) rather than as a carrier failure. The session's
 /// read buffer holds every message this lets through.
-fn ws_config() -> WebSocketConfig {
+pub(crate) fn ws_config() -> WebSocketConfig {
     let max = zmux::proto::params::ZMUX_MAX_RECORD_SIZE as usize + 1;
     WebSocketConfig::default()
         .max_message_size(Some(max))
@@ -506,9 +852,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
                 Some(Ok(m)) => m,
             };
             match msg {
-                // An empty message is an empty record, which the session
-                // charges like a record of PADDING only (a read of nothing
-                // would be the end).
+                // An empty message is an empty record, a no-op for the
+                // session (a read of nothing would be the end).
                 Message::Binary(b) if b.is_empty() => {
                     return Poll::Ready(Err(zmux::carrier::empty_message()));
                 }
@@ -538,74 +883,114 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
     }
 }
 
-/// The sending half: one binary message per write, flushed before the write
-/// returns.
+/// The sending half: one binary message per write, the session's buffer
+/// as it is, flushed before the write returns.
 struct Writer<S> {
     sink: SplitSink<WebSocketStream<S>, Message>,
     /// The length of the message handed to the sink and not yet flushed.
     started: Option<usize>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Writer<S> {
-    fn poll_message(
-        &mut self,
-        cx: &mut Context<'_>,
-        make: impl FnOnce() -> Bytes,
-    ) -> Poll<io::Result<usize>> {
-        let err = |e| io::Error::new(io::ErrorKind::ConnectionReset, e);
-        if self.started.is_none() {
-            ready!(Pin::new(&mut self.sink).poll_ready(cx)).map_err(err)?;
-            let msg = make();
-            let n = msg.len();
-            Pin::new(&mut self.sink)
-                .start_send(Message::Binary(msg))
-                .map_err(err)?;
-            self.started = Some(n);
-        }
-        ready!(Pin::new(&mut self.sink).poll_flush(cx)).map_err(err)?;
-        Poll::Ready(Ok(self.started.take().unwrap_or(0)))
-    }
+fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionReset, e)
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Writer<S> {
-    fn poll_write(
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
+    /// `chunks` is one message.
+    fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        chunks: &mut [Bytes],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .poll_message(cx, || Bytes::copy_from_slice(buf))
+        let this = self.get_mut();
+        let Some(msg) = chunks.first_mut() else {
+            return Poll::Ready(Ok(0));
+        };
+        if this.started.is_none() {
+            ready!(Pin::new(&mut this.sink).poll_ready(cx)).map_err(ws_error)?;
+            // Shared with the sink; taken from `chunks` once flushed.
+            Pin::new(&mut this.sink)
+                .start_send(Message::Binary(msg.clone()))
+                .map_err(ws_error)?;
+            this.started = Some(msg.len());
+        }
+        ready!(Pin::new(&mut this.sink).poll_flush(cx)).map_err(ws_error)?;
+        let n = this.started.take().unwrap_or(0);
+        debug_assert_eq!(n, msg.len());
+        *msg = Bytes::new();
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.sink)
-            .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
+        Pin::new(&mut self.sink).poll_flush(cx).map_err(ws_error)
     }
 
     /// Sends a Close frame: the graceful end.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.sink)
-            .poll_close(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
+        Pin::new(&mut self.sink).poll_close(cx).map_err(ws_error)
+    }
+}
+
+/// A [`zmux::Candidate`] of [`zmux::CarrierKind::WebSocket`] for carrier
+/// modes: a WebSocket to `url` (`ws://` or `wss://`, its target the
+/// endpoint's) over a connection that `connect` makes, plain TCP or TLS
+/// ([`dial_over`]).
+pub fn candidate<C, F, S>(connect: C, url: &str, options: &Options) -> zmux::Candidate
+where
+    C: Fn() -> F + Send + Sync + 'static,
+    F: std::future::Future<Output = io::Result<S>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let connect = Arc::new(connect);
+    let url: Arc<str> = url.into();
+    let options = Arc::new(options.clone());
+    zmux::Candidate::new(zmux::CarrierKind::WebSocket, move || {
+        let (connect, url, options) = (connect.clone(), url.clone(), options.clone());
+        async move { dial_over(connect().await?, &*url, &options).await }
+    })
+}
+
+/// A [`zmux::Candidate`] of [`zmux::CarrierKind::WebSocket`] over TLS to a
+/// `wss://` `url` ([`dial_tls`]).
+pub fn candidate_tls(
+    url: &str,
+    tls: tokio_rustls::TlsConnector,
+    options: &Options,
+) -> zmux::Candidate {
+    let url: Arc<str> = url.into();
+    let options = Arc::new(options.clone());
+    zmux::Candidate::new(zmux::CarrierKind::WebSocket, move || {
+        let (url, tls, options) = (url.clone(), tls.clone(), options.clone());
+        async move { dial_tls(&*url, &tls, &options).await }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+
+    fn offer(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    /// The slices as one message.
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_message(cx, || {
-            let mut v = Vec::with_capacity(bufs.iter().map(|b| b.len()).sum());
-            for b in bufs {
-                v.extend_from_slice(b);
-            }
-            Bytes::from(v)
-        })
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        true
+    /// The server's order of preference decides, and the identifier as it
+    /// is wins over its alias (SPEC.md Section 6.2).
+    #[test]
+    fn the_server_selects_in_its_own_order() {
+        let o = Options::for_protocol("app-02").with_protocol("qmux-02");
+        assert_eq!(
+            o.select(&offer(&["qmux-02", "app-02"])).as_deref(),
+            Some("app-02")
+        );
+        assert_eq!(
+            o.select(&offer(&["qmux-02", "app-01"])).as_deref(),
+            Some("app-01")
+        );
+        assert_eq!(
+            o.select(&offer(&["app-01", "app-02"])).as_deref(),
+            Some("app-02")
+        );
+        assert_eq!(o.select(&offer(&["qmux-01"])).as_deref(), Some("qmux-01"));
+        assert_eq!(o.select(&offer(&["qmux-00", "other"])), None);
     }
 }

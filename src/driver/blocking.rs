@@ -19,6 +19,7 @@ use super::engine::{self, Calls, Outbound, Progress};
 use super::handle::{self, CarrierInfo, Driver, Shared, State};
 use super::sync::{park, thread_waker};
 use super::tcp::{Probe, TcpSocket};
+use super::unsent::{RetransmittedQuery, Unsent, UnsentQuery};
 use super::wait::WaitList;
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
@@ -127,9 +128,16 @@ pub struct PipeIo {
     abort: Option<Box<dyn FnOnce() + Send>>,
     exporter: Option<Box<handle::Exporters>>,
     protocol: Option<String>,
+    carrier: Option<crate::CarrierKind>,
     /// The TCP socket under the carrier: its minimum RTT, unsent bytes and
     /// low-water mark ([`Probe`]).
     socket: Option<TcpSocket>,
+    /// The carrier's unsent count ([`PipeIo::with_unsent`]).
+    unsent: Option<Unsent>,
+    /// The carrier's retransmission count ([`PipeIo::with_retransmitted`]).
+    retransmitted: Option<Unsent>,
+    /// The carrier's write overhead ([`PipeIo::with_write_overhead`]).
+    write_overhead: u16,
     /// The carrier has a low-water mark.
     low_water: bool,
 }
@@ -140,7 +148,7 @@ impl PipeIo {
     /// write blocked on a peer that went silent). The kernel's minimum RTT
     /// and unsent bytes are queried and `TCP_NOTSENT_LOWAT` follows the send
     /// rate as for `zmux::PipeIo::tcp`.
-    pub fn tcp(stream: TcpStream) -> io::Result<Self> {
+    pub fn tcp(stream: TcpStream) -> Self {
         let _ = stream.set_nodelay(true);
         // One descriptor: the threads, the closer, the abort and the
         // socket queries share it.
@@ -151,7 +159,7 @@ impl PipeIo {
             .as_ref()
             .is_some_and(|s| s.set_notsent_lowat(super::NOTSENT_LOWAT_SINGLE));
         let (control, abort) = (stream.clone(), stream.clone());
-        Ok(Self {
+        Self {
             reader: Some(Box::new(SharedTcp(stream.clone()))),
             writer: Some(Box::new(SharedTcp(stream))),
             closer: Some(Box::new(move |how| shut_down(&control, how))),
@@ -159,9 +167,13 @@ impl PipeIo {
             abort: Some(Box::new(move || shut_down(&abort, Shutdown::Both))),
             exporter: None,
             protocol: None,
+            carrier: None,
+            unsent: socket.as_ref().and_then(TcpSocket::unsent_query),
+            retransmitted: socket.as_ref().and_then(TcpSocket::retransmitted_query),
+            write_overhead: 0,
             socket,
             low_water,
-        })
+        }
     }
 
     /// A carrier from separate halves. The write side ends by dropping the
@@ -181,7 +193,11 @@ impl PipeIo {
             abort: None,
             exporter: None,
             protocol: None,
+            carrier: None,
             socket: None,
+            unsent: None,
+            retransmitted: None,
+            write_overhead: 0,
             low_water: false,
         }
     }
@@ -217,6 +233,43 @@ impl PipeIo {
     #[must_use]
     pub fn with_closer(mut self, closer: impl Fn(Shutdown) + Send + Sync + 'static) -> Self {
         self.closer = Some(Box::new(closer));
+        self
+    }
+
+    /// The carrier's unsent count, an optional capability (API.md Section
+    /// 4.1): `unsent` returns the bytes write calls handed to the carrier
+    /// that it has not transmitted yet, `None` while it has no count. The
+    /// writer thread calls it at most every 20 ms, outside the session
+    /// lock; it must not block. It is the pipe's `queued_bytes` and, with
+    /// the bytes of the write call in progress, its Q_p (SCHEDULER.md
+    /// Section 4). [`PipeIo::tcp`] installs the socket's query where the
+    /// platform has one (Linux, Android).
+    #[must_use]
+    pub fn with_unsent(mut self, unsent: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        self.unsent = Some(Box::new(unsent));
+        self
+    }
+
+    /// The carrier's retransmission count, an optional capability (API.md
+    /// Section 4.1), as `zmux::PipeIo::with_retransmitted`: the writer
+    /// thread calls it at most once a second, outside the session lock.
+    /// [`PipeIo::tcp`] installs the socket's query where the platform has
+    /// one.
+    #[must_use]
+    pub fn with_retransmitted(
+        mut self,
+        retransmitted: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        self.retransmitted = Some(Box::new(retransmitted));
+        self
+    }
+
+    /// The fixed number of bytes the layers below zmux add to each write
+    /// call on the carrier (0 by default), passed unchanged to the shaper
+    /// factory ([`crate::shaping::ShapedPipe::write_overhead`]).
+    #[must_use]
+    pub fn with_write_overhead(mut self, bytes: u16) -> Self {
+        self.write_overhead = bytes;
         self
     }
 
@@ -271,6 +324,22 @@ impl PipeIo {
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = Some(protocol.into());
         self
+    }
+
+    /// The carrier's kind: the [`ShapedPipe::carrier`] a shaper factory
+    /// sees for its pipe, and the kind in pipe events and statistics. The
+    /// adapters set it; a carrier without one (raw TCP or TLS) has none.
+    ///
+    /// [`ShapedPipe::carrier`]: crate::shaping::ShapedPipe::carrier
+    #[must_use]
+    pub fn with_carrier(mut self, kind: crate::CarrierKind) -> Self {
+        self.carrier = Some(kind);
+        self
+    }
+
+    /// The carrier's kind ([`PipeIo::with_carrier`]).
+    pub fn carrier(&self) -> Option<crate::CarrierKind> {
+        self.carrier
     }
 }
 
@@ -347,7 +416,7 @@ impl Drop for Deferred {
 ///
 /// ```no_run
 /// let dial = zmux::blocking::Dial::new(|_req| {
-///     zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect("127.0.0.1:4433")?)
+///     Ok(zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect("127.0.0.1:4433")?))
 /// });
 /// # let _ = dial;
 /// ```
@@ -434,6 +503,9 @@ impl Driver for Blocking {
             outbound: carrier.writer.is_some().then_some(carrier.framing),
             exporter: carrier.exporter.take(),
             protocol: carrier.protocol.take(),
+            kind: carrier.carrier,
+            write_overhead: carrier.write_overhead,
+            admitted: None,
         }
     }
 
@@ -500,6 +572,42 @@ impl State<Blocking> {
     }
 }
 
+/// A writer thread's carrier queries: the TCP socket's ([`Probe`]) and the
+/// carrier's unsent count.
+struct Queries {
+    probe: Option<Probe>,
+    unsent: Option<UnsentQuery>,
+    retransmitted: Option<RetransmittedQuery>,
+}
+
+impl Queries {
+    /// Without the lock: the queries that are due.
+    fn query(&mut self, now: Instant) {
+        if let Some(p) = &mut self.probe {
+            p.query(now);
+        }
+        if let Some(q) = &mut self.unsent {
+            q.query(now);
+        }
+        if let Some(q) = &mut self.retransmitted {
+            q.query(now);
+        }
+    }
+
+    /// Under the lock: their results go to the core.
+    fn feed(&mut self, core: &mut crate::proto::session::SessionCore, id: PipeId, now: Instant) {
+        if let Some(p) = &mut self.probe {
+            p.feed(core, id);
+        }
+        if let Some(q) = &mut self.unsent {
+            q.feed(core, id.into(), now);
+        }
+        if let Some(q) = &mut self.retransmitted {
+            q.feed(core, id, now);
+        }
+    }
+}
+
 /// Starts the threads of a pipe's halves. Added pipes (`id` > 0) belong to
 /// a multipath session.
 fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Result<()> {
@@ -510,6 +618,8 @@ fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Resu
         framing,
         abort,
         socket,
+        unsent,
+        retransmitted,
         low_water,
         ..
     } = pipe;
@@ -525,7 +635,11 @@ fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Resu
     }
     // Only a writer thread uses the probe: without one there is nothing to
     // tune.
-    let probe = socket.map(|s| Probe::new(s, lowat, Instant::now()));
+    let queries = Queries {
+        probe: socket.map(|s| Probe::new(s, lowat, Instant::now())),
+        unsent: unsent.map(|q| UnsentQuery::new(q, Instant::now())),
+        retransmitted: retransmitted.map(|q| RetransmittedQuery::new(q, Instant::now())),
+    };
     let closer: Option<Arc<Closer>> = closer.map(Arc::new);
     if let Some(c) = &closer {
         let threads = usize::from(reader.is_some()) + usize::from(writer.is_some());
@@ -560,7 +674,7 @@ fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Resu
         }
         let spawned = thread::Builder::new()
             .name("zmux-write".into())
-            .spawn(move || writer_thread(s, PipeId(id), w, c, abort, framing, probe));
+            .spawn(move || writer_thread(s, PipeId(id), w, c, abort, framing, queries));
         if let Err(e) = spawned {
             let mut st = shared.lock();
             st.io.writers_alive -= 1;
@@ -857,7 +971,7 @@ fn writer_thread(
     closer: Option<Arc<Closer>>,
     mut abort: Option<Box<dyn FnOnce() + Send>>,
     framing: Framing,
-    mut probe: Option<Probe>,
+    mut queries: Queries,
 ) {
     let _driver = DriverThread::enter();
     let me = thread_waker();
@@ -870,13 +984,9 @@ fn writer_thread(
     loop {
         // The carrier is queried without the lock, fed to the core under
         // it, and its low-water mark set after it (`Probe`).
-        if let Some(p) = &mut probe {
-            p.query(Instant::now());
-        }
+        queries.query(Instant::now());
         let mut st = shared.lock();
-        if let Some(p) = &mut probe {
-            p.feed(&mut st.core, id, Instant::now());
-        }
+        queries.feed(&mut st.core, id, Instant::now());
         let ready = loop {
             if let Some(abortive) = st.take_close(id, PipeHalf::Outbound) {
                 break Err(abortive);
@@ -919,7 +1029,7 @@ fn writer_thread(
             st.io.writers.remove(t);
         }
         drop(st);
-        if let Some(p) = &mut probe {
+        if let Some(p) = &mut queries.probe {
             p.apply();
         }
         if let Err(abortive) = ready {
@@ -947,6 +1057,7 @@ fn writer_thread(
         // A blocking adapter's call returns once the bytes are handed on:
         // the carrier holds none of them unsent.
         progress.returned(call.0, now, call.1 - out.left(), false);
+        out.tell(&mut st.core, id);
         let _ = progress.report(&mut st.core, id, false, now);
         if let Err(e) = &result {
             st.core.write_failed(id, e.kind(), Instant::now());
@@ -1133,8 +1244,8 @@ impl Session {
     }
 
     /// Queues a session datagram, waiting while the queue is full.
-    pub fn send_datagram_wait(&self, data: Bytes) -> Result<(), DatagramError> {
-        call(self.send_datagram_wait_op(data))
+    pub fn send_datagram_with_backpressure(&self, data: Bytes) -> Result<(), DatagramError> {
+        call(self.send_datagram_with_backpressure_op(data))
     }
 
     /// Receives the next session datagram.
@@ -1158,10 +1269,28 @@ impl Session {
         call(async { Ok(self.ping_op().await?) })
     }
 
-    /// Waits until the session ended and returns why; on a thread that
-    /// drives sessions it fails at once ([`WaitError::OnDriverThread`]).
-    pub fn closed(&self) -> Result<SessionError, WaitError> {
-        call(async { Ok(self.closed_op().await) })
+    /// Waits until the peer's parameters arrived (the session is
+    /// established: with early data it is usable before), up to `timeout`
+    /// (`None`: as long as it takes; [`WaitError::TimedOut`] when it
+    /// expires), or fails with the error that ended the session first.
+    pub fn established(&self, timeout: Option<Duration>) -> Result<(), WaitError> {
+        if timeout != Some(Duration::ZERO) && on_driver_thread() {
+            return Err(WaitError::OnDriverThread);
+        }
+        let deadline = timeout.map(|t| Instant::now() + t);
+        run(self.established_op(), deadline).ok_or(WaitError::TimedOut)??;
+        Ok(())
+    }
+
+    /// Waits until the session ended and returns why, up to `timeout`
+    /// (`None`: as long as it takes; [`WaitError::TimedOut`] when it
+    /// expires). A zero timeout never waits (and works on any thread).
+    pub fn closed(&self, timeout: Option<Duration>) -> Result<SessionError, WaitError> {
+        if timeout != Some(Duration::ZERO) && on_driver_thread() {
+            return Err(WaitError::OnDriverThread);
+        }
+        let deadline = timeout.map(|t| Instant::now() + t);
+        run(self.closed_op(), deadline).ok_or(WaitError::TimedOut)
     }
 
     /// The next session event, waiting up to `timeout` (`None`: as long as

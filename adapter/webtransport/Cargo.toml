@@ -13,14 +13,16 @@ categories = ["network-programming"]
 [features]
 # The crypto provider of the WebTransport stack: ring (default) or aws-lc-rs.
 default = ["ring"]
-ring = ["web-transport-quinn/ring"]
-aws-lc-rs = ["web-transport-quinn/aws-lc-rs"]
+ring = ["web-transport-quinn/ring", "zmux-quinn/rustls-ring"]
+aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
 
 [dependencies]
+bytes = "1"
 url = "2"
 web-transport-quinn = { version = "0.13.5", default-features = false }
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync"] }
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
 zmux = { version = "1.2.4", path = "../.." }
+zmux-quinn = { version = "1.2.4", path = "../quinn", default-features = false }
 
 [dev-dependencies]
 bytes = "1"

@@ -550,7 +550,7 @@ fn a_window_remainder_below_the_step_is_forwarded_without_new_credit() {
             s.write_all(&[7u8; 32 * 1024]).await.unwrap();
             let inbound = hop.ra.accept_bi().await.unwrap();
             // Everything A sent is at the relay before the splice starts.
-            let readable = || inbound.1.stats().map_or(0, |st| st.bytes_received);
+            let readable = || inbound.1.stats().bytes_received;
             eventually(5, "A's data at the relay", || readable() == 32 * 1024).await;
             // The outbound stream reaches B, which finishes its side at
             // once: B is quiet from then on and sends no credit.
@@ -563,7 +563,7 @@ fn a_window_remainder_below_the_step_is_forwarded_without_new_credit() {
             opts.chunk = 3 * 1024;
             let relay = tokio::spawn(splice(inbound, (out_s, out_r), opts));
             // B's whole window, but for the preamble, arrives.
-            let received = || fr.stats().map_or(0, |st| st.bytes_received);
+            let received = || fr.stats().bytes_received;
             eventually(5, "the window remainder", || received() >= 16 * 1024 - 256).await;
             assert!(received() <= 16 * 1024, "{}", received());
             drop((s, r, fs, fr));

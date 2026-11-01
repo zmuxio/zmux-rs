@@ -93,7 +93,7 @@ fn config(edit: impl Fn(&mut Config)) -> Config {
     c.max_pipes = 16;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
     c.scheduler = Policy::SpreadEta;
-    c.max_idle_timeout = Duration::from_secs(120);
+    c.max_idle_timeout = Some(Duration::from_secs(120));
     // Credit never limits the backlog here.
     c.initial_stream_receive_window = 16 << 20;
     c.max_stream_receive_window = zmux::Cap::Fixed(16 << 20);
@@ -101,9 +101,10 @@ fn config(edit: impl Fn(&mut Config)) -> Config {
     c.max_connection_receive_window = zmux::Cap::Fixed(24 << 20);
     c.send_buffer = 64 << 20;
     c.probation = Some(Duration::ZERO);
-    // The idle-probe phase is random per session: pinned, the probe times
-    // are deterministic.
-    c.test_hooks().probe_phase = Some(0.0);
+    // Without probe jitter the probe times are deterministic.
+    c.probe_jitter = 0.0;
+    // Keep-alive would put a QX_PING on the control pipe every 15 s.
+    c.keep_alive_period = None;
     edit(&mut c);
     c
 }
@@ -186,7 +187,11 @@ fn a_burst_that_drains_within_the_overflow_delay_stays_in_its_tier() {
     // drain within D waits for it.
     n.links.get_mut(&0).unwrap().flows[A].takes = false;
     let now = n.now;
-    n.ends[A].pipe_write(PipeId(0), PipeWrite::returned(now, now, 0, 0, true), now);
+    n.ends[A].pipe_write(
+        PipeId::new(0),
+        PipeWrite::returned(now, now, 0, 0, true),
+        now,
+    );
     let before = n.stream_bytes(2);
     n.write(32 * 1024);
     n.run_for(60);
@@ -203,7 +208,7 @@ fn sustained_overload_overflows_only_the_excess() {
     let mut n = two_tiers(|c| c.overflow_delay = d);
     n.links.get_mut(&0).unwrap().flows[A].takes = false;
     let r0 = n.ends[A]
-        .pipe_info(PipeId(0))
+        .pipe_info(PipeId::new(0))
         .unwrap()
         .delivery_rate
         .unwrap();
@@ -240,7 +245,7 @@ fn a_standby_takeover_is_announced_and_withdrawn() {
     n.run_for(200);
     let req = |n: &Net| {
         n.ends[B]
-            .pipe_info(PipeId(standby))
+            .pipe_info(PipeId::new(standby))
             .unwrap()
             .peer_request
             .unwrap()
@@ -281,7 +286,7 @@ fn a_standby_takeover_is_announced_and_withdrawn() {
 fn a_fate_group_keeps_the_probation_backoff_across_rejoins() {
     let base = Duration::from_secs(1);
     let probation = |n: &Net, id: u64| {
-        let info = n.ends[A].pipe_info(PipeId(id)).unwrap();
+        let info = n.ends[A].pipe_info(PipeId::new(id)).unwrap();
         info.probation_until
             .map(|u| u.saturating_duration_since(n.now))
     };
@@ -370,7 +375,7 @@ impl zmux::proto::session::Pick for Newest {
         let newest = pipes
             .iter()
             .enumerate()
-            .max_by_key(|(_, p)| p.pipe.0)
+            .max_by_key(|(_, p)| p.pipe.get())
             .map(|(i, _)| i);
         for a in out.iter_mut().take(reqs.len()) {
             if let Some(index) = newest {
@@ -397,6 +402,45 @@ fn a_custom_policy_never_puts_new_data_on_a_joining_pipe() {
     assert!(n.stream_bytes(0) >= 64 * 1024);
 }
 
+/// Holds every direction (`Wait`), and counts its calls.
+struct Waits(std::sync::atomic::AtomicU64);
+
+impl zmux::proto::session::Pick for Waits {
+    fn pick(
+        &self,
+        reqs: &[zmux::proto::session::FrameInfo],
+        _pipes: &[zmux::proto::session::PipeSnapshot],
+        out: &mut [zmux::proto::session::PickAnswer],
+    ) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for a in out.iter_mut().take(reqs.len()) {
+            *a = zmux::proto::session::PickAnswer::Wait;
+        }
+    }
+}
+
+/// `scheduler_answers` counts the answers that named a pipe and were
+/// applied (API.md Section 7.2): `Wait` answers are neither answers nor
+/// fallbacks.
+#[test]
+fn wait_answers_are_not_counted() {
+    let waits = std::sync::Arc::new(Waits(std::sync::atomic::AtomicU64::new(0)));
+    let policy = waits.clone();
+    let mut n = net(move |c| {
+        c.resume_timeout = Some(Duration::from_secs(30));
+        c.scheduler = Policy::Custom(policy.clone());
+    });
+    n.add_pipe(&PipeOptions::default()).unwrap();
+    n.write(64 * 1024);
+    n.run_for(50);
+    assert!(
+        waits.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "asked"
+    );
+    let st = n.ends[A].stats();
+    assert_eq!((st.scheduler_answers, st.scheduler_fallbacks), (0, 0));
+}
+
 /// BUG (probation settings): disabling probation while a pipe is in it left
 /// the pipe in probation for ever, and a huge probation base overflowed the
 /// time arithmetic.
@@ -407,18 +451,18 @@ fn probation_settings_take_effect_safely() {
     opts.probation = Some(Duration::from_secs(10));
     let id = n.add_pipe(&opts).unwrap();
     n.run_for(200);
-    assert!(n.ends[A].pipe_info(PipeId(id)).unwrap().in_probation);
+    assert!(n.ends[A].pipe_info(PipeId::new(id)).unwrap().in_probation);
     n.ends[A]
-        .set_pipe_probation(PipeId(id), Some(Duration::ZERO))
+        .set_pipe_probation(PipeId::new(id), Some(Duration::ZERO))
         .unwrap();
-    assert!(!n.ends[A].pipe_info(PipeId(id)).unwrap().in_probation);
+    assert!(!n.ends[A].pipe_info(PipeId::new(id)).unwrap().in_probation);
     // A huge base: in probation, without overflow, for as long as it runs.
     let other = n.add_pipe(&PipeOptions::default()).unwrap();
     n.ends[A]
-        .set_pipe_probation(PipeId(other), Some(Duration::MAX))
+        .set_pipe_probation(PipeId::new(other), Some(Duration::MAX))
         .unwrap();
     n.run_for(500);
-    let info = n.ends[A].pipe_info(PipeId(other)).unwrap();
+    let info = n.ends[A].pipe_info(PipeId::new(other)).unwrap();
     assert!(info.probation_until.is_none() || info.in_probation);
 }
 
@@ -430,12 +474,14 @@ fn probation_settings_take_effect_safely() {
 #[test]
 fn a_ping_answer_on_a_quiet_pipe_carries_a_liveness_ping() {
     let mut n = two_tiers(|c| {
-        c.standby_probe = Duration::ZERO;
+        c.standby_probe = None;
         c.redundancy = zmux::Redundancy::Off;
     });
     n.run_for(3000);
     let before = n.links[&2].b_ack_pings.len();
-    n.ends[A].revalidate_pipes(Some(PipeId(2)), n.now).unwrap();
+    n.ends[A]
+        .revalidate_pipes(Some(PipeId::new(2)), n.now)
+        .unwrap();
     n.run_for(100);
     let answer = n.links[&2].b_ack_pings.get(before).copied();
     assert_eq!(
@@ -473,11 +519,11 @@ fn quiet_sessions_probe_at_the_probe_interval() {
     for pings in quiet_minute(&mut n) {
         assert!((3..=5).contains(&pings), "{pings} probes");
     }
-    let mut n = two_tiers(|c| c.probe_interval = Duration::from_secs(60));
+    let mut n = two_tiers(|c| c.probe_interval = Some(Duration::from_secs(60)));
     for pings in quiet_minute(&mut n) {
         assert!((1..=2).contains(&pings), "{pings} probes");
     }
-    let mut n = two_tiers(|c| c.probe_interval = Duration::ZERO);
+    let mut n = two_tiers(|c| c.probe_interval = None);
     assert_eq!(quiet_minute(&mut n), [0, 0]);
     // Traffic resumes: the less-preferred pipe is probed at once.
     let before = n.links[&2].a_pings;
@@ -486,17 +532,16 @@ fn quiet_sessions_probe_at_the_probe_interval() {
     assert_eq!(n.links[&2].a_pings, before + 1);
 }
 
-/// The phase brings forward only the first
-/// idle probe after the pipe becomes usable or a quiet session becomes busy;
-/// a session busy with a message every 10 s keeps the 15 s probe interval of
-/// the pipe carrying them, not a PIPE_PING after each message.
+/// A session busy with a message every 10 s keeps the 15 s probe interval
+/// of the pipe carrying them, not a PIPE_PING after each message, with the
+/// default probe jitter.
 #[test]
 fn intermittent_traffic_does_not_bring_probes_forward() {
     let mut n = two_tiers(|c| {
         c.scheduler = Policy::Affinity;
         c.redundancy = zmux::Redundancy::Off;
-        c.standby_probe = Duration::ZERO;
-        c.test_hooks().probe_phase = Some(0.5);
+        c.standby_probe = None;
+        c.probe_jitter = 0.25;
     });
     let message = |n: &mut Net| {
         n.write(100);
@@ -505,7 +550,8 @@ fn intermittent_traffic_does_not_bring_probes_forward() {
             n.advance(50);
         }
     };
-    // Past the first probe, which the phase may bring forward.
+    // Past the first probe, which the bootstrap pipe draws from the whole
+    // interval.
     for _ in 0..3 {
         message(&mut n);
     }
@@ -524,17 +570,17 @@ fn huge_timer_settings_never_overflow_the_clock() {
     let huge = Duration::MAX;
     let settings: [&dyn Fn(&mut Config); 4] = [
         &|c| {
-            c.probe_interval = huge;
-            c.standby_probe = huge;
+            c.probe_interval = Some(huge);
+            c.standby_probe = Some(huge);
         },
         &|c| {
-            c.probe_interval = huge - Duration::from_secs(1);
-            c.standby_probe = huge - Duration::from_secs(1);
-            c.test_hooks().probe_phase = Some(0.999);
+            c.probe_interval = Some(huge - Duration::from_secs(1));
+            c.standby_probe = Some(huge - Duration::from_secs(1));
+            c.probe_jitter = 0.99;
         },
         &|c| {
-            c.handshake_timeout = huge;
-            c.max_idle_timeout = Duration::ZERO;
+            c.handshake_timeout = Some(huge);
+            c.max_idle_timeout = None;
             c.keep_alive_period = Some(huge);
             c.overflow_delay = huge;
         },

@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use super::lanes::OutLanes;
 use super::probation::{History, Probation};
-use super::{AckSample, Batch, Estimator, OutState, PipeState, Revalidation, RttSample, SentFrame};
+use super::{
+    AckSample, Batch, Estimator, OutState, OutboundState, Revalidation, RttSample, SentFrame,
+};
 use crate::proto::record::Framing;
+use crate::proto::session::Period;
 use crate::proto::session::limiter::{Held, Limiter};
 use crate::proto::session::stream::StreamKey;
 
@@ -150,6 +153,9 @@ pub(crate) struct OutPipe {
     low_water: bool,
     /// Bytes of the last batch handed to the carrier.
     last_batch: u64,
+    /// Bytes of lane 0's batch that the carrier has not taken yet: the
+    /// write calls in progress (SCHEDULER.md Section 4, Q_p).
+    writing: u64,
     /// The carrier reports its unsent bytes (an optional capability).
     unsent_reported: bool,
     /// The position after the last ack-eliciting batch: what follows it
@@ -182,6 +188,42 @@ pub(crate) struct OutPipe {
     /// The lanes, allocated with the first one: without them the pipe is
     /// its lane 0, whose positions are the send order.
     lanes: Option<Box<OutLanes>>,
+    /// The carrier's datagram channel (EXTENSIONS.md Section 6.8), as the
+    /// driver last reported it.
+    channel: Option<Channel>,
+    /// The carrier's retransmissions, once the adapter reported a count.
+    loss: Option<Box<CarrierLoss>>,
+    /// Bytes sent and not acknowledged when the pipe failed.
+    lost: u64,
+}
+
+/// A carrier's own retransmissions as its adapter reports them, and the
+/// smoothed loss rate sampled from them (API.md Section 7.2).
+#[derive(Debug, Clone, Copy)]
+struct CarrierLoss {
+    /// The latest count.
+    retransmitted: u64,
+    /// The smoothed rate, after the first sample.
+    rate: Option<f64>,
+    /// The last sample: when, the bytes sent and the count then.
+    at: Instant,
+    sent: u64,
+    count: u64,
+}
+
+/// The shortest time between two samples of a pipe's loss rate.
+const LOSS_SAMPLE_GAP: Duration = Duration::from_secs(1);
+
+/// A pipe carrier's datagram channel as the core uses it to decide where a
+/// DATAGRAM frame goes (EXTENSIONS.md Section 6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Channel {
+    /// The Pipe Stream ID that starts the pipe's channel datagrams, on
+    /// channels shared by the streams of a connection.
+    pub(crate) id: Option<u64>,
+    /// The largest channel datagram the channel takes now, Pipe Stream ID
+    /// included; 0 while it takes none.
+    pub(crate) max: usize,
 }
 
 /// The multipath part of an outbound pipe.
@@ -206,10 +248,11 @@ struct OutMp {
     reinjected_upto: u64,
     /// When the last ack-eliciting byte was sent.
     last_eliciting: Option<Instant>,
-    /// The next idle probe comes earlier by the session's phase: set when
-    /// the pipe becomes usable and when a quiet session becomes busy,
-    /// cleared by a batch carrying a PIPE_PING.
-    phase_pending: bool,
+    /// The current idle-probe wait is a bootstrap pipe's first, drawn
+    /// from the whole interval: no PIPE_PING was sent on the pipe by
+    /// either end. A joined pipe carried the joiner's PIPE_PING, so both
+    /// of its ends draw as usual (MULTIPATH.md Section 7.1).
+    boot_wait: bool,
     /// A PIPE_PING is owed since this time.
     ping_wanted: Option<Instant>,
     /// When the pipe entered DRAINING.
@@ -218,6 +261,18 @@ struct OutMp {
     joined_at: Instant,
     suspect_floor: Duration,
     dead_timeout: Option<Duration>,
+    /// The pipe's own idle-probe interval and jitter (`None`: the
+    /// session's), and the draw u of the current wait, k (1 - j u), made
+    /// when the wait starts from the pipe's generator.
+    probe_interval: Option<Period>,
+    probe_jitter: Option<f64>,
+    probe_rng: u64,
+    probe_u: f64,
+    /// H_p of the current wait, fixed when it is first measured after it
+    /// started (in nanoseconds; `u64::MAX`: not yet), so that a
+    /// guardrail's budget used up meanwhile does not move the deadline.
+    /// Atomic only to be set from a shared borrow; the core is single-owner.
+    probe_hold: std::sync::atomic::AtomicU64,
     /// No new stream data until the acknowledged position reaches this
     /// (opportunistic-reinjection penalty, MULTIPATH.md Section 7.5.1).
     penalty_until: Option<u64>,
@@ -243,11 +298,11 @@ struct OutMp {
     bytes_opportunistic: u64,
     /// Redundant copies sent.
     bytes_redundant: u64,
-    /// A PIPE_PING went into the current batch; the position that answers
-    /// the outstanding ones, and how many they are.
+    /// A PIPE_PING went into the current batch.
     ping_in_batch: bool,
-    ping_end: Option<u64>,
-    pings_outstanding: u64,
+    /// The records with a PIPE_PING not acknowledged yet: their lane and
+    /// the lane's position at their end, in order per lane.
+    pings_unanswered: Vec<(u64, u64)>,
     /// A PIPE_PING arrived on the attachment's inbound pipe: the PIPE_ACK
     /// that answers it also goes on this pipe (MULTIPATH.md Section 6.5).
     answer_ping: bool,
@@ -259,14 +314,41 @@ struct OutMp {
     idle_copy: u64,
 }
 
+/// The detection settings of a multipath outbound pipe: the T_suspect
+/// floor, the dead timeout, its idle-probe interval and jitter (`None`:
+/// the session's) and the seed of its idle-probe draws.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Detection {
+    pub(crate) suspect_floor: Duration,
+    pub(crate) dead_timeout: Option<Duration>,
+    pub(crate) probe_interval: Option<Period>,
+    pub(crate) probe_jitter: Option<f64>,
+    pub(crate) probe_seed: u64,
+}
+
+impl Detection {
+    /// The settings of a pipe outside multipath (none is used).
+    const NONE: Self = Self {
+        suspect_floor: Duration::ZERO,
+        dead_timeout: None,
+        probe_interval: None,
+        probe_jitter: None,
+        probe_seed: 0,
+    };
+}
+
+/// The next value of a SplitMix64 generator.
+pub(crate) fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 impl OutMp {
-    fn new(
-        state: OutState,
-        suspect_floor: Duration,
-        dead_timeout: Option<Duration>,
-        now: Instant,
-    ) -> Self {
-        Self {
+    fn new(state: OutState, d: Detection, now: Instant) -> Self {
+        let mut m = Self {
             suspect_mark: false,
             confirmed: !matches!(state, OutState::Joining | OutState::Deferred),
             join_frame: None,
@@ -277,12 +359,17 @@ impl OutMp {
             waiting_since: None,
             reinjected_upto: 0,
             last_eliciting: None,
-            phase_pending: true,
+            boot_wait: false,
             ping_wanted: None,
             drain_since: None,
             joined_at: now,
-            suspect_floor,
-            dead_timeout,
+            suspect_floor: d.suspect_floor,
+            dead_timeout: d.dead_timeout,
+            probe_interval: d.probe_interval,
+            probe_jitter: d.probe_jitter,
+            probe_rng: d.probe_seed,
+            probe_u: 0.0,
+            probe_hold: std::sync::atomic::AtomicU64::new(u64::MAX),
             penalty_until: None,
             reinject_hold: None,
             reinject_held: 0,
@@ -297,13 +384,20 @@ impl OutMp {
             bytes_opportunistic: 0,
             bytes_redundant: 0,
             ping_in_batch: false,
-            ping_end: None,
-            pings_outstanding: 0,
+            pings_unanswered: Vec::new(),
             answer_ping: false,
             revalidating: None,
             copies: VecDeque::new(),
             idle_copy: 0,
-        }
+        };
+        m.draw_probe_wait();
+        m
+    }
+
+    /// A new idle-probe wait starts: its draw u in \[0, 1).
+    fn draw_probe_wait(&mut self) {
+        self.probe_u = (splitmix(&mut self.probe_rng) >> 11) as f64 / (1u64 << 53) as f64;
+        *self.probe_hold.get_mut() = u64::MAX;
     }
 
     /// The idle probe's reference: the last ack-eliciting byte, or when the
@@ -342,6 +436,7 @@ impl OutPipe {
             held_with_data: false,
             low_water: false,
             last_batch: 0,
+            writing: 0,
             unsent_reported: false,
             eliciting_end: 0,
             carrier_unsent: 0,
@@ -353,23 +448,71 @@ impl OutPipe {
             mp: None,
             lanes_offered: false,
             lanes: None,
+            channel: None,
+            loss: None,
+            lost: 0,
+        }
+    }
+
+    /// The carrier's retransmitted bytes, as its adapter reports them, and
+    /// a sample of the smoothed loss rate: an EWMA with gain 1/8 of the
+    /// retransmitted bytes per byte sent between samples at least
+    /// [`LOSS_SAMPLE_GAP`] apart. A count that moves back counts as no
+    /// retransmission.
+    pub(crate) fn set_retransmitted(&mut self, count: u64, now: Instant) {
+        let sent = self.bytes_written();
+        let Some(l) = self.loss.as_deref_mut() else {
+            self.loss = Some(Box::new(CarrierLoss {
+                retransmitted: count,
+                rate: None,
+                at: now,
+                sent,
+                count,
+            }));
+            return;
+        };
+        l.retransmitted = count;
+        if now.saturating_duration_since(l.at) < LOSS_SAMPLE_GAP || sent <= l.sent {
+            return;
+        }
+        let x = count.saturating_sub(l.count) as f64 / (sent - l.sent) as f64;
+        l.rate = Some(match l.rate {
+            Some(r) => r + (x - r) / 8.0,
+            None => x,
+        });
+        (l.at, l.sent, l.count) = (now, sent, count);
+    }
+
+    /// The carrier's retransmitted bytes, once reported.
+    pub(crate) fn retransmitted(&self) -> Option<u64> {
+        self.loss.as_deref().map(|l| l.retransmitted)
+    }
+
+    /// The smoothed carrier loss rate, after its first sample.
+    pub(crate) fn loss_rate(&self) -> Option<f64> {
+        self.loss.as_deref().and_then(|l| l.rate)
+    }
+
+    /// Bytes sent and not acknowledged when the pipe failed (0 before).
+    pub(crate) fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    /// The acknowledged positions summed over every lane.
+    fn acked_total(&self) -> u64 {
+        match self.lanes.as_deref() {
+            Some(l) => {
+                l.tx(0).map_or(0, |t| t.acked())
+                    + l.iter().map(|(_, x)| x.tx().acked()).sum::<u64>()
+            }
+            None => self.acked,
         }
     }
 
     /// The pipe with its multipath state, for a multipath session: the
     /// detection floor and dead timeout of failure detection.
-    pub(crate) fn with_mp(
-        mut self,
-        suspect_floor: Duration,
-        dead_timeout: Option<Duration>,
-        now: Instant,
-    ) -> Self {
-        self.mp = Some(Box::new(OutMp::new(
-            self.state,
-            suspect_floor,
-            dead_timeout,
-            now,
-        )));
+    pub(crate) fn with_mp(mut self, d: Detection, now: Instant) -> Self {
+        self.mp = Some(Box::new(OutMp::new(self.state, d, now)));
         self
     }
 
@@ -377,22 +520,19 @@ impl OutPipe {
     /// (SPEC.md Section 5.1).
     pub(crate) fn with_parameters_first(mut self) -> Self {
         self.tp_sent = false;
+        if let Some(m) = self.mp.as_deref_mut() {
+            m.boot_wait = true;
+        }
         self
     }
 
     /// The bootstrap pipe of a session that starts using multipath: its
-    /// multipath state with the detection settings, usable from now, with
-    /// the next idle probe phased.
-    pub(crate) fn start_multipath(
-        self,
-        suspect_floor: Duration,
-        dead_timeout: Option<Duration>,
-        now: Instant,
-    ) -> Self {
-        let mut o = self.with_mp(suspect_floor, dead_timeout, now);
+    /// multipath state with the detection settings, usable from now.
+    pub(crate) fn start_multipath(self, d: Detection, now: Instant) -> Self {
+        let mut o = self.with_mp(d, now);
         let m = o.mp_mut();
         m.usable_at = now;
-        m.phase_pending = true;
+        m.boot_wait = true;
         o.last_advance = now;
         o
     }
@@ -421,9 +561,7 @@ impl OutPipe {
         // first pipe that asks (no time in them is ever used).
         static NONE: std::sync::OnceLock<OutMp> = std::sync::OnceLock::new();
         self.mp.as_deref().unwrap_or_else(|| {
-            NONE.get_or_init(|| {
-                OutMp::new(OutState::Active, Duration::ZERO, None, self.last_advance)
-            })
+            NONE.get_or_init(|| OutMp::new(OutState::Active, Detection::NONE, self.last_advance))
         })
     }
 
@@ -433,7 +571,7 @@ impl OutPipe {
     fn mp_mut(&mut self) -> &mut OutMp {
         let (state, at) = (self.state, self.last_advance);
         self.mp
-            .get_or_insert_with(|| Box::new(OutMp::new(state, Duration::ZERO, None, at)))
+            .get_or_insert_with(|| Box::new(OutMp::new(state, Detection::NONE, at)))
     }
 
     // ---- the carrier queue limiter --------------------
@@ -490,7 +628,7 @@ impl OutPipe {
 
     /// The state as the API reports it.
     #[inline]
-    pub(crate) fn public_state(&self) -> PipeState {
+    pub(crate) fn public_state(&self) -> OutboundState {
         self.state.public()
     }
 
@@ -645,7 +783,7 @@ impl OutPipe {
         let m = self.mp_mut();
         m.joined_at = now;
         m.usable_at = now;
-        m.phase_pending = true;
+        m.draw_probe_wait();
         m.snapshot_first = true;
         m.reinject_hold = Some(reinject_hold);
         m.join_frame = join_frame;
@@ -724,6 +862,7 @@ impl OutPipe {
     /// and its write side is shut down. Whether the driver is still to be
     /// told to abort the carrier.
     pub(crate) fn fail(&mut self) -> bool {
+        self.lost = self.bytes_written().saturating_sub(self.acked_total());
         self.state = OutState::Failed;
         // The storage goes too: a failed pipe waits for its retirement.
         self.batches = VecDeque::new();
@@ -827,6 +966,20 @@ impl OutPipe {
         })
     }
 
+    /// Gives back what [`OutPipe::begin_batch`] took for a batch that wrote
+    /// nothing: the transport parameters and the in-band PIPE_JOIN still
+    /// owed.
+    pub(crate) fn unbegin_batch(&mut self, parameters: bool, join: Option<([u8; 64], u8)>) {
+        if parameters {
+            self.tp_sent = false;
+        }
+        if join.is_some()
+            && let Some(m) = self.mp.as_deref_mut()
+        {
+            m.join_frame = join;
+        }
+    }
+
     /// The batch with CONNECTION_CLOSE was written, with the shutdown.
     pub(crate) fn close_written(&mut self) {
         self.close_sent = true;
@@ -869,6 +1022,12 @@ impl OutPipe {
         if let Some(l) = self.lanes.as_deref_mut() {
             l.wrote(lane, base, total);
         }
+        // The lane's previous batch is written: a driver takes the next one
+        // only then.
+        match self.lanes.as_deref_mut() {
+            Some(l) if lane != 0 => l.set_writing(lane, total),
+            _ => self.writing = total,
+        }
         self.sent += total;
         self.records += records;
         self.last_batch = total;
@@ -889,11 +1048,11 @@ impl OutPipe {
         now: Instant,
     ) {
         let sent = self.sent;
+        let lane_end = self.sent_on(lane);
         let m = self.mp_mut();
         let ping = std::mem::take(&mut m.ping_in_batch);
         if ping {
-            m.ping_end = Some(sent);
-            m.pings_outstanding += 1;
+            m.pings_unanswered.push((lane, lane_end));
             if m.revalidating == Some(Revalidation::PingOwed) {
                 m.revalidating = Some(Revalidation::Until(sent));
             }
@@ -901,7 +1060,11 @@ impl OutPipe {
         m.waiting_since = None;
         if eliciting {
             m.last_eliciting = Some(now);
-            m.phase_pending &= !ping;
+        }
+        if ping {
+            // A PIPE_PING went: the next idle-probe wait starts.
+            m.boot_wait = false;
+            m.draw_probe_wait();
         }
         self.record_batch(lane, eliciting, peer_mad, now);
     }
@@ -996,7 +1159,7 @@ impl OutPipe {
     /// An RTT sample from a QX_PING round trip on the single pipe, taken
     /// with no ACK Delay.
     pub(crate) fn ping_rtt_sample(&mut self, rtt: Duration, now: Instant) {
-        self.est.rtt_sample(rtt, Duration::ZERO, now);
+        self.est.rtt_sample(rtt, Duration::ZERO, false, now);
     }
 
     // ---- the batches in flight ----------------------------
@@ -1077,9 +1240,14 @@ impl OutPipe {
             self.est.delivered_time = now;
             self.est.first_sent_time = now;
         }
-        let expect = Duration::from_secs_f64(
-            (self.carrier_unsent + self.last_batch) as f64 / self.est.rate.max(1) as f64,
-        ) + self.est.min_or_srtt()
+        // Q_p now includes the batch itself (`batch_sent`): what is ahead
+        // of it excludes it.
+        let queued = self.queued();
+        let unsent_ahead = queued.saturating_sub(self.last_batch);
+        let queue =
+            Duration::from_secs_f64((unsent_ahead as f64 / self.est.rate.max(1) as f64).min(1.0));
+        let expect = Duration::from_secs_f64(queued as f64 / self.est.rate.max(1) as f64)
+            + self.est.min_or_srtt()
             + peer_mad;
         self.batches.push_back(Batch {
             start: self.sent - self.last_batch.min(self.sent),
@@ -1093,7 +1261,8 @@ impl OutPipe {
             before_first_ack: self.acked == 0,
             bottleneck_epoch: self.bottleneck_epoch,
             in_bubble: self.bubble.is_some(),
-            unsent_ahead: self.carrier_unsent,
+            unsent_ahead,
+            queue,
             lane: u32::try_from(lane).unwrap_or(u32::MAX),
             expect,
         });
@@ -1142,13 +1311,16 @@ impl OutPipe {
     /// from the batches it covers and releases them. An RTT sample needs
     /// `rtt_ok`; `usable` says whether a batch may give samples at all
     /// (never one that would measure an outage). `ack_delay` is the
-    /// entry's ACK Delay, `peer_mad` the peer's `zmux_max_ack_delay`.
+    /// entry's ACK Delay, `peer_mad` the peer's `zmux_max_ack_delay`;
+    /// a `quiet` sample enters min_rtt only while it has none.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sample_ack(
         &mut self,
         pos: u64,
         ack_delay: Duration,
         peer_mad: Duration,
         rtt_ok: bool,
+        quiet: bool,
         usable: impl Fn(&Batch) -> bool,
         now: Instant,
     ) -> AckSample {
@@ -1187,7 +1359,9 @@ impl OutPipe {
             if ack_delay <= peer_mad || stale {
                 let latest = now.saturating_duration_since(b.time);
                 let min_rtt = self.est.min_rtt.get();
-                let adjusted = self.est.rtt_sample(latest, ack_delay.min(peer_mad), now);
+                let adjusted = self
+                    .est
+                    .rtt_sample(latest, ack_delay.min(peer_mad), quiet, now);
                 s.min_moved = self.est.min_rtt.get() != min_rtt;
                 s.rtt = Some(RttSample {
                     latest,
@@ -1197,11 +1371,17 @@ impl OutPipe {
                 });
             }
         }
-        // Delivery rate from the most recently sent range covered.
+        // Delivery rate from the most recently sent ack-eliciting range
+        // covered. A range of PIPE_ACK or PADDING alone is acknowledged
+        // only with whatever the peer acknowledges next, on its timer: its
+        // few bytes over that wait would read as a rate of a few hundred
+        // bytes a second and, as a bottleneck sample, replace R_p (a
+        // session-affinity pipe was then held for seconds by the limiter).
         if let Some(b) = self
             .batches
             .iter()
             .take_while(|b| b.end <= pos)
+            .filter(|b| b.eliciting)
             .last()
             .copied()
             .filter(&usable)
@@ -1255,12 +1435,15 @@ impl OutPipe {
     /// last became SUSPECT, or while it is suspect, and those `heard`
     /// rejects give no samples. The penalty, the outstanding PIPE_PING
     /// frames and a revalidation end when the position reaches them, and
-    /// the acknowledged activity records go.
+    /// the acknowledged activity records go. `quiet`: the session is quiet
+    /// (MULTIPATH.md Section 7.1), and the sample keeps out of min_rtt
+    /// (SCHEDULER.md Section 2.1).
     pub(crate) fn mp_acked(
         &mut self,
         pos: u64,
         ack_delay: Duration,
         peer_mad: Duration,
+        quiet: bool,
         heard: impl Fn(&Batch) -> bool,
         now: Instant,
     ) -> Acked {
@@ -1275,15 +1458,11 @@ impl OutPipe {
         };
         let usable = |b: &Batch| b.end > outage && heard(b);
         let rtt_ok = self.state != OutState::Failed;
-        let sample = self.sample_ack(pos, ack_delay, peer_mad, rtt_ok, usable, now);
+        let sample = self.sample_ack(pos, ack_delay, peer_mad, rtt_ok, quiet, usable, now);
         let m = self.mp_mut();
         let unpenalized = m.penalty_until.is_some_and(|p| pos >= p);
         if unpenalized {
             m.penalty_until = None;
-        }
-        if m.ping_end.is_some_and(|e| pos >= e) {
-            m.ping_end = None;
-            m.pings_answered += std::mem::take(&mut m.pings_outstanding);
         }
         // The acknowledged position reached the revalidation's PIPE_PING.
         let revalidated = matches!(m.revalidating, Some(Revalidation::Until(e)) if pos >= e);
@@ -1415,6 +1594,17 @@ impl OutPipe {
         self.lanes_offered = on;
     }
 
+    /// The carrier's datagram channel, as the driver reports it.
+    pub(crate) fn set_channel(&mut self, channel: Option<Channel>) {
+        self.channel = channel;
+    }
+
+    /// The carrier's datagram channel.
+    #[inline]
+    pub(crate) fn channel(&self) -> Option<Channel> {
+        self.channel
+    }
+
     /// Whether the carrier offers lanes.
     #[inline]
     pub(crate) fn lanes_offered(&self) -> bool {
@@ -1454,6 +1644,18 @@ impl OutPipe {
             None if lane == 0 => self.acked,
             None => 0,
         }
+    }
+
+    /// The acknowledged position of lane `lane` reached `pos`: the records
+    /// with a PIPE_PING it covers are answered, each once.
+    pub(crate) fn pings_acked(&mut self, lane: u64, pos: u64) {
+        let Some(m) = self.mp.as_deref_mut() else {
+            return;
+        };
+        let before = m.pings_unanswered.len();
+        m.pings_unanswered
+            .retain(|&(l, end)| l != lane || end > pos);
+        m.pings_answered += (before - m.pings_unanswered.len()) as u64;
     }
 
     /// The peer acknowledged position `pos`, at most the bytes written
@@ -1622,21 +1824,29 @@ impl OutPipe {
         }
     }
 
-    /// Carrier bytes not yet transmitted, as the adapter reports them.
+    /// The carrier's unsent bytes, `None` until the adapter reported a
+    /// count (API.md Section 7.2 `queued_bytes`).
     #[inline]
-    pub(crate) fn carrier_unsent(&self) -> u64 {
-        self.carrier_unsent
+    pub(crate) fn reported_unsent(&self) -> Option<u64> {
+        self.unsent_reported.then_some(self.carrier_unsent)
     }
 
-    /// Bytes committed to the pipe and not yet transmitted, as known: the
-    /// carrier's unsent bytes and a write call in progress.
+    /// The carrier took `bytes` of the batch being written on lane `lane`.
+    pub(crate) fn written(&mut self, lane: u64, bytes: u64) {
+        match self.lanes.as_deref_mut() {
+            Some(l) if lane != 0 => l.took(lane, bytes),
+            _ => self.writing = self.writing.saturating_sub(bytes),
+        }
+    }
+
+    /// Q_p (SCHEDULER.md Section 4): bytes committed to the pipe and not
+    /// yet transmitted, over its lanes: those of the batches whose write
+    /// calls have not finished (in full until a call returns, then what
+    /// the carrier did not take) plus the carrier's unsent count, 0 where
+    /// the adapter reports none.
     #[inline]
-    pub(crate) fn committed(&self) -> u64 {
-        self.carrier_unsent
-            + match self.hold {
-                Some(Hold::Call { bytes, .. }) => bytes,
-                _ => 0,
-            }
+    pub(crate) fn queued(&self) -> u64 {
+        self.carrier_unsent + self.writing + self.lanes.as_deref().map_or(0, OutLanes::writing)
     }
 
     /// A write call's progress: `w` reports a
@@ -1769,17 +1979,20 @@ impl OutPipe {
         Some(from.max(detect_from))
     }
 
-    /// queue_p: min(1 s, unsent_ahead / R_p).
+    /// queue_p of the oldest unacknowledged ack-eliciting batch: min(1 s,
+    /// unsent_ahead / R_p), both as of when it was handed to the carrier.
     pub(crate) fn queue_term(&self) -> Duration {
-        let ahead = self.oldest_eliciting_batch().map_or(0, |b| b.unsent_ahead);
-        let secs = ahead as f64 / self.est.rate.max(1) as f64;
-        Duration::from_secs_f64(secs.min(1.0))
+        self.oldest_eliciting_batch()
+            .map_or(Duration::ZERO, |b| b.queue)
     }
 
-    /// The time the bytes committed to the pipe need to be transmitted,
-    /// queued_bytes / R_p.
-    pub(crate) fn queue_delay(&self) -> Duration {
-        Duration::from_secs_f64(self.carrier_unsent as f64 / self.est.rate.max(1) as f64)
+    /// The time the carrier's unsent bytes need to be transmitted,
+    /// queued_bytes / R_p; `None` where the adapter reports no count.
+    pub(crate) fn queue_delay(&self) -> Option<Duration> {
+        let unsent = self.reported_unsent()?;
+        Some(Duration::from_secs_f64(
+            unsent as f64 / self.est.rate.max(1) as f64,
+        ))
     }
 
     // ---- probes (MULTIPATH.md Sections 6.4, 6.5 and 7.1) ---------------------------
@@ -1815,15 +2028,29 @@ impl OutPipe {
         self.mp().last_eliciting_or_usable()
     }
 
-    /// The next idle probe comes earlier by the session's phase.
+    /// The pipe's own idle-probe interval and jitter (`None`: the
+    /// session's), the draw u of the current wait, and whether it draws as
+    /// usual (false: a bootstrap pipe's first wait, from the whole interval).
     #[inline]
-    pub(crate) fn phase_pending(&self) -> bool {
-        self.mp().phase_pending
+    pub(crate) fn probe_settings(&self) -> (Option<Period>, Option<f64>, f64, bool) {
+        let m = self.mp();
+        (m.probe_interval, m.probe_jitter, m.probe_u, !m.boot_wait)
     }
 
-    /// The next idle probe takes the session's phase again.
-    pub(crate) fn rephase(&mut self) {
-        self.mp_mut().phase_pending = true;
+    /// H_p of the current idle-probe wait: `hold()` the first time it is
+    /// asked for after the wait started, the same value after.
+    pub(crate) fn probe_hold(&self, hold: impl FnOnce() -> Duration) -> Duration {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.mp().probe_hold;
+        match c.load(Relaxed) {
+            u64::MAX => {
+                let h = hold();
+                let n = u64::try_from(h.as_nanos()).unwrap_or(u64::MAX - 1);
+                c.store(n, Relaxed);
+                Duration::from_nanos(n)
+            }
+            n => Duration::from_nanos(n),
+        }
     }
 
     /// Return-pipe liveness (MULTIPATH.md Section 6.5): a PIPE_PING is owed
@@ -2158,10 +2385,133 @@ mod tests {
     /// A multipath pipe at the initial rate of 1 MB/s.
     fn pipe(now: Instant) -> OutPipe {
         OutPipe::new(Framing::ByteStream, OutState::Active, MS * 100, now).with_mp(
-            MS * 250,
-            None,
+            Detection {
+                suspect_floor: MS * 250,
+                dead_timeout: None,
+                probe_interval: None,
+                probe_jitter: None,
+                probe_seed: 0,
+            },
             now,
         )
+    }
+
+    /// A failed pipe lost what it had sent and not had acknowledged; a
+    /// live one nothing.
+    #[test]
+    fn a_failure_loses_the_unacknowledged_bytes() {
+        let mut o = pipe(Instant::now());
+        o.sent = 1000;
+        o.acked = 400;
+        assert_eq!(o.lost(), 0);
+        o.fail();
+        assert_eq!(o.lost(), 600);
+    }
+
+    /// The loss rate: no sample before a second has passed or before bytes
+    /// were sent; then an EWMA with gain 1/8, and a count that moves back
+    /// counts as no retransmission.
+    #[test]
+    fn the_loss_rate_is_sampled_once_a_second() {
+        let t = Instant::now();
+        let mut o = pipe(t);
+        o.set_retransmitted(0, t);
+        assert_eq!((o.retransmitted(), o.loss_rate()), (Some(0), None));
+        o.sent = 1000;
+        o.set_retransmitted(10, t + MS * 500);
+        assert_eq!((o.retransmitted(), o.loss_rate()), (Some(10), None));
+        o.set_retransmitted(10, t + MS * 1000);
+        assert_eq!(o.loss_rate(), Some(0.01));
+        o.sent = 2000;
+        o.set_retransmitted(5, t + MS * 2000);
+        assert_eq!(o.loss_rate(), Some(0.01 * 7.0 / 8.0));
+    }
+
+    /// Each PIPE_PING counts as answered once, when the acknowledged
+    /// position of its record's lane reaches the record's end, whatever
+    /// later pings do.
+    #[test]
+    fn pings_are_answered_each_once_by_their_own_record() {
+        let now = Instant::now();
+        let mut o = pipe(now);
+        for _ in 0..2 {
+            o.ping_written();
+            o.batch_sent(0, 100, 1, Some(100));
+            o.mp_batch_sent(0, true, MS * 25, now);
+        }
+        assert_eq!(o.mp().pings_sent, 2);
+        // A position inside the first record answers nothing.
+        o.pings_acked(0, 99);
+        assert_eq!(o.mp().pings_answered, 0);
+        // The first record's end answers the first ping only.
+        o.pings_acked(0, 100);
+        assert_eq!(o.mp().pings_answered, 1);
+        // Another lane's position answers none of lane 0's.
+        o.pings_acked(1, 1000);
+        assert_eq!(o.mp().pings_answered, 1);
+        o.pings_acked(0, 200);
+        o.pings_acked(0, 300);
+        assert_eq!(o.mp().pings_answered, 2);
+    }
+
+    /// Each idle-probe wait draws u once, when it starts: ack-eliciting
+    /// batches keep it, a batch with a PIPE_PING draws the next; the draws
+    /// cover [0, 1) to within 10% of both ends.
+    #[test]
+    fn probe_waits_draw_once_per_wait() {
+        let now = Instant::now();
+        let mut o = pipe(now);
+        let mut us = Vec::new();
+        for _ in 0..1000 {
+            let u = o.probe_settings().2;
+            assert!((0.0..1.0).contains(&u));
+            o.mp_batch_sent(0, true, MS * 25, now);
+            assert_eq!(o.probe_settings().2, u, "an eliciting batch drew again");
+            o.ping_written();
+            o.mp_batch_sent(0, true, MS * 25, now);
+            us.push(u);
+        }
+        assert!(us.iter().any(|&u| u < 0.1) && us.iter().any(|&u| u > 0.9));
+        assert!(us.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    /// Only a bootstrap pipe draws its first idle-probe wait from the whole
+    /// interval: a joined pipe carried the joiner's PIPE_PING, so both of
+    /// its ends draw as usual from the start (MULTIPATH.md Section 7.1).
+    #[test]
+    fn only_a_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
+        let now = Instant::now();
+        assert!(pipe(now).accepted(now).probe_settings().3, "accepted join");
+        let mut joiner = pipe(now);
+        joiner.start_join(None, now);
+        assert!(joiner.probe_settings().3, "join sent");
+        let mut boot = pipe(now).with_parameters_first();
+        assert!(!boot.probe_settings().3, "bootstrap");
+        boot.ping_written();
+        boot.mp_batch_sent(0, true, MS * 25, now);
+        assert!(boot.probe_settings().3, "bootstrap after a PIPE_PING");
+        let mut started = OutPipe::new(Framing::ByteStream, OutState::Active, MS * 100, now)
+            .start_multipath(Detection::NONE, now);
+        assert!(!started.probe_settings().3, "bootstrap starting multipath");
+        started.ping_written();
+        started.mp_batch_sent(0, true, MS * 25, now);
+        assert!(started.probe_settings().3);
+    }
+
+    /// H_p is fixed for a wait the first time it is measured and taken
+    /// again only when the next wait starts (a PIPE_PING went).
+    #[test]
+    fn probe_hold_is_fixed_per_wait() {
+        let now = Instant::now();
+        let mut o = pipe(now);
+        assert_eq!(o.probe_hold(|| MS * 300), MS * 300);
+        // A guardrail's budget spent meanwhile does not move it.
+        assert_eq!(o.probe_hold(|| MS * 100), MS * 300);
+        o.mp_batch_sent(0, true, MS * 25, now);
+        assert_eq!(o.probe_hold(|| MS * 100), MS * 300);
+        o.ping_written();
+        o.mp_batch_sent(0, true, MS * 25, now);
+        assert_eq!(o.probe_hold(|| MS * 100), MS * 100);
     }
 
     #[test]
@@ -2172,7 +2522,7 @@ mod tests {
         // at 1 MB/s: its stall is measured from then.
         o.write_progress(&PipeWrite::started(t0, 100_000), true, false, t0);
         assert!(o.writable() && !o.open());
-        assert_eq!(o.committed(), 100_000);
+        assert_eq!(o.queued(), 0, "a call reports no queue of its own");
         assert_eq!(o.write_stall_from(|| None), Some(t0 + MS * 100));
         // Its return while data waits makes the pipe the bottleneck.
         let t1 = t0 + MS * 30;
@@ -2223,9 +2573,44 @@ mod tests {
     fn ack(o: &mut OutPipe, lane: u64, pos: u64, now: Instant) -> Option<u64> {
         let (_, cum) = o.ack_lane(lane, pos, now);
         if let Some(c) = cum {
-            o.mp_acked(c, Duration::ZERO, MS * 25, |_| true, now);
+            o.mp_acked(c, Duration::ZERO, MS * 25, false, |_| true, now);
         }
         cum
+    }
+
+    /// Q_p and unsent_ahead (SCHEDULER.md Section 4, MULTIPATH.md Section
+    /// 7.1) on a slow carrier that reports no unsent count: a batch whose
+    /// write call has not returned counts in full ahead of a batch handed
+    /// to another lane, then by what the carrier did not take; a count the
+    /// carrier reports adds to it, and is all `queued_bytes` shows.
+    #[test]
+    fn unsent_ahead_counts_the_batches_still_being_written() {
+        let t0 = Instant::now();
+        let mut o = pipe(t0);
+        assert_eq!(o.request_lane(), 1);
+        assert!(o.lane_attached(1, Framing::ByteStream, t0));
+        o.lanes_mut().unwrap().wrote_first(1, 23);
+        // 50 kB on lane 0 that the carrier has taken none of yet.
+        o.batch_sent(0, 50_000, 1, None);
+        o.mp_batch_sent(0, false, MS * 25, t0);
+        assert_eq!((o.queued(), o.reported_unsent()), (50_000, None));
+        batch(&mut o, 1, 1000, t0);
+        let b = o.oldest_eliciting_batch().expect("the batch on lane 1");
+        assert_eq!(b.unsent_ahead, 50_000);
+        // queue_p: 50 kB at 1 MB/s.
+        assert_eq!(o.queue_term(), MS * 50);
+        o.written(0, 20_000);
+        assert_eq!(o.queued(), 31_000);
+        o.set_lane_unsent(1, 400, t0);
+        assert_eq!((o.queued(), o.reported_unsent()), (31_400, Some(400)));
+        o.written(1, 1000);
+        o.written(0, 30_000);
+        assert_eq!(o.queued(), 400);
+        // The snapshot does not grow or shrink afterwards, nor follow
+        // R_p: a rate sample taken since leaves it as it was.
+        assert_eq!(o.queue_term(), MS * 50);
+        o.est.rate = 10_000_000;
+        assert_eq!(o.queue_term(), MS * 50);
     }
 
     /// The cumulative acknowledgement point (MULTIPATH.md Section 2.5): a lane acknowledged

@@ -10,9 +10,22 @@
 //!   its own within the listener's `handshake_timeout`, and hands the
 //!   carriers to a [`Listener`].
 //!
-//! Both fill in the ALPN identifiers when the rustls configuration has none
-//! ([`zmux::alpn_protocols`]: a client offers `qmux-02` then `qmux-01`, a
-//! server accepts both); configured identifiers are left as they are.
+//! The ALPN identifiers are the rustls configuration's, as configured:
+//! neither end fills any in. [`zmux::alpn_protocols`] gives zmux's (a
+//! client offers `qmux-02` then `qmux-01`, a server accepts both).
+//!
+//! [`serve`] applies the listener's admission
+//! ([`zmux::ListenerConfig::admission`]): after the TLS handshake, the
+//! reading of the prefix and the decision take at most the admission's
+//! peek timeout; the connection's first bytes and its metadata
+//! ([`carrier_info`]: the peer's address, the negotiated ALPN identifier,
+//! the client's server name and the TLS exporter) decide whether it reaches
+//! the listener, the listener's fallback connection handler
+//! ([`zmux::ListenerConfig::fallback`]) with the bytes read replayed, or
+//! neither. Nothing is written on the connection above TLS
+//! before it is accepted, and the server refuses TLS early data. A client
+//! presents a [`Credential`] to such a server ([`dial`]), such as
+//! [`zmux::PrefixAuth`] tokens.
 //!
 //! [`pipe`] turns an established tokio-rustls stream, client or server,
 //! into a [`PipeIo`] with what the TLS connection can tell zmux:
@@ -47,7 +60,7 @@
 //!
 //! let mut config = Config::default();
 //! config.pipe_auth = PipeAuth::tls();
-//! let session = zmux_rustls::connect("example.com:443", "example.com", tls, config).await?;
+//! let session = zmux_rustls::connect("example.com:443", "example.com", tls, None, config).await?;
 //! # drop(session);
 //! # Ok(())
 //! # }
@@ -80,7 +93,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{
@@ -88,7 +101,7 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
-use zmux::{ConnectError, Listener, PipeHint, PipeIo, Session};
+use zmux::{CarrierInfo, ConnectError, Credential, Listener, PipeIo, Session};
 
 /// The length of zmux's exporter values (MULTIPATH.md Section 10).
 const EXPORTER_LEN: usize = 32;
@@ -147,19 +160,34 @@ pub fn over_tcp(stream: impl Into<TlsStream<TcpStream>>) -> PipeIo {
 
 /// A TLS carrier over a new TCP connection to `addr`, verified for
 /// `server_name`: for [`Session::connect`], or as a further pipe of a
-/// session. The ALPN identifiers default as the crate documentation says.
+/// session. With `credential`, its prefix ([`Credential::prefix`], given
+/// the server's address, the negotiated ALPN identifier, `server_name`
+/// and the TLS exporter) is written as the connection's first bytes after
+/// the handshake: the carrier of a server that admits connections
+/// ([`serve`] with an admission).
 pub async fn dial(
     addr: impl ToSocketAddrs,
     server_name: &str,
     tls: Arc<ClientConfig>,
+    credential: Option<&dyn Credential>,
 ) -> io::Result<PipeIo> {
+    let mut stream = handshake(addr, server_name, tls).await?;
+    if let Some(credential) = credential {
+        let prefix = credential.prefix(&client_carrier_info(&stream, server_name))?;
+        stream.write_all(&prefix).await?;
+    }
+    Ok(over_tcp(stream))
+}
+
+async fn handshake(
+    addr: impl ToSocketAddrs,
+    server_name: &str,
+    tls: Arc<ClientConfig>,
+) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let tcp = TcpStream::connect(addr).await?;
-    let stream = TlsConnector::from(client_alpn(tls))
-        .connect(name, tcp)
-        .await?;
-    Ok(over_tcp(stream))
+    TlsConnector::from(tls).connect(name, tcp).await
 }
 
 /// Establishes a session over a new TLS connection to `addr` ([`dial`],
@@ -168,49 +196,91 @@ pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
     tls: Arc<ClientConfig>,
+    credential: Option<&dyn Credential>,
     config: impl Into<Arc<zmux::Config>>,
 ) -> Result<Session, ConnectError> {
-    let io = dial(addr, server_name, tls)
+    let io = dial(addr, server_name, tls, credential)
         .await
         .map_err(|e| ConnectError::Io(Arc::new(e)))?;
     Session::connect(io, config).await
 }
 
-/// Serves TLS over a TCP listener until `listener` is closed: each
-/// connection's handshake runs in a task of its own, within the
-/// listener's `handshake_timeout`, and its carrier goes to
-/// [`Listener::handle_pipe`] (new sessions to [`Listener::accept`]). The
-/// ALPN identifiers default as the crate documentation says.
+/// Serves TLS over a TCP listener until `listener` is closed
+/// ([`Listener::serve_streams`]): a connection from an intermediary the
+/// listener trusts to send the PROXY protocol
+/// ([`zmux::TrustedProxies::proxy_protocol`]) has its header read first
+/// ([`zmux::proxied_source`]), and the client it reports is the carrier's
+/// source; the connection takes its source slot, its handshake runs in a
+/// task of its own within the listener's `handshake_timeout`, the
+/// listener's admission ([`zmux::ListenerConfig::admission`]) decides
+/// with its [`carrier_info`], and an accepted carrier goes to
+/// [`Listener::handle_pipe`] (new sessions to [`Listener::accept`]). With
+/// an admission, `tls` is used with TLS early data refused
+/// (`max_early_data_size` 0, no data sent before the handshake
+/// completes), so that the first bytes are never early data.
 pub async fn serve(listener: Listener, tcp: TcpListener, tls: Arc<ServerConfig>) {
-    let acceptor = TlsAcceptor::from(server_alpn(tls));
+    let tls = if listener.admission().is_some() {
+        without_early_data(tls)
+    } else {
+        tls
+    };
+    let acceptor = TlsAcceptor::from(tls);
     listener
-        .serve_with(
+        .serve_streams(
             || tcp.accept(),
-            move |stream, peer| {
-                let accept = acceptor.accept(stream);
-                async move { Ok((over_tcp(accept.await?), PipeHint::from_addr(peer.ip()))) }
-            },
+            move |stream| acceptor.accept(stream),
+            carrier_info,
+            over_tcp,
         )
         .await;
 }
 
-/// The client configuration with zmux's ALPN identifiers when it has none.
-fn client_alpn(tls: Arc<ClientConfig>) -> Arc<ClientConfig> {
-    if !tls.alpn_protocols.is_empty() {
-        return tls;
-    }
-    let mut c = (*tls).clone();
-    c.alpn_protocols = zmux::alpn_protocols(&[]);
-    Arc::new(c)
+/// The server's TLS stream over TCP.
+pub type ServerStream = tokio_rustls::server::TlsStream<TcpStream>;
+
+/// The admission metadata of a server's TLS connection: the negotiated
+/// ALPN identifier, the client's server name and the TLS exporter (the
+/// peer's address is the caller's).
+pub fn carrier_info<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> CarrierInfo<'_> {
+    let conn = stream.get_ref().1;
+    CarrierInfo::new()
+        .with_alpn(conn.alpn_protocol())
+        .with_server_name(conn.server_name())
+        .with_exporter(move |label, context, out| {
+            conn.export_keying_material(out, label, Some(context))
+                .is_ok()
+        })
 }
 
-/// The server configuration with zmux's ALPN identifiers when it has none.
-fn server_alpn(tls: Arc<ServerConfig>) -> Arc<ServerConfig> {
-    if !tls.alpn_protocols.is_empty() {
+/// The metadata of a client's TLS connection over TCP to `server_name`,
+/// for its [`Credential`]: the server's address, the negotiated ALPN
+/// identifier, the server name and the TLS exporter.
+fn client_carrier_info<'a>(
+    stream: &'a tokio_rustls::client::TlsStream<TcpStream>,
+    server_name: &'a str,
+) -> CarrierInfo<'a> {
+    let (tcp, conn) = stream.get_ref();
+    let info = CarrierInfo::new()
+        .with_alpn(conn.alpn_protocol())
+        .with_server_name(Some(server_name))
+        .with_exporter(move |label, context, out| {
+            conn.export_keying_material(out, label, Some(context))
+                .is_ok()
+        });
+    match tcp.peer_addr() {
+        Ok(peer) => info.with_source(peer).with_peer(peer),
+        Err(_) => info,
+    }
+}
+
+/// The server configuration without TLS early data.
+fn without_early_data(tls: Arc<ServerConfig>) -> Arc<ServerConfig> {
+    if tls.max_early_data_size == 0 && !tls.send_half_rtt_data {
         return tls;
     }
     let mut c = (*tls).clone();
-    c.alpn_protocols = zmux::alpn_protocols(&[]);
+    c.max_early_data_size = 0;
+    c.send_half_rtt_data = false;
     Arc::new(c)
 }
 

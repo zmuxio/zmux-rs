@@ -12,14 +12,17 @@ use super::stream::{
     StreamKey,
 };
 use super::streams::Stopped;
-use super::{
-    DatagramError, OpenError, SEND_DATAGRAM_QUEUE, SessionCore, SessionError, StreamError, di,
-    dir_of_index,
-};
+use super::{DatagramError, OpenError, SessionCore, SessionError, StreamError, di, dir_of_index};
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::meter::Count;
 use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
 use crate::proto::{ApplicationErrorCode, VarInt, varint};
+
+/// The preamble limit before the peer's parameters without remembered
+/// ones (SPEC.md Section 6.1.2).
+const MIN_PREAMBLE_FLOOR: u64 = 1024;
+/// This endpoint's own limit on the preambles it sends.
+const MAX_LOCAL_PREAMBLE: u64 = 4096;
 
 /// Smallest per-stream window or send buffer.
 const MIN_STREAM_WINDOW: u64 = 16 * 1024;
@@ -207,6 +210,13 @@ impl SessionCore {
         if ld.next_index >= ld.peer_max {
             // Opened before establishment beyond the peer's limit.
             return Err(StreamError::Blocked);
+        }
+        if self.preamble_len(key) as u64 > self.preamble_limit() {
+            // The peer's parameters arrived below the limit the open
+            // assumed: only this stream fails, nothing is sent.
+            self.unschedule(key);
+            self.reject_unopened(key, super::stream::GoAwayFail::PreambleTooLarge);
+            return Err(StreamError::PreambleTooLarge);
         }
         self.unschedule(key);
         self.assign_id(key);
@@ -591,11 +601,9 @@ impl SessionCore {
             written: false,
         });
         let freed = before - send.unacked();
-        if let Some(mp) = self.mp.as_deref_mut() {
-            mp.release(freed);
-        }
         send.state = SendState::ResetSent;
         self.streams.drop_unsent(unsent);
+        self.release_retained(freed);
         self.unschedule(key);
         self.streams.queue_ctrl(key);
         self.wake_send_waiters();
@@ -910,16 +918,16 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Turns redundancy on or off for the stream's sending part: copies of
-    /// its chunks on a second pipe of the tier, within the session's copy
-    /// bound. Until called,
-    /// the part follows the session's `redundancy` parameter.
-    pub fn set_redundant(&mut self, key: StreamKey, on: bool) -> Result<(), StreamError> {
+    /// Turns redundancy on (`Some(true)`) or off (`Some(false)`) for the
+    /// stream's sending part: copies of its chunks on a second pipe of the
+    /// tier, within the session's copy bound. `None`, as before the first
+    /// call, has the part follow the session's `redundancy` parameter.
+    pub fn set_redundant(&mut self, key: StreamKey, on: Option<bool>) -> Result<(), StreamError> {
         let send = self
             .streams
             .send_mut(key)
             .ok_or(StreamError::ClosedLocally)?;
-        send.mp_mut().redundant = Some(on);
+        send.mp_mut().redundant = on;
         Ok(())
     }
 
@@ -979,7 +987,7 @@ impl SessionCore {
     /// Opens a stream of type `dir` with `preamble` (EXTENSIONS.md Section
     /// 4): [`SessionCore::open`] when it is empty. The preamble must fit the
     /// peer's Maximum Preamble Size and one of our records, with room for a
-    /// PRIORITY TLV set later ([`OpenError::TooLarge`]), and needs the
+    /// PRIORITY TLV set later ([`OpenError::PreambleTooLarge`]), and needs the
     /// peer's `zmux_preamble` ([`OpenError::NotNegotiated`]; before
     /// establishment [`OpenError::NotEstablished`], unless the stream is
     /// an early one, whose preamble counts within the assumed set).
@@ -1004,11 +1012,7 @@ impl SessionCore {
         }
         preamble.check(dir)?;
         let (info, tlvs, carrier) = preamble.parts();
-        // Within the peer's limit, and whole in one of our records.
-        let limit = self
-            .send_tp()
-            .map_or(0, |t| t.preamble())
-            .min((self.max_record() - 25) as u64);
+        let limit = self.preamble_limit();
         // Room for the GREASE TLV of the first preamble: the test hook's,
         // or the largest random one (an 8-byte type and 8 bytes of value).
         let grease = (!self.grease_tlv_used).then(|| {
@@ -1030,13 +1034,24 @@ impl SessionCore {
                 .map(|(ty, v)| GreaseTlv { ty: *ty, value: v }),
         );
         if len as u64 > limit {
-            return Err(OpenError::TooLarge);
+            return Err(OpenError::PreambleTooLarge);
         }
         let key = self.open(dir)?;
         let s = self.streams.get_mut(key).expect("just opened");
         let e = s.extra_mut();
         (e.open_info, e.app_tlvs, e.pipe_carrier) = (info, tlvs, carrier);
         Ok(key)
+    }
+
+    /// The largest preamble a local stream may send now: the peer's
+    /// Maximum Preamble Size, or before its parameters the assumed set's
+    /// (remembered, or the 1024-byte floor of SPEC.md Section 6.1.2); at
+    /// most [`MAX_LOCAL_PREAMBLE`] and whole in one of our records.
+    pub(super) fn preamble_limit(&self) -> u64 {
+        self.send_tp()
+            .map_or(MIN_PREAMBLE_FLOOR, |t| t.preamble())
+            .min(MAX_LOCAL_PREAMBLE)
+            .min((self.max_record() - 25) as u64)
     }
 
     /// The stream's preamble: the peer's for a peer stream, the one it was
@@ -1247,7 +1262,7 @@ impl SessionCore {
 
     /// Queues a datagram until establishment.
     fn queue_early_datagram(&mut self, flow: Option<(StreamKey, u64)>, data: Bytes) {
-        if self.dgram_mut().early.len() >= SEND_DATAGRAM_QUEUE {
+        if self.dgram_mut().early.len() >= self.config.datagram_send_queue {
             self.dgram_mut().early.pop_front();
             self.stats.datagrams_dropped_send += 1;
         }
@@ -1278,17 +1293,18 @@ impl SessionCore {
     }
 
     fn queue_datagram(&mut self, flow: Option<(u64, u64)>, data: Bytes) {
-        if self.dgram_mut().send.len() >= SEND_DATAGRAM_QUEUE {
+        if self.dgram_mut().send.len() >= self.config.datagram_send_queue {
             self.dgram_mut().send.pop_front();
             self.stats.datagrams_dropped_send += 1;
         }
         self.dgram_mut().send.push_back((flow, data));
+        self.channel_kick();
     }
 
     /// Whether the datagram send queue is full (a waiting sender waits for
     /// [`super::CoreEvent::DatagramsUnblocked`]).
     pub fn datagram_queue_full(&self) -> bool {
-        self.dgram().send.len() >= SEND_DATAGRAM_QUEUE
+        self.dgram().send.len() >= self.config.datagram_send_queue
     }
 
     /// Whether received datagrams are held for the receive limiter

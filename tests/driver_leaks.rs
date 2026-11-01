@@ -112,7 +112,10 @@ fn tasks_and_threads_end_with_their_sessions() {
                 let l = listener.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::new(b), PipeHint::from_addr([127, 0, 0, 1].into()))
+                        .handle_pipe(
+                            PipeIo::new(b),
+                            PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+                        )
                         .await;
                 });
                 PipeIo::new(a)
@@ -156,18 +159,13 @@ fn tasks_and_threads_end_with_their_sessions() {
         let addr = l.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (c, _) = l.accept().unwrap();
-            zmux::blocking::Session::accept(
-                zmux::blocking::PipeIo::tcp(c).unwrap(),
-                Config::default(),
-            )
-            .unwrap()
+            zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), Config::default())
+                .unwrap()
         });
         let c = std::net::TcpStream::connect(addr).unwrap();
-        let client = zmux::blocking::Session::connect(
-            zmux::blocking::PipeIo::tcp(c).unwrap(),
-            Config::default(),
-        )
-        .unwrap();
+        let client =
+            zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(c), Config::default())
+                .unwrap();
         let server = server.join().unwrap();
         // Reader, writer and timer threads of both sessions (they count
         // themselves once running).
@@ -181,7 +179,7 @@ fn tasks_and_threads_end_with_their_sessions() {
             drop(server);
         } else {
             drop(client);
-            server.closed().unwrap();
+            server.closed(None).unwrap();
         }
     }
     settle("driver threads", base, || resources().threads);
@@ -193,14 +191,12 @@ fn tasks_and_threads_end_with_their_sessions() {
     let addr = l.local_addr().unwrap();
     let receiver = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c).unwrap(), hooked()).unwrap()
+        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), hooked()).unwrap()
     });
     let c = std::net::TcpStream::connect(addr).unwrap();
-    let sender = zmux::blocking::Session::connect(
-        zmux::blocking::PipeIo::tcp(c).unwrap(),
-        Config::default(),
-    )
-    .unwrap();
+    let sender =
+        zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(c), Config::default())
+            .unwrap();
     let receiver = receiver.join().unwrap();
     let (mut send, _r) = sender.open_bi().unwrap();
     let w = std::thread::spawn(move || {
@@ -215,7 +211,7 @@ fn tasks_and_threads_end_with_their_sessions() {
     w.join().unwrap();
     assert!(resources().hooks > hooks, "a hook thread runs");
     sender.close(0u32.into(), b"");
-    receiver.closed().unwrap();
+    receiver.closed(None).unwrap();
     drop((receiver, recv));
     settle("hook threads", hooks, || resources().hooks);
     settle("driver threads", base, || resources().threads);

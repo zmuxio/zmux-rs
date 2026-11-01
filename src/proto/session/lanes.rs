@@ -5,6 +5,11 @@
 //! A pipe is one pipe for everything else: its estimates, failure
 //! detection and place in the scheduler see its cumulative
 //! acknowledgement point (`pipes/lanes.rs`).
+//!
+//! The mode checks here are protocol rules: lanes of a pipe outside
+//! multipath keep data on lane 0 until it is acknowledged, and an orderly
+//! close waits for the other lanes (MULTIPATH.md Section 5.8, SPEC.md
+//! Section 6.5).
 
 use std::time::Instant;
 
@@ -148,8 +153,8 @@ impl SessionCore {
             return Ok(());
         };
         let number = p.lane_number(li);
-        let padding = matches!(frame, Frame::Padding(_));
-        let first = match p.frame_in(li, false, padding, !padding, false) {
+        let eliciting = !matches!(frame, Frame::Padding(_));
+        let first = match p.frame_in(li, false, eliciting, false, false) {
             super::pipes::FrameIn::Process { first, .. } => first,
             super::pipes::FrameIn::Discarded => return Ok(()),
         };
@@ -274,7 +279,7 @@ impl SessionCore {
     /// When an opening lane is due to be refused for not being confirmed
     /// within the handshake timeout (MULTIPATH.md Section 5.8).
     pub(super) fn lanes_deadline(&self) -> Option<Instant> {
-        let timeout = self.config.handshake_timeout;
+        let timeout = self.config.handshake_wait();
         self.atts
             .outs()
             .filter_map(|o| o.lanes()?.opening_since())
@@ -285,7 +290,7 @@ impl SessionCore {
     /// Refuses the lanes not confirmed within the handshake timeout: the
     /// driver resets them.
     pub(super) fn lanes_timeouts(&mut self, now: Instant) {
-        let timeout = self.config.handshake_timeout;
+        let timeout = self.config.handshake_wait();
         for i in 0..self.atts.len() {
             let a = self.atts.at(i);
             let pipe = a.id();
@@ -320,7 +325,7 @@ impl SessionCore {
         // Outside multipath a direction with data on lane 0 from before the
         // pipe had lanes stays there until it is acknowledged (MULTIPATH.md
         // Section 5.8).
-        if self.on_lane_zero(key) || (self.mp.is_none() && lanes.before_unacked()) {
+        if self.on_lane_zero(key) || (!self.is_multipath() && lanes.before_unacked()) {
             return 0;
         }
         lanes
@@ -329,20 +334,6 @@ impl SessionCore {
             .map(|(n, _)| (lanes.bound_on(n), lanes.unacked(n), n))
             .min()
             .map_or(0, |(_, _, n)| n)
-    }
-
-    /// Whether a direction that is not bound goes on lane 0: urgency 0 to
-    /// 2 outside multipath (which sends nothing twice), a direction sent
-    /// redundantly in a multipath session.
-    fn on_lane_zero(&self, key: StreamKey) -> bool {
-        let Some(send) = self.streams.send(key) else {
-            return true;
-        };
-        if self.mp.is_some() {
-            self.redundant(send)
-        } else {
-            send.priority.urgency() <= 2
-        }
     }
 
     /// Whether a direction that is not bound would need a data lane that
@@ -391,7 +382,7 @@ impl SessionCore {
     /// Section 6.5 step 1): the peer would otherwise discard data that
     /// SPEC.md Section 7.4 counts as delivered.
     pub(super) fn close_waiting(&self) -> bool {
-        self.mp.is_none()
+        !self.is_multipath()
             && self
                 .out_ref(0)
                 .and_then(OutPipe::lanes)
@@ -408,7 +399,7 @@ impl SessionCore {
             Some(super::CloseFrame::Transport { code, .. }) => *code == 0,
             None => false,
         };
-        if self.mp.is_some() || remote || !orderly {
+        if self.is_multipath() || remote || !orderly {
             return;
         }
         if let Some(l) = self.out_mut(0).and_then(OutPipe::lanes_mut)
@@ -460,7 +451,7 @@ impl SessionCore {
     /// (MULTIPATH.md Section 5.8).
     pub(super) fn send_ctrl_elsewhere(&self, key: StreamKey) -> bool {
         self.tx_lanes
-            && self.mp.is_none()
+            && !self.is_multipath()
             && self
                 .out_ref(self.tx)
                 .and_then(OutPipe::lanes)

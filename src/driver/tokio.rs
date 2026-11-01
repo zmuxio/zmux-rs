@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use super::account::AccountLink;
+use super::channel::DatagramChannel;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ use super::stream_pipe::{StreamReader, StreamWriter, claim_carrier, release_carr
 use super::sync::TryMutexGuard;
 use super::tcp::{Probe, TcpSocket};
 use super::through::{Carrier, Outbox, Polled, ReadPath, WritePath};
+use super::unsent::{RetransmittedQuery, Unsent, UnsentQuery};
 use super::wait::PipeDone;
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES, READ_BUFFER};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
@@ -60,54 +62,168 @@ impl AsyncRead for Reader {
     }
 }
 
-/// A carrier's sending half: any writer, or the sending part of a stream
-/// of another session, written with shared chunks.
-pub(crate) enum Writer {
-    Io(BoxWrite),
-    Stream(StreamWriter),
-}
-
-impl AsyncWrite for Writer {
-    fn poll_write(
+/// The sending half of a carrier that takes owned buffers rather than
+/// slices, such as a QUIC stream, an HTTP body or a WebSocket sink: the
+/// pipe's referenced payloads reach it without copying, and only the bytes
+/// the session builds (record and frame headers, small payloads) are
+/// copied, once, into shared buffers. A carrier made with
+/// [`PipeIo::from_chunk_halves`] or [`PipeIo::with_chunk_lane_opener`] is
+/// written this way.
+///
+/// A buffer handed over stays valid for as long as the carrier keeps it
+/// (for example until its peer acknowledged it); holding one holds memory
+/// that the session no longer counts.
+pub trait ChunkWrite: Send {
+    /// Takes bytes from the front of `chunks` and returns how many: a
+    /// buffer taken whole is left empty, and one taken in part is advanced
+    /// past what was taken (as quinn's `SendStream::write_chunks` does).
+    /// `chunks` is unchanged when the call returns `Pending` or an error.
+    /// On a message-framed carrier ([`PipeIo::records`]) `chunks` is one
+    /// message, taken whole or not at all. `Ok(0)` for non-empty `chunks`
+    /// means the carrier is closed.
+    fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Io(w) => w.as_mut().poll_write(cx, buf),
-            Self::Stream(w) => Pin::new(w).poll_write(cx, buf),
+        chunks: &mut [Bytes],
+    ) -> Poll<io::Result<usize>>;
+
+    /// Flushes what the carrier buffered, as `AsyncWrite::poll_flush`.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// Ends the sending half gracefully, as `AsyncWrite::poll_shutdown`.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+}
+
+/// Owned buffers as one [`bytes::Buf`], for a carrier that sends a write
+/// call's buffers as one frame of its own framing (an HTTP/2 or HTTP/3
+/// DATA frame) without joining them: small built bytes then travel with
+/// the payload that follows them instead of in a frame of their own.
+#[derive(Debug, Default, Clone)]
+pub struct ChunkBuf {
+    chunks: VecDeque<Bytes>,
+    len: usize,
+}
+
+impl ChunkBuf {
+    /// An empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the non-empty buffers of `chunks` (leaving them empty, as a
+    /// [`ChunkWrite`] does) and returns their bytes.
+    pub fn take_from(&mut self, chunks: &mut [Bytes]) -> usize {
+        let mut n = 0;
+        for c in chunks.iter_mut().filter(|c| !c.is_empty()) {
+            n += c.len();
+            self.chunks.push_back(std::mem::take(c));
+        }
+        self.len += n;
+        n
+    }
+
+    /// Appends one buffer.
+    pub fn push(&mut self, chunk: Bytes) {
+        if !chunk.is_empty() {
+            self.len += chunk.len();
+            self.chunks.push_back(chunk);
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
+    /// The bytes held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it holds nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl bytes::Buf for ChunkBuf {
+    fn remaining(&self) -> usize {
+        self.len
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.chunks.front().map_or(&[], |c| c)
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        assert!(cnt <= self.len, "advance past the end");
+        self.len -= cnt;
+        while cnt > 0 {
+            let Some(front) = self.chunks.front_mut() else {
+                return;
+            };
+            if cnt < front.len() {
+                front.advance(cnt);
+                return;
+            }
+            cnt -= front.len();
+            self.chunks.pop_front();
+        }
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut n = 0;
+        for (d, c) in dst.iter_mut().zip(&self.chunks) {
+            *d = IoSlice::new(c);
+            n += 1;
+        }
+        n
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        match self.chunks.front_mut() {
+            // Within the first buffer: shared.
+            Some(front) if len <= front.len() => {
+                let b = front.split_to(len);
+                if front.is_empty() {
+                    self.chunks.pop_front();
+                }
+                self.len -= len;
+                b
+            }
+            _ => {
+                assert!(len <= self.len, "copy_to_bytes past the end");
+                let mut out = BytesMut::with_capacity(len);
+                out.put((&mut *self).take(len));
+                out.freeze()
+            }
+        }
+    }
+}
+
+type BoxChunkWrite = Pin<Box<dyn ChunkWrite>>;
+
+/// A carrier's sending half: any writer, a writer of owned buffers, or the
+/// sending part of a stream of another session, written with shared
+/// chunks.
+pub(crate) enum Writer {
+    Io(BoxWrite),
+    Chunks(BoxChunkWrite),
+    Stream(StreamWriter),
+}
+
+impl Writer {
+    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
             Self::Io(w) => w.as_mut().poll_flush(cx),
+            Self::Chunks(w) => w.as_mut().poll_flush(cx),
             Self::Stream(w) => Pin::new(w).poll_flush(cx),
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Io(w) => w.as_mut().poll_shutdown(cx),
-            Self::Stream(w) => Pin::new(w).poll_shutdown(cx),
-        }
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Io(w) => w.as_mut().poll_write_vectored(cx, bufs),
-            Self::Stream(w) => Pin::new(w).poll_write_vectored(cx, bufs),
-        }
-    }
-
-    fn is_write_vectored(&self) -> bool {
+    pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self {
-            Self::Io(w) => w.is_write_vectored(),
-            Self::Stream(w) => w.is_write_vectored(),
+            Self::Io(w) => w.as_mut().poll_shutdown(cx),
+            Self::Chunks(w) => w.as_mut().poll_shutdown(cx),
+            Self::Stream(w) => Pin::new(w).poll_shutdown(cx),
         }
     }
 }
@@ -167,11 +283,23 @@ pub struct PipeIo {
     pub(crate) abort: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) exporter: Option<Box<handle::Exporters>>,
     pub(crate) protocol: Option<String>,
+    /// The carrier's kind ([`PipeIo::with_carrier`]).
+    pub(crate) carrier: Option<crate::CarrierKind>,
     /// Bytes already read from the carrier (by a listener).
     pub(crate) prefix: Vec<u8>,
     /// The TCP socket under the carrier: its minimum RTT, unsent bytes and
     /// low-water mark ([`Probe`]).
     pub(crate) socket: Option<TcpSocket>,
+    /// The carrier's unsent count ([`PipeIo::with_unsent`]).
+    pub(crate) unsent: Option<Unsent>,
+    /// The carrier's retransmission count ([`PipeIo::with_retransmitted`]).
+    /// Boxed twice to keep the carrier small.
+    pub(crate) retransmitted: Option<Box<Unsent>>,
+    /// The carrier's write overhead ([`PipeIo::with_write_overhead`]).
+    pub(crate) write_overhead: u16,
+    /// The value of the admission that accepted the carrier, set by the
+    /// listener ([`crate::AdmittedValue`]).
+    pub(crate) admitted: Option<Box<crate::AdmittedValue>>,
     /// The carrier has a low-water mark.
     pub(crate) low_water: bool,
     /// A read may return less than the carrier holds although it had
@@ -187,6 +315,13 @@ pub struct PipeIo {
     /// Carrier early data ([`PipeIo::with_early_data`],
     /// [`PipeIo::with_early_data_in`]).
     pub(crate) early: Option<Box<EarlyIo>>,
+    /// Called when a listener takes the carrier ([`PipeIo::with_taken`]);
+    /// boxed twice to keep the carrier one pointer larger only.
+    #[allow(clippy::type_complexity)]
+    pub(crate) taken: Option<Box<Box<dyn FnOnce() + Send>>>,
+    /// A split bootstrap ([`PipeIo::split_bootstrap`]): its pairing makes
+    /// pipe pair 0 only, so it cannot join a session.
+    pub(crate) split_bootstrap: bool,
 }
 
 /// The carrier's early data: a client sending it under remembered
@@ -212,22 +347,33 @@ pub(crate) enum CarrierEarlyIo {
 }
 
 /// A carrier that is a stream of a multi-stream connection: the
-/// connection's identity, how to open further streams of it as lanes, and
+/// connection's identity, how to open further streams of it as lanes,
 /// whether lanes are on (by default where the connection delivers its
-/// streams independently).
+/// streams independently), and the connection's datagram channel for the
+/// pipe ([`PipeIo::with_datagram_channel`]).
 #[derive(Default)]
 pub(crate) struct LaneCaps {
     pub(crate) conn: Option<CarrierConnId>,
     pub(crate) opener: Option<LaneOpener>,
     pub(crate) on: Option<bool>,
+    pub(crate) channel: Option<Arc<dyn DatagramChannel>>,
 }
 
 impl PipeIo {
-    /// A carrier from a duplex byte stream, such as a TLS stream.
+    /// A carrier from a duplex byte stream, such as a TLS stream. A
+    /// [`TcpStream`] given here has Nagle's algorithm disabled, as every
+    /// carrier needs: it would hold a record back until the previous one
+    /// was acknowledged, merging records that shaping or pacing spaced
+    /// out (prefer [`PipeIo::tcp`] for one, which also queries the
+    /// socket). Under another layer, such as TLS, disable it on the
+    /// socket before (`set_nodelay(true)`).
     pub fn new<T>(io: T) -> Self
     where
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
+        if let Some(tcp) = (&io as &dyn std::any::Any).downcast_ref::<TcpStream>() {
+            let _ = tcp.set_nodelay(true);
+        }
         let (r, w) = tokio::io::split(io);
         Self::from_halves(r, w)
     }
@@ -247,6 +393,11 @@ impl PipeIo {
         let mut io = Self::from_halves(r, w);
         #[cfg(any(unix, windows))]
         {
+            io.unsent = socket.as_ref().and_then(TcpSocket::unsent_query);
+            io.retransmitted = socket
+                .as_ref()
+                .and_then(TcpSocket::retransmitted_query)
+                .map(Box::new);
             io.socket = socket;
         }
         io.init_lowat();
@@ -255,7 +406,9 @@ impl PipeIo {
 
     /// The TCP socket under this carrier (for example under TLS): it is
     /// then queried and tuned like that of a [`PipeIo::tcp`] carrier, which
-    /// does this itself, and, unless the carrier has an abort of its own
+    /// does this itself (its unsent bytes reported as by
+    /// [`PipeIo::with_unsent`], unless the carrier has a query of its
+    /// own), and, unless the carrier has an abort of its own
     /// ([`PipeIo::with_abort`]), a pipe that zmux fails is aborted by
     /// shutting the socket down, without the graceful end of the layer
     /// above (no TLS close_notify). One duplicate of the socket serves
@@ -281,6 +434,15 @@ impl PipeIo {
             let s = s.clone();
             self.abort = Some(Box::new(move || s.shut_down()));
         }
+        if self.unsent.is_none() {
+            self.unsent = socket.as_ref().and_then(TcpSocket::unsent_query);
+        }
+        if self.retransmitted.is_none() {
+            self.retransmitted = socket
+                .as_ref()
+                .and_then(TcpSocket::retransmitted_query)
+                .map(Box::new);
+        }
         self.socket = socket;
         self.init_lowat();
         self
@@ -292,6 +454,57 @@ impl PipeIo {
         if let Some(s) = &self.socket {
             self.low_water |= s.set_notsent_lowat(super::NOTSENT_LOWAT_SINGLE);
         }
+    }
+
+    /// The carrier's unsent count, an optional capability (API.md Section
+    /// 4.1): `unsent` returns the bytes write calls handed to the carrier
+    /// that it has not transmitted yet (its own buffer, or the socket's
+    /// `tcpi_notsent_bytes`), `None` while it has no count. The driver
+    /// calls it at most every 20 ms, outside the session lock, so it must
+    /// be cheap and must not block; each lane has its own (a lane stream's
+    /// [`PipeIo`] carries it, the streams of
+    /// [`PipeIo::with_lane_opener`] have none). The count is
+    /// the pipe's `queued_bytes` (summed over its lanes) and, with the bytes
+    /// of write calls in progress, its Q_p (SCHEDULER.md Section 4). A
+    /// carrier that reports it is not paced by the carrier queue limiter.
+    /// [`PipeIo::tcp`] and [`PipeIo::with_tcp_socket`] install the socket's
+    /// query where the platform has one (Linux, Android).
+    #[must_use]
+    pub fn with_unsent(mut self, unsent: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        self.unsent = Some(Box::new(unsent));
+        self
+    }
+
+    /// The carrier's retransmission count, an optional capability (API.md
+    /// Section 4.1): `retransmitted` returns the bytes the carrier itself
+    /// has retransmitted so far (`tcpi_bytes_retrans`, a QUIC connection's
+    /// lost bytes), `None` while it cannot tell. The driver calls it on
+    /// the pipe's sending half at most once a second, outside the session
+    /// lock, so it must be cheap and must not block. For pipes that share
+    /// one carrier connection it is that connection's count. It feeds only
+    /// [`crate::PipeStats::bytes_retransmitted`] and
+    /// [`crate::PipeStats::loss_rate`]. [`PipeIo::tcp`] and
+    /// [`PipeIo::with_tcp_socket`] install the socket's query where the
+    /// platform has one (Linux, Android, Apple platforms, Windows).
+    #[must_use]
+    pub fn with_retransmitted(
+        mut self,
+        retransmitted: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        self.retransmitted = Some(Box::new(Box::new(retransmitted)));
+        self
+    }
+
+    /// The fixed number of bytes the layers below zmux add to each write
+    /// call on the carrier's sending half (0 by default), such as a
+    /// wrapping layer's record header and tag. zmux passes it unchanged to
+    /// the shaper factory ([`crate::shaping::ShapedPipe::write_overhead`])
+    /// and does not otherwise use it. A listener's inbound transform may
+    /// set it on the carrier it returns.
+    #[must_use]
+    pub fn with_write_overhead(mut self, bytes: u16) -> Self {
+        self.write_overhead = bytes;
+        self
     }
 
     /// Declares that the carrier bounds what it holds unsent itself, as a
@@ -336,15 +549,34 @@ impl PipeIo {
             abort: None,
             exporter: None,
             protocol: None,
+            carrier: None,
             prefix: Vec::new(),
             socket: None,
+            unsent: None,
+            retransmitted: None,
+            write_overhead: 0,
+            admitted: None,
             low_water: false,
             partial_reads: false,
             outer: None,
             lanes: None,
             conn_memory: 0,
             early: None,
+            taken: None,
+            split_bootstrap: false,
         }
+    }
+
+    /// A carrier from a reader and a writer of owned buffers
+    /// ([`ChunkWrite`]): a QUIC stream, an HTTP body, a WebSocket sink.
+    pub fn from_chunk_halves<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Send + 'static,
+        W: ChunkWrite + 'static,
+    {
+        let mut io = Self::from_halves(reader, tokio::io::sink());
+        io.writer = Some(Writer::Chunks(Box::pin(writer)));
+        io
     }
 
     /// A carrier from a bidirectional stream of another session, the two
@@ -391,18 +623,26 @@ impl PipeIo {
             abort: None,
             exporter: None,
             protocol: None,
+            carrier: None,
             prefix: Vec::new(),
             socket: None,
+            unsent: None,
+            retransmitted: None,
+            write_overhead: 0,
+            admitted: None,
             low_water: false,
             partial_reads: false,
             lanes: Some(Box::new(LaneCaps {
                 conn: Some(conn),
                 opener: Some(super::lanes::stream_opener(outer.clone(), Preamble::new())),
                 on: None,
+                channel: None,
             })),
             outer: Some(outer),
             conn_memory: 0,
             early: None,
+            taken: None,
+            split_bootstrap: false,
         }
     }
 
@@ -436,6 +676,19 @@ impl PipeIo {
         self
     }
 
+    /// [`PipeIo::with_lane_opener`] for a connection whose streams take
+    /// owned buffers ([`ChunkWrite`]).
+    #[must_use]
+    pub fn with_chunk_lane_opener<F, Fut, W>(mut self, open: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<W>> + Send + 'static,
+        W: ChunkWrite + 'static,
+    {
+        self.lanes.get_or_insert_default().opener = Some(super::lanes::chunk_opener(open));
+        self
+    }
+
     /// Turns the pipe's lanes on or off, whatever the default: a carrier
     /// with a lane opener opens lanes; a stream carrier only when its
     /// session has lanes or more than one pipe in use, since over a single
@@ -444,6 +697,19 @@ impl PipeIo {
     #[must_use]
     pub fn with_lanes(mut self, on: bool) -> Self {
         self.lanes.get_or_insert_default().on = Some(on);
+        self
+    }
+
+    /// The carrier's datagram channel (EXTENSIONS.md Section 6.8): an
+    /// unreliable datagram service of the carrier besides the stream that
+    /// is the pipe, such as the QUIC datagrams of the stream's connection. A
+    /// session with datagrams enabled announces the channel, and when the
+    /// peer does too, sends each datagram that fits it there rather than in
+    /// a record ([`DatagramChannel`]). The QUIC, HTTP/3 and WebTransport
+    /// adapters give their carriers one.
+    #[must_use]
+    pub fn with_datagram_channel(mut self, channel: Arc<dyn DatagramChannel>) -> Self {
+        self.lanes.get_or_insert_default().channel = Some(channel);
         self
     }
 
@@ -480,6 +746,78 @@ impl PipeIo {
         if let Some(caps) = self.lanes.as_deref_mut() {
             caps.on = Some(on);
         }
+    }
+
+    /// Pipe pair 0 of a split bootstrap from its two carriers (SPEC.md
+    /// Section 6.1.1), on either side: `uplink` is the carrier from the
+    /// initiator to the responder (the initiator writes it, the responder
+    /// reads it), `downlink` the other. Each provides its one half; the
+    /// pipe reads the one that has a reader and writes the one that has a
+    /// writer. Aborting the pipe aborts both; a listener taking it takes
+    /// both. With a TLS exporter on both, the session label's value is the
+    /// uplink's and the downlink's concatenated (64 bytes). A listener
+    /// pairs the carriers itself ([`crate::PipeHint::pair`]); a dialer
+    /// combines its two with this.
+    /// It establishes a session only: [`Session::add_pipe`] refuses it
+    /// (join a split carrier with [`crate::join_split`] instead).
+    pub fn split_bootstrap(uplink: PipeIo, downlink: PipeIo) -> PipeIo {
+        let mut io = Self::paired(uplink, downlink);
+        io.split_bootstrap = true;
+        io
+    }
+
+    pub(crate) fn paired(mut up: PipeIo, mut down: PipeIo) -> PipeIo {
+        // The sending half's own: its overhead and retransmissions.
+        if up.writer.is_none() {
+            up.write_overhead = down.write_overhead;
+            up.retransmitted = down.retransmitted.take();
+        }
+        up.reader = up.reader.take().or(down.reader.take());
+        up.writer = up.writer.take().or(down.writer.take());
+        if up.prefix.is_empty() {
+            up.prefix = std::mem::take(&mut down.prefix);
+        }
+        up.carrier = up.carrier.or(down.carrier);
+        // The session's admission value is the uplink's.
+        up.abort = match (up.abort.take(), down.abort.take()) {
+            (Some(a), Some(b)) => Some(Box::new(move || {
+                a();
+                b();
+            })),
+            (a, b) => a.or(b),
+        };
+        up.taken = match (up.taken.take(), down.taken.take()) {
+            (Some(a), Some(b)) => Some(Box::new(Box::new(move || {
+                a();
+                b();
+            }))),
+            (a, b) => a.or(b),
+        };
+        up.exporter = match (up.exporter.take(), down.exporter.take()) {
+            (Some(mut u), Some(d)) if u.session.len() == 32 && d.session.len() == 32 => {
+                u.session.extend_from_slice(&d.session);
+                Some(u)
+            }
+            _ => None,
+        };
+        // Two connections: no lanes, no socket or datagram channel of one
+        // of them.
+        up.lanes = None;
+        up.socket = None;
+        up.low_water = false;
+        up.partial_reads |= down.partial_reads;
+        up
+    }
+
+    /// An outbound-only carrier of owned buffers ([`ChunkWrite`]), for
+    /// example an HTTP GET's response body.
+    pub fn chunk_writer<W>(writer: W) -> Self
+    where
+        W: ChunkWrite + 'static,
+    {
+        let mut p = Self::from_chunk_halves(tokio::io::empty(), writer);
+        p.reader = None;
+        p
     }
 
     /// An inbound-only carrier (for example an HTTP GET response body).
@@ -628,12 +966,66 @@ impl PipeIo {
         self
     }
 
+    /// The completion of the handshake of a server carrier that accepted
+    /// carrier early data ([`Self::with_early_data_in`]), taken out.
+    pub(crate) fn take_early_in(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        let early = self.early.as_deref_mut()?;
+        match early.io.take() {
+            Some(CarrierEarlyIo::In { done }) => Some(done),
+            other => {
+                early.io = other;
+                None
+            }
+        }
+    }
+
+    /// With `prefix` read before the rest of the carrier: bytes an adapter
+    /// read from it already (an admission's prefix), given back in front of
+    /// any given before. The driver takes them as they are; the rest of the
+    /// carrier is read as before, without a further copy.
+    #[must_use]
+    pub fn with_prefix(mut self, mut prefix: Vec<u8>) -> Self {
+        if !self.prefix.is_empty() {
+            prefix.extend_from_slice(&self.prefix);
+        }
+        self.prefix = prefix;
+        self
+    }
+
+    /// Calls `taken` once a listener takes the carrier
+    /// ([`crate::Listener::handle_pipe`]): its first record made it a new
+    /// session, a join or a lane. Not called for a carrier the listener
+    /// refuses or rejects. An adapter that must not answer before the
+    /// listener took a carrier (an HTTP request whose response the
+    /// listener may never write) waits for it.
+    #[must_use]
+    pub fn with_taken(mut self, taken: impl FnOnce() + Send + 'static) -> Self {
+        self.taken = Some(Box::new(Box::new(taken)));
+        self
+    }
+
     /// The application protocol the carrier negotiated (for example the
     /// ALPN identifier), reported by `Session::protocol`.
     #[must_use]
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = Some(protocol.into());
         self
+    }
+
+    /// The carrier's kind: the [`ShapedPipe::carrier`] a shaper factory
+    /// sees for its pipe, and the kind in pipe events and statistics. The
+    /// adapters set it; a carrier without one (raw TCP or TLS) has none.
+    ///
+    /// [`ShapedPipe::carrier`]: crate::shaping::ShapedPipe::carrier
+    #[must_use]
+    pub fn with_carrier(mut self, kind: crate::CarrierKind) -> Self {
+        self.carrier = Some(kind);
+        self
+    }
+
+    /// The carrier's kind ([`PipeIo::with_carrier`]).
+    pub fn carrier(&self) -> Option<crate::CarrierKind> {
+        self.carrier
     }
 }
 
@@ -939,6 +1331,11 @@ impl Driver for Tokio {
                 |ws, st| take_batch(ws, id, st, now()),
                 State::repoll_task,
             );
+            // What the carrier took goes into Q_p now, unless the session
+            // task holds the side (it tells the core itself).
+            if let Some(mut ws) = write.try_side() {
+                ws.out.tell(&mut locked.core, id);
+            }
             release_side(&mut locked, write);
             locked
         };
@@ -996,10 +1393,17 @@ impl Driver for Tokio {
             outbound: carrier.writer.is_some().then_some(carrier.framing),
             exporter: carrier.exporter.take(),
             protocol: carrier.protocol.take(),
+            kind: carrier.carrier,
+            write_overhead: carrier.write_overhead,
+            admitted: carrier.admitted.take().map(|v| *v),
         }
     }
 
     fn check_carrier(shared: &Arc<Shared<Self>>, carrier: &PipeIo) -> Result<(), PipeError> {
+        if carrier.split_bootstrap {
+            // Its pairing token makes pipe pair 0 only (SPEC.md 6.1.1).
+            return Err(PipeError::InvalidOptions);
+        }
         match carrier.outer.as_ref().and_then(Weak::upgrade) {
             Some(outer) if runs_over(&outer, shared) => Err(PipeError::CarrierLoop),
             _ => Ok(()),
@@ -1016,8 +1420,29 @@ impl Driver for Tokio {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return false;
         };
+        let Some(shared) = session.shared() else {
+            return false;
+        };
         rt.spawn(async move {
-            if let Ok(pipe) = dial.dial(super::DialRequest::bidi()).await
+            // Bounded by the handshake timeout and given up with the
+            // session: a dial that hangs keeps nothing alive after.
+            let timeout = shared.lock().core.config().handshake_wait();
+            let pipe = {
+                let mut closed = std::pin::pin!(handle::closed_wait(&shared));
+                let mut dialed = std::pin::pin!(tokio::time::timeout(
+                    timeout,
+                    dial.dial(super::DialRequest::bidi())
+                ));
+                std::future::poll_fn(|cx| {
+                    if closed.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                    dialed.as_mut().poll(cx).map(Some)
+                })
+                .await
+            };
+            drop(shared);
+            if let Some(Ok(Ok(pipe))) = pipe
                 && let Some(session) = session.upgrade()
             {
                 let _ = session.add_pipe(pipe, PipeOptions::default());
@@ -1037,7 +1462,7 @@ impl Driver for Tokio {
 
 impl State<Tokio> {
     /// Wakes the session task (after the lock).
-    fn wake_task(&mut self) {
+    pub(crate) fn wake_task(&mut self) {
         if let Some(w) = self.io.task.take() {
             self.wakes.push(w);
         }
@@ -1105,6 +1530,12 @@ pub(crate) struct JoinOffer<'a> {
     /// The carrier runs over the session itself: refused (EXTENSIONS.md
     /// Section 10.2).
     pub(crate) looped: bool,
+    /// The carrier's kind.
+    pub(crate) carrier: Option<crate::CarrierKind>,
+    /// The carrier's write overhead.
+    pub(crate) write_overhead: u16,
+    /// The value of the admission that accepted the carrier.
+    pub(crate) admitted: Option<crate::AdmittedValue>,
 }
 
 /// The listener's view of a session: the few operations its join path and
@@ -1129,6 +1560,12 @@ impl Shared<Tokio> {
             st.core
                 .offer_join(o.frame, o.binding, o.inbound, o.outbound, o.inband, now)
         };
+        if let JoinVerdict::Accepted(p) = v {
+            // Before the session's first record on it.
+            st.core.set_pipe_carrier(p, o.carrier);
+            st.core.set_pipe_write_overhead(p, o.write_overhead);
+            st.core.set_pipe_admitted(p, o.admitted.clone());
+        }
         st.after_command();
         Some(v)
     }
@@ -1175,6 +1612,11 @@ impl Shared<Tokio> {
         let conn = pipe.conn().cloned();
         let conn_memory = pipe.conn_memory;
         let outer = pipe.outer.take();
+        let channel = pipe
+            .lanes
+            .as_deref_mut()
+            .and_then(|l| l.channel.take())
+            .filter(|_| config.enable_datagrams);
         let (early, early_restart) = match pipe.early.take() {
             Some(e) => (e.io, e.restart),
             None => (None, None),
@@ -1221,6 +1663,12 @@ impl Shared<Tokio> {
         charge_connection(&mut state, conn.as_ref(), conn_memory);
         state.core.set_pipe_low_water(PipeId(0), low_water);
         state.core.set_pipe_lanes(PipeId(0), lanes);
+        if let Some(ch) = &channel {
+            // Before the parameters are written: they announce it.
+            state
+                .core
+                .set_pipe_channel(PipeId(0), ch.channel_id(), ch.max_datagram_size());
+        }
         let lane_key = state
             .core
             .local_parameters()
@@ -1243,6 +1691,12 @@ impl Shared<Tokio> {
         // Publish listener routing and accounting before bootstrap parameters
         // can make the locator usable by a peer on another carrier.
         before_start(&shared);
+        // Registered before the task writes the parameters that announce
+        // the channel.
+        if let Some(ch) = channel {
+            let receiving = super::channel::attach(&shared, PipeId(0), &ch);
+            super::channel::start(&shared, PipeId(0), ch, receiving);
+        }
         tokio::spawn(Task::new(shared.clone(), first));
         if let Some((settled, done)) = early {
             let weak = Arc::downgrade(&shared);
@@ -1279,7 +1733,11 @@ impl Shared<Tokio> {
     /// CLOSING or CLOSED takes no new pipe: the core forgets the pipe, the
     /// carrier is closed after the
     /// lock and nothing of it is kept.
-    pub(crate) fn attach_task(&self, id: u64, io: PipeIo) -> Result<Arc<PipeDone>, PipeError> {
+    pub(crate) fn attach_task(
+        self: &Arc<Self>,
+        id: u64,
+        mut io: PipeIo,
+    ) -> Result<Arc<PipeDone>, PipeError> {
         // Pipes are added to multipath sessions only.
         if let Some(s) = &io.socket {
             s.set_notsent_lowat(super::NOTSENT_LOWAT_MULTIPATH);
@@ -1288,8 +1746,19 @@ impl Shared<Tokio> {
         let lanes = io.lanes_offered();
         let conn = io.conn().cloned();
         let conn_memory = io.conn_memory;
+        let channel = io.lanes.as_deref_mut().and_then(|l| l.channel.take());
+        // Asked before the lock: the adapter's own.
+        let shape = channel
+            .as_ref()
+            .map(|c| (c.channel_id(), c.max_datagram_size()));
         let task = PipeTask::new(PipeId(id), io, super::NOTSENT_LOWAT_MULTIPATH);
         let done = task.done.clone();
+        // Registered before the pipe's task can announce the channel;
+        // dropped with a refused pipe.
+        let receiving = channel
+            .as_ref()
+            .filter(|_| self.lock().core.config().enable_datagrams)
+            .map(|ch| super::channel::attach(self, PipeId(id), ch));
         let mut st = self.lock();
         if st.io.task_ended || st.core.state() >= CoreState::Closing {
             // The caller gives the pipe up in the core.
@@ -1308,6 +1777,10 @@ impl Shared<Tokio> {
         }
         st.core.set_pipe_low_water(PipeId(id), low_water);
         st.core.set_pipe_lanes(PipeId(id), lanes);
+        let channel = channel.filter(|_| st.core.config().enable_datagrams);
+        if let (Some(_), Some((cid, max))) = (&channel, shape) {
+            st.core.set_pipe_channel(PipeId(id), cid, max);
+        }
         charge_connection(&mut st, conn.as_ref(), conn_memory);
         if let Some(c) = conn {
             let l = st.io.lanes.get_or_insert_default();
@@ -1321,6 +1794,10 @@ impl Shared<Tokio> {
         });
         st.io.new_pipes.push(task);
         st.wake_task();
+        drop(st);
+        if let (Some(ch), Some(r)) = (channel, receiving) {
+            super::channel::start(self, PipeId(id), ch, r);
+        }
         Ok(done)
     }
 }
@@ -1373,21 +1850,37 @@ impl WriteSide {
                 self.out.pos(),
                 limit,
             ),
-            (Framing::ByteStream, writer) => {
+            (_, Writer::Chunks(w)) => {
+                let chunks = self.out.chunks(limit);
+                let before: usize = chunks.iter().map(Bytes::len).sum();
+                let poll = w.as_mut().poll_write_chunks(cx, chunks);
+                if let Poll::Ready(Ok(n)) = poll {
+                    let after: usize = chunks.iter().map(Bytes::len).sum();
+                    if before - after != n {
+                        return Poll::Ready(Err(io::Error::other(
+                            "a carrier took other bytes than it reported",
+                        )));
+                    }
+                }
+                poll
+            }
+            (Framing::ByteStream, Writer::Io(w)) => {
                 let mut slices = [IoSlice::new(&[]); MAX_SLICES];
                 let n = self.out.slices(limit, &mut slices);
-                Pin::new(writer).poll_write_vectored(cx, &slices[..n])
+                w.as_mut().poll_write_vectored(cx, &slices[..n])
             }
-            (Framing::Records, writer) => {
+            (Framing::Records, Writer::Io(w)) => {
                 // One write call per message.
                 let msg = self.out.message();
                 let len = msg.len();
-                match Pin::new(writer).poll_write(cx, msg) {
+                match w.as_mut().poll_write(cx, msg) {
                     Poll::Ready(Ok(w)) if w == len => Poll::Ready(Ok(w)),
                     Poll::Ready(Ok(_)) => Poll::Ready(Ok(0)),
                     other => other,
                 }
             }
+            // A stream carrier is a byte stream.
+            (Framing::Records, Writer::Stream(_)) => Poll::Ready(Ok(0)),
         };
         if let Poll::Ready(Ok(w)) = poll
             && w > 0
@@ -1425,7 +1918,7 @@ impl Outbox for WriteSide {
         if self.out.is_empty()
             && self.needs_flush
             && let Some(w) = self.writer.as_mut()
-            && let Poll::Ready(Ok(())) = Pin::new(w).poll_flush(&mut cx)
+            && let Poll::Ready(Ok(())) = w.poll_flush(&mut cx)
         {
             self.needs_flush = false;
         }
@@ -1855,6 +2348,11 @@ pub(crate) struct PipeTask {
     done: Arc<PipeDone>,
     /// The TCP carrier's queries and low-water mark.
     probe: Option<Probe>,
+    /// The carrier's unsent query.
+    unsent: Option<UnsentQuery>,
+    /// The carrier's retransmission query (lane 0: lanes share their
+    /// carrier connection).
+    retransmitted: Option<RetransmittedQuery>,
     /// The read side was busy this round (H1 in `super::through`).
     read_skipped: bool,
     /// The write side was busy this round.
@@ -1904,6 +2402,8 @@ struct LaneTask {
     progress: Progress,
     /// The write side failed, with this kind of error.
     failed: Option<io::ErrorKind>,
+    /// The lane's unsent query.
+    unsent: Option<UnsentQuery>,
 }
 
 impl LaneTask {
@@ -1911,7 +2411,7 @@ impl LaneTask {
         let read = lane.read.map(|(reader, prefix)| {
             ReadSide::new(Some(reader), lane.framing, prefix, lane.partial)
         });
-        let (write, keep, outer) = match lane.write {
+        let (write, keep, outer, unsent) = match lane.write {
             Some(w) => (
                 Some(WriteSide {
                     writer: Some(w.writer),
@@ -1923,8 +2423,9 @@ impl LaneTask {
                 }),
                 w.keep,
                 w.outer,
+                w.unsent.map(|q| UnsentQuery::new(q, now())),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         Self {
             lane: lane.at.lane.0,
@@ -1934,6 +2435,7 @@ impl LaneTask {
             _outer: outer,
             progress: Progress::default(),
             failed: None,
+            unsent,
         }
     }
 
@@ -1996,7 +2498,7 @@ impl LaneTask {
                 let Some(w) = ws.writer.as_mut() else {
                     return false;
                 };
-                return match Pin::new(w).poll_shutdown(cx) {
+                return match w.poll_shutdown(cx) {
                     Poll::Ready(_) => {
                         ws.writer = None;
                         ws.out.shutdown_done();
@@ -2012,7 +2514,7 @@ impl LaneTask {
             }
             if ws.needs_flush
                 && let Some(w) = ws.writer.as_mut()
-                && let Poll::Ready(r) = Pin::new(w).poll_flush(cx)
+                && let Poll::Ready(r) = w.poll_flush(cx)
             {
                 ws.needs_flush = false;
                 if let Err(e) = r {
@@ -2091,6 +2593,11 @@ impl PipeTask {
         Self {
             id,
             probe,
+            unsent: io.unsent.map(|q| UnsentQuery::new(q, now())),
+            retransmitted: io
+                .retransmitted
+                .filter(|_| io.writer.is_some())
+                .map(|q| RetransmittedQuery::new(*q, now())),
             read: Arc::new(ReadPath::new(ReadSide::new(
                 io.reader,
                 io.framing,
@@ -2158,6 +2665,33 @@ impl PipeTask {
             .push(LaneTask::new(lane));
     }
 
+    /// Step 1 of the unsent queries of the pipe and its lanes, without
+    /// the core lock: whether any ran.
+    fn query_unsent(&mut self, now: Instant) -> bool {
+        let mut ran = self.unsent.as_mut().is_some_and(|q| q.query(now));
+        ran |= self.retransmitted.as_mut().is_some_and(|q| q.query(now));
+        for l in self.lanes_mut() {
+            ran |= l.unsent.as_mut().is_some_and(|q| q.query(now));
+        }
+        ran
+    }
+
+    /// Step 2, under the core lock: the counts go to the core.
+    fn feed_unsent(&mut self, core: &mut crate::proto::session::SessionCore, now: Instant) {
+        let id = self.id;
+        if let Some(q) = &mut self.unsent {
+            q.feed(core, id.into(), now);
+        }
+        if let Some(q) = &mut self.retransmitted {
+            q.feed(core, id, now);
+        }
+        for l in self.lanes_mut() {
+            if let Some(q) = &mut l.unsent {
+                q.feed(core, id.lane(l.lane), now);
+            }
+        }
+    }
+
     /// The pipe's lanes.
     fn lanes_mut(&mut self) -> &mut [LaneTask] {
         self.lanes.as_deref_mut().map_or(&mut [], |l| &mut l.list)
@@ -2188,6 +2722,9 @@ impl PipeTask {
         let id = self.id;
         for l in self.lanes_mut() {
             let at = id.lane(l.lane);
+            if let Some(ws) = l.write.as_mut() {
+                ws.out.tell(&mut st.core, at);
+            }
             if l.progress.report(&mut st.core, at, false, now) {
                 st.dispatch();
             }
@@ -2327,6 +2864,10 @@ impl PipeTask {
     /// now, returning whether the task has work.
     fn report(&mut self, st: &mut State<Tokio>, now: Instant) {
         let id = self.id;
+        // A side an application writes through tells the core itself.
+        if let Some(mut ws) = self.write.try_side() {
+            ws.out.tell(&mut st.core, id);
+        }
         if self.progress.report(&mut st.core, id, self.low_water, now) {
             st.dispatch();
         }
@@ -2374,7 +2915,7 @@ impl PipeTask {
                 let Some(w) = ws.writer.as_mut() else {
                     return false;
                 };
-                return match Pin::new(w).poll_shutdown(cx) {
+                return match w.poll_shutdown(cx) {
                     Poll::Ready(_) => {
                         ws.writer = None;
                         ws.out.shutdown_done();
@@ -2394,7 +2935,7 @@ impl PipeTask {
             }
             if ws.needs_flush
                 && let Some(w) = ws.writer.as_mut()
-                && let Poll::Ready(r) = Pin::new(w).poll_flush(cx)
+                && let Poll::Ready(r) = w.poll_flush(cx)
             {
                 ws.needs_flush = false;
                 if let Err(e) = r {
@@ -2549,6 +3090,9 @@ struct Task {
     closes: Vec<(u64, PipeHalf, bool)>,
     /// The session's one timer, and the deadline it is armed for.
     timer: Pin<Box<Sleep>>,
+    /// The wait for a deadline closer than [`super::precise::HORIZON`],
+    /// served with the system's timer precision instead of `timer`.
+    precise: Option<super::precise::Sleep>,
     deadline: Option<Instant>,
     /// Set when the session closed with a batch still being written.
     final_deadline: Option<Instant>,
@@ -2578,6 +3122,7 @@ impl Task {
             pipes: vec![first],
             closes: Vec::new(),
             timer: Box::pin(tokio::time::sleep(Duration::from_secs(86_400))),
+            precise: None,
             deadline: None,
             final_deadline: None,
             pick: PickRequest::default(),
@@ -2805,6 +3350,7 @@ impl Future for Task {
                 if let Some(probe) = &mut p.probe {
                     probing |= probe.query(now);
                 }
+                probing |= p.query_unsent(now);
             }
 
             // Suspended sessions the listener's account asks to close, after
@@ -2823,8 +3369,9 @@ impl Future for Task {
             if probing {
                 for p in &mut this.pipes {
                     if let Some(probe) = &mut p.probe {
-                        probe.feed(&mut st.core, p.id, now);
+                        probe.feed(&mut st.core, p.id);
                     }
+                    p.feed_unsent(&mut st.core, now);
                 }
             }
             // A side an application reads through keeps what it reported.
@@ -2926,11 +3473,18 @@ impl Future for Task {
                 // is due.
                 if st.core.is_multipath() {
                     for p in &this.pipes {
-                        if let Some(probe) = &p.probe
+                        if let Some(at) = p.unsent.as_ref().map(UnsentQuery::next_query)
                             && p.write.try_side().is_some_and(|ws| ws.blocked)
                         {
-                            let at = probe.next_query();
                             deadline = Some(deadline.map_or(at, |d| d.min(at)));
+                        }
+                        let lanes = p.lanes.as_deref().map_or(&[][..], |l| &l.list);
+                        for l in lanes {
+                            if let Some(at) = l.unsent.as_ref().map(UnsentQuery::next_query)
+                                && l.write.as_ref().is_some_and(|ws| ws.blocked)
+                            {
+                                deadline = Some(deadline.map_or(at, |d| d.min(at)));
+                            }
                         }
                     }
                 }
@@ -2980,11 +3534,20 @@ impl Future for Task {
             if rearm {
                 this.deadline = deadline;
                 let at = deadline.unwrap_or(now + Duration::from_secs(86_400));
-                this.timer
-                    .as_mut()
-                    .reset(tokio::time::Instant::from_std(at));
+                this.precise = (at.saturating_duration_since(now) <= super::precise::HORIZON
+                    && super::precise::available())
+                .then(|| super::precise::Sleep::new(at));
+                if this.precise.is_none() {
+                    this.timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::from_std(at));
+                }
             }
-            if this.timer.as_mut().poll(cx).is_ready() {
+            let fired = match &mut this.precise {
+                Some(p) => Pin::new(p).poll(cx).is_ready(),
+                None => this.timer.as_mut().poll(cx).is_ready(),
+            };
+            if fired {
                 continue;
             }
             return Poll::Pending;
@@ -3078,7 +3641,7 @@ impl Session {
     /// application TLVs, PIPE_CARRIER; EXTENSIONS.md Section 4), waiting
     /// for stream credit as [`Session::open_bi`](Session#method.open_bi) does. The preamble goes
     /// out with the stream's first frame; it is checked here
-    /// ([`OpenError::InvalidArgument`], [`OpenError::TooLarge`],
+    /// ([`OpenError::InvalidArgument`], [`OpenError::PreambleTooLarge`],
     /// [`OpenError::NotNegotiated`] with a plain QMux peer). Cancel-safe.
     ///
     /// ```no_run
@@ -3145,8 +3708,8 @@ impl Session {
 
     /// Queues a session datagram, waiting while the queue is full.
     /// Cancel-safe: a cancelled call queued nothing.
-    pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), DatagramError> {
-        self.send_datagram_wait_op(data).await
+    pub async fn send_datagram_with_backpressure(&self, data: Bytes) -> Result<(), DatagramError> {
+        self.send_datagram_with_backpressure_op(data).await
     }
 
     /// Receives the next session datagram. Cancel-safe.
@@ -3162,6 +3725,13 @@ impl Session {
     /// with the same code and reason.
     pub async fn shutdown(&self, code: VarInt, reason: &[u8]) -> Result<(), SessionError> {
         self.shutdown_op(code, reason).await
+    }
+
+    /// Resolves once the peer's parameters arrived (the session is
+    /// established: with early data it is usable before), or with the
+    /// error that ended the session first. Cancel-safe.
+    pub async fn established(&self) -> Result<(), SessionError> {
+        self.established_op().await
     }
 
     /// Resolves when the session has ended, with the reason. Cancel-safe.
@@ -3416,6 +3986,48 @@ impl AsyncRead for RecvStream {
 #[cfg(test)]
 mod tests {
     use super::in_turn;
+    use super::{Bytes, ChunkBuf, IoSlice};
+
+    /// A TCP stream given to `PipeIo::new` has Nagle's algorithm off:
+    /// otherwise a record waits for the previous one's acknowledgement and
+    /// records that shaping spaced out leave together (seen on Linux,
+    /// whose delayed acknowledgements made bursts of a shaped session's
+    /// records).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tcp_stream_carrier_has_no_nagle() {
+        use std::os::fd::AsFd;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(!tcp.nodelay().unwrap());
+        let same = std::net::TcpStream::from(tcp.as_fd().try_clone_to_owned().unwrap());
+        let _io = super::PipeIo::new(tcp);
+        assert!(same.nodelay().unwrap());
+    }
+
+    /// A ChunkBuf reads as its buffers in order, shares what lies within one
+    /// buffer and copies only across them.
+    #[test]
+    fn chunk_buf_reads_its_buffers_in_order() {
+        use bytes::Buf;
+        let a = Bytes::from_static(b"head");
+        let b = Bytes::from(vec![9u8; 100]);
+        let mut chunks = [a, Bytes::new(), b.clone()];
+        let mut buf = ChunkBuf::new();
+        assert_eq!(buf.take_from(&mut chunks), 104);
+        assert!(chunks.iter().all(Bytes::is_empty));
+        let mut io = [IoSlice::new(&[]); 4];
+        assert_eq!(buf.chunks_vectored(&mut io), 2);
+        assert_eq!(&buf.copy_to_bytes(2)[..], b"he");
+        let across = buf.copy_to_bytes(4);
+        assert_eq!(&across[..], &[b'a', b'd', 9, 9]);
+        let shared = buf.copy_to_bytes(10);
+        assert_eq!(shared.as_ptr(), b[2..].as_ptr());
+        buf.advance(88);
+        assert!(buf.is_empty() && !buf.has_remaining());
+    }
 
     /// A
     /// limiter lets fewer batches through a round than there are data

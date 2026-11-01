@@ -10,12 +10,25 @@ join to a listener.
 
 - `connect(url, options, config)` / `dial(request, options)`: a session, or
   a carrier for a further pipe, over a new WebSocket;
-- `serve(listener, tcp, options)`: WebSocket upgrades on a TCP listener,
-  handed to a `zmux::Listener`; `accept(io, peer, options)` upgrades one
-  connection, plain or TLS;
+- `serve(listener, tcp, options, fallback)`: WebSocket upgrades on a TCP
+  listener, handed to a `zmux::Listener`; `serve_tls` the same over TLS
+  (`wss://`). Behind intermediaries the listener trusts, the source is the
+  client a PROXY protocol header or a forwarding header field reports;
+  `accept(io, info, listener,
+  options)` upgrades one connection, plain or TLS, or refuses it, `info`
+  giving the connection's metadata (address, TLS exporter);
 - `Options`: the subprotocols, `qmux-02[.<application>]` or an
-  application's own identifier;
+  application's own identifier, and a client's `zmux::Credential`, presented
+  in a request header field (a `zmux::PrefixAuth` token in
+  `Zmux-Prefix-Auth`, bound to the TLS connection with `dial_tls`);
 - `pipe(ws, protocol)`: any established WebSocket stream.
+
+Only a request that is a valid upgrade, offers an accepted subprotocol and
+passes the listener's admission (`ListenerConfig::admission`, decided on
+the upgrade request head) is upgraded. Every other request is refused before
+anything is written: `serve` hands it to the listener's fallback
+(`ListenerConfig::fallback`, a `zmux::Fallback`) with the bytes read replayed, or answers
+`404 Not Found` without one.
 
 A Close frame is the graceful end of a pipe; a connection that ends
 without one is a failure. Over plain TCP a failed pipe is aborted without a
@@ -25,7 +38,7 @@ established TLS stream.
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let session = zmux_websocket::connect("ws://example.com/zmux", zmux::Config::default()).await?;
+let session = zmux_websocket::connect("ws://example.com/zmux", &Default::default(), zmux::Config::default()).await?;
 # drop(session);
 # Ok(())
 # }

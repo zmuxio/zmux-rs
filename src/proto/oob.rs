@@ -1,6 +1,7 @@
-//! Out-of-band join and pairing information on HTTP carriers (SPEC.md
-//! Section 6.1.1, MULTIPATH.md Section 5.3): header names and the unpadded
-//! base64url encoding (RFC 4648 Section 5) of their values.
+//! Out-of-band join and pairing information as the HTTP and WebSocket
+//! carrier bindings carry it: header names and the
+//! unpadded base64url encoding (RFC 4648 Section 5) of their values. The
+//! frame itself is MULTIPATH.md Section 5.3.
 
 use super::error::EncodeError;
 

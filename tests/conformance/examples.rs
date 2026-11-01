@@ -177,22 +177,21 @@ fn key_schedule_vectors() {
     let token = keys::join_token(&k.join_initiator, &prefix, &[]);
     assert_eq!(to_hex(&token), v["Join Token (no carrier binding)"]);
 
-    // The HTTP header carries the whole frame in base64url.
-    let header = &v["HTTP header"];
-    let value = header
-        .strip_prefix(&format!("{}: ", oob::JOIN_HEADER))
-        .expect("header name");
-    assert!(value.len() <= oob::MAX_JOIN_HEADER_LEN);
-    let mut frame = [0u8; 64];
-    let n = oob::decode(value.as_bytes(), &mut frame).unwrap();
-    let (join, len) = PipeJoin::decode(&frame[..n]).unwrap();
-    assert_eq!(len, n);
+    // The out-of-band form is the frame alone, Type through Join Token.
+    let frame = get("PIPE_JOIN frame, out-of-band form");
+    assert_eq!(frame, [prefix.as_slice(), token.as_slice()].concat());
+    let (join, len) = PipeJoin::decode(&frame).unwrap();
+    assert_eq!(len, frame.len());
     assert_eq!(join.pipe_id, 2);
-    assert!(keys::verify_join(&k.join_initiator, &frame[..n], &[]));
-    assert!(!keys::verify_join(&k.join_responder, &frame[..n], &[]));
+    assert!(keys::verify_join(&k.join_initiator, &frame, &[]));
+    assert!(!keys::verify_join(&k.join_responder, &frame, &[]));
+    // The HTTP binding carries it in base64url without padding.
     let mut encoded = [0u8; 96];
-    let e = oob::encode(&frame[..n], &mut encoded).unwrap();
-    assert_eq!(&encoded[..e], value.as_bytes());
+    let e = oob::encode(&frame, &mut encoded).unwrap();
+    assert!(e <= oob::MAX_JOIN_HEADER_LEN);
+    let mut decoded = [0u8; 64];
+    let n = oob::decode(&encoded[..e], &mut decoded).unwrap();
+    assert_eq!(&decoded[..n], frame.as_slice());
 
     // 4.1: the in-band join of the example record verifies; signing an
     // encoded frame reproduces the token.
