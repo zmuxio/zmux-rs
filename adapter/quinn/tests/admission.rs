@@ -50,7 +50,7 @@ impl Server {
         let addr = endpoint.local_addr().unwrap();
         let mut c = Config::default();
         c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::tls();
+        c.pipe_auth = PipeAuth::exporter();
         let mut lc = ListenerConfig::default();
         lc.admission = Some(admission);
         let listener = Listener::new(c, lc);
@@ -167,7 +167,7 @@ async fn bound_token(server: Server) {
     let pipe = carrier.open_pipe_with_prefix(&token(&conn)).await.unwrap();
     let mut config = Config::default();
     config.max_pipes = 4;
-    config.pipe_auth = PipeAuth::tls();
+    config.pipe_auth = PipeAuth::exporter();
     let client = Session::connect(pipe, config).await.unwrap();
     let accepted = tokio::time::timeout(LIMIT, server.listener.accept())
         .await
@@ -252,7 +252,7 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
     let carrier = QuicCarrier::new(conn.clone(), Options::default());
     let mut config = Config::default();
     config.max_pipes = 4;
-    config.pipe_auth = PipeAuth::tls();
+    config.pipe_auth = PipeAuth::exporter();
     let pipe = carrier.open_pipe().await.unwrap();
     let connecting = tokio::spawn(Session::connect(pipe, config));
     let mut uni = conn.open_uni().await.unwrap();
@@ -281,7 +281,7 @@ async fn a_credential_writes_a_bound_token_on_the_first_stream() {
     let server = Server::new(admission(), None);
     let options = Options::default().with_credential(Arc::new(auth()));
     let mut config = Config::default();
-    config.pipe_auth = PipeAuth::tls();
+    config.pipe_auth = PipeAuth::exporter();
     let client = zmux_quinn::connect(&server.client, server.addr, "localhost", &options, config)
         .await
         .unwrap();

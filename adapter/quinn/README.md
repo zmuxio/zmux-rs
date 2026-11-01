@@ -14,7 +14,7 @@ application's (`connection()`).
 
 The carrier wires:
 
-- the connection's TLS 1.3 exporter, for `PipeAuth::tls()` and for
+- the connection's TLS 1.3 exporter, for `PipeAuth::exporter()` and for
   carrier-bound joins (none when the handshake was not complete, as with
   0-RTT);
 - flow control for lanes: the peer may open `Options::lanes` lanes at once,
@@ -34,7 +34,7 @@ use zmux_quinn::{Options, QuicCarrier};
 
 let quic = QuicCarrier::new(conn, Options::default());
 let mut config = zmux::Config::default();
-config.pipe_auth = zmux::PipeAuth::tls();
+config.pipe_auth = zmux::PipeAuth::exporter();
 let session = zmux::Session::connect(quic.open_pipe().await?, config).await?;
 # Ok(())
 # }

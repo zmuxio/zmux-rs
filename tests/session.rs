@@ -478,7 +478,7 @@ async fn join_security_unavailable_is_reported() {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let psk = zmux::PipeAuth::psk(*b"a pre-shared key of 32 bytes....");
     let listener = zmux::Listener::new(
-        Config::multipath(zmux::PipeAuth::tls()),
+        Config::multipath(zmux::PipeAuth::exporter()),
         zmux::ListenerConfig::default(),
     );
     let l = listener.clone();

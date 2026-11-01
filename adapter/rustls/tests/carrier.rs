@@ -212,7 +212,7 @@ fn futures_now<F: Future>(f: F) -> Option<F::Output> {
 async fn a_carrier_bound_join_with_the_session_secret_from_the_exporter() {
     let tls = Tls::new().await;
     // The session secret comes from the bootstrap carrier's exporter alone.
-    let (client, server, listener) = sessions(&tls, PipeAuth::tls()).await;
+    let (client, server, listener) = sessions(&tls, PipeAuth::exporter()).await;
     assert!(
         join(
             &tls,

@@ -21,7 +21,7 @@ use crate::proto::params::{
 /// ([`crate::ConnectError::InvalidConfig`]).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PipeAuth {
-    pub(crate) tls: bool,
+    pub(crate) exporter: bool,
     pub(crate) psk: Option<Vec<u8>>,
     pub(crate) insecure: bool,
 }
@@ -32,12 +32,15 @@ impl PipeAuth {
         Self::default()
     }
 
-    /// Asserts that the bootstrap carriers are TLS that terminates at the
-    /// peer and uses their exporter (E). The driver supplies the exporter
-    /// value of the bootstrap carrier.
-    pub fn tls() -> Self {
+    /// Derives the join secret from the exporter of the innermost
+    /// end-to-end handshake of the bootstrap carriers (E); today its
+    /// source is TLS 1.3 that this process terminates (a TLS connection,
+    /// or the QUIC connection under the carrier). The driver supplies the
+    /// exporter value of the bootstrap carrier; a carrier without one
+    /// fails the session.
+    pub fn exporter() -> Self {
         Self {
-            tls: true,
+            exporter: true,
             ..Self::default()
         }
     }
@@ -71,7 +74,7 @@ impl PipeAuth {
     /// The Secret Flags these credentials select.
     pub fn flags(&self) -> u8 {
         let mut f = 0;
-        if self.tls {
+        if self.exporter {
             f |= secret_flags::EXPORTER;
         }
         if self.psk.is_some() {
@@ -87,7 +90,7 @@ impl PipeAuth {
 impl fmt::Debug for PipeAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PipeAuth")
-            .field("tls", &self.tls)
+            .field("exporter", &self.exporter)
             .field("psk", &self.psk.as_ref().map(|_| ".."))
             .field("insecure", &self.insecure)
             .finish()

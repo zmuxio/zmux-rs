@@ -7,7 +7,7 @@ server, into a `zmux::PipeIo`; `zmux_rustls::over_tcp(stream)` does the same for
 TLS over TCP and adds the socket's capabilities. The carrier has:
 
 - the TLS 1.3 exporter for both labels zmux uses: the session secret of a
-  bootstrap carrier with `PipeAuth::tls()`, and the binding of carrier-bound
+  bootstrap carrier with `PipeAuth::exporter()`, and the binding of carrier-bound
   joins, so that a join token copied to another connection does not verify.
   TLS 1.2 connections and connections still in their handshake (early data)
   have none, and their joins are not carrier-bound;
@@ -37,7 +37,7 @@ such as `zmux::PrefixAuth`, writes its prefix as a client's first bytes.
 #     tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
 # ) -> Result<(), Box<dyn std::error::Error>> {
 let mut config = zmux::Config::default();
-config.pipe_auth = zmux::PipeAuth::tls();
+config.pipe_auth = zmux::PipeAuth::exporter();
 let session = zmux::Session::connect(zmux_rustls::over_tcp(tls), config).await?;
 # Ok(())
 # }

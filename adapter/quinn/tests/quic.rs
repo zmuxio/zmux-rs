@@ -151,7 +151,7 @@ async fn lanes_ride_further_streams_and_the_connection_closes_once_unused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_carrier_bound_join_over_a_second_connection() {
     let quic = Quic::new();
-    let listener = Listener::new(config(PipeAuth::tls()), ListenerConfig::default());
+    let listener = Listener::new(config(PipeAuth::exporter()), ListenerConfig::default());
     let (c1, s1) = quic.connect().await;
     let (c2, s2) = quic.connect().await;
     let _s1 = QuicCarrier::with_listener(s1, &listener, Options::default());
@@ -159,7 +159,7 @@ async fn a_carrier_bound_join_over_a_second_connection() {
     let q1 = QuicCarrier::new(c1, Options::default());
     let q2 = QuicCarrier::new(c2, Options::default());
     // The session secret comes from the first connection's exporter.
-    let client = Session::connect(q1.open_pipe().await.unwrap(), config(PipeAuth::tls()))
+    let client = Session::connect(q1.open_pipe().await.unwrap(), config(PipeAuth::exporter()))
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();

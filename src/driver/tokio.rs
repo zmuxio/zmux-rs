@@ -867,7 +867,7 @@ impl PipeIo {
     /// carrier is, RFC 9001 Section 4), or `None` when there is none. It is
     /// called here once for each label zmux uses: `EXPORTER-zmux-session`
     /// (the session secret, for a bootstrap carrier with
-    /// [`crate::PipeAuth::tls`]; for a split bootstrap the 64-byte
+    /// [`crate::PipeAuth::exporter`]; for a split bootstrap the 64-byte
     /// concatenation of the uplink's and the downlink's values) and
     /// `EXPORTER-zmux-pipe` (the binding of a carrier-bound join, made or
     /// accepted on this carrier, 32 bytes). Values of other lengths are

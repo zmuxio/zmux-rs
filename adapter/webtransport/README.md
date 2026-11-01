@@ -29,7 +29,7 @@ the token.
 The carrier wires:
 
 - the TLS 1.3 exporter of the QUIC connection under the session, for
-  `PipeAuth::tls()` and carrier-bound joins (behind a front end that
+  `PipeAuth::exporter()` and carrier-bound joins (behind a front end that
   terminates TLS, use a PSK);
 - flow control for lanes: the peer may open `Options::lanes` lanes at once,
   and the connection's receive window covers that many stream windows and a
@@ -44,7 +44,7 @@ The carrier wires:
 # async fn example(client: web_transport_quinn::Client) -> Result<(), Box<dyn std::error::Error>> {
 let url: zmux_webtransport::Url = "https://example.com/zmux".parse()?;
 let mut config = zmux::Config::default();
-config.pipe_auth = zmux::PipeAuth::tls();
+config.pipe_auth = zmux::PipeAuth::exporter();
 let options = zmux_webtransport::Options::default();
 let session = zmux_webtransport::connect(&client, url, &options, config).await?;
 # drop(session);

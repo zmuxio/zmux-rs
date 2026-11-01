@@ -462,7 +462,7 @@ fn a_stream_carrier_takes_no_exporter() {
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut tls = multipath();
-            tls.pipe_auth = PipeAuth::tls();
+            tls.pipe_auth = PipeAuth::exporter();
             let accept = {
                 let (os, tls) = (os.clone(), tls.clone());
                 tokio::spawn(async move {

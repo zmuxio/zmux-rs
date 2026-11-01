@@ -32,7 +32,7 @@
 //!
 //! - its TLS 1.3 exporter (RFC 8446 Section 7.5) for both labels zmux uses
 //!   (MULTIPATH.md Sections 10.2 and 10.5): the session secret of a
-//!   bootstrap carrier with [`zmux::PipeAuth::tls`], and the binding of a
+//!   bootstrap carrier with [`zmux::PipeAuth::exporter`], and the binding of a
 //!   carrier-bound join, made or accepted on this carrier, so that a join
 //!   token copied to another connection does not verify. A connection that
 //!   negotiated TLS 1.2, or is still handshaking (early data), has none and
@@ -59,7 +59,7 @@
 //! use zmux::{Config, PipeAuth};
 //!
 //! let mut config = Config::default();
-//! config.pipe_auth = PipeAuth::tls();
+//! config.pipe_auth = PipeAuth::exporter();
 //! let session = zmux_rustls::connect("example.com:443", "example.com", tls, None, config).await?;
 //! # drop(session);
 //! # Ok(())
@@ -72,7 +72,7 @@
 //! # async fn example(tls: std::sync::Arc<rustls::ServerConfig>) -> std::io::Result<()> {
 //! use zmux::{Config, Listener, ListenerConfig, PipeAuth};
 //!
-//! let listener = Listener::new(Config::multipath(PipeAuth::tls()), ListenerConfig::default());
+//! let listener = Listener::new(Config::multipath(PipeAuth::exporter()), ListenerConfig::default());
 //! let tcp = tokio::net::TcpListener::bind("0.0.0.0:443").await?;
 //! tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, tls));
 //! while let Some(session) = listener.accept().await {

@@ -1047,9 +1047,10 @@ impl SessionCore {
         }
     }
 
-    /// Sets the TLS exporter value of the bootstrap carrier(s) for
-    /// `PipeAuth::tls` (MULTIPATH.md Section 10.2): of the TLS 1.3
-    /// handshake that carries pipe 0 and terminates at the peer (its TLS
+    /// Sets the exporter value of the bootstrap carrier(s) for
+    /// `PipeAuth::exporter` (MULTIPATH.md Section 10.2): of the innermost
+    /// end-to-end handshake of pipe 0, today the TLS 1.3 handshake that
+    /// carries it and terminates at the peer (its TLS
     /// connection, or the QUIC connection whose stream it is), taken once
     /// the handshake completed. Call before the parameters are sent: a
     /// session without one does not offer E (a stream of a multiplexed

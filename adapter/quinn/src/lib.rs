@@ -46,7 +46,7 @@
 //!   [`Options::transport_config`] enables QUIC datagrams; the datagrams of
 //!   a connection that carries pipes belong to zmux;
 //! - its TLS 1.3 exporter (RFC 9001 Section 4), shared by its streams: the
-//!   session secret of a bootstrap pipe with [`zmux::PipeAuth::tls`], and
+//!   session secret of a bootstrap pipe with [`zmux::PipeAuth::exporter`], and
 //!   the binding of carrier-bound joins (MULTIPATH.md Section 10.5). A
 //!   connection whose handshake had not completed when the carrier was made
 //!   (0-RTT) has none;
@@ -77,7 +77,7 @@
 //! let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
 //! endpoint.set_default_client_config(zmux_quinn::client_config(tls, &opts)?);
 //! let mut config = Config::default();
-//! config.pipe_auth = PipeAuth::tls();
+//! config.pipe_auth = PipeAuth::exporter();
 //! let addr = "192.0.2.1:443".parse()?;
 //! let session = zmux_quinn::connect(&endpoint, addr, "example.com", &opts, config).await?;
 //! # drop(session);

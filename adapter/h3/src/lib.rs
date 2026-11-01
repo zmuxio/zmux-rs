@@ -38,7 +38,7 @@
 //!   routes them to its pipes ([`ConnectionDatagrams`]), so
 //!   the HTTP Datagrams of a connection that carries pipes belong to zmux;
 //! - the TLS 1.3 exporter of the QUIC connection (RFC 9001 Section 4), for
-//!   [`zmux::PipeAuth::tls`] and carrier-bound joins (MULTIPATH.md Section
+//!   [`zmux::PipeAuth::exporter`] and carrier-bound joins (MULTIPATH.md Section
 //!   10.5); behind a front end that terminates TLS the two ends export
 //!   different values, so such deployments use a PSK (MULTIPATH.md);
 //! - a connection receive window sized for the lanes ([`Options`]),
@@ -70,7 +70,7 @@
 //! let uri: http::Uri = "https://example.com/zmux".parse()?;
 //! let addr = "192.0.2.1:443".parse()?;
 //! let mut config = Config::default();
-//! config.pipe_auth = PipeAuth::tls();
+//! config.pipe_auth = PipeAuth::exporter();
 //! let session = zmux_h3::connect(&endpoint, addr, uri, &Options::default(), config).await?;
 //! # drop(session);
 //! # Ok(())

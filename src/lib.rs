@@ -45,7 +45,7 @@
 //! (a [`PipeIo`]), `connect` (a [`Session`]) and `serve` (into a
 //! [`Listener`]):
 //!
-//! | Carrier | Crate | Passes HTTP proxies and CDNs | Lanes | TLS exporter (`PipeAuth::tls`) |
+//! | Carrier | Crate | Passes HTTP proxies and CDNs | Lanes | Exporter (`PipeAuth::exporter`) |
 //! |---|---|---|---|---|
 //! | TCP | this crate ([`PipeIo::tcp`], [`Listener::serve`]) | no | no | no |
 //! | TLS over TCP | `zmux-rustls` | no | no | yes |

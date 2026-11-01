@@ -43,7 +43,7 @@
 //!   counts those that named none), so the session's datagrams belong to
 //!   zmux;
 //! - the TLS 1.3 exporter of its QUIC connection (RFC 9001 Section 4), for
-//!   [`zmux::PipeAuth::tls`] and carrier-bound joins (MULTIPATH.md Section
+//!   [`zmux::PipeAuth::exporter`] and carrier-bound joins (MULTIPATH.md Section
 //!   10.5); behind an HTTP/3 front end that terminates TLS the two ends
 //!   export different values, so such deployments use a PSK (MULTIPATH.md);
 //! - flow control sized for its lanes: the peer may open [`LaneWindows::lanes`] lanes at once (beside
@@ -67,7 +67,7 @@
 //!
 //! let url: zmux_webtransport::Url = "https://example.com/zmux".parse()?;
 //! let mut config = Config::default();
-//! config.pipe_auth = PipeAuth::tls();
+//! config.pipe_auth = PipeAuth::exporter();
 //! let session = zmux_webtransport::connect(&client, url, &Options::default(), config).await?;
 //! # drop(session);
 //! # Ok(())

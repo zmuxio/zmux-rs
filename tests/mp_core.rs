@@ -416,7 +416,7 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
 fn the_exporter_flag_needs_an_exporter() {
     for exporter in [false, true] {
         let mut a = config(Policy::SpreadEta, false);
-        a.pipe_auth = PipeAuth::tls();
+        a.pipe_auth = PipeAuth::exporter();
         let mut b = a.clone();
         b.test_hooks().locator = b"server".to_vec();
         let mut n = Net::new(a, b, Book::default());
