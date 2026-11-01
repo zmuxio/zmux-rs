@@ -52,15 +52,32 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// with the first call), and tokio's clock is the system's. A paused tokio
 /// clock (the simulations of `test-util`) stands still or jumps ahead of
 /// the system's, and only tokio's timer advances it, so its waits stay
-/// tokio's.
+/// tokio's: a wait here would end by the system's clock while the
+/// runtime's stands still.
 pub(crate) fn available() -> bool {
-    let virtual_now = tokio::time::Instant::now().into_std();
-    let real_now = Instant::now();
-    if virtual_now > real_now || real_now - virtual_now > Duration::from_micros(100) {
+    if !system_clock() {
         return false;
     }
     timers();
     RUNNING.load(Ordering::Acquire)
+}
+
+/// Whether tokio's clock is the system's, not paused. tokio's clock reads
+/// the system's when it is not paused, so a reading of it taken after one
+/// of the system's is never earlier; a paused clock stands still behind
+/// the system's or ahead of it. The system's clock is read until it moved
+/// past tokio's first reading (at most one tick of it), so that a paused
+/// clock that happens to equal it is told apart.
+fn system_clock() -> bool {
+    let tokio_now = tokio::time::Instant::now().into_std();
+    let mut system_now = Instant::now();
+    if tokio_now > system_now {
+        return false;
+    }
+    while system_now == tokio_now {
+        system_now = Instant::now();
+    }
+    tokio::time::Instant::now().into_std() >= system_now
 }
 
 fn run(t: &'static Timers) {
@@ -177,6 +194,24 @@ mod tests {
             let tx = self.tx.lock().unwrap_or_else(PoisonError::into_inner);
             let _ = tx.send((self.i, Instant::now(), name));
         }
+    }
+
+    #[test]
+    fn a_paused_tokio_clock_is_told_apart() {
+        let rt = |paused| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(paused)
+                .build()
+                .unwrap()
+        };
+        assert!(rt(false).block_on(async { system_clock() }));
+        // Right after the start, the paused clock is close to the system's.
+        assert!(!rt(true).block_on(async { system_clock() }));
+        assert!(!rt(true).block_on(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            system_clock()
+        }));
     }
 
     // How late a wait ends is the operating system's scheduling of the
