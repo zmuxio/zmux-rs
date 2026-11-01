@@ -758,7 +758,7 @@ impl PipeIo {
     /// uplink's and the downlink's concatenated (64 bytes). A listener
     /// pairs the carriers itself ([`crate::PipeHint::pair`]); a dialer
     /// combines its two with this.
-    /// It establishes a session only: [`Session::add_pipe`] refuses it
+    /// It establishes a session only: [`Session::add_pipe`](Session#method.add_pipe) refuses it
     /// (join a split carrier with [`crate::join_split`] instead).
     pub fn split_bootstrap(uplink: PipeIo, downlink: PipeIo) -> PipeIo {
         let mut io = Self::paired(uplink, downlink);

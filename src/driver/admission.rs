@@ -244,7 +244,8 @@ impl Fallback {
 
     /// Serves `conn` from `source`.
     pub async fn serve(&self, conn: Prefixed<Box<dyn FallbackStream>>, source: SocketAddr) {
-        (self.0)(conn, source).await;
+        let handler = &self.0;
+        handler(conn, source).await;
     }
 }
 

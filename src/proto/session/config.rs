@@ -176,13 +176,13 @@ impl From<u64> for Budget {
 /// The default handshake timeout ([`Config::handshake_timeout`]).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The default probe interval of idle pipe pairs ([`Config::probe_interval`]).
+/// The default probe interval of idle pipe pairs ([`Config::probe_interval`](Config#structfield.probe_interval)).
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The default keep-alive period ([`Config::keep_alive_period`]).
 pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 
-/// The default standby probe interval ([`Config::standby_probe`]).
+/// The default standby probe interval ([`Config::standby_probe`](Config#structfield.standby_probe)).
 pub const DEFAULT_STANDBY_PROBE: Duration = Duration::from_secs(1);
 
 /// The default idle timeout ([`Config::max_idle_timeout`]).

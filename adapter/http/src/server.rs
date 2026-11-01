@@ -78,7 +78,8 @@ impl HttpFallback {
         req: FallbackRequest,
         peer: Option<SocketAddr>,
     ) -> Response<PipeBody> {
-        (self.0)(req, peer).await
+        let handler = &self.0;
+        handler(req, peer).await
     }
 }
 

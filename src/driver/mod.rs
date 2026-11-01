@@ -325,7 +325,7 @@ impl DialRequest {
     }
 
     /// A request for a carrier of `direction`, with the `Zmux-Pipe-Join`
-    /// value of an out-of-band join ([`crate::PipeReservation::header`]).
+    /// value of an out-of-band join ([`PipeReservation::header`](crate::PipeReservation#method.header)).
     pub fn new(direction: PipeDirection, join_header: Option<String>) -> Self {
         Self {
             direction,

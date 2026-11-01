@@ -60,7 +60,7 @@ impl Candidate {
     }
 
     /// Joins carriers of the kind to an established session with `join`
-    /// instead of [`Session::add_pipe`] on a carrier of the dial: for a
+    /// instead of [`Session::add_pipe`](Session#method.add_pipe) on a carrier of the dial: for a
     /// kind whose dial opens no carrier that can join, such as a split
     /// bootstrap, which joins as an uplink and a downlink. `join` joins
     /// with the options given and returns the pipes once their joins are
@@ -300,7 +300,7 @@ impl std::error::Error for ModeError {}
 /// ([`crate::SessionStats::carrier`]). The background work holds no handle
 /// of the session and ends with it. A mode without candidates or with two
 /// of one kind, or a policy with an invalid timer factor, is a
-/// [`ModeError`] with [`ModeError::invalid`] set.
+/// [`ModeError`] with [`ModeError::invalid`](ModeError#structfield.invalid) set.
 pub async fn dial_mode(
     mode: &Mode,
     config: impl Into<Arc<Config>>,
@@ -745,7 +745,7 @@ impl ModeSource {
 
 /// Joins a split carrier to an established session as two further pipes
 /// (a split bootstrap's pairing makes pipe pair 0 only, so
-/// [`Session::add_pipe`] refuses its carrier): a downlink reserved for an
+/// [`Session::add_pipe`](Session#method.add_pipe) refuses its carrier): a downlink reserved for an
 /// out-of-band join, whose carrier `downlink(header)` opens with that
 /// `Zmux-Pipe-Join` value, and an uplink joined in band on the carrier of
 /// `uplink()`, both opened at once and with `options`. Returns the

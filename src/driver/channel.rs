@@ -97,7 +97,8 @@ impl ChannelReceiver {
     /// never waits: the session takes it from a bounded queue of the pipe,
     /// which drops (and counts) what does not fit.
     pub fn deliver(&self, frame: Bytes) {
-        (self.0)(frame);
+        let handler = &self.0;
+        handler(frame);
     }
 }
 

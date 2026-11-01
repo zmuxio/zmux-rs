@@ -70,7 +70,8 @@ impl InboundTransform {
         io: PipeIo,
         hint: &PipeHint,
     ) -> Pin<Box<dyn Future<Output = io::Result<PipeIo>> + Send>> {
-        (self.0)(io, hint)
+        let handler = &self.0;
+        handler(io, hint)
     }
 }
 

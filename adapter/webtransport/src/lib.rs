@@ -10,7 +10,7 @@
 //!
 //! One step from a client to a zmux session, and from a server to the
 //! sessions it accepts: [`connect`] and [`serve`]; with
-//! [`Options::admission`], [`serve`] decides on each session request before
+//! [`ListenerConfig::admission`](zmux::ListenerConfig::admission), [`serve`] decides on each session request before
 //! it answers it ([`admit`]), on the request head: a client's credential
 //! travels in a request header field ([`Options::with_credential`]), such
 //! as a prefix authentication token in `Zmux-Prefix-Auth`, bound to the
@@ -46,7 +46,7 @@
 //!   [`zmux::PipeAuth::tls`] and carrier-bound joins (MULTIPATH.md Section
 //!   10.5); behind an HTTP/3 front end that terminates TLS the two ends
 //!   export different values, so such deployments use a PSK (MULTIPATH.md);
-//! - flow control sized for its lanes: the peer may open [`Options::lanes`] lanes at once (beside
+//! - flow control sized for its lanes: the peer may open [`LaneWindows::lanes`] lanes at once (beside
 //!   the HTTP/3 control streams), and the connection's receive window
 //!   covers that many stream windows and a pipe's own, charged to the
 //!   memory budget for as long as the carrier lives: the listener's
@@ -430,7 +430,8 @@ impl WebTransportFallback {
 
     /// Serves `request`.
     pub async fn serve(&self, request: wt::Request) {
-        (self.0)(request).await;
+        let handler = &self.0;
+        handler(request).await;
     }
 }
 

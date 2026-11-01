@@ -18,7 +18,7 @@
 //! client lane apart by its first record.
 //!
 //! Nothing is answered on a request before its carrier is accepted
-//! ([`serve_connection`]): by an admission ([`Options::admission`]) on the
+//! ([`serve_connection`]): by an admission ([`ListenerConfig::admission`](zmux::ListenerConfig::admission)) on the
 //! first bytes of its body, or else by the listener's first write or its
 //! taking the carrier. Requests that carry no pipe go to
 //! [`Options::fallback`]. A client writes the prefix of its credential,
@@ -774,7 +774,8 @@ impl H3Fallback {
 
     /// Serves `req`.
     pub async fn serve(&self, req: FallbackRequest) {
-        (self.0)(req).await;
+        let handler = &self.0;
+        handler(req).await;
     }
 }
 

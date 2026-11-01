@@ -876,7 +876,8 @@ impl QuicFallback {
         send: quinn::SendStream,
         recv: Prefixed<quinn::RecvStream>,
     ) {
-        (self.0)(conn, send, recv).await;
+        let handler = &self.0;
+        handler(conn, send, recv).await;
     }
 }
 

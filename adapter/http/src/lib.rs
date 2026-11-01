@@ -18,7 +18,7 @@
 //!
 //! The server classifies each request by its head alone ([`classify`]), so
 //! that every kind can share one request target, and answers nothing before
-//! the carrier is accepted: with an [`Options::admission`], when its
+//! the carrier is accepted: with a [`ListenerConfig::admission`](zmux::ListenerConfig::admission), when its
 //! decision is `Accept` (on the first bytes of the request body, or on the
 //! request head for a request without a body); without, when the listener
 //! first writes on the carrier or has taken it. Responses that carry a
@@ -46,7 +46,7 @@
 //! - The server: [`serve`] accepts TCP connections and serves both
 //!   protocols (HTTP/2 with prior knowledge, as a reverse proxy that speaks
 //!   HTTP/2 to its origin without TLS does), handing every carrier on
-//!   [`Options::path`] to a [`Listener`]; [`serve_with`] sets each
+//!   [`Options::path`] to a [`Listener`](zmux::Listener); [`serve_with`] sets each
 //!   connection up first (TLS), [`serve_connection`] serves one
 //!   established connection, and [`handle_request`] hands over one request
 //!   inside an existing HTTP server, giving back the requests that carry
