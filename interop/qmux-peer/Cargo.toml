@@ -13,5 +13,5 @@ description = "A scripted plain QMux peer (the `qmux` crate) for interoperabilit
 [dependencies]
 bytes = "1"
 qmux = { version = "=0.6.2", default-features = false, features = ["tcp"] }
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 web-transport-trait = "0.5"
