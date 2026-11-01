@@ -265,7 +265,7 @@ async fn mode_pool_dials_the_cached_usable_kind() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let listener = Listener::new(multipath(), ListenerConfig::default());
         let (client, _server) = connected(&listener).await;
-        let soon = Some(std::time::SystemTime::now() + Duration::from_secs(3600));
+        let soon = Some(zmux::WallTime::now().saturating_add(Duration::from_secs(3600)));
         let mut failed = CacheSnapshotEntry::new("k", CarrierKind::Quic);
         failed.fail_until = soon;
         failed.backoff = Duration::from_secs(60);

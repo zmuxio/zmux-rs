@@ -139,7 +139,7 @@ impl CarrierCache {
     /// past, and the failure time plus the longest backoff past too) are
     /// left out.
     pub fn snapshot(&self) -> CacheSnapshot {
-        let (now, wall) = (Instant::now(), SystemTime::now());
+        let (now, wall) = (Instant::now(), WallTime::now());
         let hi = self.0.backoff.1;
         let mut entries: Vec<CacheSnapshotEntry> = self
             .entries()
@@ -148,8 +148,8 @@ impl CarrierCache {
             .map(|((key, kind), e)| CacheSnapshotEntry {
                 key: key.clone(),
                 kind: *kind,
-                good_until: e.good_until.and_then(|t| to_wall(t, now, wall)),
-                fail_until: e.fail_until.and_then(|t| to_wall(t, now, wall)),
+                good_until: e.good_until.map(|t| to_wall(t, now, wall)),
+                fail_until: e.fail_until.map(|t| to_wall(t, now, wall)),
                 backoff: e.backoff,
                 url: e.url.clone(),
             })
@@ -167,9 +167,9 @@ impl CarrierCache {
     /// (`fail_until`) is brought back to it, and expired entries are
     /// dropped. The cache's configuration is unchanged.
     pub fn restore(&self, snapshot: &CacheSnapshot) {
-        let (now, wall) = (Instant::now(), SystemTime::now());
+        let (now, wall) = (Instant::now(), WallTime::now());
         let (lo, hi) = self.0.backoff;
-        let bound = |t: SystemTime, ahead: Duration| {
+        let bound = |t: WallTime, ahead: Duration| {
             let t = to_mono(t, now, wall);
             now.checked_add(ahead).map_or(t, |b| t.min(b))
         };
@@ -213,23 +213,90 @@ fn merge(
 }
 
 /// `t` on the wall clock, by its distance from `now` (`wall`).
-fn to_wall(t: Instant, now: Instant, wall: SystemTime) -> Option<SystemTime> {
+fn to_wall(t: Instant, now: Instant, wall: WallTime) -> WallTime {
+    let n = |d: Duration| d.as_nanos() as i128;
     if t >= now {
-        wall.checked_add(t - now)
+        WallTime(wall.0.saturating_add(n(t - now)))
     } else {
-        wall.checked_sub(now - t)
+        WallTime(wall.0.saturating_sub(n(now - t)))
     }
 }
 
 /// The wall-clock time `t` on the monotonic clock; one before the
 /// monotonic clock's range is its earliest representable time near `now`.
-fn to_mono(t: SystemTime, now: Instant, wall: SystemTime) -> Instant {
-    match t.duration_since(wall) {
-        Ok(ahead) => now
-            .checked_add(ahead)
+fn to_mono(t: WallTime, now: Instant, wall: WallTime) -> Instant {
+    let d = t.0.saturating_sub(wall.0);
+    let span = nanos(d.unsigned_abs());
+    if d >= 0 {
+        now.checked_add(span)
             .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 86_400)))
-            .unwrap_or(now),
-        Err(e) => now.checked_sub(e.duration()).unwrap_or(now),
+            .unwrap_or(now)
+    } else {
+        now.checked_sub(span).unwrap_or(now)
+    }
+}
+
+/// `n` nanoseconds, saturated to the longest [`Duration`].
+fn nanos(n: u128) -> Duration {
+    let secs = u64::try_from(n / NANOS as u128).unwrap_or(u64::MAX);
+    Duration::new(secs, (n % NANOS as u128) as u32)
+}
+
+const NANOS: i128 = 1_000_000_000;
+
+/// A wall-clock time of a [`CacheSnapshot`]: nanoseconds since the Unix
+/// epoch (negative before it). Exact on every platform, so that the
+/// interchange form round-trips whatever the resolution of
+/// [`SystemTime`] where it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WallTime(i128);
+
+impl WallTime {
+    /// The current time of the system clock.
+    pub fn now() -> Self {
+        SystemTime::now().into()
+    }
+
+    /// The time `n` nanoseconds after the Unix epoch.
+    pub const fn from_unix_nanos(n: i128) -> Self {
+        Self(n)
+    }
+
+    /// Nanoseconds since the Unix epoch.
+    pub const fn unix_nanos(self) -> i128 {
+        self.0
+    }
+
+    /// The time as a [`SystemTime`], at that clock's resolution; `None`
+    /// outside its range.
+    pub fn to_system_time(self) -> Option<SystemTime> {
+        let span = nanos(self.0.unsigned_abs());
+        if self.0 >= 0 {
+            UNIX_EPOCH.checked_add(span)
+        } else {
+            UNIX_EPOCH.checked_sub(span)
+        }
+    }
+
+    /// `d` later, saturated.
+    #[must_use]
+    pub fn saturating_add(self, d: Duration) -> Self {
+        Self(self.0.saturating_add(d.as_nanos() as i128))
+    }
+
+    /// `d` earlier, saturated.
+    #[must_use]
+    pub fn saturating_sub(self, d: Duration) -> Self {
+        Self(self.0.saturating_sub(d.as_nanos() as i128))
+    }
+}
+
+impl From<SystemTime> for WallTime {
+    fn from(t: SystemTime) -> Self {
+        match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => Self(d.as_nanos() as i128),
+            Err(e) => Self(-(e.duration().as_nanos() as i128)),
+        }
     }
 }
 
@@ -259,9 +326,9 @@ pub struct CacheSnapshotEntry {
     /// The carrier kind.
     pub kind: CarrierKind,
     /// Until when the kind is held as usable.
-    pub good_until: Option<SystemTime>,
+    pub good_until: Option<WallTime>,
     /// Until when the kind is skipped as failed.
-    pub fail_until: Option<SystemTime>,
+    pub fail_until: Option<WallTime>,
     /// The current backoff (zero: no failure in a row).
     pub backoff: Duration,
     /// The final URL that redirects led the kind to (empty: its base).
@@ -370,7 +437,7 @@ impl CacheSnapshot {
                 Some(_) => Err(invalid(format!("{name} not a string"))),
             };
             let (key, kind, url) = (s("key")?, s("kind")?, s("url")?);
-            let time = |name: &str| -> Result<Option<SystemTime>, SnapshotError> {
+            let time = |name: &str| -> Result<Option<WallTime>, SnapshotError> {
                 let t = s(name)?;
                 if t.is_empty() {
                     return Ok(None);
@@ -404,7 +471,7 @@ impl CacheSnapshot {
 
 /// RFC 3339 times in UTC.
 mod rfc3339 {
-    use super::{Duration, SystemTime, UNIX_EPOCH};
+    use super::{NANOS, WallTime};
 
     /// Days since 1970-01-01 of a civil date (proleptic Gregorian).
     fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -431,19 +498,11 @@ mod rfc3339 {
 
     /// `t` as `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, the fraction without
     /// trailing zeros.
-    pub(super) fn format(t: SystemTime) -> String {
-        let (secs, nanos) = match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-            Err(e) => {
-                let d = e.duration();
-                let (s, n) = (d.as_secs() as i64, d.subsec_nanos());
-                if n == 0 {
-                    (-s, 0)
-                } else {
-                    (-s - 1, 1_000_000_000 - n)
-                }
-            }
-        };
+    pub(super) fn format(t: WallTime) -> String {
+        let n = t.unix_nanos();
+        let secs =
+            i64::try_from(n.div_euclid(NANOS)).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
+        let nanos = n.rem_euclid(NANOS) as u32;
         let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
         let (y, m, d) = civil_from_days(days);
         let mut s = format!(
@@ -469,7 +528,7 @@ mod rfc3339 {
     }
 
     /// Parses `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`.
-    pub(super) fn parse(s: &str) -> Option<SystemTime> {
+    pub(super) fn parse(s: &str) -> Option<WallTime> {
         let b = s.as_bytes();
         if b.len() < 20
             || b[4] != b'-'
@@ -529,13 +588,9 @@ mod rfc3339 {
             _ => return None,
         };
         let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset;
-        if secs >= 0 {
-            UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
-        } else {
-            UNIX_EPOCH
-                .checked_sub(Duration::from_secs(secs.unsigned_abs()))?
-                .checked_add(Duration::from_nanos(u64::from(nanos)))
-        }
+        Some(WallTime::from_unix_nanos(
+            i128::from(secs) * NANOS + i128::from(nanos),
+        ))
     }
 
     #[cfg(test)]
@@ -548,8 +603,8 @@ mod rfc3339 {
                 "1970-01-01T00:00:00Z",
                 "2026-11-01T12:00:00Z",
                 "2026-11-01T12:00:00.5Z",
-                // 100 ns: the resolution of `SystemTime` on Windows.
-                "2000-02-29T23:59:59.1234567Z",
+                // Finer than `SystemTime` on Windows (100 ns).
+                "2000-02-29T23:59:59.123456789Z",
                 "1969-12-31T23:59:59.25Z",
                 "2999-06-01T00:00:00.001Z",
             ] {
@@ -879,8 +934,8 @@ mod tests {
 
     #[test]
     fn restore_bounds_times() {
-        let wall = SystemTime::now();
-        let far = wall + Duration::from_secs(10 * 365 * 86_400);
+        let wall = WallTime::now();
+        let far = wall.saturating_add(Duration::from_secs(10 * 365 * 86_400));
         let mut s = CacheSnapshot::default();
         let mut good = CacheSnapshotEntry::new("g", CarrierKind::Split);
         good.good_until = Some(far);
@@ -890,7 +945,7 @@ mod tests {
         s.entries = vec![good, bad];
         let c = CarrierCache::default();
         c.restore(&s);
-        let limit = SystemTime::now() + Duration::from_secs(6 * 3600);
+        let limit = WallTime::now().saturating_add(Duration::from_secs(6 * 3600));
         for e in c.snapshot().entries {
             for t in [e.good_until, e.fail_until].into_iter().flatten() {
                 assert!(t <= limit, "{e:?} beyond its bound");

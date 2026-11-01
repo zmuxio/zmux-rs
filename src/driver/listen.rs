@@ -1184,11 +1184,10 @@ impl Listener {
         // and freed once it is done: what waits for the pipe's end is
         // small, as it is kept for the pipe's lifetime.
         let r = match Box::pin(self.handle(pipe, hint)).await {
-            Ok(Some(done)) => {
-                done.wait().await;
+            Ok(end) => {
+                end.wait().await;
                 Ok(())
             }
-            Ok(None) => Ok(()),
             Err(e) => Err(e),
         };
         if let Err(e) = r {
@@ -1288,11 +1287,7 @@ impl Listener {
 
     /// Sets up a carrier: what its pipe's end is waited for with, if it
     /// became a pipe.
-    async fn handle(
-        &self,
-        mut pipe: PipeIo,
-        mut hint: PipeHint,
-    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
+    async fn handle(&self, mut pipe: PipeIo, mut hint: PipeHint) -> Result<PipeEnd, HandleError> {
         let shared = &self.shared;
         // A stream that may be a lane of a pipe on its connection waits
         // for its first record outside the limits (MULTIPATH.md Section
@@ -1436,7 +1431,7 @@ impl Listener {
                     bytes,
                 )?;
                 shared.counts.joins.fetch_add(1, Relaxed);
-                Ok(None)
+                Ok(PipeEnd::default())
             }
             Classified::Join {
                 locator,
@@ -1525,7 +1520,7 @@ impl Listener {
         hint: PipeHint,
         mut entry: Entry,
         token: &[u8],
-    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
+    ) -> Result<PipeEnd, HandleError> {
         let shared = &self.shared;
         let Ok(token) = <[u8; PAIRING_TOKEN_LEN]>::try_from(token) else {
             return Err(HandleError::Rejected);
@@ -1618,7 +1613,7 @@ impl Listener {
             }
             drop(std::mem::take(&mut wakes));
             pending.done();
-            return Ok(Some(done));
+            return Ok(PipeEnd::of(done));
         }
         let deadline = arrived.checked_add(limits.handshake_timeout);
         let partner = PairWait {
@@ -1641,15 +1636,18 @@ impl Listener {
             }
             return Err(HandleError::TimedOut);
         };
-        // The second half resolves when the session ends, however it ends.
-        let _finish = FinishOnDrop(done);
+        // The second half resolves when the session ends, however it ends:
+        // its release goes with what this half waits for.
+        let finish = FinishOnDrop(done);
         pending.done();
         let (up, down) = if uplink { (pipe, other) } else { (other, pipe) };
         let mut io = PipeIo::paired(up, down);
         if let Some(taken) = io.taken.take() {
             taken();
         }
-        self.start_session(io).await
+        let mut end = self.start_session(io).await?;
+        end.partner = Some(finish);
+        Ok(end)
     }
 
     /// Reads until the listener classified the carrier.
@@ -1691,7 +1689,7 @@ impl Listener {
     }
 
     /// A new session on its bootstrap carrier.
-    async fn start_session(&self, pipe: PipeIo) -> Result<Option<Arc<PipeDone>>, HandleError> {
+    async fn start_session(&self, pipe: PipeIo) -> Result<PipeEnd, HandleError> {
         let config = self.shared.config.clone();
         // Each session of the listener has its own locator unless one is
         // configured.
@@ -1730,7 +1728,10 @@ impl Listener {
             }
             Err(_) => return Err(HandleError::Rejected),
         }
-        Ok(done)
+        Ok(PipeEnd {
+            done,
+            partner: None,
+        })
     }
 
     // Called synchronously by Shared::create before any bootstrap I/O.
@@ -1770,7 +1771,7 @@ impl Listener {
         inband: bool,
         mut pipe: PipeIo,
         limits: &ListenerConfig,
-    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
+    ) -> Result<PipeEnd, HandleError> {
         let session = {
             let st = self.shared.lock();
             st.sessions.get(locator).and_then(Weak::upgrade)
@@ -1867,7 +1868,7 @@ impl Listener {
                     // Counted once attached.
                     self.shared.counts.joins.fetch_add(1, Relaxed);
                     drop(session);
-                    return Ok(Some(done));
+                    return Ok(PipeEnd::of(done));
                 }
                 JoinVerdict::Wait if deadline.is_none_or(|d| now() < d) => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2053,6 +2054,30 @@ impl Drop for PairWait<'_> {
 
 /// Finishes a latch when dropped.
 struct FinishOnDrop(Arc<PipeDone>);
+
+/// What a set-up carrier's handler waits for: its pipe's end, and the
+/// second half of a split bootstrap to release then.
+#[derive(Default)]
+struct PipeEnd {
+    done: Option<Arc<PipeDone>>,
+    partner: Option<FinishOnDrop>,
+}
+
+impl PipeEnd {
+    fn of(done: Arc<PipeDone>) -> Self {
+        Self {
+            done: Some(done),
+            partner: None,
+        }
+    }
+
+    /// Resolves when the pipe ended; the partner half is released after.
+    async fn wait(self) {
+        if let Some(d) = &self.done {
+            d.wait().await;
+        }
+    }
+}
 
 impl Drop for FinishOnDrop {
     fn drop(&mut self) {

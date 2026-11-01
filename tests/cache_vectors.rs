@@ -40,7 +40,7 @@ struct Expect {
 /// The RFC 3339 form of `t` (through the snapshot's own encoding).
 fn rfc3339(t: SystemTime) -> String {
     let mut e = CacheSnapshotEntry::new("", CarrierKind::Quic);
-    e.good_until = Some(t);
+    e.good_until = Some(t.into());
     let mut s = CacheSnapshot::default();
     s.entries.push(e);
     let json = s.to_json();
@@ -74,8 +74,8 @@ fn entries(cache: &CarrierCache, now: SystemTime) -> Vec<Expect> {
         .map(|e| Expect {
             key: e.key,
             kind: e.kind.name().to_owned(),
-            usable: e.good_until.is_some_and(|t| t > now),
-            failed: e.fail_until.is_some_and(|t| t > now),
+            usable: e.good_until.is_some_and(|t| t > now.into()),
+            failed: e.fail_until.is_some_and(|t| t > now.into()),
             backoff_ms: e.backoff.as_millis() as u64,
             url: e.url,
         })

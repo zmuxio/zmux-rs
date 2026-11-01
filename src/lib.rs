@@ -143,7 +143,7 @@ pub use proto::{DetailKey, VarInt};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::cache::{CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError};
+pub use driver::cache::{CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime};
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub use driver::handle::Written;
 #[cfg(all(feature = "tokio", not(loom)))]
