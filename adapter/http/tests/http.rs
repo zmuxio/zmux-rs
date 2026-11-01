@@ -448,9 +448,7 @@ where
 {
     let tcp = TcpStream::connect(addr).await.unwrap();
     let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
-            .await
-            .unwrap();
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await?;
     tokio::spawn(conn);
     let req = http::Request::post(path)
         .header(http::header::HOST, addr)
@@ -620,7 +618,7 @@ async fn a_client_writes_its_token_first_on_the_request_body() {
 }
 
 /// Pipe 0 of each session is of carrier kind `kind`.
-fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
     for s in sessions {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));

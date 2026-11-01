@@ -42,7 +42,7 @@ use crate::proto::session::PipeId;
 ///
 /// A channel datagram is the varint [`DatagramChannel::channel_id`], when
 /// the channel has one, then one DATAGRAM frame without its Length field
-/// ([`crate::proto::frame::channel`]).
+/// (the [`channel`] frame module).
 pub trait DatagramChannel: Send + Sync + 'static {
     /// The varint each channel datagram of the pipe starts with, by which
     /// the peer's carrier routes it to the pipe: the Pipe Stream ID (the

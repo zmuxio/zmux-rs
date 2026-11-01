@@ -287,7 +287,7 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
 }
 
 /// Pipe 0 of each session is of carrier kind `kind`.
-fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
     for s in sessions {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));

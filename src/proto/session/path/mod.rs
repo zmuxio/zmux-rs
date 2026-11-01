@@ -39,18 +39,18 @@ impl SessionCore {
     /// The bytes sent and kept until a PIPE_ACK covers them (multipath
     /// only: a single pipe drops what it sent).
     pub(super) fn retained(&self) -> u64 {
-        self.mp.as_deref().map_or(0, super::mpath::Mp::retained)
+        self.mp.as_deref().map_or(0, mpath::Mp::retained)
     }
 
     /// The log of the batch being built, which multipath keeps for its
     /// acknowledgements and reinjection.
     pub(super) fn batch_log(&mut self) -> Option<&mut BatchLog> {
-        self.mp.as_deref_mut().map(super::mpath::Mp::batch_mut)
+        self.mp.as_deref_mut().map(mpath::Mp::batch_mut)
     }
 
     /// The scheduler's outstanding picks (multipath only).
     pub(super) fn picks(&mut self) -> Option<&mut Picks> {
-        self.mp.as_deref_mut().map(super::mpath::Mp::picks_mut)
+        self.mp.as_deref_mut().map(mpath::Mp::picks_mut)
     }
 
     /// The tier gate now, in a multipath session.
@@ -78,7 +78,7 @@ impl SessionCore {
     /// The sending rate of a pipe in bytes per second: its delivery-rate
     /// estimate in a multipath session, else the rate the session hands
     /// bytes to its carrier; 0 before the first measurement.
-    pub(super) fn pipe_send_rate(&self, pipe: super::PipeId) -> u64 {
+    pub(super) fn pipe_send_rate(&self, pipe: PipeId) -> u64 {
         if self.mp.is_some() {
             self.out_ref(pipe.0).map_or(0, |o| o.est().rate)
         } else {
@@ -270,7 +270,7 @@ impl SessionCore {
     /// RTT_min_p / 8) per pipe. Without an RTT_min the floor. The driver
     /// applies it at most every 20 ms and only when it changes by more than
     /// 25 %, never above the carrier's send buffer.
-    pub fn notsent_lowat(&self, pipe: super::PipeId) -> u64 {
+    pub fn notsent_lowat(&self, pipe: PipeId) -> u64 {
         const SINGLE: u64 = 128 * 1024;
         const MULTI: u64 = 32 * 1024;
         if self.mp.is_some() {
@@ -404,7 +404,7 @@ impl SessionCore {
         if control && o.takes_new_data() && self.opening_ready() {
             return true;
         }
-        if o.state() == pipes::OutState::Active
+        if o.state() == OutState::Active
             && self
                 .dgram()
                 .send
@@ -534,7 +534,7 @@ impl SessionCore {
         let carries = self.mp.is_none()
             || self
                 .out_ref(pipe)
-                .is_some_and(|o| o.state() == pipes::OutState::Active);
+                .is_some_and(|o| o.state() == OutState::Active);
         let mut i = 0;
         loop {
             let Some((flow, data)) = self.dgram().send.get(i) else {
@@ -602,7 +602,7 @@ impl SessionCore {
             }
             self.datagram_sent(flow, len);
             if was_full {
-                self.events.push_back(super::CoreEvent::DatagramsUnblocked);
+                self.events.push_back(CoreEvent::DatagramsUnblocked);
             }
         }
     }
@@ -721,7 +721,7 @@ impl SessionCore {
         if let Some(id) = s.id
             && (self.shape.is_some() || self.shape_pending.is_some())
         {
-            self.shape_stream(super::shaping::EventKind::StreamEnd, id);
+            self.shape_stream(shaping::EventKind::StreamEnd, id);
         }
         if let Some(mp) = self.mp.as_deref_mut() {
             mp.picks_mut().forget(key);
@@ -901,7 +901,7 @@ impl SessionCore {
     pub(super) fn send_buffer(&self) -> SendBuffer {
         SendBuffer {
             total: self.session_send_buffer(),
-            retained: self.mp.as_deref().map(super::mpath::Mp::retained),
+            retained: self.mp.as_deref().map(mpath::Mp::retained),
         }
     }
 
@@ -957,7 +957,7 @@ impl SessionCore {
             .streams
             .autotune_data(key, off, now, (rtt, session_rtt), pipe_rtt);
         for s in samples.into_iter().flatten() {
-            self.loop_min.sample(now, s, super::filter::LOOP_SPAN);
+            self.loop_min.sample(now, s, filter::LOOP_SPAN);
         }
     }
 }
@@ -976,7 +976,7 @@ impl SessionCore {
     /// carrier: any carrier works with it, whatever signals it offers.
     pub fn write_call_limit(
         &self,
-        pipe: super::PipeId,
+        pipe: PipeId,
         batch: usize,
         blocking: bool,
         input_pending: bool,

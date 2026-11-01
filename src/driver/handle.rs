@@ -186,7 +186,7 @@ pub struct CarrierInfo {
 
 impl CarrierInfo {
     /// Records what the core keeps of the carrier on pipe `id`.
-    pub(crate) fn describe(&self, core: &mut core::SessionCore, id: core::PipeId) {
+    pub(crate) fn describe(&self, core: &mut core::SessionCore, id: PipeId) {
         core.set_pipe_carrier(id, self.kind);
         core.set_pipe_write_overhead(id, self.write_overhead);
         core.set_pipe_admitted(id, self.admitted.clone());
@@ -334,7 +334,7 @@ impl<D: Driver> State<D> {
             core.set_bootstrap_exporter(&e.session);
         }
         core.attach_bootstrap(carrier.inbound, carrier.outbound, now);
-        carrier.describe(&mut core, core::PipeId(0));
+        carrier.describe(&mut core, PipeId(0));
         let admitted = carrier.admitted.clone();
         Ok(Self {
             core,
@@ -747,7 +747,7 @@ impl<D: Driver> Shared<D> {
 /// Work for the hook context.
 enum HookWork {
     Window(u64, u64),
-    Trace(std::collections::VecDeque<Trace>),
+    Trace(VecDeque<Trace>),
 }
 
 /// The session's hook context (a task or a thread): runs
@@ -2152,7 +2152,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])>;
     fn role_nonces(&self) -> Option<(u64, u64)>;
     fn set_scheduler(&self, policy: Policy);
-    fn set_shaper(&self, factory: Option<std::sync::Arc<dyn core::shaping::Factory>>);
+    fn set_shaper(&self, factory: Option<Arc<dyn core::shaping::Factory>>);
     fn set_pipe_shaper(&self, pipe: PipeId, shaper: Option<Box<dyn core::shaping::Shaper>>)
     -> bool;
     fn shaping_stats(&self) -> core::shaping::Stats;
@@ -2292,7 +2292,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.command(|st| st.core.set_scheduler(policy));
     }
 
-    fn set_shaper(&self, factory: Option<std::sync::Arc<dyn core::shaping::Factory>>) {
+    fn set_shaper(&self, factory: Option<Arc<dyn core::shaping::Factory>>) {
         self.command(|st| st.core.set_shaper(factory));
     }
 
@@ -2769,20 +2769,20 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
         self.command(|c, p| c.set_pipe_send_standby(p, Some(standby)))
     }
 
-    fn clear_send_standby(&self) -> Result<(), PipeError> {
-        self.command(|c, p| c.set_pipe_send_standby(p, None))
-    }
-
-    fn set_receive_standby(&self, standby: bool) -> Result<(), PipeError> {
-        self.command(|c, p| c.set_pipe_receive_standby(p, standby))
-    }
-
     fn set_priority(&self, priority: u64) -> Result<(), PipeError> {
         self.command(|c, p| c.set_pipe_priority(p, priority))
     }
 
     fn set_standby(&self, standby: bool) -> Result<(), PipeError> {
         self.command(|c, p| c.set_pipe_standby(p, standby))
+    }
+
+    fn clear_send_standby(&self) -> Result<(), PipeError> {
+        self.command(|c, p| c.set_pipe_send_standby(p, None))
+    }
+
+    fn set_receive_standby(&self, standby: bool) -> Result<(), PipeError> {
+        self.command(|c, p| c.set_pipe_receive_standby(p, standby))
     }
 
     fn set_weight(&self, weight: u64) -> Result<(), PipeError> {

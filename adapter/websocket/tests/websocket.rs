@@ -221,11 +221,7 @@ async fn empty_injector(
         )
         .await
         .unwrap();
-        let mut req =
-            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-                format!("ws://{to}/zmux"),
-            )
-            .unwrap();
+        let mut req = IntoClientRequest::into_client_request(format!("ws://{to}/zmux")).unwrap();
         req.headers_mut()
             .insert("Sec-WebSocket-Protocol", "qmux-02".parse().unwrap());
         let (server, _) = tokio_tungstenite::connect_async(req).await.unwrap();
@@ -374,10 +370,7 @@ async fn out_of_band_join() {
     let r = client
         .reserve_pipe(zmux::PipeDirection::Bidi, zmux::PipeOptions::new())
         .unwrap();
-    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-        format!("ws://{addr}/zmux"),
-    )
-    .unwrap();
+    let mut req = IntoClientRequest::into_client_request(format!("ws://{addr}/zmux")).unwrap();
     req.headers_mut()
         .insert(zmux::JOIN_HEADER, r.header().parse().unwrap());
     let io = zmux_websocket::dial(req, &Default::default())
@@ -668,7 +661,7 @@ async fn trusted_intermediaries_report_the_source() {
 }
 
 /// Pipe 0 of each session is of carrier kind `kind`.
-fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
     for s in sessions {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));

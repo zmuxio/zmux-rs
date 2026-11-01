@@ -42,7 +42,3 @@ unreachable_pub = "warn"
 [[bench]]
 name = "bulk"
 harness = false
-
-[[test]]
-name = "modes"
-required-features = ["websocket"]

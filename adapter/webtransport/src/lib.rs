@@ -277,7 +277,7 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 /// ([`Listener::enter`], taken before its QUIC handshake). Nothing is
 /// answered before the decision. The decision has no prefix; its metadata
 /// is the connection's ([`zmux_quinn::Handshake::carrier_info`]), with the
-/// request ([`ConnectRequest`] as the [`zmux::CarrierInfo::with_request`]
+/// request ([`ConnectRequest`] as the [`CarrierInfo::with_request`]
 /// value, its header fields as [`CarrierInfo::for_each_header`] gives
 /// them) and [`CarrierInfo::head`] set, so that
 /// [`zmux::Admission::prefix_auth`] takes its token from the request
@@ -353,8 +353,8 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
             }
         }
         Admit::Stall => {
-            let mut closed = std::pin::pin!(conn.closed());
-            let mut stall = std::pin::pin!(entry.stall(None::<&mut tokio::io::Empty>));
+            let mut closed = pin!(conn.closed());
+            let mut stall = pin!(entry.stall(None::<&mut tokio::io::Empty>));
             poll_fn(|cx| {
                 if closed.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());

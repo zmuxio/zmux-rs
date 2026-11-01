@@ -84,8 +84,8 @@ impl Definition {
 
 impl State {
     /// Calls `f` for every value of the state, nested ones included.
-    pub(crate) fn values<'a>(&'a self, f: &mut impl FnMut(&'a Value)) {
-        fn walk<'a>(v: &'a Value, f: &mut impl FnMut(&'a Value)) {
+    pub(crate) fn values(&self, f: &mut impl FnMut(&Value)) {
+        fn walk(v: &Value, f: &mut impl FnMut(&Value)) {
             f(v);
             if let Some(d) = &v.dist {
                 for c in &d.of {

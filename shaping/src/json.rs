@@ -1,6 +1,6 @@
 //! Strict JSON reading of configuration documents.
 //!
-//! A document is first read into a [`serde_json::Value`], rejecting
+//! A document is first read into a `serde_json` [`Value`], rejecting
 //! duplicate member names, numbers outside binary64 and anything that is
 //! not JSON. It is then deserialized through [`Strict`], which treats a
 //! `null` member as absent, accepts only JSON integers (no fraction or

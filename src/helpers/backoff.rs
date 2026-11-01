@@ -70,7 +70,7 @@ pub(crate) fn reduce(d: Duration, jitter: f64) -> Duration {
 /// A uniform value in [0, 1).
 pub(crate) fn random_fraction() -> f64 {
     #[cfg(test)]
-    DRAWS.with(|d| d.set(d.get() + 1));
+    DRAWS.set(DRAWS.get() + 1);
     let r = crate::util::random_u64() >> 11;
     r as f64 / (1u64 << 53) as f64
 }

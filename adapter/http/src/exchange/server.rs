@@ -120,7 +120,7 @@ impl ExchangeServer {
     /// ([`std::io::ErrorKind::InvalidInput`]) on options without a PSK
     /// that do not choose to run unauthenticated
     /// ([`ExchangeOptions::unauthenticated`]), or that set both.
-    pub fn new(listener: &Listener, options: ExchangeOptions) -> std::io::Result<Self> {
+    pub fn new(listener: &Listener, options: ExchangeOptions) -> io::Result<Self> {
         options.mac_psk()?;
         // A difference of Times is a signed 32-bit value: a wider window
         // takes every Time.
@@ -187,7 +187,7 @@ impl ExchangeServer {
     ) -> Result<Response<PipeBody>, Request<ReplayBody<B>>>
     where
         B: http_body::Body + Unpin,
-        B::Data: bytes::Buf,
+        B::Data: Buf,
     {
         let (parts, mut body) = req.into_parts();
         // The one classification: any other

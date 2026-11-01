@@ -1501,7 +1501,7 @@ impl SessionCore {
         now: Instant,
     ) {
         let unknown = !application && code == T::ZMUX_RESUME_FAILED.0;
-        if unknown && self.state == crate::proto::session::State::Suspended {
+        if unknown && self.state == State::Suspended {
             self.close_resume(T::ZMUX_RESUME_FAILED, "peer has no session", now);
             return;
         }

@@ -5,6 +5,8 @@
 //! with joins, a session established on the exchange carrier moves to a
 //! preferred kind.
 
+#![cfg(feature = "websocket")]
+
 mod proxy;
 
 use std::sync::Arc;
@@ -63,7 +65,7 @@ async fn origin(config: Config) -> (std::net::SocketAddr, Listener) {
 
 fn connect(
     addr: &str,
-) -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<TcpStream>> + Send>>
+) -> impl Fn() -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<TcpStream>> + Send>>
 + Send
 + Sync
 + Clone

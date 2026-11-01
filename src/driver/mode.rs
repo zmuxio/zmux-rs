@@ -461,7 +461,7 @@ async fn start(
         Some(p) => p.timer(t0.elapsed()),
         None => bound.saturating_sub(t0.elapsed()),
     };
-    let shared = match super::handle::Shared::<Tokio>::create(
+    let shared = match handle::Shared::<Tokio>::create(
         io,
         config.clone(),
         RoleConfig::Initiator,

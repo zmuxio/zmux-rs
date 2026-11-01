@@ -215,7 +215,7 @@ impl SessionCore {
             // The peer's parameters arrived below the limit the open
             // assumed: only this stream fails, nothing is sent.
             self.unschedule(key);
-            self.reject_unopened(key, super::stream::GoAwayFail::PreambleTooLarge);
+            self.reject_unopened(key, GoAwayFail::PreambleTooLarge);
             return Err(StreamError::PreambleTooLarge);
         }
         self.unschedule(key);

@@ -153,6 +153,15 @@ impl bytes::Buf for ChunkBuf {
         self.chunks.front().map_or(&[], |c| c)
     }
 
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut n = 0;
+        for (d, c) in dst.iter_mut().zip(&self.chunks) {
+            *d = IoSlice::new(c);
+            n += 1;
+        }
+        n
+    }
+
     fn advance(&mut self, mut cnt: usize) {
         assert!(cnt <= self.len, "advance past the end");
         self.len -= cnt;
@@ -167,15 +176,6 @@ impl bytes::Buf for ChunkBuf {
             cnt -= front.len();
             self.chunks.pop_front();
         }
-    }
-
-    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
-        let mut n = 0;
-        for (d, c) in dst.iter_mut().zip(&self.chunks) {
-            *d = IoSlice::new(c);
-            n += 1;
-        }
-        n
     }
 
     fn copy_to_bytes(&mut self, len: usize) -> Bytes {

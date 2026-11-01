@@ -2255,7 +2255,7 @@ mod registration_tests {
                 .await
                 .expect("client task")
                 .expect("client established");
-            server.close(crate::VarInt::ZERO, b"done");
+            server.close(VarInt::ZERO, b"done");
             server.closed().await;
             client.closed().await;
             listener.close();

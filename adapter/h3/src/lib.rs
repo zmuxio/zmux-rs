@@ -35,7 +35,7 @@
 //!   once the peer's SETTINGS enabled them too; each HTTP Datagram, a QUIC
 //!   datagram that starts with the request stream's Quarter Stream ID,
 //!   carries the DATAGRAM frame alone. One receive loop per connection
-//!   routes them to its pipes ([`zmux_quinn::ConnectionDatagrams`]), so
+//!   routes them to its pipes ([`ConnectionDatagrams`]), so
 //!   the HTTP Datagrams of a connection that carries pipes belong to zmux;
 //! - the TLS 1.3 exporter of the QUIC connection (RFC 9001 Section 4), for
 //!   [`zmux::PipeAuth::tls`] and carrier-bound joins (MULTIPATH.md Section
@@ -404,7 +404,7 @@ impl ClientInner {
 /// on one connection, make an [`H3Client`] instead.
 pub async fn dial(
     endpoint: &Endpoint,
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     uri: http::Uri,
     options: &Options,
 ) -> io::Result<PipeIo> {
@@ -421,7 +421,7 @@ pub async fn dial(
 /// [`Session::connect`]).
 pub async fn connect(
     endpoint: &Endpoint,
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     uri: http::Uri,
     options: &Options,
     config: impl Into<Arc<zmux::Config>>,
@@ -1278,7 +1278,7 @@ impl AsyncRead for BodyReader {
 /// `addr` ([`dial`]).
 pub fn http3_candidate(
     endpoint: Endpoint,
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     uri: http::Uri,
     options: &Options,
 ) -> zmux::Candidate {

@@ -105,7 +105,7 @@ impl Endpoint {
             self.listener.count_setup_failure();
             return Ok(crate::too_early());
         }
-        let peer = peer.unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        let peer = peer.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
         let info = remote_info(|i| i);
         match zmux_websocket::accept_request(req, peer, info, &self.listener, ws).await {
             RequestUpgrade::Accepted { response, carrier } => {

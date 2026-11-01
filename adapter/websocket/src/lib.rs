@@ -34,7 +34,7 @@
 //!   it with `404 Not Found` ([`not_found`]).
 //! - An admission decides on the request head, so a client's credential
 //!   travels in a request header field ([`Options::with_credential`],
-//!   [`zmux::Credential::header`]): a prefix authentication token in
+//!   [`Credential::header`]): a prefix authentication token in
 //!   `Zmux-Prefix-Auth`, bound to the TLS connection under it where the
 //!   adapter holds that ([`dial_tls`], and [`accept`] with the
 //!   connection's exporter).
@@ -938,7 +938,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
 pub fn candidate<C, F, S>(connect: C, url: &str, options: &Options) -> zmux::Candidate
 where
     C: Fn() -> F + Send + Sync + 'static,
-    F: std::future::Future<Output = io::Result<S>> + Send + 'static,
+    F: Future<Output = io::Result<S>> + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connect = Arc::new(connect);

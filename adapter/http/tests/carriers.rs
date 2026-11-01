@@ -265,7 +265,7 @@ async fn a_trusted_intermediary_reports_the_source() {
 }
 
 /// Pipe 0 of each session is of carrier kind `kind`.
-fn assert_kind(sessions: [&zmux::Session; 2], kind: zmux::CarrierKind) {
+fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
     for s in sessions {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));

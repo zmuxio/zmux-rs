@@ -2624,7 +2624,7 @@ impl<'a> Records<'a> {
             && self.out.in_record()
         {
             let len = self.out.record_len();
-            let avail = (self.max_record.saturating_sub(len)).min(self.out.room());
+            let avail = self.max_record.saturating_sub(len).min(self.out.room());
             let pad = t.end_record(len, avail);
             self.padding(pad);
         }
@@ -2786,7 +2786,8 @@ impl<'a> Records<'a> {
         let mut least = min_of(cap.min(self.max_record) - MAX_STREAM_HEADER);
         let mut min = MAX_STREAM_HEADER + least;
         if self.out.in_record() {
-            let mut left = (cap.saturating_sub(self.out.record_len()))
+            let mut left = cap
+                .saturating_sub(self.out.record_len())
                 .min(self.out.room())
                 .min(
                     self.frames_bound(true)

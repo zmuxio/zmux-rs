@@ -412,7 +412,7 @@ pub struct PoolDecision {
     /// Ask the policy again within this, even if nothing happens in the
     /// pool (`None`: no such need; the pool's own looks go on). It is
     /// lengthened to [`RECHECK_FLOOR`] at least and is not capped.
-    pub recheck: Option<std::time::Duration>,
+    pub recheck: Option<Duration>,
     probe_interval: Option<Period>,
     probe_jitter: Option<f64>,
     rejected: Option<String>,

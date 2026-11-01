@@ -18,7 +18,7 @@
 //! ([`zmux::ListenerConfig::admission`]) when it has one: the decision is
 //! taken on the first bytes of the connection's first bidirectional
 //! stream, and the connection's streams reach the listener only once it
-//! accepted. A client presents its [`zmux::Credential`] there
+//! accepted. A client presents its [`Credential`] there
 //! ([`Options::with_credential`], used by [`dial`] and [`connect`]), or
 //! sends those bytes itself with [`QuicCarrier::open_pipe_with_prefix`].
 //!
@@ -36,7 +36,7 @@
 //! What the connection gives zmux:
 //!
 //! - its QUIC datagrams, as the datagram channel of its stream pipes
-//!   ([`zmux::carrier::DatagramChannel`]): a session with datagrams enabled
+//!   ([`DatagramChannel`]): a session with datagrams enabled
 //!   sends each datagram that fits one there rather than in a record when
 //!   the peer negotiated it, so that a lost packet loses that datagram
 //!   instead of delaying the stream data and datagrams after it. Each QUIC
@@ -704,19 +704,17 @@ pub async fn serve(
                 let entry = entry.ok_or(())?;
                 let connecting = incoming.accept().map_err(drop)?;
                 if zero_rtt {
-                    match connecting.into_0rtt() {
+                    return match connecting.into_0rtt() {
                         Ok((conn, done)) => {
                             let (tx, rx) = tokio::sync::watch::channel(false);
                             tokio::spawn(async move {
                                 let _ = done.await;
                                 let _ = tx.send(true);
                             });
-                            return Ok::<_, ()>((conn, Some(rx), entry));
+                            Ok::<_, ()>((conn, Some(rx), entry))
                         }
-                        Err(connecting) => {
-                            return Ok((connecting.await.map_err(drop)?, None, entry));
-                        }
-                    }
+                        Err(connecting) => Ok((connecting.await.map_err(drop)?, None, entry)),
+                    };
                 }
                 Ok::<_, ()>((connecting.await.map_err(drop)?, None, entry))
             }

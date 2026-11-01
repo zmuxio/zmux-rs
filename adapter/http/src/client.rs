@@ -668,7 +668,7 @@ pub async fn connect_http2(
 
 // ---- candidates of carrier modes ---------------------------------------------------
 
-/// A [`zmux::Candidate`] of [`CarrierKind::Streaming`]: a bidirectional
+/// A [`Candidate`] of [`CarrierKind::Streaming`]: a bidirectional
 /// `POST` over a new HTTP/1.1 connection that `connect` makes
 /// ([`dial_http1_over`]). It passes intermediaries that forward both bodies
 /// at once.
@@ -687,7 +687,7 @@ where
     })
 }
 
-/// A [`zmux::Candidate`] of [`CarrierKind::Split`]: a split bootstrap over
+/// A [`Candidate`] of [`CarrierKind::Split`]: a split bootstrap over
 /// HTTP/1.1 connections that `connect` makes ([`dial_http1_split_with`]);
 /// as a further pipe of a session it joins as a downlink `GET` joined out
 /// of band and an uplink `POST`, two pipes ([`join_http1_split_with`]). Its
@@ -715,7 +715,7 @@ where
     })
 }
 
-/// A [`zmux::Candidate`] of [`CarrierKind::Exchange`]: an exchange carrier
+/// A [`Candidate`] of [`CarrierKind::Exchange`]: an exchange carrier
 /// whose requests go over HTTP/1.1 connections that `connect` makes
 /// ([`crate::dial_exchange_with`]). It passes intermediaries that buffer
 /// whole bodies; it authenticates with the exchange's PSK, and
@@ -739,7 +739,7 @@ where
 }
 
 impl Http2Connection {
-    /// A [`zmux::Candidate`] of [`CarrierKind::Streaming`] on new requests
+    /// A [`Candidate`] of [`CarrierKind::Streaming`] on new requests
     /// of this connection ([`Http2Connection::open_pipe`]).
     pub fn streaming_candidate(&self) -> Candidate {
         let conn = self.clone();
@@ -749,7 +749,7 @@ impl Http2Connection {
         })
     }
 
-    /// A [`zmux::Candidate`] of [`CarrierKind::Split`] on new requests of
+    /// A [`Candidate`] of [`CarrierKind::Split`] on new requests of
     /// this connection ([`Http2Connection::open_split`]; see
     /// [`split_candidate`]).
     pub fn split_candidate(&self) -> Candidate {

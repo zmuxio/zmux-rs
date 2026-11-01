@@ -151,9 +151,9 @@ impl PrefixAuth {
     pub fn token(
         &self,
         binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>,
-    ) -> std::io::Result<[u8; PREFIX_TOKEN_LEN]> {
+    ) -> io::Result<[u8; PREFIX_TOKEN_LEN]> {
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+        getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         Ok(self.token_at(binding, unix_now(), nonce))
     }
 

@@ -141,7 +141,7 @@ fn sample_frames(payload: &[u8]) -> Vec<Frame<'_>> {
 
 #[test]
 fn encoding_does_not_allocate() {
-    let _serial = crate::serial();
+    let _serial = serial();
     let payload = vec![0x5a; 16 * 1024];
     let frames = sample_frames(&payload);
     let mut buf = vec![0u8; 64 * 1024];
@@ -169,7 +169,7 @@ fn encoding_does_not_allocate() {
 
 #[test]
 fn decoding_does_not_allocate() {
-    let _serial = crate::serial();
+    let _serial = serial();
     let payload = vec![0x5a; 16 * 1024];
     let mut encoded = Vec::new();
     for f in sample_frames(&payload) {
@@ -271,7 +271,7 @@ fn parse_in_place(
 
 #[test]
 fn record_parsing_does_not_allocate() {
-    let _serial = crate::serial();
+    let _serial = serial();
     let bytes = batch();
     // Reads of 1000 bytes split frames and headers everywhere; 64 KiB
     // reads are what a driver's read buffer delivers.
@@ -306,7 +306,7 @@ fn record_parsing_does_not_allocate() {
 
 #[test]
 fn the_counter_sees_allocations() {
-    let _serial = crate::serial();
+    let _serial = serial();
     let (v, n) = allocations(|| vec![1u8; 100]);
     assert_eq!(v.len(), 100);
     assert!(n >= 1);
@@ -314,7 +314,7 @@ fn the_counter_sees_allocations() {
 
 #[test]
 fn key_schedule_does_not_allocate() {
-    let _serial = crate::serial();
+    let _serial = serial();
     let (ok, n) = allocations(|| {
         let secret = keys::session_secret(&[1; 16], &[2; 16], &[3; 32], &[]);
         let k = keys::SessionKeys::derive(&secret);

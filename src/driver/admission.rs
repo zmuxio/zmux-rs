@@ -188,6 +188,14 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -198,14 +206,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
