@@ -70,8 +70,8 @@ const MIN_PIECE_LIMIT: usize = 1 << 20;
 /// ends must agree on [`psk`](Self::psk) and [`encoding`](Self::encoding);
 /// everything else is local. A carrier is authenticated unless
 /// [`unauthenticated`](Self::unauthenticated) says otherwise: without a
-/// PSK and without that choice, [`dial_exchange`](crate::dial_exchange)
-/// and the other dials, and [`ExchangeServer::new`](crate::ExchangeServer::new),
+/// PSK and without that choice, [`dial_exchange`](dial_exchange)
+/// and the other dials, and [`ExchangeServer::new`](ExchangeServer::new),
 /// fail.
 #[derive(Clone)]
 #[non_exhaustive]

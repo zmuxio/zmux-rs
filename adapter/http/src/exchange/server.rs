@@ -117,7 +117,7 @@ impl Answer {
 
 impl ExchangeServer {
     /// A server whose carriers are handed to `listener`. Fails
-    /// ([`std::io::ErrorKind::InvalidInput`]) on options without a PSK
+    /// ([`io::ErrorKind::InvalidInput`]) on options without a PSK
     /// that do not choose to run unauthenticated
     /// ([`ExchangeOptions::unauthenticated`]), or that set both.
     pub fn new(listener: &Listener, options: ExchangeOptions) -> io::Result<Self> {

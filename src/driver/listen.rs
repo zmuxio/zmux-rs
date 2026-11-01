@@ -112,7 +112,7 @@ impl PipeHint {
 
     /// The value of the admission that accepted the carrier
     /// ([`Verdict::Accept`]): set by the listener before its inbound
-    /// transform runs ([`crate::InboundTransform`]); `None` without an
+    /// transform runs ([`InboundTransform`]); `None` without an
     /// admission or a value.
     pub fn admitted(&self) -> Option<&AdmittedValue> {
         self.value.as_ref()

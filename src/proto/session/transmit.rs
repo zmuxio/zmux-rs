@@ -368,7 +368,8 @@ impl TransmitBuf {
         max: usize,
         mut take: impl FnMut(Piece<'a>) -> usize,
     ) -> usize {
-        self.walk(cursor, offset, max, |p, skip, n| {
+        self.walk(cursor, offset, max, |i, skip, n| {
+            let p = &self.parts[i];
             take(match p {
                 Part::Copied { start, .. } => {
                     Piece::Copied(&self.buf[start + skip..start + skip + n])
@@ -391,7 +392,8 @@ impl TransmitBuf {
     ) -> &'a [u8] {
         let mut single: Option<&'a [u8]> = None;
         scratch.clear();
-        self.walk(cursor, offset, len, |p, skip, n| {
+        self.walk(cursor, offset, len, |i, skip, n| {
+            let p = &self.parts[i];
             let s = &self.part_bytes(p)[skip..skip + n];
             if n == len {
                 single = Some(s);
@@ -430,7 +432,8 @@ impl TransmitBuf {
         let start = *cursor;
         let mut probe = start;
         let (mut copied, mut pieces, mut single) = (0, 0, None);
-        let n = self.walk(&mut probe, offset, max, |p, skip, n| {
+        let n = self.walk(&mut probe, offset, max, |i, skip, n| {
+            let p = &self.parts[i];
             pieces += 1;
             match p {
                 // A message of one referenced payload is shared.
@@ -455,7 +458,8 @@ impl TransmitBuf {
             // would keep the size of the first one).
             *scratch = BytesMut::with_capacity(copied);
         }
-        let n = self.walk(cursor, offset, max, |p, skip, n| {
+        let n = self.walk(cursor, offset, max, |i, skip, n| {
+            let p = &self.parts[i];
             match p {
                 Part::Shared(b) if !whole => out.push(b.slice(skip..skip + n)),
                 _ => {
@@ -482,17 +486,17 @@ impl TransmitBuf {
         }
     }
 
-    /// Walks at most `max` bytes from byte `offset` on, handing `f` each
-    /// part with the offset and length of its bytes in range; `f` returns
+    /// Walks at most `max` bytes from byte `offset` on, handing `f` the index
+    /// of each part with the offset and length of its bytes in range; `f` returns
     /// the bytes it took, and taking less ends the walk. Starts at
     /// `cursor` when it is current and at or before `offset`, and leaves
     /// it where the walk ended.
-    fn walk<'a>(
-        &'a self,
+    fn walk(
+        &self,
         cursor: &mut PieceCursor,
         offset: usize,
         max: usize,
-        mut f: impl FnMut(&'a Part, usize, usize) -> usize,
+        mut f: impl FnMut(usize, usize, usize) -> usize,
     ) -> usize {
         let (first, mut at) = if cursor.version == self.version && cursor.at <= offset {
             (cursor.part, cursor.at)
@@ -502,7 +506,7 @@ impl TransmitBuf {
         let mut left = max;
         let mut taken = 0;
         let mut part = first;
-        for p in self.parts.get(first..).unwrap_or_default() {
+        for (i, p) in self.parts.iter().enumerate().skip(first) {
             let len = match p {
                 Part::Copied { start, end } => end - start,
                 Part::Shared(b) => b.len(),
@@ -518,7 +522,7 @@ impl TransmitBuf {
             }
             let skip = pos - at;
             let n = (len - skip).min(left);
-            let t = f(p, skip, n).min(n);
+            let t = f(i, skip, n).min(n);
             taken += t;
             left -= t;
             if t < n {

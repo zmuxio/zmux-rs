@@ -2621,8 +2621,8 @@ macro_rules! session_api {
         /// report. Off until set, and free then; it never
         /// influences scheduling. The rate of a session without multipath
         /// needs pipe acknowledgement. A band that is not
-        /// [valid](crate::QualityBand::validate) changes nothing:
-        /// [`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions).
+        /// [valid](QualityBand::validate) changes nothing:
+        /// [`PipeError::InvalidOptions`](PipeError::InvalidOptions).
         pub fn set_quality_band(
             &self,
             band: Option<crate::QualityBand>,
@@ -2637,8 +2637,8 @@ macro_rules! session_api {
         /// [`SessionEvent::CapacityRestored`](crate::SessionEvent::CapacityRestored) once when it rises to the floor
         /// times its ratio again. zmux only reports; the
         /// application decides, for example to dial another pipe. A floor
-        /// that is not [valid](crate::CapacityFloor::validate) changes
-        /// nothing: [`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions).
+        /// that is not [valid](CapacityFloor::validate) changes
+        /// nothing: [`PipeError::InvalidOptions`](PipeError::InvalidOptions).
         pub fn set_capacity_floor(
             &self,
             floor: Option<crate::CapacityFloor>,
