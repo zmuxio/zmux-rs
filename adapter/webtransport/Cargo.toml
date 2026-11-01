@@ -1,6 +1,6 @@
 [package]
 name = "zmux-webtransport"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -21,8 +21,8 @@ bytes = "1"
 url = "2"
 web-transport-quinn = { version = "0.13.5", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
-zmux = { version = "1.2.4", path = "../.." }
-zmux-quinn = { version = "1.2.4", path = "../quinn", default-features = false }
+zmux = { version = "1.2.5", path = "../.." }
+zmux-quinn = { version = "1.2.5", path = "../quinn", default-features = false }
 
 [dev-dependencies]
 bytes = "1"

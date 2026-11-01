@@ -1,6 +1,6 @@
 [package]
 name = "zmux-websocket"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -19,9 +19,9 @@ httparse = "1"
 # WebSocket upgrades inside a hyper server (feature `hyper`).
 hyper = { version = "1.6", optional = true, default-features = false, features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.10", optional = true, default-features = false, features = ["tokio"] }
-zmux = { version = "1.2.4", path = "../.." }
+zmux = { version = "1.2.5", path = "../.." }
 # serve_tls: the admission metadata of a TLS connection.
-zmux-rustls = { version = "1.2.4", path = "../rustls" }
+zmux-rustls = { version = "1.2.5", path = "../rustls" }
 
 [features]
 # accept_request: upgrades of requests a hyper server received.

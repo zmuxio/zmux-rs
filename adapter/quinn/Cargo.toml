@@ -1,6 +1,6 @@
 [package]
 name = "zmux-quinn"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ rustls-aws-lc-rs = ["quinn/rustls-aws-lc-rs"]
 bytes = "1"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio"] }
 tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
-zmux = { version = "1.2.4", path = "../.." }
+zmux = { version = "1.2.5", path = "../.." }
 
 [dev-dependencies]
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
