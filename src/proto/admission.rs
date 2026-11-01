@@ -167,12 +167,12 @@ impl Admission {
     }
 
     /// The read size of a stall's discarding.
-    pub(crate) fn discard_buffer(&self) -> usize {
+    pub fn discard_buffer(&self) -> usize {
         self.discard_buffer
     }
 
-    /// The decider.
-    pub(crate) fn decider(&self) -> &dyn Decide {
+    /// The decider, for a driver that applies the admission.
+    pub fn decider(&self) -> &dyn Decide {
         &*self.decide
     }
 }

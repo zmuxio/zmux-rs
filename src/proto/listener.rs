@@ -251,8 +251,9 @@ pub struct ListenerCore {
 
 /// A source key from a remote address, aggregated to /64 for IPv6
 /// (MULTIPATH.md Section 5.6); an IPv4-mapped address (a dual-stack
-/// socket's IPv4 client) counts as its IPv4 address.
-pub(crate) fn source_key(addr: std::net::IpAddr) -> u64 {
+/// socket's IPv4 client) counts as its IPv4 address: the key
+/// [`ListenerCore::hold`] and [`ListenerCore::stall`] take.
+pub fn source_key(addr: std::net::IpAddr) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     match addr.to_canonical() {
         std::net::IpAddr::V4(a) => a.octets().hash(&mut h),

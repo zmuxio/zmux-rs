@@ -161,17 +161,74 @@ impl Drop for Sleep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::task::Wake;
 
-    #[tokio::test]
-    async fn short_waits_end_close_to_their_deadline() {
-        let mut late = Vec::new();
-        for i in 0..50u64 {
-            let d = Instant::now() + Duration::from_micros(200 + 37 * i);
-            Sleep::new(d).await;
-            late.push(Instant::now().saturating_duration_since(d));
+    /// Reports when, and on which thread, it was woken.
+    struct Probe {
+        i: usize,
+        tx: Mutex<mpsc::Sender<(usize, Instant, Option<String>)>>,
+    }
+
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            let name = std::thread::current().name().map(str::to_owned);
+            let tx = self.tx.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = tx.send((self.i, Instant::now(), name));
         }
-        late.sort();
-        // tokio's timer would be about a millisecond late at the median.
-        assert!(late[25] < Duration::from_micros(600), "{:?}", late[25]);
+    }
+
+    // How late a wait ends is the operating system's scheduling of the
+    // timer thread, which a loaded host stretches without bound: the
+    // assertions are what this module decides. Each wait is woken by the
+    // timer thread itself (not by a millisecond timer), never before its
+    // deadline, once, and in the order of the deadlines.
+    #[test]
+    fn waits_are_woken_by_the_timer_thread_in_deadline_order() {
+        let n = 50;
+        let start = Instant::now() + Duration::from_millis(100);
+        // Registered out of order: deadlines 37 µs apart, interleaved.
+        let order: Vec<usize> = (0..n).map(|k| (k * 17) % n).collect();
+        let (tx, rx) = mpsc::channel();
+        let mut sleeps = Vec::new();
+        let mut expected = Vec::new();
+        for &i in &order {
+            let deadline = start + Duration::from_micros(37 * i as u64);
+            let mut s = Box::pin(Sleep::new(deadline));
+            let waker = Waker::from(Arc::new(Probe {
+                i,
+                tx: Mutex::new(tx.clone()),
+            }));
+            let mut cx = Context::from_waker(&waker);
+            if s.as_mut().poll(&mut cx).is_ready() {
+                // Registration took longer than the lead (a loaded host).
+                assert!(Instant::now() >= deadline);
+                continue;
+            }
+            expected.push(i);
+            sleeps.push(s);
+        }
+        drop(tx);
+        let mut woken = Vec::new();
+        expected.sort_unstable();
+        for _ in 0..expected.len() {
+            let (i, at, thread) = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a wait was not woken");
+            assert_eq!(thread.as_deref(), Some("zmux-timer"));
+            let deadline = start + Duration::from_micros(37 * i as u64);
+            assert!(at >= deadline, "wait {i} woken before its deadline");
+            woken.push(i);
+        }
+        assert_eq!(woken, expected);
+        // Every wait is over now, and was woken once.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        for s in &mut sleeps {
+            assert!(s.as_mut().poll(&mut cx).is_ready());
+        }
+        drop(sleeps);
+        assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
     }
 }

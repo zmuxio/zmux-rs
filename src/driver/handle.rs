@@ -268,6 +268,7 @@ pub struct State<D: Driver> {
     pub(super) io: D::Io,
 }
 
+#[cfg(feature = "tokio")]
 /// The tries of carrier candidates a session's statistics keep, the
 /// latest: a session that retries a kind for hours keeps a bounded
 /// history.
@@ -516,6 +517,7 @@ impl<D: Driver> State<D> {
         }
     }
 
+    #[cfg(feature = "tokio")]
     /// Records the tries of a carrier mode's candidates and, with
     /// `chosen`, its choice of kind (API.md Section 4.8): events, and the
     /// statistics, which keep the latest [`CARRIER_TRIES_KEPT`] tries.
@@ -715,6 +717,7 @@ impl<D: Driver> Shared<D> {
         r
     }
 
+    #[cfg(feature = "tokio")]
     /// Abandons the session if it is not established yet: closed without
     /// CONNECTION_CLOSE (the core's `abandon`).
     pub(crate) fn abandon(&self) {
@@ -1111,6 +1114,7 @@ impl<D: Driver> Session<D> {
         })
     }
 
+    #[cfg(feature = "tokio")]
     /// The count of pipe state changes and suspensions so far.
     pub(crate) fn pipe_changes(&self) -> u64 {
         self.conn.lock().pipe_changes
@@ -1140,6 +1144,7 @@ impl<D: Driver> Session<D> {
         self.conn.lock().core.join_wanted(D::now())
     }
 
+    #[cfg(feature = "tokio")]
     /// Records carrier tries and a choice of kind (`State::report_carrier`).
     pub(crate) fn report_carrier(
         &self,
@@ -1149,6 +1154,7 @@ impl<D: Driver> Session<D> {
         self.command(|st| st.report_carrier(results, chosen));
     }
 
+    #[cfg(feature = "tokio")]
     /// The carrier kind a carrier mode chose last, if any.
     pub(crate) fn carrier(&self) -> Option<crate::CarrierKind> {
         self.conn.lock().carrier

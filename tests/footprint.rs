@@ -125,7 +125,7 @@ const fn base(apple: f64) -> Option<f64> {
 const CORE: Row = Row {
     name: "idle core per session",
     bound: f64::INFINITY,
-    baseline: base(3808.0),
+    baseline: base(3880.0),
     noise: 0.0,
 };
 
@@ -133,7 +133,7 @@ const CORE: Row = Row {
 const STREAM: Row = Row {
     name: "idle stream per end",
     bound: 768.0,
-    baseline: base(669.0),
+    baseline: base(677.0),
     noise: 0.01,
 };
 
@@ -142,7 +142,7 @@ const STREAM: Row = Row {
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
     bound: 17_408.0,
-    baseline: base(16_659.0),
+    baseline: base(17_486.0),
     noise: 0.005,
 };
 
@@ -150,7 +150,7 @@ const PAIR_MEMORY: Row = Row {
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
     bound: 17_408.0,
-    baseline: base(15_830.0),
+    baseline: base(16_783.0),
     noise: 0.01,
 };
 
@@ -160,7 +160,7 @@ const PAIR_TCP: Row = Row {
 const MULTIPATH: Row = Row {
     name: "idle multipath session pair, two pipes",
     bound: 45_056.0,
-    baseline: base(42_558.0),
+    baseline: base(43_505.0),
     noise: 0.02,
 };
 

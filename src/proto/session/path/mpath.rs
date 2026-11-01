@@ -583,6 +583,9 @@ pub(crate) struct Deferred {
     binding: Vec<u8>,
 }
 
+/// An attachment's identifier and its directions' states.
+type PipeStates = (u64, Option<OutboundState>, Option<InboundState>);
+
 /// Session-wide multipath state: the identifiers, keys and joins of this
 /// module, and the parts the other modules of the path layer keep, each
 /// behind its own operations.
@@ -591,6 +594,9 @@ pub(crate) struct Mp {
     /// Why the last pipe that failed did (SessionError::PipesLost and
     /// ResumeTimeout report it).
     pub(in crate::proto::session) last_failure: Option<PipeFailure>,
+    /// The pipe states a pass of the multipath timers started with
+    /// ([`SessionCore::mp_timeout`]), kept for its next pass.
+    pass_states: Vec<PipeStates>,
     keys: SessionKeys,
     peer_locator: Locator,
     local_locator: Locator,
@@ -955,6 +961,7 @@ impl SessionCore {
         let local_mad = Duration::from_millis(self.local_tp().max_ack_delay());
         let threshold = self.local_tp().ack_threshold();
         let mp = Mp {
+            pass_states: Vec::new(),
             last_failure: None,
             keys,
             peer_locator: p.locator,
@@ -3001,7 +3008,14 @@ impl SessionCore {
             return;
         }
         loop {
-            let before = self.pipe_states();
+            // Kept from the last pass: no allocation per timer.
+            let mut before = self
+                .mp
+                .as_mut()
+                .map(|m| std::mem::take(&mut m.pass_states))
+                .unwrap_or_default();
+            before.clear();
+            before.extend(self.atts.iter().map(Self::pipe_states));
             // Attachments are sorted by identifier; checking one may
             // retire it.
             let mut next = self.atts.first().map(Attachment::id);
@@ -3016,24 +3030,28 @@ impl SessionCore {
             self.refresh_tiers();
             self.try_retire(now);
             self.release_deferred_joins(now);
-            if self.state >= State::Closing || self.mp.is_none() || self.pipe_states() == before {
+            let unchanged = self
+                .atts
+                .iter()
+                .map(Self::pipe_states)
+                .eq(before.iter().copied());
+            let Some(mp) = self.mp.as_mut() else {
+                return;
+            };
+            mp.pass_states = before;
+            if self.state >= State::Closing || unchanged {
                 return;
             }
         }
     }
 
-    /// Every attachment's identifier and pipe states.
-    fn pipe_states(&self) -> Vec<(u64, Option<OutboundState>, Option<InboundState>)> {
-        self.atts
-            .iter()
-            .map(|a| {
-                (
-                    a.id(),
-                    a.out().map(OutPipe::public_state),
-                    a.inp().map(|p| p.state().public()),
-                )
-            })
-            .collect()
+    /// An attachment's identifier and pipe states.
+    fn pipe_states(a: &Attachment) -> PipeStates {
+        (
+            a.id(),
+            a.out().map(OutPipe::public_state),
+            a.inp().map(|p| p.state().public()),
+        )
     }
 
     /// Applies the time-driven transitions of one attachment.

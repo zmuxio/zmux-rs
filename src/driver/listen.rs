@@ -1180,7 +1180,17 @@ impl Listener {
     /// and the session sends PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT)
     /// (MULTIPATH.md Section 5.4 step 7).
     pub async fn handle_pipe(&self, pipe: PipeIo, hint: PipeHint) -> Result<(), HandleError> {
-        let r = self.handle(pipe, hint).await;
+        // The setup's state (admission, transform, first record) is boxed
+        // and freed once it is done: what waits for the pipe's end is
+        // small, as it is kept for the pipe's lifetime.
+        let r = match Box::pin(self.handle(pipe, hint)).await {
+            Ok(Some(done)) => {
+                done.wait().await;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
         if let Err(e) = r {
             let c = &self.shared.counts;
             match e {
@@ -1276,7 +1286,13 @@ impl Listener {
         r
     }
 
-    async fn handle(&self, mut pipe: PipeIo, mut hint: PipeHint) -> Result<(), HandleError> {
+    /// Sets up a carrier: what its pipe's end is waited for with, if it
+    /// became a pipe.
+    async fn handle(
+        &self,
+        mut pipe: PipeIo,
+        mut hint: PipeHint,
+    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
         let shared = &self.shared;
         // A stream that may be a lane of a pipe on its connection waits
         // for its first record outside the limits (MULTIPATH.md Section
@@ -1420,7 +1436,7 @@ impl Listener {
                     bytes,
                 )?;
                 shared.counts.joins.fetch_add(1, Relaxed);
-                Ok(())
+                Ok(None)
             }
             Classified::Join {
                 locator,
@@ -1509,7 +1525,7 @@ impl Listener {
         hint: PipeHint,
         mut entry: Entry,
         token: &[u8],
-    ) -> Result<(), HandleError> {
+    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
         let shared = &self.shared;
         let Ok(token) = <[u8; PAIRING_TOKEN_LEN]>::try_from(token) else {
             return Err(HandleError::Rejected);
@@ -1602,8 +1618,7 @@ impl Listener {
             }
             drop(std::mem::take(&mut wakes));
             pending.done();
-            done.wait().await;
-            return Ok(());
+            return Ok(Some(done));
         }
         let deadline = arrived.checked_add(limits.handshake_timeout);
         let partner = PairWait {
@@ -1676,7 +1691,7 @@ impl Listener {
     }
 
     /// A new session on its bootstrap carrier.
-    async fn start_session(&self, pipe: PipeIo) -> Result<(), HandleError> {
+    async fn start_session(&self, pipe: PipeIo) -> Result<Option<Arc<PipeDone>>, HandleError> {
         let config = self.shared.config.clone();
         // Each session of the listener has its own locator unless one is
         // configured.
@@ -1715,10 +1730,7 @@ impl Listener {
             }
             Err(_) => return Err(HandleError::Rejected),
         }
-        if let Some(d) = done {
-            d.wait().await;
-        }
-        Ok(())
+        Ok(done)
     }
 
     // Called synchronously by Shared::create before any bootstrap I/O.
@@ -1758,7 +1770,7 @@ impl Listener {
         inband: bool,
         mut pipe: PipeIo,
         limits: &ListenerConfig,
-    ) -> Result<(), HandleError> {
+    ) -> Result<Option<Arc<PipeDone>>, HandleError> {
         let session = {
             let st = self.shared.lock();
             st.sessions.get(locator).and_then(Weak::upgrade)
@@ -1855,8 +1867,7 @@ impl Listener {
                     // Counted once attached.
                     self.shared.counts.joins.fetch_add(1, Relaxed);
                     drop(session);
-                    done.wait().await;
-                    return Ok(());
+                    return Ok(Some(done));
                 }
                 JoinVerdict::Wait if deadline.is_none_or(|d| now() < d) => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
