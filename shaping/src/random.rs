@@ -1,7 +1,7 @@
 //! Random sources and sampling.
 
 use rand_chacha::ChaCha8Rng;
-use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::rand_core::{Rng, SeedableRng};
 
 /// A source of uniformly distributed 64-bit values.
 pub trait Source: Send {
@@ -14,7 +14,9 @@ pub(crate) struct OsSeeded(ChaCha8Rng);
 
 impl OsSeeded {
     pub(crate) fn new() -> Self {
-        Self(ChaCha8Rng::from_os_rng())
+        let mut seed = <ChaCha8Rng as SeedableRng>::Seed::default();
+        getrandom::fill(&mut seed).expect("operating system random source");
+        Self(ChaCha8Rng::from_seed(seed))
     }
 }
 

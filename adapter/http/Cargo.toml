@@ -16,9 +16,9 @@ bytes = "1"
 getrandom = "0.4"
 http = "1"
 http-body = "1"
-hyper = { version = "1.6", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1.10", default-features = false, features = ["tokio", "server-auto"] }
-tokio = { version = "1.47", default-features = false, features = ["net", "rt", "io-util", "time", "sync", "macros"] }
+hyper = { version = "1.12", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server-auto"] }
+tokio = { version = "1.54", default-features = false, features = ["net", "rt", "io-util", "time", "sync", "macros"] }
 zmux = { version = "1.2.5", path = "../.." }
 zmux-websocket = { version = "1.2.5", path = "../websocket", optional = true, features = ["hyper"] }
 
@@ -30,7 +30,7 @@ websocket = ["dep:zmux-websocket"]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sha2 = "0.11"
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 zmux = { version = "1.2.5", path = "../..", features = ["test-hooks"] }
 

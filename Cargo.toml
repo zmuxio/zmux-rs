@@ -40,22 +40,22 @@ test-hooks = []
 [dependencies]
 # The tokio driver's single-waker slots (a pipe's read waker, a maintainer's stop).
 atomic-waker = { version = "1.1", optional = true }
-bytes = "1.10"
+bytes = "1.12"
 getrandom = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
-tokio = { version = "1.47", optional = true, features = ["rt", "net", "io-util", "sync", "time"] }
+tokio = { version = "1.54", optional = true, features = ["rt", "net", "io-util", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 # getsockopt(TCP_INFO) and the low-water mark of TCP carriers (src/driver/tcp.rs).
-libc = { version = "0.2.170", optional = true }
+libc = { version = "0.2.191", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.47", features = ["full", "test-util"] }
+tokio = { version = "1.54", features = ["full", "test-util"] }
 zmux = { path = ".", features = ["test-hooks", "blocking"] }
 # TLS-over-TCP carrier of the benches only; the library has no TLS dependency.
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
@@ -73,7 +73,7 @@ loom = { version = "0.7.2", features = ["futures"] }
 # RUSTFLAGS="--cfg shuttle" CARGO_TARGET_DIR=target/shuttle \
 #     cargo test --lib --release --features blocking shuttle
 [target.'cfg(shuttle)'.dev-dependencies]
-shuttle = "0.9.7"
+shuttle = "0.9.9"
 
 [[bench]]
 name = "codec"

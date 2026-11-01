@@ -20,7 +20,7 @@ aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
 bytes = "1"
 url = "2"
 web-transport-quinn = { version = "0.13.5", default-features = false }
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "sync", "time"] }
 zmux = { version = "1.2.5", path = "../.." }
 zmux-quinn = { version = "1.2.5", path = "../quinn", default-features = false }
 
@@ -28,7 +28,7 @@ zmux-quinn = { version = "1.2.5", path = "../quinn", default-features = false }
 bytes = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 
 [lints.rust]
 missing_docs = "warn"

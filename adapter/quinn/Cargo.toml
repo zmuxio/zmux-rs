@@ -20,16 +20,16 @@ rustls-aws-lc-rs = ["quinn/rustls-aws-lc-rs"]
 
 [dependencies]
 bytes = "1"
-quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio"] }
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "sync", "time"] }
 zmux = { version = "1.2.5", path = "../.." }
 
 [dev-dependencies]
-quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 bytes = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 
 [lints.rust]
 missing_docs = "warn"
