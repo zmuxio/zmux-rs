@@ -358,17 +358,23 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     let receiver = receiver.join().unwrap();
     *slot.lock().unwrap() = Some(receiver.clone());
     let (mut send, _r) = sender.open_bi().unwrap();
+    // The window grows once the arrival rate is measured over an interval, which a host
+    // that is fast or slow reaches after a different amount of data: the sender goes on
+    // until the hook ran (at least 16 MiB, at most 1 GiB).
+    let seen = calls.clone();
     let w = std::thread::spawn(move || {
         let chunk = vec![1u8; 256 * 1024];
-        for _ in 0..64 {
+        let mut sent = 0;
+        while sent < 4096 && (sent < 64 || seen.load(Ordering::SeqCst) == 0) {
             send.write_all(&chunk).unwrap();
+            sent += 1;
         }
         send.finish().unwrap();
+        sent * chunk.len()
     });
     let (_s, mut recv) = receiver.accept_bi().unwrap();
     let got = recv.read_to_end(usize::MAX).unwrap();
-    assert_eq!(got.len(), 16 << 20);
-    w.join().unwrap();
+    assert_eq!(got.len(), w.join().unwrap());
     assert!(calls.load(Ordering::SeqCst) > 0);
     assert!(receiver.window_growth() > 0);
     assert!(blocked.load(Ordering::SeqCst));
