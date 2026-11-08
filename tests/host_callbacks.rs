@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf, duplex};
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
+#[cfg(unix)]
 use zmux::blocking as b;
 use zmux::proto::listener::{OnReject, RejectAction};
 use zmux::proto::seal::Mode;

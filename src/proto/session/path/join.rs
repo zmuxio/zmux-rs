@@ -631,6 +631,7 @@ impl SessionCore {
         let keys = mp.keys.ready().ok_or_else(pending)?;
         let suite = keys.preferred().ok_or_else(pending)?;
         let (epoch, locator) = self.join_epoch();
+        let locator = locator.clone();
         let psk = keys
             .epoch(epoch)
             .and_then(|k| k.psk(suite.value(), initiator))

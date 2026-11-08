@@ -19,10 +19,27 @@ fn narrow(v: u64) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
+/// What a session reads of a zmux_multipath value; the Locator stays in the
+/// parameters, so that reading these allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MultipathValues {
+    pub(super) secret_flags: u8,
+    pub(super) session_nonce: [u8; 16],
+}
+
+impl MultipathValues {
+    pub(super) fn of(m: &MultipathParameter) -> Self {
+        Self {
+            secret_flags: m.secret_flags,
+            session_nonce: m.session_nonce,
+        }
+    }
+}
+
 /// One endpoint's transport parameter values in use after the handshake,
 /// absent ones resolved to their defaults (0: absent, where 0 is not a
 /// valid value).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TpValues {
     /// initial_max_stream_data_bidi_local.
     pub(super) window_bidi_local: u64,
@@ -38,7 +55,7 @@ pub(super) struct TpValues {
     pub(super) role_nonce: Option<u64>,
     /// zmux_multipath (the local one as the session sends it: its locator
     /// and Secret Flags may change before the parameters are sent).
-    pub(super) multipath: Option<MultipathParameter>,
+    pub(super) multipath: Option<MultipathValues>,
     /// The Lane Key of zmux_max_lanes.
     pub(super) lane_key: Option<[u8; 16]>,
     max_record_size: u32,
@@ -68,7 +85,7 @@ impl TpValues {
                 Some(RoleParameter::Auto { nonce }) => Some(nonce),
                 _ => None,
             },
-            multipath: tp.zmux_multipath.clone(),
+            multipath: tp.zmux_multipath.as_ref().map(MultipathValues::of),
             lane_key: tp.zmux_max_lanes.map(|l| l.lane_key),
             max_record_size: narrow(tp.max_record_size_or_default()),
             max_datagram_frame_size: narrow(tp.max_datagram_frame_size.unwrap_or(0)),
@@ -97,7 +114,7 @@ impl TpValues {
             streams_bidi: config.max_incoming_streams,
             max_idle_timeout: config.idle_millis(),
             role_nonce: own.role_nonce,
-            multipath: own.multipath.clone(),
+            multipath: own.multipath.as_ref().map(MultipathValues::of),
             lane_key: Some(own.lane_key),
             max_record_size: narrow(ZMUX_MAX_RECORD_SIZE),
             max_datagram_frame_size: if config.enable_datagrams {
@@ -167,7 +184,7 @@ impl LocalTp {
     pub(super) fn of(tp: &TransportParameters) -> Self {
         let v = TpValues::of(tp);
         Self {
-            multipath: v.multipath,
+            multipath: tp.zmux_multipath.clone(),
             role_nonce: v.role_nonce,
             lane_key: v.lane_key.unwrap_or_default(),
             carrier_datagrams: false,

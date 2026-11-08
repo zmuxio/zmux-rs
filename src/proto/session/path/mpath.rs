@@ -1052,7 +1052,12 @@ impl SessionCore {
             pass_states: Vec::new(),
             last_failure: None,
             keys,
-            epochs: Epochs::new(self.local_locator(), p.locator.clone(), self.locator_instance, now),
+            epochs: Epochs::new(
+                self.local_locator(),
+                p.locator.clone(),
+                self.locator_instance,
+                now,
+            ),
             peer_crypto: theirs,
             local_joins: Vec::new(),
             peer_locator: p.locator.clone(),

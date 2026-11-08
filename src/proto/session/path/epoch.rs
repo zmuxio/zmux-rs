@@ -247,7 +247,7 @@ impl SessionCore {
     }
 
     /// The epoch new local joins use, and the peer's Locator for it.
-    pub(in crate::proto::session) fn join_epoch(&self) -> (u64, Locator) {
+    pub(in crate::proto::session) fn join_epoch(&self) -> (u64, &Locator) {
         let ep = &self.mp().epochs;
         let e = ep.use_epoch();
         let locator = ep
@@ -255,7 +255,7 @@ impl SessionCore {
             .iter()
             .rev()
             .find(|(from, _)| *from <= e)
-            .map_or_else(|| self.mp().peer_locator.clone(), |(_, l)| l.clone());
+            .map_or(&self.mp().peer_locator, |(_, l)| l);
         (e, locator)
     }
 

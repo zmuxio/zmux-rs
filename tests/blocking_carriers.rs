@@ -109,7 +109,23 @@ impl Read for CountedRead {
             self.1.wait_shut();
             return Ok(0);
         }
-        self.0.read(buf)
+        // A shutdown does not end a read blocked in another thread on every platform
+        // (not on Windows, for a peer that sends nothing): the read wakes up to look.
+        loop {
+            match self.0.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if self.1.is_shut() {
+                        return Ok(0);
+                    }
+                }
+                r => return r,
+            }
+        }
     }
 }
 
@@ -119,10 +135,11 @@ impl Drop for CountedRead {
     }
 }
 
-/// How long each write of a muted carrier takes.
-/// Shorter than the linger timeout (250 ms at least), which bounds the wait for a
-/// carrier that does not take CONNECTION_CLOSE.
-const SLOW: Duration = Duration::from_millis(200);
+/// How long each write of a muted carrier takes. CONNECTION_CLOSE is the second write
+/// (a frame of 10 bytes goes first), and the wait for a carrier that does not take it is
+/// bounded by two linger timeouts (250 ms at least each): both writes together stay well
+/// within the first one, so a late scheduler does not end the wait before the delivery.
+const SLOW: Duration = Duration::from_millis(100);
 
 struct CountedWrite(TcpStream, Arc<Counts>);
 
@@ -177,6 +194,7 @@ impl Drop for Closer {
 fn counted(s: TcpStream) -> (PipeIo, Arc<Counts>) {
     let c = Arc::new(Counts::default());
     let closer = Closer(s.try_clone().unwrap(), c.clone());
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
     let io = PipeIo::from_halves(
         CountedRead(s.try_clone().unwrap(), c.clone()),
         CountedWrite(s, c.clone()),
