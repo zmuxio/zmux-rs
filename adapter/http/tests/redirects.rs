@@ -65,6 +65,15 @@ async fn front(
                         "HTTP/1.1 307 Temporary Redirect\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     let _ = conn.write_all(r.as_bytes()).await;
+                    // A lingering close, as a server does: closing with the uplink
+                    // unread resets the connection, and on Windows the reset drops
+                    // the response the client has not read yet.
+                    let _ = conn.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::io::copy(&mut conn, &mut tokio::io::sink()),
+                    )
+                    .await;
                     return;
                 }
                 // The origin serves `/zmux`: relay with the target rewritten.

@@ -341,41 +341,43 @@ async fn refused_carries_early_streams_once(cfg: fn() -> Config) {
         .await
         .expect("no session on the refusing server")
         .unwrap();
-    let mut seen = Vec::new();
+    // The streams of a rejected 0-RTT are written again and may arrive in any order:
+    // each is told by the start of its data, and `seen` holds them as the FIN stream,
+    // the reset one and the open one.
+    let mut seen: [Option<(_, _, [u8; 11])>; 3] = [None, None, None];
     for _ in 0..3 {
-        let (ss, sr) = tokio::time::timeout(Duration::from_secs(5), server.accept_bi())
+        let (ss, mut sr) = tokio::time::timeout(Duration::from_secs(5), server.accept_bi())
             .await
             .unwrap()
             .unwrap();
-        seen.push((ss, sr));
-    }
-    // The reset only after its data arrived, so the data is known to be
-    // delivered before it.
-    let mut got = vec![Vec::new(); 3];
-    for (i, (_, sr)) in seen.iter_mut().enumerate().take(2) {
-        let want: &[u8] = if i == 0 {
-            b"data then fin"
-        } else {
-            b"data then reset"
+        let mut head = [0u8; 11];
+        sr.read_exact(&mut head).await.unwrap();
+        let at = match &head {
+            b"data then f" => 0,
+            b"data then r" => 1,
+            b"data, still" => 2,
+            other => panic!("an unknown stream: {other:?}"),
         };
-        let mut buf = vec![0; want.len()];
-        sr.read_exact(&mut buf).await.unwrap();
-        got[i] = buf;
+        assert!(seen[at].is_none(), "stream {at} arrived twice");
+        seen[at] = Some((ss, sr, head));
     }
-    assert_eq!(got[0], b"data then fin");
-    assert_eq!(got[1], b"data then reset");
+    let mut seen = seen.map(Option::unwrap);
+    // The rest of the data of each; the reset only after its data arrived, so the data
+    // is known to be delivered before it.
+    for (i, rest) in [&b"in"[..], b"eset", b" open"].into_iter().enumerate() {
+        let mut buf = vec![0; rest.len()];
+        seen[i].1.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, rest);
+    }
     rst.reset(7u32.into()).unwrap();
     // FIN: nothing more after the data.
     assert_eq!(seen[0].1.read_to_end(1 << 16).await.unwrap(), b"");
     // Reset: the reading side sees it.
     assert!(seen[1].1.read_to_end(1 << 16).await.is_err());
-    let mut buf = vec![0; 16];
-    seen[2].1.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf, b"data, still open");
     open.finish().unwrap();
     assert_eq!(seen[2].1.read_to_end(1 << 16).await.unwrap(), b"");
     // Replies prove each stream lives once on the server.
-    for (i, (ss, _)) in seen.iter_mut().enumerate() {
+    for (i, (ss, _, _)) in seen.iter_mut().enumerate() {
         if i != 1 {
             ss.write_all(b"ok").await.unwrap();
             ss.finish().unwrap();

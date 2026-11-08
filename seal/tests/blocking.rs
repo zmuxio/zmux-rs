@@ -344,16 +344,20 @@ fn a_shaper_wait_ends_with_the_timeout() {
     );
     assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     assert!(began.elapsed() < Duration::from_secs(10));
-    // Without a closer: the wait is cut at the timeout, and the write that follows fails.
-    let (x, y) = std::os::unix::net::UnixStream::pair().unwrap();
-    drop(y);
-    let x2 = x.try_clone().unwrap();
-    let began = Instant::now();
-    let r = zmux_seal::blocking::establish(
-        PipeIo::from_halves(x, x2),
-        &cfg,
-        Some(Duration::from_millis(100)),
-    );
-    assert!(r.is_err());
-    assert!(began.elapsed() < Duration::from_secs(10));
+    // Without a closer: the wait is cut at the timeout, and the write that follows fails
+    // (a pair of Unix sockets with one end dropped fails the write at once).
+    #[cfg(unix)]
+    {
+        let (x, y) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(y);
+        let x2 = x.try_clone().unwrap();
+        let began = Instant::now();
+        let r = zmux_seal::blocking::establish(
+            PipeIo::from_halves(x, x2),
+            &cfg,
+            Some(Duration::from_millis(100)),
+        );
+        assert!(r.is_err());
+        assert!(began.elapsed() < Duration::from_secs(10));
+    }
 }

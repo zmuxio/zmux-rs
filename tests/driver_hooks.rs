@@ -161,7 +161,10 @@ async fn custom_policy_answers_are_applied() {
     let total = answers + stats.scheduler_fallbacks;
     assert!(answers > 0, "{stats:?}");
     assert!(
-        answers * 100 >= total * 99,
+        // An answer given for a view that changed meanwhile (a pipe's state, a penalty,
+        // an eligibility) counts as a fallback by design, and a loaded host changes
+        // views more often during the call: most answers are applied, not all.
+        answers * 100 >= total * 90,
         "applied {answers} of {total} ({} calls)",
         policy.calls.load(Ordering::Relaxed)
     );
