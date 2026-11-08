@@ -196,20 +196,11 @@ impl RoleParameter {
 }
 
 /// A Session Locator: 0 to 255 bytes chosen by the endpoint that accepts
-/// joins. Empty means "accepts no joins".
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// joins. Empty means "accepts no joins". Kept on the heap and only as long
+/// as it is, so that the session state of the common empty locator is small.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Locator {
-    len: u8,
-    bytes: [u8; Self::MAX_LEN],
-}
-
-impl Default for Locator {
-    fn default() -> Self {
-        Self {
-            len: 0,
-            bytes: [0; Self::MAX_LEN],
-        }
-    }
+    bytes: Box<[u8]>,
 }
 
 impl Locator {
@@ -218,20 +209,19 @@ impl Locator {
 
     /// Creates a locator; `None` if `bytes` is longer than 255.
     pub fn new(bytes: &[u8]) -> Option<Self> {
-        let mut out = Self::default();
-        out.bytes.get_mut(..bytes.len())?.copy_from_slice(bytes);
-        out.len = bytes.len() as u8;
-        Some(out)
+        (bytes.len() <= Self::MAX_LEN).then(|| Self {
+            bytes: bytes.into(),
+        })
     }
 
     /// The locator bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
+        &self.bytes
     }
 
     /// Whether the locator is empty.
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bytes.is_empty()
     }
 }
 
@@ -246,7 +236,7 @@ impl fmt::Debug for Locator {
 }
 
 /// The zmux_multipath value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultipathParameter {
     /// Secret Flags ([`keys::secret_flags`]); reserved bits are ignored.
     pub secret_flags: u8,

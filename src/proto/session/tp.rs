@@ -22,7 +22,7 @@ fn narrow(v: u64) -> u32 {
 /// One endpoint's transport parameter values in use after the handshake,
 /// absent ones resolved to their defaults (0: absent, where 0 is not a
 /// valid value).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TpValues {
     /// initial_max_stream_data_bidi_local.
     pub(super) window_bidi_local: u64,
@@ -68,7 +68,7 @@ impl TpValues {
                 Some(RoleParameter::Auto { nonce }) => Some(nonce),
                 _ => None,
             },
-            multipath: tp.zmux_multipath,
+            multipath: tp.zmux_multipath.clone(),
             lane_key: tp.zmux_max_lanes.map(|l| l.lane_key),
             max_record_size: narrow(tp.max_record_size_or_default()),
             max_datagram_frame_size: narrow(tp.max_datagram_frame_size.unwrap_or(0)),
@@ -97,7 +97,7 @@ impl TpValues {
             streams_bidi: config.max_incoming_streams,
             max_idle_timeout: config.idle_millis(),
             role_nonce: own.role_nonce,
-            multipath: own.multipath,
+            multipath: own.multipath.clone(),
             lane_key: Some(own.lane_key),
             max_record_size: narrow(ZMUX_MAX_RECORD_SIZE),
             max_datagram_frame_size: if config.enable_datagrams {
@@ -148,7 +148,7 @@ impl TpValues {
 
 /// What of the local transport parameters is the session's own: the rest
 /// comes from the shared configuration ([`TpValues::local`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct LocalTp {
     /// zmux_multipath as the session sends it (its locator and Secret
     /// Flags may change before the parameters are sent).

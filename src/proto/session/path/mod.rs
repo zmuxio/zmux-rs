@@ -242,9 +242,9 @@ impl SessionCore {
         if !self.is_multipath() {
             return None;
         }
-        let local = self.local_tp().multipath?;
-        let peer = self.peer_tp.as_ref()?.multipath?;
-        Some((local.session_nonce, peer.session_nonce))
+        let local_nonce = self.local_tp().multipath.as_ref()?.session_nonce;
+        let peer = self.peer_tp.as_ref()?.multipath.as_ref()?;
+        Some((local_nonce, peer.session_nonce))
     }
 
     /// The RTT estimate rules use: the smoothed RTT or 333 ms. In a multipath session it is the

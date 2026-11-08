@@ -128,6 +128,11 @@ impl AsyncRead for SealedRead {
             let read = Pin::new(&mut this.lower).poll_read(cx, &mut rb);
             let n = rb.filled().len();
             this.buf.truncate(at + n);
+            // The read buffer is only a scratch space: an idle pipe, waiting for its
+            // next record, keeps none.
+            if this.buf.len() < this.buf.capacity() / 2 {
+                this.buf.shrink_to_fit();
+            }
             ready!(read)?;
             // The end at a record's boundary reads as the carrier's end, which closes no
             // stream and which the session judges by its frames: a pipe's graceful removal

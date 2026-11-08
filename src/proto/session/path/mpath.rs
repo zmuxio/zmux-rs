@@ -954,7 +954,7 @@ impl SessionCore {
         peer: &TransportParameters,
         now: Instant,
     ) {
-        let (Some(l), Some(p)) = (local.zmux_multipath, peer.zmux_multipath) else {
+        let (Some(l), Some(p)) = (&local.zmux_multipath, &peer.zmux_multipath) else {
             return;
         };
         let source = match keys::select_secret_source(l.secret_flags, p.secret_flags) {
@@ -1052,10 +1052,10 @@ impl SessionCore {
             pass_states: Vec::new(),
             last_failure: None,
             keys,
-            epochs: Epochs::new(self.local_locator(), p.locator, self.locator_instance, now),
+            epochs: Epochs::new(self.local_locator(), p.locator.clone(), self.locator_instance, now),
             peer_crypto: theirs,
             local_joins: Vec::new(),
-            peer_locator: p.locator,
+            peer_locator: p.locator.clone(),
             resume,
             peer_mad: Duration::from_millis(
                 peer.zmux_max_ack_delay

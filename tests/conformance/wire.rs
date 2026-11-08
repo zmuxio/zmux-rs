@@ -415,7 +415,7 @@ fn param_json(id: u64, value: &[u8], tp: &TransportParameters) -> Value {
             RoleParameter::Auto { nonce } => json!({"role": "auto", "nonce": nonce}),
         },
         Some("multipath") => {
-            let m = tp.zmux_multipath.expect("validated");
+            let m = tp.zmux_multipath.as_ref().expect("validated");
             json!({
                 "flags": m.secret_flags,
                 "nonce": to_hex(&m.session_nonce),

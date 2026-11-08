@@ -1153,11 +1153,11 @@ impl SessionCore {
     /// the configuration and the session's nonces, Lane Key and locator.
     pub fn local_parameters(&self) -> TransportParameters {
         let l = &self.local;
-        let nonce = l.multipath.map(|m| m.session_nonce).unwrap_or_default();
+        let nonce = l.multipath.as_ref().map(|m| m.session_nonce).unwrap_or_default();
         let mut tp = self
             .config
             .transport_parameters(l.role_nonce, nonce, l.lane_key);
-        tp.zmux_multipath = l.multipath;
+        tp.zmux_multipath.clone_from(&l.multipath);
         tp.zmux_carrier_datagrams |= l.carrier_datagrams && tp.max_datagram_frame_size.is_some();
         tp
     }

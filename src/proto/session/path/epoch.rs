@@ -255,7 +255,7 @@ impl SessionCore {
             .iter()
             .rev()
             .find(|(from, _)| *from <= e)
-            .map_or(self.mp().peer_locator, |(_, l)| *l);
+            .map_or_else(|| self.mp().peer_locator.clone(), |(_, l)| l.clone());
         (e, locator)
     }
 

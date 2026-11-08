@@ -389,11 +389,17 @@ async fn refused_carries_early_streams_once(cfg: fn() -> Config) {
             .await
             .is_err()
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), b.accept())
-            .await
-            .is_err()
-    );
+    // `accept` ends only by a session (the listener stays open), so the
+    // timeout is the one way to see none; an extra session is reported with
+    // what it carries.
+    if let Ok(extra) = tokio::time::timeout(Duration::from_millis(300), b.accept()).await {
+        let extra = extra.expect("the listener stays open");
+        let streams = tokio::time::timeout(Duration::from_millis(300), extra.accept_bi()).await;
+        panic!(
+            "a second session on the refusing server; its first stream: {:?}",
+            streams.map(|r| r.map(|_| ()))
+        );
+    }
     assert!(report.sent() && report.accepted() == Some(false) && report.rewritten());
     second.close(0u32.into(), b"").await;
     // `b` resumed the session of `a`; it was not a full handshake.

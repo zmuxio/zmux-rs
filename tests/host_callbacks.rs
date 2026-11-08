@@ -139,6 +139,7 @@ async fn a_panicking_reject_policy_closes() {
     .unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_panicking_reject_policy_closes_on_the_std_driver() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -166,6 +167,7 @@ fn a_panicking_reject_policy_closes_on_the_std_driver() {
 }
 
 /// A Hello from a client of another listener: the session it names is not here.
+#[cfg(unix)]
 fn stray_join_hello() -> Vec<u8> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -404,6 +406,7 @@ async fn a_join_finished_on_an_ended_session_starts_no_pipe_task() {
 }
 
 /// The same on the std driver: no thread of the pipe touches the carrier afterwards.
+#[cfg(unix)]
 #[test]
 fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
     use std::io::{Read, Write};
@@ -474,6 +477,7 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
 
 /// Two one-way carriers join as one on the std driver: traffic runs, both closers run with
 /// the attachment, and a half without the contract gives the pair none.
+#[cfg(unix)]
 #[test]
 fn paired_join_on_the_std_driver() {
     use std::os::unix::net::UnixStream;
@@ -557,6 +561,7 @@ fn paired_join_on_the_std_driver() {
 }
 
 /// An accept error other than the listener's close leaves `serve` running.
+#[cfg(unix)]
 #[test]
 fn serve_goes_on_after_an_accept_error() {
     use std::os::fd::OwnedFd;
