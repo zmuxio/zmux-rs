@@ -1,0 +1,29 @@
+[package]
+name = "zmux-seal"
+version = "1.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "The zmux secure carrier: Establish, trust anchors and gates over zmux carriers"
+repository = "https://github.com/zmuxio/zmux-rs"
+keywords = ["zmux", "noise"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt", "time"] }
+zmux = { version = "1.3.0", path = "..", features = ["seal-chacha"] }
+zmux-seal-proto = { version = "1.3.0", path = "../seal-proto" }
+
+[features]
+# Establish and its transform for the std driver: `zmux_seal::blocking`.
+blocking = ["zmux/blocking"]
+
+[dev-dependencies]
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+tokio = { version = "1.54", features = ["full"] }
+zmux-seal = { path = ".", features = ["blocking"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unreachable_pub = "warn"

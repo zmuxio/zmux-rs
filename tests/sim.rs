@@ -1,10 +1,10 @@
-//! Deterministic simulation of the tokio driver (CONFORMANCE.md): a seeded
+//! Deterministic simulation of the tokio driver: a seeded
 //! single-threaded runtime with a paused clock drives two
 //! sessions over in-memory carriers with random API calls — opens,
 //! accepts, writes, reads, finishes, resets, stops, dropped handles,
 //! cancelled calls, datagrams, pings, carrier stalls and failures, pipes
-//! joined and lost, GOAWAY and closes. After every step the invariants of
-//! Section 4.4 that the API shows are checked; at the end every resource
+//! joined and lost, GOAWAY and closes. After every step the session invariants
+//! that the API shows are checked; at the end every resource
 //! returns to its baseline.
 //!
 //! A failure names its seed: `ZMUX_SEED=<n> cargo test --test sim` replays
@@ -78,7 +78,7 @@ fn config(multipath: bool, rng: &mut Rng) -> Config {
     if multipath {
         c.test_hooks().locator = b"sim".to_vec();
         c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::psk(*b"sim-test-psk-0123456789abcdef!!!");
+        c.pipe_auth = PipeAuth::psk(*b"sim-test-psk-0123456789abcdef!!!").with_end_to_end();
         c.suspect_floor = Duration::from_millis(100);
     }
     c
@@ -90,7 +90,8 @@ impl Sim {
         let multipath = rng.below(3) == 0;
         let cfg = config(multipath, &mut rng);
         let (ends, ctl, listener) = if multipath {
-            let listener = Listener::new(cfg.clone(), ListenerConfig::default());
+            let listener = Listener::new(cfg.clone(), ListenerConfig::default())
+                .expect("valid listener configuration");
             let ((a, ca), (b, _)) = duplex(1 << (12 + rng.below(6)));
             let l = listener.clone();
             tokio::spawn(async move {
@@ -243,7 +244,7 @@ impl Sim {
             95 if self.rng.below(30) == 0 => {
                 let side = self.rng.below(2) as usize;
                 self.note(|| format!("close side {side}"));
-                self.ends[side].close(VarInt::from_u32(3), b"sim");
+                self.ends[side].close(VarInt::from_u32(3), b"sim").await;
             }
             _ => tokio::task::yield_now().await,
         }
@@ -394,7 +395,7 @@ impl Sim {
                 tokio::spawn(async move {
                     let _ = listener.handle_pipe(b, PipeHint::default()).await;
                 });
-                if let Ok(p) = self.ends[0].add_pipe(a, PipeOptions::default()) {
+                if let Ok(p) = self.ends[0].begin_add_pipe(a, PipeOptions::default()) {
                     self.note(|| format!("add pipe {}", p.id()));
                     self.ctl.push(ca.clone());
                     self.pipes.push((p, ca));
@@ -416,7 +417,7 @@ impl Sim {
         }
     }
 
-    /// The invariants of CONFORMANCE.md Section 4.3 the API shows.
+    /// The session invariants the API shows.
     fn check(&self) {
         let seed = self.seed;
         for (k, h) in &self.halves {
@@ -478,7 +479,7 @@ impl Sim {
             );
         }
         for s in &self.ends {
-            s.close(VarInt::from_u32(0), b"end");
+            s.close(VarInt::from_u32(0), b"end").await;
         }
         for s in &self.ends {
             watchdog(30, "closed", s.closed()).await;

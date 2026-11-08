@@ -16,11 +16,10 @@ pub enum RequestClass {
     /// An extended `CONNECT` with `:protocol` `webtransport-h3` or
     /// `webtransport`.
     WebTransport,
-    /// A `GET` with `Zmux-Pipe-Pair` or `Zmux-Pipe-Join`: its response
+    /// A `GET` with `Zmux-Pipe-Pair`: its response
     /// body is the downlink.
     Downlink,
-    /// A `POST` with `Zmux-Pipe-Pair` (a split bootstrap's uplink), or one
-    /// without a `Content-Length` with `Zmux-Pipe-Join`: its request body
+    /// A `POST` with `Zmux-Pipe-Pair` (a split bootstrap's uplink),: its request body
     /// is the uplink.
     Uplink,
     /// A `POST` with a `Content-Length`: an exchange request.
@@ -51,7 +50,6 @@ pub fn classify_head(
 ) -> Option<RequestClass> {
     let has = |name: &str| headers.contains_key(name);
     let pair = has(zmux::PAIR_HEADER);
-    let join = has(zmux::JOIN_HEADER);
     if *method == Method::CONNECT {
         return match protocol {
             Some(p) if p.eq_ignore_ascii_case("websocket") => Some(RequestClass::WebSocket),
@@ -70,7 +68,7 @@ pub fn classify_head(
         {
             return Some(RequestClass::WebSocket);
         }
-        return (pair || join).then_some(RequestClass::Downlink);
+        return pair.then_some(RequestClass::Downlink);
     }
     if *method != Method::POST {
         return None;
@@ -81,11 +79,7 @@ pub fn classify_head(
     if headers.contains_key(CONTENT_LENGTH) {
         return Some(RequestClass::Exchange);
     }
-    Some(if join {
-        RequestClass::Uplink
-    } else {
-        RequestClass::Bidirectional
-    })
+    Some(RequestClass::Bidirectional)
 }
 
 /// [`classify_head`] of a request as hyper gives it: the extended
@@ -136,14 +130,13 @@ mod tests {
         use RequestClass as C;
         let v11 = Version::HTTP_11;
         let pair = ("zmux-pipe-pair", "AAECAwQFBgcICQoLDA0ODw");
-        let join = ("zmux-pipe-join", "miTeNgVMT0NBTAIAAACt7RBndcMxQfuIZPmHfywi");
         let cl = ("content-length", "10");
         // 1: a WebSocket upgrade, even with the other fields.
         assert_eq!(
             class(
                 Method::GET,
                 v11,
-                &[("connection", "Upgrade"), ("upgrade", "WebSocket"), join]
+                &[("connection", "Upgrade"), ("upgrade", "WebSocket"), pair]
             ),
             Some(C::WebSocket)
         );
@@ -170,20 +163,14 @@ mod tests {
         );
         // 3.
         assert_eq!(class(Method::GET, v11, &[pair]), Some(C::Downlink));
-        assert_eq!(class(Method::GET, v11, &[join]), Some(C::Downlink));
         // 4: before the Content-Length rule.
         assert_eq!(class(Method::POST, v11, &[pair, cl]), Some(C::Uplink));
         // 5.
         assert_eq!(class(Method::POST, v11, &[cl]), Some(C::Exchange));
-        assert_eq!(class(Method::POST, v11, &[cl, join]), Some(C::Exchange));
         // 6.
         assert_eq!(
             class(Method::POST, v11, &[("transfer-encoding", "chunked")]),
             Some(C::Bidirectional)
-        );
-        assert_eq!(
-            class(Method::POST, Version::HTTP_2, &[join]),
-            Some(C::Uplink)
         );
         // 7.
         assert_eq!(class(Method::GET, v11, &[]), None);

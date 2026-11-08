@@ -291,9 +291,9 @@ dependencies = [
 
 [[package]]
 name = "qmux"
-version = "0.6.2"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5813506ee76dc0d4ae9870a23105603af88552df45fe262ca776fad6dc0f94aa"
+checksum = "deb005145a7b6ba9e6a51431bc409626559cd117a83d62566fe1e5b822684eda"
 dependencies = [
  "bytes",
  "libc",
@@ -410,9 +410,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.4"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "socket2"
@@ -593,9 +593,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "web-transport-proto"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2baf87f7a4701d964fd23529b440db3da535b1d7539289f7a463c3481dafcff"
+checksum = "40d8e5dba9b14dbe25b116ac7e62ca82bf7c328d1c6072238bf0b9b47874c9d1"
 dependencies = [
  "bytes",
  "http",

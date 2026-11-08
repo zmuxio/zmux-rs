@@ -1,9 +1,9 @@
-//! Shuttle models of the std driver's thread protocol (CONFORMANCE.md):
-//! randomized and PCT schedules of application,
-//! reader, writer and timer threads around the production units
-//! ([`Locked`], [`WakeList`], [`Waiters`], [`Wait`], [`Open`], [`WaitList`],
-//! the thread waker and `park`). Shuttle fails a schedule that deadlocks (a
-//! lost wake-up leaves every thread parked) or panics.
+//! Shuttle models of the std driver's thread protocol: randomized and PCT
+//! schedules of application, reader, writer and timer threads around the
+//! production units ([`Locked`], [`WakeList`], [`Waiters`], [`Wait`],
+//! [`Open`], [`WaitList`], the thread waker and `park`). Shuttle fails a
+//! schedule that deadlocks (a lost wake-up leaves every thread parked) or
+//! panics.
 //!
 //! The threads repeat the std driver's steps (`blocking.rs`): a waiting
 //! call runs the shared wait future (`handle.rs`) on its thread, parking
@@ -174,7 +174,7 @@ fn open(s: &Session, id: usize, expiry: &Expiry) -> Option<Result<(), ()>> {
                 Attempt::Blocked
             }
         },
-        |_: &mut Inner| {},
+        |_: &mut Inner, _| {},
     );
     run(open, expiry)
 }

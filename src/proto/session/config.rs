@@ -1,5 +1,5 @@
 //! Session configuration and the transport parameters it
-//! produces (SPEC.md Section 5.3).
+//! produces.
 
 use std::fmt;
 use std::sync::Arc;
@@ -15,15 +15,39 @@ use crate::proto::params::{
     ZMUX_MAX_RECORD_SIZE, grease_id,
 };
 
-/// Join credentials: the secret sources this endpoint offers for pipe joins
-/// (MULTIPATH.md Section 10.1). There is no default:
+/// Join credentials: the secret sources this endpoint offers for pipe joins. There is no default:
 /// a configuration that offers multipath without them is refused
 /// ([`crate::ConnectError::InvalidConfig`]).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PipeAuth {
     pub(crate) exporter: bool,
-    pub(crate) psk: Option<Vec<u8>>,
-    pub(crate) insecure: bool,
+    pub(crate) psk: Option<JoinSecret>,
+    pub(crate) deferred_psk: bool,
+    pub(crate) end_to_end: bool,
+}
+
+/// A pre-shared key: its bytes are overwritten when it is dropped.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct JoinSecret(Vec<u8>);
+
+impl JoinSecret {
+    pub(crate) fn new(key: Vec<u8>) -> Self {
+        Self(key)
+    }
+}
+
+impl std::ops::Deref for JoinSecret {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for JoinSecret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
 }
 
 impl PipeAuth {
@@ -35,9 +59,9 @@ impl PipeAuth {
     /// Derives the join secret from the exporter of the innermost
     /// end-to-end handshake of the bootstrap carriers (E); today its
     /// source is TLS 1.3 that this process terminates (a TLS connection,
-    /// or the QUIC connection under the carrier). The driver supplies the
-    /// exporter value of the bootstrap carrier; a carrier without one
-    /// fails the session.
+    /// or the QUIC connection under the carrier). The driver reads the
+    /// value from the bootstrap carrier's exporter; a carrier without one
+    /// is [`crate::ConnectError::InvalidConfig`].
     pub fn exporter() -> Self {
         Self {
             exporter: true,
@@ -46,29 +70,67 @@ impl PipeAuth {
     }
 
     /// A pre-shared key of at least 16 bytes (P): static, or derived per
-    /// session by the application from its own authenticated exchange
-    /// (MULTIPATH.md Section 10.2).
+    /// session by the application from its own authenticated exchange.
     pub fn psk(key: impl Into<Vec<u8>>) -> Self {
         Self {
-            psk: Some(key.into()),
+            psk: Some(JoinSecret::new(key.into())),
             ..Self::default()
         }
     }
 
-    /// Allows insecure joins (I): only for deployments protected by other
-    /// means. Cannot be combined with a PSK.
-    pub fn insecure() -> Self {
+    /// A pre-shared key given later with
+    /// [`SessionCore::set_join_secret`](super::SessionCore::set_join_secret),
+    /// for example once the application authenticated the peer. It offers P like a static key.
+    /// Until the key is given, local joins fail with
+    /// [`PipeError::JoinPending`](super::PipeError::JoinPending)
+    /// and the peer's are held for at most the handshake timeout. Excludes
+    /// a static key.
+    pub fn deferred_psk() -> Self {
         Self {
-            insecure: true,
+            deferred_psk: true,
             ..Self::default()
         }
+    }
+
+    /// Adds a deferred pre-shared key to these credentials
+    /// ([`Self::deferred_psk`]).
+    #[must_use]
+    pub fn with_deferred_psk(mut self) -> Self {
+        self.deferred_psk = true;
+        self
+    }
+
+    /// Whether these credentials name a secret source: a pre-shared key
+    /// (static or deferred) or the exporter. [`Self::with_end_to_end`] is
+    /// no source.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn has_source(&self) -> bool {
+        self.exporter || self.psk.is_some() || self.deferred_psk
+    }
+
+    /// Declares in advance what
+    /// [`SessionCore::declare_end_to_end`](super::SessionCore::declare_end_to_end) declares:
+    /// the host proved pipe 0 end to end. Without it, a session whose first pipe is
+    /// not on the secure carrier has no join keys. It is no secret source: it only
+    /// releases the join keys of one. On a secure first pipe it is accepted and has
+    /// no effect, so one configuration serves both kinds of first pipe.
+    #[must_use]
+    pub fn with_end_to_end(mut self) -> Self {
+        self.end_to_end = true;
+        self
     }
 
     /// Adds a pre-shared key to these credentials.
     #[must_use]
     pub fn with_psk(mut self, key: impl Into<Vec<u8>>) -> Self {
-        self.psk = Some(key.into());
+        self.psk = Some(JoinSecret::new(key.into()));
         self
+    }
+
+    /// The static pre-shared key, for a test's scripted peer.
+    #[cfg(feature = "test-hooks")]
+    pub fn psk_bytes(&self) -> &[u8] {
+        self.psk.as_deref().unwrap_or_default()
     }
 
     /// The Secret Flags these credentials select.
@@ -77,11 +139,8 @@ impl PipeAuth {
         if self.exporter {
             f |= secret_flags::EXPORTER;
         }
-        if self.psk.is_some() {
+        if self.psk.is_some() || self.deferred_psk {
             f |= secret_flags::PSK;
-        }
-        if self.insecure {
-            f |= secret_flags::INSECURE;
         }
         f
     }
@@ -92,8 +151,182 @@ impl fmt::Debug for PipeAuth {
         f.debug_struct("PipeAuth")
             .field("exporter", &self.exporter)
             .field("psk", &self.psk.as_ref().map(|_| ".."))
-            .field("insecure", &self.insecure)
+            .field("deferred_psk", &self.deferred_psk)
+            .field("end_to_end", &self.end_to_end)
             .finish()
+    }
+}
+
+/// The level of a [`Logger`] message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum LogLevel {
+    /// Detail for debugging.
+    Debug,
+    /// Information.
+    Info,
+    /// Something the application should look at.
+    Warn,
+    /// A failure zmux contained.
+    Error,
+}
+
+/// The logger of a session or listener ([`Config::logger`]): a callback
+/// taking a level and a message, so that zmux depends on no logging crate.
+#[derive(Clone)]
+pub struct Logger(pub Arc<LogFn>);
+
+/// The callable behind a [`Logger`].
+pub type LogFn = dyn Fn(LogLevel, &str) + Send + Sync;
+
+impl Logger {
+    /// A logger from a closure.
+    pub fn new(f: impl Fn(LogLevel, &str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Logs `message` at `level`; a panic of the callback is contained.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn log(&self, level: LogLevel, message: &str) {
+        let f = &self.0;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(level, message)));
+    }
+}
+
+impl fmt::Debug for Logger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Logger(..)")
+    }
+}
+
+/// What a host's record mode check knows of a carrier.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CarrierDescription {
+    /// It has an exporter.
+    pub has_exporter: bool,
+    /// It declares the Bound contract.
+    pub secure: bool,
+    /// The host's name of the path.
+    pub label: Option<Arc<str>>,
+    /// It is the session's first pipe.
+    pub is_first_pipe: bool,
+}
+
+/// Chooses each carrier's record mode at the joiner: [`Config::record_policy`].
+#[derive(Clone)]
+pub struct RecordPolicy(
+    pub Arc<dyn Fn(&CarrierDescription) -> crate::proto::seal::Mode + Send + Sync>,
+);
+
+/// The acceptor's check of a Hello's mode, with the session's host value:
+/// [`Config::allow_record_mode`].
+#[derive(Clone)]
+pub struct AllowRecordMode(pub Arc<AllowRecordModeFn>);
+
+/// The callable behind an [`AllowRecordMode`].
+pub type AllowRecordModeFn = dyn Fn(
+        &CarrierDescription,
+        crate::proto::seal::Mode,
+        Option<&crate::proto::admission::AdmittedValue>,
+    ) -> bool
+    + Send
+    + Sync;
+
+/// An acceptor's further check of a join: [`Config::authorize_join`].
+#[derive(Clone)]
+pub struct AuthorizeJoin(pub Arc<dyn Fn(u64) -> bool + Send + Sync>);
+
+impl fmt::Debug for RecordPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecordPolicy(..)")
+    }
+}
+
+impl fmt::Debug for AllowRecordMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AllowRecordMode(..)")
+    }
+}
+
+impl fmt::Debug for AuthorizeJoin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthorizeJoin(..)")
+    }
+}
+
+/// The liveness settings of a session as a whole, the [`Config`] fields of
+/// the same names ([`SessionCore::set_liveness`](super::SessionCore::set_liveness)).
+/// The default is the defaults of [`Config`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Liveness {
+    /// [`keep_alive_period`](Config#structfield.keep_alive_period): `None` is off, otherwise at
+    /// least 1 s.
+    pub keep_alive_period: Option<Duration>,
+    /// [`suspect_floor`](Config#structfield.suspect_floor): at least 50 ms.
+    pub suspect_floor: Duration,
+    /// [`dead_timeout`](Config#structfield.dead_timeout): `None` is derived, otherwise at least 1
+    /// s.
+    pub dead_timeout: Option<Duration>,
+    /// [`standby_probe`](Config#structfield.standby_probe): `None` is off, otherwise at least 1 s.
+    pub standby_probe: Option<Duration>,
+    /// [`probe_interval`](Config#structfield.probe_interval): `None` is off, otherwise at least 1
+    /// s.
+    pub probe_interval: Option<Duration>,
+    /// [`probe_jitter`](Config#structfield.probe_jitter): from 0 to below 1.
+    pub probe_jitter: f64,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self::of(&Config::default())
+    }
+}
+
+impl Liveness {
+    /// The liveness settings of `config`.
+    pub fn of(config: &Config) -> Self {
+        Self {
+            keep_alive_period: config.keep_alive_period,
+            suspect_floor: config.suspect_floor,
+            dead_timeout: config.dead_timeout,
+            standby_probe: config.standby_probe,
+            probe_interval: config.probe_interval,
+            probe_jitter: config.probe_jitter,
+        }
+    }
+
+    /// Whether the settings are valid, by the rules of [`Config`].
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let below = |d: Option<Duration>| d.is_some_and(|d| d < Duration::from_secs(1));
+        if self.suspect_floor < Duration::from_millis(50) {
+            return Err("suspect_floor below 50 ms");
+        }
+        if below(self.dead_timeout) {
+            return Err("dead_timeout below 1 s");
+        }
+        if !(0.0..1.0).contains(&self.probe_jitter) {
+            return Err("probe_jitter outside [0, 1)");
+        }
+        if below(self.keep_alive_period) {
+            return Err("keep_alive_period below 1 s");
+        }
+        if below(self.standby_probe) {
+            return Err("standby_probe below 1 s");
+        }
+        if below(self.probe_interval) {
+            return Err("probe_interval below 1 s");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(&self, config: &mut Config) {
+        config.keep_alive_period = self.keep_alive_period;
+        config.suspect_floor = self.suspect_floor;
+        config.dead_timeout = self.dead_timeout;
+        config.standby_probe = self.standby_probe;
+        config.probe_interval = self.probe_interval;
+        config.probe_jitter = self.probe_jitter;
     }
 }
 
@@ -104,8 +337,7 @@ pub enum RoleConfig {
     Initiator,
     /// The accepting side; uses the transport role, sends no `zmux_role`.
     Responder,
-    /// A symmetric carrier: sends `zmux_role` auto with a random nonce
-    /// (EXTENSIONS.md Section 2).
+    /// A symmetric carrier: sends `zmux_role` auto with a random nonce.
     Auto,
 }
 
@@ -179,13 +411,26 @@ impl From<u64> for Budget {
 /// The default handshake timeout ([`Config::handshake_timeout`]).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The default probe interval of idle pipe pairs ([`Config::probe_interval`](Config#structfield.probe_interval)).
+/// The default join deadline ([`Config::join_timeout`]).
+pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The default shortest wait between redials: of the
+/// [`redial`](Config#structfield.redial) hook and of a pipe pool.
+pub const DEFAULT_MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The default longest wait between redials, which also bounds a policy's
+/// dial delay.
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The default probe interval of idle pipe pairs
+/// ([`Config::probe_interval`](Config#structfield.probe_interval)).
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The default keep-alive period ([`Config::keep_alive_period`]).
 pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 
-/// The default standby probe interval ([`Config::standby_probe`](Config#structfield.standby_probe)).
+/// The default standby probe interval
+/// ([`Config::standby_probe`](Config#structfield.standby_probe)).
 pub const DEFAULT_STANDBY_PROBE: Duration = Duration::from_secs(1);
 
 /// The default idle timeout ([`Config::max_idle_timeout`]).
@@ -210,8 +455,7 @@ pub const DEFAULT_SEND_BUFFER_MAX: u64 = 64 * 1024 * 1024;
 pub const STREAM_WINDOW_FLOOR: u64 = 64 * 1024 * 1024;
 
 /// The floor of the automatic session window cap, 1.5 x the stream floor;
-/// also the cap the session receive buffer cap is computed from (SPEC.md
-/// Section 8.3 rule 4).
+/// also the cap the session receive buffer cap is computed from.
 pub const SESSION_WINDOW_FLOOR: u64 = 96 * 1024 * 1024;
 
 /// The default memory budget of a session without a listener, the same as a listener's.
@@ -232,8 +476,7 @@ pub enum Cap {
 }
 
 /// The `initial_max_streams_uni` of an unset `max_incoming_uni_streams`,
-/// and the limit the first accept raises it to (SPEC.md Section 8.5 rule
-/// 4).
+/// and the limit the first accept raises it to.
 pub(crate) const STAGED_UNI_STREAMS: (u64, u64) = (16, 256);
 
 /// The predicate of `allow_connection_window_increase`:
@@ -285,10 +528,17 @@ pub enum Redundancy {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
-    /// Abandon establishment and unconfirmed joins and lanes after this
-    /// long (default [`DEFAULT_HANDSHAKE_TIMEOUT`], 10 s; `None` is no
-    /// timeout).
+    /// Abandon establishment after this long (default
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`], 10 s; `None` is no timeout). It
+    /// bounds establishment only.
     pub handshake_timeout: Option<Duration>,
+    /// The join deadline (default [`DEFAULT_JOIN_TIMEOUT`], 10 s; a
+    /// positive duration of at most [`MAX_JOIN_DEADLINE`](super::MAX_JOIN_DEADLINE),
+    /// 60 s, which session epochs rely on; there is no setting without a timeout): every
+    /// join, lane confirmation and held peer join ends by it, and
+    /// [`Session`](crate::Session)`::add_pipe` waits at most this
+    /// long. It does not depend on `handshake_timeout`.
+    pub join_timeout: Duration,
     /// `max_idle_timeout` (default [`DEFAULT_IDLE_TIMEOUT`], 30 s; `None`
     /// is no local limit and announces none). A set duration is at least
     /// 1 ms, the unit of the transport parameter, whose 0 means none.
@@ -296,11 +546,10 @@ pub struct Config {
     /// Send QX_PING after this much silence (default
     /// [`DEFAULT_KEEP_ALIVE_PERIOD`], 15 s; `None` turns keep-alive off; a
     /// period below 1 s, zero included, is not valid).
-    /// The period in effect is capped at half the effective idle timeout, and each wait is drawn from \[k (1 - j), k\]
-    /// with j the [`probe_jitter`](Self::probe_jitter) (SPEC.md Section
-    /// 6.4). On, an idle session stays open while the peer answers and
-    /// closes within the idle timeout once its carrier dies; off, the idle
-    /// timeout ends any session without application activity.
+    /// The period in effect is capped at half the effective idle timeout, and each wait is drawn
+    /// from \[k (1 - j), k\] with j the [`probe_jitter`](Self::probe_jitter). On, an idle session
+    /// stays open while the peer answers and closes within the idle timeout once its carrier dies;
+    /// off, the idle timeout ends any session without application activity.
     pub keep_alive_period: Option<Duration>,
     /// Initial stream receive window (default 256 KiB; at least 4 KiB,
     /// the early-data floor of [`params::floor`](floor)).
@@ -320,8 +569,7 @@ pub struct Config {
     /// Cap of the auto-tuned session window (default [`Cap::Auto`]: at
     /// least [`SESSION_WINDOW_FLOOR`], 96 MiB, and beyond it within the
     /// memory budget). The session receive buffer cap is computed from a
-    /// fixed cap or from the floor, never from a grown window (SPEC.md
-    /// Section 8.3 rule 4).
+    /// fixed cap or from the floor, never from a grown window.
     pub max_connection_receive_window: Cap,
     /// The `memory_budget` parameter of `max_connection_receive_window`
     /// (`None`, the default, is [`DEFAULT_MEMORY_BUDGET`], 1 GiB;
@@ -339,13 +587,13 @@ pub struct Config {
     /// Concurrent unidirectional streams the peer may open. `None` (the
     /// default) stages the credit: `initial_max_streams_uni` is 16 and
     /// MAX_STREAMS 256 is sent when the application first accepts a
-    /// unidirectional stream (SPEC.md Section 8.5 rule 4). A value
+    /// unidirectional stream. A value
     /// (including 0) is advertised at once.
     pub max_incoming_uni_streams: Option<u64>,
     /// Announce datagram support (default false).
     pub enable_datagrams: bool,
     /// Datagrams waiting for a pipe (default 64, at least 1); when the
-    /// queue is full the oldest is dropped (EXTENSIONS.md Section 6.5).
+    /// queue is full the oldest is dropped.
     pub datagram_send_queue: usize,
     /// Received session datagrams (flow 0) waiting for the application
     /// (default 128, at least 1); the oldest make room.
@@ -366,7 +614,7 @@ pub struct Config {
     /// memory budget, which retained data is charged to): in a multipath
     /// session the send buffer grows to the retransmit budget up to this,
     /// which also caps that budget. A fixed
-    /// value below `send_buffer` counts as `send_buffer`.
+    /// value below `send_buffer` is a configuration error.
     pub send_buffer_max: Cap,
     /// The largest Frames field of the records this endpoint sends, before
     /// the peer's `max_record_size` caps it (default 16382, one TLS record).
@@ -374,30 +622,92 @@ pub struct Config {
     /// The attachments this endpoint aims for with its own joins. 1 (the
     /// default) keeps multipath off; 8 is the recommended value when
     /// multipath is used. The peer may have up to `max_pipes +
-    /// pipe_headroom` attachments live at once (MULTIPATH.md Section 5.4
-    /// step 9).
+    /// pipe_headroom` attachments live at once.
     pub max_pipes: u32,
     /// The attachment headroom H, a parameter of `max_pipes` (default 8):
-    /// room for failed attachments whose retirement has not completed
-    /// (MULTIPATH.md Section 5.4 step 9).
+    /// room for failed attachments whose retirement has not completed.
     pub pipe_headroom: u32,
+    /// This endpoint's sets of Join Suites and Groups, as `zmux_session_crypto` declares
+    /// them and the join keys and epoch secrets take them: every Suite and Group of this
+    /// build by default. Each set is ascending, without duplicates, and holds Suite 1 and
+    /// Group 2 respectively and only values of this build. An endpoint that requires
+    /// post-quantum joins leaves Group 1 out.
+    pub session_crypto: crate::proto::seal::SessionCrypto,
+    /// When the session starts an epoch exchange on its own:
+    /// every hour, every 2^16 joins, once after the first Sealed or Bound pipe of a session
+    /// whose secret is a TLS exporter's or a pre-shared key's, and once after a
+    /// suspension, by default.
+    pub epoch_policy: crate::proto::session::EpochPolicy,
+    /// The first batch of a Hello, in bytes (`None` or 0: off; 8 KiB by default): larger ones
+    /// outgrow the first congestion window and delay both the Hello and the Reply.
+    pub join_early_hello: Option<usize>,
+    /// Chooses the record mode of each carrier this endpoint joins; unset is always
+    /// Sealed. [`PipeOptions::mode`](crate::PipeOptions::mode) wins over it.
+    pub record_policy: Option<RecordPolicy>,
+    /// Plans the messages of a Join; unset: none. The kind in its view is the carrier's.
+    pub handshake_shaper: Option<super::shaping::HandshakeShaper>,
+    /// The acceptor's check of a Hello's mode; unset passes only Sealed.
+    pub allow_record_mode: Option<AllowRecordMode>,
+    /// An acceptor's further check of a join; unset passes all.
+    pub authorize_join: Option<AuthorizeJoin>,
     /// The replay window W, a parameter of `max_pipes`, in pipe IDs of the
     /// peer's parity; `None` (the default) is max(64, 2 x (max_pipes + H)),
-    /// and a value must be at least max_pipes + H (MULTIPATH.md Section
-    /// 4.3).
+    /// and a value must be at least max_pipes + H.
     pub replay_window: Option<u64>,
     /// The lanes accepted on each inbound pipe, lane 0 included, a
     /// parameter of `max_pipes` that applies to every session, single-pipe
-    /// ones included (default 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this endpoint sends (MULTIPATH.md
-    /// Sections 2.5 and 3.6). Outbound lanes follow the peer's value and
-    /// the carrier.
+    /// ones included (default 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this
+    /// endpoint sends. Outbound lanes follow the peer's value and the carrier.
     pub max_lanes: std::num::NonZeroU64,
-    /// Resume grace period; `None` (the default) disables resume.
+    /// Resume grace period; `None` (the default) disables resume. A set
+    /// period is at least 1 ms: `Some(Duration::ZERO)` is a configuration
+    /// error, and a fraction of a millisecond is rounded up to the
+    /// millisecond the transport parameter carries. It needs a secret
+    /// source, and a session that accepts needs a listener; a dialling
+    /// session should have a redial source
+    /// ([`redial`](Config#structfield.redial) or a pipe pool).
     pub resume_timeout: Option<Duration>,
+    /// The shortest wait between two dials of the
+    /// [`redial`](Config#structfield.redial) hook (default
+    /// [`DEFAULT_MIN_BACKOFF`], 1 s; not zero, and not above
+    /// `redial_max_backoff`).
+    pub redial_min_backoff: Duration,
+    /// The longest wait between two dials of the hook (default
+    /// [`DEFAULT_MAX_BACKOFF`], 60 s): the wait doubles from
+    /// `redial_min_backoff` after each failure up to this, with jitter,
+    /// measured from the start of the previous attempt.
+    pub redial_max_backoff: Duration,
+    /// The redial hook (tokio driver; the std driver's is
+    /// [`blocking_redial`](Config#structfield.blocking_redial)): dials a carrier that
+    /// replaces the session's pipe once the session suspends or lacks a direction, for
+    /// a session that runs on one pipe at a time. A dialling session runs it
+    /// (`Session::connect` and `Session::peer`); a session a listener accepted never
+    /// dials, and its peer redials. It runs with the backoff
+    /// of `redial_min_backoff` and `redial_max_backoff`; a refused join
+    /// adds its own backoff, and a dial waits for the longer of the two.
+    /// A multipath session that keeps several pipes uses pipe pools
+    /// instead ([`maintain_pipes`](crate::helpers::maintain_pipes)).
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub redial: Option<crate::Dial>,
+    /// The std driver's redial hook, as [`redial`](Config#structfield.redial) is the
+    /// tokio driver's: run on a thread of the session, with the same backoff, by
+    /// `zmux::blocking::Session::connect` and `peer`.
+    #[cfg(all(feature = "blocking", not(loom)))]
+    pub blocking_redial: Option<crate::blocking::Dial>,
+    /// The logger: called with a level and a message, outside every lock;
+    /// it must not block. Unset (the default), nothing is logged. zmux logs
+    /// only what the application would otherwise not see: the removal of
+    /// the last pipe of a direction while streams are open,
+    /// [`SessionEvent::ResumeUnattended`](crate::SessionEvent::ResumeUnattended),
+    /// and failures of host callbacks that zmux contains.
+    pub logger: Option<Logger>,
     /// The session's default scheduling policy (default `affinity`).
     pub scheduler: Policy,
-    /// Upper bounds of what the session's shapers add (default: none).
+    /// The application's bounds on shaping (default: no account, one wait up to 1 s).
     pub shaping_limits: super::shaping::Limits,
+    /// Gives the shaping configuration's budget, called once when the session is created
+    /// (default: none). It cannot widen `shaping_limits`.
+    pub shaping_budget: Option<super::shaping::ShapingBudget>,
     /// The shaper factory installed when the session is created (default:
     /// none), as if by `set_shaper`: every pipe of the session, the
     /// bootstrap pipe of an accepted session and joined pipes included, is
@@ -406,12 +716,12 @@ pub struct Config {
     /// The `spread-eta` chunk size (default 16 KiB).
     pub spread_chunk: usize,
     /// The floor of T_suspect for every pipe (default 250 ms, at least
-    /// 50 ms; MULTIPATH.md Section 7.1).
+    /// 50 ms).
     pub suspect_floor: Duration,
     /// dead_timeout (at least 1 s): how long the last pipe of a direction
     /// may stall before it fails, effective max(T_suspect, dead_timeout).
     /// `None`: T_fail with resume, max(T_fail, half the idle timeout)
-    /// without (MULTIPATH.md Section 7.1).
+    /// without.
     pub dead_timeout: Option<Duration>,
     /// The base of the probation of pipes that join or return from
     /// suspicion; `None` (the default) is 4 x smoothed RTT for the first
@@ -433,15 +743,14 @@ pub struct Config {
     /// faster probes off, leaving such pipes at the probe interval; a
     /// period below 1 s is not valid): how often standby pipes and pipes of a
     /// less-preferred tier get a PIPE_PING while the session is busy, a
-    /// traffic frame having been sent or received within the last 15 s
-    /// (MULTIPATH.md Section 7.1). A quiet session probes them at the
-    /// probe interval, and once more when traffic resumes.
+    /// traffic frame having been sent or received within the last 15 s. A quiet session probes them
+    /// at the probe interval, and once more when traffic resumes.
     pub standby_probe: Option<Duration>,
     /// The `probe_interval` parameter of `scheduler` (default
     /// [`DEFAULT_PROBE_INTERVAL`], 15 s; `None` turns these
     /// idle probes off, and a period below 1 s is not valid): how long an outbound pipe
     /// of a pipe pair stays without an ack-eliciting byte handed to its
-    /// carrier before it gets a PIPE_PING (MULTIPATH.md Section 7.1). A
+    /// carrier before it gets a PIPE_PING. A
     /// longer interval only delays the detection of a pipe pair that dies
     /// while idle. Off turns off only these probes: the PIPE_PING that
     /// goes with the answer to the peer's, the standby probes and the
@@ -458,9 +767,8 @@ pub struct Config {
     /// The `probe_jitter` parameter of `scheduler` (default 0.25, at least
     /// 0 and below 1): each wait for an idle probe is drawn once, when it
     /// starts (the pipe becomes ACTIVE, or a PIPE_PING was sent), uniformly
-    /// from \[k (1 - j), k\] for the probe interval k (MULTIPATH.md Section
-    /// 7.1), and the first wait of the bootstrap pipe from \[0, k\];
-    /// ack-eliciting bytes sent meanwhile move its start without a new
+    /// from \[k (1 - j), k\] for the probe interval k, and the first wait of the bootstrap pipe
+    /// from \[0, k\]; ack-eliciting bytes sent meanwhile move its start without a new
     /// draw. The interval stays the upper bound. Zero gives the fixed
     /// schedule of tests; the standby probes are never jittered. The draws
     /// come from a generator seeded by the operating system's.
@@ -481,7 +789,7 @@ pub struct Config {
     /// `protocols`: application protocols to
     /// offer, in preference order, with the `qmux` crate's
     /// `application_protocols` transport parameter, for carriers without
-    /// TLS (SPEC.md Section 13.3). The protocol both offered (the
+    /// TLS. The protocol both offered (the
     /// accepting side's preference first) is the session's `protocol()`.
     /// `None` (the default) sends nothing; interoperability only, not part
     /// of zmux.
@@ -524,8 +832,7 @@ pub struct Config {
 /// 0-RTT on a resumed carrier. Such data can be replayed by an attacker:
 /// a client allows it only for streams whose effect may happen twice, and
 /// a server that allows it sees the streams opened in it as replayable
-/// until the handshake completes
-/// (`RecvStream::is_replayable`).
+/// for their whole life (`RecvStream::is_replayable`).
 /// The flow: (1) a first session, established in full, yields the
 /// server's parameters (`Session::parameters_to_remember`);
 /// (2) the client keeps them with the carrier's resumption state; (3) a
@@ -574,6 +881,16 @@ pub struct EarlyData {
     /// Carrier early data (TLS 1.3 early data, QUIC 0-RTT) is allowed, so
     /// early streams may be replayed.
     pub carrier_early_data: bool,
+    /// The bootstrap pipe's first carrier write waits for
+    /// [`Session`](crate::Session)`::release_first_flight`,
+    /// or until [`Config::handshake_timeout`] has passed since the session
+    /// started
+    /// ([`SessionStats::first_flight_timeouts`](super::SessionStats::first_flight_timeouts)); the
+    /// handshake timeout runs from the release. Streams written before the release leave in the
+    /// same write as the transport parameters, as a carrier whose first message carries the first
+    /// flight wants. A client with early data only ([`Self::zmux_peer`] or
+    /// [`Self::carrier_early_data`]).
+    pub hold_first_flight: bool,
 }
 
 impl EarlyData {
@@ -583,6 +900,7 @@ impl EarlyData {
         Self {
             zmux_peer: true,
             carrier_early_data: false,
+            hold_first_flight: false,
         }
     }
 
@@ -600,12 +918,21 @@ impl EarlyData {
         self.carrier_early_data = on;
         self
     }
+
+    /// With the first flight held (or not); see
+    /// [`Self::hold_first_flight`].
+    #[must_use]
+    pub const fn with_hold_first_flight(mut self, on: bool) -> Self {
+        self.hold_first_flight = on;
+        self
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
+            join_timeout: DEFAULT_JOIN_TIMEOUT,
             max_idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             keep_alive_period: Some(DEFAULT_KEEP_ALIVE_PERIOD),
             initial_stream_receive_window: 256 * 1024,
@@ -626,11 +953,26 @@ impl Default for Config {
             max_send_record: crate::proto::params::DEFAULT_MAX_RECORD_SIZE as usize,
             max_pipes: 1,
             pipe_headroom: 8,
+            session_crypto: crate::proto::seal::SessionCrypto::local(),
+            epoch_policy: crate::proto::session::EpochPolicy::default(),
+            join_early_hello: Some(8 << 10),
+            record_policy: None,
+            handshake_shaper: None,
+            allow_record_mode: None,
+            authorize_join: None,
             replay_window: None,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
+            redial_min_backoff: DEFAULT_MIN_BACKOFF,
+            redial_max_backoff: DEFAULT_MAX_BACKOFF,
+            #[cfg(all(feature = "tokio", not(loom)))]
+            redial: None,
+            #[cfg(all(feature = "blocking", not(loom)))]
+            blocking_redial: None,
+            logger: None,
             scheduler: Policy::Affinity,
             shaping_limits: super::shaping::Limits::default(),
+            shaping_budget: None,
             shaper: None,
             spread_chunk: 16 * 1024,
             suspect_floor: Duration::from_millis(250),
@@ -653,8 +995,8 @@ impl Default for Config {
     }
 }
 
-/// Deterministic values for the conformance trace runner (TRACES.md Section
-/// 3.3). Only reachable with the `test-hooks` feature.
+/// Deterministic values for the conformance trace runner. Only reachable with the `test-hooks`
+/// feature.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -681,8 +1023,10 @@ pub struct TestHooks {
     /// The Session Locator a core announces without a listener, so that
     /// joins can be routed to it in tests of the sans-IO core.
     pub locator: Vec<u8>,
+    /// The Locator of epoch e announced as this prefix followed by e in decimal ASCII.
+    pub epoch_locator_prefix: Option<Vec<u8>>,
     /// The cap of unretired attachments of the peer, instead of max_pipes +
-    /// H (MULTIPATH.md Section 5.4 step 9).
+    /// H.
     pub pipe_cap: Option<usize>,
     /// No QX_PING request in the first record (the traces predate that
     /// optional sample).
@@ -703,11 +1047,14 @@ pub struct TestHooks {
     /// `spread-eta`'s BLEST checks all of F against the stream's credit,
     /// not F / n.
     pub no_blest_share: bool,
+    /// How long an application close waits for the carriers to take
+    /// CONNECTION_CLOSE instead of 1 s.
+    pub close_handoff_limit: Option<Duration>,
 }
 
 impl Config {
     /// A configuration for multipath: the
-    /// recommended `max_pipes` of 8 (MULTIPATH.md Section 15) and the join
+    /// recommended `max_pipes` of 8 and the join
     /// credentials, which multipath needs; the rest default.
     ///
     /// ```
@@ -742,8 +1089,7 @@ impl Config {
     }
 
     /// The Maximum Preamble Size this endpoint announces: 4096, or its
-    /// smallest initial stream window when that is smaller (EXTENSIONS.md
-    /// Section 4.1).
+    /// smallest initial stream window when that is smaller.
     pub(super) fn preamble_limit(&self) -> u64 {
         self.initial_stream_receive_window.clamp(1, 4096)
     }
@@ -767,8 +1113,7 @@ impl Config {
     }
 
     /// The session window cap the receive buffer cap is computed from: a
-    /// fixed cap, or the floor of the automatic one (SPEC.md Section 8.3
-    /// rule 4).
+    /// fixed cap, or the floor of the automatic one.
     pub(crate) fn session_window_base(&self) -> u64 {
         match self.max_connection_receive_window {
             Cap::Fixed(v) => v,
@@ -781,7 +1126,7 @@ impl Config {
         self.max_pipes > 1 || self.resume_timeout.is_some()
     }
 
-    /// The transport parameters this endpoint sends (SPEC.md Section 5.3),
+    /// The transport parameters this endpoint sends,
     /// with `zmux_role` auto when `role_nonce` is given.
     pub(crate) fn transport_parameters(
         &self,
@@ -804,6 +1149,7 @@ impl Config {
                 session_nonce,
                 locator: Locator::new(self.own_locator()).unwrap_or_default(),
             }),
+            zmux_session_crypto: mp.then(|| self.session_crypto.clone()),
             zmux_resume: resume.filter(|_| mp),
             max_idle_timeout: (idle > 0).then_some(idle),
             initial_max_data: Some(self.initial_connection_receive_window),
@@ -840,8 +1186,7 @@ impl Config {
         }
     }
 
-    /// The GREASE parameter: the hook's, or a random one (SPEC.md Section
-    /// 5.2 rule 6).
+    /// The GREASE parameter: the hook's, or a random one.
     pub(crate) fn grease_parameter(&self, random: u64) -> (u64, Vec<u8>) {
         if let Some(g) = &self.hooks.grease_tp {
             return g.clone();
@@ -856,7 +1201,12 @@ impl Config {
     /// The handshake timeout in effect: [`Config::handshake_timeout`], or
     /// its default; `Duration::MAX`, a deadline that never comes, for no
     /// timeout.
-    #[must_use]
+    /// The join deadline ([`Config::join_timeout`]).
+    pub(crate) fn join_wait(&self) -> Duration {
+        self.join_timeout
+    }
+
+    /// The establishment deadline; no timeout is the longest wait.
     pub fn handshake_wait(&self) -> Duration {
         self.handshake_timeout.unwrap_or(Duration::MAX)
     }
@@ -891,6 +1241,9 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.own_locator().len() > Locator::MAX_LEN {
+            return Err("locator above 255 bytes");
+        }
         let fixed = |c: Cap| match c {
             Cap::Auto => u64::MAX,
             Cap::Fixed(v) => v,
@@ -901,8 +1254,7 @@ impl Config {
         if self.initial_connection_receive_window > fixed(self.max_connection_receive_window) {
             return Err("initial_connection_receive_window above max_connection_receive_window");
         }
-        // Every zmux endpoint advertises at least the early-data floor
-        // (SPEC.md Section 6.1.2).
+        // Every zmux endpoint advertises at least the early-data floor.
         if self.initial_stream_receive_window < floor::MAX_STREAM_DATA {
             return Err("initial_stream_receive_window below the 4 KiB early-data floor");
         }
@@ -951,8 +1303,8 @@ impl Config {
         if self.max_lanes.get() > varint_max {
             return Err("max_lanes above 2^62 - 1");
         }
-        if self.own_locator().len() > 16 {
-            return Err("locator above 16 bytes");
+        if self.own_locator().len() > Locator::MAX_LEN {
+            return Err("locator above 255 bytes");
         }
         if self.suspect_floor < Duration::from_millis(50) {
             return Err("suspect_floor below 50 ms");
@@ -987,8 +1339,13 @@ impl Config {
         if a.psk.as_ref().is_some_and(|k| k.len() < 16) {
             return Err("pipe_auth PSK must hold at least 16 bytes");
         }
-        if a.insecure && a.psk.is_some() {
-            return Err("insecure joins cannot be combined with a PSK");
+        if self.session_crypto.check_local().is_err() {
+            return Err(
+                "session_crypto must hold Suite 1 and Group 2 and only values of this build, ascending, once each",
+            );
+        }
+        if a.deferred_psk && a.psk.is_some() {
+            return Err("a deferred PSK cannot be combined with a static one");
         }
         if self
             .replay_window
@@ -1006,8 +1363,44 @@ impl Config {
         {
             return Err("protocols must hold at least one non-empty name");
         }
-        if self.offers_multipath() && self.pipe_auth.flags() == 0 {
-            return Err("multipath (max_pipes above 1 or resume_timeout) needs pipe_auth");
+        if self.join_timeout.is_zero() {
+            return Err("join_timeout is zero");
+        }
+        if self.join_timeout > super::MAX_JOIN_DEADLINE {
+            return Err("join_timeout above the maximum join deadline of 60 s");
+        }
+        if let (Cap::Fixed(max), b) = (self.send_buffer_max, self.send_buffer)
+            && max < b
+        {
+            return Err("send_buffer_max below send_buffer");
+        }
+        if self.redial_min_backoff > self.redial_max_backoff {
+            return Err("redial_min_backoff above redial_max_backoff");
+        }
+        if self.redial_min_backoff.is_zero() {
+            return Err("redial_min_backoff is zero");
+        }
+        Ok(())
+    }
+
+    /// The secret source check, made once the first pipe is known: with
+    /// multipath or resume, a pipe_auth with a source, or a first pipe on
+    /// the secure carrier; on a secure first pipe, no other source.
+    /// `EndToEnd` is no source.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn check_source(&self, secure_first_pipe: bool) -> Result<(), &'static str> {
+        if secure_first_pipe {
+            if self.pipe_auth.has_source() {
+                return Err(
+                    "pipe_auth with a PSK or the exporter on a secure first pipe: \
+                     the secure carrier is the source, leave pipe_auth unset",
+                );
+            }
+        } else if self.offers_multipath() && !self.pipe_auth.has_source() {
+            return Err(
+                "multipath (max_pipes above 1 or resume_timeout) needs a secret source: \
+                 a PSK, a deferred PSK, the exporter, or a secure first pipe",
+            );
         }
         Ok(())
     }
@@ -1018,5 +1411,22 @@ pub(crate) fn grease_ref(g: &(u64, Vec<u8>)) -> Grease<'_> {
     Grease {
         id: g.0,
         value: &g.1,
+    }
+}
+
+#[cfg(test)]
+mod locator_tests {
+    use super::Config;
+
+    /// A Locator its length field cannot hold is an error, not an empty one.
+    #[test]
+    fn a_locator_above_255_bytes_is_an_error() {
+        let mut c = Config {
+            locator: vec![1; 255],
+            ..Config::default()
+        };
+        assert_eq!(c.validate(), Ok(()));
+        c.locator = vec![1; 256];
+        assert_eq!(c.validate(), Err("locator above 255 bytes"));
     }
 }

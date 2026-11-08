@@ -1,4 +1,4 @@
-//! A message-framed carrier (SPEC.md Section 3.4) with the tokio driver: the
+//! A message-framed carrier with the tokio driver: the
 //! application's write-through writes whole messages, which may pass its
 //! byte budget (a regression: the budget arithmetic underflowed).
 
@@ -114,5 +114,94 @@ async fn write_through_on_a_message_carrier() {
     let (_s, mut recv) = server.accept_bi().await.unwrap();
     let got = recv.read_to_end(8 << 20).await.unwrap();
     assert_eq!(got, expect);
-    writer.await.unwrap().close(0u32.into(), b"");
+    writer.await.unwrap().close(0u32.into(), b"").await;
+}
+
+/// A writer that takes batches of messages, counting its calls.
+struct BatchWriter {
+    tx: Arc<Mutex<Queue>>,
+    calls: Arc<Mutex<Vec<usize>>>,
+}
+
+impl zmux::carrier::ChunkWrite for BatchWriter {
+    fn poll_write_chunks(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut [bytes::Bytes],
+    ) -> Poll<io::Result<usize>> {
+        panic!("a batch carrier gets batches");
+    }
+
+    fn takes_message_batches(&self) -> bool {
+        true
+    }
+
+    fn poll_write_message_batch(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        messages: &mut [bytes::Bytes],
+    ) -> Poll<io::Result<usize>> {
+        self.calls.lock().unwrap().push(messages.len());
+        let mut q = self.tx.lock().unwrap();
+        let mut n = 0;
+        for m in messages.iter_mut() {
+            n += m.len();
+            q.messages.push_back(m.to_vec());
+            *m = bytes::Bytes::new();
+        }
+        if let Some(w) = q.reader.take() {
+            w.wake();
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// An output batch of several records is one call on a carrier that takes
+/// batches, and arrives as those messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_of_messages_is_one_write_call() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (a, b) = pair();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = BatchWriter {
+            tx: a.tx.clone(),
+            calls: calls.clone(),
+        };
+        let io = PipeIo::from_chunk_halves(a, writer).records();
+        let server = tokio::spawn(async move {
+            Session::accept(PipeIo::new(b).records(), Config::default()).await
+        });
+        let client = Session::connect(io, Config::default()).await.unwrap();
+        let server = server.await.unwrap().unwrap();
+        let data = vec![9u8; 1 << 20];
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        let expect = data.clone();
+        let w = tokio::spawn(async move {
+            send.write_all(&data).await.unwrap();
+            send.finish().unwrap();
+        });
+        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        assert_eq!(recv.read_to_end(2 << 20).await.unwrap(), expect);
+        w.await.unwrap();
+        {
+            // Released before the close: the carrier's writes take it.
+            let calls = calls.lock().unwrap();
+            assert!(!calls.is_empty());
+            assert!(
+                calls.iter().any(|&n| n > 1),
+                "no call held several messages: {calls:?}"
+            );
+        }
+        client.close(0u32.into(), b"").await;
+    })
+    .await
+    .unwrap();
 }

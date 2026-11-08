@@ -1,5 +1,5 @@
-//! Frames (SPEC.md Section 4): QUIC version 1 frames, the QMux-02 frames,
-//! the QUIC extension frames RESET_STREAM_AT and DATAGRAM, and the zmux
+//! Frames: QUIC version 1 frames, the QMux-02 frames, the QUIC
+//! extension frames RESET_STREAM_AT and DATAGRAM, and the zmux
 //! extension and multipath frames.
 //!
 //! Decoding borrows from the input: payloads (STREAM data, DATAGRAM data,
@@ -18,8 +18,8 @@ use std::fmt;
 
 pub use ext::{GoAwayFrame, Priority, PriorityUpdate};
 pub use pipe::{
-    JOIN_TOKEN_LEN, JoinDirection, LANE_KEY_LEN, MAX_JOIN_FRAME_LEN, MAX_LOCATOR_LEN, PipeAbandon,
-    PipeAck, PipeAckEntry, PipeJoin, PipeLane, PipeStatus, PipeStatusValue,
+    EpochPhase, JoinDirection, LANE_KEY_LEN, MAX_LOCATOR_LEN, PipeAbandon, PipeAck, PipeAckEntry,
+    PipeLane, PipeStatus, PipeStatusValue, SessionEpoch,
 };
 pub use qmux::{QxPing, QxTransportParameters};
 use quic::parse_stream_header;
@@ -90,8 +90,6 @@ impl FrameType {
     pub const GOAWAY: Self = Self(0x1911_f43e);
     /// PRIORITY_UPDATE.
     pub const PRIORITY_UPDATE: Self = Self(0x073d_08cf);
-    /// PIPE_JOIN.
-    pub const PIPE_JOIN: Self = Self(0x1a24_de36);
     /// PIPE_ACK.
     pub const PIPE_ACK: Self = Self(0x0b2b_3eeb);
     /// PIPE_LANE.
@@ -102,9 +100,10 @@ impl FrameType {
     pub const PIPE_ABANDON: Self = Self(0x23b3_5b74);
     /// PIPE_STATUS.
     pub const PIPE_STATUS: Self = Self(0x227b_2811);
+    /// SESSION_EPOCH.
+    pub const SESSION_EPOCH: Self = Self(0x024e_93eb);
 
-    /// The registry name, if the type is in the registry (REGISTRY.md
-    /// Section 2), prohibited QUIC types included.
+    /// The registry name, if the type is in the registry, prohibited QUIC types included.
     pub const fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x00 => "PADDING",
@@ -133,12 +132,12 @@ impl FrameType {
             QX_PING_REQ | QX_PING_RESP => "QX_PING",
             0x1911_f43e => "GOAWAY",
             0x073d_08cf => "PRIORITY_UPDATE",
-            0x1a24_de36 => "PIPE_JOIN",
             0x0b2b_3eeb => "PIPE_ACK",
             0x3a05_a1c9 => "PIPE_LANE",
             0x269b_43e6 => "PIPE_PING",
             0x23b3_5b74 => "PIPE_ABANDON",
             0x227b_2811 => "PIPE_STATUS",
+            0x024e_93eb => "SESSION_EPOCH",
             _ => return None,
         })
     }
@@ -178,8 +177,8 @@ impl Dir {
     }
 }
 
-/// What a receiver accepts beyond the frames that are always available
-/// (SPEC.md Section 4.2). A frame whose gate is closed is an unknown frame:
+/// What a receiver accepts beyond the frames that are always available.
+/// A frame whose gate is closed is an unknown frame:
 /// FRAME_ENCODING_ERROR, or PROTOCOL_VIOLATION for DATAGRAM (RFC 9221
 /// Section 3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -195,11 +194,9 @@ pub struct Gates {
     pub priority: bool,
     /// Multipath is in use (PIPE_* frames).
     pub multipath: bool,
-    /// Pipe acknowledgement without multipath is in use (PIPE_ACK only,
-    /// MULTIPATH.md Section 3.5).
+    /// Pipe acknowledgement without multipath is in use (PIPE_ACK only).
     pub pipe_ack: bool,
-    /// Lanes are available toward the receiver (PIPE_LANE, MULTIPATH.md
-    /// Section 3.6).
+    /// Lanes are available toward the receiver (PIPE_LANE).
     pub lanes: bool,
 }
 
@@ -265,8 +262,6 @@ pub enum Frame<'a> {
     GoAway(GoAwayFrame),
     /// PRIORITY_UPDATE.
     PriorityUpdate(PriorityUpdate),
-    /// PIPE_JOIN.
-    PipeJoin(PipeJoin<'a>),
     /// PIPE_ACK.
     PipeAck(PipeAck<'a>),
     /// PIPE_LANE.
@@ -277,6 +272,8 @@ pub enum Frame<'a> {
     PipeAbandon(PipeAbandon),
     /// PIPE_STATUS.
     PipeStatus(PipeStatus),
+    /// SESSION_EPOCH.
+    SessionEpoch(SessionEpoch<'a>),
 }
 
 /// Why a decode stopped.
@@ -345,17 +342,17 @@ impl<'a> Frame<'a> {
             Self::QxPing(_) => FrameType::QX_PING_REQUEST.0,
             Self::GoAway(_) => FrameType::GOAWAY.0,
             Self::PriorityUpdate(_) => FrameType::PRIORITY_UPDATE.0,
-            Self::PipeJoin(_) => FrameType::PIPE_JOIN.0,
             Self::PipeAck(_) => FrameType::PIPE_ACK.0,
             Self::PipeLane(_) => FrameType::PIPE_LANE.0,
             Self::PipePing => FrameType::PIPE_PING.0,
             Self::PipeAbandon(_) => FrameType::PIPE_ABANDON.0,
             Self::PipeStatus(_) => FrameType::PIPE_STATUS.0,
+            Self::SessionEpoch(_) => FrameType::SESSION_EPOCH.0,
         })
     }
 
-    /// Whether the frame is ack-eliciting (SPEC.md Section 1.4): anything
-    /// but PADDING, PIPE_ACK and CONNECTION_CLOSE.
+    /// Whether the frame is ack-eliciting: anything but PADDING,
+    /// PIPE_ACK and CONNECTION_CLOSE.
     pub const fn is_ack_eliciting(&self) -> bool {
         !matches!(
             self,
@@ -383,12 +380,12 @@ impl<'a> Frame<'a> {
             Self::QxPing(f) => f.encoded_len(),
             Self::GoAway(f) => f.encoded_len(),
             Self::PriorityUpdate(f) => f.encoded_len(),
-            Self::PipeJoin(f) => f.encoded_len(),
             Self::PipeAck(f) => f.encoded_len(),
             Self::PipeLane(f) => f.encoded_len(),
             Self::PipePing => PIPE_PING_LEN,
             Self::PipeAbandon(f) => f.encoded_len(),
             Self::PipeStatus(f) => f.encoded_len(),
+            Self::SessionEpoch(f) => f.encoded_len(),
         }
     }
 
@@ -420,12 +417,12 @@ impl<'a> Frame<'a> {
             Self::QxPing(f) => f.write(w),
             Self::GoAway(f) => f.write(w),
             Self::PriorityUpdate(f) => f.write(w),
-            Self::PipeJoin(f) => f.write(w),
             Self::PipeAck(f) => f.write(w),
             Self::PipeLane(f) => f.write(w),
             Self::PipePing => w.varint(FrameType::PIPE_PING.0),
             Self::PipeAbandon(f) => f.write(w),
             Self::PipeStatus(f) => f.write(w),
+            Self::SessionEpoch(f) => f.write(w),
         }
     }
 }
@@ -464,11 +461,11 @@ encode_methods!(
     QxPing,
     GoAwayFrame,
     PriorityUpdate,
-    PipeJoin<'a>,
     PipeAck<'a>,
     PipeLane,
     PipeAbandon,
     PipeStatus,
+    SessionEpoch<'a>,
 );
 
 /// The truncation error for a frame that starts at `buf`.
@@ -545,10 +542,6 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
             gate(gates.priority, ty, "PRIORITY_UPDATE not in use")?;
             Frame::PriorityUpdate(PriorityUpdate::read(&mut c, ty)?)
         }
-        0x1a24_de36 => {
-            gate(gates.multipath, ty, "multipath not in use")?;
-            Frame::PipeJoin(PipeJoin::read(&mut c, ty)?)
-        }
         0x0b2b_3eeb => {
             gate(
                 gates.multipath || gates.pipe_ack,
@@ -572,6 +565,13 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         0x227b_2811 => {
             gate(gates.multipath, ty, "multipath not in use")?;
             Frame::PipeStatus(PipeStatus::read(&mut c, ty)?)
+        }
+        0x024e_93eb => {
+            gate(gates.multipath, ty, "multipath not in use")?;
+            let start = c.pos();
+            let mut f = SessionEpoch::read(&mut c, ty)?;
+            f.raw = &buf[start..c.pos()];
+            Frame::SessionEpoch(f)
         }
         _ => return Err(Error::frame_encoding(ty, "unknown frame type").into()),
     };

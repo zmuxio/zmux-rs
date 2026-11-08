@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
+use zmux::redirect::{self, RedirectError};
 use zmux::util::{hex, random_u64};
 use zmux::{ConnectError, PipeIo, Session};
 
@@ -134,7 +135,9 @@ impl ExchangeEndpoint {
 /// path ([`ExchangeOptions::down_path`]) as long as all requests of the
 /// carrier reach the same server. A few connections of each are kept open
 /// for the next requests; a request whose connection fails is repeated on
-/// another.
+/// another. A redirect of a request is followed within its endpoint's
+/// origin ([`ExchangeOptions::max_redirects`]; the scheme both endpoints'
+/// URLs are checked in is [`ExchangeOptions::https`]).
 ///
 /// The carrier is returned at once, without a round trip, so that zmux
 /// writes its first record into the first UP request. It fails when a
@@ -383,40 +386,78 @@ struct Http {
 
 impl Http {
     /// Sends one request and returns its whole response body (status 200
-    /// only), at most `limit` bytes.
+    /// only), at most `limit` bytes. A redirect within the endpoint's
+    /// origin is followed, the body sent again unchanged, up to `max`
+    /// hops ([`ExchangeOptions::max_redirects`]); a refused one is an
+    /// error that carries its [`RedirectError`].
     async fn send(
         &self,
         target: &str,
         head: Bytes,
         tail: Bytes,
         limit: usize,
+        https: bool,
+        max: usize,
     ) -> io::Result<Bytes> {
-        let mut sender = self.sender().await?;
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(target)
-            .header(header::HOST, self.authority.as_str())
-            .header(header::CACHE_CONTROL, "no-store")
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(PipeBody::fixed(head, tail))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let resp = sender.send_request(req).await.map_err(io::Error::other)?;
-        if resp.status() != StatusCode::OK {
-            return Err(io::Error::other(format!(
-                "the server answered {}",
-                resp.status()
-            )));
-        }
-        let body = collect(resp.into_body(), limit)
-            .await?
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response over the limit"))?;
-        if !sender.is_closed() {
-            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-            if idle.len() < self.most_idle {
-                idle.push(sender);
+        let scheme = if https { "https" } else { "http" };
+        let mut url = format!("{scheme}://{}{target}", self.authority);
+        let mut path = target.to_owned();
+        let mut hops = 0;
+        loop {
+            let mut sender = self.sender().await?;
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path.as_str())
+                .header(header::HOST, self.authority.as_str())
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(PipeBody::fixed(head.clone(), tail.clone()))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let resp = sender.send_request(req).await.map_err(io::Error::other)?;
+            let status = resp.status().as_u16();
+            if redirect::is_redirect(status) {
+                let location = resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                // The redirect's body is not the carrier's; its connection
+                // is not kept.
+                drop(resp);
+                let refuse = |reason| RedirectError {
+                    status,
+                    location: location.clone().unwrap_or_default(),
+                    reason,
+                };
+                let next = redirect::check(&url, "POST", status, location.as_deref())?;
+                if !redirect::same_origin(&next, &url) {
+                    return Err(refuse("another origin over the carrier's connections").into());
+                }
+                if hops >= max {
+                    return Err(refuse("too many redirects").into());
+                }
+                hops += 1;
+                crate::client::path_of(&next).clone_into(&mut path);
+                url = next;
+                continue;
             }
+            if resp.status() != StatusCode::OK {
+                return Err(io::Error::other(format!(
+                    "the server answered {}",
+                    resp.status()
+                )));
+            }
+            let body = collect(resp.into_body(), limit).await?.map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "response over the limit")
+            })?;
+            if !sender.is_closed() {
+                let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+                if idle.len() < self.most_idle {
+                    idle.push(sender);
+                }
+            }
+            return Ok(body);
         }
-        Ok(body)
     }
 
     /// An idle connection that is ready, or a new one.
@@ -502,11 +543,19 @@ async fn attempt(
     let (head, tail) = wire::encode_body(o.encoding, out.prefix.clone(), data);
     let target = o.target(kind == Kind::Down, &ctx.instance, &hex(&nonce));
     let limit = wire::encoded_len(o.encoding, RESPONSE_HEAD + o.max_down_piece_size());
-    let sent = tokio::time::timeout(o.request_timeout, http.send(&target, head, tail, limit)).await;
+    let sent = tokio::time::timeout(
+        o.request_timeout,
+        http.send(&target, head, tail, limit, o.https, o.max_redirects),
+    )
+    .await;
     let body = match sent {
         Ok(Ok(body)) => body,
         // Over the local limit: a configuration error, never retried.
         Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => return Outcome::Invalid,
+        // A redirect the carrier must not follow fails it.
+        Ok(Err(e)) if e.get_ref().is_some_and(|r| r.is::<RedirectError>()) => {
+            return Outcome::Invalid;
+        }
         _ => return Outcome::NoResult,
     };
     let Some(resp) = wire::decode_body(o.encoding, body).and_then(wire::Response::parse) else {

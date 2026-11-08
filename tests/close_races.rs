@@ -1,4 +1,4 @@
-//! Close races of the tokio driver (CONFORMANCE.md): each kind of wait raced, at a
+//! Close races of the tokio driver: each kind of wait raced, at a
 //! random point, against session close, the peer's close, stream reset,
 //! STOP_SENDING, the peer's GOAWAY, local shutdown, cancellation, deadline
 //! expiry and carrier failure. Every call returns a defined outcome (no
@@ -202,8 +202,8 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
         tokio::time::sleep(Duration::from_micros(rng.below(2000))).await;
     }
     match race {
-        Race::LocalClose => local.close(VarInt::from_u32(1), b"local"),
-        Race::PeerClose => peer.close(VarInt::from_u32(2), b"peer"),
+        Race::LocalClose => local.close(VarInt::from_u32(1), b"local").await,
+        Race::PeerClose => peer.close(VarInt::from_u32(2), b"peer").await,
         Race::StreamReset => {
             let _ = p_send.reset(VarInt::from_u32(3));
         }
@@ -241,7 +241,7 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
                     ),
                     "seed {seed}: {kind:?} raced with {race:?}: the session ended, the wait did not"
                 );
-                local.close(VarInt::from_u32(9), b"end");
+                local.close(VarInt::from_u32(9), b"end").await;
                 match tokio::time::timeout(Duration::from_secs(10), wait).await {
                     Ok(r) => r,
                     Err(_) => panic!(
@@ -257,8 +257,8 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
         Err(e) if e.is_cancelled() => assert_eq!(race, Race::Cancel, "seed {seed}"),
         Err(e) => panic!("seed {seed}: {kind:?} raced with {race:?}: the wait panicked: {e}"),
     }
-    local.close(VarInt::from_u32(0), b"");
-    peer.close(VarInt::from_u32(0), b"");
+    local.close(VarInt::from_u32(0), b"").await;
+    peer.close(VarInt::from_u32(0), b"").await;
     drop((l_send, l_recv, p_send, p_recv));
     watchdog(10, "closed", local.closed()).await;
     watchdog(10, "peer closed", peer.closed()).await;
@@ -375,7 +375,7 @@ fn cancelled_reads_and_writes_lose_nothing() {
         let t = (client.debug_tables(), server.debug_tables());
         assert!(t.0.waits == 0 && t.1.waits == 0, "stale waits: {t:?}");
         drop((recv, _r, _s));
-        client.close(VarInt::from_u32(0), b"");
+        client.close(VarInt::from_u32(0), b"").await;
         drop((client, server));
         settle(base, 10, "end").await;
     });
@@ -441,7 +441,7 @@ fn cancelled_accepts_and_opens_lose_nothing() {
             cancelled > 10 && o_cancelled > 10,
             "cancellations: {cancelled} accepts, {o_cancelled} opens"
         );
-        client.close(VarInt::from_u32(0), b"");
+        client.close(VarInt::from_u32(0), b"").await;
         drop((client, server));
         settle(base, 10, "end").await;
     });
@@ -531,7 +531,7 @@ fn multiple_waiters_are_all_served_or_released() {
                 .expect("datagram");
             assert!(got.insert(d[0]), "datagram {} read twice", d[0]);
         }
-        client.close(VarInt::from_u32(1), b"bye");
+        client.close(VarInt::from_u32(1), b"bye").await;
         for c in closed {
             watchdog(10, "closed waiter", c).await.unwrap();
         }

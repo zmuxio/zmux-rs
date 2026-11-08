@@ -75,7 +75,8 @@ fn split_url(url: &str) -> Result<(String, String), Error> {
 async fn server(o: ExchangeOptions) -> Result<(), Error> {
     let addr = env("ZMUX_EXCHANGE_ADDR").unwrap_or_else(|| "127.0.0.1:8080".into());
     let secs: u64 = env("ZMUX_EXCHANGE_FOR").map_or(Ok(60), |s| s.trim_end_matches('s').parse())?;
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     // Every path is an exchange path.
     let exchange = ExchangeServer::new(&listener, o.with_path("/"))?;
     let tcp = tokio::net::TcpListener::bind(&addr).await?;
@@ -140,7 +141,7 @@ async fn client(o: ExchangeOptions) -> Result<(), Error> {
         return Err(format!("echo: {} of {n} bytes, or a different hash", got.len()).into());
     }
     eprintln!("echoed {n} bytes");
-    session.close(0u32.into(), b"done");
+    session.close(0u32.into(), b"done").await;
     let _ = tokio::time::timeout(Duration::from_secs(5), session.closed()).await;
     Ok(())
 }

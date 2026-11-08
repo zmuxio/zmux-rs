@@ -1,10 +1,9 @@
-//! Trusted intermediaries (MULTIPATH.md Section 5.6, API.md Section 4.7):
-//! behind a reverse proxy, load balancer or CDN that the listener is
-//! configured to trust, a carrier's source is the client address that
-//! intermediary reports, taken from the PROXY protocol header of a TCP
-//! connection or from a forwarding header field of an HTTP carrier. A
-//! report from any other peer is ignored, so that a client cannot choose
-//! its own source.
+//! Trusted intermediaries: behind a reverse proxy, load balancer or CDN
+//! that the listener is configured to trust, a carrier's source is the
+//! client address that intermediary reports, taken from the PROXY
+//! protocol header of a TCP connection or from a forwarding header field
+//! of an HTTP carrier. A report from any other peer is ignored, so that
+//! a client cannot choose its own source.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 

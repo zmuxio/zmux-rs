@@ -68,7 +68,8 @@ struct Server {
 /// A listener served with the exchange server; every session it accepts
 /// echoes its bidirectional streams.
 async fn server(options: ExchangeOptions) -> Server {
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let exchange = ExchangeServer::new(&listener, options).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
@@ -175,7 +176,7 @@ async fn finish(
     base: Snapshot,
     ready: Snapshot,
 ) {
-    client.close(0u32.into(), b"done");
+    client.close(0u32.into(), b"done").await;
     let _ = tokio::time::timeout(Duration::from_secs(5), client.closed()).await;
     drop(client);
     // The server's carriers end (complete or idle) without a close.
@@ -405,7 +406,8 @@ fn seeded_fault_mix() {
 #[test]
 fn authentication_is_required_unless_declined() {
     let _g = serial();
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let e = zmux_http::ExchangeEndpoint::tcp("127.0.0.1:1");
     for o in [
         ExchangeOptions::default(),
@@ -492,7 +494,8 @@ fn fallback_gets_requests_with_their_bodies() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     run(30, async {
-        let listener = Listener::new(Config::default(), ListenerConfig::default());
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let exchange = ExchangeServer::new(&listener, quick()).unwrap();
         let fallback =
             zmux_http::HttpFallback::new(|req: zmux_http::FallbackRequest, _| async move {

@@ -1,5 +1,4 @@
-//! zmux extension frames GOAWAY (EXTENSIONS.md Section 3) and
-//! PRIORITY_UPDATE (EXTENSIONS.md Section 5).
+//! zmux extension frames GOAWAY and PRIORITY_UPDATE.
 
 use super::quic::MAX_COUNT;
 use super::{Fail, FrameType};

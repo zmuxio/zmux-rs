@@ -1,4 +1,4 @@
-//! A split bootstrap through the listener (SPEC.md Section 6.1.1): an
+//! A split bootstrap through the listener: an
 //! uplink and a downlink carrier paired by their token, in either order;
 //! a third carrier with the token, two of one direction, and a half whose
 //! partner never comes are refused.
@@ -29,7 +29,8 @@ fn hint() -> PipeHint {
 }
 
 async fn run(downlink_first: bool) {
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let (client, up, down) = carriers();
     let (up_read, _keep_up) = tokio::io::split(up);
     let (_keep_down, down_write) = tokio::io::split(down);
@@ -54,7 +55,7 @@ async fn run(downlink_first: bool) {
     ss.write_all(&got).await.unwrap();
     ss.finish().unwrap();
     assert_eq!(r.read_to_end(1 << 10).await.unwrap(), b"over two carriers");
-    session.close(zmux::VarInt::ZERO, b"");
+    session.close(zmux::VarInt::ZERO, b"").await;
     server.closed().await;
     // Both halves' handlers end with the session.
     assert!(a.await.unwrap().is_ok());
@@ -87,7 +88,8 @@ async fn bad_pairs_are_refused() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut limits = ListenerConfig::default();
         limits.handshake_timeout = Duration::from_millis(300);
-        let listener = Listener::new(Config::default(), limits);
+        let listener =
+            Listener::new(Config::default(), limits).expect("valid listener configuration");
         // Two downlinks with one token: the second is refused, the first
         // times out without a partner.
         let (a, _ka) = duplex(64);
@@ -111,21 +113,26 @@ async fn bad_pairs_are_refused() {
             listener.handle_pipe(PipeIo::new(d), two).await,
             Err(HandleError::Rejected)
         );
-        // An uplink that sends no first record times out.
+        // A pair whose uplink sends no first record times out, and nothing is read of a
+        // half before its partner arrives.
         let mut limits = ListenerConfig::default();
         limits.first_record_timeout = Duration::from_millis(100);
-        let l = Listener::new(Config::default(), limits);
+        let l = Listener::new(Config::default(), limits).expect("valid listener configuration");
         let (e, _ke) = duplex(64);
         let (er, _) = tokio::io::split(e);
-        assert_eq!(
-            l.handle_pipe(PipeIo::reader(er), hint()).await,
-            Err(HandleError::TimedOut)
-        );
+        let (g, _kg) = duplex(64);
+        let late = l.clone();
+        let lone = tokio::spawn(async move { late.handle_pipe(PipeIo::reader(er), hint()).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!lone.is_finished(), "a lone half waits for its partner");
+        let _ = l.handle_pipe(PipeIo::writer(g), hint()).await;
+        assert_eq!(lone.await.unwrap(), Err(HandleError::TimedOut));
         // A third carrier with a used token is refused.
         let (client, up, down) = carriers();
         let (up_read, _ku) = tokio::io::split(up);
         let (_kd2, down_write) = tokio::io::split(down);
-        let l3 = Listener::new(Config::default(), ListenerConfig::default());
+        let l3 = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let (x, y) = (l3.clone(), l3.clone());
         tokio::spawn(async move { x.handle_pipe(PipeIo::reader(up_read), hint()).await });
         tokio::spawn(async move { y.handle_pipe(PipeIo::writer(down_write), hint()).await });

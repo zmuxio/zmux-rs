@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
-use zmux::proto::listener::{CarrierId, ListenerConfig, ListenerCore};
+use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::Framing;
+use zmux::proto::seal::Mode;
 use zmux::proto::session::{
     Config, CoreEvent, PickRequest, PipeEnd, PipeHalf, PipeId, PipeOptions, PipeWrite, RoleConfig,
     SessionCore, State, Transmit, TransmitBuf,
@@ -26,7 +27,7 @@ use zmux::proto::session::{
 mod join;
 
 pub(crate) use join::Joined;
-use join::feed_join;
+use join::{Accepting, Joining, feed_join, feed_reply};
 
 /// The dialing end, and the accepting one (indexes of [`MpNet::ends`] and
 /// [`Link::flows`]).
@@ -150,7 +151,11 @@ pub(crate) struct Link<X> {
     /// What became of the join at B's listener (pipe 0 is attached from
     /// the start); before it is attached A's bytes go to the listener.
     pub(crate) joined: Joined,
-    carrier: Option<CarrierId>,
+    accepting: Accepting,
+    /// A's handshake on the carrier; the Hello, Reply and Confirm count in no record
+    /// stream and no batch a test observes.
+    joining: Joining,
+    reply_in: Vec<u8>,
     /// Bytes a flow takes before its writer sees it unwritable.
     pub(crate) cap: usize,
     /// An abortive close resets the carrier (RST) rather than ending it.
@@ -161,11 +166,13 @@ pub(crate) struct Link<X> {
 }
 
 impl<X: Observe> Link<X> {
-    fn new(joined: Joined) -> Self {
+    fn new(joined: Joined, joining: Joining) -> Self {
         Self {
             flows: [Flow::new(), Flow::new()],
             joined,
-            carrier: None,
+            accepting: Accepting::default(),
+            joining,
+            reply_in: Vec::new(),
             cap: usize::MAX,
             rst: false,
             failed: false,
@@ -244,7 +251,10 @@ impl<X: Observe, S> MpNet<X, S> {
         a.attach_pipe(PipeId::new(0), BS, now);
         b.attach_pipe(PipeId::new(0), BS, now);
         let mut links = BTreeMap::new();
-        links.insert(0, Link::new(Joined::Attached(PipeId::new(0))));
+        links.insert(
+            0,
+            Link::new(Joined::Attached(PipeId::new(0)), Joining::Records),
+        );
         Self {
             ends: [a, b],
             now,
@@ -268,6 +278,9 @@ impl<X: Observe, S> MpNet<X, S> {
     pub(crate) fn step(&mut self, limit: usize) {
         let ids: Vec<u64> = self.links.keys().copied().collect();
         for &id in &ids {
+            if self.links[&id].alive() && self.links[&id].accepting.hello.is_some() {
+                self.feed(id, B, &[]);
+            }
             self.transmit(id, A);
             self.transmit(id, B);
         }
@@ -291,6 +304,28 @@ impl<X: Observe, S> MpNet<X, S> {
         }
         let cap = l.cap;
         let core = &mut self.ends[w];
+        if w == A && l.joining != Joining::Records {
+            if l.joining == Joining::Hello && l.flows[A].takes && !l.flows[A].writer_closed {
+                if l.flows[A].write_err {
+                    l.flows[A].write_err_reported = true;
+                    l.joining = Joining::Gone;
+                    core.join_carrier_failed(pipe, std::io::ErrorKind::BrokenPipe, now);
+                    return;
+                }
+                match core.join_prepare(pipe, now) {
+                    Ok(Some(_)) => match core.join_hello(pipe, (BS, 0), &Default::default(), now) {
+                        Ok(hello) => {
+                            l.flows[A].push(now, &hello);
+                            l.joining = Joining::Reply;
+                        }
+                        Err(_) => l.joining = Joining::Gone,
+                    },
+                    Ok(None) => {}
+                    Err(_) => l.joining = Joining::Gone,
+                }
+            }
+            return;
+        }
         // Custom decisions are made outside the core: answer them, then send what they place.
         let mut req = PickRequest::default();
         for round in 0..64 {
@@ -325,7 +360,7 @@ impl<X: Observe, S> MpNet<X, S> {
                 let t = core.poll_transmit(pipe, now, &mut self.out);
                 self.wire.clear();
                 self.out.copy_to_vec(&mut self.wire);
-                core.pipe_written(pipe, self.wire.len() as u64);
+                core.pipe_written(pipe, self.wire.len() as u64, now);
                 if !self.wire.is_empty() {
                     if w == A {
                         l.x.a_batch(&self.wire);
@@ -398,6 +433,24 @@ impl<X: Observe, S> MpNet<X, S> {
         let now = self.now;
         let pipe = PipeId::new(id);
         let l = self.links.get_mut(&id).expect("link");
+        if r == A && l.joining != Joining::Records {
+            if l.joining != Joining::Reply {
+                return;
+            }
+            l.reply_in.extend_from_slice(bytes);
+            match feed_reply(&mut self.ends[A], pipe, &mut l.reply_in, now) {
+                Ok(None) => {}
+                Ok(Some((confirm, rest))) => {
+                    l.joining = Joining::Records;
+                    l.flows[A].push(now, &confirm);
+                    if !rest.is_empty() {
+                        self.ends[A].receive(pipe, &rest, now);
+                    }
+                }
+                Err(()) => l.joining = Joining::Gone,
+            }
+            return;
+        }
         if r == A || l.attached() {
             self.ends[r].receive(pipe, bytes, now);
             return;
@@ -409,11 +462,12 @@ impl<X: Observe, S> MpNet<X, S> {
         let fed = feed_join(
             &mut self.listener,
             &mut self.ends[B],
-            &mut l.carrier,
+            &mut l.accepting,
             0,
             bytes,
             now,
         );
+        l.flows[B].push(now, &fed.reply);
         match fed.joined {
             Joined::Attached(p) => {
                 assert_eq!(p, pipe, "join accepted under another pipe ID");
@@ -426,7 +480,7 @@ impl<X: Observe, S> MpNet<X, S> {
             let victim = self
                 .links
                 .iter()
-                .find(|(_, l)| l.carrier == Some(e))
+                .find(|(_, l)| l.accepting.carrier == Some(e))
                 .map(|(k, _)| *k);
             if let Some(v) = victim {
                 self.listener_close(v, Joined::Dropped);
@@ -438,6 +492,18 @@ impl<X: Observe, S> MpNet<X, S> {
     fn end_of(&mut self, id: u64, r: usize, end: PipeEnd) {
         if r == B && !self.links[&id].attached() {
             self.listener_close(id, Joined::Dropped);
+            return;
+        }
+        if r == A && self.links[&id].joining != Joining::Records {
+            let l = self.links.get_mut(&id).expect("link");
+            if l.joining != Joining::Gone {
+                l.joining = Joining::Gone;
+                self.ends[A].join_carrier_failed(
+                    PipeId::new(id),
+                    std::io::ErrorKind::BrokenPipe,
+                    self.now,
+                );
+            }
             return;
         }
         self.ends[r].pipe_ended(PipeId::new(id), end, self.now);
@@ -455,7 +521,7 @@ impl<X: Observe, S> MpNet<X, S> {
         }
         assert!(!self.strict_joins, "the join of pipe {id} failed: {why:?}");
         l.joined = why;
-        if let Some(c) = l.carrier.take() {
+        if let Some(c) = l.accepting.carrier.take() {
             self.listener.done(c);
         }
         let [ab, ba] = &mut l.flows;
@@ -474,7 +540,7 @@ impl<X: Observe, S> MpNet<X, S> {
                 continue;
             }
             for w in [A, B] {
-                if w == B && !l.attached() {
+                if (w == B && !l.attached()) || (w == A && l.joining != Joining::Records) {
                     continue;
                 }
                 let f = &mut l.flows[w];
@@ -544,7 +610,7 @@ impl<X: Observe, S> MpNet<X, S> {
             let link = self
                 .links
                 .iter()
-                .find(|(_, l)| l.carrier == Some(c))
+                .find(|(_, l)| l.accepting.carrier == Some(c))
                 .map(|(k, _)| *k);
             if let Some(id) = link {
                 self.listener_close(id, Joined::Dropped);
@@ -564,15 +630,19 @@ impl<X: Observe, S> MpNet<X, S> {
             return;
         }
         l.failed = true;
-        if let Some(c) = l.carrier.take() {
+        if let Some(c) = l.accepting.carrier.take() {
             self.listener.done(c);
         }
         for f in &mut l.flows {
             f.clear();
         }
         let now = self.now;
+        if l.joining == Joining::Hello || l.joining == Joining::Reply {
+            l.joining = Joining::Gone;
+            self.ends[A].join_carrier_failed(PipeId::new(id), std::io::ErrorKind::BrokenPipe, now);
+        }
         for side in [A, B] {
-            if side == B && !l.attached() {
+            if (side == B && !l.attached()) || (side == A && l.joining != Joining::Records) {
                 continue;
             }
             let inbound = &mut l.flows[1 - side];
@@ -596,12 +666,24 @@ impl<X: Observe, S> MpNet<X, S> {
     /// A adds a pipe (B joins it through its listener); `None` when A
     /// refuses.
     pub(crate) fn add_pipe(&mut self, opts: &PipeOptions) -> Option<u64> {
+        self.add_pipe_directed(true, true, opts)
+    }
+
+    /// [`Self::add_pipe`] with the directions of A's attachment.
+    pub(crate) fn add_pipe_directed(
+        &mut self,
+        inbound: bool,
+        outbound: bool,
+        opts: &PipeOptions,
+    ) -> Option<u64> {
+        let (input, output) = (inbound.then_some(BS), outbound.then_some(BS));
         let id = self.ends[A]
-            .add_pipe(Some(BS), Some(BS), opts, false, None, self.now)
+            .add_pipe(input, output, opts, Mode::Trusted, None, self.now)
             .ok()?
             .get();
         assert!(!self.links.contains_key(&id), "pipe ID {id} reused");
-        self.links.insert(id, Link::new(Joined::Pending));
+        self.links
+            .insert(id, Link::new(Joined::Pending, Joining::Hello));
         Some(id)
     }
 }

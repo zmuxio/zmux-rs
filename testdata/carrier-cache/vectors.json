@@ -1,6 +1,6 @@
 {
   "about": [
-    "Carrier cache snapshots (API.md Section 4.8), shared by every implementation.",
+    "Carrier cache snapshots, shared by every implementation. The cache remembers, per server key and carrier kind, the outcome of the last dial: usable until good_until, failed until fail_until with the backoff that set it, and the final URL after redirects.",
     "Each case restores its steps in order into a new cache with the default bounds",
     "(success TTL 6 h, backoff 1 min to 6 h). In a step, a string \"@+N\" or \"@-N\"",
     "is the RFC 3339 UTC time N seconds after or before now, substituted before parsing.",

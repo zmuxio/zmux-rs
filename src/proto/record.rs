@@ -1,17 +1,17 @@
-//! The record layer (SPEC.md Section 3): size-prefixed records of frames on
-//! byte-stream pipes, and one record per message on message-framed carriers
-//! ("Records" framing, SPEC.md Section 3.4).
+//! The record layer: size-prefixed records of frames on byte-stream pipes,
+//! and one record per message on message-framed carriers ("Records"
+//! framing).
 //!
 //! [`RecordReader`] parses records incrementally from input split at any
 //! byte boundary. A record's frames are released only once the whole record
-//! has arrived: an incomplete record is never processed (SPEC.md Sections
-//! 3.2 and 3.4), so a pipe that ends inside a record leaves nothing applied.
-//! A record that is complete in the input is decoded in place, and its
-//! payloads (STREAM and DATAGRAM data, reasons, parameter blocks) are slices
-//! of the input. A record that spans reads is either copied into a reusable
-//! buffer bounded by `max_record_size` ([`RecordReader::read`]) or left in
-//! the caller's buffer until it is complete
-//! ([`RecordReader::read_complete`]), which keeps every payload zero-copy.
+//! has arrived: an incomplete record is never processed, so a pipe that ends
+//! inside a record leaves nothing applied. A record that is complete in the
+//! input is decoded in place, and its payloads (STREAM and DATAGRAM data,
+//! reasons, parameter blocks) are slices of the input. A record that spans
+//! reads is either copied into a reusable buffer bounded by
+//! `max_record_size` ([`RecordReader::read`]) or left in the caller's buffer
+//! until it is complete ([`RecordReader::read_complete`]), which keeps every
+//! payload zero-copy.
 
 use super::codec::Writer;
 use super::error::{EncodeError, Error, TransportErrorCode};
@@ -26,7 +26,7 @@ pub const fn size_len(body_len: u64) -> usize {
 }
 
 /// The number of bytes a record with `body_len` bytes of frames counts for
-/// in pipe positions, with the shortest Size encoding (SPEC.md Section 3.4).
+/// in pipe positions, with the shortest Size encoding.
 pub const fn wire_len(body_len: u64) -> u64 {
     body_len + varint::len(body_len) as u64
 }
@@ -39,11 +39,10 @@ pub fn encode_size(body_len: u64, buf: &mut [u8]) -> Result<usize, EncodeError> 
 /// How a pipe delimits records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Framing {
-    /// Records are concatenated, each with its Size field (SPEC.md Section
-    /// 3.1).
+    /// Records are concatenated, each with its Size field.
     ByteStream,
     /// Each carrier message is one record's Frames field and the message
-    /// length is the Size (SPEC.md Section 3.4).
+    /// length is the Size.
     Records,
 }
 
@@ -54,7 +53,7 @@ pub enum Event<'a> {
     Frame(Frame<'a>),
     /// The last frame of a record has been yielded. `len` is the number of
     /// bytes the record occupied on the pipe; positions advance by it once
-    /// the record's frames are applied (MULTIPATH.md Section 6.1).
+    /// the record's frames are applied.
     RecordEnd {
         /// Bytes of the record, Size field included (with the shortest Size
         /// encoding on message-framed pipes).
@@ -93,8 +92,8 @@ impl State {
 /// transport parameters before the frames that follow them in the same
 /// record are decoded. After an error the reader stays failed.
 ///
-/// The reader does not apply the first-record check of SPEC.md Section 6.2;
-/// see [`crate::proto::ident::Classifier`].
+/// The reader does not apply the first-record check; see
+/// [`crate::proto::ident::Classifier`].
 #[derive(Debug, Clone)]
 pub struct RecordReader {
     max_record_size: u64,
@@ -137,8 +136,8 @@ impl RecordReader {
     /// Whether every record received so far has been yielded completely,
     /// [`Event::RecordEnd`] included. Check it after `read` returned
     /// `Ok(None)`. A pipe that ends while this is false ended inside a
-    /// record: it has failed and the incomplete record is never processed
-    /// (SPEC.md Section 3.2). That is a pipe failure, not a protocol error.
+    /// record: it has failed and the incomplete record is never
+    /// processed. That is a pipe failure, not a protocol error.
     pub const fn at_record_boundary(&self) -> bool {
         matches!(self.state, State::Size { have: 0, .. })
     }
@@ -171,8 +170,8 @@ impl RecordReader {
             ));
         }
         let len = len as u64;
-        // An empty message is a record without frames, a no-op (SPEC.md
-        // Section 3.4); on a byte stream a Size of 0 stays an error.
+        // An empty message is a record without frames, a no-op; on a byte stream a Size of 0 stays
+        // an error.
         if len > 0
             && let Err(e) = self.check_size(len)
         {
@@ -568,7 +567,7 @@ mod tests {
         );
         assert_eq!(r.read(&mut rest, &Gates::ALL), Ok(None));
         assert_eq!(r.position(), 4);
-        // An empty message is a record without frames (SPEC.md 3.4).
+        // An empty message is a record without frames.
         r.begin_message(0).unwrap();
         let mut none: &[u8] = &[];
         assert_eq!(

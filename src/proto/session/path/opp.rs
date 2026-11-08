@@ -1,7 +1,7 @@
-//! Opportunistic reinjection (MULTIPATH.md Section 7.5.1): when flow
-//! control holds new data back and the data that blocks it sits on a slower
-//! pipe for longer than expected, one copy of it goes on the pipe with the
-//! earliest arrival, and the slow pipe is penalized.
+//! Opportunistic reinjection: when flow control holds new data back and the
+//! data that blocks it sits on a slower pipe for longer than expected, one
+//! copy of it goes on the pipe with the earliest arrival, and the slow pipe
+//! is penalized.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,8 @@ use crate::proto::session::stream::{Carry, SendPart};
 use crate::proto::session::tier::Gate;
 use crate::proto::session::{SessionCore, StreamKey};
 
-/// What holds new stream data back (the trigger of Section 7.5.1).
+/// What holds new stream data back (the trigger of opportunistic
+/// reinjection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trigger {
     /// Session flow control.
@@ -23,8 +24,7 @@ enum Trigger {
 }
 
 /// The stream directions held back by stream credit, for opportunistic
-/// reinjection (MULTIPATH.md Section 7.5.1), and the next place in that
-/// list.
+/// reinjection, and the next place in that list.
 #[derive(Debug, Default)]
 pub(crate) struct CreditBlocked {
     list: Vec<StreamKey>,
@@ -74,7 +74,7 @@ impl SessionCore {
         send: &SendPart,
     ) -> Option<Held> {
         let seq = send.mp.as_deref()?.listed?;
-        let blocked = send.credit_blocked();
+        let blocked = send.held_back();
         Some(Held {
             seq,
             blocked,
@@ -290,21 +290,55 @@ impl SessionCore {
         true
     }
 
-    /// The penalty of Section 7.5.1, once per episode: the pipe's rate
-    /// samples are discarded and its rate halved, and it takes no new
-    /// stream data until everything sent on it so far is acknowledged.
+    /// The opportunistic-reinjection penalty, once per episode: the
+    /// pipe's rate samples are discarded and its rate halved, and it
+    /// takes no new stream data until everything sent on it so far is
+    /// acknowledged. Each direction bound to it moves off, and its stream data
+    /// on the pipe not yet acknowledged is re-sent once, for the new binding:
+    /// on a later penalty only what is still unacknowledged then and was not
+    /// re-sent before. The penalty is the only trigger, and the copies are
+    /// bounded by what the pipe has in flight.
     fn penalize(&mut self, id: u64) {
         let Some(first) = self.out_mut(id).and_then(OutPipe::penalize) else {
             return;
         };
+        self.resend_on_penalty(id);
         self.advance_pick_generation();
+        self.check_standby_takeover();
         if first {
             self.stats.penalties += 1;
         }
         self.quality_sample(id, self.now);
     }
 
-    /// Records a stream direction that stream credit holds back.
+    /// Re-sends the unacknowledged stream data on pipe `id` of the directions
+    /// bound to it, which its penalty moves off.
+    fn resend_on_penalty(&mut self, id: u64) {
+        let bound: Vec<StreamKey> = self
+            .streams
+            .keys()
+            .filter(|&k| {
+                self.streams
+                    .send(k)
+                    .and_then(|s| s.mp().bound)
+                    .is_some_and(|b| b.pipe == id)
+            })
+            .collect();
+        if bound.is_empty() {
+            return;
+        }
+        let mut frames = Vec::new();
+        if let Some(o) = self.out_mut(id) {
+            o.take_penalty_resend(|k| bound.contains(&k), &mut frames);
+        }
+        let now = self.now;
+        for f in frames {
+            self.reinject_frame(f, now);
+        }
+    }
+
+    /// Records a stream direction that stream credit, or a binding that waits on
+    /// another pipe, holds back.
     pub(in crate::proto::session) fn note_credit_blocked(&mut self, key: StreamKey) {
         let Some(blocked) = self.mp.as_deref_mut().map(Mp::blocked_mut) else {
             return;
@@ -313,14 +347,14 @@ impl SessionCore {
         let Some(send) = self.streams.send_mut(key) else {
             return;
         };
-        if send.credit_blocked() && send.mp().listed.is_none() {
+        if send.held_back() && send.mp().listed.is_none() {
             send.mp_mut().listed = Some(seq);
             blocked.seq += 1;
             blocked.list.push(key);
         }
     }
 
-    /// Forgets stream directions no longer held back by stream credit.
+    /// Forgets stream directions no longer held back.
     pub(in crate::proto::session) fn prune_credit_blocked(&mut self) {
         let Some(mut list) = self
             .mp
@@ -333,7 +367,7 @@ impl SessionCore {
             let Some(send) = self.streams.send(k) else {
                 return false;
             };
-            if send.credit_blocked() {
+            if send.held_back() {
                 return true;
             }
             if let Some(send) = self.streams.send_mut(k) {

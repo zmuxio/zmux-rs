@@ -7,7 +7,7 @@
 //!
 //! The client ([`H3Client`]) reports the QUIC connection as the carrier
 //! connection of its pipes and opens their lanes as further requests on it
-//! (MULTIPATH.md Sections 2.5 and 5.8): the request streams of one
+//! (one lane per independently delivered carrier stream): the request streams of one
 //! connection are delivered independently, so a loss on one lane does not
 //! hold back the others. Lanes are opened by the client only: an HTTP/3
 //! server cannot open request streams, so the server's outbound directions
@@ -28,7 +28,7 @@
 //! What the carriers have:
 //!
 //! - HTTP Datagrams (RFC 9297) of their request streams, as the datagram
-//!   channel of the pipe (EXTENSIONS.md Section 6.8): a session with
+//!   channel of the pipe: a session with
 //!   datagrams enabled sends each datagram that fits one there rather than
 //!   in a record when the peer negotiated it. Both ends enable HTTP
 //!   Datagrams (`SETTINGS_H3_DATAGRAM`), and a pipe's channel is usable
@@ -38,9 +38,12 @@
 //!   routes them to its pipes ([`ConnectionDatagrams`]), so
 //!   the HTTP Datagrams of a connection that carries pipes belong to zmux;
 //! - the TLS 1.3 exporter of the QUIC connection (RFC 9001 Section 4), for
-//!   [`zmux::PipeAuth::exporter`] and carrier-bound joins (MULTIPATH.md Section
-//!   10.5); behind a front end that terminates TLS the two ends export
-//!   different values, so such deployments use a PSK (MULTIPATH.md);
+//!   [`zmux::PipeAuth::exporter`] and Bound joins (the carriers declare the
+//!   secure carrier's Bound contract; the Binding names the connection, not
+//!   the request stream); behind a front end that terminates TLS the two ends export
+//!   different values, so such deployments use a PSK. The
+//!   exporter does not keep the connection: once it is gone it gives no
+//!   value ([`zmux::ExportError::Unavailable`]);
 //! - a connection receive window sized for the lanes ([`Options`]),
 //!   charged to the memory budget: the client's to the zmux session its
 //!   pipes carry, the server's to the listener's while the connection is
@@ -94,7 +97,6 @@ use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, ReadBuf};
 use zmux::carrier::{CarrierConnId, ChunkBuf, ChunkWrite};
 use zmux::proto::ApplicationErrorCode;
-use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
 use zmux::{Admit, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo, Session};
 pub use zmux_quinn::LaneWindows;
 use zmux_quinn::{ConnectionDatagrams, QuicChannel};
@@ -213,25 +215,26 @@ fn carrier_failed() -> h3::error::Code {
     h3::error::Code::from(ApplicationErrorCode::ZMUX_CARRIER_FAILED.0)
 }
 
-/// The exporter values of a connection for both labels zmux uses.
-fn exported(conn: &Connection) -> [Option<Vec<u8>>; 2] {
-    let export = |label: &str| {
-        let mut out = vec![0u8; 32];
-        conn.export_keying_material(&mut out, label.as_bytes(), b"")
-            .ok()
-            .map(|()| out)
-    };
-    [export(EXPORTER_SESSION_LABEL), export(EXPORTER_PIPE_LABEL)]
-}
-
-/// A carrier with the connection's identity and exporter.
-fn with_connection(io: PipeIo, id: CarrierConnId, exported: &[Option<Vec<u8>>; 2]) -> PipeIo {
-    let exported = exported.clone();
+/// A carrier with the connection's identity and exporter, declared secure: QUIC protects
+/// its records, and its Binding is the connection's, the same for each request stream of
+/// it. The exporter reaches the connection through `owner`, the state that holds it, and
+/// does not keep it: it gives no value once that state is gone.
+fn with_connection<T: Send + Sync + 'static>(
+    io: PipeIo,
+    id: CarrierConnId,
+    owner: &Arc<T>,
+    conn: fn(&T) -> &Connection,
+) -> PipeIo {
+    let exporter = Arc::downgrade(owner);
     io.with_carrier_conn(id)
-        .with_tls_exporter(|label| match label {
-            EXPORTER_SESSION_LABEL => exported[0].clone(),
-            EXPORTER_PIPE_LABEL => exported[1].clone(),
-            _ => None,
+        .with_terminated_tls(|| Some(zmux::TlsState::default()))
+        .with_carrier_secure()
+        .with_exporter(move |label, context, out| {
+            exporter.upgrade().is_some_and(|owner| {
+                conn(&owner)
+                    .export_keying_material(out, label.as_bytes(), context)
+                    .is_ok()
+            })
         })
 }
 
@@ -265,7 +268,6 @@ struct ClientInner {
     uri: http::Uri,
     /// The connection's identity for zmux: this state's allocation.
     id: OnceLock<CarrierConnId>,
-    exported: [Option<Vec<u8>>; 2],
     window: u64,
     /// The credential of each request, and the connection's handshake it
     /// is given.
@@ -307,7 +309,6 @@ impl H3Client {
         .abort_handle();
         let inner = Arc::new(ClientInner {
             datagrams: ConnectionDatagrams::new(conn.clone()),
-            exported: exported(&conn),
             conn,
             send,
             uri,
@@ -354,7 +355,7 @@ impl H3Client {
             .with_carrier(zmux::CarrierKind::Http3)
             .with_connection_memory(inner.window)
             .with_datagram_channel(channel)
-            .with_chunk_lane_opener(move || {
+            .with_lane_opener(move || {
                 let inner = opener.clone();
                 async move {
                     let (send, recv) = inner.request().await?;
@@ -362,10 +363,10 @@ impl H3Client {
                     // the server drop the request before the lane is routed.
                     let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner));
                     lane.response = Some(recv);
-                    Ok(lane)
+                    Ok(zmux::carrier::Lane::from_chunks(lane))
                 }
             });
-        Ok(with_connection(io, inner.id(), &inner.exported))
+        Ok(with_connection(io, inner.id(), inner, |c| &c.conn))
     }
 }
 
@@ -507,7 +508,6 @@ pub async fn serve_connection(
         datagrams: ConnectionDatagrams::new(conn.clone()),
         listener: listener.clone(),
         id: CarrierConnId::new(&identity),
-        exported: exported(&conn),
         handshake: zmux_quinn::Handshake::of(&conn),
         conn: conn.clone(),
         fallback: options.fallback.clone(),
@@ -523,7 +523,7 @@ pub async fn serve_connection(
             let Ok((head, stream)) = resolver.resolve_request().await else {
                 return;
             };
-            let (mut send, recv) = stream.split();
+            let (mut send, mut recv) = stream.split();
             if zmux::forwarded_early_data(
                 head.headers()
                     .iter()
@@ -537,6 +537,9 @@ pub async fn serve_connection(
                 if send.send_response(resp).await.is_ok() {
                     let _ = send.finish().await;
                 }
+                // The answer is complete: the rest of the body is not wanted, which is
+                // no error of the request (RFC 9114 Section 4.1).
+                recv.stop_sending(h3::error::Code::H3_NO_ERROR);
                 return;
             }
             let peer = shared.conn.remote_address();
@@ -560,7 +563,6 @@ pub async fn serve_connection(
 struct Served {
     listener: Listener,
     id: CarrierConnId,
-    exported: [Option<Vec<u8>>; 2],
     handshake: zmux_quinn::Handshake,
     conn: Connection,
     fallback: Option<H3Fallback>,
@@ -591,11 +593,11 @@ impl Served {
         )
     }
 
-    async fn handle(&self, io: PipeIo, entry: Entry) {
+    async fn handle(self: &Arc<Self>, io: PipeIo, entry: Entry) {
         let _ = self
             .listener
             .handle_pipe(
-                with_connection(io, self.id.clone(), &self.exported),
+                with_connection(io, self.id.clone(), self, |s| &s.conn),
                 PipeHint::from_entry(entry),
             )
             .await;
@@ -633,7 +635,7 @@ impl Served {
 
     /// The admission of one request ([`serve_connection`]).
     async fn admit(
-        &self,
+        self: &Arc<Self>,
         mut entry: Entry,
         head: http::Request<()>,
         mut send: ServerSend,
@@ -653,7 +655,7 @@ impl Served {
                         .iter()
                         .map(|(n, v)| (n.as_str(), v.as_bytes()))
                 });
-            entry.decide(info, prefix).await
+            entry.decide_reading(info, prefix, &mut reader).await
         };
         match admit {
             Admit::Accept(rest) => {
@@ -694,7 +696,7 @@ impl Served {
 
     /// A request without admission ([`serve_connection`]).
     async fn serve_unadmitted(
-        &self,
+        self: &Arc<Self>,
         mut entry: Entry,
         head: http::Request<()>,
         send: ServerSend,

@@ -106,7 +106,7 @@ fn has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
 /// exporter); the source, the peer, the request, its header fields and
 /// [`CarrierInfo::head`] are set here. Nothing is answered before the
 /// decision; a stall waits for its duration and ends the request. The
-/// hint carries the entry and the request's [`zmux::JOIN_HEADER`]. No TCP
+/// hint carries the entry. No TCP
 /// socket is known: a pipe that zmux fails ends with a Close frame.
 ///
 /// [`accept`]: crate::accept
@@ -190,14 +190,7 @@ where
     if let Ok(p) = HeaderValue::from_str(&protocol) {
         h.insert(PROTOCOL_HEADER, p);
     }
-    let mut hint = PipeHint::from_entry(entry);
-    if let Some(j) = parts
-        .headers
-        .get(zmux::JOIN_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
-        hint = hint.with_join_header(j);
-    }
+    let hint = PipeHint::from_entry(entry);
     let l = listener.clone();
     let carrier = Box::pin(async move {
         let upgraded = on_upgrade.await.map_err(|e| {

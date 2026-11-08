@@ -5,7 +5,7 @@
 use std::io::IoSlice;
 
 use bytes::Bytes;
-#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+#[cfg(all(feature = "tokio", not(loom)))]
 use bytes::BytesMut;
 
 use crate::proto::codec::Writer;
@@ -103,7 +103,7 @@ pub struct TransmitBuf {
     /// Message lengths, for a message-framed pipe.
     messages: Vec<usize>,
     /// The batch's length in byte-stream form at the end of each record
-    /// (positions count messages in that form, MULTIPATH.md Section 2.3).
+    /// (positions count messages in that form).
     record_ends: Vec<u64>,
     stream_len: u64,
     /// Changes with every change of the parts, for [`PieceCursor`]
@@ -159,7 +159,7 @@ impl TransmitBuf {
     }
 
     /// Sets the largest message of the next batches for a message-framed
-    /// pipe (SPEC.md Section 3.4), where one write call carries one
+    /// pipe, where one write call carries one
     /// message: the write-call bound
     /// ([`SessionCore::write_call_limit`](super::SessionCore::write_call_limit)),
     /// within which the records are then built. A
@@ -202,7 +202,7 @@ impl TransmitBuf {
         &self.record_ends
     }
 
-    /// On a message-framed pipe (SPEC.md Section 3.4), the length of each
+    /// On a message-framed pipe, the length of each
     /// message of the batch, in order: each is one record's Frames field,
     /// sent without its Size. Empty on a byte-stream pipe.
     pub fn message_lens(&self) -> &[usize] {
@@ -415,7 +415,7 @@ impl TransmitBuf {
     /// and split off it, so that buffers released by the carrier make room
     /// in it again. `cursor` as for [`TransmitBuf::take_pieces`]. Returns
     /// the bytes appended.
-    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    #[cfg(all(feature = "tokio", not(loom)))]
     pub(crate) fn owned_pieces(
         &self,
         cursor: &mut PieceCursor,

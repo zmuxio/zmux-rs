@@ -44,7 +44,7 @@ impl Shaper for Counting {
 
 impl Factory for Recording {
     fn shaper(&self, pipe: &ShapedPipe) -> Option<Box<dyn Shaper>> {
-        self.seen.lock().unwrap().push(*pipe);
+        self.seen.lock().unwrap().push(pipe.clone());
         Some(Box::new(Counting {
             planned: self.planned.clone(),
         }))
@@ -70,7 +70,7 @@ impl Recording {
 fn config(shaper: Option<Arc<Recording>>) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"carrier-kind-psk-0123456789abcde");
+    c.pipe_auth = PipeAuth::psk(*b"carrier-kind-psk-0123456789abcde").with_end_to_end();
     c.shaper = shaper.map(|s| s as Arc<dyn Factory>);
     c
 }
@@ -122,7 +122,8 @@ async fn kinds_reach_the_factories_of_both_ends() {
     let listener = Listener::new(
         config(Some(server_shaper.clone())),
         ListenerConfig::default(),
-    );
+    )
+    .expect("valid listener configuration");
     let ws = port(&listener, Some(CarrierKind::WebSocket)).await;
     let quic = port(&listener, Some(CarrierKind::Quic)).await;
 
@@ -153,7 +154,7 @@ async fn kinds_reach_the_factories_of_both_ends() {
     );
 
     let joined = client
-        .add_pipe(
+        .begin_add_pipe(
             PipeIo::tcp(TcpStream::connect(quic).await.unwrap()).with_carrier(CarrierKind::Quic),
             PipeOptions::new(),
         )
@@ -179,12 +180,16 @@ async fn kinds_reach_the_factories_of_both_ends() {
     assert_eq!(server_shaper.kind_of(id), Some(Some(CarrierKind::Quic)));
     assert_eq!(client_shaper.kind_of(id), Some(Some(CarrierKind::Quic)));
 
-    // A pipe event names the pipe's kind.
-    joined.close().unwrap();
+    // A pipe event names the pipe's kind. Read before the pipe ends: retiring it takes its
+    // unread events out of the queue.
     let kind = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match server_events.next_event().await {
-                Some(SessionEvent::PipeState { pipe, carrier, .. }) if pipe == id => {
+                Some(
+                    SessionEvent::PipeAdded { pipe, carrier }
+                    | SessionEvent::PipeJoined { pipe, carrier }
+                    | SessionEvent::PipeClosed { pipe, carrier, .. },
+                ) if pipe == id => {
                     break carrier;
                 }
                 Some(_) => {}
@@ -195,7 +200,7 @@ async fn kinds_reach_the_factories_of_both_ends() {
     .await
     .expect("an event in time");
     assert_eq!(kind, Some(CarrierKind::Quic));
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     listener.close();
 }
 
@@ -207,7 +212,8 @@ async fn raw_tcp_has_no_kind() {
     let listener = Listener::new(
         config(Some(server_shaper.clone())),
         ListenerConfig::default(),
-    );
+    )
+    .expect("valid listener configuration");
     let addr = port(&listener, None).await;
     let client = Session::connect(
         PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
@@ -222,7 +228,7 @@ async fn raw_tcp_has_no_kind() {
     assert_eq!(server_shaper.kind_of(zero), Some(None));
     assert_eq!(client_shaper.kind_of(zero), Some(None));
     assert_eq!(server.pipe(zero).unwrap().stats().unwrap().carrier, None);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     listener.close();
 }
 

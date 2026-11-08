@@ -38,7 +38,8 @@ async fn pair() -> (Session, Session) {
         .with_no_client_auth();
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(zmux_h3::client_config(tls, &opts).unwrap());
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     tokio::spawn(zmux_h3::serve(listener.clone(), server, opts.clone()));
     let uri = format!("https://127.0.0.1:{}/zmux", addr.port())
         .parse()

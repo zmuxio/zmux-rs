@@ -1,36 +1,23 @@
-//! A [`zmux::shaping::Shaper`] driven by state machines read from a
-//! [`Definition`].
+//! Shaping configuration for zmux: a [`zmux::shaping::Shaper`] driven by state machines, the
+//! plans of handshake messages and pool policies, read from one JSON format.
 //!
-//! A definition (version [`VERSION`]) holds machines that run side by side
-//! on each pipe. Each machine has states, two counters and two timer slots;
-//! a state may set record decisions, run actions when entered and move on
-//! triggers. Every number is a [`Value`]: a constant, a uniform range or a
-//! distribution, sampled per its [`Scope`] from the pipe's random
-//! [`Source`].
-//!
-//! Definitions are read from JSON ([`Definition::from_json`]) or from the
-//! compact sequence form ([`parse_sequence`]), validated (fields, ranges,
-//! reachability, injections with a zero delay on cycles of transitions
-//! taken without an outside trigger) and bounded ([`SizeLimits`]).
+//! Every number is an integer: a constant, or a table of weighted segments sampled from an
+//! injectable random [`Source`]. Lengths are bytes on the carrier, times microseconds and
+//! proportions parts per million.
 
-mod bound;
-mod check;
-mod def;
+mod bundle;
+mod error;
 mod json;
 mod limits;
 mod machine;
 mod pool;
 mod random;
-mod sequence;
 mod value;
 
-pub use check::SizeLimits;
-pub use def::{
-    Action, Comparison, Cond, Definition, Dist, DistKind, Error, Machine, Op, Quantity, Record,
-    Scope, State, Transition, Trigger, VERSION, Value,
-};
-pub use limits::session_limits;
-pub use machine::{MachineFactory, MachineShaper, Options};
+pub use bundle::{Bundle, Compiled};
+pub use error::Error;
+pub use limits::parse_limits;
+pub use machine::{DEFAULT_MAX_SLOTS, MachineFactory, MachineShaper, Options, SizeLimits};
 pub use pool::{MachinePoolPolicy, MemberDecision, PoolMember, pool_policy};
 pub use random::Source;
-pub use sequence::parse_sequence;
+pub use value::{Sampler, Value};

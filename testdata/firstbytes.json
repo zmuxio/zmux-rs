@@ -1,0 +1,320 @@
+{
+ "description": "ClassifyFirstBytes vectors (zmux-go is the reference; other implementations copy this file). hex: the first bytes; framing: stream or records; class: need_more, record or other; need: total bytes needed for need_more, else 0.",
+ "vectors": [
+  {
+   "hex": "",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 1,
+   "note": "empty"
+  },
+  {
+   "hex": "",
+   "framing": "records",
+   "class": "need_more",
+   "need": 1,
+   "note": "empty message start"
+  },
+  {
+   "hex": "09ff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "1-byte Size 9, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "3fff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "1-byte Size 63, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "4040ff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "2-byte Size 64, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "7fffff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "2-byte Size 16383, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "80004000ff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "4-byte Size 16384, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "8000ffffff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "4-byte Size 65535, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "ff",
+   "framing": "records",
+   "class": "record",
+   "need": 0,
+   "note": "message, QX_TRANSPORT_PARAMETERS"
+  },
+  {
+   "hex": "099a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "1-byte Size 9, 9a, not a first frame type"
+  },
+  {
+   "hex": "3f9a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "1-byte Size 63, 9a, not a first frame type"
+  },
+  {
+   "hex": "40409a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "2-byte Size 64, 9a, not a first frame type"
+  },
+  {
+   "hex": "7fff9a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "2-byte Size 16383, 9a, not a first frame type"
+  },
+  {
+   "hex": "800040009a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "4-byte Size 16384, 9a, not a first frame type"
+  },
+  {
+   "hex": "8000ffff9a",
+   "framing": "stream",
+   "class": "other", "need": 0, "note": "4-byte Size 65535, 9a, not a first frame type"
+  },
+  {
+   "hex": "9a",
+   "framing": "records",
+   "class": "other", "need": 0, "note": "message, 9a, not a first frame type"
+  },
+  {
+   "hex": "09ba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "1-byte Size 9, PIPE_LANE"
+  },
+  {
+   "hex": "3fba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "1-byte Size 63, PIPE_LANE"
+  },
+  {
+   "hex": "4040ba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "2-byte Size 64, PIPE_LANE"
+  },
+  {
+   "hex": "7fffba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "2-byte Size 16383, PIPE_LANE"
+  },
+  {
+   "hex": "80004000ba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "4-byte Size 16384, PIPE_LANE"
+  },
+  {
+   "hex": "8000ffffba",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "4-byte Size 65535, PIPE_LANE"
+  },
+  {
+   "hex": "ba",
+   "framing": "records",
+   "class": "record",
+   "need": 0,
+   "note": "message, PIPE_LANE"
+  },
+  {
+   "hex": "08ff",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "1-byte Size 8"
+  },
+  {
+   "hex": "00",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "Size 0"
+  },
+  {
+   "hex": "4009ff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "2-byte non-shortest Size 9"
+  },
+  {
+   "hex": "4008ff",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "2-byte Size 8"
+  },
+  {
+   "hex": "80000009ff",
+   "framing": "stream",
+   "class": "record",
+   "need": 0,
+   "note": "4-byte non-shortest Size 9"
+  },
+  {
+   "hex": "80010000ff",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "4-byte Size 65536"
+  },
+  {
+   "hex": "8001",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "4-byte Size above 65535, told at 2 bytes"
+  },
+  {
+   "hex": "c0",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "8-byte Size"
+  },
+  {
+   "hex": "09",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 2,
+   "note": "1-byte Size, no type"
+  },
+  {
+   "hex": "40",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 3,
+   "note": "2-byte Size, 1 byte"
+  },
+  {
+   "hex": "4040",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 3,
+   "note": "2-byte Size, no type"
+  },
+  {
+   "hex": "80",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 5,
+   "note": "4-byte Size, 1 byte"
+  },
+  {
+   "hex": "8000",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 5,
+   "note": "4-byte Size, 2 bytes"
+  },
+  {
+   "hex": "800040",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 5,
+   "note": "4-byte Size, 3 bytes"
+  },
+  {
+   "hex": "80004000",
+   "framing": "stream",
+   "class": "need_more",
+   "need": 5,
+   "note": "4-byte Size, no type"
+  },
+  {
+   "hex": "1603",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "TLS record"
+  },
+  {
+   "hex": "160301",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "TLS record"
+  },
+  {
+   "hex": "16",
+   "framing": "records",
+   "class": "other",
+   "need": 0,
+   "note": "TLS record in a message"
+  },
+  {
+   "hex": "474554",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "GET"
+  },
+  {
+   "hex": "504f5354",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "POST"
+  },
+  {
+   "hex": "0903",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "type beginning 03"
+  },
+  {
+   "hex": "09fe",
+   "framing": "stream",
+   "class": "other",
+   "need": 0,
+   "note": "type fe"
+  },
+  {
+   "hex": "00",
+   "framing": "records",
+   "class": "other",
+   "need": 0,
+   "note": "message type 00"
+  },
+  {
+   "hex": "08",
+   "framing": "records",
+   "class": "other",
+   "need": 0,
+   "note": "message STREAM"
+  }
+ ]
+}

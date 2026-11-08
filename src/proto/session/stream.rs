@@ -1,5 +1,5 @@
 //! Per-stream state: the sending and receiving parts of RFC 9000 Section 3
-//! with the zmux deltas of STATE_MACHINE.md Section 2.
+//! with the zmux deltas (Reliable Size, preambles, early data).
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -349,6 +349,31 @@ impl SendBuf {
         })
     }
 
+    /// Copies `dst.len()` unsent bytes starting `off` bytes after the cursor, leaving them
+    /// unsent (a first batch). Returns `false` when there are too few.
+    pub(crate) fn peek_unsent(&self, off: u64, dst: &mut [u8]) -> bool {
+        if off + dst.len() as u64 > self.len {
+            return false;
+        }
+        let mut skip = off as usize + self.seg_off;
+        let mut done = 0;
+        for i in self.seg..=self.segs.len() {
+            if done == dst.len() {
+                break;
+            }
+            let run = self.run(i);
+            if skip >= run.len() {
+                skip -= run.len();
+                continue;
+            }
+            let k = (run.len() - skip).min(dst.len() - done);
+            dst[done..done + k].copy_from_slice(&run[skip..skip + k]);
+            skip = 0;
+            done += k;
+        }
+        done == dst.len()
+    }
+
     /// Copies `dst.len()` sent bytes starting `off` bytes after the first
     /// one held (reinjection). Returns `false` when they are not held.
     pub(crate) fn copy_kept(&self, off: u64, dst: &mut [u8]) -> bool {
@@ -458,7 +483,7 @@ pub(crate) struct LocalReset {
     /// Application bytes that must still be delivered (the reliable
     /// boundary), for RESET_STREAM_AT.
     pub(crate) reliable_app: Option<u64>,
-    /// The preamble stays reliable (EXTENSIONS.md Section 4.5).
+    /// The preamble stays reliable.
     pub(crate) keep_preamble: bool,
     /// The reset answers the peer's STOP_SENDING.
     pub(crate) answer: bool,
@@ -466,8 +491,7 @@ pub(crate) struct LocalReset {
     pub(crate) written: bool,
 }
 
-/// What ended the sending part first (STATE_MACHINE.md Section 2.5: the
-/// first outcome wins).
+/// What ended the sending part first (the first outcome wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
     /// The application finished the stream.
@@ -558,6 +582,9 @@ pub(crate) struct SendPart {
     pub(crate) waiter: Option<u32>,
     /// Waits until every byte written was sent (`SessionCore::data_sent`).
     pub(crate) sent_waiting: bool,
+    /// A flush owes the opening frame, with nothing else to send
+    /// (`SessionCore::flush`).
+    pub(crate) open_want: bool,
     /// Write marks and waits (the fair share and the age test).
     pub(crate) waits: Waits,
     /// Multipath-only state, allocated when the stream first needs it in a
@@ -597,10 +624,10 @@ impl SendCold {
 }
 
 /// The multipath part of a sending part: retention and acknowledgement,
-/// reinjection, scheduling state (MULTIPATH.md Sections 7 and 11).
+/// reinjection, scheduling state.
 #[derive(Debug, Default)]
 pub(crate) struct SendMp {
-    /// Multipath retention (MULTIPATH.md Section 7.4): the
+    /// Multipath retention: the
     /// stream offset of the first byte held in `buf`.
     pub(crate) buf_floor: u64,
     /// Acknowledged ranges above `buf_floor` (multipath).
@@ -617,8 +644,7 @@ pub(crate) struct SendMp {
     pub(crate) reset_lost: bool,
     /// The smallest Reliable Size sent in a RESET_STREAM_AT (multipath).
     pub(crate) reliable_sent: Option<u64>,
-    /// Bytes sent opportunistically up to this offset (MULTIPATH.md
-    /// Section 7.5.1).
+    /// Bytes sent opportunistically up to this offset.
     pub(crate) opportunistic_to: u64,
     /// The pipe the direction is bound to (`affinity`), with whether the
     /// binding is provisional.
@@ -638,12 +664,10 @@ pub(crate) struct SendMp {
     /// The custom policy's answer for the next chunk.
     pub(crate) picked: Option<super::policy::Picked>,
     /// The pipe that carried the stream's opening frame (multipath): its
-    /// datagrams follow it there until the opening is acknowledged
-    /// (EXTENSIONS.md Section 6.4).
+    /// datagrams follow it there until the opening is acknowledged.
     pub(crate) open_pipe: Option<u64>,
-    /// The STREAM frames of the direction in the pipes' logs (MULTIPATH.md
-    /// Section 7.5.1): the first transmissions in offset order, the copies
-    /// (reinjected, opportunistic and redundant) in order of their ends,
+    /// The STREAM frames of the direction in the pipes' logs: the first transmissions in offset
+    /// order, the copies (reinjected, opportunistic and redundant) in order of their ends,
     /// and the end of the first transmissions logged.
     pub(crate) carried: VecDeque<Carry>,
     pub(crate) copies: VecDeque<Carry>,
@@ -795,6 +819,110 @@ impl SendMp {
 
 static EMPTY_SEND_MP: SendMp = SendMp::EMPTY;
 
+/// One STREAM frame of a first batch.
+pub(crate) struct BatchFrame {
+    pub(crate) off: u64,
+    pub(crate) data: Vec<u8>,
+}
+
+impl BatchFrame {
+    fn header(id: u64, off: u64, len: usize) -> crate::proto::frame::StreamHeader {
+        crate::proto::frame::StreamHeader {
+            stream_id: id,
+            offset: off,
+            len: len as u64,
+            fin: false,
+            explicit_offset: off != 0,
+            explicit_len: true,
+        }
+    }
+
+    /// Appends the frame without a FIN.
+    pub(crate) fn write(&self, id: u64, out: &mut Vec<u8>) {
+        let header = Self::header(id, self.off, self.data.len());
+        let at = out.len();
+        out.resize(at + header.encoded_len(), 0);
+        let _ = header.encode(&mut out[at..]);
+        out.extend_from_slice(&self.data);
+    }
+}
+
+impl SendPart {
+    /// What of this direction a first batch of at most `limit` encoded bytes carries, with the
+    /// new bytes of it, at most `room`: held bytes from the first unacknowledged one and
+    /// unsent bytes after them. The frame at offset 0 carries the whole preamble.
+    pub(crate) fn first_batch_frame(
+        &self,
+        id: u64,
+        limit: usize,
+        room: u64,
+    ) -> Option<(BatchFrame, u64)> {
+        let m = self.mp.as_deref()?;
+        if self.cold().reset.is_some() || self.state.is_terminal() {
+            return None;
+        }
+        let base = self.base;
+        let start = if m.buf_floor > base { m.buf_floor } else { 0 };
+        let unsent_room = self.max_data.saturating_sub(self.offset).min(room);
+        let unsent = (self.preamble_left as u64 + self.buf.len()).min(unsent_room);
+        let end = self.offset + unsent;
+        let whole = usize::try_from(end - start).ok()?.min(limit);
+        let header = BatchFrame::header(id, start, whole).encoded_len();
+        let len = whole.min(limit.saturating_sub(header));
+        if len == 0 || (start < base && (len as u64) < base) {
+            return None;
+        }
+        let mut data = vec![0; len];
+        let (head, rest) = data.split_at_mut((base.saturating_sub(start) as usize).min(len));
+        if !head.is_empty() {
+            head.copy_from_slice(self.preamble.as_deref()?.get(..head.len())?);
+        }
+        let at = start.max(base);
+        let kept_end = (m.buf_floor + self.buf.kept()).max(at);
+        let (kept, fresh) = rest.split_at_mut(((kept_end - at) as usize).min(rest.len()));
+        if !self.buf.copy_kept(at - m.buf_floor, kept) {
+            return None;
+        }
+        if !self.buf.peek_unsent(0, fresh) {
+            return None;
+        }
+        let new = (start + len as u64).saturating_sub(self.offset);
+        Some((BatchFrame { off: start, data }, new))
+    }
+
+    /// A first batch carried the next `new` bytes: they are sent, retained like any sent
+    /// bytes. Returns how many count as sent (`new`, unless the buffer lacked some) and how
+    /// many of those the application wrote (the rest a preamble).
+    pub(crate) fn batch_sent(&mut self, new: u64, chunks: &mut ChunkPool) -> (u64, u64) {
+        let pre = new.min(self.preamble_left as u64);
+        self.preamble_left -= pre as usize;
+        let mut left = (new - pre) as usize;
+        while left > 0 {
+            let took = self.buf.take_shared(left, true, chunks).len();
+            if took == 0 {
+                // The batch was built from these unsent bytes, so they are
+                // there. Should they not be, only what was taken counts as
+                // sent: the offset stays in step with the buffer, and the
+                // rest goes again from the same offset, the same bytes.
+                debug_assert!(
+                    false,
+                    "a batch carried {left} unsent bytes the buffer lacks"
+                );
+                break;
+            }
+            left -= took;
+        }
+        let app = new - pre - left as u64;
+        let new = pre + app;
+        self.offset += new;
+        self.open_want = false;
+        if self.state == SendState::Ready {
+            self.state = SendState::Send;
+        }
+        (new, app)
+    }
+}
+
 impl SendPart {
     /// A sending part whose data goes into `buf` (an empty buffer, maybe
     /// with capacity from a discarded stream).
@@ -818,6 +946,7 @@ impl SendPart {
             queued: None,
             waiter: None,
             sent_waiting: false,
+            open_want: false,
             waits: Waits::default(),
             mp: None,
             cold: None,
@@ -858,6 +987,7 @@ impl SendPart {
         self.preamble_left > 0
             || !self.buf.is_empty()
             || (self.fin && !self.fin_sent)
+            || self.open_want
             || self.has_lost()
     }
 
@@ -959,27 +1089,29 @@ impl SendPart {
         self.mp().acked.contiguous_end(from.max(self.held_from()))
     }
 
-    /// Whether new data (or the FIN) waits to be sent, reinjection aside.
-    pub(crate) fn has_fresh(&self) -> bool {
-        self.preamble_left > 0
-            || !self.buf.is_empty()
-            || (self.fin && !self.fin_sent && self.cold().reset.is_none())
-    }
-
     /// Whether only a FIN is owed: a zero-length frame that stream and
-    /// session credit and the retransmit budget never hold back (SPEC.md
-    /// Section 8.2), as it adds nothing to either sum.
+    /// session credit and the retransmit budget never hold back, as it adds nothing to either sum.
     pub(crate) fn fin_only(&self) -> bool {
         self.preamble_left == 0
             && self.buf.is_empty()
-            && self.fin
-            && !self.fin_sent
+            && ((self.fin && !self.fin_sent) || self.open_want)
             && self.cold().reset.is_none()
     }
 
     /// Whether stream credit holds the part back.
     pub(crate) fn credit_blocked(&self) -> bool {
         self.offset >= self.max_data && (self.preamble_left > 0 || !self.buf.is_empty())
+    }
+
+    /// Whether new data of a direction listed for opportunistic reinjection is held
+    /// back: by its stream credit, or by a binding that moves and so takes no new data
+    /// until its data on the old pipe is acknowledged. A small credit that arrives
+    /// during the move (a blocked direction gets any credit at once) leaves it as held
+    /// as before: the data that blocks it still sits on the old pipe.
+    pub(crate) fn held_back(&self) -> bool {
+        self.credit_blocked()
+            || ((self.preamble_left > 0 || !self.buf.is_empty())
+                && self.mp().bound.is_some_and(|b| b.move_to.is_some()))
     }
 }
 
@@ -1002,7 +1134,7 @@ pub(crate) struct RecvPart {
     gaps: Option<Box<Gaps>>,
     /// Every byte below this offset arrived (or, once the part discards its
     /// data, counts as arrived): each byte releases session credit once,
-    /// when it arrives (SPEC.md Section 8.3).
+    /// when it arrives.
     pub(crate) arrived_to: u64,
     pub(crate) final_size: Option<u64>,
     /// STOP_SENDING still to write.
@@ -1015,10 +1147,9 @@ pub(crate) struct RecvPart {
     pub(crate) window: u64,
     /// The stream's fixed auto-tuning cap (configured, or set by
     /// `set_receive_window`), or no limit under an automatic cap, which the
-    /// session's memory allowance bounds instead (SPEC.md Section 8.3 rule
-    /// 4).
+    /// session's memory allowance bounds instead.
     pub(crate) max_window: u64,
-    /// Auto-tuning (rule RB).
+    /// Receive-window auto-tuning.
     pub(crate) tuner: StreamTuner,
     /// A MAX_STREAM_DATA update is owed.
     pub(crate) update_pending: bool,
@@ -1108,7 +1239,7 @@ impl RecvPart {
 
     /// Records the arrival of `[start, end)`. Returns how many of its bytes
     /// arrived for the first time below the range a reset released: the
-    /// bytes whose session credit is handled now (SPEC.md Section 8.3).
+    /// bytes whose session credit is handled now.
     /// Bytes beyond a gap are not counted before they arrive.
     pub(crate) fn arrive(&mut self, start: u64, end: u64) -> u64 {
         let end = end.min(self.cold().released_from.unwrap_or(u64::MAX));
@@ -1144,9 +1275,8 @@ impl RecvPart {
 
     /// A reset with this Reliable Size and final size: the bytes of
     /// [Reliable Size, final size) that have not arrived will never be
-    /// delivered; returns how many, released now and never again (SPEC.md
-    /// Section 8.3). A reset that lowers the Reliable Size releases the
-    /// bytes between the two.
+    /// delivered; returns how many, released now and never again. A reset that lowers the Reliable
+    /// Size releases the bytes between the two.
     pub(crate) fn credit_reset(&mut self, reliable: u64, final_size: u64) -> u64 {
         let upto = self.cold().released_from.unwrap_or(final_size);
         if reliable >= upto {
@@ -1303,7 +1433,7 @@ impl RecvPart {
     }
 
     /// Heap bytes of the received data held for the application, with
-    /// its bookkeeping (SPEC.md Section 9.8).
+    /// its bookkeeping.
     pub(crate) fn memory(&self) -> usize {
         self.buf.memory()
             + self.tuner.memory()
@@ -1352,7 +1482,7 @@ fn within(whole: &Bytes, part: &[u8]) -> bool {
 
 /// What a receiving part keeps of the data and offsets received beyond a
 /// gap (multipath): the data in memory bounded by the span however the
-/// peer fragments it (SPEC.md Section 9.8), and the offsets that arrived
+/// peer fragments it, and the offsets that arrived
 /// beyond `arrived_to` (session credit).
 #[derive(Debug, Default)]
 struct Gaps {
@@ -1376,8 +1506,7 @@ pub(crate) enum Offer {
     Rejected,
 }
 
-/// Why a local stream fails after the peer's GOAWAY (EXTENSIONS.md Section
-/// 3.5).
+/// Why a local stream fails after the peer's GOAWAY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GoAwayFail {
     /// Emitted or pinned, at or above the watermark: the peer does not
@@ -1418,11 +1547,13 @@ pub(crate) struct Stream {
     pub(crate) send_released: bool,
     /// The application dropped its receiving handle.
     pub(crate) recv_released: bool,
-    /// The identifier was requested before the first frame (SPEC.md 7.2).
+    /// The identifier was requested before the first frame.
     pub(crate) pinned: bool,
     /// The opening frame of a pinned stream is owed.
     pub(crate) open_pending: bool,
-    /// The application declined the stream (EXTENSIONS.md 7.2).
+    /// Opened by data that arrived as carrier early data.
+    pub(crate) replayable: bool,
+    /// The application declined the stream.
     pub(crate) rejected: bool,
     /// The stream failed because of the peer's GOAWAY.
     pub(crate) goaway: Option<GoAwayFail>,
@@ -1505,6 +1636,18 @@ pub(crate) struct DatagramCounts {
 }
 
 impl Stream {
+    /// Whether the opening frame of a pinned stream is still owed: not
+    /// after a GOAWAY failed it or a reset, which carries the identifier,
+    /// took its place.
+    pub(crate) fn opening_owed(&self) -> bool {
+        self.open_pending
+            && self.goaway.is_none()
+            && self
+                .send
+                .as_ref()
+                .is_none_or(|send| send.cold().reset.is_none_or(|r| !r.written))
+    }
+
     /// The stream's datagram flow, created on first use.
     pub(crate) fn datagrams_mut(&mut self) -> &mut StreamDatagrams {
         self.datagrams.get_or_insert_default()
@@ -1539,6 +1682,7 @@ impl Stream {
             recv_released: false,
             pinned: false,
             open_pending: false,
+            replayable: false,
             rejected: false,
             goaway: None,
             extra: None,
@@ -1573,7 +1717,7 @@ impl Stream {
             .get_or_insert_with(|| Box::new(StreamExtra::NONE))
     }
 
-    /// Whether every part is terminal (STATE_MACHINE.md Section 2.3).
+    /// Whether every part is terminal.
     pub(crate) fn parts_terminal(&self) -> bool {
         self.send.as_ref().is_none_or(|s| s.state.is_terminal())
             && self.recv.as_ref().is_none_or(|r| r.state.is_terminal())
@@ -1743,7 +1887,7 @@ impl Slab {
     }
 }
 
-/// The stream index (SPEC.md Section 7.1).
+/// The stream index.
 pub(crate) const fn index(id: u64) -> u64 {
     id >> 2
 }
@@ -1761,4 +1905,23 @@ pub(crate) const fn client_initiated(id: u64) -> bool {
 /// The identifier of stream `index` of a type and initiator.
 pub(crate) const fn make_id(index: u64, dir: Dir, client: bool) -> u64 {
     (index << 2) | if matches!(dir, Dir::Uni) { 2 } else { 0 } | if client { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A first batch said to carry more than the buffer holds stops at
+    /// what it holds instead of looping, and counts only that as sent.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "the buffer lacks"))]
+    fn batch_sent_stops_at_the_buffer() {
+        let mut pool = ChunkPool::default();
+        let mut buf = SendBuf::default();
+        buf.push_slice(&[7; 10], &mut pool);
+        let mut part = SendPart::with_buf(1000, buf);
+        assert_eq!(part.batch_sent(20, &mut pool), (10, 10));
+        assert_eq!(part.offset, 10);
+        assert_eq!(part.buf.len(), 0);
+    }
 }

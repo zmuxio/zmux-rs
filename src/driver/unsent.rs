@@ -1,7 +1,7 @@
-//! The carrier's unsent count (API.md Section 4.1): an optional query of
-//! the sending half of each lane, which the drivers call without the core
-//! lock and hand to the core under it. The core's Q_p (SCHEDULER.md
-//! Section 4) is the bytes of the write calls in progress plus this count.
+//! The carrier's unsent count: an optional query of the sending half of
+//! each lane, which the drivers call without the core lock and hand to
+//! the core under it. The core's Q_p is the bytes of the write calls in
+//! progress plus this count.
 
 use std::time::Instant;
 
@@ -58,7 +58,7 @@ impl UnsentQuery {
     }
 
     /// When the next query is due.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn next_query(&self) -> Instant {
         self.next
     }
@@ -75,8 +75,8 @@ impl std::fmt::Debug for UnsentQuery {
 /// How often a pipe's retransmission count is queried, at most.
 pub(crate) const RETRANSMITTED_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A pipe's retransmission-count query (API.md Section 4.1), on its
-/// sending half, in the same two steps as [`UnsentQuery`], at most every
+/// A pipe's retransmission-count query, on its sending half, in the same
+/// two steps as [`UnsentQuery`], at most every
 /// [`RETRANSMITTED_INTERVAL`].
 pub(crate) struct RetransmittedQuery {
     query: Unsent,

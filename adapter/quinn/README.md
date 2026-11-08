@@ -15,7 +15,7 @@ application's (`connection()`).
 The carrier wires:
 
 - the connection's TLS 1.3 exporter, for `PipeAuth::exporter()` and for
-  carrier-bound joins (none when the handshake was not complete, as with
+  Bound joins (none when the handshake was not complete, as with
   0-RTT);
 - flow control for lanes: the peer may open `Options::lanes` lanes at once,
   and the connection's receive window covers that many stream windows and a

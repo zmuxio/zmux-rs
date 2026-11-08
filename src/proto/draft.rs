@@ -1,14 +1,16 @@
-//! The values that depend on the QMux draft version (SPEC.md Section
-//! 13.5): one set per draft, and the one this crate speaks
-//! ([`CURRENT`]). Every QMux-specific codepoint, the first-record check,
-//! the ALPN identifiers and their alias rule take their values from here,
-//! so that moving to another draft is a change of this module alone.
+//! The values that depend on the QMux draft version: one set per draft,
+//! and the one this crate speaks ([`CURRENT`]). Every QMux-specific
+//! codepoint, the first-record check, the ALPN identifiers and their
+//! alias rule take their values from here, so that moving to another
+//! draft is a change of this module alone.
 
 /// The values of one QMux draft version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Draft {
     /// The draft number (`2` for draft-ietf-quic-qmux-02).
     pub number: u8,
+    /// The version's name in negotiation results (`draft-02`).
+    pub name: &'static str,
     /// The QX_TRANSPORT_PARAMETERS frame type, which also starts every
     /// bootstrap pipe (the first-record check).
     pub transport_parameters: u64,
@@ -21,9 +23,9 @@ pub struct Draft {
     /// The ALPN identifier without an application.
     pub alpn: &'static str,
     /// The identifier of an earlier draft with the same codepoints, which
-    /// is accepted as an alias of [`Draft::alpn`] (SPEC.md Section 6.2),
-    /// with its application part (`<alias>.<application>`) and its
-    /// `<name>-NN` form for other names.
+    /// is accepted as an alias of [`Draft::alpn`], with its application
+    /// part (`<alias>.<application>`) and its `<name>-NN` form for other
+    /// names.
     pub alpn_alias: Option<&'static str>,
 }
 
@@ -31,6 +33,7 @@ pub struct Draft {
 /// its alias.
 pub const QMUX_02: Draft = Draft {
     number: 2,
+    name: "draft-02",
     transport_parameters: 0x3f51_5330_0d0a_0d0a,
     ping_request: 0x348c_6752_9ef8_c7bd,
     ping_response: 0x348c_6752_9ef8_c7be,

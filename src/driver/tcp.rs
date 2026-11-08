@@ -42,7 +42,7 @@ pub(crate) struct TcpSocket {
 impl TcpSocket {
     /// Duplicates the socket's descriptor (`None` when that fails).
     #[cfg(unix)]
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn new(socket: &impl std::os::fd::AsFd) -> Option<Self> {
         let fd = socket.as_fd().try_clone_to_owned().ok()?;
         Some(Self {
@@ -52,7 +52,7 @@ impl TcpSocket {
 
     /// Duplicates the socket handle (`None` when that fails).
     #[cfg(windows)]
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn new(socket: &impl std::os::windows::io::AsSocket) -> Option<Self> {
         let socket = socket.as_socket().try_clone_to_owned().ok()?;
         Some(Self {
@@ -61,7 +61,7 @@ impl TcpSocket {
     }
 
     /// A socket shared with its carrier (no duplicate).
-    #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
+    #[cfg(feature = "blocking")]
     pub(crate) fn shared(socket: std::sync::Arc<std::net::TcpStream>) -> Self {
         Self { socket }
     }
@@ -69,7 +69,7 @@ impl TcpSocket {
     /// Shuts the socket down both ways: the carrier fails without the
     /// graceful end of a layer above it (no TLS close_notify), and a read
     /// or write blocked on it returns.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn shut_down(&self) {
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }

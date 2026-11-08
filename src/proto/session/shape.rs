@@ -1,7 +1,7 @@
 //! Executes the [`Shaper`]s of the outbound pipes within the protocol's
 //! limits and the session's [`Limits`]. Nothing here exists until a
-//! factory or instance is set: the paths that consult it test
-//! `SessionCore::shape` for `None`.
+//! factory, an instance or something to meter is set: the paths that
+//! consult it test `SessionCore::shape` for `None`.
 //!
 //! While a batch is built the state moves into the batch's [`Records`]
 //! ([`ShapeTx`]) and comes back when the batch ends; stream events of that
@@ -15,9 +15,10 @@ use bytes::Bytes;
 
 use super::output::Records;
 use super::pipes::Attachment;
+use super::shape_account::{TokenBucket, WireAccount};
 use super::shaping::{
-    Caps, Event, EventKind, Factory, Inject, Limits, MIN_MAX_LEN, RecordPlan, RecordView, Reply,
-    STARTUP_ALLOWANCE, ShapedPipe, Shaper, Stats, Timer,
+    Budget, Caps, Effects, Event, EventKind, Factory, Injection, Limits, MAX_ACCOUNT_RATE, Meters,
+    RecordPlan, RecordView, RecordWire, ShapedPipe, Shaper, Stats, burst_floor, rate_floor,
 };
 use super::{CarrierKind, PipeId, SessionCore};
 
@@ -31,9 +32,15 @@ pub(crate) struct Shaping {
     factory: Option<Arc<dyn Factory>>,
     /// Bumped by `set_shaper`: an instance of an older one is replaced.
     generation: u64,
+    /// The local limits under the budget.
     limits: Limits,
+    account: WireAccount,
+    /// The session's bytes earned, as of the last batch.
+    earn: u64,
     pub(super) stats: Stats,
     pipes: Vec<PipeShape>,
+    /// Time 0 of the session clock shapers see.
+    base: Instant,
 }
 
 impl std::fmt::Debug for Shaping {
@@ -55,27 +62,36 @@ struct PipeShape {
     seq: u64,
     /// The plan of the next record, once made.
     plan: Option<RecordPlan>,
+    /// How that record's lengths convert.
+    wire: RecordWire,
+    /// PADDING frames bytes an injection added to that record.
+    added: usize,
+    /// Of those, what the account already metered.
+    added_paid: usize,
     /// The planned record's earliest send time (`RecordPlan::delay`):
     /// until then the pipe sends nothing but CONNECTION_CLOSE, and the
     /// frames owed meanwhile wait in that record.
     delay_until: Option<Instant>,
     /// Stream data waits until then (a gate's pause).
     hold: Option<Instant>,
+    /// The latest `pause_until` taken, whose pause is counted.
+    paused_until: u64,
     /// Gates applied: a batch that sees it change takes the new gate's
     /// room.
     gates: u64,
-    rate: u64,
-    burst: u64,
-    tokens: f64,
-    filled: Instant,
-    inject: Option<(Instant, usize)>,
+    /// The rate as answered; the bucket holds the rate in force.
+    rate_asked: u64,
+    bucket: TokenBucket,
+    /// The rate gate holds data since then.
+    held_since: Option<u64>,
+    inject: Option<Injection>,
     inject_due: bool,
-    timers: [Option<Instant>; 2],
-    weight: Option<f64>,
+    wake: Option<u64>,
+    weight: Option<u32>,
 }
 
 impl PipeShape {
-    fn new(pipe: u64, generation: u64, now: Instant) -> Self {
+    fn new(pipe: u64, generation: u64) -> Self {
         Self {
             pipe,
             generation,
@@ -83,31 +99,28 @@ impl PipeShape {
             caps: Caps::NONE,
             seq: 0,
             plan: None,
+            wire: RecordWire::default(),
+            added: 0,
+            added_paid: 0,
             delay_until: None,
             hold: None,
+            paused_until: 0,
             gates: 0,
-            rate: 0,
-            burst: 0,
-            tokens: 0.0,
-            filled: now,
+            rate_asked: 0,
+            bucket: TokenBucket::default(),
+            held_since: None,
             inject: None,
             inject_due: false,
-            timers: [None; 2],
+            wake: None,
             weight: None,
         }
     }
 
-    /// The bucket level at `now`.
-    fn tokens_at(&self, now: Instant) -> f64 {
-        let dt = now.saturating_duration_since(self.filled).as_secs_f64();
-        (self.tokens + self.rate as f64 * dt).min(self.burst as f64)
-    }
-
-    /// The level that releases a held pipe: one granularity's bytes.
-    fn quantum(&self) -> f64 {
-        (self.rate as f64 * GRANULARITY.as_secs_f64())
-            .min(self.burst as f64)
-            .max(1.0)
+    /// The bucket at `us`.
+    fn bucket_at(&self, us: u64) -> TokenBucket {
+        let mut b = self.bucket;
+        b.fill(us);
+        b
     }
 
     /// Whether the planned record waits for its delay.
@@ -115,43 +128,24 @@ impl PipeShape {
         self.shaper.is_some() && self.plan.is_some() && self.delay_until.is_some_and(|t| now < t)
     }
 
-    fn held(&self, now: Instant) -> bool {
+    fn held(&self, now: Instant, us: u64) -> bool {
         self.shaper.is_some()
             && (self.hold.is_some_and(|h| now < h)
-                || self.rate > 0 && self.tokens_at(now) < self.quantum())
-    }
-
-    /// When a held pipe is released.
-    fn release(&self, now: Instant) -> Instant {
-        let mut t = self.hold.unwrap_or(now);
-        let tokens = self.tokens_at(now);
-        if self.rate > 0 && tokens < self.quantum() {
-            let wait = (self.quantum() - tokens) / self.rate as f64;
-            t = t.max(now + Duration::from_secs_f64(wait) + Duration::from_nanos(1));
-        }
-        t.max(now + GRANULARITY)
+                || self.bucket.rate > 0 && self.bucket_at(us).held())
     }
 }
 
 impl Shaping {
-    /// H_p (MULTIPATH.md Section 7.1): the longest the next pause may
-    /// last, the smaller of `Limits::max_delay` and what remains of
-    /// `Limits::max_pause_total` (each counted only when set); zero when
-    /// neither is set.
+    /// H_p: the longest the next pause may
+    /// last; zero when none may or nothing bounds one.
     pub(super) fn hold_bound(&self) -> Duration {
-        let l = &self.limits;
-        let per = l.max_delay;
-        let rest = l
-            .max_pause_total
-            .map(|t| t.saturating_sub(self.stats.pause_total));
-        match (per, rest) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => Duration::ZERO,
+        if self.limits.no_pause {
+            return Duration::ZERO;
         }
+        self.limits.wait_bound().unwrap_or(Duration::ZERO)
     }
 
-    /// H_p of `pipe` (MULTIPATH.md Section 7.1): [`Self::hold_bound`] for a
+    /// H_p of `pipe`: [`Self::hold_bound`] for a
     /// pipe whose shaper plans its records, zero for any other.
     pub(super) fn probe_hold(&self, pipe: u64) -> Duration {
         let planned = self.index(pipe).is_some_and(|i| {
@@ -165,14 +159,79 @@ impl Shaping {
         }
     }
 
-    pub(super) fn new(limits: Limits) -> Self {
+    pub(super) fn new(limits: Limits, base: Instant, earn: u64) -> Self {
+        let mut account = WireAccount::default();
+        // The account runs from the session's start, whenever it is first needed.
+        account.set(0, 0, limits.wire);
         Self {
             factory: None,
             generation: 0,
             limits,
+            account,
+            earn,
             stats: Stats::default(),
             pipes: Vec::new(),
+            base,
         }
+    }
+
+    /// Puts new limits in force; the account carries over.
+    fn set_limits(&mut self, limits: Limits, now: Instant) {
+        self.limits = limits;
+        self.account.set(self.micros(now), self.earn, limits.wire);
+        for i in 0..self.pipes.len() {
+            if self.pipes[i].shaper.is_some() && self.pipes[i].rate_asked != 0 {
+                let us = self.micros(now);
+                self.pipes[i].bucket.fill(us);
+                self.settle_held(i, us);
+                self.set_rate(i);
+            }
+        }
+    }
+
+    /// The session clock as last seen by the account.
+    const fn account_now(&self) -> u64 {
+        self.account.last_us
+    }
+
+    /// Counts the wait of a rate gate that holds data up to `us` and ends it.
+    fn settle_held(&mut self, i: usize, us: u64) {
+        if let Some(from) = self.pipes[i].held_since.take() {
+            let d = Duration::from_micros(us.saturating_sub(from));
+            self.stats.stall_spent = self.stats.stall_spent.saturating_add(d);
+        }
+    }
+
+    /// Puts the rate asked in force, within the lower bound of one wait.
+    fn set_rate(&mut self, i: usize) {
+        let md = self
+            .limits
+            .wait_bound()
+            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        let (rate, clamped) = rate_floor(self.pipes[i].rate_asked, md);
+        if clamped {
+            self.stats.clamped += 1;
+        }
+        self.pipes[i].bucket.rate = rate;
+    }
+
+    /// The session's readings at `us`.
+    fn meters(&mut self, us: u64) -> Meters {
+        self.account.accrue(us, self.earn);
+        let stall = u64::try_from(self.stats.stall_spent.as_micros()).unwrap_or(u64::MAX);
+        let mut m = Meters::new(self.account.left(), u64::MAX, self.account.spent, self.earn);
+        m.stall_spent = stall;
+        m
+    }
+
+    /// `now` on the session clock.
+    fn micros(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// The instant of time `t` of the session clock.
+    fn instant(&self, t: u64) -> Instant {
+        later(self.base, Duration::from_micros(t))
     }
 
     fn index(&self, pipe: u64) -> Option<usize> {
@@ -212,16 +271,14 @@ impl Shaping {
     ) -> usize {
         let i = match self.index(pipe) {
             Some(i) => {
-                self.event(
-                    i,
-                    Event::new(EventKind::Replaced, PipeId(pipe), now),
-                    record,
-                );
-                self.pipes[i] = PipeShape::new(pipe, self.generation, now);
+                let e = Event::new(EventKind::Replaced, PipeId(pipe), self.micros(now));
+                self.event(i, e, record);
+                self.settle_held(i, self.micros(now));
+                self.pipes[i] = PipeShape::new(pipe, self.generation);
                 i
             }
             None => {
-                self.pipes.push(PipeShape::new(pipe, self.generation, now));
+                self.pipes.push(PipeShape::new(pipe, self.generation));
                 self.pipes.len() - 1
             }
         };
@@ -232,7 +289,8 @@ impl Shaping {
         let mut caps = Caps::NONE;
         if self.call(i, |x| caps = x.capabilities()) {
             self.pipes[i].caps = caps;
-            self.event(i, Event::new(EventKind::Start, PipeId(pipe), now), record);
+            let e = Event::new(EventKind::Start, PipeId(pipe), self.micros(now));
+            self.event(i, e, record);
         }
         i
     }
@@ -246,8 +304,8 @@ impl Shaping {
             return true;
         }
         self.stats.faults += 1;
-        let filled = self.pipes[i].filled;
-        self.stop(i, false, filled);
+        let now = self.instant(self.account_now());
+        self.stop(i, false, now);
         false
     }
 
@@ -256,17 +314,22 @@ impl Shaping {
         if p.shaper.is_none() {
             return;
         }
+        let pipe = p.pipe;
+        self.settle_held(i, self.micros(now));
         if notify {
-            let e = Event::new(EventKind::Stopped, PipeId(p.pipe), now);
-            self.call(i, |x| x.on_event(&e, &mut Reply::default()));
+            let e = Event::new(EventKind::Stopped, PipeId(pipe), self.micros(now));
+            self.call(i, |x| x.on_event(&e, &mut Effects::default()));
         }
         let (pipe, generation) = (self.pipes[i].pipe, self.pipes[i].generation);
-        self.pipes[i] = PipeShape::new(pipe, generation, now);
+        self.pipes[i] = PipeShape::new(pipe, generation);
     }
 
-    /// Delivers a notification and applies the reply.
-    fn event(&mut self, i: usize, e: Event, record: usize) {
-        let mut r = Reply::default();
+    /// Delivers a notification and applies the answer.
+    fn event(&mut self, i: usize, mut e: Event, record: usize) {
+        if self.pipes[i].caps.contains(Caps::BUDGET) {
+            e.meters = self.meters(e.now);
+        }
+        let mut r = Effects::default();
         if !self.call(i, |x| x.on_event(&e, &mut r)) {
             return;
         }
@@ -274,38 +337,56 @@ impl Shaping {
             e.kind,
             EventKind::Replaced | EventKind::Stopped | EventKind::PipeFailed
         ) {
-            self.apply(i, &r, e.now, record);
+            self.apply(i, &r, self.instant(e.now), record);
         }
     }
 
-    fn apply(&mut self, i: usize, r: &Reply, now: Instant, record: usize) {
+    fn apply(&mut self, i: usize, r: &Effects, now: Instant, record: usize) {
+        let p = &mut self.pipes[i];
         if let Some(inject) = r.inject {
-            let p = &mut self.pipes[i];
-            p.inject = None;
+            p.inject = inject;
             p.inject_due = false;
-            if let Inject::Send { after, len } = inject {
-                p.inject = Some((now + after, len.max(1)));
-            }
+        }
+        if let Some(wake) = r.wake {
+            p.wake = wake;
+        }
+        if let Some(w) = r.weight.filter(|w| *w > 0) {
+            p.weight = Some(w);
         }
         if let Some(g) = r.gate {
-            let hold = self.pause(g.pause, now);
-            let p = &mut self.pipes[i];
-            p.hold = hold;
-            p.rate = g.rate;
-            p.burst = if g.burst == 0 { record as u64 } else { g.burst };
-            p.tokens = p.burst as f64;
-            p.filled = now;
-            p.gates += 1;
-        }
-        for (slot, t) in self.pipes[i].timers.iter_mut().zip(&r.timers) {
-            match t {
-                Some(Timer::After(d)) => *slot = Some(now + *d),
-                Some(Timer::Cancel) => *slot = None,
-                None => {}
+            let (burst, raised) = burst_floor(g.burst, record as u64);
+            let p = &self.pipes[i];
+            let rate = g.rate.min(MAX_ACCOUNT_RATE);
+            let rated = p.rate_asked != rate || p.bucket.burst != burst as i64;
+            // Only what extends the pauses asked for so far counts: an answer repeats its
+            // pause_until, and a limit may have shortened that pause.
+            let asked = p.paused_until;
+            let current = p.hold.filter(|&h| h > now).unwrap_or(now);
+            let from = self.micros(current);
+            let paused = g.pause_until > from.max(asked);
+            if paused {
+                self.pipes[i].paused_until = g.pause_until;
+                let d = g.pause_until - from.max(asked);
+                if let Some(end) = self.pause(Duration::from_micros(d), current) {
+                    self.pipes[i].hold = Some(end);
+                }
             }
-        }
-        if let Some(w) = r.weight.filter(|w| w.is_finite() && *w > 0.0) {
-            self.pipes[i].weight = Some(w);
+            if rated {
+                let us = self.micros(now);
+                if raised && rate != 0 {
+                    self.stats.clamped += 1;
+                }
+                self.pipes[i].bucket.fill(us);
+                self.settle_held(i, us);
+                self.pipes[i].rate_asked = rate;
+                self.pipes[i].bucket.burst = burst as i64;
+                self.set_rate(i);
+                self.pipes[i].bucket.reset(us);
+            }
+            let p = &mut self.pipes[i];
+            if paused || rated {
+                p.gates += 1;
+            }
         }
         if r.stop {
             self.stop(i, true, now);
@@ -317,62 +398,29 @@ impl Shaping {
         if d.is_zero() {
             return None;
         }
-        let l = self.limits;
-        if let Some(m) = l.max_delay.filter(|&m| d > m) {
+        if self.limits.no_pause {
+            self.stats.clamped += 1;
+            return None;
+        }
+        if let Some(m) = self.limits.wait_bound().filter(|&m| d > m) {
             d = m;
             self.stats.clamped += 1;
         }
-        if let Some(m) = l
-            .max_pause_total
-            .filter(|&m| d > m.saturating_sub(self.stats.pause_total))
-        {
-            d = m.saturating_sub(self.stats.pause_total);
-            self.stats.clamped += 1;
-        }
-        if d.is_zero() {
-            return None;
-        }
-        self.stats.pause_total = self.stats.pause_total.saturating_add(d);
-        Some(now + d)
+        self.stats.stall_spent = self.stats.stall_spent.saturating_add(d);
+        Some(later(now, d))
     }
 
-    /// The PADDING bytes the limits still allow, `sent` the session's
-    /// bytes sent: by `max_padding_bytes` (a hard bound) and by
-    /// `max_padding_ratio`, with the [`STARTUP_ALLOWANCE`] at least;
-    /// `u64::MAX`: unbounded.
-    fn padding_room(&self, sent: u64) -> (u64, u64) {
-        let l = self.limits;
-        let have = self.stats.padding_bytes;
-        let mut hard = u64::MAX;
-        let mut ratio = u64::MAX;
-        if let Some(b) = l.max_padding_bytes {
-            hard = b.saturating_sub(have);
+    /// Reports an injection that will not go. An answer that keeps it is tried again a
+    /// granularity later, not at once.
+    fn dropped(&mut self, i: usize, us: u64, record: usize) {
+        self.stats.inject_dropped += 1;
+        self.pipes[i].inject_due = false;
+        let e = Event::new(EventKind::InjectDropped, PipeId(self.pipes[i].pipe), us);
+        self.event(i, e, record);
+        let next = us.saturating_add(GRANULARITY.as_micros() as u64);
+        if let Some(x) = self.pipes[i].inject.as_mut().filter(|x| x.at < next) {
+            x.at = next;
         }
-        if let Some(r) = l.max_padding_ratio {
-            let other = sent.saturating_sub(have);
-            let m = ((r * other as f64) as u64).max(STARTUP_ALLOWANCE);
-            ratio = m.saturating_sub(have);
-        }
-        (hard, ratio)
-    }
-
-    /// Whether an injection of `n` bytes may go now: the ratio allows it
-    /// whole, or a hard bound, which cuts it, binds first.
-    fn inject_covered(&self, n: usize, sent: u64) -> bool {
-        let (hard, ratio) = self.padding_room(sent);
-        ratio >= n as u64 || hard <= ratio
-    }
-
-    /// Bounds `n` bytes of PADDING by the limits and counts them; `sent`
-    /// is the session's bytes sent.
-    fn allow_padding(&mut self, n: usize, sent: u64) -> usize {
-        let (hard, ratio) = self.padding_room(sent);
-        let u = (n as u64).min(hard).min(ratio);
-        if u < n as u64 {
-            self.stats.clamped += 1;
-        }
-        self.stats.padding_bytes += u;
-        u as usize
     }
 
     /// Whether the records of `pipe` are shaped: its instance of the
@@ -389,74 +437,109 @@ impl Shaping {
     }
 
     pub(super) fn held(&self, pipe: u64, now: Instant) -> bool {
-        self.index(pipe).is_some_and(|i| self.pipes[i].held(now))
+        let us = self.micros(now);
+        self.index(pipe)
+            .is_some_and(|i| self.pipes[i].held(now, us))
     }
 
     pub(super) fn delayed(&self, pipe: u64, now: Instant) -> bool {
         self.index(pipe).is_some_and(|i| self.pipes[i].delayed(now))
     }
 
-    /// Whether `pipe` has an injection due that the limits let go now.
-    pub(super) fn inject_due(&self, pipe: u64, sent: u64) -> bool {
-        self.index(pipe).is_some_and(|i| {
-            let p = &self.pipes[i];
-            p.inject_due && p.inject.is_none_or(|(_, n)| self.inject_covered(n, sent))
-        })
+    /// Whether `pipe` has an injection due.
+    pub(super) fn inject_due(&self, pipe: u64) -> bool {
+        self.index(pipe).is_some_and(|i| self.pipes[i].inject_due)
     }
 
-    pub(super) fn weight(&self, pipe: u64) -> Option<Option<f64>> {
+    /// When a held pipe is released.
+    fn release(&self, i: usize, now: Instant) -> Instant {
+        let p = &self.pipes[i];
+        let mut t = p.hold.unwrap_or(now);
+        let us = self.micros(now);
+        let b = p.bucket_at(us);
+        if b.rate > 0 && b.held() {
+            let at = b
+                .release()
+                .map_or_else(|| later(now, Duration::MAX), |x| self.instant(x));
+            t = t.max(at);
+        }
+        t.max(now + GRANULARITY)
+    }
+
+    pub(super) fn weight(&self, pipe: u64) -> Option<Option<u32>> {
         let p = &self.pipes[self.index(pipe)?];
         p.shaper.is_some().then_some(p.weight)
     }
 
     /// Stream data room of a batch by the gate: `None` unbounded.
     fn room(&mut self, i: usize, now: Instant) -> Option<u64> {
+        let us = self.micros(now);
         let p = &mut self.pipes[i];
-        if p.held(now) {
+        if p.bucket.rate == 0 {
+            self.settle_held(i, us);
+        } else {
+            p.bucket.fill(us);
+            match (p.bucket.held(), p.held_since) {
+                (true, None) => p.held_since = Some(us),
+                (false, Some(_)) => self.settle_held(i, us),
+                _ => {}
+            }
+        }
+        let p = &self.pipes[i];
+        if p.held(now, us) {
             return Some(0);
         }
-        if p.rate == 0 {
+        if p.bucket.rate == 0 {
             return None;
         }
-        p.tokens = p.tokens_at(now);
-        p.filled = now;
-        Some(p.tokens as u64)
+        Some(p.bucket.tokens.max(0) as u64)
     }
 
     /// The earliest shaping deadline; `data` whether stream data waits.
     pub(super) fn deadline(&self, now: Instant, data: bool) -> Option<Instant> {
         let mut t: Option<Instant> = None;
         let mut at = |x: Instant| t = Some(t.map_or(x, |t| t.min(x)));
-        for p in self.pipes.iter().filter(|p| p.shaper.is_some()) {
-            p.timers.iter().flatten().for_each(|&x| at(x));
-            if let Some((x, _)) = p.inject.filter(|_| !p.inject_due) {
-                at(x);
+        let us = self.micros(now);
+        for (i, p) in self
+            .pipes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.shaper.is_some())
+        {
+            if let Some(x) = p.wake {
+                at(self.instant(x));
+            }
+            if let Some(x) = p.inject.filter(|_| !p.inject_due) {
+                at(self.instant(x.at));
             }
             if p.delayed(now) {
                 // Exactly: the delayed record goes at its time.
                 at(p.delay_until.expect("delayed"));
             }
-            if data && p.held(now) {
-                at(p.release(now));
+            if data && p.held(now, us) {
+                at(self.release(i, now));
             }
         }
         t
     }
 
-    /// Runs the due timers and injections.
+    /// Sends the due wakes and marks the due injections.
     pub(super) fn timeout(&mut self, now: Instant, record: usize) {
+        let t = self.micros(now);
         for i in 0..self.pipes.len() {
-            for slot in 0..2 {
+            let p = &self.pipes[i];
+            if p.shaper.is_some()
+                && let Some(w) = p.wake.filter(|w| *w <= t)
+            {
+                self.event(i, Event::new(EventKind::Wake, PipeId(p.pipe), t), record);
+                // Not replaced: not again at once, or the deadline stays in the past.
                 let p = &mut self.pipes[i];
-                if p.shaper.is_none() || p.timers[slot].is_none_or(|t| t > now) {
-                    continue;
+                if p.wake == Some(w) {
+                    p.wake = Some(t.saturating_add(GRANULARITY.as_micros() as u64));
                 }
-                p.timers[slot] = None;
-                let e = Event::new(EventKind::Timer, PipeId(p.pipe), now).with_timer(slot);
-                self.event(i, e, record);
             }
             let p = &mut self.pipes[i];
-            if p.shaper.is_some() && !p.inject_due && p.inject.is_some_and(|(t, _)| t <= now) {
+            if p.shaper.is_some() && !p.inject_due && p.inject.is_some_and(|x| x.at <= t) {
                 p.inject_due = true;
             }
         }
@@ -485,7 +568,8 @@ impl Shaping {
     /// Ends shaping of a pipe whose outbound direction failed.
     pub(super) fn pipe_failed(&mut self, pipe: u64, now: Instant) {
         if let Some(i) = self.index(pipe) {
-            self.event(i, Event::new(EventKind::PipeFailed, PipeId(pipe), now), 0);
+            let e = Event::new(EventKind::PipeFailed, PipeId(pipe), self.micros(now));
+            self.event(i, e, 0);
             self.pipes.swap_remove(i);
         }
     }
@@ -498,9 +582,9 @@ pub(super) struct ShapeTx {
     pipe: u64,
     lane: u64,
     now: Instant,
-    /// The session's bytes sent before the batch.
-    sent: u64,
-    /// `max_len` of the open plan; 0: none.
+    /// The carrier's write overhead.
+    overhead: usize,
+    /// The largest frames length of the open plan; 0: none.
     cut: usize,
     /// Stream data room by the gate; `None`: unbounded.
     pub(super) room: Option<u64>,
@@ -519,42 +603,69 @@ pub(super) struct ShapeTx {
     gate_spent: u64,
 }
 
+/// `now + d` for a duration of a shaper, of any size: one beyond the clock's
+/// range is a time that does not come in the life of a session.
+fn later(now: Instant, d: Duration) -> Instant {
+    const FAR: Duration = Duration::from_secs(1 << 32);
+    now.checked_add(d)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
+}
+
 impl ShapeTx {
     /// Plans the record that opens next, the first of a carrier write call
     /// when `write_start`; returns its largest frames length.
-    pub(super) fn prep(&mut self, limit: usize, write_start: bool) -> usize {
+    pub(super) fn prep(&mut self, limit: usize, write_start: bool, size_field: bool) -> usize {
         let now = self.now;
         let s = &mut *self.s;
         let i = self.i;
         if s.pipes[i].shaper.is_none() {
             return limit;
         }
-        if s.pipes[i].plan.is_none() {
+        let wire = RecordWire {
+            size_field,
+            overhead: if write_start { self.overhead } else { 0 },
+        };
+        s.pipes[i].wire = wire;
+        let fresh = s.pipes[i].plan.is_none();
+        if fresh {
             let mut plan = RecordPlan::default();
             if s.pipes[i].caps.contains(Caps::PLAN) {
-                let v = RecordView::new(PipeId(self.pipe), self.lane, s.pipes[i].seq, limit, now)
-                    .with_write_start(write_start);
+                let us = s.micros(now);
+                let mut v =
+                    RecordView::new(PipeId(self.pipe), self.lane, s.pipes[i].seq, limit, us)
+                        .with_write_start(write_start);
+                if s.pipes[i].caps.contains(Caps::BUDGET) {
+                    v = v.with_meters(s.meters(us));
+                }
                 if !s.call(i, |x| x.plan(&v, &mut plan)) {
                     return limit;
                 }
             }
-            if plan.max_len > 0 && plan.max_len < MIN_MAX_LEN {
-                plan.max_len = MIN_MAX_LEN;
+            if s.limits.no_padding && (plan.pad_to | plan.pad_multiple | plan.pad) != 0 {
+                plan.pad_to = 0;
+                plan.pad_multiple = 0;
+                plan.pad = 0;
                 s.stats.clamped += 1;
             }
             // No padding target goes beyond a record, so that the padding
             // arithmetic cannot overflow.
-            for f in [&mut plan.pad_to, &mut plan.pad_multiple, &mut plan.pad] {
-                if *f > limit {
-                    *f = limit;
+            let most = wire.wire(limit);
+            for (f, m) in [
+                (&mut plan.pad_to, most),
+                (&mut plan.pad_multiple, most),
+                (&mut plan.pad, limit),
+            ] {
+                if *f > m {
+                    *f = m;
                     s.stats.clamped += 1;
                 }
             }
-            let reply = std::mem::take(&mut plan.reply);
+            let effects = std::mem::take(&mut plan.effects);
             let delay = plan.delay;
             s.pipes[i].plan = Some(plan);
-            if !reply.is_empty() {
-                s.apply(i, &reply, now, limit);
+            if !effects.is_empty() {
+                s.apply(i, &effects, now, limit);
                 self.regate();
                 if self.s.pipes[i].shaper.is_none() {
                     return limit;
@@ -569,17 +680,17 @@ impl ShapeTx {
             self.delayed = true;
             return limit;
         }
-        let plan = s.pipes[i].plan.as_ref().expect("planned");
-        self.cut = match plan.max_len {
-            m if m > 0 && m < limit => m.max(MIN_MAX_LEN),
-            _ => 0,
-        };
+        let plan = s.pipes[i].plan.as_mut().expect("planned");
+        let (most, raised) = wire.frames_max(plan);
+        if raised && fresh {
+            s.stats.clamped += 1;
+        }
+        self.cut = if most > 0 && most < limit { most } else { 0 };
         if self.cut > 0 { self.cut } else { limit }
     }
 
-    /// After a gate was applied during the batch (a plan's or an event's
-    /// reply), the stream data room is the new gate's: from its full
-    /// bucket, which pays only for the data written after it.
+    /// After a gate was applied during the batch (by a plan or an event), the stream data room is
+    /// the new gate's: from its full bucket, which pays only for the data written after it.
     fn regate(&mut self) {
         let gates = self.s.pipes[self.i].gates;
         if gates == self.gates {
@@ -589,6 +700,11 @@ impl ShapeTx {
         self.gate_spent = self.spent;
         self.room = self.s.room(self.i, self.now);
         self.data_held = self.room == Some(0);
+    }
+
+    /// A preamble beyond the plan's largest record opens the record anyway.
+    pub(super) const fn count_clamped(&mut self) {
+        self.s.stats.clamped += 1;
     }
 
     /// The open plan's largest frames length, or `limit`.
@@ -605,11 +721,8 @@ impl ShapeTx {
         let Some(p) = self.planned() else {
             return 0;
         };
-        let mut t = n.max(p.pad_to);
-        if p.pad_multiple > 0 && t % p.pad_multiple != 0 {
-            t += p.pad_multiple - t % p.pad_multiple;
-        }
-        t - n + p.pad
+        let s = &self.s.pipes[self.i];
+        s.wire.frames(n, p) - n + s.added
     }
 
     /// The most frames bytes the planned record may hold so that, padded
@@ -619,11 +732,16 @@ impl ShapeTx {
         let Some(p) = self.planned() else {
             return Some(usize::MAX);
         };
-        let mut b = total.checked_sub(p.pad)?;
+        let (wire, added) = (self.s.pipes[self.i].wire, self.s.pipes[self.i].added);
+        let total = total.checked_sub(added)?;
+        if p.pad_to == 0 && p.pad_multiple == 0 && p.pad == 0 {
+            return Some(total);
+        }
+        let mut b = wire.wire(total).checked_sub(p.pad)?;
         if p.pad_multiple > 0 {
             b -= b % p.pad_multiple;
         }
-        (b >= p.pad_to).then_some(b)
+        (b >= p.pad_to).then(|| wire.frames_within(b))
     }
 
     /// Closes the plan of a record that is ending with `len` frames bytes
@@ -637,9 +755,17 @@ impl ShapeTx {
             pad = avail;
             self.s.stats.clamped += 1;
         }
-        let pad = self.s.allow_padding(pad, self.sent);
+        let s = &mut *self.s;
+        let p = &s.pipes[self.i];
+        if self.cut > 0 && len >= self.cut {
+            // Cut at the plan's largest record: the next record's head.
+            s.account.spend((p.wire.wire(self.cut) - self.cut) as u64);
+        }
+        s.account.spend(pad.saturating_sub(p.added_paid) as u64);
         let p = &mut self.s.pipes[self.i];
         let plan = p.plan.take().expect("planned");
+        p.added = 0;
+        p.added_paid = 0;
         p.delay_until = None;
         p.seq += 1;
         self.cut = 0;
@@ -655,8 +781,23 @@ impl ShapeTx {
 }
 
 impl SessionCore {
-    /// Installs `factory` on every outbound pipe; `None`: no shaping.
+    /// Installs `factory` on every outbound pipe, with no configuration budget; `None`: no
+    /// shaping. The account carries over.
     pub fn set_shaper(&mut self, factory: Option<Arc<dyn Factory>>) {
+        self.set_shaper_budgeted(factory, Budget::default());
+    }
+
+    /// Installs `factory` as [`Self::set_shaper`] does, under `budget`, one session's
+    /// answer of a [`super::shaping::ShapingBudget`].
+    pub fn set_shaper_budgeted(&mut self, factory: Option<Arc<dyn Factory>>, budget: Budget) {
+        self.shape_budget = budget;
+        let limits = self.shaping_limits_in_force();
+        let now = self.now;
+        self.shaping().set_limits(limits, now);
+        self.install_shaper(factory);
+    }
+
+    pub(super) fn install_shaper(&mut self, factory: Option<Arc<dyn Factory>>) {
         let record = self.max_record();
         let now = self.now;
         let s = self.shaping();
@@ -674,6 +815,59 @@ impl SessionCore {
         }
     }
 
+    /// Replaces the session's local limits, tighter or looser; invalid ones change
+    /// nothing. The account's spending carries over.
+    pub fn set_shaping_limits(&mut self, limits: Limits) -> Result<(), &'static str> {
+        limits.validate()?;
+        Arc::make_mut(&mut self.config).shaping_limits = limits;
+        let eff = self.shaping_limits_in_force();
+        let now = self.now;
+        self.shaping().set_limits(eff, now);
+        Ok(())
+    }
+
+    /// The session's local limits.
+    pub fn shaping_limits(&self) -> Limits {
+        self.config.shaping_limits
+    }
+
+    /// The local limits under the budget.
+    pub fn shaping_limits_in_force(&self) -> Limits {
+        self.config.shaping_limits.under(&self.shape_budget)
+    }
+
+    /// The session's readings.
+    pub fn shaping_meters(&mut self) -> Meters {
+        let now = self.now;
+        let s = self.shaping();
+        let us = s.micros(now);
+        s.meters(us)
+    }
+
+    /// Meters wire bytes of an accompanying action.
+    pub(super) fn shaping_spend(&mut self, n: u64) {
+        if n > 0 {
+            self.shaping().account.spend(n);
+        }
+    }
+
+    /// Meters the padding of a handshake run on the carrier before the session.
+    pub fn shaping_spend_handshake(&mut self, n: u64) {
+        self.shaping_spend(n);
+    }
+
+    /// Counts a batch of `bytes` as earned, but for its padding, injections and copies
+    /// and what a discarded first flight already earned.
+    pub(super) fn count_earned(&mut self, bytes: u64) {
+        let earned = bytes.saturating_sub(std::mem::take(&mut self.batch_not_earned));
+        let skip = earned.min(self.earn_skip);
+        self.earn_skip -= skip;
+        self.earn_bytes += earned - skip;
+        if let Some(s) = self.shape.as_deref_mut() {
+            s.earn = self.earn_bytes;
+        }
+    }
+
     /// Records the kind of pipe `pipe`'s carrier: the [`ShapedPipe`] a
     /// shaper factory sees, and the kind in pipe events and statistics.
     /// Set it before the pipe's first record is made (on the bootstrap
@@ -687,6 +881,17 @@ impl SessionCore {
             }
             None => false,
         }
+    }
+
+    /// Records the host's label of the transform pipe `pipe`'s carrier runs:
+    /// the [`ShapedPipe`] a shaper factory sees, and pipe statistics. Set it
+    /// like [`Self::set_pipe_carrier`]. `false` when there is no such pipe.
+    pub fn set_pipe_variant(&mut self, pipe: PipeId, variant: Option<Arc<str>>) -> bool {
+        let Some(a) = self.att_mut(pipe.0) else {
+            return false;
+        };
+        a.set_variant(variant);
+        true
     }
 
     /// Records the write overhead of pipe `pipe`'s carrier: the fixed
@@ -745,13 +950,21 @@ impl SessionCore {
 
     /// The shaping counters.
     pub fn shaping_stats(&self) -> Stats {
-        self.shape.as_ref().map(|s| s.stats).unwrap_or_default()
+        let mut stats = Stats::default();
+        if let Some(s) = self.shape.as_ref() {
+            stats = s.stats;
+            stats.wire_spent = s.account.spent;
+        }
+        stats.handshake_unplanned = self.join_shaping.unplanned;
+        stats.faults += self.join_shaping.faults;
+        stats
     }
 
     fn shaping(&mut self) -> &mut Shaping {
-        let limits = self.config.shaping_limits;
+        let limits = self.shaping_limits_in_force();
+        let (base, earn) = (self.started, self.earn_bytes);
         self.shape
-            .get_or_insert_with(|| Box::new(Shaping::new(limits)))
+            .get_or_insert_with(|| Box::new(Shaping::new(limits, base, earn)))
     }
 
     /// Lends the shaping state of pipe `id` to a batch of lane `lane`;
@@ -766,6 +979,7 @@ impl SessionCore {
         let shaped = self
             .att(id)
             .map_or(ShapedPipe::new(PipeId(id), None), Attachment::shaped);
+        let overhead = usize::from(shaped.write_overhead);
         let mut s = self.shape.take()?;
         let Some(i) = s.active(shaped, now, limit) else {
             self.shape = Some(s);
@@ -780,7 +994,7 @@ impl SessionCore {
             pipe: id,
             lane,
             now,
-            sent: self.stats.bytes_sent,
+            overhead,
             cut: 0,
             room,
             spent: 0,
@@ -798,55 +1012,65 @@ impl SessionCore {
             return;
         };
         let p = &mut t.s.pipes[t.i];
-        if p.rate > 0 {
-            p.tokens -= (t.spent - t.gate_spent) as f64;
+        if p.bucket.rate > 0 {
+            p.bucket.tokens -= (t.spent - t.gate_spent) as i64;
         }
         let record = w.max_record();
         let mut s = t.s;
         for (kind, stream) in self.shape_pending.take().unwrap_or_default() {
-            let e = Event::new(kind, PipeId(0), self.now).with_stream(stream);
+            let e = Event::new(kind, PipeId(0), s.micros(self.now)).with_stream(stream);
             s.broadcast(Caps::STREAMS, e, record);
         }
         self.shape = Some(s);
     }
 
-    /// Sends a due injection on lane 0 of the batch's pipe: as PADDING of
-    /// the open record, or as a record of PADDING only within the limits
-    /// and, toward a peer not known to be a zmux endpoint, SPEC.md
-    /// Section 13.2 rule 9 (together with QX_PING requests).
+    /// Sends a due injection on lane 0 of the batch's pipe: as PADDING of the open record,
+    /// or as a record of PADDING only within the limit on such records (16 per second) toward
+    /// a peer not known to be a zmux endpoint. What a limit, the account or that rule refuses is
+    /// dropped; only a batch without room defers it, before anything is charged.
     pub(super) fn shape_inject(&mut self, w: &mut Records<'_>) {
         let record = w.max_record();
         let Some(t) = w.shape.as_mut() else {
             return;
         };
         let (i, now) = (t.i, t.now);
-        let p = &mut t.s.pipes[i];
+        let p = &t.s.pipes[i];
         if t.lane != 0 || !p.inject_due || p.delayed(now) {
             return;
         }
-        let taken = p.inject.take();
-        let n = taken.as_ref().map_or(0, |(_, n)| *n);
-        p.inject_due = false;
-        let pipe = PipeId(t.pipe);
-        let injected = |n| Event::new(EventKind::Injected, pipe, now).with_len(n, false);
-        if !t.s.inject_covered(n, t.sent) {
-            // The ratio allows it later, as more is sent.
-            let p = &mut t.s.pipes[i];
-            p.inject = taken;
-            p.inject_due = true;
+        let Some(x) = p.inject else {
+            t.s.pipes[i].inject_due = false;
             return;
-        }
+        };
+        // An injection is one write of its own.
+        let wire = RecordWire {
+            size_field: !w.out.is_records(),
+            overhead: t.overhead,
+        };
+        let n = wire.frames_of(x.len).max(1);
+        let pipe = PipeId(t.pipe);
+        let clock = t.s.micros(now);
+        let injected = |n| Event::new(EventKind::Injected, pipe, clock).with_len(n, false);
+        let off = t.s.limits.no_injection || t.s.limits.no_padding;
         // Into the open record only where it fits whole, its planned
         // PADDING included; else a record of its own.
         let len = w.out.record_len();
-        let fits = |pad: usize| len + pad + n <= t.cut_or(record) && pad + n <= w.out.room();
-        if w.out.in_record()
-            && len > 0
-            && fits(t.padding_for(len))
-            && let Some(plan) = t.s.pipes[i].plan.as_mut()
-        {
-            plan.pad += n;
-            t.s.event(i, injected(n), record);
+        // `n` is a shaper's, of any size, until it is cut below.
+        let fits = |pad: usize| {
+            pad.saturating_add(n) <= t.cut_or(record).saturating_sub(len)
+                && pad.saturating_add(n) <= w.out.room()
+        };
+        if w.out.in_record() && len > 0 && fits(t.padding_for(len)) && t.s.pipes[i].plan.is_some() {
+            let earn = t.s.earn;
+            if off || !t.s.account.charge(clock, earn, n as u64) {
+                t.s.dropped(i, clock, record);
+            } else {
+                let p = &mut t.s.pipes[i];
+                p.added += n;
+                p.added_paid += n;
+                p.inject_due = false;
+                t.s.event(i, injected(n), record);
+            }
             t.regate();
             return;
         }
@@ -855,19 +1079,14 @@ impl SessionCore {
         let Some(t) = w.shape.as_mut() else {
             return;
         };
+        if limited && self.requests.available(now) < 2 || off {
+            t.s.dropped(i, clock, record);
+            t.regate();
+            return;
+        }
         if t.closed {
             // The record before it closed the batch (its plan flushes):
             // the injection goes first in the next batch.
-            let p = &mut t.s.pipes[i];
-            p.inject = taken;
-            p.inject_due = true;
-            return;
-        }
-        let max = t.s.limits.max_injected;
-        if limited && self.requests.available(now) < 2
-            || max.is_some_and(|m| t.s.stats.injected >= m)
-        {
-            t.s.stats.inject_dropped += 1;
             return;
         }
         // A record holds at most `record` bytes: a longer injection is cut
@@ -875,26 +1094,36 @@ impl SessionCore {
         // whole, first, in the next one; only a batch that has nothing in
         // it yet cuts it to its room.
         let mut n = n;
+        let mut cuts = 0;
         if n > record {
             n = record;
-            t.s.stats.clamped += 1;
+            cuts += 1;
         }
         let room = w.out.room().saturating_sub(w.out.size_width(record));
         if n > room {
             if !w.out.is_empty() {
-                let p = &mut t.s.pipes[i];
-                p.inject = taken.map(|(at, _)| (at, n));
-                p.inject_due = true;
                 return;
             }
             n = room;
-            t.s.stats.clamped += 1;
+            cuts += 1;
         }
-        let n = t.s.allow_padding(n, t.sent);
-        if n == 0 {
-            t.s.stats.inject_dropped += 1;
+        t.s.stats.clamped += cuts;
+        let earn = t.s.earn;
+        // What goes on the wire: the write overhead is the batch's first record's.
+        let actual = RecordWire {
+            overhead: if w.out.is_records() || w.out.is_empty() {
+                t.overhead
+            } else {
+                0
+            },
+            ..wire
+        };
+        if n == 0 || !t.s.account.charge(clock, earn, actual.wire(n) as u64) {
+            t.s.dropped(i, clock, record);
+            t.regate();
             return;
         }
+        t.s.pipes[i].inject_due = false;
         t.s.stats.injected += 1;
         t.s.event(i, injected(n), record);
         t.regate();
@@ -911,10 +1140,7 @@ impl SessionCore {
 
     /// Whether pipe `id` has an injection due.
     pub(super) fn shape_wants(&self, id: u64) -> bool {
-        let sent = self.stats.bytes_sent;
-        self.shape
-            .as_deref()
-            .is_some_and(|s| s.inject_due(id, sent))
+        self.shape.as_deref().is_some_and(|s| s.inject_due(id))
     }
 
     /// Whether the planned record of pipe `id` waits for its delay: the
@@ -947,7 +1173,7 @@ impl SessionCore {
     pub(super) fn shape_record_in(&mut self, id: u64, lane: u64, len: usize, padding_only: bool) {
         let (record, now) = (self.max_record(), self.now);
         if let Some(s) = self.shape.as_deref_mut() {
-            let e = Event::new(EventKind::RecordIn, PipeId(id), now)
+            let e = Event::new(EventKind::RecordIn, PipeId(id), s.micros(now))
                 .with_lane(lane)
                 .with_len(len, padding_only);
             s.record_in(e, record);
@@ -965,7 +1191,7 @@ impl SessionCore {
     pub(super) fn shape_stream(&mut self, kind: EventKind, stream: u64) {
         let (record, now) = (self.max_record(), self.now);
         if let Some(s) = self.shape.as_deref_mut() {
-            let e = Event::new(kind, PipeId(0), now).with_stream(stream);
+            let e = Event::new(kind, PipeId(0), s.micros(now)).with_stream(stream);
             s.broadcast(Caps::STREAMS, e, record);
         } else if let Some(q) = self.shape_pending.as_mut() {
             q.push((kind, stream));
@@ -980,6 +1206,7 @@ impl SessionCore {
             w.end_record();
             self.shape_return(&mut w);
         }
+        self.batch_not_earned = w.not_earned;
         w.finish()
     }
 }
@@ -989,14 +1216,18 @@ impl Records<'_> {
     pub(super) fn padding_record(&mut self, n: usize) {
         self.end_record();
         self.out.begin_record(self.max_record());
-        self.payload(Bytes::from_static(&ZERO[..n]));
+        self.padding(n);
         self.end_plain();
+        if !self.out.is_records() {
+            self.not_earned += super::shaping::varint_len(n as u64) as u64;
+        }
     }
 
     /// PADDING bytes.
     pub(super) fn padding(&mut self, n: usize) {
         if n > 0 {
             self.payload(Bytes::from_static(&ZERO[..n]));
+            self.not_earned += n as u64;
         }
     }
 }
@@ -1004,78 +1235,156 @@ impl Records<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shaping::Account;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn shaping(max_delay: Option<u64>, max_pause_total: Option<u64>, paused: u64) -> Shaping {
-        let mut s = Shaping::new(Limits {
-            max_delay: max_delay.map(Duration::from_millis),
-            max_pause_total: max_pause_total.map(Duration::from_millis),
+    fn shaping(limits: Limits) -> Shaping {
+        Shaping::new(limits, Instant::now(), 0)
+    }
+
+    fn pipe(s: &mut Shaping, shaper: impl Shaper + 'static) {
+        s.pipes.push(PipeShape::new(1, 0));
+        s.pipes[0].shaper = Some(Box::new(shaper));
+    }
+
+    /// Answers a wake with nothing, or with a time of its own.
+    struct Waked(Arc<AtomicUsize>, Option<u64>);
+
+    impl Shaper for Waked {
+        fn capabilities(&self) -> Caps {
+            Caps::default()
+        }
+        fn on_event(&mut self, e: &Event, r: &mut Effects) {
+            if e.kind == EventKind::Wake {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if let Some(at) = self.1 {
+                    r.wake = Some(Some(at));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hold_bound_follows_the_bound_on_one_wait() {
+        let limits = |max_delay, no_pause| Limits {
+            max_delay,
+            no_pause,
+            ..Limits::default()
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(shaping(limits(None, false)).hold_bound(), ms(1000));
+        assert_eq!(shaping(limits(Some(ms(300)), false)).hold_bound(), ms(300));
+        assert_eq!(
+            shaping(limits(Some(Duration::MAX), false)).hold_bound(),
+            ms(0)
+        );
+        assert_eq!(shaping(limits(None, true)).hold_bound(), ms(0));
+    }
+
+    #[test]
+    fn an_unanswered_wake_comes_again_one_granularity_later() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut s = shaping(Limits::default());
+        pipe(&mut s, Waked(calls.clone(), None));
+        s.pipes[0].wake = Some(1_000);
+        let now = s.base + Duration::from_millis(5);
+        s.timeout(now, 1200);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The deadline is ahead of the clock, and a second look at this time sends nothing.
+        assert_eq!(s.deadline(now, false), Some(now + GRANULARITY));
+        s.timeout(now, 1200);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        s.timeout(now + GRANULARITY, 1200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A time the shaper set stays, the same one included.
+        s.pipes[0].shaper = Some(Box::new(Waked(calls.clone(), Some(50_000))));
+        s.pipes[0].wake = Some(1_000);
+        s.timeout(now, 1200);
+        assert_eq!(s.pipes[0].wake, Some(50_000));
+    }
+
+    fn pause_to(s: &mut Shaping, until: u64, now: Instant) {
+        let e = Effects {
+            gate: Some(crate::shaping::Gate::new(until, 0, 0)),
+            ..Effects::default()
+        };
+        s.apply(0, &e, now, 1000);
+    }
+
+    /// An answer repeats its `pause_until`, and the bound may have shortened that pause:
+    /// it is taken and counted once, and only what extends it counts afterwards.
+    #[test]
+    fn repeated_pauses_count_once() {
+        let mut s = shaping(Limits {
+            max_delay: Some(Duration::from_millis(100)),
             ..Limits::default()
         });
-        s.stats.pause_total = Duration::from_millis(paused);
-        s
+        pipe(&mut s, Waked(Arc::default(), None));
+        let now = s.base;
+        pause_to(&mut s, 500_000, now);
+        assert_eq!(s.stats.stall_spent, Duration::from_millis(100));
+        assert_eq!(s.pipes[0].hold, Some(now + Duration::from_millis(100)));
+        assert_eq!(s.stats.clamped, 1);
+        for _ in 0..5 {
+            pause_to(&mut s, 500_000, now);
+        }
+        assert_eq!(s.stats.stall_spent, Duration::from_millis(100));
+        assert_eq!(s.stats.clamped, 1);
+        // 10 ms beyond what was asked: 10 ms beyond the current end.
+        pause_to(&mut s, 510_000, now);
+        assert_eq!(s.stats.stall_spent, Duration::from_millis(110));
+        assert_eq!(s.pipes[0].hold, Some(now + Duration::from_millis(110)));
     }
 
+    /// A shaper's times take a duration of any size.
     #[test]
-    fn hold_bound_is_the_smaller_set_bound() {
-        let ms = Duration::from_millis;
-        // Neither set: no bound counted.
-        assert_eq!(shaping(None, None, 0).hold_bound(), Duration::ZERO);
-        // Only one delay bounded.
-        assert_eq!(shaping(Some(300), None, 5_000).hold_bound(), ms(300));
-        // Only the total bounded: what remains of it.
-        assert_eq!(shaping(None, Some(2_000), 500).hold_bound(), ms(1_500));
-        // Both: the smaller, recomputed from the total spent so far.
-        assert_eq!(shaping(Some(300), Some(2_000), 0).hold_bound(), ms(300));
-        assert_eq!(shaping(Some(300), Some(2_000), 1_900).hold_bound(), ms(100));
-        // A spent total leaves nothing, never below zero.
-        assert_eq!(
-            shaping(Some(300), Some(2_000), 2_500).hold_bound(),
-            Duration::ZERO
-        );
-    }
-
-    /// A pause is bounded by what remains of `max_pause_total` without
-    /// adding to the total first, which could overflow.
-    #[test]
-    fn pause_total_bound_does_not_overflow() {
+    fn the_longest_duration_does_not_panic() {
         let now = Instant::now();
-        let mut s = shaping(None, Some(2_000), 500);
-        assert_eq!(
-            s.pause(Duration::MAX, now),
-            Some(now + Duration::from_millis(1_500))
-        );
-        assert_eq!(s.stats.pause_total, Duration::from_millis(2_000));
-        let mut s = shaping(None, Some(2_000), 0);
-        s.stats.pause_total = Duration::MAX;
-        assert_eq!(s.pause(Duration::from_secs(1), now), None);
+        assert!(later(now, Duration::MAX) > now);
+        let mut s = shaping(Limits {
+            max_delay: Some(Duration::MAX),
+            ..Limits::default()
+        });
+        assert!(s.pause(Duration::MAX, now).is_some_and(|t| t > now));
     }
 
     #[test]
-    fn zero_limits_allow_nothing() {
+    fn switches_and_the_default_bound_reduce_a_pause() {
         let now = Instant::now();
-        // A set zero bound allows no pause; unset bounds none.
-        let mut s = shaping(Some(0), None, 0);
-        assert_eq!(s.pause(Duration::from_millis(5), now), None);
-        assert_eq!(s.stats.pause_total, Duration::ZERO);
-        let mut s = shaping(None, Some(0), 0);
-        assert_eq!(s.pause(Duration::from_millis(5), now), None);
-        let mut s = shaping(None, None, 0);
-        let five = Duration::from_millis(5);
-        assert_eq!(s.pause(five, now), Some(now + five));
-        // Padding: a zero byte limit allows none; no ratio limit, no
-        // allowance; a set zero ratio keeps the allowance.
-        let pad = |l: Limits| Shaping::new(l).padding_room(1_000_000);
-        let none = Limits::default();
-        assert_eq!(pad(none), (u64::MAX, u64::MAX));
-        let zero_bytes = Limits {
-            max_padding_bytes: Some(0),
-            ..none
-        };
-        assert_eq!(pad(zero_bytes).0, 0);
-        let zero_ratio = Limits {
-            max_padding_ratio: Some(0.0),
-            ..none
-        };
-        assert_eq!(pad(zero_ratio).1, STARTUP_ALLOWANCE);
+        let five = Duration::from_secs(5);
+        let mut s = shaping(Limits::default());
+        assert_eq!(s.pause(five, now), Some(now + Duration::from_secs(1)));
+        assert_eq!(s.stats.clamped, 1);
+        let mut s = shaping(Limits {
+            no_pause: true,
+            ..Limits::default()
+        });
+        assert_eq!(s.pause(five, now), None);
+        assert_eq!(s.stats.stall_spent, Duration::ZERO);
+    }
+
+    /// Keeps an injection in the slot, whatever happens to it.
+    struct Keeps;
+
+    impl Shaper for Keeps {
+        fn capabilities(&self) -> Caps {
+            Caps::default()
+        }
+    }
+
+    /// A dropped injection the answer keeps comes again a granularity later, not at once.
+    #[test]
+    fn a_kept_dropped_injection_waits_one_granularity() {
+        let mut s = shaping(Limits {
+            wire: Account::new(1, 0, 0),
+            ..Limits::default()
+        });
+        pipe(&mut s, Keeps);
+        s.pipes[0].inject = Some(Injection::new(0, 100));
+        s.pipes[0].inject_due = true;
+        s.dropped(0, 5_000, 1200);
+        assert_eq!(s.stats.inject_dropped, 1);
+        assert!(!s.pipes[0].inject_due);
+        assert_eq!(s.pipes[0].inject.map(|x| x.at), Some(6_000));
     }
 }

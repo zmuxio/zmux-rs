@@ -156,13 +156,12 @@ fn carrier_response(
 ///
 /// - a bidirectional `POST` (no `Content-Length`): the request body is the
 ///   uplink, the response body the downlink;
-/// - a downlink `GET` (with `Zmux-Pipe-Pair` or `Zmux-Pipe-Join`): the
+/// - a downlink `GET` (with `Zmux-Pipe-Pair`): the
 ///   response body is the downlink;
-/// - an uplink `POST` (with `Zmux-Pipe-Pair`, or `Zmux-Pipe-Join` and no
-///   `Content-Length`): the request body is the uplink.
+/// - an uplink `POST` (with `Zmux-Pipe-Pair`): the request body is the uplink.
 ///
 /// A split bootstrap's two halves are paired by the listener; the
-/// `Zmux-Pipe-Join` and `Zmux-Pipe-Pair` headers are passed on
+/// The `Zmux-Pipe-Pair` header is passed on
 /// ([`PipeHint`]). Every other request (an exchange request, an upgrade,
 /// one of another method) is [`Unhandled::Fallback`] at once, its body
 /// untouched. A carrier request that an intermediary forwarded from early
@@ -234,19 +233,13 @@ where
             ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
         ))));
     };
-    let join = |name| {
-        parts
-            .headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    };
-    let (join, pair) = (join(zmux::JOIN_HEADER), join(zmux::PAIR_HEADER));
+    let pair = parts
+        .headers
+        .get(zmux::PAIR_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let hint_of = move |entry| {
         let mut hint = PipeHint::from_entry(entry);
-        if let Some(j) = &join {
-            hint = hint.with_join_header(j);
-        }
         if let Some(p) = &pair {
             hint = hint.with_pair_header(p);
         }
@@ -314,7 +307,7 @@ where
             if head {
                 info = info.with_head();
             }
-            entry.decide(info, prefix).await
+            entry.decide_reading(info, prefix, &mut reader).await
         };
         return match admit {
             Admit::Accept(rest) => {

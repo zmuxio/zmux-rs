@@ -88,6 +88,9 @@ pub trait Defer {
 
     /// Moves the deferred work out, `None` when there is none.
     fn take_after(&mut self) -> Option<Self::After>;
+
+    /// A panic unwound through the lock: the state is suspect.
+    fn poison(&mut self) {}
 }
 
 /// The core lock: a guard of the state that runs the state's deferred work
@@ -95,6 +98,9 @@ pub trait Defer {
 /// order: `guard` (unlock), then `after` (wake).
 pub struct Locked<'a, T: Defer> {
     guard: MutexGuard<'a, T>,
+    /// The thread was unwinding when it took the lock: as for std's mutex,
+    /// only a panic that starts while the lock is held poisons.
+    panicking: bool,
     #[cfg(any(debug_assertions, all(test, loom)))]
     _held: held::Token,
     after: Option<T::After>,
@@ -106,6 +112,7 @@ impl<'a, T: Defer> Locked<'a, T> {
         let guard = lock(mutex);
         Self {
             guard,
+            panicking: std::thread::panicking(),
             #[cfg(any(debug_assertions, all(test, loom)))]
             _held: held::Token::new(),
             after: None,
@@ -115,6 +122,9 @@ impl<'a, T: Defer> Locked<'a, T> {
 
 impl<T: Defer> Drop for Locked<'_, T> {
     fn drop(&mut self) {
+        if !self.panicking && std::thread::panicking() {
+            self.guard.poison();
+        }
         // Taken while the lock is held; run when `after` drops, after the
         // guard.
         self.after = self.guard.take_after();
@@ -183,13 +193,13 @@ mod held {
     }
 
     /// Whether this thread holds a core lock.
-    #[cfg(all(test, loom))]
+    #[cfg(all(test, any(debug_assertions, loom)))]
     pub(crate) fn any() -> bool {
         HELD.try_with(|h| h.get() > 0).unwrap_or(false)
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, any(debug_assertions, loom)))]
 pub(crate) use held::any as lock_held;
 
 #[cfg(all(test, not(loom)))]

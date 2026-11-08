@@ -1,6 +1,6 @@
-//! The path layer's per-pipe state (MULTIPATH.md Sections 2, 5 to 9):
-//! attachments with their inbound and outbound pipes, states, positions and
-//! the per-pipe logs of what was sent; the estimates are in `estimator.rs`.
+//! The path layer's per-pipe state: attachments with their inbound and
+//! outbound pipes, states, positions and the per-pipe logs of what was
+//! sent; the estimates are in `estimator.rs`.
 //!
 //! The state of each type is private to its module: the session reads it
 //! through accessors and changes it through the operations here, which keep
@@ -20,7 +20,7 @@ pub(crate) use super::estimator::{AckSample, Batch, Estimator, INITIAL_RTT, RttS
 use super::stream::StreamKey;
 
 pub(crate) use att::Attachment;
-pub(crate) use inp::{Classified, FrameIn, InPipe, LaneEnd};
+pub(crate) use inp::{Classified, InPipe, LaneEnd};
 pub(crate) use lanes::{LaneState, OutLanes};
 pub(crate) use out::{BatchStart, Channel, Detection, OutPipe, QueuedCopy, splitmix};
 pub(crate) use probation::History;
@@ -36,8 +36,8 @@ pub enum PipeHalf {
     Outbound,
 }
 
-/// The state of an outbound pipe direction (STATE_MACHINE.md Section 3.1;
-/// a retired attachment has no state).
+/// The state of an outbound pipe direction (a retired attachment has no
+/// state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutboundState {
     /// The join is not confirmed yet.
@@ -63,8 +63,8 @@ impl OutboundState {
     }
 }
 
-/// The state of an inbound pipe direction (STATE_MACHINE.md Section 3.2;
-/// a retired attachment has no state).
+/// The state of an inbound pipe direction (a retired attachment has no
+/// state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InboundState {
     /// The join is not confirmed yet.
@@ -113,13 +113,12 @@ impl DirectionState {
     }
 }
 
-/// Outbound pipe states (STATE_MACHINE.md Section 3.1).
+/// Outbound pipe states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutState {
     /// A local join that may not be sent yet (the cap of unretired
-    /// attachments, or the refusal backoff, MULTIPATH.md Sections 5.4 step
-    /// 9 and 5.7 step 1): its carrier stays silent, nothing names its ID,
-    /// and it has no timers. Reported as joining.
+    /// attachments, or the refusal backoff): its carrier stays silent,
+    /// nothing names its ID, and it has no timers. Reported as joining.
     Deferred,
     Joining,
     Active,
@@ -149,7 +148,7 @@ impl OutState {
     }
 }
 
-/// Inbound pipe states (STATE_MACHINE.md Section 3.2).
+/// Inbound pipe states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InState {
     /// See [`OutState::Deferred`].
@@ -169,8 +168,8 @@ impl InState {
     }
 }
 
-/// A frame whose information is re-sent when its pipe fails
-/// (MULTIPATH.md Section 7.4), or whose acknowledgement matters.
+/// A frame whose information is re-sent when its pipe fails, or
+/// whose acknowledgement matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SentFrame {
     Stream {
@@ -211,8 +210,12 @@ pub(crate) enum SentFrame {
     PipeAbandon {
         pipe: u64,
     },
-    /// A QX_PING request: it stops being outstanding when its pipe fails
-    /// (SPEC.md Section 4.5).
+    /// This end's SESSION_EPOCH answer: once acknowledged, this end switches epoch.
+    EpochAnswer {
+        epoch: u64,
+    },
+    /// A QX_PING request: it stops being outstanding when its pipe
+    /// fails.
     Ping {
         seq: u64,
     },
@@ -228,7 +231,7 @@ pub(crate) enum Revalidation {
     Until(u64),
 }
 
-/// Where an effective setting comes from (MULTIPATH.md Section 9).
+/// Where an effective setting comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PrioritySource {
@@ -287,6 +290,10 @@ impl Attachments {
     }
 
     #[inline]
+    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, Attachment> {
+        self.list.iter_mut()
+    }
+
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, Attachment> {
         self.list.iter()
     }
@@ -336,8 +343,7 @@ impl Attachments {
     }
 
     /// Drops the unattached IDs of the peer that fell below the replay
-    /// window, whose lowest pipe number is `low` (MULTIPATH.md Section
-    /// 4.3).
+    /// window, whose lowest pipe number is `low`.
     pub(crate) fn forget_unattached_below(&mut self, low: u64) {
         self.list
             .retain(|a| !(a.unattached() && (a.id() >> 1) < low));

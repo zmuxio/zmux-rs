@@ -1,5 +1,5 @@
-//! Multipath scheduling (MULTIPATH.md Section 11): which stream data goes
-//! on which outbound pipe when the pipe can take bytes (late binding).
+//! Multipath scheduling: which stream data goes on which outbound pipe
+//! when the pipe can take bytes (late binding).
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
@@ -135,9 +135,9 @@ fn placement_rate(atts: &Attachments, a: &Attachment, o: &OutPipe, off: bool) ->
     fastest
 }
 
-/// What every stream's choice at one write opportunity of a pipe shares
-/// (MULTIPATH.md Section 11): the tier gate and the pipe's place in it,
-/// worked out once for the decision instead of once per stream.
+/// What every stream's choice at one write opportunity of a pipe
+/// shares: the tier gate and the pipe's place in it, worked out once
+/// for the decision instead of once per stream.
 #[derive(Debug)]
 pub(in crate::proto::session) struct Decision {
     pub(in crate::proto::session) id: u64,
@@ -149,7 +149,6 @@ pub(in crate::proto::session) struct Decision {
     usable: bool,
     takes: bool,
     /// A JOINING pipe takes data while no pipe is usable (rule S1).
-    joining_takes: bool,
     /// The pipe of the tier with the earliest arrival of a whole chunk.
     fastest: Option<u64>,
     /// Computed when a policy needs them: the reorder budget, the session
@@ -197,18 +196,7 @@ impl Decision {
     #[cfg(debug_assertions)]
     pub(in crate::proto::session) fn check_renewed(&self, s: &SessionCore) {
         let fresh = s.decision(self.id, self.gate);
-        let core = |d: &Self| {
-            (
-                d.id,
-                d.gate,
-                d.open,
-                d.tier,
-                d.usable,
-                d.takes,
-                d.joining_takes,
-                d.fastest,
-            )
-        };
+        let core = |d: &Self| (d.id, d.gate, d.open, d.tier, d.usable, d.takes, d.fastest);
         debug_assert_eq!(core(self), core(&fresh), "renewed decision out of date");
         if let Some(&(p, f)) = self.etas.get() {
             let (q, g) = s.decision_etas(&fresh);
@@ -287,16 +275,11 @@ const BACKLOG_MEMO: usize = 8;
 
 impl SessionCore {
     /// How much more a pipe may reinject now: one chunk in all while its
-    /// reinjection hold lasts (RESUME.md Section 6), else no limit.
+    /// reinjection hold lasts, else no limit.
     pub(in crate::proto::session) fn reinject_room(&self, id: u64) -> u64 {
         self.out_ref(id)
             .and_then(|o| o.reinject_room(self.config.spread_chunk as u64, self.now))
             .unwrap_or(u64::MAX)
-    }
-
-    /// Whether any stream direction has reinjected information pending.
-    pub(in crate::proto::session) fn any_lost(&self) -> bool {
-        self.ledger().is_some_and(|l| l.any_lost())
     }
 
     /// ETA_p(L) in seconds of an attachment's
@@ -369,7 +352,7 @@ impl SessionCore {
     }
 
     /// The eligible pipe with the smallest ETA for `len` bytes, whatever
-    /// its tier (opportunistic copies, MULTIPATH.md Section 7.5.1).
+    /// its tier (opportunistic copies).
     pub(in crate::proto::session) fn fastest_eligible(&self, gate: &Gate, len: u64) -> Option<u64> {
         let views = self.views();
         views
@@ -411,7 +394,6 @@ impl SessionCore {
             tier,
             usable,
             takes,
-            joining_takes: o.is_some_and(OutPipe::joining_takes),
             fastest: gate.and_then(|g| self.fastest_in(&g, tier, chunk)),
             reorder: OnceCell::new(),
             session_buffer: OnceCell::new(),
@@ -434,27 +416,8 @@ impl SessionCore {
             return false;
         };
         let Some(gate) = d.gate else {
-            // No pipe is usable: a JOINING pipe carries stream data,
-            // reinjected information first (rule S1, MULTIPATH.md Section
-            // 11).
-            if !d.joining_takes {
-                return false;
-            }
-            let room = self.reinject_room(d.id) > 0;
-            if send.has_lost() {
-                // Reinjected information first; while the reinjection hold
-                // is used up, the stream's new data does not wait for it
-                // (when stream and session credit and the retransmit budget
-                // let it go: else nothing would be written for the write
-                // interest).
-                return room
-                    || self.fin_only(key)
-                    || (send.has_fresh()
-                        && !send.credit_blocked()
-                        && !self.streams.session_stalled()
-                        && self.mp().retained() < self.retransmit_budget());
-            }
-            return !self.any_lost() || !room;
+            // No pipe is usable: stream data waits.
+            return false;
         };
         let id = d.id;
         if send.has_lost() {
@@ -761,6 +724,7 @@ impl SessionCore {
                         move_to: target.filter(|&t| t != b.pipe),
                         ..b
                     });
+                    self.note_credit_blocked(key);
                 }
             }
         }
@@ -888,6 +852,7 @@ impl SessionCore {
             {
                 b.move_to = Some(receiver);
             }
+            self.note_credit_blocked(key);
             pipes[d].3 -= 1;
             if pipes[r].3 == 0 {
                 pipes[r].4 = true;
@@ -1457,7 +1422,7 @@ impl SessionCore {
         let class = gate.class();
         req.pipes.extend(self.atts.iter().filter_map(|a| {
             // The usable pipes: not a JOINING one while another is usable
-            // (rule S1, MULTIPATH.md Section 11).
+            // (rule S1).
             let o = a.out().filter(|o| o.takes_new_data() && class.usable(a))?;
             Some(PipeSnapshot {
                 pipe: PipeId(a.id()),
@@ -1478,7 +1443,7 @@ impl SessionCore {
                     .shape
                     .as_deref()
                     .and_then(|s| s.weight(a.id()))
-                    .map(|w| w.map(f64::to_bits)),
+                    .map(|w| w.map(u64::from)),
             })
         }));
         let generation = self.mp().picks().generation;

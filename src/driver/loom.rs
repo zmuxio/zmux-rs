@@ -778,7 +778,7 @@ fn until_closed(s: &mut Sess) -> Option<()> {
 }
 
 fn open(m: &Mutex<Sess>) -> impl Future<Output = Result<(), ()>> + Unpin + '_ {
-    Open::new(m, 0, |s: &mut Sess| s.core.open(), |_: &mut Sess| {})
+    Open::new(m, 0, |s: &mut Sess| s.core.open(), |_: &mut Sess, _| {})
 }
 
 /// Checks the waiters left nothing registered.

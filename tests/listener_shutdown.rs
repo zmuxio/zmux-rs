@@ -11,12 +11,14 @@ const LIMIT: Duration = Duration::from_secs(10);
 fn config() -> Config {
     let mut config = Config::default();
     config.max_pipes = 8;
-    config.pipe_auth = PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec());
+    config.pipe_auth =
+        PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec()).with_end_to_end();
     config
 }
 
 async fn serve() -> (Listener, std::net::SocketAddr) {
-    let listener = Listener::new(config(), ListenerConfig::default());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(listener.clone().serve(tcp));
@@ -48,7 +50,21 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         // Draining: no new session ...
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(listener.accept().await.is_none());
-        assert!(connect(addr).await.is_none());
+        // Refused with CONNECTION_REFUSED after the listener's parameters,
+        // which may establish the session at the client first.
+        if let Some(refused) = connect(addr).await {
+            let e = tokio::time::timeout(Duration::from_secs(3), refused.closed())
+                .await
+                .expect("refused in time");
+            assert!(
+                matches!(
+                    e,
+                    zmux::SessionError::TransportClosed { code, remote: true, .. }
+                        if code == zmux::proto::TransportErrorCode::CONNECTION_REFUSED
+                ),
+                "{e:?}"
+            );
+        }
         // Counted when the listener's handling of the carrier returns,
         // which may come after the client saw the carrier close.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -60,7 +76,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         let joins = listener.stats().joins;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _pipe = client
-            .add_pipe(PipeIo::tcp(tcp), PipeOptions::default())
+            .begin_add_pipe(PipeIo::tcp(tcp), PipeOptions::default())
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while listener.stats().joins == joins && tokio::time::Instant::now() < deadline {

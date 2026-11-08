@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 mod join;
 
 use bytes::BytesMut;
-use join::{Joined, feed_join};
+use join::{Joined, join_at_once};
 use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::{Event as R, Framing, RecordReader};
@@ -87,7 +87,6 @@ struct Pipe {
     fwd: Line,
     rev: Line,
     b_attached: bool,
-    carrier: Option<zmux::proto::listener::CarrierId>,
     reader: RecordReader,
     rev_reader: RecordReader,
     /// The receiver's read buffer and its identity.
@@ -131,7 +130,7 @@ struct Net {
 fn config(policy: &Policy) -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
-    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = policy.clone();
     c.max_idle_timeout = Some(Duration::from_secs(600));
     c.max_incoming_streams = 1 << 16;
@@ -154,7 +153,6 @@ impl Net {
             fwd: Line::new(mbit, delay),
             rev: Line::new(mbit, delay),
             b_attached,
-            carrier: None,
             reader: RecordReader::new(1 << 20),
             rev_reader: RecordReader::new(1 << 20),
             rbuf: BytesMut::new(),
@@ -183,13 +181,15 @@ impl Net {
                     Some(BS),
                     Some(BS),
                     &PipeOptions::default(),
-                    false,
+                    zmux::proto::seal::Mode::Trusted,
                     None,
                     n.now(),
                 )
                 .unwrap();
+            let joined = join_at_once(&mut n.listener, &mut n.a, &mut n.b, id, n.start);
+            assert_eq!(joined, Joined::Attached(id));
             n.a.set_pipe_low_water(id, true);
-            n.pipes.push(pipe(id.get(), spec, false));
+            n.pipes.push(pipe(id.get(), spec, true));
         }
         n.run(2000);
         for _ in 0..streams {
@@ -242,7 +242,7 @@ impl Net {
                 }
                 let mut v = Vec::new();
                 self.out.copy_to_vec(&mut v);
-                self.a.pipe_written(id, v.len() as u64);
+                self.a.pipe_written(id, v.len() as u64, now);
                 let p = &mut self.pipes[i];
                 let mut input = &v[..];
                 while let Ok(Some(ev)) = p.reader.read(&mut input, &Gates::ALL) {
@@ -265,7 +265,7 @@ impl Net {
                     }
                     let mut v = Vec::new();
                     self.out.copy_to_vec(&mut v);
-                    self.b.pipe_written(id, v.len() as u64);
+                    self.b.pipe_written(id, v.len() as u64, now);
                     self.pipes[i].rev.queue.extend(v);
                 }
             }
@@ -328,19 +328,6 @@ impl Net {
                 }
             }
             self.cost.recv += cpu() - t;
-            return;
-        }
-        let fed = feed_join(
-            &mut self.listener,
-            &mut self.b,
-            &mut p.carrier,
-            p.id,
-            bytes,
-            now,
-        );
-        if let Joined::Attached(id) = fed.joined {
-            p.b_attached = true;
-            self.b.set_pipe_low_water(id, true);
         }
     }
 

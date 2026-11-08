@@ -1,6 +1,6 @@
 //! TLS carriers end to end over loopback TCP: one-step `connect` and
 //! `serve` with zmux's ALPN identifiers configured, and none filled in
-//! when none is configured, a carrier-bound join made with the
+//! when none is configured, a Bound join made with the
 //! adapter's exporter is accepted, a carrier without an exporter announces
 //! no binding, a carrier that announces one is refused by an end that
 //! cannot check it (which shows the binding was announced), a lost
@@ -13,6 +13,7 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
+use zmux::proto::seal::Mode;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
     Session, SessionEvent,
@@ -110,14 +111,18 @@ impl Tls {
 fn config(auth: PipeAuth) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = auth;
+    c.pipe_auth = auth.with_end_to_end();
+    c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
+        |_, _, _| true,
+    )));
     c
 }
 
 /// A client session and the server session a listener accepted for it,
 /// over a TLS bootstrap carrier made by the adapter at both ends.
 async fn sessions(tls: &Tls, auth: PipeAuth) -> (Session, Session, Listener) {
-    let listener = Listener::new(config(auth.clone()), ListenerConfig::default());
+    let listener = Listener::new(config(auth.clone()), ListenerConfig::default())
+        .expect("valid listener configuration");
     let (c, s) = tls.pair().await;
     let l = listener.clone();
     tokio::spawn(async move {
@@ -148,7 +153,9 @@ async fn join(
     let (c, s) = tls.pair().await;
     let l = listener.clone();
     let handled = tokio::spawn(async move { l.handle_pipe(server(s), PipeHint::default()).await });
-    let pipe = session.add_pipe(client(c), PipeOptions::default()).unwrap();
+    let pipe = session
+        .begin_add_pipe(client(c), PipeOptions::default().with_mode(Mode::Bound))
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let state = pipe.stats().and_then(|i| i.outbound);
@@ -184,13 +191,12 @@ async fn transfer(client: &Session, server: &Session) {
     echo.await.unwrap();
 }
 
-/// The failed join authentications the server reported, by whether the
-/// token was carrier-bound.
-fn auth_failures(server: &Session) -> Vec<bool> {
-    let mut failed = Vec::new();
+/// The failed join authentications the server reported.
+fn auth_failures(server: &Session) -> usize {
+    let mut failed = 0;
     while let Some(Some(e)) = futures_now(server.next_event()) {
-        if let SessionEvent::JoinAuthFailed { carrier_bound, .. } = e {
-            failed.push(carrier_bound);
+        if let SessionEvent::JoinAuthFailed { .. } = e {
+            failed += 1;
         }
     }
     failed
@@ -209,7 +215,7 @@ fn futures_now<F: Future>(f: F) -> Option<F::Output> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_carrier_bound_join_with_the_session_secret_from_the_exporter() {
+async fn a_bound_join_with_the_session_secret_from_the_exporter() {
     let tls = Tls::new().await;
     // The session secret comes from the bootstrap carrier's exporter alone.
     let (client, server, listener) = sessions(&tls, PipeAuth::exporter()).await;
@@ -222,34 +228,38 @@ async fn a_carrier_bound_join_with_the_session_secret_from_the_exporter() {
             zmux_rustls::over_tcp
         )
         .await,
-        "a carrier-bound join over TLS"
+        "a Bound join over TLS"
     );
     transfer(&client, &server).await;
-    assert!(auth_failures(&server).is_empty());
-    client.close(0u32.into(), b"");
+    assert_eq!(auth_failures(&server), 0);
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_carrier_without_an_exporter_announces_no_binding() {
+async fn bound_needs_an_exporter_at_both_ends() {
     let tls = Tls::new().await;
-    let auth = PipeAuth::psk(*b"zmux-rustls-test-psk-0123456789a");
+    let auth = PipeAuth::psk(*b"zmux-rustls-test-psk-0123456789a").with_end_to_end();
     let (client, server, listener) = sessions(&tls, auth).await;
-    // The joiner's carrier has no exporter (as behind a TLS-terminating
-    // intermediary): its token binds nothing, and the acceptor, which has
-    // one, accepts it.
-    assert!(
-        join(&tls, &client, &listener, PipeIo::new, zmux_rustls::over_tcp).await,
-        "an unbound join"
+    // The joiner's carrier has no exporter (as behind a TLS-terminating intermediary):
+    // Bound fails at once at the joiner, without a byte.
+    let (c, _s) = tls.pair().await;
+    assert_eq!(
+        client
+            .begin_add_pipe(
+                PipeIo::new(c),
+                PipeOptions::default().with_mode(Mode::Bound)
+            )
+            .unwrap_err(),
+        zmux::PipeError::InvalidArgument
     );
-    transfer(&client, &server).await;
-    // A joiner with an exporter binds its token: an acceptor whose carrier
-    // has none cannot check it and refuses it.
+    // A joiner with an exporter binds its Hello: an acceptor whose carrier has none refuses
+    // it as an authentication failure.
     assert!(
         !join(&tls, &client, &listener, zmux_rustls::over_tcp, PipeIo::new).await,
         "a bound join where the acceptor has no exporter"
     );
-    assert_eq!(auth_failures(&server), [true]);
-    client.close(0u32.into(), b"");
+    assert_eq!(auth_failures(&server), 1);
+    client.close(0u32.into(), b"").await;
 }
 
 /// One step from an address to a session, and from a TCP listener to its
@@ -260,7 +270,8 @@ async fn connect_and_serve_with_zmux_alpn() {
     let alpn = zmux::alpn_protocols(&[]);
     let alpn: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
     let (client_tls, server_tls) = configs(&alpn);
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let serving = tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
@@ -271,7 +282,7 @@ async fn connect_and_serve_with_zmux_alpn() {
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     assert_eq!(server.protocol().as_deref(), Some("qmux-02"));
     transfer(&client, &server).await;
-    client.close(0u32.into(), b"bye");
+    client.close(0u32.into(), b"bye").await;
     assert!(matches!(
         server.closed().await,
         zmux::SessionError::ApplicationClosed { remote: true, .. }
@@ -286,7 +297,8 @@ async fn connect_and_serve_with_zmux_alpn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     let (client_tls, server_tls) = configs(&[]);
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
@@ -319,7 +331,8 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_alpn_is_filled_in() {
     let (client_tls, server_tls) = configs(&[]);
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
@@ -382,7 +395,8 @@ async fn admission_by_bound_prefix_auth() {
         let mut limits = ListenerConfig::default();
         limits.admission = Some(admission.clone());
         limits.fallback = fallback;
-        let listener = Listener::new(Config::default(), limits);
+        let listener =
+            Listener::new(Config::default(), limits).expect("valid listener configuration");
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let task = tokio::spawn(zmux_rustls::serve(
@@ -532,7 +546,7 @@ async fn behind_a_proxy_protocol_intermediary() {
             let mut limits = ListenerConfig::default();
             limits.trusted_proxies = proxies.clone();
             limits.admission = admission;
-            Listener::new(Config::default(), limits)
+            Listener::new(Config::default(), limits).expect("valid listener configuration")
         };
         let listeners = [listener(None), listener(Some(admission))];
         let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -562,7 +576,7 @@ async fn behind_a_proxy_protocol_intermediary() {
                 .unwrap();
             let server = listener.accept().await.unwrap();
             transfer(&client, &server).await;
-            client.close(0u32.into(), b"");
+            client.close(0u32.into(), b"").await;
             server.closed().await;
         }
         let seen = rx.recv().await.unwrap().unwrap();
@@ -576,4 +590,54 @@ async fn behind_a_proxy_protocol_intermediary() {
     })
     .await
     .unwrap();
+}
+
+/// The admission's More reads on through TLS, with the handshake's metadata
+/// given to every decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn more_reads_on_through_tls() {
+    use tokio::io::AsyncWriteExt;
+    use zmux::{Admission, Verdict};
+    let (client_tls, server_tls) = configs(&[b"x"]);
+    let admission = Admission::new(2, |info, p| {
+        assert_eq!(info.alpn, Some(&b"x"[..]));
+        if p.len() < 5 {
+            Verdict::More { need: 5 }
+        } else if p == b"token" {
+            Verdict::accept(5)
+        } else {
+            Verdict::Close
+        }
+    })
+    .with_max_peek(8);
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(admission);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
+    let name = ServerName::try_from("localhost").unwrap();
+    let raw = TcpStream::connect(addr).await.unwrap();
+    let mut tls = TlsConnector::from(client_tls)
+        .connect(name, raw)
+        .await
+        .unwrap();
+    tls.write_all(b"to").await.unwrap();
+    tls.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tls.write_all(b"ken").await.unwrap();
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        Session::connect(zmux_rustls::over_tcp(tls), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    transfer(&client, &server).await;
+    assert_eq!(listener.stats().admission.accepted, 1);
+    listener.close();
 }

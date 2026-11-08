@@ -18,3 +18,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 zmux = { path = "../.." }
 zmux-quinn = { path = "../../adapter/quinn" }
+zmux-rustls = { path = "../../adapter/rustls" }
+zmux-seal = { path = "../../seal" }
+zmux-websocket = { path = "../../adapter/websocket" }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

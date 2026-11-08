@@ -36,7 +36,22 @@ struct Slot {
     awaiting: bool,
     writer: Option<Waker>,
     reader: Option<Waker>,
+    /// A request body that a redirect may repeat: the bytes written while
+    /// the response is pending ([`Abort::keep_replay`]), until the bound.
+    replay: Option<ChunkBuf>,
+    /// More than [`REPLAY_MAX`] written while the response was pending: a
+    /// redirect cannot repeat the body.
+    over: bool,
+    /// The request body that is live: a redirect's repeat replaces the
+    /// one before ([`Abort::repeat`]).
+    generation: u64,
 }
+
+/// The bytes of a request body written before its response that are kept
+/// for a repeat at a redirect's URL. Past it the body goes on unkept and a
+/// later redirect is refused: a redirecting front answers before reading
+/// the body, a server once it has read the preface, well within it.
+pub(crate) const REPLAY_MAX: usize = 64 << 10;
 
 #[derive(Default)]
 struct Shared(Mutex<Slot>);
@@ -65,7 +80,7 @@ pub(crate) fn body() -> (BodyWriter, PipeBody, Abort) {
     let shared = Arc::new(Shared::default());
     (
         BodyWriter(shared.clone()),
-        PipeBody(Inner::Fed(shared.clone())),
+        PipeBody(Inner::Fed(shared.clone(), 0)),
         Abort(shared),
     )
 }
@@ -83,7 +98,11 @@ impl Abort {
     /// Fails the body as [`Abort::run`] does; the writer's writes then fail
     /// with `kind` (a refused request is a refused carrier).
     pub(crate) fn fail(self, kind: io::ErrorKind) {
-        self.0.lock().failure.get_or_insert(kind);
+        {
+            let mut s = self.0.lock();
+            s.failure.get_or_insert(kind);
+            s.replay = None;
+        }
         self.0.end(End::Abort);
     }
 
@@ -95,10 +114,47 @@ impl Abort {
         self.0.lock().awaiting = true;
     }
 
+    /// Keeps what is written until the response decides, for a repeat at
+    /// a redirect's URL ([`Abort::repeat`]).
+    pub(crate) fn keep_replay(&self) {
+        self.0.lock().replay = Some(ChunkBuf::new());
+    }
+
+    /// A new body for the request repeated at a redirect's URL: `prefix`
+    /// (the credential presented anew), then every byte written so far,
+    /// then what is written next. The body before it ends with an error.
+    /// `None` when more than [`REPLAY_MAX`] bytes were written.
+    pub(crate) fn repeat(&self, prefix: Option<Bytes>) -> Option<PipeBody> {
+        let mut s = self.0.lock();
+        let replay = s.replay.clone().filter(|_| !s.over)?;
+        s.generation += 1;
+        let mut chunks = ChunkBuf::new();
+        if let Some(p) = prefix {
+            chunks.push(p);
+        }
+        let mut written: Vec<Bytes> = Vec::new();
+        let mut replay = replay;
+        while Buf::has_remaining(&replay) {
+            let n = Buf::chunk(&replay).len();
+            written.push(Buf::copy_to_bytes(&mut replay, n));
+        }
+        chunks.take_from(&mut written);
+        s.chunks = chunks;
+        s.gone = false;
+        Some(PipeBody(Inner::Fed(self.0.clone(), s.generation)))
+    }
+
+    /// Whether a redirect can repeat the body ([`Abort::repeat`]).
+    pub(crate) fn replayable(&self) -> bool {
+        let s = self.0.lock();
+        s.replay.is_some() && !s.over
+    }
+
     /// The response was answered: a body gone from now on is a broken pipe.
     pub(crate) fn answered(&self) {
         let writer = {
             let mut s = self.0.lock();
+            s.replay = None;
             s.awaiting = false;
             s.writer.take()
         };
@@ -148,6 +204,18 @@ impl ChunkWrite for BodyWriter {
                 s.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
+            let s = &mut *s;
+            if let Some(replay) = &mut s.replay {
+                let n: usize = chunks.iter().map(Bytes::len).sum();
+                if replay.len() + n > REPLAY_MAX {
+                    s.replay = None;
+                    s.over = true;
+                } else {
+                    for c in chunks.iter() {
+                        replay.push(c.clone());
+                    }
+                }
+            }
             let n = s.chunks.take_from(chunks);
             if n == 0 {
                 return Poll::Ready(Ok(0));
@@ -188,7 +256,8 @@ pub struct PipeBody(Inner);
 type BoxedBody = Pin<Box<dyn Body<Data = Bytes, Error = Box<dyn StdError + Send + Sync>> + Send>>;
 
 enum Inner {
-    Fed(Arc<Shared>),
+    /// Fed by a writer: its generation ([`Abort::repeat`]).
+    Fed(Arc<Shared>, u64),
     /// A header and the data it precedes, one frame, without copying
     /// either.
     Fixed(Option<ChunkBuf>),
@@ -263,8 +332,8 @@ impl Body for PipeBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<ChunkBuf>, io::Error>>> {
-        let shared = match &mut self.get_mut().0 {
-            Inner::Fed(shared) => shared,
+        let (shared, generation) = match &mut self.get_mut().0 {
+            Inner::Fed(shared, g) => (shared, *g),
             Inner::Fixed(chunks) => return Poll::Ready(chunks.take().map(|c| Ok(Frame::data(c)))),
             Inner::Boxed(b) => {
                 return b.as_mut().poll_frame(cx).map(|f| {
@@ -283,6 +352,13 @@ impl Body for PipeBody {
         };
         let (r, waker) = {
             let mut s = shared.lock();
+            if s.generation != generation {
+                // A redirect's repeat replaced this request.
+                return Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "request redirected",
+                ))));
+            }
             if !s.chunks.is_empty() {
                 let c = std::mem::take(&mut s.chunks);
                 (Poll::Ready(Some(Ok(Frame::data(c)))), s.writer.take())
@@ -311,7 +387,7 @@ impl Body for PipeBody {
 
     fn is_end_stream(&self) -> bool {
         match &self.0 {
-            Inner::Fed(s) => {
+            Inner::Fed(s, _) => {
                 let s = s.lock();
                 s.chunks.is_empty() && s.end == Some(End::Finish)
             }
@@ -322,7 +398,7 @@ impl Body for PipeBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         match &self.0 {
-            Inner::Fed(_) => http_body::SizeHint::default(),
+            Inner::Fed(..) => http_body::SizeHint::default(),
             Inner::Fixed(chunks) => {
                 http_body::SizeHint::with_exact(chunks.as_ref().map_or(0, |c| c.len() as u64))
             }
@@ -333,9 +409,12 @@ impl Body for PipeBody {
 
 impl Drop for PipeBody {
     fn drop(&mut self) {
-        if let Inner::Fed(shared) = &self.0 {
+        if let Inner::Fed(shared, generation) = &self.0 {
             let waker = {
                 let mut s = shared.lock();
+                if s.generation != *generation {
+                    return;
+                }
                 s.gone = true;
                 s.writer.take()
             };
@@ -704,5 +783,65 @@ mod tests {
         }
         let start = collect(frames(&[4, 4, 4]), 10).await.unwrap().unwrap_err();
         assert_eq!(start.len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn write(w: &mut BodyWriter, data: &[u8]) {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut chunks = [Bytes::copy_from_slice(data)];
+        let r = Pin::new(w).poll_write_chunks(&mut cx, &mut chunks);
+        assert!(matches!(r, Poll::Ready(Ok(n)) if n == data.len()));
+    }
+
+    /// Takes what the body holds, as the exchange would.
+    fn drain(b: &mut PipeBody) -> Vec<u8> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match Pin::new(b).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(f))) => {
+                let mut d = f.into_data().ok().unwrap();
+                d.copy_to_bytes(d.remaining()).to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_repeat_sends_a_fresh_prefix_then_every_byte_written() {
+        let (mut w, mut body, abort) = body();
+        abort.keep_replay();
+        w.preload(Bytes::from_static(b"old prefix"));
+        assert_eq!(drain(&mut body), b"old prefix");
+        write(&mut w, b"abc");
+        assert_eq!(drain(&mut body), b"abc");
+        write(&mut w, b"def");
+        let mut again = abort.repeat(Some(Bytes::from_static(b"P"))).unwrap();
+        // The replaced body fails and leaves the shared state alone.
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Err(_)))
+        ));
+        drop(body);
+        assert_eq!(drain(&mut again), b"Pabcdef");
+        write(&mut w, b"g");
+        assert_eq!(drain(&mut again), b"g");
+    }
+
+    #[test]
+    fn past_the_bound_no_repeat() {
+        let (mut w, mut body, abort) = body();
+        abort.keep_replay();
+        let big = vec![7u8; REPLAY_MAX];
+        write(&mut w, &big);
+        assert!(abort.replayable());
+        drain(&mut body);
+        write(&mut w, b"x");
+        assert!(!abort.replayable());
+        assert!(abort.repeat(None).is_none());
     }
 }

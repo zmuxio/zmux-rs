@@ -1,0 +1,344 @@
+[
+ {
+  "name": "establish-binding-surplus-sealed",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "binding": "bed6a8082f5a0e05535e4a58cd295bf23506b45bdf8ea97acfc8b315c75a6ed6",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-binding-surplus-trusted",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 2,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "binding": "bed6a8082f5a0e05535e4a58cd295bf23506b45bdf8ea97acfc8b315c75a6ed6",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-binding-short-surplus",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "binding": "bed6a8082f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-bound-no-binding",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 1,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-bound-short-binding",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 1,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "binding": "bed6a8082f5a0e05535e4a58cd295bf23506b45bdf8ea97acfc8b315c75a6e",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-psk-missing",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-psk-short",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc68",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-psk-surplus",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-mode-reserved",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 3,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-missing",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-surplus",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-surplus-profile-5",
+  "kind": "establish",
+  "profile": 5,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-empty",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-15",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "establish-handle-17",
+  "kind": "establish",
+  "profile": 3,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1f2",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "session-crypto-no-suite-1",
+  "kind": "session_crypto",
+  "mode": 0,
+  "crypto": {
+   "suites": [
+    2
+   ],
+   "groups": [
+    1,
+    2
+   ]
+  },
+  "error": "invalid_config"
+ },
+ {
+  "name": "session-crypto-no-group-2",
+  "kind": "session_crypto",
+  "mode": 0,
+  "crypto": {
+   "suites": [
+    1,
+    2
+   ],
+   "groups": [
+    1
+   ]
+  },
+  "error": "invalid_config"
+ },
+ {
+  "name": "session-crypto-zero",
+  "kind": "session_crypto",
+  "mode": 0,
+  "crypto": {
+   "suites": [
+    0,
+    1
+   ],
+   "groups": [
+    2
+   ]
+  },
+  "error": "invalid_config"
+ },
+ {
+  "name": "session-crypto-descending",
+  "kind": "session_crypto",
+  "mode": 0,
+  "crypto": {
+   "suites": [
+    2,
+    1
+   ],
+   "groups": [
+    2
+   ]
+  },
+  "error": "invalid_config"
+ },
+ {
+  "name": "session-crypto-duplicate",
+  "kind": "session_crypto",
+  "mode": 0,
+  "crypto": {
+   "suites": [
+    1
+   ],
+   "groups": [
+    2,
+    2
+   ]
+  },
+  "error": "invalid_config"
+ },
+ {
+  "name": "sender-credentials-in-msg1",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "write_type": 1,
+  "error": "invalid_config"
+ },
+ {
+  "name": "sender-app-data-in-msg1-no-psk",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "app_data_len": 1,
+  "error": "invalid_config"
+ },
+ {
+  "name": "sender-credential-type-0",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "write_type": 1,
+  "cred_type_0": true,
+  "error": "invalid_config"
+ },
+ {
+  "name": "require-pq-auth-pin-without-proof-id",
+  "kind": "pin",
+  "mode": 0,
+  "require_pq_auth": true,
+  "error": "invalid_config"
+ },
+ {
+  "name": "sender-proof-in-msg1",
+  "kind": "establish",
+  "profile": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "write_type": 8,
+  "error": "invalid_config"
+ },
+ {
+  "name": "sender-first-bytes-in-msg1",
+  "kind": "establish",
+  "profile": 4,
+  "mode": 0,
+  "static": "1af1a94b15166b1ea330a388ce362dcb20e5ef3fe0b7fef9c729bbc1b619fff3",
+  "write_type": 3,
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-binding-surplus-sealed",
+  "kind": "join",
+  "suite": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "binding": "bed6a8082f5a0e05535e4a58cd295bf23506b45bdf8ea97acfc8b315c75a6ed6",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-binding-surplus-trusted",
+  "kind": "join",
+  "suite": 1,
+  "mode": 2,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "binding": "bed6a8082f5a0e05535e4a58cd295bf23506b45bdf8ea97acfc8b315c75a6ed6",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-bound-no-binding",
+  "kind": "join",
+  "suite": 1,
+  "mode": 1,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-psk-short",
+  "kind": "join",
+  "suite": 1,
+  "mode": 0,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc68",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-mode-reserved",
+  "kind": "join",
+  "suite": 1,
+  "mode": 3,
+  "handle": "1a533f8a762f0368a6b9e2d5bb8044e1",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-locator-empty",
+  "kind": "join",
+  "suite": 1,
+  "mode": 0,
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ },
+ {
+  "name": "join-locator-over",
+  "kind": "join",
+  "suite": 1,
+  "mode": 0,
+  "handle": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "psk": "c94c2d06bb597e2e18967a2baf5f149275af1f9ec76be5731a0c6d8289dc689f",
+  "error": "invalid_config"
+ }
+]

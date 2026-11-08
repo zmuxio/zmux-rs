@@ -1,5 +1,5 @@
-//! QUIC datagrams as the datagram channel of stream pipes (EXTENSIONS.md
-//! Section 6.8): a session through a delaying, lossy UDP relay, where
+//! QUIC datagrams as the datagram channel of stream pipes:
+//! a session through a delaying, lossy UDP relay, where
 //! datagrams on the channel arrive after the one-way delay while a lost
 //! packet of the pipe is retransmitted and datagrams in records wait for
 //! it; the fallback to records where the connection has no datagrams one
@@ -247,7 +247,7 @@ async fn channel_datagrams_are_not_held_behind_lost_packets() {
             100,
             "none more on the channel"
         );
-        cs.close(zmux::VarInt::from_u32(0), b"");
+        cs.close(zmux::VarInt::from_u32(0), b"").await;
     })
     .await
     .expect("deadline");
@@ -282,7 +282,7 @@ async fn quic_datagrams_disabled_locally_fall_back_to_records() {
         );
         assert!(c.datagrams_dropped_send == 0 && s.datagrams_dropped_send == 0);
         assert_eq!((c.datagrams_received, s.datagrams_received), (20, 20));
-        cs.close(zmux::VarInt::from_u32(0), b"");
+        cs.close(zmux::VarInt::from_u32(0), b"").await;
     })
     .await
     .expect("deadline");
@@ -332,7 +332,7 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
         // A closed session's pipe names no pipe any more: the peer's
         // datagrams for it are dropped and counted by the connection.
         let (cs, ss) = pairs.remove(0);
-        cs.close(zmux::VarInt::from_u32(0), b"");
+        cs.close(zmux::VarInt::from_u32(0), b"").await;
         let _ = ss.closed().await;
         let _ = cs.closed().await;
         let mut tries = 0;

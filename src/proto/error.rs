@@ -1,6 +1,5 @@
-//! Error codes of the transport and application spaces (SPEC.md Section 10,
-//! EXTENSIONS.md Section 7, REGISTRY.md Section 6) and the error types of the
-//! wire layer.
+//! Error codes of the transport and application spaces and the error
+//! types of the wire layer.
 
 use std::fmt;
 
@@ -75,13 +74,13 @@ codes! {
     PROTOCOL_VIOLATION = 0x0a, true;
     /// A multipath session lost every pipe in a direction.
     NO_VIABLE_PATH = 0x10, true;
-    /// The peer exhausted the no-effect budget (SPEC.md Section 9.4).
+    /// The peer exhausted the no-effect budget.
     ZMUX_EXCESSIVE_LOAD = 0x25ff_75ef, true;
-    /// Role negotiation failed (EXTENSIONS.md Section 2).
+    /// Role negotiation failed.
     ZMUX_ROLE_CONFLICT = 0x277d_b2c3, true;
-    /// The resume grace period expired (RESUME.md Section 8).
+    /// The resume grace period expired.
     ZMUX_RESUME_TIMEOUT = 0x0eb8_7167, true;
-    /// A resume could not be completed safely (RESUME.md Section 7).
+    /// A resume could not be completed safely.
     ZMUX_RESUME_FAILED = 0x0f05_f74e, true;
     /// PIPE_ABANDON reason: the pipe failed or was removed abruptly.
     ZMUX_PIPE_FAILED = 0x296a_5bf5, true;
@@ -89,8 +88,7 @@ codes! {
     ZMUX_PIPE_RESOURCE_LIMIT = 0x0b4f_a113, true;
     /// A join failed authentication; reported locally, never sent.
     ZMUX_PIPE_AUTH_FAILED = 0x0961_3938, false;
-    /// The sender's idle timer expired in a multipath session (SPEC.md
-    /// Section 6.4).
+    /// The sender's idle timer expired in a multipath session.
     ZMUX_IDLE_TIMEOUT = 0x2736_d55c, true;
 }
 
@@ -116,9 +114,8 @@ codes! {
     ZMUX_REJECTED = 0x5a4d_0002, None;
     /// The stream carried something that failed: a pipe of a nested
     /// session that the nested session failed or aborted, or one hop of a
-    /// relayed stream whose other side was lost (EXTENSIONS.md Section 10).
-    /// Data already delivered stands; the stream is not safe to retry
-    /// blindly.
+    /// relayed stream whose other side was lost. Data already delivered
+    /// stands; the stream is not safe to retry blindly.
     ZMUX_CARRIER_FAILED = 0x5a4d_0003, None;
     /// Proxy open failure: general failure.
     ZMUX_PROXY_GENERAL_FAILURE = 0x5a4d_0101, Some(0x01);
@@ -166,7 +163,7 @@ impl ApplicationErrorCode {
     }
 }
 
-/// A key of the diagnostic line of a Reason Phrase (SPEC.md Section 4.3).
+/// A key of the diagnostic line of a Reason Phrase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DetailKey {
@@ -182,7 +179,7 @@ pub enum DetailKey {
     Limit,
     /// `value`: the offending value of a field.
     Value,
-    /// `pos`: a byte position in a pipe (MULTIPATH.md Section 2.3).
+    /// `pos`: a byte position in a pipe.
     Pos,
     /// `rec`: a byte position in a record.
     Rec,
@@ -224,9 +221,8 @@ impl DetailKey {
 const MAX_DETAILS: usize = 4;
 
 /// A violation found while decoding peer input. A session that encounters
-/// one closes with CONNECTION_CLOSE carrying [`Error::code`] (SPEC.md Section
-/// 9.3), its reason and, after a line feed, its [`Error::details`] (SPEC.md
-/// Section 4.3).
+/// one closes with CONNECTION_CLOSE carrying [`Error::code`], its reason
+/// and, after a line feed, its [`Error::details`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Error {
     code: TransportErrorCode,
@@ -251,8 +247,7 @@ impl Error {
         }
     }
 
-    /// Adds a `key=value` pair to the diagnostic line (SPEC.md Section
-    /// 4.3); pairs beyond the fourth are left out.
+    /// Adds a `key=value` pair to the diagnostic line; pairs beyond the fourth are left out.
     #[must_use]
     pub const fn detail(mut self, key: DetailKey, value: u64) -> Self {
         let i = self.details as usize;
@@ -302,7 +297,7 @@ impl Error {
     }
 
     /// The Reason Phrase: the reason, then a line feed and the pairs when
-    /// there are any (SPEC.md Section 4.3).
+    /// there are any.
     pub fn reason_phrase(&self) -> String {
         use fmt::Write as _;
         let mut s = String::from(self.reason);

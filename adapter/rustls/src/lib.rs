@@ -31,12 +31,14 @@
 //! into a [`PipeIo`] with what the TLS connection can tell zmux:
 //!
 //! - its TLS 1.3 exporter (RFC 8446 Section 7.5) for both labels zmux uses
-//!   (MULTIPATH.md Sections 10.2 and 10.5): the session secret of a
+//!   (the bootstrap secret and the join binding): the session secret of a
 //!   bootstrap carrier with [`zmux::PipeAuth::exporter`], and the binding of a
-//!   carrier-bound join, made or accepted on this carrier, so that a join
+//!   Bound join, made or accepted on this carrier, so that a join
 //!   token copied to another connection does not verify. A connection that
 //!   negotiated TLS 1.2, or is still handshaking (early data), has none and
-//!   its joins are not carrier-bound;
+//!   its joins are not Bound. The exporter does not keep the
+//!   connection: once the pipe has dropped its halves it gives no value
+//!   ([`zmux::ExportError::Unavailable`]);
 //! - its reads, which return one TLS record's plaintext each: zmux reads
 //!   again before it decides that no input is pending
 //!   ([`PipeIo::with_partial_reads`]);
@@ -72,7 +74,7 @@
 //! # async fn example(tls: std::sync::Arc<rustls::ServerConfig>) -> std::io::Result<()> {
 //! use zmux::{Config, Listener, ListenerConfig, PipeAuth};
 //!
-//! let listener = Listener::new(Config::multipath(PipeAuth::exporter()), ListenerConfig::default());
+//! let listener = Listener::new(Config::multipath(PipeAuth::exporter()), ListenerConfig::default()).expect("valid listener configuration");
 //! let tcp = tokio::net::TcpListener::bind("0.0.0.0:443").await?;
 //! tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, tls));
 //! while let Some(session) = listener.accept().await {
@@ -91,20 +93,16 @@
 //! none.
 
 use std::io;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{
-    ClientConfig, ClientConnection, ProtocolVersion, ServerConfig, ServerConnection,
-};
+use tokio_rustls::rustls::{ClientConfig, ProtocolVersion, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
-use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
 use zmux::{CarrierInfo, ConnectError, Credential, Listener, PipeIo, Session};
-
-/// The length of zmux's exporter values (MULTIPATH.md Section 10).
-const EXPORTER_LEN: usize = 32;
 
 /// A pipe carrier from an established TLS stream over any transport: the
 /// exporter (TLS 1.3, handshake complete), partial reads and the ALPN
@@ -114,21 +112,32 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let stream = stream.into();
-    // Exported while the stream is whole: the carrier splits it.
-    let exporter = Exporter::of(&stream);
-    let exported = [EXPORTER_SESSION_LABEL, EXPORTER_PIPE_LABEL].map(|l| exporter.export(l));
     let alpn = stream
         .get_ref()
         .1
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
-    let mut io = PipeIo::new(stream)
-        .with_partial_reads()
-        .with_tls_exporter(|label| match label {
-            EXPORTER_SESSION_LABEL => exported[0].clone(),
-            EXPORTER_PIPE_LABEL => exported[1].clone(),
-            _ => None,
-        });
+    let tls13 = stream.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3);
+    let done = !stream.get_ref().1.is_handshaking();
+    let state = zmux::TlsState::new(alpn.clone().map(String::into_bytes), None);
+    // Both halves share the connection, as a split would with a lock taken
+    // per poll. The exporter does not keep it: once the halves are gone it
+    // gives no value.
+    let shared = Arc::new(Mutex::new(stream));
+    let exporter = Arc::downgrade(&shared);
+    let mut io = PipeIo::from_halves(Half(shared.clone()), Half(shared)).with_partial_reads();
+    if done {
+        io = io.with_terminated_tls(move || Some(state.clone()));
+    }
+    if tls13 {
+        io = io
+            .with_carrier_secure()
+            .with_exporter(move |label, context, out| {
+                exporter
+                    .upgrade()
+                    .is_some_and(|s| lock(&s).export(label, context, out))
+            });
+    }
     if let Some(alpn) = alpn {
         io = io.with_protocol(alpn);
     }
@@ -284,33 +293,69 @@ fn without_early_data(tls: Arc<ServerConfig>) -> Arc<ServerConfig> {
     Arc::new(c)
 }
 
-/// The exporter of a TLS 1.3 connection whose handshake completed.
-enum Exporter<'a> {
-    Client(&'a ClientConnection),
-    Server(&'a ServerConnection),
-    None,
+/// A halve of a TLS stream that the pipe's reader, writer and exporter share.
+struct Half<IO>(Arc<Mutex<TlsStream<IO>>>);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-impl<'a> Exporter<'a> {
-    fn of<IO>(stream: &'a TlsStream<IO>) -> Self {
-        let common = stream.get_ref().1;
-        if common.is_handshaking() || common.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
-            return Self::None;
+/// TLS-Exporter(label, context, L) of a stream whose handshake completed.
+trait Export {
+    fn export(&self, label: &str, context: &[u8], out: &mut [u8]) -> bool;
+}
+
+impl<IO> Export for TlsStream<IO> {
+    fn export(&self, label: &str, context: &[u8], out: &mut [u8]) -> bool {
+        let common = self.get_ref().1;
+        if common.is_handshaking() {
+            return false;
         }
-        match stream {
-            TlsStream::Client(s) => Self::Client(s.get_ref().1),
-            TlsStream::Server(s) => Self::Server(s.get_ref().1),
+        let (label, context) = (label.as_bytes(), Some(context));
+        match self {
+            TlsStream::Client(s) => s.get_ref().1.export_keying_material(out, label, context),
+            TlsStream::Server(s) => s.get_ref().1.export_keying_material(out, label, context),
         }
+        .is_ok()
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for Half<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.0)).poll_read(cx, buf)
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Half<IO> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *lock(&self.0)).poll_write(cx, buf)
     }
 
-    /// TLS-Exporter(label, "", 32).
-    fn export(&self, label: &str) -> Option<Vec<u8>> {
-        let out = vec![0u8; EXPORTER_LEN];
-        let (label, context) = (label.as_bytes(), Some(&[][..]));
-        match self {
-            Self::Client(c) => c.export_keying_material(out, label, context).ok(),
-            Self::Server(c) => c.export_keying_material(out, label, context).ok(),
-            Self::None => None,
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.0)).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.0)).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *lock(&self.0)).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        lock(&self.0).is_write_vectored()
     }
 }

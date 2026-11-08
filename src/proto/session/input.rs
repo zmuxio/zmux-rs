@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::pipes::{Attachment, Classified, FrameIn};
+use super::pipes::{Attachment, Classified};
 use super::stream::{self, Offer, RecvPart, RecvState, SendOutcome, SendState, Stream, StreamKey};
 use super::{
     BIDI, CloseFrame, CoreEvent, InState, LaneId, SessionCore, SessionError, State, UNI, di,
@@ -19,7 +19,7 @@ use crate::proto::payload::{Flow, WirePreamble};
 use crate::proto::record::{Event as RecordEvent, Framing};
 use crate::proto::{DetailKey, Error, Gates, TransportErrorCode as T};
 
-/// Which part of a stream a frame refers to (SPEC.md Section 7.2).
+/// Which part of a stream a frame refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     /// The local receiving part: STREAM, RESET_STREAM(_AT),
@@ -192,8 +192,7 @@ impl SessionCore {
         (t.iter().map(|&(_, size, _)| size).sum(), referenced)
     }
 
-    /// One complete message from a message-framed pipe (SPEC.md Section
-    /// 3.4), or lane of one.
+    /// One complete message from a message-framed pipe, or lane of one.
     pub fn receive_message(&mut self, at: impl Into<LaneId>, message: &[u8], now: Instant) {
         let at = at.into();
         let pipe = at.pipe.0;
@@ -241,7 +240,7 @@ impl SessionCore {
         self.tick(now);
         self.pick_input();
         if self.discarding() {
-            // Lingering discards what it reads (SPEC.md Section 6.5).
+            // Lingering discards what it reads.
             return data.len();
         }
         let Some(p) = self.inp_mut(pipe) else {
@@ -342,9 +341,8 @@ impl SessionCore {
         }
     }
 
-    /// Whether what arrives is discarded: the session is closing (SPEC.md
-    /// Section 6.5), unless its orderly close waits for the other lanes,
-    /// processing what it receives meanwhile.
+    /// Whether what arrives is discarded: the session is closing, unless its orderly close waits
+    /// for the other lanes, processing what it receives meanwhile.
     fn discarding(&self) -> bool {
         self.state >= State::Closing && !self.close_waiting()
     }
@@ -378,7 +376,7 @@ impl SessionCore {
     }
 
     /// Charges a duplicate or outdated frame (NE-3, NE-4, NE-6 to NE-8),
-    /// which multipath sessions never charge (SPEC.md Section 9.4.1; a
+    /// which multipath sessions never charge (a
     /// protocol rule of the mode, kept here).
     fn charge_dup(&mut self) -> Result<(), Error> {
         if self.is_multipath() {
@@ -392,17 +390,6 @@ impl SessionCore {
         if li > 0 && self.inp_mut(id).is_some_and(|p| p.in_first_record(li)) {
             return self.on_lane_first_frame(&frame);
         }
-        // Our join's first inbound record, which may be a leading
-        // QX_TRANSPORT_PARAMETERS record to discard (MULTIPATH.md Section 5.7
-        // step 3), also while the join itself is deferred.
-        let (leading, deferred) = match self.att(id) {
-            Some(a) if id != 0 && li == 0 && a.joiner_local() => {
-                a.inp().map_or((false, false), |p| {
-                    (p.leading_possible(), p.state() == InState::Deferred)
-                })
-            }
-            _ => (false, false),
-        };
         if !matches!(
             frame,
             Frame::Padding(_)
@@ -418,23 +405,10 @@ impl SessionCore {
             // while.
             self.exchange_at = Some(now);
         }
-        // A CONNECTION_CLOSE on our unconfirmed join answers the join, not
-        // the session (MULTIPATH.md Section 5.7 step 6).
-        if let Frame::ConnectionClose(f) = &frame
-            && id != 0
-            && li == 0
-            && self
-                .att(id)
-                .is_some_and(|a| a.joiner_local() && !a.joined())
-        {
-            self.join_closed(id, f.application, f.error_code, now);
-            return Ok(());
-        }
-        let (first, skip) = {
+        let first = {
             let Some(p) = self.inp_mut(id) else {
                 return Ok(());
             };
-            let leading_tp = leading && matches!(frame, Frame::TransportParameters(_));
             let eliciting = !matches!(
                 frame,
                 Frame::Padding(_) | Frame::PipeAck(_) | Frame::ConnectionClose(_)
@@ -448,23 +422,10 @@ impl SessionCore {
                     | Frame::Datagram(_)
                     | Frame::QxPing(_)
             );
-            match p.frame_in(
-                li,
-                leading_tp,
-                eliciting,
-                activity,
-                matches!(frame, Frame::PipePing),
-            ) {
-                FrameIn::Discarded => return Ok(()),
-                FrameIn::Process { first, skip_join } => (first && id == 0 && li == 0, skip_join),
-            }
+            p.frame_in(li, eliciting, activity, matches!(frame, Frame::PipePing))
+                && id == 0
+                && li == 0
         };
-        if deferred {
-            // The peer cannot know a deferred join: anything else on its
-            // carrier is the carrier's fault, and only this join fails.
-            self.fail_attachment(id, super::PipeFailure::Protocol, now);
-            return Ok(());
-        }
         if matches!(
             frame,
             Frame::Stream(_)
@@ -476,10 +437,6 @@ impl SessionCore {
             self.note_traffic(id, now);
         }
         let ty = frame.frame_type().0;
-        if skip && matches!(frame, Frame::PipeJoin(_)) {
-            // The in-band PIPE_JOIN the listener verified (MULTIPATH.md 5.2).
-            return Ok(());
-        }
         if first && !matches!(frame, Frame::TransportParameters(_)) {
             return Err(violation(
                 T::PROTOCOL_VIOLATION,
@@ -583,13 +540,8 @@ impl SessionCore {
             Frame::PriorityUpdate(p) => self.on_priority_update(p, ty),
             // Multipath frames are only decoded when multipath is in use
             // (the receive gates).
-            Frame::PipeJoin(_) => Err(violation(
-                T::PROTOCOL_VIOLATION,
-                ty,
-                "PIPE_JOIN on a pipe of the session",
-            )),
             // Decoded only while lanes are available toward us: anywhere but
-            // first on a new lane (MULTIPATH.md Section 5.8).
+            // first on a new lane.
             Frame::PipeLane(_) => Err(violation(
                 T::PROTOCOL_VIOLATION,
                 ty,
@@ -615,6 +567,7 @@ impl SessionCore {
                 f.status == crate::proto::frame::PipeStatusValue::Standby,
                 f.priority,
             ),
+            Frame::SessionEpoch(f) if self.is_multipath() => self.on_session_epoch(f, now),
             _ => Err(violation(
                 T::FRAME_ENCODING_ERROR,
                 ty,
@@ -625,8 +578,9 @@ impl SessionCore {
 
     // ---- streams ---------------------------------------------------------
 
-    /// Finds or implicitly opens the stream a frame refers to (SPEC.md
-    /// Section 7.2 rules 2 to 4).
+    /// Finds or implicitly opens the stream a frame refers to: lower-numbered
+    /// streams of the type open with it, a frame at or above the stream limit or
+    /// for a local stream not yet opened is an error.
     fn lookup(&mut self, id: u64, part: Part, ty: u64) -> Result<Lookup, Error> {
         let dir = stream::dir_of(id);
         let d = di(dir);
@@ -711,6 +665,7 @@ impl SessionCore {
         let max_window = self.config.stream_window_cap();
         let mut s = Stream::new(dir, false);
         s.id = Some(id);
+        s.replayable = self.carrier_early_in();
         match dir {
             Dir::Bidi => {
                 let send_max = peer.map_or(0, |p| p.window_bidi_local);
@@ -731,13 +686,13 @@ impl SessionCore {
         self.streams.insert_peer(id, di(dir), s)
     }
 
-    /// Offers peer stream `key` if it is ready (SPEC.md Section 7.2 rule 5).
+    /// Offers peer stream `key` if it is ready.
     pub(super) fn offer(&mut self, key: StreamKey) {
         let preamble = self.features.preamble;
         self.streams.offer(key, preamble, &mut self.events);
     }
 
-    fn on_stream(
+    pub(super) fn on_stream(
         &mut self,
         f: crate::proto::frame::Stream<'_>,
         ty: u64,
@@ -762,9 +717,8 @@ impl SessionCore {
         let len = f.data.len() as u64;
         let end = offset + len;
         let mp = self.mp.is_some();
-        // Single pipe: data arrives in order, without gaps or repeats
-        // (SPEC.md Section 7.3). Multipath: any order, duplicates allowed.
-        // Protocol rule.
+        // Single pipe: data arrives in order, without gaps or repeats. Multipath: any order,
+        // duplicates allowed. Protocol rule.
         if !mp && offset != r.received && (len > 0 || offset > r.received) {
             return Err(
                 violation(T::PROTOCOL_VIOLATION, ty, "STREAM data out of order")
@@ -840,7 +794,7 @@ impl SessionCore {
                 r.state = RecvState::SizeKnown;
             }
         }
-        // The preamble of a peer stream (EXTENSIONS.md Section 4.4): the
+        // The preamble of a peer stream: the
         // frame at offset 0 carries it whole.
         let mut data = f.data;
         let mut data_offset = offset;
@@ -886,7 +840,7 @@ impl SessionCore {
                 e.open_info = p.open_info.map(|v| body.slice(at(v)..at(v) + v.len()));
                 e.app_tlvs = (!p.app_tlvs.is_empty()).then_some(body);
             }
-            // Ignored on a unidirectional stream (EXTENSIONS.md 4.3).
+            // Ignored on a unidirectional stream.
             let carrier = p.pipe_carrier && dir == Dir::Bidi;
             if carrier || p.priority.is_some() {
                 let e = s.extra_mut();
@@ -956,9 +910,8 @@ impl SessionCore {
         } else if parsed {
             trimmed = r.pull_held();
         }
-        // Session credit: each byte once, when it arrives (SPEC.md Section
-        // 8.3), below the bytes a reset released. Bytes beyond a gap
-        // release nothing before they arrive; a part that discards its data
+        // Session credit: each byte once, when it arrives, below the bytes a reset released. Bytes
+        // beyond a gap release nothing before they arrive; a part that discards its data
         // counts every byte below the frame's end as arrived.
         let fresh = if discard {
             r.arrive(0, end)
@@ -1136,7 +1089,7 @@ impl SessionCore {
         }
         // Bytes at or above the Reliable Size that have not arrived never
         // will: their credit is released once, now, and data arriving later
-        // releases none (SPEC.md Section 8.3).
+        // releases none.
         let lost = r.credit_reset(reliable_size, final_size);
         self.credit_received(0, 0, lost);
         self.credit_consumed(dropped);
@@ -1280,19 +1233,22 @@ impl SessionCore {
     // ---- session frames --------------------------------------------------
 
     fn on_connection_close(&mut self, f: ConnectionClose<'_>, now: Instant) {
-        // An orderly close waiting for the other lanes goes now (SPEC.md
-        // Section 6.5 step 1).
+        // An orderly close waiting for the other lanes goes now.
         self.end_close_wait();
         let reason = Bytes::copy_from_slice(f.reason);
         let err = if !f.application && self.acknowledged() && f.error_code == T::ZMUX_IDLE_TIMEOUT.0
         {
-            // The peer's idle timeout in a session with acknowledgement
-            // (SPEC.md 6.4).
+            // The peer's idle timeout in a session with acknowledgement.
             SessionError::IdleTimeout { remote: true }
         } else if f.application {
             SessionError::ApplicationClosed {
                 code: varint(f.error_code),
                 reason,
+                remote: true,
+            }
+        } else if f.error_code == T::ZMUX_RESUME_FAILED.0 {
+            SessionError::ResumeFailed {
+                reason: super::error::split_reason(reason).0,
                 remote: true,
             }
         } else {
@@ -1306,7 +1262,7 @@ impl SessionCore {
             }
         };
         self.set_error(err);
-        // Answer with at most one CONNECTION_CLOSE (SPEC.md Section 6.5).
+        // Answer with at most one CONNECTION_CLOSE.
         self.enter_closing(
             Some(CloseFrame::Transport {
                 code: 0,
@@ -1361,7 +1317,7 @@ impl SessionCore {
         if self.ping.peer_request.is_some_and(|r| p.sequence <= r) {
             if self.is_multipath() {
                 // Stale: it crossed a later request on another pipe. Ignored,
-                // neither answered nor charged (SPEC.md Sections 4.5, 9.4.1).
+                // neither answered nor charged.
                 return Ok(());
             }
             return Err(
@@ -1373,7 +1329,7 @@ impl SessionCore {
         // NE-2: chargeable only while the answer to an earlier request is
         // still owed (not yet handed to a carrier or committed to a pipe):
         // that answer is coalesced away. A request answered before the
-        // next one arrives had an effect (SPEC.md Section 4.5).
+        // next one arrives had an effect.
         let owed = self.ping.response_pending.replace(p.sequence).is_some();
         if owed { self.charge() } else { Ok(()) }
     }
@@ -1399,9 +1355,8 @@ impl SessionCore {
             code: g.error_code,
         });
         // Local streams that have neither emitted their first frame nor
-        // been pinned never open: they fail with "going away" (EXTENSIONS.md
-        // Section 3.5 rule 2). Emitted and pinned streams at or above the
-        // watermark were not processed: "rejected" (rule 3); a pinned one
+        // been pinned never open: they fail with "going away". Emitted and pinned streams at or
+        // above the watermark were not processed: "rejected"; a pinned one
         // below it still sends its opening frame.
         let keys: Vec<StreamKey> = self.streams.keys().collect();
         for k in keys {
@@ -1437,7 +1392,7 @@ impl SessionCore {
                 let Some(s) = self.streams.get_mut(k) else {
                     continue;
                 };
-                // Never processed by the peer (EXTENSIONS.md Section 3.4).
+                // Never processed by the peer.
                 s.goaway = Some(stream::GoAwayFail::Rejected);
                 let (mut unsent, mut freed) = (0, 0);
                 if let Some(send) = s.send.as_mut() {
@@ -1508,8 +1463,7 @@ impl SessionCore {
                         "datagram for a stream beyond the limit",
                     ));
                 } else if index >= self.streams.remote_dir(BIDI).opened {
-                    // It overtook the stream's opening frame (EXTENSIONS.md
-                    // Sections 6.4 and 6.8): held for at most one smoothed
+                    // It overtook the stream's opening frame: held for at most one smoothed
                     // RTT.
                     // Counted as received once delivered.
                     self.stats.datagrams_received -= 1;
@@ -1649,9 +1603,8 @@ impl SessionCore {
     /// limiter; with one, held for the driver, which asks the limiter
     /// outside the lock ([`SessionCore::take_received_datagrams`]). Every
     /// datagram held, whether waiting for the limiter
-    /// or queued, counts in the session's datagram bytes (EXTENSIONS.md
-    /// Section 6.5): the oldest waiting ones make room, and one that still
-    /// does not fit is dropped.
+    /// or queued, counts in the session's datagram bytes: the oldest waiting ones make room, and
+    /// one that still does not fit is dropped.
     fn datagram_arrived(&mut self, stream: Option<(StreamKey, u64)>, data: Bytes) {
         let recv_bytes_cap = self.config.datagram_receive_bytes;
         self.trim_waiting(data.len());

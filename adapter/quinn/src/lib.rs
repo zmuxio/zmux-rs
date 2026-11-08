@@ -1,7 +1,7 @@
 //! QUIC connections as zmux carriers over quinn: zmux
 //! sessions whose pipes and lanes are streams of QUIC connections, and whose
-//! datagrams may go as QUIC datagrams of the connection (EXTENSIONS.md
-//! Section 6.8). The connection's own features (statistics, path, close)
+//! datagrams may go as QUIC datagrams of the connection, the pipes'
+//! datagram channel. The connection's own features (statistics, path, close)
 //! stay the application's, through the raw [`Connection`]
 //! ([`QuicCarrier::connection`]).
 //!
@@ -25,7 +25,7 @@
 //! A [`QuicCarrier`] takes a whole established connection: a pipe is one
 //! bidirectional stream of it ([`QuicCarrier::open_pipe`],
 //! [`QuicCarrier::accept_pipe`]), and the pipe's lanes are further
-//! unidirectional streams (MULTIPATH.md Sections 2.5 and 5.8), which zmux
+//! unidirectional streams, which zmux
 //! opens itself as it needs them. The carrier runs the connection's accept
 //! loop: every stream the peer opens is a carrier, handed to the
 //! [`Listener`] given, or else a lane to [`zmux::carrier::handle_lane`] and a
@@ -47,9 +47,10 @@
 //!   a connection that carries pipes belong to zmux;
 //! - its TLS 1.3 exporter (RFC 9001 Section 4), shared by its streams: the
 //!   session secret of a bootstrap pipe with [`zmux::PipeAuth::exporter`], and
-//!   the binding of carrier-bound joins (MULTIPATH.md Section 10.5). A
+//!   the binding of Bound joins. A
 //!   connection whose handshake had not completed when the carrier was made
-//!   (0-RTT) has none;
+//!   (0-RTT) has none. The exporter does not keep the connection: once it
+//!   is gone it gives no value ([`zmux::ExportError::Unavailable`]);
 //! - flow control sized for its lanes: the peer may open [`LaneWindows::lanes`] lanes at once, and the
 //!   connection's receive window covers that many stream windows and a
 //!   pipe's own, so that a lane blocked by a loss never holds the others
@@ -105,7 +106,6 @@ use zmux::carrier::{
     MemoryCharge,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
 use zmux::{
     Admit, Admitted, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo,
     Prefixed, Session,
@@ -169,7 +169,7 @@ impl LaneWindows {
 
     /// quinn's transport configuration with these windows (the stream and
     /// connection receive windows) and QUIC datagrams, the datagram channel
-    /// of the connection's pipes (EXTENSIONS.md Section 6.8): received
+    /// of the connection's pipes: received
     /// ones are buffered up to a stream window, and those waiting to be
     /// sent up to [`DATAGRAM_SEND_BUFFER`], a short queue, so that the
     /// sessions' datagram queues drop their oldest datagrams rather than
@@ -367,9 +367,9 @@ impl Options {
     /// data, and the streams opened in it are replayable until the
     /// handshake completes ([`zmux::RecvStream::is_replayable`]); without
     /// that, 0-RTT data is processed only once the handshake completed,
-    /// when it can no longer be a replay. A bootstrap pipe sent in 0-RTT
-    /// has no TLS exporter (it exists only once the handshake completed):
-    /// authenticate multipath joins with a pre-shared key there.
+    /// when it can no longer be a replay. The exporter of a bootstrap pipe
+    /// sent in 0-RTT is read when the peer's parameters arrive, after the
+    /// handshake completed.
     #[must_use]
     pub fn with_zero_rtt(mut self, memory: ParameterMemory) -> Self {
         self.zero_rtt = Some(memory);
@@ -800,7 +800,7 @@ async fn admit(
     let admit = {
         let handshake = Handshake::of(&conn);
         let info = handshake.carrier_info(&conn);
-        entry.decide(info, prefix).await
+        entry.decide_reading(info, prefix, &mut recv).await
     };
     match admit {
         Admit::Accept(rest) => {
@@ -909,7 +909,6 @@ struct Inner {
     own_charge: u64,
     /// The connection's ALPN identifier, where the crypto layer reports it.
     alpn: Option<String>,
-    exported: [Option<Vec<u8>>; 2],
     /// Streams of pipes the peer opened, without a listener (made pipes
     /// when taken, so that the queue holds no reference to this state).
     accepted: Mutex<Accepted>,
@@ -978,20 +977,12 @@ impl QuicCarrier {
         let window = options.windows.receive_window();
         conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
         conn.set_max_concurrent_uni_streams(VarInt::from_u32(options.windows.lanes));
-        let export = |label: &str| {
-            let mut out = vec![0u8; 32];
-            conn.export_keying_material(&mut out, label.as_bytes(), b"")
-                .ok()
-                .map(|()| out)
-        };
-        let exported = [export(EXPORTER_SESSION_LABEL), export(EXPORTER_PIPE_LABEL)];
         let own_charge = if listener.is_some() { 0 } else { window };
         let inner = Arc::new(Inner {
             conn: conn.clone(),
             id: OnceLock::new(),
             own_charge,
             alpn: alpn(&conn),
-            exported,
             accepted: Mutex::default(),
             notify: Notify::new(),
             accept_task: OnceLock::new(),
@@ -1100,7 +1091,8 @@ impl Inner {
         send.keep = Some(self.clone());
         recv.keep = Some(self.clone());
         let opener = self.clone();
-        let exported = self.exported.clone();
+        // Does not keep the connection: gives no value once it is gone.
+        let exporter = Arc::downgrade(self);
         // The connection's lost bytes: what it retransmits, the same for
         // every pipe of the connection.
         let stats = self.conn.clone();
@@ -1110,30 +1102,45 @@ impl Inner {
             .with_carrier_conn(self.id())
             .with_connection_memory(self.own_charge)
             .with_datagram_channel(channel);
+        let done = self.handshake.clone();
+        let state = zmux::TlsState::new(self.alpn.clone().map(String::into_bytes), None);
+        let io = io.with_terminated_tls(move || {
+            // Early data: the handshake is not complete yet.
+            done.as_ref()
+                .is_none_or(|h| *h.borrow())
+                .then(|| state.clone())
+        });
         let io = match &self.alpn {
             Some(a) => io.with_protocol(a.clone()),
             None => io,
         };
         let io = match self.handshake.clone().filter(|h| !*h.borrow()) {
             // Opened in 0-RTT: replayable until the handshake completes.
-            Some(mut h) => io.with_early_data_in(async move {
-                let _ = h.wait_for(|done| *done).await;
+            Some(h) => io.with_early_data_in(move || {
+                let mut h = h.clone();
+                async move {
+                    let _ = h.wait_for(|done| *done).await;
+                }
             }),
             None => io,
         };
-        io.with_chunk_lane_opener(move || {
+        io.with_lane_opener(move || {
             let inner = opener.clone();
             async move {
                 let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
                 let mut send = Send::new(send);
                 send.keep = Some(inner);
-                Ok(send)
+                Ok(zmux::carrier::Lane::from_chunks(send))
             }
         })
-        .with_tls_exporter(|label| match label {
-            EXPORTER_SESSION_LABEL => exported[0].clone(),
-            EXPORTER_PIPE_LABEL => exported[1].clone(),
-            _ => None,
+        .with_carrier_secure()
+        .with_exporter(move |label, context, out| {
+            exporter.upgrade().is_some_and(|inner| {
+                inner
+                    .conn
+                    .export_keying_material(out, label.as_bytes(), context)
+                    .is_ok()
+            })
         })
     }
 }
@@ -1263,7 +1270,7 @@ async fn accept_loop(
 }
 
 /// The QUIC datagrams of a connection as the datagram channels of its
-/// stream pipes (EXTENSIONS.md Section 6.8): each starts with a varint that
+/// stream pipes: each starts with a varint that
 /// names the pipe, the QUIC stream ID of a QUIC pipe (or the Quarter Stream
 /// ID of an HTTP/3 request, which makes it an HTTP Datagram). One receive
 /// loop routes the connection's datagrams to its pipes, which may belong

@@ -16,7 +16,6 @@ use tokio::task::JoinHandle;
 
 /// How responses are forwarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Responses {
     Stream,
     /// Buffered whole unless the response says `X-Accel-Buffering: no`.
@@ -26,7 +25,6 @@ pub(crate) enum Responses {
 
 /// What becomes of WebSocket upgrades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Upgrades {
     Refuse,
     Pass,
@@ -65,6 +63,13 @@ impl Profile {
         responses: Responses::BufferUnlessAccelNo,
         half_duplex: true,
         upgrades: Upgrades::Refuse,
+    };
+    /// A transparent front: bodies streamed both ways, WebSocket passed.
+    pub(crate) const TRANSPARENT: Self = Self {
+        buffer_requests: false,
+        responses: Responses::Stream,
+        half_duplex: false,
+        upgrades: Upgrades::Pass,
     };
     /// A front that passes WebSocket only.
     pub(crate) const WEBSOCKET_ONLY: Self = Self {

@@ -1,0 +1,292 @@
+[
+ {
+  "cipher": "ChaChaPoly",
+  "name": "first",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "9b97fc03f13f55535511eb0a91145bd72eca25fb2d5810455bbcd074d7",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "before-first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048575,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "9ee7782ca0a25d70fa0078cbedbc5fea8641d67e043236fc08d525473f",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1048576
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048576,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "4fe8dbab21ef10cf0d17d7d9c7002cd67bcb7d18ca51903f887a8c0c59",
+  "key_after": "798974fc588ec06c0447a0983a98009cd3b73992f65122b60b051d1a02fc9375",
+  "n_after": 1048577
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "after-first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048577,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "74be8d949d02322738f7f2f34a40d8d5b9f0e88ce48311b83d8359b403",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1048578
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "second-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 2097152,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "cf266c28953c0a872069b3bcb48e08940d94743de0a6dfc16c0f342319",
+  "key_after": "798974fc588ec06c0447a0983a98009cd3b73992f65122b60b051d1a02fc9375",
+  "n_after": 2097153
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "last-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551614,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "68adbbe6760aef82fa3ec488e19ed38a46a76db57011b16dd109417cbd",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 18446744073709551615
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "reserved-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551615,
+  "plaintext": "61207a6d7578207265636f7264",
+  "error": "exhausted"
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "largest",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext_fill": {
+   "byte": 90,
+   "length": 65519
+  },
+  "ciphertext_sha256": "47c5c4719061f1af03e6c7265a8576702fbe918ffbd02f4ad1ecc4dcfedbf801",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "too-large",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext_fill": {
+   "byte": 90,
+   "length": 65520
+  },
+  "error": "too_large"
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "empty",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "86de6bdf5728c11ffe6f5ec5982d2bd7",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "open-bit-flip",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "9a97fc03f13f55535511eb0a91145bd72eca25fb2d5810455bbcd074d7",
+  "error": "auth"
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "open-too-short",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "9b97fc03f13f55535511eb0a91145b",
+  "error": "auth"
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "open-reserved-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551615,
+  "ciphertext": "9b97fc03f13f55535511eb0a91145bd72eca25fb2d5810455bbcd074d7",
+  "error": "exhausted"
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "first",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "d67d1ba25464858aeda362766428d6029c23871ea044292da69a670f24",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "before-first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048575,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "3ec008dec9b19c475308280f50aa08c0b5c783a815206adb140d006976",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1048576
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048576,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "9c6613a51258424db5782d0dc9d4bf1f8742e1ccc5bb61fb6840fe19fa",
+  "key_after": "b570e2754e9e53813da2a20839ba963ba4324d392219882777675d724f291c83",
+  "n_after": 1048577
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "after-first-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 1048577,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "3539a083180741846f46f62956391064cfdfd601023b0b47263c816c63",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1048578
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "second-rekey",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 2097152,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "e9627d74cfad367c7ca2527ff88f96bf657c1d4e6155a3ec3dee2c5e53",
+  "key_after": "b570e2754e9e53813da2a20839ba963ba4324d392219882777675d724f291c83",
+  "n_after": 2097153
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "last-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551614,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "533bb61a851b0ea5b26513f71bc7764e571576efc3de2b59775c8a029b",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 18446744073709551615
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "reserved-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551615,
+  "plaintext": "61207a6d7578207265636f7264",
+  "error": "exhausted"
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "largest",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext_fill": {
+   "byte": 90,
+   "length": 65519
+  },
+  "ciphertext_sha256": "857f56a94a96e2148b77933a2fe6fafc81d0733feb6ba30f01ba4bd2af58c5ce",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "too-large",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "plaintext_fill": {
+   "byte": 90,
+   "length": 65520
+  },
+  "error": "too_large"
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "empty",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "af6f663d6187d8534cea2f015cf14d7d",
+  "key_after": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n_after": 1
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "open-bit-flip",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "d77d1ba25464858aeda362766428d6029c23871ea044292da69a670f24",
+  "error": "auth"
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "open-too-short",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 0,
+  "ciphertext": "d67d1ba25464858aeda362766428d6",
+  "error": "auth"
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "open-reserved-nonce",
+  "key": "865c94f236402e3e55ee47fa529c708c12b28a8bef51842cdf326e680e130d84",
+  "n": 18446744073709551615,
+  "ciphertext": "d67d1ba25464858aeda362766428d6029c23871ea044292da69a670f24",
+  "error": "exhausted"
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "profile1-split-c1",
+  "key": "1df0fd5e0468e1f42dd0efdc56df1ca4e8debaa8f16e0524a26da606c44f0b8c",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "8e06d77bdb4709ed738cc7fd958a0b2294711d0d74488a1d9ba62ccf67",
+  "key_after": "1df0fd5e0468e1f42dd0efdc56df1ca4e8debaa8f16e0524a26da606c44f0b8c",
+  "n_after": 1
+ },
+ {
+  "cipher": "ChaChaPoly",
+  "name": "profile1-split-c2",
+  "key": "2ed59749b6d67ecaa624532d19c441de4f514ea937b93cbac84df6165caf9015",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "37f571f22b183de248c7d3fee39f99323940be96cfb23fe61c0aee7018",
+  "key_after": "2ed59749b6d67ecaa624532d19c441de4f514ea937b93cbac84df6165caf9015",
+  "n_after": 1
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "profile3-split-c1",
+  "key": "3dc9113633cff40fa583fdb1db2db3260675296da44491d4d68f316951a0eabe",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "143a7a7a12920f0013954d0a14dcb9c0231225c3475a26ce8f6b761376",
+  "key_after": "3dc9113633cff40fa583fdb1db2db3260675296da44491d4d68f316951a0eabe",
+  "n_after": 1
+ },
+ {
+  "cipher": "AESGCM",
+  "name": "profile3-split-c2",
+  "key": "56ddebb9bde342595d375b52c0906e73885a66bfcb4c84784d6a43cf415b3228",
+  "n": 0,
+  "plaintext": "61207a6d7578207265636f7264",
+  "ciphertext": "9ce0c6cf64029c53dd2c0ea8b9d511cb64238dd9481b323d8f53230c67",
+  "key_after": "56ddebb9bde342595d375b52c0906e73885a66bfcb4c84784d6a43cf415b3228",
+  "n_after": 1
+ }
+]

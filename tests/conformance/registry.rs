@@ -4,9 +4,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zmux::proto::error::{APPLICATION_ERRORS, ApplicationErrorCode, TRANSPORT_ERRORS};
-use zmux::proto::frame::{
-    FrameType, JOIN_TOKEN_LEN, JoinDirection, LANE_KEY_LEN, MAX_JOIN_FRAME_LEN, MAX_LOCATOR_LEN,
-};
+use zmux::proto::frame::{FrameType, JoinDirection, LANE_KEY_LEN, MAX_LOCATOR_LEN};
 use zmux::proto::params;
 use zmux::proto::payload::{self, PREAMBLE_TLVS, TlvStatus};
 use zmux::proto::{ident, keys, oob};
@@ -54,12 +52,12 @@ fn frame_types_match() {
         FrameType::QX_PING_RESPONSE,
         FrameType::GOAWAY,
         FrameType::PRIORITY_UPDATE,
-        FrameType::PIPE_JOIN,
         FrameType::PIPE_ACK,
         FrameType::PIPE_LANE,
         FrameType::PIPE_PING,
         FrameType::PIPE_ABANDON,
         FrameType::PIPE_STATUS,
+        FrameType::SESSION_EPOCH,
     ];
     for t in named {
         let name = t.name().unwrap_or_else(|| panic!("{:#x} unnamed", t.0));
@@ -119,12 +117,12 @@ fn transport_parameters_match() {
         ("zmux_datagram_flows", id::ZMUX_DATAGRAM_FLOWS),
         ("zmux_carrier_datagrams", id::ZMUX_CARRIER_DATAGRAMS),
         ("zmux_multipath", id::ZMUX_MULTIPATH),
+        ("zmux_session_crypto", id::ZMUX_SESSION_CRYPTO),
         ("zmux_ack_threshold", id::ZMUX_ACK_THRESHOLD),
         ("zmux_pipe_ack", id::ZMUX_PIPE_ACK),
         ("zmux_max_ack_delay", id::ZMUX_MAX_ACK_DELAY),
         ("zmux_max_lanes", id::ZMUX_MAX_LANES),
         ("zmux_resume", id::ZMUX_RESUME),
-        ("zmux_record_protection", id::ZMUX_RECORD_PROTECTION),
     ];
     let reg = read_json("registry.json");
     let rows = reg["transport_parameters"].as_array().unwrap();
@@ -204,7 +202,7 @@ fn preamble_tlvs_and_grease_match() {
         assert_eq!(row["status"].as_str(), Some(want), "{name}: status");
         assert!(!payload::is_grease_tlv_type(*ty));
     }
-    // EXTENSIONS.md Section 4.3: the application range, GREASE excluded.
+    // The application range, GREASE excluded.
     let range = &reg["preamble_tlv_application_range"];
     assert_eq!(
         range["first"],
@@ -250,14 +248,9 @@ fn fixed_values_labels_and_limits_match() {
         (2, JoinDirection::Bidi),
     ] {
         assert_eq!(dir.to_bits(), bits);
-        let name = fixed["pipe_join_direction"][bits.to_string()]
-            .as_str()
-            .unwrap();
+        let name = fixed["join_direction"][bits.to_string()].as_str().unwrap();
         assert_eq!(name, format!("{dir:?}").to_lowercase());
     }
-    assert_eq!(fixed["pipe_join_carrier_bound"], "0x04");
-    assert_eq!(fixed["pipe_join_standby"], "0x08");
-    assert_eq!(fixed["pipe_join_reserved_mask"], "0xf0");
     assert_eq!(fixed["pipe_status"]["0"], "available");
     assert_eq!(fixed["pipe_status"]["1"], "standby");
     assert_eq!(fixed["zmux_role"]["0"], "initiator");
@@ -265,35 +258,35 @@ fn fixed_values_labels_and_limits_match() {
     assert_eq!(fixed["zmux_role"]["2"], "auto");
     let flags = &fixed["multipath_secret_flags"];
     use keys::secret_flags::*;
-    for (bit, letter) in [(EXPORTER, "E"), (PSK, "P"), (INSECURE, "I")] {
+    for (bit, letter) in [(EXPORTER, "E"), (PSK, "P")] {
         let label = flags[format!("0x{bit:02x}")].as_str().unwrap();
         assert!(label.starts_with(letter), "secret flag {bit:#x}: {label}");
     }
-    assert_eq!(flags.as_object().unwrap().len(), 3);
-    assert_eq!(RESERVED, 0xf2);
+    assert_eq!(flags.as_object().unwrap().len(), 2);
+    assert_eq!(RESERVED, 0xfa);
 
     let labels = &reg["labels"];
     assert_eq!(labels["tls_exporter_session"], keys::EXPORTER_SESSION_LABEL);
-    assert_eq!(labels["tls_exporter_pipe"], keys::EXPORTER_PIPE_LABEL);
+    assert_eq!(labels["tls_exporter_join"], keys::EXPORTER_JOIN_LABEL);
     let bytes_label = |k: &str| labels[k].as_str().unwrap().as_bytes().to_vec();
     assert_eq!(bytes_label("hkdf_salt_prefix"), keys::SALT_PREFIX);
-    assert_eq!(
-        bytes_label("hkdf_join_initiator"),
-        keys::JOIN_INITIATOR_LABEL
-    );
-    assert_eq!(
-        bytes_label("hkdf_join_responder"),
-        keys::JOIN_RESPONDER_LABEL
-    );
-    assert_eq!(labels.as_object().unwrap().len(), 5);
+    assert_eq!(bytes_label("hkdf_join_initiator"), b"zmux join i");
+    assert_eq!(bytes_label("hkdf_join_responder"), b"zmux join r");
+    for (k, v) in [
+        ("key_id", "zmux-seal key"),
+        ("hkdf_epoch", "zmux epoch"),
+        ("proof_responder", "zmux-seal proof r"),
+        ("proof_initiator", "zmux-seal proof i"),
+    ] {
+        assert_eq!(labels[k], v, "{k}");
+    }
+    assert_eq!(labels.as_object().unwrap().len(), 9);
 
     // The limits that belong to the wire layer; the others are session
     // timers and budgets.
     let limits = &reg["limits"];
     let wire_limits = [
-        ("max_join_frame_bytes", MAX_JOIN_FRAME_LEN as u64),
         ("max_locator_bytes", MAX_LOCATOR_LEN as u64),
-        ("join_token_bytes", JOIN_TOKEN_LEN as u64),
         ("lane_key_bytes", LANE_KEY_LEN as u64),
         ("default_max_record_size", params::DEFAULT_MAX_RECORD_SIZE),
         ("zmux_max_record_size", params::ZMUX_MAX_RECORD_SIZE),
@@ -315,7 +308,7 @@ fn fixed_values_labels_and_limits_match() {
             alias.as_str().unwrap().as_bytes()
         ));
     }
-    // SPEC.md Section 6.2: the alias rule, byte-exact.
+    // The alias rule, byte-exact.
     let examples = protocol["alpn_alias_examples"].as_array().unwrap();
     assert!(!examples.is_empty());
     for ex in examples {
@@ -335,7 +328,7 @@ fn fixed_values_labels_and_limits_match() {
     }
 }
 
-/// REGISTRY.md Section 2.2: zmux values are
+/// The allocation method: zmux values are
 /// 2^14 + SHA-256("zmux <kind> <name>[#i]")[0..8] mod (2^30 - 2^14).
 #[test]
 fn zmux_codepoints_follow_the_allocation_method() {

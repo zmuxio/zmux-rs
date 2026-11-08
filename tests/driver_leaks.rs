@@ -59,9 +59,9 @@ fn tasks_and_threads_end_with_their_sessions() {
             let (mut send, _recv) = client.open_bi().await.unwrap();
             send.write_all(b"x").await.unwrap();
             match i % 3 {
-                0 => client.close(0u32.into(), b""),
+                0 => client.close(0u32.into(), b"").await,
                 1 => drop((client, send)),
-                _ => server.close(1u32.into(), b"bye"),
+                _ => server.close(1u32.into(), b"bye").await,
             }
         }
     });
@@ -94,7 +94,7 @@ fn tasks_and_threads_end_with_their_sessions() {
             let _ = recv.read_to_end(usize::MAX).await;
             assert!(resources().hooks > hooks, "a hook task runs");
             if i.is_multiple_of(2) {
-                receiver.close(0u32.into(), b"");
+                receiver.close(0u32.into(), b"").await;
             } else {
                 // The last handle gone closes the session.
                 drop((receiver, recv, s2));
@@ -103,8 +103,9 @@ fn tasks_and_threads_end_with_their_sessions() {
         }
         let mut c = Config::default();
         c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::psk(*b"leaks-test-psk--0123456789abcdef");
-        let listener = Listener::new(c.clone(), ListenerConfig::default());
+        c.pipe_auth = PipeAuth::psk(*b"leaks-test-psk--0123456789abcdef").with_end_to_end();
+        let listener = Listener::new(c.clone(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let carrier = {
             let listener = listener.clone();
             move || {
@@ -127,14 +128,15 @@ fn tasks_and_threads_end_with_their_sessions() {
             let handle = zmux::helpers::maintain_pipes(
                 &client,
                 PipePool::new(2, move |_| std::future::ready(Ok(dial()))),
-            );
+            )
+            .expect("valid pool");
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(resources().maintainers > maintainers);
             match i {
                 0 => drop(handle),
                 1 => handle.stop(),
                 _ => {
-                    client.close(0u32.into(), b"");
+                    client.close(0u32.into(), b"").await;
                     drop(client);
                     while !handle.is_finished() {
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -142,7 +144,7 @@ fn tasks_and_threads_end_with_their_sessions() {
                     continue;
                 }
             }
-            client.close(0u32.into(), b"");
+            client.close(0u32.into(), b"").await;
         }
         drop(listener);
     });

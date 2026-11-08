@@ -14,7 +14,7 @@ use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Poli
 fn config(policy: Policy) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"driver-test-psk-0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"driver-test-psk-0123456789abcdef").with_end_to_end();
     c.scheduler = policy;
     c
 }
@@ -22,7 +22,8 @@ fn config(policy: Policy) -> Config {
 async fn server(policy: Policy) -> (std::net::SocketAddr, Listener) {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(config(policy), ListenerConfig::default());
+    let listener = Listener::new(config(policy), ListenerConfig::default())
+        .expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move { l.serve(tcp).await });
     // Echo every stream of every session.
@@ -71,7 +72,8 @@ async fn echo(session: &Session, len: usize) {
 async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(config(Policy::Affinity), ListenerConfig::default());
+    let listener = Listener::new(config(Policy::Affinity), ListenerConfig::default())
+        .expect("valid listener configuration");
     let l = listener.clone();
     let serving = tokio::spawn(async move { l.serve(tcp).await });
     let first = TcpStream::connect(addr).await.unwrap();
@@ -82,7 +84,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let second = TcpStream::connect(addr).await.unwrap();
     let pipe = client
-        .add_pipe(
+        .begin_add_pipe(
             PipeIo::tcp(second),
             PipeOptions::new().with_priority(5).with_label("second"),
         )
@@ -96,34 +98,43 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let stats = pipe.stats().unwrap();
     assert_eq!(stats.label.as_deref(), Some("second"));
     assert_eq!((stats.send_priority, stats.receive_priority), (5, 5));
+    assert!(stats.local);
+    let zero = client.pipe(zmux::PipeId::new(0)).unwrap().stats().unwrap();
+    assert!(zero.peer_attached);
     // The server holds handles of pipe 0 and of the pipe the client
     // joined, and can change them.
     common::eventually(10, "server sees the join", || ids(&server).len() == 2).await;
     let joined = server.pipe(pipe.id()).expect("the peer's pipe");
     joined.set_send_priority(1).unwrap();
     assert_eq!(joined.stats().unwrap().send_priority, 1);
+    // The peer's join is attached from the start.
+    assert!(joined.stats().unwrap().peer_attached);
     assert!(server.pipe(zmux::PipeId::new(0)).is_some());
     // A join over a carrier that is gone fails, and says why; the session
     // goes on.
     let (dead, far) = tokio::io::duplex(1024);
     drop(far);
     let lost = client
-        .add_pipe(PipeIo::new(dead), PipeOptions::new())
+        .begin_add_pipe(PipeIo::new(dead), PipeOptions::new())
         .unwrap();
     let e = tokio::time::timeout(Duration::from_secs(10), lost.joined())
         .await
         .expect("failed in time")
         .unwrap_err();
+    // The peer's answer to the PIPE_ABANDON retires the attachment and its failure with it.
     assert!(
-        matches!(e, zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_))),
+        matches!(
+            e,
+            zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_)) | zmux::PipeError::UnknownPipe
+        ),
         "{e:?}"
     );
     assert!(client.close_reason().is_none());
-    // `closed` reports how a pipe ended: the failed join's failure, a
-    // graceful removal at both ends, the session's end for pipe 0.
+    // `closed` reports how a pipe ended: the failed join's failure (a retired one reads as
+    // ended), a graceful removal at both ends, the session's end for pipe 0.
     assert!(matches!(
         lost.closed().await,
-        Err(zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_)))
+        Err(zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_))) | Ok(())
     ));
     assert_eq!(pipe.session().stable_id(), client.stable_id());
     pipe.close().unwrap();
@@ -136,7 +147,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         .expect("the peer's half closed in time")
         .unwrap();
     let zero = client.pipe(zmux::PipeId::new(0)).unwrap();
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     let e = tokio::time::timeout(Duration::from_secs(10), zero.closed())
         .await
         .expect("pipe 0 ended with the session")
@@ -155,13 +166,15 @@ async fn two_pipes_spread() {
         .unwrap();
     assert!(s.multipath() == zmux::Multipath::InUse);
     let c2 = TcpStream::connect(addr).await.unwrap();
-    let pipe = s.add_pipe(PipeIo::tcp(c2), PipeOptions::default()).unwrap();
+    let pipe = s
+        .begin_add_pipe(PipeIo::tcp(c2), PipeOptions::default())
+        .unwrap();
     echo(&s, 4 << 20).await;
     let info = s.pipes();
     assert_eq!(info.len(), 2, "{info:?}");
     let p = pipe.stats().unwrap();
     assert!(p.bytes_sent > 0, "{p:?}");
-    s.close(0u32.into(), b"");
+    s.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -173,7 +186,8 @@ async fn severed_pipe_fails_over() {
     let s = Session::connect(PipeIo::tcp(c), cfg).await.unwrap();
     let (raddr, cut) = relay(addr).await;
     let c2 = TcpStream::connect(raddr).await.unwrap();
-    s.add_pipe(PipeIo::tcp(c2), PipeOptions::default()).unwrap();
+    s.begin_add_pipe(PipeIo::tcp(c2), PipeOptions::default())
+        .unwrap();
     let s2 = s.clone();
     let job = tokio::spawn(async move { echo(&s2, 8 << 20).await });
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -192,7 +206,7 @@ async fn severed_pipe_fails_over() {
         .await
         .expect("transfer finishes")
         .unwrap();
-    s.close(0u32.into(), b"");
+    s.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -210,7 +224,7 @@ async fn blocking_client_two_pipes() {
         .unwrap();
         assert!(s.multipath() == zmux::Multipath::InUse);
         let c2 = std::net::TcpStream::connect(addr).unwrap();
-        s.add_pipe(zmux::blocking::PipeIo::tcp(c2), PipeOptions::default())
+        s.begin_add_pipe(zmux::blocking::PipeIo::tcp(c2), PipeOptions::default())
             .unwrap();
         let (mut send, mut recv) = s.open_bi().unwrap();
         let len = 2 << 20;
@@ -242,7 +256,7 @@ async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
         .unwrap();
     let c2 = TcpStream::connect(addr).await.unwrap();
     let io = PipeIo::tcp(c2).with_unsent(|| Some(4321));
-    let pipe = s.add_pipe(io, PipeOptions::default()).unwrap();
+    let pipe = s.begin_add_pipe(io, PipeOptions::default()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await
         .expect("joined in time")
@@ -254,5 +268,5 @@ async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
     })
     .await
     .expect("the count reported");
-    s.close(0u32.into(), b"");
+    s.close(0u32.into(), b"").await;
 }

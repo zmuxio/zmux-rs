@@ -1,7 +1,6 @@
-//! Duplicate sessions (EXTENSIONS.md Section 11): two
-//! endpoints that dialed each other at about the same time keep the same
-//! one of their two sessions, each deciding alone from values both have,
-//! and drain the other.
+//! Duplicate sessions: two endpoints that dialed each other at about the
+//! same time keep the same one of their two sessions, each deciding
+//! alone from values both have, and drain the other.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -11,7 +10,7 @@ use crate::driver::handle::{Driver, Session};
 use crate::proto::VarInt;
 use crate::proto::session::State;
 
-/// Which value decided (EXTENSIONS.md Section 11, Survivor).
+/// Which value decided which session survives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DuplicateRule {
@@ -123,8 +122,7 @@ macro_rules! duplicate_api {
             /// The peer's identity.
             pub peer_identity: Option<Vec<u8>>,
             /// `rejoin`: dials the route of the losing session again, so
-            /// that the survivor keeps it as a pipe (EXTENSIONS.md Section
-            /// 11, Keeping the route). A hint: see
+            /// that the survivor keeps it as a pipe. A hint: see
             /// [`Resolved::rejoin_started`].
             pub rejoin: Option<$dial>,
         }
@@ -178,9 +176,9 @@ macro_rules! duplicate_api {
             pub rejoin_started: bool,
         }
 
-        /// Applies the duplicate-session rule (EXTENSIONS.md Section 11) to two
-        /// established sessions that the application has identified as connecting
-        /// the same two endpoints, one dialed by each.
+        /// Applies the duplicate-session rule to two established sessions that
+        /// the application has identified as connecting the same two endpoints,
+        /// one dialed by each.
         ///
         /// The survivor is the session whose dialer has the smaller value, the
         /// first that both sessions have of: the application identities of

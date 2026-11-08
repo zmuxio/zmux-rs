@@ -1,4 +1,4 @@
-//! Receive-window auto-tuning over an in-process shaper (CONFORMANCE.md; the
+//! Receive-window auto-tuning over an in-process shaper (the
 //! shaper variant of the auto-tuning experiment): each
 //! direction of the pipe is a link with a fixed rate, a one-way delay and a
 //! bottleneck queue, with no TCP below. Run with `cargo bench --bench
@@ -268,7 +268,7 @@ async fn run(sc: &Scenario) {
         client.rtt().map(|r| r.as_micros()),
         stats.bytes_sent as f64 / 1e6,
     );
-    client.close(zmux::VarInt::from_u32(0), b"");
+    client.close(zmux::VarInt::from_u32(0), b"").await;
 }
 
 fn main() {

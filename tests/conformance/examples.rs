@@ -1,15 +1,15 @@
-//! WIRE_EXAMPLES.md: every example encodes from its JSON to its bytes and
+//! The wire examples: every example encodes from its JSON to its bytes and
 //! decodes back, the key-schedule vectors match, and the foreign prefixes are
 //! rejected at the byte shown.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use zmux::proto::frame::{Frame, PipeJoin};
+use zmux::proto::frame::Frame;
 use zmux::proto::ident::{Classifier, Verdict};
 use zmux::proto::params::{Grease, TransportParameters};
 use zmux::proto::payload::{Flow, WirePreamble};
-use zmux::proto::{Gates, keys, oob};
+use zmux::proto::{Gates, keys};
 
 use crate::corpus::read_records;
 use crate::model::FrameSpec;
@@ -169,53 +169,28 @@ fn key_schedule_vectors() {
     let nr: [u8; 16] = get("responder Session Nonce").try_into().unwrap();
     let secret = keys::session_secret(&ni, &nr, &[], &get(&psk_key));
     assert_eq!(to_hex(&secret), v["session_secret"]);
-    let k = keys::SessionKeys::derive(&secret);
-    assert_eq!(to_hex(&k.join_initiator), v["join_key_i"]);
-    assert_eq!(to_hex(&k.join_responder), v["join_key_r"]);
-
-    let prefix = get("PIPE_JOIN for pipe 2 up, bytes before the token");
-    let token = keys::join_token(&k.join_initiator, &prefix, &[]);
-    assert_eq!(to_hex(&token), v["Join Token (no carrier binding)"]);
-
-    // The out-of-band form is the frame alone, Type through Join Token.
-    let frame = get("PIPE_JOIN frame, out-of-band form");
-    assert_eq!(frame, [prefix.as_slice(), token.as_slice()].concat());
-    let (join, len) = PipeJoin::decode(&frame).unwrap();
-    assert_eq!(len, frame.len());
-    assert_eq!(join.pipe_id, 2);
-    assert!(keys::verify_join(&k.join_initiator, &frame, &[]));
-    assert!(!keys::verify_join(&k.join_responder, &frame, &[]));
-    // The HTTP binding carries it in base64url without padding.
-    let mut encoded = [0u8; 96];
-    let e = oob::encode(&frame, &mut encoded).unwrap();
-    assert!(e <= oob::MAX_JOIN_HEADER_LEN);
-    let mut decoded = [0u8; 64];
-    let n = oob::decode(&encoded[..e], &mut decoded).unwrap();
-    assert_eq!(&decoded[..n], frame.as_slice());
-
-    // 4.1: the in-band join of the example record verifies; signing an
-    // encoded frame reproduces the token.
-    let join_record = example("pipe-join");
-    let (_, join_len) = PipeJoin::decode(body(&join_record)).unwrap();
-    let mut signed = body(&join_record)[..join_len].to_vec();
-    assert!(keys::verify_join(&k.join_initiator, &signed, &[]));
-    signed[join_len - 1] ^= 1;
-    assert!(!keys::verify_join(&k.join_initiator, &signed, &[]));
-    assert!(keys::sign_join(&k.join_initiator, &mut signed, &[]));
-    assert_eq!(&signed[..], &body(&join_record)[..join_len]);
-
-    // 4.4 and 5.1: the token covers the frame through Priority, standby
-    // flag included.
-    for id in ["pipe-join-priority", "rejoin-record"] {
-        let bytes = example(id);
-        let (join, len) = PipeJoin::decode(body(&bytes)).unwrap();
-        assert!(
-            keys::verify_join(&k.join_initiator, &body(&bytes)[..len], &[]),
-            "{id}"
-        );
-        if id == "pipe-join-priority" {
-            assert!(join.standby && join.priority == 10, "{id}");
-        }
+    let one = zmux::proto::seal::SessionCrypto {
+        suites: vec![1],
+        groups: vec![2],
+    };
+    let encoded = zmux::proto::seal::session_crypto(&one, &one).unwrap();
+    assert_eq!(
+        to_hex(&encoded),
+        v["session_crypto (Suite 1, Group 2 at each end)"]
+    );
+    let suite = zmux::proto::seal::Suite::from_value(1).unwrap();
+    for (role, row) in [
+        (
+            zmux::proto::seal::JoinRole::Initiator,
+            "join_psk_i, epoch 0, Suite 1",
+        ),
+        (
+            zmux::proto::seal::JoinRole::Responder,
+            "join_psk_r, epoch 0, Suite 1",
+        ),
+    ] {
+        let psk = zmux::proto::seal::derive_join_psk(suite, &secret, role, &encoded).unwrap();
+        assert_eq!(to_hex(&psk), v[row]);
     }
 }
 
@@ -247,7 +222,7 @@ fn foreign_prefixes_rejected_at_the_byte_shown() {
         assert_eq!(c.verdict(), Verdict::Reject { at }, "{line}");
         rows += 1;
     }
-    assert!(rows >= 5, "foreign prefix table not found");
+    assert!(rows >= 4, "foreign prefix table not found");
 }
 
 #[test]

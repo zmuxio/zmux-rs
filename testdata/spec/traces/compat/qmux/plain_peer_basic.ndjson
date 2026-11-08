@@ -9,4 +9,4 @@
 {"step": 8, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
 {"step": 9, "op": "api", "call": "write", "args": {"stream": "a", "data": "6869", "fin": true}, "expect": {"accepted": 2}}
 {"step": 10, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "QX_PING", "response": true, "seq": 0}, {"type": "STREAM_DATA", "id": 1, "data": "6869", "fin": true}]}
-{"step": 11, "op": "expect_no_frames", "pipe": "*", "types": ["GOAWAY", "PRIORITY_UPDATE", "PIPE_ACK", "PIPE_PING", "PIPE_JOIN", "PIPE_LANE", "RESET_STREAM_AT", "PIPE_STATUS", "PIPE_ABANDON"]}
+{"step": 11, "op": "expect_no_frames", "pipe": "*", "types": ["GOAWAY", "PRIORITY_UPDATE", "PIPE_ACK", "PIPE_PING", "PIPE_LANE", "RESET_STREAM_AT", "PIPE_STATUS", "PIPE_ABANDON"]}

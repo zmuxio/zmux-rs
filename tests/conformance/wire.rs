@@ -4,19 +4,17 @@
 
 use serde_json::{Value, json};
 use zmux::proto::frame::{
-    ConnectionClose, DataBlocked, Datagram, Dir, Frame, FrameType, GoAwayFrame, JoinDirection,
-    MaxData, MaxStreamData, MaxStreams, Padding, PipeAbandon, PipeJoin, PipeLane, PipeStatus,
-    PipeStatusValue, Priority, PriorityUpdate, QxPing, QxTransportParameters, ResetStream,
-    ResetStreamAt, StopSending, Stream, StreamDataBlocked, StreamsBlocked,
+    ConnectionClose, DataBlocked, Datagram, Dir, Frame, FrameType, GoAwayFrame, MaxData,
+    MaxStreamData, MaxStreams, Padding, PipeAbandon, PipeLane, PipeStatus, PipeStatusValue,
+    Priority, PriorityUpdate, QxPing, QxTransportParameters, ResetStream, ResetStreamAt,
+    StopSending, Stream, StreamDataBlocked, StreamsBlocked,
 };
 use zmux::proto::params::{
     Locator, MultipathParameter, RawParameters, RoleParameter, TransportParameters,
 };
 use zmux::proto::{Gates, record, varint};
 
-use crate::model::{
-    FrameSpec, Int, JoinDirectionName, ParamId, ParamSpec, ParamValue, PipeStatusName, RoleName,
-};
+use crate::model::{FrameSpec, Int, ParamId, ParamSpec, ParamValue, PipeStatusName, RoleName};
 use crate::support::to_hex;
 
 /// Appends `frame` to `out`, checking that `encoded_len` is exact.
@@ -74,7 +72,7 @@ pub fn param_value(id: u64, value: Option<&ParamValue>) -> Vec<u8> {
         .iter()
         .find(|p| p.1 == id)
         .and_then(|p| p.2.as_deref());
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 512];
     let n = match (format, value) {
         (Some("empty"), None) => 0,
         (Some("varint"), Some(ParamValue::Int(v))) => varint::encode(*v, &mut buf).unwrap(),
@@ -94,6 +92,17 @@ pub fn param_value(id: u64, value: Option<&ParamValue>) -> Vec<u8> {
         }
         .encode(&mut buf)
         .unwrap(),
+        // By hand: the traces also send invalid sets.
+        (Some("session_crypto"), Some(ParamValue::Crypto(c))) => {
+            let mut n = 0;
+            for set in [&c.suites, &c.groups] {
+                n += varint::encode(set.len() as u64, &mut buf[n..]).unwrap();
+                for &v in set {
+                    n += varint::encode(v, &mut buf[n..]).unwrap();
+                }
+            }
+            n
+        }
         // By hand: the traces also send the invalid Max Lanes 0.
         (Some("lanes"), Some(ParamValue::Lanes(l))) => {
             let n = varint::encode(l.max_lanes, &mut buf).unwrap();
@@ -281,37 +290,10 @@ pub fn encode_frame(spec: &FrameSpec, out: &mut Vec<u8>, sent: Sent<'_>) {
                 priority: Priority::new(*urgency, *incremental).expect("urgency"),
             }),
         ),
-        FrameSpec::PipeJoin {
-            locator,
-            pipe,
-            direction,
-            carrier_bound,
-            standby,
-            fate_group,
-            priority,
-            token,
-        } => push(
-            out,
-            &Frame::PipeJoin(PipeJoin {
-                locator: &locator.0,
-                pipe_id: *pipe,
-                direction: match direction {
-                    JoinDirectionName::Up => JoinDirection::Up,
-                    JoinDirectionName::Down => JoinDirection::Down,
-                    JoinDirectionName::Bidi => JoinDirection::Bidi,
-                },
-                carrier_bound: *carrier_bound,
-                fate_group: *fate_group,
-                standby: *standby,
-                priority: *priority,
-                token: token.0.as_slice().try_into().expect("16-byte token"),
-            }),
-        ),
         FrameSpec::PipeAck { entries } => {
             // Written by hand so that invalid entry orders can be encoded;
             // a `$sent` value is written as a 4-byte varint, so that the
-            // record's length does not depend on it (TRACES.md Section
-            // 6.1).
+            // record's length does not depend on it.
             let mut put = |v: u64, width: usize| {
                 let start = out.len();
                 out.resize(start + width, 0);
@@ -366,6 +348,31 @@ pub fn encode_frame(spec: &FrameSpec, out: &mut Vec<u8>, sent: Sent<'_>) {
                 priority: *priority,
             }),
         ),
+        FrameSpec::SessionEpoch {
+            phase,
+            epoch,
+            share,
+            locator,
+        } => push(
+            out,
+            &Frame::SessionEpoch(zmux::proto::frame::SessionEpoch {
+                phase: epoch_phase(phase),
+                epoch: *epoch,
+                share: share.as_ref().map_or(&[], |h| &h.0),
+                locator: locator.as_ref().map_or(&[], |h| &h.0),
+                raw: &[],
+            }),
+        ),
+    }
+}
+
+/// The Phase of a SESSION_EPOCH by its trace name.
+pub fn epoch_phase(name: &str) -> zmux::proto::frame::EpochPhase {
+    use zmux::proto::frame::EpochPhase as P;
+    match name {
+        "offer" => P::Offer,
+        "answer" => P::Answer,
+        other => panic!("SESSION_EPOCH phase {other}"),
     }
 }
 
@@ -415,6 +422,10 @@ fn param_json(id: u64, value: &[u8], tp: &TransportParameters) -> Value {
                 "locator": to_hex(m.locator.as_bytes()),
             })
         }
+        Some("session_crypto") => {
+            let c = tp.zmux_session_crypto.clone().expect("validated");
+            json!({"suites": c.suites, "groups": c.groups})
+        }
         Some("lanes") => {
             let l = tp.zmux_max_lanes.expect("validated");
             json!({"max_lanes": l.max_lanes.get(), "lane_key": to_hex(&l.lane_key)})
@@ -424,7 +435,7 @@ fn param_json(id: u64, value: &[u8], tp: &TransportParameters) -> Value {
     json!({"id": row.0, "value": v})
 }
 
-/// Renders a decoded frame as a frame object of TRACES.md Section 6.
+/// Renders a decoded frame as a trace frame object.
 pub fn frame_json(frame: &Frame<'_>) -> Value {
     match frame {
         Frame::Padding(f) => json!({"type": "PADDING", "count": f.len}),
@@ -486,16 +497,6 @@ pub fn frame_json(frame: &Frame<'_>) -> Value {
             "type": "PRIORITY_UPDATE", "id": f.stream_id, "seq": f.sequence,
             "urgency": f.priority.urgency(), "incremental": f.priority.incremental(),
         }),
-        Frame::PipeJoin(f) => json!({
-            "type": "PIPE_JOIN", "locator": to_hex(f.locator), "pipe": f.pipe_id,
-            "direction": match f.direction {
-                JoinDirection::Up => "up",
-                JoinDirection::Down => "down",
-                JoinDirection::Bidi => "bidi",
-            },
-            "carrier_bound": f.carrier_bound, "standby": f.standby,
-            "fate_group": f.fate_group, "priority": f.priority, "token": to_hex(&f.token),
-        }),
         Frame::PipeAck(f) => {
             let entries: Vec<Value> = f
                 .entries()
@@ -524,6 +525,15 @@ pub fn frame_json(frame: &Frame<'_>) -> Value {
             },
             "priority": f.priority,
         }),
+        Frame::SessionEpoch(f) => {
+            use zmux::proto::frame::EpochPhase as P;
+            let phase = match f.phase {
+                P::Offer => "offer",
+                P::Answer => "answer",
+            };
+            json!({"type": "SESSION_EPOCH", "phase": phase, "epoch": f.epoch,
+                "share": to_hex(f.share), "locator": to_hex(f.locator)})
+        }
         other => panic!("no JSON form for {other:?}"),
     }
 }

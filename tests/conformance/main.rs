@@ -1,5 +1,5 @@
 //! Conformance tests against the zmux specification assets vendored in
-//! `testdata/spec` (refresh them with `tools/sync-spec-fixtures.sh`).
+//! `testdata/spec`, copied unchanged from the specification.
 
 // Test helpers are shared between modules with plain `pub`.
 #![allow(unreachable_pub)]

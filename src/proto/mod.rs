@@ -9,18 +9,20 @@
 //! - [`draft`]: the values that depend on the QMux draft version.
 //! - [`ident`]: first-record identification and ALPN identifiers.
 //! - [`payload`]: the stream preamble and the datagram flow prefix.
-//! - [`keys`]: the join and resume key schedule.
-//! - [`oob`]: out-of-band join and pairing header values.
+//! - [`keys`]: the session secret of Join.
+//! - [`oob`]: pairing header values.
 //! - [`admission`]: the inputs and outcome of a carrier admission.
 //! - [`prefix_auth`]: prefix authentication tokens, an admission function.
 //! - [`trusted`]: trusted intermediaries and the sources they report.
 //! - [`listener`]: classification and limits of new carriers, join routing.
 //! - [`meter`]: the application byte counters of streams and sessions.
 //! - [`limit`]: the limiter interface of datagrams and the relay helper.
+//! - [`seal`]: the shared part of the secure carrier: Join, Suites, Sealed
+//!   records, the handshake payload codec and `Export`. It allocates.
 //! - [`error`]: error codes and the error types of this layer.
 //!
-//! Nothing in this module performs I/O or panics on peer input, and
-//! decoding and encoding allocate nothing.
+//! Nothing in this module performs I/O or panics on peer input, and outside
+//! [`seal`] decoding and encoding allocate nothing.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +30,7 @@ pub mod admission;
 mod codec;
 pub mod draft;
 pub mod error;
+pub mod exporter;
 pub mod frame;
 pub mod ident;
 pub mod keys;
@@ -39,6 +42,8 @@ pub mod params;
 pub mod payload;
 pub mod prefix_auth;
 pub mod record;
+pub mod replay;
+pub mod seal;
 pub mod trusted;
 pub mod varint;
 

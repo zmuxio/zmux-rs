@@ -1,6 +1,6 @@
 [package]
 name = "zmux"
-version = "1.2.5"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -20,6 +20,8 @@ members = [
     "adapter/webtransport",
     "adapter/h3",
     "shaping",
+    "seal-proto",
+    "seal",
 ]
 # The default gate: the core and the TLS and QUIC adapters; `--workspace`
 # builds the other adapters too.
@@ -33,18 +35,27 @@ default = ["tokio"]
 tokio = ["dep:tokio", "dep:libc", "dep:atomic-waker"]
 # The std driver: `zmux::blocking`.
 blocking = ["dep:libc"]
-# Deterministic values for the conformance trace runner (TRACES.md Section
-# 3.3). Never enable this in production builds.
+# Suite 2 of Join and the ChaCha20-Poly1305 of the secure carrier's records.
+seal-chacha = ["dep:chacha20poly1305"]
+# Deterministic values for the conformance trace runner (the trace
+# profiles' test-mode choices). Never enable this in production builds.
 test-hooks = []
 
 [dependencies]
+# Suite 1 of Join, always present.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"], optional = true }
 # The tokio driver's single-waker slots (a pipe's read waker, a maintainer's stop).
 atomic-waker = { version = "1.1", optional = true }
 bytes = "1.12"
 getrandom = "0.4"
 hmac = "0.13"
+# The ML-KEM-768 of Group 2 (Join and session epochs) and of the Establish Profiles.
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768", "std"] }
 sha2 = "0.11"
 tokio = { version = "1.54", optional = true, features = ["rt", "net", "io-util", "sync", "time"] }
+# The X25519 of Groups 1 and 2 and of the Establish Profiles.
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 
 [target.'cfg(unix)'.dependencies]
 # getsockopt(TCP_INFO) and the low-water mark of TCP carriers (src/driver/tcp.rs).
@@ -56,7 +67,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.54", features = ["full", "test-util"] }
-zmux = { path = ".", features = ["test-hooks", "blocking"] }
+zmux = { path = ".", features = ["test-hooks", "blocking", "seal-chacha"] }
 # TLS-over-TCP carrier of the benches only; the library has no TLS dependency.
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -69,11 +80,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 loom = { version = "0.7.2", features = ["futures"] }
 
 # Randomized schedules of the std driver's thread protocol
-# (src/driver/shuttle.rs, CONFORMANCE.md Section 4.7 item 2):
+# (src/driver/shuttle.rs, the driver's thread-protocol schedule exploration):
 # RUSTFLAGS="--cfg shuttle" CARGO_TARGET_DIR=target/shuttle \
 #     cargo test --lib --release --features blocking shuttle
 [target.'cfg(shuttle)'.dev-dependencies]
-shuttle = "0.9.9"
+shuttle = "0.9.10"
 
 [[bench]]
 name = "codec"
@@ -91,6 +102,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }
 
 [profile.bench]
 debug = 1
+
+# ML-KEM is slow unoptimised; its vectors run thousands of operations.
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+
+[profile.dev.package.libcrux-sha3]
+opt-level = 3
 
 [[bench]]
 name = "session"

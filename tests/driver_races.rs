@@ -217,7 +217,7 @@ async fn random_cancellation_storm() {
         }
     })
     .await;
-    client.close(VarInt::from_u32(7), b"done");
+    client.close(VarInt::from_u32(7), b"done").await;
     watchdog(10, "server sees the close", server.closed()).await;
     watchdog(10, "server tasks end", server_task).await.unwrap();
 }
@@ -431,7 +431,7 @@ fn session_task_dropped_with_its_runtime() {
 fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"driver-race-psk-0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"driver-race-psk-0123456789abcdef").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
     c.suspect_floor = Duration::from_millis(100);
     c
@@ -444,7 +444,8 @@ fn mp_config() -> Config {
 async fn multipath_pipe_loss_under_concurrency() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = tcp.local_addr().unwrap();
-    let listener = Listener::new(mp_config(), ListenerConfig::default());
+    let listener = Listener::new(mp_config(), ListenerConfig::default())
+        .expect("valid listener configuration");
     {
         let l = listener.clone();
         tokio::spawn(async move {
@@ -476,13 +477,13 @@ async fn multipath_pipe_loss_under_concurrency() {
     let server = watchdog(5, "listener accepts", accepted).await.unwrap();
     let (raddr, cut) = relay(target).await;
     client
-        .add_pipe(
+        .begin_add_pipe(
             PipeIo::tcp(TcpStream::connect(raddr).await.unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
     let third = client
-        .add_pipe(
+        .begin_add_pipe(
             PipeIo::tcp(TcpStream::connect(target).await.unwrap()),
             PipeOptions::default(),
         )
@@ -514,7 +515,7 @@ async fn multipath_pipe_loss_under_concurrency() {
     cut.store(true, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = third.abort();
-    let _ = client.add_pipe(
+    let _ = client.begin_add_pipe(
         PipeIo::tcp(TcpStream::connect(target).await.unwrap()),
         PipeOptions::default(),
     );
@@ -529,7 +530,7 @@ async fn multipath_pipe_loss_under_concurrency() {
     })
     .await;
     assert!(echoes > 12, "{echoes} echoes");
-    client.close(VarInt::from_u32(0), b"");
+    client.close(VarInt::from_u32(0), b"").await;
     watchdog(10, "server sees the close", server.closed()).await;
 }
 
@@ -575,7 +576,7 @@ async fn send_capacity_waits_end_on_credit_stop_close_and_cancellation() {
         send2.write_all(&vec![3; window as usize]).await.unwrap();
         let close = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            server.close(VarInt::from_u32(0), b"");
+            server.close(VarInt::from_u32(0), b"").await;
         };
         let (closed, ()) = tokio::join!(send2.wait_send_capacity(1), close);
         assert!(closed.is_err(), "{closed:?}");
@@ -622,7 +623,7 @@ async fn application_bytes_read_concurrently_are_monotonic_and_exact() {
         let s = server.meter().get();
         assert_eq!((s.bytes_written, s.bytes_read), (len as u64, len as u64));
         assert_eq!(client.meter().bytes_written(), len as u64);
-        client.close(VarInt::from_u32(0), b"");
+        client.close(VarInt::from_u32(0), b"").await;
     })
     .await;
 }

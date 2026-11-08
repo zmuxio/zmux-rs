@@ -1,7 +1,7 @@
-//! Carrier modes (API.md Section 4.8): a client dials a session over the
-//! carrier kind a [`Mode`] selects, explicitly one, or automatically among
-//! candidates in their order of preference, remembering per server and
-//! local network which kinds the path lets through ([`CarrierCache`]).
+//! Carrier modes: a client dials a session over the carrier kind a
+//! [`Mode`] selects, explicitly one, or automatically among candidates in
+//! their order of preference, remembering per server and local network
+//! which kinds the path lets through ([`CarrierCache`]).
 
 use std::fmt;
 use std::future::Future;
@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use super::cache::{CarrierCache, Known};
 use super::handle;
 use super::tokio::{Pipe, PipeIo, Session, Tokio};
+use crate::ConnectError;
 use crate::proto::params::Role;
 use crate::proto::session::{
     CandidateOutcome, CandidateResult, CarrierKind, Config, EarlyData, Multipath, PipeError,
     PipeFailure, PipeId, PipeOptions, RoleConfig, SessionError,
 };
-use crate::{ConnectError, PipeDirection};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type DialFn = dyn Fn() -> BoxFuture<io::Result<PipeIo>> + Send + Sync;
@@ -32,8 +32,54 @@ type JoinFn = dyn Fn(Session, PipeOptions) -> BoxFuture<io::Result<Vec<Pipe>>> +
 #[derive(Clone)]
 pub struct Candidate {
     kind: CarrierKind,
+    variant: Option<Arc<str>>,
+    target: Option<Arc<HttpTarget>>,
     dial: Arc<DialFn>,
     join: Option<Arc<JoinFn>>,
+}
+
+/// The URL of a candidate dialed at a URL and the URL redirects last led
+/// it to: later carriers start from the final URL. Safe for concurrent use.
+#[derive(Debug)]
+pub struct HttpTarget {
+    base: String,
+    current: std::sync::Mutex<Option<String>>,
+}
+
+impl HttpTarget {
+    /// A target at `base`.
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            current: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The URL the next carrier starts from.
+    pub fn url(&self) -> String {
+        self.lock().clone().unwrap_or_else(|| self.base.clone())
+    }
+
+    /// The URL the target was made with.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Records the final URL of a carrier that redirects led to.
+    pub fn redirected(&self, last: &str) {
+        *self.lock() = (last != self.base).then(|| last.to_owned());
+    }
+
+    /// Starts the next carrier from the base URL again.
+    pub fn reset(&self) {
+        *self.lock() = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl fmt::Debug for Candidate {
@@ -54,6 +100,8 @@ impl Candidate {
     {
         Self {
             kind,
+            variant: None,
+            target: None,
             dial: Arc::new(move || Box::pin(dial())),
             join: None,
         }
@@ -96,15 +144,52 @@ impl Candidate {
         }
     }
 
+    /// Names the target its dial opens carriers at, for a kind dialed at a
+    /// URL: the dial starts at [`HttpTarget::url`] and records where
+    /// redirects led it ([`HttpTarget::redirected`]); a carrier mode keeps
+    /// that URL per server in its [`CarrierCache`] while the kind is
+    /// usable, and starts the target at its base URL again after a failure.
+    #[must_use]
+    pub fn with_target(mut self, target: Arc<HttpTarget>) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// The candidate's target ([`Candidate::with_target`]).
+    pub fn target(&self) -> Option<&Arc<HttpTarget>> {
+        self.target.as_ref()
+    }
+
     /// The candidate's kind.
     pub fn kind(&self) -> CarrierKind {
         self.kind
     }
 
+    /// Labels the transform the candidate's carriers run: the carriers'
+    /// variant ([`PipeIo::with_variant`]). A kind with different variants
+    /// makes different candidates, each with its own place in the
+    /// [`CarrierCache`]. Order expresses the preference, as for kinds.
+    #[must_use]
+    pub fn with_variant(mut self, variant: impl Into<Arc<str>>) -> Self {
+        self.variant = Some(variant.into());
+        self
+    }
+
+    /// The candidate's variant ([`Candidate::with_variant`]).
+    pub fn variant(&self) -> Option<&Arc<str>> {
+        self.variant.as_ref()
+    }
+
     /// Opens a carrier of the candidate.
     /// Its kind is the candidate's ([`PipeIo::with_carrier`]).
     pub async fn dial(&self) -> io::Result<PipeIo> {
-        (self.dial)().await.map(|io| io.with_carrier(self.kind))
+        (self.dial)().await.map(|io| {
+            let io = io.with_carrier(self.kind);
+            match &self.variant {
+                Some(v) => io.with_variant(v.clone()),
+                None => io,
+            }
+        })
     }
 }
 
@@ -271,8 +356,8 @@ impl fmt::Display for ModeError {
 
 impl std::error::Error for ModeError {}
 
-/// Dials a client session over the carrier `mode` selects (API.md Section
-/// 4.8). `policy` is the policy of [`Mode::auto`].
+/// Dials a client session over the carrier `mode` selects. `policy` is the policy of
+/// [`Mode::auto`].
 ///
 /// [`Mode::explicit`] dials its one candidate, within the configuration's
 /// handshake timeout. [`Mode::auto`] sends no early data (the
@@ -315,7 +400,7 @@ pub async fn dial_mode(
         let Some(s) = session else {
             return Err(ModeError::tried(results));
         };
-        s.report_carrier(&results, Some(first.kind));
+        s.report_carrier(&results, Some((first.kind, first.variant.clone())));
         return Ok(s);
     }
     let src = Arc::new(src);
@@ -336,12 +421,18 @@ pub async fn dial_mode(
         let cand = &src.cands[i];
         let (session, res) = start(cand, &config, Some(p)).await;
         results.push(res);
-        p.cache
-            .record(&p.key, cand.kind, session.is_some(), Instant::now());
+        p.cache.record(
+            &p.key,
+            cand.kind,
+            cand.variant(),
+            cand.target().map(|t| &**t),
+            session.is_some(),
+            Instant::now(),
+        );
         let Some(s) = session else {
             continue;
         };
-        s.report_carrier(&results, Some(cand.kind));
+        s.report_carrier(&results, Some((cand.kind, cand.variant.clone())));
         let chosen = Instant::now();
         if join
             && s.multipath() == Multipath::InUse
@@ -386,7 +477,7 @@ impl Params {
 }
 
 fn result(
-    kind: CarrierKind,
+    cand: &Candidate,
     joined: bool,
     r: Result<(), (CandidateOutcome, String)>,
 ) -> CandidateResult {
@@ -395,7 +486,8 @@ fn result(
         Err((o, e)) => (o, Some(e)),
     };
     CandidateResult {
-        kind,
+        kind: cand.kind,
+        variant: cand.variant.clone(),
         outcome,
         joined,
         error,
@@ -439,6 +531,9 @@ async fn start(
     config: &Arc<Config>,
     p: Option<&Params>,
 ) -> (Option<Session>, CandidateResult) {
+    if let Some(p) = p {
+        p.cache.prime(&p.key, cand);
+    }
     let bound = config.handshake_wait();
     let t0 = Instant::now();
     let io = match tokio::time::timeout(bound, cand.dial()).await {
@@ -446,14 +541,14 @@ async fn start(
         Ok(Err(e)) => {
             return (
                 None,
-                result(cand.kind, false, Err((io_outcome(&e), e.to_string()))),
+                result(cand, false, Err((io_outcome(&e), e.to_string()))),
             );
         }
         Err(_) => {
             let e = "the carrier did not open in time".to_owned();
             return (
                 None,
-                result(cand.kind, false, Err((CandidateOutcome::TimedOut, e))),
+                result(cand, false, Err((CandidateOutcome::TimedOut, e))),
             );
         }
     };
@@ -473,7 +568,7 @@ async fn start(
         Err(e) => {
             return (
                 None,
-                result(cand.kind, false, Err((connect_outcome(&e), e.to_string()))),
+                result(cand, false, Err((connect_outcome(&e), e.to_string()))),
             );
         }
     };
@@ -489,10 +584,10 @@ async fn start(
     })
     .await;
     match r {
-        Some(Ok(s)) => (Some(s), result(cand.kind, false, Ok(()))),
+        Some(Ok(s)) => (Some(s), result(cand, false, Ok(()))),
         Some(Err(e)) => (
             None,
-            result(cand.kind, false, Err((connect_outcome(&e), e.to_string()))),
+            result(cand, false, Err((connect_outcome(&e), e.to_string()))),
         ),
         None => {
             // Abandoned before the pending establishment is dropped, so
@@ -506,7 +601,7 @@ async fn start(
             );
             (
                 None,
-                result(cand.kind, false, Err((CandidateOutcome::TimedOut, e))),
+                result(cand, false, Err((CandidateOutcome::TimedOut, e))),
             )
         }
     }
@@ -520,6 +615,7 @@ async fn join_candidate(
     p: &Params,
     options: PipeOptions,
 ) -> (Vec<Pipe>, CandidateResult) {
+    p.cache.prime(&p.key, cand);
     let r: Result<Vec<Pipe>, (CandidateOutcome, String)> = async {
         if let Some(join) = &cand.join {
             return match tokio::time::timeout(p.policy.timer_min, join(s.clone(), options)).await {
@@ -545,8 +641,10 @@ async fn join_candidate(
             }
         };
         let limit = p.timer(t0.elapsed());
+        // The candidate's timer bounds the join, and the pipe is aborted
+        // here when it ends first.
         let pipe = s
-            .add_pipe(io, options)
+            .begin_add_pipe(io, options)
             .map_err(|e| (pipe_outcome(&e), e.to_string()))?;
         let confirmed = async {
             pipe.joined().await?;
@@ -570,8 +668,8 @@ async fn join_candidate(
     }
     .await;
     match r {
-        Ok(pipes) => (pipes, result(cand.kind, true, Ok(()))),
-        Err(e) => (Vec::new(), result(cand.kind, true, Err(e))),
+        Ok(pipes) => (pipes, result(cand, true, Ok(()))),
+        Err(e) => (Vec::new(), result(cand, true, Err(e))),
     }
 }
 
@@ -634,7 +732,12 @@ impl ModeSource {
 
     fn failed(&self, i: usize, now: Instant) -> bool {
         matches!(
-            self.p.cache.state(&self.p.key, self.cands[i].kind, now),
+            self.p.cache.state(
+                &self.p.key,
+                self.cands[i].kind,
+                self.cands[i].variant(),
+                now
+            ),
             Known::Failed(_)
         )
     }
@@ -659,7 +762,11 @@ impl ModeSource {
         order
             .iter()
             .copied()
-            .find(|&i| p.cache.state(&p.key, self.cands[i].kind, now) == Known::Usable)
+            .find(|&i| {
+                p.cache
+                    .state(&p.key, self.cands[i].kind, self.cands[i].variant(), now)
+                    == Known::Usable
+            })
             .or_else(|| {
                 order
                     .iter()
@@ -718,9 +825,14 @@ impl ModeSource {
 
     pub(crate) fn record(&self, i: usize, usable: bool) {
         if self.auto {
-            self.p
-                .cache
-                .record(&self.p.key, self.cands[i].kind, usable, Instant::now());
+            self.p.cache.record(
+                &self.p.key,
+                self.cands[i].kind,
+                self.cands[i].variant(),
+                self.cands[i].target().map(|t| &**t),
+                usable,
+                Instant::now(),
+            );
         }
     }
 
@@ -728,9 +840,9 @@ impl ModeSource {
     /// when it is not already.
     pub(crate) fn established(&self, session: &Session, i: usize) {
         self.record(i, true);
-        let kind = self.cands[i].kind;
-        if session.carrier() != Some(kind) {
-            session.report_carrier(&[], Some(kind));
+        let (kind, variant) = (self.cands[i].kind, &self.cands[i].variant);
+        if !session.carrier_is(kind, variant.as_ref()) {
+            session.report_carrier(&[], Some((kind, variant.clone())));
         }
     }
 
@@ -741,81 +853,4 @@ impl ModeSource {
             self.record(i, false);
         }
     }
-}
-
-/// Joins a split carrier to an established session as two further pipes
-/// (a split bootstrap's pairing makes pipe pair 0 only, so
-/// [`Session::add_pipe`](Session#method.add_pipe) refuses its carrier): a downlink reserved for an
-/// out-of-band join, whose carrier `downlink(header)` opens with that
-/// `Zmux-Pipe-Join` value, and an uplink joined in band on the carrier of
-/// `uplink()`, both opened at once and with `options`. Returns the
-/// downlink and the uplink once both joins are confirmed; when either
-/// fails, the other pipe is aborted. The adapters' split joins and split
-/// candidates ([`Candidate::with_join`]) use it, and so can a
-/// [`PipePool::join`](crate::helpers::PipePool::join).
-pub async fn join_split<D, DF, U, UF>(
-    session: &Session,
-    options: PipeOptions,
-    downlink: D,
-    uplink: U,
-) -> io::Result<Vec<Pipe>>
-where
-    D: FnOnce(String) -> DF,
-    DF: Future<Output = io::Result<PipeIo>>,
-    U: FnOnce() -> UF,
-    UF: Future<Output = io::Result<PipeIo>>,
-{
-    let to_io = |e: PipeError| io::Error::other(e.to_string());
-    let reservation = session
-        .reserve_pipe(PipeDirection::In, options.clone())
-        .map_err(to_io)?;
-    let (down, up) = both(downlink(reservation.header()), uplink()).await;
-    let down = match down {
-        Ok(io) => reservation.attach(io).map_err(to_io),
-        Err(e) => {
-            reservation.cancel();
-            Err(e)
-        }
-    };
-    let up = up.and_then(|io| session.add_pipe(io, options).map_err(to_io));
-    let (down, up) = match (down, up) {
-        (Ok(d), Ok(u)) => (d, u),
-        (Ok(p), Err(e)) | (Err(e), Ok(p)) => {
-            let _ = p.abort();
-            return Err(e);
-        }
-        (Err(e), Err(_)) => return Err(e),
-    };
-    for p in [&down, &up] {
-        if let Err(e) = p.joined().await {
-            let _ = down.abort();
-            let _ = up.abort();
-            return Err(to_io(e));
-        }
-    }
-    Ok(vec![down, up])
-}
-
-/// Runs two futures at once; their outputs once both are ready.
-async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
-    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
-    let (mut ra, mut rb) = (None, None);
-    std::future::poll_fn(|cx| {
-        if ra.is_none()
-            && let Poll::Ready(v) = a.as_mut().poll(cx)
-        {
-            ra = Some(v);
-        }
-        if rb.is_none()
-            && let Poll::Ready(v) = b.as_mut().poll(cx)
-        {
-            rb = Some(v);
-        }
-        if ra.is_some() && rb.is_some() {
-            Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }

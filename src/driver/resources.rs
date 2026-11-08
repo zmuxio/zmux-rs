@@ -1,8 +1,7 @@
 //! Test-only accounting of the drivers' resources (feature `test-hooks`):
 //! process-wide counts of live sessions, session tasks, driver threads,
 //! pipes, listeners and their tasks, pipe maintainers and hook contexts,
-//! for leak tests that check every
-//! count returns to its baseline (CONFORMANCE.md).
+//! for leak tests that check every count returns to its baseline.
 //!
 //! A driver object that is counted holds a [`Live`] token: it counts one
 //! when created and uncounts when dropped, so the counts follow the objects
@@ -14,19 +13,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// What a [`Live`] token counts.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) enum Kind {
     /// A session's shared state (either driver), with its core.
     Session,
     /// A tokio session task (with its timer).
+    #[cfg(any(feature = "tokio", feature = "test-hooks"))]
     Task,
     /// A std driver thread: reader, writer, timer or hook.
+    #[cfg(any(feature = "blocking", feature = "test-hooks"))]
     Thread,
     /// A pipe's I/O in a tokio session task.
+    #[cfg(any(feature = "tokio", feature = "test-hooks"))]
     Pipe,
     /// A listener's shared state.
+    #[cfg(any(feature = "tokio", feature = "test-hooks"))]
     Listener,
     /// A pipe maintainer (`maintain_pipes`).
+    #[cfg(any(feature = "tokio", feature = "test-hooks"))]
     Maintainer,
     /// A session's hook task or thread.
     Hook,
@@ -108,8 +111,6 @@ pub struct Tables {
     pub waits: usize,
     /// Pipe events queued for the application.
     pub pipe_events: usize,
-    /// Out-of-band join frames held for reservations.
-    pub oob: usize,
     /// Carrier halves waiting to be closed.
     pub closing: usize,
     /// Pipes handed to the session task, not yet taken over.

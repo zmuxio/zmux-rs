@@ -1,277 +1,255 @@
-//! Strict JSON reading of configuration documents.
-//!
-//! A document is first read into a `serde_json` [`Value`], rejecting
-//! duplicate member names, numbers outside binary64 and anything that is
-//! not JSON. It is then deserialized through [`Strict`], which treats a
-//! `null` member as absent, accepts only JSON integers (no fraction or
-//! exponent) for integer fields and only objects for structs.
+//! Strict JSON: duplicate member names anywhere are an error, and integers keep their
+//! exact value, so that the configuration's error classes do not depend on a float.
 
-use serde::de::{self, DeserializeOwned, IntoDeserializer, Visitor};
-use serde::{Deserialize, Deserializer};
-use serde_json::{Map, Number, Value};
+use std::collections::HashSet;
 
-use crate::def::{Error, err};
+use crate::error::{Error, err};
 
-/// Reads `b` strictly as a `T`; errors are prefixed with `what`.
-pub(crate) fn from_slice<T: DeserializeOwned>(what: &str, b: &[u8]) -> Result<T, Error> {
-    let v = parse(b).map_err(|e| err(format!("{what}: {e}")))?;
-    T::deserialize(Strict(&v)).map_err(|e| err(format!("{what}: {e}")))
+/// A parsed JSON value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Json {
+    Null,
+    Bool(bool),
+    /// An integer, saturated to the bounds of `i128`.
+    Int(i128),
+    /// A number with a fraction or an exponent: never an integer.
+    Float,
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
 }
 
-fn parse(b: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice::<Doc>(b).map(|d| d.0).map_err(|e| {
-        let s = e.to_string();
-        if s.contains("number out of range") {
-            format!("number overflows binary64 ({s})")
-        } else if e.is_data() {
-            s
+impl Json {
+    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(m) => m
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .filter(|v| !matches!(v, Json::Null)),
+            _ => None,
+        }
+    }
+}
+
+/// The nesting a document may have, which bounds the parser's stack.
+const MAX_DEPTH: usize = 512;
+
+pub(crate) fn parse(b: &[u8]) -> Result<Json, Error> {
+    let text = std::str::from_utf8(b).map_err(|_| syntax("not UTF-8"))?;
+    let mut p = Parser {
+        b: text.as_bytes(),
+        i: 0,
+    };
+    p.ws();
+    let v = p.value(0)?;
+    p.ws();
+    if p.i != p.b.len() {
+        return Err(syntax("bytes after the document"));
+    }
+    Ok(v)
+}
+
+fn syntax(m: &str) -> Error {
+    err("syntax", m)
+}
+
+struct Parser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Parser<'_> {
+    fn ws(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> bool {
+        let hit = self.b.get(self.i) == Some(&c);
+        self.i += usize::from(hit);
+        hit
+    }
+
+    fn word(&mut self, w: &str, v: Json) -> Result<Json, Error> {
+        if self.b[self.i..].starts_with(w.as_bytes()) {
+            self.i += w.len();
+            Ok(v)
         } else {
-            format!("parse error: {s}")
+            Err(syntax("unknown token"))
         }
-    })
-}
-
-/// A JSON value read without duplicate member names.
-struct Doc(Value);
-
-impl<'de> Deserialize<'de> for Doc {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(DocVisitor).map(Doc)
-    }
-}
-
-struct DocVisitor;
-
-impl<'de> Visitor<'de> for DocVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a JSON value")
     }
 
-    fn visit_bool<E>(self, x: bool) -> Result<Value, E> {
-        Ok(Value::Bool(x))
-    }
-
-    fn visit_i64<E>(self, x: i64) -> Result<Value, E> {
-        Ok(Value::Number(x.into()))
-    }
-
-    fn visit_u64<E>(self, x: u64) -> Result<Value, E> {
-        Ok(Value::Number(x.into()))
-    }
-
-    fn visit_f64<E: de::Error>(self, x: f64) -> Result<Value, E> {
-        Number::from_f64(x)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("number overflows binary64"))
-    }
-
-    fn visit_str<E>(self, s: &str) -> Result<Value, E> {
-        Ok(Value::String(s.to_owned()))
-    }
-
-    fn visit_string<E>(self, s: String) -> Result<Value, E> {
-        Ok(Value::String(s))
-    }
-
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_seq<A: de::SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
-        let mut v = Vec::new();
-        while let Some(Doc(x)) = a.next_element()? {
-            v.push(x);
+    fn value(&mut self, depth: usize) -> Result<Json, Error> {
+        if depth > MAX_DEPTH {
+            return Err(syntax("nested too deep"));
         }
-        Ok(Value::Array(v))
+        match self.b.get(self.i) {
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
+            Some(b'"') => self.string().map(Json::Str),
+            Some(b't') => self.word("true", Json::Bool(true)),
+            Some(b'f') => self.word("false", Json::Bool(false)),
+            Some(b'n') => self.word("null", Json::Null),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(syntax("expected a value")),
+        }
     }
 
-    fn visit_map<A: de::MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
-        let mut m = Map::new();
-        while let Some(k) = a.next_key::<String>()? {
-            if m.contains_key(&k) {
-                return Err(de::Error::custom(format!("duplicate member `{k}`")));
+    fn object(&mut self, depth: usize) -> Result<Json, Error> {
+        self.i += 1;
+        let mut members: Vec<(String, Json)> = Vec::new();
+        let mut names = HashSet::new();
+        self.ws();
+        if self.eat(b'}') {
+            return Ok(Json::Obj(members));
+        }
+        loop {
+            self.ws();
+            let key = self.string()?;
+            self.ws();
+            if !self.eat(b':') {
+                return Err(syntax("expected a colon"));
             }
-            let Doc(v) = a.next_value()?;
-            m.insert(k, v);
-        }
-        Ok(Value::Object(m))
-    }
-}
-
-/// A deserializer over a read document; see the module documentation.
-struct Strict<'a>(&'a Value);
-
-type E = serde_json::Error;
-
-impl Strict<'_> {
-    fn integer<'de, V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-        match self.0 {
-            Value::Number(n) if n.is_u64() => v.visit_u64(n.as_u64().unwrap_or_default()),
-            Value::Number(n) if n.is_i64() => v.visit_i64(n.as_i64().unwrap_or_default()),
-            Value::Number(n) => Err(de::Error::custom(format!(
-                "{n}: expected a JSON integer (no fraction or exponent)"
-            ))),
-            _ => self.deserialize_any(v),
+            self.ws();
+            let v = self.value(depth + 1)?;
+            if !names.insert(key.clone()) {
+                return Err(err("duplicate_key", key));
+            }
+            members.push((key, v));
+            self.ws();
+            if self.eat(b',') {
+                continue;
+            }
+            if self.eat(b'}') {
+                return Ok(Json::Obj(members));
+            }
+            return Err(syntax("expected a comma or a brace"));
         }
     }
 
-    fn unsigned<'de, V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-        match self.0 {
-            Value::Number(n) if n.as_i64().is_some_and(|x| x < 0) => Err(de::Error::custom(
-                format!("{n}: negative, expected a non-negative integer"),
-            )),
-            _ => self.integer(v),
+    fn array(&mut self, depth: usize) -> Result<Json, Error> {
+        self.i += 1;
+        let mut items = Vec::new();
+        self.ws();
+        if self.eat(b']') {
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            self.ws();
+            items.push(self.value(depth + 1)?);
+            self.ws();
+            if self.eat(b',') {
+                continue;
+            }
+            if self.eat(b']') {
+                return Ok(Json::Arr(items));
+            }
+            return Err(syntax("expected a comma or a bracket"));
         }
     }
-}
 
-macro_rules! integers {
-    ($how:ident: $($f:ident)*) => {$(
-        fn $f<V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-            self.$how(v)
+    fn hex4(&mut self) -> Result<u32, Error> {
+        let h = self.b.get(self.i..self.i + 4).ok_or(syntax("cut escape"))?;
+        let h = std::str::from_utf8(h).map_err(|_| syntax("bad escape"))?;
+        if !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(syntax("bad escape"));
         }
-    )*};
-}
+        self.i += 4;
+        u32::from_str_radix(h, 16).map_err(|_| syntax("bad escape"))
+    }
 
-impl<'de> Deserializer<'de> for Strict<'_> {
-    type Error = E;
-
-    fn deserialize_any<V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-        match self.0 {
-            Value::Null => v.visit_unit(),
-            Value::Bool(b) => v.visit_bool(*b),
-            Value::Number(n) => {
-                if let Some(x) = n.as_u64() {
-                    v.visit_u64(x)
-                } else if let Some(x) = n.as_i64() {
-                    v.visit_i64(x)
-                } else {
-                    v.visit_f64(n.as_f64().unwrap_or(f64::NAN))
+    fn string(&mut self) -> Result<String, Error> {
+        if !self.eat(b'"') {
+            return Err(syntax("expected a string"));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let c = *self.b.get(self.i).ok_or(syntax("cut string"))?;
+            self.i += 1;
+            match c {
+                b'"' => return String::from_utf8(out).map_err(|_| syntax("bad string")),
+                0..=0x1f => return Err(syntax("control character in a string")),
+                b'\\' => {
+                    let e = *self.b.get(self.i).ok_or(syntax("cut escape"))?;
+                    self.i += 1;
+                    let ch = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.unicode()?,
+                        _ => return Err(syntax("bad escape")),
+                    };
+                    let mut buf = [0; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
-            }
-            Value::String(s) => v.visit_str(s),
-            Value::Array(a) => v.visit_seq(Seq(a.iter())),
-            Value::Object(m) => v.visit_map(Members {
-                it: m.iter(),
-                value: None,
-            }),
-        }
-    }
-
-    integers!(unsigned: deserialize_u8 deserialize_u16 deserialize_u32 deserialize_u64 deserialize_u128);
-    integers!(integer: deserialize_i8 deserialize_i16 deserialize_i32 deserialize_i64 deserialize_i128);
-
-    fn deserialize_option<V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-        match self.0 {
-            Value::Null => v.visit_none(),
-            _ => v.visit_some(self),
-        }
-    }
-
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        v: V,
-    ) -> Result<V::Value, E> {
-        v.visit_newtype_struct(self)
-    }
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        _: &'static [&'static str],
-        v: V,
-    ) -> Result<V::Value, E> {
-        self.deserialize_map(v)
-    }
-
-    fn deserialize_map<V: Visitor<'de>>(self, v: V) -> Result<V::Value, E> {
-        match self.0 {
-            Value::Object(_) => self.deserialize_any(v),
-            x => Err(de::Error::custom(format!(
-                "expected a JSON object, found {}",
-                kind(x)
-            ))),
-        }
-    }
-
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        _: &'static [&'static str],
-        v: V,
-    ) -> Result<V::Value, E> {
-        match self.0 {
-            Value::String(s) => v.visit_enum(s.as_str().into_deserializer()),
-            x => Err(de::Error::custom(format!(
-                "expected a string, found {}",
-                kind(x)
-            ))),
-        }
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool f32 f64 char str string bytes byte_buf unit unit_struct seq tuple
-        tuple_struct identifier ignored_any
-    }
-}
-
-fn kind(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
-struct Seq<'a>(std::slice::Iter<'a, Value>);
-
-impl<'de> de::SeqAccess<'de> for Seq<'_> {
-    type Error = E;
-
-    fn next_element_seed<T: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: T,
-    ) -> Result<Option<T::Value>, E> {
-        self.0
-            .next()
-            .map(|x| seed.deserialize(Strict(x)))
-            .transpose()
-    }
-}
-
-/// The members of an object; a `null` member is skipped, as absent.
-struct Members<'a> {
-    it: serde_json::map::Iter<'a>,
-    value: Option<&'a Value>,
-}
-
-impl<'de> de::MapAccess<'de> for Members<'_> {
-    type Error = E;
-
-    fn next_key_seed<K: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, E> {
-        for (k, v) in self.it.by_ref() {
-            if !v.is_null() {
-                self.value = Some(v);
-                return seed.deserialize(k.as_str().into_deserializer()).map(Some);
+                c => out.push(c),
             }
         }
-        Ok(None)
     }
 
-    fn next_value_seed<T: de::DeserializeSeed<'de>>(&mut self, seed: T) -> Result<T::Value, E> {
-        seed.deserialize(Strict(self.value.take().unwrap_or(&Value::Null)))
+    /// A `\u` escape; a lone surrogate reads as U+FFFD, as no name holds one.
+    fn unicode(&mut self) -> Result<char, Error> {
+        let hi = self.hex4()?;
+        if (0xd800..0xdc00).contains(&hi) && self.b[self.i..].starts_with(b"\\u") {
+            let at = self.i;
+            self.i += 2;
+            let lo = self.hex4()?;
+            if (0xdc00..0xe000).contains(&lo) {
+                let c = 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
+                return Ok(char::from_u32(c).unwrap_or('\u{fffd}'));
+            }
+            self.i = at;
+        }
+        Ok(char::from_u32(hi).unwrap_or('\u{fffd}'))
+    }
+
+    fn digits(&mut self) -> usize {
+        let at = self.i;
+        while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i - at
+    }
+
+    fn number(&mut self) -> Result<Json, Error> {
+        let negative = self.eat(b'-');
+        let start = self.i;
+        let n = self.digits();
+        if n == 0 || (n > 1 && self.b[start] == b'0') {
+            return Err(syntax("bad number"));
+        }
+        let end = self.i;
+        let mut float = false;
+        if self.eat(b'.') {
+            float = true;
+            if self.digits() == 0 {
+                return Err(syntax("bad number"));
+            }
+        }
+        if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+            self.i += 1;
+            float = true;
+            if !self.eat(b'+') {
+                self.eat(b'-');
+            }
+            if self.digits() == 0 {
+                return Err(syntax("bad number"));
+            }
+        }
+        if float {
+            return Ok(Json::Float);
+        }
+        let mut v: i128 = 0;
+        for &d in &self.b[start..end] {
+            v = v.saturating_mul(10).saturating_add(i128::from(d - b'0'));
+        }
+        Ok(Json::Int(if negative { -v } else { v }))
     }
 }

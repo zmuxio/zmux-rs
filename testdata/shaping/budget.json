@@ -1,0 +1,1848 @@
+{
+ "parse": [
+  {
+   "name": "absent",
+   "limits": {},
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "null",
+   "limits": {
+    "wire": null,
+    "max_delay": null,
+    "no_padding": null
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "switches",
+   "limits": {
+    "no_padding": true,
+    "no_pause": true,
+    "no_injection": true
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": true,
+    "no_pause": true,
+    "no_injection": true
+   }
+  },
+  {
+   "name": "wire",
+   "limits": {
+    "wire": {
+     "initial": 5,
+     "per_mb": 6,
+     "per_sec": 7
+    }
+   },
+   "want": {
+    "wire": {
+     "initial": 5,
+     "per_mb": 6,
+     "per_sec": 7
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "wire-partial",
+   "limits": {
+    "wire": {
+     "per_mb": 6
+    }
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 6,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "wire-empty-is-no-injection",
+   "limits": {
+    "wire": {}
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": true
+   }
+  },
+  {
+   "name": "wire-zero-is-no-injection",
+   "limits": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    }
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": true
+   }
+  },
+  {
+   "name": "max",
+   "limits": {
+    "wire": {
+     "initial": 9007199254740992,
+     "per_mb": 8796093022208,
+     "per_sec": 8796093022208
+    },
+    "max_delay": 1000000000000000
+   },
+   "want": {
+    "wire": {
+     "initial": 9007199254740992,
+     "per_mb": 8796093022208,
+     "per_sec": 8796093022208
+    },
+    "max_delay": 1000000000000000,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "delay-zero-default",
+   "limits": {
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "delay-negative-unbounded",
+   "limits": {
+    "max_delay": -1
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": -1,
+    "no_padding": false,
+    "no_pause": false,
+    "no_injection": false
+   }
+  },
+  {
+   "name": "initial-over",
+   "limits": {
+    "wire": {
+     "initial": 9007199254740993
+    }
+   },
+   "error": "range"
+  },
+  {
+   "name": "per-mb-over",
+   "limits": {
+    "wire": {
+     "per_mb": 8796093022209
+    }
+   },
+   "error": "range"
+  },
+  {
+   "name": "per-sec-over",
+   "limits": {
+    "wire": {
+     "per_sec": 8796093022209
+    }
+   },
+   "error": "range"
+  },
+  {
+   "name": "negative-field",
+   "limits": {
+    "wire": {
+     "initial": -1
+    }
+   },
+   "error": "range"
+  },
+  {
+   "name": "delay-over",
+   "limits": {
+    "max_delay": 1000000000000001
+   },
+   "error": "range"
+  },
+  {
+   "name": "unknown",
+   "limits": {
+    "max_padding_bytes": 1
+   },
+   "error": "unknown_member"
+  },
+  {
+   "name": "unknown-wire",
+   "limits": {
+    "wire": {
+     "cap": 1
+    }
+   },
+   "error": "unknown_member"
+  },
+  {
+   "name": "not-integer",
+   "limits": {
+    "max_delay": 1.5
+   },
+   "error": "type"
+  },
+  {
+   "name": "table-not-local",
+   "limits": {
+    "wire": {
+     "initial": {
+      "t": [
+       [
+        1,
+        1,
+        2
+       ]
+      ],
+      "scope": "session"
+     }
+    }
+   },
+   "error": "type"
+  },
+  {
+   "name": "switch-not-bool",
+   "limits": {
+    "no_padding": 1
+   },
+   "error": "type"
+  }
+ ],
+ "merge": [
+  {
+   "local": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 7
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": true,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 7
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": true,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 50,
+     "per_mb": 20,
+     "per_sec": 5
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 50,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 50,
+     "per_mb": 20,
+     "per_sec": 5
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 100,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 50,
+     "per_mb": 10,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 200000
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 200000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 5000000
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 1000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": -1
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": -1
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": -1
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 5000000
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 5000000
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 300
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 200
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 200
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 200
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 300
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 200
+   }
+  },
+  {
+   "local": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 5000000
+   },
+   "config": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "max_delay": 0
+   },
+   "want": {
+    "wire": {
+     "initial": 0,
+     "per_mb": 0,
+     "per_sec": 0
+    },
+    "no_injection": false,
+    "max_delay": 5000000
+   }
+  }
+ ],
+ "account": [
+  {
+   "name": "unset-left-is-max",
+   "account": null,
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 18446744073709551615,
+     "granted": true,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 18446744073709551615
+    },
+    {
+     "op": "spend",
+     "now": 0,
+     "earn": 0,
+     "n": 5,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 18446744073709551615
+    },
+    {
+     "op": "charge",
+     "now": 10,
+     "earn": 10,
+     "n": 7,
+     "granted": true,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 18446744073709551615
+    }
+   ]
+  },
+  {
+   "name": "charge-exact-then-deny",
+   "account": {
+    "initial": 10,
+    "per_mb": 0,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 10,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 10
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 10
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 10
+    }
+   ]
+  },
+  {
+   "name": "deny-changes-nothing",
+   "account": {
+    "initial": 10,
+    "per_mb": 0,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 11,
+     "granted": false,
+     "left": 10,
+     "level": 10,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 10,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 10
+    }
+   ]
+  },
+  {
+   "name": "spend-does-not-touch-account",
+   "account": {
+    "initial": 10,
+    "per_mb": 0,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "spend",
+     "now": 0,
+     "earn": 0,
+     "n": 1000000,
+     "left": 10,
+     "level": 10,
+     "spent": 1000000
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 10,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 1000010
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 1000010
+    },
+    {
+     "op": "spend",
+     "now": 0,
+     "earn": 0,
+     "n": 18446744073709551615,
+     "left": 0,
+     "level": 0,
+     "spent": 18446744073709551615
+    },
+    {
+     "op": "spend",
+     "now": 0,
+     "earn": 0,
+     "n": 18446744073709551615,
+     "left": 0,
+     "level": 0,
+     "spent": 18446744073709551615
+    }
+   ]
+  },
+  {
+   "name": "per-mb-remainder",
+   "account": {
+    "initial": 1,
+    "per_mb": 1,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 1,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 1
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 999999,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 1
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 1000000,
+     "n": 1,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 2
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 1999999,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 2
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 2000000,
+     "n": 1,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 3
+    }
+   ]
+  },
+  {
+   "name": "per-mb-small-steps-sum",
+   "account": {
+    "initial": 1,
+    "per_mb": 3,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 1,
+     "n": 0,
+     "granted": true,
+     "left": 1,
+     "level": 1,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 333333,
+     "n": 0,
+     "granted": true,
+     "left": 1,
+     "level": 1,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 333334,
+     "n": 0,
+     "granted": true,
+     "left": 2,
+     "level": 2,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 666667,
+     "n": 0,
+     "granted": true,
+     "left": 3,
+     "level": 3,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 1000000,
+     "n": 0,
+     "granted": true,
+     "left": 4,
+     "level": 4,
+     "spent": 0
+    }
+   ]
+  },
+  {
+   "name": "per-sec-remainder",
+   "account": {
+    "initial": 1,
+    "per_mb": 0,
+    "per_sec": 7
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 1,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 1,
+     "level": 1,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 142857,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 1,
+     "level": 1,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 142858,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 2,
+     "level": 2,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 1000000,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 8,
+     "level": 8,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 3000005,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 22,
+     "level": 22,
+     "spent": 0
+    }
+   ]
+  },
+  {
+   "name": "both-routes",
+   "account": {
+    "initial": 1,
+    "per_mb": 500000,
+    "per_sec": 1000
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 1000000,
+     "earn": 2000,
+     "n": 0,
+     "granted": true,
+     "left": 2001,
+     "level": 2001,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 2000000,
+     "earn": 4000,
+     "n": 2000,
+     "granted": true,
+     "left": 2001,
+     "level": 2001,
+     "spent": 2000
+    }
+   ]
+  },
+  {
+   "name": "saturate-rates",
+   "account": {
+    "initial": 9007199254740992,
+    "per_mb": 8796093022208,
+    "per_sec": 8796093022208
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 4611686018427387904,
+     "earn": 18446744073709551615,
+     "n": 0,
+     "granted": true,
+     "left": 9223372036854775807,
+     "level": 9223372036854775807,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 9223372036854775808,
+     "earn": 18446744073709551615,
+     "n": 1,
+     "granted": true,
+     "left": 9223372036854775806,
+     "level": 9223372036854775806,
+     "spent": 1
+    },
+    {
+     "op": "charge",
+     "now": 18446744073709551615,
+     "earn": 18446744073709551615,
+     "n": 9223372036854775808,
+     "granted": false,
+     "left": 9223372036854775807,
+     "level": 9223372036854775807,
+     "spent": 1
+    }
+   ]
+  },
+  {
+   "name": "set-widen-tighten",
+   "account": {
+    "initial": 100,
+    "per_mb": 0,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 40,
+     "granted": true,
+     "left": 60,
+     "level": 60,
+     "spent": 40
+    },
+    {
+     "op": "set",
+     "now": 0,
+     "earn": 0,
+     "account": {
+      "initial": 200,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "left": 160,
+     "level": 160,
+     "spent": 40
+    },
+    {
+     "op": "set",
+     "now": 0,
+     "earn": 0,
+     "account": {
+      "initial": 50,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "left": 10,
+     "level": 10,
+     "spent": 40
+    },
+    {
+     "op": "set",
+     "now": 0,
+     "earn": 0,
+     "account": {
+      "initial": 10,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "left": 0,
+     "level": 0,
+     "spent": 40
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 40
+    }
+   ]
+  },
+  {
+   "name": "set-keeps-spent-and-remainder",
+   "account": {
+    "initial": 1,
+    "per_mb": 0,
+    "per_sec": 1
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 500000,
+     "earn": 0,
+     "n": 1,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 1
+    },
+    {
+     "op": "set",
+     "now": 500000,
+     "earn": 0,
+     "account": {
+      "initial": 1,
+      "per_mb": 0,
+      "per_sec": 3
+     },
+     "left": 0,
+     "level": 0,
+     "spent": 1
+    },
+    {
+     "op": "charge",
+     "now": 1000000,
+     "earn": 0,
+     "n": 0,
+     "granted": true,
+     "left": 2,
+     "level": 2,
+     "spent": 1
+    }
+   ]
+  },
+  {
+   "name": "set-accrues-old-first",
+   "account": {
+    "initial": 0,
+    "per_mb": 0,
+    "per_sec": 10
+   },
+   "steps": [
+    {
+     "op": "set",
+     "now": 1000000,
+     "earn": 0,
+     "account": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 1
+     },
+     "left": 10,
+     "level": 10,
+     "spent": 0
+    },
+    {
+     "op": "charge",
+     "now": 2000000,
+     "earn": 0,
+     "n": 11,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 11
+    },
+    {
+     "op": "charge",
+     "now": 2000000,
+     "earn": 0,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 11
+    }
+   ]
+  },
+  {
+   "name": "unset-to-set",
+   "account": null,
+   "steps": [
+    {
+     "op": "charge",
+     "now": 5,
+     "earn": 5,
+     "n": 3,
+     "granted": true,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 3
+    },
+    {
+     "op": "set",
+     "now": 1000000,
+     "earn": 100,
+     "account": {
+      "initial": 7,
+      "per_mb": 1000000,
+      "per_sec": 1
+     },
+     "left": 7,
+     "level": 7,
+     "spent": 3
+    },
+    {
+     "op": "charge",
+     "now": 1000000,
+     "earn": 100,
+     "n": 7,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 10
+    },
+    {
+     "op": "charge",
+     "now": 2000000,
+     "earn": 200,
+     "n": 101,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 111
+    },
+    {
+     "op": "charge",
+     "now": 2000000,
+     "earn": 200,
+     "n": 1,
+     "granted": false,
+     "left": 0,
+     "level": 0,
+     "spent": 111
+    }
+   ]
+  },
+  {
+   "name": "set-to-unset",
+   "account": {
+    "initial": 7,
+    "per_mb": 0,
+    "per_sec": 0
+   },
+   "steps": [
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 7,
+     "granted": true,
+     "left": 0,
+     "level": 0,
+     "spent": 7
+    },
+    {
+     "op": "set",
+     "now": 0,
+     "earn": 0,
+     "account": null,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 7
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 100,
+     "granted": true,
+     "left": 18446744073709551615,
+     "level": null,
+     "spent": 107
+    },
+    {
+     "op": "set",
+     "now": 0,
+     "earn": 0,
+     "account": {
+      "initial": 2,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "left": 2,
+     "level": 2,
+     "spent": 107
+    },
+    {
+     "op": "charge",
+     "now": 0,
+     "earn": 0,
+     "n": 3,
+     "granted": false,
+     "left": 2,
+     "level": 2,
+     "spent": 107
+    }
+   ]
+  }
+ ],
+ "rate_floor": [
+  {
+   "rate": 0,
+   "max_delay": 1000000,
+   "want": 0,
+   "clamped": false
+  },
+  {
+   "rate": 1,
+   "max_delay": 1000000,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "rate": 63,
+   "max_delay": 1000000,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "rate": 64,
+   "max_delay": 1000000,
+   "want": 64,
+   "clamped": false
+  },
+  {
+   "rate": 65,
+   "max_delay": 1000000,
+   "want": 65,
+   "clamped": false
+  },
+  {
+   "rate": 1,
+   "max_delay": -1,
+   "want": 1,
+   "clamped": false
+  },
+  {
+   "rate": 0,
+   "max_delay": -1,
+   "want": 0,
+   "clamped": false
+  },
+  {
+   "rate": 8796093022208,
+   "max_delay": 1,
+   "want": 8796093022208,
+   "clamped": false
+  },
+  {
+   "rate": 1,
+   "max_delay": 1,
+   "want": 64000000,
+   "clamped": true
+  },
+  {
+   "rate": 1000,
+   "max_delay": 64000,
+   "want": 1000,
+   "clamped": false
+  },
+  {
+   "rate": 999,
+   "max_delay": 64000,
+   "want": 1000,
+   "clamped": true
+  },
+  {
+   "rate": 1,
+   "max_delay": 1000000000000000,
+   "want": 1,
+   "clamped": false
+  },
+  {
+   "rate": 1,
+   "max_delay": 64000001,
+   "want": 1,
+   "clamped": false
+  },
+  {
+   "rate": 10,
+   "max_delay": 3000000,
+   "want": 22,
+   "clamped": true
+  }
+ ],
+ "burst_floor": [
+  {
+   "burst": 0,
+   "record_max": 16382,
+   "want": 16382,
+   "clamped": false
+  },
+  {
+   "burst": 0,
+   "record_max": 16,
+   "want": 64,
+   "clamped": false
+  },
+  {
+   "burst": 1,
+   "record_max": 16382,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "burst": 2,
+   "record_max": 16382,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "burst": 4,
+   "record_max": 16382,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "burst": 63,
+   "record_max": 16382,
+   "want": 64,
+   "clamped": true
+  },
+  {
+   "burst": 64,
+   "record_max": 16382,
+   "want": 64,
+   "clamped": false
+  },
+  {
+   "burst": 65,
+   "record_max": 16382,
+   "want": 65,
+   "clamped": false
+  },
+  {
+   "burst": 9007199254740992,
+   "record_max": 16382,
+   "want": 9007199254740992,
+   "clamped": false
+  }
+ ],
+ "wire_ppm": [
+  {
+   "s": 0,
+   "e": 0,
+   "want": 18446744073709551615
+  },
+  {
+   "s": 1,
+   "e": 0,
+   "want": 18446744073709551615
+  },
+  {
+   "s": 0,
+   "e": 1,
+   "want": 0
+  },
+  {
+   "s": 1,
+   "e": 1,
+   "want": 1000000
+  },
+  {
+   "s": 3,
+   "e": 2,
+   "want": 1500000
+  },
+  {
+   "s": 17592186044415,
+   "e": 17592186044415,
+   "want": 1000000
+  },
+  {
+   "s": 17592186044416,
+   "e": 1,
+   "want": 18446744073709551615
+  },
+  {
+   "s": 1,
+   "e": 17592186044416,
+   "want": 0
+  },
+  {
+   "s": 17592186044416,
+   "e": 1048576,
+   "want": 16777216000000
+  },
+  {
+   "s": 17592187092991,
+   "e": 17592186044416,
+   "want": 1000000
+  },
+  {
+   "s": 18446744073709551615,
+   "e": 18446744073709551615,
+   "want": 1000000
+  },
+  {
+   "s": 18446744073709551615,
+   "e": 1,
+   "want": 18446744073709551615
+  },
+  {
+   "s": 8796093022208,
+   "e": 3,
+   "want": 2932031007402666666
+  },
+  {
+   "s": 1048576,
+   "e": 17592186044416,
+   "want": 0
+  }
+ ],
+ "gate": [
+  {
+   "name": "slow",
+   "rate": 64,
+   "burst": 16382,
+   "steps": [
+    {
+     "now": 0,
+     "take": 16382,
+     "held": false,
+     "tokens": 16382,
+     "release": null
+    },
+    {
+     "now": 1,
+     "take": 0,
+     "held": true,
+     "tokens": 0,
+     "release": 1000000
+    },
+    {
+     "now": 15625,
+     "take": 0,
+     "held": true,
+     "tokens": 1,
+     "release": 1000000
+    },
+    {
+     "now": 15626,
+     "take": 0,
+     "held": true,
+     "tokens": 1,
+     "release": 1000000
+    },
+    {
+     "now": 1000000,
+     "take": 0,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    }
+   ]
+  },
+  {
+   "name": "overdraw",
+   "rate": 1000,
+   "burst": 100,
+   "steps": [
+    {
+     "now": 0,
+     "take": 300,
+     "held": false,
+     "tokens": 100,
+     "release": null
+    },
+    {
+     "now": 1000,
+     "take": 0,
+     "held": true,
+     "tokens": -199,
+     "release": 264000
+    },
+    {
+     "now": 201000,
+     "take": 0,
+     "held": true,
+     "tokens": 1,
+     "release": 264000
+    },
+    {
+     "now": 202000,
+     "take": 0,
+     "held": true,
+     "tokens": 2,
+     "release": 264000
+    },
+    {
+     "now": 10000000,
+     "take": 0,
+     "held": false,
+     "tokens": 100,
+     "release": null
+    }
+   ]
+  },
+  {
+   "name": "quantum-rate",
+   "rate": 1000000,
+   "burst": 16382,
+   "steps": [
+    {
+     "now": 0,
+     "take": 16382,
+     "held": false,
+     "tokens": 16382,
+     "release": null
+    },
+    {
+     "now": 500,
+     "take": 0,
+     "held": true,
+     "tokens": 500,
+     "release": 1000
+    },
+    {
+     "now": 1000,
+     "take": 0,
+     "held": false,
+     "tokens": 1000,
+     "release": null
+    },
+    {
+     "now": 1001,
+     "take": 1000,
+     "held": false,
+     "tokens": 1001,
+     "release": null
+    },
+    {
+     "now": 1002,
+     "take": 0,
+     "held": true,
+     "tokens": 2,
+     "release": 2000
+    }
+   ]
+  },
+  {
+   "name": "small-burst",
+   "rate": 8796093022208,
+   "burst": 64,
+   "steps": [
+    {
+     "now": 0,
+     "take": 64,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 0,
+     "take": 0,
+     "held": true,
+     "tokens": 0,
+     "release": 1
+    },
+    {
+     "now": 1,
+     "take": 0,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 2,
+     "take": 0,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    }
+   ]
+  },
+  {
+   "name": "quantum-floor",
+   "rate": 1,
+   "burst": 64,
+   "steps": [
+    {
+     "now": 0,
+     "take": 1,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 1,
+     "take": 0,
+     "held": true,
+     "tokens": 63,
+     "release": 1000000
+    },
+    {
+     "now": 1000000,
+     "take": 0,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 1000001,
+     "take": 64,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 64000000,
+     "take": 0,
+     "held": true,
+     "tokens": 62,
+     "release": 65000001
+    }
+   ]
+  },
+  {
+   "name": "quantum-floor-1000",
+   "rate": 1000,
+   "burst": 64,
+   "steps": [
+    {
+     "now": 0,
+     "take": 64,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    },
+    {
+     "now": 1000,
+     "take": 0,
+     "held": true,
+     "tokens": 1,
+     "release": 64000
+    },
+    {
+     "now": 63000,
+     "take": 0,
+     "held": true,
+     "tokens": 63,
+     "release": 64000
+    },
+    {
+     "now": 64000,
+     "take": 0,
+     "held": false,
+     "tokens": 64,
+     "release": null
+    }
+   ]
+  },
+  {
+   "name": "remainder",
+   "rate": 7,
+   "burst": 16382,
+   "steps": [
+    {
+     "now": 0,
+     "take": 16382,
+     "held": false,
+     "tokens": 16382,
+     "release": null
+    },
+    {
+     "now": 142857,
+     "take": 0,
+     "held": true,
+     "tokens": 0,
+     "release": 9142858
+    },
+    {
+     "now": 142858,
+     "take": 0,
+     "held": true,
+     "tokens": 1,
+     "release": 9142858
+    },
+    {
+     "now": 285715,
+     "take": 0,
+     "held": true,
+     "tokens": 2,
+     "release": 9142858
+    },
+    {
+     "now": 1000000000000000,
+     "take": 0,
+     "held": false,
+     "tokens": 16382,
+     "release": null
+    }
+   ]
+  }
+ ]
+}

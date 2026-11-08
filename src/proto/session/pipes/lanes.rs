@@ -1,6 +1,6 @@
-//! The lanes of a pipe direction (MULTIPATH.md Section 2.5): further
-//! streams of the carrier connection of the pipe's lane 0, each a record
-//! stream with its own position.
+//! The lanes of a pipe direction: further streams of the carrier
+//! connection of the pipe's lane 0, each a record stream with its own
+//! position.
 //!
 //! A direction without lanes is its lane 0 and keeps no state here: its
 //! position is the pipe's. The state of lanes 1, 2, ... is allocated when
@@ -23,7 +23,7 @@ use crate::proto::session::stream::StreamKey;
 
 // ---- outbound ------------------------------------------------------------------
 
-/// Where an outbound lane stands (MULTIPATH.md Section 5.8).
+/// Where an outbound lane stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneState {
     /// Asked of the driver, which has not attached a stream yet (it may
@@ -153,8 +153,8 @@ pub(crate) struct OutLane {
     tx: LaneTx,
     /// The first record, PIPE_LANE alone, is still to be written.
     first_owed: bool,
-    /// The frames it carried that are retained (MULTIPATH.md Section 7.4),
-    /// with the send-order position after their record.
+    /// The frames it carried that are retained, with the send-order
+    /// position after their record.
     log: VecDeque<(u64, SentFrame)>,
     /// The carrier stream takes bytes, and what it holds unsent.
     writable: bool,
@@ -162,7 +162,7 @@ pub(crate) struct OutLane {
     /// Bytes of its batch that the carrier stream has not taken yet.
     writing: u64,
     /// Since when the carrier stream refuses bytes it was given (its write
-    /// stall, MULTIPATH.md Section 7.1).
+    /// stall).
     refused_since: Option<Instant>,
     /// The driver was told to shut the lane down or to reset it, or wrote
     /// its last batch; the stream failed or ended under us.
@@ -179,12 +179,11 @@ pub(crate) struct OutLanes {
     before: u64,
     /// What lane 0's carrier holds unsent, when it reports it.
     zero_unsent: u64,
-    /// Lanes 1, 2, ...: lane n at index n - 1 (numbers are given in
-    /// order and each once, MULTIPATH.md Section 5.8).
+    /// Lanes 1, 2, ...: lane n at index n - 1 (numbers are given in order and
+    /// each once).
     lanes: Vec<OutLane>,
-    /// The last write of any lane, lane 0 included, that the carrier
-    /// took bytes of: no lane's stall is longer than the time since
-    /// (MULTIPATH.md Section 7.1).
+    /// The last write of any lane, lane 0 included, that the carrier took
+    /// bytes of: no lane's stall is longer than the time since.
     progress: Option<Instant>,
     /// A lane was not opened (no refusal): none is requested before this.
     retry_at: Option<Instant>,
@@ -209,9 +208,8 @@ pub(crate) struct OutLanes {
     copy_lane: Option<u64>,
     copy_wanted: bool,
     copies: VecDeque<QueuedCopy>,
-    /// Outside multipath, the orderly CONNECTION_CLOSE waits until a
-    /// PIPE_ACK covers the other lanes, at most until then (SPEC.md
-    /// Section 6.5 step 1).
+    /// Outside multipath, the orderly CONNECTION_CLOSE waits until a PIPE_ACK
+    /// covers the other lanes, at most until then.
     close_wait: Option<Instant>,
     /// The held bytes and their minimum over the last RTT_base_p.
     held: HeldBytes,
@@ -364,8 +362,7 @@ impl OutLanes {
         self.closed
     }
 
-    /// A lane is requested or opening: at most one is (MULTIPATH.md
-    /// Section 5.8).
+    /// A lane is requested or opening: at most one is.
     pub(crate) fn unconfirmed(&self) -> Option<u64> {
         self.lanes
             .iter()
@@ -556,7 +553,7 @@ impl OutLanes {
     }
 
     /// The cumulative acknowledgement point given the pipe's send order up
-    /// to `sent` (MULTIPATH.md Section 2.5).
+    /// to `sent`.
     pub(crate) fn cumulative(&self, sent: u64) -> u64 {
         std::iter::once(&self.zero)
             .chain(self.lanes.iter().map(|l| &l.tx))
@@ -669,12 +666,12 @@ impl OutLanes {
         self.progress = Some(now);
     }
 
-    /// The write stall of the pipe's lanes (MULTIPATH.md Section 7.1):
-    /// each lane with bytes waiting is a carrier of its own, the pipe's
-    /// stall is the shortest of theirs and no longer than the time since
-    /// any lane progressed. `zero` is lane 0's stall reference, if it has
-    /// one; a lane that takes bytes has none, and then neither has the
-    /// pipe unless lane 0 has. Returns the reference time.
+    /// The write stall of the pipe's lanes: each lane with bytes waiting
+    /// is a carrier of its own, the pipe's stall is the shortest of
+    /// theirs and no longer than the time since any lane progressed.
+    /// `zero` is lane 0's stall reference, if it has one; a lane that
+    /// takes bytes has none, and then neither has the pipe unless lane 0
+    /// has. Returns the reference time.
     pub(crate) fn stall_from(&self, zero: Option<Instant>) -> Option<Instant> {
         let stalled = self
             .lanes
@@ -899,9 +896,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// The pipe's write stall with lanes (MULTIPATH.md Section 7.1): the
-    /// shortest stall of the lanes that refuse bytes, none longer than the
-    /// time since any lane progressed.
+    /// The pipe's write stall with lanes: the shortest stall of the lanes
+    /// that refuse bytes, none longer than the time since any lane
+    /// progressed.
     #[test]
     fn the_shortest_lane_stall_capped_by_any_progress() {
         let t0 = Instant::now();

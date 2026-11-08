@@ -1,7 +1,7 @@
-//! Datagram channels of pipe carriers (EXTENSIONS.md Section 6.8): the
-//! interface a carrier adapter implements ([`DatagramChannel`]), the router
-//! of the channel datagrams of a connection shared by several pipes
-//! ([`ChannelDemux`]), and the task of each pipe with a channel.
+//! Datagram channels of pipe carriers: the interface a carrier adapter
+//! implements ([`DatagramChannel`]), the router of the channel datagrams of
+//! a connection shared by several pipes ([`ChannelDemux`]), and the task of
+//! each pipe with a channel.
 //!
 //! The task owns the channel's sending side: it polls the core for the
 //! datagrams that go on the channel ([`SessionCore::poll_channel`]) and
@@ -34,11 +34,11 @@ use crate::proto::session::PipeId;
 /// datagram service of the carrier besides the reliable stream that is the
 /// pipe, such as the QUIC datagrams of the connection a QUIC stream belongs
 /// to, the HTTP Datagrams of an HTTP/3 request stream, or the datagrams of
-/// a WebTransport session (EXTENSIONS.md Section 6.8). When both endpoints
-/// negotiate it, a session with datagrams enabled sends a DATAGRAM frame
-/// that fits the channel on it instead of in a record, so that a lost
-/// carrier packet loses that datagram instead of delaying every later one;
-/// nothing changes for the application.
+/// a WebTransport session. When both endpoints negotiate it, a session with
+/// datagrams enabled sends a DATAGRAM frame that fits the channel on it
+/// instead of in a record, so that a lost carrier packet loses that
+/// datagram instead of delaying every later one; nothing changes for the
+/// application.
 ///
 /// A channel datagram is the varint [`DatagramChannel::channel_id`], when
 /// the channel has one, then one DATAGRAM frame without its Length field

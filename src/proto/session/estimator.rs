@@ -20,8 +20,8 @@ pub(crate) struct Batch {
     /// The batch holds an ack-eliciting frame.
     pub(crate) eliciting: bool,
     /// Its acknowledgement is waited for by failure detection: false for
-    /// what was sent before multipath was in use (MULTIPATH.md Section
-    /// 7.1 starts with the session's data).
+    /// what was sent before multipath was in use (failure detection starts
+    /// with the multipath session's data).
     pub(crate) watched: bool,
     pub(crate) delivered: u64,
     pub(crate) delivered_time: Instant,
@@ -35,18 +35,18 @@ pub(crate) struct Batch {
     /// Sent while an application-limited bubble was in flight (BBR's
     /// `app_limited` mark).
     pub(crate) in_bubble: bool,
-    /// unsent_ahead (MULTIPATH.md Section 7.1): Q_p when the batch was
+    /// unsent_ahead: Q_p when the batch was
     /// handed over, without the batch itself: the bytes of the write calls
     /// in progress on the pipe's lanes plus the carrier's unsent count.
     pub(crate) unsent_ahead: u64,
-    /// queue_p (MULTIPATH.md Section 7.1), min(1 s, unsent_ahead / R_p),
+    /// queue_p, min(1 s, unsent_ahead / R_p),
     /// with R_p taken with unsent_ahead, when the batch was handed over.
     pub(crate) queue: Duration,
-    /// The lane of the pipe it went on (MULTIPATH.md Section 2.5); its
+    /// The lane of the pipe it went on; its
     /// positions are the pipe's send order.
     pub(crate) lane: u32,
-    /// The acknowledgement time expected at sending, E of MULTIPATH.md
-    /// Section 7.5.1: (unsent_ahead + L) / R_p + min_rtt_p + the peer's
+    /// The acknowledgement time expected at sending, the E of opportunistic
+    /// reinjection: (unsent_ahead + L) / R_p + min_rtt_p + the peer's
     /// max ACK delay, with the estimates of that moment.
     pub(crate) expect: Duration,
 }
@@ -82,7 +82,7 @@ pub(crate) struct Estimator {
     /// A sample was taken while the pipe was the bottleneck: the rate is
     /// measured, not only a lower bound.
     pub(crate) rate_measured: bool,
-    /// A penalty measured the pipe slow (MULTIPATH.md Section 7.5.1): like
+    /// A penalty measured the pipe slow: like
     /// a bottleneck sample, it ends the placement rate.
     pub(crate) penalized: bool,
     /// The round trip in which the placement rate first counted for more
@@ -123,7 +123,7 @@ impl Estimator {
 
     /// An RTT sample (RFC 9002 Section 5.3) with the peer's ACK Delay,
     /// already capped; returns the adjusted RTT. A `quiet` sample (taken
-    /// while a multipath session is quiet, SCHEDULER.md Section 2.1)
+    /// while a multipath session is quiet)
     /// enters min_rtt only while it has no value.
     pub(crate) fn rtt_sample(
         &mut self,
@@ -198,7 +198,7 @@ impl Estimator {
         self.bound();
     }
 
-    /// Opportunistic-reinjection penalty (MULTIPATH.md Section 7.5.1).
+    /// Opportunistic-reinjection penalty.
     pub(crate) fn penalize(&mut self) {
         self.penalized = true;
         self.rate_window.clear();
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(est.rate, 2_500_000);
     }
 
-    /// §21.7.7 item 10: a sample taken while the session is quiet enters
+    /// Quiet samples: a sample taken while the session is quiet enters
     /// min_rtt only while it has none; smoothed_rtt takes it.
     #[test]
     fn quiet_samples_keep_out_of_min_rtt() {

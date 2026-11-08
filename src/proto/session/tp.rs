@@ -52,7 +52,7 @@ pub(super) struct TpValues {
     pub(super) reset_stream_at: bool,
     /// zmux_pipe_ack.
     pub(super) pipe_ack: bool,
-    /// None of the zmux parameters is present (SPEC.md Section 13.1).
+    /// None of the zmux parameters is present.
     pub(super) plain_qmux: bool,
 }
 

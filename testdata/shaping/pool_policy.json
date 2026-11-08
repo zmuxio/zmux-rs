@@ -1,209 +1,1737 @@
 {
-  "version": 3,
-  "parse": [
-    {"name": "empty", "policy": {}, "ok": true},
-    {"name": "all_fields", "policy": {
-      "count": {"dist": {"kind": "poisson", "params": [2.5]}, "scope": "shared", "min": 1, "max": 5},
-      "dial_after": [
-        {"dist": {"kind": "empirical", "points": [0.5, 1.5, 2.5], "weights": [1, 2, 1]}, "min": 0.2, "max": 3},
-        {"dist": {"kind": "weibull", "params": [8, 1.5]}, "min": 1, "max": 15}
+ "decide": [
+  {
+   "name": "empty-keeps-pool",
+   "policy": {},
+   "source": {
+    "seed": "0000000000000100"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "failures": 3,
+     "members": [
+      {
+       "id": 1,
+       "age": 1000000000000,
+       "idle": 1000000000000,
+       "pipes": 9,
+       "bytes_sent": 1000000000000,
+       "bytes_received": 1000000000000
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "count-const",
+   "policy": {
+    "count": 3
+   },
+   "source": {
+    "seed": "0000000000000101"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": 3,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "count-table-each",
+   "policy": {
+    "count": {
+     "t": [
+      [
+       1,
+       2,
+       6
+      ]
+     ]
+    }
+   },
+   "source": {
+    "seed": "0000000000000102"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": 2,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "want": {
+      "count": 6,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 2
+    },
+    {
+     "want": {
+      "count": 2,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 3
+    }
+   ]
+  },
+  {
+   "name": "count-table-weights",
+   "policy": {
+    "count": {
+     "t": [
+      [
+       1,
+       1,
+       1
       ],
+      [
+       3,
+       2,
+       9
+      ]
+     ]
+    }
+   },
+   "source": {
+    "seed": "0000000000000103"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": 9,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 2
+    },
+    {
+     "want": {
+      "count": 5,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 4
+    }
+   ]
+  },
+  {
+   "name": "dial-after-tiers",
+   "policy": {
+    "dial_after": [
+     1000000,
+     3000000,
+     7000000
+    ]
+   },
+   "source": {
+    "seed": "0000000000000104"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "failures": 0,
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    },
+    {
+     "failures": 1,
+     "want": {
+      "count": null,
+      "dial_after": 3000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    },
+    {
+     "failures": 2,
+     "want": {
+      "count": null,
+      "dial_after": 7000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    },
+    {
+     "failures": 7,
+     "want": {
+      "count": null,
+      "dial_after": 7000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "retire-each-metric",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100
+     },
+     {
+      "metric": "idle",
+      "above": 50
+     },
+     {
+      "metric": "pipes",
+      "above": 4
+     },
+     {
+      "metric": "bytes_sent",
+      "above": 1000
+     },
+     {
+      "metric": "bytes_received",
+      "above": 2000
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000105"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 7,
+       "age": 101
+      },
+      {
+       "id": 3
+      },
+      {
+       "id": 5,
+       "idle": 51
+      },
+      {
+       "id": 6,
+       "pipes": 5
+      },
+      {
+       "id": 2,
+       "bytes_sent": 1001
+      },
+      {
+       "id": 4,
+       "bytes_received": 2001
+      },
+      {
+       "id": 9,
+       "age": 100,
+       "idle": 50,
+       "pipes": 4,
+       "bytes_sent": 1000,
+       "bytes_received": 2000
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
       "retire": [
-        {"metric": "age", "above": {"dist": {"kind": "gamma", "params": [5, 400]}, "scope": "pipe", "min": 500, "max": 5000}},
-        {"metric": "bytes", "above": {"dist": {"kind": "lognormal", "params": [19.5, 0.4]}, "scope": "pipe", "min": 50000000, "max": 900000000}},
-        {"metric": "idle", "above": {"range": [150, 250], "scope": "pipe", "min": 120, "max": 240}}
-      ]}, "ok": true},
-    {"name": "every_metric", "policy": {"retire": [
-      {"metric": "age", "above": {"const": 1}}, {"metric": "idle", "above": {"const": 1}},
-      {"metric": "pipes", "above": {"const": 1}}, {"metric": "bytes_sent", "above": {"const": 1}},
-      {"metric": "bytes_received", "above": {"const": 1}}, {"metric": "bytes", "above": {"const": 1}}]}, "ok": true},
-    {"name": "scope_names", "policy": {"count": {"const": 1, "scope": "shared"}, "dial_after": [
-      {"const": 1, "scope": "each"}, {"const": 1}]}, "ok": true},
-    {"name": "scope_session", "policy": {"count": {"const": 1, "scope": "session"}}, "ok": false},
-    {"name": "scope_instance", "policy": {"dial_after": [{"const": 1, "scope": "instance"}]}, "ok": false},
-    {"name": "scope_record", "policy": {"retire": [{"metric": "age", "above": {"const": 1, "scope": "record"}}]}, "ok": false},
-    {"name": "empty_lists", "policy": {"dial_after": [], "retire": []}, "ok": true},
-    {"name": "mixture", "policy": {"count": {"dist": {"kind": "mixture", "of": [{"const": 1}, {"range": [2, 3]}], "weights": [1, 1]}}}, "ok": true},
-    {"name": "unknown_field", "policy": {"count": {"const": 1}, "redial_after": {"const": 1}}, "ok": false},
-    {"name": "unknown_metric", "policy": {"retire": [{"metric": "lifetime", "above": {"const": 1}}]}, "ok": false},
-    {"name": "rule_unknown_field", "policy": {"retire": [{"metric": "age", "above": {"const": 1}, "below": {"const": 0}}]}, "ok": false},
-    {"name": "rule_without_above", "policy": {"retire": [{"metric": "age"}]}, "ok": false},
-    {"name": "rule_without_metric", "policy": {"retire": [{"above": {"const": 1}}]}, "ok": false},
-    {"name": "value_two_kinds", "policy": {"count": {"const": 1, "range": [1, 2]}}, "ok": false},
-    {"name": "value_no_kind", "policy": {"count": {"min": 1}}, "ok": false},
-    {"name": "range_reversed", "policy": {"dial_after": [{"range": [2, 1]}]}, "ok": false},
-    {"name": "unknown_scope", "policy": {"count": {"const": 1, "scope": "member"}}, "ok": false},
-    {"name": "dist_bad_params", "policy": {"retire": [{"metric": "age", "above": {"dist": {"kind": "gamma", "params": [0, 1]}}}]}, "ok": false},
-    {"name": "dist_unknown_kind", "policy": {"count": {"dist": {"kind": "zipf", "params": [1]}}}, "ok": false},
-    {"name": "min_above_max", "policy": {"count": {"const": 1, "min": 3, "max": 2}}, "ok": false},
-    {"name": "pipe_scope_in_count", "policy": {"count": {"const": 1, "scope": "pipe"}}, "ok": false},
-    {"name": "pipe_scope_in_dial_after", "policy": {"dial_after": [{"const": 1}, {"const": 1, "scope": "pipe"}]}, "ok": false},
-    {"name": "pipe_scope_in_mixture_count", "policy": {"count": {"dist": {"kind": "mixture", "of": [{"const": 1, "scope": "pipe"}], "weights": [1]}}}, "ok": false},
-    {"name": "dial_after_not_list", "policy": {"dial_after": {"const": 1}}, "ok": false},
-    {"name": "count_not_object", "policy": {"count": 2}, "ok": false},
-    {"name": "count_below_one", "policy": {"count": {"const": 0.2}}, "ok": false},
-    {"name": "count_negative", "policy": {"count": {"const": -4}}, "ok": false},
-    {"name": "count_normal_without_min", "policy": {"count": {"dist": {"kind": "normal", "params": [3, 1]}}}, "ok": false},
-    {"name": "count_normal_min_below_one", "policy": {"count": {"dist": {"kind": "normal", "params": [3, 1]}, "min": 0}}, "ok": false},
-    {"name": "count_normal_min_one", "policy": {"count": {"dist": {"kind": "normal", "params": [3, 1]}, "min": 1}}, "ok": true},
-    {"name": "count_poisson_without_min", "policy": {"count": {"dist": {"kind": "poisson", "params": [3]}}}, "ok": false},
-    {"name": "not_object", "policy": [], "ok": false},
-    {"name": "jitter_fields", "policy": {
-      "dial_after": [{"const": 1}, {"range": [5, 10]}], "dial_jitter": 0.5,
-      "retire": [{"metric": "age", "above": {"const": 600}, "jitter": 0.3},
-                 {"metric": "bytes", "above": {"const": 1e9, "scope": "shared"}, "jitter": 0},
-                 {"metric": "pipes", "above": {"const": 4}, "jitter": 0.1}],
-      "probe_interval": {"range": [10, 20], "scope": "shared"}, "probe_jitter": 0.25}, "ok": true},
-    {"name": "probe_interval_alone", "policy": {"probe_interval": {"const": 15}}, "ok": true},
-    {"name": "retire_jitter_negative", "policy": {"retire": [{"metric": "age", "above": {"const": 1}, "jitter": -0.1}]}, "ok": false},
-    {"name": "retire_jitter_one", "policy": {"retire": [{"metric": "age", "above": {"const": 1}, "jitter": 1}]}, "ok": false},
-    {"name": "retire_jitter_string", "policy": {"retire": [{"metric": "age", "above": {"const": 1}, "jitter": "0.2"}]}, "ok": false},
-    {"name": "retire_jitter_value", "policy": {"retire": [{"metric": "age", "above": {"const": 1}, "jitter": {"const": 0.2}}]}, "ok": false},
-    {"name": "dial_jitter_one", "policy": {"dial_after": [{"const": 1}], "dial_jitter": 1}, "ok": false},
-    {"name": "dial_jitter_without_dial_after", "policy": {"dial_jitter": 0.2}, "ok": false},
-    {"name": "probe_jitter_without_interval", "policy": {"probe_jitter": 0.2}, "ok": false},
-    {"name": "probe_jitter_one", "policy": {"probe_interval": {"const": 15}, "probe_jitter": 1}, "ok": false},
-    {"name": "probe_interval_pipe_scope", "policy": {"probe_interval": {"const": 15, "scope": "pipe"}}, "ok": false},
-    {"name": "probe_interval_mixture_pipe_scope", "policy": {"probe_interval": {"dist": {"kind": "mixture", "of": [{"const": 15, "scope": "pipe"}], "weights": [1]}}}, "ok": false},
-    {"name": "probe_interval_number", "policy": {"probe_interval": 15}, "ok": false},
-    {"name": "count_geometric_without_min", "policy": {"count": {"dist": {"kind": "geometric", "params": [0.5]}}}, "ok": true, "note": "lower bound 1"},
-    {"name": "count_pareto", "policy": {"count": {"dist": {"kind": "pareto", "params": [0.5, 2]}}}, "ok": false, "error": "below 1", "note": "lower bound = scale 0.5"},
-    {"name": "count_pareto_scale_one", "policy": {"count": {"dist": {"kind": "pareto", "params": [1, 2]}}}, "ok": true, "note": "lower bound = scale 1"},
-    {"name": "count_const_max_below_one", "policy": {"count": {"const": 3, "max": 0.5}}, "ok": false, "error": "below 1", "note": "max counts in the lower bound"},
-    {"name": "count_mixture_zero_weight_zero", "policy": {"count": {"dist": {"kind": "mixture", "of": [{"const": 0}, {"const": 2}], "weights": [0, 1]}}}, "ok": false, "error": "below 1", "note": "weight-0 component counts"},
-    {"name": "count_overflow", "policy": {"count": {"const": 1e+16}}, "ok": false, "error": "max", "note": "declared count > 2^53"},
-    {"name": "count_overflow_raw", "raw": "{\"count\":{\"const\":1e400}}", "ok": false, "error": "overflow", "note": "parse error"},
-    {"name": "value_unknown_field", "policy": {"count": {"const": 2, "mean": 3}}, "ok": false, "error": "unknown field", "note": "unknown member of a Value"},
-    {"name": "dist_unknown_field", "policy": {"count": {"dist": {"kind": "poisson", "params": [2], "weights": [1]}, "min": 1}}, "ok": false, "error": "unknown field", "note": "weights is not a poisson member"},
-    {"name": "uppercase_field", "policy": {"Count": {"const": 2}}, "ok": false, "error": "unknown field", "note": "case-sensitive"},
-    {"name": "uppercase_metric", "policy": {"retire": [{"metric": "Age", "above": {"const": 1}}]}, "ok": false, "error": "metric", "note": "case-sensitive enum"},
-    {"name": "duplicate_key", "raw": "{\"count\":{\"const\":1},\"count\":{\"const\":2}}", "ok": false, "error": "duplicate", "note": "duplicate member"},
-    {"name": "jitter_null", "policy": {"retire": [{"metric": "age", "above": {"const": 10}, "jitter": null}], "dial_jitter": null, "probe_jitter": null}, "ok": true, "note": "null = absent = 0; no dial_after/probe_interval needed"},
-    {"name": "fields_null", "policy": {"count": null, "dial_after": null, "retire": null, "probe_interval": null}, "ok": true, "note": "null = absent"},
-    {"name": "dial_after_negative", "policy": {"dial_after": [{"const": -3}]}, "ok": false, "error": "negative", "note": "replaces dial_after_negative_passes_to_rejection"},
-    {"name": "dial_after_normal_without_min", "policy": {"dial_after": [{"dist": {"kind": "normal", "params": [5, 2]}}]}, "ok": false, "error": "negative", "note": "lower bound -inf"},
-    {"name": "retire_above_negative", "policy": {"retire": [{"metric": "age", "above": {"const": -1}}]}, "ok": false, "error": "negative", "note": "declared negative"},
-    {"name": "retire_above_range_negative", "policy": {"retire": [{"metric": "bytes", "above": {"range": [-1, 10], "min": 0}}]}, "ok": false, "error": "negative", "note": "declared negative even with min"},
-    {"name": "probe_interval_negative", "policy": {"probe_interval": {"const": -5}}, "ok": false, "error": "negative", "note": "replaces probe_interval_negative_passes_to_rejection"},
-    {"name": "probe_interval_over_1e9_loads", "policy": {"probe_interval": {"const": 2000000000.0}}, "ok": true, "note": "outside {0} U [1, 1e9] is a decision-time rejection (decide vector probe_interval_over_1e9)"},
-    {"name": "dial_after_over_1e9", "policy": {"dial_after": [{"const": 2000000000.0}]}, "ok": false, "error": "max", "note": "declared seconds > 1e9"},
-    {"name": "jitter_decimal_ok", "raw": "{\"retire\":[{\"metric\":\"age\",\"above\":{\"const\":1},\"jitter\":0}]}", "ok": true, "note": "jitter is a number; integer 0 is fine"},
-    {"name": "scope_empty_string", "policy": {"count": {"const": 1, "scope": ""}}, "ok": false, "error": "scope", "note": "no alias; changes existing scope_names (drop its \"\" item)"}
-  ],
-  "decide": [
-    {"name": "empty_keeps_pool", "policy": {}, "steps": [
-      {"failures": 3, "members": [{"id": 1, "age": 1e6, "idle": 1e6, "pipes": 9, "bytes_sent": 1e12, "bytes_received": 1e12}],
-       "want": {"count": null, "dial_after": null, "retire": [], "recheck": null}}]},
-    {"name": "count_rounds", "policy": {"count": {"const": 2.6}}, "steps": [{"want": {"count": 3}}]},
-    {"name": "count_bounds", "policy": {"count": {"const": 9, "max": 4}}, "steps": [{"want": {"count": 4}}]},
-    {"name": "dial_after_tiers", "policy": {"dial_after": [{"const": 1}, {"const": 5}, {"const": 30}]}, "steps": [
-      {"failures": 0, "want": {"dial_after": 1}},
-      {"failures": 1, "want": {"dial_after": 5}},
-      {"failures": 2, "want": {"dial_after": 30}},
-      {"failures": 7, "want": {"dial_after": 30}}]},
-    {"name": "dial_after_single", "policy": {"dial_after": [{"const": 2.5}]}, "steps": [
-      {"failures": 0, "want": {"dial_after": 2.5}},
-      {"failures": 4, "want": {"dial_after": 2.5}}]},
-    {"name": "retire_each_metric", "policy": {"retire": [
-      {"metric": "age", "above": {"const": 100}}, {"metric": "idle", "above": {"const": 50}},
-      {"metric": "pipes", "above": {"const": 4}}, {"metric": "bytes_sent", "above": {"const": 1000}},
-      {"metric": "bytes_received", "above": {"const": 2000}}]}, "steps": [
-      {"members": [
-        {"id": 7, "age": 101}, {"id": 3}, {"id": 5, "idle": 51}, {"id": 6, "pipes": 5},
-        {"id": 2, "bytes_sent": 1001}, {"id": 4, "bytes_received": 2001},
-        {"id": 9, "age": 100, "idle": 50, "pipes": 4, "bytes_sent": 1000, "bytes_received": 2000}],
-       "want": {"retire": [7, 5, 6, 2, 4]}}]},
-    {"name": "retire_bytes_is_sum", "policy": {"retire": [{"metric": "bytes", "above": {"const": 10}}]}, "steps": [
-      {"members": [{"id": 1, "bytes_sent": 6, "bytes_received": 5}, {"id": 2, "bytes_sent": 10}],
-       "want": {"retire": [1]}}]},
-    {"name": "retire_once_per_member", "policy": {"retire": [
-      {"metric": "age", "above": {"const": 1}}, {"metric": "idle", "above": {"const": 1}}]}, "steps": [
-      {"members": [{"id": 1, "age": 5, "idle": 5}, {"id": 2, "idle": 5}], "want": {"retire": [1, 2]}}]},
-    {"name": "shared_drawn_once", "policy": {"count": {"range": [1, 1000], "scope": "shared"},
-      "dial_after": [{"range": [0, 1000], "scope": "shared"}]}, "steps": [
-      {"want": {"count_in": [1, 1000], "dial_after_in": [0, 1000]}},
-      {"want": {"same_as": 0}}, {"failures": 0, "want": {"same_as": 0}}]},
-    {"name": "pipe_kept_per_member", "policy": {"retire": [{"metric": "age", "above": {"range": [10, 20], "scope": "pipe"}}]}, "steps": [
-      {"members": [{"id": 1, "age": 15}, {"id": 2, "age": 5}, {"id": 3, "age": 25}, {"id": 4, "age": 15}]},
-      {"members": [{"id": 1, "age": 15}, {"id": 2, "age": 5}, {"id": 3, "age": 25}, {"id": 4, "age": 15}], "want": {"same_as": 0}},
-      {"members": [{"id": 1, "age": 15}, {"id": 2, "age": 5}, {"id": 3, "age": 25}, {"id": 4, "age": 15}], "want": {"same_as": 0}}]},
-    {"name": "recheck_age", "policy": {"retire": [{"metric": "age", "above": {"const": 100}}]}, "steps": [
-      {"members": [{"id": 1, "age": 40}, {"id": 2, "age": 70}], "want": {"retire": [], "recheck": 30}}]},
-    {"name": "recheck_age_idle_min", "policy": {"retire": [
-      {"metric": "age", "above": {"const": 100}}, {"metric": "idle", "above": {"const": 50}}]}, "steps": [
-      {"members": [{"id": 1, "age": 90, "idle": 45}], "want": {"recheck": 5}},
-      {"members": [{"id": 1, "age": 99, "idle": 10}], "want": {"recheck": 1}}]},
-    {"name": "recheck_skips_retired", "policy": {"retire": [{"metric": "age", "above": {"const": 100}}]}, "steps": [
-      {"members": [{"id": 1, "age": 150}, {"id": 2, "age": 75}], "want": {"retire": [1], "recheck": 25}},
-      {"members": [{"id": 1, "age": 150}], "want": {"retire": [1], "recheck": null}}]},
-    {"name": "recheck_at_threshold", "policy": {"retire": [{"metric": "age", "above": {"const": 100}}]}, "steps": [
-      {"members": [{"id": 1, "age": 100}], "want": {"retire": [], "recheck_in": [0, 0.001]}}]},
-    {"name": "recheck_not_from_byte_rules", "policy": {"retire": [
-      {"metric": "bytes", "above": {"const": 10}}, {"metric": "bytes_sent", "above": {"const": 10}},
-      {"metric": "bytes_received", "above": {"const": 10}}, {"metric": "pipes", "above": {"const": 10}}]}, "steps": [
-      {"members": [{"id": 1, "age": 5, "idle": 5, "bytes_sent": 2, "bytes_received": 2, "pipes": 1}], "want": {"retire": [], "recheck": null}}]},
-    {"name": "recheck_dial_after", "policy": {"dial_after": [{"const": 1}, {"const": 5}]}, "steps": [
-      {"since_dial": 0.5, "want": {"dial_after": 1, "recheck": 0.5}},
-      {"failures": 1, "since_dial": 2, "want": {"dial_after": 5, "recheck": 3}},
-      {"since_dial": 3, "want": {"dial_after": 1, "recheck": null}},
-      {"want": {"dial_after": 1, "recheck": null}}]},
-    {"name": "recheck_min_of_dial_and_rule", "policy": {"dial_after": [{"const": 1}],
-      "retire": [{"metric": "age", "above": {"const": 100}}]}, "steps": [
-      {"since_dial": 0.25, "members": [{"id": 1, "age": 99.5}], "want": {"recheck": 0.5}},
-      {"since_dial": 0.75, "members": [{"id": 1, "age": 99.5}], "want": {"recheck": 0.25}}]},
-    {"name": "recheck_pipe_threshold_in_range", "policy": {"retire": [{"metric": "age", "above": {"range": [10, 20], "scope": "pipe"}}]}, "steps": [
-      {"members": [{"id": 1, "age": 5}], "want": {"recheck_in": [5, 15]}},
-      {"members": [{"id": 1, "age": 5}], "want": {"same_as": 0}}]},
-    {"name": "range_bounds", "policy": {"count": {"range": [2, 6]}, "dial_after": [{"range": [0.5, 1.5]}]}, "steps": [
-      {"want": {"count_in": [2, 6], "dial_after_in": [0.5, 1.5]}},
-      {"want": {"count_in": [2, 6], "dial_after_in": [0.5, 1.5]}},
-      {"want": {"count_in": [2, 6], "dial_after_in": [0.5, 1.5]}}]},
-    {"name": "retire_jitter_bounds", "policy": {"retire": [{"metric": "age", "above": {"const": 100}, "jitter": 0.5}]}, "steps": [
-      {"members": [{"id": 1, "age": 40}, {"id": 2, "age": 101}], "want": {"retire": [2], "recheck_in": [10, 60]}},
-      {"members": [{"id": 1, "age": 40}, {"id": 2, "age": 101}], "want": {"same_as": 0}}]},
-    {"name": "retire_jitter_zero_is_plain", "policy": {"retire": [{"metric": "age", "above": {"const": 100}, "jitter": 0}]}, "steps": [
-      {"members": [{"id": 1, "age": 40}, {"id": 2, "age": 70}], "want": {"retire": [], "recheck": 30}}]},
-    {"name": "retire_jitter_kept_per_member", "policy": {"retire": [{"metric": "age", "above": {"const": 100}, "jitter": 0.9}]}, "steps": [
-      {"members": [{"id": 1, "age": 50}, {"id": 2, "age": 50}, {"id": 3, "age": 50}, {"id": 4, "age": 50}]},
-      {"members": [{"id": 1, "age": 50}, {"id": 2, "age": 50}, {"id": 3, "age": 50}, {"id": 4, "age": 50}], "want": {"same_as": 0}},
-      {"members": [{"id": 1, "age": 50}, {"id": 2, "age": 50}, {"id": 3, "age": 50}, {"id": 4, "age": 50}], "want": {"same_as": 0}}]},
-    {"name": "retire_jitter_on_shared", "policy": {"retire": [{"metric": "age", "above": {"range": [100, 200], "scope": "shared"}, "jitter": 0.5}]}, "steps": [
-      {"members": [{"id": 1, "age": 49}, {"id": 2, "age": 201}], "want": {"retire": [2], "recheck_in": [1, 151]}},
-      {"members": [{"id": 1, "age": 49}, {"id": 2, "age": 201}], "want": {"same_as": 0}}]},
-    {"name": "retire_jitter_after_bounds", "policy": {"retire": [{"metric": "age", "above": {"const": 500, "max": 100}, "jitter": 0.5}]}, "steps": [
-      {"members": [{"id": 1, "age": 49}, {"id": 2, "age": 101}], "want": {"retire": [2], "recheck_in": [1, 51]}}]},
-    {"name": "retire_jitter_bytes", "policy": {"retire": [{"metric": "bytes", "above": {"const": 1000}, "jitter": 0.5}]}, "steps": [
-      {"members": [{"id": 1, "bytes_sent": 499}, {"id": 2, "bytes_sent": 600, "bytes_received": 401}], "want": {"retire": [2], "recheck": null}}]},
-    {"name": "dial_jitter_bounds_and_kept", "policy": {"dial_after": [{"const": 10}], "dial_jitter": 0.5}, "steps": [
-      {"since_dial": 1, "want": {"dial_after_in": [5, 10], "recheck_in": [4, 9]}},
-      {"since_dial": 1, "want": {"same_as": 0}},
-      {"since_dial": 4, "want": {"dial_after_same_as": 0, "recheck_in": [1, 6]}},
-      {"failures": 1, "since_dial": 0.5, "want": {"dial_after_in": [5, 10], "recheck_in": [4.5, 9.5]}}]},
-    {"name": "dial_jitter_first_dial_starts_a_wait", "policy": {"dial_after": [{"const": 10}], "dial_jitter": 0.5}, "steps": [
-      {"want": {"dial_after_in": [5, 10], "recheck": null}},
-      {"want": {"dial_after_same_as": 0}},
-      {"since_dial": 0, "want": {"dial_after_in": [5, 10], "dial_after_redrawn_from": 1}}]},
-    {"name": "dial_jitter_tiers", "policy": {"dial_after": [{"const": 2}, {"const": 30}], "dial_jitter": 0.25}, "steps": [
-      {"failures": 0, "want": {"dial_after_in": [1.5, 2]}},
-      {"failures": 1, "want": {"dial_after_in": [22.5, 30]}},
-      {"failures": 5, "want": {"dial_after_in": [22.5, 30]}}]},
-    {"name": "dial_jitter_zero_is_plain", "policy": {"dial_after": [{"const": 1}, {"const": 5}], "dial_jitter": 0}, "steps": [
-      {"failures": 0, "since_dial": 0.5, "want": {"dial_after": 1, "recheck": 0.5}},
-      {"failures": 1, "since_dial": 2, "want": {"dial_after": 5, "recheck": 3}}]},
-    {"name": "probe_absent", "policy": {"count": {"const": 2}}, "steps": [
-      {"want": {"count": 2, "probe_interval": null, "probe_jitter": null}}]},
-    {"name": "probe_passthrough", "policy": {"probe_interval": {"const": 20}, "probe_jitter": 0.3}, "steps": [
-      {"want": {"probe_interval": 20, "probe_jitter": 0.3, "recheck": null}}]},
-    {"name": "probe_jitter_unset", "policy": {"probe_interval": {"const": 12}}, "steps": [
-      {"want": {"probe_interval": 12, "probe_jitter": null}}]},
-    {"name": "probe_jitter_explicit_zero", "policy": {"probe_interval": {"const": 12}, "probe_jitter": 0}, "steps": [
-      {"want": {"probe_interval": 12, "probe_jitter": 0}}]},
-    {"name": "probe_interval_below_one_passes_to_rejection", "policy": {"probe_interval": {"const": 0.2}}, "steps": [{"want": {"probe_interval": 0.2}}]},
-    {"name": "probe_interval_shared_kept", "policy": {"probe_interval": {"range": [10, 15], "scope": "shared"}}, "steps": [
-      {"want": {"probe_interval_in": [10, 15]}}, {"want": {"same_as": 0}}]},
-    {"name": "probe_interval_each_in_range", "policy": {"probe_interval": {"range": [10, 15]}}, "steps": [
-      {"want": {"probe_interval_in": [10, 15]}}, {"want": {"probe_interval_in": [10, 15]}}]},
-    {"name": "probe_interval_over_1e9", "policy": {"probe_interval": {"const": 2000000000.0}}, "steps": [{"want": {"probe_interval": 2000000000.0}}], "note": "executor emits it; the pool rejects the decision (keep, report)"},
-    {"name": "count_draw_rounds_half_up", "policy": {"count": {"const": 2.5}}, "steps": [{"want": {"count": 3}}], "note": "half away from zero"}
-  ]
+       7,
+       5,
+       6,
+       2,
+       4
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 1
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "retire-bytes-is-sum",
+   "policy": {
+    "retire": [
+     {
+      "metric": "bytes",
+      "above": 10
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000106"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "bytes_sent": 6,
+       "bytes_received": 5
+      },
+      {
+       "id": 2,
+       "bytes_sent": 10
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       1
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "retire-once-per-member",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 1
+     },
+     {
+      "metric": "idle",
+      "above": 1
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000107"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5,
+       "idle": 5
+      },
+      {
+       "id": 2,
+       "idle": 5
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       1,
+       2
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "shared-drawn-at-compile",
+   "policy": {
+    "count": {
+     "t": [
+      [
+       1,
+       1,
+       1000
+      ]
+     ],
+     "scope": "shared"
+    },
+    "dial_after": [
+     {
+      "t": [
+       [
+        1,
+        0,
+        1000
+       ]
+      ],
+      "scope": "shared"
+     }
+    ],
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         10,
+         20
+        ]
+       ],
+       "scope": "shared"
+      }
+     }
+    ],
+    "probe_interval": {
+     "t": [
+      [
+       1,
+       3000000,
+       9000000
+      ]
+     ],
+     "scope": "shared"
+    }
+   },
+   "source": {
+    "seed": "0000000000000108"
+   },
+   "compile": {
+    "shared": [
+     549,
+     319,
+     16,
+     6187115
+    ],
+    "consumed": 4
+   },
+   "steps": [
+    {
+     "want": {
+      "count": 549,
+      "dial_after": 319,
+      "retire": [],
+      "probe_interval": 6187115,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 4
+    },
+    {
+     "want": {
+      "count": 549,
+      "dial_after": 319,
+      "retire": [],
+      "probe_interval": 6187115,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 4
+    }
+   ]
+  },
+  {
+   "name": "pipe-kept-per-member",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         10,
+         20
+        ]
+       ],
+       "scope": "pipe"
+      }
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000109"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 15
+      },
+      {
+       "id": 2,
+       "age": 5
+      },
+      {
+       "id": 3,
+       "age": 25
+      },
+      {
+       "id": 4,
+       "age": 15
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       3
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 1
+     },
+     "consumed": 4
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 15
+      },
+      {
+       "id": 2,
+       "age": 5
+      },
+      {
+       "id": 3,
+       "age": 25
+      },
+      {
+       "id": 4,
+       "age": 15
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       3
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 1
+     },
+     "consumed": 4
+    }
+   ]
+  },
+  {
+   "name": "pipe-dropped-out-of-view",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         10,
+         20
+        ]
+       ],
+       "scope": "pipe"
+      }
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010a"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 14
+     },
+     "consumed": 1
+    },
+    {
+     "members": [],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 12
+     },
+     "consumed": 2
+    }
+   ]
+  },
+  {
+   "name": "above-each-redrawn",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         10,
+         20
+        ]
+       ]
+      }
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010b"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 10
+     },
+     "consumed": 1
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 15
+     },
+     "consumed": 2
+    }
+   ]
+  },
+  {
+   "name": "recheck-age",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010c"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 40
+      },
+      {
+       "id": 2,
+       "age": 70
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 30
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-age-idle-min",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100
+     },
+     {
+      "metric": "idle",
+      "above": 50
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010d"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 90,
+       "idle": 45
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 5
+     },
+     "consumed": 0
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 99,
+       "idle": 10
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 1
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-skips-retired",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010e"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 150
+      },
+      {
+       "id": 2,
+       "age": 75
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       1
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 25
+     },
+     "consumed": 0
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 150
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       1
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-at-threshold",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000010f"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 100
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 1
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-not-from-counts",
+   "policy": {
+    "retire": [
+     {
+      "metric": "bytes",
+      "above": 10
+     },
+     {
+      "metric": "bytes_sent",
+      "above": 10
+     },
+     {
+      "metric": "bytes_received",
+      "above": 10
+     },
+     {
+      "metric": "pipes",
+      "above": 10
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000110"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 5,
+       "idle": 5,
+       "bytes_sent": 2,
+       "bytes_received": 2,
+       "pipes": 1
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-dial-after",
+   "policy": {
+    "dial_after": [
+     1000000,
+     5000000
+    ]
+   },
+   "source": {
+    "seed": "0000000000000111"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "since_dial": 500000,
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 500000
+     },
+     "consumed": 0
+    },
+    {
+     "failures": 1,
+     "since_dial": 2000000,
+     "want": {
+      "count": null,
+      "dial_after": 5000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 3000000
+     },
+     "consumed": 0
+    },
+    {
+     "since_dial": 3000000,
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    },
+    {
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "recheck-min-of-dial-and-rule",
+   "policy": {
+    "dial_after": [
+     1000000
+    ],
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100000000
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000112"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "since_dial": 250000,
+     "members": [
+      {
+       "id": 1,
+       "age": 99500000
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 500000
+     },
+     "consumed": 0
+    },
+    {
+     "since_dial": 750000,
+     "members": [
+      {
+       "id": 1,
+       "age": 99500000
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": 1000000,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 250000
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "retire-jitter-kept",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100,
+      "jitter": 500000
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000113"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 40
+      },
+      {
+       "id": 2,
+       "age": 101
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       2
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 29
+     },
+     "consumed": 2
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 40
+      },
+      {
+       "id": 2,
+       "age": 101
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [
+       2
+      ],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 29
+     },
+     "consumed": 2
+    }
+   ]
+  },
+  {
+   "name": "retire-jitter-zero",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": 100,
+      "jitter": 0
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000114"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 40
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 60
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "retire-jitter-order",
+   "policy": {
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         100,
+         200
+        ]
+       ],
+       "scope": "pipe"
+      },
+      "jitter": 900000
+     },
+     {
+      "metric": "idle",
+      "above": 10
+     },
+     {
+      "metric": "bytes",
+      "above": 1000,
+      "jitter": 500000
+     }
+    ]
+   },
+   "source": {
+    "seed": "0000000000000115"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 20,
+       "bytes_sent": 400
+      },
+      {
+       "id": 2,
+       "age": 20
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 3
+     },
+     "consumed": 6
+    },
+    {
+     "members": [
+      {
+       "id": 1,
+       "age": 20,
+       "bytes_sent": 400
+      },
+      {
+       "id": 2,
+       "age": 20
+      }
+     ],
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 3
+     },
+     "consumed": 6
+    }
+   ]
+  },
+  {
+   "name": "dial-jitter-waits",
+   "policy": {
+    "dial_after": [
+     10000000
+    ],
+    "dial_jitter": 500000
+   },
+   "source": {
+    "seed": "0000000000000116"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "since_dial": 1000000,
+     "want": {
+      "count": null,
+      "dial_after": 9199323,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 8199323
+     },
+     "consumed": 1
+    },
+    {
+     "since_dial": 1000000,
+     "want": {
+      "count": null,
+      "dial_after": 9199323,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 8199323
+     },
+     "consumed": 1
+    },
+    {
+     "since_dial": 4000000,
+     "want": {
+      "count": null,
+      "dial_after": 9199323,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 5199323
+     },
+     "consumed": 1
+    },
+    {
+     "failures": 1,
+     "since_dial": 500000,
+     "want": {
+      "count": null,
+      "dial_after": 7916608,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 7416608
+     },
+     "consumed": 2
+    },
+    {
+     "failures": 1,
+     "since_dial": 250000,
+     "want": {
+      "count": null,
+      "dial_after": 8040945,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 7790945
+     },
+     "consumed": 3
+    }
+   ]
+  },
+  {
+   "name": "dial-jitter-first-dial",
+   "policy": {
+    "dial_after": [
+     10000000
+    ],
+    "dial_jitter": 500000
+   },
+   "source": {
+    "seed": "0000000000000117"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": 7816560,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "want": {
+      "count": null,
+      "dial_after": 7816560,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "since_dial": 0,
+     "want": {
+      "count": null,
+      "dial_after": 9811344,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": 9811344
+     },
+     "consumed": 2
+    }
+   ]
+  },
+  {
+   "name": "dial-jitter-tiers",
+   "policy": {
+    "dial_after": [
+     2000000,
+     30000000
+    ],
+    "dial_jitter": 250000
+   },
+   "source": {
+    "seed": "0000000000000118"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "failures": 0,
+     "want": {
+      "count": null,
+      "dial_after": 1585898,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "failures": 1,
+     "want": {
+      "count": null,
+      "dial_after": 26842657,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 2
+    },
+    {
+     "failures": 5,
+     "want": {
+      "count": null,
+      "dial_after": 29845283,
+      "retire": [],
+      "probe_interval": null,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 3
+    }
+   ]
+  },
+  {
+   "name": "probe-passthrough",
+   "policy": {
+    "probe_interval": 7000000,
+    "probe_jitter": 300000
+   },
+   "source": {
+    "seed": "0000000000000119"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 7000000,
+      "probe_jitter": 300000,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "probe-jitter-zero",
+   "policy": {
+    "probe_interval": 5000000,
+    "probe_jitter": 0
+   },
+   "source": {
+    "seed": "000000000000011a"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 5000000,
+      "probe_jitter": 0,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "probe-zero-disables",
+   "policy": {
+    "probe_interval": 0
+   },
+   "source": {
+    "seed": "000000000000011b"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 0,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "probe-below-one-second-is-output",
+   "policy": {
+    "probe_interval": 200000
+   },
+   "source": {
+    "seed": "000000000000011c"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 200000,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "probe-each",
+   "policy": {
+    "probe_interval": {
+     "t": [
+      [
+       1,
+       3000000,
+       9000000
+      ]
+     ]
+    }
+   },
+   "source": {
+    "seed": "000000000000011d"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 7549994,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 1
+    },
+    {
+     "want": {
+      "count": null,
+      "dial_after": null,
+      "retire": [],
+      "probe_interval": 3048878,
+      "probe_jitter": null,
+      "recheck": null
+     },
+     "consumed": 2
+    }
+   ]
+  },
+  {
+   "name": "order-all",
+   "policy": {
+    "count": {
+     "t": [
+      [
+       1,
+       1,
+       9
+      ]
+     ]
+    },
+    "dial_after": [
+     {
+      "t": [
+       [
+        1,
+        1000000,
+        2000000
+       ]
+      ]
+     }
+    ],
+    "dial_jitter": 1000,
+    "probe_interval": {
+     "t": [
+      [
+       1,
+       4000000,
+       5000000
+      ]
+     ]
+    },
+    "retire": [
+     {
+      "metric": "age",
+      "above": {
+       "t": [
+        [
+         1,
+         5,
+         9
+        ]
+       ],
+       "scope": "pipe"
+      },
+      "jitter": 1000
+     }
+    ]
+   },
+   "source": {
+    "seed": "000000000000011e"
+   },
+   "compile": {
+    "shared": [],
+    "consumed": 0
+   },
+   "steps": [
+    {
+     "since_dial": 5,
+     "members": [
+      {
+       "id": 1,
+       "age": 1
+      }
+     ],
+     "want": {
+      "count": 7,
+      "dial_after": 1362726,
+      "retire": [],
+      "probe_interval": 4377254,
+      "probe_jitter": null,
+      "recheck": 4
+     },
+     "consumed": 6
+    },
+    {
+     "since_dial": 6,
+     "members": [
+      {
+       "id": 1,
+       "age": 1
+      },
+      {
+       "id": 2,
+       "age": 2
+      }
+     ],
+     "want": {
+      "count": 8,
+      "dial_after": 1152036,
+      "retire": [],
+      "probe_interval": 4833964,
+      "probe_jitter": null,
+      "recheck": 4
+     },
+     "consumed": 11
+    }
+   ]
+  }
+ ]
 }

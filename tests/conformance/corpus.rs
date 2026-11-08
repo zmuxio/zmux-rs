@@ -1,4 +1,4 @@
-//! The wire corpus (CONFORMANCE.md Section 5): every valid case round-trips
+//! The wire corpus: every valid case round-trips
 //! byte for byte and every invalid case fails with exactly its error.
 
 use serde_json::Value;
@@ -132,8 +132,7 @@ fn valid_cases_round_trip() {
                 let spec: FrameSpec = serde_json::from_value(e["frame"].clone()).unwrap();
                 let built = wire::encode_frames(&[spec], &no_placeholders);
                 if e.get("non_minimal") == Some(&Value::Bool(true)) {
-                    // Re-encoding is minimal: compare meaning, not bytes
-                    // (CONFORMANCE.md).
+                    // Re-encoding is minimal: compare meaning, not bytes.
                     for (what, enc) in [("re-encoding", &again), ("JSON encoding", &built)] {
                         let (f, _) = Frame::decode(enc, &gates).unwrap();
                         assert_eq!(

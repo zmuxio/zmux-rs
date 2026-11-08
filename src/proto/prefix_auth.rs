@@ -11,20 +11,19 @@
 //! ```
 //!
 //! A carrier decided on its HTTP request head carries the token in a
-//! request header field instead, in base64url without padding (Section
-//! 2.1).
+//! request header field instead, in base64url without padding.
 //!
 //! [`PrefixAuth`] makes tokens, and is a client's [`Credential`];
 //! [`PrefixAuthVerifier`] checks them within a number of slots of its own
 //! clock and accepts each Nonce once.
 
-use std::collections::HashSet;
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::admission::{CarrierInfo, Credential, Verdict};
 use super::oob;
+use super::replay::{ReplayFilter, ReplayVerdict};
 use crate::util::HmacSha256;
 
 /// The length of a token: the admission's prefix length.
@@ -186,7 +185,7 @@ impl PrefixAuth {
 pub struct PrefixAuthVerifier {
     auth: PrefixAuth,
     skew: u64,
-    record: Mutex<NonceRecord>,
+    record: Option<ReplayFilter>,
 }
 
 impl std::fmt::Debug for PrefixAuthVerifier {
@@ -204,10 +203,15 @@ impl PrefixAuthVerifier {
     /// that finds the record full is not accepted.
     pub fn new(auth: PrefixAuth, skew: u32, max_nonces: usize) -> Self {
         let skew = u64::from(skew);
+        let slot = auth.slot;
         Self {
             auth,
             skew,
-            record: Mutex::new(NonceRecord::new(2 * skew + 1, max_nonces)),
+            record: ReplayFilter::new(
+                Duration::from_secs((skew + 1).saturating_mul(slot)),
+                max_nonces,
+            )
+            .ok(),
         }
     }
 
@@ -243,12 +247,12 @@ impl PrefixAuthVerifier {
         }) else {
             return false;
         };
-        let mut key = [0u8; NONCE_LEN];
-        key.copy_from_slice(nonce);
-        self.record
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .add(key, slot, low)
+        let ms = |secs: u64| i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        // A slot stands for its start: within (skew + 1) slots of the clock.
+        self.record.as_ref().is_some_and(|r| {
+            r.check_at(nonce, ms(slot.saturating_mul(self.auth.slot)), ms(unix))
+                == ReplayVerdict::Fresh
+        })
     }
 
     /// An admission decision: [`Verdict::Accept`] of the token when it
@@ -329,67 +333,6 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The accepted Nonces, in groups by slot: a group is dropped as a whole
-/// once its slot is below the acceptable range, so nothing is scanned
-/// Nonce by Nonce, and a Nonce is kept at least as long as its slot is
-/// acceptable. Bounded in Nonces: when full, nothing is added.
-struct NonceRecord {
-    groups: Vec<Group>,
-    len: usize,
-    max: usize,
-}
-
-struct Group {
-    slot: u64,
-    nonces: HashSet<[u8; NONCE_LEN]>,
-}
-
-impl NonceRecord {
-    /// A record for ranges of `span` acceptable slots.
-    fn new(span: u64, max: usize) -> Self {
-        // The groups a range touches, and one more for the slot that
-        // enters as the oldest leaves.
-        let n = usize::try_from(span.saturating_add(1))
-            .unwrap_or(usize::MAX)
-            .min(1 << 16);
-        Self {
-            groups: (0..n)
-                .map(|_| Group {
-                    slot: 0,
-                    nonces: HashSet::new(),
-                })
-                .collect(),
-            len: 0,
-            max,
-        }
-    }
-
-    /// Records `nonce` of `slot` while slots below `low` are no longer
-    /// acceptable; false when it is recorded already or the record is full.
-    fn add(&mut self, nonce: [u8; NONCE_LEN], slot: u64, low: u64) -> bool {
-        for g in &mut self.groups {
-            if g.slot < low && !g.nonces.is_empty() {
-                self.len -= g.nonces.len();
-                g.nonces = HashSet::new();
-            }
-        }
-        let n = self.groups.len() as u64;
-        let g = &mut self.groups[(slot % n) as usize];
-        if g.slot != slot && !g.nonces.is_empty() {
-            // An older slot than any acceptable one.
-            self.len -= g.nonces.len();
-            g.nonces = HashSet::new();
-        }
-        g.slot = slot;
-        if g.nonces.contains(&nonce) || self.len >= self.max {
-            return false;
-        }
-        g.nonces.insert(nonce);
-        self.len += 1;
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,7 +401,7 @@ mod tests {
             "full"
         );
         assert!(
-            v.verify_at(&a.token_at(None, 11, [3; 16]), None, 11),
+            v.verify_at(&a.token_at(None, 12, [3; 16]), None, 12),
             "slot 10 dropped"
         );
     }
@@ -482,7 +425,7 @@ mod tests {
             .with_headers(|| fields.iter().map(|(n, v)| (*n, v.as_bytes())))
     }
 
-    /// The header form of the Section 6 vectors verifies at their time,
+    /// The header form of the test vectors verifies at their time,
     /// once, by the configured field; missing, repeated and malformed
     /// fields fail.
     #[test]

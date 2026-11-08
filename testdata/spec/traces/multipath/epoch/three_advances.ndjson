@@ -1,0 +1,893 @@
+{"kind": "trace", "id": "multipath.epoch.three_advances", "title": "Three exchanges in a row, each after the epoch before the previous one is deleted: each epoch's joins use its key phase and Locator", "profile": "zmux-mp", "local_role": "responder", "overrides": {}, "refs": ["MULTIPATH.md#10.7", "secure-carrier/SPEC.md#11.2"], "findings": [], "groups": ["multipath", "epoch"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap"}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "zmux_multipath": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}, "zmux_session_crypto": {"suites": [1], "groups": [2]}, "zmux_ack_threshold": 4096}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 512}, {"id": "zmux_priority", "value": null}, {"id": "max_record_size", "value": 65535}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "00112233445566778899aabbccddeeff", "locator": "50454552"}}, {"id": "zmux_session_crypto", "value": {"suites": [1], "groups": [2]}}, {"id": 58, "raw": "abcd"}]}]], "hex": "406eff5153300d0a0d0a4064010480007530040260000502480006024800070248000801040901041d0084528a5f008439e07a024200b1e7139d00c571c59429cd0845048000ffffb0dc2978160400112233445566778899aabbccddeeff0450454552826f24b504010101023a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath"]}}
+{"step": 5, "op": "pipe_up", "dir": "bidi", "via": "listener", "carrier": "c2", "carrier_binding": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}
+{"step": 6, "op": "peer_join", "carrier": "c2", "pipe": 2, "direction": "bidi", "fate_group": 0, "priority": 0, "standby": false, "locator": "4c4f43414c", "mode": "bound", "outcome": "accept", "binding": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}
+{"step": 7, "op": "peer_send", "pipe": 2, "records": [[{"type": "MAX_DATA", "max": 0}]], "hex": "021000"}
+{"step": 8, "op": "advance", "ms": 25}
+{"step": 9, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "PIPE_PING"}]}
+{"step": 10, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 11, "op": "peer_epoch", "pipe": 2, "phase": "offer", "epoch": 1, "locator": ""}
+{"step": 12, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "SESSION_EPOCH", "phase": "answer", "epoch": 1, "share": {"len": 1120}, "locator": "4c4f43414c2d31"}]}
+{"step": 13, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 14, "op": "pipe_up", "dir": "in", "via": "listener", "carrier": "c4"}
+{"step": 15, "op": "peer_join", "carrier": "c4", "pipe": 4, "direction": "up", "fate_group": 0, "priority": 0, "standby": false, "locator": "4c4f43414c2d31", "mode": "trusted", "outcome": "accept", "phase": 1}
+{"step": 16, "op": "peer_send", "pipe": 4, "records": [[{"type": "MAX_DATA", "max": 0}]], "hex": "021000"}
+{"step": 17, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 0}]], "hex": "09f48c67529ef8c7bd00"}
+{"step": 18, "op": "advance", "ms": 50}
+{"step": 19, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 0}]}
+{"step": 20, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 21, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 22, "op": "advance", "ms": 1000}
+{"step": 23, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 24, "op": "advance", "ms": 1000}
+{"step": 25, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 26, "op": "advance", "ms": 1000}
+{"step": 27, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 28, "op": "advance", "ms": 1000}
+{"step": 29, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 30, "op": "advance", "ms": 1000}
+{"step": 31, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 32, "op": "advance", "ms": 1000}
+{"step": 33, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 34, "op": "advance", "ms": 1000}
+{"step": 35, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 36, "op": "advance", "ms": 1000}
+{"step": 37, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 38, "op": "advance", "ms": 1000}
+{"step": 39, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 40, "op": "advance", "ms": 1000}
+{"step": 41, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 42, "op": "advance", "ms": 1000}
+{"step": 43, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 44, "op": "advance", "ms": 1000}
+{"step": 45, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 46, "op": "advance", "ms": 1000}
+{"step": 47, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 48, "op": "advance", "ms": 1000}
+{"step": 49, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 50, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 1}]], "hex": "09f48c67529ef8c7bd01"}
+{"step": 51, "op": "advance", "ms": 50}
+{"step": 52, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 1}]}
+{"step": 53, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 54, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 55, "op": "advance", "ms": 1000}
+{"step": 56, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 57, "op": "advance", "ms": 1000}
+{"step": 58, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 59, "op": "advance", "ms": 1000}
+{"step": 60, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 61, "op": "advance", "ms": 1000}
+{"step": 62, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 63, "op": "advance", "ms": 1000}
+{"step": 64, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 65, "op": "advance", "ms": 1000}
+{"step": 66, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 67, "op": "advance", "ms": 1000}
+{"step": 68, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 69, "op": "advance", "ms": 1000}
+{"step": 70, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 71, "op": "advance", "ms": 1000}
+{"step": 72, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 73, "op": "advance", "ms": 1000}
+{"step": 74, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 75, "op": "advance", "ms": 1000}
+{"step": 76, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 77, "op": "advance", "ms": 1000}
+{"step": 78, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 79, "op": "advance", "ms": 1000}
+{"step": 80, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 81, "op": "advance", "ms": 1000}
+{"step": 82, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 83, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 2}]], "hex": "09f48c67529ef8c7bd02"}
+{"step": 84, "op": "advance", "ms": 50}
+{"step": 85, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 2}]}
+{"step": 86, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 87, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 88, "op": "advance", "ms": 1000}
+{"step": 89, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 90, "op": "advance", "ms": 1000}
+{"step": 91, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 92, "op": "advance", "ms": 1000}
+{"step": 93, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 94, "op": "advance", "ms": 1000}
+{"step": 95, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 96, "op": "advance", "ms": 1000}
+{"step": 97, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 98, "op": "advance", "ms": 1000}
+{"step": 99, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 100, "op": "advance", "ms": 1000}
+{"step": 101, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 102, "op": "advance", "ms": 1000}
+{"step": 103, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 104, "op": "advance", "ms": 1000}
+{"step": 105, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 106, "op": "advance", "ms": 1000}
+{"step": 107, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 108, "op": "advance", "ms": 1000}
+{"step": 109, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 110, "op": "advance", "ms": 1000}
+{"step": 111, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 112, "op": "advance", "ms": 1000}
+{"step": 113, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 114, "op": "advance", "ms": 1000}
+{"step": 115, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 116, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 3}]], "hex": "09f48c67529ef8c7bd03"}
+{"step": 117, "op": "advance", "ms": 50}
+{"step": 118, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 3}]}
+{"step": 119, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 120, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 121, "op": "advance", "ms": 1000}
+{"step": 122, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 123, "op": "advance", "ms": 1000}
+{"step": 124, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 125, "op": "advance", "ms": 1000}
+{"step": 126, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 127, "op": "advance", "ms": 1000}
+{"step": 128, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 129, "op": "advance", "ms": 1000}
+{"step": 130, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 131, "op": "advance", "ms": 1000}
+{"step": 132, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 133, "op": "advance", "ms": 1000}
+{"step": 134, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 135, "op": "advance", "ms": 1000}
+{"step": 136, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 137, "op": "advance", "ms": 1000}
+{"step": 138, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 139, "op": "advance", "ms": 1000}
+{"step": 140, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 141, "op": "advance", "ms": 1000}
+{"step": 142, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 143, "op": "advance", "ms": 1000}
+{"step": 144, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 145, "op": "advance", "ms": 1000}
+{"step": 146, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 147, "op": "advance", "ms": 1000}
+{"step": 148, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 149, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 4}]], "hex": "09f48c67529ef8c7bd04"}
+{"step": 150, "op": "advance", "ms": 50}
+{"step": 151, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 4}]}
+{"step": 152, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 153, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 154, "op": "advance", "ms": 1000}
+{"step": 155, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 156, "op": "advance", "ms": 1000}
+{"step": 157, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 158, "op": "advance", "ms": 1000}
+{"step": 159, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 160, "op": "advance", "ms": 1000}
+{"step": 161, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 162, "op": "advance", "ms": 1000}
+{"step": 163, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 164, "op": "advance", "ms": 1000}
+{"step": 165, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 166, "op": "advance", "ms": 1000}
+{"step": 167, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 168, "op": "advance", "ms": 1000}
+{"step": 169, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 170, "op": "advance", "ms": 1000}
+{"step": 171, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 172, "op": "advance", "ms": 1000}
+{"step": 173, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 174, "op": "advance", "ms": 1000}
+{"step": 175, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 176, "op": "advance", "ms": 1000}
+{"step": 177, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 178, "op": "advance", "ms": 1000}
+{"step": 179, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 180, "op": "advance", "ms": 1000}
+{"step": 181, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 182, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 5}]], "hex": "09f48c67529ef8c7bd05"}
+{"step": 183, "op": "advance", "ms": 50}
+{"step": 184, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 5}]}
+{"step": 185, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 186, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 187, "op": "advance", "ms": 1000}
+{"step": 188, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 189, "op": "advance", "ms": 1000}
+{"step": 190, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 191, "op": "advance", "ms": 1000}
+{"step": 192, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 193, "op": "advance", "ms": 1000}
+{"step": 194, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 195, "op": "advance", "ms": 1000}
+{"step": 196, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 197, "op": "advance", "ms": 1000}
+{"step": 198, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 199, "op": "advance", "ms": 1000}
+{"step": 200, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 201, "op": "advance", "ms": 1000}
+{"step": 202, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 203, "op": "advance", "ms": 1000}
+{"step": 204, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 205, "op": "advance", "ms": 1000}
+{"step": 206, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 207, "op": "advance", "ms": 1000}
+{"step": 208, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 209, "op": "advance", "ms": 1000}
+{"step": 210, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 211, "op": "advance", "ms": 1000}
+{"step": 212, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 213, "op": "advance", "ms": 1000}
+{"step": 214, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 215, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 6}]], "hex": "09f48c67529ef8c7bd06"}
+{"step": 216, "op": "advance", "ms": 50}
+{"step": 217, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 6}]}
+{"step": 218, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 219, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 220, "op": "advance", "ms": 1000}
+{"step": 221, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 222, "op": "advance", "ms": 1000}
+{"step": 223, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 224, "op": "advance", "ms": 1000}
+{"step": 225, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 226, "op": "advance", "ms": 1000}
+{"step": 227, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 228, "op": "advance", "ms": 1000}
+{"step": 229, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 230, "op": "advance", "ms": 1000}
+{"step": 231, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 232, "op": "advance", "ms": 1000}
+{"step": 233, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 234, "op": "advance", "ms": 1000}
+{"step": 235, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 236, "op": "advance", "ms": 1000}
+{"step": 237, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 238, "op": "advance", "ms": 1000}
+{"step": 239, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 240, "op": "advance", "ms": 1000}
+{"step": 241, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 242, "op": "advance", "ms": 1000}
+{"step": 243, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 244, "op": "advance", "ms": 1000}
+{"step": 245, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 246, "op": "advance", "ms": 1000}
+{"step": 247, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 248, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 7}]], "hex": "09f48c67529ef8c7bd07"}
+{"step": 249, "op": "advance", "ms": 50}
+{"step": 250, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 7}]}
+{"step": 251, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 252, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 253, "op": "advance", "ms": 1000}
+{"step": 254, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 255, "op": "advance", "ms": 1000}
+{"step": 256, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 257, "op": "advance", "ms": 1000}
+{"step": 258, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 259, "op": "advance", "ms": 1000}
+{"step": 260, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 261, "op": "advance", "ms": 1000}
+{"step": 262, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 263, "op": "advance", "ms": 1000}
+{"step": 264, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 265, "op": "advance", "ms": 1000}
+{"step": 266, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 267, "op": "advance", "ms": 1000}
+{"step": 268, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 269, "op": "advance", "ms": 1000}
+{"step": 270, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 271, "op": "advance", "ms": 1000}
+{"step": 272, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 273, "op": "advance", "ms": 1000}
+{"step": 274, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 275, "op": "advance", "ms": 1000}
+{"step": 276, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 277, "op": "advance", "ms": 1000}
+{"step": 278, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 279, "op": "advance", "ms": 1000}
+{"step": 280, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 281, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 8}]], "hex": "09f48c67529ef8c7bd08"}
+{"step": 282, "op": "advance", "ms": 50}
+{"step": 283, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 8}]}
+{"step": 284, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 285, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 286, "op": "advance", "ms": 1000}
+{"step": 287, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 288, "op": "advance", "ms": 1000}
+{"step": 289, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 290, "op": "advance", "ms": 1000}
+{"step": 291, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 292, "op": "advance", "ms": 1000}
+{"step": 293, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 294, "op": "advance", "ms": 1000}
+{"step": 295, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 296, "op": "advance", "ms": 1000}
+{"step": 297, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 298, "op": "advance", "ms": 1000}
+{"step": 299, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 300, "op": "advance", "ms": 1000}
+{"step": 301, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 302, "op": "advance", "ms": 1000}
+{"step": 303, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 304, "op": "advance", "ms": 1000}
+{"step": 305, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 306, "op": "advance", "ms": 1000}
+{"step": 307, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 308, "op": "advance", "ms": 1000}
+{"step": 309, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 310, "op": "advance", "ms": 1000}
+{"step": 311, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 312, "op": "advance", "ms": 1000}
+{"step": 313, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 314, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 9}]], "hex": "09f48c67529ef8c7bd09"}
+{"step": 315, "op": "advance", "ms": 50}
+{"step": 316, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 9}]}
+{"step": 317, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 318, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 319, "op": "advance", "ms": 1000}
+{"step": 320, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 321, "op": "advance", "ms": 1000}
+{"step": 322, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 323, "op": "advance", "ms": 1000}
+{"step": 324, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 325, "op": "advance", "ms": 1000}
+{"step": 326, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 327, "op": "advance", "ms": 1000}
+{"step": 328, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 329, "op": "advance", "ms": 1000}
+{"step": 330, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 331, "op": "advance", "ms": 1000}
+{"step": 332, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 333, "op": "advance", "ms": 1000}
+{"step": 334, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 335, "op": "advance", "ms": 1000}
+{"step": 336, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 337, "op": "advance", "ms": 1000}
+{"step": 338, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 339, "op": "advance", "ms": 1000}
+{"step": 340, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 341, "op": "advance", "ms": 1000}
+{"step": 342, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 343, "op": "advance", "ms": 1000}
+{"step": 344, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 345, "op": "advance", "ms": 1000}
+{"step": 346, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 347, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 10}]], "hex": "09f48c67529ef8c7bd0a"}
+{"step": 348, "op": "advance", "ms": 50}
+{"step": 349, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 10}]}
+{"step": 350, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 351, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 352, "op": "advance", "ms": 1000}
+{"step": 353, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 354, "op": "advance", "ms": 1000}
+{"step": 355, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 356, "op": "advance", "ms": 1000}
+{"step": 357, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 358, "op": "advance", "ms": 1000}
+{"step": 359, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 360, "op": "advance", "ms": 1000}
+{"step": 361, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 362, "op": "advance", "ms": 1000}
+{"step": 363, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 364, "op": "advance", "ms": 1000}
+{"step": 365, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 366, "op": "advance", "ms": 1000}
+{"step": 367, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 368, "op": "advance", "ms": 1000}
+{"step": 369, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 370, "op": "advance", "ms": 1000}
+{"step": 371, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 372, "op": "advance", "ms": 1000}
+{"step": 373, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 374, "op": "advance", "ms": 1000}
+{"step": 375, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 376, "op": "advance", "ms": 1000}
+{"step": 377, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 378, "op": "advance", "ms": 1000}
+{"step": 379, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 380, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 11}]], "hex": "09f48c67529ef8c7bd0b"}
+{"step": 381, "op": "advance", "ms": 50}
+{"step": 382, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 11}]}
+{"step": 383, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 384, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 385, "op": "advance", "ms": 1000}
+{"step": 386, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 387, "op": "advance", "ms": 1000}
+{"step": 388, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 389, "op": "advance", "ms": 1000}
+{"step": 390, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 391, "op": "advance", "ms": 1000}
+{"step": 392, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 393, "op": "advance", "ms": 1000}
+{"step": 394, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 395, "op": "advance", "ms": 1000}
+{"step": 396, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 397, "op": "advance", "ms": 1000}
+{"step": 398, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 399, "op": "advance", "ms": 1000}
+{"step": 400, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 401, "op": "advance", "ms": 1000}
+{"step": 402, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 403, "op": "advance", "ms": 1000}
+{"step": 404, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 405, "op": "advance", "ms": 1000}
+{"step": 406, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 407, "op": "advance", "ms": 1000}
+{"step": 408, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 409, "op": "advance", "ms": 1000}
+{"step": 410, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 411, "op": "advance", "ms": 1000}
+{"step": 412, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 413, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 12}]], "hex": "09f48c67529ef8c7bd0c"}
+{"step": 414, "op": "advance", "ms": 50}
+{"step": 415, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 12}]}
+{"step": 416, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 417, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 418, "op": "advance", "ms": 1000}
+{"step": 419, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 420, "op": "advance", "ms": 1000}
+{"step": 421, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 422, "op": "advance", "ms": 1000}
+{"step": 423, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 424, "op": "advance", "ms": 1000}
+{"step": 425, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 426, "op": "advance", "ms": 1000}
+{"step": 427, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 428, "op": "advance", "ms": 1000}
+{"step": 429, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 430, "op": "advance", "ms": 1000}
+{"step": 431, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 432, "op": "advance", "ms": 1000}
+{"step": 433, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 434, "op": "advance", "ms": 1000}
+{"step": 435, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 436, "op": "advance", "ms": 1000}
+{"step": 437, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 438, "op": "advance", "ms": 1000}
+{"step": 439, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 440, "op": "advance", "ms": 350}
+{"step": 441, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 442, "op": "peer_epoch", "pipe": 2, "phase": "offer", "epoch": 2, "locator": ""}
+{"step": 443, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "SESSION_EPOCH", "phase": "answer", "epoch": 2, "share": {"len": 1120}, "locator": "4c4f43414c2d32"}]}
+{"step": 444, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 445, "op": "pipe_up", "dir": "in", "via": "listener", "carrier": "c6"}
+{"step": 446, "op": "peer_join", "carrier": "c6", "pipe": 6, "direction": "up", "fate_group": 0, "priority": 0, "standby": false, "locator": "4c4f43414c2d32", "mode": "trusted", "outcome": "accept", "phase": 0}
+{"step": 447, "op": "peer_send", "pipe": 6, "records": [[{"type": "MAX_DATA", "max": 0}]], "hex": "021000"}
+{"step": 448, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 13}]], "hex": "09f48c67529ef8c7bd0d"}
+{"step": 449, "op": "advance", "ms": 50}
+{"step": 450, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 13}]}
+{"step": 451, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 452, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 453, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 454, "op": "advance", "ms": 1000}
+{"step": 455, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 456, "op": "advance", "ms": 1000}
+{"step": 457, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 458, "op": "advance", "ms": 1000}
+{"step": 459, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 460, "op": "advance", "ms": 1000}
+{"step": 461, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 462, "op": "advance", "ms": 1000}
+{"step": 463, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 464, "op": "advance", "ms": 1000}
+{"step": 465, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 466, "op": "advance", "ms": 1000}
+{"step": 467, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 468, "op": "advance", "ms": 1000}
+{"step": 469, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 470, "op": "advance", "ms": 1000}
+{"step": 471, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 472, "op": "advance", "ms": 1000}
+{"step": 473, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 474, "op": "advance", "ms": 1000}
+{"step": 475, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 476, "op": "advance", "ms": 1000}
+{"step": 477, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 478, "op": "advance", "ms": 1000}
+{"step": 479, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 480, "op": "advance", "ms": 1000}
+{"step": 481, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 482, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 14}]], "hex": "09f48c67529ef8c7bd0e"}
+{"step": 483, "op": "advance", "ms": 50}
+{"step": 484, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 14}]}
+{"step": 485, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 486, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 487, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 488, "op": "advance", "ms": 1000}
+{"step": 489, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 490, "op": "advance", "ms": 1000}
+{"step": 491, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 492, "op": "advance", "ms": 1000}
+{"step": 493, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 494, "op": "advance", "ms": 1000}
+{"step": 495, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 496, "op": "advance", "ms": 1000}
+{"step": 497, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 498, "op": "advance", "ms": 1000}
+{"step": 499, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 500, "op": "advance", "ms": 1000}
+{"step": 501, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 502, "op": "advance", "ms": 1000}
+{"step": 503, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 504, "op": "advance", "ms": 1000}
+{"step": 505, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 506, "op": "advance", "ms": 1000}
+{"step": 507, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 508, "op": "advance", "ms": 1000}
+{"step": 509, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 510, "op": "advance", "ms": 1000}
+{"step": 511, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 512, "op": "advance", "ms": 1000}
+{"step": 513, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 514, "op": "advance", "ms": 1000}
+{"step": 515, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 516, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 15}]], "hex": "09f48c67529ef8c7bd0f"}
+{"step": 517, "op": "advance", "ms": 50}
+{"step": 518, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 15}]}
+{"step": 519, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 520, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 521, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 522, "op": "advance", "ms": 1000}
+{"step": 523, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 524, "op": "advance", "ms": 1000}
+{"step": 525, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 526, "op": "advance", "ms": 1000}
+{"step": 527, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 528, "op": "advance", "ms": 1000}
+{"step": 529, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 530, "op": "advance", "ms": 1000}
+{"step": 531, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 532, "op": "advance", "ms": 1000}
+{"step": 533, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 534, "op": "advance", "ms": 1000}
+{"step": 535, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 536, "op": "advance", "ms": 1000}
+{"step": 537, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 538, "op": "advance", "ms": 1000}
+{"step": 539, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 540, "op": "advance", "ms": 1000}
+{"step": 541, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 542, "op": "advance", "ms": 1000}
+{"step": 543, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 544, "op": "advance", "ms": 1000}
+{"step": 545, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 546, "op": "advance", "ms": 1000}
+{"step": 547, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 548, "op": "advance", "ms": 1000}
+{"step": 549, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 550, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 16}]], "hex": "09f48c67529ef8c7bd10"}
+{"step": 551, "op": "advance", "ms": 50}
+{"step": 552, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 16}]}
+{"step": 553, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 554, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 555, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 556, "op": "advance", "ms": 1000}
+{"step": 557, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 558, "op": "advance", "ms": 1000}
+{"step": 559, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 560, "op": "advance", "ms": 1000}
+{"step": 561, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 562, "op": "advance", "ms": 1000}
+{"step": 563, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 564, "op": "advance", "ms": 1000}
+{"step": 565, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 566, "op": "advance", "ms": 1000}
+{"step": 567, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 568, "op": "advance", "ms": 1000}
+{"step": 569, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 570, "op": "advance", "ms": 1000}
+{"step": 571, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 572, "op": "advance", "ms": 1000}
+{"step": 573, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 574, "op": "advance", "ms": 1000}
+{"step": 575, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 576, "op": "advance", "ms": 1000}
+{"step": 577, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 578, "op": "advance", "ms": 1000}
+{"step": 579, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 580, "op": "advance", "ms": 1000}
+{"step": 581, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 582, "op": "advance", "ms": 1000}
+{"step": 583, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 584, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 17}]], "hex": "09f48c67529ef8c7bd11"}
+{"step": 585, "op": "advance", "ms": 50}
+{"step": 586, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 17}]}
+{"step": 587, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 588, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 589, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 590, "op": "advance", "ms": 1000}
+{"step": 591, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 592, "op": "advance", "ms": 1000}
+{"step": 593, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 594, "op": "advance", "ms": 1000}
+{"step": 595, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 596, "op": "advance", "ms": 1000}
+{"step": 597, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 598, "op": "advance", "ms": 1000}
+{"step": 599, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 600, "op": "advance", "ms": 1000}
+{"step": 601, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 602, "op": "advance", "ms": 1000}
+{"step": 603, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 604, "op": "advance", "ms": 1000}
+{"step": 605, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 606, "op": "advance", "ms": 1000}
+{"step": 607, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 608, "op": "advance", "ms": 1000}
+{"step": 609, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 610, "op": "advance", "ms": 1000}
+{"step": 611, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 612, "op": "advance", "ms": 1000}
+{"step": 613, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 614, "op": "advance", "ms": 1000}
+{"step": 615, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 616, "op": "advance", "ms": 1000}
+{"step": 617, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 618, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 18}]], "hex": "09f48c67529ef8c7bd12"}
+{"step": 619, "op": "advance", "ms": 50}
+{"step": 620, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 18}]}
+{"step": 621, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 622, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 623, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 624, "op": "advance", "ms": 1000}
+{"step": 625, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 626, "op": "advance", "ms": 1000}
+{"step": 627, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 628, "op": "advance", "ms": 1000}
+{"step": 629, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 630, "op": "advance", "ms": 1000}
+{"step": 631, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 632, "op": "advance", "ms": 1000}
+{"step": 633, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 634, "op": "advance", "ms": 1000}
+{"step": 635, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 636, "op": "advance", "ms": 1000}
+{"step": 637, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 638, "op": "advance", "ms": 1000}
+{"step": 639, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 640, "op": "advance", "ms": 1000}
+{"step": 641, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 642, "op": "advance", "ms": 1000}
+{"step": 643, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 644, "op": "advance", "ms": 1000}
+{"step": 645, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 646, "op": "advance", "ms": 1000}
+{"step": 647, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 648, "op": "advance", "ms": 1000}
+{"step": 649, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 650, "op": "advance", "ms": 1000}
+{"step": 651, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 652, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 19}]], "hex": "09f48c67529ef8c7bd13"}
+{"step": 653, "op": "advance", "ms": 50}
+{"step": 654, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 19}]}
+{"step": 655, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 656, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 657, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 658, "op": "advance", "ms": 1000}
+{"step": 659, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 660, "op": "advance", "ms": 1000}
+{"step": 661, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 662, "op": "advance", "ms": 1000}
+{"step": 663, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 664, "op": "advance", "ms": 1000}
+{"step": 665, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 666, "op": "advance", "ms": 1000}
+{"step": 667, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 668, "op": "advance", "ms": 1000}
+{"step": 669, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 670, "op": "advance", "ms": 1000}
+{"step": 671, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 672, "op": "advance", "ms": 1000}
+{"step": 673, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 674, "op": "advance", "ms": 1000}
+{"step": 675, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 676, "op": "advance", "ms": 1000}
+{"step": 677, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 678, "op": "advance", "ms": 1000}
+{"step": 679, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 680, "op": "advance", "ms": 1000}
+{"step": 681, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 682, "op": "advance", "ms": 1000}
+{"step": 683, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 684, "op": "advance", "ms": 1000}
+{"step": 685, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 686, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 20}]], "hex": "09f48c67529ef8c7bd14"}
+{"step": 687, "op": "advance", "ms": 50}
+{"step": 688, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 20}]}
+{"step": 689, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 690, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 691, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 692, "op": "advance", "ms": 1000}
+{"step": 693, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 694, "op": "advance", "ms": 1000}
+{"step": 695, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 696, "op": "advance", "ms": 1000}
+{"step": 697, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 698, "op": "advance", "ms": 1000}
+{"step": 699, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 700, "op": "advance", "ms": 1000}
+{"step": 701, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 702, "op": "advance", "ms": 1000}
+{"step": 703, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 704, "op": "advance", "ms": 1000}
+{"step": 705, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 706, "op": "advance", "ms": 1000}
+{"step": 707, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 708, "op": "advance", "ms": 1000}
+{"step": 709, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 710, "op": "advance", "ms": 1000}
+{"step": 711, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 712, "op": "advance", "ms": 1000}
+{"step": 713, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 714, "op": "advance", "ms": 1000}
+{"step": 715, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 716, "op": "advance", "ms": 1000}
+{"step": 717, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 718, "op": "advance", "ms": 1000}
+{"step": 719, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 720, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 21}]], "hex": "09f48c67529ef8c7bd15"}
+{"step": 721, "op": "advance", "ms": 50}
+{"step": 722, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 21}]}
+{"step": 723, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 724, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 725, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 726, "op": "advance", "ms": 1000}
+{"step": 727, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 728, "op": "advance", "ms": 1000}
+{"step": 729, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 730, "op": "advance", "ms": 1000}
+{"step": 731, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 732, "op": "advance", "ms": 1000}
+{"step": 733, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 734, "op": "advance", "ms": 1000}
+{"step": 735, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 736, "op": "advance", "ms": 1000}
+{"step": 737, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 738, "op": "advance", "ms": 1000}
+{"step": 739, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 740, "op": "advance", "ms": 1000}
+{"step": 741, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 742, "op": "advance", "ms": 1000}
+{"step": 743, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 744, "op": "advance", "ms": 1000}
+{"step": 745, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 746, "op": "advance", "ms": 1000}
+{"step": 747, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 748, "op": "advance", "ms": 1000}
+{"step": 749, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 750, "op": "advance", "ms": 1000}
+{"step": 751, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 752, "op": "advance", "ms": 1000}
+{"step": 753, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 754, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 22}]], "hex": "09f48c67529ef8c7bd16"}
+{"step": 755, "op": "advance", "ms": 50}
+{"step": 756, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 22}]}
+{"step": 757, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 758, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 759, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 760, "op": "advance", "ms": 1000}
+{"step": 761, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 762, "op": "advance", "ms": 1000}
+{"step": 763, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 764, "op": "advance", "ms": 1000}
+{"step": 765, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 766, "op": "advance", "ms": 1000}
+{"step": 767, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 768, "op": "advance", "ms": 1000}
+{"step": 769, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 770, "op": "advance", "ms": 1000}
+{"step": 771, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 772, "op": "advance", "ms": 1000}
+{"step": 773, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 774, "op": "advance", "ms": 1000}
+{"step": 775, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 776, "op": "advance", "ms": 1000}
+{"step": 777, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 778, "op": "advance", "ms": 1000}
+{"step": 779, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 780, "op": "advance", "ms": 1000}
+{"step": 781, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 782, "op": "advance", "ms": 1000}
+{"step": 783, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 784, "op": "advance", "ms": 1000}
+{"step": 785, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 786, "op": "advance", "ms": 1000}
+{"step": 787, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 788, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 23}]], "hex": "09f48c67529ef8c7bd17"}
+{"step": 789, "op": "advance", "ms": 50}
+{"step": 790, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 23}]}
+{"step": 791, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 792, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 793, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 794, "op": "advance", "ms": 1000}
+{"step": 795, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 796, "op": "advance", "ms": 1000}
+{"step": 797, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 798, "op": "advance", "ms": 1000}
+{"step": 799, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 800, "op": "advance", "ms": 1000}
+{"step": 801, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 802, "op": "advance", "ms": 1000}
+{"step": 803, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 804, "op": "advance", "ms": 1000}
+{"step": 805, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 806, "op": "advance", "ms": 1000}
+{"step": 807, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 808, "op": "advance", "ms": 1000}
+{"step": 809, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 810, "op": "advance", "ms": 1000}
+{"step": 811, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 812, "op": "advance", "ms": 1000}
+{"step": 813, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 814, "op": "advance", "ms": 1000}
+{"step": 815, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 816, "op": "advance", "ms": 1000}
+{"step": 817, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 818, "op": "advance", "ms": 1000}
+{"step": 819, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 820, "op": "advance", "ms": 1000}
+{"step": 821, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 822, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 24}]], "hex": "09f48c67529ef8c7bd18"}
+{"step": 823, "op": "advance", "ms": 50}
+{"step": 824, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 24}]}
+{"step": 825, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 826, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 827, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 828, "op": "advance", "ms": 1000}
+{"step": 829, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 830, "op": "advance", "ms": 1000}
+{"step": 831, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 832, "op": "advance", "ms": 1000}
+{"step": 833, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 834, "op": "advance", "ms": 1000}
+{"step": 835, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 836, "op": "advance", "ms": 1000}
+{"step": 837, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 838, "op": "advance", "ms": 1000}
+{"step": 839, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 840, "op": "advance", "ms": 1000}
+{"step": 841, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 842, "op": "advance", "ms": 1000}
+{"step": 843, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 844, "op": "advance", "ms": 1000}
+{"step": 845, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 846, "op": "advance", "ms": 1000}
+{"step": 847, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 848, "op": "advance", "ms": 1000}
+{"step": 849, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 850, "op": "advance", "ms": 1000}
+{"step": 851, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 852, "op": "advance", "ms": 1000}
+{"step": 853, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 854, "op": "advance", "ms": 1000}
+{"step": 855, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 856, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_PING", "response": false, "seq": 25}]], "hex": "09f48c67529ef8c7bd19"}
+{"step": 857, "op": "advance", "ms": 50}
+{"step": 858, "op": "expect_frames", "pipe": "*", "match": "contains", "frames": [{"type": "QX_PING", "response": true, "seq": 25}]}
+{"step": 859, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 860, "op": "peer_send", "pipe": 4, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 861, "op": "peer_send", "pipe": 6, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 862, "op": "advance", "ms": 1000}
+{"step": 863, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 864, "op": "advance", "ms": 1000}
+{"step": 865, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 866, "op": "advance", "ms": 1000}
+{"step": 867, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 868, "op": "advance", "ms": 1000}
+{"step": 869, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 870, "op": "advance", "ms": 1000}
+{"step": 871, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 872, "op": "advance", "ms": 1000}
+{"step": 873, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 874, "op": "advance", "ms": 1000}
+{"step": 875, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 876, "op": "advance", "ms": 1000}
+{"step": 877, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 878, "op": "advance", "ms": 1000}
+{"step": 879, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 880, "op": "advance", "ms": 1000}
+{"step": 881, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 882, "op": "advance", "ms": 1000}
+{"step": 883, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 884, "op": "advance", "ms": 350}
+{"step": 885, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}, {"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 886, "op": "peer_epoch", "pipe": 2, "phase": "offer", "epoch": 3, "locator": ""}
+{"step": 887, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "SESSION_EPOCH", "phase": "answer", "epoch": 3, "share": {"len": 1120}, "locator": "4c4f43414c2d33"}]}
+{"step": 888, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 889, "op": "pipe_up", "dir": "in", "via": "listener", "carrier": "c8"}
+{"step": 890, "op": "peer_join", "carrier": "c8", "pipe": 8, "direction": "up", "fate_group": 0, "priority": 0, "standby": false, "locator": "4c4f43414c2d33", "mode": "trusted", "outcome": "accept", "phase": 1}
+{"step": 891, "op": "peer_send", "pipe": 8, "records": [[{"type": "MAX_DATA", "max": 0}]], "hex": "021000"}
+{"step": 892, "op": "expect_open"}

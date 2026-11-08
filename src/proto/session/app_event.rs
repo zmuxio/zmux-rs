@@ -4,9 +4,9 @@
 
 use std::fmt;
 
-use super::{DirectionState, PipeFailure, PipeId, PrioritySource, SessionError};
+use super::{PipeFailure, PipeHalf, PipeId, PrioritySource, SessionError};
 
-/// The GOAWAY watermarks the peer sent (EXTENSIONS.md Section 3).
+/// The GOAWAY watermarks the peer sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoAway {
     /// Bidirectional streams with a lower index were or may be processed.
@@ -17,8 +17,17 @@ pub struct GoAway {
     pub code: u64,
 }
 
-/// A kind of carrier a dial in a carrier mode chooses among (API.md
-/// Section 4.8): its name is the one events, statistics and caches use.
+/// Support of a protocol extension at each side, a negotiation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Support {
+    /// The local endpoint announced it.
+    pub local: bool,
+    /// The peer announced it (false until its parameters were processed).
+    pub peer: bool,
+}
+
+/// A kind of carrier a dial in a carrier mode chooses among: its name is the one events, statistics
+/// and caches use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum CarrierKind {
@@ -76,7 +85,7 @@ impl fmt::Display for CarrierKind {
     }
 }
 
-/// How one try of a candidate carrier fared (API.md Section 4.8).
+/// How one try of a candidate carrier fared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CandidateOutcome {
@@ -116,6 +125,8 @@ impl fmt::Display for CandidateOutcome {
 pub struct CandidateResult {
     /// The candidate's kind.
     pub kind: CarrierKind,
+    /// The candidate's variant.
+    pub variant: Option<std::sync::Arc<str>>,
     /// How it fared.
     pub outcome: CandidateOutcome,
     /// Tried as a further pipe of the established session.
@@ -126,50 +137,81 @@ pub struct CandidateResult {
 
 /// A session event: pipe state changes,
 /// pipe quality and priority reports, and the session's own events
-/// (GOAWAY, suspension, capacity), read with [`Session::next_event`](crate::Session#method.next_event).
+/// (GOAWAY, suspension, capacity), read with
+/// [`Session::next_event`](crate::Session#method.next_event).
 ///
 /// The queue is bounded however many pipes a session goes through: unread
-/// events coalesce (a pipe direction reports its latest state, a pipe its
-/// latest priority change and quality report, a tier its latest
-/// saturation, the session its latest GOAWAY, suspension and capacity
-/// state; failed join authentications are counted), a terminal state
-/// ([`DirectionState::is_terminal`]: outbound failed or closed, inbound
-/// ended) is never replaced, and the unread events of a
+/// events coalesce (a pipe direction reports its latest state event among
+/// `PipeJoined`, `PipeSuspect`, `PipeRecovered`, `PipeFailed` and
+/// `PipeClosed`, a pipe its `PipeAdded`, latest priority change and quality
+/// report, a tier its latest saturation, the session its latest GOAWAY,
+/// suspension and capacity state; failed join authentications are
+/// counted), a terminal event ([`SessionEvent::is_terminal`]: `PipeFailed`,
+/// `PipeClosed`) is never replaced, and the unread events of a
 /// pipe that is retired fold into one [`SessionEvent::PipesRetired`]. After the
 /// session ended, the queued events are still delivered before the end of
 /// the stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
-    /// A pipe direction changed state: its latest state when several
-    /// changes were not read. Retirement is reported by
-    /// [`SessionEvent::PipesRetired`] instead.
-    PipeState {
+    /// A local outbound pipe direction appeared (a join began, or pipe 0).
+    PipeAdded {
         /// The pipe.
         pipe: PipeId,
-        /// The direction and its new state.
-        state: DirectionState,
-        /// Why the pipe failed, with an outbound
-        /// [`OutboundState::Failed`](super::OutboundState::Failed).
-        failure: Option<PipeFailure>,
         /// The pipe's carrier kind (`PipeIo::with_carrier`).
         carrier: Option<CarrierKind>,
     },
-    /// A join's token did not verify at this endpoint (a secret mismatch,
-    /// or a TLS-terminating intermediary when the secret is the exporter).
+    /// An outbound pipe direction became active.
+    PipeJoined {
+        /// The pipe.
+        pipe: PipeId,
+        /// The pipe's carrier kind.
+        carrier: Option<CarrierKind>,
+    },
+    /// An outbound pipe direction stopped making progress.
+    PipeSuspect {
+        /// The pipe.
+        pipe: PipeId,
+        /// The pipe's carrier kind.
+        carrier: Option<CarrierKind>,
+    },
+    /// A suspect outbound pipe direction is active again.
+    PipeRecovered {
+        /// The pipe.
+        pipe: PipeId,
+        /// The pipe's carrier kind.
+        carrier: Option<CarrierKind>,
+    },
+    /// An outbound pipe direction failed. Terminal.
+    PipeFailed {
+        /// The pipe.
+        pipe: PipeId,
+        /// Why it failed.
+        failure: Option<PipeFailure>,
+        /// The pipe's carrier kind.
+        carrier: Option<CarrierKind>,
+    },
+    /// A pipe direction ended: the outbound one closed, or the inbound one
+    /// ended. Terminal. Retirement is reported by
+    /// [`SessionEvent::PipesRetired`] instead.
+    PipeClosed {
+        /// The pipe.
+        pipe: PipeId,
+        /// The direction that ended.
+        half: PipeHalf,
+        /// The pipe's carrier kind.
+        carrier: Option<CarrierKind>,
+    },
+    /// A Hello did not verify at this endpoint (a secret mismatch, or in Bound an
+    /// intermediary that terminates the carrier).
     JoinAuthFailed {
-        /// The token was carrier-bound.
-        carrier_bound: bool,
+        /// The error class, `auth`.
+        reason: &'static str,
         /// How many joins failed since the last such event was read.
         count: u64,
     },
-    /// Both endpoints offered multipath but no secret source of
-    /// `pipe_auth` matched: the session runs on one pipe
-    /// ([`crate::Multipath::JoinSecurityUnavailable`]).
-    JoinSecurityUnavailable,
     /// The effective priority, standby flag or weight of a pipe's outbound
-    /// direction changed, by a local setting or the peer's request
-    /// (MULTIPATH.md Section 9).
+    /// direction changed, by a local setting or the peer's request.
     PipePriorityChanged {
         /// The pipe.
         pipe: PipeId,
@@ -215,18 +257,29 @@ pub enum SessionEvent {
         /// The capacity in bytes per second.
         rate: u64,
     },
-    /// The peer sent GOAWAY (EXTENSIONS.md Section 3).
-    GoAway(GoAway),
+    /// The peer sent GOAWAY.
+    GoAwayReceived(GoAway),
     /// Every pipe in a direction was lost; the session is suspended.
-    Suspended,
+    SessionSuspended,
     /// The session left SUSPENDED.
-    Resumed,
-    /// A carrier mode tried a candidate (API.md Section 4.8): the latest
+    SessionResumed,
+    /// The session, which can rejoin (the peer announced a Session
+    /// Locator), suspended while it has neither a
+    /// [`redial`](crate::Config#structfield.redial) hook nor a running pipe
+    /// pool: nothing in the library will dial, and the session ends at the
+    /// grace period unless the application adds a pipe. It follows
+    /// [`SessionEvent::SessionSuspended`]
+    /// and is also logged as a warning. An application that resumes by its
+    /// own `add_pipe` calls can ignore it.
+    ResumeUnattended,
+    /// A carrier mode tried a candidate: the latest
     /// try of a kind, as the session or as a further pipe, when several
     /// were not read.
     CarrierCandidate {
         /// The candidate's kind.
         kind: CarrierKind,
+        /// The candidate's variant.
+        variant: Option<std::sync::Arc<str>>,
         /// How it fared.
         outcome: CandidateOutcome,
         /// Tried as a further pipe of the established session.
@@ -235,7 +288,7 @@ pub enum SessionEvent {
     /// A carrier mode chose the session's carrier kind, first when the
     /// session was established and again on every switch: the latest when
     /// several were not read.
-    CarrierChosen(CarrierKind),
+    CarrierChosen(CarrierKind, Option<std::sync::Arc<str>>),
     /// Pipes were retired since the last such event was read (at least
     /// one): their unread events left the queue (only unretired pipes hold
     /// events), and their unread terminal states are counted here. It is
@@ -254,6 +307,19 @@ pub enum SessionEvent {
         dropped: u64,
         /// The last retired pipes, oldest first (at most 4).
         last: Vec<PipeId>,
+    },
+    /// The session committed an epoch: its secret is known, and joins of it are
+    /// accepted ([`Session`](crate::Session)`::advance_epoch`). The latest
+    /// when several were not read.
+    EpochCommitted {
+        /// The epoch.
+        epoch: u64,
+    },
+    /// An epoch, its keys and its Locators were deleted. The latest when several were
+    /// not read.
+    EpochDeleted {
+        /// The epoch.
+        epoch: u64,
     },
 }
 
@@ -288,5 +354,30 @@ pub trait Tracer: Send + Sync + 'static {
 impl fmt::Debug for dyn Tracer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Tracer(..)")
+    }
+}
+
+impl SessionEvent {
+    /// The pipe a pipe event is about.
+    #[must_use]
+    pub const fn pipe(&self) -> Option<PipeId> {
+        match self {
+            Self::PipeAdded { pipe, .. }
+            | Self::PipeJoined { pipe, .. }
+            | Self::PipeSuspect { pipe, .. }
+            | Self::PipeRecovered { pipe, .. }
+            | Self::PipeFailed { pipe, .. }
+            | Self::PipeClosed { pipe, .. }
+            | Self::PipePriorityChanged { pipe, .. }
+            | Self::PipeQualityChanged { pipe, .. } => Some(*pipe),
+            _ => None,
+        }
+    }
+
+    /// Whether it is a pipe direction's terminal event: [`SessionEvent::PipeFailed`]
+    /// or [`SessionEvent::PipeClosed`].
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::PipeFailed { .. } | Self::PipeClosed { .. })
     }
 }

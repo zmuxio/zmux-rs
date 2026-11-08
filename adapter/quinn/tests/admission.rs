@@ -50,10 +50,10 @@ impl Server {
         let addr = endpoint.local_addr().unwrap();
         let mut c = Config::default();
         c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::exporter();
+        c.pipe_auth = PipeAuth::exporter().with_end_to_end();
         let mut lc = ListenerConfig::default();
         lc.admission = Some(admission);
-        let listener = Listener::new(c, lc);
+        let listener = Listener::new(c, lc).expect("valid listener configuration");
         let serving = if one_by_one {
             let (l, opts) = (listener.clone(), opts.clone());
             tokio::spawn(async move {
@@ -167,7 +167,7 @@ async fn bound_token(server: Server) {
     let pipe = carrier.open_pipe_with_prefix(&token(&conn)).await.unwrap();
     let mut config = Config::default();
     config.max_pipes = 4;
-    config.pipe_auth = PipeAuth::exporter();
+    config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let client = Session::connect(pipe, config).await.unwrap();
     let accepted = tokio::time::timeout(LIMIT, server.listener.accept())
         .await
@@ -178,7 +178,7 @@ async fn bound_token(server: Server) {
     transfer(&accepted, &client, 2, 1 << 16).await;
     // A further pipe on the same connection joins without a token.
     let joined = client
-        .add_pipe(carrier.open_pipe().await.unwrap(), PipeOptions::default())
+        .begin_add_pipe(carrier.open_pipe().await.unwrap(), PipeOptions::default())
         .unwrap();
     let deadline = tokio::time::Instant::now() + LIMIT;
     while joined.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
@@ -187,7 +187,7 @@ async fn bound_token(server: Server) {
     }
     transfer(&client, &accepted, 4, 1 << 18).await;
     assert_eq!(server.listener.stats().setup_failures, 0);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     server.stop().await;
 }
 
@@ -252,7 +252,7 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
     let carrier = QuicCarrier::new(conn.clone(), Options::default());
     let mut config = Config::default();
     config.max_pipes = 4;
-    config.pipe_auth = PipeAuth::exporter();
+    config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let pipe = carrier.open_pipe().await.unwrap();
     let connecting = tokio::spawn(Session::connect(pipe, config));
     let mut uni = conn.open_uni().await.unwrap();
@@ -272,7 +272,7 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
         .unwrap();
     let client = connecting.await.unwrap().unwrap();
     transfer(&client, &accepted, 2, 1 << 16).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     server.stop().await;
 }
 
@@ -281,7 +281,7 @@ async fn a_credential_writes_a_bound_token_on_the_first_stream() {
     let server = Server::new(admission(), None);
     let options = Options::default().with_credential(Arc::new(auth()));
     let mut config = Config::default();
-    config.pipe_auth = PipeAuth::exporter();
+    config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let client = zmux_quinn::connect(&server.client, server.addr, "localhost", &options, config)
         .await
         .unwrap();
@@ -290,6 +290,6 @@ async fn a_credential_writes_a_bound_token_on_the_first_stream() {
         .unwrap()
         .unwrap();
     transfer(&client, &accepted, 2, 1 << 16).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     server.stop().await;
 }

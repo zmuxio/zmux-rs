@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::listener::{Classified, ListenerConfig, ListenerCore, Opened};
 use crate::proto::record::Framing;
+use crate::proto::seal::Mode;
+use crate::proto::seal::join::JoinHello;
 use crate::proto::session::pipes::{Estimator, INITIAL_RTT};
 use crate::proto::session::{
-    Config, JoinVerdict, PipeAuth, PipeId, PipeOptions, Policy, RoleConfig, SessionCore, StreamKey,
-    TransmitBuf,
+    ClaimedHello, Config, ConfirmedJoin, JoinStep, OpenedHello, PeerCarrier, PipeAuth, PipeId,
+    PipeOptions, Policy, RoleConfig, SessionCore, StreamKey, TransmitBuf,
 };
 
 const BS: Framing = Framing::ByteStream;
@@ -21,7 +23,7 @@ pub(in crate::proto::session) const FAST: u64 = 12_500_000;
 fn config(policy: Policy) -> Config {
     let mut c = Config {
         max_pipes: 4,
-        pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef"),
+        pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end(),
         scheduler: policy,
         max_idle_timeout: Some(Duration::from_secs(600)),
         probation: Some(Duration::ZERO),
@@ -31,19 +33,49 @@ fn config(policy: Policy) -> Config {
     c
 }
 
-/// Moves every byte both ways until nothing is left: B's listener takes
-/// the join of a pipe B has not attached.
-fn pump(
-    a: &mut SessionCore,
-    b: &mut SessionCore,
-    l: &mut ListenerCore,
-    joined: &mut Vec<u64>,
-    now: Instant,
-) {
+/// Runs the handshake of pipe 2 on in-memory bytes: Hello through B's listener, Reply,
+/// Confirm. Records on it start after that.
+fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, now: Instant) {
+    let id = PipeId(2);
+    a.join_prepare(id, now).unwrap().expect("not deferred");
+    let plan = crate::shaping::UnitPlan::default();
+    let hello = a.join_hello(id, (BS, 0), &plan, now).unwrap();
+    let Opened::Accepted { id: c, .. } = l.open(2, BS, now) else {
+        panic!("refused");
+    };
+    let Classified::Join { hello, .. } = l.data(c, &hello, now) else {
+        panic!("not a Hello");
+    };
+    let parsed = JoinHello::parse(BS, &hello).unwrap();
+    let OpenedHello::Verified(mut peer) = b.open_hello(&parsed, &[], now) else {
+        panic!("Hello not verified");
+    };
+    let carrier = PeerCarrier {
+        inbound: Some(BS),
+        outbound: Some(BS),
+        looped: false,
+        overhead: 0,
+        received: 0,
+    };
+    let ClaimedHello::Accept(reply) = b.claim_hello(&mut peer, carrier, &plan, now) else {
+        panic!("Hello not accepted");
+    };
+    let JoinStep::Verified { .. } = a.verify_reply(id, &reply, now) else {
+        panic!("Reply not verified");
+    };
+    let confirm = a.join_finish(id, &plan, now).unwrap().confirm;
+    assert!(peer.read_confirm(&confirm).unwrap().is_some());
+    let confirmed = b.confirm_join(*peer, carrier, now);
+    assert!(matches!(confirmed, ConfirmedJoin::Attached { pipe, .. } if pipe == id));
+    l.done(c);
+}
+
+/// Moves every byte both ways until nothing is left.
+fn pump(a: &mut SessionCore, b: &mut SessionCore, ids: &[u64], now: Instant) {
     let mut out = TransmitBuf::default();
     for _ in 0..64 {
         let mut moved = false;
-        for id in [0, 2] {
+        for &id in ids {
             while a.wants_write(PipeId(id)) {
                 a.poll_transmit(PipeId(id), now, &mut out);
                 let mut v = Vec::new();
@@ -51,37 +83,18 @@ fn pump(
                 if v.is_empty() {
                     break;
                 }
-                a.pipe_written(PipeId(id), v.len() as u64);
+                a.pipe_written(PipeId(id), v.len() as u64, now);
                 moved = true;
-                if id == 0 || joined.contains(&id) {
-                    b.receive(PipeId(id), &v, now);
-                    continue;
-                }
-                let Opened::Accepted { id: c, .. } = l.open(id, BS, now) else {
-                    panic!("refused");
-                };
-                if let Classified::Join {
-                    frame,
-                    bytes,
-                    inband,
-                    ..
-                } = l.data(c, &v, now)
-                {
-                    let v = b.offer_join(&frame, &[], Some(BS), Some(BS), inband, now);
-                    assert!(matches!(v, JoinVerdict::Accepted(p) if p.0 == id), "{v:?}");
-                    l.done(c);
-                    joined.push(id);
-                    b.receive(PipeId(id), &bytes, now);
-                }
+                b.receive(PipeId(id), &v, now);
             }
-            while (id == 0 || joined.contains(&id)) && b.wants_write(PipeId(id)) {
+            while b.wants_write(PipeId(id)) {
                 b.poll_transmit(PipeId(id), now, &mut out);
                 let mut v = Vec::new();
                 out.copy_to_vec(&mut v);
                 if v.is_empty() {
                     break;
                 }
-                b.pipe_written(PipeId(id), v.len() as u64);
+                b.pipe_written(PipeId(id), v.len() as u64, now);
                 moved = true;
                 a.receive(PipeId(id), &v, now);
             }
@@ -108,23 +121,23 @@ pub(in crate::proto::session) fn two_pipes(
     b_cfg.locator = b"server".to_vec();
     let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, now).unwrap();
     let mut l = ListenerCore::new(ListenerConfig::default());
-    let mut joined = Vec::new();
     a.attach_pipe(PipeId(0), BS, now);
     b.attach_pipe(PipeId(0), BS, now);
-    pump(&mut a, &mut b, &mut l, &mut joined, now);
+    pump(&mut a, &mut b, &[0], now);
     let id = a
         .add_pipe(
             Some(BS),
             Some(BS),
             &PipeOptions::default(),
-            false,
+            Mode::Trusted,
             None,
             now,
         )
         .unwrap();
     assert_eq!(id, PipeId(2));
+    join(&mut a, &mut b, &mut l, now);
     for _ in 0..20 {
-        pump(&mut a, &mut b, &mut l, &mut joined, now);
+        pump(&mut a, &mut b, &[0, 2], now);
         now += 5 * MS;
         a.handle_timeout(now);
         b.handle_timeout(now);
@@ -323,9 +336,9 @@ fn blest_checks_the_streams_share_of_f_against_its_credit() {
 
 #[test]
 fn bytes_wait_only_for_the_one_pipe_neither_suspect_nor_penalized() {
-    // MULTIPATH.md Section 7.1: with two pipes that may carry the ready
-    // data neither is waited for; a penalized pipe neither counts as a
-    // carrier nor is waited for itself.
+    // With two pipes that may carry the ready data neither is waited
+    // for; a penalized pipe neither counts as a carrier nor is waited
+    // for itself.
     let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 1 << 20);
     assert!(!a.bytes_wait_for(0) && !a.bytes_wait_for(2));
     let mut out = TransmitBuf::default();
@@ -338,9 +351,9 @@ fn bytes_wait_only_for_the_one_pipe_neither_suspect_nor_penalized() {
     assert!(!a.bytes_wait_for(2), "a penalized pipe is not waited for");
 }
 
-/// T_suspect includes queue_p (MULTIPATH.md Section 7.1) on a carrier that
-/// reports no unsent count: the oldest ack-eliciting batch went out behind
-/// a batch whose write call on another lane had not returned.
+/// T_suspect includes queue_p on a carrier that reports no unsent count:
+/// the oldest ack-eliciting batch went out behind a batch whose write call
+/// on another lane had not returned.
 #[test]
 fn t_suspect_includes_the_write_calls_in_progress_ahead() {
     let (mut a, _) = two_pipes(Policy::SpreadEta, Some(100_000), 0);

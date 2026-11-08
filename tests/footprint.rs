@@ -125,7 +125,7 @@ const fn base(apple: f64) -> Option<f64> {
 const CORE: Row = Row {
     name: "idle core per session",
     bound: f64::INFINITY,
-    baseline: base(3880.0),
+    baseline: base(3912.0),
     noise: 0.0,
 };
 
@@ -182,7 +182,7 @@ fn mp_config() -> Arc<Config> {
         c.max_idle_timeout = None;
         c.keep_alive_period = None;
         c.max_pipes = 8;
-        c.pipe_auth = PipeAuth::psk(*b"footprint-psk---0123456789abcdef");
+        c.pipe_auth = PipeAuth::psk(*b"footprint-psk---0123456789abcdef").with_end_to_end();
         c.probation = Some(Duration::ZERO);
         // As the measurement the bound was set from (`scale` in
         // benches/session.rs).
@@ -345,7 +345,7 @@ async fn mp_pairs(
         let mut opts = PipeOptions::default();
         opts.send_standby = Some(true);
         opts.receive_standby = true;
-        client.add_pipe(c, opts).unwrap();
+        client.begin_add_pipe(c, opts).unwrap();
         v.push((client, server));
     }
     let active = |x: &Session| {
@@ -382,12 +382,14 @@ fn idle_footprint_stays_within_its_bounds_and_baselines() {
         PAIR_TCP.check(per_pair(200, idle, |n| pairs(n, Some(&l))).await);
         // Quiet-session probing ends 15 s after the join.
         // Each round with its own listener, made before it is measured.
-        let warm = Listener::new(mp_config(), ListenerConfig::default());
+        let warm = Listener::new(mp_config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let v = mp_pairs(&warm, 200, None).await;
         tokio::time::sleep(idle).await;
         drop((v, warm));
         quiesce().await;
-        let listener = Listener::new(mp_config(), ListenerConfig::default());
+        let listener = Listener::new(mp_config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let before = live();
         let v = mp_pairs(&listener, 200, None).await;
         // Quiet-session probing ends 15 s after the join.

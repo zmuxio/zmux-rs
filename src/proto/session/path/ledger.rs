@@ -1,13 +1,10 @@
-//! The running aggregates the multipath scheduler reads at every decision
-//! (MULTIPATH.md Section 7.5.1, 7 and 10): per urgency level the ready data within stream credit (X
-//! of tier saturation, the backlog of `spread-eta`), in total and per
-//! direction in order (the round robin's share of ECF's backlog), and the
-//! incremental directions with data ready (BLEST's n), the reinjected
-//! information pending, the oldest wait start, per pipe the expected bytes
-//! of the directions bound to it (A_p of `affinity`), the directions with
-//! new data by how a decision treats them, the blocking data of the
-//! directions held back by stream credit, the waiting writers, and the
-//! redundant copy bytes outstanding.
+//! The running aggregates the multipath scheduler reads at every decision per urgency level the
+//! ready data within stream credit (X of tier saturation, the backlog of `spread-eta`), in total
+//! and per direction in order (the round robin's share of ECF's backlog), and the incremental
+//! directions with data ready (BLEST's n), the reinjected information pending, the oldest wait
+//! start, per pipe the expected bytes of the directions bound to it (A_p of `affinity`), the
+//! directions with new data by how a decision treats them, the blocking data of the directions held
+//! back by stream credit, the waiting writers, and the redundant copy bytes outstanding.
 //!
 //! The ledger keeps what each stream contributes. The stream slab notes
 //! every stream it hands out for change, and those are brought up to date
@@ -190,7 +187,7 @@ struct PipeLoad {
 }
 
 /// What a stream direction listed as held back by stream credit
-/// contributes to opportunistic reinjection (MULTIPATH.md Section 7.5.1).
+/// contributes to opportunistic reinjection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::proto::session) struct Held {
     /// Its place in the list.

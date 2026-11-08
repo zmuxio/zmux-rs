@@ -1,68 +1,71 @@
-//! Key schedule for pipe joins (MULTIPATH.md Section 10): secret source
-//! selection, the session secret, the join keys and join tokens.
+//! The session secret of Join: the secret sources and the derivations before `join_psk`.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-
-use super::frame::JOIN_TOKEN_LEN;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// TLS exporter label of the session secret input.
 pub const EXPORTER_SESSION_LABEL: &str = "EXPORTER-zmux-session";
-/// TLS exporter label of a carrier-bound join.
-pub const EXPORTER_PIPE_LABEL: &str = "EXPORTER-zmux-pipe";
+/// Exporter label of the Binding of a Bound Join.
+pub const EXPORTER_JOIN_LABEL: &str = "EXPORTER-zmux-join";
 /// Prefix of the HKDF salt.
 pub const SALT_PREFIX: &[u8] = b"zmux session";
-/// HKDF label of the initiator's join key.
-pub const JOIN_INITIATOR_LABEL: &[u8] = b"zmux join i";
-/// HKDF label of the responder's join key.
-pub const JOIN_RESPONDER_LABEL: &[u8] = b"zmux join r";
 
-/// The Secret Flags of `zmux_multipath` (MULTIPATH.md Section 3.1).
+/// The Secret Flags of `zmux_multipath`.
 pub mod secret_flags {
     /// E: TLS exporter of the bootstrap carrier.
     pub const EXPORTER: u8 = 0x01;
     /// P: pre-shared key.
     pub const PSK: u8 = 0x04;
-    /// I: insecure join allowed.
-    pub const INSECURE: u8 = 0x08;
     /// Reserved bits: sent as 0, ignored on receipt.
-    pub const RESERVED: u8 = 0xf2;
+    pub const RESERVED: u8 = !(EXPORTER | PSK);
 }
 
-/// The secret sources both endpoints selected (MULTIPATH.md Section 10.1).
+/// The secret sources a session uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SecretSource {
-    /// Whether the bootstrap exporter value enters the secret.
+    /// Whether the exporter value enters the secret.
     pub exporter: bool,
     /// Whether the PSK enters the secret.
     pub psk: bool,
-    /// Insecure mode: neither.
-    pub insecure: bool,
 }
 
-/// Selects the secret sources from both endpoints' Secret Flags, or `None`
-/// when there is no source and multipath is not in use.
-pub const fn select_secret_source(local: u8, peer: u8) -> Option<SecretSource> {
-    let both = local & peer;
-    let exporter = both & secret_flags::EXPORTER != 0;
-    let psk = both & secret_flags::PSK != 0;
-    if exporter || psk {
-        return Some(SecretSource {
-            exporter,
-            psk,
-            insecure: false,
-        });
+/// What both endpoints' Secret Flags mean together. They state a choice and never
+/// negotiate it: flags that differ end the session, so that an on-path party that
+/// clears one cannot take that source out of the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecretFlags {
+    /// A side has no source: multipath is not in use.
+    NoSource,
+    /// Both non-zero and different: a TRANSPORT_PARAMETER_ERROR.
+    Differ,
+    /// Equal flags select these sources.
+    Selected(SecretSource),
+}
+
+/// Compares both endpoints' Secret Flags; reserved bits are ignored.
+pub const fn select_secret_source(local: u8, peer: u8) -> SecretFlags {
+    let (local, peer) = (
+        local & !secret_flags::RESERVED,
+        peer & !secret_flags::RESERVED,
+    );
+    if local == 0 || peer == 0 {
+        SecretFlags::NoSource
+    } else if local != peer {
+        SecretFlags::Differ
+    } else {
+        SecretFlags::Selected(SecretSource {
+            exporter: local & secret_flags::EXPORTER != 0,
+            psk: local & secret_flags::PSK != 0,
+        })
     }
-    if both & secret_flags::INSECURE != 0 {
-        return Some(SecretSource {
-            exporter: false,
-            psk: false,
-            insecure: true,
-        });
-    }
-    None
+}
+
+/// The public binding value of a session: HKDF-Extract with SHA-256 of the
+/// two Session Nonces under a fixed label.
+pub fn session_binding(initiator: &[u8; 16], responder: &[u8; 16]) -> [u8; 32] {
+    hmac(b"zmux session binding", &[initiator, responder])
 }
 
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -86,7 +89,7 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 /// HKDF-Expand with SHA-256 (RFC 5869 Section 2.3) into `out`. RFC 5869
 /// allows at most 255 * 32 bytes; bytes of `out` beyond that are left
 /// unwritten. zmux only derives 32-byte keys.
-pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) {
+pub fn hkdf_expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
     let mut prev: [u8; 32] = [0; 32];
     for (i, chunk) in out.chunks_mut(32).enumerate().take(255) {
         let counter = [i as u8 + 1];
@@ -96,11 +99,10 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) {
     }
 }
 
-/// The session secret (MULTIPATH.md Section 10.3):
-/// HKDF-Extract("zmux session" || initiator nonce || responder nonce,
-/// exporter value || psk). Pass empty slices for absent inputs; the exporter
-/// value has a fixed length per bootstrap form, so the concatenation is
-/// unambiguous.
+/// The session secret: HKDF-Extract("zmux session" || initiator nonce ||
+/// responder nonce, exporter value || psk). Pass empty slices for absent
+/// inputs; the exporter value has a fixed length per bootstrap form, so the
+/// concatenation is unambiguous.
 pub fn session_secret(
     initiator_nonce: &[u8; 16],
     responder_nonce: &[u8; 16],
@@ -116,82 +118,8 @@ pub fn session_secret(
     hmac(&salt, &[exporter, psk])
 }
 
-/// The keys derived from the session secret (MULTIPATH.md Section 10.4).
-#[derive(Clone, PartialEq, Eq)]
-pub struct SessionKeys {
-    /// join_key_i.
-    pub join_initiator: [u8; 32],
-    /// join_key_r.
-    pub join_responder: [u8; 32],
-}
-
-impl std::fmt::Debug for SessionKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SessionKeys(..)")
-    }
-}
-
-impl SessionKeys {
-    /// Derives the keys from the session secret.
-    pub fn derive(secret: &[u8; 32]) -> Self {
-        let expand = |label: &[u8]| {
-            let mut k = [0u8; 32];
-            hkdf_expand(secret, label, &mut k);
-            k
-        };
-        Self {
-            join_initiator: expand(JOIN_INITIATOR_LABEL),
-            join_responder: expand(JOIN_RESPONDER_LABEL),
-        }
-    }
-}
-
-/// The Join Token (MULTIPATH.md Section 10.5): the first 16 bytes of
-/// HMAC-SHA256(join key, frame bytes from Type through Priority ||
-/// carrier binding).
-pub fn join_token(
-    join_key: &[u8; 32],
-    frame_without_token: &[u8],
-    carrier_binding: &[u8],
-) -> [u8; JOIN_TOKEN_LEN] {
-    let mac = hmac(join_key, &[frame_without_token, carrier_binding]);
-    let mut token = [0u8; JOIN_TOKEN_LEN];
-    token.copy_from_slice(&mac[..JOIN_TOKEN_LEN]);
-    token
-}
-
-/// Computes the token of an encoded PIPE_JOIN frame and writes it into the
-/// frame's last 16 bytes. Returns `false` if `frame` is too short.
-pub fn sign_join(join_key: &[u8; 32], frame: &mut [u8], carrier_binding: &[u8]) -> bool {
-    let Some(split) = frame.len().checked_sub(JOIN_TOKEN_LEN) else {
-        return false;
-    };
-    let (head, token) = frame.split_at_mut(split);
-    token.copy_from_slice(&join_token(join_key, head, carrier_binding));
-    true
-}
-
-/// Verifies the token of a PIPE_JOIN frame as received (`frame` is the whole
-/// frame, Type through Join Token), in constant time.
-pub fn verify_join(join_key: &[u8; 32], frame: &[u8], carrier_binding: &[u8]) -> bool {
-    let Some((head, token)) = frame
-        .len()
-        .checked_sub(JOIN_TOKEN_LEN)
-        .map(|split| frame.split_at(split))
-    else {
-        return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(join_key) else {
-        return false;
-    };
-    mac.update(head);
-    mac.update(carrier_binding);
-    mac.verify_truncated_left(token).is_ok()
-}
-
 /// Whether two Lane Keys are equal, compared in constant time: a reader
-/// looks a lane's key up among its sessions this way (MULTIPATH.md
-/// Section 5.8).
+/// looks a lane's key up among its sessions this way.
 pub fn lane_key_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
     std::hint::black_box(diff) == 0
@@ -224,19 +152,24 @@ mod tests {
     #[test]
     fn secret_selection() {
         use secret_flags::*;
+        let both = SecretSource {
+            exporter: true,
+            psk: true,
+        };
         assert_eq!(
             select_secret_source(EXPORTER | PSK, EXPORTER | PSK),
-            Some(SecretSource {
-                exporter: true,
-                psk: true,
-                insecure: false
-            })
+            SecretFlags::Selected(both)
         );
-        // 0x02 is reserved: it selects nothing.
-        assert_eq!(select_secret_source(EXPORTER | 0x02, PSK | 0x02), None);
+        // Reserved bits select nothing and differ in nothing.
+        assert_eq!(select_secret_source(0x02, EXPORTER), SecretFlags::NoSource);
+        assert!(matches!(
+            select_secret_source(PSK | 0x02, PSK),
+            SecretFlags::Selected(_)
+        ));
+        // Never the intersection: a cleared flag cannot drop a source.
         assert_eq!(
-            select_secret_source(INSECURE, INSECURE | RESERVED).map(|s| s.insecure),
-            Some(true)
+            select_secret_source(EXPORTER | PSK, PSK),
+            SecretFlags::Differ
         );
     }
 }

@@ -1,14 +1,14 @@
 //! Out-of-order stream data and arrival sets whose memory does not depend
-//! on how the peer fragments the data (SPEC.md Section 9.8).
+//! on how the peer fragments the data.
 //!
 //! A few ranges are kept as ranges: a map entry each, with the range's
 //! bytes in chunks that go to the stream's received data without a copy
 //! once the gap before them fills. A chunk is a piece of the driver's read
 //! buffer, referenced as in-order data is (and subject to the session's bound
 //! on the buffers it keeps alive), or
-//! storage of the range's own for pieces below the copy threshold. A peer that scatters small pieces beyond holes would make that
-//! bookkeeping cost far more than the bytes it holds, so once a stream's
-//! ranges cost more than an eighth of its span (the offsets from what the
+//! storage of the range's own for pieces below the copy threshold. A peer that scatters small
+//! pieces beyond holes would make that bookkeeping cost far more than the bytes it holds, so once a
+//! stream's ranges cost more than an eighth of its span (the offsets from what the
 //! application read to the highest received, which flow control charges),
 //! the data moves to a flat store over the span: pages of [`PAGE`] bytes
 //! allocated when first written and a presence bitmap of one bit per byte,
@@ -234,9 +234,8 @@ fn mask(lo: u64, hi: u64) -> u64 {
     upper & !((1u64 << lo) - 1)
 }
 
-/// Stream offsets that arrived beyond the contiguous ones (session credit,
-/// SPEC.md Section 8.3): ranges while they are few, a bitmap over the span
-/// once they cost more than an eighth of it.
+/// Stream offsets that arrived beyond the contiguous ones (session credit): ranges while they are
+/// few, a bitmap over the span once they cost more than an eighth of it.
 #[derive(Debug)]
 pub(crate) enum Arrived {
     Ranges(RangeSet),

@@ -7,8 +7,7 @@ HTTP/1.1 and HTTP/2 carriers of [zmux](../../README.md) pipes over `hyper`.
   the same time (`dial_http1`, `Http2Connection::open_pipe`).
 - **Uplink** `POST` and **downlink** `GET`: one-way carriers
   (`dial_http1_carrier_over`, `Http2Connection::open_carrier` with a
-  `zmux::DialRequest`). A downlink joins a session out of band with the
-  `Zmux-Pipe-Join` header of a `zmux::PipeReservation`; the two together
+  `zmux::DialRequest`). An uplink and a downlink paired by `Zmux-Pipe-Pair` run one Join; the two together
   form a split bootstrap, paired by a random token in `Zmux-Pipe-Pair`
   (`dial_http1_split`, `connect_http1_split`,
   `Http2Connection::open_split`), for paths that pass a streamed request
@@ -20,10 +19,9 @@ HTTP/1.1 and HTTP/2 carriers of [zmux](../../README.md) pipes over `hyper`.
   that buffer whole bodies (below).
 
 The server classifies every request by its head alone (`classify`): an
-upgrade, a `GET` with `Zmux-Pipe-Pair` or `Zmux-Pipe-Join` (downlink), a
+upgrade, a `GET` with `Zmux-Pipe-Pair` (downlink), a
 `POST` with `Zmux-Pipe-Pair` (uplink), a `POST` with a `Content-Length`
-(exchange), a `POST` without one (bidirectional, or an uplink with
-`Zmux-Pipe-Join`), and everything else for the host's handler. All kinds
+(exchange), a `POST` without one (bidirectional), and everything else for the host's handler. All kinds
 can therefore share one request target (`Options::path`, default
 `/zmux`). Nothing is answered before a carrier is accepted: with an
 admission (the listener's `ListenerConfig::admission`, which every carrier
@@ -46,7 +44,7 @@ error at the other end, never a clean end.
   requests of the connection are off by default, since the streams of an
   HTTP/2 connection share one ordered TCP byte stream; `Options::lanes`
   turns them on (client side). `Http2Connection::dial` and `http1_dial`
-  give a `zmux::Dial` for pools, rejoins and out-of-band joins.
+  give a `zmux::Dial` for pools, rejoins.
 - Server: `serve` accepts TCP connections, speaks HTTP/1.1 and HTTP/2
   (prior knowledge, as a reverse proxy that speaks HTTP/2 to its origin
   without TLS does) and hands every carrier on `Options::path` to a
@@ -65,12 +63,21 @@ error at the other end, never a clean end.
   `X-Forwarded-For` (`request_source`). Keep the session's keep-alive
   period and probe interval below the shortest idle limit on the path.
 - Split carriers: `join_http1_split_with` (or `Http2Connection::join_split`)
-  joins a downlink and an uplink as two further pipes of a session; a split
+  joins a paired uplink and downlink as one further pipe of a session; a split
   bootstrap's carrier makes pipe pair 0 only, and `Session::add_pipe`
   refuses it. A `zmux::helpers::PipePool::join` keeps such pairs up.
 - Client: `Options::credential` presents a `zmux::Credential`, such as an
   unbound `zmux::PrefixAuth` token: its prefix first on every request body
   that carries a pipe or a lane, its header form on a downlink `GET`.
+- Redirects: a carrier request follows a redirect within its origin (the
+  connections are the caller's): another path or query on the same scheme
+  (`Options::https`), host and port, at most `Options::max_redirects` (5)
+  hops, a `POST` for 307 and 308 only. It is repeated with the credential
+  presented anew and the uplink written so far, up to 64 KiB, on a new
+  connection (HTTP/1.1) or a further request of the connection (HTTP/2);
+  the candidate's next carriers start at the URL it led to. A refused
+  redirect fails the carrier with a `zmux::redirect::RedirectError`. A
+  carrier over one connection the caller gave follows none.
 
 TLS is the caller's concern: the adapter speaks HTTP over the connections
 it is given.
@@ -132,6 +139,10 @@ let session = zmux_http::connect_exchange("127.0.0.1:8080", &options, Config::de
   reach the same server process. `ExchangeServer::handle` answers one
   request inside an HTTP server of the application's own, or gives it
   back, its body bytes replayed, when it is not authenticated.
+- Every exchange request follows redirects as the other carriers do
+  (`ExchangeOptions::https`, `ExchangeOptions::max_redirects`), with its
+  body unchanged; the next request starts at the configured path again. A
+  refused redirect fails the carrier.
 - A server authenticates a request when its MAC verifies, its Time is
   within `ExchangeOptions::time_window` (60 s) of the server's clock and
   its (Carrier ID, Nonce) pair is new; at most

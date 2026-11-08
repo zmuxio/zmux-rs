@@ -1,8 +1,7 @@
-//! Tiers (MULTIPATH.md Section 9, 10 and 11): the
-//! priority, standby
-//! flag and weight of each outbound direction, PIPE_STATUS requests for the
-//! peer's directions, standby takeover, probation, tier saturation, and the
-//! tier gate that every scheduling policy runs behind.
+//! Tiers: the priority, standby flag and weight of each outbound direction,
+//! PIPE_STATUS requests for the peer's directions, standby takeover,
+//! probation, tier saturation, and the tier gate that every scheduling
+//! policy runs behind.
 //!
 //! Tier saturation is a property of a tier, not of a pipe: the data offered
 //! to a tier (what is ready and what the more-preferred tiers cannot absorb
@@ -262,12 +261,11 @@ pub(crate) struct TierReport {
     pub(crate) at: Instant,
 }
 
-/// The pipe views every scheduling decision reads (MULTIPATH.md), kept while
-/// the view generation stands
-/// ([`SessionCore::views_changed`]): it advances whenever an attachment comes or
-/// goes, or an outbound pipe changes state, usability, tier, standby flag
-/// or minimum RTT. A decision reads them instead of passing over every
-/// pipe, or every pair of pipes, again; debug builds check them against a
+/// The pipe views every scheduling decision reads, kept while the view
+/// generation stands ([`SessionCore::views_changed`]): it advances whenever an
+/// attachment comes or goes, or an outbound pipe changes state, usability, tier,
+/// standby flag or minimum RTT. A decision reads them instead of passing over
+/// every pipe, or every pair of pipes, again; debug builds check them against a
 /// rebuild.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Views {
@@ -282,7 +280,7 @@ pub(crate) struct Views {
     /// attachment order within a tier.
     usable: Vec<usize>,
     /// The attachment indices of the pipes that may carry control frames,
-    /// in control order (Section 6.5).
+    /// in control order.
     control: Vec<usize>,
 }
 
@@ -691,9 +689,8 @@ impl SessionCore {
     }
 
     /// Updates since when data waits for each tier, reports tier
-    /// saturation changes, and the standby takeover (MULTIPATH.md Section
-    /// 9). Called at every batch and timer, and when writers or
-    /// pipes change.
+    /// saturation changes, and the standby takeover. Called at every batch
+    /// and timer, and when writers or pipes change.
     pub(in crate::proto::session) fn refresh_tiers(&mut self) {
         if self.mp.is_none() {
             return;
@@ -816,8 +813,8 @@ impl SessionCore {
 
     /// Sets the priority of the local outbound direction of a pipe (lower
     /// preferred); `None` clears the local setting, returning to the peer's
-    /// request, else 0 (MULTIPATH.md Section 9). Used from the next
-    /// scheduling decision; nothing is sent.
+    /// request, else 0. Used from the next scheduling decision; nothing is
+    /// sent.
     pub fn set_pipe_send_priority(
         &mut self,
         pipe: PipeId,
@@ -1067,8 +1064,7 @@ impl SessionCore {
         i: usize,
         opts: &crate::proto::session::PipeOptions,
     ) {
-        // The initial request travels in the PIPE_JOIN (MULTIPATH.md
-        // Section 5.1).
+        // The initial request travels in the Hello.
         self.atts.at_mut(i).tier_mut().configure(
             opts.send_priority,
             opts.send_standby,
@@ -1081,8 +1077,8 @@ impl SessionCore {
 
     // ---- PIPE_STATUS -----------------------------------------------------------------
 
-    /// PIPE_STATUS (MULTIPATH.md Section 9): the peer's request for the
-    /// local outbound direction of an attachment.
+    /// PIPE_STATUS: the peer's request for the local outbound direction
+    /// of an attachment.
     pub(in crate::proto::session) fn on_pipe_status(
         &mut self,
         id: u64,
@@ -1139,12 +1135,11 @@ impl SessionCore {
         true
     }
 
-    /// A standby takeover (MULTIPATH.md Section 9): while an attachment's
-    /// own standby outbound pipe carries the traffic because no non-standby
-    /// pipe is usable, the standby request for the peer's direction is
-    /// replaced by "available" with the configured priority; once a
-    /// non-standby pipe is usable again (after its probation) the
-    /// configured request is restored.
+    /// A standby takeover: while an attachment's own standby outbound pipe
+    /// carries the traffic because no non-standby pipe is usable, the
+    /// standby request for the peer's direction is replaced by "available"
+    /// with the configured priority; once a non-standby pipe is usable
+    /// again (after its probation) the configured request is restored.
     pub(in crate::proto::session) fn check_standby_takeover(&mut self) {
         if self.mp.is_none() {
             return;

@@ -1,5 +1,5 @@
-//! Resume (RESUME.md): the SUSPENDED state and the grace timer. Positions
-//! travel in PIPE_ACK snapshots (RESUME.md Section 5, `ack.rs`).
+//! Resume: the SUSPENDED state and the grace timer. Positions after a
+//! rejoin travel in PIPE_ACK snapshots (`ack.rs`).
 
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::proto::TransportErrorCode as T;
 use crate::proto::session::{CloseFrame, CoreEvent, SessionCore, SessionError, State};
 
-/// The SUSPENDED state of a multipath session (RESUME.md Section 4).
+/// The SUSPENDED state of a multipath session.
 #[derive(Debug)]
 pub(crate) struct Suspension {
     /// The grace period.
@@ -41,7 +41,7 @@ impl Suspension {
     }
 
     /// A shutdown or GOAWAY while SUSPENDED: the session resumes into
-    /// DRAINING (RESUME.md Section 4.1).
+    /// DRAINING.
     pub(in crate::proto::session) fn drain_after(&mut self) {
         self.was_draining = true;
     }
@@ -53,7 +53,7 @@ impl Suspension {
 }
 
 impl SessionCore {
-    // ---- the SUSPENDED state (RESUME.md Section 4) --------------------------------
+    // ---- the SUSPENDED state --------------------------------------------------------
 
     /// Enters SUSPENDED: no live pipe in a direction, resume in use.
     pub(in crate::proto::session) fn suspend(&mut self, now: Instant) {
@@ -73,7 +73,7 @@ impl SessionCore {
     }
 
     /// Leaves SUSPENDED once an ACTIVE outbound pipe and an OPEN inbound
-    /// pipe exist (Section 4.4).
+    /// pipe exist.
     pub(in crate::proto::session) fn check_resume(&mut self, now: Instant) {
         if self.state != State::Suspended {
             return;
@@ -105,9 +105,10 @@ impl SessionCore {
         }
         self.restart_idle(now);
         self.push_event(CoreEvent::Resumed);
+        self.epoch_after_resume(now);
     }
 
-    /// The grace timer (Section 8). Returns whether the session ended.
+    /// The grace timer expired. Returns whether the session ended.
     pub(in crate::proto::session) fn resume_timeout_fired(&mut self, now: Instant) -> bool {
         let Some(t) = self.mp.as_deref().and_then(|m| m.suspension().deadline) else {
             return false;
@@ -120,8 +121,8 @@ impl SessionCore {
         true
     }
 
-    /// Ends a suspended session for a listener limit (RESUME.md Section 9):
-    /// ZMUX_RESUME_TIMEOUT, as at grace expiry.
+    /// Ends a suspended session for a listener limit: ZMUX_RESUME_TIMEOUT, as
+    /// at grace expiry.
     pub fn close_suspended(&mut self, now: Instant) {
         self.tick(now);
         if self.state == State::Suspended {
@@ -135,7 +136,7 @@ impl SessionCore {
     }
 
     /// Closes with ZMUX_RESUME_FAILED or ZMUX_RESUME_TIMEOUT: CONNECTION_CLOSE
-    /// on any live outbound pipe, otherwise locally (Sections 7 and 8).
+    /// on any live outbound pipe, otherwise locally.
     pub(in crate::proto::session) fn close_resume(
         &mut self,
         code: T,
@@ -150,11 +151,8 @@ impl SessionCore {
                 last: self.mp.as_deref().and_then(|m| m.last_failure),
             }
         } else {
-            SessionError::TransportClosed {
-                code,
-                frame_type: 0,
+            SessionError::ResumeFailed {
                 reason: Bytes::from_static(reason.as_bytes()),
-                details: Vec::new(),
                 remote: false,
             }
         });

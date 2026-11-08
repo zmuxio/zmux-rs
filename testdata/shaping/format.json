@@ -1,0 +1,1489 @@
+{
+ "bundles": [
+  {
+   "name": "minimal",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "top-strings",
+   "bundle": "{\"generated_at\": \"2026-11-07T00:00:00Z\", \"next_change\": \"2026-11-08T00:00:00Z\", \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "empty-candidate-is-valid",
+   "bundle": "{\"kinds\": {\"default\": [{}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "null-is-absent",
+   "bundle": "{\"generated_at\":null,\"tables\":null,\"kinds\":{\"default\":[{\"requires\":null,\"pool\":null}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "no-default",
+   "bundle": "{\"kinds\": {\"quic\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "no_default"
+  },
+  {
+   "name": "no-kinds",
+   "bundle": "{\"tables\":{}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "kinds-not-object",
+   "bundle": "{\"kinds\":[]}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "top-unknown-member",
+   "bundle": "{\"version\": 1, \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "top-duplicate-key",
+   "bundle": "{\"kinds\":{\"default\":[{}]},\"kinds\":{\"default\":[{}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "duplicate_key"
+  },
+  {
+   "name": "duplicate-key-in-skipped-candidate",
+   "bundle": "{\"kinds\":{\"default\":[{\"requires\":[\"x\"],\"a\":1,\"a\":2},{}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "duplicate_key"
+  },
+  {
+   "name": "syntax",
+   "bundle": "{\"kinds\":",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "syntax"
+  },
+  {
+   "name": "nan",
+   "bundle": "{\"kinds\":{\"default\":[{\"budget\":{\"max_delay\":NaN}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "syntax"
+  },
+  {
+   "name": "generated-at-number",
+   "bundle": "{\"generated_at\": 1, \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "unknown-kind-ignored",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"k-new\": \"any shape\"}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "known-kind-selected",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"quic\": [{}, {\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0,
+    "quic": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "kind-null-is-absent",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"quic\": null}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "default-null-is-no-default",
+   "bundle": "{\"kinds\": {\"default\": null, \"quic\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "no_default"
+  },
+  {
+   "name": "kind-not-list",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"quic\": {}}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "candidate-not-object",
+   "bundle": "{\"kinds\": {\"default\": [1]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "first-without-requires-selected",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}, {\"nonsense\": 1}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "later-candidate-not-parsed",
+   "bundle": "{\"kinds\": {\"default\": [{}, {\"machines\": \"bad\"}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-unknown-skipped-unparsed",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}, {\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 1
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-known-selected-parsed",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"new-action\"], \"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}, {}]}}",
+   "features": [
+    "new-action"
+   ],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-known-then-strict",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}, {\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [
+    "new-action"
+   ],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "requires-all-must-be-known",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"a\", \"b\"], \"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}, {}]}}",
+   "features": [
+    "a"
+   ],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 1
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-two-known",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"a\", \"b\"], \"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}, {}]}}",
+   "features": [
+    "a",
+    "b"
+   ],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-empty-list",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [], \"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "requires-not-list",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": \"a\"}, {}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "requires-not-strings",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [1]}, {}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "all-skipped-fails",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "no_candidate"
+  },
+  {
+   "name": "all-skipped-allow-unshaped",
+   "bundle": "{\"kinds\": {\"default\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}]}}",
+   "features": [],
+   "allow_unshaped": true,
+   "selected": {
+    "default": null
+   },
+   "unshaped": [
+    "default"
+   ]
+  },
+  {
+   "name": "empty-candidates-fails",
+   "bundle": "{\"kinds\": {\"default\": []}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "no_candidate"
+  },
+  {
+   "name": "empty-candidates-allow-unshaped",
+   "bundle": "{\"kinds\": {\"default\": []}}",
+   "features": [],
+   "allow_unshaped": true,
+   "selected": {
+    "default": null
+   },
+   "unshaped": [
+    "default"
+   ]
+  },
+  {
+   "name": "one-kind-all-skipped-fails-whole",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"quic\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "no_candidate"
+  },
+  {
+   "name": "one-kind-all-skipped-allow",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}], \"quic\": [{\"requires\": [\"new-action\"], \"future_member\": 1.5}]}}",
+   "features": [],
+   "allow_unshaped": true,
+   "selected": {
+    "default": 0,
+    "quic": null
+   },
+   "unshaped": [
+    "quic"
+   ]
+  },
+  {
+   "name": "allow-unshaped-does-not-excuse-errors",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"nope\": 1}}]}}",
+   "features": [],
+   "allow_unshaped": true,
+   "error": "unknown_member"
+  },
+  {
+   "name": "candidate-unknown-member",
+   "bundle": "{\"kinds\": {\"default\": [{\"nope\": 1}, {}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "error-in-selected-does-not-fall-through",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"max_delay\": -1}}, {}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "unknown-handshake-ignored-unparsed",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"future_handshake\": 5}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "unknown-message-ignored-unparsed",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"ack\": 5}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "handshake-not-object",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": 5}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "message-unknown-field",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"max_len\": 5}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "message-target-rejected",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"target\": 5}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "handshake-pipe-scope-rejected",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 2]], \"scope\": \"pipe\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "handshake-shared-accepted",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 2]], \"scope\": \"shared\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "handshake-length-above-range",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 2147483648}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "float-as-integer",
+   "bundle": "{\"kinds\":{\"default\":[{\"handshakes\":{\"join\":{\"hello\":{\"pad_to\":1.0}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "exponent-as-integer",
+   "bundle": "{\"kinds\":{\"default\":[{\"budget\":{\"max_delay\":1e0}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "bool-as-integer",
+   "bundle": "{\"kinds\":{\"default\":[{\"budget\":{\"max_delay\":true}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "float-in-skipped-candidate",
+   "bundle": "{\"kinds\":{\"default\":[{\"requires\":[\"x\"],\"v\":1.0},{}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 1
+   },
+   "unshaped": []
+  },
+  {
+   "name": "table-reference",
+   "bundle": "{\"tables\": {\"a\": [[1, 1, 2]]}, \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": \"a\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "table-missing",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": \"a\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "table"
+  },
+  {
+   "name": "table-used-invalid",
+   "bundle": "{\"tables\": {\"a\": [[1, 2, 1]]}, \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": \"a\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "table-unused-new-form-ignored",
+   "bundle": "{\"tables\": {\"a\": {\"beta\": [1.5]}}, \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 1}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "table-used-only-by-skipped-ignored",
+   "bundle": "{\"tables\": {\"a\": \"z\"}, \"kinds\": {\"default\": [{\"requires\": [\"x\"], \"v\": {\"t\": \"a\"}}, {}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 1
+   },
+   "unshaped": []
+  },
+  {
+   "name": "tables-not-object",
+   "bundle": "{\"tables\": [], \"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": 100}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "segment-short",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 2]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "segment-float",
+   "bundle": "{\"kinds\":{\"default\":[{\"handshakes\":{\"join\":{\"hello\":{\"pad_to\":{\"t\":[[1.5,1,2]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "segment-weight-above-u32",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[4294967296, 1, 2]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "segment-lo-above-hi",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 3, 2]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "segment-hi-above-family",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 2147483648]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "segments-empty",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": []}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "total-weight-zero",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[0, 1, 2]]}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "value-no-t",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"scope\": \"each\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "value-unknown-member",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 2]], \"min\": 1}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "value-scope-empty-string",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 2]], \"scope\": \"\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "value-negative-const",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": -1}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "value-string",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": \"1\"}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "slots-at-default-bound",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"counters\": 4000, \"timers\": 96, \"states\": [{}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "slots-above-default-bound",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"counters\": 4000, \"timers\": 97, \"states\": [{}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "limit"
+  },
+  {
+   "name": "slots-across-machines",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"counters\": 4096, \"states\": [{}]}, {\"start\": 0, \"timers\": 1, \"states\": [{}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "limit"
+  },
+  {
+   "name": "budget-all",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": 9007199254740992, \"per_mb\": 8796093022208, \"per_sec\": 8796093022208}, \"max_delay\": 1000000000000000}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "budget-session",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}, \"per_mb\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}, \"per_sec\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}}, \"max_delay\": 1}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "budget-empty",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "budget-wire-empty",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "budget-initial-above",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": 9007199254740993}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-per-mb-above",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"per_mb\": 8796093022209}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-per-sec-above",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"per_sec\": 8796093022209}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-table-above",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"per_sec\": {\"t\": [[1, 1, 8796093022209]], \"scope\": \"session\"}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-delay-zero",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"max_delay\": 0}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-delay-above",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"max_delay\": 1000000000000001}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "budget-delay-table",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"max_delay\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "budget-unknown-member",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"cover\": {}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "budget-unknown-wire-member",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"cap\": 1}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "budget-scope-each",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": {\"t\": [[1, 1, 9]], \"scope\": \"each\"}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "budget-scope-pipe",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": {\"t\": [[1, 1, 9]], \"scope\": \"pipe\"}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "budget-scope-shared",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": {\"t\": [[1, 1, 9]], \"scope\": \"shared\"}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "budget-scope-absent",
+   "bundle": "{\"kinds\": {\"default\": [{\"budget\": {\"wire\": {\"initial\": {\"t\": [[1, 1, 9]]}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "session-scope-in-handshake",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}}}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "session-scope-in-pool",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"count\": {\"t\": [[1, 1, 2]], \"scope\": \"session\"}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "session-scope-in-machine",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"states\": [{\"record\": {\"pad\": {\"t\": [[1, 1, 9]], \"scope\": \"session\"}}}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "limits-member-gone",
+   "bundle": "{\"kinds\":{\"default\":[{\"limits\":{}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  },
+  {
+   "name": "pool-all",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"count\": 2, \"dial_after\": [0, {\"t\": [[1, 1000, 2000]], \"scope\": \"shared\"}], \"dial_jitter\": 123456, \"retire\": [{\"metric\": \"age\", \"above\": {\"t\": [[1, 1000, 2000]], \"scope\": \"pipe\"}, \"jitter\": 999999}, {\"metric\": \"bytes\", \"above\": 9007199254740992}], \"probe_interval\": 7000000, \"probe_jitter\": 1}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "pool-count-zero",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"count\": 0}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "pool-count-pipe-scope",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"count\": {\"t\": [[1, 1, 2]], \"scope\": \"pipe\"}}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "pool-dial-after-pipe-scope",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"dial_after\": [{\"t\": [[1, 1, 2]], \"scope\": \"pipe\"}]}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "scope"
+  },
+  {
+   "name": "pool-jitter-million",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"dial_after\": [1], \"dial_jitter\": 1000000}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "pool-jitter-without-base",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"dial_jitter\": 1}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "conflict"
+  },
+  {
+   "name": "pool-probe-jitter-without-base",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"probe_jitter\": 1}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "conflict"
+  },
+  {
+   "name": "pool-unknown-metric",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"retire\": [{\"metric\": \"x\", \"above\": 1}]}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "pool-age-above-time",
+   "bundle": "{\"kinds\": {\"default\": [{\"pool\": {\"retire\": [{\"metric\": \"age\", \"above\": 1000000000000001}]}}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "range"
+  },
+  {
+   "name": "machines-empty",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": []}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "type"
+  },
+  {
+   "name": "machines-ok",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"states\": [{}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "machines-table",
+   "bundle": "{\"tables\": {\"a\": [[1, 100, 200]]}, \"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"states\": [{\"record\": {\"target\": {\"t\": \"a\"}}}]}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "selected": {
+    "default": 0
+   },
+   "unshaped": []
+  },
+  {
+   "name": "machines-version-member",
+   "bundle": "{\"kinds\": {\"default\": [{\"machines\": [{\"start\": 0, \"states\": [{}], \"version\": 1}]}]}}",
+   "features": [],
+   "allow_unshaped": false,
+   "error": "unknown_member"
+  }
+ ],
+ "handshake": [
+  {
+   "name": "default-all-names",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 500, 1500], [1, 3000, 4000]]}, \"delay\": {\"t\": [[1, 0, 0], [1, 1000, 5000]]}}, \"reply\": {\"pad_multiple\": 256, \"pad\": {\"t\": [[1, 1, 16]]}}}, \"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 700, 800]], \"scope\": \"shared\"}}, \"hello_early\": {\"pad_to\": 12345}, \"reply\": {\"delay\": 2000}, \"confirm\": {\"pad_to\": {\"t\": [[1, 64, 128]]}}}}}]}}",
+   "kind": "default",
+   "source": {
+    "seed": "0000000000000015"
+   },
+   "resolved": "default",
+   "shared": [
+    702
+   ],
+   "calls": [
+    {
+     "handshake": "establish",
+     "message": "hello",
+     "plan": {
+      "pad_to": 3525,
+      "delay": 1360
+     },
+     "consumed": 5
+    },
+    {
+     "handshake": "establish",
+     "message": "reply",
+     "plan": {
+      "pad_multiple": 256,
+      "pad": 8
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "establish",
+     "message": "finish",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "future_handshake",
+     "message": "hello",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 702
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 702
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello_early",
+     "plan": {
+      "pad_to": 12345
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "reply",
+     "plan": {
+      "delay": 2000
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "confirm",
+     "plan": {
+      "pad_to": 119
+     },
+     "consumed": 7
+    },
+    {
+     "handshake": "join",
+     "message": "ack",
+     "plan": null,
+     "consumed": 7
+    },
+    {
+     "handshake": "other",
+     "message": "hello",
+     "plan": null,
+     "consumed": 7
+    }
+   ]
+  },
+  {
+   "name": "empty-kind-is-default",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 500, 1500], [1, 3000, 4000]]}, \"delay\": {\"t\": [[1, 0, 0], [1, 1000, 5000]]}}, \"reply\": {\"pad_multiple\": 256, \"pad\": {\"t\": [[1, 1, 16]]}}}, \"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 700, 800]], \"scope\": \"shared\"}}, \"hello_early\": {\"pad_to\": 12345}, \"reply\": {\"delay\": 2000}, \"confirm\": {\"pad_to\": {\"t\": [[1, 64, 128]]}}}}}]}}",
+   "kind": "",
+   "source": {
+    "seed": "0000000000000016"
+   },
+   "resolved": "default",
+   "shared": [
+    778
+   ],
+   "calls": [
+    {
+     "handshake": "establish",
+     "message": "hello",
+     "plan": {
+      "pad_to": 3076,
+      "delay": 4331
+     },
+     "consumed": 5
+    },
+    {
+     "handshake": "establish",
+     "message": "reply",
+     "plan": {
+      "pad_multiple": 256,
+      "pad": 13
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "establish",
+     "message": "finish",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "future_handshake",
+     "message": "hello",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 778
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 778
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello_early",
+     "plan": {
+      "pad_to": 12345
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "reply",
+     "plan": {
+      "delay": 2000
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "confirm",
+     "plan": {
+      "pad_to": 82
+     },
+     "consumed": 7
+    },
+    {
+     "handshake": "join",
+     "message": "ack",
+     "plan": null,
+     "consumed": 7
+    },
+    {
+     "handshake": "other",
+     "message": "hello",
+     "plan": null,
+     "consumed": 7
+    }
+   ]
+  },
+  {
+   "name": "unknown-kind-falls-to-default",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 500, 1500], [1, 3000, 4000]]}, \"delay\": {\"t\": [[1, 0, 0], [1, 1000, 5000]]}}, \"reply\": {\"pad_multiple\": 256, \"pad\": {\"t\": [[1, 1, 16]]}}}, \"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 700, 800]], \"scope\": \"shared\"}}, \"hello_early\": {\"pad_to\": 12345}, \"reply\": {\"delay\": 2000}, \"confirm\": {\"pad_to\": {\"t\": [[1, 64, 128]]}}}}}]}}",
+   "kind": "k-new",
+   "source": {
+    "seed": "0000000000000017"
+   },
+   "resolved": "default",
+   "shared": [
+    791
+   ],
+   "calls": [
+    {
+     "handshake": "establish",
+     "message": "hello",
+     "plan": {
+      "pad_to": 3016,
+      "delay": 4039
+     },
+     "consumed": 5
+    },
+    {
+     "handshake": "establish",
+     "message": "reply",
+     "plan": {
+      "pad_multiple": 256,
+      "pad": 9
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "establish",
+     "message": "finish",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "future_handshake",
+     "message": "hello",
+     "plan": null,
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 791
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello",
+     "plan": {
+      "pad_to": 791
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "hello_early",
+     "plan": {
+      "pad_to": 12345
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "reply",
+     "plan": {
+      "delay": 2000
+     },
+     "consumed": 6
+    },
+    {
+     "handshake": "join",
+     "message": "confirm",
+     "plan": {
+      "pad_to": 121
+     },
+     "consumed": 7
+    },
+    {
+     "handshake": "join",
+     "message": "ack",
+     "plan": null,
+     "consumed": 7
+    },
+    {
+     "handshake": "other",
+     "message": "hello",
+     "plan": null,
+     "consumed": 7
+    }
+   ]
+  },
+  {
+   "name": "known-kind-own-entry",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 500, 1500], [1, 3000, 4000]]}, \"delay\": {\"t\": [[1, 0, 0], [1, 1000, 5000]]}}, \"reply\": {\"pad_multiple\": 256, \"pad\": {\"t\": [[1, 1, 16]]}}}, \"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 700, 800]], \"scope\": \"shared\"}}, \"hello_early\": {\"pad_to\": 12345}, \"reply\": {\"delay\": 2000}, \"confirm\": {\"pad_to\": {\"t\": [[1, 64, 128]]}}}}}], \"quic\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": 77}}}}]}}",
+   "kind": "quic",
+   "source": {
+    "seed": "0000000000000018"
+   },
+   "resolved": "quic",
+   "shared": [],
+   "calls": [
+    {
+     "handshake": "establish",
+     "message": "hello",
+     "plan": {
+      "pad_to": 77
+     },
+     "consumed": 0
+    },
+    {
+     "handshake": "establish",
+     "message": "reply",
+     "plan": null,
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "known-kind-absent-falls-to-default",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 500, 1500], [1, 3000, 4000]]}, \"delay\": {\"t\": [[1, 0, 0], [1, 1000, 5000]]}}, \"reply\": {\"pad_multiple\": 256, \"pad\": {\"t\": [[1, 1, 16]]}}}, \"join\": {\"hello\": {\"pad_to\": {\"t\": [[1, 700, 800]], \"scope\": \"shared\"}}, \"hello_early\": {\"pad_to\": 12345}, \"reply\": {\"delay\": 2000}, \"confirm\": {\"pad_to\": {\"t\": [[1, 64, 128]]}}}}}]}}",
+   "kind": "quic",
+   "source": {
+    "seed": "0000000000000019"
+   },
+   "resolved": "default",
+   "shared": [
+    763
+   ],
+   "calls": [
+    {
+     "handshake": "join",
+     "message": "reply",
+     "plan": {
+      "delay": 2000
+     },
+     "consumed": 1
+    }
+   ]
+  },
+  {
+   "name": "unknown-handshake-name-has-no-plan",
+   "bundle": "{\"kinds\": {\"default\": [{\"handshakes\": {\"future_handshake\": {\"hello\": {\"pad_to\": 300}}, \"establish\": {\"hello\": {\"pad_to\": {\"t\": [[1, 1400, 1600]]}}, \"finish\": {\"pad_multiple\": 128}}}}]}}",
+   "kind": "default",
+   "source": {
+    "seed": "000000000000001a"
+   },
+   "resolved": "default",
+   "shared": [],
+   "calls": [
+    {
+     "handshake": "establish",
+     "message": "hello",
+     "plan": {
+      "pad_to": 1553
+     },
+     "consumed": 1
+    },
+    {
+     "handshake": "establish",
+     "message": "reply",
+     "plan": null,
+     "consumed": 1
+    },
+    {
+     "handshake": "establish",
+     "message": "finish",
+     "plan": {
+      "pad_multiple": 128
+     },
+     "consumed": 1
+    },
+    {
+     "handshake": "future_handshake",
+     "message": "hello",
+     "plan": null,
+     "consumed": 1
+    }
+   ]
+  }
+ ],
+ "budget": [
+  {
+   "name": "constants",
+   "budget": {
+    "wire": {
+     "initial": 5,
+     "per_mb": 6,
+     "per_sec": 7
+    },
+    "max_delay": 9
+   },
+   "source": {
+    "seed": "0000000000000001"
+   },
+   "draws": [
+    {
+     "wire": {
+      "initial": 5,
+      "per_mb": 6,
+      "per_sec": 7
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 5,
+      "per_mb": 6,
+      "per_sec": 7
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 5,
+      "per_mb": 6,
+      "per_sec": 7
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "absent-wire",
+   "budget": {
+    "max_delay": 9
+   },
+   "source": {
+    "seed": "0000000000000001"
+   },
+   "draws": [
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": false,
+     "max_delay": 9,
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "empty-wire",
+   "budget": {
+    "wire": {}
+   },
+   "source": {
+    "seed": "0000000000000001"
+   },
+   "draws": [
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    }
+   ]
+  },
+  {
+   "name": "session-order",
+   "budget": {
+    "wire": {
+     "per_sec": {
+      "t": [
+       [
+        1,
+        10,
+        20
+       ]
+      ],
+      "scope": "session"
+     },
+     "initial": {
+      "t": [
+       [
+        1,
+        1,
+        9
+       ],
+       [
+        1,
+        100,
+        900
+       ]
+      ],
+      "scope": "session"
+     },
+     "per_mb": {
+      "t": [
+       [
+        1,
+        5,
+        5
+       ]
+      ],
+      "scope": "session"
+     }
+    }
+   },
+   "source": {
+    "seed": "000000000000000b"
+   },
+   "draws": [
+    {
+     "wire": {
+      "initial": 3,
+      "per_mb": 5,
+      "per_sec": 17
+     },
+     "no_injection": false,
+     "max_delay": 0,
+     "consumed": 3
+    },
+    {
+     "wire": {
+      "initial": 232,
+      "per_mb": 5,
+      "per_sec": 16
+     },
+     "no_injection": false,
+     "max_delay": 0,
+     "consumed": 6
+    },
+    {
+     "wire": {
+      "initial": 8,
+      "per_mb": 5,
+      "per_sec": 13
+     },
+     "no_injection": false,
+     "max_delay": 0,
+     "consumed": 9
+    }
+   ]
+  },
+  {
+   "name": "session-draws-zero",
+   "budget": {
+    "wire": {
+     "initial": {
+      "t": [
+       [
+        1,
+        0,
+        0
+       ]
+      ],
+      "scope": "session"
+     }
+    }
+   },
+   "source": {
+    "seed": "0000000000000003"
+   },
+   "draws": [
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    },
+    {
+     "wire": {
+      "initial": 0,
+      "per_mb": 0,
+      "per_sec": 0
+     },
+     "no_injection": true,
+     "max_delay": 0,
+     "consumed": 0
+    }
+   ]
+  }
+ ]
+}

@@ -1,6 +1,6 @@
 [package]
 name = "zmux-webtransport"
-version = "1.2.5"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -19,10 +19,10 @@ aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
 [dependencies]
 bytes = "1"
 url = "2"
-web-transport-quinn = { version = "0.13.5", default-features = false }
+web-transport-quinn = { version = "0.13.6", default-features = false }
 tokio = { version = "1.54", default-features = false, features = ["rt", "sync", "time"] }
-zmux = { version = "1.2.5", path = "../.." }
-zmux-quinn = { version = "1.2.5", path = "../quinn", default-features = false }
+zmux = { version = "1.3.0", path = "../.." }
+zmux-quinn = { version = "1.3.0", path = "../quinn", default-features = false }
 
 [dev-dependencies]
 bytes = "1"

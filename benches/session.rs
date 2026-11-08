@@ -389,7 +389,7 @@ fn bench_config() -> Config {
     let mut c = Config::default();
     if std::env::var("ZMUX_BENCH_MP").is_ok() {
         c.max_pipes = 2;
-        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     }
     if let Some(us) = std::env::var("ZMUX_BENCH_B")
         .ok()
@@ -466,7 +466,7 @@ async fn driver_bulk(zero_copy: bool) {
 
 /// One stream over the `shaped` carrier for `ZMUX_BENCH_SECS` seconds
 /// (default 20): throughput per second, the mean of the last 5 s, and the
-/// time to 90 % of the link (the long-path rows of CONFORMANCE.md).
+/// time to 90 % of the link (the long-path performance rows).
 async fn wan_bulk() {
     let (rate, owd, queue) = shape();
     let secs: u64 = std::env::var("ZMUX_BENCH_SECS")
@@ -541,14 +541,14 @@ async fn wan_bulk() {
         cpu.map_or("-".into(), |c| format!("{c:.3}")),
         receiver.window_growth() as f64 / 1e6,
     );
-    client.close(zmux::VarInt::from_u32(0), b"");
+    client.close(zmux::VarInt::from_u32(0), b"").await;
     let _ = writer.await;
     let _ = reader.await;
 }
 
 /// `scale`: `ZMUX_BENCH_SCALE_N` (default 10 000) quiet sessions over
 /// in-memory pipes, single-pipe and multipath (two pipe pairs, the second
-/// standby), both ends in this process (CONFORMANCE.md scale rows): live heap
+/// standby), both ends in this process (the scale rows): live heap
 /// per session (both ends, the
 /// in-memory pipes' buffers included), then the process CPU over
 /// `ZMUX_BENCH_SCALE_SECS` (default 30) of silence, as a share of one core.
@@ -599,7 +599,9 @@ async fn scale(multipath: bool) {
     // sessions shares it.
     let shared = Arc::new(config());
     let config = || shared.clone();
-    let listener = multipath.then(|| Listener::new(config(), ListenerConfig::default()));
+    let listener = multipath.then(|| {
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration")
+    });
     let before = live();
     let mut pairs = Vec::with_capacity(n);
     for _ in 0..n {
@@ -625,7 +627,7 @@ async fn scale(multipath: bool) {
                 let mut opts = PipeOptions::default();
                 opts.send_standby = Some(true);
                 opts.receive_standby = true;
-                client.add_pipe(PipeIo::new(c), opts).unwrap();
+                client.begin_add_pipe(PipeIo::new(c), opts).unwrap();
                 (client, server)
             }
         };
@@ -676,7 +678,7 @@ async fn scale(multipath: bool) {
         keep_alive,
     );
     for (c, _) in &pairs {
-        c.close(zmux::VarInt::from_u32(0), b"");
+        c.close(zmux::VarInt::from_u32(0), b"").await;
     }
     drop(pairs);
     // The next measurement starts once these sessions are gone: closing
@@ -1324,7 +1326,9 @@ async fn soak_slot(
 ) {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (slot + 1).wrapping_mul(0x1234_5678_9abc_def1));
     let multipath = slot % 2 == 1;
-    let listener = multipath.then(|| Listener::new(mp.clone(), ListenerConfig::default()));
+    let listener = multipath.then(|| {
+        Listener::new(mp.clone(), ListenerConfig::default()).expect("valid listener configuration")
+    });
     let workers: usize = env_or("ZMUX_SOAK_STREAMS", 3);
     while soak.wait_active().await {
         let (a, b) = tokio::io::duplex(64 * 1024);
@@ -1401,7 +1405,7 @@ async fn soak_slot(
                 tokio::spawn(
                     async move { l2.handle_pipe(PipeIo::new(d), PipeHint::default()).await },
                 );
-                match client.add_pipe(PipeIo::new(c), PipeOptions::default()) {
+                match client.begin_add_pipe(PipeIo::new(c), PipeOptions::default()) {
                     Ok(pipe) => {
                         soak.counts.joins.fetch_add(1, Relaxed);
                         tokio::time::sleep(Duration::from_millis(500 + rng.below(3000))).await;
@@ -1426,9 +1430,9 @@ async fn soak_slot(
         for s in [&client, &server] {
             soak.open.lock().unwrap().remove(&s.stable_id());
         }
-        client.close(zmux::VarInt::from_u32(0), b"");
+        client.close(zmux::VarInt::from_u32(0), b"").await;
         let _ = tokio::time::timeout(Duration::from_secs(5), client.closed()).await;
-        server.close(zmux::VarInt::from_u32(0), b"");
+        server.close(zmux::VarInt::from_u32(0), b"").await;
         let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
     }
     if let Some(l) = listener {
@@ -1654,7 +1658,7 @@ fn policy_name(p: &Policy) -> &'static str {
 fn mp_config(policy: &Policy) -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
-    c.pipe_auth = PipeAuth::psk(*b"bench-multipath-psk-0123456789ab");
+    c.pipe_auth = PipeAuth::psk(*b"bench-multipath-psk-0123456789ab").with_end_to_end();
     c.scheduler = policy.clone();
     // Loopback pipes are trusted: a new pipe carries data at once instead
     // of after a second of probation.
@@ -1692,7 +1696,8 @@ impl Pair {
     async fn multipath(pipes: usize, policy: &Policy) -> Self {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
-        let listener = Listener::new(mp_config(policy), ListenerConfig::default());
+        let listener = Listener::new(mp_config(policy), ListenerConfig::default())
+            .expect("valid listener configuration");
         let l = listener.clone();
         let acceptor = tokio::spawn(async move {
             while let Ok((c, peer)) = tcp.accept().await {
@@ -1728,7 +1733,7 @@ impl Pair {
         for _ in 0..n {
             let c = TcpStream::connect(addr).await.unwrap();
             self.client
-                .add_pipe(PipeIo::tcp(c), PipeOptions::default())
+                .begin_add_pipe(PipeIo::tcp(c), PipeOptions::default())
                 .unwrap();
         }
         self.pipes += n;
@@ -1764,8 +1769,8 @@ impl Pair {
     }
 
     fn close(self) {
-        self.client.close(0u32.into(), b"");
-        self.server.close(0u32.into(), b"");
+        drop(self.client.close(0u32.into(), b""));
+        drop(self.server.close(0u32.into(), b""));
         if let Some(l) = &self.listener {
             l.close();
         }

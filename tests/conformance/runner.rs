@@ -1,4 +1,4 @@
-//! The trace runner (TRACES.md Section 7): executes every trace of the
+//! The trace runner: executes every trace of the
 //! single-pipe groups against the sans-IO session core with a virtual
 //! clock, and lists the multipath and resume traces it skips.
 
@@ -15,11 +15,12 @@ use zmux::proto::listener::{
 };
 use zmux::proto::params::{Features, Role, TransportParameters};
 use zmux::proto::record::{self, Framing};
+use zmux::proto::seal::{self, join as seal_join};
 use zmux::proto::session::{
-    Config, CoreEvent, DEFAULT_OVERFLOW_DELAY, DatagramError, JoinVerdict, LaneAccept, LaneId,
-    OpenError, PipeAuth, PipeEnd, PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Policy,
-    Preamble, Redundancy, RoleConfig, SessionCore, SessionError, State, StreamError, StreamKey,
-    Transmit, TransmitBuf,
+    ClaimedHello, Config, ConfirmedJoin, CoreEvent, DEFAULT_OVERFLOW_DELAY, DatagramError,
+    JoinStep, LaneAccept, LaneId, OpenError, OpenedHello, PeerCarrier, PipeAuth, PipeEnd,
+    PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Policy, Preamble, Redundancy, RoleConfig,
+    SessionCore, SessionError, State, StreamError, StreamKey, Transmit, TransmitBuf,
 };
 use zmux::proto::{Gates, VarInt, varint};
 
@@ -35,7 +36,7 @@ use crate::wire;
 const RUN_GROUPS: &[&str] = &["core", "ext", "compat", "findings", "multipath", "resume"];
 
 /// What the local endpoint wrote on one outbound lane of a pipe (lane 0
-/// is the pipe's own carrier, TRACES.md Section 5.1.1).
+/// is the pipe's own carrier).
 #[derive(Default)]
 struct OutIo {
     /// Written bytes not yet decoded into records.
@@ -68,8 +69,17 @@ struct PipeIo {
     in_closed: Option<ClosedHow>,
     /// The carrier names attached to the pipe.
     carriers: Vec<String>,
-    /// The connection of its lane 0 (TRACES.md Section 5.1.1).
+    /// The connection of its lane 0.
     conn: Option<String>,
+    /// A local join: JOINING until the Reply, with the Hello it wrote and the scripted
+    /// acceptor reading it.
+    joining: bool,
+    hello: Option<Vec<u8>>,
+    /// The key phase of that Hello.
+    hello_phase: Option<u8>,
+    acceptor: Option<seal_join::Unconfirmed>,
+    reply_in: Vec<u8>,
+    framing: Option<Framing>,
 }
 
 impl PipeIo {
@@ -103,14 +113,27 @@ struct Carrier {
     framing: Framing,
     id: Option<CarrierId>,
     binding: Vec<u8>,
-    /// A join waiting for establishment: frame, bytes, in band.
-    waiting: Option<(Vec<u8>, Vec<u8>, bool)>,
+    /// A Hello held until establishment or the join keys.
+    waiting: Option<Vec<u8>>,
+    /// An Unconfirmed carrier's join; the carrier's bytes until Confirmed.
+    join: Option<Box<zmux::proto::session::PeerJoin>>,
+    buf: Vec<u8>,
+    msgs: Vec<Vec<u8>>,
+    /// The scripted peer's handshake.
+    joiner: Option<seal_join::HelloSent>,
+    proven: Option<seal_join::Proven>,
+    confirm: bool,
+    reply: Option<Vec<u8>>,
+    decision: Option<bool>,
+    outcome: Option<&'static str>,
+    /// Its handshake timeout.
+    deadline: Option<Instant>,
     /// Closed by the local endpoint without writing.
     rejected: bool,
     pairing: Option<[u8; 16]>,
     /// Bytes received while the carrier waits for its pairing.
     held: Vec<Vec<u8>>,
-    /// Its connection (TRACES.md Section 5.1.1).
+    /// Its connection.
     conn: Option<String>,
     /// A new stream of a connection (`via: "lane"`): the lane it turned
     /// out to be, once accepted, with its unconsumed bytes.
@@ -136,6 +159,23 @@ struct Runner {
     /// Feed inbound bytes with `receive` (copying) instead of
     /// `receive_in_place`.
     copy: bool,
+    /// The peer's side of the epoch exchanges.
+    epochs: EpochPeer,
+}
+
+/// The scripted peer's epoch exchanges: every epoch secret it
+/// derived, the frames both ends wrote.
+#[derive(Default)]
+struct EpochPeer {
+    secrets: BTreeMap<u64, Vec<u8>>,
+    /// The first frame of each phase and epoch the local endpoint wrote, as JSON.
+    local_first: BTreeMap<(String, u64), Value>,
+    /// The latest such frame: body and share.
+    local_last: BTreeMap<(String, u64), (Vec<u8>, Vec<u8>)>,
+    /// The peer's offers awaiting the local answer: private values and body.
+    offers: BTreeMap<u64, (seal::GroupInitiator, Vec<u8>)>,
+    /// The bytes of each frame the peer wrote, by phase and epoch.
+    written: BTreeMap<(String, u64), Vec<u8>>,
 }
 
 fn pipe_auth(a: &crate::model::PipeAuth) -> PipeAuth {
@@ -225,7 +265,9 @@ impl Runner {
             standby_probe,
             probe_jitter,
             pipe_auth,
-            early_data
+            early_data,
+            declared_end_to_end,
+            record_modes
         );
         let mut hooks = profile.test.clone();
         let t = &h.overrides.test;
@@ -241,10 +283,13 @@ impl Runner {
             session_nonce,
             pipe_rtt_ms,
             pipe_cap,
-            lane_key
+            lane_key,
+            epoch_locator_prefix
         );
 
         let mut config = Config::default();
+        // Exchanges start only when a trace asks for one.
+        config.epoch_policy = zmux::proto::session::EpochPolicy::MANUAL;
         // A trace's 0 (and an absent keep-alive or idle timeout) is off.
         let period = |ms: u64| (ms != 0).then(|| Duration::from_millis(ms));
         if let Some(ms) = cfg.handshake_timeout {
@@ -262,7 +307,7 @@ impl Runner {
         if let Some(m) = cfg.max_pipes {
             config.max_pipes = m;
         }
-        // The test-mode sender (TRACES.md Section 3.4): the ETA choice,
+        // The test-mode sender : the ETA choice,
         // no probation, no redundant copies, standby pipes probed at 15 s.
         match cfg.sender.as_deref() {
             None => {}
@@ -280,6 +325,23 @@ impl Runner {
         if let Some(a) = &cfg.pipe_auth {
             config.pipe_auth = pipe_auth(a);
         }
+        if cfg.declared_end_to_end.unwrap_or(true) {
+            config.pipe_auth = config.pipe_auth.clone().with_end_to_end();
+        }
+        if let Some(c) = &tp.zmux_session_crypto {
+            config.session_crypto = c.clone();
+        }
+        let modes = cfg.record_modes.clone().unwrap_or_default();
+        config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(
+            std::sync::Arc::new(move |_, m, _| {
+                let name = match m {
+                    seal::Mode::Sealed => "sealed",
+                    seal::Mode::Bound => "bound",
+                    seal::Mode::Trusted => "trusted",
+                };
+                modes.iter().any(|x| x == name)
+            }),
+        ));
         config.resume_timeout = cfg.resume_timeout.map(Duration::from_millis);
         if let Some(f) = cfg.suspect_floor {
             config.suspect_floor = Duration::from_millis(f);
@@ -336,6 +398,7 @@ impl Runner {
             })
             .collect::<Result<_, &str>>()?;
         th.pipe_cap = hooks.pipe_cap.map(|c| c as usize);
+        th.epoch_locator_prefix = hooks.epoch_locator_prefix.map(|p| p.0);
         th.lane_key = hooks
             .lane_key
             .map(|k| k.0.try_into().map_err(|_| "lane_key length"))
@@ -369,6 +432,7 @@ impl Runner {
             handles: HashMap::new(),
             close_covered: false,
             copy,
+            epochs: EpochPeer::default(),
         })
     }
 
@@ -400,7 +464,7 @@ impl Runner {
                 }
                 CoreEvent::OpenLane(lane) => {
                     // A carrier with `conn` opens lanes at once, its stream
-                    // credit never running out (TRACES.md Section 3.3).
+                    // credit never running out.
                     let now = self.now();
                     let framing = self
                         .pipes
@@ -429,9 +493,10 @@ impl Runner {
         })
     }
 
-    /// Writes everything the core has for every writable pipe (TRACES.md
-    /// 5.4), pipe by pipe in ID order until nothing more comes out.
+    /// Writes everything the core has for every writable pipe,
+    /// pipe by pipe in ID order until nothing more comes out.
     fn flush(&mut self) -> Result<(), String> {
+        self.write_hellos();
         let now = self.now();
         let mut rounds = 0;
         loop {
@@ -515,7 +580,7 @@ impl Runner {
         Ok(())
     }
 
-    /// CONFORMANCE.md: stream data appears on a JOINING
+    /// Stream data appears on a JOINING
     /// pipe only while no other outbound pipe is usable, and then at most
     /// one `spread_chunk`; never on a pipe in probation while another pipe
     /// out of probation is usable. `infos` is the state before the batch,
@@ -608,8 +673,13 @@ impl Runner {
     }
 
     fn decode_record(&mut self, id: u64, lane: u64, body: &[u8]) -> Result<(), String> {
-        let frames = wire::decode_body(body, Gates::ALL)
+        let mut frames = wire::decode_body(body, Gates::ALL)
             .map_err(|e| format!("the local endpoint wrote an undecodable record: {e:?}"))?;
+        for f in &mut frames {
+            if f["type"] == "SESSION_EPOCH" {
+                self.local_epoch_frame(f)?;
+            }
+        }
         for f in &frames {
             if f["type"] == "CONNECTION_CLOSE" {
                 self.closes.push(f.clone());
@@ -647,7 +717,7 @@ impl Runner {
     /// The first bytes of a new stream of a connection: the listener tells
     /// a lane by its first record, which goes to the session whose Lane
     /// Key it carries when the pipe it names has its lane 0 on the same
-    /// connection (MULTIPATH.md Section 5.8); anything else is rejected.
+    /// connection ; anything else is rejected.
     fn lane_bytes(&mut self, name: &str, bytes: &[u8]) {
         let now = self.now();
         let Some(c) = self.carriers.get(name) else {
@@ -791,7 +861,10 @@ impl Runner {
             for c in self.carriers.values_mut() {
                 if c.id == Some(id) && c.pipe.is_none() {
                     c.rejected = true;
+                    c.outcome = Some("reject");
                     c.waiting = None;
+                    c.join = None;
+                    c.id = None;
                 }
             }
         }
@@ -834,72 +907,22 @@ impl Runner {
             p.carriers.push(n.to_string());
         }
         if write && p.conn.is_some() {
-            // A stream of a multi-stream connection offers lanes (TRACES.md
-            // Section 3.3).
+            // A stream of a multi-stream connection offers lanes.
             self.session.set_pipe_lanes(PipeId::new(pipe), true);
         }
     }
 
-    /// Offers a join the listener extracted to the session.
-    fn offer(&mut self, name: &str, frame: &[u8], bytes: &[u8], inband: bool) {
-        let now = self.now();
-        let Some(c) = self.carriers.get(name) else {
-            return;
-        };
-        let framing = c.framing;
-        let inbound = c.can_read.then_some(framing);
-        let outbound = c.can_write.then_some(framing);
-        let binding = c.binding.clone();
-        let v = self
-            .session
-            .offer_join(frame, &binding, inbound, outbound, inband, now);
-        self.drain_events();
-        let c = self.carriers.get_mut(name).expect("carrier");
-        match v {
-            JoinVerdict::Wait => {
-                c.waiting = Some((frame.to_vec(), bytes.to_vec(), inband));
-            }
-            JoinVerdict::Accepted(pipe) => {
-                c.waiting = None;
-                c.pipe = Some(pipe.get());
-                if let Some(id) = c.id.take() {
-                    self.listener.done(id);
-                }
-                let (read, write) = (c.can_read, c.can_write);
-                self.attach(pipe.get(), Some(name), read, write, framing);
-                if !bytes.is_empty() {
-                    match framing {
-                        Framing::ByteStream => self.deliver(pipe.get(), bytes, None),
-                        Framing::Records => self.message(pipe.get(), bytes),
-                    }
-                }
-            }
-            _ => {
-                c.waiting = None;
-                c.rejected = true;
-                if let Some(id) = c.id.take() {
-                    self.listener.done(id);
-                }
-            }
-        }
-    }
-
-    /// Joins that waited for establishment are offered again.
+    /// Hellos held until establishment or the join keys are offered again.
     fn retry_waiting(&mut self) {
-        if self.session.state() == State::Establishing {
-            return;
-        }
         let names: Vec<String> = self
             .carriers
             .iter()
-            .filter(|(_, c)| c.waiting.is_some())
+            .filter(|(_, c)| c.waiting.is_some() && !c.rejected)
             .map(|(n, _)| n.clone())
             .collect();
         for n in names {
-            if let Some((frame, bytes, inband)) =
-                self.carriers.get_mut(&n).and_then(|c| c.waiting.take())
-            {
-                self.offer(&n, &frame, &bytes, inband);
+            if let Some(hello) = self.carriers.get(&n).and_then(|c| c.waiting.clone()) {
+                self.offer_hello(&n, &hello);
             }
         }
     }
@@ -918,80 +941,456 @@ impl Runner {
             c.held.push(bytes.to_vec());
             return;
         }
-        if c.waiting.is_some() {
-            if let Some(w) = c.waiting.as_mut() {
-                w.1.extend_from_slice(bytes);
-            }
+        if c.join.is_some() || c.waiting.is_some() {
+            c.buf.extend_from_slice(bytes);
+            c.msgs.extend_from_slice(messages);
             return;
         }
         let Some(id) = c.id else {
             return;
         };
-        let result = if c.framing == Framing::Records {
-            let mut r = Classified::NeedMore;
-            let mut rest: Vec<Vec<u8>> = Vec::new();
+        let results: Vec<Classified> = if c.framing == Framing::Records {
+            let mut out = Vec::new();
             for m in messages {
-                if matches!(r, Classified::NeedMore) {
-                    r = self.listener.message(id, m, now);
-                } else {
-                    rest.push(m.clone());
-                }
+                out.push(self.listener.message(id, m, now));
             }
-            if let Classified::Join {
-                locator,
-                frame,
-                bytes,
-                inband,
-            } = r
-            {
-                // The first message is fed after acceptance; later ones too.
-                let name = name.to_string();
-                self.join_found(&name, &locator, &frame, &bytes, inband);
-                if let Some(pipe) = self.carriers.get(&name).and_then(|c| c.pipe) {
-                    for m in rest {
-                        self.message(pipe, &m);
+            out
+        } else {
+            vec![self.listener.data(id, bytes, now)]
+        };
+        for result in results {
+            match result {
+                Classified::NeedMore => {}
+                // A listener carrier is never a lane (that is a stream of a
+                // connection carrying a pipe, `lane_bytes`).
+                Classified::Reject | Classified::NewSession { .. } | Classified::Lane { .. } => {
+                    if let Some(c) = self.carriers.get_mut(name) {
+                        c.rejected = true;
+                        c.outcome = Some("reject");
+                        c.id = None;
                     }
                 }
-                return;
-            }
-            r
-        } else {
-            self.listener.data(id, bytes, now)
-        };
-        match result {
-            Classified::NeedMore => {}
-            // A listener carrier is never a lane (that is a stream of a
-            // connection carrying a pipe, `lane_bytes`).
-            Classified::Reject | Classified::NewSession { .. } | Classified::Lane { .. } => {
-                if let Some(c) = self.carriers.get_mut(name) {
-                    c.rejected = true;
-                    c.id = None;
-                }
-            }
-            Classified::Join {
-                locator,
-                frame,
-                bytes,
-                inband,
-            } => {
-                let name = name.to_string();
-                self.join_found(&name, &locator, &frame, &bytes, inband);
+                // Closed: a stall of the reject policy writes nothing either.
+                Classified::BadHello { .. } => self.close_carrier(name, "reject"),
+                Classified::Join { hello, .. } => self.offer_hello(name, &hello),
             }
         }
     }
 
-    fn join_found(&mut self, name: &str, locator: &[u8], frame: &[u8], bytes: &[u8], inband: bool) {
-        // Step 3: the session lookup by locator.
-        if locator != self.session.local_locator() {
-            if let Some(c) = self.carriers.get_mut(name) {
-                c.rejected = true;
+    fn close_carrier(&mut self, name: &str, outcome: &'static str) {
+        if let Some(c) = self.carriers.get_mut(name) {
+            c.rejected = true;
+            c.outcome = Some(outcome);
+            c.buf.clear();
+            c.msgs.clear();
+            c.waiting = None;
+            c.join = None;
+            if let Some(id) = c.id.take() {
+                self.listener.done(id);
+            }
+        }
+    }
+
+    fn peer_carrier(&self, name: &str) -> PeerCarrier {
+        let c = &self.carriers[name];
+        PeerCarrier {
+            inbound: c.can_read.then_some(c.framing),
+            outbound: c.can_write.then_some(c.framing),
+            looped: false,
+            overhead: 0,
+            received: 0,
+        }
+    }
+
+    /// The listener's handshake from a Hello on, up to its confirmation. A
+    /// held join stays pending and is offered again.
+    fn offer_hello(&mut self, name: &str, hello: &[u8]) {
+        let now = self.now();
+        let timeout = self.session.config().handshake_wait();
+        let Some(c) = self.carriers.get_mut(name) else {
+            return;
+        };
+        c.deadline
+            .get_or_insert_with(|| now.checked_add(timeout).unwrap_or(now));
+        let framing = c.framing;
+        let binding = c.binding.clone();
+        let Ok(parsed) = seal_join::JoinHello::parse(framing, hello) else {
+            return self.close_carrier(name, "reject");
+        };
+        if !self.session.accepts_locator(parsed.locator()) {
+            return self.close_carrier(name, "reject");
+        }
+        let opened = self.session.open_hello(&parsed, &binding, now);
+        self.drain_events();
+        let mut join = match opened {
+            OpenedHello::Hold | OpenedHello::KeyWait => {
+                self.carriers.get_mut(name).expect("carrier").waiting = Some(hello.to_vec());
+                return;
+            }
+            OpenedHello::Verified(j) => j,
+            OpenedHello::Fatal => return self.close_carrier(name, "fatal"),
+            OpenedHello::AuthFailed
+            | OpenedHello::UnknownSuite
+            | OpenedHello::UnknownLocator
+            | OpenedHello::Close => {
+                return self.close_carrier(name, "reject");
+            }
+        };
+        self.carriers.get_mut(name).expect("carrier").waiting = None;
+        let allowed = self
+            .session
+            .config()
+            .allow_record_mode
+            .clone()
+            .is_none_or(|f| {
+                (f.0)(
+                    &zmux::proto::session::CarrierDescription::default(),
+                    join.mode(),
+                    None,
+                )
+            });
+        if !allowed {
+            return self.close_carrier(name, "reject"); // the Pipe ID's bit stays clear
+        }
+        let carrier = self.peer_carrier(name);
+        let claimed = self
+            .session
+            .claim_hello(&mut join, carrier, &Default::default(), now);
+        self.drain_events();
+        match claimed {
+            ClaimedHello::Accept(reply) => {
+                let c = self.carriers.get_mut(name).expect("carrier");
+                c.reply = Some(reply);
+                c.join = Some(join);
+                c.outcome = Some("accept");
+                self.peer_reads_reply(name);
+                let c = self.carriers.get_mut(name).expect("carrier");
+                if c.proven.is_some() && c.confirm {
+                    self.write_confirm(name);
+                }
+            }
+            ClaimedHello::Refuse(reply) => {
+                self.carriers.get_mut(name).expect("carrier").reply = Some(reply);
+                self.peer_reads_reply(name);
+                self.close_carrier(name, "refuse");
+            }
+            ClaimedHello::Close => self.close_carrier(name, "reject"),
+        }
+    }
+
+    /// The scripted peer verifies the Reply.
+    fn peer_reads_reply(&mut self, name: &str) {
+        let c = self.carriers.get_mut(name).expect("carrier");
+        let (Some(sent), Some(reply)) = (c.joiner.take(), c.reply.as_ref()) else {
+            return;
+        };
+        let Ok((proven, _)) = sent.read_reply(reply) else {
+            panic!("carrier {name}: the peer cannot read the Reply");
+        };
+        c.decision = proven.payload().join_accepted();
+        c.proven = Some(proven);
+    }
+
+    /// The scripted peer writes its confirmation; the carrier is Confirmed by it.
+    fn write_confirm(&mut self, name: &str) {
+        let c = self.carriers.get_mut(name).expect("carrier");
+        let Some(proven) = c.proven.take() else {
+            return;
+        };
+        let (confirm, _) = proven.write_confirm(0).expect("confirmation");
+        self.read_confirm(name, &confirm);
+    }
+
+    fn read_confirm(&mut self, name: &str, confirm: &[u8]) {
+        let now = self.now();
+        let carrier = self.peer_carrier(name);
+        let c = self.carriers.get_mut(name).expect("carrier");
+        let Some(mut join) = c.join.take() else {
+            return;
+        };
+        let framing = c.framing;
+        match join.read_confirm(confirm) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                c.join = Some(join);
+                return;
+            }
+            Err(_) => return self.close_carrier(name, "reject"),
+        }
+        let pipe = join.pipe().id;
+        let direction = join.pipe().direction;
+        let confirmed = self.session.confirm_join(*join, carrier, now);
+        self.drain_events();
+        match confirmed {
+            ConfirmedJoin::Attached { .. } => {
+                let c = self.carriers.get_mut(name).expect("carrier");
+                c.pipe = Some(pipe);
+                c.deadline = None;
+                let (read, write) = (c.can_read && direction != 1, c.can_write && direction != 0);
                 if let Some(id) = c.id.take() {
                     self.listener.done(id);
                 }
+                self.attach(pipe, Some(name), read, write, framing);
+                let c = self.carriers.get_mut(name).expect("carrier");
+                let (buf, msgs) = (std::mem::take(&mut c.buf), std::mem::take(&mut c.msgs));
+                if !buf.is_empty() {
+                    self.deliver(pipe, &buf, None);
+                }
+                for m in msgs {
+                    self.message(pipe, &m);
+                }
             }
-            return;
+            ConfirmedJoin::Refused | ConfirmedJoin::Close => {
+                let outcome = self.carriers[name].outcome.unwrap_or("reject");
+                self.close_carrier(name, outcome);
+            }
         }
-        self.offer(name, frame, bytes, inband);
+    }
+
+    /// `join_psk` of a role from the session secret of the local parameters and the
+    /// peer's, as both ends compute it. The wire examples give the nonces of a
+    /// Hello written before the peer's parameters reached the session.
+    /// `join_psk` of the latest epoch of key phase `phase` the runner derived.
+    fn join_psk_of(&self, initiator_role: bool, phase: u8) -> Vec<u8> {
+        let (secret0, encoded) = self.session_basics();
+        let secret = self
+            .epochs
+            .secrets
+            .iter()
+            .rev()
+            .find(|(e, _)| *e & 1 == u64::from(phase))
+            .map(|(_, s)| s.clone())
+            .unwrap_or(secret0);
+        let suite = seal_join::Suite::from_value(1).expect("Suite 1");
+        let role = if initiator_role {
+            seal::JoinRole::Initiator
+        } else {
+            seal::JoinRole::Responder
+        };
+        seal::derive_join_psk(suite, &secret, role, &encoded).expect("psk")
+    }
+
+    /// The secret of an epoch the runner derived; epoch 0 is the session secret.
+    fn epoch_secret(&self, e: u64) -> Option<Vec<u8>> {
+        if e == 0 {
+            return Some(self.session_basics().0);
+        }
+        self.epochs.secrets.get(&e).cloned()
+    }
+
+    /// A local SESSION_EPOCH: marks whether it repeats the first of its phase and epoch,
+    /// and derives the epoch an answer completes.
+    fn local_epoch_frame(&mut self, f: &mut Value) -> Result<(), String> {
+        let phase = f["phase"].as_str().unwrap_or("").to_string();
+        let epoch = f["epoch"].as_u64().unwrap_or(0);
+        let key = (phase.clone(), epoch);
+        let same = self
+            .epochs
+            .local_first
+            .get(&key)
+            .is_some_and(|first| first == f);
+        self.epochs
+            .local_first
+            .entry(key.clone())
+            .or_insert_with(|| f.clone());
+        let hx = |k: &str| crate::support::hex(f[k].as_str().unwrap_or(""));
+        let (share, locator) = (hx("share"), hx("locator"));
+        let body = zmux::proto::frame::SessionEpoch {
+            phase: wire::epoch_phase(&phase),
+            epoch,
+            share: &share,
+            locator: &locator,
+            raw: &[],
+        }
+        .body();
+        f["same_as_previous"] = json!(same);
+        self.epochs
+            .local_last
+            .insert(key, (body.clone(), share.clone()));
+        if phase == "answer"
+            && let Some((kex, offer_body)) = self.epochs.offers.remove(&epoch)
+        {
+            let ss = kex
+                .finish(&share)
+                .map_err(|e| format!("answer share: {e}"))?;
+            self.derive_epoch(epoch, &offer_body, &body, ss.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn derive_epoch(
+        &mut self,
+        epoch: u64,
+        offer: &[u8],
+        answer: &[u8],
+        ss: &[seal::Secret],
+    ) -> Result<(), String> {
+        let prev = self
+            .epoch_secret(epoch - 1)
+            .ok_or(format!("epoch {}: no secret", epoch - 1))?;
+        let (_, sc) = self.session_basics();
+        let (_, secret) = seal::derive_epoch_secret(&prev, epoch, &sc, offer, answer, ss)
+            .map_err(|e| e.to_string())?;
+        self.epochs.secrets.insert(epoch, secret.to_vec());
+        Ok(())
+    }
+
+    /// The session secret of the local parameters and the peer's, and `session_crypto`.
+    fn session_basics(&self) -> (Vec<u8>, Vec<u8>) {
+        const INIT_NONCE: [u8; 16] =
+            *b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff";
+        const RESP_NONCE: [u8; 16] =
+            *b"\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11\x00";
+        let local = self.session.local_parameters();
+        let own = local.zmux_multipath.expect("multipath").session_nonce;
+        let own_set = local.zmux_session_crypto.clone().expect("multipath");
+        let local_init = self.session.role() == Role::Initiator;
+        let (their, their_set) = match (
+            self.session.session_nonces(),
+            self.session.peer_session_crypto(),
+        ) {
+            (Some((_, n)), Some(set)) => (n, set.clone()),
+            _ => (
+                if local_init { RESP_NONCE } else { INIT_NONCE },
+                seal::SessionCrypto {
+                    suites: vec![1],
+                    groups: vec![2],
+                },
+            ),
+        };
+        let (i_nonce, r_nonce, i_set, r_set) = if local_init {
+            (own, their, own_set, their_set)
+        } else {
+            (their, own, their_set, own_set)
+        };
+        let encoded = seal::session_crypto(&i_set, &r_set).expect("sets");
+        let key = self.session.config().pipe_auth.psk_bytes();
+        let secret = zmux::proto::keys::session_secret(&i_nonce, &r_nonce, &[], key);
+        (secret.to_vec(), encoded)
+    }
+
+    fn peer_is_initiator(&self) -> bool {
+        self.session.role() != Role::Initiator
+    }
+
+    fn check_outcome(&self, name: &str, want: &str) -> Result<(), String> {
+        let c = &self.carriers[name];
+        let got = c.outcome.unwrap_or("none");
+        if got != want {
+            return Err(format!("carrier {name}: outcome {got:?}, want {want:?}"));
+        }
+        match want {
+            "accept" | "refuse" => {
+                if c.decision == Some(want == "refuse") {
+                    return Err(format!("carrier {name}: decision, want {want}"));
+                }
+            }
+            _ => {
+                if c.reply.is_some() {
+                    return Err(format!("carrier {name}: wrote a Reply, want {want}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every local join writes its Hello once allowed.
+    fn write_hellos(&mut self) {
+        let now = self.now();
+        let ids: Vec<u64> = self
+            .pipes
+            .iter()
+            .filter(|(_, p)| p.joining && p.hello.is_none())
+            .map(|(&i, _)| i)
+            .collect();
+        for id in ids {
+            let framing = self.pipes[&id].framing.unwrap_or(Framing::ByteStream);
+            let pipe = PipeId::new(id);
+            let r = self.session.join_prepare(pipe, now).map(|ready| {
+                ready.map(|_| {
+                    self.session
+                        .join_hello(pipe, (framing, 0), &Default::default(), now)
+                })
+            });
+            self.drain_events();
+            match r {
+                Ok(Some(Ok(hello))) => self.pipes.get_mut(&id).expect("pipe").hello = Some(hello),
+                Ok(None) => {}
+                Ok(Some(Err(_))) | Err(_) => self.pipes.get_mut(&id).expect("pipe").joining = false,
+            }
+        }
+    }
+
+    /// The scripted peer reads the Hello of a local join.
+    fn read_hello(&mut self, id: u64) -> Result<(u8, Vec<u8>, seal::Payload), String> {
+        self.write_hellos();
+        let local_init = !self.peer_is_initiator();
+        let p = self.pipes.get(&id).ok_or(format!("no pipe {id}"))?;
+        let hello = p
+            .hello
+            .clone()
+            .ok_or(format!("pipe {id}: no Hello written"))?;
+        let framing = p.framing.unwrap_or(Framing::ByteStream);
+        let phase = seal_join::JoinHello::parse(framing, &hello)
+            .map_err(|e| format!("pipe {id}: Hello: {e}"))?
+            .phase();
+        let psk = self.join_psk_of(local_init, phase);
+        let p = self.pipes.get_mut(&id).ok_or(format!("no pipe {id}"))?;
+        let parsed = seal_join::JoinHello::parse(framing, &hello)
+            .map_err(|e| format!("pipe {id}: Hello: {e}"))?;
+        let (acc, payload) = seal_join::Acceptor::open(
+            &parsed,
+            seal_join::AcceptorKeys {
+                psk: &psk,
+                binding: &[],
+                groups: &[1, 2],
+            },
+        )
+        .map_err(|e| format!("pipe {id}: Hello does not verify: {e}"))?;
+        let mode = parsed.mode().byte();
+        let locator = parsed.locator().to_vec();
+        p.hello_phase = Some(parsed.phase());
+        p.acceptor = Some(acc);
+        Ok((mode, locator, payload))
+    }
+
+    /// Feeds bytes to a JOINING carrier.
+    fn joiner_feed(&mut self, id: u64, data: &[u8]) -> Result<(), String> {
+        let now = self.now();
+        let p = self.pipes.get_mut(&id).ok_or(format!("no pipe {id}"))?;
+        p.reply_in.extend_from_slice(data);
+        while self.pipes[&id].joining {
+            let input = self.pipes[&id].reply_in.clone();
+            let step = self.session.verify_reply(PipeId::new(id), &input, now);
+            self.drain_events();
+            let p = self.pipes.get_mut(&id).expect("pipe");
+            match step {
+                JoinStep::More { consumed, .. } => {
+                    p.reply_in.drain(..consumed);
+                    if consumed == 0 {
+                        return Ok(());
+                    }
+                }
+                JoinStep::Verified { consumed, .. } => {
+                    let pipe = PipeId::new(id);
+                    let done = self.session.join_finish(pipe, &Default::default(), now);
+                    self.drain_events();
+                    assert!(done.is_ok(), "pipe {id}: join_finish");
+                    let p = self.pipes.get_mut(&id).expect("pipe");
+                    p.joining = false;
+                    p.reply_in.drain(..consumed);
+                    let rest = std::mem::take(&mut p.reply_in);
+                    if !rest.is_empty() {
+                        self.deliver(id, &rest, None);
+                    }
+                }
+                JoinStep::Declined | JoinStep::Failed => {
+                    p.joining = false;
+                    p.reply_in.clear();
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- steps ---------------------------------------------------------------
@@ -1009,7 +1408,6 @@ impl Runner {
                 carrier,
                 dir,
                 via,
-                oob_join,
                 carrier_binding,
                 pairing,
                 framing,
@@ -1037,6 +1435,16 @@ impl Runner {
                             id: Some(id),
                             binding: Vec::new(),
                             waiting: None,
+                            join: None,
+                            buf: Vec::new(),
+                            msgs: Vec::new(),
+                            joiner: None,
+                            proven: None,
+                            confirm: true,
+                            reply: None,
+                            decision: None,
+                            outcome: None,
+                            deadline: None,
                             rejected: false,
                             pairing: None,
                             held: Vec::new(),
@@ -1077,6 +1485,16 @@ impl Runner {
                         .map(|b| b.0.clone())
                         .unwrap_or_default(),
                     waiting: None,
+                    join: None,
+                    buf: Vec::new(),
+                    msgs: Vec::new(),
+                    joiner: None,
+                    proven: None,
+                    confirm: true,
+                    reply: None,
+                    decision: None,
+                    outcome: None,
+                    deadline: None,
                     rejected: false,
                     pairing: None,
                     held: Vec::new(),
@@ -1088,7 +1506,7 @@ impl Runner {
                     let token: [u8; 16] =
                         token.0.clone().try_into().map_err(|_| "pairing length")?;
                     // The pairing table lives in the listener; carriers that
-                    // are paired form pipe 0 (SPEC.md 6.1.1).
+                    // are paired form pipe 0.
                     let fake = CarrierId(u64::MAX - self.carriers.len() as u64);
                     match self.listener.pair(token, fake, read, now) {
                         Paired::Waiting => {
@@ -1145,25 +1563,7 @@ impl Runner {
                     }
                     Opened::Refused => c.rejected = true,
                 }
-                let oob = oob_join.as_ref().map(|h| h.0.clone());
-                let id = c.id;
-                self.carriers.insert(name.clone(), c);
-                if let (Some(frame), Some(id)) = (oob, id) {
-                    match self.listener.oob(id, &frame, now) {
-                        Classified::Join {
-                            locator,
-                            frame,
-                            bytes,
-                            inband,
-                        } => self.join_found(&name, &locator, &frame, &bytes, inband),
-                        _ => {
-                            if let Some(c) = self.carriers.get_mut(&name) {
-                                c.rejected = true;
-                                c.id = None;
-                            }
-                        }
-                    }
-                }
+                self.carriers.insert(name, c);
                 self.flush()
             }
             Op::PipeDown {
@@ -1221,6 +1621,235 @@ impl Runner {
                     );
                 }
                 Ok(())
+            }
+            Op::PeerJoin {
+                carrier,
+                pipe,
+                direction,
+                fate_group,
+                priority,
+                standby,
+                locator,
+                mode,
+                outcome,
+                batch,
+                bad_key,
+                binding,
+                hold,
+                confirm,
+                group,
+                key_share,
+                phase,
+            } => {
+                let mut psk = self.join_psk_of(self.peer_is_initiator(), *phase);
+                if *bad_key {
+                    psk[0] ^= 0xff;
+                }
+                let c = self.carriers.get(carrier).ok_or("unknown carrier")?;
+                let framing = c.framing;
+                let mode = match mode.as_deref() {
+                    Some("sealed") => seal::Mode::Sealed,
+                    Some("bound") => seal::Mode::Bound,
+                    _ => seal::Mode::Trusted,
+                };
+                let suite = seal_join::Suite::from_value(1).expect("Suite 1");
+                let empty = Vec::new();
+                let binding = binding.as_ref().map_or(&empty, |b| &b.0);
+                let group = seal::Group::from_value(group.unwrap_or(2)).ok_or("unknown group")?;
+                let joiner = seal_join::Joiner::new(seal_join::JoinConfig {
+                    suite,
+                    group,
+                    mode,
+                    phase: *phase,
+                    framing,
+                    locator: &locator.0,
+                    psk: &psk,
+                    binding,
+                })
+                .map_err(|e| e.to_string())?;
+                let item = seal::JoinPipe {
+                    id: *pipe,
+                    direction: match direction.as_str() {
+                        "up" => 0,
+                        "down" => 1,
+                        _ => 2,
+                    },
+                    fate_group: *fate_group,
+                    priority: *priority,
+                    standby: *standby,
+                }
+                .encode();
+                let frames: Vec<u8> = batch
+                    .as_ref()
+                    .map(|f| wire::encode_frames(f, &|_, _| 0))
+                    .unwrap_or_default();
+                let mut items: Vec<(u64, &[u8])> = vec![(5, &item)];
+                if !frames.is_empty() {
+                    items.push((6, &frames));
+                }
+                let payload = seal::encode_payload(&items);
+                let share = key_share_override(group, key_share.as_deref())?;
+                let (hello, sent) = joiner
+                    .write_hello_with_unknown(&payload, share)
+                    .map_err(|e| e.to_string())?;
+                let c = self.carriers.get_mut(carrier).expect("carrier");
+                c.joiner = Some(sent);
+                c.confirm = confirm.unwrap_or(true);
+                if c.rejected {
+                    return self.check_outcome(carrier, outcome);
+                }
+                if framing == Framing::Records {
+                    self.carrier_bytes(carrier, &[], std::slice::from_ref(&hello));
+                } else {
+                    self.carrier_bytes(carrier, &hello, &[]);
+                }
+                if *hold {
+                    return if self.carriers[carrier].waiting.is_some() {
+                        Ok(())
+                    } else {
+                        Err(format!("carrier {carrier}: the join was not held"))
+                    };
+                }
+                self.check_outcome(carrier, outcome)
+            }
+            Op::PeerJoinFinish { carrier, outcome } => {
+                self.retry_waiting();
+                if self
+                    .carriers
+                    .get(carrier)
+                    .is_some_and(|c| c.waiting.is_some())
+                {
+                    return Err(format!("carrier {carrier}: the join is still held"));
+                }
+                self.check_outcome(carrier, outcome)
+            }
+            Op::PeerConfirm { carrier } => {
+                if self.carriers.get(carrier).is_none_or(|c| c.join.is_none()) {
+                    return Err(format!("carrier {carrier} is not Unconfirmed"));
+                }
+                self.write_confirm(carrier);
+                Ok(())
+            }
+            Op::ExpectJoinHello {
+                pipe,
+                direction,
+                fate_group,
+                priority,
+                standby,
+                locator,
+                mode,
+                batch: _,
+                group,
+                phase,
+            } => {
+                self.flush()?;
+                let (got_mode, got_locator, payload) = self.read_hello(*pipe)?;
+                if let Some(g) = group
+                    && payload.key_share().map(|k| k.0) != Some(*g)
+                {
+                    return Err(format!(
+                        "Hello key share {:?}, want Group {g}",
+                        payload.key_share().map(|k| k.0)
+                    ));
+                }
+                if let Some(ph) = phase
+                    && self.pipes[pipe].hello_phase != Some(*ph)
+                {
+                    return Err(format!(
+                        "Hello key phase {:?}, want {ph}",
+                        self.pipes[pipe].hello_phase
+                    ));
+                }
+                let (frames, _, _) = self.take_frames(&crate::model::PipeSelector::Id(*pipe), None);
+                if !frames.is_empty() {
+                    return Err(format!("frames besides the Hello: {}", summarise(&frames)));
+                }
+                let item = payload.join_pipe().ok_or("no join pipe")?;
+                let dir = ["up", "down", "bidi"][usize::from(item.direction)];
+                if item.id != *pipe
+                    || dir != direction
+                    || item.fate_group != *fate_group
+                    || item.priority != *priority
+                    || item.standby != *standby
+                {
+                    return Err(format!("Hello fields {item:?}"));
+                }
+                if got_locator != locator.0 {
+                    return Err(format!("Hello locator {}", to_hex(&got_locator)));
+                }
+                let want = match mode.as_str() {
+                    "sealed" => 0,
+                    "bound" => 1,
+                    _ => 2,
+                };
+                if got_mode != want {
+                    return Err(format!("Hello mode {got_mode}"));
+                }
+                if let Some(patterns) = step.raw["batch"].as_array() {
+                    let gates = Gates::ALL;
+                    let mut frames: Vec<Value> = Vec::new();
+                    let mut b = payload.frames().unwrap_or_default();
+                    while !b.is_empty() {
+                        let (f, n) = zmux::proto::frame::Frame::decode(b, &gates)
+                            .map_err(|e| format!("first batch: {e}"))?;
+                        frames.push(wire::frame_json(&f));
+                        b = &b[n..];
+                    }
+                    match_exact(patterns, &frames).map_err(|e| {
+                        format!("first batch: {e}\n    frames: {}", summarise(&frames))
+                    })?;
+                }
+                Ok(())
+            }
+            Op::PeerJoinReply {
+                pipe,
+                decision,
+                leading_parameters,
+            } => {
+                self.flush()?;
+                if self.pipes.get(pipe).is_none_or(|p| p.acceptor.is_none()) {
+                    self.read_hello(*pipe)?;
+                }
+                let p = self.pipes.get_mut(pipe).ok_or("no pipe")?;
+                let acc = p.acceptor.take().ok_or("no Hello read")?;
+                let framing = p.framing.unwrap_or(Framing::ByteStream);
+                let payload = seal::encode_payload(&[(7, &[*decision])]);
+                let (mut reply, _) = acc.write_reply(&payload).map_err(|e| e.to_string())?;
+                if *leading_parameters {
+                    let mut block = vec![0u8; 512];
+                    let tp = self.session.local_parameters();
+                    let n = tp
+                        .encode_frame(None, &mut block)
+                        .map_err(|e| e.to_string())?;
+                    block.truncate(n);
+                    if framing == Framing::Records {
+                        self.joiner_feed(*pipe, &block)?;
+                    } else {
+                        let mut rec = vec![0u8; 8];
+                        let w = varint::encode(n as u64, &mut rec).map_err(|e| e.to_string())?;
+                        rec.truncate(w);
+                        rec.extend_from_slice(&block);
+                        rec.append(&mut reply);
+                        reply = rec;
+                    }
+                }
+                self.joiner_feed(*pipe, &reply)
+            }
+            Op::PeerSend {
+                pipe: Some(p),
+                records,
+                hex,
+                ..
+            } if self.pipes.get(p).is_some_and(|x| x.joining) => {
+                let data = match (hex, records) {
+                    (Some(h), _) => h.0.clone(),
+                    (None, Some(r)) => r
+                        .iter()
+                        .flat_map(|f| wire::encode_record(f, &|_, _| 0))
+                        .collect(),
+                    _ => return Err("peer_send without bytes".into()),
+                };
+                self.joiner_feed(*p, &data)
             }
             Op::PeerSend {
                 pipe,
@@ -1303,6 +1932,88 @@ impl Runner {
                         self.carrier_bytes(&c, &bytes, &[]);
                     }
                     _ => return Err("peer_send without a target".into()),
+                }
+                Ok(())
+            }
+            Op::PeerEpoch {
+                pipe,
+                phase,
+                epoch,
+                locator,
+                share_len,
+                repeat,
+            } => {
+                let key = (phase.clone(), *epoch);
+                let frame = if *repeat {
+                    self.epochs
+                        .written
+                        .get(&key)
+                        .cloned()
+                        .ok_or("peer_epoch repeat without an earlier frame")?
+                } else {
+                    let group = seal::Group::from_value(2).expect("Group 2");
+                    let mut derive = None;
+                    let share = match (phase.as_str(), share_len) {
+                        (_, Some(n)) => vec![0x5a; *n],
+                        ("offer", None) => {
+                            let (share, kex) = group.initiate().map_err(|e| e.to_string())?;
+                            derive = Some(kex);
+                            share
+                        }
+                        ("answer", None) => {
+                            match self.epochs.local_last.get(&("offer".into(), *epoch)) {
+                                Some((_, offer_share)) => {
+                                    let (share, ss) =
+                                        group.respond(offer_share).map_err(|e| e.to_string())?;
+                                    let offer_body =
+                                        self.epochs.local_last[&("offer".into(), *epoch)].0.clone();
+                                    let body = zmux::proto::frame::SessionEpoch {
+                                        phase: zmux::proto::frame::EpochPhase::Answer,
+                                        epoch: *epoch,
+                                        share: &share,
+                                        locator: &locator.0,
+                                        raw: &[],
+                                    }
+                                    .body();
+                                    self.derive_epoch(*epoch, &offer_body, &body, ss.as_slice())?;
+                                    share
+                                }
+                                None => vec![0x5a; group.responder_share_len()],
+                            }
+                        }
+                        (p, _) => return Err(format!("peer_epoch phase {p}")),
+                    };
+                    let f = zmux::proto::frame::SessionEpoch {
+                        phase: wire::epoch_phase(phase),
+                        epoch: *epoch,
+                        share: &share,
+                        locator: &locator.0,
+                        raw: &[],
+                    };
+                    if let Some(kex) = derive {
+                        self.epochs.offers.insert(*epoch, (kex, f.body()));
+                    }
+                    let mut buf = vec![0; zmux::proto::frame::Frame::SessionEpoch(f).encoded_len()];
+                    zmux::proto::frame::Frame::SessionEpoch(f)
+                        .encode(&mut buf)
+                        .map_err(|e| e.to_string())?;
+                    self.epochs.written.insert(key, buf.clone());
+                    buf
+                };
+                let framing = self
+                    .pipes
+                    .get(pipe)
+                    .and_then(|x| x.in_framing)
+                    .unwrap_or(Framing::ByteStream);
+                if framing == Framing::Records {
+                    self.message(*pipe, &frame);
+                } else {
+                    let mut rec = vec![0u8; 8];
+                    let w =
+                        varint::encode(frame.len() as u64, &mut rec).map_err(|e| e.to_string())?;
+                    rec.truncate(w);
+                    rec.extend_from_slice(&frame);
+                    self.deliver(*pipe, &rec, None);
                 }
                 Ok(())
             }
@@ -1777,13 +2488,12 @@ impl Runner {
                     opts.weight = w;
                 }
                 opts.probation = a.probation.map(Duration::from_millis);
-                let binding = a.carrier_bound.then_some(&[0u8; 32][..]);
                 match s.add_pipe(
                     read.then_some(framing),
                     write.then_some(framing),
                     &opts,
-                    a.oob,
-                    binding,
+                    seal::Mode::Trusted,
+                    None,
                     now,
                 ) {
                     Ok(id) => {
@@ -1796,6 +2506,9 @@ impl Runner {
                         }
                         let waiting = s.join_deferred(id);
                         self.attach(id.get(), None, read, write, framing);
+                        let p = self.pipe_mut(id.get());
+                        p.joining = true;
+                        p.framing = Some(framing);
                         if waiting {
                             json!({"pending": true})
                         } else {
@@ -1860,6 +2573,13 @@ impl Runner {
                 match self.session.set_redundant(key, Some(a.redundant)) {
                     Ok(()) => ok,
                     Err(e) => stream_error(&e),
+                }
+            }
+            Call::AdvanceEpoch(_) => {
+                let now = self.now();
+                match self.session.advance_epoch(now) {
+                    Ok(()) => ok,
+                    Err(e) => pipe_error(&e),
                 }
             }
             Call::RevalidatePipes(a) => {
@@ -1944,11 +2664,17 @@ fn session_fields(e: &SessionError) -> (ErrorSpace, Value, bool) {
         SessionError::HandshakeTimeout => (ErrorSpace::Local, json!("HANDSHAKE_TIMEOUT"), false),
         SessionError::EarlyDataRejected => (ErrorSpace::Local, json!("EARLY_DATA_REJECTED"), false),
         SessionError::PipesLost { .. } => (ErrorSpace::Local, json!("PIPES_LOST"), false),
-        // Locally, CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT) (RESUME.md Section 8).
+        // Locally, CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT) (the resume deadline passed).
         SessionError::ResumeTimeout { .. } => (
             ErrorSpace::Transport,
             json!(zmux::proto::TransportErrorCode::ZMUX_RESUME_TIMEOUT.0),
             false,
+        ),
+        // CONNECTION_CLOSE(ZMUX_RESUME_FAILED), sent or received.
+        SessionError::ResumeFailed { remote, .. } => (
+            ErrorSpace::Transport,
+            json!(zmux::proto::TransportErrorCode::ZMUX_RESUME_FAILED.0),
+            *remote,
         ),
         other => (ErrorSpace::Local, json!(format!("{other:?}")), false),
     }
@@ -2042,7 +2768,6 @@ fn event_name(e: &CoreEvent) -> Option<EventName> {
         CoreEvent::GoAway { .. } => EventName::GoawayReceived,
         CoreEvent::DatagramsDropped { .. } => EventName::DatagramDropped,
         CoreEvent::Closed(_) => EventName::Closed,
-        CoreEvent::OobJoin { .. } => EventName::OobJoin,
         CoreEvent::JoinAuthFailed { .. } => EventName::JoinAuthFailed,
         CoreEvent::Suspended => EventName::Suspended,
         CoreEvent::Resumed => EventName::Resumed,
@@ -2118,26 +2843,14 @@ fn match_event(
             Some(spec) => match_close(spec, err),
             None => Ok(()),
         },
-        CoreEvent::OobJoin { pipe, frame } => {
-            if fields.pipe.is_some_and(|p| p != pipe.get()) {
-                return Err(format!("oob_join pipe {}", pipe.get()));
+        CoreEvent::JoinAuthFailed { reason } => {
+            let want = fields.reason.map_or("auth", |r| r.name());
+            if *reason == want {
+                Ok(())
+            } else {
+                Err(format!("join_auth_failed reason {reason}, want {want}"))
             }
-            if let Some(f) = &fields.frame
-                && f.0 != frame[..]
-            {
-                return Err(format!("oob_join frame {}", to_hex(frame)));
-            }
-            Ok(())
         }
-        CoreEvent::JoinAuthFailed { carrier_bound } => match fields.reason {
-            Some(crate::model::AuthFailure::Mac) if *carrier_bound => {
-                Err("join_auth_failed reason mac_carrier_bound".into())
-            }
-            Some(crate::model::AuthFailure::MacCarrierBound) if !*carrier_bound => {
-                Err("join_auth_failed reason mac".into())
-            }
-            _ => Ok(()),
-        },
         CoreEvent::Suspended | CoreEvent::Resumed => Ok(()),
         CoreEvent::PipeRetired { pipe } => {
             if fields.pipe.is_some_and(|p| p != pipe.get()) {
@@ -2459,7 +3172,7 @@ fn match_unordered(patterns: &[Value], frames: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-/// SPEC.md Section 8.3 rule 5: at most one MAX_DATA, one MAX_STREAM_DATA
+/// Credit coalescing: at most one MAX_DATA, one MAX_STREAM_DATA
 /// per stream and one MAX_STREAMS per type in a record.
 fn check_one_credit(records: &[Vec<Value>]) -> Result<(), String> {
     for r in records {
@@ -2522,9 +3235,7 @@ fn traces_run_against_the_core() {
     let mut passed: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = Vec::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let all = crate::traces::load_all()
-        .into_iter()
-        .chain(crate::traces::load_local());
+    let all = crate::traces::load_all();
     for (_rel, trace) in all {
         let group = trace.header.groups.first().cloned().unwrap_or_default();
         if !RUN_GROUPS.contains(&group.as_str()) {
@@ -2591,3 +3302,33 @@ const KNOWN_SPEC_ISSUES: &[(&str, &str)] = &[];
 
 #[allow(dead_code)]
 fn unused(_: &record::Event<'_>) {}
+
+/// The key share a `peer_join` writes instead of its own: none, one byte short, or an
+/// X25519 share of a small-order point.
+fn key_share_override(
+    group: &'static seal::Group,
+    how: Option<&str>,
+) -> Result<Option<seal_join::ShareOverride>, String> {
+    let fresh = || -> Result<Vec<u8>, String> {
+        let (share, _) = group.initiate().map_err(|e| e.to_string())?;
+        let mut v = Vec::new();
+        seal::put_varint(&mut v, group.value());
+        v.extend_from_slice(&share);
+        Ok(v)
+    };
+    Ok(match how {
+        None => None,
+        Some("missing") => Some(seal_join::ShareOverride::Missing),
+        Some("bad_length") => {
+            let mut v = fresh()?;
+            v.pop();
+            Some(seal_join::ShareOverride::Value(v))
+        }
+        Some("low_order") => {
+            let mut v = fresh()?;
+            v[1..33].fill(0);
+            Some(seal_join::ShareOverride::Value(v))
+        }
+        Some(other) => return Err(format!("key_share {other}")),
+    })
+}

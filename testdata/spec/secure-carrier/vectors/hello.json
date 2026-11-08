@@ -1,0 +1,448 @@
+[
+ {
+  "name": "establish-profile1-handle",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "01004848484848484848484848484848484804e0",
+  "fill": 1248,
+  "consumed": 1268
+ },
+ {
+  "name": "establish-profile3-handle",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "03004848484848484848484848484848484804e0",
+  "fill": 1248,
+  "consumed": 1268
+ },
+ {
+  "name": "establish-handle-cut",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "01004848484848484848",
+  "fill": 0,
+  "need": 18,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-handle-cut-before-length",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "010048484848484848484848484848484848",
+  "fill": 0,
+  "need": 20,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-empty-msg1-parses",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "0100484848484848484848484848484848480000",
+  "fill": 0,
+  "consumed": 20
+ },
+ {
+  "name": "establish-longest-msg1",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "010048484848484848484848484848484848ffff",
+  "fill": 65535,
+  "consumed": 65555
+ },
+ {
+  "name": "establish-msg1-cut",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "010048484848484848484848484848484848ffff",
+  "fill": 65534,
+  "need": 65555,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-byte-only",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "01",
+  "fill": 0,
+  "need": 2,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-empty",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "",
+  "fill": 0,
+  "need": 1,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-escape-cut",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "0840",
+  "fill": 0,
+  "need": 3,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-profile4-no-handle",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "040004c0",
+  "fill": 1216,
+  "consumed": 1220
+ },
+ {
+  "name": "establish-profile5-no-handle",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "050004c0",
+  "fill": 1216,
+  "consumed": 1220
+ },
+ {
+  "name": "establish-profile5-no-handle-cut",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "050004c0",
+  "fill": 1215,
+  "need": 1220,
+  "error": "incomplete"
+ },
+ {
+  "name": "establish-unassigned-profile6",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "060004c0",
+  "fill": 1216,
+  "error": "unknown_profile"
+ },
+ {
+  "name": "establish-escape-unassigned-profile9",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "0809004848484848484848484848484848484804e0",
+  "fill": 1248,
+  "error": "unknown_profile"
+ },
+ {
+  "name": "establish-escape-private-profile",
+  "kind": "establish",
+  "framing": "stream",
+  "header": "08c000000040000000004848484848484848484848484848484804e0",
+  "fill": 1248,
+  "error": "unknown_profile"
+ },
+ {
+  "name": "establish-message-longest",
+  "kind": "establish",
+  "framing": "message",
+  "header": "010048484848484848484848484848484848",
+  "fill": 65535,
+  "consumed": 65553
+ },
+ {
+  "name": "establish-message-over",
+  "kind": "establish",
+  "framing": "message",
+  "header": "010048484848484848484848484848484848",
+  "fill": 65536,
+  "error": "too_large"
+ },
+ {
+  "name": "establish-message-empty-msg1-parses",
+  "kind": "establish",
+  "framing": "message",
+  "header": "010048484848484848484848484848484848",
+  "fill": 0,
+  "consumed": 18
+ },
+ {
+  "name": "establish-message-handle-cut",
+  "kind": "establish",
+  "framing": "message",
+  "header": "0300484848484848484848484848484848",
+  "fill": 0,
+  "error": "malformed"
+ },
+ {
+  "name": "establish-message-profile4",
+  "kind": "establish",
+  "framing": "message",
+  "header": "0400",
+  "fill": 1216,
+  "consumed": 1218
+ },
+ {
+  "name": "frame-longest",
+  "kind": "frame",
+  "framing": "stream",
+  "header": "ffff",
+  "fill": 65535,
+  "consumed": 65537
+ },
+ {
+  "name": "frame-cut",
+  "kind": "frame",
+  "framing": "stream",
+  "header": "ffff",
+  "fill": 65534,
+  "need": 65537,
+  "error": "incomplete"
+ },
+ {
+  "name": "frame-message-longest",
+  "kind": "frame",
+  "framing": "message",
+  "header": "",
+  "fill": 65535,
+  "consumed": 65535
+ },
+ {
+  "name": "frame-message-over",
+  "kind": "frame",
+  "framing": "message",
+  "header": "",
+  "fill": 65536,
+  "error": "too_large"
+ },
+ {
+  "name": "reply-longest",
+  "kind": "reply",
+  "framing": "stream",
+  "header": "035252525252525252525252525252525252525252525252525252525252525252ffff",
+  "fill": 65535,
+  "consumed": 65570
+ },
+ {
+  "name": "reply-cut",
+  "kind": "reply",
+  "framing": "stream",
+  "header": "035252525252525252525252525252525252525252525252525252525252525252ffff",
+  "fill": 65534,
+  "need": 65570,
+  "error": "incomplete"
+ },
+ {
+  "name": "reply-empty",
+  "kind": "reply",
+  "framing": "stream",
+  "header": "",
+  "fill": 0,
+  "need": 1,
+  "error": "incomplete"
+ },
+ {
+  "name": "reply-type",
+  "kind": "reply",
+  "framing": "stream",
+  "header": "04",
+  "fill": 0,
+  "error": "malformed"
+ },
+ {
+  "name": "reply-message-longest",
+  "kind": "reply",
+  "framing": "message",
+  "header": "035252525252525252525252525252525252525252525252525252525252525252",
+  "fill": 65535,
+  "consumed": 65568
+ },
+ {
+  "name": "reply-message-over",
+  "kind": "reply",
+  "framing": "message",
+  "header": "035252525252525252525252525252525252525252525252525252525252525252",
+  "fill": 65536,
+  "error": "too_large"
+ },
+ {
+  "name": "join-shortest-locator",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-longest-locator",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100ff4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 309
+ },
+ {
+  "name": "join-locator-zero",
+  "kind": "join",
+  "framing": "stream",
+  "header": "0201000052525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_handle"
+ },
+ {
+  "name": "join-longest-ciphertext",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100104c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c5252525252525252525252525252525252525252525252525252525252525252ffff",
+  "fill": 65535,
+  "consumed": 65589
+ },
+ {
+  "name": "join-ciphertext-cut",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100104c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c5252525252525252525252525252525252525252525252525252525252525252ffff",
+  "fill": 65534,
+  "need": 65589,
+  "error": "incomplete"
+ },
+ {
+  "name": "join-suite-cut",
+  "kind": "join",
+  "framing": "stream",
+  "header": "0240",
+  "fill": 0,
+  "need": 3,
+  "error": "incomplete"
+ },
+ {
+  "name": "join-empty",
+  "kind": "join",
+  "framing": "stream",
+  "header": "",
+  "fill": 0,
+  "need": 1,
+  "error": "incomplete"
+ },
+ {
+  "name": "join-r-cut",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100044c4c4c4c525252525252525252525252",
+  "fill": 0,
+  "need": 40,
+  "error": "incomplete"
+ },
+ {
+  "name": "join-suite2",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020200014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-message-longest",
+  "kind": "join",
+  "framing": "message",
+  "header": "020100104c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c5252525252525252525252525252525252525252525252525252525252525252",
+  "fill": 65535,
+  "consumed": 65587
+ },
+ {
+  "name": "join-message-over",
+  "kind": "join",
+  "framing": "message",
+  "header": "020100104c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c5252525252525252525252525252525252525252525252525252525252525252",
+  "fill": 65536,
+  "error": "too_large"
+ },
+ {
+  "name": "join-message-no-ciphertext-parses",
+  "kind": "join",
+  "framing": "message",
+  "header": "020100014c5252525252525252525252525252525252525252525252525252525252525252",
+  "fill": 0,
+  "consumed": 37
+ },
+ {
+  "name": "join-mode-byte-00",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020100014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-01",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020101014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-02",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020102014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-80",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020180014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-81",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020181014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-82",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020182014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "consumed": 55
+ },
+ {
+  "name": "join-mode-byte-03",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020103014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_flags"
+ },
+ {
+  "name": "join-mode-byte-04",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020104014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_flags"
+ },
+ {
+  "name": "join-mode-byte-40",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020140014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_flags"
+ },
+ {
+  "name": "join-mode-byte-7f",
+  "kind": "join",
+  "framing": "stream",
+  "header": "02017f014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_flags"
+ },
+ {
+  "name": "join-mode-byte-83",
+  "kind": "join",
+  "framing": "stream",
+  "header": "020183014c52525252525252525252525252525252525252525252525252525252525252520010",
+  "fill": 16,
+  "error": "bad_flags"
+ }
+]

@@ -76,8 +76,8 @@ impl Hop {
     }
 
     fn close(&self) {
-        self.a.close(VarInt::ZERO, b"");
-        self.b.close(VarInt::ZERO, b"");
+        drop(self.a.close(VarInt::ZERO, b""));
+        drop(self.b.close(VarInt::ZERO, b""));
     }
 }
 
@@ -317,7 +317,7 @@ fn a_lost_session_resets_and_stops_the_other_side_with_carrier_failed() {
             let relay = hop.relay(SpliceOptions::default());
             let ((_s, _r), (fs, mut fr)) = hop.stream(b"x").await;
             // A's session goes away under the relay.
-            hop.a.close(VarInt::from_u32(5), b"");
+            hop.a.close(VarInt::from_u32(5), b"").await;
             let (_, e) = watchdog(10, "B reads", read_until_end(&mut fr)).await;
             assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == carrier_failed()));
             assert_eq!(
@@ -531,8 +531,7 @@ fn a_splice_cancelled_in_a_limiter_wait_leaves_nothing_behind() {
     });
 }
 
-/// A downstream window smaller than a step (Appendix
-/// A.2 step 1): once what the relay wrote was sent, the capacity left
+/// A downstream window smaller than the relay's forwarding step: once what the relay wrote was sent, the capacity left
 /// below the step is forwarded, though no credit arrives (B reads nothing,
 /// so it sends no MAX_STREAM_DATA) and nothing else happens upstream: the
 /// drained send buffer wakes the capacity wait.

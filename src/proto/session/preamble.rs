@@ -1,4 +1,4 @@
-//! The application's view of a stream preamble (EXTENSIONS.md Section 4):
+//! The application's view of a stream preamble:
 //! one value given when a stream is opened and returned for a stream the
 //! peer opened, so that a relay forwards it whole.
 
@@ -13,16 +13,17 @@ use crate::proto::varint;
 use super::OpenError;
 
 /// A stream's preamble: its open info, its application TLVs in order, and
-/// whether it carries a pipe pair of a nested session (EXTENSIONS.md
-/// Sections 4 and 10.2).
+/// whether it carries a pipe pair of a nested session.
 ///
 /// Given when the stream is opened ([`Session::open_bi_with`](crate::Session#method.open_bi_with),
-/// [`Session::open_uni_with`](crate::Session#method.open_uni_with), [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream)), so that it
-/// cannot come too late; for a stream the peer opened,
-/// [`RecvStream::preamble`](crate::RecvStream#method.preamble) returns the same type, and a relay opens the
-/// next hop's stream with it, adjusted as its conventions say. The stream's
-/// requested priority is not part of it: [`RecvStream::set_peer_priority`](crate::RecvStream#method.set_peer_priority)
-/// may be called at any time.
+/// [`Session::open_uni_with`](crate::Session#method.open_uni_with),
+/// [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream)), so that it cannot come
+/// too late; for a stream the peer opened,
+/// [`RecvStream::preamble`](crate::RecvStream#method.preamble) returns the same type, and a relay
+/// opens the next hop's stream with it, adjusted as its conventions say. The stream's requested
+/// priority is not part of it:
+/// [`RecvStream::set_peer_priority`](crate::RecvStream#method.set_peer_priority) may be called at
+/// any time.
 ///
 /// Values share the buffers they came in; cloning is cheap.
 ///
@@ -76,7 +77,7 @@ impl Preamble {
     }
 
     /// Marked as the carrier of a pipe pair of a nested session
-    /// (PIPE_CARRIER, EXTENSIONS.md Section 10.2; bidirectional streams
+    /// (PIPE_CARRIER; bidirectional streams
     /// only). [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream) sets it itself.
     #[must_use]
     pub fn with_pipe_carrier(mut self) -> Self {

@@ -1,16 +1,10 @@
-//! Out-of-band join and pairing information as the HTTP and WebSocket
-//! carrier bindings carry it: header names and the
-//! unpadded base64url encoding (RFC 4648 Section 5) of their values. The
-//! frame itself is MULTIPATH.md Section 5.3.
+//! Pairing information as the HTTP carrier bindings carry it: the header name and
+//! the unpadded base64url encoding (RFC 4648 Section 5) of values.
 
 use super::error::EncodeError;
 
-/// Request header carrying a PIPE_JOIN frame.
-pub const JOIN_HEADER: &str = "Zmux-Pipe-Join";
 /// Request header carrying a split-bootstrap pairing token.
 pub const PAIR_HEADER: &str = "Zmux-Pipe-Pair";
-/// The longest `Zmux-Pipe-Join` value: 64 bytes of frame in base64url.
-pub const MAX_JOIN_HEADER_LEN: usize = encoded_len(64);
 /// Length of a pairing token.
 pub const PAIRING_TOKEN_LEN: usize = 16;
 
@@ -101,7 +95,7 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<usize, InvalidBase64> {
 }
 
 /// Encodes `input` in base64url without padding into a new string (for a
-/// header value such as [`JOIN_HEADER`]).
+/// header value such as [`PAIR_HEADER`]).
 pub fn encode_string(input: &[u8]) -> String {
     let mut out = vec![0u8; encoded_len(input.len())];
     let n = encode(input, &mut out).unwrap_or(0);
@@ -136,6 +130,5 @@ mod tests {
         assert_eq!(decode(b"QR", &mut [0; 4]), Err(InvalidBase64));
         assert_eq!(decode(b"Q", &mut [0; 4]), Err(InvalidBase64));
         assert_eq!(decode(b"QQ", &mut [0; 4]), Ok(1));
-        assert_eq!(MAX_JOIN_HEADER_LEN, 86);
     }
 }

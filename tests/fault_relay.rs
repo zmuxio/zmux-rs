@@ -14,14 +14,14 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until};
 use zmux::helpers::{Backoff, PipePool, PoolDecision, PoolView, RotatePolicy, maintain_pipes};
 use zmux::{
-    Config, DialRequest, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth,
-    PipeDirection, PipeHint, PipeIo, PipeOptions, Session, SessionError, SessionState,
+    Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
+    PipeHint, PipeIo, PipeOptions, Session, SessionError, SessionState,
 };
 
 fn config(edit: impl FnOnce(&mut Config)) -> Config {
     let mut c = Config::default();
     c.max_pipes = 6;
-    c.pipe_auth = PipeAuth::psk(*b"fault-relay-psk-0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"fault-relay-psk-0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = None;
     c.resume_timeout = Some(Duration::from_secs(120));
     edit(&mut c);
@@ -178,24 +178,26 @@ impl Relay {
         Ok(PipeIo::new(near))
     }
 
-    /// A one-way carrier through the relay for a split pool.
-    fn one_way(&self, req: &DialRequest) -> io::Result<PipeIo> {
+    /// A one-way carrier through the relay of a split pool's member, paired at the
+    /// listener by `token`.
+    fn one_way(&self, direction: PipeDirection, token: [u8; 16]) -> io::Result<PipeIo> {
         self.dials.lock().unwrap().push(Instant::now());
         if self.faults.refuse.load(Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
         }
         let (near, far, conn) = self.connect();
-        *conn.direction.lock().unwrap() = Some(req.direction);
+        *conn.direction.lock().unwrap() = Some(direction);
         let l = self.listener.clone();
-        match req.direction {
+        let mut hint = Self::hint();
+        hint.pair = Some(token.to_vec());
+        match direction {
             PipeDirection::Out => {
                 tokio::spawn(async move {
-                    let _ = l.handle_pipe(PipeIo::reader(far), Self::hint()).await;
+                    let _ = l.handle_pipe(PipeIo::reader(far), hint).await;
                 });
                 Ok(PipeIo::writer(near))
             }
             PipeDirection::In => {
-                let hint = Self::hint().with_join_header(req.join_header.as_deref().unwrap_or(""));
                 tokio::spawn(async move {
                     let _ = l.handle_pipe(PipeIo::writer(far), hint).await;
                 });
@@ -221,19 +223,14 @@ impl Relay {
         PipePool::join(1, move |session: Session, options| {
             let r = r.clone();
             async move {
-                zmux::join_split(
-                    &session,
-                    options,
-                    |join| {
-                        let io = r.one_way(&DialRequest::new(PipeDirection::In, Some(join)));
-                        async move { io }
-                    },
-                    || {
-                        let io = r.one_way(&DialRequest::new(PipeDirection::Out, None));
-                        async move { io }
-                    },
-                )
-                .await
+                let mut token = [0; 16];
+                getrandom::fill(&mut token).map_err(io::Error::other)?;
+                let up = r.one_way(PipeDirection::Out, token)?;
+                let down = r.one_way(PipeDirection::In, token)?;
+                let pipe = session
+                    .begin_add_pipe(PipeIo::paired_join(up, down), options)
+                    .map_err(io::Error::other)?;
+                Ok(vec![pipe])
             }
         })
         .with_options(options)
@@ -332,10 +329,10 @@ fn check(data: &[u8], from: usize) -> usize {
 #[tokio::test(start_paused = true)]
 async fn probes_keep_an_idle_relay_open() {
     // Only the pool pipe's own probes may cross the relay. A session is
-    // busy for the first 15 s after it was established (MULTIPATH.md
-    // Section 7.1), and while it is busy the answer to a probe of the
-    // direct pipe 0 also goes, as the redundant PIPE_ACK copy, on the
-    // second live pipe (Section 6.5): the relayed one. Pipe 0's first
+    // busy for the first 15 s after it was established, and while it is
+    // busy the answer to a probe of the direct pipe 0 also goes, as the
+    // redundant PIPE_ACK copy, on the second live pipe: the relayed one.
+    // Pipe 0's first
     // probe wait is drawn from [0, k], so such a copy fell inside the 8 s
     // the idle cut below needs about one run in five; with k = 1 h, still
     // about one in 300 (a draw below 12 s at either end). Pipe 0 probes
@@ -344,7 +341,8 @@ async fn probes_keep_an_idle_relay_open() {
         c.probe_interval = Some(Duration::from_secs(3600));
         c.probe_jitter = 0.0;
     };
-    let listener = Listener::new(config(quiet), ListenerConfig::default());
+    let listener = Listener::new(config(quiet), ListenerConfig::default())
+        .expect("valid listener configuration");
     let relay = Relay::new(
         &listener,
         Faults {
@@ -356,7 +354,7 @@ async fn probes_keep_an_idle_relay_open() {
     let opts = PipeOptions::new()
         .with_probe_interval(Duration::from_secs(5))
         .with_probe_jitter(0.3);
-    let handle = maintain_pipes(&client, relay.pool(1, opts));
+    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -366,7 +364,7 @@ async fn probes_keep_an_idle_relay_open() {
     assert_eq!(relay.dial_count(), 1);
     assert_eq!(failed(&client), 0);
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 
     let relay = Relay::new(
         &listener,
@@ -381,7 +379,7 @@ async fn probes_keep_an_idle_relay_open() {
     let opts = PipeOptions::new()
         .with_probe_interval(Duration::from_secs(12))
         .with_probe_jitter(0.0);
-    let handle = maintain_pipes(&client, relay.pool(1, opts));
+    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -411,18 +409,19 @@ async fn probes_keep_an_idle_relay_open() {
     })
     .await;
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A relay that takes bytes and forwards none: the idle pipe fails within
 /// k + T_fail.
 #[tokio::test(start_paused = true)]
 async fn a_black_hole_is_found_by_the_probe() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default());
+    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
+        .expect("valid listener configuration");
     let relay = Relay::new(&listener, Faults::default());
     let (client, _server) = direct(&listener, config(|_| {})).await;
     let opts = PipeOptions::new().with_probe_interval(Duration::from_secs(5));
-    let handle = maintain_pipes(&client, relay.pool(1, opts));
+    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -443,7 +442,7 @@ async fn a_black_hole_is_found_by_the_probe() {
         found - start
     );
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// The policy of the resume tests: redial 1 s after the last dial, reduced
@@ -479,14 +478,15 @@ fn redial_policy(
 /// stream's bytes arrive once each, in order.
 #[tokio::test(start_paused = true)]
 async fn the_last_pipe_cut_resumes_without_loss() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default());
+    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
+        .expect("valid listener configuration");
     let relay = Relay::new(&listener, Faults::default());
     let (client, server) = relayed(&relay, config(|_| {})).await;
     let asked = Arc::new(Mutex::new(Vec::new()));
     let pool = relay
         .pool(1, PipeOptions::new())
         .with_policy(redial_policy(asked.clone()));
-    let handle = maintain_pipes(&client, pool);
+    let handle = maintain_pipes(&client, pool).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -543,7 +543,7 @@ async fn the_last_pipe_cut_resumes_without_loss() {
     writer.await.unwrap();
     assert!(client.close_reason().is_none());
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// The relay refuses every redial during the grace period: the session
@@ -551,10 +551,11 @@ async fn the_last_pipe_cut_resumes_without_loss() {
 #[tokio::test(start_paused = true)]
 async fn refused_redials_end_in_resume_timeout() {
     let cfg = || config(|c| c.resume_timeout = Some(Duration::from_secs(20)));
-    let listener = Listener::new(cfg(), ListenerConfig::default());
+    let listener =
+        Listener::new(cfg(), ListenerConfig::default()).expect("valid listener configuration");
     let relay = Relay::new(&listener, Faults::default());
     let (client, _server) = relayed(&relay, cfg()).await;
-    let handle = maintain_pipes(&client, relay.pool(1, PipeOptions::new()));
+    let handle = maintain_pipes(&client, relay.pool(1, PipeOptions::new())).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -582,10 +583,11 @@ async fn refused_redials_end_in_resume_timeout() {
 /// parallel; the session carries on.
 #[tokio::test(start_paused = true)]
 async fn a_silent_downlink_cut_is_found_and_redialled() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default());
+    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
+        .expect("valid listener configuration");
     let relay = Relay::new(&listener, Faults::default());
     let (client, server) = relayed(&relay, config(|_| {})).await;
-    let handle = maintain_pipes(&client, relay.split_pool(PipeOptions::new()));
+    let handle = maintain_pipes(&client, relay.split_pool(PipeOptions::new())).expect("valid pool");
     let halves = |s: &Session| {
         let p = s.pipe_stats();
         let up = p
@@ -642,7 +644,7 @@ async fn a_silent_downlink_cut_is_found_and_redialled() {
     assert_eq!(r.read_to_end(64).await.unwrap(), b"after");
     assert!(client.close_reason().is_none());
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A relay that ends each connection 30 s after it opened (a load
@@ -651,7 +653,8 @@ async fn a_silent_downlink_cut_is_found_and_redialled() {
 /// along never stalls.
 #[tokio::test(start_paused = true)]
 async fn age_rotation_beats_a_lifetime_limit() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default());
+    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
+        .expect("valid listener configuration");
     let relay = Relay::new(
         &listener,
         Faults {
@@ -671,7 +674,7 @@ async fn age_rotation_beats_a_lifetime_limit() {
             .with_max_age(Duration::from_secs(25))
             .with_jitter(0.1),
     );
-    let handle = maintain_pipes(&client, pool);
+    let handle = maintain_pipes(&client, pool).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
     })
@@ -715,5 +718,5 @@ async fn age_rotation_beats_a_lifetime_limit() {
     assert!(relay.count(|c| c.expired.load(Ordering::SeqCst)) <= 1);
     assert_eq!(client.stats().bytes_reinjected, 0);
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }

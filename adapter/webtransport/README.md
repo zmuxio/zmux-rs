@@ -29,7 +29,8 @@ the token.
 The carrier wires:
 
 - the TLS 1.3 exporter of the QUIC connection under the session, for
-  `PipeAuth::exporter()` and carrier-bound joins (behind a front end that
+  `PipeAuth::exporter()` and Bound joins, declared secure with a Binding of the
+  connection, not the stream (behind a front end that
   terminates TLS, use a PSK);
 - flow control for lanes: the peer may open `Options::lanes` lanes at once,
   and the connection's receive window covers that many stream windows and a
@@ -39,6 +40,13 @@ The carrier wires:
 - failure signalling: a stream zmux drops without ending it is reset (or
   stopped) with `ZMUX_CARRIER_FAILED`, and a session that ends under a pipe
   is a failure of the pipe.
+
+quinn has no RESET_STREAM_AT, the frame of QUIC stream resets with partial
+delivery, so this adapter does not offer the `reset_stream_at` transport
+parameter: quinn would close the connection on the first such frame it read.
+A client that requires the parameter of its server refuses this one before the
+session starts. As a client this adapter connects to servers that do not
+require it of their clients.
 
 ```rust,no_run
 # async fn example(client: web_transport_quinn::Client) -> Result<(), Box<dyn std::error::Error>> {

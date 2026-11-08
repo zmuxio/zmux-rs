@@ -1,27 +1,26 @@
-//! Acknowledgement (MULTIPATH.md Section 6) and reinjection (Section 7.4):
-//! receive positions and PIPE_ACK generation, PIPE_ACK processing with RTT
-//! and delivery-rate sampling, and re-sending the information of suspect
-//! and failed pipes.
+//! Multipath acknowledgement and reinjection: receive positions and
+//! PIPE_ACK generation, PIPE_ACK processing with RTT and delivery-rate
+//! sampling, and re-sending the information of suspect and failed pipes.
 
 use std::time::{Duration, Instant};
 
 use crate::proto::frame::{Frame, PipeAck, PipeAckEntry};
 use crate::proto::session::output::Records;
-use crate::proto::session::pipes::{Attachment, Batch, OutPipe, OutState, PipeHalf, SentFrame};
+use crate::proto::session::pipes::{Attachment, Batch, OutPipe, OutState, SentFrame};
 use crate::proto::session::stream::{RecvState, SendState};
-use crate::proto::session::{BIDI, SessionCore, StreamKey, UNI};
+use crate::proto::session::{BIDI, CoreEvent, PipeId, SessionCore, StreamKey, UNI};
 use crate::proto::{DetailKey, Error};
 
 /// Snapshots listing at most this many pipes are always complete; larger
-/// ones omit the unchanged entries (MULTIPATH.md Section 6.2).
+/// ones omit the unchanged entries.
 const PARTIAL_SNAPSHOT: usize = 8;
 /// A complete snapshot goes out at least this often while snapshots are
 /// sent.
 const COMPLETE_SNAPSHOT: Duration = Duration::from_secs(1);
 
-/// The acknowledgement state of a multipath session (MULTIPATH.md Section
-/// 6): what PIPE_ACK owes, the primary pipe and its redundant copy, and the
-/// scratch of snapshots and acknowledged frames.
+/// The acknowledgement state of a multipath session: what PIPE_ACK owes,
+/// the primary pipe and its redundant copy, and the scratch of snapshots
+/// and acknowledged frames.
 #[derive(Debug)]
 pub(crate) struct AckState {
     /// Our own `zmux_max_ack_delay` and `zmux_ack_threshold`.
@@ -31,7 +30,7 @@ pub(crate) struct AckState {
     ack_now: bool,
     /// The primary pipe owes it whatever the session's activity: a pipe
     /// ended, or a PIPE_PING arrived on a pipe pair without a usable
-    /// outbound direction to answer on (MULTIPATH.md Section 6.5).
+    /// outbound direction to answer on.
     primary_owed: bool,
     /// Inbound positions changed since the last snapshot on the primary
     /// pipe; when the redundant copy is due, and on which pipe the last
@@ -40,11 +39,9 @@ pub(crate) struct AckState {
     copy_due: Option<Instant>,
     primary: Option<u64>,
     /// The next primary snapshot must be complete: it answers a PIPE_PING
-    /// in the first record of a newly attached inbound pipe (MULTIPATH.md
-    /// Section 6.3 rule 5).
+    /// in the first record of a newly attached inbound pipe.
     complete_owed: bool,
-    /// When the last complete PIPE_ACK snapshot was sent (MULTIPATH.md
-    /// Section 6.2).
+    /// When the last complete PIPE_ACK snapshot was sent.
     complete_ack_at: Option<Instant>,
     /// Scratch for PIPE_ACK entries and acknowledged frames.
     scratch: Vec<PipeAckEntry>,
@@ -109,8 +106,8 @@ impl AckState {
 /// Builds a snapshot of the inbound pipes of `atts` into `entries`, every
 /// lane of a pipe with lanes in its own entry: complete when `complete` or
 /// when it lists at most [`PARTIAL_SNAPSHOT`] entries, otherwise only the
-/// entries changed since the last complete snapshot (MULTIPATH.md Section
-/// 6.2). Whether it is complete.
+/// entries changed since the last complete snapshot. Whether it is
+/// complete.
 pub(in crate::proto::session) fn snapshot_of(
     atts: &crate::proto::session::pipes::Attachments,
     entries: &mut Vec<PipeAckEntry>,
@@ -134,28 +131,39 @@ pub(in crate::proto::session) fn snapshot_of(
 }
 
 impl SessionCore {
+    /// Reports one of our joins that was not attached before, once it is.
+    fn note_attached(&mut self, id: u64) {
+        if self.att(id).is_some_and(Attachment::peer_attached) {
+            self.push_event(CoreEvent::PipeAttached { pipe: PipeId(id) });
+        }
+    }
+
     // ---- receive positions --------------------------------------------------------
 
     /// A complete record of `len` bytes was processed on the inbound pipe
-    /// `self.rx` (MULTIPATH.md Section 6.1).
+    /// `self.rx`.
     pub(in crate::proto::session) fn mp_record_end(&mut self, len: u64, now: Instant) {
         let (id, li) = (self.rx, self.rx_lane);
         let threshold = self.mp().acks().threshold;
+        let attached = self.att(id).is_none_or(Attachment::peer_attached);
         let Some(p) = self.inp_mut(id) else {
             return;
         };
         let rec = p.mp_record(li, len, threshold, now);
+        if !attached {
+            self.note_attached(id);
+        }
         // The answer to a PIPE_PING in the first record of a newly attached
-        // pipe is a complete snapshot (MULTIPATH.md Section 6.3 rule 5).
+        // pipe is a complete snapshot.
         let first_ping = rec.first_ping && id != 0;
         let acks = self.mp_mut().acks_mut();
         acks.snapshot_dirty = true;
         acks.ack_now |= rec.immediate;
         acks.complete_owed |= first_ping;
         if rec.ping {
-            // The answer goes on the probed pair (MULTIPATH.md 6.5), when
-            // its outbound direction is neither suspect nor failed; else on
-            // the primary pipe whatever the session's activity.
+            // The answer goes on the probed pair when its outbound
+            // direction is neither suspect nor failed; else on the primary
+            // pipe whatever the session's activity.
             match self
                 .out_mut(id)
                 .filter(|o| o.is_live() && !o.shutdown_pending() && o.state() != OutState::Suspect)
@@ -163,18 +171,6 @@ impl SessionCore {
                 Some(o) => o.answer_ping(),
                 None => self.mp_mut().acks_mut().primary_owed = true,
             }
-        }
-        if rec.joined {
-            // A record on the down direction confirms the join (Section 5.7).
-            self.pipe_event(id, PipeHalf::Inbound);
-            if self.out_ref(id).is_some() {
-                self.ack_progress(id, now);
-            } else {
-                // A down-only join: nothing else confirms it.
-                self.join_confirmed(id);
-                self.release_deferred_joins(now);
-            }
-            self.after_pipe_change(now);
         }
         if rec.activity {
             self.restart_idle(now);
@@ -190,9 +186,8 @@ impl SessionCore {
         self.ack_deadline().filter(|&t| t > self.now)
     }
 
-    /// When a PIPE_ACK is due on the primary pipe (MULTIPATH.md Section
-    /// 6.3); never while the answers on the probed pairs acknowledge
-    /// everything owed.
+    /// When a PIPE_ACK is due on the primary pipe; never while the answers
+    /// on the probed pairs acknowledge everything owed.
     pub(in crate::proto::session) fn ack_deadline(&self) -> Option<Instant> {
         let acks = self.mp.as_deref()?.acks();
         if self.pairs_answer_all() {
@@ -216,7 +211,7 @@ impl SessionCore {
     /// Whether, in a quiet session, everything a PIPE_ACK owes is
     /// PIPE_PING frames answered on their own pipe pairs: such an answer
     /// goes only there, neither on the primary pipe nor as the redundant
-    /// copy (MULTIPATH.md Section 6.5).
+    /// copy.
     fn pairs_answer_all(&self) -> bool {
         let Some(mp) = self.mp.as_deref() else {
             return false;
@@ -231,7 +226,7 @@ impl SessionCore {
                 .any(|a| a.inp().is_some_and(|p| p.unacked_other()))
     }
 
-    // ---- pipe choice (MULTIPATH.md Sections 6.5 and 11) --------------------------
+    // ---- pipe choice --------------------------------------------------------------
 
     /// The estimated one-way delay of an outbound pipe.
     pub(in crate::proto::session) fn owd(&self, o: &OutPipe) -> Duration {
@@ -242,18 +237,21 @@ impl SessionCore {
         }
     }
 
-    /// The writable pipe that carries control frames and PIPE_ACK first,
-    /// optionally excluding one (for the redundant copy): the first in the
-    /// control order of MULTIPATH.md Section 6.5 (ACTIVE first, then the
-    /// most preferred tier, non-standby, then the lowest priority, then the
-    /// lowest one-way delay) that is writable and not waiting to join.
+    /// The pipe that carries control frames and PIPE_ACK first, optionally
+    /// excluding one (for the redundant copy): the first in the
+    /// acknowledgement control order (ACTIVE first, then the most preferred
+    /// tier, non-standby, then the lowest priority, then the lowest one-way
+    /// delay). A carrier that refused its last bytes keeps the role: it takes
+    /// bytes again soon, and the frames go first in its next batch, while a
+    /// slower pipe whose carrier takes everything would deliver them behind
+    /// its own queue.
     pub(in crate::proto::session) fn control_pipe(&self, except: Option<u64>) -> Option<u64> {
         let views = self.views();
         views
             .control()
             .iter()
             .map(|&i| self.atts.at(i))
-            .find(|a| Some(a.id()) != except && a.out().is_some_and(OutPipe::writable))
+            .find(|a| Some(a.id()) != except && a.out().is_some())
             .map(Attachment::id)
     }
 
@@ -288,8 +286,7 @@ impl SessionCore {
     }
 
     /// Whether the first record on a new outbound pipe still owes its
-    /// complete snapshot (MULTIPATH.md Sections 5.2 and 5.4 step 8); only
-    /// when there is at least one entry.
+    /// complete snapshot; only when there is at least one entry.
     fn snapshot_first(&self, pipe: u64) -> bool {
         self.out_ref(pipe).is_some_and(OutPipe::snapshot_first)
             && self
@@ -301,8 +298,7 @@ impl SessionCore {
     /// Builds the current snapshot into `entries`; returns whether it is
     /// complete. A large snapshot may omit the pipes and lanes whose
     /// position has not changed since the last complete one, which goes
-    /// out at least once per second (MULTIPATH.md Section 6.2); `complete`
-    /// forces a complete one.
+    /// out at least once per second; `complete` forces a complete one.
     fn snapshot(&self, entries: &mut Vec<PipeAckEntry>, complete: bool, now: Instant) -> bool {
         let complete = complete
             || self
@@ -315,9 +311,8 @@ impl SessionCore {
 
     /// Writes PIPE_ACK on `pipe` when it is due there (primary), the
     /// redundant copy is due there, or it is the first record on a new
-    /// outbound pipe (a complete snapshot, Sections 5.2 and 5.4 step 8).
-    /// Returns whether it wrote the redundant copy, with which the credit
-    /// copies go (Section 6.5).
+    /// outbound pipe (a complete snapshot). Returns whether it wrote the
+    /// redundant copy, with which the credit copies go.
     pub(in crate::proto::session) fn write_pipe_ack(
         &mut self,
         pipe: u64,
@@ -333,7 +328,7 @@ impl SessionCore {
         // It is all that is owed (a quiet session's probes).
         let pair_only = pair && self.pairs_answer_all();
         // Due, or a credit update goes out in this batch while something
-        // is unacknowledged (Section 6.3).
+        // is unacknowledged.
         let due = self.ack_due(now)
             || (self
                 .atts
@@ -359,7 +354,7 @@ impl SessionCore {
         self.mp_mut().acks_mut().scratch = entries;
         if !written {
             // The complete snapshot is still owed, at the start of the next
-            // record (Section 5.2).
+            // record.
             return false;
         }
         if let Some(o) = self.out_mut(pipe) {
@@ -424,10 +419,9 @@ impl SessionCore {
 
     /// A PIPE_ACK written on a pipe whose last ack-eliciting byte (or its
     /// becoming live) is more than R_p = max(1 s, T_suspect) ago gets a
-    /// PIPE_PING in the same record (MULTIPATH.md Section 6.5): the answer
-    /// on a probed pair, which starts the pipe's next probe wait, and in a
-    /// busy session the primary PIPE_ACK and its redundant copy
-    /// (return-pipe liveness).
+    /// PIPE_PING in the same record: the answer on a probed pair, which
+    /// starts the pipe's next probe wait, and in a busy session the primary
+    /// PIPE_ACK and its redundant copy (return-pipe liveness).
     fn liveness_ping(&mut self, pipe: u64, w: &mut Records<'_>, now: Instant) {
         let t_suspect = self.out_ref(pipe).map(|o| self.limits(o).0);
         if let Some(o) = self.out_mut(pipe) {
@@ -438,8 +432,8 @@ impl SessionCore {
     }
 
     /// Writes a snapshot: one PIPE_ACK, or several with strictly increasing
-    /// subsets when one does not fit in a record (MULTIPATH.md Section
-    /// 6.2). `false` when the batch could not take all of it.
+    /// subsets when one does not fit in a record. `false` when the batch
+    /// could not take all of it.
     pub(in crate::proto::session) fn write_snapshot(
         entries: &[PipeAckEntry],
         w: &mut Records<'_>,
@@ -459,7 +453,7 @@ impl SessionCore {
 
     // ---- receiving PIPE_ACK --------------------------------------------------------
 
-    /// PIPE_ACK (MULTIPATH.md Section 6.2).
+    /// Processes a received PIPE_ACK.
     pub(in crate::proto::session) fn on_pipe_ack(
         &mut self,
         f: &PipeAck<'_>,
@@ -467,7 +461,7 @@ impl SessionCore {
     ) -> Result<(), Error> {
         let ty = 0x0b2b_3eeb;
         // The first PIPE_ACK after a pipe became live ends its reinjection
-        // hold (RESUME.md Section 6).
+        // hold.
         for o in self.atts.outs_mut() {
             o.end_reinject_hold();
         }
@@ -484,7 +478,7 @@ impl SessionCore {
             let sent = self.sent_on(e.pipe_id, e.lane);
             if e.position > sent {
                 // The peer claims data never sent; with resume the two
-                // states diverged (RESUME.md Section 7).
+                // states diverged, which fails closed.
                 let reason = "PIPE_ACK acknowledges bytes never sent";
                 let err = if self.mp().resume() {
                     Error::new(
@@ -501,14 +495,17 @@ impl SessionCore {
                     .detail(DetailKey::Limit, sent));
             }
             let delay = Duration::from_micros(e.ack_delay.min(u64::MAX >> 2));
+            let attached = self.att(e.pipe_id).is_none_or(Attachment::peer_attached);
             self.process_ack(e.pipe_id, e.lane, e.position, delay, now);
+            if !attached {
+                self.note_attached(e.pipe_id);
+            }
         }
         Ok(())
     }
 
-    /// The bytes written on a lane of an outbound pipe: 0 for a pipe
-    /// without an outbound direction and for a lane never opened
-    /// (MULTIPATH.md Section 6.2).
+    /// The bytes written on a lane of an outbound pipe: 0 for a pipe without
+    /// an outbound direction and for a lane never opened.
     pub(in crate::proto::session) fn sent_on(&self, pipe: u64, lane: u64) -> u64 {
         self.out_ref(pipe).map_or(0, |o| o.sent_on(lane))
     }
@@ -516,7 +513,7 @@ impl SessionCore {
     /// The peer's position on lane `lane` of an outbound pipe advanced to
     /// `pos`; `delay` is the entry's ACK Delay. The frames the lane carried
     /// up to it are acknowledged, and the pipe's samples and progress come
-    /// from its cumulative acknowledgement point (MULTIPATH.md Section 2.5).
+    /// from its cumulative acknowledgement point.
     pub(in crate::proto::session) fn process_ack(
         &mut self,
         id: u64,
@@ -553,7 +550,10 @@ impl SessionCore {
                 self.views_changed();
             }
             if ack.unpenalized {
+                // Usable again: eligibility and the standby takeover
+                // change, as at the end of a revalidation.
                 self.advance_pick_generation();
+                self.check_standby_takeover();
             }
             if ack.revalidated {
                 self.end_revalidation(id);
@@ -577,8 +577,8 @@ impl SessionCore {
         self.mp_mut().acks_mut().frames = acked;
         if let Some(ack) = ack {
             if ack.activity {
-                // A record with an activity frame was acknowledged (SPEC.md
-                // 6.4).
+                // A record with an activity frame was acknowledged: the
+                // idle timer restarts.
                 self.restart_idle(now);
             }
             self.ack_progress(id, now);
@@ -617,12 +617,12 @@ impl SessionCore {
                     s.extra_mut().priority_resend = false;
                 }
             }
+            SentFrame::EpochAnswer { epoch } => self.epoch_answer_acked(epoch, now),
             _ => {}
         }
     }
 
-    /// The delay of unilateral retirement: max(2 s, 3 x PTO) (MULTIPATH.md
-    /// Section 8.4).
+    /// The delay of unilateral retirement: max(2 s, 3 x PTO).
     fn retire_delay(&self) -> Duration {
         let mad = self.mp().peer_mad();
         let mut pto = None::<Duration>;
@@ -687,7 +687,7 @@ impl SessionCore {
     }
 
     /// A multipath sending part reaches "Data Recvd" or "Reset Recvd"
-    /// once acknowledged (SPEC.md Section 7.4).
+    /// once acknowledged.
     pub(in crate::proto::session) fn check_send_done(&mut self, key: StreamKey) {
         let Some(send) = self.streams.send_mut(key) else {
             return;
@@ -732,7 +732,7 @@ impl SessionCore {
         self.try_discard(key);
     }
 
-    // ---- reinjection (MULTIPATH.md Section 7.4) ------------------------------------
+    // ---- reinjection --------------------------------------------------------------
 
     /// Re-sends the information of every ack-eliciting frame sent on an
     /// outbound pipe beyond its acknowledged position, once per pipe.
@@ -754,7 +754,7 @@ impl SessionCore {
         self.mp_mut().acks_mut().frames = frames;
     }
 
-    fn reinject_frame(&mut self, f: SentFrame, now: Instant) {
+    pub(super) fn reinject_frame(&mut self, f: SentFrame, now: Instant) {
         match f {
             SentFrame::Stream { key, off, len, fin } => {
                 let Some(send) = self.streams.send_mut(key) else {
@@ -866,7 +866,7 @@ impl SessionCore {
                 }
             }
             SentFrame::PipeStatus { pipe, seq } => {
-                // Only the latest request is sent again (MULTIPATH.md 7.4).
+                // Only the latest request is sent again.
                 if let Some(a) = self.att_mut(pipe) {
                     a.tier_mut().request_again(seq);
                 }
@@ -876,9 +876,11 @@ impl SessionCore {
                     a.abandon_lost();
                 }
             }
+            // An answer repeats on its own until this end switches.
+            SentFrame::EpochAnswer { .. } => {}
             SentFrame::Ping { seq } => {
                 // The request stops being outstanding with its pipe; a
-                // GOAWAY fence asks again (SPEC.md Section 4.5).
+                // GOAWAY fence asks again.
                 if self.ping.outstanding.is_some_and(|(s, _)| s == seq) {
                     self.ping_lost();
                 }

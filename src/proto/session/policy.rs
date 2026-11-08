@@ -54,10 +54,10 @@ impl PartialEq for Policy {
 
 /// An application scheduling policy. It never runs under a zmux lock: the
 /// core hands the driver a value-only view of the stream directions waiting
-/// for a decision ([`SessionCore::take_pick`](super::SessionCore::take_pick)), the driver calls the policy
-/// outside every lock and gives the answers back
-/// ([`SessionCore::answer_pick`](super::SessionCore::answer_pick)), which are applied if the view's generation is
-/// still current; otherwise, and for an invalid answer or a panic, the chunk
+/// for a decision ([`SessionCore::take_pick`](super::SessionCore::take_pick)), the driver calls the
+/// policy outside every lock and gives the answers back
+/// ([`SessionCore::answer_pick`](super::SessionCore::answer_pick)), which are applied if the view's
+/// generation is still current; otherwise, and for an invalid answer or a panic, the chunk
 /// takes the `affinity` choice and the miss is counted. The policy must not
 /// block: the drivers call it on the
 /// thread or task that drives the session, where a blocking zmux call fails
@@ -128,9 +128,9 @@ pub enum PickAnswer {
 
 /// The custom scheduling decisions for the driver to make outside the
 /// lock: fill it with
-/// [`SessionCore::take_pick`](super::SessionCore::take_pick), call [`PickRequest::run`] with no zmux lock
-/// held, then hand it to [`SessionCore::answer_pick`](super::SessionCore::answer_pick). Reuse one request: its
-/// buffers are kept.
+/// [`SessionCore::take_pick`](super::SessionCore::take_pick), call [`PickRequest::run`] with no
+/// zmux lock held, then hand it to [`SessionCore::answer_pick`](super::SessionCore::answer_pick).
+/// Reuse one request: its buffers are kept.
 #[derive(Default)]
 pub struct PickRequest {
     /// The generation the view belongs to.
@@ -226,7 +226,7 @@ pub struct PipeSnapshot {
     pub rate: u64,
     /// Q_p: bytes committed to the pipe and not yet transmitted, those of
     /// the write calls in progress plus the carrier's unsent count where
-    /// the adapter reports one (SCHEDULER.md Section 4).
+    /// the adapter reports one.
     pub unsent: u64,
     /// Unacknowledged bytes.
     pub in_flight: u64,
@@ -258,8 +258,8 @@ impl PipeSnapshot {
 
     /// The weight the pipe's shaper set; `None`: none.
     #[must_use]
-    pub fn shaping_weight(&self) -> Option<f64> {
-        self.shaping.flatten().map(f64::from_bits)
+    pub fn shaping_weight(&self) -> Option<u32> {
+        self.shaping.flatten().map(|w| w as u32)
     }
 }
 

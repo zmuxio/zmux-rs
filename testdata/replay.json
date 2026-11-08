@@ -1,0 +1,213 @@
+{
+ "description": "ReplayFilter vectors (zmux-go is the reference; other implementations copy this file). Each case is a new filter (window_ms, max, not_before_ms: Unix ms, 0 none); each step checks key_hex stamped t_ms at clock now_ms and expects verdict fresh, seen, outside or full. Expiry is exact only after 2*window_ms has passed (filters may keep keys longer within that bound).",
+ "cases": [
+  {
+   "name": "fresh then seen",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000010,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "seen"
+    },
+    {
+     "now_ms": 1700000000010,
+     "key_hex": "02",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    }
+   ]
+  },
+  {
+   "name": "seen with another stamp",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000500,
+     "key_hex": "01",
+     "t_ms": 1700000000900,
+     "verdict": "seen"
+    }
+   ]
+  },
+  {
+   "name": "window edges",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1699999999000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "02",
+     "t_ms": 1700000001000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "03",
+     "t_ms": 1699999998999,
+     "verdict": "outside"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "04",
+     "t_ms": 1700000001001,
+     "verdict": "outside"
+    }
+   ]
+  },
+  {
+   "name": "outside is not recorded",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000005000,
+     "verdict": "outside"
+    },
+    {
+     "now_ms": 1700000005000,
+     "key_hex": "01",
+     "t_ms": 1700000005000,
+     "verdict": "fresh"
+    }
+   ]
+  },
+  {
+   "name": "expiry",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000002250,
+     "key_hex": "01",
+     "t_ms": 1700000002250,
+     "verdict": "fresh"
+    }
+   ]
+  },
+  {
+   "name": "not before",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 1700000000000,
+   "steps": [
+    {
+     "now_ms": 1700000000100,
+     "key_hex": "01",
+     "t_ms": 1699999999999,
+     "verdict": "outside"
+    },
+    {
+     "now_ms": 1700000000100,
+     "key_hex": "02",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    }
+   ]
+  },
+  {
+   "name": "full",
+   "window_ms": 1000,
+   "max": 2,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "02",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "03",
+     "t_ms": 1700000000000,
+     "verdict": "full"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "01",
+     "t_ms": 1700000000000,
+     "verdict": "seen"
+    },
+    {
+     "now_ms": 1700000002500,
+     "key_hex": "03",
+     "t_ms": 1700000002500,
+     "verdict": "fresh"
+    }
+   ]
+  },
+  {
+   "name": "key lengths differ",
+   "window_ms": 1000,
+   "max": 8,
+   "not_before_ms": 0,
+   "steps": [
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "00",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "0000",
+     "t_ms": 1700000000000,
+     "verdict": "fresh"
+    },
+    {
+     "now_ms": 1700000000000,
+     "key_hex": "",
+     "t_ms": 1700000000000,
+     "verdict": "seen"
+    }
+   ]
+  }
+ ]
+}

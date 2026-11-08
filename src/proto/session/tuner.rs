@@ -1,5 +1,4 @@
-//! Receive-window auto-tuning state (rule RB of SPEC.md Section 8.3 rule
-//! 6): a scope's arrival rate and its
+//! Receive-window auto-tuning state: a scope's arrival rate and its
 //! credit-loop samples.
 
 use std::collections::VecDeque;
@@ -10,7 +9,7 @@ use super::filter::IntervalRate;
 /// Credit-loop samples a scope keeps pending at most; a full queue drops
 /// samples, never credit.
 const PENDING: usize = 17;
-/// K of rule RB: windows target K x RTT_min of the arrival rate.
+/// K of auto-tuning: windows target K x RTT_min of the arrival rate.
 const K: u32 = 4;
 
 /// An update sent at `sent_at` that raised the limit from `old_limit`;
@@ -23,7 +22,7 @@ struct Loop {
 }
 
 /// Receive-window auto-tuning of one scope (a stream's receiving part, or
-/// the session), SPEC.md Section 8.3 rule 6:
+/// the session):
 /// the window is the arrival rate (the
 /// largest of the last 4 intervals of max(RTT, 1 ms)) times max(K x
 /// RTT_min, B), and never shrinks.
@@ -166,7 +165,7 @@ impl Tuner {
         }
     }
 
-    /// The window growth of rule RB: the target for `rtt` (the scope's
+    /// The window growth of auto-tuning: the target for `rtt` (the scope's
     /// RTT_min, `None` before a sample) and the latency budget `b`.
     pub(super) fn target(&self, rtt: Option<Duration>, b: Duration) -> Option<u64> {
         let rate = self.rate()?;

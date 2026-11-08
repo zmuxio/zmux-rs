@@ -19,7 +19,7 @@ use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
 use crate::proto::{ApplicationErrorCode, VarInt, varint};
 
 /// The preamble limit before the peer's parameters without remembered
-/// ones (SPEC.md Section 6.1.2).
+/// ones.
 const MIN_PREAMBLE_FLOOR: u64 = 1024;
 /// This endpoint's own limit on the preambles it sends.
 const MAX_LOCAL_PREAMBLE: u64 = 4096;
@@ -41,8 +41,7 @@ enum Readable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcomeKind {
     /// The FIN was written (on a single pipe: acknowledged). Delivery ends
-    /// at the peer's zmux endpoint, not its application (SPEC.md Section
-    /// 7.4).
+    /// at the peer's zmux endpoint, not its application.
     Finished,
     /// The peer sent STOP_SENDING with this code.
     Stopped(VarInt),
@@ -79,17 +78,16 @@ impl SessionCore {
 
     /// Opens a stream of a type. Opening reserves stream-count credit, so
     /// the stream's identifier is always below the peer's limit; nothing is
-    /// sent until the first write or [`SessionCore::stream_id`] (SPEC.md Section
-    /// 7.2). Fails with [`OpenError::Blocked`] without credit; the driver
-    /// waits for [`super::CoreEvent::StreamsAvailable`] and tries again. Before
-    /// establishment the peer's limits are unknown: the stream is created
+    /// sent until the first write or [`SessionCore::stream_id`]. Fails with [`OpenError::Blocked`]
+    /// without credit; the driver waits for [`super::CoreEvent::StreamsAvailable`] and tries again.
+    /// Before establishment the peer's limits are unknown: the stream is created
     /// and its data waits for the peer's parameters (and for credit).
     pub fn open(&mut self, dir: Dir) -> Result<StreamKey, OpenError> {
         if let Some(e) = self.lost() {
             return Err(OpenError::SessionLost(e));
         }
         // After any GOAWAY from the peer no new stream opens, whatever the
-        // watermarks (EXTENSIONS.md Section 3.5).
+        // watermarks.
         if self.goaway().shutdown.is_some() || self.streams.goaway_received() {
             return Err(OpenError::GoingAway);
         }
@@ -129,7 +127,7 @@ impl SessionCore {
         }
         let d = di(dir);
         // Staged unidirectional credit: 256 on the first accept, unless a
-        // GOAWAY was sent (SPEC.md Section 8.5 rule 4).
+        // GOAWAY was sent.
         if self.streams.remote_dir(d).staged {
             let grant = !self.goaway_announced();
             self.streams.unstage(d, grant);
@@ -178,7 +176,7 @@ impl SessionCore {
 
     /// The stream's identifier. Before the stream's first frame this pins
     /// the identifier and sends the opening frame as soon as flow control
-    /// allows, before any later stream of the type (SPEC.md Section 7.2).
+    /// allows, before any later stream of the type.
     pub fn stream_id(&mut self, key: StreamKey) -> Result<u64, StreamError> {
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
         if let Some(id) = s.id {
@@ -201,8 +199,7 @@ impl SessionCore {
         let d = di(s.dir);
         let ld = &self.streams.local_dir(d);
         if ld.goaway.is_some() {
-            // Unemitted and unpinned when the GOAWAY arrived (EXTENSIONS.md
-            // Section 3.5 rule 2).
+            // Unemitted and unpinned when the GOAWAY arrived.
             self.unschedule(key);
             self.reject_unopened(key, GoAwayFail::GoingAway);
             return Err(StreamError::GoingAway);
@@ -411,6 +408,9 @@ impl SessionCore {
         }
         self.sync_holder(key);
         self.schedule(key);
+        // Data that a moving binding holds back waits for the blocking data on the
+        // old pipe: the direction is held, for opportunistic reinjection.
+        self.note_credit_blocked(key);
     }
 
     /// Registers a writer that waits for room; it is woken once
@@ -419,6 +419,62 @@ impl SessionCore {
         self.mark_write(key, 0, true);
         self.streams.add_send_waiter(key);
         self.sync_holder(key);
+    }
+
+    /// Makes the stream's opening frame owed, with the data written so far
+    /// in it: as soon as credit lets, even with nothing written; before
+    /// establishment as soon as the stream may open, in early data if that
+    /// is in use. [`SessionCore::flushed`] tells when it left.
+    ///
+    /// A finished or reset part flushes as usual: only a part the peer
+    /// stopped or a lost session reports an error.
+    pub fn flush(&mut self, key: StreamKey) -> Result<(), StreamError> {
+        let reset = self.flushable_part(key)?.outcome == Some(SendOutcome::Reset);
+        let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
+        if s.id.is_none() && !reset {
+            self.send_part(key).open_want = true;
+            self.schedule(key);
+        }
+        Ok(())
+    }
+
+    /// Whether the stream's opening frame and every byte written were passed
+    /// to a carrier (nothing is left to pass of a reset part), or are queued
+    /// in the held first flight, which leaves with them; if not,
+    /// registers for [`super::CoreEvent::StreamWritable`] once that is so or
+    /// the part ends.
+    pub fn flushed(&mut self, key: StreamKey) -> Result<bool, StreamError> {
+        let send = self.flushable_part(key)?;
+        if send.outcome == Some(SendOutcome::Reset) {
+            return Ok(true);
+        }
+        if self.first_held.is_some() {
+            return Ok(true);
+        }
+        let done = send.buf.is_empty() && send.preamble_left == 0 && !send.open_want;
+        let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
+        if done && s.id.is_some() && !s.open_pending {
+            return Ok(true);
+        }
+        self.send_part(key).sent_waiting = true;
+        Ok(false)
+    }
+
+    /// The sending part as a flush sees it: finishing or resetting it is no
+    /// error.
+    fn flushable_part(&self, key: StreamKey) -> Result<&SendPart, StreamError> {
+        let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
+        if let Some(f) = s.goaway {
+            return Err(f.error());
+        }
+        let send = s.send.as_ref().ok_or(StreamError::ClosedLocally)?;
+        if let Some(SendOutcome::Stopped(code)) = send.outcome {
+            return Err(stopped_error(code));
+        }
+        if let Some(e) = self.lost() {
+            return Err(StreamError::SessionLost(e));
+        }
+        Ok(send)
     }
 
     /// Ends the stream cleanly: a FIN follows the data written.
@@ -449,7 +505,7 @@ impl SessionCore {
     }
 
     /// Resets the sending part. Data below the reliable boundary is still
-    /// delivered (RESET_STREAM_AT, SPEC.md Section 4.3); a stream that has
+    /// delivered (RESET_STREAM_AT); a stream that has
     /// sent nothing yet consumes no identifier.
     pub fn reset(&mut self, key: StreamKey, code: VarInt) -> Result<(), StreamError> {
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
@@ -522,9 +578,10 @@ impl SessionCore {
         }
         send.fin = false;
         if unopened && send.cold().reliable_boundary.is_none_or(|b| b == 0) {
-            // Nothing was sent: no identifier is consumed (SPEC.md 7.2).
+            // Nothing was sent: no identifier is consumed.
             let unsent = send.buf.len();
             send.buf.clear();
+            send.open_want = false;
             send.state = SendState::ResetRecvd;
             send.cold_mut().reset = Some(LocalReset {
                 code,
@@ -551,7 +608,7 @@ impl SessionCore {
             return;
         }
         // Keep the preamble reliable on streams this endpoint opened, unless
-        // the peer asked to stop (EXTENSIONS.md Section 4.5); keep the data
+        // the peer asked to stop; keep the data
         // below the application's boundary.
         let keep_preamble = preamble && local && send.cold().stopped.is_none();
         let reliable_app = send.cold().reliable_boundary.filter(|&b| b > 0);
@@ -577,7 +634,7 @@ impl SessionCore {
     }
 
     /// Answers the peer's STOP_SENDING with a reset carrying its code; the
-    /// reset keeps nothing reliable (SPEC.md Section 4.3).
+    /// reset keeps nothing reliable.
     pub(super) fn respond_to_stop(&mut self, key: StreamKey, code: u64) {
         let Some(send) = self.streams.send_mut(key) else {
             return;
@@ -796,7 +853,7 @@ impl SessionCore {
 
     /// The application dropped every handle of the stream without finishing
     /// it: an unfinished sending part is reset and an unread receiving part
-    /// stopped, both with code 0 (EXTENSIONS.md Section 7.4). The stream's
+    /// stopped, both with code 0. The stream's
     /// state is discarded once both parts end.
     pub fn release(&mut self, key: StreamKey) {
         self.release_send(key);
@@ -851,7 +908,7 @@ impl SessionCore {
 
     /// Declines an accepted stream before reading it: STOP_SENDING with
     /// ZMUX_REJECTED, and RESET_STREAM with ZMUX_REJECTED on a sending
-    /// part not written to (EXTENSIONS.md Section 7.2). Releases the
+    /// part not written to. Releases the
     /// receiving handle, and the sending handle when it was reset.
     pub fn reject(&mut self, key: StreamKey) -> Result<(), StreamError> {
         let s = self
@@ -950,7 +1007,7 @@ impl SessionCore {
 
     /// Asks the peer to schedule its sending part of the stream with
     /// `priority`: the PRIORITY TLV of a local stream's preamble before its
-    /// first frame, PRIORITY_UPDATE otherwise (EXTENSIONS.md Section 5).
+    /// first frame, PRIORITY_UPDATE otherwise.
     pub fn set_peer_priority(
         &mut self,
         key: StreamKey,
@@ -958,7 +1015,7 @@ impl SessionCore {
     ) -> Result<(), StreamError> {
         let preamble = self.features.preamble;
         // Before the peer's parameters only the preamble's PRIORITY TLV of
-        // an early stream can carry the request (SPEC.md Section 6.1.2).
+        // an early stream can carry the request.
         let early = self.early_open();
         if !self.features.priority && !(early && preamble) {
             return Err(StreamError::NotNegotiated);
@@ -984,9 +1041,8 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Opens a stream of type `dir` with `preamble` (EXTENSIONS.md Section
-    /// 4): [`SessionCore::open`] when it is empty. The preamble must fit the
-    /// peer's Maximum Preamble Size and one of our records, with room for a
+    /// Opens a stream of type `dir` with `preamble`: [`SessionCore::open`] when it is empty. The
+    /// preamble must fit the peer's Maximum Preamble Size and one of our records, with room for a
     /// PRIORITY TLV set later ([`OpenError::PreambleTooLarge`]), and needs the
     /// peer's `zmux_preamble` ([`OpenError::NotNegotiated`]; before
     /// establishment [`OpenError::NotEstablished`], unless the stream is
@@ -1002,8 +1058,7 @@ impl SessionCore {
         if let Some(e) = self.lost() {
             return Err(OpenError::SessionLost(e));
         }
-        // Early streams carry their preamble within the assumed set
-        // (SPEC.md Section 6.1.2).
+        // Early streams carry their preamble within the assumed set.
         if !self.is_established() && !self.early_open() {
             return Err(OpenError::NotEstablished);
         }
@@ -1045,7 +1100,7 @@ impl SessionCore {
 
     /// The largest preamble a local stream may send now: the peer's
     /// Maximum Preamble Size, or before its parameters the assumed set's
-    /// (remembered, or the 1024-byte floor of SPEC.md Section 6.1.2); at
+    /// (remembered, or the 1024-byte floor every zmux endpoint advertises); at
     /// most [`MAX_LOCAL_PREAMBLE`] and whole in one of our records.
     pub(super) fn preamble_limit(&self) -> u64 {
         self.send_tp()
@@ -1116,7 +1171,7 @@ impl SessionCore {
     // ---- datagrams ---------------------------------------------------------------
 
     /// The largest session datagram payload the peer accepts, or `None`
-    /// when it accepts none (EXTENSIONS.md Section 6.6): the smaller of the
+    /// when it accepts none: the smaller of the
     /// peer's `max_datagram_frame_size` and `max_record_size`, minus the
     /// frame type and, with datagram flows, Flow 0. 65533 with datagram
     /// flows and 65534 without for a zmux peer, 16381 for a plain QMux peer
@@ -1130,7 +1185,7 @@ impl SessionCore {
     }
 
     /// The largest payload of a datagram on stream `key` with Context ID
-    /// `context` (EXTENSIONS.md Section 6.6): the session's limit less the
+    /// `context`: the session's limit less the
     /// stream's Flow and Context ID. Before the stream has an identifier
     /// its Flow counts as the longest one. `None` without datagram flows.
     pub fn max_stream_datagram_size(&self, key: StreamKey, context: u64) -> Option<usize> {
@@ -1194,9 +1249,8 @@ impl SessionCore {
         allowed
     }
 
-    /// Queues a datagram on a bidirectional stream (Flow = stream ID + 1,
-    /// EXTENSIONS.md Section 6.3). A stream without an identifier is
-    /// pinned first. `allowed` and the result as for
+    /// Queues a datagram on a bidirectional stream (Flow = stream ID + 1). A stream without an
+    /// identifier is pinned first. `allowed` and the result as for
     /// [`SessionCore::send_datagram`].
     pub fn send_stream_datagram(
         &mut self,
@@ -1385,11 +1439,28 @@ impl SessionCore {
         }
     }
 
+    /// Raises the number of bidirectional and of unidirectional streams the
+    /// peer may have open to `bidi` and `uni`, sending the credit as
+    /// MAX_STREAMS. The credit only grows: a value at
+    /// or below the current one leaves that type as it is, so 0 raises
+    /// nothing. While unidirectional credit is staged, `uni` raises the
+    /// value the first accept moves it to. After a GOAWAY no credit is
+    /// sent. A value above 2^60 is refused and changes nothing.
+    pub fn raise_incoming_streams(&mut self, bidi: u64, uni: u64) -> Result<(), &'static str> {
+        const MAX: u64 = 1 << 60;
+        if bidi > MAX || uni > MAX {
+            return Err("raise_incoming_streams above 2^60");
+        }
+        let grant = self.goaway().sent.is_none() && self.lost().is_none();
+        self.streams.raise_remote(di(Dir::Bidi), bidi, grant);
+        self.streams.raise_remote(di(Dir::Uni), uni, grant);
+        Ok(())
+    }
+
     // ---- liveness ----------------------------------------------------------------
 
-    /// Sends a QX_PING request, or joins the one outstanding (SPEC.md
-    /// Section 4.5), with every peer, plain QMux peers included. The response
-    /// updates the RTT estimate. Returns the
+    /// Sends a QX_PING request, or joins the one outstanding, with every peer, plain QMux peers
+    /// included. The response updates the RTT estimate. Returns the
     /// request's ticket for [`SessionCore::ping_rtt`]. Until the ticket is
     /// answered, a request that stops being outstanding without its
     /// response (its timeout, or the loss of its pipe) is sent again.

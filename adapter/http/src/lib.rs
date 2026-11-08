@@ -8,9 +8,7 @@
 //! - **Uplink**: a `POST` whose request body is the uplink, and
 //!   **Downlink**: a `GET` whose response body is the downlink
 //!   ([`dial_http1_carrier_over`], [`Http2Connection::open_carrier`]):
-//!   one-way pipes, joined out of band with `Zmux-Pipe-Join`
-//!   ([`zmux::DialRequest`], [`zmux::PipeReservation::header`]), or the
-//!   two carriers of a split bootstrap paired by `Zmux-Pipe-Pair`
+//!   the two carriers of a split bootstrap or join paired by `Zmux-Pipe-Pair`
 //!   ([`dial_http1_split`], [`Http2Connection::open_split`]) for paths
 //!   that do not pass a bidirectional request.
 //! - **Exchange** ([`dial_exchange`], [`ExchangeServer`]): bounded `POST`
@@ -40,7 +38,7 @@
 //!   listener knows they share it. Lanes (further requests of the same
 //!   connection carrying a pipe's records) are off by default: the streams
 //!   of an HTTP/2 connection share one ordered TCP byte stream, so lanes
-//!   recover nothing from a loss (MULTIPATH.md Section 2.5);
+//!   recover nothing from a loss;
 //!   [`Options::lanes`] turns them on. Only the client opens lanes (a
 //!   server cannot open requests).
 //! - The server: [`serve`] accepts TCP connections and serves both
@@ -59,6 +57,11 @@
 //!
 //! TLS is the caller's: the `*_over`/[`Http2Connection::handshake`] entry
 //! points and [`serve_with`] speak HTTP over any established connection.
+//! The adapter sees only a byte stream, so its carriers have no exporter
+//! and are not declared secure ([`zmux::PipeIo::with_carrier_secure`]),
+//! even over TLS: no Bound join and no session exporter. A carrier whose
+//! TLS the adapter itself establishes and can read the exporter of (the
+//! WebSocket adapter's `wss://`, HTTP/3, WebTransport) declares both.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,7 +69,7 @@
 //! use zmux_http::Options;
 //!
 //! // Server.
-//! let listener = Listener::new(Config::default(), ListenerConfig::default());
+//! let listener = Listener::new(Config::default(), ListenerConfig::default()).expect("valid listener configuration");
 //! let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 //! tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
 //!
@@ -138,9 +141,26 @@ pub struct Options {
     /// ([`Credential::prefix`]) is written first on each request body that
     /// carries a pipe or a lane, and a downlink `GET`, which has no body,
     /// carries its header form ([`Credential::header`]). The adapter does
-    /// not see the TLS layer of its connections: the credential is given
-    /// no exporter, so a bound one fails each request.
+    /// not see the TLS layer of its connections (they are the caller's
+    /// byte streams): the credential is given no exporter, so a bound one
+    /// fails each request.
     pub credential: Option<Arc<dyn Credential>>,
+    /// Client: the connections carry TLS, so the carriers' URL is
+    /// `https://` (default `false`, `http://`): the scheme redirects are
+    /// checked against and HTTP/2 requests name.
+    pub https: bool,
+    /// Client: the redirects a carrier request follows (default
+    /// [`zmux::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none). One is
+    /// followed only within the origin, since the connection's endpoint is
+    /// the caller's: the same scheme, host and port, as
+    /// [`zmux::redirect::check`] allows (a `POST` only for 307 and 308). The
+    /// request is repeated on a new connection that the carrier's `connect`
+    /// makes (an HTTP/2 connection's further request), with the credential
+    /// presented anew and every uplink byte written before the response,
+    /// up to 64 KiB; past that a later redirect is refused. A carrier over
+    /// one connection the caller gave (`*_over`) follows none. A refused
+    /// redirect fails the carrier with a [`zmux::redirect::RedirectError`].
+    pub max_redirects: usize,
 }
 
 impl Default for Options {
@@ -152,6 +172,8 @@ impl Default for Options {
             exchange: None,
             fallback: None,
             credential: None,
+            https: false,
+            max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
         }
     }
 }
@@ -194,6 +216,20 @@ impl Options {
     #[must_use]
     pub fn with_fallback(mut self, fallback: HttpFallback) -> Self {
         self.fallback = Some(fallback);
+        self
+    }
+
+    /// With the carriers' URL `https://` ([`Options::https`]).
+    #[must_use]
+    pub fn with_https(mut self, on: bool) -> Self {
+        self.https = on;
+        self
+    }
+
+    /// With this bound on the redirects followed ([`Options::max_redirects`]).
+    #[must_use]
+    pub fn with_max_redirects(mut self, redirects: usize) -> Self {
+        self.max_redirects = redirects;
         self
     }
 

@@ -1,7 +1,7 @@
 //! Multipath sessions end to end, sans IO: two cores joined by in-memory
 //! pipes. Data spread over pipes, pipes that fail with data in flight,
 //! joins, removals and suspension: every stream is delivered exactly once,
-//! in order, and nothing panics (MULTIPATH.md Sections 7, 8 and 13).
+//! in order, and nothing panics.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -34,7 +34,7 @@ type Net = MpNet<(), Book>;
 fn config(policy: Policy, resume: bool) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = policy;
     c.max_idle_timeout = Some(Duration::from_secs(60));
     if resume {
@@ -225,7 +225,7 @@ fn spread_over_two_pipes_and_survive_a_failure() {
     );
 }
 
-/// SPEC.md Section 4.5, MULTIPATH.md Section 7: a request lost with its
+/// A request lost with its
 /// pipe stops being outstanding; a ping still waiting asks again on the
 /// pipes left, so it is answered.
 #[test]
@@ -268,6 +268,56 @@ fn a_ping_lost_with_its_pipe_asks_again() {
         "{:?}",
         n.ends[A].error()
     );
+}
+
+/// A keep-alive period set while the session runs counts from the last
+/// activity, not from the call.
+#[test]
+fn a_new_keep_alive_counts_from_the_last_activity() {
+    let mut n = net(Policy::SpreadEta, false);
+    let mut l = zmux::Liveness::of(n.ends[A].config());
+    l.keep_alive_period = None;
+    l.probe_interval = None;
+    l.probe_jitter = 0.0;
+    n.ends[A].set_liveness(&l).unwrap();
+    n.pump(2);
+    let activity = n.now;
+    n.advance(600);
+    l.keep_alive_period = Some(Duration::from_secs(1));
+    n.ends[A].set_liveness(&l).unwrap();
+    assert!(n.ends[A].poll_timeout().unwrap() <= activity + Duration::from_secs(1));
+}
+
+/// A pipe already suspect keeps the dead timeout it turned suspect under.
+#[test]
+fn a_suspect_pipe_keeps_its_dead_timeout() {
+    let mut n = net(Policy::SpreadEta, false);
+    let mut l = zmux::Liveness::of(n.ends[A].config());
+    l.dead_timeout = Some(Duration::from_secs(50));
+    n.ends[A].set_liveness(&l).unwrap();
+    n.open_and_write(200_000, true);
+    n.step(4000);
+    n.links.get_mut(&0).unwrap().stall(true);
+    n.links.get_mut(&0).unwrap().cap = 64 * 1024;
+    let suspect = |n: &Net| {
+        n.ends[A].pipe_state(PipeId::new(0), PipeHalf::Outbound)
+            == Some(DirectionState::Outbound(OutboundState::Suspect))
+    };
+    for _ in 0..2000 {
+        if suspect(&n) {
+            break;
+        }
+        n.pump(1);
+        n.advance(10);
+    }
+    assert!(suspect(&n));
+    l.dead_timeout = Some(Duration::from_secs(1));
+    n.ends[A].set_liveness(&l).unwrap();
+    for _ in 0..500 {
+        n.pump(1);
+        n.advance(10);
+    }
+    assert!(suspect(&n), "five seconds under the old 50 s");
 }
 
 #[test]
@@ -369,7 +419,7 @@ fn acknowledgements_drive_quality_events() {
     }
 }
 
-/// MULTIPATH.md Section 2.4 ("Carrier liveness and zmux's timers"): a
+/// Carrier liveness and zmux's timers: a
 /// carrier's own verdict, reported by the adapter as a read error, an
 /// unexpected end or a write error, fails the pipe at once, while another
 /// pipe is ACTIVE, without waiting for T_suspect or T_fail: no time
@@ -407,7 +457,7 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
     }
 }
 
-/// MULTIPATH.md Sections 3.1 and 10.1: E names a secret source the
+/// Secret sources: E names a secret source the
 /// endpoint can provide. Without the bootstrap exporter it is not offered,
 /// so a session secret is never derived from the public nonces alone:
 /// with E as the only source, multipath stays off; with the exporter on
@@ -422,7 +472,8 @@ fn the_exporter_flag_needs_an_exporter() {
         let mut n = Net::new(a, b, Book::default());
         if exporter {
             for end in &mut n.ends {
-                end.set_bootstrap_exporter(&[7; 32]);
+                end.announce_bootstrap_exporter();
+                end.set_bootstrap_exporter_value(vec![7; 32]);
             }
         }
         for _ in 0..10 {
@@ -863,8 +914,8 @@ fn paced_pipes_send_whole_chunks() {
     );
 }
 
-/// A peer that fragments on purpose (CONFORMANCE.md Section 4.2, SPEC.md
-/// Section 9.8): one byte at every other offset of each stream's window,
+/// A peer that fragments on purpose (fragmentation the
+/// receiver must accept): one byte at every other offset of each stream's window,
 /// in 1-byte STREAM frames alternating between two pipes, in records of
 /// those frames alone and with each frame in its own record padded to
 /// 64 KiB. The session stays open, the received data costs at most 2.5 x
@@ -907,8 +958,8 @@ fn deliberate_fragmentation_is_bounded_by_the_span() {
                 n.ends[B].receive(PipeId::new(pipes[i]), &r, n.now);
             }
         };
-        // Offset 0 holds an empty stream preamble (EXTENSIONS.md Section
-        // 4.4): the application data starts at 1.
+        // Offset 0 holds an empty stream preamble:
+        // the application data starts at 1.
         let byte = |id: u64, off: u64| if off == 0 { 0 } else { (id * 7 + off) as u8 };
         let mut k = 0;
         for s in 0..STREAMS {
@@ -971,4 +1022,17 @@ fn deliberate_fragmentation_is_bounded_by_the_span() {
         }
         assert_eq!(done, STREAMS);
     }
+}
+
+/// The bootstrap pair is no join: its end counts no failed join.
+#[test]
+fn the_end_of_the_bootstrap_pair_is_no_failed_join() {
+    let mut n = net(Policy::default(), false);
+    assert_eq!(n.ends[A].stats().join_failures, 0);
+    n.ends[A].pipe_ended(
+        PipeId::new(0),
+        PipeEnd::Error(std::io::ErrorKind::ConnectionReset),
+        n.now,
+    );
+    assert_eq!(n.ends[A].stats().join_failures, 0);
 }

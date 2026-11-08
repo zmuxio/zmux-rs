@@ -1,6 +1,6 @@
 [package]
 name = "zmux-websocket"
-version = "1.2.5"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -19,13 +19,18 @@ httparse = "1"
 # WebSocket upgrades inside a hyper server (feature `hyper`).
 hyper = { version = "1.12", optional = true, default-features = false, features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", optional = true, default-features = false, features = ["tokio"] }
-zmux = { version = "1.2.5", path = "../.." }
+# wss:// in dial and connect (feature `wss`): the Mozilla roots.
+webpki-roots = { version = "1", optional = true }
+zmux = { version = "1.3.0", path = "../.." }
 # serve_tls: the admission metadata of a TLS connection.
-zmux-rustls = { version = "1.2.5", path = "../rustls" }
 
 [features]
 # accept_request: upgrades of requests a hyper server received.
 hyper = ["dep:hyper", "dep:hyper-util"]
+# dial and connect also take wss:// URLs: TLS by rustls with the ring provider and the
+# Mozilla roots of webpki-roots (tls_connector for other roots). Off by default, as the
+# application's own TLS configuration goes to dial_tls without it.
+wss = ["dep:webpki-roots", "tokio-rustls/ring"]
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
@@ -34,6 +39,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1.54", features = ["full"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+zmux-seal = { path = "../../seal" }
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

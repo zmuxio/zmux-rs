@@ -1,4 +1,4 @@
-//! Datagrams on a carrier's datagram channel (EXTENSIONS.md Section 6.8),
+//! Datagrams on a carrier's datagram channel,
 //! in the sans-IO core: the per-frame choice between the channel and a
 //! record, what a receiver does with channel datagrams, and the datagrams
 //! held for streams that have not opened yet, in records and on channels.

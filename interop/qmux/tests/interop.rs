@@ -1,6 +1,6 @@
 //! Interoperability with an independent QMux implementation: the `qmux`
-//! crate 0.6.2 (draft-ietf-quic-qmux-02), as a plain QMux peer (SPEC.md
-//! Section 13, CONFORMANCE.md Section 6).
+//! crate 0.6.2 (draft-ietf-quic-qmux-02), as a plain QMux peer (the
+//! QMux compatibility profile).
 //!
 //! A crate of its own, outside the zmux workspace, so that its
 //! dependencies are fetched only when it runs:
@@ -24,7 +24,7 @@
 //!
 //! The bytes on the carrier are tapped in both directions and decoded
 //! afterwards. Towards the plain peer zmux may send only QMux-02 frames
-//! (SPEC.md Section 13.2): no GOAWAY, PRIORITY_UPDATE or PIPE_* frame, no
+//! (the plain-peer sending rules): no GOAWAY, PRIORITY_UPDATE or PIPE_* frame, no
 //! out-of-order or repeated STREAM data, no record above the peer's
 //! `max_record_size`, and QX_TRANSPORT_PARAMETERS exactly once, first.
 
@@ -173,7 +173,7 @@ struct Pair {
 fn zmux_config() -> zmux::Config {
     let mut c = zmux::Config::default();
     c.enable_datagrams = true;
-    // CONFORMANCE.md: the full unidirectional credit at once.
+    // The full unidirectional credit at once.
     c.max_incoming_uni_streams = Some(256);
     c
 }
@@ -243,7 +243,7 @@ async fn establish(carrier: Carrier, zmux_client: bool) -> Pair {
             let addr = listener.local_addr().unwrap();
             let (dialed, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
             let (dialed, accepted) = (dialed.unwrap(), accepted.unwrap().0);
-            // The TCP client is the initiator (SPEC.md Section 5.6).
+            // The TCP client is the initiator.
             let (z, q) = if zmux_client {
                 (dialed, accepted)
             } else {
@@ -599,7 +599,7 @@ fn frame_name(f: &Frame<'_>) -> &'static str {
         Frame::QxPing(_) => "QX_PING(request)",
         Frame::GoAway(_) => "GOAWAY",
         Frame::PriorityUpdate(_) => "PRIORITY_UPDATE",
-        Frame::PipeJoin(_) => "PIPE_JOIN",
+        Frame::SessionEpoch(_) => "SESSION_EPOCH",
         Frame::PipeAck(_) => "PIPE_ACK",
         Frame::PipeLane(_) => "PIPE_LANE",
         Frame::PipePing => "PIPE_PING",
@@ -610,7 +610,7 @@ fn frame_name(f: &Frame<'_>) -> &'static str {
 }
 
 /// Decodes one direction. `max_record` is the receiver's `max_record_size`;
-/// `strict` applies the rules of SPEC.md Section 13.2 to the sender.
+/// `strict` applies the plain-QMux-peer sending rules to the sender.
 fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
     let mut w = Wire::default();
     let mut streams: HashMap<u64, StreamTrack> = HashMap::new();
@@ -645,7 +645,7 @@ fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
         first = false;
         if !w.closes.is_empty() {
             w.violations.push(format!(
-                "{name} after CONNECTION_CLOSE (SPEC.md Section 6.5)"
+                "{name} after CONNECTION_CLOSE (nothing may follow it)"
             ));
         }
         if let Frame::ConnectionClose(c) = f {
@@ -681,8 +681,7 @@ fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
                         s.stream_id, s.offset, t.next
                     ));
                 }
-                // An empty frame without FIN only opens a stream (SPEC.md
-                // Section 4.3).
+                // An empty frame without FIN only opens a stream.
                 if s.data.is_empty() && !s.fin && t.frames != 0 {
                     w.violations
                         .push(format!("empty STREAM {} without FIN", s.stream_id));
@@ -716,12 +715,12 @@ fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
             | Frame::ConnectionClose(_)
             | Frame::QxPing(_)
             // The peer advertised `reset_stream_at` and
-            // `max_datagram_frame_size` (SPEC.md Section 13.2 rule 3).
+            // `max_datagram_frame_size` (so a plain peer may get them).
             | Frame::ResetStreamAt(_)
             | Frame::Datagram(_) => {}
             _ => w
                 .violations
-                .push(format!("{name}: not a QMux-02 frame (SPEC.md Section 13.2)")),
+                .push(format!("{name}: not a QMux-02 frame (plain-peer rules)")),
         }
     }
     if w.wire_len != bytes.len() as u64 {
@@ -822,7 +821,7 @@ fn check_wire(label: &str, pair: &Pair, closer: Closer) {
         Closer::Qmux => {
             assert_eq!(qw.closes, app_close(7, "done"), "[{label}]");
             // At most one CONNECTION_CLOSE in response, without error
-            // (QMux-02 Section 7.3, SPEC.md Section 6.5): whether it is
+            // (QMux-02 Section 7.3): whether it is
             // written depends on whether the carrier still takes it.
             let no_error = "0x1c code 0x0 frame type 0x0 reason \"\"".to_string();
             assert!(
@@ -896,7 +895,7 @@ async fn duplex_zmux_server() {
     scenario(Carrier::Duplex, false, Closer::Zmux).await;
 }
 
-/// CONFORMANCE.md test 11: zmux as client with `early_data`
+/// Interop case: zmux as client with `early_data`
 /// wrongly declaring the target a zmux endpoint. The target stops at the
 /// PIPE_ACK fence with FRAME_ENCODING_ERROR, its application sees no
 /// stream, and zmux reports `EarlyDataRejected`.

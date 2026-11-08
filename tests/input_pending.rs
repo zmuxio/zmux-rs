@@ -24,7 +24,7 @@ const MIB: usize = 1 << 20;
 fn config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"input-pending---0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"input-pending---0123456789abcdef").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
     c
 }
@@ -99,7 +99,8 @@ async fn carriers(tcp: bool, l: Option<&TcpListener>) -> (PipeIo, PipeIo) {
 /// transfer over `pipes` pipes in calls cut at the write-call bound.
 async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
     let tl = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let listener = Listener::new(config(), ListenerConfig::default());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let (a, b) = carriers(tcp, Some(&tl)).await;
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(b, PipeHint::default()).await });
@@ -109,7 +110,7 @@ async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
         let (a, b) = carriers(tcp, Some(&tl)).await;
         let l = listener.clone();
         tokio::spawn(async move { l.handle_pipe(b, PipeHint::default()).await });
-        client.add_pipe(a, PipeOptions::default()).unwrap();
+        client.begin_add_pipe(a, PipeOptions::default()).unwrap();
     }
     let total = 64 * MIB;
     let (mut send, _) = client.open_bi().await.unwrap();
@@ -135,7 +136,7 @@ async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
     let (all, bounded) = take_write_call_bytes();
     assert_eq!(got, total);
     drop(writer.await.unwrap());
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     bounded as f64 / all as f64
 }
 

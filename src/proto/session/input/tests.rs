@@ -100,7 +100,7 @@ fn key(s: &SessionCore, id: u64) -> StreamKey {
 }
 
 /// Bytes of a frame that arrived before the preamble and overlap it leave
-/// the buffers when the preamble is parsed (EXTENSIONS.md Section 4.4):
+/// the buffers when the preamble is parsed:
 /// the session's and the stream's buffered counts both drop to 0, and the
 /// session credit released covers every byte consumed, the overlap
 /// included.
@@ -133,12 +133,11 @@ fn preamble_overlap_leaves_the_buffers() {
     );
 }
 
-/// Ranges beyond a gap merge as data arrives (SPEC.md Section 7.3): a
+/// Ranges beyond a gap merge as data arrives: a
 /// frame adjacent to a range extends it and one that fills a gap joins two,
 /// so the bookkeeping follows the gaps, not the frames, and inserts cost
-/// O(log n). Nothing is charged: the list of chargeable frames is closed
-/// (SPEC.md Section 9.4.1), and a sender spreading small frames over pipes
-/// of different delays legitimately leaves many small gaps.
+/// O(log n). Nothing is charged: the list of chargeable frames is closed, and a sender spreading
+/// small frames over pipes of different delays legitimately leaves many small gaps.
 #[test]
 fn ranges_beyond_a_gap_merge() {
     let (_a, mut b, now) = pair();
@@ -167,7 +166,7 @@ fn ranges_beyond_a_gap_merge() {
 }
 
 /// Bytes beyond a gap release session credit when they arrive; the gap
-/// releases nothing before its own bytes arrive (SPEC.md Section 8.3).
+/// releases nothing before its own bytes arrive.
 #[test]
 fn gap_bytes_release_no_credit_before_they_arrive() {
     let (_a, mut b, now) = pair();
@@ -219,8 +218,7 @@ fn drained_receive_buffers_release_their_capacity() {
 }
 
 /// A local stream's receiving part leaves the buffer cap's `n_local`
-/// when it is terminal, before the stream is discarded (SPEC.md Section
-/// 8.3 rule 4).
+/// when it is terminal, before the stream is discarded.
 #[test]
 fn local_receiving_parts_leave_the_cap_when_terminal() {
     let (mut a, mut b, now) = pair();
@@ -313,7 +311,7 @@ fn retired_read_buffers_stay_within_twice_the_referenced_bytes() {
     }
 }
 
-/// A FIN-only frame needs no credit (SPEC.md Section 8.2): in a
+/// A FIN-only frame needs no credit: in a
 /// multipath session, a stream whose data used up its stream credit sends
 /// its FIN at once when it is finished.
 #[test]
@@ -353,7 +351,7 @@ fn fin_only_frames_go_without_credit() {
     assert_eq!(r.final_size, Some(r.received), "the FIN arrived");
 }
 
-/// A FIN-only frame needs no session credit (SPEC.md Section 8.2): in a
+/// A FIN-only frame needs no session credit: in a
 /// multipath session whose credit is used up while another stream waits
 /// for more, a finished stream's FIN still goes.
 #[test]

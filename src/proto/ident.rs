@@ -1,28 +1,26 @@
-//! Identification of a new carrier (SPEC.md Section 6.2, MULTIPATH.md
-//! Section 5.5) and ALPN identifiers (SPEC.md Sections 6.2 and 13.3).
+//! Identification of a new carrier and ALPN identifiers.
 //!
-//! Without TLS the first bytes identify the protocol: the first record of a
-//! bootstrap pipe must have a Size from 9 to the receiver's own
-//! `max_record_size` followed by the QX_TRANSPORT_PARAMETERS type
-//! (`ff 51 53 30 0d 0a 0d 0a` in QMux-02). A listener that also accepts joins accepts the
-//! PIPE_JOIN type `9a 24 de 36` after a Size from 26, and on a new stream of
-//! a connection that already carries a pipe of the endpoint the PIPE_LANE
-//! type `ba 05 a1 c9` after a Size from 22 (a lane, MULTIPATH.md Section
-//! 5.8). The check runs byte by byte and rejects as soon as no valid first
+//! Without TLS the first bytes identify the protocol: the first record of a bootstrap
+//! pipe must have a Size from 9 to the receiver's own `max_record_size` followed by the
+//! QX_TRANSPORT_PARAMETERS type (`ff 51 53 30 0d 0a 0d 0a` in QMux-02). A listener that
+//! also accepts joins takes the first byte `02` of a Join Hello, which no first record
+//! begins with since a Size is at least 9, and on a new stream of a connection that
+//! already carries a pipe of the endpoint the PIPE_LANE type `ba 05 a1 c9` after a Size
+//! from 22 (a lane). The check runs byte by byte and rejects as soon as no valid first
 //! record can begin with the bytes seen.
 
 use super::draft::CURRENT;
 use super::error::Error;
+use super::params::ZMUX_MAX_RECORD_SIZE;
+use super::record::Framing;
 
 /// The encoded QX_TRANSPORT_PARAMETERS type that starts a session
 /// ([`crate::proto::draft`]).
 pub const SESSION_PREFIX: [u8; 8] = CURRENT.session_prefix();
-/// The encoded PIPE_JOIN type that starts an in-band join.
-pub const JOIN_PREFIX: [u8; 4] = [0x9a, 0x24, 0xde, 0x36];
+/// The first byte of a Join Hello.
+pub const JOIN_FIRST_BYTE: u8 = 0x02;
 /// The smallest Size of a first record that starts a session.
 pub const MIN_SESSION_RECORD: u64 = 9;
-/// The smallest Size of a first record that starts a join.
-pub const MIN_JOIN_RECORD: u64 = 26;
 /// The encoded PIPE_LANE type that starts a lane.
 pub const LANE_PREFIX: [u8; 4] = [0xba, 0x05, 0xa1, 0xc9];
 /// The smallest Size of a first record that starts a lane.
@@ -33,7 +31,7 @@ pub const MIN_LANE_RECORD: u64 = 22;
 pub enum FirstRecord {
     /// A new session (QX_TRANSPORT_PARAMETERS first).
     Session,
-    /// A pipe join (PIPE_JOIN first).
+    /// A pipe join (a Join Hello).
     Join,
     /// A lane of a pipe (PIPE_LANE first).
     Lane,
@@ -88,8 +86,7 @@ impl Classifier {
     }
 
     /// The check also accepts a lane: for a new stream of a connection
-    /// that already carries a pipe of the endpoint (MULTIPATH.md Section
-    /// 5.5).
+    /// that already carries a pipe of the endpoint.
     pub const fn with_lanes(mut self) -> Self {
         self.lanes = true;
         self
@@ -116,10 +113,14 @@ impl Classifier {
     }
 
     /// Checks the first message of a message-framed carrier: the message
-    /// length stands for the Size (SPEC.md Section 3.4). `at` in a
-    /// rejection counts the message bytes, 0 meaning the length itself.
+    /// length stands for the Size. `at` in a rejection counts the
+    /// message bytes, 0 meaning the length itself.
     pub fn message(&mut self, message: &[u8]) -> Verdict {
         if self.verdict != Verdict::NeedMore || self.have != 0 {
+            return self.verdict;
+        }
+        if self.joins && message.first() == Some(&JOIN_FIRST_BYTE) {
+            self.verdict = Verdict::Accept(FirstRecord::Join);
             return self.verdict;
         }
         let mut size = [0u8; 8];
@@ -152,6 +153,9 @@ impl Classifier {
 
     fn evaluate(&self) -> Verdict {
         let seen = &self.seen[..self.have];
+        if self.joins && seen.first() == Some(&JOIN_FIRST_BYTE) {
+            return Verdict::Accept(FirstRecord::Join);
+        }
         let Some((size, width)) = super::varint::decode(seen) else {
             return Verdict::NeedMore;
         };
@@ -163,12 +167,6 @@ impl Classifier {
                 MIN_SESSION_RECORD,
                 &SESSION_PREFIX[..],
                 FirstRecord::Session,
-            ),
-            (
-                self.joins,
-                MIN_JOIN_RECORD,
-                &JOIN_PREFIX[..],
-                FirstRecord::Join,
             ),
             (
                 self.lanes,
@@ -206,8 +204,7 @@ impl Classifier {
     }
 }
 
-/// The default ALPN identifier (SPEC.md Section 6.2;
-/// [`crate::proto::draft`]).
+/// The default ALPN identifier ([`crate::proto::draft`]).
 pub const DEFAULT_ALPN: &[u8] = CURRENT.alpn.as_bytes();
 
 /// The draft's identifier and its alias, each with its `-NN` suffix:
@@ -231,12 +228,10 @@ fn alias_rule() -> Option<AliasRule> {
     })
 }
 
-/// The alias of a configured ALPN identifier (SPEC.md Section 6.2), for a
-/// draft whose codepoints an earlier draft shares ([`crate::proto::draft::Draft::alpn_alias`]):
-/// for QMux-02, `qmux-01` for `qmux-02`, `qmux-01.<application>` for
-/// `qmux-02.<application>`, `<name>-01` for any other `<name>-02`, and no
-/// alias otherwise. A client may offer the aliases after its configured
-/// identifiers.
+/// The alias of a configured ALPN identifier, for a draft whose codepoints an earlier draft
+/// shares ([`crate::proto::draft::Draft::alpn_alias`]): for QMux-02, `qmux-01` for `qmux-02`,
+/// `qmux-01.<application>` for `qmux-02.<application>`, `<name>-01` for any other `<name>-02`,
+/// and no alias otherwise. A client may offer the aliases after its configured identifiers.
 pub fn alpn_alias(configured: &[u8]) -> Option<Vec<u8>> {
     let AliasRule {
         own,
@@ -259,10 +254,10 @@ pub fn alpn_alias(configured: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The ALPN identifiers to configure on a TLS client or server for
-/// `applications` (SPEC.md Sections 6.2 and 13.3): `qmux-02` without
-/// applications, `qmux-02.<application>` for each, followed by their
-/// draft-01 aliases (`qmux-01`, `qmux-01.<application>`), which a server
-/// accepts and a client may offer last.
+/// `applications`: `qmux-02` without applications,
+/// `qmux-02.<application>` for each, followed by their draft-01 aliases
+/// (`qmux-01`, `qmux-01.<application>`), which a server accepts and a
+/// client may offer last.
 ///
 /// ```
 /// assert_eq!(zmux::alpn_protocols(&[]), [b"qmux-02".to_vec(), b"qmux-01".to_vec()]);
@@ -352,6 +347,67 @@ where
         .find(|o| configured.clone().into_iter().any(|c| alpn_matches(c, o)))
 }
 
+/// The most bytes [`classify_first_bytes`] needs.
+pub const MAX_FIRST_BYTES: usize = 5;
+
+/// What [`classify_first_bytes`] tells about a carrier's first bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FirstBytes {
+    /// More bytes are needed to tell: this many in all, at most
+    /// [`MAX_FIRST_BYTES`].
+    NeedMore(usize),
+    /// They can begin a first record of this specification.
+    Record,
+    /// They cannot.
+    Other,
+}
+
+/// Whether `b`, the first bytes a carrier delivered with `framing` (in a
+/// message-framed carrier, the start of the first message), can begin a
+/// first record or is a Join Hello's first byte `02`: on a byte stream a
+/// Size of at least 9 and at most [`ZMUX_MAX_RECORD_SIZE`] as a
+/// variable-length integer of 1, 2 or 4 bytes, then a first frame type; in a
+/// message, the first frame type at once.
+///
+/// It judges the syntax of a prefix only, not the limits of a receiver,
+/// which [`Classifier`] applies. `16 03`, as TLS begins, is always
+/// [`FirstBytes::Other`]. It is the one authority for hosts and transforms
+/// that tell zmux records from other content.
+pub fn classify_first_bytes(b: &[u8], framing: Framing) -> FirstBytes {
+    let Some(&first) = b.first() else {
+        return FirstBytes::NeedMore(1);
+    };
+    if first == JOIN_FIRST_BYTE {
+        return FirstBytes::Record;
+    }
+    let lead = |x: u8| [SESSION_PREFIX[0], LANE_PREFIX[0]].contains(&x);
+    let judged = |x: u8| {
+        if lead(x) {
+            FirstBytes::Record
+        } else {
+            FirstBytes::Other
+        }
+    };
+    if framing == Framing::Records {
+        return judged(first);
+    }
+    let width = 1usize << (first >> 6);
+    if width == 8 || (width == 1 && first < 9) || (width == 4 && b.get(1).is_some_and(|&x| x != 0))
+    {
+        return FirstBytes::Other;
+    }
+    let Some((size, _)) = super::varint::decode(b) else {
+        return FirstBytes::NeedMore(width + 1);
+    };
+    if !(MIN_SESSION_RECORD..=ZMUX_MAX_RECORD_SIZE).contains(&size) {
+        return FirstBytes::Other;
+    }
+    match b.get(width) {
+        Some(&x) => judged(x),
+        None => FirstBytes::NeedMore(width + 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +418,7 @@ mod tests {
 
     #[test]
     fn foreign_prefixes() {
-        // WIRE_EXAMPLES.md Section 7.
-        assert_eq!(
-            reject_at(&[0x5a, 0x4d, 0x55, 0x58, 0x01]),
-            Verdict::Reject { at: 3 }
-        );
+        // The specification's wire examples of foreign protocols.
         assert_eq!(reject_at(b"GET / "), Verdict::Reject { at: 3 });
         assert_eq!(reject_at(b"PRI * "), Verdict::Reject { at: 3 });
         assert_eq!(reject_at(&[0x16, 0x03, 0x01]), Verdict::Reject { at: 2 });
@@ -385,18 +437,13 @@ mod tests {
             }
         }
         assert_eq!(c.verdict(), Verdict::Accept(FirstRecord::Session));
-        let join = [0x26, 0x9a, 0x24, 0xde, 0x36];
+        let join = [JOIN_FIRST_BYTE];
         assert_eq!(
             Classifier::new(65_535, true, true).push(&join),
             Verdict::Accept(FirstRecord::Join)
         );
         assert_eq!(
             Classifier::bootstrap(65_535).push(&join),
-            Verdict::Reject { at: 2 }
-        );
-        // A Size of 24 cannot start a join.
-        assert_eq!(
-            Classifier::new(65_535, false, true).push(&[0x18]),
             Verdict::Reject { at: 1 }
         );
     }

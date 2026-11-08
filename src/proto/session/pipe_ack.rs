@@ -1,4 +1,4 @@
-//! Pipe acknowledgement without multipath (MULTIPATH.md Section 3.5): two
+//! Pipe acknowledgement without multipath: two
 //! zmux endpoints acknowledge the single pipe pair of a session that does
 //! not use multipath, for the sender's estimates
 //! and its carrier queue limiter only. Nothing
@@ -16,7 +16,7 @@ use super::pipes::{AckSample, Attachment};
 use crate::proto::frame::{Frame, FrameType, PipeAck};
 use crate::proto::{DetailKey, Error};
 
-/// The pipe pair of a session without multipath (MULTIPATH.md Section 4.2).
+/// The pipe pair of a session without multipath.
 const PIPE: u64 = 0;
 
 /// The most sample entries kept for batches in flight: at 10 Gbit/s and
@@ -40,9 +40,8 @@ pub(crate) struct PipeAckState {
     /// The threshold was reached: a PIPE_ACK goes with the next records.
     due: bool,
     /// The send-order ends of batches that carried an activity frame and
-    /// wait for the PIPE_ACK that restarts the idle timer (SPEC.md Section
-    /// 6.4): the oldest and the newest (0: none). The ones between count
-    /// as the newest, which can only make the timer restart later, never
+    /// wait for the PIPE_ACK that restarts the idle timer: the oldest and the newest (0: none). The
+    /// ones between count as the newest, which can only make the timer restart later, never
     /// keep a session alive longer.
     activity_first: u64,
     activity_last: u64,
@@ -67,7 +66,7 @@ impl SessionCore {
             });
         } else if self.features.multipath {
             // The batches before multipath was in use stay for the
-            // positions their PIPE_ACK counts (MULTIPATH.md Section 6),
+            // positions their PIPE_ACK counts,
             // without starting the acknowledgement-stall clock: failure
             // detection starts with the session's first data.
             if let Some(o) = self.out_mut(PIPE) {
@@ -75,7 +74,7 @@ impl SessionCore {
             }
         } else if let Some(o) = self.out_mut(PIPE) {
             // A multipath session keeps it: PIPE_ACK acknowledges the
-            // pipe's positions from its first byte (MULTIPATH.md Section 6).
+            // pipe's positions from its first byte.
             o.forget_batches();
         }
     }
@@ -83,9 +82,8 @@ impl SessionCore {
     /// A batch was handed to the single pipe's carrier: its sample state is
     /// kept while pipe acknowledgement is in use, and for the first batch,
     /// which goes out before the peer's parameters say whether it will be
-    /// (positions count from the pipe's first byte, MULTIPATH.md Section
-    /// 3.5). At most [`SAMPLE_ENTRIES`] are kept: beyond them a batch joins
-    /// the latest entry (an ack-eliciting one replaces a non-eliciting
+    /// (positions count from the pipe's first byte). At most [`SAMPLE_ENTRIES`] are kept: beyond
+    /// them a batch joins the latest entry (an ack-eliciting one replaces a non-eliciting
     /// entry with its own send time), so that a peer that
     /// acknowledges late (a large `zmux_max_ack_delay`) cannot make the
     /// state grow with the batches sent meanwhile.
@@ -120,15 +118,13 @@ impl SessionCore {
     }
 
     /// When the received ack-eliciting bytes must be acknowledged at the
-    /// latest: our `zmux_max_ack_delay` after the first of them
-    /// (MULTIPATH.md Section 6.3 rule 2).
+    /// latest: our `zmux_max_ack_delay` after the first of them.
     fn single_ack_deadline(&self, pa: &PipeAckState) -> Option<Instant> {
         let p = self.atts.first()?.inp()?;
         Some(p.unacked_since()? + pa.local_mad)
     }
 
-    /// Whether a PIPE_ACK is due on pipe 0 (MULTIPATH.md Section 6.3 rules
-    /// 1 and 2).
+    /// Whether a PIPE_ACK is due on pipe 0.
     pub(super) fn single_pipe_ack_due(&self, now: Instant) -> bool {
         self.pipe_ack
             .as_ref()
@@ -145,9 +141,8 @@ impl SessionCore {
     }
 
     /// Writes the PIPE_ACK of pipe 0 when it is due, or when the batch
-    /// carries a credit update anyway while received bytes wait for it
-    /// (MULTIPATH.md Sections 3.5 and 6.3): a record of its own only when
-    /// the deadline passed with nothing else to send.
+    /// carries a credit update anyway while received bytes wait for it: a record of its own only
+    /// when the deadline passed with nothing else to send.
     pub(super) fn write_single_pipe_ack(&mut self, w: &mut Records<'_>, now: Instant) {
         if self.pipe_ack.is_none() {
             return;
@@ -163,8 +158,7 @@ impl SessionCore {
         }
         if p.lane_count() > 1 {
             // Every lane in an entry of its own; unchanged ones may be
-            // omitted, with a complete snapshot at least once per second
-            // (MULTIPATH.md Sections 3.5 and 6.2).
+            // omitted, with a complete snapshot at least once per second.
             let mut entries = Vec::new();
             let complete =
                 super::ack::snapshot_of(&self.atts, &mut entries, p.complete_due(now), now);
@@ -195,7 +189,7 @@ impl SessionCore {
     }
 
     /// PIPE_ACK while pipe acknowledgement is in use: one entry, for pipe
-    /// 0, at most the bytes sent on it (MULTIPATH.md Section 3.5).
+    /// 0, at most the bytes sent on it.
     pub(super) fn on_single_pipe_ack(
         &mut self,
         f: &PipeAck<'_>,
@@ -230,13 +224,13 @@ impl SessionCore {
                 continue;
             };
             // Outdated entries are ignored, never charged. The samples come
-            // from the cumulative acknowledgement point (MULTIPATH.md
-            // Section 2.5).
+            // from the cumulative acknowledgement point.
             let lanes = o.lanes().is_some();
             let (moved, cum) = o.ack_lane(e.lane, e.position, now);
             if let Some(cum) = cum {
                 let delay = Duration::from_micros(e.ack_delay.min(u64::MAX >> 2));
-                let sample = o.sample_ack(cum, delay, peer_mad, true, false, |_| true, now);
+                let sample =
+                    o.sample_ack(cum, delay, peer_mad, true, false, |_| true, |_| true, now);
                 self.single_pipe_acked(sample, now);
                 self.activity_acked(cum, now);
             }
@@ -277,7 +271,7 @@ impl SessionCore {
 
     /// What an acknowledgement of the single pipe measured: the estimators
     /// of pipe 0 have taken it, and its RTT sample enters the credit-loop
-    /// minimum of auto-tuning (SPEC.md Section 8.3 rule 6). This is where
+    /// minimum of auto-tuning. This is where
     /// per-acknowledgement consumers of the samples, such as the carrier
     /// queue limiter, take them.
     /// A batch that carried activity ended at send-order position `end`.
@@ -291,7 +285,7 @@ impl SessionCore {
     }
 
     /// The cumulative point reached `cum`: acknowledged activity restarts
-    /// the idle timer (SPEC.md Section 6.4).
+    /// the idle timer.
     fn activity_acked(&mut self, cum: u64, now: Instant) {
         let Some(pa) = self.pipe_ack.as_mut() else {
             return;

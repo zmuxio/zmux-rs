@@ -13,7 +13,7 @@
 //! that advances the pipe's position ([`SessionCore::pace_ack`] with an
 //! [`AckEvent`]) and one per batch handed to the carrier
 //! ([`Limiter::on_sent`]); a multipath session feeds every outbound pipe,
-//! and a single pipe with pipe acknowledgement (MULTIPATH.md Section 3.5)
+//! and a single pipe with pipe acknowledgement
 //! feeds pipe 0 the same way. Everything is constant work per event
 //! (amortised): the standing queue is a three-sample windowed minimum,
 //! r_q the exact maximum of its window, the gain cycle a phase and its
@@ -302,7 +302,7 @@ impl Limiter {
         self.base(est)
     }
 
-    /// The held bytes left out of the bytes in flight (Section 9.1): all
+    /// The held bytes left out of the bytes in flight: all
     /// of them during start-up, their smallest count over the last
     /// RTT_base_p afterwards.
     pub(crate) fn left_out(&self, held: Held) -> u64 {

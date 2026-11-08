@@ -1,5 +1,4 @@
-//! Credit of the stream layer: stream counts per type (SPEC.md Section
-//! 8.5) and session flow control (Sections 8.2 to 8.4).
+//! Credit of the stream layer: stream counts per type and session flow control.
 //!
 //! The types are read through [`Streams`] and changed only by it:
 //! their fields are visible to the session for reading, and no mutable
@@ -15,13 +14,13 @@ use super::Streams;
 /// The regular update floor.
 const UPDATE_FLOOR: u64 = 256 * 1024;
 
-/// SPEC.md Section 8.3 rules 2 and 3: whether released credit `unsent`
+/// The regular-update and blocked-liveness rules: whether released credit `unsent`
 /// (C - L > 0) must be sent now, given the window, the peer's remaining
 /// credit and whether it reported BLOCKED at the current limit.
 fn credit_due(unsent: u64, window: u64, remaining: u64, blocked_reported: bool) -> bool {
     let quarter = window / 4;
-    // Rule 2, sent early as SPEC.md Section 8.3 rule 2 allows: min(W/4,
-    // max(W/16, 256 KiB)) released. Rule 3:
+    // Regular update, sent as early as allowed: min(W/4,
+    // max(W/16, 256 KiB)) released. Blocked liveness:
     // a blocked peer gets any credit at once; a nearly blocked one from a
     // minimum increment on.
     unsent >= quarter.min((window / 16).max(UPDATE_FLOOR))
@@ -134,7 +133,7 @@ pub(in super::super) struct RemoteDir {
     /// Lowest GOAWAY watermark sent.
     pub(in super::super) goaway_sent: Option<u64>,
     /// More credit is granted on the first accept (staged unidirectional
-    /// credit, SPEC.md Section 8.5 rule 4).
+    /// credit).
     pub(in super::super) staged: bool,
     /// MAX_STREAMS was lost with a pipe: send the current limit again.
     pub(in super::super) resend: bool,
@@ -177,7 +176,7 @@ impl RemoteDir {
     }
 }
 
-/// Session-level receive flow control (SPEC.md Section 8.2).
+/// Session-level receive flow control.
 #[derive(Debug)]
 pub(in super::super) struct RecvFlow {
     /// The MAX_DATA value last written (or the initial one): L.
@@ -186,7 +185,7 @@ pub(in super::super) struct RecvFlow {
     pub(in super::super) window: u64,
     /// Sum over streams of max(received, final size).
     pub(in super::super) used: u64,
-    /// Credit released (SPEC.md Section 8.3 rule 4).
+    /// Credit released.
     pub(in super::super) released: u64,
     /// Bytes received at or above the buffer cap, not released yet.
     pub(in super::super) held: u64,
@@ -277,7 +276,7 @@ impl RecvFlow {
         self.check_credit();
     }
 
-    /// Decides whether MAX_DATA is due (SPEC.md Section 8.3 rules 2 and 3).
+    /// Decides whether MAX_DATA is due.
     pub(super) fn check_credit(&mut self) {
         let c = self.credit();
         if c <= self.limit_sent {
@@ -523,7 +522,7 @@ impl Streams {
         self.recv_flow.consumed(cap, n, pressure);
     }
 
-    /// Decides whether MAX_DATA is due (SPEC.md Section 8.3 rules 2 and 3).
+    /// Decides whether MAX_DATA is due.
     pub(in super::super) fn check_session_credit(&mut self) {
         self.recv_flow.check_credit();
     }
@@ -535,7 +534,7 @@ impl Streams {
     }
 
     /// Whether auto-tuning is paused: at the buffer cap until the buffered
-    /// bytes fall below half of it (SPEC.md Section 8.3 rule 4), or under
+    /// bytes fall below half of it, or under
     /// the listener's memory pressure.
     pub(in super::super) fn growth_paused(&self) -> bool {
         self.recv_flow.at_cap || self.memory_pressure

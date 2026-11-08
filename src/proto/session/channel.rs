@@ -1,4 +1,4 @@
-//! Datagrams on a carrier's datagram channel (EXTENSIONS.md Section 6.8).
+//! Datagrams on a carrier's datagram channel.
 //!
 //! A pipe carrier may have an unreliable datagram service of its own: QUIC
 //! datagrams of the connection a QUIC stream pipe belongs to, the HTTP
@@ -77,9 +77,8 @@ impl SessionCore {
 
     /// Moves the queued datagrams that go on the datagram channel of `pipe`
     /// now to the end of `out`, each a whole channel datagram for the
-    /// driver to send in order, outside the lock (EXTENSIONS.md Section
-    /// 6.8). Returns [`SessionCore::channel_live`]. Datagrams returned
-    /// count as sent; [`SessionCore::channel_send_failed`] counts those the
+    /// driver to send in order, outside the lock. Returns [`SessionCore::channel_live`]. Datagrams
+    /// returned count as sent; [`SessionCore::channel_send_failed`] counts those the
     /// carrier refused as dropped instead.
     pub fn poll_channel(&mut self, pipe: PipeId, out: &mut Vec<Bytes>) -> bool {
         let send_queue = self.config.datagram_send_queue;
@@ -141,9 +140,8 @@ impl SessionCore {
         }
     }
 
-    /// A channel datagram received for `pipe`, its Pipe Stream ID removed
-    /// (EXTENSIONS.md Section 6.8). Dropped and counted when the pipe is
-    /// not an open inbound pipe of the session or the session did not
+    /// A channel datagram received for `pipe`, its Pipe Stream ID removed. Dropped and counted when
+    /// the pipe is not an open inbound pipe of the session or the session did not
     /// negotiate the channel; otherwise anything but one DATAGRAM frame of
     /// type 0x30 closes the session with PROTOCOL_VIOLATION, and the frame
     /// is processed as one in a record on that pipe, without the
@@ -185,8 +183,7 @@ impl SessionCore {
 
     /// The pipe whose datagram channel the datagrams that go with the
     /// control frames may take: the bootstrap pipe outside multipath, the
-    /// first live pipe of the control order in a multipath session
-    /// (MULTIPATH.md Section 11.1 rule S7). Unlike the control pipe it does
+    /// first live pipe of the control order in a multipath session. Unlike the control pipe it does
     /// not change while a carrier refuses bytes.
     fn channel_pipe(&self) -> Option<u64> {
         if self.mp.is_none() {

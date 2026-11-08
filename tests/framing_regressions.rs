@@ -1,5 +1,5 @@
 //! Record framing at the end of a batch, sans IO, one pipe: every byte a
-//! core hands to its carrier belongs to a record (SPEC.md Section 3).
+//! core hands to its carrier belongs to a record.
 //! Found by `tests/mp_fuzz.rs`.
 
 use std::time::Instant;

@@ -7,6 +7,11 @@ Published crates, all with one version (major 1, in lockstep):
 - `zmux` (the core)
 - `zmux-rustls`, `zmux-quinn`, `zmux-websocket`, `zmux-http`, `zmux-h3`, `zmux-webtransport` (carrier adapters)
 - `zmux-shaping` (the state-machine shaper)
+- `zmux-seal-proto` (the sans-IO secure carrier handshake) and `zmux-seal` (the secure carrier over zmux carriers)
+
+The workflow derives the publication order from the dependencies: `zmux` first, `zmux-seal-proto` before
+`zmux-seal`, `zmux-rustls` before the adapters built on it. The Python binding, which depends on these crates (`zmux-seal`
+among them), is released only after all of them are on crates.io.
 
 Releases are automated from tag `vX.Y.Z` (`.github/workflows/release.yml`). The workflow:
 
@@ -23,6 +28,8 @@ crates.io versions are immutable after publication. The repository secret `CARGO
 
 - every `Cargo.toml` package version under the workspace: `X.Y.Z`
 - every adapter's dependency on `zmux`: `{ version = "X.Y.Z", path = "../.." }` (`zmux-shaping`'s: `path = ".."`)
+- every dependency on another workspace crate: `{ version = "X.Y.Z", path = ... }` (`zmux-seal` on `zmux-seal-proto`
+  and `zmux`, `zmux-seal-proto` on `zmux`)
 - git tag: `vX.Y.Z`
 
 ## Dependency update
@@ -54,7 +61,7 @@ The ahead/behind count should be `0 0`. Update the versions above, then:
 ```bash
 cargo metadata --locked --no-deps --format-version 1 > /dev/null
 cargo publish --dry-run --locked --workspace
-git add Cargo.toml Cargo.lock adapter/*/Cargo.toml shaping/Cargo.toml
+git add Cargo.toml Cargo.lock adapter/*/Cargo.toml shaping/Cargo.toml seal/Cargo.toml seal-proto/Cargo.toml
 git commit -m "release: prepare vX.Y.Z"
 git push origin main
 git tag -a vX.Y.Z -m "vX.Y.Z"

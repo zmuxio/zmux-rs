@@ -19,11 +19,10 @@
 //! - `blocking` (feature `blocking`): the same API for threads.
 //!
 //! Every delivery guarantee, exactly-once in-order stream data across pipes
-//! and resumptions included, ends at the peer's zmux endpoint (SPEC.md
-//! Section 7.4): a completed write, a finished stream or a closed session
-//! says nothing about whether the peer's application read, processed or
-//! stored the data. Applications that need that acknowledge at their own
-//! level, as over TCP.
+//! and resumptions included, ends at the peer's zmux endpoint: a completed
+//! write, a finished stream or a closed session says nothing about whether
+//! the peer's application read, processed or stored the data. Applications
+//! that need that acknowledge at their own level, as over TCP.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,34 +106,50 @@ mod error;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub mod helpers;
 pub mod proto;
+pub mod redirect;
 pub mod util;
 
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
 pub use proto::admission::{
-    Admission, AdmittedValue, CarrierInfo, Credential, Decide, DecideFuture, PEEK_TIMEOUT_DRAWN,
-    STALL_MAX_DRAWN, Verdict,
+    Admission, AdmittedValue, CarrierInfo, Credential, Decide, DecideFuture, Decision,
+    PEEK_TIMEOUT_DRAWN, STALL_MAX_DRAWN, Verdict,
 };
+pub use proto::exporter::{CarrierExporter, ExportError, RESERVED_EXPORTER_PREFIX, TlsState};
 pub use proto::frame::{Dir, Priority};
+pub use proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
 pub use proto::ident::{alpn_protocols, default_alpn};
 pub use proto::limit::{DatagramLimiter, Limiter};
-pub use proto::listener::{ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure};
+pub use proto::listener::{
+    ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure, OnReject, RejectAction,
+    RejectError, RejectInfo,
+};
+pub use proto::listener::{SessionCarrier, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};
-pub use proto::oob::{JOIN_HEADER, PAIR_HEADER, PAIRING_TOKEN_LEN};
+pub use proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
 pub use proto::params::Role;
 pub use proto::prefix_auth::{
     InvalidPrefixAuth, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL, PREFIX_AUTH_HEADER,
     PREFIX_TOKEN_LEN, PrefixAuth, PrefixAuthVerifier,
 };
+pub use proto::replay::{InvalidReplayConfig, ReplayFilter, ReplayVerdict};
 pub use proto::session::shaping;
 pub use proto::session::{
-    Budget, CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierKind, Config,
-    DatagramError, DirectionState, EarlyData, EarlyDataState, GoAway, InboundState, LaneStats,
-    Multipath, OpenError, OutboundState, Period, PipeAuth, PipeError, PipeFailure, PipeHalf,
-    PipeId, PipeOptions, PipeStats, PipeUpdate, Policy, Preamble, PrioritySource, QualityBand,
-    Redundancy, RttSource, SessionError, SessionEvent, SessionStats, State as SessionState,
-    StreamError, StreamStats, Tracer,
+    AllowRecordMode, AuthorizeJoin, CarrierDescription, RecordMode, RecordPolicy,
 };
+pub use proto::session::{
+    Budget, CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierKind, Config,
+    DEFAULT_JOIN_TIMEOUT, DEFAULT_MAX_BACKOFF, DEFAULT_MIN_BACKOFF, DatagramError, DirectionState,
+    EarlyData, EarlyDataState, GoAway, InboundState, JoinMissing, LaneStats, Liveness, LogLevel,
+    Logger, Multipath, OpenError, OutboundState, Period, PipeAuth, PipeError, PipeFailure,
+    PipeHalf, PipeId, PipeLiveness, PipeOptions, PipeStats, PipeUpdate, Policy, Preamble,
+    PrioritySource, QualityBand, Redundancy, RttSource, SessionError, SessionEvent, SessionStats,
+    State as SessionState, StreamError, StreamStats, Support, Tracer,
+};
+
+/// The QMux version this crate speaks, the only one: what
+/// [`Session::qmux_version`](Session#method.qmux_version) reports.
+pub const QMUX_VERSION: &str = proto::draft::CURRENT.name;
 pub use proto::trusted::{InvalidNet, IpNet, TrustedProxies, forwarded_early_data};
 pub use proto::{DetailKey, VarInt};
 
@@ -143,18 +158,20 @@ pub use proto::{DetailKey, VarInt};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::cache::{CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime};
+pub use driver::cache::{
+    CacheOutcome, CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime,
+};
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub use driver::handle::Written;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::listen::{
-    AdmissionStats, Admit, Admitted, Entry, HandleError, Listener, ListenerStats, PipeHint,
-    SetupGuard,
+    AdmissionStats, AdmissionVariants, Admit, Admitted, Entry, HandleError, Listener,
+    ListenerStats, MAX_ADMISSION_VARIANTS, PipeHint, SetupGuard, VariantStats,
 };
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::mode::{Candidate, Mode, ModeError, ModePolicy, dial_mode, join_split};
+pub use driver::mode::{Candidate, HttpTarget, Mode, ModeError, ModePolicy, dial_mode};
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::tokio::{Dial, Pipe, PipeIo, PipeReservation, RecvStream, SendStream, Session};
+pub use driver::tokio::{Dial, Pipe, PipeIo, RecvStream, SendStream, Session};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::transform::{InboundTransform, PipeStream};
 
@@ -163,10 +180,9 @@ pub use driver::transform::{InboundTransform, PipeStream};
 /// router of its incoming lanes, and the memory charge of a connection
 /// held for a listener's sessions. Applications that only use carriers
 /// need none of it. The [`PipeIo`] methods for carrier authors are
-/// `from_chunk_halves`, `with_carrier_conn`, `with_lane_opener`,
-/// `with_chunk_lane_opener`, `with_lanes`,
+/// `from_chunk_halves`, `with_carrier_conn`, `with_lane_opener`, `with_lanes`,
 /// `with_connection_memory`, `with_tcp_socket`, `with_unsent`, `with_low_water`,
-/// `with_partial_reads`, `with_tls_exporter`, `with_abort`,
+/// `with_partial_reads`, `with_exporter`, `with_abort`,
 /// `with_datagram_channel` and `with_protocol`.
 #[cfg(all(feature = "tokio", not(loom)))]
 pub mod carrier {
@@ -174,7 +190,7 @@ pub mod carrier {
         ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
     };
     pub use crate::driver::empty_message;
-    pub use crate::driver::lanes::{CarrierConnId, handle_lane};
+    pub use crate::driver::lanes::{CarrierConnId, Lane, handle_lane};
     pub use crate::driver::listen::MemoryCharge;
     pub use crate::driver::tokio::{ChunkBuf, ChunkWrite};
 }
@@ -229,7 +245,9 @@ pub mod test_hooks {
 /// | `resolve_duplicate` | yes | yes |
 /// | early data under the zmux floor (`EarlyData::zmux_peer`) | yes | yes |
 /// | carrier early data (`PipeIo::with_early_data`, QUIC 0-RTT) | yes | no |
-/// | `Listener` (joins, resumption at the accepting side) | yes | no |
+/// | `Listener`: sessions, joins, resumption, `count_setup_failure` | yes | yes |
+/// | `Listener`: split carriers, lanes, admission (`Fallback`, `Prefixed`), memory budget | yes | no |
+/// | `Mode`, `dial_mode`, `CarrierCache` | yes | no |
 /// | streams as pipes (`open_pipe_stream`, `PipeIo::from_stream`) | yes | no |
 /// | lanes, `handle_lane` | yes | no |
 /// | `helpers::splice`, `helpers::maintain_pipes` | yes | no |
@@ -252,9 +270,11 @@ pub mod test_hooks {
 #[cfg(all(feature = "blocking", not(loom)))]
 pub mod blocking {
     pub use crate::driver::blocking::{
-        Dial, Pipe, PipeIo, PipeReservation, RecvStream, SendStream, Session, WaitError,
+        Dial, HandshakeWait, Pipe, PipeIo, RecvStream, SendStream, Session, WaitError, Watchdog,
     };
+    pub use crate::driver::blocking_listen::{InboundTransform, Listener, PipeHint};
     pub use crate::driver::empty_message;
+    pub use crate::proto::listener::{HandleError, ListenerStats};
 
     /// The helpers of the std driver, as `zmux::helpers` has them for the
     /// tokio one.

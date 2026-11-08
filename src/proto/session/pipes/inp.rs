@@ -1,6 +1,5 @@
 //! The inbound pipe of an attachment: its state, the record reader and
-//! the receive position with what PIPE_ACK reports of it (MULTIPATH.md
-//! Sections 6.1 to 6.3 and 7.3).
+//! the receive position with what PIPE_ACK reports of it.
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +9,7 @@ use crate::proto::ident::{Classifier, Verdict};
 use crate::proto::record::{Framing, RecordReader};
 
 /// The receive state of one record stream: lane 0 of an inbound pipe, or
-/// another lane of it (MULTIPATH.md Section 2.5).
+/// another lane of it.
 #[derive(Debug)]
 pub(crate) struct RecvLane {
     reader: Option<RecordReader>,
@@ -24,7 +23,7 @@ pub(crate) struct RecvLane {
     rec_activity: bool,
     rec_ping: bool,
     rec_other: bool,
-    /// Receive position (MULTIPATH.md Section 6.1).
+    /// Receive position.
     position: u64,
     /// When the record that brought the position to its value was
     /// processed (ACK Delay).
@@ -110,14 +109,14 @@ struct InLane {
 
 impl InLane {
     /// Whether its end is the pipe's: once a record after its first has
-    /// arrived (MULTIPATH.md Section 5.8 reader rule 3).
+    /// arrived.
     fn counts(&self) -> bool {
         self.records > 1
     }
 }
 
-/// How the end of an inbound lane other than lane 0 affects its pipe
-/// (MULTIPATH.md Sections 5.8 and 7.3, SPEC.md Section 6.6).
+/// How the end of an inbound lane other than lane 0 affects its
+/// pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneEnd {
     /// No event of the pipe: it ended before its second record, or other
@@ -143,14 +142,6 @@ pub(crate) struct InPipe {
     /// Lane 0 ended at a record boundary while other lanes were open.
     zero_ended: bool,
     state: InState,
-    /// The next frame is the in-band PIPE_JOIN the listener verified.
-    skip_join: bool,
-    /// The record being read is a leading QX_TRANSPORT_PARAMETERS record
-    /// on a pipe this endpoint joined: it is discarded (MULTIPATH.md
-    /// Section 5.7 step 3).
-    discard: bool,
-    /// The first record ended: no record is a leading one any more.
-    leading_seen: bool,
     /// Ack-eliciting bytes since the last PIPE_ACK that listed the pipe,
     /// summed over its lanes, and when the first of them arrived; and
     /// whether frames other than PIPE_PING were among them.
@@ -164,7 +155,7 @@ pub(crate) struct InPipe {
     opened_at: Instant,
     /// Duplicate stream bytes received on the pipe.
     dup_bytes: u64,
-    /// Linger deadline after the PIPE_ABANDON exchange (MULTIPATH.md 8.2).
+    /// Linger deadline after the PIPE_ABANDON exchange.
     linger_until: Option<Instant>,
     /// The driver was told to close the carrier half.
     close_reported: bool,
@@ -177,9 +168,8 @@ pub(crate) struct InPipe {
 #[derive(Debug, Default)]
 struct InLanes {
     list: Vec<InLane>,
-    /// When the last complete snapshot listed them, outside multipath
-    /// (MULTIPATH.md Section 6.2; a multipath session keeps one time for
-    /// every pipe).
+    /// When the last complete snapshot listed them, outside multipath (a
+    /// multipath session keeps one time for every pipe).
     complete_at: Option<Instant>,
 }
 
@@ -208,30 +198,17 @@ pub(crate) enum Classified {
     Rejected(usize),
 }
 
-/// What the end of a record on a pipe of a multipath session brings
-/// (MULTIPATH.md Section 6.1).
+/// What the end of a record on a pipe of a multipath session brings.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordEnd {
     /// The record carried an activity frame.
     pub(crate) activity: bool,
     /// It carried PIPE_PING.
     pub(crate) ping: bool,
-    /// It confirmed a joining pipe, which is open now.
-    pub(crate) joined: bool,
     /// A PIPE_ACK is due at once (a PIPE_PING, or the ack threshold).
     pub(crate) immediate: bool,
     /// The pipe's first record carried a PIPE_PING.
     pub(crate) first_ping: bool,
-}
-
-/// What a received frame is to the pipe's record accounting.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FrameIn {
-    /// Part of a discarded leading record: not processed.
-    Discarded,
-    /// Processed: whether it is the pipe's first frame, and whether it is
-    /// the in-band PIPE_JOIN the listener verified.
-    Process { first: bool, skip_join: bool },
 }
 
 impl InPipe {
@@ -243,9 +220,6 @@ impl InPipe {
             zero: RecvLane::new(framing, max_record, now),
             zero_ended: false,
             state,
-            skip_join: false,
-            discard: false,
-            leading_seen: false,
             elicit: 0,
             elicit_since: None,
             elicit_other: false,
@@ -270,13 +244,6 @@ impl InPipe {
     /// With the first-record check of a bootstrap pipe.
     pub(crate) fn with_classifier(mut self, classifier: Classifier) -> Self {
         self.classifier = Some(classifier);
-        self
-    }
-
-    /// With the in-band PIPE_JOIN the listener verified as its first frame
-    /// (`inband`, MULTIPATH.md Section 5.2).
-    pub(crate) fn with_inband_join(mut self, inband: bool) -> Self {
-        self.skip_join = inband;
         self
     }
 
@@ -309,6 +276,17 @@ impl InPipe {
     pub(crate) fn restart(&mut self, now: Instant) {
         self.opened_at = now;
         self.last_record = now;
+    }
+
+    /// Records received.
+    pub(crate) fn records_received(&self) -> u64 {
+        self.records
+    }
+
+    /// A verified Reply: the direction is open and its clocks start.
+    pub(crate) fn join_proven(&mut self, now: Instant) {
+        self.state = InState::Open;
+        self.restart(now);
     }
 
     /// A deferred join goes: the pipe is joining.
@@ -366,7 +344,7 @@ impl InPipe {
         self.dup_bytes += bytes;
     }
 
-    // ---- lanes (MULTIPATH.md Sections 2.5 and 5.8) -------------------------------
+    // ---- lanes ----------------------------------------------------------------------
 
     /// Whether lane `number` (0: the pipe's own carrier) is still read: it
     /// was accepted and has not ended.
@@ -531,64 +509,26 @@ impl InPipe {
         self.zero.at_clean_end() && self.classifier.is_none()
     }
 
-    /// Whether the first record of a pipe this endpoint joined may still
-    /// be a leading QX_TRANSPORT_PARAMETERS record (MULTIPATH.md Section
-    /// 5.7 step 3).
-    pub(crate) fn leading_possible(&self) -> bool {
-        matches!(self.state, InState::Joining | InState::Deferred) && !self.leading_seen
-    }
-
-    /// A frame of the current record of lane `li`: `leading_tp`, a
-    /// QX_TRANSPORT_PARAMETERS frame that leads the first record of a pipe
-    /// this endpoint joined, discards the record; the frame's kind marks
-    /// the record (ack-eliciting, an activity frame, PIPE_PING: `ping`).
+    /// A frame of the current record of lane `li`: its kind marks the record (ack-eliciting,
+    /// an activity frame, PIPE_PING: `ping`). Whether it is the lane's first frame.
     pub(crate) fn frame_in(
         &mut self,
         li: usize,
-        leading_tp: bool,
         eliciting: bool,
         activity: bool,
         ping: bool,
-    ) -> FrameIn {
-        if li == 0 {
-            if self.discard {
-                return FrameIn::Discarded;
-            }
-            if leading_tp {
-                self.zero.frames_in += 1;
-                self.discard = true;
-                return FrameIn::Discarded;
-            }
-        }
-        let skip_join = li == 0 && std::mem::replace(&mut self.skip_join, false);
+    ) -> bool {
         let r = self.recv_mut(li);
         r.frames_in += 1;
         r.rec_eliciting |= eliciting;
         r.rec_activity |= activity;
         r.rec_other |= eliciting && !ping;
-        FrameIn::Process {
-            first: r.frames_in == 1,
-            skip_join,
-        }
+        r.frames_in == 1
     }
 
     /// The current record of lane `li` carries a PIPE_PING.
     pub(crate) fn ping_in(&mut self, li: usize) {
         self.recv_mut(li).rec_ping = true;
-    }
-
-    /// The current record of lane `li` ended: `false` for a discarded
-    /// leading record (which counts for nothing, MULTIPATH.md Section 5.7
-    /// step 3).
-    pub(crate) fn record_closed(&mut self, li: usize) -> bool {
-        if li == 0 {
-            self.leading_seen = true;
-            if std::mem::replace(&mut self.discard, false) {
-                self.zero.take_marks();
-                return false;
-            }
-        }
-        true
     }
 
     /// A record of `len` bytes ended on lane `li` of a pipe outside
@@ -617,7 +557,7 @@ impl InPipe {
 
     /// Lane `li`'s position was processed now; ack-eliciting bytes of the
     /// record wait for a PIPE_ACK. Whether the bytes waiting, summed over
-    /// the lanes, reach `threshold` (MULTIPATH.md Section 6.3).
+    /// the lanes, reach `threshold`.
     pub(crate) fn await_ack(
         &mut self,
         li: usize,
@@ -636,9 +576,9 @@ impl InPipe {
     }
 
     /// A record of `len` bytes ended on lane `li` of a pipe of a multipath
-    /// session (MULTIPATH.md Section 6.1): the position and the record
-    /// statistics count it, a joining pipe opens, and its ack-eliciting
-    /// bytes wait for a PIPE_ACK, due at once from `threshold` bytes.
+    /// session: the position and the record statistics count it, a joining
+    /// pipe opens, and its ack-eliciting bytes wait for a PIPE_ACK, due at
+    /// once from `threshold` bytes.
     pub(crate) fn mp_record(
         &mut self,
         li: usize,
@@ -657,16 +597,10 @@ impl InPipe {
         r.position += len;
         let (eliciting, activity, ping, other) = r.take_marks();
         self.elicit_other |= eliciting && other;
-        let joined = self.state == InState::Joining;
-        if joined {
-            self.state = InState::Open;
-            self.opened_at = now;
-        }
         let threshold_reached = self.await_ack(li, len, eliciting, threshold, now);
         RecordEnd {
             activity,
             ping,
-            joined,
             immediate: ping || threshold_reached,
             first_ping: ping && self.records == 1,
         }
@@ -699,7 +633,7 @@ impl InPipe {
     /// The entries the pipe, numbered `pipe_id`, adds to a PIPE_ACK at
     /// `now`, in lane order: every lane with a position above 0, or with
     /// `!complete` only those whose position changed since the last
-    /// complete snapshot (MULTIPATH.md Section 6.2). How many.
+    /// complete snapshot. How many.
     pub(crate) fn ack_entries(
         &self,
         pipe_id: u64,
@@ -742,8 +676,7 @@ impl InPipe {
     }
 
     /// Whether the PIPE_ACK of a pipe with lanes outside multipath must be
-    /// a complete snapshot: none went out in the last second (MULTIPATH.md
-    /// Sections 3.5 and 6.2).
+    /// a complete snapshot: none went out in the last second.
     pub(crate) fn complete_due(&self, now: Instant) -> bool {
         self.lanes.as_deref().is_none_or(|l| {
             l.complete_at
@@ -776,8 +709,8 @@ impl InPipe {
         self.linger_until
     }
 
-    /// Starts the linger after the PIPE_ABANDON exchange (MULTIPATH.md
-    /// Section 8.2), unless it runs or the pipe is not live.
+    /// Starts the linger after the PIPE_ABANDON exchange, unless it
+    /// runs or the pipe is not live.
     pub(crate) fn start_linger(&mut self, until: Instant) {
         if self.is_live() && self.linger_until.is_none() {
             self.linger_until = Some(until);
@@ -795,7 +728,7 @@ impl InPipe {
     }
 
     /// Whether every lane other than lane 0 whose end counts ended at a
-    /// record boundary (MULTIPATH.md Section 7.3).
+    /// record boundary.
     fn lanes_ended_cleanly(&self) -> bool {
         self.lanes.as_deref().is_none_or(|l| {
             l.iter()
@@ -806,7 +739,7 @@ impl InPipe {
 
     /// Lane 0 ended at a record boundary: whether that is the pipe's
     /// graceful end, every lane whose end counts having ended so too;
-    /// otherwise the pipe waits for the others (SPEC.md Section 6.6).
+    /// otherwise the pipe waits for the others.
     pub(crate) fn zero_ended_cleanly(&mut self) -> bool {
         self.zero_ended = true;
         self.zero.reader = None;

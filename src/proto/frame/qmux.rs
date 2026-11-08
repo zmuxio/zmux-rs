@@ -11,7 +11,7 @@ use crate::proto::varint::len as vlen;
 /// [`crate::proto::draft`]), carrying an encoded
 /// transport-parameter block.
 ///
-/// Decoding validates the block (SPEC.md Section 5.2); parse it with
+/// Decoding validates the block; parse it with
 /// [`TransportParameters::decode`] to read the values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QxTransportParameters<'a> {

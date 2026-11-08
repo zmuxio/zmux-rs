@@ -1,6 +1,6 @@
 //! QUIC version 1 frames (RFC 9000 Section 19) and the QUIC extension frames
 //! RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset-11) and DATAGRAM
-//! (RFC 9221) as zmux uses them (SPEC.md Section 4.3).
+//! (RFC 9221) as zmux uses them.
 
 use super::{Dir, Fail, FrameType};
 use crate::proto::codec::{Cursor, Writer};
@@ -585,7 +585,7 @@ pub struct Datagram<'a> {
 
 impl<'a> Datagram<'a> {
     /// Splits the data into its flow and payload when datagram flows are in
-    /// use (EXTENSIONS.md Section 6.3).
+    /// use.
     pub fn flow(&self) -> Result<(crate::proto::payload::Flow, &'a [u8]), Error> {
         let ty = if self.explicit_len {
             FrameType::DATAGRAM_LEN.0

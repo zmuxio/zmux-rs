@@ -359,7 +359,7 @@ fn options() -> Options {
 fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"quicnet-bench-psk-0123456789abcd");
+    c.pipe_auth = PipeAuth::psk(*b"quicnet-bench-psk-0123456789abcd").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
     c
 }
@@ -637,7 +637,7 @@ async fn run_flows(loss: f64, lanes: bool, seed: u64, secs: f64) {
 
 /// Closes a run's sessions, then its endpoints.
 async fn end(cs: Session, ss: Session, quic: Quic) {
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ss.closed()).await;
     drop((cs, ss));
     quic.client.close(0u32.into(), b"");
@@ -714,7 +714,8 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
         queue: tcp_rate * tcp_rtt.as_secs_f64(),
     };
     let cut = env("QN_CUT", 10.0);
-    let listener = Listener::new(mp_config(), ListenerConfig::default());
+    let listener = Listener::new(mp_config(), ListenerConfig::default())
+        .expect("valid listener configuration");
     // TCP: server side.
     let tl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp_server = tl.local_addr().unwrap();
@@ -750,7 +751,7 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
     let _server_quic = QuicCarrier::with_listener(sc, &listener, options());
     let client_quic = QuicCarrier::new(cc, options());
     let pipe = client
-        .add_pipe(
+        .begin_add_pipe(
             client_quic.open_pipe().await.unwrap(),
             PipeOptions::default(),
         )

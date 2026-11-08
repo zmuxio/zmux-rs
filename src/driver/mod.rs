@@ -43,6 +43,8 @@ mod account;
 pub(crate) mod admission;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking;
+#[cfg(all(feature = "blocking", not(loom)))]
+pub(crate) mod blocking_listen;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod cache;
 #[cfg(all(feature = "tokio", not(loom)))]
@@ -69,6 +71,8 @@ pub(crate) mod mode;
 mod precise;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod resources;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod sealed;
 #[cfg(all(test, shuttle, feature = "blocking", not(loom)))]
 mod shuttle;
 #[cfg(all(feature = "tokio", not(loom)))]
@@ -157,7 +161,7 @@ pub(crate) mod read_pool {
 
     /// A read buffer of [`super::READ_BUFFER`] initialized bytes, for
     /// readers that need initialized memory (`std::io::Read`).
-    #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
+    #[cfg(feature = "blocking")]
     pub(crate) fn take_initialized() -> BytesMut {
         let (mut buf, _) = take();
         buf.resize(super::READ_BUFFER, 0);
@@ -185,7 +189,7 @@ pub(crate) mod read_pool {
 
     /// A fresh identity for `buf`, a buffer that was reclaimed or grown
     /// in place.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn renew(buf: &BytesMut) -> Backing {
         Backing {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
@@ -245,7 +249,7 @@ impl CallLimit {
     }
 }
 
-/// A stream identifier (SPEC.md Section 7.1).
+/// A stream identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub(crate) u64);
 
@@ -304,42 +308,40 @@ pub enum PipeDirection {
     Bidi,
 }
 
-/// What a dial is for: the pipe's direction, and for a pipe the local
-/// endpoint only reads (a downlink), the `Zmux-Pipe-Join` header value the
-/// carrier's request must carry (MULTIPATH.md Section 5.3); the others join
-/// in band. The argument of a [`Dial`](crate::Dial) function.
+/// What a dial is for: the halves the carrier provides. The argument of a
+/// [`Dial`](crate::Dial) function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DialRequest {
     /// The halves the carrier provides.
     pub direction: PipeDirection,
-    /// The out-of-band join of a downlink.
-    pub join_header: Option<String>,
 }
 
 impl DialRequest {
-    /// A request for a carrier with both halves, joined in band (a rejoin,
-    /// a pool's dial).
+    /// A request for a carrier with both halves (a rejoin, a pool's dial).
     pub fn bidi() -> Self {
-        Self::new(PipeDirection::Bidi, None)
+        Self::new(PipeDirection::Bidi)
     }
 
-    /// A request for a carrier of `direction`, with the `Zmux-Pipe-Join`
-    /// value of an out-of-band join ([`PipeReservation::header`](crate::PipeReservation#method.header)).
-    pub fn new(direction: PipeDirection, join_header: Option<String>) -> Self {
-        Self {
-            direction,
-            join_header,
-        }
+    /// A request for a carrier of `direction`.
+    pub fn new(direction: PipeDirection) -> Self {
+        Self { direction }
     }
 }
 
 /// A session with role auto: its role depends on the peer, so it cannot
-/// send early data.
+/// send early data; without a listener it may become the accepting side,
+/// which cannot resume.
 pub(crate) fn check_peer(config: &crate::Config) -> Result<(), crate::ConnectError> {
     if config.early_data.zmux_peer {
         return Err(crate::ConnectError::InvalidConfig(
             "early_data needs a role that does not depend on the peer: not with role auto",
+        ));
+    }
+    if config.resume_timeout.is_some() {
+        return Err(crate::ConnectError::InvalidConfig(
+            "resume_timeout on a symmetric session without a listener: \
+             the accepting side of a resume needs a Listener",
         ));
     }
     Ok(())
@@ -358,10 +360,10 @@ impl fmt::Display for EmptyMessage {
 impl std::error::Error for EmptyMessage {}
 
 /// For message-framed carriers ([`PipeIo::records`](crate::PipeIo::records)):
-/// the read result that reports an empty message. A read that returns
-/// nothing is the end of the carrier, so a carrier's reader returns this
-/// error for a message without bytes instead; the session takes it as an
-/// empty record, a no-op that is not chargeable (SPEC.md Section 3.4).
+/// the read result that reports an empty message. A read that returns nothing
+/// is the end of the carrier, so a carrier's reader returns this error for a
+/// message without bytes instead; the session takes it as an empty record, a
+/// no-op that is not chargeable.
 pub fn empty_message() -> std::io::Error {
     std::io::Error::other(EmptyMessage)
 }
@@ -369,4 +371,17 @@ pub fn empty_message() -> std::io::Error {
 /// Whether a read error is [`empty_message`].
 pub(crate) fn is_empty_message(e: &std::io::Error) -> bool {
     e.get_ref().is_some_and(|i| i.is::<EmptyMessage>())
+}
+
+/// How long accepting pauses after an error that says nothing of the next connection.
+pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether accepting pauses after `e`: not for an error of one connection. No error ends
+/// the accepting, only closing the listener does.
+pub(crate) fn accept_backs_off(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    !matches!(
+        e.kind(),
+        K::ConnectionAborted | K::ConnectionReset | K::Interrupted | K::WouldBlock
+    )
 }

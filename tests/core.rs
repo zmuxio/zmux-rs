@@ -198,7 +198,7 @@ impl Limiter for Budget {
 
 /// Received datagrams waiting for the receive limiter, the ones the driver
 /// took to police included, count in the session's datagram bytes with
-/// the queued ones (EXTENSIONS.md Section 6.5): the oldest waiting ones
+/// the queued ones: the oldest waiting ones
 /// make room, and the session never holds more than 1 MiB of them.
 #[test]
 fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
@@ -457,7 +457,7 @@ fn send_capacity_wait_is_woken_only_once_its_minimum_is_reached() {
     );
 }
 
-/// SPEC.md Section 4.5: a request whose response is later than its
+/// A request whose response is later than its
 /// timeout, max(1 s, 3 x SRTT), stops being outstanding, and its late
 /// response matches nothing; a ping still waiting asks again, so it is
 /// answered.
@@ -486,7 +486,7 @@ fn a_ping_whose_response_is_late_asks_again() {
     );
 }
 
-/// EXTENSIONS.md Section 6.6: a single-pipe
+/// Datagram statistics: a single-pipe
 /// session reports pipe 0 like any pipe; its RTT comes from QX_PING with a
 /// plain QMux peer, which gives no acknowledgements and so no rates or
 /// acknowledged positions; `ping` measures a fresh RTT; the largest

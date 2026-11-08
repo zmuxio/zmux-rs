@@ -11,7 +11,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use zmux::DialRequest;
 use zmux::helpers::{Backoff, PipePool, PoolDecision, PoolView, RotatePolicy};
 use zmux::{
     Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
@@ -21,7 +20,7 @@ use zmux::{
 fn config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 6;
-    c.pipe_auth = PipeAuth::psk(*b"maintain-psk----0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"maintain-psk----0123456789abcdef").with_end_to_end();
     c
 }
 
@@ -131,20 +130,19 @@ impl Dialer {
         PipeIo::new(Killable { io: a, kill })
     }
 
-    /// A one-way carrier for a split pool: an uplink joins in band, a
-    /// downlink with the join header of its request.
-    fn one_way(&self, req: &DialRequest) -> PipeIo {
+    /// A one-way carrier of a split pool's member, paired at the listener by `token`.
+    fn one_way(&self, direction: PipeDirection, token: [u8; 16]) -> PipeIo {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        self.times.lock().unwrap().push(Instant::now());
         let (a, b) = tokio::io::duplex(256 * 1024);
         let l = self.listener.clone();
         let kill = Arc::new(Kill::default());
         self.kills.lock().unwrap().push(kill.clone());
-        self.one_way
-            .lock()
-            .unwrap()
-            .push((req.direction, kill.clone()));
+        self.one_way.lock().unwrap().push((direction, kill.clone()));
         let mine = Killable { io: a, kill };
-        let hint = PipeHint::from_peer(([127, 0, 0, 1], 0).into());
-        match req.direction {
+        let mut hint = PipeHint::from_peer(([127, 0, 0, 1], 0).into());
+        hint.pair = Some(token.to_vec());
+        match direction {
             PipeDirection::Out => {
                 tokio::spawn(async move {
                     let _ = l.handle_pipe(PipeIo::reader(b), hint).await;
@@ -152,7 +150,6 @@ impl Dialer {
                 PipeIo::writer(mine)
             }
             PipeDirection::In => {
-                let hint = hint.with_join_header(req.join_header.as_deref().unwrap_or(""));
                 tokio::spawn(async move {
                     let _ = l.handle_pipe(PipeIo::writer(b), hint).await;
                 });
@@ -163,30 +160,22 @@ impl Dialer {
     }
 
     /// A pool whose members are split carriers: a downlink and an uplink
-    /// joined together ([`zmux::join_split`]).
+    /// paired into one join.
     fn split_pool(&self, count: usize) -> PipePool {
         let d = self.clone();
         let mut pool = PipePool::join(count, move |session: Session, options| {
             let d = d.clone();
             async move {
-                let dial = |req: DialRequest| {
-                    d.dials.fetch_add(1, Ordering::SeqCst);
-                    d.times.lock().unwrap().push(Instant::now());
-                    d.one_way(&req)
-                };
-                zmux::join_split(
-                    &session,
-                    options,
-                    |join| {
-                        let io = dial(DialRequest::new(PipeDirection::In, Some(join)));
-                        async move { Ok(io) }
-                    },
-                    || {
-                        let io = dial(DialRequest::new(PipeDirection::Out, None));
-                        async move { Ok(io) }
-                    },
-                )
-                .await
+                // The pool's joins do not wait for the attachment.
+                assert!(options.no_wait_attached);
+                let mut token = [0; 16];
+                getrandom::fill(&mut token).map_err(io::Error::other)?;
+                let up = d.one_way(PipeDirection::Out, token);
+                let down = d.one_way(PipeDirection::In, token);
+                let pipe = session
+                    .begin_add_pipe(PipeIo::paired_join(up, down), options)
+                    .map_err(io::Error::other)?;
+                Ok(vec![pipe])
             }
         });
         pool.options.probation = Some(Duration::from_millis(50));
@@ -220,7 +209,8 @@ impl Dialer {
 }
 
 async fn setup() -> (Session, Session, Dialer) {
-    let listener = Listener::new(config(), ListenerConfig::default());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let dialer = Dialer::new(&listener);
     let client = Session::connect(dialer.carrier(), config()).await.unwrap();
     let server = listener.accept().await.unwrap();
@@ -251,7 +241,7 @@ async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keeps_count_pipes_and_redials_failures() {
     let (client, _server, dialer) = setup().await;
-    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(2));
+    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(2)).expect("valid pool");
     until("two usable pipes", 10, || usable(&client) == 2).await;
     // Kill one pool carrier (index 0 is the bootstrap's).
     let kill = dialer.kills.lock().unwrap()[1].clone();
@@ -261,14 +251,14 @@ async fn keeps_count_pipes_and_redials_failures() {
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 3);
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_dials_back_off() {
     let (client, _server, dialer) = setup().await;
     *dialer.fail_next.lock().unwrap() = 4;
-    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(1));
+    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(1)).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     let times = dialer.times.lock().unwrap().clone();
     assert_eq!(times.len(), 5);
@@ -278,7 +268,7 @@ async fn failed_dials_back_off() {
         assert!(*gap >= Duration::from_millis(want), "{gaps:?}");
     }
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// Writes `len` bytes to the server and reads them back to the end.
@@ -314,7 +304,7 @@ async fn rotates_by_bytes_make_before_break() {
     let (client, server, dialer) = setup().await;
     let mut pool = dialer.pool(1);
     pool.rotate = Some(RotatePolicy::new().with_max_bytes(1 << 20));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     // The bootstrap pipe is the fallback tier: the stream's data goes on
     // the pool's pipes, whose bytes rotate them (affinity alone may bind
@@ -332,8 +322,8 @@ async fn rotates_by_bytes_make_before_break() {
     assert_eq!(stats.bytes_reinjected, 0, "{stats:?}");
     // Not asserted: `pipe_failures`. The peer's PIPE_ABANDON of a graceful
     // removal may travel on another pipe and arrive after the old pipe's
-    // end, which MULTIPATH.md Section 7.3 then calls unexpected (an open
-    // spec issue); nothing is lost or re-sent either way.
+    // end, which the receiver then treats as
+    // unexpected; nothing is lost or re-sent either way.
     until("one pool pipe left", 10, || {
         client
             .pipe_stats()
@@ -344,7 +334,7 @@ async fn rotates_by_bytes_make_before_break() {
     })
     .await;
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,7 +346,7 @@ async fn rotates_by_age() {
             .with_max_age(Duration::from_millis(300))
             .with_jitter(0.1),
     );
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("three rotations", 10, || {
         dialer.dials.load(Ordering::SeqCst) >= 4
     })
@@ -366,8 +356,8 @@ async fn rotates_by_age() {
     assert_eq!(stats.bytes_reinjected, 0, "{stats:?}");
     // Not asserted: `pipe_failures`. The peer's PIPE_ABANDON of a graceful
     // removal may travel on another pipe and arrive after the old pipe's
-    // end, which MULTIPATH.md Section 7.3 then calls unexpected (an open
-    // spec issue); nothing is lost or re-sent either way.
+    // end, which the receiver then treats as
+    // unexpected; nothing is lost or re-sent either way.
     // Make before break: the pool never ran without a usable pipe after
     // the first one (checked by the transfer); old pipes are closed.
     until("old pipes retired", 10, || {
@@ -381,7 +371,7 @@ async fn rotates_by_age() {
     .await;
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// Stopping the pool closes a replacement still being rotated in; the
@@ -391,7 +381,7 @@ async fn stop_closes_a_replacement_being_rotated_in() {
     let (client, _server, dialer) = setup().await;
     let mut pool = dialer.pool(1);
     pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(1)));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a replacement dialled", 10, || {
         dialer.dials.load(Ordering::SeqCst) >= 3
     })
@@ -406,15 +396,15 @@ async fn stop_closes_a_replacement_being_rotated_in() {
             .count()
     };
     until("one pool pipe left", 10, || pool_pipes() == 1).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ends_with_the_session() {
     let (client, _server, dialer) = setup().await;
-    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(1));
+    let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(1)).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     until("finished", 5, || handle.is_finished()).await;
 }
 
@@ -436,18 +426,19 @@ async fn single_pipe_sessions_end_it_at_once() {
             let (x, _y) = tokio::io::duplex(1024);
             async move { Ok(PipeIo::new(x)) }
         }),
-    );
+    )
+    .expect("valid pool");
     until("finished", 5, || handle.is_finished()).await;
     // Without multipath nothing is dialled.
     assert_eq!(dials.load(Ordering::SeqCst), 0);
 }
 
-/// A split pool (RESUME.md Section 4.3): one uplink and one downlink,
+/// A split pool: one uplink and one downlink,
 /// dialled in parallel at the start and again, together, when both are lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_pool_dials_both_directions_in_parallel() {
     let (client, _server, dialer) = setup().await;
-    let handle = zmux::helpers::maintain_pipes(&client, dialer.split_pool(1));
+    let handle = zmux::helpers::maintain_pipes(&client, dialer.split_pool(1)).expect("valid pool");
     let halves = |s: &Session| {
         let pipes = s.pipe_stats();
         let up = pipes
@@ -478,7 +469,7 @@ async fn split_pool_dials_both_directions_in_parallel() {
     }
     until("both halves again", 10, || halves(&client) == (1, 1)).await;
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// The downlinks a split pool dialled so far.
@@ -498,7 +489,7 @@ fn downlinks(dialer: &Dialer) -> Vec<Arc<Kill>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_pool_redials_a_member_whole() {
     let (client, _server, dialer) = setup().await;
-    let handle = zmux::helpers::maintain_pipes(&client, dialer.split_pool(1));
+    let handle = zmux::helpers::maintain_pipes(&client, dialer.split_pool(1)).expect("valid pool");
     let open_in = |s: &Session| {
         s.pipe_stats()
             .iter()
@@ -517,7 +508,7 @@ async fn split_pool_redials_a_member_whole() {
     })
     .await;
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A split member rotates by age like any member of the pool.
@@ -526,14 +517,14 @@ async fn split_pool_rotates_a_downlink() {
     let (client, _server, dialer) = setup().await;
     let mut pool = dialer.split_pool(1);
     pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(300)));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a downlink rotated twice", 10, || {
         downlinks(&dialer).len() >= 3
     })
     .await;
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -542,12 +533,12 @@ async fn policy_count_replaces_the_pool_count() {
     let pool = dialer
         .pool(1)
         .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(3));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("three usable pipes", 10, || usable(&client) == 3).await;
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 3);
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -556,12 +547,12 @@ async fn policy_count_of_zero_keeps_one_pipe() {
     let pool = dialer
         .pool(2)
         .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(0));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A dial held by the policy starts at the policy's time, and a time
@@ -574,7 +565,7 @@ async fn policy_next_dial_at_holds_dials_within_the_backoff_max() {
     let pool = dialer
         .pool(1)
         .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| d.next_dial_at = Some(hold));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     let first = dialer.times.lock().unwrap()[0];
     assert!(first >= hold, "{:?}", first - start);
@@ -587,7 +578,7 @@ async fn policy_next_dial_at_holds_dials_within_the_backoff_max() {
         .pool(1)
         .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| d.next_dial_at = Some(far));
     let held = Instant::now();
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a second dial", 10, || {
         dialer.dials.load(Ordering::SeqCst) >= 2
     })
@@ -598,7 +589,7 @@ async fn policy_next_dial_at_holds_dials_within_the_backoff_max() {
         "{waited:?}"
     );
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// The policy replaces a pipe, make before break, at the time it names.
@@ -614,7 +605,7 @@ async fn policy_rotate_replaces_the_named_pipe() {
                 d.rotate.push((p.id, v.now));
             }
         });
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one rotation", 10, || {
         dialer.dials.load(Ordering::SeqCst) >= 2
     })
@@ -633,7 +624,7 @@ async fn policy_rotate_replaces_the_named_pipe() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// Counts the policy's decisions over `window` once the pool is up, the
@@ -648,13 +639,13 @@ async fn decisions_with_recheck(recheck: Duration, window: Duration) -> usize {
             n.fetch_add(1, Ordering::SeqCst);
             d.recheck = Some(recheck);
         });
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     let before = calls.load(Ordering::SeqCst);
     tokio::time::sleep(window).await;
     let got = calls.load(Ordering::SeqCst) - before;
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     got
 }
 
@@ -686,7 +677,7 @@ async fn policy_dial_time_replaces_the_backoff() {
         .with_policy(|v: &PoolView<'_>, d: &mut PoolDecision| {
             d.next_dial_at = v.last_dial_at.map(|t| t + Duration::from_millis(10));
         });
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     let times = dialer.times.lock().unwrap().clone();
     assert_eq!(times.len(), 4);
@@ -698,7 +689,7 @@ async fn policy_dial_time_replaces_the_backoff() {
         );
     }
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// The policy's probe settings go to the pipes added after the decision
@@ -712,7 +703,8 @@ async fn policy_probe_settings_apply_to_later_pipes() {
         c.standby_probe = None;
         c
     };
-    let listener = Listener::new(slow(), ListenerConfig::default());
+    let listener =
+        Listener::new(slow(), ListenerConfig::default()).expect("valid listener configuration");
     let dialer = Dialer::new(&listener);
     let client = Session::connect(dialer.carrier(), slow()).await.unwrap();
     let _server = listener.accept().await.unwrap();
@@ -729,7 +721,7 @@ async fn policy_probe_settings_apply_to_later_pipes() {
                 d.set_probe_jitter(0.0).unwrap();
             }
         });
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) >= 1).await;
     let first = client
         .pipe_stats()
@@ -759,8 +751,7 @@ async fn policy_probe_settings_apply_to_later_pipes() {
     let b = pings(second) - before;
     assert!(b >= 3, "{b} probes on the later pipe");
     // Alone, the earlier pipe keeps the minute (the later pipe's probes
-    // also brought PIPE_PINGs with acknowledgements on it, MULTIPATH.md
-    // Section 6.5).
+    // also brought PIPE_PINGs with acknowledgements on it).
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
     client.pipe(second).unwrap().close().unwrap();
@@ -770,7 +761,7 @@ async fn policy_probe_settings_apply_to_later_pipes() {
     let a = pings(first) - before;
     assert!(a <= 1, "{a} probes on the earlier pipe");
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A handwritten decision's probe settings are checked when they are set:
@@ -826,7 +817,7 @@ async fn backoff_counts_from_the_start_of_the_attempt() {
         Duration::from_millis(500),
         Duration::from_millis(500),
     ));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("three attempts", 10, || starts.lock().unwrap().len() >= 3).await;
     let t = starts.lock().unwrap().clone();
     for w in t.windows(2) {
@@ -837,7 +828,7 @@ async fn backoff_counts_from_the_start_of_the_attempt() {
         );
     }
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A dial that succeeded backs off too: the next dial, after its member
@@ -849,7 +840,7 @@ async fn backoff_follows_a_successful_dial() {
         Duration::from_millis(800),
         Duration::from_secs(2),
     ));
-    let handle = zmux::helpers::maintain_pipes(&client, pool);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     // Past the maintainer's next look (100 ms): it saw the member usable.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -859,7 +850,7 @@ async fn backoff_follows_a_successful_dial() {
     let t = dialer.times.lock().unwrap().clone();
     assert!(t[1] - t[0] >= Duration::from_millis(790), "{t:?}");
     drop(handle);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A split bootstrap's carrier makes pipe pair 0 only: adding it as a
@@ -871,8 +862,222 @@ async fn a_split_bootstrap_carrier_cannot_join() {
     let (c, _d) = tokio::io::duplex(1024);
     let io = PipeIo::split_bootstrap(PipeIo::writer(a), PipeIo::reader(c));
     assert_eq!(
-        client.add_pipe(io, zmux::PipeOptions::new()).err(),
+        client.begin_add_pipe(io, zmux::PipeOptions::new()).err(),
         Some(zmux::PipeError::InvalidOptions)
     );
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
+}
+
+/// A carrier whose writes after the first wait until `hold` passed: the
+/// joiner's Confirm reaches the acceptor late, while the joiner is
+/// already ACTIVE, which the secure carrier allows.
+struct LateConfirm {
+    io: Killable,
+    first: bool,
+    hold: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl AsyncRead for LateConfirm {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LateConfirm {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !std::mem::replace(&mut self.first, false) && self.hold.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// A replacement counts as usable only once the acceptor attached it: an
+/// old member closed while the acceptor still waits for the replacement's
+/// Confirm would leave the acceptor with no live pipe, and it would end
+/// the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_waits_for_the_acceptor_to_attach() {
+    let (client, server, dialer) = setup().await;
+    let late = Arc::new(AtomicBool::new(false));
+    let d = dialer.clone();
+    let l = late.clone();
+    let mut pool = PipePool::new(1, move |_| {
+        let d = d.clone();
+        let late = l.load(Ordering::SeqCst);
+        async move {
+            d.dials.fetch_add(1, Ordering::SeqCst);
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let listener = d.listener.clone();
+            tokio::spawn(async move {
+                let _ = listener
+                    .handle_pipe(
+                        PipeIo::new(b),
+                        PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+                    )
+                    .await;
+            });
+            let kill = Arc::new(Kill::default());
+            d.kills.lock().unwrap().push(kill.clone());
+            let io = Killable { io: a, kill };
+            if !late {
+                return Ok(PipeIo::new(io));
+            }
+            Ok(PipeIo::new(LateConfirm {
+                io,
+                first: true,
+                hold: Box::pin(tokio::time::sleep(Duration::from_millis(300))),
+            }))
+        }
+    });
+    // No probation: a replacement is usable as soon as it is attached.
+    pool.options.probation = Some(Duration::ZERO);
+    pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(400)));
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("one pool pipe", 10, || usable(&client) == 1).await;
+    // The pool's member is the session's only pipe.
+    dialer.kills.lock().unwrap()[0].kill();
+    until("pipe 0 gone", 10, || {
+        client
+            .pipe_stats()
+            .iter()
+            .all(|p| p.pipe.get() != 0 || p.outbound != Some(OutboundState::Active))
+    })
+    .await;
+    late.store(true, Ordering::SeqCst);
+    until("rotated", 10, || dialer.dials.load(Ordering::SeqCst) >= 2).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    transfer(&client, &server, 64 << 10).await;
+    handle.stop();
+    until("stopped", 5, || handle.is_finished()).await;
+    client.close(0u32.into(), b"").await;
+}
+
+/// Pipe 0 and a pipe the peer joined are attached from the start; one of
+/// our joins only once the acceptor showed it attached it, which a late
+/// Confirm delays past `joined`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_waits_for_the_acceptor() {
+    let (client, server, dialer) = setup().await;
+    let soon = |p: &zmux::Pipe| {
+        let p = p.clone();
+        async move { tokio::time::timeout(Duration::from_secs(5), p.attached()).await }
+    };
+    let zero = |s: &Session| s.pipes().into_iter().find(|p| p.id().get() == 0).unwrap();
+    soon(&zero(&client)).await.unwrap().unwrap();
+    soon(&zero(&server)).await.unwrap().unwrap();
+
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let listener = dialer.listener.clone();
+    tokio::spawn(async move {
+        let _ = listener
+            .handle_pipe(
+                PipeIo::new(b),
+                PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+            )
+            .await;
+    });
+    let io = LateConfirm {
+        io: Killable {
+            io: a,
+            kill: Arc::new(Kill::default()),
+        },
+        first: true,
+        hold: Box::pin(tokio::time::sleep(Duration::from_millis(400))),
+    };
+    let pipe = client
+        .begin_add_pipe(PipeIo::new(io), zmux::PipeOptions::new())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pipe.joined())
+        .await
+        .unwrap()
+        .unwrap();
+    // The Confirm is still held: the acceptor has not attached it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), pipe.attached())
+            .await
+            .is_err()
+    );
+    soon(&pipe).await.unwrap().unwrap();
+    let accepted = server
+        .pipes()
+        .into_iter()
+        .find(|p| p.id() == pipe.id())
+        .unwrap();
+    soon(&accepted).await.unwrap().unwrap();
+    client.close(0u32.into(), b"").await;
+}
+
+/// A forced epoch advance replaces the pool's carrier of the old epoch, make before
+/// break, with one joined in the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_epoch_advance_replaces_old_carriers() {
+    // No exchange of the policy's own, so the forced one starts at Stable(0).
+    let manual = || {
+        let mut c = config();
+        c.epoch_policy = zmux::proto::session::EpochPolicy::MANUAL;
+        c
+    };
+    let listener =
+        Listener::new(manual(), ListenerConfig::default()).expect("valid listener configuration");
+    let dialer = Dialer::new(&listener);
+    let client = Session::connect(dialer.carrier(), manual()).await.unwrap();
+    let server = listener.accept().await.unwrap();
+    let pool = dialer.pool(1);
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("one usable pipe", 10, || usable(&client) == 1).await;
+    let epoch_of_pool = |s: &Session| {
+        s.pipe_stats()
+            .iter()
+            .filter(|p| p.pipe.get() != 0 && p.outbound == Some(OutboundState::Active))
+            .map(|p| p.epoch)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(epoch_of_pool(&client), [Some(0)]);
+    assert_eq!(client.epoch(), Some(0));
+    client
+        .force_epoch_advance(Duration::from_secs(60))
+        .expect("multipath session");
+    until("replaced by an epoch-1 carrier", 10, || {
+        epoch_of_pool(&client) == [Some(1)]
+    })
+    .await;
+    assert!(dialer.dials.load(Ordering::SeqCst) >= 2);
+    assert_eq!(client.epoch(), Some(1));
+    // Both ends report the commit; the old epoch stays for the retention time.
+    for s in [&client, &server] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(e) = s.next_event().await {
+                assert!(
+                    !matches!(e, zmux::SessionEvent::EpochDeleted { .. }),
+                    "{e:?}"
+                );
+                if e == (zmux::SessionEvent::EpochCommitted { epoch: 1 }) {
+                    return;
+                }
+            }
+            panic!("no EpochCommitted");
+        })
+        .await
+        .expect("EpochCommitted in time");
+    }
+    transfer(&client, &server, 1 << 16).await;
+    drop(handle);
+    client.close(0u32.into(), b"").await;
 }

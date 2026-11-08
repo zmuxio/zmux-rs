@@ -1,4 +1,4 @@
-//! Early data under the zmux floor (SPEC.md Section 6.1.2): stream data an
+//! Early data under the zmux floor: stream data an
 //! initiator sends before it has processed the peer's parameters, when the
 //! application declares the peer a zmux endpoint.
 //!
@@ -90,9 +90,8 @@ pub(super) enum CarrierEarly {
     Pending,
 }
 
-/// The parameters stored for 0-RTT (RFC 9000 Section 7.4.1; SPEC.md
-/// Section 6.1.2): the flow-control limits, `max_record_size`,
-/// `zmux_preamble`, `zmux_pipe_ack` and `reset_stream_at`.
+/// The parameters stored for 0-RTT (RFC 9000 Section 7.4.1): the flow-control limits,
+/// `max_record_size`, `zmux_preamble`, `zmux_pipe_ack` and `reset_stream_at`.
 fn stored(tp: &TransportParameters) -> TransportParameters {
     TransportParameters {
         initial_max_data: tp.initial_max_data,
@@ -125,9 +124,8 @@ fn floor_parameters() -> TransportParameters {
 
 impl SessionCore {
     /// Prepares early data when the configuration declares the peer a
-    /// zmux endpoint and the role does not depend on the peer (SPEC.md
-    /// Section 6.1.2, Sending rule 1): it has a transport role and sends
-    /// no `zmux_role` auto.
+    /// zmux endpoint and the role does not depend on the peer, as early data requires: it
+    /// has a transport role and sends no `zmux_role` auto.
     pub(super) fn early_setup(&mut self, transport_role: Option<Role>) {
         let local = self.local_parameters();
         let independent = match (local.zmux_role, transport_role) {
@@ -161,7 +159,8 @@ impl SessionCore {
     /// parameters of the session that issued the ticket, instead of the
     /// floor. Call it before anything is written on the bootstrap pipe,
     /// with [`super::EarlyData::carrier_early_data`] set; then tell the
-    /// outcome with [`SessionCore::carrier_early_data_settled`]. Returns
+    /// outcome with [`SessionCore::carrier_early_data_settled`], before
+    /// feeding anything read from that pipe. Returns
     /// whether the session sends carrier early data. Only the parameters
     /// QUIC stores for 0-RTT are used: the flow-control limits,
     /// `max_record_size`, `zmux_preamble`, `zmux_pipe_ack` and
@@ -233,7 +232,7 @@ impl SessionCore {
     /// of it reached the peer). After a rejection the session writes its
     /// parameters again as the first record of the bootstrap pipe, and the
     /// early streams' data again from offset 0 once the peer's parameters
-    /// arrived; the streams do not fail (SPEC.md Section 6.1.2).
+    /// arrived; the streams do not fail.
     pub fn carrier_early_data_settled(&mut self, accepted: bool, now: std::time::Instant) {
         if !self.early_retains() {
             return;
@@ -241,7 +240,7 @@ impl SessionCore {
         self.early_state().carrier = CarrierEarly::Off;
         if accepted {
             // The held bytes are not needed any more, and what was written
-            // is final, as on any single pipe (SPEC.md Section 7.4).
+            // is final, as on any single pipe.
             let keys: Vec<_> = self.streams.keys().collect();
             for k in keys {
                 let mut finished = false;
@@ -290,6 +289,9 @@ impl SessionCore {
             send.buf.rewind();
             send.offset = 0;
             send.preamble_left = send.preamble.as_ref().map_or(0, Bytes::len);
+            // An identifier was given by a frame the peer never saw: the
+            // stream opens again, with whatever it has to carry.
+            send.open_want |= s.id.is_some();
             send.fin_sent = false;
             send.max_data = 0;
             send.blocked_at = None;
@@ -341,6 +343,8 @@ impl SessionCore {
             }
         }
         self.stats.bytes_sent = 0;
+        // Nothing of it reached the peer; it goes again.
+        self.earn_skip = self.earn_bytes;
     }
 
     /// How often the bootstrap pipe started writing again from its first
@@ -364,14 +368,18 @@ impl SessionCore {
         }
     }
 
-    /// Whether `key`'s opening frame arrived as carrier early data and the
-    /// carrier's handshake has not completed: an attacker may have
-    /// replayed it, so the application should not act on it in a way that
-    /// must not happen twice. Once the handshake completed, the data can
-    /// no longer be a replay.
+    /// Whether `key` was opened by data that arrived as carrier early data:
+    /// an attacker may have replayed it, so the application should not act
+    /// on it in a way that must not happen twice. It tells how the stream
+    /// arrived, for the stream's life: its request may have been repeated
+    /// whatever followed the handshake.
     pub fn is_replayable(&self, key: super::StreamKey) -> bool {
+        self.streams.get(key).is_some_and(|s| s.replayable)
+    }
+
+    /// Inbound data is carrier early data now.
+    pub(super) fn carrier_early_in(&self) -> bool {
         self.early.as_deref().is_some_and(|e| e.carrier_in)
-            && self.streams.get(key).is_some_and(|s| !s.local)
     }
 
     /// The early state, allocated on first use.
@@ -415,8 +423,8 @@ impl SessionCore {
             .or_else(|| Some(&self.early.as_deref()?.sending.as_ref()?.assumed))
     }
 
-    /// Writes the fence before the first early STREAM frame (SPEC.md
-    /// Section 6.1.2, Sending rule 3); `false` when it does not fit.
+    /// Writes the fence that an assumed set with zmux parameters puts before the first early
+    /// STREAM frame; `false` when it does not fit.
     pub(super) fn write_fence(&mut self, w: &mut Records<'_>) -> bool {
         let Some(es) = self.early.as_deref_mut() else {
             return true;
@@ -446,9 +454,8 @@ impl SessionCore {
         true
     }
 
-    /// The peer's parameters arrived after early data: the outcome rules
-    /// (SPEC.md Section 6.1.2, Outcome). `Ok(false)` when the session
-    /// closed with "early data rejected"; an error for parameters below
+    /// The peer's parameters arrived after early data: the outcome rules. `Ok(false)` when the
+    /// session closed with "early data rejected"; an error for parameters below
     /// the floor.
     pub(super) fn early_outcome(
         &mut self,

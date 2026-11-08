@@ -1,5 +1,4 @@
-//! Errors of the session (STATE_MACHINE.md Section
-//! 2.5): one type per kind of operation, shared by the sans-IO core and the
+//! Errors of the session: one type per kind of operation, shared by the sans-IO core and the
 //! drivers, which return them unchanged.
 //!
 //! | type | returned by |
@@ -46,7 +45,7 @@ use bytes::Bytes;
 
 use crate::proto::{DetailKey, TransportErrorCode, VarInt};
 
-/// Why a session ended. The first cause wins (SPEC.md Section 6.5).
+/// Why a session ended. The first cause wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionError {
@@ -66,7 +65,7 @@ pub enum SessionError {
         /// The Frame Type field.
         frame_type: u64,
         /// The reason phrase; when it ends with a diagnostic line, the text
-        /// before that line (SPEC.md Section 4.3).
+        /// before that line.
         reason: Bytes,
         /// The defined `key=value` pairs of the diagnostic line, in order;
         /// empty without one. Unknown keys are left out.
@@ -75,7 +74,7 @@ pub enum SessionError {
         remote: bool,
     },
     /// The idle timer expired; `remote` when the peer ended the session by
-    /// shutting down its pipe without CONNECTION_CLOSE (SPEC.md Section 6.4).
+    /// shutting down its pipe without CONNECTION_CLOSE.
     IdleTimeout {
         /// Caused by the peer.
         remote: bool,
@@ -90,25 +89,32 @@ pub enum SessionError {
     /// [`io::Error`] it is [`io::ErrorKind::Other`]: see
     /// [`SessionError::in_io`].
     EarlyDataRejected,
-    /// The resume grace period expired while the session was suspended
-    /// (RESUME.md Section 8), or a listener limit ended the suspended
-    /// session: CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT) when a pipe remains.
+    /// The resume grace period expired while the session was suspended, or a listener limit ended
+    /// the suspended session: CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT) when a pipe remains.
     /// A peer's ZMUX_RESUME_TIMEOUT is [`SessionError::TransportClosed`].
     ResumeTimeout {
         /// The most recent pipe failure of the session, when a pipe failed.
         last: Option<PipeFailure>,
     },
     /// Every pipe in a direction was lost without resume, or the single
-    /// carrier failed or ended inside a record (MULTIPATH.md Section 8.5,
-    /// SPEC.md Section 6.6).
+    /// carrier failed or ended inside a record.
     PipesLost {
         /// The most recent pipe failure of the session, when a pipe failed
         /// (`None` when none did: the last pipe was removed gracefully).
         last: Option<PipeFailure>,
     },
+    /// Resume could not continue safely: the two endpoints' states
+    /// diverged, so the data in flight is in an unknown state
+    /// (CONNECTION_CLOSE with ZMUX_RESUME_FAILED, sent or received).
+    ResumeFailed {
+        /// The reason phrase.
+        reason: Bytes,
+        /// Whether the peer detected it.
+        remote: bool,
+    },
 }
 
-/// Why a pipe failed (MULTIPATH.md Section 7): reported with the session's
+/// Why a pipe failed: reported with the session's
 /// end ([`SessionError::PipesLost`], [`SessionError::ResumeTimeout`]) and
 /// by a pipe's statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,24 +125,24 @@ pub enum PipeFailure {
     /// end (inside a record, or without its removal).
     Carrier(io::ErrorKind),
     /// No acknowledgement, write progress or input in time, or a drain
-    /// that did not complete (MULTIPATH.md Sections 7.1 and 8.2).
+    /// that did not complete.
     Stalled,
     /// The join was not confirmed within `handshake_timeout`: the peer
-    /// refused it or never saw it (MULTIPATH.md Section 5.4).
+    /// refused it or never saw it.
     JoinTimedOut,
     /// The peer abandoned the pipe with this error code (PIPE_ABANDON).
     Abandoned(VarInt),
     /// This endpoint removed it abruptly: [`Pipe::abort`](crate::Pipe#method.abort), a resource
-    /// limit, or room for a new join (MULTIPATH.md Sections 5.4 and 8.3).
+    /// limit, or room for a new join.
     Aborted,
-    /// The carrier broke the protocol for its state (MULTIPATH.md Section
-    /// 5.4).
+    /// The carrier broke the protocol for its state.
     Protocol,
     /// The acceptor closed the carrier of this endpoint's join before
-    /// confirming it, with a CONNECTION_CLOSE of this error code
-    /// (MULTIPATH.md Section 5.7 step 6); ZMUX_RESUME_FAILED: it has no
+    /// confirming it, with a CONNECTION_CLOSE of this error code; ZMUX_RESUME_FAILED: it has no
     /// session for the locator.
-    JoinClosed(VarInt),
+    JoinFailed,
+    /// The peer refused the join in its Reply.
+    JoinRefused,
 }
 
 impl fmt::Display for PipeFailure {
@@ -148,7 +154,8 @@ impl fmt::Display for PipeFailure {
             Self::Abandoned(code) => write!(f, "abandoned by the peer with code {code}"),
             Self::Aborted => f.write_str("aborted locally"),
             Self::Protocol => f.write_str("protocol violation on the carrier"),
-            Self::JoinClosed(code) => write!(f, "join closed by the peer with code {code}"),
+            Self::JoinFailed => f.write_str("join failed"),
+            Self::JoinRefused => f.write_str("join refused"),
         }
     }
 }
@@ -159,7 +166,8 @@ impl SessionError {
         match self {
             Self::ApplicationClosed { remote, .. }
             | Self::TransportClosed { remote, .. }
-            | Self::IdleTimeout { remote } => *remote,
+            | Self::IdleTimeout { remote }
+            | Self::ResumeFailed { remote, .. } => *remote,
             Self::HandshakeTimeout
             | Self::EarlyDataRejected
             | Self::ResumeTimeout { .. }
@@ -219,7 +227,7 @@ impl SessionError {
             Self::IdleTimeout { .. } | Self::HandshakeTimeout | Self::ResumeTimeout { .. } => {
                 io::ErrorKind::TimedOut
             }
-            Self::PipesLost { .. } => io::ErrorKind::ConnectionReset,
+            Self::PipesLost { .. } | Self::ResumeFailed { .. } => io::ErrorKind::ConnectionReset,
             // Not "refused": the peer is there and closed cleanly.
             Self::EarlyDataRejected => io::ErrorKind::Other,
         }
@@ -273,18 +281,35 @@ impl fmt::Display for SessionError {
                 f.write_str("pipes lost")?;
                 last.map_or(Ok(()), |l| write!(f, " (last pipe: {l})"))
             }
+            Self::ResumeFailed { reason, remote } => write!(
+                f,
+                "resume failed ({}: {}): the data in flight is in an unknown state",
+                side(*remote),
+                String::from_utf8_lossy(reason)
+            ),
         }
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SessionError {
+    /// The last pipe failure of [`SessionError::ResumeTimeout`] and
+    /// [`SessionError::PipesLost`].
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResumeTimeout { last: Some(l) } | Self::PipesLost { last: Some(l) } => Some(l),
+            _ => None,
+        }
+    }
+}
+
+impl std::error::Error for PipeFailure {}
 
 /// The most `key=value` pairs kept from a received diagnostic line: one
-/// of each key (SPEC.md Section 4.3), whatever the peer sends.
+/// of each key, whatever the peer sends.
 const MAX_DETAILS: usize = 8;
 
 /// Splits a transport Reason Phrase into its text and the defined pairs of
-/// its diagnostic line (SPEC.md Section 4.3): a last line of space-separated
+/// its diagnostic line: a last line of space-separated
 /// `key=value` pairs, keys lower-case ASCII, values decimal or `0x`
 /// hexadecimal. A last line that does not parse leaves the phrase plain
 /// text; unknown keys are ignored. Only reported, never acted upon.
@@ -353,8 +378,7 @@ pub enum StreamError {
     /// rejected it, or it is above a GOAWAY watermark.
     Rejected,
     /// The peer sent GOAWAY before the stream emitted its first frame: it
-    /// never opened and may be retried on another session (EXTENSIONS.md
-    /// Section 3.5).
+    /// never opened and may be retried on another session.
     GoingAway,
     /// The stream's preamble did not fit the peer's Maximum Preamble Size
     /// known when its identifier was due (the peer's parameters arrived
@@ -458,7 +482,7 @@ pub enum OpenError {
     /// The session is not established yet.
     NotEstablished,
     /// The preamble needs the peer's `zmux_preamble`, which a plain QMux
-    /// peer does not send (EXTENSIONS.md Section 4).
+    /// peer does not send.
     NotNegotiated,
     /// The preamble, with room for a PRIORITY and a GREASE TLV, is larger
     /// than the limit known now: the peer's Maximum Preamble Size (before
@@ -592,6 +616,33 @@ impl From<DatagramError> for io::Error {
     }
 }
 
+/// What a join-pending session still waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum JoinMissing {
+    /// The end-to-end declaration (`declare_end_to_end`, or
+    /// [`PipeAuth::with_end_to_end`](crate::PipeAuth::with_end_to_end)).
+    EndToEnd,
+    /// The deferred pre-shared key (`set_join_secret`).
+    DeferredPsk,
+    /// Both.
+    Both,
+}
+
+impl fmt::Display for JoinMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EndToEnd => {
+                "the end-to-end declaration of pipe 0 is missing (declare_end_to_end)"
+            }
+            Self::DeferredPsk => "the deferred pre-shared key is missing (set_join_secret)",
+            Self::Both => {
+                "the end-to-end declaration of pipe 0 and the deferred pre-shared key are missing"
+            }
+        })
+    }
+}
+
 /// Why a pipe operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -601,14 +652,12 @@ pub enum PipeError {
     /// The session is not established yet.
     NotEstablished,
     /// The endpoint may not join now: it has max_pipes + H unretired
-    /// attachments of its own, or a join was refused recently (MULTIPATH.md
-    /// Sections 5.4 step 9 and 5.7 step 1). An out-of-band reservation needs
-    /// its join at once; retry later.
+    /// attachments of its own, or a join was refused recently; retry later.
     Deferred,
     /// No such pipe (it was retired).
     UnknownPipe,
-    /// The carrier cannot be used so: a pipe added in band needs an
-    /// outbound half.
+    /// The carrier cannot be used so: a join needs both of its directions, and Bound a
+    /// `Secure` declaration and an exporter on one connection.
     InvalidArgument,
     /// The [`PipeOptions`](crate::PipeOptions) are not valid: an idle-probe
     /// interval above 0 and below 1 s or a jitter outside \[0, 1); or a
@@ -617,6 +666,14 @@ pub enum PipeError {
     InvalidOptions,
     /// The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined)).
     Failed(PipeFailure),
+    /// The peer refused the join in its Reply: the carrier was closed and
+    /// the join backoff started; the session goes on.
+    JoinRefused,
+    /// The session is join pending: it has no join keys until what this
+    /// names is in place.
+    JoinPending(JoinMissing),
+    /// The deferred pre-shared key was given already.
+    JoinSecretSet,
     /// A blocking call was refused on a thread that drives sessions
     /// (drivers only).
     OnDriverThread,
@@ -629,7 +686,7 @@ pub enum PipeError {
     Io(io::ErrorKind),
     /// The carrier is a stream of a session that runs, directly or through
     /// other sessions of the process, over a pipe of this session
-    /// (EXTENSIONS.md Section 10.2; drivers only).
+    /// (drivers only).
     CarrierLoop,
 }
 
@@ -637,7 +694,10 @@ impl PipeError {
     /// Whether the operation may succeed if retried: once the session is
     /// established ([`PipeError::NotEstablished`]).
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::NotEstablished | Self::Deferred)
+        matches!(
+            self,
+            Self::NotEstablished | Self::Deferred | Self::JoinPending(_)
+        )
     }
 }
 
@@ -645,12 +705,15 @@ impl fmt::Display for PipeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotNegotiated => f.write_str("multipath not in use"),
+            Self::JoinPending(m) => write!(f, "join pending: {m}"),
+            Self::JoinSecretSet => f.write_str("join secret already set"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::Deferred => f.write_str("joining is deferred"),
             Self::UnknownPipe => f.write_str("unknown pipe"),
             Self::InvalidArgument => f.write_str("carrier not usable as this pipe"),
             Self::InvalidOptions => f.write_str("pipe options not valid"),
             Self::Failed(e) => write!(f, "pipe failed: {e}"),
+            Self::JoinRefused => f.write_str("join refused by the peer"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
             Self::TimedOut => f.write_str("pipe wait timed out"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
@@ -674,12 +737,14 @@ impl From<PipeError> for io::Error {
         let kind = match &e {
             PipeError::NotNegotiated => io::ErrorKind::Unsupported,
             PipeError::NotEstablished => io::ErrorKind::NotConnected,
-            PipeError::Deferred => io::ErrorKind::WouldBlock,
+            PipeError::Deferred | PipeError::JoinPending(_) => io::ErrorKind::WouldBlock,
+            PipeError::JoinSecretSet => io::ErrorKind::AlreadyExists,
             PipeError::UnknownPipe => io::ErrorKind::NotFound,
             PipeError::InvalidArgument | PipeError::InvalidOptions | PipeError::CarrierLoop => {
                 io::ErrorKind::InvalidInput
             }
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
+            PipeError::JoinRefused => io::ErrorKind::ConnectionRefused,
             PipeError::OnDriverThread => io::ErrorKind::Deadlock,
             PipeError::TimedOut => io::ErrorKind::TimedOut,
             PipeError::SessionLost(s) => s.kind(),
@@ -715,7 +780,7 @@ mod tests {
         assert!(SessionError::in_io(&io::Error::other("x")).is_none());
     }
 
-    /// SPEC.md Section 4.3: the diagnostic line is split off when it parses;
+    /// A Reason Phrase's diagnostic line is split off when it parses;
     /// unknown keys are ignored, and a last line that does not parse leaves
     /// the phrase plain text.
     #[test]

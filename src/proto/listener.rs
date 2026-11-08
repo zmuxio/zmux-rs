@@ -1,18 +1,18 @@
-//! A sans-IO listener (MULTIPATH.md Sections 5.4 to 5.6):
-//! it classifies new carriers by their first record, extracts PIPE_JOIN
-//! frames (in band or out of band), pairs split bootstraps, and bounds the
-//! carriers that are not authenticated yet. It never touches session state:
-//! the driver looks up the session by locator and offers the join to it
-//! ([`crate::proto::session::SessionCore::offer_join`]).
+//! A sans-IO listener: it classifies new carriers by their first bytes, cuts Join
+//! Hellos, pairs split carriers, and bounds the carriers that are not authenticated
+//! yet. It never touches session state: the driver looks up the session by locator and
+//! offers the Hello to it ([`crate::proto::session::SessionCore::open_hello`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use crate::proto::frame::{LANE_KEY_LEN, MAX_JOIN_FRAME_LEN, PipeJoin, PipeLane};
+use crate::proto::frame::{LANE_KEY_LEN, PipeLane};
 use crate::proto::ident::{Classifier, FirstRecord, Verdict};
 use crate::proto::oob::PAIRING_TOKEN_LEN;
 use crate::proto::record::Framing;
+use crate::proto::seal::Error as SealError;
+use crate::proto::seal::join::JoinHello;
 use crate::proto::session::Budget;
 use crate::proto::varint;
 
@@ -43,7 +43,7 @@ impl std::fmt::Debug for OnMemoryPressure {
     }
 }
 
-/// Listener limits (MULTIPATH.md Section 5.6, RESUME.md Section 9).
+/// Listener limits.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ListenerConfig {
@@ -52,10 +52,11 @@ pub struct ListenerConfig {
     pub max_pending: usize,
     /// Pending carriers per source (default 8).
     pub max_pending_per_source: usize,
-    /// Pending joins per session (default 4).
+    /// Unconfirmed carriers per session: joins that passed authentication and wait for the
+    /// joiner's confirmation (default 4). A new authenticated Hello beyond it evicts the one
+    /// Unconfirmed longest and is never refused for lack of room.
     pub max_pending_per_session: usize,
-    /// The first record (or the out-of-band join) must arrive within this
-    /// (default 2 s).
+    /// The first record or Hello must arrive within this (default 2 s).
     pub first_record_timeout: Duration,
     /// A pending carrier is closed after this (default 10 s).
     pub handshake_timeout: Duration,
@@ -75,9 +76,9 @@ pub struct ListenerConfig {
     /// most [`MAX_INSTANCE_ID_LEN`] bytes (empty by default).
     pub instance_id: Vec<u8>,
     /// The intermediaries whose report of a carrier's client address the
-    /// listener's adapters take as the carrier's source (MULTIPATH.md
-    /// Section 5.6): the PROXY protocol on TCP connections, a forwarding
-    /// header field on HTTP carriers (none by default).
+    /// listener's adapters take as the carrier's source: the PROXY
+    /// protocol on TCP connections, a forwarding header field on HTTP
+    /// carriers (none by default).
     pub trusted_proxies: super::trusted::TrustedProxies,
     /// The admission of every new carrier, at every entry of the listener
     /// (its byte-stream, HTTP, WebSocket, WebTransport and QUIC adapters,
@@ -97,21 +98,292 @@ pub struct ListenerConfig {
     /// [`crate::InboundTransform`].
     #[cfg(all(feature = "tokio", not(loom)))]
     pub inbound_transform: Option<crate::driver::transform::InboundTransform>,
-    /// Answers a join that names no session of this listener with a fixed
-    /// close (MULTIPATH.md Section 5.4 step 3), so that its joiner ends a
-    /// resumption at once instead of at the end of its grace period: only
-    /// on a carrier the admission accepted (any carrier without an
-    /// admission), only for a well-formed join, and only when the locator
-    /// begins with [`ListenerConfig::instance_id`] (any locator with an
-    /// empty one). Every other rejection stays silent; the answered join
-    /// is counted as rejected.
-    ///
-    /// Off by default: turn it on only where a locator with this
-    /// listener's instance identifier reaches no other instance (a single
-    /// instance, or instances with distinct identifiers), since a joiner
-    /// sent to the wrong instance would end a session that lives on.
-    pub answer_unknown_joins: bool,
+    /// Decides the response to an unauthenticated carrier: an unknown Locator, a failed
+    /// Hello, an Establish a transform refused. Unset is
+    /// [`RejectAction::default_for`]: an Establish refused before
+    /// authentication is stalled, a Join closed. No verdict sends anything.
+    pub on_reject: Option<OnReject>,
+    /// Chooses the [`Config`](crate::Config) of each new session (not of a
+    /// join); unset, the listener's.
+    pub session_config: Option<SessionConfigFn>,
+    /// The listener's logger (unset: nothing is logged): failures of its
+    /// host callbacks that it contains. Its sessions log through their own
+    /// [`Config::logger`](crate::Config#structfield.logger).
+    pub logger: Option<crate::proto::session::Logger>,
 }
+
+/// What [`ListenerConfig::on_reject`] knows of a refused carrier.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RejectInfo {
+    /// The Profile, 2 for a Join; `None` when the first bytes named none.
+    pub profile: Option<u64>,
+    /// The record mode the carrier asked for, when it named one.
+    pub mode: Option<crate::proto::seal::Mode>,
+    /// The reason: a secure-carrier error class, or `unknown_locator`.
+    pub reason: &'static str,
+    /// The carrier's source.
+    pub source: Option<std::net::SocketAddr>,
+}
+
+impl RejectInfo {
+    /// A refusal for `reason`.
+    pub fn new(
+        profile: Option<u64>,
+        mode: Option<crate::proto::seal::Mode>,
+        reason: &'static str,
+        source: Option<std::net::SocketAddr>,
+    ) -> Self {
+        Self {
+            profile,
+            mode,
+            reason,
+            source,
+        }
+    }
+}
+
+/// The error of a transform that refused a carrier before authentication: it goes to
+/// [`ListenerConfig::on_reject`], inside an `io::Error`, and nothing is ever sent for it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RejectError {
+    /// The Profile, when the first bytes named one.
+    pub profile: Option<u64>,
+    /// The record mode, when they named one.
+    pub mode: Option<crate::proto::seal::Mode>,
+    /// The reason: `profile_disabled`, `unknown_handle`, `auth`,
+    /// `binding_unavailable`, `record_mode`, `early_data`, `gate_error`, or another error
+    /// class of the secure carrier. Every reason gets the same response: no byte, and the
+    /// reject policy's way of ending.
+    pub reason: &'static str,
+    /// The underlying error, such as a gate's ([`std::error::Error::source`]).
+    pub err: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+}
+
+impl RejectError {
+    /// A refusal for `reason`.
+    pub fn new(
+        profile: Option<u64>,
+        mode: Option<crate::proto::seal::Mode>,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            profile,
+            mode,
+            reason,
+            err: None,
+        }
+    }
+
+    /// With the underlying error.
+    #[must_use]
+    pub fn with_source(mut self, err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.err = Some(std::sync::Arc::new(err));
+        self
+    }
+}
+
+impl std::fmt::Display for RejectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "carrier refused: {}", self.reason)
+    }
+}
+
+impl std::error::Error for RejectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.err
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// A [`RejectError`] with the refused carrier handed back, inside an `io::Error`: the
+/// listener keeps the carrier open while it stalls it ([`RejectAction::Stall`]), since a
+/// carrier the transform dropped is closed at once. `P` is the driver's carrier type.
+pub struct Refused<P> {
+    /// The refusal.
+    pub error: RejectError,
+    carrier: std::sync::Mutex<Option<P>>,
+}
+
+impl<P: Send + 'static> Refused<P> {
+    /// The refusal of `carrier`, as an `io::Error`.
+    pub fn error(error: RejectError, carrier: P) -> std::io::Error {
+        std::io::Error::other(Self {
+            error,
+            carrier: std::sync::Mutex::new(Some(carrier)),
+        })
+    }
+
+    /// The carrier, once.
+    pub fn take_carrier(&self) -> Option<P> {
+        self.carrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl<P> std::fmt::Debug for Refused<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refused")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P> std::fmt::Display for Refused<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<P> std::error::Error for Refused<P> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.error)
+    }
+}
+
+/// The answer of [`ListenerConfig::on_reject`]. Without one, an Establish
+/// refused before authentication is stalled, and a Join and every other
+/// refusal closed ([`RejectAction::default_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RejectAction {
+    /// Close the carrier.
+    Close,
+    /// Keep the carrier without a byte, holding its source slot: a Join
+    /// until the join timeout, an Establish until the handshake timeout
+    /// and never beyond the listener's maximum stall duration. A source
+    /// that holds its maximum of stalled carriers has it closed at once
+    /// (`stall_overflow`).
+    Stall,
+}
+
+impl RejectAction {
+    /// The answer without [`ListenerConfig::on_reject`]: `Stall` for an
+    /// Establish (a Profile other than 2), `Close` for a Join and for a
+    /// refusal that named no Profile.
+    pub fn default_for(info: &RejectInfo) -> Self {
+        match info.profile {
+            Some(p) if p != 2 => Self::Stall,
+            _ => Self::Close,
+        }
+    }
+}
+
+/// The function of [`ListenerConfig::on_reject`].
+#[derive(Clone)]
+pub struct OnReject(pub std::sync::Arc<dyn Fn(&RejectInfo) -> RejectAction + Send + Sync>);
+
+impl OnReject {
+    /// What the policy chooses for `info`; one that panics closes the carrier.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn ask(
+        &self,
+        info: &RejectInfo,
+        logger: Option<&crate::proto::session::Logger>,
+    ) -> RejectAction {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(info))).unwrap_or_else(
+            |_| {
+                if let Some(l) = logger {
+                    l.log(
+                        crate::proto::session::LogLevel::Error,
+                        "zmux: on_reject panicked; the carrier is closed",
+                    );
+                }
+                RejectAction::Close
+            },
+        )
+    }
+}
+
+impl std::fmt::Debug for OnReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnReject(..)")
+    }
+}
+
+/// What [`ListenerConfig::session_config`] knows of a carrier that starts a
+/// session.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SessionCarrier<'a> {
+    /// The carrier's source, as the admission saw it.
+    pub source: Option<std::net::SocketAddr>,
+    /// The directly connected peer.
+    pub peer: Option<std::net::SocketAddr>,
+    /// The TLS or QUIC handshake this process terminated for the carrier.
+    pub tls: Option<&'a crate::proto::exporter::TlsState>,
+    /// The value of the admission that accepted the carrier.
+    pub admitted: Option<&'a crate::proto::admission::AdmittedValue>,
+}
+
+/// The function of [`ListenerConfig::session_config`].
+///
+/// It runs once for every carrier that starts a new session, outside every
+/// lock, and returns the session's configuration, such as an exporter where
+/// TLS ends here and a deferred key where it ends at an intermediary, or
+/// per-session shaping limits; `Ok(None)` selects the listener's. Joins to
+/// the session verify with its own configuration. Settings of the listener
+/// as a whole stay the listener's: its memory budget and the bounds at the
+/// carrier level use the listener's configuration. A configuration invalid
+/// for a server session, an error and a panic close the carrier without a
+/// byte, counted as rejected.
+#[derive(Clone)]
+pub struct SessionConfigFn(pub std::sync::Arc<SessionConfigDyn>);
+
+/// The callable behind a [`SessionConfigFn`].
+pub type SessionConfigDyn =
+    dyn Fn(&SessionCarrier<'_>) -> Result<Option<crate::Config>, String> + Send + Sync;
+
+impl SessionConfigFn {
+    /// Wraps `f`.
+    pub fn new(
+        f: impl Fn(&SessionCarrier<'_>) -> Result<Option<crate::Config>, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    /// Runs the function for `carrier`: `Ok(None)` selects the listener's
+    /// configuration; an error, a panic or a configuration invalid for a
+    /// session is logged to the listener's `logger` and returns `Err`.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn choose(
+        &self,
+        carrier: &SessionCarrier<'_>,
+        logger: Option<&crate::proto::session::Logger>,
+    ) -> Result<Option<crate::Config>, ()> {
+        let why = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(carrier)))
+        {
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Ok(Some(c))) => match c.validate() {
+                Ok(()) => return Ok(Some(c)),
+                Err(e) => format!("returned an invalid configuration ({e})"),
+            },
+            Ok(Err(e)) => format!("failed: {e}"),
+            Err(_) => "panicked; the panic was contained".to_string(),
+        };
+        if let Some(l) = logger {
+            l.log(
+                crate::proto::session::LogLevel::Warn,
+                &format!("zmux: session_config {why}; the carrier is closed"),
+            );
+        }
+        Err(())
+    }
+}
+
+impl std::fmt::Debug for SessionConfigFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionConfigFn(..)")
+    }
+}
+
+/// The longest Hello a listener holds on a byte stream: its limit, independent of
+/// `max_record_size`.
+pub const MAX_HELLO: usize = 2 + 8 + 1 + 1 + 255 + 64 + 2 + 65_535;
 
 /// The longest [`ListenerConfig::instance_id`], so that at least 8 random
 /// bytes remain in the 16-byte session locator.
@@ -137,7 +409,9 @@ impl Default for ListenerConfig {
             fallback: None,
             #[cfg(all(feature = "tokio", not(loom)))]
             inbound_transform: None,
-            answer_unknown_joins: false,
+            on_reject: None,
+            session_config: None,
+            logger: None,
         }
     }
 }
@@ -173,9 +447,9 @@ pub enum Classified {
         /// The bytes received so far.
         first: Vec<u8>,
     },
-    /// A lane (MULTIPATH.md Section 5.8): route it by `lane_key` over the
-    /// sessions (comparing in constant time), check that the pipe's lane 0
-    /// is on the stream's connection, and offer it to the session
+    /// A lane: route it by `lane_key` over the sessions (comparing in
+    /// constant time), check that the pipe's lane 0 is on the stream's
+    /// connection, and offer it to the session
     /// ([`crate::proto::session::SessionCore::accept_lane`]); once it is
     /// accepted, feed `bytes`, the stream's bytes so far, to that lane.
     Lane {
@@ -188,18 +462,20 @@ pub enum Classified {
         /// The stream's bytes so far.
         bytes: Vec<u8>,
     },
-    /// A join: offer `frame` to the session whose locator is `locator`.
-    /// Once it is accepted, feed `bytes` (in band: starting with the record
-    /// that carries the frame) to the session as the pipe's first bytes.
+    /// A Join whose Hello does not parse: an unauthenticated rejection, given the
+    /// listener's reject policy (closed or stalled, nothing written) like an unknown
+    /// Locator. The carrier stays pending until [`ListenerCore::done`].
+    BadHello {
+        /// The class of the parse failure.
+        reason: &'static str,
+    },
+    /// A Join: find the session whose locator is `locator` and offer it `hello`
+    /// ([`JoinHello::parse`]).
     Join {
         /// The Session Locator.
         locator: Vec<u8>,
-        /// The PIPE_JOIN frame, Type through Join Token.
-        frame: Vec<u8>,
-        /// The carrier's bytes so far.
-        bytes: Vec<u8>,
-        /// Whether the frame came in band.
-        inband: bool,
+        /// The whole Hello.
+        hello: Vec<u8>,
     },
 }
 
@@ -222,14 +498,15 @@ struct Pending {
     framing: Framing,
     classifier: Classifier,
     buf: Vec<u8>,
-    /// The locator once a join was parsed (per-session limit).
-    locator: Option<Vec<u8>>,
-    /// The first record (or join) arrived.
+    /// The first record or Hello arrived.
     first: bool,
+    /// The session's locator once a verified Hello made it Unconfirmed, with the order in
+    /// which carriers became Unconfirmed.
+    unconfirmed: Option<(Vec<u8>, u64)>,
     /// A new stream of a connection that already carries a pipe of the
     /// endpoint: not an unauthenticated carrier (the connection's stream
     /// credit bounds them), so outside the source and pending limits, and
-    /// only the first-record timeout applies (MULTIPATH.md Section 5.5).
+    /// only the first-record timeout applies.
     stream: bool,
 }
 
@@ -247,11 +524,13 @@ pub struct ListenerCore {
     /// Stalled carriers by source, a subset of `held`
     /// ([`ListenerCore::stall`]).
     stalled: HashMap<u64, usize>,
+    /// The order of the next carrier to become Unconfirmed.
+    unconfirmed_seq: u64,
 }
 
-/// A source key from a remote address, aggregated to /64 for IPv6
-/// (MULTIPATH.md Section 5.6); an IPv4-mapped address (a dual-stack
-/// socket's IPv4 client) counts as its IPv4 address: the key
+/// A source key from a remote address, aggregated to /64 for IPv6; an
+/// IPv4-mapped address (a dual-stack socket's IPv4 client) counts as
+/// its IPv4 address: the key
 /// [`ListenerCore::hold`] and [`ListenerCore::stall`] take.
 pub fn source_key(addr: std::net::IpAddr) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -279,6 +558,7 @@ impl ListenerCore {
             pairs: HashMap::new(),
             held: HashMap::new(),
             stalled: HashMap::new(),
+            unconfirmed_seq: 0,
         }
     }
 
@@ -294,10 +574,10 @@ impl ListenerCore {
 
     /// A new stream that the peer opened on a connection that carries lane
     /// 0 of an open inbound pipe of the endpoint, within the streams such
-    /// pipes let wait for their first record unlimited (MULTIPATH.md
-    /// Section 5.5, which the caller counts): its first record may begin a
-    /// lane, which takes no slot; one that turns out a join or a new
-    /// session takes a slot then ([`ListenerCore::admit`]).
+    /// pipes let wait for their first record unlimited (which the caller
+    /// counts): its first record may begin a lane, which takes no slot;
+    /// one that turns out a join or a new session takes a slot then
+    /// ([`ListenerCore::admit`]).
     pub fn open_stream(&mut self, framing: Framing, now: Instant) -> CarrierId {
         let id = CarrierId(self.next);
         self.next += 1;
@@ -313,14 +593,14 @@ impl ListenerCore {
             )
             .with_lanes(),
             buf: Vec::new(),
-            locator: None,
             first: false,
+            unconfirmed: None,
             stream: true,
         });
         id
     }
 
-    /// A new carrier from `source` (MULTIPATH.md Section 5.6).
+    /// A new carrier from `source`.
     pub fn open(&mut self, source: u64, framing: Framing, now: Instant) -> Opened {
         let evicted = match self.make_slot(source) {
             Ok(evicted) => evicted,
@@ -366,8 +646,8 @@ impl ListenerCore {
                 true,
             ),
             buf: Vec::new(),
-            locator: None,
             first: false,
+            unconfirmed: None,
             stream: false,
         });
         Opened::Accepted { id, evicted }
@@ -375,7 +655,7 @@ impl ListenerCore {
 
     /// A slot for a carrier from `source`: refused when the source has
     /// its share, else the oldest pending carrier evicted when all are
-    /// taken (MULTIPATH.md Section 5.6).
+    /// taken.
     fn make_slot(&mut self, source: u64) -> Result<Option<CarrierId>, ()> {
         if self.per_source(source) >= self.config.max_pending_per_source {
             return Err(());
@@ -441,6 +721,18 @@ impl ListenerCore {
         true
     }
 
+    /// The carriers of `source` counted against its pending limit now.
+    #[cfg(test)]
+    pub(crate) fn pending_of(&self, source: u64) -> usize {
+        self.per_source(source)
+    }
+
+    /// The carriers of `source` stalled now.
+    #[cfg(test)]
+    pub(crate) fn stalled(&self, source: u64) -> usize {
+        self.stalled.get(&source).copied().unwrap_or(0)
+    }
+
     /// A stall [`ListenerCore::stall`] counted ended.
     pub fn unstall(&mut self, source: u64) {
         if let Some(n) = self.stalled.get_mut(&source) {
@@ -452,8 +744,8 @@ impl ListenerCore {
     }
 
     /// A stream opened by [`ListenerCore::open_stream`] turned out a join or a
-    /// new session: it takes a slot from `source` now, like any carrier
-    /// (MULTIPATH.md Section 5.5). `Refused`: close it.
+    /// new session: it takes a slot from `source` now, like any carrier.
+    /// `Refused`: close it.
     pub fn admit(&mut self, id: CarrierId, source: u64) -> Opened {
         if self.find(id).is_none() {
             return Opened::Refused;
@@ -477,7 +769,7 @@ impl ListenerCore {
     /// Bytes from a byte-stream carrier.
     pub fn data(&mut self, id: CarrierId, bytes: &[u8], now: Instant) -> Classified {
         let _ = now;
-        let max_hold = self.config.max_record_size as usize + 8;
+        let max_hold = (self.config.max_record_size as usize + 8).max(MAX_HELLO);
         let Some(i) = self.find(id) else {
             return Classified::Reject;
         };
@@ -513,39 +805,22 @@ impl ListenerCore {
                 }
                 c
             }
-            Verdict::Accept(FirstRecord::Join) => {
-                let Some((size, width)) = varint::decode(&p.buf) else {
-                    return Classified::NeedMore;
-                };
-                let body = &p.buf[width..];
-                let have = body.len().min(size as usize);
-                match PipeJoin::decode(&body[..have]) {
-                    Ok((join, len)) => {
-                        let locator = join.locator.to_vec();
-                        let frame = body[..len].to_vec();
-                        p.first = true;
-                        p.locator = Some(locator.clone());
-                        let bytes = p.buf.clone();
-                        if self.over_session_limit(i) {
-                            self.done(id);
-                            return Classified::Reject;
-                        }
-                        Classified::Join {
-                            locator,
-                            frame,
-                            bytes,
-                            inband: true,
-                        }
-                    }
-                    Err(_) if have < (size as usize).min(MAX_JOIN_FRAME_LEN) => {
-                        Classified::NeedMore
-                    }
-                    Err(_) => {
-                        self.done(id);
-                        Classified::Reject
+            Verdict::Accept(FirstRecord::Join) => match JoinHello::parse(p.framing, &p.buf) {
+                Err(SealError::Incomplete { .. }) if p.buf.len() <= MAX_HELLO => {
+                    Classified::NeedMore
+                }
+                Ok(h) => {
+                    let locator = h.locator().to_vec();
+                    p.first = true;
+                    Classified::Join {
+                        locator,
+                        hello: std::mem::take(&mut p.buf),
                     }
                 }
-            }
+                Err(_) => Classified::BadHello {
+                    reason: "malformed",
+                },
+            },
         }
     }
 
@@ -575,26 +850,18 @@ impl ListenerCore {
                 self.done(id);
                 lane_message(message)
             }
-            Verdict::Accept(FirstRecord::Join) => match PipeJoin::decode(message) {
-                Ok((join, len)) => {
-                    let locator = join.locator.to_vec();
+            Verdict::Accept(FirstRecord::Join) => match JoinHello::parse(p.framing, message) {
+                Ok(h) => {
+                    let locator = h.locator().to_vec();
                     p.first = true;
-                    p.locator = Some(locator.clone());
-                    if self.over_session_limit(i) {
-                        self.done(id);
-                        return Classified::Reject;
-                    }
                     Classified::Join {
                         locator,
-                        frame: message[..len].to_vec(),
-                        bytes: message.to_vec(),
-                        inband: true,
+                        hello: message.to_vec(),
                     }
                 }
-                Err(_) => {
-                    self.done(id);
-                    Classified::Reject
-                }
+                Err(_) => Classified::BadHello {
+                    reason: "malformed",
+                },
             },
             _ => {
                 self.done(id);
@@ -603,46 +870,31 @@ impl ListenerCore {
         }
     }
 
-    /// An out-of-band PIPE_JOIN delivered with the carrier (MULTIPATH.md
-    /// Section 5.3); it must be exactly one frame of at most 64 bytes.
-    pub fn oob(&mut self, id: CarrierId, frame: &[u8], now: Instant) -> Classified {
-        let _ = now;
-        let Some(i) = self.find(id) else {
-            return Classified::Reject;
+    /// A verified Hello of the session named `locator` is Unconfirmed: beyond the session's
+    /// limit, the carrier that became Unconfirmed first, never this one, is evicted rather
+    /// than the new Hello refused. Returns the carrier to close.
+    pub fn unconfirmed(&mut self, id: CarrierId, locator: &[u8]) -> Option<CarrierId> {
+        let i = self.find(id)?;
+        let seq = self.unconfirmed_seq;
+        self.unconfirmed_seq += 1;
+        self.pending[i].unconfirmed = Some((locator.to_vec(), seq));
+        let of = |p: &Pending| {
+            p.unconfirmed
+                .as_ref()
+                .filter(|(l, _)| l.as_slice() == locator)
+                .map(|&(_, seq)| seq)
         };
-        match PipeJoin::decode(frame) {
-            Ok((join, len)) if len == frame.len() => {
-                let locator = join.locator.to_vec();
-                let p = &mut self.pending[i];
-                p.first = true;
-                p.locator = Some(locator.clone());
-                if self.over_session_limit(i) {
-                    self.done(id);
-                    return Classified::Reject;
-                }
-                Classified::Join {
-                    locator,
-                    frame: frame.to_vec(),
-                    bytes: Vec::new(),
-                    inband: false,
-                }
-            }
-            _ => {
-                self.done(id);
-                Classified::Reject
-            }
+        if self.pending.iter().filter_map(of).count() <= self.config.max_pending_per_session {
+            return None;
         }
-    }
-
-    fn over_session_limit(&self, i: usize) -> bool {
-        let Some(l) = &self.pending[i].locator else {
-            return false;
-        };
-        self.pending
+        let (i, _) = self
+            .pending
             .iter()
-            .filter(|p| p.locator.as_ref() == Some(l))
-            .count()
-            > self.config.max_pending_per_session
+            .enumerate()
+            .filter(|(_, p)| p.id != id)
+            .filter_map(|(i, p)| of(p).map(|seq| (i, seq)))
+            .min_by_key(|&(_, seq)| seq)?;
+        self.pending.remove(i).map(|p| p.id)
     }
 
     /// The carrier left the listener (attached, rejected or closed).
@@ -665,8 +917,15 @@ impl ListenerCore {
         self.pending.iter().find(|p| p.id == id).map(|p| p.framing)
     }
 
-    /// Pairs a split-bootstrap carrier by its token (SPEC.md Section
-    /// 6.1.1); `inbound` is the half the carrier gives the local endpoint.
+    /// What an inbound transform made of the carrier's framing, before its first record.
+    pub fn set_framing(&mut self, id: CarrierId, framing: Framing) {
+        if let Some(i) = self.find(id) {
+            self.pending[i].framing = framing;
+        }
+    }
+
+    /// Pairs a split-bootstrap carrier by its token; `inbound` is the half the carrier gives the
+    /// local endpoint.
     pub fn pair(
         &mut self,
         token: [u8; PAIRING_TOKEN_LEN],
@@ -675,7 +934,7 @@ impl ListenerCore {
         now: Instant,
     ) -> Paired {
         // Entries older than the handshake timeout are gone: their halves
-        // gave up (SPEC.md Section 6.1.1 step 3).
+        // gave up.
         let limit = self.config.handshake_timeout;
         self.pairs
             .retain(|_, v| now.saturating_duration_since(v.2) < limit);
@@ -695,6 +954,14 @@ impl ListenerCore {
                 Paired::Complete(entry.0)
             }
             Some(_) => Paired::Reject,
+        }
+    }
+
+    /// Forgets the pairing of `token` the half `id` began: the half gave up, so the token
+    /// starts a new pairing.
+    pub fn unpair(&mut self, token: &[u8; PAIRING_TOKEN_LEN], id: CarrierId) {
+        if self.pairs.get(token).is_some_and(|v| v.0 == id) {
+            self.pairs.remove(token);
         }
     }
 
@@ -771,10 +1038,10 @@ fn lane_message(message: &[u8]) -> Classified {
 }
 
 /// The first record of a new stream of a connection that already carries a
-/// pipe of the endpoint, checked for a lane without a listener
-/// (MULTIPATH.md Sections 5.5 and 5.8): an endpoint whose adapter hands
-/// such streams to its sessions directly classifies them the same way. It
-/// decides within the first record; only a lane is accepted.
+/// pipe of the endpoint, checked for a lane without a listener: an
+/// endpoint whose adapter hands such streams to its sessions directly
+/// classifies them the same way. It decides within the first record; only
+/// a lane is accepted.
 #[derive(Debug, Clone)]
 pub struct LaneProbe {
     classifier: Classifier,
@@ -860,6 +1127,136 @@ impl MemoryBudget {
     }
 }
 
+/// What the listener's admission ([`crate::ListenerConfig::admission`])
+/// decided ([`ListenerStats::admission`]): counts since the listener was
+/// made, each carrier that took a source slot counted once its outcome is
+/// known, all 0 without an admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdmissionStats {
+    /// Decided with [`crate::Verdict::Accept`]; each then counts once more as a
+    /// pipe input in the other fields of [`ListenerStats`].
+    pub accepted: u64,
+    /// Decided with [`crate::Verdict::Fallback`] (stalled without a fallback
+    /// target, still counted here).
+    pub fallback: u64,
+    /// Decided with [`crate::Verdict::Stall`], counted when the stall starts.
+    pub stalled: u64,
+    /// Decided with [`crate::Verdict::Close`], an `Accept` beyond the prefix, a
+    /// decision that panicked, or one cancelled because the listener
+    /// closed.
+    pub closed: u64,
+    /// Decided with [`crate::Verdict::Stall`] when the listener could not stall
+    /// it: its source already stalled `max_pending_per_source - 1`
+    /// carriers ([`ListenerConfig::max_pending_per_source`]), or the
+    /// listener closed meanwhile. Closed at once.
+    pub stall_overflow: u64,
+    /// The decision did not come before the end of the peek timeout.
+    pub peek_timed_out: u64,
+    /// The outer handshake (TLS, an HTTP upgrade, QUIC) failed or timed
+    /// out: never decided on. Not counted in
+    /// [`ListenerStats::setup_failures`].
+    pub handshake_failed: u64,
+}
+
+/// What happened to the pipe inputs handed to a listener
+/// ([`crate::Listener::stats`]): counts since it was made.
+///
+/// The unit is the pipe input: a carrier, a lane, or the two carriers of a
+/// split pipe once paired (a half never paired is an input of its own).
+/// Every input whose outcome is known is counted once, in one of
+/// `sessions`, `joins`, `rejected`, `refused` and `timed_out`;
+/// `setup_failures` counts connections that never became an input, and
+/// `admission` what the listener's admission decided on carriers before
+/// they became inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListenerStats {
+    /// Sessions started: bootstraps offered to [`crate::Listener::accept`], a
+    /// split bootstrap once.
+    pub sessions: u64,
+    /// Joins accepted into existing sessions, and lanes accepted into
+    /// their pipes.
+    pub joins: u64,
+    /// Connections never made a pipe input: a failed TLS handshake or its
+    /// timeout (also the handshake a join sent in early data waits for), a
+    /// failed HTTP or WebSocket upgrade, or the setup limit
+    /// ([`crate::Listener::count_setup_failure`]). With an admission, a carrier's
+    /// failed outer handshake counts in [`AdmissionStats::handshake_failed`]
+    /// instead.
+    pub setup_failures: u64,
+    /// Inputs closed without a distinguishable reason: unknown,
+    /// unauthenticated or replayed joins, lanes that name no pipe, or not
+    /// zmux at all ([`HandleError::Rejected`]). An admission's decisions
+    /// count in [`ListenerStats::admission`] only.
+    pub rejected: u64,
+    /// Inputs refused at a limit: of the listener, of its source (a
+    /// carrier refused its source slot, before any handshake), of the
+    /// session (a join closed with ZMUX_PIPE_RESOURCE_LIMIT), new sessions
+    /// during [`crate::Listener::shutdown`], or anything after [`crate::Listener::close`]
+    /// ([`HandleError::Refused`]).
+    pub refused: u64,
+    /// Inputs without a first record, or join, in time, and split halves
+    /// whose other half did not arrive in time ([`HandleError::TimedOut`]).
+    pub timed_out: u64,
+    /// What the listener's admission decided.
+    pub admission: AdmissionStats,
+}
+
+/// Why a carrier was not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandleError {
+    /// Closed without a distinguishable reason: unknown, unauthenticated
+    /// or replayed, a lane that names no pipe, or not zmux at all.
+    Rejected,
+    /// At a limit: of the listener for this source, of the session (a
+    /// join closed with ZMUX_PIPE_RESOURCE_LIMIT), or the listener closed.
+    Refused,
+    /// No first record (or join) in time, or a split half whose other half
+    /// did not arrive in time.
+    TimedOut,
+    /// The carrier's setup did not complete: the handshake that a join
+    /// sent in carrier early data waits for failed or timed out. Counted
+    /// as a setup failure ([`ListenerStats::setup_failures`]) only.
+    SetupFailed,
+    /// The listener's admission did not accept the carrier: it was
+    /// closed, stalled or handed to a fallback. Counted in
+    /// [`ListenerStats::admission`] only.
+    NotAdmitted,
+}
+
+impl std::fmt::Display for HandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rejected => "carrier rejected",
+            Self::Refused => "carrier refused",
+            Self::SetupFailed => "carrier setup failed",
+            Self::TimedOut => "carrier timed out",
+            Self::NotAdmitted => "carrier not admitted",
+        })
+    }
+}
+
+impl std::error::Error for HandleError {}
+
+/// A 16-byte session locator: `prefix`, then random bytes.
+#[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+pub(crate) fn random_locator(prefix: &[u8]) -> Vec<u8> {
+    let mut l = vec![0u8; 16];
+    l[..prefix.len()].copy_from_slice(prefix);
+    let rest = &mut l[prefix.len()..];
+    if getrandom::fill(rest).is_err() {
+        use std::hash::BuildHasher;
+        let s = std::collections::hash_map::RandomState::new();
+        for (i, c) in rest.chunks_mut(8).enumerate() {
+            let t = s.hash_one((0x006c_6f63_6174_6f72_u64, i));
+            c.copy_from_slice(&t.to_le_bytes()[..c.len()]);
+        }
+    }
+    l
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1311,28 @@ mod tests {
         ));
         // The first expired above.
         assert_eq!(l.pending(), 1);
+    }
+
+    /// Beyond the session's limit the carrier Unconfirmed longest goes, by when it became
+    /// Unconfirmed and not by when it arrived, and never the Hello that went over it.
+    #[test]
+    fn the_longest_unconfirmed_is_evicted() {
+        let mut l = ListenerCore::new(ListenerConfig::default());
+        let now = Instant::now();
+        let ids: Vec<_> = (0..6)
+            .map(|n| match l.open(n, Framing::ByteStream, now) {
+                Opened::Accepted { id, .. } => id,
+                Opened::Refused => panic!("refused"),
+            })
+            .collect();
+        // The first to arrive is the slowest to be verified.
+        for &id in &ids[1..5] {
+            assert_eq!(l.unconfirmed(id, b"s"), None);
+        }
+        assert_eq!(l.unconfirmed(ids[0], b"s"), Some(ids[1]));
+        // Another session's Unconfirmed carriers are not counted.
+        assert_eq!(l.unconfirmed(ids[5], b"t"), None);
+        assert_eq!(l.pending(), 5);
     }
 
     #[test]

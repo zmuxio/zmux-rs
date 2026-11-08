@@ -1,4 +1,4 @@
-//! The pipe-event queue stays bounded (CONFORMANCE.md): a peer that joins and drops pipes in
+//! The pipe-event queue stays bounded: a peer that joins and drops pipes in
 //! a loop while the application reads no events leaves memory bounded, and
 //! no terminal outcome is lost.
 
@@ -12,7 +12,7 @@ use zmux::{
 fn config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"events-test-psk-0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"events-test-psk-0123456789abcdef").with_end_to_end();
     c
 }
 
@@ -44,7 +44,8 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn join_and_drop_churn_keeps_the_queue_bounded() {
-    let listener = Listener::new(config(), ListenerConfig::default());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let client = Session::connect(carrier(&listener), config())
         .await
         .unwrap();
@@ -56,7 +57,7 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
     let mut most = (0, 0);
     for round in 0..60u32 {
         let pipe = client
-            .add_pipe(carrier(&listener), PipeOptions::default())
+            .begin_add_pipe(carrier(&listener), PipeOptions::default())
             .unwrap();
         until("pipe active", || {
             pipe.stats()
@@ -87,16 +88,17 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
     assert_eq!(recv.read_to_end(16).await.unwrap(), b"");
 
     // Every pipe is accounted for: reported live, or counted as retired.
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     let mut retired = 0;
     let mut seen = std::collections::HashSet::new();
     while let Some(e) = server.next_event().await {
         match e {
             SessionEvent::PipesRetired { retired: n, .. } => retired += n,
-            SessionEvent::PipeState { pipe, .. } => {
-                seen.insert(pipe);
+            e => {
+                if let Some(pipe) = e.pipe() {
+                    seen.insert(pipe);
+                }
             }
-            _ => {}
         }
     }
     assert!(retired > 0);
@@ -113,13 +115,14 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
 /// is reported at once, and a pipe takes a band of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quality_events_reach_the_application() {
-    let listener = Listener::new(config(), ListenerConfig::default());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let client = Session::connect(carrier(&listener), config())
         .await
         .unwrap();
     let _server = listener.accept().await.unwrap();
     let pipe = client
-        .add_pipe(carrier(&listener), PipeOptions::default())
+        .begin_add_pipe(carrier(&listener), PipeOptions::default())
         .unwrap();
     pipe.set_quality_band(Some(QualityBand::new(Duration::from_millis(5), 1.5)))
         .unwrap();
@@ -161,4 +164,69 @@ async fn quality_events_reach_the_application() {
         "{event:?}"
     );
     client.set_capacity_floor(None).unwrap();
+}
+
+/// A local join is reported by the six pipe state events: `PipeAdded`, then `PipeJoined`, then its terminal event, which
+/// closes the outbound direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_reports_added_joined_and_closed() {
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let client = Session::connect(carrier(&listener), config())
+        .await
+        .unwrap();
+    let _server = listener.accept().await.unwrap();
+    let pipe = client
+        .begin_add_pipe(carrier(&listener), PipeOptions::default())
+        .unwrap();
+    let id = pipe.id();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !seen.iter().any(|e: &SessionEvent| e.is_terminal()) {
+            let e = client.next_event().await.expect("an event");
+            // Retired before its end was read, the end is counted there.
+            if let SessionEvent::PipesRetired { last, closed, .. } = &e
+                && last.contains(&id)
+            {
+                assert!(*closed <= 1, "{e:?}");
+                seen.push(SessionEvent::PipeClosed {
+                    pipe: id,
+                    half: zmux::PipeHalf::Outbound,
+                    carrier: None,
+                });
+                continue;
+            }
+            // The inbound end may come before or after the outbound one.
+            let inbound = matches!(
+                e,
+                SessionEvent::PipeClosed {
+                    half: zmux::PipeHalf::Inbound,
+                    ..
+                }
+            );
+            if e.pipe() != Some(id) || inbound {
+                continue;
+            }
+            if matches!(e, SessionEvent::PipeJoined { .. }) {
+                pipe.close().unwrap();
+            }
+            seen.push(e);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("events: {seen:?}"));
+    assert!(
+        matches!(
+            seen[..],
+            [
+                SessionEvent::PipeAdded { .. },
+                SessionEvent::PipeJoined { .. },
+                SessionEvent::PipeClosed {
+                    half: zmux::PipeHalf::Outbound,
+                    ..
+                }
+            ]
+        ),
+        "{seen:?}"
+    );
 }

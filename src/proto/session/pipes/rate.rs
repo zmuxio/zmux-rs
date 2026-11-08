@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 const SECOND: u64 = 1_000_000_000;
 
 /// At most `N` frames of a kind in any one-second interval at a sustained
-/// `N` per second: 8 PIPE_PING frames (MULTIPATH.md Section 6.4).
+/// `N` per second: 8 PIPE_PING frames.
 ///
 /// A sliding window, not a token bucket: a bucket of `N` tokens refilled at
 /// `N` per second lets almost `2N` frames into one second. The window keeps
@@ -87,8 +87,7 @@ impl<const N: usize> RateLimiter<N> {
 /// algorithm: one instant of state, no history): a burst of `N / 2`, then
 /// one frame every `2 / N` seconds, so that a burst and the refill within
 /// any second stay within `N`. Half the sliding window's sustained rate,
-/// for a fraction of its size; the probes it limits (SPEC.md Section
-/// 9.4.3 rule 1) are rare.
+/// for a fraction of its size; the probes it limits are rare.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TokenBucket<const N: usize> {
     /// When the bucket is full again (the theoretical arrival time of the
@@ -131,9 +130,9 @@ impl<const N: usize> TokenBucket<N> {
 mod tests {
     use super::*;
 
-    /// The window of SPEC.md Section 9.4.3 rule 1: 16 frames at once, then
-    /// each slot frees exactly one second after the frame that took it, so
-    /// no one-second interval holds more than 16.
+    /// The window of the QX_PING and PIPE_PING sender limit: 16 frames at
+    /// once, then each slot frees exactly one second after the frame that
+    /// took it, so no one-second interval holds more than 16.
     #[test]
     fn sixteen_in_any_second() {
         let t0 = Instant::now();
@@ -182,9 +181,8 @@ mod tests {
         assert!(sent.len() >= 16 * 5, "{} frames in 5 s", sent.len());
     }
 
-    /// The bucket of SPEC.md Section 9.4.3 rule 1: 8 at once, then one
-    /// every 125 ms; sending whenever it lets, no one-second interval
-    /// holds more than 16.
+    /// The bucket for the same limit: 8 at once, then one every 125 ms;
+    /// sending whenever it lets, no one-second interval holds more than 16.
     #[test]
     fn bucket_keeps_sixteen_in_any_second() {
         let t0 = Instant::now();

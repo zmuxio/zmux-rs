@@ -23,3 +23,23 @@ The `close` command waits for the request FIN and sends the requested session
 close without a stream reply. Drivers assert that session close's remote code
 and reason, then the child's exit status. There is no sleep or unacknowledged
 response FIN whose delivery the session close could overtake.
+
+`tls-server`, `tls-client <host:port>` and `tls-split-client <host:port>` run over
+TLS 1.3 with the join secret from the exporter alone and a Bound join; each
+connection's first byte says what it is (`B` bootstrap, `J` join, `U` uplink, `D`
+downlink, the split's halves paired with the token `zmux split pair!`). They print
+`KEYS <hex>`, the value of the exporter label `EXPORTER-interop-app` with length 16
+(32 bytes for a split bootstrap on two connections).
+
+`wss-server` and `wss-client <host:port>` run the same sessions over WebSocket over
+TLS 1.3 (`wss://<host:port>/zmux`, any path on the server, ALPN `http/1.1`): the
+bootstrap carrier and a Bound join are each a WebSocket, whose exporter is its
+connection's. Both print `KEYS <hex>` (16 bytes).
+
+`seal-server <profiles> [host:port]` and `seal-client <host:port> <profile>` run the
+secure carrier's Establish over TCP before the session: the server accepts the
+comma-separated Profile numbers (those without a pre-shared key included), the
+client offers the one Profile. The node's static key is 32 bytes of `0x5a`, which
+the client pins; Handle and pre-shared key derive from the test PSK above with
+domain `interop`. The client prints `PROFILE <n>`; both print `KEYS <hex>` as the
+TLS modes do.

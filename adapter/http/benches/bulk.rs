@@ -53,7 +53,8 @@ fn main() {
         .unwrap();
     rt.block_on(async {
         for h2 in [false, true] {
-            let listener = Listener::new(Config::default(), ListenerConfig::default());
+            let listener = Listener::new(Config::default(), ListenerConfig::default())
+                .expect("valid listener configuration");
             let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = tcp.local_addr().unwrap().to_string();
             tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));

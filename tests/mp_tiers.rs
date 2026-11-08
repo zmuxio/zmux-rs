@@ -1,5 +1,5 @@
 //! Tier gating, standby takeover, probation and acknowledgement snapshots
-//! (MULTIPATH.md Sections 6.2 and 9), sans IO: two cores joined by
+//! sans IO: two cores joined by
 //! in-memory pipes, with the harness deciding when each of A's carriers
 //! takes bytes, and counting what A puts on each pipe.
 
@@ -9,7 +9,7 @@ use std::time::Duration;
 mod mp_net;
 
 use mp_net::{A, B, MpNet, Observe};
-use zmux::proto::frame::{Dir, Frame, Gates};
+use zmux::proto::frame::{Dir, Frame, Gates, JoinDirection};
 use zmux::proto::record::{Event as Rec, RecordReader};
 use zmux::proto::session::{
     Config, CoreEvent, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, StreamKey,
@@ -91,7 +91,7 @@ type Net = MpNet<Seen, Vec<StreamKey>>;
 fn config(edit: impl Fn(&mut Config)) -> Config {
     let mut c = Config::default();
     c.max_pipes = 16;
-    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
     c.max_idle_timeout = Some(Duration::from_secs(120));
     // Credit never limits the backlog here.
@@ -277,9 +277,85 @@ fn a_standby_takeover_is_announced_and_withdrawn() {
         .chain(&n.links[&fresh].statuses)
         .map(|s| s.1)
         .collect();
-    // The initial request went in the PIPE_JOIN (sequence 0): the takeover
+    // The initial request went in the Hello (sequence 0): the takeover
     // is 1, its withdrawal 2.
     assert!(seqs.contains(&2), "requests {seqs:?}");
+}
+
+/// Changing a pending request for a down attachment: it has no outbound direction, so
+/// a request changed while JOINING goes on another pipe, and only once the attachment's
+/// first record arrived; until then nothing, since the acceptor may not have it yet.
+#[test]
+fn a_down_attachment_states_its_request_on_another_pipe_after_its_first_record() {
+    let mut n = net(|_| {});
+    let mut opts = PipeOptions::default();
+    opts.direction = JoinDirection::Down;
+    opts.receive_priority = 6;
+    let down = n.add_pipe_directed(true, false, &opts).unwrap();
+    let pipe = PipeId::new(down);
+    n.ends[A].set_pipe_receive_priority(pipe, 3).unwrap();
+    let on_any = |n: &Net| -> Vec<(u64, u64, bool, u64)> {
+        n.links.values().flat_map(|l| l.statuses.clone()).collect()
+    };
+    // Once B attached it, B's way on the new pipe is held: nothing arrives on it.
+    for _ in 0..200 {
+        n.step(1 << 20);
+        if n.links[&down].attached() {
+            break;
+        }
+        n.advance(1);
+    }
+    assert!(n.links[&down].attached());
+    n.links.get_mut(&down).unwrap().flows[B].stalled = true;
+    n.run_for(100);
+    assert_eq!(on_any(&n), [], "before the first record");
+    n.links.get_mut(&down).unwrap().flows[B].stalled = false;
+    n.run_for(200);
+    assert_eq!(n.links[&down].statuses, [], "A writes nothing on it");
+    assert_eq!(n.links[&0].statuses, [(down, 1, false, 3)], "on pipe 0");
+    assert_eq!(
+        n.ends[B]
+            .pipe_info(pipe)
+            .unwrap()
+            .peer_request
+            .unwrap()
+            .priority,
+        3
+    );
+    // Once it runs, a change goes at once, on another pipe.
+    n.ends[A].set_pipe_receive_standby(pipe, true).unwrap();
+    n.run_for(50);
+    assert_eq!(n.links[&0].statuses.last(), Some(&(down, 2, true, 3)));
+    assert!(
+        n.ends[B]
+            .pipe_info(pipe)
+            .unwrap()
+            .peer_request
+            .unwrap()
+            .standby
+    );
+    // An up attachment has no inbound direction to ask about: no PIPE_STATUS ever.
+    let mut opts = PipeOptions::default();
+    opts.direction = JoinDirection::Up;
+    let up = n.add_pipe_directed(false, true, &opts).unwrap();
+    n.run_for(100);
+    let before = on_any(&n).len();
+    let _ = n.ends[A].set_pipe_receive_priority(PipeId::new(up), 4);
+    n.run_for(100);
+    assert_eq!(on_any(&n).len(), before);
+}
+
+/// The bidi counterpart: the first request after JOINING goes on the attachment itself.
+#[test]
+fn a_bidi_attachment_states_its_request_on_itself() {
+    let mut n = net(|_| {});
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.ends[A]
+        .set_pipe_receive_priority(PipeId::new(id), 3)
+        .unwrap();
+    n.run_for(100);
+    assert_eq!(n.links[&id].statuses, [(id, 1, false, 3)]);
+    assert_eq!(n.links[&0].statuses, []);
 }
 
 #[test]
@@ -318,7 +394,12 @@ fn a_fate_group_keeps_the_probation_backoff_across_rejoins() {
 fn large_acknowledgement_snapshots_omit_unchanged_pipes() {
     let mut n = net(|c| c.scheduler = Policy::Affinity);
     let ids: Vec<u64> = (0..10)
-        .map(|_| n.add_pipe(&PipeOptions::default()).unwrap())
+        .map(|_| {
+            // Within the per-source bound of carriers before Confirmed.
+            let id = n.add_pipe(&PipeOptions::default()).unwrap();
+            n.run_for(50);
+            id
+        })
         .collect();
     n.run_for(500);
     // Every inbound pipe of B has a position; then traffic on few pipes.
@@ -347,9 +428,18 @@ fn a_reinjection_hold_reports_no_false_blocked() {
     n.links.get_mut(&0).unwrap().stall(true);
     n.write(64 * 1024);
     n.run_for(20);
-    // A new pipe whose join is not confirmed yet carries the reinjection,
-    // one chunk at first.
+    // A new pipe, ACTIVE and not acknowledged yet, carries the reinjection, one chunk at
+    // first.
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    while n.ends[A]
+        .pipes()
+        .iter()
+        .find(|p| p.pipe.get() == id)
+        .and_then(|p| p.outbound)
+        != Some(zmux::proto::session::OutboundState::Active)
+    {
+        n.run_for(1);
+    }
     n.links.get_mut(&id).unwrap().stall(true);
     n.fail(0);
     n.run_for(100);
@@ -420,7 +510,7 @@ impl zmux::proto::session::Pick for Waits {
 }
 
 /// `scheduler_answers` counts the answers that named a pipe and were
-/// applied (API.md Section 7.2): `Wait` answers are neither answers nor
+/// applied: `Wait` answers are neither answers nor
 /// fallbacks.
 #[test]
 fn wait_answers_are_not_counted() {
@@ -468,7 +558,7 @@ fn probation_settings_take_effect_safely() {
 
 /// A PIPE_ACK on a pipe that has carried nothing ack-eliciting for more
 /// than max(1 s, T_suspect) brings a PIPE_PING in the same record
-/// (MULTIPATH.md Section 6.5), also when it is the answer to a PIPE_PING
+/// also when it is the answer to a PIPE_PING
 /// on that pipe pair rather than the primary acknowledgement: the peer's
 /// return path is probed while it is in use.
 #[test]
@@ -491,7 +581,7 @@ fn a_ping_answer_on_a_quiet_pipe_carries_a_liveness_ping() {
     );
 }
 
-/// MULTIPATH.md Section 7.1: a quiet session
+/// A quiet session
 /// (no traffic frame for the 15 s busy window) probes its less-preferred
 /// pipe at the probe interval, not every `standby_probe`; `probe_interval`
 /// sets that interval for pipe pairs, and 0 turns those probes off.

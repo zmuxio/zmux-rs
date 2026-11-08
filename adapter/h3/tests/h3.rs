@@ -62,7 +62,7 @@ impl H3 {
         let client_config = zmux_h3::client_config(tls, opts).unwrap();
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client.set_default_client_config(client_config);
-        let listener = Listener::new(config, lc);
+        let listener = Listener::new(config, lc).expect("valid listener configuration");
         let serving = tokio::spawn(zmux_h3::serve(listener.clone(), server, opts.clone()));
         Self {
             client,
@@ -149,7 +149,7 @@ async fn connect_and_serve() {
     assert_kind([&client, &server], zmux::CarrierKind::Http3);
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(0u32.into(), b"bye");
+    client.close(0u32.into(), b"bye").await;
     let e = tokio::time::timeout(Duration::from_secs(10), server.closed())
         .await
         .expect("closed");
@@ -167,7 +167,8 @@ async fn connect_and_serve() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_lanes_and_a_second_pipe_on_further_requests() {
     let opts = Options::default();
-    let config = Config::multipath(PipeAuth::psk(*b"zmux-h3-adapter-test-psk-0123456"));
+    let config =
+        Config::multipath(PipeAuth::psk(*b"zmux-h3-adapter-test-psk-0123456").with_end_to_end());
     let h3 = H3::new(config.clone(), &opts);
     let client = h3.h3_client(&opts).await;
     let cs = Session::connect(client.open_pipe().await.unwrap(), config)
@@ -180,14 +181,80 @@ async fn client_lanes_and_a_second_pipe_on_further_requests() {
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
     assert_eq!(ss.pipe_stats()[0].lanes_out, 1, "a server opens no lanes");
     let pipe = cs
-        .add_pipe(client.open_pipe().await.unwrap(), PipeOptions::new())
+        .begin_add_pipe(client.open_pipe().await.unwrap(), PipeOptions::new())
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await
         .expect("joined in time")
         .unwrap();
     transfer(&ss, &cs, 4, 256 << 10).await;
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
+    h3.stop().await;
+}
+
+/// A Bound join over a further request of the connection: the carrier declares the Bound
+/// contract and its Binding is the connection's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_join_on_a_further_request() {
+    let opts = Options::default();
+    let mut config = Config::multipath(PipeAuth::exporter().with_end_to_end());
+    // Bound joins only when the carrier says it is secure.
+    config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
+        |c, mode, _| mode != zmux::proto::seal::Mode::Bound || c.secure,
+    )));
+    let h3 = H3::new(config.clone(), &opts);
+    let client = h3.h3_client(&opts).await;
+    let cs = Session::connect(client.open_pipe().await.unwrap(), config)
+        .await
+        .unwrap();
+    let ss = h3.listener.accept().await.unwrap();
+    let pipe = cs
+        .begin_add_pipe(
+            client.open_pipe().await.unwrap(),
+            PipeOptions::new().with_mode(zmux::proto::seal::Mode::Bound),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+        .await
+        .expect("joined in time")
+        .unwrap();
+    transfer(&ss, &cs, 4, 256 << 10).await;
+    cs.close(0u32.into(), b"").await;
+    h3.stop().await;
+}
+
+/// Waits until the session's exporter gives no value.
+async fn exporter_goes_away(session: &Session) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while session.export_keying_material("app", b"", 16) != Err(zmux::ExportError::Unavailable)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the exporter kept the connection");
+}
+
+/// The exporter gives the connection's value while it lives, the same at
+/// both ends, and does not keep it: a session handle outlives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_exporter_does_not_keep_the_connection() {
+    let opts = Options::default();
+    let config = Config::multipath(PipeAuth::exporter().with_end_to_end());
+    let h3 = H3::new(config.clone(), &opts);
+    let client = h3.h3_client(&opts).await;
+    let cs = Session::connect(client.open_pipe().await.unwrap(), config)
+        .await
+        .unwrap();
+    let ss = h3.listener.accept().await.unwrap();
+    assert_eq!(
+        cs.export_keying_material("app", b"", 16).unwrap(),
+        ss.export_keying_material("app", b"", 16).unwrap()
+    );
+    drop(client);
+    cs.close(0u32.into(), b"").await;
+    exporter_goes_away(&cs).await;
+    exporter_goes_away(&ss).await;
     h3.stop().await;
 }
 
@@ -263,12 +330,10 @@ async fn raw_request_with(
         request = request.header(*n, *v);
     }
     let mut stream = send.send_request(request.body(()).unwrap()).await.unwrap();
-    stream
-        .send_data(bytes::Bytes::copy_from_slice(body))
-        .await
-        .unwrap();
+    // The server may answer first and stop the body: the answer still reads.
+    let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
     if end {
-        stream.finish().await.unwrap();
+        let _ = stream.finish().await;
     }
     let status = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
         .await
@@ -286,7 +351,8 @@ async fn raw_request_with(
 /// pipe's and its lanes', and both are accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admitted_requests_with_tokens_on_pipes_and_lanes() {
-    let config = Config::multipath(PipeAuth::psk(*b"zmux-h3-adapter-test-psk-0123456"));
+    let config =
+        Config::multipath(PipeAuth::psk(*b"zmux-h3-adapter-test-psk-0123456").with_end_to_end());
     let h3 = H3::admitted(config.clone(), admission(), &Options::default());
     let client = h3
         .h3_client(&Options::default().with_credential(Arc::new(auth())))
@@ -301,7 +367,7 @@ async fn admitted_requests_with_tokens_on_pipes_and_lanes() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
     transfer(&ss, &cs, 2, 64 << 10).await;
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
     h3.stop().await;
 }
 
@@ -369,7 +435,7 @@ async fn early_data_is_too_early_and_a_setup_failure() {
 }
 
 /// A session with datagrams enabled sends them as HTTP Datagrams of its
-/// request stream (EXTENSIONS.md Section 6.8), both ways.
+/// request stream, the pipe's datagram channel, both ways.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn datagrams_ride_http_datagrams_of_the_request() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -398,7 +464,7 @@ async fn datagrams_ride_http_datagrams_of_the_request() {
         assert_eq!(s.datagrams_sent_channel, 20);
         assert_eq!(c.datagrams_received_channel, 20);
         assert_eq!(s.datagrams_received_channel, c.datagrams_sent_channel);
-        client.close(0u32.into(), b"bye");
+        client.close(0u32.into(), b"bye").await;
         let _ = server.closed().await;
         h3.stop().await;
     })
@@ -421,15 +487,31 @@ async fn the_source_behind_a_trusted_proxy_is_the_forwarded_client() {
         .with_forwarded_header("x-forwarded-for");
     lc.admission = Some(admission);
     let h3 = H3::with_listener(Config::default(), lc, &Options::default());
-    let _ = raw_request_with(&h3, &[("x-forwarded-for", "192.0.2.7")], b"x", true).await;
-    let source = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    // A closed carrier may end a request before its decision: repeated.
+    let source = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let _ = raw_request_with(&h3, &[("x-forwarded-for", "192.0.2.7")], b"x", true).await;
+            if let Ok(s) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                return s.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(source, Some("192.0.2.7:0".parse().unwrap()));
     // Without the field: the connection's peer.
-    let _ = raw_request(&h3, b"x", true).await;
-    let source = rx.recv().await.unwrap().unwrap();
+    while rx.try_recv().is_ok() {}
+    let source = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let _ = raw_request(&h3, b"x", true).await;
+            if let Ok(s) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                return s.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         source.ip(),
         "127.0.0.1".parse::<std::net::IpAddr>().unwrap()

@@ -14,6 +14,6 @@
 {"step": 13, "op": "peer_send", "pipe": 0, "records": [[{"type": "STREAM", "id": 8, "off": 0, "data": "0063", "fin": false}]], "hex": "050a08020063"}
 {"step": 14, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "RESET_STREAM", "id": 8, "code": 1514995714, "final_size": 0}, {"type": "STOP_SENDING", "id": 8, "code": 1514995714}]}
 {"step": 15, "op": "api", "call": "accept_bidi", "args": {}, "expect": {"pending": true}}
-{"step": 16, "op": "note", "text": "After the local STOP_SENDING a plain reset from the opener is allowed (EXTENSIONS 4.4)."}
+{"step": 16, "op": "note", "text": "After the local STOP_SENDING a plain reset from the opener is allowed."}
 {"step": 17, "op": "peer_send", "pipe": 0, "records": [[{"type": "RESET_STREAM", "id": 8, "code": 1514995714, "final_size": 2}]], "hex": "0b0408c00000005a4d000202"}
 {"step": 18, "op": "expect_open"}

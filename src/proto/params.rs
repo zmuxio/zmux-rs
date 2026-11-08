@@ -1,6 +1,4 @@
-//! Transport parameters (SPEC.md Section 5, REGISTRY.md Section 4) and the
-//! negotiation results derived from them (SPEC.md Section 5.5,
-//! EXTENSIONS.md Section 2.3).
+//! Transport parameters and the negotiation results derived from them.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -9,6 +7,7 @@ use super::codec::{Cursor, Writer, has_duplicates};
 use super::error::{EncodeError, Error, TransportErrorCode};
 use super::frame::{FrameType, Gates, LANE_KEY_LEN};
 use super::keys;
+use super::seal::SessionCrypto;
 use super::varint::{self, len as vlen};
 
 /// Transport parameter identifiers.
@@ -67,6 +66,8 @@ pub mod id {
     pub const ZMUX_CARRIER_DATAGRAMS: u64 = 0x3d27_4c5f;
     /// zmux_multipath.
     pub const ZMUX_MULTIPATH: u64 = 0x30dc_2978;
+    /// zmux_session_crypto.
+    pub const ZMUX_SESSION_CRYPTO: u64 = 0x026f_24b5;
     /// zmux_ack_threshold.
     pub const ZMUX_ACK_THRESHOLD: u64 = 0x2762_c7e5;
     /// zmux_pipe_ack.
@@ -77,8 +78,6 @@ pub mod id {
     pub const ZMUX_MAX_LANES: u64 = 0x2785_6ef0;
     /// zmux_resume.
     pub const ZMUX_RESUME: u64 = 0x0d57_78ce;
-    /// zmux_record_protection (reserved: never sent, ignored on receipt).
-    pub const ZMUX_RECORD_PROTECTION: u64 = 0x1dbe_26bc;
     /// The `qmux` crate's application_protocols parameter; zmux does not
     /// define it and ignores it unless an application opts in.
     pub const APPLICATION_PROTOCOLS: u64 = 0x3d4f_9c2a_8b1e_6075;
@@ -101,7 +100,7 @@ fn parse_names(mut value: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 /// Whether QMux-02 prohibits a QUIC version 1 parameter: receiving it is a
-/// TRANSPORT_PARAMETER_ERROR (SPEC.md Section 5.2).
+/// TRANSPORT_PARAMETER_ERROR.
 pub const fn is_prohibited(pid: u64) -> bool {
     matches!(
         pid,
@@ -139,7 +138,7 @@ pub const fn is_grease_id(id: u64) -> bool {
     id % 31 == 27
 }
 
-/// The zmux_role value (EXTENSIONS.md Section 2.2).
+/// The zmux_role value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoleParameter {
     /// Role 0.
@@ -196,19 +195,28 @@ impl RoleParameter {
     }
 }
 
-/// A Session Locator: 0 to 16 bytes chosen by the endpoint that accepts
+/// A Session Locator: 0 to 255 bytes chosen by the endpoint that accepts
 /// joins. Empty means "accepts no joins".
-#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Locator {
     len: u8,
-    bytes: [u8; 16],
+    bytes: [u8; Self::MAX_LEN],
+}
+
+impl Default for Locator {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; Self::MAX_LEN],
+        }
+    }
 }
 
 impl Locator {
     /// The largest locator.
-    pub const MAX_LEN: usize = 16;
+    pub const MAX_LEN: usize = 255;
 
-    /// Creates a locator; `None` if `bytes` is longer than 16.
+    /// Creates a locator; `None` if `bytes` is longer than 255.
     pub fn new(bytes: &[u8]) -> Option<Self> {
         let mut out = Self::default();
         out.bytes.get_mut(..bytes.len())?.copy_from_slice(bytes);
@@ -237,7 +245,7 @@ impl fmt::Debug for Locator {
     }
 }
 
-/// The zmux_multipath value (MULTIPATH.md Section 3.1).
+/// The zmux_multipath value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MultipathParameter {
     /// Secret Flags ([`keys::secret_flags`]); reserved bits are ignored.
@@ -274,11 +282,6 @@ impl MultipathParameter {
         let (Ok(flags), Ok(nonce), Ok(len)) = (c.u8(), c.array::<16>(), c.u8()) else {
             return Err(Error::transport_parameter("zmux_multipath too short"));
         };
-        if usize::from(len) > Locator::MAX_LEN {
-            return Err(Error::transport_parameter(
-                "zmux_multipath locator above 16 bytes",
-            ));
-        }
         if c.remaining() != usize::from(len) {
             return Err(Error::transport_parameter("zmux_multipath length mismatch"));
         }
@@ -310,12 +313,11 @@ pub mod floor {
     pub const MAX_RECORD_SIZE: u64 = super::DEFAULT_MAX_RECORD_SIZE;
 }
 
-/// The `max_lanes` zmux endpoints announce by default:
-/// the default stream concurrency of 256, lane 0 and the copy lane
-/// (MULTIPATH.md Section 3.6).
+/// The `max_lanes` zmux endpoints announce by default: the default
+/// stream concurrency of 256, lane 0 and the copy lane.
 pub const DEFAULT_MAX_LANES: NonZeroU64 = NonZeroU64::new(258).expect("not 0");
 
-/// The zmux_max_lanes value (MULTIPATH.md Section 3.6).
+/// The zmux_max_lanes value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LanesParameter {
     /// Max Lanes L: the lanes, lane 0 included, the sender accepts on each
@@ -371,7 +373,7 @@ impl LanesParameter {
     }
 }
 
-/// A GREASE parameter to send (SPEC.md Section 5.2 rule 6).
+/// A GREASE parameter to send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grease<'a> {
     /// A GREASE ID, 31 * N + 27.
@@ -418,26 +420,26 @@ pub struct TransportParameters {
     /// zmux_datagram_flows.
     pub zmux_datagram_flows: bool,
     /// zmux_carrier_datagrams: the sender accepts DATAGRAM frames on the
-    /// datagram channels of its pipes' carriers (EXTENSIONS.md Section
-    /// 6.8).
+    /// datagram channels of its pipes' carriers.
     pub zmux_carrier_datagrams: bool,
     /// zmux_multipath.
     pub zmux_multipath: Option<MultipathParameter>,
+    /// zmux_session_crypto: the Join Suites and Groups the endpoint declares.
+    pub zmux_session_crypto: Option<SessionCrypto>,
     /// zmux_ack_threshold in bytes (1024 to 2^30).
     pub zmux_ack_threshold: Option<u64>,
-    /// zmux_pipe_ack: pipe acknowledgement without multipath (MULTIPATH.md
-    /// Section 3.5).
+    /// zmux_pipe_ack: pipe acknowledgement without multipath.
     pub zmux_pipe_ack: bool,
     /// zmux_max_ack_delay in milliseconds (below 2^14).
     pub zmux_max_ack_delay: Option<u64>,
     /// zmux_max_lanes: the lanes the sender accepts per inbound pipe and
-    /// its Lane Key (MULTIPATH.md Section 3.6).
+    /// its Lane Key.
     pub zmux_max_lanes: Option<LanesParameter>,
     /// zmux_resume: Resume Grace in milliseconds (1 to 86400000).
     pub zmux_resume: Option<u64>,
     /// The `qmux` crate's `application_protocols`: names in preference
-    /// order (SPEC.md Section 13.3); not a zmux parameter, sent only when
-    /// the application configures `protocols`.
+    /// order; not a zmux parameter, sent only when the application
+    /// configures `protocols`.
     pub application_protocols: Option<Vec<Vec<u8>>>,
 }
 
@@ -448,6 +450,7 @@ enum Value<'a> {
     Role(RoleParameter),
     Multipath(&'a MultipathParameter),
     Lanes(&'a LanesParameter),
+    Crypto(&'a SessionCrypto),
     Raw(&'a [u8]),
     /// Length-prefixed names.
     Names(&'a [Vec<u8>]),
@@ -461,6 +464,7 @@ impl Value<'_> {
             Self::Role(r) => r.encoded_len(),
             Self::Multipath(m) => m.encoded_len(),
             Self::Lanes(l) => l.encoded_len(),
+            Self::Crypto(c) => c.encoded_len(),
             Self::Raw(b) => b.len(),
             Self::Names(n) => n.iter().map(|n| vlen(n.len() as u64) + n.len()).sum(),
         }
@@ -473,6 +477,7 @@ impl Value<'_> {
             Self::Role(r) => r.write(w),
             Self::Multipath(m) => m.write(w),
             Self::Lanes(l) => l.write(w),
+            Self::Crypto(c) => w.bytes(&c.encode()),
             Self::Raw(b) => w.bytes(b),
             Self::Names(names) => {
                 for n in *names {
@@ -502,8 +507,7 @@ impl TransportParameters {
     }
 
     /// Whether these are the parameters of a plain QMux peer: none of the
-    /// zmux parameters of SPEC.md Section 5.4 is present (SPEC.md Section
-    /// 13.1).
+    /// zmux transport parameters is present.
     pub fn is_plain_qmux(&self) -> bool {
         self.zmux_role.is_none()
             && !self.zmux_goaway
@@ -512,6 +516,7 @@ impl TransportParameters {
             && !self.zmux_datagram_flows
             && !self.zmux_carrier_datagrams
             && self.zmux_multipath.is_none()
+            && self.zmux_session_crypto.is_none()
             && !self.zmux_pipe_ack
             && self.zmux_ack_threshold.is_none()
             && self.zmux_max_ack_delay.is_none()
@@ -584,6 +589,9 @@ impl TransportParameters {
         }
         if let Some(m) = &self.zmux_multipath {
             f(id::ZMUX_MULTIPATH, Value::Multipath(m))?;
+        }
+        if let Some(c) = &self.zmux_session_crypto {
+            f(id::ZMUX_SESSION_CRYPTO, Value::Crypto(c))?;
         }
         let multipath = [
             (id::ZMUX_ACK_THRESHOLD, self.zmux_ack_threshold),
@@ -661,8 +669,8 @@ impl TransportParameters {
         Ok(w.pos())
     }
 
-    /// Parses and validates a parameter block (SPEC.md Section 5.2): every
-    /// violation is a TRANSPORT_PARAMETER_ERROR.
+    /// Parses and validates a parameter block: every violation is a
+    /// TRANSPORT_PARAMETER_ERROR.
     pub fn decode(block: &[u8]) -> Result<Self, Error> {
         let mut tp = Self::default();
         for p in RawParameters::new(block) {
@@ -721,6 +729,12 @@ impl TransportParameters {
             id::ZMUX_DATAGRAM_FLOWS => self.zmux_datagram_flows = empty()?,
             id::ZMUX_CARRIER_DATAGRAMS => self.zmux_carrier_datagrams = empty()?,
             id::ZMUX_MULTIPATH => self.zmux_multipath = Some(MultipathParameter::parse(value)?),
+            id::ZMUX_SESSION_CRYPTO => {
+                self.zmux_session_crypto = Some(
+                    SessionCrypto::parse(value)
+                        .map_err(|_| Error::transport_parameter("malformed zmux_session_crypto"))?,
+                )
+            }
             id::ZMUX_ACK_THRESHOLD => self.zmux_ack_threshold = Some(varint()?),
             id::ZMUX_PIPE_ACK => self.zmux_pipe_ack = empty()?,
             id::ZMUX_MAX_ACK_DELAY => self.zmux_max_ack_delay = Some(varint()?),
@@ -728,7 +742,7 @@ impl TransportParameters {
             id::ZMUX_RESUME => self.zmux_resume = Some(varint()?),
             id::APPLICATION_PROTOCOLS => {
                 // Not zmux's: a malformed value is ignored like any
-                // unknown parameter (SPEC.md Section 13.2).
+                // unknown parameter.
                 self.application_protocols = parse_names(value);
             }
             _ => {}
@@ -736,9 +750,7 @@ impl TransportParameters {
         Ok(())
     }
 
-    /// Checks value ranges and dependencies between parameters (SPEC.md
-    /// Sections 3.2 and 5.5, EXTENSIONS.md Section 4.1, MULTIPATH.md Section
-    /// 3, RESUME.md Section 3).
+    /// Checks value ranges and dependencies between parameters.
     pub fn validate(&self) -> Result<(), Error> {
         let err = Error::transport_parameter;
         if self
@@ -775,6 +787,11 @@ impl TransportParameters {
         if acks && self.zmux_multipath.is_none() && !self.zmux_pipe_ack {
             return Err(err(
                 "acknowledgement or lanes parameter without zmux_multipath or zmux_pipe_ack",
+            ));
+        }
+        if self.zmux_session_crypto.is_some() != self.zmux_multipath.is_some() {
+            return Err(err(
+                "zmux_session_crypto without zmux_multipath, or the reverse",
             ));
         }
         if self.zmux_resume.is_some() && self.zmux_multipath.is_none() {
@@ -836,7 +853,7 @@ impl<'a> Iterator for RawParameters<'a> {
     }
 }
 
-/// The two session roles (SPEC.md Section 5.6).
+/// The two session roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     /// Uses client-initiated stream IDs and even pipe IDs.
@@ -845,7 +862,7 @@ pub enum Role {
     Responder,
 }
 
-/// Resolves the local role (EXTENSIONS.md Section 2.3).
+/// Resolves the local role.
 ///
 /// `local` and `peer` are the `zmux_role` values sent by each endpoint;
 /// `transport` is the local transport role (`None` for a symmetric carrier).
@@ -872,7 +889,7 @@ pub fn resolve_role(
     }
 }
 
-/// The zmux features in use in a session (SPEC.md Section 5.5).
+/// The zmux features in use in a session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Features {
     /// Role negotiation.
@@ -885,19 +902,19 @@ pub struct Features {
     pub priority: bool,
     /// Datagram flows.
     pub datagram_flows: bool,
-    /// DATAGRAM frames may go on the datagram channels of pipe carriers
-    /// (EXTENSIONS.md Section 6.8): both endpoints sent
-    /// `zmux_carrier_datagrams` and this one announced datagram support.
+    /// DATAGRAM frames may go on the datagram channels of pipe carriers:
+    /// both endpoints sent `zmux_carrier_datagrams` and this one
+    /// announced datagram support.
     pub carrier_datagrams: bool,
     /// Multipath.
     pub multipath: bool,
-    /// Pipe acknowledgement without multipath (MULTIPATH.md Section 3.5).
+    /// Pipe acknowledgement without multipath.
     pub pipe_ack: bool,
     /// Resume.
     pub resume: bool,
     /// Lanes are available toward the peer: the local endpoint may open
-    /// lanes on its outbound pipes, as many as the peer's Max Lanes allows
-    /// (MULTIPATH.md Section 3.6).
+    /// lanes on its outbound pipes, as many as the peer's Max Lanes
+    /// allows.
     pub lanes_out: bool,
     /// Lanes are available toward the local endpoint.
     pub lanes_in: bool,
@@ -907,9 +924,10 @@ impl Features {
     /// Computes the features in use from both endpoints' parameters.
     pub fn negotiate(local: &TransportParameters, peer: &TransportParameters) -> Self {
         let multipath = match (&local.zmux_multipath, &peer.zmux_multipath) {
-            (Some(l), Some(p)) => {
-                keys::select_secret_source(l.secret_flags, p.secret_flags).is_some()
-            }
+            (Some(l), Some(p)) => !matches!(
+                keys::select_secret_source(l.secret_flags, p.secret_flags),
+                keys::SecretFlags::NoSource
+            ),
             _ => false,
         };
         let resume = multipath
@@ -989,7 +1007,7 @@ mod tests {
 
     #[test]
     fn default_parameters_match_wire_example() {
-        // WIRE_EXAMPLES.md Section 1.1, without the record Size.
+        // The specification's wire example of the default parameters, without the record Size.
         let grease = Grease {
             id: grease_id(3).unwrap(),
             value: &[0x9a, 0x7b],

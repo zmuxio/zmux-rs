@@ -457,22 +457,6 @@
       }
     },
     {
-      "name": "PIPE_JOIN",
-      "kind": "zmux",
-      "gate": "zmux_multipath",
-      "spec": "MULTIPATH.md#5",
-      "ack_eliciting": true,
-      "retransmit": "never",
-      "first": {
-        "value": 438623798,
-        "hex": "0x1a24de36"
-      },
-      "last": {
-        "value": 438623798,
-        "hex": "0x1a24de36"
-      }
-    },
-    {
       "name": "PIPE_ACK",
       "kind": "zmux",
       "gate": [
@@ -553,6 +537,22 @@
       "last": {
         "value": 578496529,
         "hex": "0x227b2811"
+      }
+    },
+    {
+      "name": "SESSION_EPOCH",
+      "kind": "zmux",
+      "gate": "zmux_multipath",
+      "spec": "MULTIPATH.md#10.7",
+      "ack_eliciting": true,
+      "retransmit": "offer-until-answered-answer-until-acked",
+      "first": {
+        "value": 38704107,
+        "hex": "0x024e93eb"
+      },
+      "last": {
+        "value": 38704107,
+        "hex": "0x024e93eb"
       }
     }
   ],
@@ -842,6 +842,18 @@
       }
     },
     {
+      "name": "zmux_session_crypto",
+      "scope": "zmux",
+      "format": "session_crypto",
+      "absent_default": "not allowed with zmux_multipath",
+      "zmux_sends": "with zmux_multipath",
+      "spec": "MULTIPATH.md#3.7",
+      "id": {
+        "value": 40838325,
+        "hex": "0x026f24b5"
+      }
+    },
+    {
       "name": "zmux_pipe_ack",
       "scope": "zmux",
       "format": "empty",
@@ -899,18 +911,6 @@
       "id": {
         "value": 223836366,
         "hex": "0x0d5778ce"
-      }
-    },
-    {
-      "name": "zmux_record_protection",
-      "scope": "zmux-reserved",
-      "format": "opaque",
-      "absent_default": "not supported",
-      "zmux_sends": "never (reserved)",
-      "spec": "REGISTRY.md#7",
-      "id": {
-        "value": 499001020,
-        "hex": "0x1dbe26bc"
       }
     }
   ],
@@ -1261,18 +1261,18 @@
       "1": "responder",
       "2": "auto"
     },
-    "pipe_join_direction": {
+    "join_direction": {
       "0": "up",
       "1": "down",
       "2": "bidi"
     },
-    "pipe_join_carrier_bound": "0x04",
-    "pipe_join_standby": "0x08",
-    "pipe_join_reserved_mask": "0xf0",
+    "join_suites": {
+      "1": "AES-256-GCM, SHA-256",
+      "2": "ChaCha20-Poly1305, SHA-256"
+    },
     "multipath_secret_flags": {
-      "0x01": "E (TLS exporter)",
-      "0x04": "P (pre-shared key)",
-      "0x08": "I (insecure join allowed)"
+      "0x01": "E (exporter)",
+      "0x04": "P (pre-shared key)"
     },
     "pipe_status": {
       "0": "available",
@@ -1285,17 +1285,100 @@
       "order": "lower preferred; every value valid"
     }
   },
+  "secure_carrier": {
+    "groups": [
+      {
+        "value": 1,
+        "name": "X25519",
+        "priority": 1,
+        "share_initiator": 32,
+        "share_responder": 32,
+        "components": [
+          "X25519"
+        ]
+      },
+      {
+        "value": 2,
+        "name": "X25519+MLKEM768",
+        "priority": 2,
+        "share_initiator": 1216,
+        "share_responder": 1120,
+        "components": [
+          "X25519",
+          "ML-KEM-768"
+        ]
+      }
+    ],
+    "key_algs": [
+      {
+        "value": 1,
+        "name": "X25519",
+        "key": 32,
+        "signature": null,
+        "pq": false,
+        "use": "static key of Establish"
+      },
+      {
+        "value": 3,
+        "name": "ML-DSA-44",
+        "key": 1312,
+        "signature": 2420,
+        "pq": true,
+        "use": "proof key"
+      }
+    ],
+    "cred_types": {
+      "0": "no credential"
+    },
+    "profile_pq_confidentiality": {
+      "1": true,
+      "3": true,
+      "4": true,
+      "5": true
+    },
+    "pq_authenticated": "the verdict named a proof key and a proof of a KeyAlg with PQ yes verified",
+    "payload_type": {
+      "0": "ignorable padding",
+      "1": "credential",
+      "2": "application data",
+      "3": "carrier first bytes",
+      "5": "join pipe",
+      "6": "frames",
+      "7": "join decision",
+      "8": "proof",
+      "9": "key share"
+    },
+    "session_epoch_phase": {
+      "0": "offer",
+      "1": "answer"
+    },
+    "private_range": {
+      "first": 1073741824,
+      "last": 2147483647,
+      "spaces": [
+        "Profile",
+        "payload type",
+        "CredType",
+        "Suite",
+        "Group",
+        "KeyAlg"
+      ]
+    }
+  },
   "labels": {
     "tls_exporter_session": "EXPORTER-zmux-session",
-    "tls_exporter_pipe": "EXPORTER-zmux-pipe",
+    "tls_exporter_join": "EXPORTER-zmux-join",
     "hkdf_salt_prefix": "zmux session",
     "hkdf_join_initiator": "zmux join i",
-    "hkdf_join_responder": "zmux join r"
+    "hkdf_join_responder": "zmux join r",
+    "key_id": "zmux-seal key",
+    "hkdf_epoch": "zmux epoch",
+    "proof_responder": "zmux-seal proof r",
+    "proof_initiator": "zmux-seal proof i"
   },
   "limits": {
-    "max_join_frame_bytes": 64,
-    "max_locator_bytes": 16,
-    "join_token_bytes": 16,
+    "join_first_batch_default_bytes": 8192,
+    "max_locator_bytes": 255,
     "lane_key_bytes": 16,
     "default_max_record_size": 16382,
     "zmux_max_record_size": 65535,
@@ -1314,6 +1397,7 @@
     "datagram_receive_bytes": 1048576,
     "suspect_floor_min_ms": 50,
     "probe_interval_ms": 15000,
+    "max_join_deadline_ms": 60000,
     "busy_window_ms": 15000,
     "ack_redundancy_ms": 50,
     "unretired_attachments_extra": 8,

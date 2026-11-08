@@ -1,7 +1,6 @@
-//! Lanes in the tokio driver (MULTIPATH.md Sections 2.5 and 5.8): the identity
-//! of a carrier's connection, the opener of new
-//! streams on it, and the routing of the streams the peer opens there to
-//! the session and pipe they are lanes of.
+//! Lanes in the tokio driver: the identity of a carrier's connection,
+//! the opener of new streams on it, and the routing of the streams the
+//! peer opens there to the session and pipe they are lanes of.
 //!
 //! The routing table holds every session of the process that accepts
 //! lanes, by its Lane Key; a stream is looked up by the key its PIPE_LANE
@@ -75,14 +74,13 @@ impl fmt::Debug for CarrierConnId {
 
 /// What a connection carries for this process's sessions: the pipes with
 /// their lane 0 on it, and the new streams on it that wait for their first
-/// record outside the listener's limits (MULTIPATH.md Section 5.5, at most
-/// one per pipe).
+/// record outside the listener's limits (at most one per pipe).
 #[derive(Debug, Default)]
 struct Carried {
     pipes: usize,
     waiting: usize,
     /// The lanes the nested pipes of this process opened as streams of
-    /// the connection, an outer session (MULTIPATH.md Section 5.8).
+    /// the connection, an outer session.
     lanes: usize,
 }
 
@@ -106,9 +104,8 @@ fn prune(t: &mut std::collections::HashMap<CarrierConnId, Carried>, conn: &Carri
 }
 
 /// A pipe's claim that its connection carries lane 0 of an OPEN inbound
-/// pipe of the endpoint (MULTIPATH.md Section 5.5): counted while the
-/// session task finds the pipe open ([`ConnClaim::set_open`]) and the
-/// claim lives.
+/// pipe of the endpoint: counted while the session task finds the pipe
+/// open ([`ConnClaim::set_open`]) and the claim lives.
 pub(crate) struct ConnClaim {
     conn: CarrierConnId,
     open: bool,
@@ -148,15 +145,14 @@ impl Drop for ConnClaim {
 
 /// A new stream on a connection that carries pipes of this process's
 /// sessions, waiting for its first record outside the listener's limits
-/// (MULTIPATH.md Section 5.5) until the ticket is dropped.
+/// until the ticket is dropped.
 pub(crate) struct Exempt(CarrierConnId);
 
 impl Exempt {
     /// A ticket for a new stream on `conn`, when it carries lane 0 of a
     /// pipe of ours and fewer of its new streams than such pipes wait for
-    /// their first record: the lane the peer's writer may open per pipe
-    /// (MULTIPATH.md Section 5.8). Otherwise the stream is a carrier like
-    /// any other.
+    /// their first record: the lane the peer's writer may open per pipe.
+    /// Otherwise the stream is a carrier like any other.
     pub(crate) fn new(conn: &CarrierConnId) -> Option<Self> {
         let mut t = carrying();
         let c = t.get_mut(conn)?;
@@ -180,8 +176,8 @@ impl Drop for Exempt {
 
 /// The sending half of a lane, with what it keeps open alongside: the
 /// unused receiving half of a bidirectional stream, which the peer ends at
-/// once and which is no event of the pipe (MULTIPATH.md Section 2.5), and
-/// for a lane that is a stream of an outer session, its count there.
+/// once and which is no event of the pipe, and for a lane that is a stream
+/// of an outer session, its count there.
 pub(crate) struct LaneWriter {
     pub(crate) writer: Writer,
     pub(crate) keep: Option<StreamReader>,
@@ -192,7 +188,7 @@ pub(crate) struct LaneWriter {
 
 /// A lane that is a stream of an outer session, counted there while it
 /// lives: the nested pipes of the process hold at most half of the outer
-/// peer's initial_max_streams_bidi as lanes (MULTIPATH.md Section 5.8).
+/// peer's initial_max_streams_bidi as lanes.
 pub(crate) struct OuterLane(CarrierConnId);
 
 impl OuterLane {
@@ -225,53 +221,56 @@ pub(crate) type OpenFuture = Pin<Box<dyn Future<Output = io::Result<LaneWriter>>
 /// Opens new streams on a carrier's connection.
 pub(crate) type LaneOpener = Arc<dyn Fn() -> OpenFuture + Send + Sync>;
 
-/// An opener from an application's function returning a writer.
-pub(crate) fn opener<F, Fut, W>(f: F) -> LaneOpener
-where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = io::Result<W>> + Send + 'static,
-    W: AsyncWrite + Send + 'static,
-{
-    Arc::new(move || {
-        let fut = f();
-        Box::pin(async move {
-            let w = fut.await?;
-            Ok(LaneWriter {
-                writer: Writer::Io(Box::pin(w)),
-                keep: None,
-                outer: None,
-                unsent: None,
-            })
+/// The sending part of a lane, from a carrier's lane opener
+/// ([`PipeIo::with_lane_opener`]).
+pub struct Lane(LaneWriter);
+
+impl Lane {
+    fn of(writer: Writer) -> Self {
+        Self(LaneWriter {
+            writer,
+            keep: None,
+            outer: None,
+            unsent: None,
         })
-    })
+    }
+
+    /// A lane written by byte slices.
+    pub fn new<W: AsyncWrite + Send + 'static>(writer: W) -> Self {
+        Self::of(Writer::Io(Box::pin(writer)))
+    }
+
+    /// A lane whose stream takes owned buffers ([`ChunkWrite`]).
+    pub fn from_chunks<W: ChunkWrite + 'static>(writer: W) -> Self {
+        Self::of(Writer::Chunks(Box::pin(writer)))
+    }
+
+    /// The lane's unsent count, as
+    /// [`PipeIo::with_unsent`] gives a pipe's:
+    /// the bytes write calls handed to this stream that the carrier has not
+    /// transmitted yet, `None` while it has no count.
+    #[must_use]
+    pub fn with_unsent(mut self, unsent: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        self.0.unsent = Some(Box::new(unsent));
+        self
+    }
 }
 
-/// An opener from an application's function returning a writer of owned
-/// buffers.
-pub(crate) fn chunk_opener<F, Fut, W>(f: F) -> LaneOpener
+/// An opener from a carrier's function returning a [`Lane`].
+pub(crate) fn opener<F, Fut>(f: F) -> LaneOpener
 where
     F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = io::Result<W>> + Send + 'static,
-    W: ChunkWrite + 'static,
+    Fut: Future<Output = io::Result<Lane>> + Send + 'static,
 {
     Arc::new(move || {
         let fut = f();
-        Box::pin(async move {
-            let w = fut.await?;
-            Ok(LaneWriter {
-                writer: Writer::Chunks(Box::pin(w)),
-                keep: None,
-                outer: None,
-                unsent: None,
-            })
-        })
+        Box::pin(async move { fut.await.map(|lane| lane.0) })
     })
 }
 
 /// The opener of a stream carrier: a further stream of the outer session,
 /// with PIPE_CARRIER and the application TLVs of the pipe's own stream
-/// (which a relay routes it by), whose sending part carries the lane
-/// (EXTENSIONS.md Section 10.2).
+/// (which a relay routes it by), whose sending part carries the lane.
 pub(crate) fn stream_opener(outer: Weak<Shared<Tokio>>, preamble: crate::Preamble) -> LaneOpener {
     Arc::new(move || {
         let (outer, preamble) = (outer.clone(), preamble.clone());
@@ -341,7 +340,7 @@ pub(crate) fn registered() -> Vec<[u8; 16]> {
 }
 
 /// The session whose Lane Key is `key`, compared in constant time with
-/// every entry (MULTIPATH.md Section 5.8).
+/// every entry.
 fn lookup(key: &[u8; 16]) -> Option<Arc<Shared<Tokio>>> {
     let t = table();
     let mut found = None;
@@ -353,8 +352,7 @@ fn lookup(key: &[u8; 16]) -> Option<Arc<Shared<Tokio>>> {
     found?.upgrade()
 }
 
-/// How long a stream may take to bring its first record (MULTIPATH.md
-/// Section 5.6, the first-record timeout).
+/// How long a stream may take to bring its first record (the first-record timeout).
 const FIRST_RECORD: Duration = Duration::from_secs(2);
 
 /// Hands a stream the peer opened on a lane-capable connection to the
@@ -364,8 +362,8 @@ const FIRST_RECORD: Duration = Duration::from_secs(2);
 /// [`crate::Listener::handle_pipe`] routes such streams the same way). The
 /// carrier must report its connection ([`PipeIo::with_carrier_conn`]; a
 /// stream carrier does). A stream that names no pipe of a session with
-/// its lane 0 on the same connection is aborted, and nothing else happens
-/// (MULTIPATH.md Section 5.8).
+/// its lane 0 on the same connection is aborted, and nothing else
+/// happens.
 pub async fn handle_lane(mut io: PipeIo) -> Result<(), HandleError> {
     let framing = io.framing;
     let mut probe = LaneProbe::new(ZMUX_MAX_RECORD_SIZE, framing);
@@ -435,7 +433,7 @@ impl PipeIo {
 }
 
 /// Ends the unused sending half of an accepted lane at once and
-/// gracefully (MULTIPATH.md Section 2.5).
+/// gracefully.
 pub(crate) fn finish_reverse(writer: Option<Writer>) {
     match writer {
         Some(Writer::Stream(w)) => finish_stream(w),

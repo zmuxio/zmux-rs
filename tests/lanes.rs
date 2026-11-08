@@ -1,4 +1,4 @@
-//! Lanes (MULTIPATH.md Sections 2.5 and 5.8)
+//! Lanes
 //! between two sans-IO cores, with the pitfalls that are cheap to check
 //! deterministically: the unsent
 //! count of a pipe is the sum of its lanes', a stream direction never
@@ -172,7 +172,7 @@ fn pattern(stream: usize, len: usize) -> Vec<u8> {
 /// Bulk streams of a session without multipath spread over lanes, which
 /// the "driver" delivers out of order across lanes: every stream arrives
 /// whole and in order (a frame of a stream direction that overtook an
-/// earlier one would be a PROTOCOL_VIOLATION, SPEC.md Section 7.3), and
+/// earlier one would be a PROTOCOL_VIOLATION), and
 /// the writer opened lanes for them.
 #[test]
 fn bulk_streams_spread_over_lanes_and_keep_their_order_without_multipath() {
@@ -321,7 +321,7 @@ fn urgent_data_of_a_single_pipe_tier_is_copied_on_the_copy_lane() {
     let multipath = || {
         let mut c = Config::default();
         c.max_pipes = 2;
-        c.pipe_auth = zmux::PipeAuth::psk(*b"lanes-psk-------0123456789abcdef");
+        c.pipe_auth = zmux::PipeAuth::psk(*b"lanes-psk-------0123456789abcdef").with_end_to_end();
         c
     };
     let mut p = LanePair::new(multipath(), multipath());
@@ -371,10 +371,10 @@ impl zmux::shaping::Shaper for DelayAll {
         plan.pad_to = 400;
     }
 
-    fn on_event(&mut self, _: &zmux::shaping::Event, _: &mut zmux::shaping::Reply) {}
+    fn on_event(&mut self, _: &zmux::shaping::Event, _: &mut zmux::shaping::Effects) {}
 }
 
-/// MULTIPATH.md Section 5.8: the first record of a lane, PIPE_LANE, is a
+/// The first record of a lane, PIPE_LANE, is a
 /// record of its pipe: it is planned by the pipe's shaper and waits for
 /// the delay of the pipe's planned record like every other record: it
 /// carries the plan's PADDING.

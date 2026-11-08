@@ -1,4 +1,4 @@
-//! Lanes at the session level (MULTIPATH.md Sections 2.5, 3.6 and 5.8):
+//! Lanes at the session level:
 //! opening the lanes of outbound pipes and accepting the peer's, the ends
 //! of lanes, and the placement of frames on the lanes of a pipe.
 //!
@@ -8,8 +8,7 @@
 //!
 //! The mode checks here are protocol rules: lanes of a pipe outside
 //! multipath keep data on lane 0 until it is acknowledged, and an orderly
-//! close waits for the other lanes (MULTIPATH.md Section 5.8, SPEC.md
-//! Section 6.5).
+//! close waits for the other lanes.
 
 use std::time::Instant;
 
@@ -20,7 +19,7 @@ use crate::proto::Error;
 use crate::proto::frame::{Frame, FrameType};
 use crate::proto::record::Framing;
 
-/// What became of a lane the peer opened (MULTIPATH.md Section 5.8).
+/// What became of a lane the peer opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneAccept {
     /// The lane belongs to the pipe: feed its bytes, from its first, to
@@ -35,10 +34,9 @@ pub enum LaneAccept {
 }
 
 impl SessionCore {
-    /// The Lane Key every PIPE_LANE toward this endpoint carries
-    /// (MULTIPATH.md Section 3.6): the key by which a driver routes the
-    /// streams the peer opens to the session, comparing it in constant
-    /// time (MULTIPATH.md Section 5.8, [`crate::proto::keys::lane_key_eq`]).
+    /// The Lane Key every PIPE_LANE toward this endpoint carries: the key by which a driver routes
+    /// the streams the peer opens to the session, comparing it in constant
+    /// time ([`crate::proto::keys::lane_key_eq`]).
     pub fn lane_key(&self) -> Option<[u8; 16]> {
         self.local_tp().lane_key
     }
@@ -65,10 +63,10 @@ impl SessionCore {
             .is_some_and(|o| o.lane_attached(lane.lane.0, framing, now))
     }
 
-    /// Whether inbound pipe `pipe` is OPEN (STATE_MACHINE.md Section 3.2):
+    /// Whether inbound pipe `pipe` is OPEN:
     /// the session is established and not closing, and the pipe is
     /// attached, takes records and has not ended. A new stream on its
-    /// carrier connection may be its lane (MULTIPATH.md Section 5.5).
+    /// carrier connection may be its lane.
     pub fn inbound_open(&self, pipe: super::PipeId) -> bool {
         matches!(
             self.state,
@@ -85,15 +83,14 @@ impl SessionCore {
     }
 
     /// The peer's initial_max_streams_bidi, once its parameters arrived: a
-    /// stream carrier's lanes on this session are at most half of it
-    /// (MULTIPATH.md Section 5.8).
+    /// stream carrier's lanes on this session are at most half of it.
     pub fn peer_initial_streams_bidi(&self) -> Option<u64> {
         self.peer_tp.as_ref().map(|t| t.streams_bidi)
     }
 
     /// The driver did not open lane `lane` this time, which is no refusal:
     /// a carrier that shares its stream credit with the application opens
-    /// a lane only when it can at once (MULTIPATH.md Section 5.8). The
+    /// a lane only when it can at once. The
     /// writer asks again at its next chance.
     pub fn lane_unopened(&mut self, lane: LaneId, now: Instant) {
         self.tick(now);
@@ -104,9 +101,8 @@ impl SessionCore {
 
     /// A new stream that the peer opened on the carrier connection of the
     /// pipe's lane 0, whose first record begins with PIPE_LANE naming this
-    /// session's Lane Key, the pipe and the lane (MULTIPATH.md Section 5.8;
-    /// the driver checked the key and the connection). Its bytes, from its
-    /// first, go to the receive calls once it is accepted.
+    /// session's Lane Key, the pipe and the lane (the driver checked the key and the connection).
+    /// Its bytes, from its first, go to the receive calls once it is accepted.
     pub fn accept_lane(&mut self, lane: LaneId, framing: Framing, now: Instant) -> LaneAccept {
         self.tick(now);
         let (pipe, number) = (lane.pipe.0, lane.lane.0);
@@ -115,7 +111,7 @@ impl SessionCore {
         }
         let ty = FrameType::PIPE_LANE.0;
         if self.peer_tp.is_none() || !self.features.lanes_in {
-            // A frame of a feature not in use (SPEC.md Section 4.1 rule 3).
+            // A frame of a feature not in use.
             self.protocol_error(
                 Error::frame_encoding(ty, "lanes not available toward the receiver"),
                 now,
@@ -144,8 +140,7 @@ impl SessionCore {
     }
 
     /// A frame of the first record of an inbound lane: PIPE_LANE naming
-    /// the lane, then PADDING only (MULTIPATH.md Section 5.8 reader rule
-    /// 2).
+    /// the lane, then PADDING only.
     pub(super) fn on_lane_first_frame(&mut self, frame: &Frame<'_>) -> Result<(), Error> {
         let (id, li) = (self.rx, self.rx_lane);
         let key = self.lane_key();
@@ -154,10 +149,7 @@ impl SessionCore {
         };
         let number = p.lane_number(li);
         let eliciting = !matches!(frame, Frame::Padding(_));
-        let first = match p.frame_in(li, false, eliciting, false, false) {
-            super::pipes::FrameIn::Process { first, .. } => first,
-            super::pipes::FrameIn::Discarded => return Ok(()),
-        };
+        let first = p.frame_in(li, eliciting, false, false);
         let ty = frame.frame_type().0;
         match frame {
             Frame::PipeLane(f) if first => {
@@ -180,8 +172,7 @@ impl SessionCore {
 
     // ---- ends of lanes ------------------------------------------------------------
 
-    /// Lane `li` (not 0) of inbound pipe `pipe` ended (MULTIPATH.md
-    /// Sections 5.8 and 7.3, SPEC.md Section 6.6).
+    /// Lane `li` (not 0) of inbound pipe `pipe` ended.
     pub(super) fn inbound_lane_ended(&mut self, pipe: u64, li: usize, end: PipeEnd, now: Instant) {
         let Some(p) = self.inp_mut(pipe) else {
             return;
@@ -195,8 +186,7 @@ impl SessionCore {
 
     /// Lane `n` (not 0) of outbound pipe `pipe` failed under us, or its
     /// stream ended or was reset: before it was confirmed it is refused,
-    /// which costs the pipe nothing; after, the pipe failed (MULTIPATH.md
-    /// Sections 5.8 and 7.1).
+    /// which costs the pipe nothing; after, the pipe failed.
     pub(super) fn outbound_lane_failed(
         &mut self,
         pipe: u64,
@@ -238,7 +228,7 @@ impl SessionCore {
     // ---- opening lanes ----------------------------------------------------------
 
     /// Asks the driver for the next lane of outbound pipe `pipe` when one
-    /// may be opened (MULTIPATH.md Section 5.8): the peer's Max Lanes
+    /// may be opened: the peer's Max Lanes
     /// allows it, its carrier offers lanes, lane 0 has an acknowledged
     /// position and no lane is unconfirmed or was refused.
     pub(super) fn request_lane(&mut self, pipe: u64) {
@@ -277,9 +267,9 @@ impl SessionCore {
     }
 
     /// When an opening lane is due to be refused for not being confirmed
-    /// within the handshake timeout (MULTIPATH.md Section 5.8).
+    /// within the handshake timeout.
     pub(super) fn lanes_deadline(&self) -> Option<Instant> {
-        let timeout = self.config.handshake_wait();
+        let timeout = self.config.join_wait();
         self.atts
             .outs()
             .filter_map(|o| o.lanes()?.opening_since())
@@ -290,7 +280,7 @@ impl SessionCore {
     /// Refuses the lanes not confirmed within the handshake timeout: the
     /// driver resets them.
     pub(super) fn lanes_timeouts(&mut self, now: Instant) {
-        let timeout = self.config.handshake_wait();
+        let timeout = self.config.join_wait();
         for i in 0..self.atts.len() {
             let a = self.atts.at(i);
             let pipe = a.id();
@@ -323,8 +313,7 @@ impl SessionCore {
             return n;
         }
         // Outside multipath a direction with data on lane 0 from before the
-        // pipe had lanes stays there until it is acknowledged (MULTIPATH.md
-        // Section 5.8).
+        // pipe had lanes stays there until it is acknowledged.
         if self.on_lane_zero(key) || (!self.is_multipath() && lanes.before_unacked()) {
             return 0;
         }
@@ -375,12 +364,11 @@ impl SessionCore {
                 .is_some_and(|l| l.state() == LaneState::Confirmed && !l.writes_ended())
     }
 
-    // ---- the orderly close outside multipath (SPEC.md Section 6.5) ---------------
+    // ---- the orderly close outside multipath ---------------
 
     /// Whether an orderly CONNECTION_CLOSE of a session without multipath
-    /// waits for a PIPE_ACK to cover the other lanes of its pipe (SPEC.md
-    /// Section 6.5 step 1): the peer would otherwise discard data that
-    /// SPEC.md Section 7.4 counts as delivered.
+    /// waits for a PIPE_ACK to cover the other lanes of its pipe: the peer would otherwise discard
+    /// data that a written FIN or reset counts as delivered.
     pub(super) fn close_waiting(&self) -> bool {
         !self.is_multipath()
             && self
@@ -447,8 +435,7 @@ impl SessionCore {
 
     /// Outside multipath, whether the control frames of `key`'s sending
     /// part (STREAM_DATA_BLOCKED, its reset) wait because its frames are
-    /// on another lane than the batch's until a PIPE_ACK covers them
-    /// (MULTIPATH.md Section 5.8).
+    /// on another lane than the batch's until a PIPE_ACK covers them.
     pub(super) fn send_ctrl_elsewhere(&self, key: StreamKey) -> bool {
         self.tx_lanes
             && !self.is_multipath()

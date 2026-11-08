@@ -1,12 +1,11 @@
-//! Executable traces (TRACES.md): every trace loads into the typed model,
+//! Executable traces: every trace loads into the typed model,
 //! and every byte string in them decodes with the codec. Running the traces
 //! against a session needs the sans-IO core.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use zmux::proto::frame::PipeJoin;
 use zmux::proto::ident::{Classifier, Verdict};
 use zmux::proto::record::{Event, RecordReader};
 use zmux::proto::{Gates, TransportErrorCode};
@@ -19,52 +18,59 @@ use crate::model::{
 use crate::support::{read, read_json, spec_dir, to_hex};
 use crate::wire::{self, json_subset, normalise};
 
-/// Every trace listed in index.json, parsed.
-pub fn load_all() -> Vec<(String, Trace)> {
-    let index = read_json("traces/index.json");
-    index["traces"]
+/// The public traces, relative to the vendored assets, with their index.
+const PUBLIC: &str = "traces";
+
+/// The prefix of a local trace's path in [`load_all`].
+const LOCAL: &str = "local";
+
+/// Traces of the local sender policy, which the specification leaves to implementations:
+/// kept in the development repository only, and skipped when the directory is absent.
+fn local_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local/spec-traces")
+}
+
+/// The index entries of the public traces.
+fn index_entries() -> Vec<Value> {
+    read_json(&format!("{PUBLIC}/index.json"))["traces"]
         .as_array()
         .expect("traces")
+        .clone()
+}
+
+/// Every trace, parsed: those the public index lists (in its order, the path relative to
+/// the vendored assets), then the local ones (the path below [`LOCAL`]).
+pub fn load_all() -> Vec<(String, Trace)> {
+    let mut all: Vec<_> = index_entries()
         .iter()
         .map(|t| {
             let file = t["file"].as_str().unwrap();
-            let rel = file.strip_prefix("fixtures/").expect("fixtures/ path");
+            let rel = file.strip_prefix("fixtures/").expect("a fixtures/ path");
             let trace = parse_trace(&read(rel)).unwrap_or_else(|e| panic!("{file}: {e}"));
             (rel.to_string(), trace)
         })
-        .collect()
+        .collect();
+    let dir = local_dir();
+    if dir.is_dir() {
+        let mut files = BTreeSet::new();
+        collect_files(&dir, &dir, &mut files);
+        for rel in files {
+            let text = std::fs::read_to_string(dir.join(&rel)).unwrap();
+            let trace = parse_trace(&text).unwrap_or_else(|e| panic!("{LOCAL}/{rel}: {e}"));
+            all.push((format!("{LOCAL}/{rel}"), trace));
+        }
+    }
+    all
 }
 
-/// The traces of local behaviour in `testdata/local` that the
-/// specification leaves to implementations, when that directory exists.
-pub fn load_local() -> Vec<(String, Trace)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local");
-    let Ok(index) = std::fs::read_to_string(dir.join("traces/index.json")) else {
-        return Vec::new();
-    };
-    let index: Value = serde_json::from_str(&index).expect("local index.json");
-    index["traces"]
-        .as_array()
-        .expect("traces")
-        .iter()
-        .map(|t| {
-            let file = t["file"].as_str().unwrap();
-            let rel = file.strip_prefix("fixtures/").expect("fixtures/ path");
-            let text =
-                std::fs::read_to_string(dir.join(rel)).unwrap_or_else(|e| panic!("{file}: {e}"));
-            let trace = parse_trace(&text).unwrap_or_else(|e| panic!("{file}: {e}"));
-            (format!("local/{rel}"), trace)
-        })
-        .collect()
-}
-
-fn collect_files(dir: &Path, out: &mut BTreeSet<String>) {
+/// The NDJSON files below `dir`, relative to `base`.
+fn collect_files(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            collect_files(&path, out);
+            collect_files(base, &path, out);
         } else if path.extension().is_some_and(|e| e == "ndjson") {
-            let rel = path.strip_prefix(spec_dir()).unwrap();
+            let rel = path.strip_prefix(base).unwrap();
             out.insert(rel.to_string_lossy().replace('\\', "/"));
         }
     }
@@ -83,33 +89,36 @@ fn frame_names() -> BTreeSet<String> {
 
 #[test]
 fn traces_load_into_the_typed_model() {
-    let index = read_json("traces/index.json");
-    let entries = index["traces"].as_array().unwrap();
+    let entries = index_entries();
     let profiles: BTreeMap<String, Profile> =
         serde_json::from_str(&read("profiles.json")).expect("profiles.json");
     let traces = load_all();
     let mut listed = BTreeSet::new();
     let mut steps = 0usize;
-    for ((rel, trace), entry) in traces.iter().zip(entries) {
+    for (i, (rel, trace)) in traces.iter().enumerate() {
         let h = &trace.header;
-        listed.insert(rel.clone());
-        let id = rel
-            .strip_prefix("traces/")
+        let id = [PUBLIC, LOCAL]
+            .iter()
+            .find_map(|d| rel.strip_prefix(d).and_then(|r| r.strip_prefix('/')))
             .and_then(|r| r.strip_suffix(".ndjson"))
             .unwrap()
             .replace('/', ".");
         assert_eq!(h.id, id, "{rel}: id");
-        assert_eq!(entry["id"], h.id.as_str());
         assert!(
             profiles.contains_key(&h.profile),
             "{rel}: profile {}",
             h.profile
         );
-        assert_eq!(
-            entry["steps"].as_u64(),
-            Some(trace.steps.len() as u64),
-            "{rel}: step count"
-        );
+        // The public traces come first, in the order of their index.
+        if let Some(entry) = entries.get(i) {
+            listed.insert(rel.clone());
+            assert_eq!(entry["id"], h.id.as_str());
+            assert_eq!(
+                entry["steps"].as_u64(),
+                Some(trace.steps.len() as u64),
+                "{rel}: step count"
+            );
+        }
         for (i, s) in trace.steps.iter().enumerate() {
             assert_eq!(s.number as usize, i + 1, "{rel}: step numbering");
         }
@@ -117,7 +126,7 @@ fn traces_load_into_the_typed_model() {
         check_references(rel, trace);
     }
     let mut files = BTreeSet::new();
-    collect_files(&spec_dir().join("traces"), &mut files);
+    collect_files(&spec_dir(), &spec_dir().join(PUBLIC), &mut files);
     assert_eq!(files, listed, "index.json and the trace files differ");
     eprintln!("traces: {} files, {} steps", traces.len(), steps);
 }
@@ -237,7 +246,7 @@ fn trace_bytes_decode() {
     }
     eprintln!(
         "trace bytes: {} peer_send blobs, {} decoded and compared with their records, \
-         {} messages, {} PIPE_JOIN frames",
+         {} messages, {} carriers with a join",
         totals.blobs, totals.compared, totals.messages, totals.joins
     );
     assert!(totals.compared > 500);
@@ -264,17 +273,9 @@ fn check_trace_bytes(rel: &str, trace: &Trace, totals: &mut Totals) {
                 carrier,
                 via,
                 framing,
-                oob_join,
                 ..
             } => {
                 let key = carrier_key(*pipe, carrier.as_deref());
-                if let Some(join) = oob_join {
-                    let (frame, len) =
-                        PipeJoin::decode(&join.0).unwrap_or_else(|e| panic!("{at}: oob_join: {e}"));
-                    assert_eq!(len, join.0.len(), "{at}: oob_join length");
-                    aliases.insert(carrier_key(Some(frame.pipe_id), None), key.clone());
-                    totals.joins += 1;
-                }
                 if *framing != Some(FramingName::Records) {
                     let bootstrap = matches!(via, None | Some(Via::Bootstrap));
                     inbound.insert(key, Inbound::new(bootstrap));
@@ -380,14 +381,6 @@ fn check_trace_bytes(rel: &str, trace: &Trace, totals: &mut Totals) {
                 let pv = TransportErrorCode::PROTOCOL_VIOLATION.name().unwrap();
                 if error.space == ErrorSpace::Transport && error.code == CodeRef::Name(pv.into()) {
                     expects_violation = false;
-                }
-            }
-            Op::ExpectEvent { fields, .. } => {
-                if let Some(frame) = &fields.frame {
-                    let (_, len) = PipeJoin::decode(&frame.0)
-                        .unwrap_or_else(|e| panic!("{at}: event frame: {e}"));
-                    assert_eq!(len, frame.0.len(), "{at}: event frame length");
-                    totals.joins += 1;
                 }
             }
             _ => {}

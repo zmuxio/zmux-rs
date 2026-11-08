@@ -18,14 +18,12 @@ pub struct Backoff {
     pub jitter: f64,
 }
 
-/// The largest delay of the default [`Backoff`], which pipe pools redial
-/// with.
-pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(60);
-
 impl Default for Backoff {
-    /// From 1 s to at most [`DEFAULT_BACKOFF_MAX`] (60 s), with 20 % jitter.
+    /// From [`DEFAULT_MIN_BACKOFF`](crate::DEFAULT_MIN_BACKOFF) (1 s) to
+    /// at most [`DEFAULT_MAX_BACKOFF`](crate::DEFAULT_MAX_BACKOFF) (60 s),
+    /// with 20 % jitter: the backoff of the redial hook and of pipe pools.
     fn default() -> Self {
-        Self::new(Duration::from_secs(1), DEFAULT_BACKOFF_MAX).with_jitter(0.2)
+        Self::new(crate::DEFAULT_MIN_BACKOFF, crate::DEFAULT_MAX_BACKOFF).with_jitter(0.2)
     }
 }
 
@@ -44,6 +42,21 @@ impl Backoff {
     pub fn with_jitter(mut self, jitter: f64) -> Self {
         self.jitter = jitter;
         self
+    }
+
+    /// Whether the bounds are valid: `initial` not zero and not above
+    /// `max`, and the jitter in \[0, 1\].
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.initial.is_zero() {
+            return Err("backoff initial delay is zero");
+        }
+        if self.initial > self.max {
+            return Err("backoff initial delay above its max");
+        }
+        if !(0.0..=1.0).contains(&self.jitter) {
+            return Err("backoff jitter outside [0, 1]");
+        }
+        Ok(())
     }
 
     /// The delay after `failures` consecutive failures (none before the

@@ -252,7 +252,6 @@ async fn tables_at_rest(client: &Session, server: &Session, what: &str) -> (Tabl
                 && t.held_bytes == 0
                 && t.waits == waits
                 && t.pipe_events == 0
-                && t.oob == 0
                 && t.closing == 0
                 && t.new_pipes == 0
         };
@@ -330,7 +329,7 @@ async fn stream_churn(tcp_carrier: bool, seed: u64) {
             );
         }
     }
-    client.close(VarInt::from_u32(0), b"");
+    client.close(VarInt::from_u32(0), b"").await;
     drop(client);
     drop(server);
     watchdog(10, "server loop", served).await.unwrap();
@@ -408,8 +407,8 @@ async fn session_life(end: End, tcp_carrier: bool) {
     });
     tokio::time::sleep(Duration::from_millis(1)).await;
     match end {
-        End::ClientClose => client.close(VarInt::from_u32(1), b"client"),
-        End::ServerClose => server.close(VarInt::from_u32(2), b"server"),
+        End::ClientClose => client.close(VarInt::from_u32(1), b"client").await,
+        End::ServerClose => server.close(VarInt::from_u32(2), b"server").await,
         End::Shutdown => {
             let c = client.clone();
             let sd = tokio::spawn(async move { c.shutdown(VarInt::from_u32(0), b"").await });
@@ -435,7 +434,7 @@ async fn session_life(end: End, tcp_carrier: bool) {
         End::DropAll => {}
         End::StuckClose => {
             ca.stall(true);
-            client.close(VarInt::from_u32(4), b"stuck");
+            client.close(VarInt::from_u32(4), b"stuck").await;
         }
     }
     drop(send);
@@ -513,7 +512,7 @@ fn session_churn_returns_to_baseline() {
 fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"leak-test-psk-0123456789abcdef!!");
+    c.pipe_auth = PipeAuth::psk(*b"leak-test-psk-0123456789abcdef!!").with_end_to_end();
     c.suspect_floor = Duration::from_millis(100);
     c.resume_timeout = Some(Duration::from_secs(5));
     c
@@ -521,7 +520,8 @@ fn mp_config() -> Config {
 
 /// A listener whose sessions are handed to the test.
 fn mp_listener() -> (Listener, tokio::sync::mpsc::UnboundedReceiver<Session>) {
-    let listener = Listener::new(mp_config(), ListenerConfig::default());
+    let listener = Listener::new(mp_config(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let l = listener.clone();
     tokio::spawn(async move {
@@ -596,7 +596,7 @@ async fn mp_churn() {
     let mut pipes = Vec::new();
     for _ in 0..3 {
         let (io, _) = dial(&listener, PipeHint::default());
-        pipes.push(client.add_pipe(io, opts.clone()).expect("add"));
+        pipes.push(client.begin_add_pipe(io, opts.clone()).expect("add"));
     }
     echo(&client, 256 * 1024).await;
     expect_pipes(&client, &server, 4, "joined").await;
@@ -609,9 +609,9 @@ async fn mp_churn() {
     progress("A failed carrier ");
     // A failed carrier and an aborted pipe.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let failing = client.add_pipe(io, opts.clone()).expect("add");
+    let failing = client.begin_add_pipe(io, opts.clone()).expect("add");
     let (io, _) = dial(&listener, PipeHint::default());
-    let aborted = client.add_pipe(io, opts.clone()).expect("add");
+    let aborted = client.begin_add_pipe(io, opts.clone()).expect("add");
     echo(&client, 128 * 1024).await;
     ctl.fail();
     echo(&client, 128 * 1024).await;
@@ -625,39 +625,20 @@ async fn mp_churn() {
     // listener.
     let (stranger, _none) = mp_listener();
     let (io, _) = dial(&stranger, PipeHint::default());
-    let rejected = client.add_pipe(io, opts.clone()).expect("add");
+    let rejected = client.begin_add_pipe(io, opts.clone()).expect("add");
     let (closed, _none2) = mp_listener();
     closed.close();
     let (io, _) = dial(&closed, PipeHint::default());
-    let refused = client.add_pipe(io, opts.clone()).expect("add");
+    let refused = client.begin_add_pipe(io, opts.clone()).expect("add");
     echo(&client, 64 * 1024).await;
     stranger.close();
     drop((rejected, refused, stranger, closed));
     expect_pipes(&client, &server, 1, "failed joins").await;
 
-    progress("Out-of-band joins");
-    // Out-of-band joins: a reservation given up, one attached.
-    let r = client
-        .reserve_pipe(zmux::PipeDirection::Bidi, opts.clone())
-        .expect("reserve");
-    r.cancel();
-    let r = client
-        .reserve_pipe(zmux::PipeDirection::Bidi, opts.clone())
-        .expect("reserve");
-    let mut hint = PipeHint::default();
-    hint.join = Some(r.frame().to_vec());
-    let (io, _) = dial(&listener, hint);
-    let oob = r.attach(io).expect("attach");
-    echo(&client, 128 * 1024).await;
-    oob.close().expect("close");
-    echo(&client, 16 * 1024).await;
-    expect_pipes(&client, &server, 1, "out-of-band").await;
-    drop(oob);
-
     progress("Every pipe lost");
     // Every pipe lost: suspended, then resumed on a new pipe.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let p = client.add_pipe(io, opts.clone()).expect("add");
+    let p = client.begin_add_pipe(io, opts.clone()).expect("add");
     echo(&client, 16 * 1024).await;
     ctl.fail();
     _bootstrap.fail();
@@ -666,7 +647,7 @@ async fn mp_churn() {
     })
     .await;
     let (io, resumed_ctl) = dial(&listener, PipeHint::default());
-    let resumed = client.add_pipe(io, opts.clone()).expect("resume");
+    let resumed = client.begin_add_pipe(io, opts.clone()).expect("resume");
     eventually(30, "resumed", || {
         client.state() == zmux::SessionState::Active
     })
@@ -678,7 +659,7 @@ async fn mp_churn() {
     progress("Lost again and ne");
     // Lost again and never resumed: the resume timeout ends both ends.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let extra = client.add_pipe(io, opts.clone()).expect("add");
+    let extra = client.begin_add_pipe(io, opts.clone()).expect("add");
     echo(&client, 16 * 1024).await;
     ctl.fail();
     resumed_ctl.fail();
@@ -722,7 +703,8 @@ fn multipath_churn_returns_to_baseline() {
 /// that complete their handshake after the close.
 async fn listener_shutdown(accept_some: bool) {
     let base = snapshot();
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let mut handlers = Vec::new();
     let mut dial = |l: &Listener| {
         let ((a, _), (b, _)) = duplex(16 * 1024);
@@ -835,7 +817,7 @@ async fn stuck_carrier(how: Stuck) {
                     // Both ends go silent: the server's writes block too.
                     cb.stall(true);
                 }
-                Stuck::AppClose => client.close(VarInt::from_u32(1), b"app"),
+                Stuck::AppClose => client.close(VarInt::from_u32(1), b"app").await,
                 // The peer's handles go: it closes and ends its carrier.
                 Stuck::PeerEndsPipe => drop(server.take()),
                 Stuck::ReadFails => ca.fail_reads(),

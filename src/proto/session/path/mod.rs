@@ -10,6 +10,8 @@
 //! multipath module's own entry points.
 
 pub(super) mod ack;
+pub(super) mod epoch;
+pub(super) mod join;
 pub(super) mod ledger;
 pub(super) mod mpath;
 pub(super) mod opp;
@@ -31,7 +33,7 @@ use crate::proto::varint;
 
 impl SessionCore {
     /// A session with acknowledgement: multipath or pipe acknowledgement
-    /// in use, as between zmux endpoints always (SPEC.md Section 6.4).
+    /// in use, as between zmux endpoints always.
     pub(super) fn acknowledged(&self) -> bool {
         self.mp.is_some() || self.pipe_ack.is_some()
     }
@@ -140,11 +142,11 @@ impl SessionCore {
             && self
                 .atts
                 .iter()
-                .any(|a| a.abandon_owed(false) || (a.tier().status_owed() && !a.joining_local()))
+                .any(|a| a.abandon_owed(false) || (a.tier().status_owed() && !a.status_held()))
     }
 
     /// A PIPE_PING is owed on `id` and the limit of 8 per second lets it go
-    /// now: pipes that have waited longest first (MULTIPATH.md 6.4).
+    /// now: pipes that have waited longest first.
     pub(super) fn ping_due(&self, id: u64, now: Instant) -> bool {
         let Some(mp) = self.mp.as_deref() else {
             return false;
@@ -178,8 +180,7 @@ impl SessionCore {
 
     /// Owes a copy of a credit frame just written, when the window is the
     /// bottleneck: the latest value rides with the next redundant snapshot
-    /// on the second pipe, due at most 50 ms later (MULTIPATH.md Section
-    /// 6.5).
+    /// on the second pipe, due at most 50 ms later.
     pub(super) fn copy_credit(&mut self, kind: mpath::CreditCopy) {
         if self.mp.is_none() {
             return;
@@ -204,7 +205,7 @@ impl SessionCore {
 
     /// The pipe a stream datagram must follow (multipath): the pipe of the
     /// stream's opening frame while that is unacknowledged and the pipe is
-    /// live (EXTENSIONS.md Section 6.4, MULTIPATH.md Section 11).
+    /// live.
     pub(super) fn datagram_pipe(&self, flow: Option<(u64, u64)>) -> Option<u64> {
         self.mp.as_ref()?;
         let (stream_id, _) = flow?;
@@ -218,6 +219,7 @@ impl SessionCore {
 
     pub(super) fn count_sent(&mut self, bytes: usize, records: u64) {
         self.stats.bytes_sent += bytes as u64;
+        self.count_earned(bytes as u64);
         self.stats.records_sent += records;
         if self.mp.is_none() {
             let rtt = self.session_rtt_min();
@@ -234,9 +236,8 @@ impl SessionCore {
 }
 
 impl SessionCore {
-    /// The Session Nonces both endpoints sent in `zmux_multipath`
-    /// (MULTIPATH.md Section 3.1), this endpoint's first, while multipath
-    /// is in use.
+    /// The Session Nonces both endpoints sent in `zmux_multipath` this
+    /// endpoint's first, while multipath is in use.
     pub fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])> {
         if !self.is_multipath() {
             return None;
@@ -246,9 +247,8 @@ impl SessionCore {
         Some((local.session_nonce, peer.session_nonce))
     }
 
-    /// The RTT estimate rules use: the smoothed RTT or 333 ms (SPEC.md
-    /// Section 1.3). In a multipath session it is the largest smoothed RTT
-    /// of the live outbound pipes.
+    /// The RTT estimate rules use: the smoothed RTT or 333 ms. In a multipath session it is the
+    /// largest smoothed RTT of the live outbound pipes.
     pub(super) fn rtt_or_default(&self) -> Duration {
         if self.mp.is_some()
             && let Some(r) = self
@@ -345,6 +345,9 @@ impl SessionCore {
     /// it can.
     pub fn wants_write(&self, at: impl Into<LaneId>) -> bool {
         let at = at.into();
+        if self.holds_first_flight(at.pipe.0) {
+            return false;
+        }
         if at.lane.0 != 0 {
             return self.lane_wants_write(at.pipe.0, at.lane.0);
         }
@@ -355,7 +358,7 @@ impl SessionCore {
         let Some(o) = a.out() else {
             return false;
         };
-        if o.writes_ended() || self.state == State::Closed {
+        if o.writes_ended() || self.state == State::Closed || o.in_handshake() {
             return false;
         }
         // A record whose plan sets a delay waits for it, and the pipe
@@ -378,7 +381,7 @@ impl SessionCore {
             return true;
         }
         if self.state == State::Establishing {
-            // Early data under the floor (SPEC.md Section 6.1.2).
+            // Early data under the floor.
             return self.early_open() && id == 0 && (self.opening_ready() || self.data_pending());
         }
         if self.shape.is_some() && self.shape_wants(id) {
@@ -394,7 +397,11 @@ impl SessionCore {
             return false;
         }
         let now = self.now;
-        if a.abandon_owed(true) || self.wants_pipe_ack(id, now) || self.ping_due(id, now) {
+        if a.abandon_owed(true)
+            || self.wants_pipe_ack(id, now)
+            || self.ping_due(id, now)
+            || self.epoch_owed(id, now)
+        {
             return true;
         }
         let control = self.control_pipe(None) == Some(id);
@@ -455,8 +462,8 @@ impl SessionCore {
     }
 
     /// Accounts a batch handed to pipe `id`: its position, the retained
-    /// frames and the batch log (MULTIPATH.md Sections 6 and 7);
-    /// `eliciting` is where its last ack-eliciting byte ends, if any.
+    /// frames and the batch log; `eliciting` is where its last
+    /// ack-eliciting byte ends, if any.
     pub(super) fn after_batch(
         &mut self,
         id: u64,
@@ -508,7 +515,7 @@ impl SessionCore {
         let eliciting = eliciting.is_some();
         if !mp {
             // Pipe acknowledgement keeps the sample state of each batch
-            // (MULTIPATH.md Section 3.5); so does the first batch, sent
+            // even without multipath; so does the first batch, sent
             // before the peer's parameters tell whether it is in use.
             self.single_batch_sent(eliciting, now);
             return;
@@ -524,7 +531,7 @@ impl SessionCore {
     /// opening frame on another pipe; on another pipe only those that
     /// follow it there, and only while it may carry DATAGRAM (ACTIVE).
     /// Those that the pipe's datagram channel takes are left to
-    /// [`SessionCore::poll_channel`] (EXTENSIONS.md Section 6.8).
+    /// [`SessionCore::poll_channel`].
     pub(super) fn write_datagrams(&mut self, pipe: u64, control: bool, w: &mut Records<'_>) {
         let send_queue = self.config.datagram_send_queue;
         let max_frame = self.max_datagram_frame().unwrap_or(0);
@@ -563,7 +570,7 @@ impl SessionCore {
             }
             // With a Length field when it fits the peer's frame limit and
             // our records; otherwise last in its record, in one of its own
-            // when it exceeds our record size (EXTENSIONS.md Section 6.6).
+            // when it exceeds our record size.
             let with_len = 1 + varint::len(total as u64) + total;
             let last = with_len > max_frame.min(w.max_record());
             let frame_len = if last { 1 + total } else { with_len };
@@ -691,8 +698,7 @@ impl SessionCore {
 
     /// Discards a stream once both parts are terminal, its control frames
     /// are out, and the application released it or the stack rejected it
-    /// (SPEC.md Section 7.6). A peer stream returns its credit (Section
-    /// 8.5).
+    /// A peer stream returns its stream-count credit.
     pub(super) fn try_discard(&mut self, key: StreamKey) {
         if self.early_retains() {
             // Carrier early data may still be rejected and sent again.
@@ -736,7 +742,7 @@ impl SessionCore {
             && owed > 0
         {
             // Bytes below a Reliable Size that never arrived would be
-            // discarded on arrival (SPEC.md Section 8.3).
+            // discarded on arrival.
             self.credit_received(0, 0, owed);
         }
         if let Some(send) = &s.send {
@@ -788,7 +794,7 @@ impl SessionCore {
                 .outs()
                 .filter(|o| o.state() == OutState::Active)
                 .count() as u64;
-            // The primary pipe's estimates (MULTIPATH.md Section 6.5).
+            // The primary pipe's estimates.
             let primary = mp
                 .acks()
                 .primary()
@@ -839,7 +845,7 @@ impl SessionCore {
         // Attachments (with their pipe halves) live inline in `atts`.
         n += self.atts.heap_bytes();
         n += self.mp.as_deref().map_or(0, mpath::Mp::heap_bytes);
-        n += self.grease.1.capacity() + self.exporter.as_ref().map_or(0, Vec::capacity);
+        n += self.grease.1.capacity();
         n += self.error.as_ref().map_or(0, |_| size_of::<SessionError>());
         n += self.close.as_ref().map_or(0, |_| size_of::<CloseFrame>());
         n += self
@@ -874,10 +880,10 @@ impl SessionCore {
         }
     }
 
-    /// The fence completed (EXTENSIONS.md Section 3.3): phase 2 follows
-    /// at once, or one SRTT later in a multipath session and in a session
-    /// whose pipe toward this endpoint has lanes, as the response may have
-    /// overtaken stream frames on a slower pipe or lane.
+    /// The GOAWAY PING fence completed: phase 2 follows at once, or one
+    /// SRTT later in a multipath session and in a session whose pipe
+    /// toward this endpoint has lanes, as the response may have overtaken
+    /// stream frames on a slower pipe or lane.
     pub(super) fn fence_completed(&mut self, now: Instant) {
         let lanes = self.mp.is_none()
             && self
@@ -1003,13 +1009,7 @@ impl SessionCore {
     pub(super) fn on_record_end(&mut self, len: u64, now: Instant) -> Result<(), Error> {
         self.stats.records_received += 1;
         let (id, li) = (self.rx, self.rx_lane);
-        let Some(p) = self.inp_mut(id) else {
-            return Ok(());
-        };
-        // A leading QX_TRANSPORT_PARAMETERS record on a pipe we joined
-        // confirms nothing, is not counted and is not acknowledged
-        // (MULTIPATH.md Section 5.7 step 3).
-        if !p.record_closed(li) {
+        if self.inp_mut(id).is_none() {
             return Ok(());
         }
         if self.mp.is_some() {
@@ -1022,7 +1022,7 @@ impl SessionCore {
                 self.single_record_end(len, eliciting, now);
             }
             // With acknowledgement only a record with an activity frame
-            // counts; without it, every record (SPEC.md Section 6.4).
+            // counts; without it, every record.
             if activity || !self.acknowledged() {
                 self.restart_idle(now);
             }
@@ -1034,15 +1034,14 @@ impl SessionCore {
 // The path layer's properties and the hooks of what multipath alone does.
 impl SessionCore {
     /// Whether sent stream data is kept until a PIPE_ACK covers it and
-    /// resent when lost (MULTIPATH.md Sections 6 and 7.4); a single pipe
-    /// drops what it wrote.
+    /// resent when lost; a single pipe drops what it wrote.
     #[inline]
     pub(super) fn retains(&self) -> bool {
         self.mp.is_some()
     }
 
     /// Whether outbound pipes are measured, scheduled and failed one by
-    /// one (MULTIPATH.md Sections 7 to 11); a single pipe is the session's.
+    /// one; a single pipe is the session's.
     #[inline]
     pub(super) fn per_pipe(&self) -> bool {
         self.mp.is_some()
@@ -1082,8 +1081,7 @@ impl SessionCore {
         }
     }
 
-    /// GOAWAY while suspended: the drain starts once the session resumes
-    /// (RESUME.md Section 4.1).
+    /// GOAWAY while suspended: the drain starts once the session resumes.
     pub(super) fn drain_after_suspension(&mut self) {
         if let Some(mp) = self.mp.as_deref_mut() {
             mp.suspension_mut().drain_after();

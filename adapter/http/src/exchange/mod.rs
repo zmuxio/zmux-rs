@@ -128,6 +128,19 @@ pub struct ExchangeOptions {
     /// Client: a request that has had no result for this long fails the
     /// carrier (default 30 s).
     pub deadline: Duration,
+    /// Client: the connections carry TLS, so the requests' URL is
+    /// `https://` (default `false`, `http://`): the scheme redirects are
+    /// checked against.
+    pub https: bool,
+    /// Client: the redirects one request follows (default
+    /// [`zmux::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none), each
+    /// only within the origin of its endpoint, since the connections are
+    /// the caller's: another path or query of the same scheme, host and
+    /// port, as [`zmux::redirect::check`] allows (a `POST`, so 307 and 308
+    /// only). The request is repeated with its body unchanged, on a
+    /// connection of the endpoint; the next request starts at its
+    /// configured path again. A refused redirect fails the carrier.
+    pub max_redirects: usize,
 
     /// Server: a held DOWN request is answered within this (default 20 s);
     /// below every intermediary's response timeout on the path.
@@ -182,6 +195,8 @@ impl std::fmt::Debug for ExchangeOptions {
             .field("encoding", &self.encoding)
             .field("path", &self.path)
             .field("query", &self.query)
+            .field("https", &self.https)
+            .field("max_redirects", &self.max_redirects)
             .finish_non_exhaustive()
     }
 }
@@ -204,6 +219,8 @@ impl Default for ExchangeOptions {
                 .with_jitter(0.5),
             request_timeout: Duration::from_secs(25),
             deadline: Duration::from_secs(30),
+            https: false,
+            max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
             hold: Duration::from_secs(20),
             coalesce: Duration::from_millis(2),
             down_piece: None,
@@ -308,6 +325,21 @@ impl ExchangeOptions {
     #[must_use]
     pub fn with_encoding(mut self, encoding: BodyEncoding) -> Self {
         self.encoding = encoding;
+        self
+    }
+
+    /// With the requests' URL `https://` ([`https`](Self::https)).
+    #[must_use]
+    pub fn with_https(mut self, on: bool) -> Self {
+        self.https = on;
+        self
+    }
+
+    /// With this bound on the redirects one request follows
+    /// ([`max_redirects`](Self::max_redirects)).
+    #[must_use]
+    pub fn with_max_redirects(mut self, redirects: usize) -> Self {
+        self.max_redirects = redirects;
         self
     }
 

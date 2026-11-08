@@ -15,7 +15,7 @@ use std::time::Duration;
 use super::prefix_auth::{PREFIX_TOKEN_LEN, PrefixAuthVerifier};
 
 /// The future of a decision ([`Decide::decide`]).
-pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Verdict> + Send + 'a>>;
+pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
 /// The decision on a carrier from its metadata and its prefix: called
 /// once per carrier, outside the listener's locks, concurrently for
@@ -32,12 +32,13 @@ pub trait Decide: Send + Sync + 'static {
     fn decide<'a>(&'a self, info: &'a CarrierInfo<'a>, prefix: &'a [u8]) -> DecideFuture<'a>;
 }
 
-impl<F> Decide for F
+impl<F, D> Decide for F
 where
-    F: Fn(&CarrierInfo<'_>, &[u8]) -> Verdict + Send + Sync + 'static,
+    F: Fn(&CarrierInfo<'_>, &[u8]) -> D + Send + Sync + 'static,
+    D: Into<Decision>,
 {
     fn decide<'a>(&'a self, info: &'a CarrierInfo<'a>, prefix: &'a [u8]) -> DecideFuture<'a> {
-        Box::pin(std::future::ready(self(info, prefix)))
+        Box::pin(std::future::ready(self(info, prefix).into()))
     }
 }
 
@@ -64,6 +65,7 @@ pub const STALL_MAX_DRAWN: (Duration, Duration) =
 #[derive(Clone)]
 pub struct Admission {
     peek: usize,
+    max_peek: usize,
     peek_timeout: Duration,
     stall: (Duration, Duration),
     discard_buffer: usize,
@@ -74,6 +76,7 @@ impl std::fmt::Debug for Admission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Admission")
             .field("peek", &self.peek)
+            .field("max_peek", &self.max_peek)
             .field("peek_timeout", &self.peek_timeout)
             .field("stall", &self.stall)
             .field("discard_buffer", &self.discard_buffer)
@@ -86,9 +89,9 @@ impl Admission {
     /// `decide` with the carrier's metadata and the bytes read (fewer when
     /// the carrier ends or the peek timeout passes first): a synchronous
     /// decision ([`Admission::with_decider`] takes one that waits).
-    pub fn new(
+    pub fn new<D: Into<Decision>>(
         peek: usize,
-        decide: impl Fn(&CarrierInfo<'_>, &[u8]) -> Verdict + Send + Sync + 'static,
+        decide: impl Fn(&CarrierInfo<'_>, &[u8]) -> D + Send + Sync + 'static,
     ) -> Self {
         Self::with_decider(peek, decide)
     }
@@ -109,6 +112,7 @@ impl Admission {
         let min = draw(max / 4, max * 3 / 4);
         Self {
             peek,
+            max_peek: 0,
             peek_timeout,
             stall: (min, max),
             discard_buffer: 512,
@@ -130,7 +134,18 @@ impl Admission {
     /// deciding, from the end of the carrier's outer handshake.
     #[must_use]
     pub fn with_peek_timeout(mut self, timeout: Duration) -> Self {
-        self.peek_timeout = timeout;
+        if !timeout.is_zero() {
+            self.peek_timeout = timeout;
+        }
+        self
+    }
+
+    /// The largest prefix a decision may ask for with [`Verdict::More`].
+    /// 0, the default: the peek length, so that [`Verdict::More`] is not
+    /// valid.
+    #[must_use]
+    pub fn with_max_peek(mut self, bytes: usize) -> Self {
+        self.max_peek = bytes;
         self
     }
 
@@ -139,7 +154,9 @@ impl Admission {
     /// carrier's source.
     #[must_use]
     pub fn with_stall_interval(mut self, min: Duration, max: Duration) -> Self {
-        self.stall = (min.min(max), max);
+        if !max.is_zero() {
+            self.stall = (min.min(max), max);
+        }
         self
     }
 
@@ -154,6 +171,12 @@ impl Admission {
     /// The number of bytes read before the decision.
     pub fn peek(&self) -> usize {
         self.peek
+    }
+
+    /// The largest prefix: [`Admission::with_max_peek`], at least the peek
+    /// length.
+    pub fn max_peek(&self) -> usize {
+        self.max_peek.max(self.peek)
     }
 
     /// The peek timeout.
@@ -175,6 +198,13 @@ impl Admission {
     pub fn decider(&self) -> &dyn Decide {
         &*self.decide
     }
+}
+
+/// A listener's maximum stall duration without an admission: drawn from
+/// [`STALL_MAX_DRAWN`], as an admission's is.
+#[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+pub(crate) fn draw_stall_max() -> Duration {
+    draw(STALL_MAX_DRAWN.0, STALL_MAX_DRAWN.1)
 }
 
 /// Uniform in `[lo, hi]` from the system's secure random source.
@@ -224,6 +254,38 @@ pub enum Verdict {
     Stall,
     /// The carrier is closed at once.
     Close,
+    /// Read until the prefix holds `need` bytes in all (or the carrier
+    /// ends, or the peek timeout passes, all rounds sharing it), then decide
+    /// again with the longer prefix. `need` must exceed the prefix and not
+    /// exceed [`Admission::max_peek`], and the carrier must be a byte
+    /// stream read by [`crate::Entry::admit`] or
+    /// [`crate::Entry::decide_reading`]; otherwise it counts as
+    /// [`Verdict::Close`], as it does when the carrier ended short.
+    More {
+        /// The total prefix length wanted.
+        need: usize,
+    },
+}
+
+/// A decision on a carrier: its [`Verdict`] and the host's label of the kind
+/// of carrier. A label counts the verdict per label
+/// ([`crate::AdmissionVariants::variants`]); on an accepted carrier it becomes
+/// the carrier's variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    /// What to do.
+    pub verdict: Verdict,
+    /// The carrier's label; `None` for none.
+    pub variant: Option<Arc<str>>,
+}
+
+impl From<Verdict> for Decision {
+    fn from(verdict: Verdict) -> Self {
+        Self {
+            verdict,
+            variant: None,
+        }
+    }
 }
 
 /// Values compare by identity.
@@ -264,6 +326,15 @@ impl Verdict {
                 value: Some(value),
             },
             v => v,
+        }
+    }
+
+    /// A [`Decision`] of this verdict labelled `variant`.
+    #[must_use]
+    pub fn labelled(self, variant: impl Into<Arc<str>>) -> Decision {
+        Decision {
+            verdict: self,
+            variant: Some(variant.into()),
         }
     }
 

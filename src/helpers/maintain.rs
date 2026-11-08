@@ -9,11 +9,14 @@
 //! a downlink of a split carrier), redials failed ones with exponential
 //! backoff and jitter, measured from the start of the previous attempt,
 //! and rotates them make-before-break: when a usable member has carried
-//! `max_bytes` in either direction or is `max_age` old (each reduced by a
-//! random fraction of up to `jitter`), a replacement is joined with the
+//! `max_bytes` in either direction, is `max_age` old (each reduced by a
+//! random fraction of up to `jitter`), or has a pipe whose
+//! `PipeStats::replace_by` passed (a carrier of an older session epoch), a
+//! replacement is joined with the
 //! same options, and the old member is closed gracefully once the
 //! replacement is usable (every pipe ACTIVE and out of probation, or a
-//! downlink OPEN). A member one of whose pipes fails is closed and
+//! downlink OPEN, and attached by the peer, `Pipe::attached`). A member
+//! one of whose pipes fails is closed and
 //! redialled whole. A failed dial or a replacement that fails keeps the
 //! old member and retries with backoff.
 //! Nothing rotates while the session lacks a usable outbound or a live
@@ -51,7 +54,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::driver::handle::{self, WeakSession};
+use crate::driver::handle::{self, WeakSession, dead, usable};
 use crate::driver::mode::ModeSource;
 use crate::driver::resources::{Kind, Live};
 use crate::driver::tokio::Tokio;
@@ -61,8 +64,7 @@ use crate::proto::session::{
 use crate::{ConnectError, Dial, DialRequest, Mode, ModePolicy, Pipe, PipeIo, Session};
 use atomic_waker::AtomicWaker;
 
-/// How often the maintainer looks at its pipes, at most.
-pub(crate) const POLL: Duration = Duration::from_millis(100);
+use super::POLL;
 
 /// The shortest [`PoolDecision::recheck`] a pool honours: a shorter one
 /// is lengthened to this, so that a policy cannot make it spin.
@@ -72,7 +74,7 @@ pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
 /// a pipe on a carrier that [`PipePool::new`]'s dial opens (its
 /// [`DialRequest`] is `Bidi`), or the group of pipes that
 /// [`PipePool::join`]'s function joins, such as the downlink and uplink of
-/// a split carrier ([`crate::join_split`]).
+/// a split carrier ([`crate::PipeIo::paired_join`]).
 ///
 /// ```no_run
 /// # async fn example(session: zmux::Session) {
@@ -85,7 +87,7 @@ pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
 /// })
 /// .with_options(PipeOptions::new().with_priority(10).with_label("relay"))
 /// .with_rotate(RotatePolicy::new().with_max_age(Duration::from_secs(600)));
-/// let _keep = maintain_pipes(&session, pool);
+/// let _keep = maintain_pipes(&session, pool).expect("valid pool");
 /// # }
 /// ```
 #[derive(Clone)]
@@ -142,7 +144,7 @@ impl PipePool {
     }
 
     /// A pool of `count` members, each the pipes that `join` joins to the
-    /// session with the options given (for example [`crate::join_split`]
+    /// session with the options given (for example over [`crate::PipeIo::paired_join`]
     /// or an adapter's split join): a member is usable while all of its
     /// pipes are, counts once against `count`, and is redialled, rotated
     /// (make before break) and retired as a whole. `join` returns the
@@ -158,8 +160,7 @@ impl PipePool {
         )
     }
 
-    /// A pool of one member dialed over the carrier kinds of `mode`
-    /// (API.md Section 4.8), under `policy` (its
+    /// A pool of one member dialed over the carrier kinds of `mode`, under `policy` (its
     /// [`no_join`](ModePolicy::no_join) does not apply); set
     /// [`count`](Self::count) for more. Stable first, then upgrade: a
     /// member is dialed over the most robust kind available (a kind the
@@ -356,7 +357,8 @@ pub struct PoolMember {
     /// The statistics of its pipes (one for a dialled member).
     pub pipes: Vec<PipeStats>,
     /// Every pipe serves its direction (an outbound pipe ACTIVE and out
-    /// of probation, a downlink OPEN).
+    /// of probation, a downlink OPEN) and the peer attached it
+    /// (`Pipe::attached`).
     pub usable: bool,
     /// It is the replacement of this member, until it becomes usable.
     pub replaces: Option<PipeId>,
@@ -537,7 +539,15 @@ impl Stop {
 /// it (a replacement still being rotated in is closed; the members' pipes
 /// stay), as does the end of the session. Needs a multipath session and a
 /// tokio runtime (it panics outside one).
-pub fn maintain_pipes(session: &Session, pool: PipePool) -> MaintainHandle {
+///
+/// # Errors
+///
+/// [`ConnectError::InvalidConfig`] for a backoff whose initial delay is
+/// zero or above its max, or whose jitter is outside \[0, 1\].
+pub fn maintain_pipes(session: &Session, pool: PipePool) -> Result<MaintainHandle, ConnectError> {
+    pool.backoff
+        .validate()
+        .map_err(ConnectError::InvalidConfig)?;
     let stop = Arc::new(Stop::default());
     Maintainer::spawn(
         Link::Strong(session.clone()),
@@ -545,7 +555,23 @@ pub fn maintain_pipes(session: &Session, pool: PipePool) -> MaintainHandle {
         Vec::new(),
         stop.clone(),
     );
-    MaintainHandle { stop }
+    Ok(MaintainHandle { stop })
+}
+
+/// The redial of a session with [`Config::redial`](crate::Config#structfield.redial):
+/// one member, first `pipe0`, replaced by the hook's carrier when it fails,
+/// with the configuration's backoff. It holds no handle of the session
+/// between its looks and ends with it.
+pub(crate) fn maintain_redial(session: &Session, dial: Dial, backoff: Backoff, pipe0: Pipe) {
+    let mut first = Member::new(vec![pipe0], None);
+    first.was_usable = true;
+    let pool = PipePool::with_dial(1, dial).with_backoff(backoff);
+    Maintainer::spawn(
+        Link::Weak(session.downgrade()),
+        pool,
+        vec![first],
+        Arc::default(),
+    );
 }
 
 /// The pool of a session dialed by [`crate::dial_mode`]: one member over
@@ -690,6 +716,9 @@ struct Maintainer {
     recheck_at: Option<Instant>,
     /// The session's pipe changes as of the last look.
     seen: u64,
+    /// The pool counted as a redial source while it runs (ResumeUnattended),
+    /// from its spawn.
+    source: Option<handle::RedialSource<Tokio>>,
 }
 
 /// What woke the maintainer.
@@ -697,26 +726,6 @@ enum Wake {
     Stop,
     Dial(Box<Dialing>, Box<Made>),
     Tick,
-}
-
-/// A pipe serves its direction: an outbound one is ACTIVE and out of
-/// probation, an inbound-only one (a downlink) is OPEN.
-fn usable(info: &PipeStats) -> bool {
-    match info.outbound {
-        None => info.inbound == Some(InboundState::Open),
-        Some(s) => s == OutboundState::Active && !info.in_probation,
-    }
-}
-
-/// A pipe no longer serves its direction.
-fn dead(info: Option<&PipeStats>) -> bool {
-    info.is_none_or(|i| match i.outbound {
-        None => matches!(i.inbound, Some(InboundState::Ended) | None),
-        Some(s) => matches!(
-            s,
-            OutboundState::Failed | OutboundState::Closed | OutboundState::Draining
-        ),
-    })
 }
 
 impl Maintainer {
@@ -739,7 +748,13 @@ impl Maintainer {
             started: now,
             recheck_at: None,
             seen: 0,
+            source: None,
         };
+        let mut task = task;
+        task.source = task
+            .link
+            .get()
+            .map(|s| handle::RedialSource::new(s.shared()));
         tokio::spawn(task.run());
     }
 
@@ -753,6 +768,7 @@ impl Maintainer {
 
     async fn run(mut self) {
         let _live = Live::new(Kind::Maintainer);
+        let source = self.source.take();
         let mut shared = None;
         loop {
             // A weak link holds the session only during a look.
@@ -829,6 +845,7 @@ impl Maintainer {
                 }
             }
         }
+        drop(source);
         self.stop.finished.store(true, Ordering::SeqCst);
     }
 
@@ -872,7 +889,7 @@ impl Maintainer {
                 let pipes = pipes?;
                 Some(PoolMember {
                     id: m.id(),
-                    usable: pipes.iter().all(usable),
+                    usable: m.pipes.iter().zip(&pipes).all(|(p, i)| usable(p, i)),
                     pipes,
                     replaces: m.replaces,
                     replaced: m.replaced,
@@ -990,7 +1007,12 @@ impl Maintainer {
                 gone.push(m.id());
                 continue;
             }
-            if !info.iter().all(|i| i.as_ref().is_some_and(usable)) {
+            if !m
+                .pipes
+                .iter()
+                .zip(info)
+                .all(|(p, i)| i.as_ref().is_some_and(|i| usable(p, i)))
+            {
                 m.usable_since = None;
                 continue;
             }
@@ -1071,12 +1093,20 @@ impl Maintainer {
             let Some(i): Option<Vec<&PipeStats>> = i.iter().map(Option::as_ref).collect() else {
                 continue;
             };
-            if m.replaced || m.replaces.is_some() || !i.iter().all(|p| usable(p)) {
+            if m.replaced
+                || m.replaces.is_some()
+                || !m.pipes.iter().zip(&i).all(|(p, i)| usable(p, i))
+            {
                 continue;
             }
             let sent: u64 = i.iter().map(|p| p.bytes_sent).sum();
             let received: u64 = i.iter().map(|p| p.bytes_received).sum();
-            let limit = m.max_age.is_some_and(|t| now >= t)
+            // A carrier of an older session epoch is replaced as its epoch policy says.
+            let stale = i
+                .iter()
+                .any(|p| p.replace_by.is_some_and(|t| now.into_std() >= t));
+            let limit = stale
+                || m.max_age.is_some_and(|t| now >= t)
                 || m.max_bytes.is_some_and(|b| sent >= b || received >= b);
             let better = match (&mode, m.kind) {
                 (Some(src), Some(k)) if !upgrading => src.better(k),
@@ -1168,9 +1198,13 @@ impl Maintainer {
     }
 
     /// The options of a pipe added now: the pool's, with the policy's
-    /// idle-probe settings.
+    /// idle-probe settings, and `no_wait_attached` set: a replacement
+    /// closes its old pipe only once the peer attached it (the member's own
+    /// judgement), and a redial must not wait for a PIPE_ACK that only the
+    /// direction it restores could carry.
     fn options(&self) -> PipeOptions {
         let mut o = self.pool.options.clone();
+        o.no_wait_attached = true;
         let (interval, jitter) = self.probe;
         o.probe_interval = interval.or(o.probe_interval);
         o.probe_jitter = jitter.or(o.probe_jitter);
@@ -1211,7 +1245,10 @@ impl Maintainer {
         let now = Instant::now();
         let purpose = dialing.purpose;
         let pipes = match made {
-            Made::Carrier(Ok(io)) => session.add_pipe(*io, self.options()).map(|p| vec![p]),
+            Made::Carrier(Ok(io)) => {
+                // The member waits for the Reply and the attachment itself.
+                session.begin_add_pipe(*io, self.options()).map(|p| vec![p])
+            }
             Made::Carrier(Err(e)) => Err(PipeError::Io(e.kind())),
             Made::Joined(Ok(pipes)) if !pipes.is_empty() => Ok(pipes),
             Made::Joined(Ok(_)) => Err(PipeError::InvalidArgument),
@@ -1259,7 +1296,7 @@ mod tests {
     fn config() -> Config {
         Config {
             max_pipes: 4,
-            pipe_auth: PipeAuth::psk(*b"maintain-psk----0123456789abcdef"),
+            pipe_auth: PipeAuth::psk(*b"maintain-psk----0123456789abcdef").with_end_to_end(),
             ..Config::default()
         }
     }
@@ -1270,7 +1307,8 @@ mod tests {
     /// per dial. Paused time on one thread: the count is exact.
     #[tokio::test(start_paused = true)]
     async fn redial_jitter_is_drawn_once() {
-        let listener = Listener::new(config(), ListenerConfig::default());
+        let listener = Listener::new(config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let (a, b) = tokio::io::duplex(64 * 1024);
         let l = listener.clone();
         tokio::spawn(async move {
@@ -1292,7 +1330,7 @@ mod tests {
             d.recheck = Some(Duration::from_millis(10));
         });
         let before = super::super::backoff::DRAWS.with(std::cell::Cell::get);
-        let handle = maintain_pipes(&client, pool);
+        let handle = maintain_pipes(&client, pool).expect("valid pool");
         while dials.load(Ordering::SeqCst) < 16 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1301,6 +1339,6 @@ mod tests {
         let n = dials.load(Ordering::SeqCst) as u64;
         // One at each dial's start, one at its failure.
         assert!(draws <= 2 * n, "{draws} draws for {n} dials");
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     }
 }

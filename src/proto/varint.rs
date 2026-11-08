@@ -3,8 +3,7 @@
 //! The two most significant bits of the first byte give the encoded width
 //! (1, 2, 4 or 8 bytes); the remaining bits hold the value in network byte
 //! order. Values may be encoded in more bytes than necessary everywhere
-//! except in frame types (SPEC.md Section 4.1 rule 2), so decoders report the
-//! width they saw.
+//! except in frame types, so decoders report the width they saw.
 
 use std::fmt;
 

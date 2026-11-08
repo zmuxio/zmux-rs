@@ -1,0 +1,259 @@
+[
+ {
+  "framing": "stream",
+  "bytes": "01ff000000",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "01",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "stream",
+  "bytes": "02ff000000",
+  "hello": true,
+  "record": false,
+  "class": "join"
+ },
+ {
+  "framing": "message",
+  "bytes": "02",
+  "hello": true,
+  "record": false,
+  "class": "join"
+ },
+ {
+  "framing": "stream",
+  "bytes": "03ff000000",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "03",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "stream",
+  "bytes": "04ff000000",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "04",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "stream",
+  "bytes": "05ff000000",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "05",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "stream",
+  "bytes": "06ff000000",
+  "hello": true,
+  "record": false,
+  "class": "reserved"
+ },
+ {
+  "framing": "message",
+  "bytes": "06",
+  "hello": true,
+  "record": false,
+  "class": "reserved"
+ },
+ {
+  "framing": "stream",
+  "bytes": "07ff000000",
+  "hello": true,
+  "record": false,
+  "class": "reserved"
+ },
+ {
+  "framing": "message",
+  "bytes": "07",
+  "hello": true,
+  "record": false,
+  "class": "reserved"
+ },
+ {
+  "framing": "stream",
+  "bytes": "08ff000000",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "08",
+  "hello": true,
+  "record": false,
+  "class": "establish"
+ },
+ {
+  "framing": "message",
+  "bytes": "ff",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "stream",
+  "bytes": "09ff",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "stream",
+  "bytes": "4040ff",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "message",
+  "bytes": "9a",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "stream",
+  "bytes": "099a",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "stream",
+  "bytes": "40409a",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "message",
+  "bytes": "ba",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "stream",
+  "bytes": "09ba",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "stream",
+  "bytes": "4040ba",
+  "hello": false,
+  "record": true,
+  "class": "record"
+ },
+ {
+  "framing": "stream",
+  "bytes": "00ff",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "message",
+  "bytes": "00",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "stream",
+  "bytes": "0903",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "message",
+  "bytes": "09",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "stream",
+  "bytes": "",
+  "hello": false,
+  "record": false,
+  "class": "incomplete",
+  "need": 1
+ },
+ {
+  "framing": "message",
+  "bytes": "",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ },
+ {
+  "framing": "stream",
+  "bytes": "09",
+  "hello": false,
+  "record": false,
+  "class": "incomplete",
+  "need": 2
+ },
+ {
+  "framing": "stream",
+  "bytes": "40",
+  "hello": false,
+  "record": false,
+  "class": "incomplete",
+  "need": 3
+ },
+ {
+  "framing": "stream",
+  "bytes": "4040",
+  "hello": false,
+  "record": false,
+  "class": "incomplete",
+  "need": 3
+ },
+ {
+  "framing": "stream",
+  "bytes": "8000",
+  "hello": false,
+  "record": false,
+  "class": "incomplete",
+  "need": 5
+ },
+ {
+  "framing": "stream",
+  "bytes": "160301",
+  "hello": false,
+  "record": false,
+  "class": "other"
+ }
+]

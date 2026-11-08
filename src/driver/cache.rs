@@ -1,6 +1,6 @@
-//! The carrier cache of carrier modes (API.md Section 4.8) and its
-//! interchange form: which carrier kinds worked, per server and local
-//! network, exported and imported as versioned JSON with wall-clock times.
+//! The carrier cache of carrier modes and its interchange form: which
+//! carrier kinds worked, per server and local network, exported and
+//! imported as versioned JSON with wall-clock times.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,11 +22,14 @@ use crate::proto::session::CarrierKind;
 #[derive(Debug, Clone)]
 pub struct CarrierCache(Arc<CacheInner>);
 
+/// A server and local network, a carrier kind and a variant.
+type CacheKey = (String, CarrierKind, Option<Arc<str>>);
+
 #[derive(Debug)]
 struct CacheInner {
     success_ttl: Duration,
     backoff: (Duration, Duration),
-    entries: Mutex<HashMap<(String, CarrierKind), CacheEntry>>,
+    entries: Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,6 +54,20 @@ impl CacheEntry {
             && past(self.fail_until)
             && past(self.fail_until.and_then(|t| t.checked_add(backoff_max)))
     }
+}
+
+/// What a host learnt of a candidate after dialling it
+/// ([`CarrierCache::report`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CacheOutcome {
+    /// Usable, as a chosen candidate.
+    Usable,
+    /// An ordinary failure: the backoff doubles.
+    Failed,
+    /// A definite verdict of the host (a binding check that proves the path
+    /// unsuitable): skipped for the longest backoff.
+    Rejected,
 }
 
 impl Default for CarrierCache {
@@ -83,15 +100,24 @@ impl CarrierCache {
         }))
     }
 
-    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<(String, CarrierKind), CacheEntry>> {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, CacheEntry>> {
         self.0
             .entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn state(&self, key: &str, kind: CarrierKind, now: Instant) -> Known {
-        match self.entries().get(&(key.to_owned(), kind)) {
+    pub(crate) fn state(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: Option<&Arc<str>>,
+        now: Instant,
+    ) -> Known {
+        match self
+            .entries()
+            .get(&(key.to_owned(), kind, variant.cloned()))
+        {
             Some(e) if e.fail_until.is_some_and(|t| now < t) => {
                 Known::Failed(e.fail_until.unwrap_or(now))
             }
@@ -102,16 +128,66 @@ impl CarrierCache {
 
     /// Records an outcome. A usable kind keeps the URL remembered for it;
     /// a failed one starts at its base URL again.
-    pub(crate) fn record(&self, key: &str, kind: CarrierKind, usable: bool, now: Instant) {
+    /// Records an outcome the host learnt after a dial: `key` the
+    /// [`ModePolicy::key`](crate::ModePolicy::key) in use, `variant` the
+    /// candidate's ([`Candidate::with_variant`](crate::Candidate::with_variant)).
+    /// The same table as the automatic results and under the same rules.
+    pub fn report(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: Option<&str>,
+        outcome: CacheOutcome,
+    ) {
+        let variant = variant.map(Arc::from);
+        let now = Instant::now();
+        match outcome {
+            CacheOutcome::Usable => self.record(key, kind, variant.as_ref(), None, true, now),
+            CacheOutcome::Failed => self.record(key, kind, variant.as_ref(), None, false, now),
+            CacheOutcome::Rejected => {
+                let hi = self.0.backoff.1;
+                let mut entries = self.entries();
+                let e = entries.entry((key.to_owned(), kind, variant)).or_default();
+                e.backoff = hi;
+                e.good_until = None;
+                e.fail_until = now.checked_add(hi);
+                e.url.clear();
+            }
+        }
+    }
+
+    pub(crate) fn record(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: Option<&Arc<str>>,
+        target: Option<&crate::HttpTarget>,
+        usable: bool,
+        now: Instant,
+    ) {
         let mut entries = self.entries();
-        let e = entries.entry((key.to_owned(), kind)).or_default();
+        let e = entries
+            .entry((key.to_owned(), kind, variant.cloned()))
+            .or_default();
         if usable {
+            // A kind with a target keeps the URL its redirects led to; an
+            // outcome without one keeps the URL known.
+            let url = match target {
+                Some(t) => {
+                    let u = t.url();
+                    if u == t.base() { String::new() } else { u }
+                }
+                None => std::mem::take(&mut e.url),
+            };
             *e = CacheEntry {
                 good_until: now.checked_add(self.0.success_ttl),
-                url: std::mem::take(&mut e.url),
+                url,
                 ..CacheEntry::default()
             };
             return;
+        }
+        if let Some(t) = target {
+            t.reset();
         }
         let (lo, hi) = self.0.backoff;
         e.backoff = (e.backoff * 2).clamp(lo, hi);
@@ -120,16 +196,44 @@ impl CarrierCache {
         e.url.clear();
     }
 
-    /// Whether `kind` is held as usable under `key` now.
-    pub fn is_usable(&self, key: &str, kind: CarrierKind) -> bool {
-        self.state(key, kind, Instant::now()) == Known::Usable
+    /// Whether `kind` with `variant` is held as usable under `key` now.
+    pub fn is_usable(&self, key: &str, kind: CarrierKind, variant: Option<&str>) -> bool {
+        let variant = variant.map(Arc::from);
+        self.state(key, kind, variant.as_ref(), Instant::now()) == Known::Usable
     }
 
-    /// Until when `kind` is skipped under `key`, if it is backing off.
-    pub fn failed_until(&self, key: &str, kind: CarrierKind) -> Option<Instant> {
-        match self.state(key, kind, Instant::now()) {
+    /// Until when `kind` with `variant` is skipped under `key`, if it is
+    /// backing off.
+    pub fn failed_until(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: Option<&str>,
+    ) -> Option<Instant> {
+        let variant = variant.map(Arc::from);
+        match self.state(key, kind, variant.as_ref(), Instant::now()) {
             Known::Failed(t) => Some(t),
             _ => None,
+        }
+    }
+
+    /// The URL redirects last led a usable `kind` with `variant` to under
+    /// `key`, where its carriers start (`None`: its base URL).
+    pub fn url(&self, key: &str, kind: CarrierKind, variant: Option<&str>) -> Option<String> {
+        let variant = variant.map(Arc::from);
+        self.entries()
+            .get(&(key.to_owned(), kind, variant))
+            .map(|e| e.url.clone())
+            .filter(|u| !u.is_empty())
+    }
+
+    /// Starts `cand`'s target at the URL the cache remembers for it under
+    /// `key`.
+    pub(crate) fn prime(&self, key: &str, cand: &crate::Candidate) {
+        let Some(t) = cand.target() else { return };
+        let variant = cand.variant().map(|v| &**v);
+        if let Some(u) = self.url(key, cand.kind(), variant) {
+            t.redirected(&u);
         }
     }
 
@@ -145,16 +249,19 @@ impl CarrierCache {
             .entries()
             .iter()
             .filter(|(_, e)| !e.expired(now, hi))
-            .map(|((key, kind), e)| CacheSnapshotEntry {
+            .map(|((key, kind, variant), e)| CacheSnapshotEntry {
                 key: key.clone(),
                 kind: *kind,
+                variant: variant.as_deref().map(str::to_owned),
                 good_until: e.good_until.map(|t| to_wall(t, now, wall)),
                 fail_until: e.fail_until.map(|t| to_wall(t, now, wall)),
                 backoff: e.backoff,
                 url: e.url.clone(),
             })
             .collect();
-        entries.sort_by(|a, b| (&a.key, a.kind.name()).cmp(&(&b.key, b.kind.name())));
+        entries.sort_by(|a, b| {
+            (&a.key, a.kind.name(), &a.variant).cmp(&(&b.key, b.kind.name(), &b.variant))
+        });
         CacheSnapshot { entries }
     }
 
@@ -173,7 +280,7 @@ impl CarrierCache {
             let t = to_mono(t, now, wall);
             now.checked_add(ahead).map_or(t, |b| t.min(b))
         };
-        let mut merged: HashMap<(String, CarrierKind), CacheEntry> = HashMap::new();
+        let mut merged: HashMap<CacheKey, CacheEntry> = HashMap::new();
         for s in &snapshot.entries {
             let e = CacheEntry {
                 good_until: s.good_until.map(|t| bound(t, self.0.success_ttl)),
@@ -189,7 +296,11 @@ impl CarrierCache {
             if e.expired(now, hi) {
                 continue;
             }
-            merge(&mut merged, (s.key.clone(), s.kind), e);
+            merge(
+                &mut merged,
+                (s.key.clone(), s.kind, s.variant.as_deref().map(Arc::from)),
+                e,
+            );
         }
         let mut entries = self.entries();
         for (k, e) in merged {
@@ -199,11 +310,7 @@ impl CarrierCache {
 }
 
 /// Keeps the newer of `e` and the entry at `k`.
-fn merge(
-    m: &mut HashMap<(String, CarrierKind), CacheEntry>,
-    k: (String, CarrierKind),
-    e: CacheEntry,
-) {
+fn merge(m: &mut HashMap<CacheKey, CacheEntry>, k: CacheKey, e: CacheEntry) {
     match m.get(&k) {
         Some(o) if e.latest() <= o.latest() => {}
         _ => {
@@ -302,7 +409,7 @@ impl From<SystemTime> for WallTime {
 
 /// The content of a [`CarrierCache`] with wall-clock times
 /// ([`CarrierCache::snapshot`], [`CarrierCache::restore`]), and its JSON
-/// interchange form, the same in every language (API.md Section 4.8):
+/// interchange form, the same in every language:
 ///
 /// ```json
 /// {"version":1,"entries":[{"key":"…","kind":"websocket",
@@ -325,6 +432,8 @@ pub struct CacheSnapshotEntry {
     pub key: String,
     /// The carrier kind.
     pub kind: CarrierKind,
+    /// The candidate's variant.
+    pub variant: Option<String>,
     /// Until when the kind is held as usable.
     pub good_until: Option<WallTime>,
     /// Until when the kind is skipped as failed.
@@ -341,6 +450,7 @@ impl CacheSnapshotEntry {
         Self {
             key: key.into(),
             kind,
+            variant: None,
             good_until: None,
             fail_until: None,
             backoff: Duration::ZERO,
@@ -400,6 +510,10 @@ impl CacheSnapshot {
                 out.push_str(",\"url\":");
                 json::write_str(&mut out, &e.url);
             }
+            if let Some(v) = &e.variant {
+                out.push_str(",\"variant\":");
+                json::write_str(&mut out, v);
+            }
             out.push('}');
         }
         out.push_str("]}");
@@ -437,6 +551,7 @@ impl CacheSnapshot {
                 Some(_) => Err(invalid(format!("{name} not a string"))),
             };
             let (key, kind, url) = (s("key")?, s("kind")?, s("url")?);
+            let variant = Some(s("variant")?).filter(|v| !v.is_empty());
             let time = |name: &str| -> Result<Option<WallTime>, SnapshotError> {
                 let t = s(name)?;
                 if t.is_empty() {
@@ -459,6 +574,7 @@ impl CacheSnapshot {
             entries.push(CacheSnapshotEntry {
                 key,
                 kind,
+                variant,
                 good_until,
                 fail_until,
                 backoff,
@@ -906,11 +1022,11 @@ mod tests {
     fn snapshot_round_trips_and_drops_expired() {
         let c = CarrierCache::default();
         let now = Instant::now();
-        c.record("k", CarrierKind::Streaming, false, now);
-        c.record("k", CarrierKind::Streaming, false, now); // 2 min
-        c.record("k2", CarrierKind::Streaming, true, now);
+        c.record("k", CarrierKind::Streaming, None, None, false, now);
+        c.record("k", CarrierKind::Streaming, None, None, false, now); // 2 min
+        c.record("k2", CarrierKind::Streaming, None, None, true, now);
         if let Some(old) = now.checked_sub(Duration::from_secs(7 * 3600)) {
-            c.record("old", CarrierKind::Split, false, old);
+            c.record("old", CarrierKind::Split, None, None, false, old);
         }
         let snap = c.snapshot();
         assert_eq!(snap.entries.len(), 2);
@@ -918,18 +1034,52 @@ mod tests {
         let back = CacheSnapshot::from_json(&json).unwrap();
         let r = CarrierCache::default();
         r.restore(&back);
-        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, now) else {
+        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, None, now) else {
             panic!("backoff not restored");
         };
         assert!(at(t, now).abs_diff(Duration::from_secs(120)) < Duration::from_millis(50));
-        assert!(r.is_usable("k2", CarrierKind::Streaming));
-        assert_eq!(r.state("old", CarrierKind::Split, now), Known::Unknown);
+        assert!(r.is_usable("k2", CarrierKind::Streaming, None));
+        assert_eq!(
+            r.state("old", CarrierKind::Split, None, now),
+            Known::Unknown
+        );
         // The restored backoff doubles on the next failure.
-        r.record("k", CarrierKind::Streaming, false, now);
-        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, now) else {
+        r.record("k", CarrierKind::Streaming, None, None, false, now);
+        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, None, now) else {
             panic!();
         };
         assert!(at(t, now).abs_diff(Duration::from_secs(240)) < Duration::from_millis(50));
+    }
+
+    /// A reported URL stays while the kind is usable, travels in the
+    /// snapshot, and is dropped once the kind fails.
+    #[test]
+    fn a_redirect_url_is_kept_while_usable() {
+        let c = CarrierCache::default();
+        let (k, kind) = ("k", CarrierKind::WebSocket);
+        let t = crate::HttpTarget::new("wss://a.example/old");
+        let cand = crate::Candidate::new(kind, || async {
+            Err::<crate::PipeIo, _>(std::io::Error::other("unused"))
+        })
+        .with_target(Arc::new(crate::HttpTarget::new("wss://a.example/old")));
+        let now = Instant::now();
+        assert_eq!(c.url(k, kind, None), None);
+        t.redirected("wss://a.example/new");
+        c.record(k, kind, None, Some(&t), true, now);
+        assert_eq!(c.url(k, kind, None).as_deref(), Some("wss://a.example/new"));
+        assert_eq!(c.url(k, kind, Some("v")), None);
+        // An outcome the host reports keeps it.
+        c.report(k, kind, None, CacheOutcome::Usable);
+        assert_eq!(c.url(k, kind, None).as_deref(), Some("wss://a.example/new"));
+        // A later candidate starts there, in this run or the next.
+        let r = CarrierCache::default();
+        r.restore(&CacheSnapshot::from_json(&c.snapshot().to_json()).unwrap());
+        r.prime(k, &cand);
+        assert_eq!(cand.target().unwrap().url(), "wss://a.example/new");
+        // A failure forgets it and starts the target at its base again.
+        c.record(k, kind, None, Some(&t), false, now);
+        assert_eq!(c.url(k, kind, None), None);
+        assert_eq!(t.url(), "wss://a.example/old");
     }
 
     #[test]
@@ -951,8 +1101,8 @@ mod tests {
                 assert!(t <= limit, "{e:?} beyond its bound");
             }
         }
-        assert!(c.is_usable("g", CarrierKind::Split));
-        assert!(c.failed_until("f", CarrierKind::Split).is_some());
+        assert!(c.is_usable("g", CarrierKind::Split, None));
+        assert!(c.failed_until("f", CarrierKind::Split, None).is_some());
     }
 
     #[test]

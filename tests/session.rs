@@ -151,7 +151,7 @@ async fn reset_and_stop_reach_the_peer() {
 #[tokio::test]
 async fn preamble_and_priority_reach_the_peer() {
     let (client, server) = pair().await;
-    // Application TLVs in order, repeats included (EXTENSIONS.md 4.3).
+    // Application TLVs in order, repeats included.
     let pre = zmux::Preamble::new()
         .with_info("route=/chat")
         .with_tlv(0x1000, b"dst")
@@ -216,7 +216,7 @@ async fn preamble_and_priority_reach_the_peer() {
 #[tokio::test]
 async fn datagrams_both_ways() {
     let (client, server) = pair_with(datagram_config(), datagram_config()).await;
-    // EXTENSIONS.md Section 6.6: the peer's 65535-byte limits less the
+    // The datagram size limit: the peer's 65535-byte limits less the
     // frame type and Flow 0, beyond this endpoint's 16 KiB records.
     assert_eq!(client.max_datagram_size(), Some(65533));
     for len in [65533, 1500, 9000, 16380, 65533] {
@@ -250,7 +250,7 @@ async fn datagrams_both_ways() {
 #[tokio::test]
 async fn close_code_reaches_the_peer() {
     let (client, server) = pair().await;
-    client.close(VarInt::from_u32(42), b"bye");
+    client.close(VarInt::from_u32(42), b"bye").await;
     let e = server.closed().await;
     assert_eq!(
         e,
@@ -308,7 +308,7 @@ async fn ping_measures_rtt() {
     let (a, b) = (a.unwrap(), b.unwrap());
     assert!(client.rtt().is_some());
     assert!(a <= Duration::from_secs(1) && b <= Duration::from_secs(1));
-    client.close(VarInt::from_u32(0), b"");
+    client.close(VarInt::from_u32(0), b"").await;
     assert!(client.ping().await.is_err());
 }
 
@@ -470,35 +470,43 @@ async fn multipath_configuration_errors_are_reported() {
     ));
 }
 
-/// MULTIPATH.md Section 3.3: both endpoints offer multipath with
-/// credentials that share no secret source; the session reports "join
-/// security unavailable", as a state and as an event, and runs on one pipe.
+/// Secret Flags state a choice and never negotiate it: flags
+/// that differ close the session with TRANSPORT_PARAMETER_ERROR. (A side without a source
+/// is the trace multipath.negotiation.no_secret_source.)
 #[tokio::test]
-async fn join_security_unavailable_is_reported() {
+async fn secret_flags_that_differ_close_the_session() {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let psk = zmux::PipeAuth::psk(*b"a pre-shared key of 32 bytes....");
     let listener = zmux::Listener::new(
         Config::multipath(zmux::PipeAuth::exporter()),
         zmux::ListenerConfig::default(),
-    );
+    )
+    .expect("valid listener configuration");
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
-    let client = Session::connect(PipeIo::new(a), Config::multipath(psk))
+    tokio::spawn(async move {
+        l.handle_pipe(
+            PipeIo::new(b).with_exporter(|_, _, out| {
+                out.fill(1);
+                true
+            }),
+            Default::default(),
+        )
         .await
-        .unwrap();
-    let server = listener.accept().await.unwrap();
-    for s in [&client, &server] {
-        assert_eq!(s.multipath(), zmux::Multipath::JoinSecurityUnavailable);
-        assert_eq!(
-            s.next_event().await,
-            Some(zmux::SessionEvent::JoinSecurityUnavailable)
+    });
+    let client = Session::connect(PipeIo::new(a), Config::multipath(psk)).await;
+    if let Ok(client) = client {
+        let e = tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .expect("closed");
+        assert!(
+            matches!(
+                e,
+                SessionError::TransportClosed { code, .. }
+                    if code == zmux::proto::TransportErrorCode::TRANSPORT_PARAMETER_ERROR
+            ),
+            "{e:?}"
         );
     }
-    let (mut send, _r) = client.open_bi().await.unwrap();
-    send.write_all(b"one pipe").await.unwrap();
-    let (_s, mut r) = server.accept_bi().await.unwrap();
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b).await.unwrap();
 }
 
 /// A graceful shutdown that is cancelled (here by a
@@ -536,7 +544,7 @@ async fn the_tracer_sees_events_in_order_and_the_end_last() {
         }
         fn event(&self, event: &zmux::SessionEvent) {
             let name = match event {
-                zmux::SessionEvent::GoAway(_) => "goaway",
+                zmux::SessionEvent::GoAwayReceived(_) => "goaway",
                 _ => "other",
             };
             self.0.lock().unwrap().push(name.into());
@@ -561,7 +569,7 @@ async fn the_tracer_sees_events_in_order_and_the_end_last() {
     assert_eq!(*log.0.lock().unwrap(), ["established", "goaway", "closed"]);
 }
 
-/// SPEC.md Section 13.3: with `protocols` on both ends, the session's
+/// With `protocols` on both ends, the session's
 /// protocol is the accepting side's most preferred one that both list.
 #[tokio::test]
 async fn protocols_negotiate_the_accepting_sides_preference() {
@@ -603,7 +611,7 @@ async fn a_shaper_pads_the_records_of_a_session() {
     let (_s, mut recv) = server.accept_bi().await.unwrap();
     assert_eq!(recv.read_to_end(100).await.unwrap(), b"0123456789");
     let st = client.shaping_stats();
-    assert!(st.padding_bytes >= 900, "{st:?}");
+    assert!(st.wire_spent >= 900, "{st:?}");
 }
 
 /// Delays the first record of each pipe it shapes, or every record.
@@ -703,7 +711,7 @@ fn blocking_a_delayed_first_record_keeps_the_parameters_first() {
     }
 }
 
-/// API.md Section 7.2: the session's application byte counts are those of
+/// The session's application byte counts are those of
 /// its meter, streams and datagrams together.
 #[tokio::test]
 async fn session_stats_report_the_meter() {
@@ -735,7 +743,7 @@ async fn session_stats_report_the_meter() {
     );
 }
 
-/// API.md Section 7.2: a handle that outlives its stream (the sending part
+/// A handle that outlives its stream (the sending part
 /// of a rejected stream) keeps reading the final statistics.
 #[tokio::test]
 async fn stream_stats_stay_after_release() {
@@ -760,7 +768,7 @@ async fn stream_stats_stay_after_release() {
     assert_eq!(st.bytes_read, 0);
 }
 
-/// API.md Section 7.2: the durations since an event are measured at the
+/// The durations since an event are measured at the
 /// time of the snapshot, not at the session's latest input.
 #[tokio::test]
 async fn pipe_stats_are_taken_at_the_current_time() {
@@ -775,4 +783,89 @@ async fn pipe_stats_are_taken_at_the_current_time() {
     assert!(since >= wait, "{since:?}");
     let one = client.pipes()[0].stats().unwrap();
     assert!(one.since_last_traffic.unwrap() >= wait);
+}
+
+/// An open that waits for stream credit is counted once in
+/// `stream_credit_waits`, however long it waits; an open with credit is not.
+#[tokio::test]
+async fn opens_waiting_for_stream_credit_are_counted() {
+    let mut server = Config::default();
+    // No bidirectional credit: every bidirectional open waits.
+    server.max_incoming_streams = 0;
+    let (client, _srv) = pair_with(Config::default(), server).await;
+    client.open_uni().await.unwrap();
+    assert_eq!(client.stats().stream_credit_waits, 0);
+    let waiting = {
+        let c = client.clone();
+        tokio::spawn(async move { c.open_bi().await.map(|_| ()) })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.stats().stream_credit_waits == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the waiting open was not counted");
+    // Woken again (another command), it is not counted twice.
+    client.open_uni().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(client.stats().stream_credit_waits, 1);
+    waiting.abort();
+}
+
+/// The negotiation results that are reported by
+/// their own calls: establishment, QMux version, TLS state, DATAGRAM and
+/// RESET_STREAM_AT support per side, pipe acknowledgement and resume.
+#[tokio::test]
+async fn negotiation_results_are_reported() {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let tls = zmux::TlsState::new(Some(b"app".to_vec()), Some("example.test".into()));
+    let reported = tls.clone();
+    let server_io = PipeIo::new(b).with_terminated_tls(move || Some(reported.clone()));
+    let server = tokio::spawn(Session::accept(server_io, datagram_config()));
+    let client = Session::connect(PipeIo::new(a), Config::default())
+        .await
+        .expect("connect");
+    let server = server.await.unwrap().expect("accept");
+    server.established().await.unwrap();
+    for s in [&client, &server] {
+        assert!(s.is_established());
+        assert_eq!(s.qmux_version(), "draft-02");
+        assert_eq!(
+            s.reset_stream_at_support(),
+            zmux::Support {
+                local: true,
+                peer: true
+            }
+        );
+        // Pipe acknowledgement is on by default; resume needs multipath.
+        assert!(s.pipe_ack_in_use());
+        assert!(!s.resume_in_use());
+        assert!(!s.is_plain_qmux_peer());
+    }
+    assert_eq!(server.tls(), Some(tls));
+    assert_eq!(client.tls(), None);
+    assert_eq!(
+        server.datagram_support(),
+        zmux::Support {
+            local: true,
+            peer: false
+        }
+    );
+    assert_eq!(
+        client.datagram_support(),
+        zmux::Support {
+            local: false,
+            peer: true
+        }
+    );
+}
+
+/// A session without multipath has no epoch.
+#[tokio::test]
+async fn a_single_pipe_session_has_no_epoch() {
+    let (client, server) = pair().await;
+    client.established().await.unwrap();
+    assert_eq!(client.epoch(), None);
+    assert_eq!(server.epoch(), None);
 }

@@ -1,4 +1,4 @@
-//! Streams as pipes (EXTENSIONS.md Section 10.2): a
+//! Streams as pipes: a
 //! nested session over streams of an outer session, single-pipe and
 //! multipath; the mapping of every pipe event to a stream operation and
 //! back; no carrier capability; the loop check; an outer session without
@@ -30,7 +30,7 @@ fn carrier_failed() -> VarInt {
 fn multipath() -> Config {
     let mut c = Config::default();
     c.max_pipes = 6;
-    c.pipe_auth = PipeAuth::psk(*b"nested-psk------0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"nested-psk------0123456789abcdef").with_end_to_end();
     c
 }
 
@@ -124,7 +124,7 @@ fn a_nested_session_runs_over_a_stream_and_closes_it_cleanly() {
             assert_eq!((p.lanes_out, p.lanes_in), (1, 1));
             // A graceful close ends the outer stream with a FIN each way:
             // both sides read everything written, nothing was reset.
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             watchdog(10, "nested closed", ns.closed()).await;
             eventually(10, "outer streams released", || {
                 oc.stats().streams_active == 0 && os.stats().streams_active == 0
@@ -133,7 +133,7 @@ fn a_nested_session_runs_over_a_stream_and_closes_it_cleanly() {
             assert_eq!(oc.meter().bytes_written(), os.meter().bytes_read());
             assert_eq!(os.meter().bytes_written(), oc.meter().bytes_read());
             assert!(oc.close_reason().is_none() && os.close_reason().is_none());
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
         }
         settle(base, 10, "nested over a stream").await;
     });
@@ -235,7 +235,7 @@ impl Nested {
         // An instance id exercises the locator prefix on every join.
         let mut limits = ListenerConfig::default();
         limits.instance_id = b"instance".to_vec();
-        let listener = Listener::new(multipath(), limits);
+        let listener = Listener::new(multipath(), limits).expect("valid listener configuration");
         let ((a, _), (b, _)) = duplex(1 << 20);
         {
             let l = listener.clone();
@@ -270,7 +270,7 @@ impl Nested {
             .open_pipe_stream(&zmux::Preamble::new())
             .await
             .unwrap();
-        let p = self.x.add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = self.x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
         self.until_active(&p).await;
         p
     }
@@ -283,7 +283,7 @@ impl Nested {
             .open_pipe_stream(&zmux::Preamble::new())
             .await
             .unwrap();
-        let p = self.x.add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = self.x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
         let (send, recv) = self.os.accept_bi().await.unwrap();
         let (send, recv) = (Raw::new(send), Raw::new(recv));
         let l = self.listener.clone();
@@ -325,8 +325,8 @@ fn a_nested_multipath_session_moves_between_stream_pipes_and_a_direct_carrier() 
             // stream pipe fails.
             p1.abort().unwrap();
             watchdog(30, "echo over the rest", echo(&n.x, &n.y, 1 << 20)).await;
-            n.x.close(VarInt::ZERO, b"");
-            n.oc.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
+            n.oc.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 10, "nested multipath").await;
@@ -401,7 +401,7 @@ fn stream_events_map_to_pipe_events() {
             );
 
             // STOP_SENDING received fails the outbound pipe at once, though
-            // the pipe has nothing to write (EXTENSIONS.md Section 10.2).
+            // the pipe has nothing to write.
             // The server reads nothing more, so only the STOP_SENDING can
             // end the client's pipe.
             let (x, _y, recv, mute) = single_muted(&oc, &os).await;
@@ -417,7 +417,7 @@ fn stream_events_map_to_pipe_events() {
                 }
             );
             assert!(oc.close_reason().is_none() && os.close_reason().is_none());
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
 
             // In a multipath session: a pipe aborted locally resets and
             // stops its stream with ZMUX_CARRIER_FAILED (the reset keeps
@@ -437,24 +437,24 @@ fn stream_events_map_to_pipe_events() {
             // The outer session lost: its stream pipes fail, the nested
             // session continues on its direct carrier.
             let p = n.join_stream().await;
-            n.os.close(VarInt::from_u32(3), b"");
+            n.os.close(VarInt::from_u32(3), b"").await;
             eventually(10, "the stream pipe failed", || {
                 matches!(state(&p).1, Some(OutboundState::Failed) | None)
             })
             .await;
             watchdog(30, "echo on the direct carrier", echo(&n.x, &n.y, 64 << 10)).await;
-            n.x.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 10, "mapping").await;
     });
 }
 
-/// MULTIPATH.md Section 10.5: a stream of a multiplexed session is never
-/// carrier-bound and never offers E from the exporter of a connection
+/// A stream of a multiplexed session is never
+/// Bound and never offers E from the exporter of a connection
 /// below it, which the multiplexer's other carriers share: a stream
-/// carrier ignores an exporter, so a nested session whose only secret
-/// source is E does not use multipath.
+/// carrier ignores an exporter, so a session whose secret source is E is a
+/// configuration error on it.
 #[test]
 fn a_stream_carrier_takes_no_exporter() {
     multi_thread(async {
@@ -463,30 +463,19 @@ fn a_stream_carrier_takes_no_exporter() {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut tls = multipath();
             tls.pipe_auth = PipeAuth::exporter();
-            let accept = {
-                let (os, tls) = (os.clone(), tls.clone());
-                tokio::spawn(async move {
-                    let (send, recv) = os.accept_bi().await.unwrap();
-                    let carrier =
-                        PipeIo::from_stream(send, recv).with_tls_exporter(|_| Some(vec![7; 32]));
-                    common::accept(carrier, tls).await.unwrap()
-                })
-            };
             let carrier = oc
                 .open_pipe_stream(&zmux::Preamble::new())
                 .await
                 .unwrap()
-                .with_tls_exporter(|_| Some(vec![7; 32]));
-            let nc = Session::connect(carrier, tls).await.unwrap();
-            let ns = accept.await.unwrap();
-            assert!(
-                nc.multipath() != zmux::Multipath::InUse
-                    && ns.multipath() != zmux::Multipath::InUse
-            );
-            watchdog(30, "echo", echo(&nc, &ns, 64 << 10)).await;
-            nc.close(VarInt::ZERO, b"");
-            watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"");
+                .with_exporter(|_, _, out| {
+                    out.fill(7);
+                    true
+                });
+            assert!(matches!(
+                Session::connect(carrier, tls).await,
+                Err(zmux::ConnectError::InvalidConfig(_))
+            ));
+            oc.close(VarInt::ZERO, b"").await;
             watchdog(10, "outer closed", os.closed()).await;
         }
         settle(base, 10, "stream carrier without exporter").await;
@@ -508,7 +497,7 @@ fn a_stream_carrier_takes_the_parts_of_one_stream() {
             }));
             assert!(mixed.is_err(), "the parts of two streams");
             drop((s2, r1));
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             watchdog(10, "closed", os.closed()).await;
         }
         settle(base, 10, "mixed parts").await;
@@ -526,13 +515,13 @@ fn a_pipe_never_runs_over_its_own_session() {
             // nested session that runs over it.
             let looped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert_eq!(
-                n.oc.add_pipe(looped, PipeOptions::default()).err(),
+                n.oc.begin_add_pipe(looped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             );
             // Nor a session a stream of its own.
             let own = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert_eq!(
-                n.x.add_pipe(own, PipeOptions::default()).err(),
+                n.x.begin_add_pipe(own, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             );
             // Once the pipe over the outer session is gone, nothing runs
@@ -541,18 +530,18 @@ fn a_pipe_never_runs_over_its_own_session() {
             eventually(10, "the stream pipe retired", || p.stats().is_none()).await;
             let unlooped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert_ne!(
-                n.oc.add_pipe(unlooped, PipeOptions::default()).err(),
+                n.oc.begin_add_pipe(unlooped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             );
-            n.x.close(VarInt::ZERO, b"");
-            n.oc.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
+            n.oc.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 10, "loop check").await;
     });
 }
 
-/// MULTIPATH.md Section 5.4 step 7: a joiner that
+/// Join loop detection: a joiner that
 /// cannot see the loop (its carrier hides that it is a stream of its own
 /// session) joins over a stream of that session; the listener sees that
 /// the carrier is a stream of the session it would join, refuses with
@@ -573,7 +562,7 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
             };
             let (send, recv) = n.x.open_bi().await.unwrap();
             let hidden = PipeIo::from_halves(Raw::new(recv), Raw::new(send));
-            let p = n.x.add_pipe(hidden, PipeOptions::default()).unwrap();
+            let p = n.x.begin_add_pipe(hidden, PipeOptions::default()).unwrap();
             let handled = watchdog(10, "the join handled", handled).await.unwrap();
             assert_eq!(handled.err(), Some(zmux::HandleError::Refused));
             // ZMUX_PIPE_RESOURCE_LIMIT: a limit of the session.
@@ -585,8 +574,8 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
             .await;
             eventually(10, "the refused pipe retired", || p.stats().is_none()).await;
             assert_eq!(n.y.pipe_stats().len(), 1, "only the direct carrier");
-            n.x.close(VarInt::ZERO, b"");
-            n.oc.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
+            n.oc.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 10, "looped join").await;
@@ -595,7 +584,7 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
 
 /// Streams of a connection that carries no pipe of the listener's
 /// sessions are unauthenticated carriers like any other: the pending
-/// limits apply to them (MULTIPATH.md Section 5.5).
+/// limits apply to them.
 #[test]
 fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
     multi_thread(async {
@@ -604,7 +593,8 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut limits = ListenerConfig::default();
             limits.max_pending_per_source = 1;
-            let listener = Listener::new(Config::default(), limits);
+            let listener =
+                Listener::new(Config::default(), limits).expect("valid listener configuration");
             let mut held = Vec::new();
             let mut handled = Vec::new();
             for _ in 0..2 {
@@ -619,14 +609,21 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
                         .await
                 }));
             }
-            let second = watchdog(10, "the second refused", handled.pop().unwrap())
+            // Whichever took the source's slot first holds it: the other
+            // is refused at once (the two tasks may start in either order).
+            eventually(10, "one refused", || {
+                handled.iter().any(|h| h.is_finished())
+            })
+            .await;
+            let i = handled.iter().position(|h| h.is_finished()).unwrap();
+            let refused = watchdog(10, "the refused one", handled.remove(i))
                 .await
                 .unwrap();
-            assert_eq!(second.err(), Some(zmux::HandleError::Refused));
+            assert_eq!(refused.err(), Some(zmux::HandleError::Refused));
             listener.close();
-            let _ = watchdog(10, "the first ended", handled.pop().unwrap()).await;
+            let _ = watchdog(10, "the held one ended", handled.pop().unwrap()).await;
             drop(held);
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             os.closed().await;
         }
         settle(base, 10, "pending streams").await;
@@ -635,7 +632,7 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
 
 /// A connection that carries a pipe of ours lets one new stream per such
 /// pipe wait for its first record outside the pending limits (the lane the
-/// peer may be opening, MULTIPATH.md Section 5.5): a second one takes a
+/// peer may be opening): a second one takes a
 /// slot like any carrier, and an exempt stream that turns out a new session
 /// takes one then, refused when its source has its share.
 #[test]
@@ -648,7 +645,8 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             let (nc, ns) = nested_over(&oc, &os, &[]).await;
             let mut limits = ListenerConfig::default();
             limits.max_pending_per_source = 1;
-            let listener = Listener::new(Config::default(), limits);
+            let listener =
+                Listener::new(Config::default(), limits).expect("valid listener configuration");
             let handle = |send, recv| {
                 let l = listener.clone();
                 tokio::spawn(async move {
@@ -691,9 +689,9 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             let _ = watchdog(10, "the slot holder ended", c_handled).await;
             drop((c, d));
             let _ = watchdog(10, "client", client).await;
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             ns.closed().await;
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             os.closed().await;
         }
         settle(base, 10, "exempt streams").await;
@@ -701,7 +699,7 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
 }
 
 /// A carrier evicted for a newer one when every pending slot is taken is
-/// closed at once (MULTIPATH.md Section 5.6), not left to its first-record
+/// closed at once, not left to its first-record
 /// timeout.
 #[test]
 fn an_evicted_carrier_is_closed_at_once() {
@@ -712,7 +710,8 @@ fn an_evicted_carrier_is_closed_at_once() {
             let mut limits = ListenerConfig::default();
             limits.max_pending = 1;
             limits.first_record_timeout = Duration::from_secs(60);
-            let listener = Listener::new(Config::default(), limits);
+            let listener =
+                Listener::new(Config::default(), limits).expect("valid listener configuration");
             let mut held = Vec::new();
             let mut handled = Vec::new();
             for _ in 0..2 {
@@ -733,7 +732,7 @@ fn an_evicted_carrier_is_closed_at_once() {
             listener.close();
             let _ = watchdog(10, "the second ended", handled.remove(0)).await;
             drop(held);
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             os.closed().await;
         }
         settle(base, 10, "evicted carriers").await;
@@ -766,9 +765,9 @@ fn an_outer_session_without_the_preamble_carries_a_pipe_from_offset_zero() {
             ));
             let (nc, ns) = nested_over(&oc, &os, &[]).await;
             watchdog(30, "echo", echo(&nc, &ns, 1 << 20)).await;
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
         }
         settle(base, 10, "plain outer").await;
     });
@@ -784,12 +783,11 @@ fn an_unused_carrier_is_aborted_when_dropped() {
         drop(pipe);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(os.stats().streams_opened_remote, 0);
-        oc.close(VarInt::ZERO, b"");
+        oc.close(VarInt::ZERO, b"").await;
     });
 }
 
-/// Lanes over a stream carrier (MULTIPATH.md Section 2.5, EXTENSIONS.md
-/// Section 10.2): the nested writer opens further streams of the outer
+/// Lanes over a stream carrier: the nested writer opens further streams of the outer
 /// session as lanes once lane 0 is acknowledged, the receiving application
 /// routes the streams it accepts with `handle_lane`, and the data of a
 /// bulk stream moves to a lane; a stream that names no pipe is refused.
@@ -843,9 +841,9 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
             // A stream that names no pipe of a session is refused.
             let (stray, _) = oc.open_bi().await.unwrap();
             drop(stray);
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             watchdog(10, "outer closed", os.closed()).await;
             lanes.await.unwrap();
         }
@@ -855,14 +853,15 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
 
 /// A listener that takes the streams of an outer session counts the
 /// nested session's bootstrap once and each lane it accepts into its pipe
-/// as a join (API.md Section 7.2).
+/// as a join.
 #[test]
 fn a_listener_counts_accepted_lanes_as_joins() {
     multi_thread(async {
         let base = snapshot();
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
-            let listener = Listener::new(Config::default(), ListenerConfig::default());
+            let listener = Listener::new(Config::default(), ListenerConfig::default())
+                .expect("valid listener configuration");
             let router = {
                 let (os, l) = (os.clone(), listener.clone());
                 tokio::spawn(async move {
@@ -889,9 +888,9 @@ fn a_listener_counts_accepted_lanes_as_joins() {
             .await;
             let st = listener.stats();
             assert_eq!((st.sessions, st.rejected, st.refused), (1, 0, 0));
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             watchdog(10, "outer closed", os.closed()).await;
             router.await.unwrap();
             listener.close();
@@ -902,7 +901,7 @@ fn a_listener_counts_accepted_lanes_as_joins() {
 
 /// The lanes of nested pipes over an outer session hold at most half of
 /// the outer peer's initial bidirectional streams, without waiting for
-/// its credit (MULTIPATH.md Section 5.8): with 4, two lanes besides each
+/// its credit: with 4, two lanes besides each
 /// pipe's lane 0, none refused, and the application's own opens go on.
 #[test]
 fn stream_carrier_lanes_keep_to_half_the_outer_streams() {
@@ -947,9 +946,9 @@ fn stream_carrier_lanes_keep_to_half_the_outer_streams() {
             assert!(out.lanes_out <= 3, "lane 0 and at most two: {out:?}");
             assert_eq!(out.lanes_refused, 0);
             assert!(oc.stats().streams_opened_local <= 3);
-            nc.close(VarInt::ZERO, b"");
+            nc.close(VarInt::ZERO, b"").await;
             watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"");
+            oc.close(VarInt::ZERO, b"").await;
             watchdog(10, "outer closed", os.closed()).await;
             lanes.await.unwrap();
         }
@@ -1033,8 +1032,8 @@ fn lanes_ended_at_any_point_wake_nothing_under_a_core_lock() {
             }
             tokio::time::sleep(Duration::from_millis(5 + (i * 37) % 120)).await;
             match i % 3 {
-                0 => nc.close(VarInt::ZERO, b""),
-                1 => oc.close(VarInt::ZERO, b""),
+                0 => nc.close(VarInt::ZERO, b"").await,
+                1 => oc.close(VarInt::ZERO, b"").await,
                 _ => {}
             }
             tokio::time::sleep(Duration::from_millis((i * 13) % 7)).await;

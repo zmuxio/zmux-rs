@@ -1,4 +1,4 @@
-//! Idle-pipe probes as the per-pipe heartbeat (MULTIPATH.md Section 7.1),
+//! Idle-pipe probes as the per-pipe heartbeat,
 //! sans IO: per-pipe intervals and jitter, the bounds of each wait, their
 //! isolation from the session's idle and keep-alive timers, the answer's
 //! pipe pair, the pipes' traffic clock and shaping of the probes.
@@ -16,7 +16,7 @@ use zmux::proto::record::{Event as Rec, RecordReader};
 use zmux::proto::session::{
     Config, PipeAuth, PipeError, PipeId, PipeOptions, RoleConfig, SessionCore, SessionError,
 };
-use zmux::shaping::{Caps, Event, RecordPlan, RecordView, Reply, Shaper};
+use zmux::shaping::{Caps, Effects, Event, RecordPlan, RecordView, Shaper};
 
 /// What a link's batches showed.
 struct Seen {
@@ -74,7 +74,7 @@ const STEP: u64 = 10;
 fn config(edit: &dyn Fn(&mut Config)) -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
-    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = None;
     c.probation = Some(Duration::ZERO);
     c.standby_probe = None;
@@ -123,7 +123,7 @@ fn gaps(times: &[Instant]) -> Vec<Duration> {
     times.windows(2).map(|w| w[1] - w[0]).collect()
 }
 
-/// §21.7.7 item 1: a pipe's probe interval below 1 s and a jitter outside
+/// Idle probe settings: a pipe's probe interval below 1 s and a jitter outside
 /// [0, 1) are refused, and so is a session jitter outside it.
 #[test]
 fn probe_settings_are_validated() {
@@ -162,7 +162,7 @@ fn probe_settings_are_validated() {
         PipeOptions::new().with_probe_jitter(-0.01),
     ];
     for opts in bad {
-        let r = n.ends[A].add_pipe(bs, bs, &opts, false, None, n.now);
+        let r = n.ends[A].add_pipe(bs, bs, &opts, zmux::proto::seal::Mode::Trusted, None, n.now);
         assert_eq!(r.err(), Some(PipeError::InvalidOptions), "{opts:?}");
     }
     let ok = PipeOptions::new()
@@ -184,7 +184,7 @@ fn probe_settings_are_validated() {
     );
 }
 
-/// §21.7.7 item 2: without jitter each wait is the interval; with it, each
+/// Idle probe waits: without jitter each wait is the interval; with it, each
 /// lies in [k (1 - j), k] and they differ.
 #[test]
 fn probe_waits_lie_within_the_jittered_interval() {
@@ -232,7 +232,7 @@ fn pipe_options_override_the_session_settings() {
     }
 }
 
-/// §21.7.7 item 4: a session with nothing but probes and their answers
+/// Idle probes and the idle timeout: a session with nothing but probes and their answers
 /// still closes on its idle timeout; probes do not move keep-alive, whose
 /// QX_PINGs (ack-eliciting) only move the start of the probes' waits.
 #[test]
@@ -281,7 +281,7 @@ fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
     assert_eq!(with, keep_alive(None));
 }
 
-/// §21.7.7 item 5: with jitter, each PIPE_PING on a pipe pair is answered by
+/// Probe answers: with jitter, each PIPE_PING on a pipe pair is answered by
 /// a PIPE_ACK on the same pair's other direction.
 #[test]
 fn jittered_probes_are_answered_on_their_pipe_pair() {
@@ -301,7 +301,7 @@ fn jittered_probes_are_answered_on_their_pipe_pair() {
     assert!(a >= p, "{p} probes, {a} answers on the pair");
 }
 
-/// §21.7.7 item 6: probes, their answers and padding leave a pipe's traffic
+/// The traffic clock: probes, their answers and padding leave a pipe's traffic
 /// clock alone; stream data in either direction restarts it.
 #[test]
 fn since_last_traffic_counts_traffic_frames_only() {
@@ -353,10 +353,10 @@ impl Shaper for Delay {
         plan.delay = self.by;
     }
 
-    fn on_event(&mut self, _: &Event, _: &mut Reply) {}
+    fn on_event(&mut self, _: &Event, _: &mut Effects) {}
 }
 
-/// §21.7.7 item 7: probe records pass through the shaper; a delay longer
+/// Probes and shaping: probe records pass through the shaper; a delay longer
 /// than T_suspect's floor holds them, and the stall clock starts when the
 /// record goes, so the pipe is never suspected.
 #[test]
@@ -390,7 +390,7 @@ fn probes_are_shaped_and_a_delay_is_no_stall() {
     assert!(n.ends[A].error().is_none());
 }
 
-/// §21.7.7 item 9: the first wait of the bootstrap pipe, which has sent no
+/// The first probe wait: the first wait of the bootstrap pipe, which has sent no
 /// PIPE_PING, is drawn from [0, k] when j > 0, and is k with j = 0.
 #[test]
 fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
@@ -415,7 +415,7 @@ fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
     assert!(draws.iter().any(|d| *d < k * 3 / 4), "{draws:?}");
 }
 
-/// §21.7.7 item 9: the probe deadline is measured to the carrier. Records
+/// The probe deadline: it is measured to the carrier. Records
 /// that shaping may hold for up to `max_delay` (here held 2 s each) are
 /// built that much before the interval ends, so that each PIPE_PING is
 /// handed to the carrier at most k after the previous one.
@@ -457,7 +457,7 @@ impl Shaper for Unplanned {
         Caps::RECORD_IN
     }
 
-    fn on_event(&mut self, _: &Event, _: &mut Reply) {}
+    fn on_event(&mut self, _: &Event, _: &mut Effects) {}
 }
 
 /// H_p is nonzero only for a pipe whose shaper plans its records: a
@@ -483,7 +483,7 @@ fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
     assert!(g.iter().all(|d| d.abs_diff(k) <= slack), "{g:?}");
 }
 
-/// §21.7.7 item 9 (P3 to P6): in a quiet session the answer to a PIPE_PING
+/// Probe answers in a quiet session: in a quiet session the answer to a PIPE_PING
 /// goes only on the probed pipe pair, never on the primary pipe, and
 /// carries a PIPE_PING of its own once the answering pipe has been idle
 /// for R_p, even at an end whose idle probes are off.
@@ -523,7 +523,7 @@ fn quiet_answers_stay_on_the_probed_pair_and_probe_back() {
     );
 }
 
-/// MULTIPATH.md Section 7.1: when `DeadTimeout` is below T_suspect, the
+/// When `DeadTimeout` is below T_suspect, the
 /// suspicion and the failure of the last pipe fall due together, and the
 /// timer pass that suspects the pipe also fails it.
 #[test]
@@ -561,7 +561,7 @@ fn a_suspicion_and_a_failure_due_together_fire_in_one_pass() {
     );
 }
 
-/// MULTIPATH.md Section 7.1: a suspicion deadline that passed before its
+/// A suspicion deadline that passed before its
 /// timer pass ran stays pending through a critical section in between (a
 /// transmit at the later time), so the timer armed after it still fires it.
 #[test]
@@ -591,7 +591,7 @@ fn a_passed_suspicion_stays_pending() {
     );
 }
 
-/// SPEC.md Section 6.4: the keep-alive period in effect is capped at half
+/// The keep-alive period in effect is capped at half
 /// the effective idle timeout, and each wait is drawn from [k (1 - j), k]
 /// with the probe jitter j; an idle session whose peer answers stays open.
 #[test]

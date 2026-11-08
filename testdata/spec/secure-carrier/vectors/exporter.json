@@ -1,0 +1,118 @@
+[
+ {
+  "name": "session",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-zmux-session",
+  "context": "",
+  "length": 32,
+  "output": "0277a8f7a95224007b6388cece1b6f021d9a4b50a9ca2eedf661cbd775df2671"
+ },
+ {
+  "name": "pipe",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-zmux-pipe",
+  "context": "",
+  "length": 32,
+  "output": "7889c968347a49d409c8386f07c4d7f954025723757ed332abbc9e868f88f8e8"
+ },
+ {
+  "name": "context",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "636f6e74657874",
+  "length": 32,
+  "output": "3980b1821ea43907f05843e49e237791a54c1f5be02c663c719ac40c02eb0e92"
+ },
+ {
+  "name": "short",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 16,
+  "output": "51a216398a599223a872b9b028aee0b0"
+ },
+ {
+  "name": "long",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 64,
+  "output": "ee38aef26ed3d5bf1199ec5e4d2732df86b9ca38920e4e305a62c96ab539823c1a79abf01fb292b82e2ec0a66df8c2da4631eb3e01cc3b1459b4bbcb7097feff"
+ },
+ {
+  "name": "empty-label",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "",
+  "context": "",
+  "length": 1,
+  "output": "48"
+ },
+ {
+  "name": "longest",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 8160,
+  "output_sha256": "00d83e40cfb7a79bcc4ad5b443a3234212a719591ba5a5e95a506d782572e7f3"
+ },
+ {
+  "name": "longest-label-and-context",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "",
+  "label_fill": 255,
+  "context": "",
+  "context_fill": 65535,
+  "length": 32,
+  "output": "0685fc4162533975221a95ff404c8a9f41f57f717e69072ceae135c13f952851"
+ },
+ {
+  "name": "secret-longer-than-hash",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac16761b27b6b57ffa912b0bb27d18a02b8",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 32,
+  "output": "eb7e6b9cbef3a99dbb68233a26ee5fb11d6b9cbf93dbb0123224bfd9270d8d1a"
+ },
+ {
+  "name": "secret-shorter-than-hash",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6a",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 32,
+  "error": "invalid_config"
+ },
+ {
+  "name": "length-zero",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 0,
+  "error": "invalid_config"
+ },
+ {
+  "name": "length-over-limit",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "length": 8161,
+  "error": "invalid_config"
+ },
+ {
+  "name": "label-too-long",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "",
+  "label_fill": 256,
+  "context": "",
+  "length": 32,
+  "error": "invalid_config"
+ },
+ {
+  "name": "context-too-long",
+  "exporter_secret": "366884290735f5dd767124ef4d1852bf780407a3637336760637210ad13b6ac1",
+  "label": "EXPORTER-host",
+  "context": "",
+  "context_fill": 65536,
+  "length": 32,
+  "error": "invalid_config"
+ }
+]

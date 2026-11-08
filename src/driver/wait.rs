@@ -224,6 +224,8 @@ pub(crate) enum List<K> {
     Events,
     /// Pipe state changes (`Pipe::joined`).
     Pipes,
+    /// `close` calls waiting for the carriers to take CONNECTION_CLOSE.
+    Close,
     /// `ping` calls (a QX_PING response arrived).
     Ping,
     /// The session's hook task (a hook's input arrived).
@@ -494,7 +496,7 @@ impl<T: Waiting, F> Drop for Wait<'_, T, F> {
 /// Opening a stream of type `dir` (0 bidirectional, 1 unidirectional),
 /// waiting for stream credit in arrival order: `open` opens in the core,
 /// `after` ends the command (a blocked open may owe the peer a
-/// STREAMS_BLOCKED). Dropped while waiting, it leaves the queue and passes
+/// STREAMS_BLOCKED), told whether this open just began waiting for credit. Dropped while waiting, it leaves the queue and passes
 /// its turn on.
 pub(crate) struct Open<'a, T: Waiting, F, A> {
     mutex: &'a Mutex<T>,
@@ -520,7 +522,7 @@ impl<T, K, E, F, A> Future for Open<'_, T, F, A>
 where
     T: Waiting,
     F: FnMut(&mut T) -> Attempt<K, E> + Unpin,
-    A: FnMut(&mut T) + Unpin,
+    A: FnMut(&mut T, bool) + Unpin,
 {
     type Output = Result<K, E>;
 
@@ -529,9 +531,10 @@ where
         let mut state = Locked::lock(this.mutex);
         let turn = state.waits().0.open[this.dir].turn(this.ticket);
         let attempt = turn.then(|| (this.open)(&mut *state));
+        let queued = this.ticket.is_some();
         let (waiters, wakes) = state.waits();
         let r = waiters.open[this.dir].settle(&mut this.ticket, attempt, cx.waker(), wakes);
-        (this.after)(&mut *state);
+        (this.after)(&mut *state, !queued && this.ticket.is_some());
         r
     }
 }

@@ -1,5 +1,4 @@
-//! Receive-side flow control: releasing and issuing credit (SPEC.md
-//! Section 8.3) and window auto-tuning.
+//! Receive-side flow control: releasing and issuing credit and window auto-tuning.
 
 use std::time::Instant;
 
@@ -27,7 +26,7 @@ pub(super) struct IncreaseState {
 }
 
 impl SessionCore {
-    /// The session receive buffer cap (SPEC.md Section 8.3 rule 4).
+    /// The session receive buffer cap.
     pub(super) fn buffer_cap(&self) -> u64 {
         let tp = self.local_tp();
         // The stream counts the peer may have open (constant once granted;
@@ -77,7 +76,7 @@ impl SessionCore {
         self.streams.credit_consumed(cap, n);
     }
 
-    /// The MAX_DATA value to send now, after auto-tuning (rule RB).
+    /// The MAX_DATA value to send now, after auto-tuning.
     pub(super) fn session_credit_value(&mut self, now: Instant) -> u64 {
         let paused = self.streams.growth_paused();
         if !paused {
@@ -121,7 +120,7 @@ impl SessionCore {
 
     /// The largest session window now: a fixed cap within the memory
     /// allowance, or the automatic cap, the 96 MiB floor and above it the
-    /// allowance (SPEC.md Section 8.3 rule 4).
+    /// allowance.
     fn session_window_limit(&self) -> u64 {
         let allowance = self.session_allowance();
         match self.config.max_connection_receive_window {
@@ -262,7 +261,7 @@ impl SessionCore {
     }
 
     /// The MAX_STREAM_DATA value to send now for a stream, after
-    /// auto-tuning (rule RB); a grown stream window raises the session
+    /// auto-tuning; a grown stream window raises the session
     /// window to 1.5 times it.
     pub(super) fn stream_credit_value(&mut self, key: StreamKey, now: Instant) -> Option<u64> {
         let paused = self.streams.growth_paused();
@@ -294,10 +293,9 @@ impl SessionCore {
         Some(value)
     }
 
-    /// MAX_STREAMS for a discarded peer stream (SPEC.md Section 8.5).
+    /// MAX_STREAMS for a discarded peer stream.
     pub(super) fn stream_count_credit(&mut self, d: usize) {
-        // An endpoint that sent GOAWAY raises MAX_STREAMS no more
-        // (EXTENSIONS.md Section 3.3).
+        // An endpoint that sent GOAWAY raises MAX_STREAMS no more.
         let raise = !self.goaway_announced();
         self.streams.count_discarded(d, raise);
     }
@@ -307,7 +305,7 @@ impl SessionCore {
 mod tests {
     use super::*;
 
-    /// SPEC.md Section 8.3: every reset releases the session credit of
+    /// Every reset releases the session credit of
     /// the bytes in [Reliable Size, final size) that never arrived, each
     /// byte once, also after a FIN and when the Reliable Size is lowered;
     /// late copies release nothing, and bytes below the Reliable Size are
@@ -349,7 +347,7 @@ mod tests {
         assert_eq!(r.credit_owed(), 1500);
     }
 
-    /// SPEC.md Section 8.3: bytes beyond a gap (multipath) release credit
+    /// Bytes beyond a gap (multipath) release credit
     /// when they arrive, never before; the gap releases its own bytes when
     /// they arrive, and a reset releases the gap's bytes at or above the
     /// Reliable Size that never arrived.
@@ -409,6 +407,7 @@ mod tests {
         c.memory_budget = Some(crate::proto::session::Budget::Unlimited);
         c.max_connection_receive_window = Cap::Fixed(8 * MIB);
         c.send_buffer_max = Cap::Fixed(2 * MIB);
+        c.send_buffer = 2 * MIB;
         let mut s = session(c);
         s.grow_session_window(1 << 40);
         assert_eq!(s.streams.recv_flow().window, 8 * MIB);

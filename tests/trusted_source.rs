@@ -1,5 +1,5 @@
 //! The source of a TCP connection from a trusted intermediary is the
-//! client its PROXY protocol header reports (MULTIPATH.md Section 5.6).
+//! client its PROXY protocol header reports.
 
 use std::time::Duration;
 
@@ -59,7 +59,8 @@ async fn admitted_tcp_reads_the_proxy_header() {
                 .with_net(net.parse().unwrap())
                 .with_proxy_protocol(true);
             limits.admission = Some(admission);
-            let listener = zmux::Listener::new(zmux::Config::default(), limits);
+            let listener = zmux::Listener::new(zmux::Config::default(), limits)
+                .expect("valid listener configuration");
             let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = tcp.local_addr().unwrap();
             let serving = tokio::spawn(listener.clone().serve(tcp));

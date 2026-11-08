@@ -83,7 +83,7 @@ async fn carriers_go_with_the_session_task() {
     s2.write_all(b"pong").await.unwrap();
     recv.read_exact(&mut buf).await.unwrap();
     // Every handle is kept; the sessions close.
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     client.closed().await;
     server.closed().await;
     let start = Instant::now();
@@ -96,4 +96,73 @@ async fn carriers_go_with_the_session_task() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     drop((send, recv, s2, r2, client, server));
+}
+
+/// Dropped stream handles are released by the session, without waiting in the drop, also
+/// after pipe 0 failed: the release is not tied to the bootstrap pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_streams_are_released_after_pipe_0_went() {
+    use zmux::{Listener, ListenerConfig, PipeAuth, PipeHint, PipeId, PipeOptions};
+    let mut c = Config::default();
+    c.max_pipes = 4;
+    c.pipe_auth = PipeAuth::psk(*b"carrier-release-0123456789abcdef").with_end_to_end();
+    let listener = Listener::new(c.clone(), ListenerConfig::default()).unwrap();
+    let carrier = || {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let l = listener.clone();
+        tokio::spawn(async move {
+            let _ = l
+                .handle_pipe(
+                    PipeIo::new(b),
+                    PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+                )
+                .await;
+        });
+        PipeIo::new(a)
+    };
+    let client = Session::connect(carrier(), c).await.unwrap();
+    let server = listener.accept().await.unwrap();
+    client
+        .add_pipe(carrier(), PipeOptions::default())
+        .await
+        .unwrap();
+    client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
+    let active = |s: &Session| s.stats().streams_active;
+    for round in 0..4 {
+        let (mut w, r) = client.open_bi().await.unwrap();
+        w.write_all(b"unfinished").await.unwrap();
+        let (sw, mut sr) = server.accept_bi().await.unwrap();
+        let mut buf = [0; 10];
+        sr.read_exact(&mut buf).await.unwrap();
+        let begun = Instant::now();
+        match round {
+            0 => drop((w, r, sw, sr)),
+            1 => drop((sr, sw, r, w)),
+            // On a thread outside the runtime, as a binding's finalizer drops them.
+            2 => std::thread::spawn(move || drop((w, r, sw, sr)))
+                .join()
+                .unwrap(),
+            _ => {
+                drop((w, r));
+                assert!(sr.read_to_end(1 << 10).await.is_err());
+                drop((sw, sr));
+            }
+        }
+        assert!(
+            begun.elapsed() < Duration::from_millis(100),
+            "a drop blocked"
+        );
+        let start = Instant::now();
+        while active(&client) + active(&server) > 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "round {round}: {} and {} streams active",
+                active(&client),
+                active(&server)
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    client.close(0u32.into(), b"").await;
+    listener.close();
 }

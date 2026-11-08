@@ -1,14 +1,13 @@
-//! Formats carried inside frame payloads: the stream preamble
-//! (EXTENSIONS.md Section 4) at the start of a stream's data, and the flow
-//! prefix of DATAGRAM data (EXTENSIONS.md Section 6.3). Violations of either
-//! are PROTOCOL_VIOLATION.
+//! Formats carried inside frame payloads: the stream preamble at the
+//! start of a stream's data, and the flow prefix of DATAGRAM data.
+//! Violations of either are PROTOCOL_VIOLATION.
 
 use super::codec::{Cursor, Writer};
 use super::error::{EncodeError, Error};
 use super::frame::Priority;
 use super::varint::{self, len as vlen};
 
-/// Preamble TLV types (REGISTRY.md Section 5).
+/// Preamble TLV types.
 pub mod tlv {
     /// OPEN_INFO: the opener's metadata for the peer application.
     pub const OPEN_INFO: u64 = 0x01;
@@ -17,9 +16,9 @@ pub mod tlv {
     /// DEADLINE: reserved; never sent, ignored on receipt.
     pub const DEADLINE: u64 = 0x03;
     /// PIPE_CARRIER: empty; the stream carries a pipe pair of a nested
-    /// session (EXTENSIONS.md Section 10).
+    /// session.
     pub const PIPE_CARRIER: u64 = 0x05;
-    /// The first type of the application range (EXTENSIONS.md Section 4.3).
+    /// The first type of the application range.
     pub const APPLICATION_FIRST: u64 = 0x1000;
     /// The last type of the application range.
     pub const APPLICATION_LAST: u64 = 0x3fff;
@@ -57,8 +56,8 @@ pub const fn is_grease_tlv_type(ty: u64) -> bool {
 }
 
 /// Whether `ty` is an application TLV type: 0x1000 to 0x3fff, GREASE values
-/// excluded (EXTENSIONS.md Section 4.3). zmux never interprets these and
-/// delivers them to the application in the order received.
+/// excluded. zmux never interprets these and delivers them to the
+/// application in the order received.
 pub const fn is_application_tlv_type(ty: u64) -> bool {
     ty >= tlv::APPLICATION_FIRST && ty <= tlv::APPLICATION_LAST && !is_grease_tlv_type(ty)
 }
@@ -159,10 +158,10 @@ pub struct WirePreamble<'a> {
 }
 
 impl<'a> WirePreamble<'a> {
-    /// Parses the preamble from the data of the STREAM frame at offset 0
-    /// (EXTENSIONS.md Section 4.4). `limit` is the receiver's Maximum
-    /// Preamble Size. Returns the preamble and its size (Length field plus
-    /// Length), where the application data starts.
+    /// Parses the preamble from the data of the STREAM frame at offset 0.
+    /// `limit` is the receiver's Maximum Preamble Size. Returns the
+    /// preamble and its size (Length field plus Length), where the
+    /// application data starts.
     pub fn parse(frame_data: &'a [u8], limit: u64) -> Result<(Self, usize), Error> {
         let pv = |reason| Error::protocol_violation(0, reason);
         let (len, width) =
@@ -279,7 +278,7 @@ impl<'a> WirePreamble<'a> {
     }
 }
 
-/// The association of a datagram (EXTENSIONS.md Section 6.3).
+/// The association of a datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Flow {
     /// Flow 0: the session as a whole.
@@ -353,8 +352,9 @@ mod tests {
 
     #[test]
     fn preamble_round_trip() {
-        // WIRE_EXAMPLES.md Section 2.1: OPEN_INFO, PRIORITY urgency 1 and
-        // an empty GREASE TLV of type 0x21, then "hello".
+        // The specification's preamble wire example: OPEN_INFO,
+        // PRIORITY urgency 1 and an empty GREASE TLV of type 0x21, then
+        // "hello".
         let data = b"\x16\x01\x0fexample.com:443\x02\x01\x20\x21\x00hello";
         let (p, size) = WirePreamble::parse(data, 4096).unwrap();
         assert_eq!(p.open_info, Some(&b"example.com:443"[..]));
@@ -373,9 +373,9 @@ mod tests {
         assert_eq!(WirePreamble::parse(&[0x00], 1).unwrap().1, 1);
     }
 
-    /// EXTENSIONS.md Section 4.3: application TLVs in order, repeats
-    /// included; GREASE values in the range and other types are not
-    /// application TLVs; PIPE_CARRIER is empty and at most once.
+    /// Application TLVs in order, repeats included; GREASE values in
+    /// the range and other types are not application TLVs; PIPE_CARRIER
+    /// is empty and at most once.
     #[test]
     fn application_tlvs_and_pipe_carrier() {
         let mut tlvs = Vec::new();

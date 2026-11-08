@@ -1,5 +1,5 @@
 //! QUIC carriers over loopback: a session's lanes on further streams of
-//! its connection, a carrier-bound join over a second connection through a
+//! its connection, a Bound join over a second connection through a
 //! listener, and a connection that closes once nothing of zmux holds it.
 
 use std::sync::Arc;
@@ -69,7 +69,10 @@ impl Quic {
 fn config(auth: PipeAuth) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = auth;
+    c.pipe_auth = auth.with_end_to_end();
+    c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
+        |_, _, _| true,
+    )));
     c
 }
 
@@ -140,7 +143,7 @@ async fn lanes_ride_further_streams_and_the_connection_closes_once_unused() {
 
     // Nothing of zmux keeps the connection once the sessions and their
     // pipes are gone: it closes, and the server sees it.
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
     drop(cs);
     tokio::time::timeout(Duration::from_secs(10), sc.closed())
         .await
@@ -149,9 +152,10 @@ async fn lanes_ride_further_streams_and_the_connection_closes_once_unused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_carrier_bound_join_over_a_second_connection() {
+async fn a_bound_join_over_a_second_connection() {
     let quic = Quic::new();
-    let listener = Listener::new(config(PipeAuth::exporter()), ListenerConfig::default());
+    let listener = Listener::new(config(PipeAuth::exporter()), ListenerConfig::default())
+        .expect("valid listener configuration");
     let (c1, s1) = quic.connect().await;
     let (c2, s2) = quic.connect().await;
     let _s1 = QuicCarrier::with_listener(s1, &listener, Options::default());
@@ -165,7 +169,10 @@ async fn a_carrier_bound_join_over_a_second_connection() {
     let server = listener.accept().await.unwrap();
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let pipe = client
-        .add_pipe(q2.open_pipe().await.unwrap(), PipeOptions::default())
+        .begin_add_pipe(
+            q2.open_pipe().await.unwrap(),
+            PipeOptions::default().with_mode(zmux::proto::seal::Mode::Bound),
+        )
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while pipe.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
@@ -181,7 +188,7 @@ async fn a_carrier_bound_join_over_a_second_connection() {
     while let Ok(Some(e)) = tokio::time::timeout(Duration::ZERO, server.next_event()).await {
         assert!(!matches!(e, SessionEvent::JoinAuthFailed { .. }), "{e:?}");
     }
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A rustls configuration pair for "localhost" without ALPN identifiers.
@@ -222,7 +229,8 @@ async fn connect_and_serve_with_zmux_alpn() {
     )
     .unwrap();
     let addr = server_ep.local_addr().unwrap();
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let serving = tokio::spawn(zmux_quinn::serve(
         listener.clone(),
         server_ep,
@@ -239,7 +247,7 @@ async fn connect_and_serve_with_zmux_alpn() {
     assert_eq!(server.protocol().as_deref(), Some("qmux-02"));
     transfer(&client, &server, 4, 1 << 20).await;
     transfer(&server, &client, 4, 1 << 20).await;
-    client.close(0u32.into(), b"bye");
+    client.close(0u32.into(), b"bye").await;
     assert!(matches!(
         server.closed().await,
         zmux::SessionError::ApplicationClosed { remote: true, .. }

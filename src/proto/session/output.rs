@@ -52,7 +52,7 @@ enum Step {
     Full,
     /// Nothing more from this stream on this pipe now: the retransmit
     /// budget is spent, the pipe is JOINING while new data has another
-    /// (rule S1), the reinjection hold is used up, or only reinjected
+    /// usable pipe, the reinjection hold is used up, or only reinjected
     /// information is owed, which goes elsewhere.
     Budget,
 }
@@ -164,7 +164,7 @@ impl Pick for LanePick {
 }
 
 /// A pipe of a multipath session: the scheduler's decisions, one per chunk
-/// of new data (MULTIPATH.md Section 11). A decision is worked out again
+/// of new data. A decision is worked out again
 /// only when its gate or the pipe views changed: the same inputs give the
 /// same decision. The scan of the queues goes on where the last chunk was
 /// taken while nothing before that place was passed over by the decision
@@ -223,8 +223,7 @@ pub(crate) struct BatchLog {
     /// Pipes whose PIPE_ABANDON the current batch carries.
     abandons_sent: Vec<u64>,
     /// Credit frames sent while the window was the bottleneck, with the
-    /// pipe that carried them: a copy goes on a second pipe (MULTIPATH.md
-    /// Section 6.5).
+    /// pipe that carried them: a copy goes on a second pipe.
     pub(super) credit_copies: Vec<(mpath::CreditCopy, u64)>,
     /// The tier loads of the gates of the batch being written.
     gate_inputs: GateInputs,
@@ -246,6 +245,28 @@ impl BatchLog {
 }
 
 impl SessionCore {
+    /// Whether the pipe's output waits for
+    /// [`Self::release_first_flight`] (a CONNECTION_CLOSE does not wait).
+    pub(super) fn holds_first_flight(&self, pipe: u64) -> bool {
+        pipe == 0
+            && self.first_held.is_some()
+            && !matches!(self.state, State::Closing | State::Closed)
+    }
+
+    /// Ends [`EarlyData::hold_first_flight`](super::EarlyData::hold_first_flight):
+    /// what is queued is built into records for the bootstrap carrier's next
+    /// write, as far as one batch holds it, and the handshake timeout starts.
+    /// Returns whether the first flight was held; other calls do nothing.
+    pub fn release_first_flight(&mut self, now: Instant) -> bool {
+        if self.first_held.take().is_none() {
+            return false;
+        }
+        if self.state == State::Establishing {
+            self.handshake_deadline = now.checked_add(self.config.handshake_wait());
+        }
+        true
+    }
+
     /// Whether any pipe has something to write (drivers wake their writers
     /// on it).
     pub fn wants_write_any(&self) -> bool {
@@ -274,7 +295,7 @@ impl SessionCore {
     }
 
     /// A credit update (MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA) waits:
-    /// a PIPE_ACK goes in the same batch (MULTIPATH.md Section 6.3).
+    /// a PIPE_ACK goes in the same batch.
     pub(super) fn credit_update_pending(&self) -> bool {
         self.streams.credit_update_pending()
     }
@@ -322,7 +343,7 @@ impl SessionCore {
     }
 
     /// Whether stream `key` owes only a FIN that neither stream nor session
-    /// credit nor the retransmit budget holds back (SPEC.md Section 8.2):
+    /// credit nor the retransmit budget holds back:
     /// a FIN-only frame of an opened stream, or one that opens a stream
     /// without a preamble while the peer's stream limit lets it.
     pub(super) fn fin_only(&self, key: StreamKey) -> bool {
@@ -381,7 +402,7 @@ impl SessionCore {
             return true;
         }
         // A delayed record of the pipe holds back every lane of it, the
-        // first record of a new one included (MULTIPATH.md Section 5.8).
+        // first record of a new one included.
         if self.shape.is_some() && self.shape_delayed(id) {
             return false;
         }
@@ -417,7 +438,7 @@ impl SessionCore {
         // New data waits for session credit or the retransmit budget;
         // reinjected information does not.
         let fresh = !self.streams.session_stalled() && budget_left;
-        // A FIN-only frame waits for neither (SPEC.md Section 8.2): looked
+        // A FIN-only frame waits for neither: looked
         // for only while they hold new data back.
         let found = self.any_stream_on(&d, fresh)
             || (!fresh
@@ -450,7 +471,7 @@ impl SessionCore {
                 return true;
             };
             match s.send.as_ref() {
-                Some(send) if s.open_pending && s.goaway.is_none() => {
+                Some(send) if s.opening_owed() => {
                     let len = send.preamble_left as u64;
                     len <= send.max_data.saturating_sub(send.offset) && len <= session_room
                 }
@@ -480,6 +501,11 @@ impl SessionCore {
         out: &mut TransmitBuf,
     ) -> Transmit {
         let at = at.into();
+        if self.holds_first_flight(at.pipe.0) {
+            self.tick(now);
+            out.clear();
+            return Transmit::Idle;
+        }
         if at.lane.0 != 0 {
             return self.poll_lane(at.pipe.0, at.lane.0, now, out);
         }
@@ -493,7 +519,7 @@ impl SessionCore {
         let Some(BatchStart {
             framing,
             parameters,
-            join,
+            joined_first,
             live,
             close_sent,
             shutdown,
@@ -508,6 +534,8 @@ impl SessionCore {
             Framing::ByteStream => self.max_record(),
             Framing::Records => self.max_record().min(out.max_message().max(MIN_MESSAGE)),
         };
+        let carrier_max = self.out_ref(id).and_then(OutPipe::max_record);
+        let max_record = carrier_max.map_or(max_record, |m| max_record.min(m));
         let mut w = Records::new(out, max_record);
         if self.shape.is_some() {
             w.shape = self.shape_lend(id, 0, max_record, now);
@@ -521,7 +549,7 @@ impl SessionCore {
                 // The planned record waits for its delay, and everything
                 // the pipe owes with it.
                 if let Some(o) = self.out_mut(id) {
-                    o.unbegin_batch(parameters, join);
+                    o.unbegin_batch(parameters, joined_first);
                 }
                 self.shape_return(&mut w);
                 return Transmit::Idle;
@@ -529,7 +557,7 @@ impl SessionCore {
         }
         if parameters {
             self.offer_exporter_only_with_one();
-            // QX_TRANSPORT_PARAMETERS opens the first record (SPEC.md 5.1).
+            // QX_TRANSPORT_PARAMETERS opens the first record.
             let grease = Some(config::grease_ref(&self.grease));
             let tp = self.local_parameters();
             let n = tp.frame_len(grease);
@@ -537,7 +565,7 @@ impl SessionCore {
             w.out
                 .push_with(n, |dst| tp.encode_frame(grease, dst).unwrap_or(0));
             // Without a carrier RTT, a QX_PING request in the first record
-            // gives auto-tuning an early sample (SPEC.md Section 5.1 rule 3).
+            // gives auto-tuning an early sample.
             if id == 0
                 && self.carrier_rtt.is_none()
                 && self.config.hooks.rtt.is_none()
@@ -547,24 +575,19 @@ impl SessionCore {
                 self.write_ping_request(&mut w, now);
             }
         }
-        if let Some((buf, len)) = join {
-            // An in-band PIPE_JOIN is the first frame of the pipe; then a
-            // complete PIPE_ACK snapshot and a PIPE_PING, in that order,
-            // continuing in the next record when they do not fit
-            // (MULTIPATH.md Section 5.2).
-            let len = usize::from(len);
-            w.force(len);
-            w.out.push_bytes(&buf[..len]);
-            w.elicit();
+        if joined_first {
+            // A complete PIPE_ACK snapshot and a PIPE_PING, in that order, continuing in
+            // the next record when they do not fit; a request
+            // changed while JOINING goes on the attachment itself.
             self.write_pipe_ack(id, &mut w, now);
-            if let Some(o) = self.out_mut(id) {
-                o.want_ping(now);
-            }
             self.write_pipe_ping(id, &mut w, now);
+            if let Some(i) = self.att_index(id) {
+                self.write_status(i, &mut w);
+            }
         }
         if self.state == State::Closing && self.close_waiting() {
-            // The close waits for the other lanes (SPEC.md Section 6.5 step
-            // 1); the acknowledgements the peer waits for meanwhile go.
+            // The close waits for the other lanes; the acknowledgements the peer waits for
+            // meanwhile go.
             self.write_single_pipe_ack(&mut w, now);
             w.end_record();
             let records = self.shape_finish(w);
@@ -609,13 +632,13 @@ impl SessionCore {
             if let Some(p) = self.out_mut(id) {
                 p.close_written();
             }
-            // Linger from the time the close is written (SPEC.md 6.5).
+            // Linger from the time the close is written.
             self.linger_deadline = Some(now + self.linger_timeout());
             self.maybe_closed(now);
             return Transmit::Shutdown;
         }
         if shutdown {
-            // A drained pipe (MULTIPATH.md Section 8.2) or a failed one.
+            // A drained pipe or a failed one.
             let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
@@ -626,7 +649,7 @@ impl SessionCore {
         }
         if self.early_open() && id == 0 {
             // Early data: the fence, then openings and stream data within
-            // the floor (SPEC.md Section 6.1.2).
+            // the floor.
             if (self.opening_ready() || self.data_pending()) && self.write_fence(&mut w) {
                 self.write_openings(&mut w);
                 self.write_stream_data(id, &mut w);
@@ -689,7 +712,7 @@ impl SessionCore {
             .is_some_and(|m| !m.batch().abandons_sent.is_empty())
         {
             // Handing our PIPE_ABANDON to a carrier may complete an
-            // exchange, and with it a drain (MULTIPATH.md Section 8.2).
+            // exchange, and with it a drain.
             let mut sent = std::mem::take(&mut self.mp_mut().batch_mut().abandons_sent);
             for &pipe in &sent {
                 self.exchange_progress(pipe, now);
@@ -711,9 +734,8 @@ impl SessionCore {
             return Transmit::Idle;
         }
         // A record passed to the carrier restarts the idle timer outside
-        // multipath, unless it carries only a QX_PING request (SPEC.md
-        // Section 6.4): an unanswered keep-alive must not keep a dead
-        // session open. In a multipath session only acknowledged activity
+        // multipath, unless it carries only a QX_PING request: an unanswered keep-alive must not
+        // keep a dead session open. In a multipath session only acknowledged activity
         // counts. Protocol rule.
         if !self.is_multipath() {
             if self.pipe_ack.is_some() {
@@ -759,7 +781,7 @@ impl SessionCore {
                 return Transmit::Idle;
             };
             // The first record holds PIPE_LANE and the PADDING shaping
-            // adds (MULTIPATH.md Section 5.8), and waits for the delay of
+            // adds, and waits for the delay of
             // the pipe's planned record; its bytes are outside the pipe's
             // send order.
             let frame = Frame::PipeLane(PipeLane {
@@ -921,7 +943,7 @@ impl SessionCore {
     }
 
     /// The current record carries an activity frame (multipath idle
-    /// timer, SPEC.md Section 6.4).
+    /// timer).
     pub(super) fn note_activity(&mut self, w: &Records<'_>) {
         if let Some(m) = self.batch_log() {
             let idx = w.record_index();
@@ -935,6 +957,9 @@ impl SessionCore {
 
     /// PIPE_PING, PIPE_ACK, PIPE_ABANDON and PIPE_STATUS for pipe `id`.
     pub(super) fn write_pipe_frames(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {
+        if !self.write_epoch(id, w, now) {
+            return;
+        }
         self.write_pipe_ping(id, w, now);
         if self.write_pipe_ack(id, w, now) && !self.write_credit_copies(id, w) {
             return;
@@ -953,9 +978,8 @@ impl SessionCore {
         self.write_abandon(w, None);
         for i in 0..self.atts.len() {
             // No PIPE_STATUS for our own attachment while it is JOINING: a
-            // changed request goes out once it is ACTIVE (MULTIPATH.md
-            // Section 5.7 step 3).
-            if !self.atts.at(i).joining_local() && !self.write_status(i, w) {
+            // changed request goes out once it is ACTIVE.
+            if !self.atts.at(i).status_held() && !self.write_status(i, w) {
                 return;
             }
         }
@@ -1002,7 +1026,7 @@ impl SessionCore {
 
     fn write_ping_request(&mut self, w: &mut Records<'_>, now: Instant) -> bool {
         if self.requests.available(now) == 0 {
-            // Rate-limited (SPEC.md 9.4.3 rule 1): later, not lost.
+            // Rate-limited: later, not lost.
             return true;
         }
         let seq = self.ping.next_seq;
@@ -1039,7 +1063,7 @@ impl SessionCore {
             self.ping.response_pending = None;
             self.note_activity(w);
         }
-        // A fence request follows its GOAWAY (EXTENSIONS.md Section 3.3).
+        // A fence request follows its GOAWAY.
         if self.ping.request_pending
             && self.ping.outstanding.is_none()
             && !(self.goaway().fence_pending && self.goaway().pending.is_some())
@@ -1125,7 +1149,7 @@ impl SessionCore {
         if let Some((bidi, uni)) = self.goaway().resend
             && self.goaway().pending.is_none()
         {
-            // The current watermarks again (MULTIPATH.md Section 7.4).
+            // The current watermarks again.
             let code = self.goaway().shutdown.unwrap_or(0);
             let frame = Frame::GoAway(GoAwayFrame {
                 max_bidi: bidi,
@@ -1187,10 +1211,11 @@ impl SessionCore {
         let Some(s) = self.streams.get_mut(key) else {
             return Ok(());
         };
-        // A stream without an identifier, or whose opening frame is not
-        // written yet, is queued again once it is (`assign_id`,
-        // `write_openings`); its control state waits.
-        let Some(id) = s.id.filter(|_| !s.open_pending) else {
+        // Without an identifier a control frame has nothing to carry: the
+        // stream is queued again when it gets one (`assign_id`). Once it has
+        // one, nothing waits for the opening frame, which credit may hold
+        // back.
+        let Some(id) = s.id else {
             return Ok(());
         };
         if let Some(r) = s.recv.as_mut()
@@ -1324,8 +1349,8 @@ impl SessionCore {
     }
 
     /// Writes the opening frames of pinned streams, per type in identifier
-    /// order, stopping at the first that credit holds back (SPEC.md Section
-    /// 7.2: no stream's first frame before those of lower-numbered ones).
+    /// order, stopping at the first that credit holds back (no stream's first frame before those of
+    /// lower-numbered ones).
     fn write_openings(&mut self, w: &mut Records<'_>) {
         for d in [BIDI, UNI] {
             let mut opened = false;
@@ -1333,11 +1358,14 @@ impl SessionCore {
                 let pending = self
                     .streams
                     .get(key)
-                    .is_some_and(|s| s.open_pending && s.goaway.is_none());
+                    .is_some_and(stream::Stream::opening_owed);
                 if pending {
                     match self.write_opening(key, w) {
-                        Ok(true) => {}
-                        Ok(false) => break,
+                        Ok(true) => self.after_send_progress(key),
+                        Ok(false) => {
+                            self.report_opening_blocked(key);
+                            break;
+                        }
                         Err(Full) => return,
                     }
                 }
@@ -1349,6 +1377,25 @@ impl SessionCore {
             if opened && self.streams.pinned(d).is_empty() {
                 self.schedule_unopened(d);
             }
+        }
+    }
+
+    /// Reports the limit that holds back the opening frame of pinned stream
+    /// `key`: the peer may give no credit before it
+    /// learns that.
+    fn report_opening_blocked(&mut self, key: StreamKey) {
+        let session_room = self.streams.send_flow().room();
+        let Some(send) = self.streams.send_mut(key) else {
+            return;
+        };
+        let len = send.preamble_left as u64;
+        if len > send.max_data.saturating_sub(send.offset) {
+            if send.blocked_reported != Some(send.max_data) {
+                send.blocked_at = Some(send.max_data);
+                self.streams.queue_ctrl(key);
+            }
+        } else if len > session_room {
+            self.streams.report_data_blocked();
         }
     }
 
@@ -1413,8 +1460,8 @@ impl SessionCore {
     }
 
     /// Writes a reset the stream owes, once the data below its Reliable
-    /// Size is written (SPEC.md Section 4.3); in a multipath session also
-    /// again when it was lost with a pipe (MULTIPATH.md Section 7.4).
+    /// Size is written; in a multipath session also
+    /// again when it was lost with a pipe.
     fn write_reset(&mut self, key: StreamKey, id: u64, w: &mut Records<'_>) -> Result<(), Full> {
         let peer_rsa = self.send_tp().is_some_and(|t| t.reset_stream_at);
         let mp = self.retains();
@@ -1490,7 +1537,7 @@ impl SessionCore {
         } else if held {
             send.state = SendState::ResetSent;
         } else {
-            // Outside multipath a written reset is acknowledged (SPEC.md 7.4).
+            // Outside multipath a written reset is acknowledged.
             send.state = SendState::ResetRecvd;
         }
         let after = send.unacked();
@@ -1579,7 +1626,7 @@ impl SessionCore {
                 Step::SessionBlocked => {
                     // Blocked by session credit, at the limit or by a
                     // preamble that does not fit in what is left: report it
-                    // once per limit (SPEC.md Section 8.4).
+                    // once per limit.
                     if let Some(limit) = self.streams.report_data_blocked()
                         && w.try_frame(&Frame::DataBlocked(DataBlocked { limit }))
                     {
@@ -1617,8 +1664,8 @@ impl SessionCore {
     }
 
     /// Stream data for pipe `pipe` in a multipath session: reinjected data
-    /// first, then new data of the streams the scheduler places on the pipe
-    /// (MULTIPATH.md Section 11), by urgency and round robin.
+    /// first, then new data of the streams the scheduler places on the pipe, by urgency and round
+    /// robin.
     pub(super) fn write_stream_data_mp(&mut self, pipe: u64, w: &mut Records<'_>) {
         // Redundant copies queued for the pipe go first.
         if !self.write_copies(pipe, w) {
@@ -1667,7 +1714,7 @@ impl SessionCore {
                     self.decision(pipe, gate)
                 }
             };
-            // Reinjected information goes first (MULTIPATH.md Section 11 rule S3).
+            // Reinjected information goes first.
             // Reinjected information goes to the eligible pipe with the
             // earliest arrival; other pipes go on with new data meanwhile.
             if let Some((u, key)) = self.first_lost().filter(|&(_, k)| {
@@ -1690,8 +1737,7 @@ impl SessionCore {
                 p.at = (0, 0);
                 continue;
             }
-            // Opportunistic copies of the data that blocks the window
-            // (Section 7.5.1).
+            // Opportunistic copies of the data that blocks the window.
             let copied = self.stats.bytes_opportunistic;
             if !self.write_opportunistic(pipe, self.now, d.gate, w) {
                 return Next::Stop;
@@ -1703,7 +1749,7 @@ impl SessionCore {
                 p.at = (0, 0);
             }
             if self.streams.session_stalled() {
-                // Only FIN-only frames go (SPEC.md Section 8.2).
+                // Only FIN-only frames go.
                 self.write_credit_free(w, Some(&d));
                 return Next::Stop;
             }
@@ -1806,7 +1852,7 @@ impl SessionCore {
         }
     }
 
-    /// Re-sends lost stream data or a lost FIN (MULTIPATH.md Section 7.4).
+    /// Re-sends lost stream data or a lost FIN.
     /// The frame at offset 0 carries the whole preamble.
     fn write_lost_frame(&mut self, key: StreamKey, w: &mut Records<'_>) -> Step {
         let Some(send) = self.streams.send(key) else {
@@ -1834,6 +1880,17 @@ impl SessionCore {
         let Ok((n, fin)) = self.write_copy(key, start, end, fin_ok, w) else {
             return Step::Full;
         };
+        let tx = self.tx;
+        if start == 0
+            && let Some(m) = self
+                .stream_mut(key)
+                .send
+                .as_mut()
+                .and_then(|s| s.mp.as_deref_mut())
+        {
+            // A first batch may have carried the opening frame; this one is the record's.
+            m.open_pipe.get_or_insert(tx);
+        }
         self.batch_stream_bytes += n;
         self.note_lane_frame(key);
         if let Some(o) = self.out_mut(self.tx) {
@@ -1928,6 +1985,7 @@ impl SessionCore {
             explicit_len: true,
         };
         w.stream_header(&header);
+        w.not_earned += header.encoded_len() as u64 + n;
         let send = self.stream_mut(key).send.as_mut().expect("present");
         let mut at = start;
         let stop = start + n;
@@ -2023,8 +2081,7 @@ impl SessionCore {
         if s.id.is_none() {
             let d = di(s.dir);
             if self.streams.local_dir(d).goaway.is_some() {
-                // After a GOAWAY no stream emits its first frame
-                // (EXTENSIONS.md Section 3.5 rule 2).
+                // After a GOAWAY no stream emits its first frame.
                 self.reject_unopened(key, stream::GoAwayFail::GoingAway);
                 return Step::Done;
             }
@@ -2050,9 +2107,8 @@ impl SessionCore {
             if w.stream_room(|_| need, need).is_none_or(|(r, _)| r < need) {
                 return Step::Full;
             }
-            // The identifier goes with the first frame (SPEC.md Section
-            // 7.2): not assigned while the limiter holds back the bytes
-            // that frame would carry.
+            // The identifier goes with the first frame: not assigned while the limiter holds back
+            // the bytes that frame would carry.
             if (self.pace_left == Some(0) || w.gate_out()) && self.opening_paced(key) {
                 return Step::Full;
             }
@@ -2061,7 +2117,7 @@ impl SessionCore {
         let session_room = self.streams.send_flow().room();
         let mp = self.retains();
         // Sent bytes stay held for a retransmission, or while carrier early
-        // data may still be rejected (SPEC.md Section 6.1.2).
+        // data may still be rejected.
         let retain = mp || self.early_retains();
         // Multipath: the retransmit budget, one chunk per
         // decision for every policy but `affinity` (spreading, overflow
@@ -2092,13 +2148,6 @@ impl SessionCore {
             {
                 cap = cap.min(self.config.spread_chunk as u64);
             }
-            // Rule S1: a JOINING pipe takes new data only while no pipe is
-            // usable (a decision without a tier gate).
-            if self.out_ref(pipe).is_some_and(|o| {
-                o.state() == pipes::OutState::Joining && (gate.is_some() || !o.joining_takes())
-            }) {
-                return Step::Budget;
-            }
         }
         // The stream and the session's chunk pool are borrowed together.
         let (s, chunks) = self.streams.stream_and_chunks(key).expect("stream present");
@@ -2127,6 +2176,20 @@ impl SessionCore {
         };
         let fin_owed = send.fin && !send.fin_sent && send.cold().reset.is_none();
         if available == 0 && !fin_owed {
+            if send.open_want && send.cold().reset.is_none() {
+                // A flush of a stream with nothing to carry: an empty
+                // opening frame.
+                return match self.write_opening(key, w) {
+                    Ok(_) => {
+                        if let Some(send) = self.streams.send_mut(key) {
+                            send.open_want = false;
+                        }
+                        self.after_send_progress(key);
+                        Step::Done
+                    }
+                    Err(Full) => Step::Full,
+                };
+            }
             if !send.has_pending() {
                 // Nothing is owed any more (reinjected information was
                 // acknowledged meanwhile): the direction leaves the queue
@@ -2160,7 +2223,7 @@ impl SessionCore {
         let pre = send.preamble_left;
         if (credit as usize) < pre {
             // The preamble goes whole into the frame at offset 0; report
-            // the limit that holds it back (SPEC.md Section 8.4).
+            // the limit that holds it back.
             if stream_room < pre as u64 {
                 if send.blocked_reported != Some(send.max_data) {
                     send.blocked_at = Some(send.max_data);
@@ -2230,6 +2293,7 @@ impl SessionCore {
         }
         let off = send.offset;
         send.offset += n;
+        send.open_want = false;
         send.deficit -= n as i64;
         let lanes = self.tx_lanes;
         if send.state == SendState::Ready {
@@ -2237,7 +2301,7 @@ impl SessionCore {
         }
         if fin {
             send.fin_sent = true;
-            // Outside multipath a written FIN is acknowledged (SPEC.md 7.4);
+            // Outside multipath a written FIN is acknowledged;
             // in a multipath session a PIPE_ACK must cover it.
             send.state = if retain {
                 SendState::DataSent
@@ -2272,7 +2336,7 @@ impl SessionCore {
         if !more && send.priority.urgency() <= 2 {
             // An urgent write ends its record, so the receiver, which
             // decodes whole records, does not wait for the bulk data
-            // behind it (SPEC.md Section 3.3).
+            // behind it.
             w.end_record();
         }
         // The quantum is used up, up to less than a small fragment that
@@ -2290,7 +2354,7 @@ impl SessionCore {
         let reset_owed = send.cold().reset.is_some_and(|r| !r.written)
             && (!more || send.reset_reliable().is_some_and(|r| send.offset >= r));
         self.streams.sent(n, app);
-        if app > 0 {
+        if app > 0 || pre > 0 {
             self.after_send_progress(key);
         }
         if reset_owed {
@@ -2315,7 +2379,7 @@ impl SessionCore {
     }
 
     /// A local stream that never sent a frame fails after the peer's
-    /// GOAWAY: it never opens (EXTENSIONS.md Section 3.5).
+    /// GOAWAY: it never opens.
     pub(super) fn reject_unopened(&mut self, key: StreamKey, why: stream::GoAwayFail) {
         let s = self.stream_mut(key);
         s.goaway = Some(why);
@@ -2323,6 +2387,7 @@ impl SessionCore {
         if let Some(send) = s.send.as_mut() {
             unsent = send.buf.len();
             send.buf.clear();
+            send.open_want = false;
             send.state = SendState::ResetRecvd;
         }
         if let Some(r) = s.recv.as_mut() {
@@ -2382,7 +2447,7 @@ impl SessionCore {
     }
 
     /// Allocates the next identifier of a local stream's type and builds
-    /// its preamble (SPEC.md Section 7.2, EXTENSIONS.md Section 4).
+    /// its preamble.
     pub(super) fn assign_id(&mut self, key: StreamKey) {
         let client = matches!(self.role, Role::Initiator);
         let mp = self.retains();
@@ -2440,7 +2505,7 @@ impl SessionCore {
     }
 
     /// The GREASE TLV of the session's first preamble: the test hook's, or
-    /// a random one (EXTENSIONS.md Section 4.3).
+    /// a random one.
     fn grease_tlv(&self) -> (u64, Vec<u8>) {
         if let Some(g) = &self.config.hooks.grease_tlv {
             return g.clone();
@@ -2460,7 +2525,7 @@ impl SessionCore {
         let mut sent = false;
         if let Some(send) = self.streams.send_mut(key) {
             send.pop_marks();
-            sent = send.sent_waiting && send.buf.is_empty();
+            sent = send.sent_waiting && send.buf.is_empty() && send.preamble_left == 0;
             send.sent_waiting &= !sent;
         }
         self.sync_holder(key);
@@ -2493,24 +2558,24 @@ pub(super) struct Records<'a> {
     max_record: usize,
     records: u64,
     /// A frame other than a QX_PING request (or PADDING) was written: the
-    /// batch restarts the idle timer (SPEC.md Section 6.4).
+    /// batch restarts the idle timer.
     pub(super) activity: bool,
-    /// The record of the last ack-eliciting frame written (SPEC.md
-    /// Section 1.4), by its index in the batch: the bytes in flight end
-    /// with it.
+    /// The record of the last ack-eliciting frame written, by its index in the batch: the bytes in
+    /// flight end with it.
     eliciting: Option<u64>,
     /// A frame that goes ahead of bulk data was written, other than an
     /// acknowledgement or credit.
     pub(super) exchange: bool,
     /// A traffic frame was written: STREAM, RESET_STREAM,
-    /// RESET_STREAM_AT, STOP_SENDING or DATAGRAM (MULTIPATH.md Section
-    /// 7.1, the busy window).
+    /// RESET_STREAM_AT, STOP_SENDING or DATAGRAM (the busy window).
     pub(super) traffic: bool,
     /// A QX_PING was written: with `traffic`, the activity a PIPE_ACK
-    /// confirms in a session with acknowledgement (SPEC.md Section 6.4).
+    /// confirms in a session with acknowledgement.
     ping: bool,
     /// The pipe's shaping state, lent for the batch.
     pub(super) shape: Option<super::shape::ShapeTx>,
+    /// Padding, injections and copies written, which the batch does not earn.
+    pub(super) not_earned: u64,
 }
 
 impl<'a> Records<'a> {
@@ -2525,6 +2590,7 @@ impl<'a> Records<'a> {
             traffic: false,
             ping: false,
             shape: None,
+            not_earned: 0,
         }
     }
 
@@ -2534,7 +2600,8 @@ impl<'a> Records<'a> {
         match &mut self.shape {
             // Each message is a write call; a byte stream's batch is one.
             Some(t) if !self.out.in_record() => {
-                t.prep(self.max_record, self.records == 0 || self.out.is_records())
+                let records = self.out.is_records();
+                t.prep(self.max_record, self.records == 0 || records, !records)
             }
             Some(t) => t.cut_or(self.max_record),
             None => self.max_record,
@@ -2687,9 +2754,8 @@ impl<'a> Records<'a> {
     }
 
     /// Opens a record of its own for one frame of `n` bytes, more than
-    /// the batch's record size (a large datagram, EXTENSIONS.md Section
-    /// 6.6): the record may exceed the write-call bound by what the frame
-    /// needs. `false` when the batch already holds records and has no
+    /// the batch's record size (a large datagram): the record may exceed the write-call bound by
+    /// what the frame needs. `false` when the batch already holds records and has no
     /// room left for it.
     pub(super) fn own_record(&mut self, n: usize) -> bool {
         self.end_record();
@@ -2818,6 +2884,12 @@ impl<'a> Records<'a> {
             // The batch is full: no record is open, so nothing may be
             // written (even a frame without data, such as a lone FIN).
             return None;
+        }
+        if min > cap
+            && cap < self.max_record
+            && let Some(t) = self.shape.as_mut()
+        {
+            t.count_clamped();
         }
         self.out.begin_record(self.max_record);
         Some((fits - MAX_STREAM_HEADER, least))

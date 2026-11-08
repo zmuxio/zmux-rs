@@ -1,10 +1,10 @@
 [package]
 name = "zmux-shaping"
-version = "1.2.5"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-description = "A zmux Shaper driven by state machines read from a versioned definition"
+description = "Shaping configuration for zmux: state machines, handshake plans and pool policies"
 repository = "https://github.com/zmuxio/zmux-rs"
 readme = "README.md"
 keywords = ["zmux"]
@@ -17,11 +17,9 @@ tokio = ["zmux/tokio"]
 [dependencies]
 rand_chacha = "0.10"
 getrandom = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-zmux = { version = "1.2.5", path = "..", default-features = false }
+zmux = { version = "1.3.0", path = "..", default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1.54", features = ["full"] }
-zmux = { version = "1.2.5", path = "..", features = ["tokio"] }
+zmux = { version = "1.3.0", path = "..", features = ["tokio"] }

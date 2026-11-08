@@ -15,7 +15,7 @@ description = "Interoperability tests between zmux and the `qmux` crate over TCP
 
 [dev-dependencies]
 bytes = "1"
-qmux = { version = "=0.6.2", default-features = false, features = ["tcp"] }
+qmux = { version = "=0.6.6", default-features = false, features = ["tcp"] }
 tokio = { version = "1.54", features = ["full"] }
 web-transport-trait = "0.5"
 zmux = { path = "../.." }

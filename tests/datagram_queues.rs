@@ -1,5 +1,5 @@
-//! The datagram queue knobs (API.md Section 6, knob 10; EXTENSIONS.md
-//! Section 6.5): each bounds its queue as configured, the oldest making
+//! The datagram queue knobs:
+//! each bounds its queue as configured, the oldest making
 //! room, and zero is not a configuration.
 
 use std::time::Instant;

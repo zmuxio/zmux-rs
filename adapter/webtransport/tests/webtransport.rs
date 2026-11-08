@@ -120,7 +120,8 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
 async fn connect_and_serve() {
     let opts = Options::default();
     let mut wt = Wt::new(&opts);
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let serving = tokio::spawn(zmux_webtransport::serve(
         listener.clone(),
         (*wt.server.take().unwrap()).clone(),
@@ -133,7 +134,7 @@ async fn connect_and_serve() {
     assert_kind([&client, &server], zmux::CarrierKind::WebTransport);
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(0u32.into(), b"bye");
+    client.close(0u32.into(), b"bye").await;
     let e = tokio::time::timeout(Duration::from_secs(10), server.closed())
         .await
         .expect("closed");
@@ -171,7 +172,43 @@ async fn lanes_without_a_listener() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(cs.pipe_stats()[0].lanes_out > 1, "no lane was opened");
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
+}
+
+/// The exporter gives the connection's value while it lives, the same at
+/// both ends, and does not keep it: a session handle outlives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_exporter_does_not_keep_the_connection() {
+    let opts = Options::default();
+    let mut wt = Wt::new(&opts);
+    let config = Config::multipath(PipeAuth::exporter().with_end_to_end());
+    let listener = Listener::new(config.clone(), ListenerConfig::default())
+        .expect("valid listener configuration");
+    let serving = tokio::spawn(zmux_webtransport::serve(
+        listener.clone(),
+        (*wt.server.take().unwrap()).clone(),
+        opts.clone(),
+    ));
+    let client = zmux_webtransport::connect(&wt.client, wt.url.clone(), &opts, config)
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    assert_eq!(
+        client.export_keying_material("app", b"", 16).unwrap(),
+        server.export_keying_material("app", b"", 16).unwrap()
+    );
+    client.close(0u32.into(), b"").await;
+    for s in [&client, &server] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while s.export_keying_material("app", b"", 16) != Err(zmux::ExportError::Unavailable) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the exporter kept the connection");
+    }
+    listener.close();
+    serving.await.unwrap();
 }
 
 /// Through a listener, in a multipath session: the listener takes the
@@ -180,8 +217,10 @@ async fn lanes_without_a_listener() {
 async fn lanes_through_a_listener() {
     let opts = Options::default();
     let mut wt = Wt::new(&opts);
-    let config = Config::multipath(PipeAuth::psk(*b"zmux-webtransport-test-psk-01234"));
-    let listener = Listener::new(config.clone(), ListenerConfig::default());
+    let config =
+        Config::multipath(PipeAuth::psk(*b"zmux-webtransport-test-psk-01234").with_end_to_end());
+    let listener = Listener::new(config.clone(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let (cw, sw) = wt.pair().await;
     let _server = WebTransportCarrier::with_listener(sw, &listener, opts.clone());
     let client = WebTransportCarrier::new(cw, opts);
@@ -193,7 +232,41 @@ async fn lanes_through_a_listener() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(cs.pipe_stats()[0].lanes_out > 1, "no lane was opened");
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
-    cs.close(0u32.into(), b"");
+    cs.close(0u32.into(), b"").await;
+}
+
+/// A Bound join on a further stream of the WebTransport session: the carrier declares the
+/// Bound contract and its Binding is the connection's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_join_on_a_further_stream() {
+    let opts = Options::default();
+    let mut wt = Wt::new(&opts);
+    let mut config = Config::multipath(PipeAuth::exporter().with_end_to_end());
+    // Bound joins only when the carrier says it is secure.
+    config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
+        |c, mode, _| mode != zmux::proto::seal::Mode::Bound || c.secure,
+    )));
+    let listener = Listener::new(config.clone(), ListenerConfig::default())
+        .expect("valid listener configuration");
+    let (cw, sw) = wt.pair().await;
+    let _server = WebTransportCarrier::with_listener(sw, &listener, opts.clone());
+    let client = WebTransportCarrier::new(cw, opts);
+    let cs = Session::connect(client.open_pipe().await.unwrap(), config)
+        .await
+        .unwrap();
+    let ss = listener.accept().await.unwrap();
+    let pipe = cs
+        .begin_add_pipe(
+            client.open_pipe().await.unwrap(),
+            zmux::PipeOptions::new().with_mode(zmux::proto::seal::Mode::Bound),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+        .await
+        .expect("joined in time")
+        .unwrap();
+    transfer(&ss, &cs, 4, 256 << 10).await;
+    cs.close(0u32.into(), b"").await;
 }
 
 /// A WebTransport session that ends under the zmux session is a failure of
@@ -264,7 +337,8 @@ async fn an_admission_decides_on_the_session_request() {
     });
     let opts = Options::default().with_fallback(fallback);
     let mut wt = Wt::new(&opts);
-    let listener = Listener::new(Config::default(), admitted(Some(admission)));
+    let listener = Listener::new(Config::default(), admitted(Some(admission)))
+        .expect("valid listener configuration");
     let serving = tokio::spawn(zmux_webtransport::serve(
         listener.clone(),
         (*wt.server.take().unwrap()).clone(),
@@ -279,7 +353,7 @@ async fn an_admission_decides_on_the_session_request() {
     other.set_path("/other");
     assert!(wt.client.connect(other).await.is_err());
     assert_eq!(rx.recv().await.unwrap(), "/other");
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     listener.close();
     serving.await.unwrap();
 }
@@ -298,7 +372,8 @@ async fn a_bound_token_in_the_session_request() {
     let listener = Listener::new(
         Config::default(),
         admitted(Some(zmux::Admission::prefix_auth(verifier))),
-    );
+    )
+    .expect("valid listener configuration");
     let serving = tokio::spawn(zmux_webtransport::serve(
         listener.clone(),
         (*wt.server.take().unwrap()).clone(),
@@ -329,7 +404,7 @@ async fn a_bound_token_in_the_session_request() {
         let client = Session::connect(pipe, Config::default()).await.unwrap();
         let server = listener.accept().await.unwrap();
         transfer(&client, &server, 1, 64 << 10).await;
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     };
     tokio::time::timeout(limit, body).await.unwrap();
     listener.close();
@@ -350,7 +425,8 @@ async fn a_request_forwarded_from_early_data_is_answered_425() {
     for admission in [None, Some(admission)] {
         let opts = Options::default();
         let mut wt = Wt::new(&opts);
-        let listener = Listener::new(Config::default(), admitted(admission));
+        let listener = Listener::new(Config::default(), admitted(admission))
+            .expect("valid listener configuration");
         let serving = tokio::spawn(zmux_webtransport::serve(
             listener.clone(),
             (*wt.server.take().unwrap()).clone(),
@@ -374,7 +450,7 @@ async fn a_request_forwarded_from_early_data_is_answered_425() {
 }
 
 /// A session with datagrams enabled sends them as datagrams of the
-/// WebTransport session (EXTENSIONS.md Section 6.8), both ways.
+/// WebTransport session, the pipe's datagram channel, both ways.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn datagrams_ride_webtransport_datagrams() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -382,7 +458,8 @@ async fn datagrams_ride_webtransport_datagrams() {
         config.enable_datagrams = true;
         let opts = Options::default();
         let mut wt = Wt::new(&opts);
-        let listener = Listener::new(config.clone(), ListenerConfig::default());
+        let listener = Listener::new(config.clone(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let serving = tokio::spawn(zmux_webtransport::serve(
             listener.clone(),
             (*wt.server.take().unwrap()).clone(),
@@ -411,7 +488,7 @@ async fn datagrams_ride_webtransport_datagrams() {
             (c.datagrams_received_channel, s.datagrams_received_channel),
             (20, 20)
         );
-        client.close(0u32.into(), b"bye");
+        client.close(0u32.into(), b"bye").await;
         let _ = server.closed().await;
         listener.close();
         serving.await.unwrap();

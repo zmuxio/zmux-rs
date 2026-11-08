@@ -1,5 +1,4 @@
-//! Hooks whose answers the core needs run outside every lock
-//! (CONFORMANCE.md):
+//! Hooks whose answers the core needs run outside every lock:
 //! a custom scheduling policy on the driver's task or thread, and
 //! `allow_connection_window_increase` on the session's hook task or thread.
 
@@ -74,7 +73,7 @@ impl Pick for LeastUnsent {
 fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"hooks-test-psk--0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"hooks-test-psk--0123456789abcdef").with_end_to_end();
     c
 }
 
@@ -82,7 +81,8 @@ fn mp_config() -> Config {
 async fn sink() -> (SocketAddr, Listener) {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(mp_config(), ListenerConfig::default());
+    let listener = Listener::new(mp_config(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move {
         while let Ok((c, peer)) = tcp.accept().await {
@@ -127,7 +127,7 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
         .await
         .unwrap();
     client
-        .add_pipe(
+        .begin_add_pipe(
             PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
             PipeOptions::default(),
         )
@@ -150,7 +150,7 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
         "{:?}",
         client.close_reason()
     );
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     (stats, policy)
 }
 
@@ -253,7 +253,7 @@ async fn window_transfer(approve: bool, panic: bool) -> (u64, u64) {
     writer.await.unwrap();
     let growth = receiver.window_growth();
     slot.lock().unwrap().take();
-    sender.close(0u32.into(), b"");
+    sender.close(0u32.into(), b"").await;
     receiver.closed().await;
     (growth, calls.load(Ordering::SeqCst))
 }
@@ -304,7 +304,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     )
     .unwrap();
     client
-        .add_pipe(
+        .begin_add_pipe(
             zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
             PipeOptions::default(),
         )

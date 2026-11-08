@@ -1,13 +1,13 @@
-//! An attachment's tier settings (MULTIPATH.md Section 9): the local
-//! settings of its outbound direction, the request for the peer's, the
-//! peer's request, and the PIPE_STATUS frames owed.
+//! An attachment's tier settings: the local settings of its outbound
+//! direction, the request for the peer's, the peer's request, and the
+//! PIPE_STATUS frames owed.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use super::PrioritySource;
 
-/// An attachment's tier settings (MULTIPATH.md Section 9).
+/// An attachment's tier settings.
 #[derive(Debug, Clone)]
 pub(crate) struct TierState {
     /// Local settings of the outbound direction; `None` follows the peer's
@@ -18,7 +18,7 @@ pub(crate) struct TierState {
     receive_priority: u64,
     receive_standby: bool,
     /// A standby takeover is announced: the request says "available" until
-    /// a non-standby pipe is usable again (MULTIPATH.md Section 9).
+    /// a non-standby pipe is usable again.
     takeover: bool,
     /// The peer's latest request (standby, priority) and its sequence.
     peer: Option<(bool, u64)>,
@@ -159,8 +159,8 @@ impl TierState {
 
     // ---- changing -------------------------------------------------------------------
 
-    /// The settings of a new attachment's options (MULTIPATH.md Section
-    /// 9); the initial request travels in the PIPE_JOIN (Section 5.1).
+    /// The settings of a new attachment's options; the initial request
+    /// travels in the Hello.
     pub(crate) fn configure(
         &mut self,
         send_priority: Option<u64>,
@@ -210,7 +210,7 @@ impl TierState {
     }
 
     /// The joiner's initial request for our outbound direction, carried
-    /// by its PIPE_JOIN with sequence number 0 (MULTIPATH.md Section 5.1).
+    /// by its Hello with sequence number 0.
     pub(crate) fn join_request(&mut self, standby: bool, priority: u64) {
         self.peer = Some((standby, priority));
     }

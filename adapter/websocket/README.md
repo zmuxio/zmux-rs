@@ -5,8 +5,7 @@ WebSocket pipe carriers for [zmux](../../README.md) over `tokio-tungstenite`.
 Every binary message carries one record's Frames field (message framing),
 so intermediaries that re-chunk the byte stream cannot break records. The
 subprotocol is the ALPN identifier (`qmux-02` by default, `qmux-01`
-accepted), and the `Zmux-Pipe-Join` request header carries an out-of-band
-join to a listener.
+accepted).
 
 - `connect(url, options, config)` / `dial(request, options)`: a session, or
   a carrier for a further pipe, over a new WebSocket;
@@ -34,7 +33,10 @@ A Close frame is the graceful end of a pipe; a connection that ends
 without one is a failure. Over plain TCP a failed pipe is aborted without a
 Close frame. For `wss://`, `dial_tls` and `connect_tls` take the
 application's `tokio_rustls::TlsConnector`; `dial_over` upgrades an
-established TLS stream.
+established TLS stream. With the `wss` feature (off by default), `dial` and
+`connect` also take `wss://` URLs, trusting the Mozilla roots of
+`webpki-roots` with rustls's ring provider; `tls_connector` makes a connector
+of other roots.
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {

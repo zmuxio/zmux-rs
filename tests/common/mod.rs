@@ -263,7 +263,8 @@ pub(crate) async fn accept(pipe: PipeIo, config: Config) -> Result<Session, zmux
     if config.max_pipes == 1 && config.resume_timeout.is_none() {
         return Session::accept(pipe, config).await;
     }
-    let listener = zmux::Listener::new(config, zmux::ListenerConfig::default());
+    let listener = zmux::Listener::new(config, zmux::ListenerConfig::default())
+        .expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(pipe, zmux::PipeHint::default()).await });
     listener

@@ -1,4 +1,4 @@
-//! Carrier modes through intermediaries (API.md Section 4.8): one unified
+//! Carrier modes through intermediaries: one unified
 //! endpoint with prefix authentication serves every kind, and a test proxy
 //! in front of it behaves as common reverse proxies and CDNs do. Auto mode
 //! picks the best kind each path passes; an explicit mode never falls back;
@@ -36,7 +36,7 @@ async fn origin(config: Config) -> (std::net::SocketAddr, Listener) {
     let verifier = Arc::new(PrefixAuthVerifier::new(auth(), 1, 4096));
     let mut limits = ListenerConfig::default();
     limits.admission = Some(Admission::prefix_auth(verifier));
-    let listener = Listener::new(config, limits);
+    let listener = Listener::new(config, limits).expect("valid listener configuration");
     let exchange = ExchangeServer::new(&listener, exchange_options()).unwrap();
     let endpoint = Endpoint::new(listener.clone(), Options::default().with_exchange(exchange))
         .with_websocket(zmux_websocket::Options::default());
@@ -144,6 +144,12 @@ async fn auto_picks_the_best_kind_each_path_passes() {
         let cases: Vec<(&str, Option<Profile>, &[CarrierKind], Vec<_>)> = vec![
             ("direct", None, &ORDER, vec![(WebSocket, Usable)]),
             (
+                "transparent proxy",
+                Some(Profile::TRANSPARENT),
+                &[Streaming, WebSocket],
+                vec![(Streaming, Usable)],
+            ),
+            (
                 "reverse proxy",
                 Some(Profile::REVERSE_PROXY),
                 &ORDER,
@@ -193,7 +199,7 @@ async fn auto_picks_the_best_kind_each_path_passes() {
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(tries(&client), expect, "{name}");
             works(&client).await;
-            client.close(0u32.into(), b"");
+            client.close(0u32.into(), b"").await;
         }
     })
     .await
@@ -233,7 +239,7 @@ async fn explicit_never_falls_back() {
         .await
         .unwrap();
         works(&client).await;
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     })
     .await
     .unwrap();
@@ -242,7 +248,7 @@ async fn explicit_never_falls_back() {
 fn multipath() -> Config {
     let mut c = config();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"carrier-modes-psk-0123456789abcd");
+    c.pipe_auth = PipeAuth::psk(*b"carrier-modes-psk-0123456789abcd").with_end_to_end();
     c
 }
 
@@ -277,7 +283,7 @@ async fn auto_with_joins_moves_off_the_exchange() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         works(&client).await;
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     })
     .await
     .unwrap();

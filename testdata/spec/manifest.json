@@ -1,26 +1,26 @@
 {
   "protocol": "zmux",
   "counts": {
-    "traces": 369,
-    "trace_steps": 6085,
+    "traces": 372,
+    "trace_steps": 7051,
     "traces_by_group": {
       "compat": 10,
-      "core": 156,
+      "core": 155,
       "ext": 51,
       "findings": 3,
-      "multipath": 132,
-      "resume": 17
+      "multipath": 135,
+      "resume": 18
     },
-    "wire_valid": 59,
-    "wire_invalid": 92
+    "wire_valid": 57,
+    "wire_invalid": 100
   },
   "sha256": {
-    "assets/registry.json": "d7406d873dd8baab7536b93596f5c41f685f1a40a240fdf4e8cd1c60879ec02d",
-    "fixtures/profiles.json": "3c80e2960070593fa6630ab027bb8f2be142546e91f9487ba1489833363462a4",
-    "fixtures/wire/valid.ndjson": "bd0aa9bd9644e20c27c6fea55e35d65d59648e6c7ab479cc3894dd40da852cc5",
-    "fixtures/wire/invalid.ndjson": "41479aba13b4d23daa5b149dee1c120035c67452b6311de94d2dbc7cad08ac84",
-    "fixtures/traces/index.json": "75dc42cdacbed4aa90b4e9c9d441f5798cbc09f389d5cc6b2bc3560aadf0f1a5",
-    "WIRE_EXAMPLES.md": "397e11e56169c1b42193ccab7ae01b4f72bd89be5996fd440fd7d429f1b1ee9b"
+    "assets/registry.json": "bfcee5f019d82ec78af9a453b21985b1a7aa093657f992c45f3443b8c1e08926",
+    "fixtures/profiles.json": "8efe1ec711b76bf85c657c16eb9411682b7101aa0db1a5ed2a8c1698f38ac89c",
+    "fixtures/wire/valid.ndjson": "7cafc4488518721b044644fcf7979000f6fa4cb0d375d9853ed6367157352a69",
+    "fixtures/wire/invalid.ndjson": "027805f0ff24796d9d847473a4cab8cc08d1f1447ef818d22b0d44ccb6a2a106",
+    "fixtures/traces/index.json": "29ae4d1cd75a2274c1cf6c3433e82d0ab043522e530cc9d1ec7b372aff7e3c53",
+    "WIRE_EXAMPLES.md": "0df557fa54d0abae95381e0fa303efc1e5d9684cd92d3cf17b4afd82301ca312"
   },
-  "traces_sha256": "e1e619312a64746bca5ab424817b43c9bfc49c9f1900be1027f5c2324d7c2081"
+  "traces_sha256": "0e5634f02f596ceafd07932313962a9b75d3a5facd3fff8effcf00aaa2e560f6"
 }

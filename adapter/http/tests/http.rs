@@ -15,7 +15,8 @@ use zmux_http::{Http2Connection, Options};
 
 /// A listener served on loopback: its address and the serving task.
 async fn server(config: Config) -> (String, Listener, tokio::task::JoinHandle<()>) {
-    let listener = Listener::new(config, ListenerConfig::default());
+    let listener =
+        Listener::new(config, ListenerConfig::default()).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     let serving = tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
@@ -66,7 +67,7 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
 async fn round_trip_and_close(client: Session, server: Session) {
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(3u32.into(), b"bye");
+    client.close(3u32.into(), b"bye").await;
     let e = tokio::time::timeout(Duration::from_secs(5), server.closed())
         .await
         .expect("closed");
@@ -107,7 +108,8 @@ async fn a_session_over_http2() {
 /// `handle_request`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_exchange_carries_both_directions() {
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -136,11 +138,11 @@ async fn one_exchange_carries_both_directions() {
     transfer(&client, &server, 1, 1 << 20).await;
     transfer(&server, &client, 1, 1 << 20).await;
     assert_eq!(requests.load(Ordering::SeqCst), 1, "one exchange");
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 fn multipath() -> Config {
-    Config::multipath(PipeAuth::psk(*b"zmux-http-test-psk-0123456789abc"))
+    Config::multipath(PipeAuth::psk(*b"zmux-http-test-psk-0123456789abc").with_end_to_end())
 }
 
 /// HTTP/2: two pipes of a multipath session on one connection (the join
@@ -156,7 +158,7 @@ async fn http2_pipes_share_a_connection_and_lanes_only_when_enabled() {
         let client = conn.connect_session(multipath()).await.unwrap();
         let server = listener.accept().await.unwrap();
         let second = client
-            .add_pipe(conn.open_pipe().await.unwrap(), PipeOptions::new())
+            .begin_add_pipe(conn.open_pipe().await.unwrap(), PipeOptions::new())
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), second.joined())
             .await
@@ -174,7 +176,7 @@ async fn http2_pipes_share_a_connection_and_lanes_only_when_enabled() {
         } else {
             assert_eq!(most, 1, "a lane was opened while lanes are off");
         }
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     }
     listener.close();
     serving.await.unwrap();
@@ -265,7 +267,8 @@ fn tls(client_alpn: &[u8]) -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcce
 async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
     for alpn in [&b"h2"[..], b"http/1.1"] {
         let (connector, acceptor) = tls(alpn);
-        let listener = Listener::new(Config::default(), ListenerConfig::default());
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let l = listener.clone();
@@ -322,13 +325,13 @@ async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
 }
 
 /// A full setup limit ends the oldest handshake rather than refusing the
-/// new client (MULTIPATH.md Section 5.6).
+/// new client.
 #[tokio::test]
 async fn a_stalled_handshake_yields_its_setup_slot() {
     let (connector, acceptor) = tls(b"http/1.1");
     let mut limits = ListenerConfig::default();
     limits.max_pending = 1;
-    let listener = Listener::new(Config::default(), limits);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let l = listener.clone();
@@ -374,7 +377,7 @@ async fn serve_admitted(
 ) -> (String, Listener) {
     let mut limits = ListenerConfig::default();
     limits.admission = admission;
-    let listener = Listener::new(Config::default(), limits);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     tokio::spawn(zmux_http::serve(listener.clone(), tcp, options));
@@ -519,7 +522,7 @@ async fn an_admitted_request_carries_a_session() {
     let server = listener.accept().await.unwrap();
     transfer(&client, &server, 1, 64 << 10).await;
     transfer(&server, &client, 1, 64 << 10).await;
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
 }
 
 /// A fallback decision hands the request to the fallback handler with
@@ -608,7 +611,7 @@ async fn a_client_writes_its_token_first_on_the_request_body() {
         let server = listener.accept().await.unwrap();
         transfer(&client, &server, 1, 64 << 10).await;
         transfer(&server, &client, 1, 64 << 10).await;
-        client.close(0u32.into(), b"");
+        client.close(0u32.into(), b"").await;
     }
     let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
     let e = zmux_http::dial_http1(&addr, &Options::default().with_credential(Arc::new(bound)))

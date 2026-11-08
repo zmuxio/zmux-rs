@@ -1,4 +1,4 @@
-//! The unified endpoint (API.md Section 4.8):
+//! The unified endpoint of the carrier modes:
 //! every HTTP carrier on one request target, told apart by the request
 //! head alone ([`classify`]), each handed to its adapter.
 

@@ -1,6 +1,6 @@
-//! Streams as pipes: a bidirectional stream of an
-//! outer session as the carrier of a pipe pair of a nested session, mapped
-//! as EXTENSIONS.md Section 10.2 specifies.
+//! Streams as pipes: a bidirectional stream of an outer session as the
+//! carrier of a pipe pair of a nested session, mapped as the stream
+//! carrier of the zmux specification.
 //!
 //! | Pipe | Outer stream |
 //! |---|---|
@@ -20,11 +20,10 @@
 //! carrier queue limiter, and the outer stream's
 //! own send buffer is never reported as the carrier's unsent bytes.
 //!
-//! A pipe never runs over its own session (EXTENSIONS.md Section 10.2): a
-//! table of the process records the sessions whose streams carry pipes of
-//! other sessions, and a carrier is refused when its outer session runs,
-//! directly or through other sessions of the process, over the session it
-//! is for.
+//! A pipe never runs over its own session: a table of the process records
+//! the sessions whose streams carry pipes of other sessions, and a
+//! carrier is refused when its outer session runs, directly or through
+//! other sessions of the process, over the session it is for.
 
 use std::io;
 use std::pin::Pin;
@@ -174,7 +173,7 @@ impl AsyncWrite for StreamWriter {
 impl Drop for StreamWriter {
     /// Any end but the graceful one is an abort: reset with
     /// ZMUX_CARRIER_FAILED (on the opener's part RESET_STREAM_AT keeping the
-    /// preamble, EXTENSIONS.md Section 4.5).
+    /// preamble).
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.send.reset_shared(carrier_failed());
@@ -182,12 +181,11 @@ impl Drop for StreamWriter {
     }
 }
 
-/// The nesting table of the process (MULTIPATH.md Section 5.4 step 7): one edge
-/// per pipe carried by a stream,
-/// from the session the pipe belongs to (`inner`) to the session whose
-/// stream carries it (`outer`). A leaf lock: no other lock is taken while
-/// it is held, so a loop check and the recording of the edge it allows are
-/// one atomic step.
+/// The nesting table of the process: one edge per pipe carried by a
+/// stream, from the session the pipe belongs to (`inner`) to the session
+/// whose stream carries it (`outer`). A leaf lock: no other lock is taken
+/// while it is held, so a loop check and the recording of the edge it
+/// allows are one atomic step.
 struct Edge {
     inner: Weak<Shared<Tokio>>,
     pipe: u64,

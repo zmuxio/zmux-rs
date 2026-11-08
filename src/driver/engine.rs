@@ -6,7 +6,9 @@
 use std::io::IoSlice;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(feature = "tokio")]
+use bytes::BytesMut;
 
 use super::CallLimit;
 use crate::proto::record::Framing;
@@ -47,9 +49,9 @@ pub(crate) fn fire_timers(core: &mut Core, now: Instant) -> bool {
 
 /// How a driver's write calls behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) enum Calls {
     /// Non-blocking calls that may take part of a batch.
+    #[cfg(feature = "tokio")]
     NonBlocking,
     /// Blocking calls on a writer thread: a call's bytes are handed on
     /// when it returns.
@@ -94,7 +96,7 @@ enum Told {
 
 impl Progress {
     /// A blocking call handed `bytes` to the carrier at `start`.
-    #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
+    #[cfg(feature = "blocking")]
     pub(crate) fn started(&mut self, start: Instant, bytes: usize) {
         self.pending = Some(Pending {
             start,
@@ -131,8 +133,7 @@ impl Progress {
     /// Hands the report to the core, under its lock, when it changes what
     /// the core holds; returns whether it did. U is 0 unless the carrier
     /// refused bytes; then, with a low-water mark (`low_water`), up to the
-    /// mark the core gives it plus what the last call added (MULTIPATH.md
-    /// Section 7.1).
+    /// mark the core gives it plus what the last call added.
     pub(crate) fn report(
         &mut self,
         core: &mut Core,
@@ -209,6 +210,7 @@ pub(crate) struct Outbound {
     owned_head: usize,
     owned_end: usize,
     /// The copies of built bytes in `owned`, split off as they are made.
+    #[cfg(feature = "tokio")]
     scratch: BytesMut,
 }
 
@@ -229,6 +231,7 @@ impl Outbound {
             owned: Vec::new(),
             owned_head: 0,
             owned_end: 0,
+            #[cfg(feature = "tokio")]
             scratch: BytesMut::new(),
         }
     }
@@ -238,13 +241,13 @@ impl Outbound {
     }
 
     /// The batch, whole (written or not).
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn batch(&self) -> &TransmitBuf {
         &self.out
     }
 
     /// Where the unwritten rest of the batch starts.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn pos(&self) -> usize {
         self.pos
     }
@@ -270,7 +273,7 @@ impl Outbound {
     }
 
     /// Drops the batch: the write side is closed.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn clear(&mut self) {
         self.out.clear();
         self.restart();
@@ -288,7 +291,7 @@ impl Outbound {
     }
 
     /// The batch's buffers go while the pipe is idle.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn release(&mut self) {
         self.out.shrink();
         self.msg = Vec::new();
@@ -297,13 +300,13 @@ impl Outbound {
     }
 
     /// The batch's storage is that of a small batch.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn is_small(&self) -> bool {
         self.out.is_small()
     }
 
     /// Heap bytes held.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn capacity(&self) -> usize {
         self.out.capacity()
             + self.msg.capacity()
@@ -323,7 +326,7 @@ impl Outbound {
         input: bool,
     ) -> bool {
         let id = id.into();
-        self.tell(core, id);
+        self.tell(core, id, now);
         if !self.out.is_empty() || self.shutdown || !core.wants_write(id) {
             return false;
         }
@@ -332,6 +335,7 @@ impl Outbound {
         // while latency-sensitive work waits (whatever the carrier is: these
         // use zmux's own state and rate estimate).
         let batch = match self.calls {
+            #[cfg(feature = "tokio")]
             Calls::NonBlocking => core.batch_limit(id.pipe, DEFAULT_BATCH, input),
             Calls::Blocking => DEFAULT_BATCH,
         };
@@ -381,7 +385,7 @@ impl Outbound {
     }
 
     /// The cached call limit (for writes with a budget of their own).
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn current_call_limit(&self) -> usize {
         self.call_limit
     }
@@ -413,7 +417,7 @@ impl Outbound {
     /// most `limit` bytes of the rest of the batch (the next message,
     /// whole, on a message-framed carrier), referenced payloads shared and
     /// built bytes copied once. The carrier leaves what it takes empty.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn chunks(&mut self, limit: usize) -> &mut [Bytes] {
         let head = self.owned_head;
         if self.framing == Framing::Records {
@@ -459,13 +463,49 @@ impl Outbound {
         &mut self.owned[head..end]
     }
 
+    /// Every remaining message of a message-framed carrier, each one buffer,
+    /// for a carrier that takes them in one call
+    /// ([`ChunkWrite::takes_message_batches`](super::tokio::ChunkWrite::takes_message_batches)).
+    #[cfg(feature = "tokio")]
+    pub(crate) fn message_batch(&mut self) -> &mut [Bytes] {
+        let head = self.owned_head;
+        if head == self.owned.len() {
+            let (mut pos, mut index) = (self.pos, self.msg_index);
+            while pos < self.out.len() {
+                let len = self
+                    .out
+                    .message_lens()
+                    .get(index)
+                    .copied()
+                    .unwrap_or(self.out.len() - pos);
+                self.owned_end += self.out.owned_pieces(
+                    &mut self.cursor,
+                    pos,
+                    len,
+                    true,
+                    &mut self.owned,
+                    &mut self.scratch,
+                );
+                pos += len;
+                index += 1;
+            }
+        }
+        &mut self.owned[head..]
+    }
+
     /// Tells the core, under its lock, the bytes the carrier took since
     /// it was last told: what is left of the batch counts in Q_p
     /// ([`Core::pipe_written`]). [`Outbound::take_batch`] does it first.
-    pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>) {
-        let n = std::mem::take(&mut self.untold);
+    /// The last byte of a batch that ends with a shutdown is told once the
+    /// shutdown is done: a close counts as handed off only when the
+    /// carrier's write side is shut, so a process that exits then leaves no
+    /// half-written carrier behind.
+    pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>, now: Instant) {
+        let held = u64::from(self.shutdown && self.pos >= self.out.len() && self.untold > 0);
+        let n = self.untold - held;
+        self.untold = held;
         if n > 0 {
-            core.pipe_written(id, n);
+            core.pipe_written(id, n, now);
         }
     }
 

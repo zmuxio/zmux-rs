@@ -31,7 +31,8 @@ proxies and load balancers that forward HTTP/3 requests.
   over a new connection.
 
 The carriers wire the TLS 1.3 exporter of the QUIC connection (for
-`PipeAuth::exporter()` and carrier-bound joins; behind a front end that
+`PipeAuth::exporter()` and Bound joins, declared secure with a Binding of the
+connection, not the request; behind a front end that
 terminates TLS, use a PSK), a connection receive window sized for the lanes
 and charged to the memory budget, and failure signalling: a sent body dropped
 without its end is reset with `ZMUX_CARRIER_FAILED`; dropping a received

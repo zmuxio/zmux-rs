@@ -6,7 +6,7 @@
 use std::sync::LazyLock;
 
 use proptest::prelude::*;
-use zmux::proto::frame::{Frame, Frames, PipeJoin};
+use zmux::proto::frame::{Frame, Frames};
 use zmux::proto::ident::{Classifier, Verdict};
 use zmux::proto::params::TransportParameters;
 use zmux::proto::payload::{Flow, WirePreamble};
@@ -367,12 +367,6 @@ proptest! {
                 prop_assert!(flow.encoded_len() + payload.len() <= bytes.len());
             }
             Err(e) => prop_assert_eq!(e.code(), TransportErrorCode::PROTOCOL_VIOLATION),
-        }
-        match PipeJoin::decode(&bytes) {
-            Ok((join, n)) => {
-                prop_assert!(n <= bytes.len() && join.encoded_len() <= n);
-            }
-            Err(e) => prop_assert_eq!(e.code(), TransportErrorCode::FRAME_ENCODING_ERROR),
         }
         let mut out = [0u8; 256];
         let _ = oob::decode(&bytes, &mut out);

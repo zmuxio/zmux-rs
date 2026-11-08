@@ -1,7 +1,7 @@
 //! The one-way carriers over loopback: a split
 //! bootstrap (an uplink `POST` and a downlink `GET` paired by a token) over
 //! HTTP/1.1 and HTTP/2, with and without prefix authentication; a downlink
-//! joined out of band; the downlink response headers; forwarded early data
+//! joined by one paired Join; the downlink response headers; forwarded early data
 //! answered 425; and the source a trusted intermediary reports.
 
 use std::net::SocketAddr;
@@ -9,10 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use zmux::{
-    Config, DialRequest, Listener, ListenerConfig, PipeAuth, PipeDirection, PipeOptions, Session,
-    TrustedProxies,
-};
+use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Session, TrustedProxies};
 use zmux_http::{Http2Connection, Options};
 
 async fn server_with(
@@ -20,7 +17,7 @@ async fn server_with(
     limits: ListenerConfig,
     options: Options,
 ) -> (String, Listener) {
-    let listener = Listener::new(config, limits);
+    let listener = Listener::new(config, limits).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     tokio::spawn(zmux_http::serve(listener.clone(), tcp, options));
@@ -41,7 +38,7 @@ async fn exchange(client: Session, server: Session) {
     s.write_all(&data).await.unwrap();
     s.finish().unwrap();
     assert_eq!(r.read_to_end(1 << 20).await.unwrap(), data);
-    client.close(0u32.into(), b"");
+    client.close(0u32.into(), b"").await;
     tokio::time::timeout(Duration::from_secs(5), echo)
         .await
         .unwrap()
@@ -114,51 +111,63 @@ async fn split_bootstrap_without_a_credential_is_refused() {
 fn multipath() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"http-carriers-psk-0123456789abcd");
+    c.pipe_auth = PipeAuth::psk(*b"http-carriers-psk-0123456789abcd").with_end_to_end();
     c
 }
 
-/// A downlink `GET` joins an established session out of band: the session
-/// then has two pipes, and the server sends on the new one.
+/// A split carrier, an uplink `POST` and a downlink `GET` paired by a token, joins an
+/// established session: it then has two pipes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_downlink_joins_out_of_band() {
+async fn a_split_carrier_joins() {
     tokio::time::timeout(Duration::from_secs(30), async {
         for http2 in [false, true] {
             let (addr, listener) =
                 server_with(multipath(), ListenerConfig::default(), Options::default()).await;
             let opts = Options::default();
-            let (client, dial) = if http2 {
-                let h2 = Http2Connection::connect(&addr, opts.clone()).await.unwrap();
-                (h2.connect_session(multipath()).await.unwrap(), h2.dial())
+            let h2 = if http2 {
+                Some(Http2Connection::connect(&addr, opts.clone()).await.unwrap())
             } else {
-                let a = addr.clone();
-                let dial = zmux_http::http1_dial(
-                    move || {
-                        let a = a.clone();
-                        async move { TcpStream::connect(a).await }
-                    },
-                    &addr,
-                    &opts,
-                );
-                (
-                    zmux_http::connect_http1(&addr, &opts, multipath())
-                        .await
-                        .unwrap(),
-                    dial,
-                )
+                None
+            };
+            let client = match &h2 {
+                Some(h2) => h2.connect_session(multipath()).await.unwrap(),
+                None => zmux_http::connect_http1(&addr, &opts, multipath())
+                    .await
+                    .unwrap(),
             };
             let server = listener.accept().await.unwrap();
-            let reservation = client
-                .reserve_pipe(PipeDirection::In, PipeOptions::default())
-                .unwrap();
-            let request = DialRequest::new(PipeDirection::In, Some(reservation.header()));
-            let carrier = dial.dial(request).await.unwrap();
-            let pipe = reservation.attach(carrier).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), pipe.joined())
-                .await
-                .expect("joined in time")
-                .unwrap();
+            let joined = tokio::time::timeout(Duration::from_secs(5), async {
+                match &h2 {
+                    Some(h2) => h2.join_split(&client, PipeOptions::default()).await,
+                    None => {
+                        let a = addr.clone();
+                        zmux_http::join_http1_split_with(
+                            &client,
+                            move || {
+                                let a = a.clone();
+                                async move {
+                                    let tcp = TcpStream::connect(a).await?;
+                                    tcp.set_nodelay(true)?;
+                                    Ok(tcp)
+                                }
+                            },
+                            &addr,
+                            &opts,
+                            PipeOptions::default(),
+                        )
+                        .await
+                    }
+                }
+            })
+            .await
+            .expect("joined in time");
+            joined.unwrap();
             assert_eq!(client.pipes().len(), 2, "http2 {http2}");
+            // The joiner is done once Confirm is written; the listener counts the join when
+            // it has read that, and the exchange ends with a close of the session.
+            while listener.stats().joins == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             exchange(client, server).await;
             assert_eq!(listener.stats().joins, 1);
         }

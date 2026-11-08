@@ -317,12 +317,14 @@ fn key_schedule_does_not_allocate() {
     let _serial = serial();
     let (ok, n) = allocations(|| {
         let secret = keys::session_secret(&[1; 16], &[2; 16], &[3; 32], &[]);
-        let k = keys::SessionKeys::derive(&secret);
-        let mut frame = [
-            0x9a, 0x24, 0xde, 0x36, 1, 0x4c, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        keys::sign_join(&k.join_initiator, &mut frame, &[]);
-        keys::verify_join(&k.join_initiator, &frame, &[])
+        let binding = keys::session_binding(&[1; 16], &[2; 16]);
+        let mut expanded = [0u8; 32];
+        keys::hkdf_expand(&secret, b"label", &mut expanded);
+        secret != [0; 32]
+            && binding != [0; 32]
+            && expanded != secret
+            && keys::lane_key_eq(&[7; 16], &[7; 16])
+            && !keys::lane_key_eq(&[7; 16], &[8; 16])
     });
     assert!(ok);
     assert_eq!(n, 0);
@@ -511,7 +513,7 @@ mod core_bulk {
     }
 
     /// Moves `total` bytes in 1 MiB steps with the clock running, so that
-    /// pipe acknowledgement (MULTIPATH.md Section 3.5) takes RTT and
+    /// pipe acknowledgement takes RTT and
     /// delivery-rate samples on both sides.
     fn ticking_transfer(
         p: &mut Pair,
@@ -556,7 +558,7 @@ mod core_bulk {
 mod core_multipath {
     use std::time::{Duration, Instant};
 
-    use super::join::{Joined, feed_join};
+    use super::join::{Joined, join_at_once};
     use zmux::proto::frame::Dir;
     use zmux::proto::listener::{ListenerConfig, ListenerCore};
     use zmux::proto::record::Framing;
@@ -579,7 +581,7 @@ mod core_multipath {
     fn config(policy: &Policy) -> Config {
         let mut c = Config::default();
         c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = policy.clone();
         c.max_idle_timeout = Some(Duration::from_secs(600));
         c.max_incoming_uni_streams = Some(4);
@@ -587,7 +589,7 @@ mod core_multipath {
     }
 
     impl Pair {
-        /// A multipath pair on pipe 0, then pipe 1 joined in band through
+        /// A multipath pair on pipe 0, then pipe 1 joined through
         /// B's listener.
         fn new(policy: Policy) -> Self {
             let now = Instant::now();
@@ -613,23 +615,15 @@ mod core_multipath {
                     Some(BS),
                     Some(BS),
                     &PipeOptions::default(),
-                    false,
+                    zmux::proto::seal::Mode::Trusted,
                     None,
                     now,
                 )
                 .unwrap();
-            // A's first bytes on the new pipe go through B's listener.
+            // The handshake runs through B's listener.
             let mut listener = ListenerCore::new(ListenerConfig::default());
-            let mut first = Vec::new();
-            while p.a.wants_write(id) {
-                p.a.poll_transmit(id, now, &mut p.out);
-                if p.out.is_empty() {
-                    break;
-                }
-                p.out.copy_to_vec(&mut first);
-            }
-            let fed = feed_join(&mut listener, &mut p.b, &mut None, id.get(), &first, now);
-            assert_eq!(fed.joined, Joined::Attached(id));
+            let joined = join_at_once(&mut listener, &mut p.a, &mut p.b, id, now);
+            assert_eq!(joined, Joined::Attached(id));
             p.pipes.push(id);
             // The pump hands everything over at once, as a carrier with a
             // low-water mark does, which the carrier queue limiter does
@@ -831,7 +825,7 @@ mod driver {
                     }
                 }
             }
-            client.close(VarInt::from_u32(0), b"");
+            client.close(VarInt::from_u32(0), b"").await;
             client.closed().await;
             server.closed().await;
             echo.await.unwrap();
@@ -923,8 +917,7 @@ mod driver {
     }
 
     /// The relay helper and the stream carriers hand data over as shared
-    /// chunks without allocating per frame (Section
-    /// 4.6). 32 MiB more are 2048 more records of 16 KiB and 512 more
+    /// chunks without allocating per frame. 32 MiB more are 2048 more records of 16 KiB and 512 more
     /// chunks of 64 KiB: they may cost at most one allocation per chunk,
     /// the receive buffer's new storage while the chunks it lent are still
     /// queued downstream (zero copy: the bytes are never copied instead).

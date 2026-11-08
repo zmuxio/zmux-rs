@@ -25,7 +25,7 @@ fn limits(admission: Admission, fallback: Option<Fallback>) -> ListenerConfig {
 }
 
 async fn serve_with(limits: ListenerConfig) -> (Listener, String) {
-    let listener = Listener::new(Config::default(), limits);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
     tokio::spawn(listener.clone().serve(tcp));
@@ -198,7 +198,7 @@ impl Decide for Slow {
     fn decide<'a>(&'a self, _: &'a CarrierInfo<'a>, _: &'a [u8]) -> DecideFuture<'a> {
         Box::pin(async move {
             tokio::time::sleep(self.0).await;
-            self.1.clone()
+            self.1.clone().into()
         })
     }
 }
@@ -294,7 +294,8 @@ async fn the_source_slot_is_taken_before_any_handshake() {
 async fn stall_duration_is_a_function_of_the_source() {
     let (min, max) = (Duration::from_secs(1), Duration::from_secs(1000));
     let admission = Admission::new(0, |_, _| Verdict::Stall).with_stall_interval(min, max);
-    let listener = Listener::new(Config::default(), limits(admission, None));
+    let listener = Listener::new(Config::default(), limits(admission, None))
+        .expect("valid listener configuration");
     let d = async |s: &str| {
         let mut e = listener.enter(s.parse().unwrap(), None).unwrap();
         let start = tokio::time::Instant::now();
@@ -317,7 +318,7 @@ async fn a_source_stalls_at_most_its_share_less_one() {
         .with_stall_interval(Duration::from_secs(1), Duration::from_secs(1));
     let mut config = limits(admission, None);
     config.max_pending_per_source = 3;
-    let listener = Listener::new(Config::default(), config);
+    let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let none = || None::<&mut tokio::io::Empty>;
     let enter = |s: &str| listener.enter(s.parse().unwrap(), None).unwrap();
     async fn admit(e: &mut zmux::Entry) -> Admit {
@@ -359,7 +360,7 @@ async fn a_share_of_one_closes_every_stall() {
     let admission = Admission::new(0, |_, _| Verdict::Stall);
     let mut config = limits(admission, None);
     config.max_pending_per_source = 1;
-    let listener = Listener::new(Config::default(), config);
+    let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let mut e = listener
         .enter("192.0.2.1:1".parse().unwrap(), None)
         .unwrap();
@@ -413,7 +414,8 @@ async fn handle_pipe_applies_the_admission() {
             Verdict::Close
         }
     });
-    let listener = Listener::new(Config::default(), limits(admission, None));
+    let listener = Listener::new(Config::default(), limits(admission, None))
+        .expect("valid listener configuration");
     let (a, b) = tokio::io::duplex(1 << 16);
     let source: SocketAddr = "198.51.100.7:4000".parse().unwrap();
     let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
@@ -453,7 +455,8 @@ async fn handle_pipe_applies_the_admission() {
 
 #[tokio::test]
 async fn no_admission_counts_nothing() {
-    let listener = Listener::new(Config::default(), ListenerConfig::default());
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(listener.clone().serve(tcp));
@@ -466,5 +469,67 @@ async fn no_admission_counts_nothing() {
     assert!(listener.accept().await.is_some());
     assert_eq!(listener.stats().admission, AdmissionStats::default());
     drop(session);
+    listener.close();
+}
+
+/// More reads on from the carrier in the listener's own serve loop, and the
+/// bytes past the accepted ones reach the session.
+#[tokio::test]
+async fn more_reads_on_in_the_serve_loop() {
+    let admission = Admission::new(2, |_, p| {
+        if p.len() < 5 {
+            Verdict::More { need: 5 }
+        } else if p == b"token" {
+            Verdict::accept(5)
+        } else {
+            Verdict::Close
+        }
+    })
+    .with_max_peek(8);
+    let (listener, addr) = serve(admission, None).await;
+    let mut tcp = TcpStream::connect(&addr).await.unwrap();
+    tcp.write_all(b"to").await.unwrap();
+    tcp.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.write_all(b"ken").await.unwrap();
+    let session =
+        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
+            .await
+            .unwrap()
+            .unwrap();
+    let accepted = tokio::time::timeout(LIMIT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut send, _recv) = session.open_bi().await.unwrap();
+    send.write_all(b"ping").await.unwrap();
+    send.finish().unwrap();
+    let (_s, mut recv) = accepted.accept_bi().await.unwrap();
+    assert_eq!(recv.read_to_end(16).await.unwrap(), b"ping");
+    let st = listener.stats().admission;
+    assert_eq!((st.accepted, st.closed), (1, 0));
+    listener.close();
+}
+
+/// A carrier that ends short of what More asked for is decided once more on
+/// what it sent; another More then closes it.
+#[tokio::test]
+async fn more_past_the_end_of_the_carrier_closes() {
+    let admission = Admission::new(2, |_, p| {
+        if p.len() < 5 {
+            Verdict::More { need: 5 }
+        } else {
+            Verdict::accept(5)
+        }
+    })
+    .with_max_peek(8);
+    let (listener, addr) = serve(admission, None).await;
+    let mut tcp = TcpStream::connect(&addr).await.unwrap();
+    tcp.write_all(b"tok").await.unwrap();
+    tcp.shutdown().await.unwrap();
+    assert!(ended(&mut tcp).await.is_empty());
+    let l = listener.clone();
+    eventually(move || l.stats().admission.closed == 1).await;
+    assert_eq!(listener.stats().admission.accepted, 0);
     listener.close();
 }

@@ -1,0 +1,30 @@
+[package]
+name = "zmux-seal-proto"
+version = "1.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Sans-IO Establish handshake of the zmux secure carrier"
+repository = "https://github.com/zmuxio/zmux-rs"
+keywords = ["zmux", "noise"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Fixed ephemeral keys and internal state access for the conformance vectors.
+# Never enable this in production builds.
+test-vectors = ["zmux/test-hooks"]
+
+[dependencies]
+# The ML-DSA-44 of proofs (KeyAlg 3), on its portable code.
+libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["std", "mldsa44"] }
+zmux = { version = "1.3.0", path = "..", default-features = false, features = ["seal-chacha"] }
+
+[dev-dependencies]
+libcrux-sha3 = "=0.0.11"
+serde_json = "1"
+zmux-seal-proto = { path = ".", features = ["test-vectors"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unreachable_pub = "warn"

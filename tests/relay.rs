@@ -1,4 +1,4 @@
-//! Stream carriers and relays (CONFORMANCE.md): a
+//! Stream carriers and relays: a
 //! nested multipath session over a direct carrier and pipes relayed by
 //! splicing relays, three sessions per relay hop (X to the relay, the
 //! relay to Y, and the nested one), in one process.
@@ -38,7 +38,7 @@ fn carrier_failed() -> VarInt {
 fn nested_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
-    c.pipe_auth = PipeAuth::psk(*b"relay-psk-------0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"relay-psk-------0123456789abcdef").with_end_to_end();
     // Every pipe carries data: a relayed pipe fails with data in flight.
     c.scheduler = Policy::SpreadRoundRobin;
     c
@@ -62,7 +62,8 @@ struct Nested {
 
 impl Nested {
     async fn new() -> Self {
-        let listener = Listener::new(nested_config(), ListenerConfig::default());
+        let listener = Listener::new(nested_config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let ((a, _), (b, _)) = duplex(1 << 20);
         let l = listener.clone();
         tokio::spawn(async move {
@@ -191,7 +192,7 @@ impl Relay {
             .open_pipe_stream(&zmux::Preamble::new().with_tlv(0x1002, [8]))
             .await
             .unwrap();
-        let p = x.add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
         eventually(10, "relayed pipe active", || {
             p.stats()
                 .is_some_and(|i| i.outbound == Some(OutboundState::Active) && !i.in_probation)
@@ -207,8 +208,8 @@ impl Relay {
     }
 
     async fn close(self) {
-        self.xr.close(VarInt::ZERO, b"");
-        self.ry.close(VarInt::ZERO, b"");
+        self.xr.close(VarInt::ZERO, b"").await;
+        self.ry.close(VarInt::ZERO, b"").await;
         let handles: Vec<_> = self.splices.lock().unwrap().drain(..).collect();
         for h in handles {
             let _ = watchdog(10, "splices end", h).await;
@@ -309,7 +310,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
                 // nested session's own reaction to the failed pipe when that
                 // reaches the relay first: the far nested end learns of the
                 // failure over the other pipes and aborts its halves of the
-                // carrier stream (EXTENSIONS.md Section 10.2), a reset or a
+                // carrier stream, a reset or a
                 // stop with ZMUX_CARRIER_FAILED racing the event's own end.
                 let ends = |s: &Spliced, a_to_b: [SpliceEnd; 2], b_to_a: [SpliceEnd; 2]| {
                     assert!(
@@ -336,7 +337,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
                         );
                     }
                     Event::UpstreamLost => {
-                        relay.rx.close(VarInt::from_u32(1), b"");
+                        relay.rx.close(VarInt::from_u32(1), b"").await;
                         let s = relay.last().await.expect("a result");
                         ends(
                             &s,
@@ -370,7 +371,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
             let reinjected = n.x.stats().bytes_reinjected + n.y.stats().bytes_reinjected;
             assert!(reinjected > 0, "the nested session reinjected");
             steady.close().await;
-            n.x.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 20, "relay events").await;
@@ -431,7 +432,7 @@ fn a_stalled_downstream_fails_the_relayed_pipe_and_every_hop_releases_its_credit
             stop.store(true, Ordering::SeqCst);
             watchdog(60, "bulk transfer", transfer).await.unwrap();
             relay.close().await;
-            n.x.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 20, "stall").await;
@@ -473,7 +474,7 @@ fn splices_cancelled_in_limiter_waits_leave_nothing_and_charge_what_they_forward
             }
             stop.store(true, Ordering::SeqCst);
             watchdog(60, "bulk transfer", transfer).await.unwrap();
-            n.x.close(VarInt::ZERO, b"");
+            n.x.close(VarInt::ZERO, b"").await;
             n.listener.close();
         }
         settle(base, 20, "cancelled splices").await;

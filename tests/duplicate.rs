@@ -1,4 +1,4 @@
-//! `helpers::resolve_duplicate` (EXTENSIONS.md Section 11): two endpoints that
+//! `helpers::resolve_duplicate`: two endpoints that
 //! dialed each other keep the same session at
 //! both ends, by identities, by the dialers' Session Nonces or by their
 //! role nonces, and drain the other one: no new streams, GOAWAY, and a
@@ -22,14 +22,16 @@ use zmux::helpers::DuplicateOptions;
 struct End {
     mine: Session,
     theirs: Session,
+    /// The carriers: stalled, neither end sees the other's decision yet.
+    links: Vec<Arc<common::Ctl>>,
 }
 
 /// Two sessions between endpoints 1 and 2, one dialed by each: endpoint
 /// 1's view and endpoint 2's.
 async fn race(c1: Config, c2: Config) -> (End, End) {
-    let ((a, _), (b, _)) = duplex(1 << 20);
+    let ((a, l1), (b, l2)) = duplex(1 << 20);
     let (dialed_by_1, accepted_by_2) = connect(a, b, c1.clone(), c2.clone()).await;
-    let ((a, _), (b, _)) = duplex(1 << 20);
+    let ((a, l3), (b, l4)) = duplex(1 << 20);
     let (dialed_by_2, accepted_by_1) = connect(a, b, c2, c1).await;
     // `connect` returns once one end is established; both must be.
     let all = [&dialed_by_1, &accepted_by_2, &dialed_by_2, &accepted_by_1];
@@ -42,10 +44,12 @@ async fn race(c1: Config, c2: Config) -> (End, End) {
         End {
             mine: dialed_by_1,
             theirs: accepted_by_1,
+            links: vec![l1, l2, l3, l4],
         },
         End {
             mine: dialed_by_2,
             theirs: accepted_by_2,
+            links: Vec::new(),
         },
     )
 }
@@ -60,9 +64,12 @@ fn both_ends(
     o2: &DuplicateOptions,
     rule: DuplicateRule,
 ) -> (bool, bool) {
+    // Both ends decide before either hears of the other's decision.
+    e1.links.iter().for_each(|l| l.stall(true));
     let r1 = resolve_duplicate(&e1.mine, &e1.theirs, o1).unwrap();
     // Endpoint 2 lists them the other way round.
     let r2 = resolve_duplicate(&e2.theirs, &e2.mine, o2).unwrap();
+    e1.links.iter().for_each(|l| l.stall(false));
     assert_eq!((r1.rule, r2.rule), (rule, rule));
     let kept_1s = r1.survivor.stable_id() == e1.mine.stable_id();
     let kept_1s_at_2 = r2.survivor.stable_id() == e2.theirs.stable_id();
@@ -93,14 +100,14 @@ async fn drained(e1: &End, e2: &End, kept_1s: bool) {
         );
     }
     for s in keep {
-        s.close(VarInt::ZERO, b"");
+        s.close(VarInt::ZERO, b"").await;
     }
 }
 
 fn multipath(nonce: u8) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"duplicate-psk---0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"duplicate-psk---0123456789abcdef").with_end_to_end();
     c.test_hooks().session_nonce = Some([nonce; 16]);
     c
 }
@@ -199,17 +206,19 @@ fn role_nonces_decide_between_symmetric_sessions() {
                 let s = Session::peer(a, x).await.unwrap();
                 (s, other.await.unwrap().unwrap())
             };
-            let ((a, _), (b, _)) = duplex(1 << 20);
+            let ((a, l1), (b, l2)) = duplex(1 << 20);
             let (dialed_by_1, at_2) = peer(a, b, c1.clone(), c2.clone()).await;
-            let ((a, _), (b, _)) = duplex(1 << 20);
+            let ((a, l3), (b, l4)) = duplex(1 << 20);
             let (dialed_by_2, at_1) = peer(a, b, c2, c1).await;
             let e1 = End {
                 mine: dialed_by_1,
                 theirs: at_1,
+                links: vec![l1, l2, l3, l4],
             };
             let e2 = End {
                 mine: dialed_by_2,
                 theirs: at_2,
+                links: Vec::new(),
             };
             let none = DuplicateOptions::default();
             assert_eq!(
@@ -296,7 +305,7 @@ fn the_rule_does_not_apply_without_a_race_or_a_deciding_value() {
             assert!(s.open_bi().await.is_ok());
         }
         for s in all {
-            s.close(VarInt::ZERO, b"");
+            s.close(VarInt::ZERO, b"").await;
         }
     });
 }

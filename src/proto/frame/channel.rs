@@ -1,7 +1,7 @@
-//! Channel datagrams (EXTENSIONS.md Section 6.8): one DATAGRAM frame sent
-//! on a carrier's own datagram channel instead of in a record, after the
-//! Pipe Stream ID on channels that the pipes of a connection share (QUIC,
-//! WebTransport), alone where the channel belongs to the pipe.
+//! Channel datagrams: one DATAGRAM frame sent on a carrier's own datagram
+//! channel instead of in a record, after the Pipe Stream ID on channels
+//! that the pipes of a connection share (QUIC, WebTransport), alone where
+//! the channel belongs to the pipe.
 //!
 //! ```text
 //! Channel Datagram {

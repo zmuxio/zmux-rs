@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The vendored specification assets (`tools/sync-spec-fixtures.sh`), or
+/// The vendored specification assets (`testdata/spec`), or
 /// the directory `ZMUX_SPEC_FIXTURES` names (a preview of unreleased
 /// specification assets laid out the same way).
 pub fn spec_dir() -> PathBuf {

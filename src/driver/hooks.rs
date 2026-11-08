@@ -16,7 +16,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use crate::proto::session::{
-    Config, SessionCore as Core, SessionError, SessionEvent, Tracer, WindowIncrease,
+    Config, LogLevel, Logger, SessionCore as Core, SessionError, SessionEvent, Tracer,
+    WindowIncrease,
 };
 
 /// Events a tracer may have unread before more are dropped.
@@ -82,14 +83,20 @@ impl TraceQueue {
 }
 
 /// Tells the tracer `items`, outside every lock; a panic is ignored.
-pub(crate) fn trace(tracer: &Arc<dyn Tracer>, items: VecDeque<Trace>) {
+pub(crate) fn trace(tracer: &Arc<dyn Tracer>, items: VecDeque<Trace>, logger: Option<&Logger>) {
     for item in items {
-        let _ = catch_unwind(AssertUnwindSafe(|| match &item {
+        let r = catch_unwind(AssertUnwindSafe(|| match &item {
             Trace::Established => tracer.established(),
             Trace::Event(e) => tracer.event(e),
             Trace::Dropped(n) => tracer.dropped(*n),
             Trace::Closed(e) => tracer.closed(e),
         }));
+        if let (Err(_), Some(l)) = (r, logger) {
+            l.log(
+                LogLevel::Error,
+                "zmux: the tracer panicked; the panic was contained",
+            );
+        }
     }
 }
 
@@ -99,6 +106,7 @@ pub(crate) fn trace(tracer: &Arc<dyn Tracer>, items: VecDeque<Trace>) {
 pub(crate) struct HookStart {
     pub(crate) predicate: Option<WindowIncrease>,
     pub(crate) tracer: Option<Arc<dyn Tracer>>,
+    pub(crate) logger: Option<Logger>,
 }
 
 /// The mailbox of a session's `allow_connection_window_increase`: at most
@@ -156,7 +164,7 @@ impl WindowHook {
 
     /// The hook context could not be started: the proposal is refused, so
     /// that the core proposes again at its next growth decision.
-    #[cfg_attr(not(feature = "blocking"), allow(dead_code))]
+    #[cfg(feature = "blocking")]
     pub(crate) fn not_started(&mut self, core: &mut Core) {
         self.started = false;
         if let Some((generation, _)) = self.proposal.take() {
@@ -166,6 +174,14 @@ impl WindowHook {
 }
 
 /// Asks the predicate (with no zmux lock held); a panic is a refusal.
-pub(crate) fn ask(predicate: &WindowIncrease, delta: u64) -> bool {
-    catch_unwind(AssertUnwindSafe(|| predicate.0.as_ref()(delta))).unwrap_or(false)
+pub(crate) fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&Logger>) -> bool {
+    catch_unwind(AssertUnwindSafe(|| predicate.0.as_ref()(delta))).unwrap_or_else(|_| {
+        if let Some(l) = logger {
+            l.log(
+                LogLevel::Error,
+                "zmux: allow_connection_window_increase panicked; counted as a refusal",
+            );
+        }
+        false
+    })
 }

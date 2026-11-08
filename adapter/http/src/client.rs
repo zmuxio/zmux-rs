@@ -14,9 +14,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use zmux::carrier::CarrierConnId;
+use zmux::redirect::{self, RedirectError};
 use zmux::{
-    Candidate, CarrierInfo, CarrierKind, ConnectError, Dial, DialRequest, Pipe, PipeDirection,
-    PipeIo, PipeOptions, Session,
+    Candidate, CarrierInfo, CarrierKind, ConnectError, Dial, DialRequest, HttpTarget, Pipe,
+    PipeDirection, PipeIo, PipeOptions, Session,
 };
 
 use crate::Options;
@@ -39,12 +40,10 @@ pub(crate) async fn within<T>(
     })
 }
 
-/// What one carrier request is: its
-/// direction and its out-of-band fields.
+/// What one carrier request is: its direction and its pairing token.
 #[derive(Debug, Clone)]
 struct Head {
     direction: PipeDirection,
-    join: Option<String>,
     pair: Option<String>,
 }
 
@@ -52,7 +51,6 @@ impl Head {
     fn of(request: &DialRequest) -> Self {
         Self {
             direction: request.direction,
-            join: request.join_header.clone(),
             pair: None,
         }
     }
@@ -75,25 +73,28 @@ impl Options {
     /// [`Options::credential`] first on a body and its header form on a
     /// `GET`. Neither body has a
     /// `Content-Length`.
+    ///
+    /// `path` is the request target; `repeat`, the body of the request
+    /// this one repeats at a redirect's URL, whose bytes it sends again
+    /// after a fresh prefix ([`body::Abort::repeat`]).
     fn carrier_request(
         &self,
         authority: &str,
+        path: &str,
         version: Version,
         head: &Head,
+        repeat: Option<&body::Abort>,
     ) -> io::Result<(Request<PipeBody>, Option<BodyFeed>)> {
         let get = head.direction == PipeDirection::In;
         let mut req = Request::builder()
             .method(if get { Method::GET } else { Method::POST })
             .version(version);
         req = if version == Version::HTTP_2 {
-            req.uri(format!("http://{authority}{}", self.path))
+            let scheme = if self.https { "https" } else { "http" };
+            req.uri(format!("{scheme}://{authority}{path}"))
         } else {
-            req.uri(self.path.as_str())
-                .header(http::header::HOST, authority)
+            req.uri(path).header(http::header::HOST, authority)
         };
-        if let Some(j) = &head.join {
-            req = req.header(zmux::JOIN_HEADER, j.as_str());
-        }
         if let Some(p) = &head.pair {
             req = req.header(zmux::PAIR_HEADER, p.as_str());
         }
@@ -104,16 +105,156 @@ impl Options {
             }
             (PipeBody::empty(), None)
         } else {
-            let (writer, body, abort) = body::body();
-            if let Some(c) = &self.credential {
-                writer.preload(bytes::Bytes::from(c.prefix(&CarrierInfo::new())?));
+            let prefix = match &self.credential {
+                Some(c) => Some(bytes::Bytes::from(c.prefix(&CarrierInfo::new())?)),
+                None => None,
+            };
+            match repeat {
+                Some(a) => {
+                    let body = a.repeat(prefix).ok_or_else(|| {
+                        io::Error::other("the uplink is past the bound of a repeat")
+                    })?;
+                    (body, None)
+                }
+                None => {
+                    let (writer, body, abort) = body::body();
+                    if let Some(p) = prefix {
+                        writer.preload(p);
+                    }
+                    (body, Some((writer, abort)))
+                }
             }
-            (body, Some((writer, abort)))
         };
         let req = req
             .body(body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Ok((req, writer))
+    }
+
+    /// The URL of a carrier request to `authority` at `path`.
+    pub(crate) fn url(&self, authority: &str, path: &str) -> String {
+        let scheme = if self.https { "https" } else { "http" };
+        format!("{scheme}://{authority}{path}")
+    }
+
+    /// These options at the path of `target`'s URL, when it is of the
+    /// same origin as its base.
+    fn at(&self, target: &HttpTarget) -> Self {
+        let url = target.url();
+        let mut o = self.clone();
+        if redirect::same_origin(&url, target.base()) {
+            path_of(&url).clone_into(&mut o.path);
+        }
+        o
+    }
+}
+
+/// The path and query of a URL.
+pub(crate) fn path_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.find(['/', '?']).map_or("/", |i| &rest[i..])
+}
+
+/// A connection of a redial.
+pub(crate) trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> IoStream for T {}
+type BoxIo = Box<dyn IoStream>;
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Makes a new connection to the carriers' endpoint, for a request
+/// repeated at a redirect's URL.
+pub(crate) type Redial = Arc<dyn Fn() -> BoxFuture<io::Result<BoxIo>> + Send + Sync>;
+
+fn redial<C, F, IO>(connect: Arc<C>) -> Redial
+where
+    C: Fn() -> F + Send + Sync + 'static,
+    F: Future<Output = io::Result<IO>> + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    Arc::new(move || {
+        let f = connect();
+        Box::pin(async move { Ok(Box::new(f.await?) as BoxIo) })
+    })
+}
+
+/// Sends a carrier's request again at a path: its response.
+type Resend = Arc<dyn Fn(String) -> BoxFuture<io::Result<ResponseFuture>> + Send + Sync>;
+
+/// How a carrier request follows redirects, as [`redirect::check`]
+/// allows and only within its origin (the connection's endpoint), up to
+/// [`Options::max_redirects`]: the request is repeated whole, with a fresh
+/// credential and every uplink byte written so far, up to
+/// [`body::REPLAY_MAX`].
+pub(crate) struct Follow {
+    url: String,
+    method: &'static str,
+    max: usize,
+    target: Option<Arc<HttpTarget>>,
+    body: Option<body::Abort>,
+    resend: Resend,
+}
+
+impl Follow {
+    fn new(
+        options: &Options,
+        authority: &str,
+        head: &Head,
+        body: Option<&BodyFeed>,
+        target: Option<Arc<HttpTarget>>,
+        resend: Resend,
+    ) -> Self {
+        Self {
+            url: options.url(authority, &options.path),
+            method: if head.direction == PipeDirection::In {
+                "GET"
+            } else {
+                "POST"
+            },
+            max: options.max_redirects,
+            target,
+            body: body.map(|(_, a)| a.clone()),
+            resend,
+        }
+    }
+
+    /// The first response that is not a redirect, and its URL.
+    async fn run(&self, mut resp: Response<Incoming>) -> io::Result<(Response<Incoming>, String)> {
+        let mut url = self.url.clone();
+        let mut hops = 0;
+        loop {
+            let status = resp.status().as_u16();
+            if !redirect::is_redirect(status) {
+                return Ok((resp, url));
+            }
+            let location = resp
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            // The redirect's body is not the carrier's.
+            drop(resp);
+            let refuse = |reason| RedirectError {
+                status,
+                location: location.clone().unwrap_or_default(),
+                reason,
+            };
+            let next = redirect::check(&url, self.method, status, location.as_deref())?;
+            if !redirect::same_origin(&next, &url) {
+                return Err(refuse("another origin over the carrier's connections").into());
+            }
+            if hops >= self.max {
+                return Err(refuse("too many redirects").into());
+            }
+            if self.body.as_ref().is_some_and(|a| !a.replayable()) {
+                return Err(refuse("the uplink is past the replay bound").into());
+            }
+            hops += 1;
+            resp = (self.resend)(path_of(&next).to_owned())
+                .await?
+                .await
+                .map_err(hyper_err)?;
+            url = next;
+        }
     }
 }
 
@@ -121,17 +262,20 @@ impl Options {
 /// response body and writes the request body; an uplink writes the request
 /// body, its response's end (or failure) ending the carrier; a downlink
 /// reads the response body.
-fn carrier<F>(timeout: Duration, sent: Sent<F>) -> PipeIo
+fn carrier<F>(timeout: Duration, sent: Sent<F>, follow: Option<Follow>) -> PipeIo
 where
     F: Future<Output = Result<Response<Incoming>, hyper::Error>> + Send + 'static,
 {
+    if let (Some(_), Some((_, abort))) = (&follow, &sent.body) {
+        abort.keep_replay();
+    }
     match (sent.head.direction, sent.body) {
         (PipeDirection::In, _) | (_, None) => {
-            PipeIo::reader(ResponseReader::spawn(timeout, sent.resp, None))
+            PipeIo::reader(ResponseReader::spawn(timeout, sent.resp, None, follow))
                 .with_carrier(CarrierKind::Split)
         }
         (PipeDirection::Bidi, Some((writer, abort))) => {
-            let reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()));
+            let reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()), follow);
             PipeIo::from_chunk_halves(reader, writer)
                 .with_abort(move || abort.run())
                 .with_carrier(CarrierKind::Streaming)
@@ -139,7 +283,7 @@ where
         (PipeDirection::Out, Some((writer, abort))) => {
             // The response carries no pipe bytes: it is read to its end,
             // which ends the carrier, as does a failure or another status.
-            let mut reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()));
+            let mut reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()), follow);
             let ended = abort.clone();
             tokio::spawn(async move {
                 match tokio::io::copy(&mut reader, &mut tokio::io::sink()).await {
@@ -172,8 +316,14 @@ enum ReaderState {
 impl ResponseReader {
     /// With `request`, the request body of the same exchange learns the
     /// outcome: its writes fail as the response did
-    /// ([`body::Abort::await_response`]).
-    pub(crate) fn spawn<F>(timeout: Duration, resp: F, request: Option<body::Abort>) -> Self
+    /// ([`body::Abort::await_response`]). With `follow`, redirects are
+    /// followed, and its target records the URL they led to.
+    pub(crate) fn spawn<F>(
+        timeout: Duration,
+        resp: F,
+        request: Option<body::Abort>,
+        follow: Option<Follow>,
+    ) -> Self
     where
         F: Future<Output = Result<Response<Incoming>, hyper::Error>> + Send + 'static,
     {
@@ -182,9 +332,22 @@ impl ResponseReader {
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let r = within(timeout, async { resp.await.map_err(hyper_err) })
-                .await
-                .and_then(answered);
+            let r = within(timeout, async {
+                let resp = resp.await.map_err(hyper_err)?;
+                match &follow {
+                    Some(f) => f.run(resp).await,
+                    None => Ok((resp, String::new())),
+                }
+            })
+            .await
+            .and_then(|(resp, url)| Ok((answered(resp)?, url)));
+            if let Some(t) = follow.as_ref().and_then(|f| f.target.as_ref()) {
+                match &r {
+                    Ok((_, url)) => t.redirected(url),
+                    Err(_) => t.reset(),
+                }
+            }
+            let r = r.map(|(resp, _)| resp);
             match (&r, request) {
                 (Ok(_), Some(a)) => a.answered(),
                 (Err(e), Some(a)) => a.fail(e.kind()),
@@ -254,12 +417,10 @@ fn split_heads() -> io::Result<(Head, Head)> {
     Ok((
         Head {
             direction: PipeDirection::Out,
-            join: None,
             pair: pair.clone(),
         },
         Head {
             direction: PipeDirection::In,
-            join: None,
             pair,
         },
     ))
@@ -272,7 +433,15 @@ fn split_heads() -> io::Result<(Head, Head)> {
 /// response bodies streamed at the same time ([`dial_http1_over`] on a TCP
 /// connection).
 pub async fn dial_http1(addr: &str, options: &Options) -> io::Result<PipeIo> {
-    dial_http1_over(tcp(addr).await?, addr, options).await
+    let addr: Arc<str> = addr.into();
+    let a = addr.clone();
+    let connect = redial(Arc::new(move || tcp_owned(a.clone())));
+    let head = Head::of(&DialRequest::bidi());
+    send_http1(tcp(&addr).await?, &addr, options, head, Some(connect), None).await
+}
+
+async fn tcp_owned(addr: Arc<str>) -> io::Result<TcpStream> {
+    tcp(&addr).await
 }
 
 async fn tcp(addr: &str) -> io::Result<TcpStream> {
@@ -307,8 +476,7 @@ where
 /// connection, one request on it with `authority` as its `Host` header: a
 /// bidirectional `POST`, an uplink `POST` (the local endpoint only writes;
 /// the response's end ends the carrier), or a downlink `GET` (it only
-/// reads), with the `Zmux-Pipe-Join` value of a reservation
-/// ([`zmux::PipeReservation::header`]) when `request` has one. It returns
+/// reads). It returns
 /// once the request is under way, before the response: the server answers
 /// once the carrier is accepted, and the carrier's reads wait for the
 /// response, which must arrive within [`Options::timeout`] (a read error
@@ -323,7 +491,7 @@ pub async fn dial_http1_carrier_over<IO>(
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    send_http1(io, authority, options, Head::of(request)).await
+    send_http1(io, authority, options, Head::of(request), None, None).await
 }
 
 async fn send_http1<IO>(
@@ -331,7 +499,45 @@ async fn send_http1<IO>(
     authority: &str,
     options: &Options,
     head: Head,
+    redial: Option<Redial>,
+    target: Option<Arc<HttpTarget>>,
 ) -> io::Result<PipeIo>
+where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (resp, body) = http1_request(io, authority, options, &options.path, &head, None).await?;
+    let follow = redial.map(|redial| {
+        let abort = body.as_ref().map(|(_, a)| a.clone());
+        let (a, o, h) = (Arc::<str>::from(authority), options.clone(), head.clone());
+        let resend: Resend = Arc::new(move |path| {
+            let (redial, a, o, h, abort) = (
+                redial.clone(),
+                a.clone(),
+                o.clone(),
+                h.clone(),
+                abort.clone(),
+            );
+            Box::pin(async move {
+                let io = redial().await?;
+                let (resp, _) = http1_request(io, &a, &o, &path, &h, abort.as_ref()).await?;
+                Ok(resp)
+            })
+        });
+        Follow::new(options, authority, &head, body.as_ref(), target, resend)
+    });
+    Ok(carrier(options.timeout, Sent { head, body, resp }, follow))
+}
+
+/// One carrier request on a new HTTP/1.1 connection over `io`, the
+/// connection closed once it is done.
+async fn http1_request<IO>(
+    io: IO,
+    authority: &str,
+    options: &Options,
+    path: &str,
+    head: &Head,
+    repeat: Option<&body::Abort>,
+) -> io::Result<(ResponseFuture, Option<BodyFeed>)>
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -342,15 +548,15 @@ where
     })
     .await?;
     tokio::spawn(conn);
-    let (req, body) = options.carrier_request(authority, Version::HTTP_11, &head)?;
+    let (req, body) = options.carrier_request(authority, path, Version::HTTP_11, head, repeat)?;
     let resp = sender.send_request(req);
     // One request per connection: it closes once this one is done.
     drop(sender);
-    Ok(carrier(options.timeout, Sent { head, body, resp }))
+    Ok((Box::pin(resp), body))
 }
 
 /// A split bootstrap over two HTTP/1.1 connections that `connect` makes
-/// (SPEC.md Section 6.1.1): an uplink `POST` and a downlink `GET` with one
+/// (one pipe from two one-way carriers): an uplink `POST` and a downlink `GET` with one
 /// fresh pairing token in `Zmux-Pipe-Pair`, combined into pipe pair 0
 /// ([`PipeIo::split_bootstrap`]). The pairing token is a bearer secret
 /// until the session is established: the connections must be confidential
@@ -362,22 +568,68 @@ pub async fn dial_http1_split_with<C, F, IO>(
     options: &Options,
 ) -> io::Result<PipeIo>
 where
-    C: Fn() -> F,
-    F: Future<Output = io::Result<IO>>,
+    C: Fn() -> F + Send + Sync + 'static,
+    F: Future<Output = io::Result<IO>> + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    split_http1(Arc::new(connect), authority, options, None).await
+}
+
+/// The two carriers of a split bootstrap or join over HTTP/1.1.
+async fn split_http1_pair<C, F, IO>(
+    connect: Arc<C>,
+    authority: &str,
+    options: &Options,
+    target: Option<Arc<HttpTarget>>,
+) -> io::Result<(PipeIo, PipeIo)>
+where
+    C: Fn() -> F + Send + Sync + 'static,
+    F: Future<Output = io::Result<IO>> + Send + 'static,
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (up, down) = split_heads()?;
-    let up = send_http1(connect().await?, authority, options, up).await?;
-    let down = send_http1(connect().await?, authority, options, down).await?;
+    let again = redial(connect.clone());
+    let up = send_http1(
+        connect().await?,
+        authority,
+        options,
+        up,
+        Some(again.clone()),
+        target.clone(),
+    )
+    .await?;
+    let down = send_http1(
+        connect().await?,
+        authority,
+        options,
+        down,
+        Some(again),
+        target,
+    )
+    .await?;
+    Ok((up, down))
+}
+
+async fn split_http1<C, F, IO>(
+    connect: Arc<C>,
+    authority: &str,
+    options: &Options,
+    target: Option<Arc<HttpTarget>>,
+) -> io::Result<PipeIo>
+where
+    C: Fn() -> F + Send + Sync + 'static,
+    F: Future<Output = io::Result<IO>> + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (up, down) = split_http1_pair(connect, authority, options, target).await?;
     Ok(PipeIo::split_bootstrap(up, down).with_carrier(CarrierKind::Split))
 }
 
-/// Joins a split carrier over two HTTP/1.1 connections that `connect`
-/// makes to `session` as two further pipes, both with `pipe_options`: a
-/// downlink `GET` joined out of band and an uplink `POST` joined in band,
-/// opened at once ([`zmux::join_split`]; a split bootstrap's carrier joins
-/// no session). Returns the downlink and the uplink once both joins are
-/// confirmed. A [`zmux::helpers::PipePool::join`] keeps such pairs up.
+/// Joins a split carrier over two HTTP/1.1 connections that `connect` makes to `session`:
+/// one Join across a `POST` and a `GET` paired by a token, one attachment of the
+/// two directions, `pipe_options` choosing its direction. Returns the pipe as
+/// [`Session::add_pipe`] does: once the peer attached it, or with
+/// [`PipeOptions::no_wait_attached`] once its join is confirmed. A [`zmux::helpers::PipePool::join`] keeps such carriers up.
 pub async fn join_http1_split_with<C, F, IO>(
     session: &Session,
     connect: C,
@@ -386,29 +638,21 @@ pub async fn join_http1_split_with<C, F, IO>(
     pipe_options: PipeOptions,
 ) -> io::Result<Vec<Pipe>>
 where
-    C: Fn() -> F,
-    F: Future<Output = io::Result<IO>>,
+    C: Fn() -> F + Send + Sync + 'static,
+    F: Future<Output = io::Result<IO>> + Send + 'static,
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let connect = &connect;
-    zmux::join_split(
-        session,
-        pipe_options,
-        |join| async move {
-            let down = DialRequest::new(PipeDirection::In, Some(join));
-            dial_http1_carrier_over(connect().await?, authority, options, &down).await
-        },
-        || async move {
-            let up = DialRequest::new(PipeDirection::Out, None);
-            dial_http1_carrier_over(connect().await?, authority, options, &up).await
-        },
-    )
-    .await
+    let (up, down) = split_http1_pair(Arc::new(connect), authority, options, None).await?;
+    let io = PipeIo::paired_join(up, down).with_carrier(CarrierKind::Split);
+    let to_io = |e: zmux::PipeError| io::Error::other(e.to_string());
+    let pipe = session.add_pipe(io, pipe_options).await.map_err(to_io)?;
+    Ok(vec![pipe])
 }
 
 /// [`dial_http1_split_with`] over plain TCP connections to `addr`.
 pub async fn dial_http1_split(addr: &str, options: &Options) -> io::Result<PipeIo> {
-    dial_http1_split_with(|| tcp(addr), addr, options).await
+    let a: Arc<str> = addr.into();
+    dial_http1_split_with(move || tcp_owned(a.clone()), addr, options).await
 }
 
 /// Establishes a session over a new HTTP/1.1 connection ([`dial_http1`]).
@@ -437,7 +681,7 @@ pub async fn connect_http1_split(
 }
 
 /// A [`Dial`] for the session's helpers (pools, rejoins, joins of
-/// [`zmux::PipeReservation`]s): every carrier on a new HTTP/1.1 connection
+/// split carriers): every carrier on a new HTTP/1.1 connection
 /// that `connect` makes, in the direction each [`DialRequest`] asks for
 /// ([`dial_http1_carrier_over`]).
 pub fn http1_dial<C, F, IO>(connect: C, authority: &str, options: &Options) -> Dial
@@ -453,7 +697,16 @@ where
         let (connect, authority, options) = (connect.clone(), authority.clone(), options.clone());
         async move {
             let io = connect().await?;
-            dial_http1_carrier_over(io, &authority, &options, &request).await
+            let again = redial(connect);
+            send_http1(
+                io,
+                &authority,
+                &options,
+                Head::of(&request),
+                Some(again),
+                None,
+            )
+            .await
         }
     })
 }
@@ -548,9 +801,14 @@ impl Http2Connection {
         let mut io = self.open(head).await?;
         if bidi && self.inner.options.lanes {
             let inner = self.inner.clone();
-            io = io.with_chunk_lane_opener(move || {
+            io = io.with_lane_opener(move || {
                 let inner = inner.clone();
-                async move { inner.open_lane().await }
+                async move {
+                    inner
+                        .open_lane()
+                        .await
+                        .map(zmux::carrier::Lane::from_chunks)
+                }
             });
         }
         Ok(io)
@@ -567,9 +825,41 @@ impl Http2Connection {
     }
 
     async fn open(&self, head: Head) -> io::Result<PipeIo> {
-        let options = &self.inner.options;
-        let (resp, body) = within(options.timeout, self.inner.send(&head)).await?;
-        Ok(carrier(options.timeout, Sent { head, body, resp }).with_carrier_conn(self.conn_id()))
+        self.open_at(head, &self.inner.options, None).await
+    }
+
+    /// A carrier request at `options`' path; its redirects are followed on
+    /// further requests of the connection, `target` recording where they
+    /// led.
+    async fn open_at(
+        &self,
+        head: Head,
+        options: &Options,
+        target: Option<Arc<HttpTarget>>,
+    ) -> io::Result<PipeIo> {
+        let (resp, body) =
+            within(options.timeout, self.inner.send(&head, &options.path, None)).await?;
+        let abort = body.as_ref().map(|(_, a)| a.clone());
+        let (inner, h) = (self.inner.clone(), head.clone());
+        let resend: Resend = Arc::new(move |path| {
+            let (inner, h, abort) = (inner.clone(), h.clone(), abort.clone());
+            Box::pin(async move {
+                let (resp, _) = inner.send(&h, &path, abort.as_ref()).await?;
+                Ok(resp)
+            })
+        });
+        let follow = Follow::new(
+            options,
+            &self.inner.authority,
+            &head,
+            body.as_ref(),
+            target,
+            resend,
+        );
+        Ok(
+            carrier(options.timeout, Sent { head, body, resp }, Some(follow))
+                .with_carrier_conn(self.conn_id()),
+        )
     }
 
     /// Establishes a session on a new bidirectional request of the
@@ -615,12 +905,17 @@ type ResponseFuture =
 impl H2Inner {
     /// Sends the request of `head` once the connection can take one; the
     /// future resolves to its response head.
-    async fn send(&self, head: &Head) -> io::Result<(ResponseFuture, Option<BodyFeed>)> {
+    async fn send(
+        &self,
+        head: &Head,
+        path: &str,
+        repeat: Option<&body::Abort>,
+    ) -> io::Result<(ResponseFuture, Option<BodyFeed>)> {
         let mut sender = self.sender.clone();
         sender.ready().await.map_err(hyper_err)?;
-        let (req, body) = self
-            .options
-            .carrier_request(&self.authority, Version::HTTP_2, head)?;
+        let (req, body) =
+            self.options
+                .carrier_request(&self.authority, path, Version::HTTP_2, head, repeat)?;
         Ok((Box::pin(sender.send_request(req)), body))
     }
 
@@ -631,14 +926,17 @@ impl H2Inner {
     async fn open_lane(self: Arc<Self>) -> io::Result<body::BodyWriter> {
         let head = Head {
             direction: PipeDirection::Bidi,
-            join: None,
             pair: None,
         };
-        let (resp, body) = within(self.options.timeout, self.send(&head)).await?;
+        let (resp, body) = within(
+            self.options.timeout,
+            self.send(&head, &self.options.path, None),
+        )
+        .await?;
         let Some((writer, abort)) = body else {
             return Err(io::Error::other("a lane request without a body"));
         };
-        let mut reader = ResponseReader::spawn(self.options.timeout, resp, None);
+        let mut reader = ResponseReader::spawn(self.options.timeout, resp, None, None);
         tokio::spawn(async move {
             if tokio::io::copy(&mut reader, &mut tokio::io::sink())
                 .await
@@ -679,18 +977,33 @@ where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let connect = Arc::new(connect);
+    let target = Arc::new(HttpTarget::new(options.url(authority, &options.path)));
     let authority: Arc<str> = authority.into();
     let options = Arc::new(options.clone());
+    let named = target.clone();
     Candidate::new(CarrierKind::Streaming, move || {
-        let (connect, authority, options) = (connect.clone(), authority.clone(), options.clone());
-        async move { dial_http1_over(connect().await?, &authority, &options).await }
+        let (connect, authority, target) = (connect.clone(), authority.clone(), target.clone());
+        let options = options.at(&target);
+        async move {
+            let head = Head::of(&DialRequest::bidi());
+            let io = match connect().await {
+                Ok(io) => io,
+                Err(e) => {
+                    target.reset();
+                    return Err(e);
+                }
+            };
+            let again = redial(connect);
+            send_http1(io, &authority, &options, head, Some(again), Some(target)).await
+        }
     })
+    .with_target(named)
 }
 
 /// A [`Candidate`] of [`CarrierKind::Split`]: a split bootstrap over
 /// HTTP/1.1 connections that `connect` makes ([`dial_http1_split_with`]);
-/// as a further pipe of a session it joins as a downlink `GET` joined out
-/// of band and an uplink `POST`, two pipes ([`join_http1_split_with`]). Its
+/// as a further pipe of a session it joins across a paired `POST` and `GET`
+/// ([`join_http1_split_with`]). Its
 /// carriers must be confidential to the server or to a trusted
 /// TLS-terminating intermediary.
 pub fn split_candidate<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
@@ -700,17 +1013,38 @@ where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let connect = Arc::new(connect);
+    let target = Arc::new(HttpTarget::new(options.url(authority, &options.path)));
     let authority: Arc<str> = authority.into();
     let options = Arc::new(options.clone());
-    let (c, a, o) = (connect.clone(), authority.clone(), options.clone());
+    let (c, a, o, t) = (
+        connect.clone(),
+        authority.clone(),
+        options.clone(),
+        target.clone(),
+    );
     Candidate::new(CarrierKind::Split, move || {
-        let (connect, authority, options) = (c.clone(), a.clone(), o.clone());
-        async move { dial_http1_split_with(|| connect(), &authority, &options).await }
+        let (connect, authority, target) = (c.clone(), a.clone(), t.clone());
+        let options = o.at(&target);
+        async move {
+            let r = split_http1(connect, &authority, &options, Some(target.clone())).await;
+            if r.is_err() {
+                target.reset();
+            }
+            r
+        }
     })
+    .with_target(target)
     .with_join(move |session, pipe_options| {
         let (connect, authority, options) = (connect.clone(), authority.clone(), options.clone());
         async move {
-            join_http1_split_with(&session, || connect(), &authority, &options, pipe_options).await
+            join_http1_split_with(
+                &session,
+                move || connect(),
+                &authority,
+                &options,
+                pipe_options,
+            )
+            .await
         }
     })
 }
@@ -743,10 +1077,27 @@ impl Http2Connection {
     /// of this connection ([`Http2Connection::open_pipe`]).
     pub fn streaming_candidate(&self) -> Candidate {
         let conn = self.clone();
+        let target = Arc::new(self.target());
+        let named = target.clone();
         Candidate::new(CarrierKind::Streaming, move || {
-            let conn = conn.clone();
-            async move { conn.open_pipe().await }
+            let (conn, target) = (conn.clone(), target.clone());
+            async move {
+                let options = conn.inner.options.at(&target);
+                let head = Head::of(&DialRequest::bidi());
+                let r = conn.open_at(head, &options, Some(target.clone())).await;
+                if r.is_err() {
+                    target.reset();
+                }
+                r
+            }
         })
+        .with_target(named)
+    }
+
+    /// A target at the URL of the connection's carriers.
+    fn target(&self) -> HttpTarget {
+        let o = &self.inner.options;
+        HttpTarget::new(o.url(&self.inner.authority, &o.path))
     }
 
     /// A [`Candidate`] of [`CarrierKind::Split`] on new requests of
@@ -755,35 +1106,45 @@ impl Http2Connection {
     pub fn split_candidate(&self) -> Candidate {
         let conn = self.clone();
         let joining = self.clone();
+        let target = Arc::new(self.target());
+        let named = target.clone();
         Candidate::new(CarrierKind::Split, move || {
-            let conn = conn.clone();
-            async move { conn.open_split().await }
+            let (conn, target) = (conn.clone(), target.clone());
+            async move {
+                let options = conn.inner.options.at(&target);
+                let (up, down) = split_heads()?;
+                let r = async {
+                    let up = conn.open_at(up, &options, Some(target.clone())).await?;
+                    let down = conn.open_at(down, &options, Some(target.clone())).await?;
+                    Ok(PipeIo::split_bootstrap(up, down).with_carrier(CarrierKind::Split))
+                }
+                .await;
+                if r.is_err() {
+                    target.reset();
+                }
+                r
+            }
         })
+        .with_target(named)
         .with_join(move |session, pipe_options| {
             let conn = joining.clone();
             async move { conn.join_split(&session, pipe_options).await }
         })
     }
 
-    /// Joins a split carrier on two new requests of the connection to
-    /// `session` as two further pipes, both with `pipe_options`: a downlink
-    /// `GET` joined out of band and an uplink `POST` joined in band, opened
-    /// at once (see [`join_http1_split_with`]).
+    /// Joins a split carrier on two new requests of the connection to `session`: one Join
+    /// across a paired `POST` and `GET` (see [`join_http1_split_with`]).
     pub async fn join_split(
         &self,
         session: &Session,
         pipe_options: PipeOptions,
     ) -> io::Result<Vec<Pipe>> {
-        zmux::join_split(
-            session,
-            pipe_options,
-            |join| self.open_carrier_owned(DialRequest::new(PipeDirection::In, Some(join))),
-            || self.open_carrier_owned(DialRequest::new(PipeDirection::Out, None)),
-        )
-        .await
-    }
-
-    async fn open_carrier_owned(&self, request: DialRequest) -> io::Result<PipeIo> {
-        self.open_carrier(&request).await
+        let (up, down) = split_heads()?;
+        let up = self.open(up).await?;
+        let down = self.open(down).await?;
+        let io = PipeIo::paired_join(up, down).with_carrier(CarrierKind::Split);
+        let to_io = |e: zmux::PipeError| io::Error::other(e.to_string());
+        let pipe = session.add_pipe(io, pipe_options).await.map_err(to_io)?;
+        Ok(vec![pipe])
     }
 }

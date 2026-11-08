@@ -1,7 +1,7 @@
 //! WebTransport sessions as zmux carriers over web-transport-quinn: zmux
 //! sessions whose pipes are bidirectional streams of a
 //! WebTransport session and whose lanes are its unidirectional streams, in
-//! both directions (MULTIPATH.md Sections 2.5 and 5.8). WebTransport runs
+//! both directions. WebTransport runs
 //! over HTTP/3, so a carrier reaches a server through HTTP/3 front ends and
 //! load balancers that forward WebTransport, where a plain QUIC carrier may
 //! not; the session's own features (datagrams, statistics, close) and the
@@ -34,18 +34,20 @@
 //!
 //! What the session gives zmux:
 //!
-//! - its datagrams, as the datagram channel of its stream pipes
-//!   (EXTENSIONS.md Section 6.8): a zmux session with datagrams enabled
-//!   sends each datagram that fits one there rather than in a record when
+//! - its datagrams, as the datagram channel of its stream pipes: a zmux
+//!   session with datagrams enabled sends each datagram that fits one there rather than in a record when
 //!   the peer negotiated it. Each WebTransport datagram starts with the
 //!   pipe's QUIC stream ID; one receive loop per WebTransport session
 //!   routes them to its pipes ([`WebTransportCarrier::channel_dropped`]
 //!   counts those that named none), so the session's datagrams belong to
 //!   zmux;
 //! - the TLS 1.3 exporter of its QUIC connection (RFC 9001 Section 4), for
-//!   [`zmux::PipeAuth::exporter`] and carrier-bound joins (MULTIPATH.md Section
-//!   10.5); behind an HTTP/3 front end that terminates TLS the two ends
-//!   export different values, so such deployments use a PSK (MULTIPATH.md);
+//!   [`zmux::PipeAuth::exporter`] and Bound joins (the carriers declare the
+//!   secure carrier's Bound contract; the Binding names the connection, not
+//!   the stream); behind an HTTP/3 front end that terminates TLS the two ends
+//!   export different values, so such deployments use a PSK.
+//!   The exporter does not keep the connection: once it is gone it gives
+//!   no value ([`zmux::ExportError::Unavailable`]);
 //! - flow control sized for its lanes: the peer may open [`LaneWindows::lanes`] lanes at once (beside
 //!   the HTTP/3 control streams), and the connection's receive window
 //!   covers that many stream windows and a pipe's own, charged to the
@@ -94,7 +96,6 @@ use zmux::carrier::{
     MemoryCharge,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::proto::keys::{EXPORTER_PIPE_LABEL, EXPORTER_SESSION_LABEL};
 use zmux::{
     Admit, Admitted, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo,
 };
@@ -461,7 +462,6 @@ struct Inner {
     /// The receive window charged to the sessions its pipes carry, without
     /// a listener (0 with one, which is charged instead).
     own_charge: u64,
-    exported: [Option<Vec<u8>>; 2],
     /// Streams of pipes the peer opened, without a listener (made pipes
     /// when taken, so that the queue holds no reference to this state).
     accepted: Mutex<Accepted>,
@@ -518,19 +518,11 @@ impl WebTransportCarrier {
         conn.set_max_concurrent_uni_streams(VarInt::from_u32(
             options.windows.lanes.saturating_add(H3_UNI_STREAMS),
         ));
-        let export = |label: &str| {
-            let mut out = vec![0u8; 32];
-            conn.export_keying_material(&mut out, label.as_bytes(), b"")
-                .ok()
-                .map(|()| out)
-        };
-        let exported = [export(EXPORTER_SESSION_LABEL), export(EXPORTER_PIPE_LABEL)];
         let own_charge = if listener.is_some() { 0 } else { window };
         let inner = Arc::new(Inner {
             conn: conn.clone(),
             id: OnceLock::new(),
             own_charge,
-            exported,
             accepted: Mutex::default(),
             notify: Notify::new(),
             accept_task: OnceLock::new(),
@@ -616,7 +608,8 @@ impl Inner {
         send.keep = Some(self.clone());
         recv.keep = Some(self.clone());
         let opener = self.clone();
-        let exported = self.exported.clone();
+        // Does not keep the connection: gives no value once it is gone.
+        let exporter = Arc::downgrade(self);
         let channel = Arc::new(WtChannel {
             datagrams: self.datagrams.clone(),
             id: recv.stream.quic_id().into(),
@@ -626,19 +619,25 @@ impl Inner {
             .with_carrier_conn(self.id())
             .with_connection_memory(self.own_charge)
             .with_datagram_channel(channel);
-        io.with_chunk_lane_opener(move || {
+        io.with_lane_opener(move || {
             let inner = opener.clone();
             async move {
                 let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
                 let mut send = Send::new(send);
                 send.keep = Some(inner);
-                Ok(send)
+                Ok(zmux::carrier::Lane::from_chunks(send))
             }
         })
-        .with_tls_exporter(|label| match label {
-            EXPORTER_SESSION_LABEL => exported[0].clone(),
-            EXPORTER_PIPE_LABEL => exported[1].clone(),
-            _ => None,
+        .with_terminated_tls(|| Some(zmux::TlsState::default()))
+        // QUIC protects the records; the Binding is the connection's, not the stream's.
+        .with_carrier_secure()
+        .with_exporter(move |label, context, out| {
+            exporter.upgrade().is_some_and(|inner| {
+                inner
+                    .conn
+                    .export_keying_material(out, label.as_bytes(), context)
+                    .is_ok()
+            })
         })
     }
 }

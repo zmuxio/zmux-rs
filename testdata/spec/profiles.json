@@ -188,6 +188,14 @@
         "nonce": "ffeeddccbbaa99887766554433221100",
         "locator": "4c4f43414c"
       },
+      "zmux_session_crypto": {
+        "suites": [
+          1
+        ],
+        "groups": [
+          2
+        ]
+      },
       "zmux_ack_threshold": 4096
     },
     "config": {
@@ -198,6 +206,11 @@
       "pipe_auth": {
         "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
       },
+      "declared_end_to_end": true,
+      "record_modes": [
+        "trusted",
+        "bound"
+      ],
       "max_incoming_uni_streams": 4,
       "probation": 0,
       "redundancy": "off",
@@ -216,7 +229,8 @@
       "ping_seq_start": 0,
       "lane_key": "7a6d75782d6c616e652d6b65792d4c4c",
       "session_nonce": "ffeeddccbbaa99887766554433221100",
-      "rtt_ms": 10
+      "rtt_ms": 10,
+      "epoch_locator_prefix": "4c4f43414c2d"
     }
   },
   "zmux-mp-resume": {
@@ -243,6 +257,14 @@
         "nonce": "ffeeddccbbaa99887766554433221100",
         "locator": "4c4f43414c"
       },
+      "zmux_session_crypto": {
+        "suites": [
+          1
+        ],
+        "groups": [
+          2
+        ]
+      },
       "zmux_ack_threshold": 4096,
       "zmux_resume": 30000
     },
@@ -254,6 +276,11 @@
       "pipe_auth": {
         "psk": "7a6d75782d74726163652d70736b2d3031323334353637383961626364656621"
       },
+      "declared_end_to_end": true,
+      "record_modes": [
+        "trusted",
+        "bound"
+      ],
       "resume_timeout": 30000,
       "max_incoming_uni_streams": 4,
       "probation": 0,

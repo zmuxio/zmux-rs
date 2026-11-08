@@ -41,6 +41,32 @@ where
 
 /// Reads and discards what arrives on `r`, `chunk` bytes at a time, until
 /// it ends, fails, or `duration` has passed.
+/// Reads on until `prefix` holds `need` bytes, the carrier ends, or
+/// `deadline` passes; returns it and whether the deadline passed.
+pub(crate) async fn read_more<R>(
+    mut prefix: Vec<u8>,
+    need: usize,
+    r: &mut R,
+    deadline: Instant,
+) -> (Vec<u8>, bool)
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut got = prefix.len();
+    prefix.resize(need.max(got), 0);
+    let fill = async {
+        while got < prefix.len() {
+            match r.read(&mut prefix[got..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+    };
+    let late = tokio::time::timeout_at(deadline, fill).await.is_err();
+    prefix.truncate(got);
+    (prefix, late)
+}
+
 pub(crate) async fn discard<R>(r: &mut R, chunk: usize, duration: Duration)
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -72,16 +98,15 @@ impl<F: Future + Unpin> Future for CatchUnwind<F> {
     }
 }
 
-/// The source of a TCP connection that arrived from `peer`, which
-/// `trusted` may say is an intermediary that reports its client with a
-/// PROXY protocol header (MULTIPATH.md Section 5.6): from a trusted
-/// address with the PROXY protocol configured, the header is read (exactly,
-/// nothing after it) and the client it reports is returned, or `peer` for
-/// the intermediary's own connections (`LOCAL`, `UNKNOWN`); a missing or
-/// invalid header is an error, and the caller closes the connection.
-/// From any other address nothing is read and the source is `peer`. Bound
-/// the call (the listener's handshake timeout, an admission's peek
-/// timeout).
+/// The source of a TCP connection that arrived from `peer`, which `trusted`
+/// may say is an intermediary that reports its client with a PROXY protocol
+/// header: from a trusted address with the PROXY protocol configured, the
+/// header is read (exactly, nothing after it) and the client it reports is
+/// returned, or `peer` for the intermediary's own connections (`LOCAL`,
+/// `UNKNOWN`); a missing or invalid header is an error, and the caller
+/// closes the connection. From any other address nothing is read and the
+/// source is `peer`. Bound the call (the listener's handshake timeout, an
+/// admission's peek timeout).
 pub async fn proxied_source<S>(
     io: &mut S,
     peer: SocketAddr,

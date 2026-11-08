@@ -54,7 +54,7 @@ async fn expect_lowat(socket: &impl AsRawFd, want: u32) {
 fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"lowat-test-psk-0123456789abcdef!");
+    c.pipe_auth = PipeAuth::psk(*b"lowat-test-psk-0123456789abcdef!").with_end_to_end();
     c
 }
 
@@ -71,7 +71,8 @@ async fn connect(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, std::net
 async fn multipath_pipes_get_32_kib() {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(mp_config(), ListenerConfig::default());
+    let listener = Listener::new(mp_config(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move {
         while let Ok((c, peer)) = tcp.accept().await {
@@ -91,10 +92,10 @@ async fn multipath_pipes_get_32_kib() {
     expect_lowat(&bootstrap, 32 * 1024).await;
     let (stream, added) = connect(addr).await;
     session
-        .add_pipe(PipeIo::tcp(stream), PipeOptions::default())
+        .begin_add_pipe(PipeIo::tcp(stream), PipeOptions::default())
         .unwrap();
     expect_lowat(&added, 32 * 1024).await;
-    session.close(0u32.into(), b"");
+    session.close(0u32.into(), b"").await;
     drop(listener);
 }
 
@@ -129,7 +130,8 @@ fn blocking_multipath_pipes_get_32_kib() {
     let addr = rt.block_on(async {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
-        let listener = Listener::new(mp_config(), ListenerConfig::default());
+        let listener = Listener::new(mp_config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         tokio::spawn(async move {
             while let Ok((c, peer)) = tcp.accept().await {
                 let l = listener.clone();
@@ -161,7 +163,7 @@ fn blocking_multipath_pipes_get_32_kib() {
     let stream = std::net::TcpStream::connect(addr).unwrap();
     let added = stream.try_clone().unwrap();
     session
-        .add_pipe(zmux::blocking::PipeIo::tcp(stream), PipeOptions::default())
+        .begin_add_pipe(zmux::blocking::PipeIo::tcp(stream), PipeOptions::default())
         .unwrap();
     assert_eq!(lowat(&added), 32 * 1024);
     session.close(0u32.into(), b"");

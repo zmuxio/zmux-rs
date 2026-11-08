@@ -37,34 +37,35 @@ struct AttMp {
     fate_group: u64,
     /// A peer ID used without attachment state (refused join, or abandoned
     /// before it was seen): only its PIPE_ABANDON is kept, while the ID is
-    /// in the replay window (MULTIPATH.md Section 4.3).
+    /// in the replay window.
     unattached: bool,
-    /// The join was confirmed: the acceptor attached it (MULTIPATH.md
-    /// Section 5.7 step 4). Always true for attachments the peer joined.
+    /// The join was confirmed: the acceptor attached it. Always true for
+    /// attachments the peer joined.
     joined: bool,
     /// The attachment failed (or was refused).
     failed: bool,
     /// Creation order, for "oldest".
     seq: u64,
+    /// The record mode, fixed by its handshake.
+    mode: Option<crate::proto::seal::Mode>,
     /// Our joins refused in a row before this one was confirmed: they
-    /// continue if the peer abandons it for a resource limit (MULTIPATH.md
-    /// Section 5.7 step 1).
+    /// continue if the peer abandons it for a resource limit.
     refusals_at_join: u32,
     /// The code of the local PIPE_ABANDON, once decided.
     abandon_code: Option<u64>,
     /// PIPE_ABANDON to (re)send.
     abandon_pending: bool,
     /// A graceful removal of our own outbound pipe puts PIPE_ABANDON on
-    /// that pipe (MULTIPATH.md Section 8.1).
+    /// that pipe.
     abandon_on_self: bool,
     /// The local PIPE_ABANDON was written at least once.
     abandon_sent: bool,
     abandon_acked: bool,
     /// The peer's PIPE_ABANDON code.
     abandon_received: Option<u64>,
-    /// Unilateral retirement deadline (MULTIPATH.md Section 8.4).
+    /// Unilateral retirement deadline.
     retire_at: Option<Instant>,
-    /// Priority, standby and weight (MULTIPATH.md Section 9).
+    /// Priority, standby and weight.
     tier: TierState,
     /// Why it failed, once it did.
     failure: Option<crate::proto::session::PipeFailure>,
@@ -76,6 +77,8 @@ struct AttMp {
     ///
     /// [`SessionCore::set_pipe_admitted`]: crate::proto::session::SessionCore::set_pipe_admitted
     admitted: Option<crate::proto::admission::AdmittedValue>,
+    /// The host's label of the transform the carrier runs.
+    variant: Option<std::sync::Arc<str>>,
 }
 
 impl AttMp {
@@ -86,6 +89,7 @@ impl AttMp {
             joined: false,
             failed: false,
             seq,
+            mode: None,
             refusals_at_join: 0,
             abandon_code: None,
             abandon_pending: false,
@@ -98,6 +102,7 @@ impl AttMp {
             failure: None,
             options: None,
             admitted: None,
+            variant: None,
         }
     }
 }
@@ -121,7 +126,7 @@ impl Attachment {
     }
 
     /// An attachment the peer joined: its join is confirmed by being
-    /// attached (MULTIPATH.md Section 5.4 step 8).
+    /// attached.
     pub(crate) fn accepted(id: u64, fate_group: u64, seq: u64) -> Self {
         let mut a = Self::new(id, false, fate_group, seq);
         a.mp_mut().joined = true;
@@ -130,7 +135,7 @@ impl Attachment {
 
     /// A peer-parity ID used without attachment state, with our
     /// PIPE_ABANDON (`code`) for it pending and the peer's, when it sent
-    /// one (MULTIPATH.md Sections 4.3 and 5.4 step 7).
+    /// one.
     pub(crate) fn unattached_id(id: u64, seq: u64, code: u64, received: Option<u64>) -> Self {
         let mut a = Self::new(id, false, 0, seq);
         let m = a.mp_mut();
@@ -230,6 +235,22 @@ impl Attachment {
         self.joiner_local
     }
 
+    /// The peer has attached the pipe: pipe 0 and a pipe the peer joined
+    /// are attached from the start; one of our joins once the peer showed
+    /// it attached it, by a PIPE_ACK covering any byte on any lane of the
+    /// outbound pipe or, for an inbound-only pipe, by a record received
+    /// on it.
+    pub(crate) fn peer_attached(&self) -> bool {
+        if self.id == 0 || !self.joiner_local {
+            return true;
+        }
+        match (self.out(), self.inp()) {
+            (Some(o), _) => o.acked_total() > 0,
+            (None, Some(i)) => i.records_received() > 0,
+            (None, None) => false,
+        }
+    }
+
     #[inline]
     pub(crate) fn inp(&self) -> Option<&InPipe> {
         self.inp.as_ref()
@@ -309,15 +330,24 @@ impl Attachment {
         self.mp().seq
     }
 
-    /// Our join was confirmed (MULTIPATH.md Section 5.7 step 4), with
-    /// `refusals` of our joins refused in a row before it: a request for
-    /// the peer's direction changed while JOINING goes out with its latest
-    /// value only.
+    /// Our join was confirmed, with `refusals` of our joins refused in a
+    /// row before it: a request for the peer's direction changed while
+    /// JOINING goes out with its latest value only.
     pub(crate) fn join_confirmed(&mut self, refusals: u32) {
         let m = self.mp_mut();
         m.refusals_at_join = refusals;
         m.joined = true;
         m.tier.keep_latest_request();
+    }
+
+    /// The record mode, fixed by its handshake.
+    pub(crate) fn mode(&self) -> Option<crate::proto::seal::Mode> {
+        self.mp().mode
+    }
+
+    /// Fixes the record mode.
+    pub(crate) fn set_mode(&mut self, mode: crate::proto::seal::Mode) {
+        self.mp_mut().mode = Some(mode);
     }
 
     /// Our joins refused in a row before this one was confirmed.
@@ -370,6 +400,20 @@ impl Attachment {
             self.carrier,
         )
         .with_write_overhead(self.write_overhead)
+        .with_variant(self.variant().cloned())
+    }
+
+    /// The host's label of the transform the carrier runs.
+    pub(crate) fn variant(&self) -> Option<&std::sync::Arc<str>> {
+        self.mp().variant.as_ref()
+    }
+
+    /// Keeps the host's label of the transform the carrier runs.
+    pub(crate) fn set_variant(&mut self, variant: Option<std::sync::Arc<str>>) {
+        // The cold part is allocated only for a label.
+        if variant.is_some() || self.mp.is_some() {
+            self.mp_mut().variant = variant;
+        }
     }
 
     /// The host's admission value of the carrier.
@@ -390,6 +434,14 @@ impl Attachment {
     }
 
     /// The options the application added the pipe with.
+    /// The pipe's own T_suspect floor and dead timeout, if it has them.
+    pub(crate) fn mp_options_liveness(&self) -> (Option<Duration>, Option<Duration>) {
+        self.mp
+            .as_deref()
+            .and_then(|m| m.options.as_deref())
+            .map_or((None, None), |o| (o.suspect_floor, o.dead_timeout))
+    }
+
     pub(crate) fn options(&self) -> Option<&crate::proto::session::PipeOptions> {
         self.mp().options.as_deref()
     }
@@ -399,7 +451,7 @@ impl Attachment {
         self.mp_mut().options = Some(Box::new(options.clone()));
     }
 
-    // ---- the PIPE_ABANDON exchange (MULTIPATH.md Section 8) -------------------
+    // ---- the PIPE_ABANDON exchange --------------------------------------------------
 
     /// The peer's PIPE_ABANDON code, once received.
     #[inline]
@@ -423,9 +475,8 @@ impl Attachment {
         }
     }
 
-    /// A graceful removal (MULTIPATH.md Section 8.1): PIPE_ABANDON(NO_ERROR)
-    /// unless one was decided, as the last frame of the drained pipe itself
-    /// when it can still carry it.
+    /// A graceful removal: PIPE_ABANDON(NO_ERROR) unless one was decided, as
+    /// the last frame of the drained pipe itself when it can still carry it.
     pub(crate) fn abandon_gracefully(&mut self) {
         let on_self = self
             .out
@@ -467,8 +518,7 @@ impl Attachment {
     }
 
     /// The local PIPE_ABANDON was acknowledged; without the peer's, the
-    /// attachment retires unilaterally after `delay` (MULTIPATH.md Section
-    /// 8.4).
+    /// attachment retires unilaterally after `delay`.
     pub(crate) fn abandon_acknowledged(&mut self, delay: Duration, now: Instant) {
         let m = self.mp_mut();
         m.abandon_acked = true;
@@ -508,14 +558,14 @@ impl Attachment {
     /// Its graceful removal has started: PIPE_ABANDON(NO_ERROR) sent (or
     /// decided) or received. Its failure or suspicion then affects no other
     /// attachment of its fate group and does not count in the group's
-    /// probation history (MULTIPATH.md Section 7.1).
+    /// probation history.
     #[inline]
     pub(crate) fn draining(&self) -> bool {
         self.mp().abandon_code == Some(0) || self.mp().abandon_received == Some(0)
     }
 
     /// Abandoned with ZMUX_PIPE_RESOURCE_LIMIT, by either endpoint: it did
-    /// not fail with its path (MULTIPATH.md Section 7.1).
+    /// not fail with its path.
     #[inline]
     pub(crate) fn limit_abandoned(&self) -> bool {
         let rl = Some(T::ZMUX_PIPE_RESOURCE_LIMIT.0);
@@ -523,31 +573,29 @@ impl Attachment {
     }
 
     /// This endpoint abandoned it for its own resource limit: the peer's
-    /// answer starts no join backoff (MULTIPATH.md Section 5.7 step 1).
+    /// answer starts no join backoff.
     #[inline]
     pub(crate) fn own_limit_abandon(&self) -> bool {
         self.mp().abandon_code == Some(T::ZMUX_PIPE_RESOURCE_LIMIT.0)
     }
 
     /// Its failure or suspicion affects no other attachment of its fate
-    /// group and counts for nothing in the probation history (MULTIPATH.md
-    /// Section 7.1): its graceful removal started,
-    /// or it was abandoned for a resource limit.
+    /// group and counts for nothing in the probation history: its graceful
+    /// removal started, or it was abandoned for a resource limit.
     #[inline]
     pub(crate) fn outside_fate(&self) -> bool {
         self.draining() || self.limit_abandoned()
     }
 
     /// The PIPE_ABANDON exchange is complete: ours sent, the peer's
-    /// received (MULTIPATH.md Section 8.2).
+    /// received.
     #[inline]
     pub(crate) fn exchange_complete(&self) -> bool {
         self.mp().abandon_sent && self.mp().abandon_received.is_some()
     }
 
     /// A graceful end of the inbound pipe is expected: the peer abandoned
-    /// the attachment, or this endpoint started its graceful removal
-    /// (MULTIPATH.md Section 7.3).
+    /// the attachment, or this endpoint started its graceful removal.
     pub(crate) fn end_expected(&self) -> bool {
         self.mp().abandon_received.is_some() || self.mp().abandon_code == Some(0)
     }
@@ -558,7 +606,7 @@ impl Attachment {
         self.mp().abandon_code.is_some() && self.mp().abandon_acked
     }
 
-    // ---- tier settings (MULTIPATH.md Section 9) -------------------------------
+    // ---- tier settings --------------------------------------------------------------
 
     /// The tier settings.
     #[inline]
@@ -571,8 +619,7 @@ impl Attachment {
         &mut self.mp_mut().tier
     }
 
-    /// The outbound direction is standby: it takes new stream data only
-    /// on failover (MULTIPATH.md Section 9).
+    /// The outbound direction is standby: it takes new stream data only on failover.
     #[inline]
     pub(crate) fn standby(&self) -> bool {
         self.mp().tier.standby().0
@@ -587,16 +634,25 @@ impl Attachment {
 
     // ---- the pipes --------------------------------------------------------------
 
-    /// One of our joins that is not confirmed yet: it sends no PIPE_STATUS
-    /// (MULTIPATH.md Section 5.7 step 3).
-    #[inline]
-    pub(crate) fn joining_local(&self) -> bool {
-        self.joiner_local && !self.mp().joined && !self.mp().failed
+    /// A changed request of ours waits: while JOINING, for the attachment's own first
+    /// record, or on a down attachment for the first record to arrive on it.
+    pub(crate) fn status_held(&self) -> bool {
+        if !self.joiner_local || self.id == 0 {
+            return false;
+        }
+        self.joining_local()
+            || self.out().is_some_and(OutPipe::joined_first)
+            || (self.out().is_none() && self.inp().is_some_and(|p| p.records_received() == 0))
     }
 
-    /// The last progress (MULTIPATH.md Section 5.4 step 9): the later of
-    /// the last advance of the outbound acknowledged position, the last
-    /// record received inbound, and the attachment.
+    /// One of our joins that is not confirmed yet: it sends no PIPE_STATUS.
+    #[inline]
+    pub(crate) fn joining_local(&self) -> bool {
+        self.id != 0 && self.joiner_local && !self.mp().joined && !self.mp().failed
+    }
+
+    /// The last progress: the later of the last advance of the outbound acknowledged
+    /// position, the last record received inbound, and the attachment.
     pub(crate) fn last_progress(&self) -> Option<Instant> {
         let out = self.out.as_ref().map(OutPipe::last_progress);
         let inp = self.inp.as_ref().map(InPipe::last_progress);

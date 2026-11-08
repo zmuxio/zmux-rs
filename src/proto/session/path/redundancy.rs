@@ -1,11 +1,10 @@
-//! Redundant urgent data (MULTIPATH.md Section
-//! 7.5): a chunk of a stream direction whose redundancy is on is taken by
-//! whichever of the two pipes of its eligible tier with the earliest
-//! arrival writes first, and a copy is queued for the other; the first
-//! `spread_chunk` of new data after an idle period of a pipe is copied
-//! likewise. Copies wait outside the carrier for their pipe's next write
-//! opportunity, go ahead of its other stream data, and are bounded by the
-//! copy bytes outstanding, counted by the ledger.
+//! Redundant urgent data: a chunk of a stream direction whose redundancy
+//! is on is taken by whichever of the two pipes of its eligible tier with
+//! the earliest arrival writes first, and a copy is queued for the other;
+//! the first `spread_chunk` of new data after an idle period of a pipe is
+//! copied likewise. Copies wait outside the carrier for their pipe's next
+//! write opportunity, go ahead of its other stream data, and are bounded
+//! by the copy bytes outstanding, counted by the ledger.
 
 use std::time::Duration;
 
@@ -260,8 +259,8 @@ impl SessionCore {
     /// Writes the copies queued for pipe `id`, ahead of its other stream
     /// data; those whose data is acknowledged or no longer owed are
     /// dropped, and all of them when the pipe is no longer eligible under
-    /// the tier gate of the write (late binding, MULTIPATH.md Section 11
-    /// rule S2). `false` when the batch filled up.
+    /// the tier gate of the write (late binding, rule S2). `false` when
+    /// the batch filled up.
     pub(in crate::proto::session) fn write_copies(&mut self, id: u64, w: &mut Records<'_>) -> bool {
         let lane = self.tx_lane;
         if !self.copies_queued(id, lane) {

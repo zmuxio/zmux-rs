@@ -2,7 +2,7 @@
 //! two cores joined by modelled TCP carriers that fail, stall, delay,
 //! reorder and deliver late, while both ends open, write, read, finish,
 //! reset and stop streams, switch policies and change pipe tiers in random
-//! order (MULTIPATH.md Sections 7, 8, 11 to 13).
+//! order.
 //!
 //! Properties: every byte read is the byte written at that offset (nothing
 //! duplicated, reordered or invented), a FIN only after everything, a reset
@@ -273,7 +273,7 @@ impl Setup {
     fn config(&self, side: usize) -> Config {
         let mut c = Config::default();
         c.max_pipes = self.max_pipes;
-        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef");
+        c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = self.policies[side].clone();
         c.max_idle_timeout = Some(Duration::from_secs(60));
         c.suspect_floor = self.suspect_floor;
@@ -880,14 +880,19 @@ impl Net {
     }
 
     /// Lets acknowledgements, PIPE_ABANDON exchanges and retirement finish
-    /// on a healed network (unilateral retirement waits up to max(2 s,
-    /// 3 x PTO) after the acknowledgement): afterwards no attachment may be
-    /// left with no live direction.
+    /// on a healed network: afterwards no attachment may be left with no
+    /// live direction. Unilateral retirement waits max(2 s, 3 x PTO) after
+    /// the acknowledgement, and PTO follows the
+    /// RTT samples, which a stalled carrier stretches to seconds: past 30 s
+    /// the wait goes on while such an attachment is left, up to 5 minutes.
     fn linger(&mut self) {
         let mut last_add = None;
-        for _ in 0..1_500 {
+        for i in 0..15_000 {
             if !self.alive() {
                 return;
+            }
+            if i >= 1_500 && [A, B].iter().all(|&side| self.dead(side).is_empty()) {
+                break;
             }
             self.heal(&mut last_add);
             self.tick(usize::MAX);
@@ -899,31 +904,36 @@ impl Net {
             return;
         }
         for side in [A, B] {
-            let dead: Vec<_> = self.ends[side]
-                .pipes()
-                .into_iter()
-                .filter(|i| {
-                    !matches!(
-                        i.outbound,
-                        Some(
-                            OutboundState::Active
-                                | OutboundState::Joining
-                                | OutboundState::Suspect
-                                | OutboundState::Draining
-                        )
-                    ) && i.inbound != Some(InboundState::Open)
-                        && i.inbound != Some(InboundState::Joining)
-                })
-                // `abandon_after_a_failed_drain_is_sent`.
-                .filter(|i| !self.s.drained[side].contains(&i.pipe))
-                .map(|i| (i.pipe, i.inbound, i.outbound))
-                .collect();
+            let dead = self.dead(side);
             assert!(
                 dead.is_empty(),
-                "end {side} ({:?}): attachments not retired after 30 s: {dead:?}",
+                "end {side} ({:?}): attachments not retired after 5 minutes: {dead:?}",
                 self.ends[side].state()
             );
         }
+    }
+
+    /// The attachments of end `side` with no live direction, but those it
+    /// drained itself (`abandon_after_a_failed_drain_is_sent`).
+    fn dead(&self, side: usize) -> Vec<(PipeId, Option<InboundState>, Option<OutboundState>)> {
+        self.ends[side]
+            .pipes()
+            .into_iter()
+            .filter(|i| {
+                !matches!(
+                    i.outbound,
+                    Some(
+                        OutboundState::Active
+                            | OutboundState::Joining
+                            | OutboundState::Suspect
+                            | OutboundState::Draining
+                    )
+                ) && i.inbound != Some(InboundState::Open)
+                    && i.inbound != Some(InboundState::Joining)
+            })
+            .filter(|i| !self.s.drained[side].contains(&i.pipe))
+            .map(|i| (i.pipe, i.inbound, i.outbound))
+            .collect()
     }
 
     fn report(&self, label: &str) {
@@ -1645,7 +1655,7 @@ fn preamble_lost_before_a_reset_is_sent_again() {
 /// another pipe and the failed pipe writes nothing more. The frame is never
 /// sent, so it is never acknowledged, and the attachment is never retired
 /// at the remover (unilateral retirement also waits for that
-/// acknowledgement, MULTIPATH.md Section 8.4): its state and a slot of the
+/// acknowledgement): its state and a slot of the
 /// unretired-attachment cap leak for the session's life. The peer retires
 /// it on its own after 2 s. `abandon_on_self` must be cleared when the
 /// attachment fails.
@@ -1932,7 +1942,7 @@ fn reset_then_session_loss() -> (Net, usize) {
 /// even when the data below the Reliable Size never arrived (`read_offset <
 /// reliable`), because the reset branch also fires on `lost.is_some()`.
 /// `reliable_size` is documented as the application bytes delivered before
-/// the reset took effect, and STATE_MACHINE.md Section 2.5 reports the
+/// the reset took effect, and the stream state machine reports the
 /// reset only "after reliable data read"; the read should report the
 /// session error (`SessionLost`) instead.
 #[test]
@@ -1953,4 +1963,181 @@ fn reset_after_session_loss_claims_unread_reliable_data() {
             "{other:?}"
         ),
     }
+}
+
+/// Session credit is charged once per stream offset, whichever pipe carries
+/// it and however often it is sent again. Found by
+/// `exactly_once_under_churn` (minimized).
+#[test]
+fn session_credit_after_a_pipe_is_replaced() {
+    let setup = Setup {
+        resume: true,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: true,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 2,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let open = |len, commit| Op::Open {
+        side: A,
+        bidi: false,
+        len,
+        commit,
+    };
+    let remove = |sel| Op::Remove {
+        side: A,
+        sel,
+        graceful: false,
+    };
+    let ops = [
+        remove(0),
+        open(8298, false),
+        Op::Write {
+            side: A,
+            sel: 0,
+            len: 0,
+            chunk: false,
+        },
+        Op::Add {
+            opts: po!(probation: Some(Duration::ZERO)),
+            cap: 16 * 1024,
+            rst: false,
+        },
+        Op::Run {
+            ms: 41,
+            per_tick: 4188,
+        },
+        remove(61),
+        open(8187, true),
+        open(16327, false),
+        open(16356, false),
+        open(16356, false),
+    ];
+    run_case(&setup, &ops);
+}
+
+/// Both directions of a pipe the peer never attached fail after stalls
+/// stretched the RTT samples: unilateral retirement then waits 3 x PTO,
+/// about 30 s, past the acknowledgement. Found by `exactly_once_under_churn`
+/// (minimized).
+#[test]
+fn unilateral_retirement_after_stretched_rtt() {
+    let setup = Setup {
+        resume: false,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: true,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 4,
+        dead_timeout: None,
+        cap: 64 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let ops = [
+        Op::Stall { sel: 0, which: 0 },
+        Op::Advance(288),
+        Op::Stall { sel: 0, which: 1 },
+        Op::Advance(308),
+        Op::Advance(282),
+        Op::Add {
+            opts: PipeOptions::default(),
+            cap: 16 * 1024,
+            rst: false,
+        },
+        Op::Break {
+            sel: 19,
+            how: Break::Error(1),
+        },
+        Op::Advance(80),
+        Op::Break {
+            sel: 49,
+            how: Break::Error(1),
+        },
+        Op::Run {
+            ms: 511,
+            per_tick: 1,
+        },
+        Op::Run {
+            ms: 591,
+            per_tick: 1,
+        },
+        Op::Advance(2612),
+        Op::Advance(370),
+        Op::Advance(314),
+    ];
+    run_case(&setup, &ops);
+}
+
+/// BUG (`ack.rs` `process_ack`, `opp.rs` `penalize`): the start and end of
+/// the opportunistic-reinjection penalty change which pipes are usable, but
+/// only the pick generation moved; the standby takeover
+/// was re-evaluated at the end of the next batch, so an empty
+/// batch left a PIPE_STATUS owed and write interest behind. Found by
+/// `exactly_once_under_churn` (minimized).
+#[test]
+fn takeover_follows_the_reinjection_penalty() {
+    let setup = Setup {
+        resume: true,
+        policies: [
+            Policy::Custom(Arc::new(HashPick::default())),
+            Policy::Affinity,
+        ],
+        tight_windows: true,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 4,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let open = |len| Op::Open {
+        side: A,
+        bidi: false,
+        len,
+        commit: false,
+    };
+    let ops = [
+        Op::Add {
+            opts: po!(probation: Some(Duration::ZERO)),
+            cap: 16 * 1024,
+            rst: false,
+        },
+        Op::Remove {
+            side: A,
+            sel: 8,
+            graceful: false,
+        },
+        Op::Add {
+            opts: po!(send_standby: Some(true), receive_standby: true),
+            cap: 16 * 1024,
+            rst: false,
+        },
+        Op::Run {
+            ms: 31,
+            per_tick: 67,
+        },
+        open(42867),
+        Op::Step(16402),
+        Op::Step(29),
+        Op::Step(23),
+        Op::Advance(250),
+        Op::Step(23),
+        open(1),
+        Op::Step(20),
+        Op::Read {
+            side: A,
+            sel: 0,
+            max: 1,
+        },
+    ];
+    run_case(&setup, &ops);
 }

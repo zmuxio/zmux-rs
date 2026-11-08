@@ -1,5 +1,5 @@
-//! Typed model of the conformance assets: frame objects (TRACES.md Section
-//! 6), profiles (Section 3) and trace files (Sections 4 and 5).
+//! Typed model of the conformance assets: frame objects, profiles
+//! and trace files.
 //!
 //! Every struct rejects unknown fields so that a change of the trace format
 //! fails loudly here instead of being ignored by the runner. The trace runner
@@ -32,7 +32,7 @@ impl<'de> Deserialize<'de> for Hex {
 }
 
 /// An integer field of a `peer_send` frame, possibly a `$sent` placeholder
-/// (Section 6.1).
+/// in a frame object.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Int {
@@ -42,7 +42,7 @@ pub enum Int {
     Sent(SentPlaceholder),
 }
 
-/// `{"$sent": pipe, "lane": l, "plus": n}` (TRACES.md Section 6.1).
+/// `{"$sent": pipe, "lane": l, "plus": n}`.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SentPlaceholder {
@@ -70,9 +70,18 @@ pub enum ParamValue {
     Role(RoleValue),
     Multipath(MultipathValue),
     Lanes(LanesValue),
+    Crypto(CryptoValue),
 }
 
-/// `{"max_lanes": n, "lane_key": hex}` (TRACES.md Section 3).
+/// `{"suites": [...], "groups": [...]}`: kept as given, invalid sets included.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CryptoValue {
+    pub suites: Vec<u64>,
+    pub groups: Vec<u64>,
+}
+
+/// `{"max_lanes": n, "lane_key": hex}`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LanesValue {
@@ -117,14 +126,6 @@ pub struct ParamSpec {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JoinDirectionName {
-    Up,
-    Down,
-    Bidi,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum PipeStatusName {
     Available,
     Standby,
@@ -143,7 +144,7 @@ fn yes() -> bool {
     true
 }
 
-/// A concrete frame object (TRACES.md Section 6), as the wire corpus, the
+/// A concrete frame object , as the wire corpus, the
 /// wire examples and `peer_send` steps use it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -226,16 +227,6 @@ pub enum FrameSpec {
         urgency: u8,
         incremental: bool,
     },
-    PipeJoin {
-        locator: Hex,
-        pipe: u64,
-        direction: JoinDirectionName,
-        carrier_bound: bool,
-        standby: bool,
-        fate_group: u64,
-        priority: u64,
-        token: Hex,
-    },
     PipeAck {
         entries: Vec<AckEntrySpec>,
     },
@@ -254,6 +245,12 @@ pub enum FrameSpec {
         seq: u64,
         status: PipeStatusName,
         priority: u64,
+    },
+    SessionEpoch {
+        phase: String,
+        epoch: u64,
+        share: Option<Hex>,
+        locator: Option<Hex>,
     },
     Raw {
         bytes: Hex,
@@ -304,9 +301,11 @@ pub struct Config {
     pub role: Option<RoleName>,
     pub max_pipes: Option<u32>,
     pub scheduler: Option<String>,
-    /// `test-mode`: the test-mode sender (TRACES.md Section 3.4).
+    /// `test-mode`: the test-mode sender.
     pub sender: Option<String>,
     pub pipe_auth: Option<PipeAuth>,
+    pub declared_end_to_end: Option<bool>,
+    pub record_modes: Option<Vec<String>>,
     pub resume_timeout: Option<u64>,
     /// Absent: not set by this entry; `null`: unset (staged credit).
     #[serde(default, deserialize_with = "present")]
@@ -366,6 +365,7 @@ pub struct TestHooks {
     pub pipe_rtt_ms: Option<BTreeMap<String, u64>>,
     pub pipe_cap: Option<u64>,
     pub lane_key: Option<Hex>,
+    pub epoch_locator_prefix: Option<Hex>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,8 +453,7 @@ pub enum Direction {
 pub enum Via {
     Bootstrap,
     Listener,
-    /// A new stream that the peer opened on connection `conn` (TRACES.md
-    /// Section 5.1.1).
+    /// A new stream that the peer opened on connection `conn`.
     Lane,
 }
 
@@ -521,7 +520,6 @@ pub enum Op {
         dir: Direction,
         via: Option<Via>,
         conn: Option<String>,
-        oob_join: Option<Hex>,
         carrier_binding: Option<Hex>,
         pairing: Option<Hex>,
         framing: Option<FramingName>,
@@ -537,6 +535,62 @@ pub enum Op {
     SetWritable {
         pipe: u64,
         writable: bool,
+    },
+    PeerJoin {
+        carrier: String,
+        pipe: u64,
+        direction: String,
+        fate_group: u64,
+        priority: u64,
+        standby: bool,
+        locator: Hex,
+        mode: Option<String>,
+        outcome: String,
+        batch: Option<Vec<FrameSpec>>,
+        #[serde(default)]
+        bad_key: bool,
+        binding: Option<Hex>,
+        #[serde(default)]
+        hold: bool,
+        confirm: Option<bool>,
+        group: Option<u64>,
+        key_share: Option<String>,
+        #[serde(default)]
+        phase: u8,
+    },
+    PeerJoinFinish {
+        carrier: String,
+        outcome: String,
+    },
+    PeerConfirm {
+        carrier: String,
+    },
+    ExpectJoinHello {
+        pipe: u64,
+        direction: String,
+        fate_group: u64,
+        priority: u64,
+        standby: bool,
+        locator: Hex,
+        mode: String,
+        batch: Option<Vec<FramePattern>>,
+        group: Option<u64>,
+        phase: Option<u8>,
+    },
+    PeerEpoch {
+        pipe: u64,
+        phase: String,
+        epoch: u64,
+        locator: Hex,
+        share_len: Option<usize>,
+        #[serde(default)]
+        repeat: bool,
+    },
+    PeerJoinReply {
+        pipe: u64,
+        decision: u8,
+        #[serde(default)]
+        leading_parameters: bool,
     },
     PeerSend {
         pipe: Option<u64>,
@@ -600,7 +654,7 @@ pub enum Op {
     },
 }
 
-/// An `api` step (Section 5.3).
+/// An `api` step.
 #[derive(Debug, Clone)]
 pub struct ApiStep {
     pub call: Call,
@@ -664,6 +718,7 @@ pub enum Call {
     SetScheduler(SchedulerArgs),
     SetRedundant(RedundantArgs),
     RevalidatePipes(RevalidateArgs),
+    AdvanceEpoch(NoArgs),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -749,10 +804,6 @@ pub struct AddPipeArgs {
     pub pipe: u64,
     pub dir: Direction,
     pub fate_group: u64,
-    #[serde(default)]
-    pub oob: bool,
-    #[serde(default)]
-    pub carrier_bound: bool,
     pub send_priority: Option<u64>,
     pub receive_priority: Option<u64>,
     pub send_standby: Option<bool>,
@@ -806,7 +857,7 @@ pub struct RevalidateArgs {
     pub pipe: Option<u64>,
 }
 
-/// The expected result of an API call (Section 5.5); absent fields match
+/// The expected result of an API call; absent fields match
 /// anything.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -817,7 +868,7 @@ pub struct ApiExpect {
     pub open_info: Option<Hex>,
     pub priority: Option<PrioritySpec>,
     pub pipe_carrier: Option<bool>,
-    /// The application TLVs in the order received (EXTENSIONS.md 4.4).
+    /// The application TLVs in the order received.
     pub app_tlvs: Option<Vec<AppTlvSpec>>,
     pub accepted: Option<u64>,
     pub data: Option<Hex>,
@@ -923,7 +974,6 @@ pub struct OneOf<T> {
 #[serde(rename_all = "snake_case")]
 pub enum EventName {
     Established,
-    OobJoin,
     GoawayReceived,
     PipeState,
     JoinAuthFailed,
@@ -949,11 +999,24 @@ pub enum Feature {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthFailure {
-    Mac,
-    MacCarrierBound,
+    Auth,
+    MissingField,
+    BadField,
+    Kex,
 }
 
-/// The fields of an expected event (Section 5.7); absent fields match
+impl AuthFailure {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::MissingField => "missing_field",
+            Self::BadField => "bad_field",
+            Self::Kex => "kex",
+        }
+    }
+}
+
+/// The fields of an expected event; absent fields match
 /// anything.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -980,7 +1043,7 @@ pub enum TypePattern {
     OneOf(OneOf<String>),
 }
 
-/// A field pattern (Section 5.6).
+/// A field pattern.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ValuePattern {
@@ -1027,7 +1090,7 @@ pub struct EntryPattern {
     pub delay: Option<ValuePattern>,
 }
 
-/// A frame pattern of `expect_frames` (Section 5.6).
+/// A frame pattern of `expect_frames`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FramePattern {
@@ -1058,10 +1121,8 @@ pub struct FramePattern {
     pub locator: Option<ValuePattern>,
     pub pipe: Option<ValuePattern>,
     pub direction: Option<ValuePattern>,
-    pub carrier_bound: Option<ValuePattern>,
     pub standby: Option<ValuePattern>,
     pub fate_group: Option<ValuePattern>,
-    pub token: Option<ValuePattern>,
     pub lane_key: Option<ValuePattern>,
     pub lane: Option<ValuePattern>,
     pub entries: Option<Vec<EntryPattern>>,
@@ -1070,6 +1131,10 @@ pub struct FramePattern {
     pub params_include: Option<BTreeMap<String, ParamPattern>>,
     pub params_exclude: Option<Vec<String>>,
     pub grease: Option<bool>,
+    pub phase: Option<ValuePattern>,
+    pub epoch: Option<ValuePattern>,
+    pub share: Option<ValuePattern>,
+    pub same_as_previous: Option<bool>,
 }
 
 /// An expected parameter value in `params_include`: `"*"`, `null` for an

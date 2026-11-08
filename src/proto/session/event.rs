@@ -1,7 +1,5 @@
 //! Events the core reports to its driver.
 
-use bytes::Bytes;
-
 use crate::proto::frame::Dir;
 use crate::proto::params::{Features, Role};
 
@@ -16,14 +14,23 @@ use super::{LaneId, PipeId, SessionError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoreEvent {
+    /// The deferred pre-shared key derived the join keys: joins may go.
+    JoinKeysReady,
+    /// The Session Locators the session accepts changed with an epoch: a listener updates
+    /// its table from [`super::SessionCore::accepted_locators`].
+    LocatorsChanged,
+    /// The session committed this epoch: its secret is known, and joins of it are
+    /// accepted.
+    EpochCommitted(u64),
+    /// This epoch, its keys and its Locators were deleted.
+    EpochDeleted(u64),
     /// The peer's parameters were processed; roles and features are fixed.
     Established {
         /// The local role.
         role: Role,
         /// The features in use.
         features: Features,
-        /// The application protocol negotiated with `protocols` (SPEC.md
-        /// Section 13.3), when both endpoints offered one.
+        /// The application protocol negotiated with `protocols`, when both endpoints offered one.
         protocol: Option<Box<str>>,
     },
     /// A peer stream of this type can be accepted.
@@ -64,21 +71,26 @@ pub enum CoreEvent {
         /// The peer's application error code.
         code: u64,
     },
-    /// A pipe direction changed state (STATE_MACHINE.md Section 3).
+    /// A pipe direction changed state.
     PipeState {
         /// The attachment.
         pipe: PipeId,
         /// The direction and its new state.
         state: DirectionState,
     },
-    /// The attachment was retired and its state freed (STATE_MACHINE.md
-    /// Section 3.3): it has no state any more.
+    /// The peer attached one of our joins
+    /// ([`super::SessionCore::pipe_attached`]).
+    PipeAttached {
+        /// The attachment.
+        pipe: PipeId,
+    },
+    /// The attachment was retired and its state freed: it has no state any more.
     PipeRetired {
         /// The attachment.
         pipe: PipeId,
     },
     /// The effective priority, standby flag or weight of a pipe's outbound
-    /// direction changed (MULTIPATH.md Section 9).
+    /// direction changed.
     PipePriorityChanged {
         /// The attachment.
         pipe: PipeId,
@@ -125,19 +137,10 @@ pub enum CoreEvent {
         /// The capacity in bytes per second.
         rate: u64,
     },
-    /// Hand this PIPE_JOIN to the pipe's adapter for out-of-band delivery
-    /// (MULTIPATH.md Section 5.3), for example in the `Zmux-Pipe-Join`
-    /// header.
-    OobJoin {
-        /// The new attachment.
-        pipe: PipeId,
-        /// The frame, Type through Join Token.
-        frame: Bytes,
-    },
-    /// A join's token did not verify (MULTIPATH.md Section 5.4 step 5).
+    /// A Hello did not verify.
     JoinAuthFailed {
-        /// The token was carrier-bound.
-        carrier_bound: bool,
+        /// The error class, `auth`.
+        reason: &'static str,
     },
     /// Close a pipe's carrier half, every lane of it: after a failure
     /// (`abort`), or at the end of a drain or linger. An outbound pipe that
@@ -151,16 +154,16 @@ pub enum CoreEvent {
         /// Abortively (the pipe failed).
         abort: bool,
     },
-    /// Open a lane of an outbound pipe (MULTIPATH.md Section 5.8): a new
+    /// Open a lane of an outbound pipe: a new
     /// stream of the carrier connection of the pipe's lane 0, attached
     /// with [`super::SessionCore::lane_opened`] once the carrier's stream
     /// credit allows; a stream that cannot be opened is reported with
     /// [`super::SessionCore::write_failed`].
     OpenLane(LaneId),
-    /// Reset an outbound lane that was not confirmed in time (MULTIPATH.md
-    /// Section 5.8): it is refused, which is no failure of its pipe.
+    /// Reset an outbound lane that was not confirmed in time: it is refused, which is no failure of
+    /// its pipe.
     ResetLane(LaneId),
-    /// The session entered SUSPENDED (RESUME.md Section 4).
+    /// The session entered SUSPENDED.
     Suspended,
     /// The session left SUSPENDED.
     Resumed,
@@ -170,9 +173,6 @@ pub enum CoreEvent {
         /// The round-trip time measured.
         rtt: std::time::Duration,
     },
-    /// Multipath was offered by both endpoints but no secret source
-    /// matched: "join security unavailable" (MULTIPATH.md Section 3.3).
-    JoinSecurityUnavailable,
     /// The session ended. Carriers are closed once `poll_transmit` reports
     /// it and the session is [`super::State::Closed`].
     Closed(SessionError),

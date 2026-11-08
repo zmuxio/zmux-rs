@@ -1,5 +1,4 @@
-//! Blocking calls on threads that drive sessions fail at once
-//! (CONFORMANCE.md):
+//! Blocking calls on threads that drive sessions fail at once:
 //! inside a tokio runtime, and on the std driver's own threads (here a
 //! carrier's `Read`, which runs on the session's reader thread). Calls that
 //! never wait still work there, nothing deadlocks, and the session keeps
@@ -98,7 +97,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
                 Ok(_) | Err(zmux::blocking::WaitError::TimedOut)
             ),
             c.try_open_bi().is_ok(),
-            c.add_pipe(
+            c.begin_add_pipe(
                 PipeIo::from_halves(io::empty(), io::sink()),
                 Default::default(),
             )

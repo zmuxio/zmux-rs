@@ -14,17 +14,6 @@
       "steps": 5
     },
     {
-      "id": "core.handshake.legacy_zmux_rejected",
-      "file": "fixtures/traces/core/handshake/legacy_zmux_rejected.ndjson",
-      "title": "A legacy zmux preface fails at its third byte",
-      "refs": [
-        "SPEC.md#6.2"
-      ],
-      "findings": [],
-      "profile": "zmux-small",
-      "steps": 8
-    },
-    {
       "id": "core.handshake.http1_rejected",
       "file": "fixtures/traces/core/handshake/http1_rejected.ndjson",
       "title": "An HTTP/1.1 request fails at its third byte",
@@ -116,7 +105,7 @@
     {
       "id": "core.handshake.tp_unknown_and_grease_ignored",
       "file": "fixtures/traces/core/handshake/tp_unknown_and_grease_ignored.ndjson",
-      "title": "GREASE and unknown parameters, including the qmux crate's application_protocols, are ignored",
+      "title": "GREASE and unknown parameters, including an application_protocols parameter that some QMux implementations send, are ignored",
       "refs": [
         "SPEC.md#5.2",
         "SPEC.md#13.2"
@@ -520,7 +509,7 @@
         "EXTENSIONS.md#4.3"
       ],
       "findings": [
-        "Go-1"
+        "D-S03"
       ],
       "profile": "zmux-small",
       "steps": 7
@@ -611,7 +600,7 @@
         "SPEC.md#7.5"
       ],
       "findings": [
-        "Rust-5"
+        "D-S07"
       ],
       "profile": "zmux-small",
       "steps": 6
@@ -636,8 +625,8 @@
         "STATE_MACHINE.md#2.5"
       ],
       "findings": [
-        "Java-12",
-        "Go-5"
+        "D-S09",
+        "D-S05"
       ],
       "profile": "zmux-small",
       "steps": 11
@@ -651,7 +640,7 @@
         "SPEC.md#9.4"
       ],
       "findings": [
-        "X1"
+        "D-F01"
       ],
       "profile": "zmux-small",
       "steps": 10
@@ -664,7 +653,7 @@
         "SPEC.md#4.3"
       ],
       "findings": [
-        "Java-9"
+        "D-S08"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -688,7 +677,7 @@
         "SPEC.md#7.2"
       ],
       "findings": [
-        "Rust-1"
+        "D-S06"
       ],
       "profile": "zmux-small",
       "steps": 10
@@ -726,7 +715,7 @@
         "SPEC.md#7.6"
       ],
       "findings": [
-        "open_info-lost"
+        "D-S02"
       ],
       "profile": "zmux-small",
       "steps": 9
@@ -796,7 +785,7 @@
         "SPEC.md#8.3"
       ],
       "findings": [
-        "zero-window-deadlock"
+        "D-F03"
       ],
       "profile": "zmux-small",
       "steps": 8
@@ -913,7 +902,7 @@
         "SPEC.md#4.3"
       ],
       "findings": [
-        "Rust-6"
+        "D-F06"
       ],
       "profile": "zmux-small",
       "steps": 6
@@ -937,7 +926,7 @@
         "SPEC.md#8.1"
       ],
       "findings": [
-        "Rust-7"
+        "D-F07"
       ],
       "profile": "zmux-small",
       "steps": 14
@@ -983,7 +972,7 @@
         "SPEC.md#8.5"
       ],
       "findings": [
-        "rapid-reset"
+        "D-F04"
       ],
       "profile": "zmux-small",
       "steps": 17
@@ -993,11 +982,10 @@
       "file": "fixtures/traces/core/flow/rapid_reset_bounded.ndjson",
       "title": "Open-and-reset churn cannot exceed the stream limit without application release",
       "refs": [
-        "SPEC.md#8.5",
-        "SPEC.md#14.1"
+        "SPEC.md#8.5"
       ],
       "findings": [
-        "rapid-reset"
+        "D-F04"
       ],
       "profile": "zmux-small",
       "steps": 7
@@ -1129,12 +1117,12 @@
     {
       "id": "core.robustness.budget_churn_never_trips",
       "file": "fixtures/traces/core/robustness/budget_churn_never_trips.ndjson",
-      "title": "Stream churn with crossing STOP_SENDING never drains the budget (X1): frames for terminal or discarded streams are not chargeable",
+      "title": "Stream churn with crossing STOP_SENDING never drains the budget (D-F01): frames for terminal or discarded streams are not chargeable",
       "refs": [
         "SPEC.md#9.4"
       ],
       "findings": [
-        "X1"
+        "D-F01"
       ],
       "profile": "zmux-small",
       "steps": 709
@@ -1238,7 +1226,7 @@
         "SPEC.md#6.5"
       ],
       "findings": [
-        "Rust-closer-no-CLOSE"
+        "D-C02"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -1262,8 +1250,8 @@
         "SPEC.md#6.5"
       ],
       "findings": [
-        "peer-close-code-lost",
-        "Java-10"
+        "D-C01",
+        "D-C04"
       ],
       "profile": "zmux-small",
       "steps": 10
@@ -1331,8 +1319,8 @@
         "STATE_MACHINE.md#2.5"
       ],
       "findings": [
-        "Java-10",
-        "Rust-3"
+        "D-C04",
+        "D-C03"
       ],
       "profile": "zmux-small",
       "steps": 11
@@ -1529,7 +1517,7 @@
     {
       "id": "core.pipe_ack.not_with_multipath",
       "file": "fixtures/traces/core/pipe_ack/not_with_multipath.ndjson",
-      "title": "When multipath is in use, pipe acknowledgement is not: the session acknowledges by MULTIPATH.md Section 6",
+      "title": "When multipath is in use, pipe acknowledgement is not: the session acknowledges with PIPE_ACK of multipath",
       "refs": [
         "MULTIPATH.md#3.5",
         "SPEC.md#5.5"
@@ -1560,8 +1548,7 @@
       "refs": [
         "MULTIPATH.md#2.5",
         "MULTIPATH.md#6.1",
-        "SPEC.md#4.1",
-        "IMPLEMENTATION.md#13.8"
+        "SPEC.md#4.1"
       ],
       "findings": [],
       "profile": "zmux-small",
@@ -1574,7 +1561,7 @@
       "refs": [
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#3.6",
-        "SCHEDULER.md#9.2",
+        "MULTIPATH.md#2.5",
         "STATE_MACHINE.md#3.3"
       ],
       "findings": [],
@@ -2445,7 +2432,7 @@
     {
       "id": "compat.qmux.close_with_frame_type_zero",
       "file": "fixtures/traces/compat/qmux/close_with_frame_type_zero.ndjson",
-      "title": "CONNECTION_CLOSE 0x1c with Frame Type 0, as the qmux crate sends it",
+      "title": "CONNECTION_CLOSE 0x1c with Frame Type 0, as some QMux implementations send it",
       "refs": [
         "SPEC.md#13.2"
       ],
@@ -2557,6 +2544,17 @@
       "steps": 6
     },
     {
+      "id": "multipath.negotiation.secret_flags_differ",
+      "file": "fixtures/traces/multipath/negotiation/secret_flags_differ.ndjson",
+      "title": "Secret Flags that are both non-zero and differ close the session: no source is taken out of the secret by clearing a flag",
+      "refs": [
+        "MULTIPATH.md#10.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 4
+    },
+    {
       "id": "multipath.negotiation.max_lanes_feature_not_in_use",
       "file": "fixtures/traces/multipath/negotiation/max_lanes_feature_not_in_use.ndjson",
       "title": "zmux_max_lanes sent with zmux_multipath is valid although multipath ends up not in use (no common secret source) and pipe acknowledgement is not announced; lanes are then not available and a PIPE_LANE is a frame of a feature not in use",
@@ -2571,40 +2569,136 @@
       "steps": 8
     },
     {
-      "id": "multipath.join.inband_up_with_zero_rtt_data",
-      "file": "fixtures/traces/multipath/join/inband_up_with_zero_rtt_data.ndjson",
-      "title": "An authenticated in-band join carries data in its first record",
+      "id": "multipath.join.first_batch",
+      "file": "fixtures/traces/multipath/join/first_batch.ndjson",
+      "title": "A Hello's first batch is delivered before the confirmation, counts in no position and elicits no acknowledgement: the acknowledgement that falls due for pipe 0 has no entry for pipe 2",
       "refs": [
         "MULTIPATH.md#5.2",
-        "MULTIPATH.md#5.4"
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#6.3"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 16
     },
     {
-      "id": "multipath.join.bad_token",
-      "file": "fixtures/traces/multipath/join/bad_token.ndjson",
-      "title": "A join with a wrong token is closed silently",
+      "id": "multipath.join.first_batch_bad_frame_dropped",
+      "file": "fixtures/traces/multipath/join/first_batch_bad_frame_dropped.ndjson",
+      "title": "A frame of a first batch that breaks its rules is dropped and counted: a FIN in the batch closes nothing and delivers nothing",
+      "refs": [
+        "MULTIPATH.md#5.2",
+        "secure-carrier/SPEC.md#11.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.join.unconfirmed_has_no_pipe",
+      "file": "fixtures/traces/multipath/join/unconfirmed_has_no_pipe.ndjson",
+      "title": "A verified Hello without a confirmation has no attachment: a replay moves no pipe and the carrier ends at the handshake timeout",
       "refs": [
         "MULTIPATH.md#5.4",
-        "MULTIPATH.md#10.5"
+        "secure-carrier/SPEC.md#11.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "multipath.join.bad_key",
+      "file": "fixtures/traces/multipath/join/bad_key.ndjson",
+      "title": "A Hello that fails its AEAD is closed silently and reported",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "secure-carrier/SPEC.md#11.5"
       ],
       "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
     {
+      "id": "multipath.join.key_share_missing",
+      "file": "fixtures/traces/multipath/join/key_share_missing.ndjson",
+      "title": "A Hello without a key share fails when its payload is parsed: the reject policy answers, the Pipe ID stays free and the join is reported",
+      "refs": [
+        "secure-carrier/SPEC.md#11.3",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.join.key_share_bad_length",
+      "file": "fixtures/traces/multipath/join/key_share_bad_length.ndjson",
+      "title": "A Hello whose key share has the wrong length fails when its payload is parsed: the reject policy answers, the Pipe ID stays free and the join is reported",
+      "refs": [
+        "secure-carrier/SPEC.md#11.3",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.join.key_share_group_not_usable",
+      "file": "fixtures/traces/multipath/join/key_share_group_not_usable.ndjson",
+      "title": "A Hello with a Group that only the joiner declared is refused as bad_field: the usable Groups are the intersection of both sets",
+      "refs": [
+        "MULTIPATH.md#3.7",
+        "secure-carrier/SPEC.md#11.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.join.key_share_low_order",
+      "file": "fixtures/traces/multipath/join/key_share_low_order.ndjson",
+      "title": "An authenticated Hello whose X25519 share gives an all-zero output fails with kex after the Pipe ID's bit is set: the carrier is closed and the ID cannot be used again",
+      "refs": [
+        "secure-carrier/SPEC.md#11.6",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "multipath.join.local_group",
+      "file": "fixtures/traces/multipath/join/local_group.ndjson",
+      "title": "The local joiner uses a usable Group: Group 2 when the peer did not declare Group 1",
+      "refs": [
+        "MULTIPATH.md#3.7",
+        "secure-carrier/SPEC.md#11.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "multipath.negotiation.session_crypto_without_group_2",
+      "file": "fixtures/traces/multipath/negotiation/session_crypto_without_group_2.ndjson",
+      "title": "zmux_session_crypto whose GroupSet lacks Group 2 is a TRANSPORT_PARAMETER_ERROR",
+      "refs": [
+        "MULTIPATH.md#3.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 4
+    },
+    {
       "id": "multipath.join.replay",
       "file": "fixtures/traces/multipath/join/replay.ndjson",
-      "title": "A replayed join for a used pipe ID is closed",
+      "title": "A replayed Hello for a used pipe ID is closed",
       "refs": [
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#10.6"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 11
     },
     {
       "id": "multipath.join.wrong_parity",
@@ -2642,36 +2736,25 @@
     {
       "id": "multipath.join.held_until_established",
       "file": "fixtures/traces/multipath/join/held_until_established.ndjson",
-      "title": "A join that arrives before the joiner's parameters is held, then verified",
+      "title": "A Hello that arrives before the joiner's parameters is held, then verified",
       "refs": [
         "MULTIPATH.md#5.4"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 8
-    },
-    {
-      "id": "multipath.join.out_of_band_down",
-      "file": "fixtures/traces/multipath/join/out_of_band_down.ndjson",
-      "title": "An out-of-band join for a downlink makes it usable at once",
-      "refs": [
-        "MULTIPATH.md#5.3",
-        "SCHEDULER.md#5"
       ],
       "findings": [],
       "profile": "zmux-mp",
       "steps": 9
     },
     {
-      "id": "multipath.join.join_not_first",
-      "file": "fixtures/traces/multipath/join/join_not_first.ndjson",
-      "title": "PIPE_JOIN anywhere but first on a joined pipe is fatal",
+      "id": "multipath.join.down_accepted",
+      "file": "fixtures/traces/multipath/join/down_accepted.ndjson",
+      "title": "A join for a downlink makes it usable once Confirmed",
       "refs": [
-        "MULTIPATH.md#5.2"
+        "MULTIPATH.md#5.3",
+        "MULTIPATH.md#11"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 6
+      "steps": 10
     },
     {
       "id": "multipath.join.parameters_on_joined_pipe",
@@ -2682,7 +2765,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 8
+      "steps": 9
     },
     {
       "id": "multipath.bootstrap.split_pairing",
@@ -2705,34 +2788,34 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 14
+      "steps": 15
     },
     {
-      "id": "multipath.join.local_inband",
-      "file": "fixtures/traces/multipath/join/local_inband.ndjson",
-      "title": "A local join carries a token keyed with the local role",
+      "id": "multipath.join.local_up",
+      "file": "fixtures/traces/multipath/join/local_up.ndjson",
+      "title": "A local join writes a Hello keyed with the local role and nothing else until the Reply",
       "refs": [
         "MULTIPATH.md#5.7"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 6
+      "steps": 9
     },
     {
-      "id": "multipath.join.local_out_of_band",
-      "file": "fixtures/traces/multipath/join/local_out_of_band.ndjson",
-      "title": "A local out-of-band join is handed to the adapter",
+      "id": "multipath.join.local_down",
+      "file": "fixtures/traces/multipath/join/local_down.ndjson",
+      "title": "A local down join writes a Hello and its confirmation, and then only reads",
       "refs": [
         "MULTIPATH.md#5.3"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 6
+      "steps": 8
     },
     {
       "id": "multipath.join.local_join_becomes_active",
       "file": "fixtures/traces/multipath/join/local_join_becomes_active.ndjson",
-      "title": "A local join is JOINING until the peer acknowledges bytes on it",
+      "title": "A local join is JOINING until the Reply is verified",
       "refs": [
         "MULTIPATH.md#5.7",
         "STATE_MACHINE.md#3.1"
@@ -2744,25 +2827,26 @@
     {
       "id": "multipath.join.leading_parameters_discarded",
       "file": "fixtures/traces/multipath/join/leading_parameters_discarded.ndjson",
-      "title": "A shared listener may send its transport parameters before it sees the join: the joiner discards that leading record, which confirms nothing and does not count in the pipe's position",
+      "title": "A shared listener may send its transport parameters before it sees the Hello: the joiner consumes that one record, which proves nothing and does not count in the pipe's position",
       "refs": [
         "MULTIPATH.md#5.7",
         "SPEC.md#13.2"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
+      "steps": 12
     },
     {
-      "id": "multipath.failover.joining_sole_path_carries_data",
-      "file": "fixtures/traces/multipath/failover/joining_sole_path_carries_data.ndjson",
-      "title": "While no outbound pipe is usable, a JOINING pipe carries stream data as an ACTIVE pipe would, not just one chunk",
+      "id": "multipath.failover.joining_sole_path_first_batch",
+      "file": "fixtures/traces/multipath/failover/joining_sole_path_first_batch.ndjson",
+      "title": "While no outbound pipe is usable, a Hello's first batch carries stream data, the reinjected x first; everything is sent again after the Reply",
       "refs": [
-        "MULTIPATH.md#11.1"
+        "MULTIPATH.md#11",
+        "MULTIPATH.md#5.2"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 16
+      "steps": 18
     },
     {
       "id": "multipath.join.acceptor_confirms_downlink",
@@ -2770,16 +2854,16 @@
       "title": "The acceptor writes a record carrying PIPE_PING on a joined bidirectional pipe within its max_ack_delay, and the acknowledgement gives the pipe its first RTT sample",
       "refs": [
         "MULTIPATH.md#5.4",
-        "SCHEDULER.md#2"
+        "MULTIPATH.md#6.6"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 11
     },
     {
       "id": "multipath.join.direction_mismatch",
       "file": "fixtures/traces/multipath/join/direction_mismatch.ndjson",
-      "title": "An authenticated join whose direction the carrier cannot provide is abandoned, not fatal",
+      "title": "An authenticated join whose direction the carrier cannot provide is refused in the Reply, not fatal",
       "refs": [
         "MULTIPATH.md#5.4"
       ],
@@ -2805,12 +2889,12 @@
       "file": "fixtures/traces/multipath/spread/reorder_across_pipes.ndjson",
       "title": "Frames of one stream arrive interleaved on two pipes, the preamble last",
       "refs": [
-        "MULTIPATH.md#13",
+        "MULTIPATH.md#12",
         "SPEC.md#7.3"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 11
     },
     {
       "id": "multipath.spread.duplicates_are_harmless",
@@ -2821,89 +2905,41 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 11
     },
     {
       "id": "multipath.spread.beyond_window",
       "file": "fixtures/traces/multipath/spread/beyond_window.ndjson",
       "title": "Reordered data beyond the window is fatal",
       "refs": [
-        "MULTIPATH.md#13"
+        "MULTIPATH.md#12"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 7
-    },
-    {
-      "id": "multipath.redundancy.urgent_on_two_pipes",
-      "file": "fixtures/traces/multipath/redundancy/urgent_on_two_pipes.ndjson",
-      "title": "A chunk of an urgent stream direction goes to the two pipes of its tier with the earliest arrival estimate; a stream of the default urgency is sent once",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "MULTIPATH.md#7.5"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 20
-    },
-    {
-      "id": "multipath.redundancy.first_chunk_after_idle",
-      "file": "fixtures/traces/multipath/redundancy/first_chunk_after_idle.ndjson",
-      "title": "New data on a pipe that has been idle without acknowledgement progress for max(1 s, T_suspect) is sent at once, without a probe first, and its first chunk is also sent on the next pipe in control order",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 19
+      "steps": 8
     },
     {
       "id": "multipath.redundancy.partial_copy_no_fin",
       "file": "fixtures/traces/multipath/redundancy/partial_copy_no_fin.ndjson",
       "title": "A copy that covers only part of a stream direction carries no FIN: after an idle period only the first chunk of a write that ends the direction is copied, and only the frame that reaches the final size carries FIN",
       "refs": [
-        "SCHEDULER.md#4.1",
+        "MULTIPATH.md#7.5",
         "SPEC.md#7.5"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 18
+      "steps": 19
     },
     {
       "id": "multipath.revalidate.pipes_await_acknowledgement",
       "file": "fixtures/traces/multipath/revalidate/pipes_await_acknowledgement.ndjson",
       "title": "After a revalidation request every live outbound pipe gets a PIPE_PING at once and takes no new stream data until it is acknowledged, while another pipe is",
       "refs": [
-        "SCHEDULER.md#11.1",
-        "API.md#4.2"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 23
-    },
-    {
-      "id": "multipath.redundancy.byte_bound",
-      "file": "fixtures/traces/multipath/redundancy/byte_bound.ndjson",
-      "title": "Redundant copies whose data is unacknowledged stay within max(spread_chunk, retransmit budget / 64); a chunk beyond it is sent once, and acknowledgements free the bound",
-      "refs": [
-        "SCHEDULER.md#4.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 22
-    },
-    {
-      "id": "multipath.redundancy.set_redundant",
-      "file": "fixtures/traces/multipath/redundancy/set_redundant.ndjson",
-      "title": "SetRedundant turns redundancy on for a stream direction of the default urgency while the session's redundancy is off, and off again",
-      "refs": [
-        "SCHEDULER.md#4.1",
-        "API.md#5.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
+      "steps": 24
     },
     {
       "id": "multipath.ack.pipe_ping_answered_on_its_pair",
@@ -2914,7 +2950,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 18
+      "steps": 20
     },
     {
       "id": "multipath.credit.reset_lowering_reliable_size_releases",
@@ -2925,7 +2961,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 19
+      "steps": 20
     },
     {
       "id": "multipath.credit.reset_releases_lost_bytes",
@@ -2937,7 +2973,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 20
+      "steps": 21
     },
     {
       "id": "multipath.ping.out_of_order_request_ignored",
@@ -2949,7 +2985,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 14
+      "steps": 15
     },
     {
       "id": "multipath.ack.threshold",
@@ -2960,7 +2996,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 7
+      "steps": 8
     },
     {
       "id": "multipath.ack.pipe_ping",
@@ -2971,7 +3007,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 7
+      "steps": 8
     },
     {
       "id": "multipath.ack.ahead_of_sent",
@@ -2993,7 +3029,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 10
+      "steps": 11
     },
     {
       "id": "multipath.ack.outdated_ignored",
@@ -3017,7 +3053,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
+      "steps": 14
     },
     {
       "id": "multipath.failover.carrier_error_reinjects",
@@ -3029,7 +3065,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.failover.suspect_reinjects_and_probes",
@@ -3041,18 +3077,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 23
-    },
-    {
-      "id": "multipath.failover.suspect_then_failed",
-      "file": "fixtures/traces/multipath/failover/suspect_then_failed.ndjson",
-      "title": "Without progress a suspect pipe fails after T_fail when another pipe is ACTIVE",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 26
+      "steps": 24
     },
     {
       "id": "multipath.failover.last_pipe_survives_pause",
@@ -3060,34 +3085,11 @@
       "title": "A single pipe pair in a multipath session survives a mutual pause: acknowledgements keep flowing on the suspect pipe and the last usable pipe does not fail on T_fail",
       "refs": [
         "MULTIPATH.md#7.1",
-        "MULTIPATH.md#11.1"
+        "MULTIPATH.md#11"
       ],
       "findings": [],
       "profile": "zmux-mp",
       "steps": 21
-    },
-    {
-      "id": "multipath.failover.both_pipes_suspect_recover",
-      "file": "fixtures/traces/multipath/failover/both_pipes_suspect_recover.ndjson",
-      "title": "When every outbound pipe is suspect none fails on T_fail; acknowledgements bring both back",
-      "refs": [
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 29
-    },
-    {
-      "id": "multipath.failover.last_pipe_without_resume_dead_timeout",
-      "file": "fixtures/traces/multipath/failover/last_pipe_without_resume_dead_timeout.ndjson",
-      "title": "Without resume the last pipe fails from a stall only after T_dead (its default dead_timeout, half the 30 s idle timeout), and the session then ends",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.5"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 14
     },
     {
       "id": "multipath.failover.write_stall_suspect",
@@ -3110,43 +3112,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 19
-    },
-    {
-      "id": "multipath.failover.fate_group_suspect",
-      "file": "fixtures/traces/multipath/failover/fate_group_suspect.ndjson",
-      "title": "When an attachment fails abruptly, attachments in the same fate group become suspect at once",
-      "refs": [
-        "MULTIPATH.md#2.2",
-        "MULTIPATH.md#7.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 24
-    },
-    {
-      "id": "multipath.failover.fate_group_drain_exempt",
-      "file": "fixtures/traces/multipath/failover/fate_group_drain_exempt.ndjson",
-      "title": "An attachment whose graceful removal has started affects no other attachment of its fate group when its carrier then fails",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.2"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 27
-    },
-    {
-      "id": "multipath.failover.fate_group_resource_limit_exempt",
-      "file": "fixtures/traces/multipath/failover/fate_group_resource_limit_exempt.ndjson",
-      "title": "An attachment the peer abandons with ZMUX_PIPE_RESOURCE_LIMIT affects no other attachment of its fate group",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 26
+      "steps": 20
     },
     {
       "id": "multipath.remove.graceful_local",
@@ -3158,7 +3124,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 23
+      "steps": 24
     },
     {
       "id": "multipath.remove.drain_deadline_fails_pipe",
@@ -3170,7 +3136,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 33
+      "steps": 34
     },
     {
       "id": "multipath.remove.draining_never_returns_active",
@@ -3178,12 +3144,12 @@
       "title": "A draining pipe that stalls and recovers stays DRAINING and takes no new stream data; it closes once the PIPE_ABANDON exchange is complete and its data is acknowledged",
       "refs": [
         "MULTIPATH.md#8.2",
-        "MULTIPATH.md#11.1",
+        "MULTIPATH.md#11",
         "STATE_MACHINE.md#3.1"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 26
+      "steps": 27
     },
     {
       "id": "multipath.remove.linger_after_exchange_is_graceful",
@@ -3195,7 +3161,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 21
+      "steps": 22
     },
     {
       "id": "multipath.remove.peer_graceful",
@@ -3206,7 +3172,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 15
+      "steps": 16
     },
     {
       "id": "multipath.remove.abrupt_local",
@@ -3217,7 +3183,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.remove.last_outbound_without_resume",
@@ -3228,7 +3194,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 8
+      "steps": 9
     },
     {
       "id": "multipath.remove.last_inbound_without_resume",
@@ -3239,19 +3205,18 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 8
+      "steps": 9
     },
     {
       "id": "multipath.status.local_standby",
       "file": "fixtures/traces/multipath/status/local_standby.ndjson",
       "title": "A pipe marked standby locally carries no new stream data while another pipe works, and the peer is asked to treat its direction as standby too",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 15
+      "steps": 16
     },
     {
       "id": "multipath.status.stale_ignored",
@@ -3262,7 +3227,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 11
+      "steps": 12
     },
     {
       "id": "multipath.status.invalid_value",
@@ -3285,7 +3250,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
+      "steps": 14
     },
     {
       "id": "multipath.idle.received_records_only",
@@ -3343,12 +3308,12 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 132
+      "steps": 133
     },
     {
       "id": "multipath.join.refusal_backoff",
       "file": "fixtures/traces/multipath/join/refusal_backoff.ndjson",
-      "title": "After a join is refused with ZMUX_PIPE_RESOURCE_LIMIT, the joiner joins again only after a backoff of 1 s (or an own retirement); pipe IDs are not credit",
+      "title": "After a join is refused in the Reply, the joiner joins again only after a backoff of 1 s (or an own retirement); pipe IDs are not credit",
       "refs": [
         "MULTIPATH.md#5.7",
         "MULTIPATH.md#4.1"
@@ -3360,7 +3325,7 @@
     {
       "id": "multipath.join.local_join_timeout",
       "file": "fixtures/traces/multipath/join/local_join_timeout.ndjson",
-      "title": "A local join that is not confirmed within the handshake timeout fails and is abandoned",
+      "title": "A local join with no Reply within the handshake timeout fails and is abandoned",
       "refs": [
         "MULTIPATH.md#5.7",
         "STATE_MACHINE.md#3.2"
@@ -3379,7 +3344,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.ack.retired_bootstrap_entry_ignored",
@@ -3392,7 +3357,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.remove.failed_attachment_retired",
@@ -3405,7 +3370,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 14
+      "steps": 15
     },
     {
       "id": "multipath.remove.abandon_answered_once",
@@ -3416,7 +3381,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.remove.abandon_unseen_above_window_ignored",
@@ -3428,7 +3393,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 11
+      "steps": 12
     },
     {
       "id": "multipath.join.replay_window",
@@ -3440,7 +3405,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 24
+      "steps": 27
     },
     {
       "id": "multipath.ack.unknown_peer_id_nonzero_position",
@@ -3491,18 +3456,6 @@
       "steps": 19
     },
     {
-      "id": "multipath.failover.resource_limit_abandon_keeps_fate_group",
-      "file": "fixtures/traces/multipath/failover/resource_limit_abandon_keeps_fate_group.ndjson",
-      "title": "When the acceptor abandons one of the joiner's attachments with ZMUX_PIPE_RESOURCE_LIMIT, the joiner's other attachments of the same fate group stay ACTIVE",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#8.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 24
-    },
-    {
       "id": "multipath.join.message_framed_positions",
       "file": "fixtures/traces/multipath/join/message_framed_positions.ndjson",
       "title": "On a message-framed pipe each message counts as its byte-stream form in positions",
@@ -3512,7 +3465,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 9
+      "steps": 10
     },
     {
       "id": "multipath.failover.control_frames_reinjected",
@@ -3524,7 +3477,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 25
+      "steps": 26
     },
     {
       "id": "multipath.ack.lowest_delay_pipe_and_copy",
@@ -3535,7 +3488,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 16
+      "steps": 17
     },
     {
       "id": "multipath.credit.copy_with_redundant_snapshot",
@@ -3546,7 +3499,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.ack.suspect_primary_moves_to_active",
@@ -3554,11 +3507,11 @@
       "title": "When the lowest-delay pipe becomes suspect, PIPE_ACK and credit frames go to an ACTIVE pipe",
       "refs": [
         "MULTIPATH.md#6.5",
-        "MULTIPATH.md#11.1"
+        "MULTIPATH.md#11"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 22
+      "steps": 23
     },
     {
       "id": "multipath.failover.inbound_silence",
@@ -3570,42 +3523,20 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 20
+      "steps": 21
     },
     {
-      "id": "multipath.failover.pair_outage_waits_dead_timeout",
-      "file": "fixtures/traces/multipath/failover/pair_outage_waits_dead_timeout.ndjson",
-      "title": "Without resume and with a 120 s idle timeout, a single pipe pair survives a 30 s outage: its outbound direction waits for T_dead (by default half the idle timeout, 60 s), and the inbound silence rule does not apply to a pair",
-      "refs": [
-        "MULTIPATH.md#7.1",
-        "MULTIPATH.md#7.3"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
-    },
-    {
-      "id": "multipath.join.carrier_bound_token",
-      "file": "fixtures/traces/multipath/join/carrier_bound_token.ndjson",
-      "title": "A carrier-bound token verifies only on its own carrier; a copy on another carrier is a join authentication failure",
+      "id": "multipath.join.bound_mode",
+      "file": "fixtures/traces/multipath/join/bound_mode.ndjson",
+      "title": "A Bound join verifies only on a carrier whose exporter both ends share: a Hello made with another binding is a join authentication failure",
       "refs": [
         "MULTIPATH.md#10.5",
-        "MULTIPATH.md#5.4"
+        "MULTIPATH.md#5.4",
+        "secure-carrier/SPEC.md#11.4"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
-    },
-    {
-      "id": "multipath.budget.retransmit_floor",
-      "file": "fixtures/traces/multipath/budget/retransmit_floor.ndjson",
-      "title": "Before any rate estimate the retransmit budget is its 1 MiB floor: retained stream data stops there until acknowledgements arrive",
-      "refs": [
-        "SCHEDULER.md#13.1"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 10
+      "steps": 14
     },
     {
       "id": "multipath.budget.fin_only_duplicates_not_charged",
@@ -3617,7 +3548,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.remove.abandon_unknown_code",
@@ -3629,7 +3560,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
+      "steps": 14
     },
     {
       "id": "multipath.ack.pipe_ping_rate_limit",
@@ -3641,19 +3572,18 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 43
+      "steps": 58
     },
     {
       "id": "multipath.status.standby_takeover",
       "file": "fixtures/traces/multipath/status/standby_takeover.ndjson",
       "title": "When every non-standby pipe has failed, the standby pipe carries the traffic and the endpoint announces it with PIPE_STATUS",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 18
+      "steps": 19
     },
     {
       "id": "multipath.status.standby_restore",
@@ -3661,12 +3591,11 @@
       "title": "A standby takeover is temporary: a JOINING pipe does not end it, and once a non-standby pipe is usable again the endpoint restores its standby request",
       "refs": [
         "MULTIPATH.md#9",
-        "SCHEDULER.md#10",
         "MULTIPATH.md#5.7"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 31
+      "steps": 32
     },
     {
       "id": "multipath.status.untaken_own_parity",
@@ -3683,19 +3612,19 @@
     {
       "id": "multipath.status.request_without_attachment_ignored",
       "file": "fixtures/traces/multipath/status/request_without_attachment_ignored.ndjson",
-      "title": "A PIPE_STATUS for a peer pipe ID that has no attachment is ignored and not stored; the joined pipe starts from the request in its PIPE_JOIN",
+      "title": "A PIPE_STATUS for a peer pipe ID that has no attachment is ignored and not stored; the joined pipe starts from the request in its Hello",
       "refs": [
         "MULTIPATH.md#9",
         "MULTIPATH.md#5.1"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "multipath.status.change_while_joining_sent_on_active",
       "file": "fixtures/traces/multipath/status/change_while_joining_sent_on_active.ndjson",
-      "title": "A joiner states its initial request in PIPE_JOIN; a change made while the attachment is JOINING is sent as PIPE_STATUS once it is ACTIVE",
+      "title": "A joiner states its initial request in the Hello; a change made while the attachment is JOINING is sent as PIPE_STATUS once it is ACTIVE",
       "refs": [
         "MULTIPATH.md#5.7",
         "MULTIPATH.md#9"
@@ -3709,110 +3638,33 @@
       "file": "fixtures/traces/multipath/tier/lower_tier_idle.ndjson",
       "title": "While a pipe of the preferred tier has room, a less-preferred pipe carries no stream data, even with the lower delay",
       "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 18
-    },
-    {
-      "id": "multipath.tier.overflow_and_return",
-      "file": "fixtures/traces/multipath/tier/overflow_and_return.ndjson",
-      "title": "A pipe that is not writable does not make its tier overflow. A less-preferred tier takes only what the preferred tier cannot send within the overflow delay (drain test) or data that has waited for it that long (age test), and traffic returns as soon as the backlog fits",
-      "refs": [
-        "SCHEDULER.md#10"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 36
-    },
-    {
-      "id": "multipath.tier.failover_to_lower_tier",
-      "file": "fixtures/traces/multipath/tier/failover_to_lower_tier.ndjson",
-      "title": "When every pipe of the preferred tier has failed, the less-preferred tier carries the traffic",
-      "refs": [
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
       "steps": 19
     },
     {
-      "id": "multipath.tier.return_after_probation",
-      "file": "fixtures/traces/multipath/tier/return_after_probation.ndjson",
-      "title": "A new pipe, and a pipe back from SUSPECT, take stream data only after probation; a second suspicion right after probation doubles it",
+      "id": "multipath.tier.overflow_and_return",
+      "file": "fixtures/traces/multipath/tier/overflow_and_return.ndjson",
+      "title": "A pipe that is not writable does not make its tier overflow. A less-preferred tier takes only what the preferred tier cannot send within the overflow delay (drain test) or data that has waited for it that long (age test), and traffic returns as soon as the backlog fits",
       "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 136
-    },
-    {
-      "id": "multipath.tier.short_suspicion_enters_probation",
-      "file": "fixtures/traces/multipath/tier/short_suspicion_enters_probation.ndjson",
-      "title": "A pipe that returns from SUSPECT enters probation however short the suspicion, with k raised when it was suspect soon after its last probation",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 97
-    },
-    {
-      "id": "multipath.tier.suspicion_during_probation",
-      "file": "fixtures/traces/multipath/tier/suspicion_during_probation.ndjson",
-      "title": "A pipe that becomes suspect while in probation starts a new probation with k raised when it returns, however short the suspicion",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 90
-    },
-    {
-      "id": "multipath.tier.probation_capped_by_uptime",
-      "file": "fixtures/traces/multipath/tier/probation_capped_by_uptime.ndjson",
-      "title": "After a short up period, probation is capped at max(base, 2 x the longest uptime) instead of base x 2^k",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 87
-    },
-    {
-      "id": "multipath.probe.backup_pipe_every_second",
-      "file": "fixtures/traces/multipath/probe/backup_pipe_every_second.ndjson",
-      "title": "A pipe of a less-preferred tier that carries nothing is probed every standby_probe (1 s), not every 15 s",
-      "refs": [
-        "MULTIPATH.md#7.1"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
       "steps": 37
     },
     {
-      "id": "multipath.probe.backup_pipe_quiet_session",
-      "file": "fixtures/traces/multipath/probe/backup_pipe_quiet_session.ndjson",
-      "title": "In a quiet session (no traffic frame for the 15 s busy window) a less-preferred pipe falls back to the probe interval, and is probed at once when traffic resumes",
+      "id": "multipath.tier.failover_to_lower_tier",
+      "file": "fixtures/traces/multipath/tier/failover_to_lower_tier.ndjson",
+      "title": "When every pipe of the preferred tier has failed, the less-preferred tier carries the traffic",
       "refs": [
-        "MULTIPATH.md#7.1"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 102
-    },
-    {
-      "id": "multipath.tier.first_join_probation_without_history",
-      "file": "fixtures/traces/multipath/tier/first_join_probation_without_history.ndjson",
-      "title": "A pipe that joins a path without history is in probation for 4 x SRTT only, without the 1 s floor",
-      "refs": [
-        "SCHEDULER.md#11"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 30
+      "steps": 20
     },
     {
       "id": "multipath.tier.peer_request_and_local_override",
@@ -3823,42 +3675,40 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 24
+      "steps": 25
     },
     {
       "id": "multipath.tier.asymmetric_directions",
       "file": "fixtures/traces/multipath/tier/asymmetric_directions.ndjson",
       "title": "Send and receive priorities are separate: the local outbound direction of pipe 2 is preferred, while the peer is asked to use its own outbound direction of pipe 2 as a less-preferred tier",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 16
+      "steps": 17
     },
     {
       "id": "multipath.tier.standby_not_used_for_overflow",
       "file": "fixtures/traces/multipath/tier/standby_not_used_for_overflow.ndjson",
       "title": "Overflow goes to a less-preferred tier, never to a standby pipe; the standby pipe takes over only when every other pipe has failed",
       "refs": [
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 29
+      "steps": 31
     },
     {
       "id": "multipath.tier.online_local_changes",
       "file": "fixtures/traces/multipath/tier/online_local_changes.ndjson",
       "title": "Send priorities, receive priorities and standby change online; every request change is sent at once as a PIPE_STATUS with the next sequence number",
       "refs": [
-        "MULTIPATH.md#9",
-        "SCHEDULER.md#10"
+        "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 29
+      "steps": 30
     },
     {
       "id": "multipath.tier.online_peer_requests",
@@ -3869,34 +3719,12 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 25
-    },
-    {
-      "id": "multipath.policy.round_robin_weights",
-      "file": "fixtures/traces/multipath/policy/round_robin_weights.ndjson",
-      "title": "spread-round-robin assigns chunks in smooth weighted round-robin order by the configured weights; a pipe that is not writable is skipped and builds up no claim",
-      "refs": [
-        "SCHEDULER.md#6"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 45
-    },
-    {
-      "id": "multipath.policy.switch_online",
-      "file": "fixtures/traces/multipath/policy/switch_online.ndjson",
-      "title": "A policy change takes effect at the next chunk; data already placed is not moved",
-      "refs": [
-        "SCHEDULER.md#6"
-      ],
-      "findings": [],
-      "profile": "zmux-mp",
-      "steps": 21
+      "steps": 26
     },
     {
       "id": "multipath.tier.join_with_priority_local",
       "file": "fixtures/traces/multipath/tier/join_with_priority_local.ndjson",
-      "title": "A local join carries the requested priority for the peer's outbound direction in its PIPE_JOIN; no PIPE_STATUS is needed",
+      "title": "A local join carries the requested priority for the peer's outbound direction in its Hello; no PIPE_STATUS is needed",
       "refs": [
         "MULTIPATH.md#5.1",
         "MULTIPATH.md#9"
@@ -3908,31 +3736,30 @@
     {
       "id": "multipath.tier.join_with_priority_peer",
       "file": "fixtures/traces/multipath/tier/join_with_priority_peer.ndjson",
-      "title": "The priority in the peer's PIPE_JOIN applies to the local outbound direction of the new pipe from its first frame",
+      "title": "The priority in the peer's Hello applies to the local outbound direction of the new pipe from its first frame",
       "refs": [
         "MULTIPATH.md#5.1",
         "MULTIPATH.md#9"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 13
+      "steps": 14
     },
     {
-      "id": "multipath.join.out_of_band_with_priority",
-      "file": "fixtures/traces/multipath/join/out_of_band_with_priority.ndjson",
-      "title": "An out-of-band join states the acceptor's priority in the PIPE_JOIN it carries out of band, before any byte flows",
+      "id": "multipath.join.down_with_priority",
+      "file": "fixtures/traces/multipath/join/down_with_priority.ndjson",
+      "title": "A join states the acceptor's priority in its Hello, before any byte flows",
       "refs": [
-        "MULTIPATH.md#5.1",
-        "MULTIPATH.md#5.3"
+        "MULTIPATH.md#5.1"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 9
+      "steps": 10
     },
     {
       "id": "multipath.join.local_resource_limit",
       "file": "fixtures/traces/multipath/join/local_resource_limit.ndjson",
-      "title": "An authenticated join beyond the acceptor's pipe capacity is refused with PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT), not a session error",
+      "title": "An authenticated join beyond the acceptor's pipe capacity is refused in the Reply, without PIPE_ABANDON, and is not a session error",
       "refs": [
         "MULTIPATH.md#5.4"
       ],
@@ -4011,11 +3838,11 @@
         "MULTIPATH.md#5.8",
         "MULTIPATH.md#6.2",
         "MULTIPATH.md#7.4",
-        "SCHEDULER.md#9.2"
+        "MULTIPATH.md#2.5"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 25
+      "steps": 26
     },
     {
       "id": "multipath.lanes.refused_lane_no_stall",
@@ -4037,11 +3864,11 @@
       "title": "A lane with the session's Lane Key that names a pipe whose lane 0 is on another carrier connection is closed and nothing else happens",
       "refs": [
         "MULTIPATH.md#5.8",
-        "MULTIPATH.md#17"
+        "MULTIPATH.md#15"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 16
+      "steps": 17
     },
     {
       "id": "multipath.lanes.graceful_end_every_lane",
@@ -4055,7 +3882,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 22
+      "steps": 23
     },
     {
       "id": "multipath.lanes.lane_end_fails_pipe",
@@ -4068,7 +3895,201 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 22
+      "steps": 23
+    },
+    {
+      "id": "multipath.epoch.offer_answer",
+      "file": "fixtures/traces/multipath/epoch/offer_answer.ndjson",
+      "title": "The peer offers epoch 1: the local endpoint answers with its Group 2 share and its Locator for epoch 1, and then accepts joins of epoch 0 and of epoch 1",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "secure-carrier/SPEC.md#11.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.epoch.answerer_switches_on_ack",
+      "file": "fixtures/traces/multipath/epoch/answerer_switches_on_ack.ndjson",
+      "title": "The answering end joins with epoch 0 until a PIPE_ACK acknowledges the record of its answer, and with epoch 1 and the peer's Locator for it afterwards",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "secure-carrier/SPEC.md#11.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 21
+    },
+    {
+      "id": "multipath.epoch.answerer_switches_on_peer_join",
+      "file": "fixtures/traces/multipath/epoch/answerer_switches_on_peer_join.ndjson",
+      "title": "A verified join of the peer with epoch 1 switches the answering end to epoch 1 before any acknowledgement of its answer",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "secure-carrier/SPEC.md#11.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 19
+    },
+    {
+      "id": "multipath.epoch.previous_deleted_after_retention",
+      "file": "fixtures/traces/multipath/epoch/previous_deleted_after_retention.ndjson",
+      "title": "The answering end keeps epoch 0 and its Locator for R after it starts using epoch 1, and then deletes them: a join of epoch 0 is accepted until then and refused afterwards, and a late offer of epoch 1 is ignored",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "MULTIPATH.md#14"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 445
+    },
+    {
+      "id": "multipath.epoch.copies_and_late_frames",
+      "file": "fixtures/traces/multipath/epoch/copies_and_late_frames.ndjson",
+      "title": "Copies and late frames change nothing: a repeated offer while answering and a late offer or answer after the answer is acknowledged are ignored",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 30
+    },
+    {
+      "id": "multipath.epoch.answer_repeated_same_bytes",
+      "file": "fixtures/traces/multipath/epoch/answer_repeated_same_bytes.ndjson",
+      "title": "Until a PIPE_ACK acknowledges a record that carried it, the answering end repeats its answer on each new Sealed or Bound pipe, with the same bytes; afterwards it no longer repeats it",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "MULTIPATH.md#7.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 32
+    },
+    {
+      "id": "multipath.epoch.local_offer",
+      "file": "fixtures/traces/multipath/epoch/local_offer.ndjson",
+      "title": "A local advance offers on a Sealed or Bound pipe and repeats the offer once per probe interval with the same bytes until the answer arrives; it then joins with epoch 1 and still accepts joins of epoch 0",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 45
+    },
+    {
+      "id": "multipath.epoch.collision_responder_yields",
+      "file": "fixtures/traces/multipath/epoch/collision_responder_yields.ndjson",
+      "title": "Both ends offer epoch 1: the session's responder drops its own offer and answers the initiator's",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 31
+    },
+    {
+      "id": "multipath.epoch.offer_while_keeping_previous",
+      "file": "fixtures/traces/multipath/epoch/offer_while_keeping_previous.ndjson",
+      "title": "An offer of epoch 2 that arrives while the offering end still keeps epoch 0 ends epoch 0 there first: the end deletes epoch 0 and its Locator and then answers",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 26
+    },
+    {
+      "id": "multipath.epoch.three_advances",
+      "file": "fixtures/traces/multipath/epoch/three_advances.ndjson",
+      "title": "Three exchanges in a row, each after the epoch before the previous one is deleted: each epoch's joins use its key phase and Locator",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "secure-carrier/SPEC.md#11.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 892
+    },
+    {
+      "id": "multipath.epoch.local_join_uses_new_epoch",
+      "file": "fixtures/traces/multipath/epoch/local_join_uses_new_epoch.ndjson",
+      "title": "On the answer the offering end joins with the new key phase and the peer's Locator for the new epoch",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "secure-carrier/SPEC.md#11.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.epoch.violation_trusted_pipe",
+      "file": "fixtures/traces/multipath/epoch/violation_trusted_pipe.ndjson",
+      "title": "SESSION_EPOCH on a pipe that is neither Sealed nor Bound is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.epoch.violation_bad_share_length",
+      "file": "fixtures/traces/multipath/epoch/violation_bad_share_length.ndjson",
+      "title": "An offer whose Share has the length of Group 1 is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.epoch.violation_epoch_too_far",
+      "file": "fixtures/traces/multipath/epoch/violation_epoch_too_far.ndjson",
+      "title": "An offer of epoch 2 at Stable(0) is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "multipath.epoch.violation_epoch_three_ahead",
+      "file": "fixtures/traces/multipath/epoch/violation_epoch_three_ahead.ndjson",
+      "title": "An offer of epoch 3 while epochs 0 and 1 are accepted is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.epoch.violation_answer_two_ahead",
+      "file": "fixtures/traces/multipath/epoch/violation_answer_two_ahead.ndjson",
+      "title": "An answer of epoch 2 while epochs 0 and 1 are accepted is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 14
+    },
+    {
+      "id": "multipath.epoch.violation_answer_at_stable",
+      "file": "fixtures/traces/multipath/epoch/violation_answer_at_stable.ndjson",
+      "title": "An answer of epoch 1 at Stable(0) is a PROTOCOL_VIOLATION",
+      "refs": [
+        "MULTIPATH.md#10.7"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
     },
     {
       "id": "resume.suspend.on_last_pipe_loss",
@@ -4094,7 +4115,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 17
+      "steps": 18
     },
     {
       "id": "resume.rejoin.up_only_ping_answered_complete",
@@ -4106,7 +4127,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 13
+      "steps": 15
     },
     {
       "id": "resume.fail_closed.peer_ahead",
@@ -4118,7 +4139,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 15
+      "steps": 16
     },
     {
       "id": "resume.fail_closed.unknown_pipe",
@@ -4130,7 +4151,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 15
+      "steps": 16
     },
     {
       "id": "resume.grace.expiry",
@@ -4148,7 +4169,7 @@
     {
       "id": "resume.credit.unretired_cap",
       "file": "fixtures/traces/resume/credit/unretired_cap.ndjson",
-      "title": "A peer that joins and drops attachments without ever answering PIPE_ABANDON is held to max_pipes + 8 unretired attachments, the bootstrap pair included: further joins are refused with ZMUX_PIPE_RESOURCE_LIMIT, and unilateral retirement frees the state",
+      "title": "A peer that joins and drops attachments without ever answering PIPE_ABANDON is held to max_pipes + 8 unretired attachments, the bootstrap pair included: further joins are refused in the Reply, and unilateral retirement frees the state",
       "refs": [
         "MULTIPATH.md#5.4",
         "MULTIPATH.md#8.4",
@@ -4156,7 +4177,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 79
+      "steps": 94
     },
     {
       "id": "resume.rejoin.cut_off_rejoins_still_resume",
@@ -4169,7 +4190,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 93
+      "steps": 103
     },
     {
       "id": "resume.rejoin.live_one_way_attachment_displaced",
@@ -4181,12 +4202,12 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 32
+      "steps": 35
     },
     {
       "id": "resume.rejoin.silent_downlink_replaced",
       "file": "fixtures/traces/resume/rejoin/silent_downlink_replaced.ndjson",
-      "title": "A downlink that stays open but silent is failed by the inbound silence rule, also while suspended; a new downlink then confirms the rejoined uplink and the session leaves suspension",
+      "title": "A downlink that stays open but silent is failed by the inbound silence rule, which suspends the session again; a new downlink then confirms the rejoined uplink and the session leaves suspension",
       "refs": [
         "MULTIPATH.md#7.3",
         "RESUME.md#4.3",
@@ -4194,12 +4215,12 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 29
+      "steps": 40
     },
     {
       "id": "resume.suspend.dead_timeout_respected",
       "file": "fixtures/traces/resume/suspend/dead_timeout_respected.ndjson",
-      "title": "With resume and DeadTimeout = 60 s, a single pipe pair survives a 25 s outage: neither T_fail nor the inbound silence limit (17.25 s for other pipes) cuts it; the outage stays below the 30 s idle timeout, which fires at 30 s (SPEC.md 1.3)",
+      "title": "With resume and DeadTimeout = 60 s, a single pipe pair survives a 25 s outage: neither T_fail nor the inbound silence limit (17.25 s for other pipes) cuts it; the outage stays below the 30 s idle timeout, which fires at 30 s",
       "refs": [
         "MULTIPATH.md#7.1",
         "MULTIPATH.md#7.3"
@@ -4229,7 +4250,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 12
+      "steps": 13
     },
     {
       "id": "resume.rejoin.old_pipe_id_replay_rejected",
@@ -4240,7 +4261,19 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 13
+      "steps": 14
+    },
+    {
+      "id": "resume.rejoin.unconfirmed_hello_does_not_resume",
+      "file": "fixtures/traces/resume/rejoin/unconfirmed_hello_does_not_resume.ndjson",
+      "title": "A replayed Hello that never confirms leaves the session SUSPENDED: only a Confirmed join makes a pipe",
+      "refs": [
+        "RESUME.md#4.4",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 18
     },
     {
       "id": "resume.suspend.half_suspended_keeps_reading",
@@ -4251,7 +4284,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 14
+      "steps": 15
     },
     {
       "id": "resume.suspend.half_suspended_keeps_sending",
@@ -4264,7 +4297,7 @@
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 15
+      "steps": 16
     },
     {
       "id": "resume.suspend.application_close",
@@ -4285,8 +4318,8 @@
         "SPEC.md#9.3"
       ],
       "findings": [
-        "Go-2",
-        "Go-5"
+        "D-S04",
+        "D-S05"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -4299,7 +4332,7 @@
         "SPEC.md#8.2"
       ],
       "findings": [
-        "Go-4"
+        "D-F05"
       ],
       "profile": "zmux-small",
       "steps": 12
@@ -4312,7 +4345,7 @@
         "STATE_MACHINE.md#2.5"
       ],
       "findings": [
-        "Go-5"
+        "D-S05"
       ],
       "profile": "zmux-small",
       "steps": 9

@@ -48,6 +48,8 @@ type IdMap = HashMap<u64, StreamKey, BuildHasherDefault<IdHasher>>;
 /// The stream layer's state.
 #[derive(Debug)]
 pub(crate) struct Streams {
+    /// The limit the first accept moves staged unidirectional credit to.
+    staged_target: u64,
     /// Released chunks of the send buffers, shared by the streams.
     chunks: ChunkPool,
     /// Streams that owe a MAX_STREAM_DATA update.
@@ -72,14 +74,13 @@ pub(crate) struct Streams {
     /// Buffers of discarded streams for the next ones.
     spare: Spare,
     /// Pinned local streams whose opening frame is not written yet, per type
-    /// in identifier order; later streams of the type wait for them
-    /// (SPEC.md Section 7.2).
+    /// in identifier order; later streams of the type wait for them.
     pinned: [VecDeque<StreamKey>; 2],
     /// Every queued stream waits for session credit: nothing to send until
     /// MAX_DATA or a new stream.
     session_stalled: bool,
     /// Local bidirectional streams whose receiving part is open (the
-    /// n_local term of the buffer cap, SPEC.md Section 8.3 rule 4): those
+    /// n_local term of the buffer cap): those
     /// whose part `counts_open`.
     local_recv_open: u64,
     /// Streams waiting for send-buffer room, in the order they began to
@@ -125,6 +126,7 @@ impl Streams {
         let mut remote_dirs = stream_limits.map(RemoteDir::new);
         remote_dirs[super::UNI].staged = staged_uni;
         Self {
+            staged_target: config::STAGED_UNI_STREAMS.1,
             chunks,
             stream_updates: 0,
             slab: Slab::default(),
@@ -367,7 +369,7 @@ impl Streams {
 
     /// Holds a new peer stream `s` with identifier `id`. Streams at or
     /// above a GOAWAY watermark already sent are rejected, and so is every
-    /// new stream under memory pressure (SPEC.md 8.5): never offered,
+    /// new stream under memory pressure: never offered,
     /// whatever frame opened them; [`Self::take_reject`] hands them out.
     pub(super) fn insert_peer(&mut self, id: u64, d: usize, mut s: Stream) -> StreamKey {
         let reject = self.memory_pressure || self.remote_dirs[d].above_goaway(stream::index(id));
@@ -388,7 +390,7 @@ impl Streams {
     }
 
     /// The index of the next peer stream of type `d` to open implicitly
-    /// up to `index` (SPEC.md Section 7.2 rule 4), counted as opened.
+    /// up to `index`, counted as opened.
     pub(super) fn open_peer_index(&mut self, d: usize, index: u64) -> Option<u64> {
         let r = &mut self.remote_dirs[d];
         if r.opened > index {
@@ -412,7 +414,7 @@ impl Streams {
     }
 
     /// A local bidirectional stream's receiving part leaves `n_local` of
-    /// the buffer cap once it is terminal (SPEC.md Section 8.3 rule 4), not
+    /// the buffer cap once it is terminal, not
     /// when the stream is discarded.
     pub(super) fn settle_local_recv(&mut self, key: StreamKey) {
         if let Some(r) = self.recv_mut(key)
@@ -554,7 +556,7 @@ impl Streams {
         if r.staged {
             r.staged = false;
             if grant {
-                r.initial = config::STAGED_UNI_STREAMS.1;
+                r.initial = self.staged_target;
                 r.update_pending = true;
             }
         }
@@ -575,9 +577,8 @@ impl Streams {
 
     /// Offers peer stream `key` once it is ready: at once without
     /// preambles (`preamble` false), else when its own preamble arrived,
-    /// regardless of lower-numbered streams (SPEC.md Section 7.2 rule 5).
-    /// A stream stopped before its preamble arrived is never offered
-    /// (EXTENSIONS.md Section 4.4 rule 5).
+    /// regardless of lower-numbered streams.
+    /// A stream stopped before its preamble arrived is never offered.
     pub(super) fn offer(
         &mut self,
         key: StreamKey,
@@ -608,10 +609,28 @@ impl Streams {
         }
     }
 
+    /// Raises the concurrency of the peer's streams of type `d` to `n`; owes
+    /// MAX_STREAMS when `grant`. It only grows; `false` when unchanged.
+    pub(in super::super) fn raise_remote(&mut self, d: usize, n: u64, grant: bool) -> bool {
+        let r = &mut self.remote_dirs[d];
+        if r.staged {
+            if n <= self.staged_target {
+                return false;
+            }
+            self.staged_target = n;
+            return true;
+        }
+        if n <= r.initial {
+            return false;
+        }
+        r.initial = n;
+        r.update_pending |= grant;
+        true
+    }
+
     /// A peer stream of type `d` was discarded: its count returns to the
-    /// peer with MAX_STREAMS (SPEC.md Section 8.5), owed when `raise` (an
-    /// endpoint that sent GOAWAY raises MAX_STREAMS no more, EXTENSIONS.md
-    /// Section 3.3).
+    /// peer with MAX_STREAMS, owed when `raise` (an
+    /// endpoint that sent GOAWAY raises MAX_STREAMS no more).
     pub(super) fn count_discarded(&mut self, d: usize, raise: bool) {
         let r = &mut self.remote_dirs[d];
         r.discarded += 1;

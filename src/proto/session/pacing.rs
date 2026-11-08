@@ -31,7 +31,7 @@ impl SessionCore {
     }
 
     /// Whether the limiter paces a pipe: in a multipath session, or on the
-    /// single pipe with pipe acknowledgement (MULTIPATH.md Section 3.5),
+    /// single pipe with pipe acknowledgement,
     /// when its carrier has neither a low-water mark nor an unsent count.
     pub(super) fn paced(&self, o: &OutPipe) -> bool {
         self.acknowledged() && !o.carrier_signals_queue() && !self.config.hooks.unpaced

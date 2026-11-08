@@ -128,7 +128,7 @@ const RATE_INTERVAL_FLOOR: Duration = Duration::from_millis(1);
 
 /// A rate over intervals of max(RTT, 1 ms): the largest of the last 4
 /// (the send rate of the low-water mark,
-/// and the arrival rate of auto-tuning, Section 6.2).
+/// and the arrival rate of auto-tuning).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IntervalRate {
     rates: [u64; 4],

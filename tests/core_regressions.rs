@@ -213,7 +213,7 @@ fn goaway_setup() -> (Pair, Vec<u8>) {
 #[test]
 fn no_stream_opens_after_a_goaway() {
     // A has the peer's first GOAWAY: nothing new opens, whatever the
-    // watermarks (EXTENSIONS.md Section 3.5 rule 2).
+    // watermarks.
     let (mut p, held) = goaway_setup();
     assert!(matches!(p.a.open(Dir::Bidi), Err(OpenError::GoingAway)));
     p.a.receive(P0, &held, p.now);
@@ -718,7 +718,7 @@ fn unsent_counts_on_a_single_pipe_are_taken() {
     assert!(p.b.accept(Dir::Bidi).unwrap().is_some());
 }
 
-/// Carrier early data that the carrier rejects (SPEC.md Section 6.1.2):
+/// Carrier early data that the carrier rejects:
 /// nothing reached the peer, so a unidirectional stream finished and
 /// released meanwhile, a bidirectional one with its FIN and one reset with
 /// a reliable prefix all go again once the peer's parameters arrive, with
@@ -849,4 +849,21 @@ fn early_preambles_are_bounded_by_the_floor() {
             .err(),
         Some(OpenError::PreambleTooLarge)
     );
+}
+
+/// A pinned stream's reset goes even though its opening frame was not sent,
+/// and its identifier reaches the peer.
+#[test]
+fn a_reset_of_a_pinned_stream_does_not_wait_for_the_opening_frame() {
+    let mut pair = Pair::attached(Config::default(), Config::default());
+    pair.pump();
+    let key = pair.a.open(Dir::Bidi).unwrap();
+    let id = pair.a.stream_id(key).unwrap();
+    pair.a.reset(key, VarInt::from_u32(9)).unwrap();
+    pair.pump();
+    let at_peer = pair
+        .b
+        .stream_key(id)
+        .expect("the identifier reached the peer");
+    assert!(pair.b.received_reset(at_peer).is_ok());
 }

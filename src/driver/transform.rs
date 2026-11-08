@@ -1,7 +1,7 @@
-//! A listener's inbound transform (API.md Section 4.4): a function that
-//! every new carrier passes through after the admission and before the
-//! listener classifies it, and [`PipeStream`], a carrier's halves as one
-//! byte stream for the layers such a transform runs.
+//! A listener's inbound transform: a function that every new carrier
+//! passes through after the admission and before the listener classifies
+//! it, and [`PipeStream`], a carrier's halves as one byte stream for the
+//! layers such a transform runs.
 
 use std::future::Future;
 use std::io;
@@ -21,15 +21,15 @@ type TransformFn = dyn Fn(PipeIo, &PipeHint) -> Pin<Box<dyn Future<Output = io::
     + Sync;
 
 /// A listener's inbound transform ([`crate::ListenerConfig::inbound_transform`]):
-/// called once for every carrier the listener takes, at every entry, each
-/// half of a split bootstrap included, after the admission accepted it and
-/// before the listener reads its first record. It returns the carrier the
+/// called once for every carrier the listener takes, at every entry, after
+/// the admission accepted it and before the listener reads its first record.
+/// The two halves of a split carrier are one carrier: it is called once, when
+/// they are paired, with both directions. It returns the carrier the
 /// listener goes on with, such as one with a layer over
 /// [`PipeIo::wrap`], or the carrier itself. Cheap to clone.
 ///
-/// The hint is the carrier's ([`PipeHint::pair`] marks a half of a split
-/// bootstrap, a carrier with one half only; [`PipeHint::admitted`] is the
-/// admission's value). While the transform runs, the carrier holds its
+/// The hint is the carrier's ([`PipeHint::admitted`] is the admission's
+/// value, the uplink's for a split carrier). While the transform runs, the carrier holds its
 /// source's slot, and the listener's handshake timeout bounds it: at that
 /// bound, or when the listener closes, its future is dropped, and with it
 /// the carrier. The listener's first-record timeout runs from its return.

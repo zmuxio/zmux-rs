@@ -1,10 +1,8 @@
-//! A listener's memory budget and suspended-session limit (RESUME.md Section
-//! 9), kept up to date by its sessions as their
-//! charges change: a session reports
-//! its charge from its own task's rounds, at most every [`CHARGE_INTERVAL`],
-//! and takes its allowance and the budget's pressure in the same step, so a
-//! quiet session costs the listener nothing and no task visits every
-//! session.
+//! A listener's memory budget and suspended-session limit, kept up to date
+//! by its sessions as their charges change: a session reports its charge
+//! from its own task's rounds, at most every [`CHARGE_INTERVAL`], and takes
+//! its allowance and the budget's pressure in the same step, so a quiet
+//! session costs the listener nothing and no task visits every session.
 //!
 //! The account is a leaf: its atomics, and one lock that is never held
 //! while any other is taken (the suspended sessions it closes are closed

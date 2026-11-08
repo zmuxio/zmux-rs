@@ -1,7 +1,6 @@
 //! Splicing two bidirectional streams into each other: how a relay connects an
-//! inbound stream to an outbound one, whether
-//! the streams carry application data or a nested session's pipe
-//! (EXTENSIONS.md Section 10).
+//! inbound stream to an outbound one, whether the streams carry application
+//! data or a nested session's pipe.
 //!
 //! Each direction, from a receiving part `r` to a sending part `w`, waits
 //! for `w`'s send capacity with `min` = m = min(chunk, the bytes readable
@@ -176,11 +175,11 @@ impl std::error::Error for SpliceError {}
 /// | either session ends | reset and stop the other side's stream with ZMUX_CARRIER_FAILED |
 /// | the future is dropped | reset and stop both streams with code 0 |
 ///
-/// Stream datagrams (EXTENSIONS.md Section 6.3) are forwarded to the other
-/// stream with their context, without waiting and without a queue of the
-/// helper's own: the direction's limiter allows the whole payload or the
-/// datagram is dropped, then the other session's datagram limiter and send
-/// queue take it.
+/// Stream datagrams are forwarded to the other stream with their context,
+/// without waiting and without a queue of the helper's own: the
+/// direction's limiter allows the whole payload or the datagram is
+/// dropped, then the other session's datagram limiter and send queue take
+/// it.
 ///
 /// Each direction holds at most one chunk ([`SpliceOptions::chunk`], and
 /// never more than the downstream capacity); the backlog stays in the
@@ -540,10 +539,10 @@ impl<'a> Direction<'a> {
     }
 
     /// Forwards the bytes below the Reliable Size as `w`'s credit allows
-    /// (EXTENSIONS.md Section 10.5: a relay forwards data only within the
-    /// next hop's credit), then marks the reliable boundary after them and
-    /// resets `w`; with nothing left to forward, at once. The wait for
-    /// credit ends early only when `w` ends.
+    /// (a relay forwards data only within the next hop's credit), then
+    /// marks the reliable boundary after them and resets `w`; with nothing
+    /// left to forward, at once. The wait for credit ends early only when
+    /// `w` ends.
     fn reliable(&mut self, waker: &Waker, code: VarInt, reliable: u64) -> Poll<()> {
         if self.bytes < reliable {
             let need = usize::try_from(reliable - self.bytes).unwrap_or(usize::MAX);

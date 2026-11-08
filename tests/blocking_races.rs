@@ -163,7 +163,7 @@ fn carrier_write_error_mid_batch() {
 fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"blocking-race-psk-0123456789abcd");
+    c.pipe_auth = PipeAuth::psk(*b"blocking-race-psk-0123456789abcd").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
     c.suspect_floor = Duration::from_millis(100);
     c
@@ -218,7 +218,8 @@ fn mp_server(rt: &tokio::runtime::Runtime) -> SocketAddr {
     rt.block_on(async {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
-        let listener = zmux::Listener::new(mp_config(), zmux::ListenerConfig::default());
+        let listener = zmux::Listener::new(mp_config(), zmux::ListenerConfig::default())
+            .expect("valid listener configuration");
         let l = listener.clone();
         tokio::spawn(async move {
             while let Ok((c, peer)) = tcp.accept().await {
@@ -267,7 +268,7 @@ fn multipath_pipe_loss_during_traffic() {
         assert!(client.multipath() == zmux::Multipath::InUse);
         let (raddr, cut) = relay(addr);
         let pipe = client
-            .add_pipe(
+            .begin_add_pipe(
                 PipeIo::tcp(TcpStream::connect(raddr).unwrap()),
                 PipeOptions::default(),
             )

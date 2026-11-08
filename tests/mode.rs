@@ -1,4 +1,4 @@
-//! Carrier modes (API.md Section 4.8) over in-memory carriers: an explicit
+//! Carrier modes over in-memory carriers: an explicit
 //! mode never falls back; auto mode keeps the first usable candidate in
 //! order, reports every try, abandons a silent candidate at its timer and
 //! skips kinds the cache holds as failed; with multipath it establishes on
@@ -71,7 +71,8 @@ fn quick() -> ModePolicy {
 #[tokio::test]
 async fn explicit_never_falls_back() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(Config::default(), ListenerConfig::default());
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let e = dial_mode(
             &Mode::explicit(refused(CarrierKind::WebSocket)),
             Config::default(),
@@ -98,7 +99,8 @@ async fn explicit_never_falls_back() {
 #[tokio::test]
 async fn auto_keeps_the_first_usable_and_reports_every_try() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(Config::default(), ListenerConfig::default());
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let cache = CarrierCache::default();
         let policy = quick().with_cache(cache.clone(), "server|net");
         let mode = Mode::auto([
@@ -127,19 +129,20 @@ async fn auto_keeps_the_first_usable_and_reports_every_try() {
         for _ in 0..4 {
             events.push(s.next_event().await.unwrap());
         }
-        assert!(events.contains(&SessionEvent::CarrierChosen(CarrierKind::Split)));
+        assert!(events.contains(&SessionEvent::CarrierChosen(CarrierKind::Split, None)));
         assert!(events.contains(&SessionEvent::CarrierCandidate {
             kind: CarrierKind::Streaming,
+            variant: None,
             outcome: CandidateOutcome::TimedOut,
             joined: false,
         }));
         // The failed kinds back off: the next dial goes straight to split.
         assert!(
             cache
-                .failed_until("server|net", CarrierKind::WebSocket)
+                .failed_until("server|net", CarrierKind::WebSocket, None)
                 .is_some()
         );
-        assert!(cache.is_usable("server|net", CarrierKind::Split));
+        assert!(cache.is_usable("server|net", CarrierKind::Split, None));
         let s2 = dial_mode(&mode, Config::default(), &policy).await.unwrap();
         assert_eq!(s2.stats().carrier_candidates.len(), 1);
         // Nothing usable: every try in the error.
@@ -163,14 +166,15 @@ async fn auto_keeps_the_first_usable_and_reports_every_try() {
 fn multipath() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"mode-test-psk-0123456789abcdefgh");
+    c.pipe_auth = PipeAuth::psk(*b"mode-test-psk-0123456789abcdefgh").with_end_to_end();
     c
 }
 
 #[tokio::test]
 async fn auto_with_joins_moves_to_a_preferred_kind() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(multipath(), ListenerConfig::default());
+        let listener = Listener::new(multipath(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let mode = Mode::auto([
             refused(CarrierKind::WebSocket),
             served(CarrierKind::Streaming, &listener),
@@ -183,6 +187,7 @@ async fn auto_with_joins_moves_to_a_preferred_kind() {
             s.next_event().await,
             Some(SessionEvent::CarrierCandidate {
                 kind: CarrierKind::Exchange,
+                variant: None,
                 outcome: CandidateOutcome::Usable,
                 joined: false
             })
@@ -263,7 +268,8 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
 #[tokio::test]
 async fn mode_pool_dials_the_cached_usable_kind() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(multipath(), ListenerConfig::default());
+        let listener = Listener::new(multipath(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let (client, _server) = connected(&listener).await;
         let soon = Some(zmux::WallTime::now().saturating_add(Duration::from_secs(3600)));
         let mut failed = CacheSnapshotEntry::new("k", CarrierKind::Quic);
@@ -281,7 +287,7 @@ async fn mode_pool_dials_the_cached_usable_kind() {
             served(CarrierKind::Exchange, &listener),
         ]);
         let pool = PipePool::mode(&mode, &quick().with_cache(cache, "k")).unwrap();
-        let _keep = maintain_pipes(&client, pool);
+        let _keep = maintain_pipes(&client, pool).expect("valid pool");
         until("no member", || client.pipes().len() == 2).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
@@ -301,7 +307,8 @@ async fn mode_pool_dials_the_cached_usable_kind() {
 #[tokio::test]
 async fn mode_pool_upgrade_failures_back_off() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(multipath(), ListenerConfig::default());
+        let listener = Listener::new(multipath(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let (client, _server) = connected(&listener).await;
         let cache = CarrierCache::new(
             Duration::from_secs(3600),
@@ -319,7 +326,7 @@ async fn mode_pool_upgrade_failures_back_off() {
                 Duration::from_millis(50),
             ));
         let pipe0 = client.pipes()[0].id();
-        let _keep = maintain_pipes(&client, pool);
+        let _keep = maintain_pipes(&client, pool).expect("valid pool");
         let backoff = |kind| {
             cache
                 .snapshot()
@@ -342,7 +349,7 @@ async fn mode_pool_upgrade_failures_back_off() {
             "{tries:?}"
         );
         assert_eq!(client.pipes().len(), 2);
-        assert!(cache.is_usable("k", CarrierKind::Streaming));
+        assert!(cache.is_usable("k", CarrierKind::Streaming, None));
         // Its pipe fails soon after it was joined: streaming backs off.
         let member = client
             .pipes()
@@ -351,7 +358,9 @@ async fn mode_pool_upgrade_failures_back_off() {
             .unwrap();
         member.abort().unwrap();
         until("member failure not recorded", || {
-            cache.failed_until("k", CarrierKind::Streaming).is_some()
+            cache
+                .failed_until("k", CarrierKind::Streaming, None)
+                .is_some()
         })
         .await;
         listener.close();
@@ -363,7 +372,8 @@ async fn mode_pool_upgrade_failures_back_off() {
 /// A mode without candidates or with a kind twice is rejected.
 #[tokio::test]
 async fn invalid_modes_are_rejected() {
-    let listener = Listener::new(multipath(), ListenerConfig::default());
+    let listener = Listener::new(multipath(), ListenerConfig::default())
+        .expect("valid listener configuration");
     let twice = Mode::auto([
         refused(CarrierKind::Split),
         served(CarrierKind::Split, &listener),

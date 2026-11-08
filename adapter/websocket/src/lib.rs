@@ -1,7 +1,7 @@
 //! WebSocket pipe carriers for zmux over tokio-tungstenite.
 //!
-//! A WebSocket carries zmux records with message framing (SPEC.md Section
-//! 3.4, [`PipeIo::records`]): every binary message is one record's
+//! A WebSocket carries zmux records with message framing
+//! ([`PipeIo::records`]): every binary message is one record's
 //! Frames field, without the Size, byte-compatible with other QMux
 //! implementations over WebSocket. A message never splits a record and a
 //! record never spans messages, so intermediaries that re-chunk the byte
@@ -38,9 +38,6 @@
 //!   `Zmux-Prefix-Auth`, bound to the TLS connection under it where the
 //!   adapter holds that ([`dial_tls`], and [`accept`] with the
 //!   connection's exporter).
-//! - The `Zmux-Pipe-Join` request header ([`zmux::JOIN_HEADER`]) carries an
-//!   out-of-band join (MULTIPATH.md Section 5.3): [`serve`] and [`accept`]
-//!   hand it to the listener.
 //! - Closing the sending half sends a Close frame, the graceful end; a pipe
 //!   that zmux fails over a plain TCP connection is aborted by shutting the
 //!   socket down without a Close frame, so that the peer sees a failure. A
@@ -49,7 +46,14 @@
 //!
 //! - `wss://`: [`dial_tls`] and [`connect_tls`] with the application's
 //!   `tokio_rustls::TlsConnector`, or [`dial_over`] on a TLS stream the
-//!   application established; [`dial`] and [`connect`] are for `ws://`.
+//!   application established. [`dial`] and [`connect`] take `ws://`, and
+//!   with the `wss` feature also `wss://`, through [`dial_tls`] with
+//!   [`tls_connector`] of the Mozilla roots (webpki-roots) and the ring
+//!   provider; without the feature a `wss://` URL is refused as invalid input.
+//!   Over TLS 1.3 a carrier of [`dial_tls`] or [`serve_tls`] has the
+//!   connection's exporter and is declared secure, for Bound joins.
+//! - A client follows a redirect of the upgrade to the same host only
+//!   ([`Options::with_max_redirects`], [`RedirectError`]).
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +69,7 @@
 //! # async fn example() -> std::io::Result<()> {
 //! use zmux::{Config, Listener, ListenerConfig};
 //!
-//! let listener = Listener::new(Config::default(), ListenerConfig::default());
+//! let listener = Listener::new(Config::default(), ListenerConfig::default()).expect("valid listener configuration");
 //! let tcp = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 //! tokio::spawn(zmux_websocket::serve(listener.clone(), tcp, Default::default()));
 //! while let Some(session) = listener.accept().await {
@@ -82,18 +86,21 @@
 mod hyper_upgrade;
 #[cfg(feature = "hyper")]
 pub use hyper_upgrade::{RequestUpgrade, UpgradedCarrier, accept_request};
+pub use zmux::redirect::{DEFAULT_MAX_REDIRECTS, RedirectError};
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, ready};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::ProtocolVersion;
 use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::{
     Request as ClientRequest, Response as ClientResponse,
@@ -102,7 +109,6 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use zmux::carrier::ChunkWrite;
 use zmux::{
     Admit, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo, Prefixed,
@@ -124,7 +130,7 @@ where
         Reader { stream },
         Writer {
             sink,
-            started: None,
+            started: (0, 0),
         },
     )
     .records()
@@ -136,38 +142,206 @@ where
 }
 
 /// A carrier over a new WebSocket to `request` (a `ws://` URL, or a request
-/// with headers such as [`zmux::JOIN_HEADER`]): the subprotocols default to
+/// with headers of the host's): the subprotocols default to
 /// [`zmux::alpn_protocols`], and the header field of
 /// [`Options::with_credential`] is added (given no exporter: there is no TLS).
 /// Over plain TCP, a pipe that zmux fails is aborted without a Close
-/// frame.
+/// frame. A `wss://` request goes over TLS as with [`dial_tls`], with the
+/// default [`tls_connector`] (feature `wss`); without the feature it is
+/// refused with [`io::ErrorKind::InvalidInput`]. Redirects of the upgrade
+/// are followed as [`Options::with_max_redirects`] says.
 pub async fn dial(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
 ) -> io::Result<PipeIo> {
-    let request = offer(request, options, &CarrierInfo::new())?;
-    let (ws, response) =
-        tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), true)
-            .await
-            .map_err(io::Error::other)?;
-    let protocol = negotiated(&response);
-    let socket = match ws.get_ref() {
-        MaybeTlsStream::Plain(tcp) => {
-            let _ = tcp.set_nodelay(true);
-            tcp_dup(tcp)
+    let request = request.into_client_request().map_err(io::Error::other)?;
+    dial_following(request, None, options)
+        .await
+        .map(|(io, _)| io)
+}
+
+/// What became of one upgrade request that did not upgrade.
+enum Hop {
+    /// A redirect: its status and `Location`.
+    Redirect(u16, Option<String>),
+    Failed(io::Error),
+}
+
+impl From<io::Error> for Hop {
+    fn from(e: io::Error) -> Self {
+        Hop::Failed(e)
+    }
+}
+
+impl From<Hop> for io::Error {
+    /// A redirect where none is followed: a refusal.
+    fn from(h: Hop) -> Self {
+        match h {
+            Hop::Failed(e) => e,
+            Hop::Redirect(status, _) => io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("the server answered {status}"),
+            ),
         }
-        #[allow(unreachable_patterns)]
-        _ => None,
+    }
+}
+
+/// Dials `request` and follows its redirects, each over a new connection
+/// that `hop` makes, with the credential presented anew: the carrier and
+/// the URL it was upgraded at.
+async fn follow<F, Fut>(
+    request: ClientRequest,
+    options: &Options,
+    hop: F,
+) -> io::Result<(PipeIo, http::Uri)>
+where
+    F: Fn(ClientRequest) -> Fut,
+    Fut: Future<Output = Result<PipeIo, Hop>>,
+{
+    let mut request = request;
+    let mut hops = 0;
+    loop {
+        match hop(copy(&request)).await {
+            Ok(io) => return Ok((io, request.uri().clone())),
+            Err(Hop::Failed(e)) => return Err(e),
+            Err(Hop::Redirect(status, location)) => {
+                let next = zmux::redirect::check(
+                    &request.uri().to_string(),
+                    "GET",
+                    status,
+                    location.as_deref(),
+                )?;
+                let next: http::Uri = next
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if hops >= options.max_redirects {
+                    return Err(RedirectError {
+                        status,
+                        location: location.unwrap_or_default(),
+                        reason: "too many redirects",
+                    }
+                    .into());
+                }
+                hops += 1;
+                request = retarget(&request, next)?;
+            }
+        }
+    }
+}
+
+/// A copy of a request head.
+fn copy(r: &ClientRequest) -> ClientRequest {
+    let mut c = ClientRequest::new(());
+    *c.method_mut() = r.method().clone();
+    *c.uri_mut() = r.uri().clone();
+    *c.version_mut() = r.version();
+    *c.headers_mut() = r.headers().clone();
+    c
+}
+
+/// `request` at `uri`: a new upgrade request there, with the header fields
+/// of `request` that it does not set itself.
+fn retarget(request: &ClientRequest, uri: http::Uri) -> io::Result<ClientRequest> {
+    let mut next = uri.into_client_request().map_err(io::Error::other)?;
+    for name in request.headers().keys() {
+        if next.headers().contains_key(name) {
+            continue;
+        }
+        for v in request.headers().get_all(name) {
+            next.headers_mut().append(name.clone(), v.clone());
+        }
+    }
+    Ok(next)
+}
+
+/// [`dial`] and [`dial_tls`]: a `ws://` URL over TCP, a `wss://` one over
+/// TLS with `tls` (the default connector without), redirects followed.
+async fn dial_following(
+    request: ClientRequest,
+    tls: Option<&tokio_rustls::TlsConnector>,
+    options: &Options,
+) -> io::Result<(PipeIo, http::Uri)> {
+    let tls = tls.cloned();
+    let shared = Arc::new(options.clone());
+    follow(request, options, move |r| {
+        let (tls, options) = (tls.clone(), shared.clone());
+        async move { dial_once(r, tls.as_ref(), &options).await }
+    })
+    .await
+}
+
+/// One upgrade request to its URL's host and port.
+async fn dial_once(
+    request: ClientRequest,
+    tls: Option<&tokio_rustls::TlsConnector>,
+    options: &Options,
+) -> Result<PipeIo, Hop> {
+    let uri = request.uri();
+    let secure = match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => false,
+        _ => {
+            return Err(Hop::Failed(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a ws:// or wss:// URL",
+            )));
+        }
     };
-    Ok(with_socket(pipe(ws, protocol), socket))
+    let host = uri
+        .host()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL without a host"))?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+    if !secure {
+        let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        let _ = tcp.set_nodelay(true);
+        let socket = tcp_dup(&tcp);
+        let request = offer(request, options, &CarrierInfo::new())?;
+        return Ok(with_socket(upgrade_over(tcp, request).await?, socket));
+    }
+    #[cfg(feature = "wss")]
+    let tls = tls.unwrap_or_else(|| default_tls_connector());
+    #[cfg(not(feature = "wss"))]
+    let Some(tls) = tls else {
+        return Err(Hop::Failed(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a wss:// URL needs dial_tls or the wss feature",
+        )));
+    };
+    let name = ServerName::try_from(host.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let _ = tcp.set_nodelay(true);
+    let socket = tcp_dup(&tcp);
+    let peer = tcp.peer_addr().ok();
+    let conn = SharedTls::new(tls.connect(name, tcp).await?);
+    let request = {
+        let mut info = conn.info().with_server_name(Some(&host));
+        if let Some(p) = peer {
+            info = info.with_source(p).with_peer(p);
+        }
+        offer(request, options, &info)?
+    };
+    let exporter = conn.exporter();
+    let io = with_socket(upgrade_over(conn, request).await?, socket);
+    let state = zmux::TlsState::new(None, Some(host));
+    Ok(secured(
+        io.with_terminated_tls(move || Some(state.clone())),
+        exporter,
+    ))
 }
 
 /// A carrier over a new WebSocket on `io`, an established byte stream such
 /// as a TLS stream: the client handshake for `request` (a `ws://` or
 /// `wss://` URL, or a request with headers), the subprotocols and the
 /// credential's header field as in [`dial`] (the credential is given no
-/// exporter: a bound one needs [`dial_tls`]). Give the carrier the TCP
-/// socket underneath
+/// exporter: a bound one needs [`dial_tls`]). A redirect is not followed
+/// (it is a refusal: the connection is the caller's). The carrier has no
+/// exporter and is not declared secure: the adapter does not see the TLS
+/// layer of `io`. Give the carrier the TCP socket underneath
 /// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without a
 /// Close frame, as [`dial_tls`] does.
 ///
@@ -190,11 +364,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = offer(request, options, &CarrierInfo::new())?;
-    upgrade_over(io, request).await
+    Ok(upgrade_over(io, request).await?)
 }
 
 /// The client handshake of `request` on `io`.
-async fn upgrade_over<S>(io: S, request: ClientRequest) -> io::Result<PipeIo>
+async fn upgrade_over<S>(io: S, request: ClientRequest) -> Result<PipeIo, Hop>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -203,11 +377,23 @@ where
             .await
             .map_err(|e| match e {
                 // The server or an intermediary answered without upgrading.
-                tokio_tungstenite::tungstenite::Error::Http(r) => io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("the server answered {}", r.status()),
-                ),
-                e => io::Error::other(e),
+                tokio_tungstenite::tungstenite::Error::Http(r) => {
+                    let status = r.status().as_u16();
+                    if zmux::redirect::is_redirect(status) {
+                        let location = r
+                            .headers()
+                            .get(http::header::LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        Hop::Redirect(status, location)
+                    } else {
+                        Hop::Failed(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("the server answered {}", r.status()),
+                        ))
+                    }
+                }
+                e => Hop::Failed(io::Error::other(e)),
             })?;
     Ok(pipe(ws, negotiated(&response)))
 }
@@ -215,46 +401,189 @@ where
 /// A carrier over a new WebSocket over TLS to a `wss://` `request`: TCP to
 /// the URL's host and port (443 by default), TLS with `tls` for the host's
 /// name (the application's client configuration chooses roots, ALPN and
-/// early data, as with the other adapters), then [`dial_over`], with the
-/// credential given the server's address, the negotiated ALPN identifier,
-/// the host's name and the TLS exporter. A pipe that zmux fails is aborted
-/// without a Close frame.
+/// early data, as with the other adapters), then the client handshake,
+/// with the credential given the server's address, the negotiated ALPN
+/// identifier, the host's name and the TLS exporter. Over TLS 1.3 the
+/// carrier has the connection's exporter and is declared secure
+/// ([`PipeIo::with_carrier_secure`]), for Bound joins and the session's
+/// exporter. A pipe that zmux fails is aborted without a Close frame.
+/// Redirects of the upgrade are followed as [`Options::with_max_redirects`]
+/// says, each over a new connection with the credential presented anew.
 pub async fn dial_tls(
     request: impl IntoClientRequest + Unpin,
     tls: &tokio_rustls::TlsConnector,
     options: &Options,
 ) -> io::Result<PipeIo> {
     let request = request.into_client_request().map_err(io::Error::other)?;
-    let uri = request.uri();
-    let host = uri
-        .host()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL without a host"))?;
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-    let name = ServerName::try_from(host.clone())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    let _ = tcp.set_nodelay(true);
-    let socket = tcp_dup(&tcp);
-    let peer = tcp.peer_addr().ok();
-    let conn = tls.connect(name, tcp).await?;
-    let request = {
-        let c = conn.get_ref().1;
-        let mut info = CarrierInfo::new()
-            .with_alpn(c.alpn_protocol())
-            .with_server_name(Some(&host))
-            .with_exporter(|label, context, out| {
-                c.export_keying_material(out, label, Some(context)).is_ok()
-            });
-        if let Some(p) = peer {
-            info = info.with_source(p).with_peer(p);
+    dial_following(request, Some(tls), options)
+        .await
+        .map(|(io, _)| io)
+}
+
+/// The exporter of a TLS connection, for a carrier.
+type Exporter = Arc<dyn Fn(&str, &[u8], &mut [u8]) -> bool + Send + Sync>;
+
+/// `io` with `exporter` and declared secure, when there is one.
+fn secured(io: PipeIo, exporter: Option<Exporter>) -> PipeIo {
+    match exporter {
+        Some(e) => io
+            .with_carrier_secure()
+            .with_exporter(move |label, context, out| e(label, context, out)),
+        None => io,
+    }
+}
+
+/// A TLS stream of either side, as the carrier needs it.
+trait TlsSide {
+    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool;
+    fn tls13(&self) -> bool;
+    fn alpn(&self) -> Option<Vec<u8>>;
+    fn server_name(&self) -> Option<String>;
+}
+
+impl<IO> TlsSide for tokio_rustls::client::TlsStream<IO> {
+    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
+        let c = self.get_ref().1;
+        !c.is_handshaking() && c.export_keying_material(out, label, Some(context)).is_ok()
+    }
+    fn tls13(&self) -> bool {
+        self.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3)
+    }
+    fn alpn(&self) -> Option<Vec<u8>> {
+        self.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
+    }
+    fn server_name(&self) -> Option<String> {
+        None
+    }
+}
+
+impl<IO> TlsSide for tokio_rustls::server::TlsStream<IO> {
+    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
+        let c = self.get_ref().1;
+        !c.is_handshaking() && c.export_keying_material(out, label, Some(context)).is_ok()
+    }
+    fn tls13(&self) -> bool {
+        self.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3)
+    }
+    fn alpn(&self) -> Option<Vec<u8>> {
+        self.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
+    }
+    fn server_name(&self) -> Option<String> {
+        self.get_ref().1.server_name().map(str::to_owned)
+    }
+}
+
+/// A TLS stream that the WebSocket takes while the carrier keeps its
+/// exporter: both share the stream, which a lock taken per poll guards. The
+/// exporter does not keep it: once the WebSocket is gone it gives no value.
+struct SharedTls<S> {
+    stream: Arc<Mutex<S>>,
+    alpn: Option<Vec<u8>>,
+    server_name: Option<String>,
+}
+
+fn lock<S>(m: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl<S: TlsSide + Send + 'static> SharedTls<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            alpn: stream.alpn(),
+            server_name: stream.server_name(),
+            stream: Arc::new(Mutex::new(stream)),
         }
-        offer(request, options, &info)?
-    };
-    Ok(with_socket(upgrade_over(conn, request).await?, socket))
+    }
+
+    /// The metadata for an admission or a credential: the exporter, the
+    /// ALPN identifier and the server name.
+    fn info(&self) -> CarrierInfo<'_> {
+        let stream = &self.stream;
+        CarrierInfo::new()
+            .with_alpn(self.alpn.as_deref())
+            .with_server_name(self.server_name.as_deref())
+            .with_exporter(move |label, context, out| lock(stream).export(label, context, out))
+    }
+
+    /// The carrier's exporter, over TLS 1.3 only.
+    fn exporter(&self) -> Option<Exporter> {
+        if !lock(&self.stream).tls13() {
+            return None;
+        }
+        let weak = Arc::downgrade(&self.stream);
+        Some(Arc::new(move |label, context, out| {
+            weak.upgrade()
+                .is_some_and(|s| lock(&s).export(label.as_bytes(), context, out))
+        }))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for SharedTls<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.stream)).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for SharedTls<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *lock(&self.stream)).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.stream)).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *lock(&self.stream)).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *lock(&self.stream)).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        lock(&self.stream).is_write_vectored()
+    }
+}
+
+/// A TLS connector for `wss://` that trusts `roots`, with rustls's ring provider, its
+/// safe default protocol versions and the ALPN identifier `http/1.1`, as [`serve_tls`]
+/// expects; [`dial`] uses the one of the Mozilla roots.
+#[cfg(feature = "wss")]
+pub fn tls_connector(roots: tokio_rustls::rustls::RootCertStore) -> tokio_rustls::TlsConnector {
+    use tokio_rustls::rustls;
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the ring provider supports the default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+/// The [`tls_connector`] of the Mozilla roots of webpki-roots, made once.
+#[cfg(feature = "wss")]
+fn default_tls_connector() -> &'static tokio_rustls::TlsConnector {
+    static CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    CONNECTOR.get_or_init(|| {
+        tls_connector(tokio_rustls::rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+    })
 }
 
 /// Establishes a session over a new WebSocket over TLS ([`dial_tls`], then
@@ -363,7 +692,10 @@ pub enum Upgrade<S> {
 /// ([`CarrierInfo::request`], an `http::request::Parts`, and its header
 /// fields, [`CarrierInfo::for_each_header`]; [`CarrierInfo::head`] is
 /// set), without a prefix ([`zmux::Admission::prefix_auth`] takes its
-/// token from the request header field), together with what `info` gives
+/// token from the request header field), so that nothing is answered or
+/// read as a WebSocket before the decision and a refused request is replayed
+/// as it came; no message of the carrier is read for it. It also has what
+/// `info` gives
 /// of the connection (over TLS its exporter, ALPN identifier and server
 /// name: `zmux_rustls::carrier_info`). Every other request, a malformed
 /// or oversized head included, is [`Upgrade::Refused`], the bytes read
@@ -373,14 +705,16 @@ pub enum Upgrade<S> {
 /// is an intermediary the listener trusts to report its client in a
 /// forwarding header field, the client it reports is the carrier's source
 /// instead ([`zmux::TrustedProxies::source`], [`Entry::set_source`]). The
-/// hint carries the entry and the [`zmux::JOIN_HEADER`] of the request,
+/// hint carries the entry,
 /// for [`Listener::handle_pipe`]. An upgrade that an intermediary
 /// forwarded from TLS early data (`Early-Data: 1`) is answered
 /// `425 Too Early` before any admission and is [`Upgrade::Ended`]. A
 /// refused or too-early request counts in the listener's statistics as a
 /// failed handshake. Over TLS, give the carrier the TCP socket underneath
 /// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without
-/// a Close frame.
+/// a Close frame. The carrier has no exporter and is not declared
+/// secure ([`PipeIo::with_carrier_secure`]): the stream is the caller's,
+/// and [`serve_tls`] gives both.
 ///
 /// ```no_run
 /// # async fn example(listener: zmux::Listener, tcp: tokio::net::TcpListener,
@@ -474,10 +808,7 @@ where
     io.flush().await?;
     let rest = buf[head_len..].to_vec();
     let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
-    let mut hint = PipeHint::from_entry(entry);
-    if let Some(j) = upgrade.join {
-        hint = hint.with_join_header(&j);
-    }
+    let hint = PipeHint::from_entry(entry);
     Ok(Upgrade::Accepted(pipe(ws, Some(upgrade.protocol)), hint))
 }
 
@@ -522,7 +853,6 @@ struct UpgradeRequest {
     parts: http::request::Parts,
     protocol: String,
     accept_key: String,
-    join: Option<String>,
 }
 
 /// The upgrade of `head` (a complete request head), when it is a
@@ -568,14 +898,9 @@ fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
     }
     let key = headers.get("Sec-WebSocket-Key")?;
     let protocol = options.select(&tokens(PROTOCOL_HEADER))?;
-    let join = headers
-        .get(zmux::JOIN_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     Some(UpgradeRequest {
         accept_key: derive_accept_key(key.as_bytes()),
         protocol,
-        join,
         parts,
     })
 }
@@ -601,6 +926,7 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
         options,
         |conn| std::future::ready(Ok(conn)),
         |_| CarrierInfo::new(),
+        |_| None,
     )
     .await;
 }
@@ -611,8 +937,10 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
 /// handshake, the handshake and the upgrade run within the listener's
 /// `handshake_timeout`, and the admission decides with the connection's
 /// exporter, ALPN identifier and server name
-/// ([`zmux_rustls::carrier_info`]). `tls` should offer the ALPN
-/// identifier `http/1.1`.
+/// (as `zmux_rustls::carrier_info` gives). Over TLS 1.3 a carrier has the
+/// connection's exporter and is declared secure
+/// ([`PipeIo::with_carrier_secure`]), for Bound joins and the session's
+/// exporter. `tls` should offer the ALPN identifier `http/1.1`.
 pub async fn serve_tls(
     listener: Listener,
     tcp: TcpListener,
@@ -623,20 +951,26 @@ pub async fn serve_tls(
         listener,
         tcp,
         options,
-        move |conn| tls.accept(conn),
-        zmux_rustls::carrier_info::<TcpStream>,
+        move |conn| {
+            let accepted = tls.accept(conn);
+            async move { accepted.await.map(SharedTls::new) }
+        },
+        SharedTls::info,
+        SharedTls::exporter,
     )
     .await;
 }
 
 /// [`serve`] with `setup` (a TLS handshake) between the PROXY protocol
-/// header and the upgrade, and `info` the metadata of a set-up connection.
+/// header and the upgrade, `info` the metadata of a set-up connection and
+/// `exporter` its exporter for the carrier.
 async fn serve_over<C, S, SF>(
     listener: Listener,
     tcp: TcpListener,
     options: Options,
     setup: S,
     info: fn(&C) -> CarrierInfo<'_>,
+    exporter: fn(&C) -> Option<Exporter>,
 ) where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Fn(TcpStream) -> SF + Send + Sync + 'static,
@@ -659,17 +993,19 @@ async fn serve_over<C, S, SF>(
                 let entry = listener.enter(peer, Some(source)).ok_or(())?;
                 // A failed handshake or upgrade counts with the entry.
                 let conn = setup(conn).await.map_err(drop)?;
+                let exporter = exporter(&conn);
                 let upgraded = accept(conn, entry, info, &listener, options)
                     .await
                     .map_err(drop)?;
-                Ok((upgraded, socket, source))
+                Ok((upgraded, socket, source, exporter))
             }
         }
     };
-    let served = move |l: Listener, (upgraded, socket, source)| async move {
+    let served = move |l: Listener, (upgraded, socket, source, exporter)| async move {
         match upgraded {
             Upgrade::Accepted(io, hint) => {
-                let _ = l.handle_pipe(with_socket(io, socket), hint).await;
+                let io = secured(with_socket(io, socket), exporter);
+                let _ = l.handle_pipe(io, hint).await;
             }
             Upgrade::Refused(conn) => match l.limits().fallback {
                 Some(f) => {
@@ -708,6 +1044,7 @@ pub struct Options {
     protocols: Vec<String>,
     credential: Option<Arc<dyn Credential>>,
     max_request_head: usize,
+    max_redirects: usize,
 }
 
 /// The default of [`Options::max_request_head`].
@@ -736,6 +1073,7 @@ impl Options {
             protocols: vec![id.into()],
             credential: None,
             max_request_head: DEFAULT_MAX_REQUEST_HEAD,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
         }
     }
 
@@ -760,6 +1098,24 @@ impl Options {
         self.max_request_head
     }
 
+    /// With this bound on the redirects of the upgrade a client follows
+    /// (default [`DEFAULT_MAX_REDIRECTS`]; 0 follows none). A redirect is
+    /// followed only to the same host: the same scheme and port, or `ws`
+    /// to `wss` on any port; never `wss` to `ws`, another host, or a
+    /// location with credentials. Each is a new connection with the
+    /// credential presented anew. One not followed fails the dial with a
+    /// [`RedirectError`].
+    #[must_use]
+    pub fn with_max_redirects(mut self, redirects: usize) -> Self {
+        self.max_redirects = redirects;
+        self
+    }
+
+    /// The bound on the redirects of the upgrade a client follows.
+    pub fn max_redirects(&self) -> usize {
+        self.max_redirects
+    }
+
     /// With one more identifier, after the others in preference.
     #[must_use]
     pub fn with_protocol(mut self, id: impl Into<String>) -> Self {
@@ -777,7 +1133,7 @@ impl Options {
         self.protocols.iter().cloned().chain(aliases).collect()
     }
 
-    /// The offered identifier selected (SPEC.md Section 6.2): the first of
+    /// The offered identifier selected: the first of
     /// these, in order, that the client offered as it is or as its alias;
     /// the identifier as it is when both were offered.
     pub(crate) fn select(&self, offered: &[String]) -> Option<String> {
@@ -887,8 +1243,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
 /// as it is, flushed before the write returns.
 struct Writer<S> {
     sink: SplitSink<WebSocketStream<S>, Message>,
-    /// The length of the message handed to the sink and not yet flushed.
-    started: Option<usize>,
+    /// The messages handed to the sink and not yet flushed: their count and
+    /// bytes.
+    started: (usize, usize),
 }
 
 fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
@@ -902,23 +1259,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
         cx: &mut Context<'_>,
         chunks: &mut [Bytes],
     ) -> Poll<io::Result<usize>> {
+        self.poll_write_message_batch(cx, chunks)
+    }
+
+    fn takes_message_batches(&self) -> bool {
+        true
+    }
+
+    /// The messages go into the sink's buffer, then one flush.
+    fn poll_write_message_batch(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        messages: &mut [Bytes],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let Some(msg) = chunks.first_mut() else {
-            return Poll::Ready(Ok(0));
-        };
-        if this.started.is_none() {
+        while let Some(msg) = messages.get(this.started.0) {
             ready!(Pin::new(&mut this.sink).poll_ready(cx)).map_err(ws_error)?;
-            // Shared with the sink; taken from `chunks` once flushed.
+            // Shared with the sink; taken from `messages` once flushed.
             Pin::new(&mut this.sink)
                 .start_send(Message::Binary(msg.clone()))
                 .map_err(ws_error)?;
-            this.started = Some(msg.len());
+            this.started.0 += 1;
+            this.started.1 += msg.len();
         }
         ready!(Pin::new(&mut this.sink).poll_flush(cx)).map_err(ws_error)?;
-        let n = this.started.take().unwrap_or(0);
-        debug_assert_eq!(n, msg.len());
-        *msg = Bytes::new();
-        Poll::Ready(Ok(n))
+        let (_, bytes) = std::mem::take(&mut this.started);
+        messages.fill(Bytes::new());
+        Poll::Ready(Ok(bytes))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -934,7 +1301,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
 /// A [`zmux::Candidate`] of [`zmux::CarrierKind::WebSocket`] for carrier
 /// modes: a WebSocket to `url` (`ws://` or `wss://`, its target the
 /// endpoint's) over a connection that `connect` makes, plain TCP or TLS
-/// ([`dial_over`]).
+/// ([`dial_over`]). A redirect is followed when it keeps the scheme, host
+/// and port (the connection is `connect`'s), and later carriers start at
+/// the URL it led to; one that fails starts at `url` again.
 pub fn candidate<C, F, S>(connect: C, url: &str, options: &Options) -> zmux::Candidate
 where
     C: Fn() -> F + Send + Sync + 'static,
@@ -942,27 +1311,73 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connect = Arc::new(connect);
-    let url: Arc<str> = url.into();
+    let target = Arc::new(zmux::HttpTarget::new(url));
     let options = Arc::new(options.clone());
+    let named = target.clone();
     zmux::Candidate::new(zmux::CarrierKind::WebSocket, move || {
-        let (connect, url, options) = (connect.clone(), url.clone(), options.clone());
-        async move { dial_over(connect().await?, &*url, &options).await }
+        let (connect, target, options) = (connect.clone(), target.clone(), options.clone());
+        async move {
+            let request = target
+                .url()
+                .into_client_request()
+                .map_err(io::Error::other)?;
+            let scheme = request.uri().scheme().cloned();
+            let dialed = follow(request, &options, |r| {
+                let (connect, options, scheme) = (connect.clone(), options.clone(), scheme.clone());
+                async move {
+                    if r.uri().scheme() != scheme.as_ref() {
+                        return Err(Hop::Failed(
+                            RedirectError {
+                                status: 0,
+                                location: r.uri().to_string(),
+                                reason: "another scheme over the same connection",
+                            }
+                            .into(),
+                        ));
+                    }
+                    let request = offer(r, &options, &CarrierInfo::new())?;
+                    upgrade_over(connect().await?, request).await
+                }
+            })
+            .await;
+            match &dialed {
+                Ok((_, last)) => target.redirected(&last.to_string()),
+                Err(_) => target.reset(),
+            }
+            dialed.map(|(io, _)| io)
+        }
     })
+    .with_target(named)
 }
 
 /// A [`zmux::Candidate`] of [`zmux::CarrierKind::WebSocket`] over TLS to a
-/// `wss://` `url` ([`dial_tls`]).
+/// `wss://` `url` ([`dial_tls`]): later carriers start at the URL
+/// redirects led the last one to, and one that fails starts at `url`
+/// again.
 pub fn candidate_tls(
     url: &str,
     tls: tokio_rustls::TlsConnector,
     options: &Options,
 ) -> zmux::Candidate {
-    let url: Arc<str> = url.into();
+    let target = Arc::new(zmux::HttpTarget::new(url));
     let options = Arc::new(options.clone());
+    let named = target.clone();
     zmux::Candidate::new(zmux::CarrierKind::WebSocket, move || {
-        let (url, tls, options) = (url.clone(), tls.clone(), options.clone());
-        async move { dial_tls(&*url, &tls, &options).await }
+        let (target, tls, options) = (target.clone(), tls.clone(), options.clone());
+        async move {
+            let request = target
+                .url()
+                .into_client_request()
+                .map_err(io::Error::other)?;
+            let dialed = dial_following(request, Some(&tls), &options).await;
+            match &dialed {
+                Ok((_, last)) => target.redirected(&last.to_string()),
+                Err(_) => target.reset(),
+            }
+            dialed.map(|(io, _)| io)
+        }
     })
+    .with_target(named)
 }
 
 #[cfg(test)]
@@ -974,7 +1389,7 @@ mod tests {
     }
 
     /// The server's order of preference decides, and the identifier as it
-    /// is wins over its alias (SPEC.md Section 6.2).
+    /// is wins over its alias.
     #[test]
     fn the_server_selects_in_its_own_order() {
         let o = Options::for_protocol("app-02").with_protocol("qmux-02");

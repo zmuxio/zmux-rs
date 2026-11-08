@@ -1105,7 +1105,8 @@ mod tests {
     static NONCES: AtomicU64 = AtomicU64::new(1);
 
     fn server(o: ExchangeOptions) -> (Listener, ExchangeServer) {
-        let listener = Listener::new(zmux::Config::default(), zmux::ListenerConfig::default());
+        let listener = Listener::new(zmux::Config::default(), zmux::ListenerConfig::default())
+            .expect("valid listener configuration");
         let server = ExchangeServer::new(&listener, o.with_unauthenticated()).unwrap();
         (listener, server)
     }
@@ -1228,7 +1229,8 @@ mod tests {
     async fn new_carriers_take_the_sources_pending_share() {
         let mut limits = zmux::ListenerConfig::default();
         limits.max_pending_per_source = 1;
-        let listener = Listener::new(zmux::Config::default(), limits);
+        let listener =
+            Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =
             ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
                 .unwrap();

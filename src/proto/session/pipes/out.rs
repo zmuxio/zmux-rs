@@ -1,7 +1,6 @@
-//! The outbound pipe of an attachment: its state machine (STATE_MACHINE.md
-//! Section 3.1), positions, the sample state of the batches in flight, the
-//! retained frames, write progress, probes, penalties, probation and the
-//! redundant copies queued for it (MULTIPATH.md Sections 5 to 8, 4.1, 9.1 and 11).
+//! The outbound pipe of an attachment: its state machine, positions, the sample
+//! state of the batches in flight, the retained frames, write progress, probes,
+//! penalties, probation and the redundant copies queued for it.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -61,11 +60,11 @@ impl QueuedCopy {
 /// What a batch starts with, taken when the batch is built.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BatchStart {
+    /// The joiner's first record after Proven.
+    pub(crate) joined_first: bool,
     pub(crate) framing: Framing,
     /// QX_TRANSPORT_PARAMETERS is still to be written first.
     pub(crate) parameters: bool,
-    /// An in-band PIPE_JOIN to write first.
-    pub(crate) join: Option<([u8; 64], u8)>,
     /// The pipe is live.
     pub(crate) live: bool,
     /// CONNECTION_CLOSE was written on it.
@@ -101,9 +100,8 @@ pub(crate) struct Acked {
     pub(crate) activity: bool,
 }
 
-/// What holds a pipe's writes back (MULTIPATH.md Section 7.1): the one
-/// write-progress input of a pipe, in the state each driver style reports. The
-/// write-stall clock runs from it.
+/// What holds a pipe's writes back: the one write-progress input of a pipe, in
+/// the state each driver style reports. The write-stall clock runs from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hold {
     /// A write call in progress (a blocking driver's): when it started, and
@@ -121,6 +119,8 @@ pub(crate) struct OutPipe {
     state: OutState,
     /// QX_TRANSPORT_PARAMETERS written (bootstrap pipes; true elsewhere).
     tp_sent: bool,
+    /// The largest record plaintext of the carrier, local.
+    max_record: Option<usize>,
     close_sent: bool,
     /// Write side to be shut down with the next batch.
     shutdown: bool,
@@ -154,7 +154,7 @@ pub(crate) struct OutPipe {
     /// Bytes of the last batch handed to the carrier.
     last_batch: u64,
     /// Bytes of lane 0's batch that the carrier has not taken yet: the
-    /// write calls in progress (SCHEDULER.md Section 4, Q_p).
+    /// write calls in progress (part of the queue Q_p).
     writing: u64,
     /// The carrier reports its unsent bytes (an optional capability).
     unsent_reported: bool,
@@ -171,7 +171,7 @@ pub(crate) struct OutPipe {
     bottleneck_epoch: u64,
     /// The position at the pipe's last application-limited moment (a write
     /// opportunity that left it writable with nothing to send for it),
-    /// until the acknowledged position passes it (MULTIPATH.md).
+    /// until the acknowledged position passes it.
     bubble: Option<u64>,
     /// Records written so far.
     records: u64,
@@ -179,17 +179,15 @@ pub(crate) struct OutPipe {
     /// the pipe while its carrier has neither a low-water mark nor an
     /// unsent count. Allocated while the pipe is paced.
     limiter: Option<Box<Limiter>>,
-    /// Multipath state of the pipe (MULTIPATH.md), allocated
-    /// only in a multipath session.
+    /// Multipath state of the pipe, allocated only in a multipath session.
     mp: Option<Box<OutMp>>,
-    /// The carrier offers lanes (MULTIPATH.md Section 2.5): the adapter
-    /// opens further streams of lane 0's connection.
+    /// The carrier offers lanes: the adapter opens further streams of lane
+    /// 0's connection.
     lanes_offered: bool,
     /// The lanes, allocated with the first one: without them the pipe is
     /// its lane 0, whose positions are the send order.
     lanes: Option<Box<OutLanes>>,
-    /// The carrier's datagram channel (EXTENSIONS.md Section 6.8), as the
-    /// driver last reported it.
+    /// The carrier's datagram channel, as the driver last reported it.
     channel: Option<Channel>,
     /// The carrier's retransmissions, once the adapter reported a count.
     loss: Option<Box<CarrierLoss>>,
@@ -198,7 +196,7 @@ pub(crate) struct OutPipe {
 }
 
 /// A carrier's own retransmissions as its adapter reports them, and the
-/// smoothed loss rate sampled from them (API.md Section 7.2).
+/// smoothed loss rate sampled from them.
 #[derive(Debug, Clone, Copy)]
 struct CarrierLoss {
     /// The latest count.
@@ -215,7 +213,7 @@ struct CarrierLoss {
 const LOSS_SAMPLE_GAP: Duration = Duration::from_secs(1);
 
 /// A pipe carrier's datagram channel as the core uses it to decide where a
-/// DATAGRAM frame goes (EXTENSIONS.md Section 6.8).
+/// DATAGRAM frame goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Channel {
     /// The Pipe Stream ID that starts the pipe's channel datagrams, on
@@ -229,12 +227,10 @@ pub(crate) struct Channel {
 /// The multipath part of an outbound pipe.
 #[derive(Debug)]
 struct OutMp {
-    /// A DRAINING pipe that stalled (MULTIPATH.md Section 8.2).
+    /// A DRAINING pipe that stalled.
     suspect_mark: bool,
     /// The join was confirmed (or needs no confirmation).
     confirmed: bool,
-    /// An in-band PIPE_JOIN to write first.
-    join_frame: Option<([u8; 64], u8)>,
     usable_at: Instant,
     /// Retained frames: (end position of their record, frame).
     log: VecDeque<(u64, SentFrame)>,
@@ -246,12 +242,14 @@ struct OutMp {
     unsent_progress: Instant,
     /// Information up to this position was reinjected already.
     reinjected_upto: u64,
+    /// Stream data up to this position was re-sent for a penalty already.
+    penalty_resent_upto: u64,
     /// When the last ack-eliciting byte was sent.
     last_eliciting: Option<Instant>,
-    /// The current idle-probe wait is a bootstrap pipe's first, drawn
-    /// from the whole interval: no PIPE_PING was sent on the pipe by
-    /// either end. A joined pipe carried the joiner's PIPE_PING, so both
-    /// of its ends draw as usual (MULTIPATH.md Section 7.1).
+    /// The current idle-probe wait is a bootstrap pipe's first, drawn from
+    /// the whole interval: no PIPE_PING was sent on the pipe by either
+    /// end. A joined pipe carried the joiner's PIPE_PING, so both of its
+    /// ends draw as usual.
     boot_wait: bool,
     /// A PIPE_PING is owed since this time.
     ping_wanted: Option<Instant>,
@@ -261,6 +259,8 @@ struct OutMp {
     joined_at: Instant,
     suspect_floor: Duration,
     dead_timeout: Option<Duration>,
+    /// The two above when the pipe last turned suspect.
+    suspect_held: (Duration, Option<Duration>),
     /// The pipe's own idle-probe interval and jitter (`None`: the
     /// session's), and the draw u of the current wait, k (1 - j u), made
     /// when the wait starts from the pipe's generator.
@@ -274,16 +274,17 @@ struct OutMp {
     /// Atomic only to be set from a shared borrow; the core is single-owner.
     probe_hold: std::sync::atomic::AtomicU64,
     /// No new stream data until the acknowledged position reaches this
-    /// (opportunistic-reinjection penalty, MULTIPATH.md Section 7.5.1).
+    /// (opportunistic-reinjection penalty).
     penalty_until: Option<u64>,
-    /// A new pipe reinjects at most one chunk until the first PIPE_ACK
-    /// received after it became live, or this deadline (one smoothed RTT,
-    /// RESUME.md Section 6); and the bytes it reinjected meanwhile.
+    /// A new pipe reinjects at most one chunk until the first PIPE_ACK received
+    /// after it became live, or this deadline (one smoothed RTT); and the bytes
+    /// it reinjected meanwhile.
     reinject_hold: Option<Instant>,
     reinject_held: u64,
-    /// The first record carries a complete PIPE_ACK snapshot (MULTIPATH.md
-    /// Sections 5.2 and 5.4 step 8).
+    /// The first record carries a complete PIPE_ACK snapshot.
     snapshot_first: bool,
+    /// The joiner's first record after Proven is due.
+    joined_first: bool,
     probation: Probation,
     /// The send position when the pipe last became SUSPECT: bytes up to
     /// it give no RTT or rate samples.
@@ -304,7 +305,7 @@ struct OutMp {
     /// the lane's position at their end, in order per lane.
     pings_unanswered: Vec<(u64, u64)>,
     /// A PIPE_PING arrived on the attachment's inbound pipe: the PIPE_ACK
-    /// that answers it also goes on this pipe (MULTIPATH.md Section 6.5).
+    /// that answers it also goes on this pipe.
     answer_ping: bool,
     /// Awaiting revalidation.
     revalidating: Option<Revalidation>,
@@ -351,13 +352,13 @@ impl OutMp {
         let mut m = Self {
             suspect_mark: false,
             confirmed: !matches!(state, OutState::Joining | OutState::Deferred),
-            join_frame: None,
             usable_at: now,
             log: VecDeque::new(),
             activity_ends: VecDeque::new(),
             unsent_progress: now,
             waiting_since: None,
             reinjected_upto: 0,
+            penalty_resent_upto: 0,
             last_eliciting: None,
             boot_wait: false,
             ping_wanted: None,
@@ -365,6 +366,7 @@ impl OutMp {
             joined_at: now,
             suspect_floor: d.suspect_floor,
             dead_timeout: d.dead_timeout,
+            suspect_held: (d.suspect_floor, d.dead_timeout),
             probe_interval: d.probe_interval,
             probe_jitter: d.probe_jitter,
             probe_rng: d.probe_seed,
@@ -374,6 +376,7 @@ impl OutMp {
             reinject_hold: None,
             reinject_held: 0,
             snapshot_first: false,
+            joined_first: false,
             probation: Probation::default(),
             suspect_pos: 0,
             rr_current: 0.0,
@@ -420,6 +423,7 @@ impl OutPipe {
             framing,
             state,
             tp_sent: true,
+            max_record: None,
             close_sent: false,
             shutdown: false,
             shutdown_reported: false,
@@ -499,7 +503,7 @@ impl OutPipe {
     }
 
     /// The acknowledged positions summed over every lane.
-    fn acked_total(&self) -> u64 {
+    pub(crate) fn acked_total(&self) -> u64 {
         match self.lanes.as_deref() {
             Some(l) => {
                 l.tx(0).map_or(0, |t| t.acked())
@@ -516,8 +520,8 @@ impl OutPipe {
         self
     }
 
-    /// A bootstrap pipe: QX_TRANSPORT_PARAMETERS opens its first record
-    /// (SPEC.md Section 5.1).
+    /// A bootstrap pipe: QX_TRANSPORT_PARAMETERS opens its first
+    /// record.
     pub(crate) fn with_parameters_first(mut self) -> Self {
         self.tp_sent = false;
         if let Some(m) = self.mp.as_deref_mut() {
@@ -637,12 +641,10 @@ impl OutPipe {
         self.state.is_live() && !self.out_closed
     }
 
-    /// Usable for new stream data (MULTIPATH.md Section 11 rule S1).
+    /// Usable for new stream data: never before its handshake.
     #[inline]
     pub(crate) fn takes_new_data(&self) -> bool {
-        matches!(self.state, OutState::Joining | OutState::Active)
-            && !self.out_closed
-            && !self.shutdown
+        self.state == OutState::Active && !self.out_closed && !self.shutdown
     }
 
     /// The write side is to be shut down with the next batch (drained or
@@ -668,10 +670,9 @@ impl OutPipe {
     }
 
     /// The first frames of the pipe are owed: QX_TRANSPORT_PARAMETERS, or
-    /// an in-band PIPE_JOIN.
     #[inline]
     pub(crate) fn leading_frames_owed(&self) -> bool {
-        !self.tp_sent || self.mp.as_deref().is_some_and(|m| m.join_frame.is_some())
+        !self.tp_sent
     }
 
     /// Live, and not yet told to shut down: a batch may still be written.
@@ -706,8 +707,7 @@ impl OutPipe {
     }
 
     /// The preference class of the pipe for control frames: ACTIVE,
-    /// JOINING, SUSPECT, DRAINING, DRAINING marked suspect (MULTIPATH.md
-    /// Section 6.5).
+    /// JOINING, SUSPECT, DRAINING, DRAINING marked suspect.
     #[inline]
     pub(crate) fn control_rank(&self) -> Option<u8> {
         if !self.is_live() || self.shutdown {
@@ -738,31 +738,17 @@ impl OutPipe {
             })
     }
 
-    /// Whether a JOINING pipe can take stream data now, as an ACTIVE pipe
-    /// would (rule S1, MULTIPATH.md Section 11, lets it only while no
-    /// outbound pipe is usable).
-    #[inline]
-    pub(crate) fn joining_takes(&self) -> bool {
-        self.state == OutState::Joining
-            && self.writable()
-            && !self.out_closed
-            && !self.shutdown
-            && self.mp().penalty_until.is_none()
-    }
-
-    /// Whether a revalidation may start: JOINING or ACTIVE, open, and none
-    /// awaited.
+    /// Whether a revalidation may start: ACTIVE, open, and none awaited.
     fn revalidatable(&self) -> bool {
-        matches!(self.state, OutState::Joining | OutState::Active)
+        self.state == OutState::Active
             && !self.out_closed
             && !self.shutdown
             && self.mp().revalidating.is_none()
     }
 
-    /// Whether the pipe may carry the endpoint's pending stream data and
-    /// reinjection for the write stall of MULTIPATH.md Section 7.1:
-    /// JOINING or ACTIVE, open, and not penalized (standby and lower tiers
-    /// included).
+    /// Whether the pipe may carry the endpoint's pending stream data and reinjection
+    /// for the write-stall rule: ACTIVE, open, and not penalized (standby and lower
+    /// tiers included).
     #[inline]
     pub(crate) fn may_carry(&self) -> bool {
         self.takes_new_data() && self.mp.as_deref().is_none_or(|m| m.penalty_until.is_none())
@@ -773,26 +759,54 @@ impl OutPipe {
         self.state = OutState::Joining;
     }
 
-    /// The join goes now: the pipe's clocks start, the first record carries
-    /// a complete snapshot (MULTIPATH.md Section 5.7 step 2) after the
-    /// in-band PIPE_JOIN `join_frame`, when it is joined in band, and
-    /// reinjection waits for a PIPE_ACK for up to a smoothed RTT.
-    pub(crate) fn start_join(&mut self, join_frame: Option<([u8; 64], u8)>, now: Instant) {
+    /// Its handshake runs: nothing but the handshake reaches the carrier.
+    #[inline]
+    pub(crate) fn in_handshake(&self) -> bool {
+        matches!(self.state, OutState::Joining | OutState::Deferred)
+    }
+
+    /// The joiner's first record after Proven is still due.
+    pub(crate) fn joined_first(&self) -> bool {
+        self.mp.as_deref().is_some_and(|m| m.joined_first)
+    }
+
+    /// The largest record plaintext of the pipe's carrier.
+    pub(crate) fn set_max_record(&mut self, max: usize) {
+        self.max_record = Some(max);
+    }
+
+    /// See [`OutPipe::set_max_record`].
+    pub(crate) fn max_record(&self) -> Option<usize> {
+        self.max_record
+    }
+
+    /// The join goes now: its handshake timeout runs. No stall clock runs until it is
+    /// ACTIVE.
+    pub(crate) fn start_join(&mut self, now: Instant) {
+        self.mp_mut().joined_at = now;
+    }
+
+    /// A verified Reply: ACTIVE. Stall clocks start here, the first record carries a
+    /// complete snapshot and a PIPE_PING, and reinjection waits for a PIPE_ACK for up to a
+    /// smoothed RTT.
+    pub(crate) fn join_proven(&mut self, now: Instant) {
         let reinject_hold = now + self.est.srtt;
+        self.state = OutState::Active;
         self.last_advance = now;
         let m = self.mp_mut();
+        m.confirmed = true;
         m.joined_at = now;
         m.usable_at = now;
         m.draw_probe_wait();
+        m.ping_wanted = Some(now);
         m.snapshot_first = true;
+        m.joined_first = true;
         m.reinject_hold = Some(reinject_hold);
-        m.join_frame = join_frame;
     }
 
-    /// The pipe of a join accepted from the peer (MULTIPATH.md Section 5.4
-    /// step 8): its first record carries a complete snapshot and a
-    /// PIPE_PING, and reinjection waits for a PIPE_ACK for up to a
-    /// smoothed RTT.
+    /// The pipe of a join accepted from the peer: its first record carries a complete
+    /// snapshot and a PIPE_PING, and reinjection waits for a PIPE_ACK for up to a smoothed
+    /// RTT.
     pub(crate) fn accepted(mut self, now: Instant) -> Self {
         let reinject_hold = now + self.est.srtt;
         let m = self.mp_mut();
@@ -802,8 +816,7 @@ impl OutPipe {
         self
     }
 
-    /// Starts draining (MULTIPATH.md Section 8.2): `false` when it drains,
-    /// failed or closed already.
+    /// Starts draining: `false` when it drains, failed or closed already.
     pub(crate) fn start_drain(&mut self, now: Instant) -> bool {
         if matches!(
             self.state,
@@ -824,43 +837,38 @@ impl OutPipe {
         self.mp().drain_since
     }
 
-    /// The pipe becomes suspect (MULTIPATH.md Section 7.2), or a DRAINING
-    /// one is marked so: `false` when nothing changed. A PIPE_PING is owed,
-    /// and the bytes sent so far give no samples.
+    /// The pipe becomes suspect, or a DRAINING one is marked so: `false` when
+    /// nothing changed. A PIPE_PING is owed, and the bytes sent so far give no
+    /// samples.
     pub(crate) fn suspect(&mut self, now: Instant) -> bool {
         match self.state {
-            OutState::Joining | OutState::Active => self.state = OutState::Suspect,
+            OutState::Active => self.state = OutState::Suspect,
             OutState::Draining if !self.mp().suspect_mark => self.mp_mut().suspect_mark = true,
             _ => return false,
         }
         let sent = self.sent;
         let m = self.mp_mut();
         m.ping_wanted.get_or_insert(now);
+        m.suspect_held = (m.suspect_floor, m.dead_timeout);
         // Bytes held through the outage give no samples.
         m.suspect_pos = sent;
         m.suspect_count += 1;
         true
     }
 
-    /// The acknowledged position advanced: a joining pipe is confirmed, a
-    /// suspect one whose carrier takes bytes recovers. `Some(true)` for a
-    /// confirmed join, `Some(false)` for a recovery, `None` when nothing
-    /// changed.
-    pub(crate) fn ack_progress(&mut self) -> Option<bool> {
-        let joined = match self.state {
-            OutState::Joining => true,
-            OutState::Suspect if self.open() => false,
-            _ => return None,
-        };
-        self.state = OutState::Active;
-        self.mp_mut().confirmed = true;
-        Some(joined)
+    /// The acknowledged position advanced: a suspect pipe whose carrier takes bytes
+    /// recovers; whether one did.
+    pub(crate) fn ack_progress(&mut self) -> bool {
+        if self.state == OutState::Suspect && self.open() {
+            self.state = OutState::Active;
+            return true;
+        }
+        false
     }
 
-    /// The attachment failed (MULTIPATH.md Section 7.2), after its
-    /// information was reinjected: the pipe stops, its retained state goes
-    /// and its write side is shut down. Whether the driver is still to be
-    /// told to abort the carrier.
+    /// The attachment failed, after its information was reinjected: the pipe stops,
+    /// its retained state goes and its write side is shut down. Whether the driver
+    /// is still to be told to abort the carrier.
     pub(crate) fn fail(&mut self) -> bool {
         self.lost = self.bytes_written().saturating_sub(self.acked_total());
         self.state = OutState::Failed;
@@ -873,7 +881,6 @@ impl OutPipe {
         m.log = VecDeque::new();
         m.activity_ends = Default::default();
         m.waiting_since = None;
-        m.join_frame = None;
         m.ping_wanted = None;
         self.shutdown = true;
         let report = !self.out_closed && !self.abort_reported && !self.shutdown_reported;
@@ -881,8 +888,8 @@ impl OutPipe {
         report
     }
 
-    /// A drained pipe closes (MULTIPATH.md Section 8.2 step 3): its write
-    /// side is shut down with the next batch.
+    /// A drained pipe closes: its write side is shut down with the next
+    /// batch.
     pub(crate) fn close_drained(&mut self) {
         self.state = OutState::Closed;
         self.shutdown = true;
@@ -935,11 +942,35 @@ impl OutPipe {
         self.mp().joined_at
     }
 
-    /// The last progress (MULTIPATH.md Section 5.4 step 9): the last
-    /// acknowledgement advance, or the join.
+    /// The last progress: the last acknowledgement advance, or the join.
     #[inline]
     pub(crate) fn last_progress(&self) -> Instant {
         self.last_advance.max(self.mp().joined_at)
+    }
+
+    /// Replaces the floor of T_suspect and the dead timeout of this pipe.
+    pub(crate) fn set_detection_limits(&mut self, floor: Duration, dead: Option<Duration>) {
+        if self.mp.is_some() {
+            let m = self.mp_mut();
+            m.suspect_floor = floor;
+            m.dead_timeout = dead;
+        }
+    }
+
+    /// Replaces this pipe's own idle-probe settings.
+    pub(crate) fn set_probe(&mut self, interval: Option<Period>, jitter: Option<f64>) {
+        if self.mp.is_some() {
+            let m = self.mp_mut();
+            m.probe_interval = interval;
+            m.probe_jitter = jitter;
+        }
+    }
+
+    /// The floor of T_suspect and the dead timeout when the pipe last turned
+    /// suspect.
+    #[inline]
+    pub(crate) fn held_detection(&self) -> (Duration, Option<Duration>) {
+        self.mp().suspect_held
     }
 
     /// The floor of T_suspect and the dead timeout of this pipe.
@@ -951,15 +982,18 @@ impl OutPipe {
     // ---- building batches ----------------------------------------------------------
 
     /// A batch starts: what it begins with, `None` when the pipe writes no
-    /// more. The parameters and an in-band PIPE_JOIN are written once.
+    /// more. The parameters are written once.
     pub(crate) fn begin_batch(&mut self, closed: bool) -> Option<BatchStart> {
-        if self.out_closed || self.shutdown_reported || closed {
+        if self.out_closed || self.shutdown_reported || closed || self.in_handshake() {
             return None;
         }
         Some(BatchStart {
             framing: self.framing,
             parameters: !std::mem::replace(&mut self.tp_sent, true),
-            join: self.mp.as_deref_mut().and_then(|m| m.join_frame.take()),
+            joined_first: self
+                .mp
+                .as_deref_mut()
+                .is_some_and(|m| std::mem::take(&mut m.joined_first)),
             live: self.state.is_live(),
             close_sent: self.close_sent,
             shutdown: self.shutdown,
@@ -967,17 +1001,26 @@ impl OutPipe {
     }
 
     /// Gives back what [`OutPipe::begin_batch`] took for a batch that wrote
-    /// nothing: the transport parameters and the in-band PIPE_JOIN still
-    /// owed.
-    pub(crate) fn unbegin_batch(&mut self, parameters: bool, join: Option<([u8; 64], u8)>) {
+    /// nothing: the transport parameters still owed.
+    pub(crate) fn unbegin_batch(&mut self, parameters: bool, joined_first: bool) {
         if parameters {
             self.tp_sent = false;
         }
-        if join.is_some()
-            && let Some(m) = self.mp.as_deref_mut()
-        {
-            m.join_frame = join;
+        if joined_first {
+            self.mp_mut().joined_first = true;
         }
+    }
+
+    /// The pipe's carrier no longer holds a close back: it took the whole
+    /// batch with CONNECTION_CLOSE (nothing follows it, and a lane's next
+    /// batch is taken only once the last is written), or the pipe cannot
+    /// carry it: closed, shut down without it, not live, or still in its
+    /// handshake.
+    pub(crate) fn close_handed_off(&self) -> bool {
+        if self.close_sent {
+            return self.out_closed || self.writing == 0;
+        }
+        self.out_closed || self.shutdown_reported || !self.state.is_live() || self.in_handshake()
     }
 
     /// The batch with CONNECTION_CLOSE was written, with the shutdown.
@@ -1207,7 +1250,7 @@ impl OutPipe {
     }
 
     /// The batches sent so far are not watched by failure detection: they
-    /// went out before multipath was in use (MULTIPATH.md Section 7.1).
+    /// went out before multipath was in use.
     pub(crate) fn unwatch_batches(&mut self) {
         for b in &mut self.batches {
             b.watched = false;
@@ -1310,9 +1353,11 @@ impl OutPipe {
     /// takes the RTT and delivery-rate samples
     /// from the batches it covers and releases them. An RTT sample needs
     /// `rtt_ok`; `usable` says whether a batch may give samples at all
-    /// (never one that would measure an outage). `ack_delay` is the
-    /// entry's ACK Delay, `peer_mad` the peer's `zmux_max_ack_delay`;
-    /// a `quiet` sample enters min_rtt only while it has none.
+    /// (never one that would measure an outage), and `proven_ok` whether one
+    /// that `usable` refuses may still give a queue-proven rate sample.
+    /// `ack_delay` is the entry's ACK Delay, `peer_mad` the peer's
+    /// `zmux_max_ack_delay`; a `quiet` sample enters min_rtt only while it has
+    /// none.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sample_ack(
         &mut self,
@@ -1322,6 +1367,7 @@ impl OutPipe {
         rtt_ok: bool,
         quiet: bool,
         usable: impl Fn(&Batch) -> bool,
+        proven_ok: impl Fn(&Batch) -> bool,
         now: Instant,
     ) -> AckSample {
         let old = self.acked;
@@ -1377,6 +1423,25 @@ impl OutPipe {
         // few bytes over that wait would read as a rate of a few hundred
         // bytes a second and, as a bottleneck sample, replace R_p (a
         // session-affinity pipe was then held for seconds by the limiter).
+        // Queue-proven: the corrected RTT of the batch exceeds min_rtt by at least
+        // 4 x min_rtt. A FIFO path held its bytes that long and was busy all the
+        // while, so the sample is the path's rate: a bottleneck sample, in a bubble
+        // too, and taken also from bytes sent before the pipe became SUSPECT (its
+        // RTT sample stays out).
+        // A zero RTT (which the filter keeps as 1 ns) proves nothing.
+        let min_rtt = self
+            .est
+            .min_rtt
+            .get()
+            .filter(|&m| m > Duration::from_nanos(1));
+        let proven = |b: &Batch| {
+            min_rtt.is_some_and(|m| {
+                now.saturating_duration_since(b.time)
+                    .saturating_sub(ack_delay.min(peer_mad))
+                    .saturating_sub(m)
+                    >= m * 4
+            })
+        };
         if let Some(b) = self
             .batches
             .iter()
@@ -1384,7 +1449,7 @@ impl OutPipe {
             .filter(|b| b.eliciting)
             .last()
             .copied()
-            .filter(&usable)
+            .filter(|b| usable(b) || (proven(b) && proven_ok(b)))
         {
             // As BBR, the delivered bytes over the longer of the send and
             // the acknowledgement interval, but each with its own bytes:
@@ -1406,9 +1471,10 @@ impl OutPipe {
             .map(|r| r as u64)
             .filter(|&r| r > 0);
             if let Some(rate) = rate {
-                let app_limited = b.before_first_ack
+                let app_limited = (b.before_first_ack
                     || b.in_bubble
-                    || self.bottleneck_epoch == b.bottleneck_epoch;
+                    || self.bottleneck_epoch == b.bottleneck_epoch)
+                    && !proven(&b);
                 self.est.rate_sample(rate, app_limited, now);
                 s.rate = Some((rate, app_limited));
             }
@@ -1435,9 +1501,8 @@ impl OutPipe {
     /// last became SUSPECT, or while it is suspect, and those `heard`
     /// rejects give no samples. The penalty, the outstanding PIPE_PING
     /// frames and a revalidation end when the position reaches them, and
-    /// the acknowledged activity records go. `quiet`: the session is quiet
-    /// (MULTIPATH.md Section 7.1), and the sample keeps out of min_rtt
-    /// (SCHEDULER.md Section 2.1).
+    /// the acknowledged activity records go. `quiet`: the session is quiet,
+    /// and the sample keeps out of min_rtt.
     pub(crate) fn mp_acked(
         &mut self,
         pos: u64,
@@ -1458,7 +1523,12 @@ impl OutPipe {
         };
         let usable = |b: &Batch| b.end > outage && heard(b);
         let rtt_ok = self.state != OutState::Failed;
-        let sample = self.sample_ack(pos, ack_delay, peer_mad, rtt_ok, quiet, usable, now);
+        // Bytes sent before SUSPECT (or acknowledged while suspect) still give a
+        // queue-proven rate sample; a failed pipe and a suspension give none.
+        let proven_ok = |b: &Batch| rtt_ok && heard(b);
+        let sample = self.sample_ack(
+            pos, ack_delay, peer_mad, rtt_ok, quiet, usable, proven_ok, now,
+        );
         let m = self.mp_mut();
         let unpenalized = m.penalty_until.is_some_and(|p| pos >= p);
         if unpenalized {
@@ -1479,12 +1549,11 @@ impl OutPipe {
         }
     }
 
-    // ---- retained frames (MULTIPATH.md Sections 6 and 7.4) -------------------------
+    // ---- retained frames ------------------------------------------------------------
 
     /// The send-order position up to which lane `lane`'s bytes are all
-    /// acknowledged (MULTIPATH.md Section 2.5): every frame it carried
-    /// that ends there or before is acknowledged. Without lanes, the
-    /// acknowledged position.
+    /// acknowledged: every frame it carried that ends there or before is
+    /// acknowledged. Without lanes, the acknowledged position.
     #[inline]
     fn lane_floor(&self, lane: u64) -> u64 {
         match self.lanes.as_deref() {
@@ -1555,8 +1624,8 @@ impl OutPipe {
     }
 
     /// Adds to `frames` every retained frame beyond the acknowledged
-    /// position of its lane not reinjected yet (once per pipe, MULTIPATH.md
-    /// Section 7.4), and counts their stream bytes as reinjected.
+    /// position of its lane not reinjected yet (once per pipe), and counts
+    /// their stream bytes as reinjected.
     pub(crate) fn take_reinjection(&mut self, frames: &mut Vec<SentFrame>) {
         let sent = self.sent;
         let upto = self.mp().reinjected_upto;
@@ -1581,7 +1650,33 @@ impl OutPipe {
             .sum::<u64>();
     }
 
-    // ---- lanes (MULTIPATH.md Sections 2.5 and 5.8) -------------------------------
+    /// The STREAM frames of the directions `moves` names that the pipe sent
+    /// and has not had acknowledged, for the re-send on a penalty: each once,
+    /// what an earlier penalty or a reinjection re-sent excluded.
+    pub(crate) fn take_penalty_resend(
+        &mut self,
+        moves: impl Fn(StreamKey) -> bool,
+        frames: &mut Vec<SentFrame>,
+    ) {
+        let sent = self.sent;
+        let upto = self.mp().reinjected_upto.max(self.mp().penalty_resent_upto);
+        let mut beyond = |floor: u64, log: &VecDeque<(u64, SentFrame)>| {
+            let from = floor.max(upto);
+            frames.extend(log.iter().filter_map(|&(end, f)| match f {
+                SentFrame::Stream { key, .. } if end > from && moves(key) => Some(f),
+                _ => None,
+            }));
+        };
+        beyond(self.lane_floor(0), &self.mp().log);
+        if let Some(l) = self.lanes.as_deref() {
+            for (n, log) in l.logs() {
+                beyond(l.floor_of(n).unwrap_or(u64::MAX), log);
+            }
+        }
+        self.mp_mut().penalty_resent_upto = sent;
+    }
+
+    // ---- lanes ----------------------------------------------------------------------
 
     /// The lanes, once one was opened.
     #[inline]
@@ -1660,9 +1755,9 @@ impl OutPipe {
 
     /// The peer acknowledged position `pos`, at most the bytes written
     /// there, on lane `lane`: whether the lane's position moved, and the
-    /// cumulative acknowledgement point when it advanced (MULTIPATH.md
-    /// Section 2.5). Without lanes both move together. With lanes the
-    /// held bytes are taken again at `now`.
+    /// cumulative acknowledgement point when it advanced. Without lanes
+    /// both move together. With lanes the held bytes are taken again at
+    /// `now`.
     pub(crate) fn ack_lane(&mut self, lane: u64, pos: u64, now: Instant) -> (bool, Option<u64>) {
         let span = self.held_span();
         let Some(l) = self.lanes.as_deref_mut() else {
@@ -1709,10 +1804,10 @@ impl OutPipe {
         }
     }
 
-    /// Whether a lane may be opened now (MULTIPATH.md Section 5.8): the
-    /// carrier offers lanes, a position above 0 is acknowledged on lane 0,
-    /// no lane is unconfirmed, none was refused, and the next number is
-    /// below the peer's `max` (its Max Lanes).
+    /// Whether a lane may be opened now: the carrier offers lanes, a
+    /// position above 0 is acknowledged on lane 0, no lane is unconfirmed,
+    /// none was refused, and the next number is below the peer's `max`
+    /// (its Max Lanes).
     pub(crate) fn may_open_lane(&self, max: u64, now: Instant) -> bool {
         if !self.lanes_offered || !self.takes_new_data() || self.acked_on(0) == 0 {
             return false;
@@ -1766,7 +1861,7 @@ impl OutPipe {
         self.lanes.as_deref_mut()
     }
 
-    // ---- write progress (MULTIPATH.md Section 7.1) ---------------------------------
+    // ---- write progress -------------------------------------------------------------
 
     /// The carrier takes bytes: it did not refuse the last ones.
     #[inline]
@@ -1816,8 +1911,8 @@ impl OutPipe {
     }
 
     /// A write to lane `lane` (not 0) ended, the carrier refusing bytes or
-    /// not: the lane's writability and write stall (MULTIPATH.md Section
-    /// 7.1, [`OutPipe::write_stall_from`]).
+    /// not: the lane's writability and write stall
+    /// ([`OutPipe::write_stall_from`]).
     pub(crate) fn lane_write(&mut self, lane: u64, refused: bool, now: Instant) {
         if let Some(l) = self.lanes.as_deref_mut() {
             l.set_writable(lane, !refused, now);
@@ -1825,7 +1920,7 @@ impl OutPipe {
     }
 
     /// The carrier's unsent bytes, `None` until the adapter reported a
-    /// count (API.md Section 7.2 `queued_bytes`).
+    /// count (reported as `queued_bytes`).
     #[inline]
     pub(crate) fn reported_unsent(&self) -> Option<u64> {
         self.unsent_reported.then_some(self.carrier_unsent)
@@ -1839,23 +1934,21 @@ impl OutPipe {
         }
     }
 
-    /// Q_p (SCHEDULER.md Section 4): bytes committed to the pipe and not
-    /// yet transmitted, over its lanes: those of the batches whose write
-    /// calls have not finished (in full until a call returns, then what
-    /// the carrier did not take) plus the carrier's unsent count, 0 where
-    /// the adapter reports none.
+    /// Q_p: bytes committed to the pipe and not yet transmitted, over its
+    /// lanes: those of the batches whose write calls have not finished (in
+    /// full until a call returns, then what the carrier did not take) plus
+    /// the carrier's unsent count, 0 where the adapter reports none.
     #[inline]
     pub(crate) fn queued(&self) -> u64 {
         self.carrier_unsent + self.writing + self.lanes.as_deref().map_or(0, OutLanes::writing)
     }
 
-    /// A write call's progress: `w` reports a
-    /// call that started, or one that ended and whether the carrier refused
-    /// bytes. `has_data`: stream data waits for a pipe, which makes a pipe
-    /// that holds the writes the bottleneck, when the hold begins or ends.
-    /// `waits`: bytes wait for this one, which
-    /// starts the write-stall clock of a refusing carrier (MULTIPATH.md
-    /// Section 7.1). A refusal reported again changes nothing.
+    /// A write call's progress: `w` reports a call that started, or one
+    /// that ended and whether the carrier refused bytes. `has_data`: stream
+    /// data waits for a pipe, which makes a pipe that holds the writes the
+    /// bottleneck, when the hold begins or ends. `waits`: bytes wait for
+    /// this one, which starts the write-stall clock of a refusing carrier.
+    /// A refusal reported again changes nothing.
     pub(crate) fn write_progress(
         &mut self,
         w: &super::super::PipeWrite,
@@ -1924,12 +2017,12 @@ impl OutPipe {
         !self.writable() && self.is_live() && self.mp().waiting_since.is_none()
     }
 
-    /// The reference time of a write stall (MULTIPATH.md Section 7.1), if
-    /// the pipe has one: a write call in progress from its start plus its
-    /// expected duration, its size / R_p; a refusing carrier, while bytes
-    /// wait (since `waits_since` when none were recorded), from when its
-    /// unsent count last decreased, or from the end of the call that found
-    /// it full plus the time to drain U, what it held then.
+    /// The reference time of a write stall, if the pipe has one: a write
+    /// call in progress from its start plus its expected duration, its
+    /// size / R_p; a refusing carrier, while bytes wait (since
+    /// `waits_since` when none were recorded), from when its unsent count
+    /// last decreased, or from the end of the call that found it full plus
+    /// the time to drain U, what it held then.
     ///
     /// With lanes, each lane with bytes waiting is a carrier of its own:
     /// the shortest of their stalls, and none longer than the time since
@@ -1964,15 +2057,15 @@ impl OutPipe {
                 }
                 // Minus the time the carrier needs to drain what it held
                 // when the call ended: a slow carrier still taking bytes at
-                // its rate never looks stalled (MULTIPATH.md Section 7.1).
+                // its rate never looks stalled.
                 let drain = Duration::from_secs_f64(unsent as f64 / rate);
                 since.max(end).checked_add(drain)
             }
         }
     }
 
-    /// The reference time of an ack stall (MULTIPATH.md Section 7.1), not
-    /// before `detect_from`, if the pipe has one.
+    /// The reference time of an ack stall, not before `detect_from`, if
+    /// the pipe has one.
     pub(crate) fn ack_stall_from(&self, detect_from: Instant) -> Option<Instant> {
         let oldest = self.oldest_unacked_watched()?;
         let from = self.last_advance.max(oldest);
@@ -1995,7 +2088,7 @@ impl OutPipe {
         ))
     }
 
-    // ---- probes (MULTIPATH.md Sections 6.4, 6.5 and 7.1) ---------------------------
+    // ---- probes ---------------------------------------------------------------------
 
     /// Since when a PIPE_PING is owed.
     #[inline]
@@ -2053,9 +2146,9 @@ impl OutPipe {
         }
     }
 
-    /// Return-pipe liveness (MULTIPATH.md Section 6.5): a PIPE_PING is owed
-    /// when the pipe has sent nothing ack-eliciting for longer than
-    /// `quiet`, unless the batch carries one.
+    /// Return-pipe liveness: a PIPE_PING is owed when the pipe has sent
+    /// nothing ack-eliciting for longer than `quiet`, unless the batch
+    /// carries one.
     pub(crate) fn check_liveness(&mut self, quiet: Duration, now: Instant) {
         let last = self.mp().last_eliciting_or_usable();
         let m = self.mp_mut();
@@ -2065,7 +2158,7 @@ impl OutPipe {
         }
     }
 
-    // ---- PIPE_ACK on the pipe (MULTIPATH.md Sections 5.2, 5.4 and 6.5) -----------
+    // ---- PIPE_ACK on the pipe -------------------------------------------------------
 
     /// The first record still owes its complete snapshot.
     #[inline]
@@ -2098,7 +2191,7 @@ impl OutPipe {
         m.answer_ping = false;
     }
 
-    // ---- reinjection hold (RESUME.md Section 6) ------------------------------------
+    // ---- reinjection hold -----------------------------------------------------------
 
     /// The reinjection hold ends: a PIPE_ACK arrived.
     pub(crate) fn end_reinject_hold(&mut self) {
@@ -2139,10 +2232,10 @@ impl OutPipe {
 
     // ---- penalties and counters ------------------------------------------------------
 
-    /// The penalty of MULTIPATH.md Section 7.5.1: the pipe takes no new
-    /// stream data until everything sent so far is acknowledged; the first
-    /// of an episode halves its rate. `None` when nothing is in flight,
-    /// else whether this started an episode.
+    /// The opportunistic-reinjection penalty: the pipe takes no new stream
+    /// data until everything sent so far is acknowledged; the first of an
+    /// episode halves its rate. `None` when nothing is in flight, else
+    /// whether this started an episode.
     pub(crate) fn penalize(&mut self) -> Option<bool> {
         if self.acked >= self.sent {
             return None;
@@ -2477,14 +2570,14 @@ mod tests {
 
     /// Only a bootstrap pipe draws its first idle-probe wait from the whole
     /// interval: a joined pipe carried the joiner's PIPE_PING, so both of
-    /// its ends draw as usual from the start (MULTIPATH.md Section 7.1).
+    /// its ends draw as usual from the start.
     #[test]
     fn only_a_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
         let now = Instant::now();
         assert!(pipe(now).accepted(now).probe_settings().3, "accepted join");
         let mut joiner = pipe(now);
-        joiner.start_join(None, now);
-        assert!(joiner.probe_settings().3, "join sent");
+        joiner.join_proven(now);
+        assert!(joiner.probe_settings().3, "join proven");
         let mut boot = pipe(now).with_parameters_first();
         assert!(!boot.probe_settings().3, "bootstrap");
         boot.ping_written();
@@ -2578,11 +2671,62 @@ mod tests {
         cum
     }
 
-    /// Q_p and unsent_ahead (SCHEDULER.md Section 4, MULTIPATH.md Section
-    /// 7.1) on a slow carrier that reports no unsent count: a batch whose
-    /// write call has not returned counts in full ahead of a batch handed
-    /// to another lane, then by what the carrier did not take; a count the
-    /// carrier reports adds to it, and is all `queued_bytes` shows.
+    /// A slow path of 20 kB/s and 20 ms behind a deep carrier buffer: a
+    /// small batch gives min_rtt, then 2 s of batches handed over at once,
+    /// which the carrier takes whole (never a bottleneck by refusal), are
+    /// acknowledged as the path serialises them. `suspect` marks the pipe
+    /// SUSPECT once they are handed over. Returns R_p after the last.
+    fn deep_buffer_rate(suspect: bool) -> u64 {
+        let t0 = Instant::now();
+        let mut o = pipe(t0);
+        let (rate, rtt) = (20_000.0, MS * 20);
+        let mut pos = 0;
+        let mut done = t0;
+        let mut acks = Vec::new();
+        for (i, len) in std::iter::once(20)
+            .chain(std::iter::repeat_n(1000, 40))
+            .enumerate()
+        {
+            let sent = if i == 0 { t0 } else { t0 + rtt * 2 };
+            batch(&mut o, 0, len, sent);
+            pos += len;
+            done = done.max(sent) + Duration::from_secs_f64(len as f64 / rate);
+            acks.push((pos, done + rtt));
+            if i == 0 {
+                ack(&mut o, 0, pos, done + rtt);
+                acks.clear();
+            }
+        }
+        if suspect {
+            assert!(o.suspect(t0 + rtt * 2));
+        }
+        for (p, at) in acks {
+            ack(&mut o, 0, p, at);
+        }
+        o.est().rate
+    }
+
+    /// Queue-proven samples: on a deep carrier buffer R_p converges to the
+    /// slow path's rate, though no write was ever refused.
+    #[test]
+    fn a_deep_buffer_slow_pipe_converges() {
+        let r = deep_buffer_rate(false);
+        assert!((10_000..=40_000).contains(&r), "R_p {r}");
+    }
+
+    /// Bytes sent before SUSPECT give no RTT sample but a queue-proven rate
+    /// sample: R_p does not stay at its old maximum.
+    #[test]
+    fn a_suspect_pipe_does_not_keep_its_old_rate() {
+        let r = deep_buffer_rate(true);
+        assert!((10_000..=40_000).contains(&r), "R_p {r}");
+    }
+
+    /// Q_p and unsent_ahead on a slow carrier that reports no unsent
+    /// count: a batch whose write call has not returned counts in full
+    /// ahead of a batch handed to another lane, then by what the carrier
+    /// did not take; a count the carrier reports adds to it, and is all
+    /// `queued_bytes` shows.
     #[test]
     fn unsent_ahead_counts_the_batches_still_being_written() {
         let t0 = Instant::now();
@@ -2613,10 +2757,9 @@ mod tests {
         assert_eq!(o.queue_term(), MS * 50);
     }
 
-    /// The cumulative acknowledgement point (MULTIPATH.md Section 2.5): a lane acknowledged
-    /// ahead of another moves no whole-pipe state, neither the samples nor
-    /// the last progress nor the ack stall, until the point moves; the
-    /// first record of a lane is outside the send order.
+    /// The cumulative acknowledgement point: a lane acknowledged ahead of another moves no
+    /// whole-pipe state, neither the samples nor the last progress nor the ack stall, until
+    /// the point moves; the first record of a lane is outside the send order.
     #[test]
     fn the_cumulative_point_moves_as_the_position_of_a_pipe_without_lanes() {
         let t0 = Instant::now();

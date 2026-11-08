@@ -6,7 +6,6 @@
 
 mod common;
 
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ const KEY: [u8; 16] = [0x5a; 16];
 fn config(key: Option<[u8; 16]>) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"lane-lifecycle--0123456789abcdef");
+    c.pipe_auth = PipeAuth::psk(*b"lane-lifecycle--0123456789abcdef").with_end_to_end();
     c.test_hooks().lane_key = key;
     c
 }
@@ -40,7 +39,7 @@ fn lane_carrier(io: Carrier, conn: &CarrierConnId, peer: CarrierConnId) -> PipeI
                 tokio::spawn(zmux::carrier::handle_lane(
                     PipeIo::reader(r).with_carrier_conn(peer),
                 ));
-                Ok::<_, io::Error>(w)
+                Ok(zmux::carrier::Lane::new(w))
             }
         })
 }
@@ -76,7 +75,8 @@ async fn lane_is_aborted(conn: &CarrierConnId, key: &[u8; 16]) {
 async fn attach_fails(s: &Session) {
     let (a, mut b) = tokio::io::duplex(4096);
     assert!(
-        s.add_pipe(PipeIo::new(a), PipeOptions::default()).is_err(),
+        s.begin_add_pipe(PipeIo::new(a), PipeOptions::default())
+            .is_err(),
         "a closing or closed session takes no pipe"
     );
     let mut buf = [0u8; 1];
@@ -118,7 +118,7 @@ fn a_closing_or_closed_session_takes_no_lanes_or_pipes_and_keeps_no_lane_state()
 
         // CLOSING: the server's close frame waits behind a stalled carrier.
         stall.stall(true);
-        server.close(VarInt::ZERO, b"");
+        drop(server.close(VarInt::ZERO, b""));
         assert_eq!(server.state(), State::Closing);
         attach_fails(&server).await;
         lane_is_aborted(&sid, &KEY).await;
@@ -134,12 +134,62 @@ fn a_closing_or_closed_session_takes_no_lanes_or_pipes_and_keeps_no_lane_state()
         assert_eq!(server.debug_tables().lane_state, 0, "nothing recreated");
         assert!(!lane_keys().contains(&KEY));
 
-        client.close(VarInt::ZERO, b"");
+        drop(client.close(VarInt::ZERO, b""));
         eventually(5, "the client closes", || client.state() == State::Closed).await;
         assert_eq!(client.debug_tables().lane_state, 0);
         assert_eq!(lane_keys().len(), n);
         drop((client, server, srecv, crecv));
         settle(base, 10, "sessions with lanes").await;
         tokio::time::sleep(Duration::from_millis(1)).await;
+    });
+}
+
+/// The unsent count a lane opener gives its lane reaches the pipe.
+#[test]
+fn a_lane_openers_unsent_count_is_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    multi_thread(async {
+        let (ca, sa) = (Arc::new(()), Arc::new(()));
+        let (cid, sid) = (CarrierConnId::new(&ca), CarrierConnId::new(&sa));
+        let (x, y) = tokio::io::duplex(1 << 20);
+        let (x, _) = Carrier::new(x);
+        let (y, _) = Carrier::new(y);
+        let server = tokio::spawn(common::accept(
+            lane_carrier(y, &sid, cid.clone()),
+            config(Some(KEY)),
+        ));
+        let read = Arc::new(AtomicBool::new(false));
+        let (peer, was_read) = (sid.clone(), read.clone());
+        let io = PipeIo::new(x)
+            .with_carrier_conn(cid.clone())
+            .with_lane_opener(move || {
+                let (peer, was_read) = (peer.clone(), was_read.clone());
+                async move {
+                    let (w, r) = tokio::io::duplex(1 << 20);
+                    tokio::spawn(zmux::carrier::handle_lane(
+                        PipeIo::reader(r).with_carrier_conn(peer),
+                    ));
+                    Ok(zmux::carrier::Lane::new(w).with_unsent(move || {
+                        was_read.store(true, Ordering::SeqCst);
+                        Some(1234)
+                    }))
+                }
+            });
+        let client = Session::connect(io, config(None)).await.unwrap();
+        let server = server.await.unwrap().unwrap();
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let _ = send.write_all(&vec![7; 4 << 20]).await;
+            send
+        });
+        watchdog(10, "the lane's count is read", async {
+            while !read.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        drop(client.close(0u32.into(), b""));
+        drop(server.close(0u32.into(), b""));
+        drop(writer);
     });
 }

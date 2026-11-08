@@ -49,6 +49,86 @@ stream operation), `OpenError`, `DatagramError`, `PipeError`, and
 Each tells whether the operation may be retried (`is_retryable`) and
 converts into `std::io::Error`.
 
+```rust
+use std::error::Error as _;
+use zmux::SessionError;
+
+match session.closed().await {
+    SessionError::ApplicationClosed { code, remote: true, .. } => println!("peer closed: {code}"),
+    SessionError::ApplicationClosed { .. } => println!("closed here"),
+    // Resume ran out of time, or every pipe was lost without resume: the
+    // last pipe's failure is the source, for example a refused rejoin.
+    e @ (SessionError::ResumeTimeout { .. } | SessionError::PipesLost { .. }) => {
+        println!("{e}; last pipe: {:?}", e.source());
+    }
+    SessionError::ResumeFailed { .. } => println!("resume diverged; data in flight is lost"),
+    e => println!("{e}"),
+}
+```
+
+## Multipath
+
+A session can run on several pipes at once (`Config::max_pipes` above 1).
+Joins need a secret source, given in `Config::pipe_auth`: a pre-shared key
+(`PipeAuth::psk`, or `PipeAuth::deferred_psk` given later with
+`set_join_secret`), the TLS exporter of the first pipe (`PipeAuth::exporter`),
+or a first pipe on the secure carrier (`zmux-seal`), for which `pipe_auth`
+stays unset. Multipath or resume without a source is a configuration error
+before any byte. A first pipe that is not on the secure carrier gives join
+keys only once the host states that it proved the pipe end to end:
+`with_end_to_end` in the configuration, or `declare_end_to_end` later.
+
+```rust
+use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Session};
+
+let auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
+let config = Config::multipath(auth);
+// Server: a Listener routes joins to their session.
+let listener = Listener::new(config.clone(), ListenerConfig::default())?;
+// Client: a second TCP connection becomes a second pipe.
+let session = Session::connect(PipeIo::tcp(first), config).await?;
+let pipe = session.add_pipe(PipeIo::tcp(second), PipeOptions::default()).await?;
+```
+
+`add_pipe` waits at most `Config::join_timeout` (10 s) for the peer to
+attach the pipe; it fails with `PipeError::JoinRefused` when the peer
+refused the join. `helpers::maintain_pipes` keeps a pool of pipes up per
+path, redialling with backoff.
+
+## Resume
+
+With `Config::resume_timeout` set, a session whose pipes are all lost is
+suspended for that long instead of ending, and resumes when a pipe joins
+again. Something has to dial: the `redial` hook (a session on one pipe at a
+time), a pipe pool, or the application's own `add_pipe`. A suspension with
+none of them is reported as `SessionEvent::ResumeUnattended` and logged.
+
+```rust
+use std::time::Duration;
+use zmux::{Config, Dial, PipeAuth, PipeIo, Session};
+
+let mut config = Config::default();
+config.pipe_auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
+config.resume_timeout = Some(Duration::from_secs(60));
+// Replaces the lost pipe, with backoff from 1 s doubling up to 60 s.
+config.redial = Some(Dial::new(|_req| async {
+    Ok(PipeIo::tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
+}));
+config.logger = Some(zmux::Logger::new(|level, msg| eprintln!("{level:?}: {msg}")));
+let session = Session::connect(PipeIo::tcp(first), config).await?;
+```
+
+The server side needs a `Listener` with `resume_timeout` set as well.
+
+## Closing
+
+`session.close(code, reason).await` sends CONNECTION_CLOSE at once and
+returns once it has been handed to the carriers (for a socket, in the
+kernel's send buffer), after 1 s at the latest; a process may exit then.
+Dropping the last handle closes with code 0 without waiting.
+`session.closed().await` waits for the session's whole end and returns
+why it ended.
+
 ## Servers, carrier choice and shaping
 
 - **Admission.** `ListenerConfig::admission` (an `Admission`) decides on
@@ -67,11 +147,9 @@ converts into `std::io::Error`.
   joining them as further pipes. A `CarrierCache` in the `ModePolicy`
   remembers which kinds worked per server and network; `snapshot` and
   `restore` carry it across restarts.
-- **Shaping.** `zmux::shaping` lets a `Factory` (set as `Config::shaper` or
-  with `Session::set_shaper`) plan each record's length, padding and delay,
-  inject padding records and gate the sending rate, bounded by the session's
-  `shaping::Limits`. The `zmux-shaping` crate (`shaping`) is such a factory,
-  driven by state machines read from a versioned JSON definition.
+- **Shaping.** `zmux::shaping` holds the hooks for record sizes and timing
+  (`Config::shaper`, `Session::set_shaper`, `shaping::Limits`); the
+  `zmux-shaping` crate offers a factory for them.
 
 ## Memory and allocators
 
@@ -117,7 +195,7 @@ The carrier crates of the workspace turn connections into pipes, each with
 
 | Crate | Carrier | Lanes |
 |---|---|---|
-| `zmux-rustls` (`adapter/rustls`) | TLS 1.3 over TCP (tokio-rustls), with the exporter for carrier-bound joins | no |
+| `zmux-rustls` (`adapter/rustls`) | TLS 1.3 over TCP (tokio-rustls), with the exporter for Bound joins | no |
 | `zmux-quinn` (`adapter/quinn`) | QUIC (quinn): pipes on streams of a connection | further streams |
 | `zmux-websocket` (`adapter/websocket`) | WebSocket (tokio-tungstenite), `ws` and `wss` | no |
 | `zmux-http` (`adapter/http`) | HTTP/1.1 and HTTP/2 exchanges (hyper), over TCP or TLS | HTTP/2, off by default |
@@ -161,11 +239,7 @@ cargo run --release --manifest-path interop/carrier-mem/Cargo.toml
 
 `testdata/spec` holds the conformance assets of the zmux specification:
 the codepoint registry, the wire corpus, the wire examples and the
-executable traces. Refresh them from a specification checkout with:
-
-```sh
-ZMUX_SPEC_DIR=../zmux-spec tools/sync-spec-fixtures.sh
-```
+executable traces, copied unchanged from the specification.
 
 ## License
 
