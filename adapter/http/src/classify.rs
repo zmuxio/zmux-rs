@@ -3,8 +3,77 @@
 //! place that decides it, for this adapter's server and for endpoints that
 //! also serve WebSocket and WebTransport.
 
-use http::header::{CONTENT_LENGTH, UPGRADE};
+use std::io;
+
+use http::header::{CONTENT_LENGTH, HeaderName, UPGRADE};
 use http::{HeaderMap, Method, Version};
+
+/// The request field that pairs the uplink `POST` and the downlink `GET`
+/// of a split bootstrap: [`zmux::PAIR_HEADER`] by default, another name
+/// only where an intermediary strips unknown fields. Both ends must use
+/// the same ([`crate::Options::pair_field`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PairField(HeaderName);
+
+/// Fields with a meaning of their own that a pairing field must not take
+/// over (lower case); prefixes in [`RESERVED_PREFIXES`].
+const RESERVED: &[&str] = &[
+    "content-length",
+    "content-type",
+    "content-encoding",
+    "transfer-encoding",
+    "host",
+    "connection",
+    "upgrade",
+    "keep-alive",
+    "te",
+    "trailer",
+    "authorization",
+    "cookie",
+    "expect",
+    "date",
+    "early-data",
+    "forwarded",
+    "via",
+    "location",
+    "origin",
+];
+const RESERVED_PREFIXES: &[&str] = &["proxy-", "sec-websocket-", "x-forwarded-"];
+
+impl PairField {
+    /// The field `name`: a header field name that no protocol field of
+    /// HTTP, WebSocket or the adapters uses ([`io::ErrorKind::InvalidInput`]
+    /// otherwise).
+    pub fn new(name: &str) -> io::Result<Self> {
+        let invalid = |why| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pairing field {name:?} {why}"),
+            )
+        };
+        let field = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid("is not a header field name"))?;
+        let l = field.as_str();
+        if RESERVED.contains(&l)
+            || l.eq_ignore_ascii_case(zmux::PREFIX_AUTH_HEADER)
+            || RESERVED_PREFIXES.iter().any(|p| l.starts_with(p))
+        {
+            return Err(invalid("is reserved"));
+        }
+        Ok(Self(field))
+    }
+
+    /// The field's name.
+    pub fn name(&self) -> &HeaderName {
+        &self.0
+    }
+}
+
+impl Default for PairField {
+    fn default() -> Self {
+        Self(HeaderName::from_static("zmux-pipe-pair"))
+    }
+}
 
 /// The carrier a request is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -16,11 +85,11 @@ pub enum RequestClass {
     /// An extended `CONNECT` with `:protocol` `webtransport-h3` or
     /// `webtransport`.
     WebTransport,
-    /// A `GET` with `Zmux-Pipe-Pair`: its response
-    /// body is the downlink.
+    /// A `GET` with the pairing field ([`PairField`]): its response body
+    /// is the downlink.
     Downlink,
-    /// A `POST` with `Zmux-Pipe-Pair` (a split bootstrap's uplink),: its request body
-    /// is the uplink.
+    /// A `POST` with the pairing field (a split bootstrap's uplink): its
+    /// request body is the uplink.
     Uplink,
     /// A `POST` with a `Content-Length`: an exchange request.
     Exchange,
@@ -41,15 +110,15 @@ impl RequestClass {
 /// The class of a request with this head (the first rule that matches), or
 /// `None` for a request that is no carrier and goes to the host's handler.
 /// `protocol` is the `:protocol` pseudo-header of an extended `CONNECT`
-/// (HTTP/2, HTTP/3).
+/// (HTTP/2, HTTP/3); `pair` the pairing field.
 pub fn classify_head(
     method: &Method,
     version: Version,
     headers: &HeaderMap,
     protocol: Option<&str>,
+    pair: &PairField,
 ) -> Option<RequestClass> {
-    let has = |name: &str| headers.contains_key(name);
-    let pair = has(zmux::PAIR_HEADER);
+    let pair = headers.contains_key(pair.name());
     if *method == Method::CONNECT {
         return match protocol {
             Some(p) if p.eq_ignore_ascii_case("websocket") => Some(RequestClass::WebSocket),
@@ -84,12 +153,12 @@ pub fn classify_head(
 
 /// [`classify_head`] of a request as hyper gives it: the extended
 /// `CONNECT`'s `:protocol` is hyper's `Protocol` extension.
-pub fn classify(parts: &http::request::Parts) -> Option<RequestClass> {
+pub fn classify(parts: &http::request::Parts, pair: &PairField) -> Option<RequestClass> {
     let protocol = parts
         .extensions
         .get::<hyper::ext::Protocol>()
         .map(hyper::ext::Protocol::as_str);
-    classify_head(&parts.method, parts.version, &parts.headers, protocol)
+    classify_head(&parts.method, parts.version, &parts.headers, protocol, pair)
 }
 
 /// Whether an intermediary forwarded the request from TLS early data
@@ -122,7 +191,7 @@ mod tests {
                 v.parse().unwrap(),
             );
         }
-        classify_head(&method, version, &h, None)
+        classify_head(&method, version, &h, None, &PairField::default())
     }
 
     #[test]
@@ -147,18 +216,36 @@ mod tests {
         );
         let h = HeaderMap::new();
         assert_eq!(
-            classify_head(&Method::CONNECT, Version::HTTP_2, &h, Some("websocket")),
+            classify_head(
+                &Method::CONNECT,
+                Version::HTTP_2,
+                &h,
+                Some("websocket"),
+                &PairField::default()
+            ),
             Some(C::WebSocket)
         );
         // 2.
         for p in ["webtransport", "webtransport-h3"] {
             assert_eq!(
-                classify_head(&Method::CONNECT, Version::HTTP_3, &h, Some(p)),
+                classify_head(
+                    &Method::CONNECT,
+                    Version::HTTP_3,
+                    &h,
+                    Some(p),
+                    &PairField::default()
+                ),
                 Some(C::WebTransport)
             );
         }
         assert_eq!(
-            classify_head(&Method::CONNECT, Version::HTTP_2, &h, None),
+            classify_head(
+                &Method::CONNECT,
+                Version::HTTP_2,
+                &h,
+                None,
+                &PairField::default()
+            ),
             None
         );
         // 3.
@@ -176,6 +263,36 @@ mod tests {
         assert_eq!(class(Method::GET, v11, &[]), None);
         assert_eq!(class(Method::PUT, v11, &[pair]), None);
         assert!(C::Downlink.head_decided() && !C::Uplink.head_decided());
+    }
+
+    #[test]
+    fn pair_field() {
+        assert_eq!(
+            PairField::default().name().as_str(),
+            zmux::PAIR_HEADER.to_ascii_lowercase()
+        );
+        let x = PairField::new("X-Pair").unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-pair", "t".parse().unwrap());
+        assert_eq!(
+            classify_head(&Method::GET, Version::HTTP_11, &h, None, &x),
+            Some(RequestClass::Downlink)
+        );
+        // Not paired by the default field then.
+        assert_eq!(
+            class(Method::GET, Version::HTTP_11, &[("x-pair", "t")]),
+            None
+        );
+        for bad in [
+            "",
+            "a b",
+            "Content-Length",
+            "Sec-WebSocket-Key",
+            "X-Forwarded-For",
+            "zmux-prefix-auth",
+        ] {
+            assert!(PairField::new(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

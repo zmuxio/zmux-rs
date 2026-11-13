@@ -15,12 +15,14 @@ HTTP/1.1 and HTTP/2 carriers of [zmux](../../README.md) pipes over `hyper`.
   pairing token is a bearer secret until the session is established: run
   a split bootstrap over TLS to the server or to an intermediary trusted
   with the carriers' contents.
+  Where an intermediary strips unknown fields, both ends may pair by
+  another field (`Options::pair_field`, `PairField`).
 - **Exchange**: bounded `POST` requests with a `Content-Length`, for paths
   that buffer whole bodies (below).
 
 The server classifies every request by its head alone (`classify`): an
-upgrade, a `GET` with `Zmux-Pipe-Pair` (downlink), a
-`POST` with `Zmux-Pipe-Pair` (uplink), a `POST` with a `Content-Length`
+upgrade, a `GET` with the pairing field (downlink), a
+`POST` with the pairing field (uplink), a `POST` with a `Content-Length`
 (exchange), a `POST` without one (bidirectional), and everything else for the host's handler. All kinds
 can therefore share one request target (`Options::path`, default
 `/zmux`). Nothing is answered before a carrier is accepted: with an

@@ -4181,7 +4181,9 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::is_replayable(self)
         }
 
-        /// The priority the peer requested for this stream in its preamble.
+        /// The priority the peer requested for this stream in its opening
+        /// preamble (its PRIORITY TLV), `None` when it sent none: the
+        /// opening value only, not a later PRIORITY_UPDATE.
         pub fn requested_priority(&self) -> Option<crate::Priority> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::requested_priority(self)
         }

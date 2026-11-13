@@ -159,7 +159,9 @@ impl ExchangeServer {
 
     /// Serves one request routed here by an HTTP server of the
     /// application's own. A request that is not an exchange request as
-    /// [`crate::classify`] tells is given back at once. One that the
+    /// [`crate::classify`] tells with `pair`, the pairing field the host
+    /// serves split halves by ([`crate::Options::pair_field`]), is given
+    /// back at once. One that the
     /// server authenticates (a `Content-Length` within the body limit, a
     /// body that is a
     /// request, whose MAC verifies, whose Time is within
@@ -184,6 +186,7 @@ impl ExchangeServer {
         &self,
         req: Request<B>,
         peer: Option<SocketAddr>,
+        pair: &crate::PairField,
     ) -> Result<Response<PipeBody>, Request<ReplayBody<B>>>
     where
         B: http_body::Body + Unpin,
@@ -192,7 +195,7 @@ impl ExchangeServer {
         let (parts, mut body) = req.into_parts();
         // The one classification: any other
         // request is the host's, before anything else.
-        if crate::classify(&parts) != Some(crate::RequestClass::Exchange) {
+        if crate::classify(&parts, pair) != Some(crate::RequestClass::Exchange) {
             return Err(Request::from_parts(
                 parts,
                 ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
@@ -1097,6 +1100,7 @@ impl Drop for DownWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PairField;
     use crate::body::collect;
     use http::StatusCode;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1144,7 +1148,10 @@ mod tests {
     ) -> Response {
         let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let (out, req) = request(cid, kind, flags, seq, wire::unix_time(), nonce, data);
-        let resp = server.handle(req, None).await.unwrap();
+        let resp = server
+            .handle(req, None, &PairField::default())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = collect(resp.into_body(), 1 << 20).await.unwrap().unwrap();
         let r = Response::parse(body).unwrap();
@@ -1170,7 +1177,11 @@ mod tests {
             .headers
             .insert(zmux::PAIR_HEADER, http::HeaderValue::from_static("x"));
         let back = server
-            .handle(Request::from_parts(parts, body), None)
+            .handle(
+                Request::from_parts(parts, body),
+                None,
+                &PairField::default(),
+            )
             .await
             .expect_err("not an exchange request");
         assert!(!replayed(back).await.is_empty());
@@ -1290,12 +1301,20 @@ mod tests {
         for time in [now.wrapping_add(40), now.wrapping_sub(40)] {
             let (_, req) = request(&[1; 16], Kind::Up, 0, 0, time, [time as u8; 8], b"hi");
             let body = http_body::Body::size_hint(req.body()).exact().unwrap();
-            let back = server.handle(req, None).await.unwrap_err();
+            let back = server
+                .handle(req, None, &PairField::default())
+                .await
+                .unwrap_err();
             assert_eq!(replayed(back).await.len() as u64, body);
         }
         assert_eq!(server.carriers(), 0);
         let (_, req) = request(&[1; 16], Kind::Up, 0, 0, now.wrapping_add(5), [1; 8], b"hi");
-        assert!(server.handle(req, None).await.is_ok());
+        assert!(
+            server
+                .handle(req, None, &PairField::default())
+                .await
+                .is_ok()
+        );
         listener.close();
     }
 
@@ -1305,13 +1324,26 @@ mod tests {
         let (listener, server) = server(ExchangeOptions::default());
         let now = wire::unix_time();
         let (_, req) = request(&[2; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
-        assert!(server.handle(req, None).await.is_ok());
+        assert!(
+            server
+                .handle(req, None, &PairField::default())
+                .await
+                .is_ok()
+        );
         let (_, req) = request(&[2; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
-        let back = server.handle(req, None).await.unwrap_err();
+        let back = server
+            .handle(req, None, &PairField::default())
+            .await
+            .unwrap_err();
         assert!(replayed(back).await.ends_with(b"a"));
         // The same Nonce with another carrier is another pair.
         let (_, req) = request(&[3; 16], Kind::Up, 0, 0, now, [9; 8], b"a");
-        assert!(server.handle(req, None).await.is_ok());
+        assert!(
+            server
+                .handle(req, None, &PairField::default())
+                .await
+                .is_ok()
+        );
         listener.close();
     }
 
@@ -1322,7 +1354,14 @@ mod tests {
         let now = wire::unix_time();
         for n in 0..3u8 {
             let (_, req) = request(&[4; 16], Kind::Up, 0, n.into(), now, [n; 8], b"a");
-            assert_eq!(server.handle(req, None).await.is_ok(), n < 2, "{n}");
+            assert_eq!(
+                server
+                    .handle(req, None, &PairField::default())
+                    .await
+                    .is_ok(),
+                n < 2,
+                "{n}"
+            );
         }
         listener.close();
     }
@@ -1336,7 +1375,10 @@ mod tests {
         let req = Request::get("/zmux/exchange")
             .body(PipeBody::empty())
             .unwrap();
-        let back = server.handle(req, None).await.unwrap_err();
+        let back = server
+            .handle(req, None, &PairField::default())
+            .await
+            .unwrap_err();
         assert_eq!(back.method(), http::Method::GET);
         assert!(replayed(back).await.is_empty());
         // Without a Content-Length: nothing read.
@@ -1344,7 +1386,13 @@ mod tests {
             .body(PipeBody::full(Bytes::from_static(b"body")))
             .unwrap();
         assert_eq!(
-            &replayed(server.handle(req, None).await.unwrap_err()).await[..],
+            &replayed(
+                server
+                    .handle(req, None, &PairField::default())
+                    .await
+                    .unwrap_err()
+            )
+            .await[..],
             b"body"
         );
         // Not a request, read whole.
@@ -1353,7 +1401,13 @@ mod tests {
             .body(PipeBody::full(Bytes::from_static(b"body")))
             .unwrap();
         assert_eq!(
-            &replayed(server.handle(req, None).await.unwrap_err()).await[..],
+            &replayed(
+                server
+                    .handle(req, None, &PairField::default())
+                    .await
+                    .unwrap_err()
+            )
+            .await[..],
             b"body"
         );
         // A MAC that does not verify.
@@ -1365,7 +1419,13 @@ mod tests {
         let sent = bytes.freeze();
         let req = Request::from_parts(parts, PipeBody::full(sent.clone()));
         assert_eq!(
-            replayed(server.handle(req, None).await.unwrap_err()).await,
+            replayed(
+                server
+                    .handle(req, None, &PairField::default())
+                    .await
+                    .unwrap_err()
+            )
+            .await,
             sent
         );
         // Over the body limit: nothing read.
@@ -1375,7 +1435,13 @@ mod tests {
             .body(PipeBody::full(big.clone()))
             .unwrap();
         assert_eq!(
-            replayed(server.handle(req, None).await.unwrap_err()).await,
+            replayed(
+                server
+                    .handle(req, None, &PairField::default())
+                    .await
+                    .unwrap_err()
+            )
+            .await,
             big
         );
         assert_eq!(server.carriers(), 0);

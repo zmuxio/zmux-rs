@@ -77,11 +77,32 @@ fn mp_config() -> Config {
     c
 }
 
+/// The custom policy's view of the pipes changes only when a pipe's state, penalty,
+/// probation or eligibility changes, and an answer given for an older view falls back
+/// by design. A transfer that keeps the view still, whatever the host's speed:
+/// receive windows larger than what [`custom_transfer`] sends never hold data back
+/// (no opportunistic reinjection, so no penalty), a suspect floor longer than the test
+/// never suspects a pipe a loaded host is slow to serve, and no probation ends after
+/// the join.
+const STILL_WINDOW: u64 = 32 << 20;
+
+fn still_sender(mut c: Config) -> Config {
+    c.probation = Some(Duration::ZERO);
+    c.suspect_floor = Duration::from_secs(600);
+    c
+}
+
+fn still_receiver(mut c: Config) -> Config {
+    c.initial_stream_receive_window = STILL_WINDOW;
+    c.initial_connection_receive_window = STILL_WINDOW;
+    c
+}
+
 /// A listener whose sessions read every unidirectional stream to its end.
 async fn sink() -> (SocketAddr, Listener) {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(mp_config(), ListenerConfig::default())
+    let listener = Listener::new(still_receiver(mp_config()), ListenerConfig::default())
         .expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move {
@@ -110,9 +131,11 @@ async fn sink() -> (SocketAddr, Listener) {
     (addr, listener)
 }
 
-/// Sends `len` bytes over two pipes with a custom policy; the client's
-/// statistics and the policy afterwards.
+/// Sends `len` bytes (below [`STILL_WINDOW`]) over two pipes, both attached
+/// first, with a custom policy; the client's statistics and the policy
+/// afterwards.
 async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<LeastUnsent>) {
+    assert!((len as u64) < STILL_WINDOW);
     let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let policy = Arc::new(LeastUnsent {
         mode,
@@ -121,16 +144,18 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
         spare: spare.local_addr().unwrap(),
     });
     let (addr, _listener) = sink().await;
-    let mut config = mp_config();
+    let mut config = still_sender(mp_config());
     config.scheduler = Policy::Custom(policy.clone());
     let client = Session::connect(PipeIo::tcp(TcpStream::connect(addr).await.unwrap()), config)
         .await
         .unwrap();
+    // The view the policy answers for is complete before the first chunk.
     client
-        .begin_add_pipe(
+        .add_pipe(
             PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
             PipeOptions::default(),
         )
+        .await
         .unwrap();
     let mut send = client.open_uni().await.unwrap();
     let chunk = vec![7u8; 64 * 1024];
@@ -160,13 +185,13 @@ async fn custom_policy_answers_are_applied() {
     let answers = stats.scheduler_answers;
     let total = answers + stats.scheduler_fallbacks;
     assert!(answers > 0, "{stats:?}");
-    assert!(
-        // An answer given for a view that changed meanwhile (a pipe's state, a penalty,
-        // an eligibility) counts as a fallback by design, and a loaded host changes
-        // views more often during the call: most answers are applied, not all.
-        answers * 100 >= total * 90,
-        "applied {answers} of {total} ({} calls)",
-        policy.calls.load(Ordering::Relaxed)
+    // The view never changes during the transfer: every answer is applied.
+    assert_eq!(
+        stats.scheduler_fallbacks,
+        0,
+        "applied {answers} of {total} ({} calls, {} penalties)",
+        policy.calls.load(Ordering::Relaxed),
+        stats.penalties
     );
 }
 

@@ -11,8 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
     Admission, AdmissionStats, Admit, CarrierInfo, Config, Decide, DecideFuture, Fallback,
-    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier,
-    Session, Verdict,
+    HandleError, JoinPrefix, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth,
+    PrefixAuthVerifier, Session, Verdict,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -236,6 +236,44 @@ async fn a_late_decision_is_a_peek_timeout() {
     assert!(ended(&mut tcp).await.is_empty());
     eventually(|| listener.stats().admission.peek_timed_out == 1).await;
     assert_eq!(listener.stats().admission.closed, 0);
+    listener.close();
+}
+
+#[tokio::test]
+async fn a_late_prefix_is_closed_or_falls_back() {
+    // Two of four bytes, then silence: the decision is never asked.
+    let never = |_: &CarrierInfo<'_>, _: &[u8]| -> Verdict { panic!("decided a late prefix") };
+    let late = || Admission::new(4, never).with_peek_timeout(Duration::from_millis(50));
+    let (listener, addr) = serve(late(), None).await;
+    let mut tcp = TcpStream::connect(&addr).await.unwrap();
+    tcp.write_all(b"ab").await.unwrap();
+    assert!(ended(&mut tcp).await.is_empty());
+    let a = listener.stats().admission;
+    assert_eq!((a.peek_timed_out, a.fallback, a.closed), (1, 0, 0));
+    listener.close();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let fallback = Fallback::new(move |mut conn, _| {
+        let tx = tx.clone();
+        async move {
+            let mut got = Vec::new();
+            let _ = conn.read_to_end(&mut got).await;
+            let _ = tx.send(got);
+        }
+    });
+    let (listener, addr) = serve(late().with_fallback_on_peek_timeout(true), Some(fallback)).await;
+    let mut tcp = TcpStream::connect(&addr).await.unwrap();
+    tcp.write_all(b"ab").await.unwrap();
+    eventually(|| listener.stats().admission.fallback == 1).await;
+    tcp.write_all(b"cdef").await.unwrap();
+    tcp.shutdown().await.unwrap();
+    let got = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"abcdef");
+    let a = listener.stats().admission;
+    assert_eq!((a.peek_timed_out, a.fallback, a.closed), (1, 1, 0));
     listener.close();
 }
 
@@ -532,4 +570,22 @@ async fn more_past_the_end_of_the_carrier_closes() {
     eventually(move || l.stats().admission.closed == 1).await;
     assert_eq!(listener.stats().admission.accepted, 0);
     listener.close();
+}
+
+#[test]
+fn join_prefix_reads_the_hello_head() {
+    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+    // 02, Suite 1, ModeByte Sealed, LocatorLen 16, Locator, R (32 bytes).
+    let mut hello = vec![0x02, 0x01, 0x00, 16];
+    hello.extend_from_slice(&[7; 16]);
+    hello.extend_from_slice(&[9; 32]);
+    assert_eq!(listener.join_prefix(&hello[..1]), JoinPrefix::Need(2));
+    assert_eq!(listener.join_prefix(&hello[..4]), JoinPrefix::Need(20));
+    assert_eq!(listener.join_prefix(&hello[..30]), JoinPrefix::Need(52));
+    assert_eq!(listener.join_prefix(&hello), JoinPrefix::Unknown);
+    assert_eq!(listener.join_prefix(b"GET / HTTP/1.1"), JoinPrefix::NotJoin);
+    assert_eq!(
+        listener.join_prefix(&[0x02, 0x01, 0x7c]),
+        JoinPrefix::NotJoin
+    );
 }

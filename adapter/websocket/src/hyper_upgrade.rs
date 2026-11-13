@@ -126,7 +126,7 @@ where
     let offered: Vec<String> = tokens(req.headers(), PROTOCOL_HEADER)
         .map(str::to_owned)
         .collect();
-    let Some(protocol) = options.select(&offered) else {
+    let Some(protocol) = options.accept(&offered) else {
         return RequestUpgrade::Refused(req);
     };
     if zmux::forwarded_early_data(
@@ -187,7 +187,7 @@ where
             h.insert("Sec-WebSocket-Accept", accept);
         }
     }
-    if let Ok(p) = HeaderValue::from_str(&protocol) {
+    if let Some(Ok(p)) = protocol.as_deref().map(HeaderValue::from_str) {
         h.insert(PROTOCOL_HEADER, p);
     }
     let hint = PipeHint::from_entry(entry);
@@ -204,7 +204,7 @@ where
             Some(ws_config()),
         )
         .await;
-        Ok((pipe(ws, Some(protocol)), hint))
+        Ok((pipe(ws, protocol), hint))
     });
     RequestUpgrade::Accepted { response, carrier }
 }

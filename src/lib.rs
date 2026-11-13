@@ -165,7 +165,7 @@ pub use driver::cache::{
 pub use driver::handle::Written;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::listen::{
-    AdmissionStats, AdmissionVariants, Admit, Admitted, Entry, HandleError, Listener,
+    AdmissionStats, AdmissionVariants, Admit, Admitted, Entry, HandleError, JoinPrefix, Listener,
     ListenerStats, MAX_ADMISSION_VARIANTS, PipeHint, SetupGuard, VariantStats,
 };
 #[cfg(all(feature = "tokio", not(loom)))]

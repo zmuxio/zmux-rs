@@ -81,7 +81,7 @@ impl Endpoint {
         #[cfg(feature = "websocket")]
         if let Some(ws) = &self.websocket {
             let (parts, body) = req.into_parts();
-            let class = crate::classify(&parts);
+            let class = crate::classify(&parts, &self.options.pair_field);
             let req = Request::from_parts(parts, body);
             if class == Some(crate::RequestClass::WebSocket)
                 && req.uri().path() == self.options.path

@@ -759,24 +759,20 @@ impl Finished {
     }
 }
 
-/// A parsed Join Hello: nothing is authenticated yet.
-#[derive(Clone, Copy, Debug)]
-pub struct JoinHello<'a> {
+/// The clear head of a Join Hello, through the nonce R.
+struct HelloHead<'a> {
     suite: &'static Suite,
     mode: Mode,
     phase: u8,
     locator: &'a [u8],
-    prefix: &'a [u8],
-    ciphertext: &'a [u8],
-    framing: Framing,
-    consumed: usize,
+    /// The head's length.
+    len: usize,
 }
 
-impl<'a> JoinHello<'a> {
-    /// Parses a Hello in wire order. On a byte stream a byte past the Hello is
-    /// `trailing_bytes`.
-    pub fn parse(framing: Framing, input: &'a [u8]) -> Result<JoinHello<'a>, Error> {
-        let stream = framing == Framing::ByteStream;
+impl<'a> HelloHead<'a> {
+    /// The head `input` starts with; a cut one is `Incomplete` on a byte
+    /// stream (`stream`), `Malformed` otherwise.
+    fn parse(stream: bool, input: &'a [u8]) -> Result<Self, Error> {
         let cut = |need| {
             if stream {
                 Error::Incomplete { need }
@@ -807,8 +803,40 @@ impl<'a> JoinHello<'a> {
         }
         let locator_end = at + locator_len;
         let locator = input.get(at..locator_end).ok_or(cut(locator_end))?;
-        let prefix_end = locator_end + suite.r_len;
-        let prefix = input.get(..prefix_end).ok_or(cut(prefix_end))?;
+        let len = locator_end + suite.r_len;
+        if input.len() < len {
+            return Err(cut(len));
+        }
+        Ok(Self {
+            suite,
+            mode,
+            phase,
+            locator,
+            len,
+        })
+    }
+}
+
+/// A parsed Join Hello: nothing is authenticated yet.
+#[derive(Clone, Copy, Debug)]
+pub struct JoinHello<'a> {
+    suite: &'static Suite,
+    mode: Mode,
+    phase: u8,
+    locator: &'a [u8],
+    prefix: &'a [u8],
+    ciphertext: &'a [u8],
+    framing: Framing,
+    consumed: usize,
+}
+
+impl<'a> JoinHello<'a> {
+    /// Parses a Hello in wire order. On a byte stream a byte past the Hello is
+    /// `trailing_bytes`.
+    pub fn parse(framing: Framing, input: &'a [u8]) -> Result<JoinHello<'a>, Error> {
+        let stream = framing == Framing::ByteStream;
+        let head = HelloHead::parse(stream, input)?;
+        let prefix_end = head.len;
         let (ciphertext, consumed) = if stream {
             let (unit, total) = cut_frame(input, prefix_end)?;
             if total != input.len() {
@@ -822,15 +850,22 @@ impl<'a> JoinHello<'a> {
             (&input[prefix_end..], input.len())
         };
         Ok(JoinHello {
-            suite,
-            mode,
-            phase,
-            locator,
-            prefix,
+            suite: head.suite,
+            mode: head.mode,
+            phase: head.phase,
+            locator: head.locator,
+            prefix: &input[..prefix_end],
             ciphertext,
             framing,
             consumed,
         })
+    }
+
+    /// The Locator of the Hello that `input` starts with, from its clear
+    /// head (through the nonce R) alone: [`Error::Incomplete`] with the
+    /// head's whole length while `input` is shorter.
+    pub fn head_locator(input: &'a [u8]) -> Result<&'a [u8], Error> {
+        HelloHead::parse(true, input).map(|h| h.locator)
     }
 
     /// The Suite.

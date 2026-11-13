@@ -317,6 +317,8 @@ pub struct Entry {
     stalling: bool,
     /// The end of the peek timeout, from the end of the outer handshake.
     deadline: Option<Instant>,
+    /// The prefix did not arrive within the peek timeout.
+    late: bool,
     /// The value the admission accepted it with.
     value: Option<AdmittedValue>,
     /// The label the admission gave it.
@@ -356,6 +358,21 @@ enum Round {
     Done(Admit),
     /// Another decision once the prefix has this many bytes.
     Read(usize),
+}
+
+/// What a carrier's prefix is to the listener's sessions
+/// ([`Listener::join_prefix`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinPrefix {
+    /// A Join Hello whose Locator names a current session.
+    Known,
+    /// A Join Hello whose Locator names no current session.
+    Unknown,
+    /// Not a Join Hello, or a malformed one (a suite this build does not
+    /// have, reserved mode bits, an empty Locator).
+    NotJoin,
+    /// The prefix ends inside the Hello's head: its total length.
+    Need(usize),
 }
 
 /// The source of a carrier that its connection's admission accepted, for
@@ -420,7 +437,11 @@ impl Entry {
     {
         let deadline = self.start();
         match (&self.shared.admission, deadline) {
-            (Some(adm), Some(d)) if adm.peek() > 0 => read_prefix(adm.peek(), reader, d).await.0,
+            (Some(adm), Some(d)) if adm.peek() > 0 => {
+                let (prefix, late) = read_prefix(adm.peek(), reader, d).await;
+                self.late = late;
+                prefix
+            }
             _ => Vec::new(),
         }
     }
@@ -483,10 +504,7 @@ impl Entry {
                     let Some(r) = reader.as_deref_mut() else {
                         return Admit::Close;
                     };
-                    match self.read_round(&mut prefix, need, r).await {
-                        Some(s) => short = s,
-                        None => return Admit::Close,
-                    }
+                    short = self.read_round(&mut prefix, need, r).await;
                 }
             }
         }
@@ -507,39 +525,48 @@ impl Entry {
             };
             match round {
                 Round::Done(admit) => return admit,
-                Round::Read(need) => match self.read_round(&mut prefix, need, conn).await {
-                    Some(s) => short = s,
-                    None => return Admit::Close,
-                },
+                Round::Read(need) => short = self.read_round(&mut prefix, need, conn).await,
             }
         }
     }
 
     /// Reads `prefix` on to `need` bytes within the peek timeout: whether
-    /// the carrier ended short of it, `None` (counted) past the timeout.
-    async fn read_round<R>(
-        &mut self,
-        prefix: &mut Vec<u8>,
-        need: usize,
-        reader: &mut R,
-    ) -> Option<bool>
+    /// the carrier ended short of it. Past the timeout the entry is late,
+    /// which the next round decides.
+    async fn read_round<R>(&mut self, prefix: &mut Vec<u8>, need: usize, reader: &mut R) -> bool
     where
         R: AsyncRead + Unpin + Send + ?Sized,
     {
-        let deadline = self.start()?;
+        let Some(deadline) = self.start() else {
+            return false;
+        };
         let have = std::mem::take(prefix);
         let (more, late) = read_more(have, need, reader, deadline).await;
-        if late {
-            self.shared
-                .counts
-                .admission
-                .peek_timed_out
-                .fetch_add(1, Relaxed);
-            return None;
-        }
+        self.late = late;
         let short = more.len() < need;
         *prefix = more;
-        Some(short)
+        short
+    }
+
+    /// The outcome of a prefix that did not arrive within the peek
+    /// timeout: counted in `peek_timed_out`, then closed, or taken to the
+    /// fallback with `prefix` replayed when the admission says so
+    /// ([`crate::Admission::with_fallback_on_peek_timeout`]; counted in
+    /// `fallback` as well), except an HTTP request carrier (`request`),
+    /// which is always closed.
+    fn late_outcome(
+        &mut self,
+        adm: &crate::Admission,
+        prefix: &mut Vec<u8>,
+        request: bool,
+    ) -> Admit {
+        let c = &self.shared.counts.admission;
+        c.peek_timed_out.fetch_add(1, Relaxed);
+        if adm.fallback_on_peek_timeout() && !request {
+            c.fallback.fetch_add(1, Relaxed);
+            return Admit::Fallback(std::mem::take(prefix));
+        }
+        Admit::Close
     }
 
     /// One decision on `prefix`, with `info`'s source and peer filled in:
@@ -559,6 +586,9 @@ impl Entry {
         let Some(adm) = self.shared.admission.clone() else {
             return Round::Done(Admit::Close);
         };
+        if self.late {
+            return Round::Done(self.late_outcome(&adm, prefix, info.request.is_some()));
+        }
         let shared = self.shared.clone();
         let c = &shared.counts.admission;
         let listener = Listener {
@@ -971,6 +1001,7 @@ impl Listener {
             admitted: false,
             handshaken: false,
             deadline: None,
+            late: false,
             value: None,
         })
     }
@@ -978,6 +1009,26 @@ impl Listener {
     /// The listener's admission ([`ListenerConfig::admission`]).
     pub fn admission(&self) -> Option<&Admission> {
         self.shared.admission.as_ref()
+    }
+
+    /// For use in an admission's decision: whether `prefix`, a byte-stream
+    /// carrier's first bytes, begins a Join Hello (first byte `02`) whose
+    /// Locator names a session of the listener at this moment. While the
+    /// prefix is shorter than the Hello's clear head (through the nonce,
+    /// at most 291 bytes for the suites defined) the answer is
+    /// [`JoinPrefix::Need`], to ask for with [`crate::Verdict::More`]
+    /// ([`crate::Admission::with_max_peek`] must allow it). On a
+    /// message-framed carrier the prefix is the whole message, and `Need`
+    /// means it is too short. Advisory: the join still authenticates, and
+    /// one whose session ended meanwhile is an unknown Locator.
+    pub fn join_prefix(&self, prefix: &[u8]) -> JoinPrefix {
+        use crate::proto::seal::{Error, join::JoinHello};
+        match JoinHello::head_locator(prefix) {
+            Ok(l) if self.shared.locators.get(l).is_some() => JoinPrefix::Known,
+            Ok(_) => JoinPrefix::Unknown,
+            Err(Error::Incomplete { need }) => JoinPrefix::Need(need),
+            Err(_) => JoinPrefix::NotJoin,
+        }
     }
 
     /// The intermediaries the listener trusts to report a carrier's client

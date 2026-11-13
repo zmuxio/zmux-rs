@@ -69,6 +69,7 @@ pub struct Admission {
     peek_timeout: Duration,
     stall: (Duration, Duration),
     discard_buffer: usize,
+    fallback_on_peek_timeout: bool,
     decide: Arc<dyn Decide>,
 }
 
@@ -80,6 +81,7 @@ impl std::fmt::Debug for Admission {
             .field("peek_timeout", &self.peek_timeout)
             .field("stall", &self.stall)
             .field("discard_buffer", &self.discard_buffer)
+            .field("fallback_on_peek_timeout", &self.fallback_on_peek_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -87,7 +89,9 @@ impl std::fmt::Debug for Admission {
 impl Admission {
     /// An admission that reads up to `peek` bytes (0: none) and then calls
     /// `decide` with the carrier's metadata and the bytes read (fewer when
-    /// the carrier ends or the peek timeout passes first): a synchronous
+    /// the carrier ends; one whose prefix does not arrive within the peek
+    /// timeout is closed, or see
+    /// [`Admission::with_fallback_on_peek_timeout`]): a synchronous
     /// decision ([`Admission::with_decider`] takes one that waits).
     pub fn new<D: Into<Decision>>(
         peek: usize,
@@ -98,7 +102,9 @@ impl Admission {
 
     /// An admission that reads up to `peek` bytes (0: none) and then asks
     /// `decide` with the carrier's metadata and the bytes read (fewer when
-    /// the carrier ends or the peek timeout passes first).
+    /// the carrier ends; one whose prefix does not arrive within the peek
+    /// timeout is closed, or see
+    /// [`Admission::with_fallback_on_peek_timeout`]).
     ///
     /// The peek timeout is drawn here, once, uniformly from
     /// [`PEEK_TIMEOUT_DRAWN`], and the stall interval's upper end from
@@ -116,6 +122,7 @@ impl Admission {
             peek_timeout,
             stall: (min, max),
             discard_buffer: 512,
+            fallback_on_peek_timeout: false,
             decide: Arc::new(decide),
         }
     }
@@ -166,6 +173,26 @@ impl Admission {
     pub fn with_discard_buffer(mut self, bytes: usize) -> Self {
         self.discard_buffer = bytes.max(1);
         self
+    }
+
+    /// Takes a byte-stream carrier whose prefix has not arrived when the
+    /// peek timeout ends, in the first read or in a [`Verdict::More`]
+    /// round, to [`Verdict::Fallback`] with every byte read replayed,
+    /// instead of closing it (default off). Without a fallback target it
+    /// is stalled, as for any fallback. It is counted in both
+    /// `peek_timed_out` and `fallback`. A carrier read without a reader
+    /// (message-framed), an HTTP request carrier and a decision that does
+    /// not return in time are closed either way.
+    #[must_use]
+    pub fn with_fallback_on_peek_timeout(mut self, on: bool) -> Self {
+        self.fallback_on_peek_timeout = on;
+        self
+    }
+
+    /// Whether a late prefix goes to the fallback
+    /// ([`Admission::with_fallback_on_peek_timeout`]).
+    pub fn fallback_on_peek_timeout(&self) -> bool {
+        self.fallback_on_peek_timeout
     }
 
     /// The number of bytes read before the decision.

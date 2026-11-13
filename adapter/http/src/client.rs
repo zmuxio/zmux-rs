@@ -96,7 +96,7 @@ impl Options {
             req.uri(path).header(http::header::HOST, authority)
         };
         if let Some(p) = &head.pair {
-            req = req.header(zmux::PAIR_HEADER, p.as_str());
+            req = req.header(self.pair_field.name(), p.as_str());
         }
         let (body, writer) = if get {
             if let Some(c) = &self.credential {

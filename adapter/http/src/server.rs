@@ -21,7 +21,7 @@ use zmux::{Admit, CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::body::{self, BodyReader, PipeBody, ReplayBody};
 use crate::classify::{RequestClass, classify, forwarded_early_data};
-use crate::{ExchangeServer, Options};
+use crate::{ExchangeServer, Options, PairField};
 
 /// A request [`handle_request`] did not hand to the listener.
 #[derive(Debug)]
@@ -152,17 +152,18 @@ fn carrier_response(
 /// application's own that routes it here, to `listener`, and returns its
 /// response: status 200, whose body is the downlink (fed by zmux) or, for
 /// an uplink, empty and ended with the carrier. The request is classified
-/// by its head ([`classify`]):
+/// by its head ([`classify`] with `pair`, the pairing field of split
+/// halves, [`Options::pair_field`]):
 ///
 /// - a bidirectional `POST` (no `Content-Length`): the request body is the
 ///   uplink, the response body the downlink;
-/// - a downlink `GET` (with `Zmux-Pipe-Pair`): the
-///   response body is the downlink;
-/// - an uplink `POST` (with `Zmux-Pipe-Pair`): the request body is the uplink.
+/// - a downlink `GET` (with the pairing field): the response body is the
+///   downlink;
+/// - an uplink `POST` (with the pairing field): the request body is the
+///   uplink.
 ///
-/// A split bootstrap's two halves are paired by the listener; the
-/// The `Zmux-Pipe-Pair` header is passed on
-/// ([`PipeHint`]). Every other request (an exchange request, an upgrade,
+/// A split bootstrap's two halves are paired by the listener, which is
+/// given the pairing field's value ([`PipeHint`]). Every other request (an exchange request, an upgrade,
 /// one of another method) is [`Unhandled::Fallback`] at once, its body
 /// untouched. A carrier request that an intermediary forwarded from early
 /// data is answered [`too_early`]. `peer` is the connection's remote
@@ -202,6 +203,7 @@ pub async fn handle_request<B>(
     req: Request<B>,
     peer: Option<SocketAddr>,
     conn: Option<CarrierConnId>,
+    pair: &PairField,
 ) -> Result<Response<PipeBody>, Unhandled<B>>
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -209,7 +211,7 @@ where
 {
     let (parts, body) = req.into_parts();
     let version = parts.version;
-    let class = match classify(&parts) {
+    let class = match classify(&parts, pair) {
         Some(c @ (RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)) => {
             c
         }
@@ -235,7 +237,7 @@ where
     };
     let pair = parts
         .headers
-        .get(zmux::PAIR_HEADER)
+        .get(pair.name())
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let hint_of = move |entry| {
@@ -668,12 +670,12 @@ pub async fn route_request(
 ) -> Result<Response<PipeBody>, Unhandled<Incoming>> {
     let path = req.uri().path().to_owned();
     let (parts, body) = req.into_parts();
-    let class = classify(&parts);
+    let class = classify(&parts, &options.pair_field);
     let req = Request::from_parts(parts, body);
     match class {
         Some(RequestClass::Exchange) if exchange_on(options.exchange.as_ref(), &path) => {
             let x = options.exchange.as_ref().expect("matched an exchange path");
-            x.handle(req, peer)
+            x.handle(req, peer, &options.pair_field)
                 .await
                 .map_err(|req| Unhandled::Fallback(Box::new(req)))
         }
@@ -683,7 +685,7 @@ pub async fn route_request(
             let h2 = (req.version() == http::Version::HTTP_2)
                 .then_some(conn)
                 .flatten();
-            handle_request(listener, req, peer, h2).await
+            handle_request(listener, req, peer, h2, &options.pair_field).await
         }
         _ => Err(Unhandled::Fallback(Box::new(req.map(|b| {
             ReplayBody::new([Bytes::new(), Bytes::new()], Some(b))

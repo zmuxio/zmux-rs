@@ -1138,7 +1138,9 @@ pub struct AdmissionStats {
     /// pipe input in the other fields of [`ListenerStats`].
     pub accepted: u64,
     /// Decided with [`crate::Verdict::Fallback`] (stalled without a fallback
-    /// target, still counted here).
+    /// target, still counted here), or taken to the fallback by a peek
+    /// timeout ([`crate::Admission::with_fallback_on_peek_timeout`], also
+    /// counted in `peek_timed_out`).
     pub fallback: u64,
     /// Decided with [`crate::Verdict::Stall`], counted when the stall starts.
     pub stalled: u64,
@@ -1151,7 +1153,8 @@ pub struct AdmissionStats {
     /// carriers ([`ListenerConfig::max_pending_per_source`]), or the
     /// listener closed meanwhile. Closed at once.
     pub stall_overflow: u64,
-    /// The decision did not come before the end of the peek timeout.
+    /// The prefix or the decision did not come before the end of the peek
+    /// timeout.
     pub peek_timed_out: u64,
     /// The outer handshake (TLS, an HTTP upgrade, QUIC) failed or timed
     /// out: never decided on. Not counted in

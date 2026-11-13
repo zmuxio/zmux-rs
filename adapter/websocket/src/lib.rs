@@ -26,7 +26,8 @@
 //!   session counts in its pipe positions and does not charge; zmux never
 //!   sends one.
 //! - A server upgrades only a client that offers a subprotocol it
-//!   accepts. Any other request, one offering none, one that is not a
+//!   accepts, or one that offers none where it is configured so
+//!   ([`Options::with_no_subprotocol`]). Any other request, one that is not a
 //!   valid upgrade, or one the listener's admission does not accept
 //!   ([`zmux::ListenerConfig::admission`]), is refused
 //!   before anything is written: [`serve`] hands it to the listener's
@@ -609,8 +610,9 @@ fn offer(
     info: &CarrierInfo<'_>,
 ) -> io::Result<ClientRequest> {
     let mut request = request.into_client_request().map_err(io::Error::other)?;
-    if !request.headers().contains_key(PROTOCOL_HEADER) {
-        let offer = options.offer().join(", ");
+    let offer = options.offer();
+    if !offer.is_empty() && !request.headers().contains_key(PROTOCOL_HEADER) {
+        let offer = offer.join(", ");
         let value = HeaderValue::from_str(&offer).map_err(io::Error::other)?;
         request.headers_mut().insert(PROTOCOL_HEADER, value);
     }
@@ -799,17 +801,22 @@ where
         }
         _ => return Ok(Upgrade::Ended),
     }
+    let selected = upgrade
+        .protocol
+        .as_ref()
+        .map(|p| format!("{PROTOCOL_HEADER}: {p}\r\n"))
+        .unwrap_or_default();
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Accept: {}\r\n{PROTOCOL_HEADER}: {}\r\n\r\n",
-        upgrade.accept_key, upgrade.protocol
+         Sec-WebSocket-Accept: {}\r\n{selected}\r\n",
+        upgrade.accept_key
     );
     io.write_all(response.as_bytes()).await?;
     io.flush().await?;
     let rest = buf[head_len..].to_vec();
     let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
     let hint = PipeHint::from_entry(entry);
-    Ok(Upgrade::Accepted(pipe(ws, Some(upgrade.protocol)), hint))
+    Ok(Upgrade::Accepted(pipe(ws, upgrade.protocol), hint))
 }
 
 /// Answers a refused request with `404 Not Found` and ends the
@@ -851,7 +858,7 @@ async fn read_head<S: AsyncRead + Unpin>(
 /// A request head that upgrades.
 struct UpgradeRequest {
     parts: http::request::Parts,
-    protocol: String,
+    protocol: Option<String>,
     accept_key: String,
 }
 
@@ -897,7 +904,7 @@ fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
         return None;
     }
     let key = headers.get("Sec-WebSocket-Key")?;
-    let protocol = options.select(&tokens(PROTOCOL_HEADER))?;
+    let protocol = options.accept(&tokens(PROTOCOL_HEADER))?;
     Some(UpgradeRequest {
         accept_key: derive_accept_key(key.as_bytes()),
         protocol,
@@ -1042,6 +1049,7 @@ async fn serve_over<C, S, SF>(
 #[derive(Debug, Clone)]
 pub struct Options {
     protocols: Vec<String>,
+    no_subprotocol: bool,
     credential: Option<Arc<dyn Credential>>,
     max_request_head: usize,
     max_redirects: usize,
@@ -1071,6 +1079,7 @@ impl Options {
     pub fn for_protocol(id: impl Into<String>) -> Self {
         Self {
             protocols: vec![id.into()],
+            no_subprotocol: false,
             credential: None,
             max_request_head: DEFAULT_MAX_REQUEST_HEAD,
             max_redirects: DEFAULT_MAX_REDIRECTS,
@@ -1123,14 +1132,39 @@ impl Options {
         self
     }
 
-    /// The offer: the identifiers, then their aliases.
+    /// Without a subprotocol (default off): a server also upgrades a
+    /// request that offers none, and a client offers none, its
+    /// identifiers then serving only as a server's. Such a carrier has no
+    /// application protocol identifier. A request that offers
+    /// subprotocols, none of them accepted, is still refused.
+    #[must_use]
+    pub fn with_no_subprotocol(mut self, on: bool) -> Self {
+        self.no_subprotocol = on;
+        self
+    }
+
+    /// The offer: the identifiers, then their aliases; none
+    /// ([`Options::with_no_subprotocol`]).
     fn offer(&self) -> Vec<String> {
+        if self.no_subprotocol {
+            return Vec::new();
+        }
         let aliases = self
             .protocols
             .iter()
             .filter_map(|p| zmux::proto::ident::alpn_alias(p.as_bytes()))
             .map(|a| String::from_utf8_lossy(&a).into_owned());
         self.protocols.iter().cloned().chain(aliases).collect()
+    }
+
+    /// Whether a server upgrades a request offering `offered` (empty
+    /// tokens ignored), and with which subprotocol: `Some(None)` for one
+    /// that offers none, with [`Options::with_no_subprotocol`].
+    pub(crate) fn accept(&self, offered: &[String]) -> Option<Option<String>> {
+        if offered.iter().all(String::is_empty) {
+            return self.no_subprotocol.then_some(None);
+        }
+        self.select(offered).map(Some)
     }
 
     /// The offered identifier selected: the first of
@@ -1407,5 +1441,17 @@ mod tests {
         );
         assert_eq!(o.select(&offer(&["qmux-01"])).as_deref(), Some("qmux-01"));
         assert_eq!(o.select(&offer(&["qmux-00", "other"])), None);
+    }
+
+    #[test]
+    fn no_subprotocol() {
+        let o = Options::default();
+        assert_eq!(o.accept(&[]), None);
+        let o = o.with_no_subprotocol(true);
+        assert_eq!(o.accept(&[]), Some(None));
+        assert_eq!(o.accept(&offer(&[""])), Some(None));
+        assert_eq!(o.accept(&offer(&["qmux-02"])), Some(Some("qmux-02".into())));
+        assert_eq!(o.accept(&offer(&["other"])), None);
+        assert!(o.offer().is_empty());
     }
 }

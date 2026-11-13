@@ -9,6 +9,7 @@
 //!   **Downlink**: a `GET` whose response body is the downlink
 //!   ([`dial_http1_carrier_over`], [`Http2Connection::open_carrier`]):
 //!   the two carriers of a split bootstrap or join paired by `Zmux-Pipe-Pair`
+//!   (or another agreed field, [`Options::pair_field`])
 //!   ([`dial_http1_split`], [`Http2Connection::open_split`]) for paths
 //!   that do not pass a bidirectional request.
 //! - **Exchange** ([`dial_exchange`], [`ExchangeServer`]): bounded `POST`
@@ -94,7 +95,7 @@ use std::time::Duration;
 use zmux::Credential;
 
 pub use body::{PipeBody, ReplayBody};
-pub use classify::{RequestClass, classify, classify_head, forwarded_early_data};
+pub use classify::{PairField, RequestClass, classify, classify_head, forwarded_early_data};
 pub use client::{
     Http2Connection, connect_http1, connect_http1_split, connect_http2, dial_http1,
     dial_http1_carrier_over, dial_http1_over, dial_http1_split, dial_http1_split_with,
@@ -161,6 +162,11 @@ pub struct Options {
     /// one connection the caller gave (`*_over`) follows none. A refused
     /// redirect fails the carrier with a [`zmux::redirect::RedirectError`].
     pub max_redirects: usize,
+    /// The request field that pairs the two halves of a split bootstrap
+    /// (default [`zmux::PAIR_HEADER`]): the client sends its token in it,
+    /// and the server classifies by it ([`classify`]). Both ends must
+    /// agree.
+    pub pair_field: PairField,
 }
 
 impl Default for Options {
@@ -174,6 +180,7 @@ impl Default for Options {
             credential: None,
             https: false,
             max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
+            pair_field: PairField::default(),
         }
     }
 }
@@ -230,6 +237,13 @@ impl Options {
     #[must_use]
     pub fn with_max_redirects(mut self, redirects: usize) -> Self {
         self.max_redirects = redirects;
+        self
+    }
+
+    /// Pairs split halves by `field` ([`Options::pair_field`]).
+    #[must_use]
+    pub fn with_pair_field(mut self, field: PairField) -> Self {
+        self.pair_field = field;
         self
     }
 

@@ -314,7 +314,8 @@ pub struct ZeroRtt {
 impl ZeroRtt {
     /// Whether the session's first records were sent as 0-RTT data (the
     /// options and configuration allowed it, the memory held the server's
-    /// parameters and the TLS session was resumed).
+    /// parameters, the TLS session was resumed, and the handshake had not
+    /// completed when the session's first stream was opened).
     pub fn sent(&self) -> bool {
         self.retry.is_some()
     }
@@ -571,6 +572,16 @@ pub async fn connect_with_report(
                     .open_bi()
                     .await
                     .map_err(|e| io_err(io::Error::other(e)))?;
+                if !recv.is_0rtt() {
+                    // The handshake completed before the stream was opened: the stream
+                    // is a 1-RTT one and nothing goes as 0-RTT data. Rewriting after a
+                    // rejection would start the session a second time on another stream.
+                    let pipe = carrier.inner.pipe(Send::new(send), Recv::new(recv));
+                    let wait = config.handshake_wait();
+                    let session = Session::connect(pipe, config).await?;
+                    remember(&session, memory, server_name, wait);
+                    return Ok((session, ZeroRtt::default()));
+                }
                 let retry = Arc::new(Retry::default());
                 let (mut send, mut recv) = (Send::new(send), Recv::new(recv));
                 send.retry = Some(retry.clone());
@@ -1470,6 +1481,26 @@ impl Send {
         }
     }
 
+    /// Moves to the 1-RTT stream once the pipe switched to it.
+    fn follow(&mut self) {
+        if let Some(r) = &self.retry
+            && let Some(next) = r.take(|s| s.send.take())
+        {
+            self.stream = next;
+            self.retry = None;
+        }
+    }
+
+    /// Whether the stream is a 0-RTT one the server rejected, not yet
+    /// replaced: quinn gives a rejected stream's ID to the next stream
+    /// opened, and its `finish` is not refused like its writes, so it would
+    /// end the 1-RTT stream that replaces it.
+    fn rejected(&self) -> bool {
+        self.retry
+            .as_ref()
+            .is_some_and(|r| r.lock().accepted == Some(false))
+    }
+
     /// One write of owned buffers, moving to the 1-RTT stream after a
     /// 0-RTT rejection.
     fn write_chunks(
@@ -1478,12 +1509,7 @@ impl Send {
         chunks: &mut [Bytes],
     ) -> Poll<io::Result<usize>> {
         loop {
-            if let Some(r) = &self.retry
-                && let Some(next) = r.take(|s| s.send.take())
-            {
-                self.stream = next;
-                self.retry = None;
-            }
+            self.follow();
             // Cancel safe: a write that is not ready took nothing, and
             // registered the waker.
             let polled = pin!(self.stream.write_chunks(chunks)).poll(cx);
@@ -1626,10 +1652,18 @@ impl ChunkWrite for Send {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.follow();
         AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.follow();
+        if self.rejected() {
+            // Nothing written on it reached the server, and the session has
+            // not started again on the 1-RTT stream: there is nothing to end.
+            self.finished = true;
+            return Poll::Ready(Ok(()));
+        }
         let r = AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx);
         if r.is_ready() {
             self.finished = true;

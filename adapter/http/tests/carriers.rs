@@ -87,6 +87,36 @@ async fn split_bootstrap_over_http1_and_http2() {
     .unwrap();
 }
 
+/// Both ends pairing by another field: the split bootstrap works, and a
+/// server pairing by the default field does not take the halves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_bootstrap_with_another_pair_field() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let opts = Options::default().with_pair_field(zmux_http::PairField::new("X-Tie").unwrap());
+        let (addr, listener) =
+            server_with(Config::default(), ListenerConfig::default(), opts.clone()).await;
+        let client = zmux_http::connect_http1_split(&addr, &opts, Config::default())
+            .await
+            .unwrap();
+        exchange(client, listener.accept().await.unwrap()).await;
+
+        let (addr, _listener) = server_with(
+            Config::default(),
+            ListenerConfig::default(),
+            Options::default(),
+        )
+        .await;
+        let opts = opts.with_timeout(Duration::from_secs(2));
+        assert!(
+            zmux_http::connect_http1_split(&addr, &opts, Config::default())
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+}
+
 /// Without the credential, neither half is accepted: the downlink's header
 /// token and the uplink's prefix are both checked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

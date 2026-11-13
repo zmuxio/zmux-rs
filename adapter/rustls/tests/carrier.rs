@@ -368,7 +368,8 @@ async fn first_record() -> Vec<u8> {
 /// bytes and a first record without a token each reach the fallback with
 /// exactly the bytes sent, and nothing else is written; without a fallback
 /// they are stalled: nothing is written, and the connection ends with an
-/// orderly close once the stall has lasted its duration.
+/// orderly close once the stall has lasted its duration (a truncated token
+/// not ended is closed at the peek timeout).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_by_bound_prefix_auth() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -493,13 +494,18 @@ async fn admission_by_bound_prefix_auth() {
             assert_eq!(got, send, "{name}: fallback bytes");
         }
 
-        // No fallback: stalled.
+        // No fallback: stalled; a truncated token left open is a prefix
+        // that does not arrive, closed at the peek timeout.
         for (name, send) in cases {
             let mut tls = dial(stalling).await;
             tls.write_all(send).await.unwrap();
             let start = tokio::time::Instant::now();
             let mut reply = Vec::new();
             let n = tls.read_to_end(&mut reply).await;
+            if name == "truncated" {
+                assert!(reply.is_empty() && n.is_err(), "{name}: {reply:x?}, {n:?}");
+                continue;
+            }
             assert!(
                 matches!(n, Ok(0)),
                 "{name}: stalled carrier answered {reply:x?}, {n:?}"

@@ -121,7 +121,7 @@ async fn one_exchange_carries_both_directions() {
                 requests.fetch_add(1, Ordering::SeqCst);
                 let listener = listener.clone();
                 async move {
-                    zmux_http::handle_request(&listener, req, Some(peer), None)
+                    zmux_http::handle_request(&listener, req, Some(peer), None, &Default::default())
                         .await
                         .map_err(|_| std::io::Error::other("not handled"))
                 }
@@ -572,6 +572,26 @@ async fn a_stalled_or_closed_request_gets_no_response() {
         );
         assert!(start.elapsed() >= at_least, "{verdict:?}: ended early");
     }
+}
+
+/// An HTTP request carrier whose prefix is late is closed without a
+/// response, even where the admission takes late byte streams to the
+/// fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_prefix_on_a_request_is_closed() {
+    let admission = zmux::Admission::new(32, |_, _| -> zmux::Verdict { panic!("decided") })
+        .with_peek_timeout(Duration::from_millis(100))
+        .with_fallback_on_peek_timeout(true);
+    let (addr, l) = serve_admitted(Options::default().with_fallback(echo()), Some(admission)).await;
+    // Four bytes of 32, then a body that does not end.
+    let (_ours, theirs) = tokio::io::duplex(1024);
+    let body = StreamBody(tokio::io::AsyncReadExt::chain(&BODY[..4], theirs));
+    let r = tokio::time::timeout(Duration::from_secs(5), post(&addr, "/zmux", body))
+        .await
+        .expect("ended in time");
+    assert!(r.is_err(), "answered {:?}", r.map(|r| r.status()));
+    let a = l.stats().admission;
+    assert_eq!((a.peek_timed_out, a.fallback), (1, 0));
 }
 
 /// Without an admission, a request the listener does not take, nothing

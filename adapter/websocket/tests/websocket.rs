@@ -174,12 +174,18 @@ async fn application_subprotocols() {
         (
             Options::for_protocol("moq-transport-18"),
             Options::for_protocol("moq-transport-18"),
-            "moq-transport-18",
+            Some("moq-transport-18"),
         ),
         (
             Options::for_application("chat"),
             Options::for_protocol("qmux-01.chat"),
-            "qmux-01.chat",
+            Some("qmux-01.chat"),
+        ),
+        // Neither offered nor selected: no application protocol.
+        (
+            Options::default().with_no_subprotocol(true),
+            Options::default().with_no_subprotocol(true),
+            None,
         ),
     ] {
         let listener = Listener::new(Config::default(), ListenerConfig::default())
@@ -192,8 +198,8 @@ async fn application_subprotocols() {
                 .await
                 .unwrap();
         let server = listener.accept().await.unwrap();
-        assert_eq!(client.protocol().as_deref(), Some(expect));
-        assert_eq!(server.protocol().as_deref(), Some(expect));
+        assert_eq!(client.protocol().as_deref(), expect);
+        assert_eq!(server.protocol().as_deref(), expect);
         client.close(0u32.into(), b"").await;
         listener.close();
         serving.await.unwrap();
