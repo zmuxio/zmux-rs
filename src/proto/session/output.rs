@@ -501,6 +501,11 @@ impl SessionCore {
         out: &mut TransmitBuf,
     ) -> Transmit {
         let at = at.into();
+        if self.close_flush.is_some() {
+            // A graceful close sends its CONNECTION_CLOSE once the streams
+            // passed what they can.
+            self.check_close_flush(now);
+        }
         if self.holds_first_flight(at.pipe.0) {
             self.tick(now);
             out.clear();
@@ -2449,7 +2454,7 @@ impl SessionCore {
     /// Allocates the next identifier of a local stream's type and builds
     /// its preamble.
     pub(super) fn assign_id(&mut self, key: StreamKey) {
-        let client = matches!(self.role, Role::Initiator);
+        let client = matches!(self.role, Role::Client);
         let mp = self.retains();
         let preamble = self.features.preamble;
         let grease = (preamble && !self.grease_tlv_used).then(|| self.grease_tlv());

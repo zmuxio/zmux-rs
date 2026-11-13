@@ -160,7 +160,7 @@ async fn resumed_connections_send_and_accept_0rtt() {
     assert!(!report.sent() && report.accepted().is_none());
     assert!(!exchange(&first, &listener, b"first").await);
     assert!(memory.get("localhost").is_some());
-    first.close(0u32.into(), b"").await;
+    first.close().await;
     // Resumed: the request goes as 0-RTT data.
     let (second, report) =
         zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, early())
@@ -170,7 +170,7 @@ async fn resumed_connections_send_and_accept_0rtt() {
     // Its current replayability is not evidence of whether 0-RTT was sent.
     exchange(&second, &listener, b"second, in 0-RTT").await;
     settled(&report, true);
-    second.close(0u32.into(), b"").await;
+    second.close().await;
     listener.close();
 }
 
@@ -201,7 +201,7 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
         .await
         .unwrap();
     exchange(&first, &listener, b"first").await;
-    first.close(0u32.into(), b"").await;
+    first.close().await;
     listener.close();
     ep.close(0u32.into(), b"");
     ep.wait_idle().await;
@@ -214,7 +214,7 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
         .unwrap();
     assert!(!exchange(&second, &listener2, b"sent again after the rejection").await);
     settled(&report, false);
-    second.close(0u32.into(), b"").await;
+    second.close().await;
     listener2.close();
 }
 
@@ -222,7 +222,7 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
 fn parameter_memory_capacity_forgets_the_oldest_name() {
     let tp = zmux::proto::session::SessionCore::new(
         Config::default(),
-        zmux::proto::session::RoleConfig::Initiator,
+        zmux::Role::Client,
         None,
         std::time::Instant::now(),
     )
@@ -334,7 +334,7 @@ async fn refused_carries_early_streams_once(cfg: fn() -> Config) {
         .await
         .unwrap();
     exchange(&first, &a, b"first").await;
-    first.close(0u32.into(), b"").await;
+    first.close().await;
     // `b` resumes the session of `a` and refuses its 0-RTT data.
     let (second, report) = zmux_quinn::connect_with_report(
         &c_ep,
@@ -416,7 +416,7 @@ async fn refused_carries_early_streams_once(cfg: fn() -> Config) {
             .is_err()
     );
     settled(&report, false);
-    second.close(0u32.into(), b"").await;
+    second.close().await;
     // `b` resumed the session of `a`; it was not a full handshake.
     assert_eq!(resumed.load(Ordering::Relaxed), 1);
     a.close();

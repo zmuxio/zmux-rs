@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
-use zmux::proto::session::{self as core, PipeId, RoleConfig};
+use zmux::proto::session::{self as core, PipeId, Role};
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
     Policy, Session, SessionStats,
@@ -106,7 +106,7 @@ impl CorePair {
     fn new() -> Self {
         // Unidirectional streams at once (no lazy credit).
         let mut config = Config::default();
-        config.max_incoming_uni_streams = Some(256);
+        config.max_incoming_uni_streams = zmux::UniCredit::Limit(256);
         Self::with(config)
     }
 
@@ -541,7 +541,7 @@ async fn wan_bulk() {
         cpu.map_or("-".into(), |c| format!("{c:.3}")),
         receiver.window_growth() as f64 / 1e6,
     );
-    client.close(zmux::VarInt::from_u32(0), b"").await;
+    client.close().await;
     let _ = writer.await;
     let _ = reader.await;
 }
@@ -574,7 +574,7 @@ async fn scale(multipath: bool) {
             Config::default()
         };
         c.max_idle_timeout = None;
-        c.keep_alive_period = keep_alive;
+        c.liveness.keep_alive_period = keep_alive;
         c
     };
     if !multipath && std::env::var("ZMUX_BENCH_SCALE_DUPLEX").is_ok() {
@@ -678,7 +678,7 @@ async fn scale(multipath: bool) {
         keep_alive,
     );
     for (c, _) in &pairs {
-        c.close(zmux::VarInt::from_u32(0), b"").await;
+        c.close().await;
     }
     drop(pairs);
     // The next measurement starts once these sessions are gone: closing
@@ -1110,8 +1110,7 @@ fn core_memory() {
     let now = Instant::now();
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut s =
-            core::SessionCore::new(config.clone(), RoleConfig::Initiator, None, now).unwrap();
+        let mut s = core::SessionCore::new(config.clone(), Role::Client, None, now).unwrap();
         s.attach_pipe(P0, Framing::ByteStream, now);
         v.push(s);
     }
@@ -1430,9 +1429,9 @@ async fn soak_slot(
         for s in [&client, &server] {
             soak.open.lock().unwrap().remove(&s.stable_id());
         }
-        client.close(zmux::VarInt::from_u32(0), b"").await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), client.closed()).await;
-        server.close(zmux::VarInt::from_u32(0), b"").await;
+        client.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.closing()).await;
+        server.close().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
     }
     if let Some(l) = listener {
@@ -1662,7 +1661,7 @@ fn mp_config(policy: &Policy) -> Config {
     c.scheduler = policy.clone();
     // Loopback pipes are trusted: a new pipe carries data at once instead
     // of after a second of probation.
-    c.probation = Some(Duration::ZERO);
+    c.probation = None;
     c
 }
 
@@ -1769,8 +1768,8 @@ impl Pair {
     }
 
     fn close(self) {
-        drop(self.client.close(0u32.into(), b""));
-        drop(self.server.close(0u32.into(), b""));
+        drop(self.client.close());
+        drop(self.server.close());
         if let Some(l) = &self.listener {
             l.close();
         }

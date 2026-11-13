@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use zmux::proto::record::Framing;
-use zmux::proto::session::{Config, CoreEvent, PipeId, RoleConfig, SessionCore, TransmitBuf};
+use zmux::proto::session::{Config, CoreEvent, PipeId, Role, SessionCore, TransmitBuf};
 
 pub(crate) const P0: PipeId = PipeId::new(0);
 
@@ -46,8 +46,8 @@ impl CorePair {
     /// The pair with pipe 0 attached, before anything moved.
     pub(crate) fn attached(a: Config, b: Config) -> Self {
         let now = Instant::now();
-        let mut a = SessionCore::new(a, RoleConfig::Initiator, None, now).unwrap();
-        let mut b = SessionCore::new(b, RoleConfig::Responder, None, now).unwrap();
+        let mut a = SessionCore::new(a, Role::Client, None, now).unwrap();
+        let mut b = SessionCore::new(b, Role::Server, None, now).unwrap();
         a.attach_pipe(P0, Framing::ByteStream, now);
         b.attach_pipe(P0, Framing::ByteStream, now);
         a.set_pipe_low_water(P0, true);

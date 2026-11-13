@@ -63,6 +63,67 @@ impl AsyncWrite for Counted {
     }
 }
 
+/// Every carrier's writes, on both sides, wait while the gate is shut.
+#[derive(Default)]
+struct Gate {
+    shut: std::sync::atomic::AtomicBool,
+    writers: std::sync::Mutex<Vec<std::task::Waker>>,
+}
+
+impl Gate {
+    fn set(&self, shut: bool) {
+        self.shut.store(shut, Ordering::SeqCst);
+        if !shut {
+            for w in self.writers.lock().unwrap().drain(..) {
+                w.wake();
+            }
+        }
+    }
+
+    /// Runs `f` while no carrier can write, then opens the gate again.
+    fn shut_for(&self, f: impl FnOnce()) {
+        self.set(true);
+        f();
+        self.set(false);
+    }
+}
+
+struct Gated(DuplexStream, Arc<Gate>);
+
+impl AsyncRead for Gated {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Gated {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.1.shut.load(Ordering::SeqCst) {
+            self.1.writers.lock().unwrap().push(cx.waker().clone());
+            if self.1.shut.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn carriers_go_with_the_session_task() {
     let live = Arc::new(AtomicUsize::new(0));
@@ -83,9 +144,9 @@ async fn carriers_go_with_the_session_task() {
     s2.write_all(b"pong").await.unwrap();
     recv.read_exact(&mut buf).await.unwrap();
     // Every handle is kept; the sessions close.
-    client.close(0u32.into(), b"").await;
-    client.closed().await;
-    server.closed().await;
+    client.close().await;
+    client.closing().await;
+    server.closing().await;
     let start = Instant::now();
     while live.load(Ordering::SeqCst) != 0 {
         assert!(
@@ -99,7 +160,8 @@ async fn carriers_go_with_the_session_task() {
 }
 
 /// Dropped stream handles are released by the session, without waiting in the drop, also
-/// after pipe 0 failed: the release is not tied to the bootstrap pipe.
+/// after pipe 0 failed: the release is not tied to the bootstrap pipe. The drops run while
+/// no carrier can write, so a drop that returns waited for no write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_streams_are_released_after_pipe_0_went() {
     use zmux::{Listener, ListenerConfig, PipeAuth, PipeHint, PipeId, PipeOptions};
@@ -107,18 +169,20 @@ async fn dropped_streams_are_released_after_pipe_0_went() {
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"carrier-release-0123456789abcdef").with_end_to_end();
     let listener = Listener::new(c.clone(), ListenerConfig::default()).unwrap();
+    let gate = Arc::new(Gate::default());
     let carrier = || {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let l = listener.clone();
+        let far = Gated(b, gate.clone());
         tokio::spawn(async move {
             let _ = l
                 .handle_pipe(
-                    PipeIo::new(b),
+                    PipeIo::new(far),
                     PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
                 )
                 .await;
         });
-        PipeIo::new(a)
+        PipeIo::new(Gated(a, gate.clone()))
     };
     let client = Session::connect(carrier(), c).await.unwrap();
     let server = listener.accept().await.unwrap();
@@ -134,24 +198,21 @@ async fn dropped_streams_are_released_after_pipe_0_went() {
         let (sw, mut sr) = server.accept_bi().await.unwrap();
         let mut buf = [0; 10];
         sr.read_exact(&mut buf).await.unwrap();
-        let begun = Instant::now();
         match round {
-            0 => drop((w, r, sw, sr)),
-            1 => drop((sr, sw, r, w)),
+            0 => gate.shut_for(|| drop((w, r, sw, sr))),
+            1 => gate.shut_for(|| drop((sr, sw, r, w))),
             // On a thread outside the runtime, as a binding's finalizer drops them.
-            2 => std::thread::spawn(move || drop((w, r, sw, sr)))
-                .join()
-                .unwrap(),
+            2 => gate.shut_for(|| {
+                std::thread::spawn(move || drop((w, r, sw, sr)))
+                    .join()
+                    .unwrap();
+            }),
             _ => {
-                drop((w, r));
+                gate.shut_for(|| drop((w, r)));
                 assert!(sr.read_to_end(1 << 10).await.is_err());
-                drop((sw, sr));
+                gate.shut_for(|| drop((sw, sr)));
             }
         }
-        assert!(
-            begun.elapsed() < Duration::from_millis(100),
-            "a drop blocked"
-        );
         let start = Instant::now();
         while active(&client) + active(&server) > 0 {
             assert!(
@@ -163,6 +224,6 @@ async fn dropped_streams_are_released_after_pipe_0_went() {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
 }

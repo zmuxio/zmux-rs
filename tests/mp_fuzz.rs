@@ -276,10 +276,14 @@ impl Setup {
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = self.policies[side].clone();
         c.max_idle_timeout = Some(Duration::from_secs(60));
-        c.suspect_floor = self.suspect_floor;
-        c.probation = self.probation;
+        c.liveness.suspect_floor = self.suspect_floor;
+        c.probation = match self.probation {
+            None => Some(zmux::Cap::Auto),
+            Some(p) if p.is_zero() => None,
+            Some(p) => Some(zmux::Cap::Fixed(p)),
+        };
         c.spread_chunk = self.spread_chunk;
-        c.dead_timeout = self.dead_timeout;
+        c.liveness.dead_timeout = self.dead_timeout.map_or(zmux::Cap::Auto, zmux::Cap::Fixed);
         if self.resume {
             c.resume_timeout = Some(Duration::from_secs(30));
         }
@@ -364,13 +368,7 @@ fn net(setup: &Setup) -> Net {
         // An automatic cap grows within the memory budget.
         let window = match c.max_connection_receive_window {
             zmux::Cap::Fixed(w) => w,
-            _ => c
-                .memory_budget
-                .unwrap_or(zmux::Budget::Bytes(
-                    zmux::proto::session::DEFAULT_MEMORY_BUDGET,
-                ))
-                .bytes()
-                .unwrap_or(u64::MAX),
+            _ => c.memory_budget.unwrap_or(u64::MAX),
         };
         (c.send_buffer, window)
     });
@@ -1123,9 +1121,9 @@ fn pipe_options() -> impl Strategy<Value = PipeOptions> {
                 o.send_standby = standby;
                 o.receive_standby = standby.unwrap_or(false);
                 o.weight = weight;
-                o.probation = probation;
-                o.suspect_floor = floor;
-                o.dead_timeout = dead;
+                o.probation = self::probation(probation);
+                o.liveness.suspect_floor = inherit(floor);
+                o.liveness.dead_timeout = inherit(dead);
                 o
             },
         )
@@ -1400,7 +1398,16 @@ impl Net {
                         TierChange::SendStandby(v) => s.set_pipe_send_standby(pipe, v),
                         TierChange::ReceiveStandby(v) => s.set_pipe_receive_standby(pipe, v),
                         TierChange::Weight(w) => s.set_pipe_weight(pipe, w),
-                        TierChange::Probation(p) => s.set_pipe_probation(pipe, p),
+                        TierChange::Probation(p) => s.update_pipe(
+                            pipe,
+                            &zmux::PipeUpdate {
+                                probation: match probation(p) {
+                                    zmux::Inherit::Session => zmux::Change::Clear,
+                                    zmux::Inherit::Set(v) => zmux::Change::Set(v),
+                                },
+                                ..Default::default()
+                            },
+                        ),
                         TierChange::Revalidate(all) => {
                             s.revalidate_pipes((!all).then_some(pipe), now)
                         }
@@ -1416,9 +1423,41 @@ impl Net {
 macro_rules! po {
     ($($field:ident: $value:expr),* $(,)?) => {{
         let mut o = PipeOptions::default();
-        $(o.$field = $value;)*
+        $(po_set!(o, $field, $value);)*
         o
     }};
+}
+
+/// One field of [`po!`]: the generated cases name a pipe's probation base
+/// (`None` the session's, zero off) and its liveness overrides (`None` the
+/// session's) as plain options.
+macro_rules! po_set {
+    ($o:ident, probation, $v:expr) => {
+        $o.probation = probation($v)
+    };
+    ($o:ident, suspect_floor, $v:expr) => {
+        $o.liveness.suspect_floor = inherit($v)
+    };
+    ($o:ident, dead_timeout, $v:expr) => {
+        $o.liveness.dead_timeout = inherit($v)
+    };
+    ($o:ident, $field:ident, $v:expr) => {
+        $o.$field = $v
+    };
+}
+
+/// A generated probation base: `None` the session's, zero off.
+fn probation(p: Option<Duration>) -> zmux::Inherit<Option<zmux::Cap<Duration>>> {
+    match p {
+        None => zmux::Inherit::Session,
+        Some(d) if d.is_zero() => zmux::Inherit::Set(None),
+        Some(d) => zmux::Inherit::Set(Some(zmux::Cap::Fixed(d))),
+    }
+}
+
+/// A generated override: `None` the session's.
+fn inherit<T>(v: Option<T>) -> zmux::Inherit<T> {
+    v.map_or(zmux::Inherit::Session, zmux::Inherit::Set)
 }
 
 fn pick<T>(v: &[T], sel: u8) -> Option<&T> {

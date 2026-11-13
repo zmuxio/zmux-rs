@@ -13,7 +13,7 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
-use zmux::proto::seal::Mode;
+use zmux::RecordMode;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
     Session, SessionEvent,
@@ -112,9 +112,7 @@ fn config(auth: PipeAuth) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = auth.with_end_to_end();
-    c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-        |_, _, _| true,
-    )));
+    c.allow_record_mode = Some(zmux::AllowRecordMode::new(|_, _, _| true));
     c
 }
 
@@ -154,7 +152,10 @@ async fn join(
     let l = listener.clone();
     let handled = tokio::spawn(async move { l.handle_pipe(server(s), PipeHint::default()).await });
     let pipe = session
-        .begin_add_pipe(client(c), PipeOptions::default().with_mode(Mode::Bound))
+        .begin_add_pipe(
+            client(c),
+            PipeOptions::default().with_record_mode(RecordMode::Bound),
+        )
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -232,7 +233,7 @@ async fn a_bound_join_with_the_session_secret_from_the_exporter() {
     );
     transfer(&client, &server).await;
     assert_eq!(auth_failures(&server), 0);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -247,7 +248,7 @@ async fn bound_needs_an_exporter_at_both_ends() {
         client
             .begin_add_pipe(
                 PipeIo::new(c),
-                PipeOptions::default().with_mode(Mode::Bound)
+                PipeOptions::default().with_record_mode(RecordMode::Bound)
             )
             .unwrap_err(),
         zmux::PipeError::InvalidArgument
@@ -259,7 +260,7 @@ async fn bound_needs_an_exporter_at_both_ends() {
         "a bound join where the acceptor has no exporter"
     );
     assert_eq!(auth_failures(&server), 1);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// One step from an address to a session, and from a TCP listener to its
@@ -275,16 +276,22 @@ async fn connect_and_serve_with_zmux_alpn() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let serving = tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
-    let client = zmux_rustls::connect(addr, "localhost", client_tls, None, Config::default())
-        .await
-        .unwrap();
+    let client = zmux_rustls::connect(
+        addr,
+        "localhost",
+        client_tls,
+        &zmux_rustls::Options::new(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     let server = listener.accept().await.unwrap();
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     assert_eq!(server.protocol().as_deref(), Some("qmux-02"));
     transfer(&client, &server).await;
-    client.close(0u32.into(), b"bye").await;
+    client.close().await;
     assert!(matches!(
-        server.closed().await,
+        server.closing().await,
         zmux::SessionError::ApplicationClosed { remote: true, .. }
     ));
     listener.close();
@@ -303,14 +310,20 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
     let (front, proxy) = proxy(addr).await;
-    let client = zmux_rustls::connect(front, "localhost", client_tls, None, Config::default())
-        .await
-        .unwrap();
+    let client = zmux_rustls::connect(
+        front,
+        "localhost",
+        client_tls,
+        &zmux_rustls::Options::new(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     let server = listener.accept().await.unwrap();
     transfer(&client, &server).await;
     proxy.abort();
     for s in [&client, &server] {
-        let e = tokio::time::timeout(Duration::from_secs(10), s.closed())
+        let e = tokio::time::timeout(Duration::from_secs(10), s.closing())
             .await
             .expect("ended");
         assert!(
@@ -336,9 +349,15 @@ async fn no_alpn_is_filled_in() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
-    let client = zmux_rustls::connect(addr, "localhost", client_tls, None, Config::default())
-        .await
-        .unwrap();
+    let client = zmux_rustls::connect(
+        addr,
+        "localhost",
+        client_tls,
+        &zmux_rustls::Options::new(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     let server = listener.accept().await.unwrap();
     assert_eq!(client.protocol(), None);
     assert_eq!(server.protocol(), None);
@@ -443,14 +462,14 @@ async fn admission_by_bound_prefix_auth() {
             .shutdown(zmux::VarInt::from_u32(0), b"")
             .await
             .unwrap();
-        server.closed().await;
+        server.closing().await;
 
         // The dialer's credential: a bound token of its own connection.
         let client = zmux_rustls::connect(
             addr,
             "localhost",
             client_tls.clone(),
-            Some(&auth),
+            &zmux_rustls::Options::new().with_carrier_credential(Arc::new(auth.clone())),
             Config::default(),
         )
         .await
@@ -461,7 +480,7 @@ async fn admission_by_bound_prefix_auth() {
             .shutdown(zmux::VarInt::from_u32(0), b"")
             .await
             .unwrap();
-        server.closed().await;
+        server.closing().await;
 
         let record = first_record().await;
         let mut random = vec![0u8; 64];
@@ -546,7 +565,7 @@ async fn behind_a_proxy_protocol_intermediary() {
         let tx = std::sync::Mutex::new(tx);
         let admission = zmux::Admission::new(0, move |info, _| {
             let _ = tx.lock().unwrap().send(info.source);
-            zmux::Verdict::accept(0)
+            zmux::AdmissionVerdict::accept(0)
         });
         let listener = |admission| {
             let mut limits = ListenerConfig::default();
@@ -582,8 +601,8 @@ async fn behind_a_proxy_protocol_intermediary() {
                 .unwrap();
             let server = listener.accept().await.unwrap();
             transfer(&client, &server).await;
-            client.close(0u32.into(), b"").await;
-            server.closed().await;
+            client.close().await;
+            server.closing().await;
         }
         let seen = rx.recv().await.unwrap().unwrap();
         assert_eq!(seen.to_string(), "198.51.100.7:4000");
@@ -603,16 +622,16 @@ async fn behind_a_proxy_protocol_intermediary() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn more_reads_on_through_tls() {
     use tokio::io::AsyncWriteExt;
-    use zmux::{Admission, Verdict};
+    use zmux::{Admission, AdmissionVerdict};
     let (client_tls, server_tls) = configs(&[b"x"]);
     let admission = Admission::new(2, |info, p| {
         assert_eq!(info.alpn, Some(&b"x"[..]));
         if p.len() < 5 {
-            Verdict::More { need: 5 }
+            AdmissionVerdict::More { need: 5 }
         } else if p == b"token" {
-            Verdict::accept(5)
+            AdmissionVerdict::accept(5)
         } else {
-            Verdict::Close
+            AdmissionVerdict::Close
         }
     })
     .with_max_peek(8);
@@ -646,4 +665,133 @@ async fn more_reads_on_through_tls() {
     transfer(&client, &server).await;
     assert_eq!(listener.stats().admission.accepted, 1);
     listener.close();
+}
+
+// ---- N16: close delivery ---------------------------------------------------------------
+
+/// N16 on one carrier class: the client writes 1 MiB on a stream it
+/// finishes and a few bytes on a second one it leaves open, then closes
+/// with `code` and `reason` (code 0 and no reason: the plain close) and
+/// waits for the whole end. The server reads the whole 1 MiB in order and
+/// ends with the client's code and reason; the close returned within its
+/// guard; the wait, under a client linger of an hour, returned once the
+/// server read the close and ended its side; the open
+/// stream failed locally with the session's error. `slow`: the server starts
+/// reading only after a pause, so the close arrives before it read everything.
+/// `c` with a linger of an hour: a session that ends ended at the peer's end
+/// of its side.
+fn lingering(mut c: Config) -> Config {
+    c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
+    c
+}
+
+async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
+    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let reader = {
+        let (server, data) = (server.clone(), data.clone());
+        tokio::spawn(async move {
+            let (_s, mut r) = server.accept_bi().await.unwrap();
+            if slow {
+                // A slow reader: the close arrives while data waits unread.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            assert_eq!(r.read_to_end(2 << 20).await.unwrap(), data);
+            server.closing().await
+        })
+    };
+    let (mut w, _r) = client.open_bi().await.unwrap();
+    w.write_all(&data).await.unwrap();
+    w.finish().unwrap();
+    let (mut open, _r2) = client.open_bi().await.unwrap();
+    open.write_all(b"left open").await.unwrap();
+    let start = std::time::Instant::now();
+    let code = zmux::VarInt::from_u32(code);
+    if code == zmux::VarInt::ZERO && reason.is_empty() {
+        client.close().await;
+    } else {
+        client.close_with_error(code, reason).await;
+    }
+    // A guard only: the server's delivery below shows the close completed
+    // normally.
+    let closed = start.elapsed();
+    assert!(closed < Duration::from_secs(3), "{closed:?}");
+    // The client lingers an hour (`lingering`): a wait that returns within
+    // its guard returned at the server's end of its side, after it read the
+    // close.
+    let end = tokio::time::timeout(Duration::from_secs(5), client.wait())
+        .await
+        .expect("the server ended its side after the close");
+    assert!(
+        matches!(&end, zmux::SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
+        "{end:?}"
+    );
+    let seen = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the server read everything")
+        .unwrap();
+    assert!(
+        matches!(&seen, zmux::SessionError::ApplicationClosed { code: c, reason: r, remote: true }
+            if *c == code && r.as_ref() == reason),
+        "{seen:?}"
+    );
+    let e = open.write_all(b"more").await.unwrap_err();
+    assert!(
+        matches!(&e, zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
+        "{e:?}"
+    );
+}
+
+/// N16 over TCP and over TLS, through the adapter's `connect` and `serve`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_is_delivered_with_its_code_over_tcp_and_tls() {
+    for (code, reason, slow) in [
+        (0x2a, &b"bye"[..], false),
+        (0, &b""[..], false),
+        (0x2a, &b"bye"[..], true),
+    ] {
+        // TCP.
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let l = listener.clone();
+        let serving = tokio::spawn(async move {
+            let (s, peer) = tcp.accept().await.unwrap();
+            l.handle_pipe(PipeIo::tcp(s), PipeHint::from_peer(peer))
+                .await
+        });
+        let client = Session::connect(
+            PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+            lingering(Config::default()),
+        )
+        .await
+        .unwrap();
+        let server = listener.accept().await.unwrap();
+        close_delivery(&client, &server, code, reason, slow).await;
+        let _ = serving.await;
+        listener.close();
+
+        // TLS.
+        let alpn = zmux::alpn_protocols(&[]);
+        let alpn: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
+        let (client_tls, server_tls) = configs(&alpn);
+        let listener = Listener::new(Config::default(), ListenerConfig::default())
+            .expect("valid listener configuration");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let serving = tokio::spawn(zmux_rustls::serve(listener.clone(), tcp, server_tls));
+        let client = zmux_rustls::connect(
+            addr,
+            "localhost",
+            client_tls,
+            &zmux_rustls::Options::new(),
+            lingering(Config::default()),
+        )
+        .await
+        .unwrap();
+        let server = listener.accept().await.unwrap();
+        close_delivery(&client, &server, code, reason, slow).await;
+        listener.close();
+        serving.await.unwrap();
+    }
 }

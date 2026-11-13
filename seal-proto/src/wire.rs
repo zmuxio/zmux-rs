@@ -1,6 +1,6 @@
 //! The Establish Hello.
 
-use zmux::proto::seal::{Error, Framing, Mode, cut_frame, frame, put_varint, read_shortest};
+use zmux::proto::seal::{Error, Framing, RecordMode, cut_frame, frame, put_varint, read_shortest};
 
 use crate::Profile;
 
@@ -13,7 +13,7 @@ const MAX_UNIT: usize = u16::MAX as usize;
 #[derive(Clone, Copy, Debug)]
 pub struct Hello<'a> {
     pub(crate) profile: Profile,
-    pub(crate) mode: Mode,
+    pub(crate) mode: RecordMode,
     pub(crate) handle: &'a [u8],
     pub(crate) noise: &'a [u8],
     pub(crate) framing: Framing,
@@ -56,7 +56,7 @@ impl<'a> Hello<'a> {
             return Err(Error::UnknownProfile);
         }
         let profile = Profile::from_value(value).ok_or(Error::UnknownProfile)?;
-        let mode = Mode::from_byte(*input.get(at).ok_or(cut(at + 1))?)?;
+        let mode = RecordMode::from_byte(*input.get(at).ok_or(cut(at + 1))?)?;
         at += 1;
         let mut handle: &[u8] = &[];
         if profile.has_handle() {
@@ -91,7 +91,7 @@ impl<'a> Hello<'a> {
     }
 
     /// The record mode the client chose.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -117,7 +117,7 @@ pub(crate) fn handle_fits(profile: Profile, handle: &[u8]) -> bool {
 pub(crate) fn write_hello(
     framing: Framing,
     profile: Profile,
-    mode: Mode,
+    mode: RecordMode,
     handle: &[u8],
     noise: &[u8],
 ) -> Result<Vec<u8>, Error> {

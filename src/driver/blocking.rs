@@ -24,11 +24,10 @@ use super::wait::WaitList;
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
 use crate::proto::VarInt;
-use crate::proto::params::Role;
 use crate::proto::record::Framing;
 use crate::proto::session::{
     Config, DatagramError, OpenError, PickRequest, PipeEnd, PipeError, PipeHalf, PipeId,
-    PipeOptions, Preamble, RoleConfig, SessionError, State as CoreState, StreamError,
+    PipeOptions, Preamble, Role, SessionError, State as CoreState, StreamError,
 };
 
 pub(crate) type Closer = Box<dyn Fn(Shutdown) + Send + Sync>;
@@ -200,7 +199,7 @@ pub struct PipeIo {
     /// The largest record the carrier takes.
     max_record: Option<usize>,
     /// The record mode of an Establish this carrier ran.
-    first_mode: Option<crate::proto::seal::Mode>,
+    first_mode: Option<crate::proto::seal::RecordMode>,
     /// The value of the peer a transform authenticated.
     admitted: Option<crate::AdmittedValue>,
 }
@@ -240,7 +239,7 @@ impl PipeIo {
     /// The carrier ran an Establish with this record mode: a session's first pipe is then
     /// on the secure carrier, its exporter being the handshake's.
     #[must_use]
-    pub fn with_secure_first_pipe(mut self, mode: crate::proto::seal::Mode) -> Self {
+    pub fn with_secure_first_pipe(mut self, mode: crate::proto::seal::RecordMode) -> Self {
         self.first_mode = Some(mode);
         self
     }
@@ -310,6 +309,7 @@ impl PipeIo {
                 lower,
                 framing,
                 opener,
+                buf: vec![0; u16::MAX as usize + 1].into_boxed_slice(),
                 failed: false,
             }) as Box<dyn Read + Send>
         });
@@ -318,6 +318,7 @@ impl PipeIo {
                 lower,
                 framing,
                 sealer,
+                unit: Vec::new(),
             }) as Box<dyn Write + Send>
         });
         let overhead = 16 + if framing == Framing::ByteStream { 2 } else { 0 };
@@ -784,6 +785,15 @@ impl Driver for Blocking {
         state.wake_timer();
     }
 
+    /// The writer threads have ended: the last of what goes out on the
+    /// carriers is written or given up (each ends at most
+    /// [`engine::FINAL_WRITE`] after CLOSED). A reader thread may stay in a
+    /// read of a carrier without a socket to shut down until the carrier
+    /// ends; it delivers nothing more.
+    fn released(state: &State<Self>) -> bool {
+        state.io.writers_alive == 0
+    }
+
     fn kick(state: &mut State<Self>) {
         if std::mem::take(&mut state.io.wake_writers)
             || state.core.wants_write_any()
@@ -844,7 +854,7 @@ impl Driver for Blocking {
             .name("zmux-join".into())
             .spawn(move || join_thread(s, PipeId(id), carrier, closer.is_some()))
             .map(drop)
-            .map_err(|e| PipeError::Io(e.kind()))
+            .map_err(|e| PipeError::Io(std::sync::Arc::new(e)))
     }
 
     fn start_rejoin(session: handle::WeakSession<Self>, dial: Dial) -> bool {
@@ -996,9 +1006,9 @@ impl Redial {
                 };
                 // A redial must not wait for a PIPE_ACK that only the direction it
                 // restores could carry.
-                session.begin_add_pipe(io, PipeOptions::new().with_no_wait_attached(true))
+                session.begin_add_pipe(io, PipeOptions::new().with_return_on_reply(true))
             }
-            Err(e) => Err(PipeError::Io(e.kind())),
+            Err(e) => Err(PipeError::Io(std::sync::Arc::new(e))),
         };
         match added {
             Ok(p) => {
@@ -1028,6 +1038,11 @@ impl State<Blocking> {
     /// A thread of pipe `id` ended: the pipe's closer goes with the last
     /// (dropped after the lock).
     fn thread_done(&mut self, id: PipeId) {
+        if self.io.writers_alive == 0 {
+            // `wait` may resolve now.
+            self.waiters
+                .wake_list(super::wait::List::Close, &mut self.wakes);
+        }
         if let Some(i) = self.io.closers.iter().position(|p| p.id == id.0) {
             self.io.closers[i].threads -= 1;
             if self.io.closers[i].threads == 0 {
@@ -1175,7 +1190,7 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                 };
             }
             crate::proto::session::JoinStep::Verified { consumed, mode } => {
-                let plan = if mode == crate::proto::seal::Mode::Bound {
+                let plan = if mode == crate::proto::seal::RecordMode::Bound {
                     crate::shaping::UnitPlan::default()
                 } else {
                     let plan = shared.join_plan(kind, "confirm");
@@ -1222,23 +1237,35 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                         st.core.set_pipe_max_record(id, m);
                     }
                     st.core.set_pipe_write_overhead(id, pipe.write_overhead);
-                    if closer {
-                        st.thread_done(id);
-                    }
                     // The session or the attachment may have ended while the Confirm was
                     // written.
-                    st.core.state() >= CoreState::Closing
-                        || matches!(st.core.pipe_joined(id), Some(Err(_)))
+                    let gone = st.core.state() >= CoreState::Closing
+                        || matches!(st.core.pipe_joined(id), Some(Err(_)));
+                    if gone && closer {
+                        st.thread_done(id);
+                    }
+                    gone
                 };
                 if gone {
+                    // No thread takes the carrier: it ends here, as the session's end
+                    // would have ended it.
+                    if let Some(c) = pipe.closer.take() {
+                        c(Shutdown::Both);
+                    }
                     return;
                 }
-                if spawn_pipe(&shared, id.0, pipe).is_err() {
-                    let mut st = shared.lock();
+                let spawned = spawn_pipe(&shared, id.0, pipe);
+                // The join's hold on the closer ends only once the pipe's threads hold
+                // it: the session's end, whenever it comes, finds the closer.
+                let mut st = shared.lock();
+                if spawned.is_err() {
                     st.core
                         .join_carrier_failed(id, io::ErrorKind::BrokenPipe, Instant::now());
-                    st.after_command();
                 }
+                if closer {
+                    st.thread_done(id);
+                }
+                st.after_command();
                 return;
             }
             crate::proto::session::JoinStep::Declined | crate::proto::session::JoinStep::Failed => {
@@ -1312,11 +1339,33 @@ impl Watchdog {
     }
 }
 
+/// Byte-stream halves as Sealed records, for allocation tests.
+#[cfg(feature = "test-hooks")]
+pub fn sealed_halves<R, W>(
+    reader: R,
+    writer: W,
+    sealer: crate::proto::seal::Sealer,
+    opener: crate::proto::seal::Opener,
+) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let p = PipeIo::from_halves(reader, writer).seal_records(sealer, opener);
+    (
+        p.reader.expect("a reading half"),
+        p.writer.expect("a writing half"),
+    )
+}
+
 /// The reading half of a Sealed carrier: one record per read.
 struct SealedRead {
     lower: Box<dyn Read + Send>,
     framing: Framing,
     opener: crate::proto::seal::Opener,
+    /// The ciphertext of the record being read: allocated once, at the size of the
+    /// largest message, and reused for every record.
+    buf: Box<[u8]>,
     failed: bool,
 }
 
@@ -1328,32 +1377,29 @@ impl Read for SealedRead {
         loop {
             // The end at a record's boundary reads as the carrier's end (see the tokio
             // reader); inside a record `read_exact` fails.
-            let unit = if self.framing == Framing::Records {
-                let mut m = vec![0; u16::MAX as usize + 1];
-                let n = self.lower.read(&mut m)?;
-                if n == 0 {
-                    return Ok(0);
+            let n = if self.framing == Framing::Records {
+                match self.lower.read(&mut self.buf)? {
+                    0 => return Ok(0),
+                    n => n,
                 }
-                m.truncate(n);
-                m
             } else {
                 let mut head = [0; 2];
                 match self.lower.read(&mut head[..1])? {
                     0 => return Ok(0),
                     _ => self.lower.read_exact(&mut head[1..])?,
                 }
-                let mut m = vec![0; usize::from(u16::from_be_bytes(head))];
-                self.lower.read_exact(&mut m)?;
-                m
+                let n = usize::from(u16::from_be_bytes(head));
+                self.lower.read_exact(&mut self.buf[..n])?;
+                n
             };
-            let plain = self.opener.open(&unit);
+            let plain = self.opener.open_in_place(&mut self.buf[..n]);
             let Some(plain) = plain.ok().filter(|p| p.len() <= out.len()) else {
                 self.failed = true;
                 return Err(io::ErrorKind::InvalidData.into());
             };
             // No bytes of a record are not the end of the carrier.
             if !plain.is_empty() {
-                out[..plain.len()].copy_from_slice(&plain);
+                out[..plain.len()].copy_from_slice(plain);
                 return Ok(plain.len());
             }
         }
@@ -1365,21 +1411,39 @@ struct SealedWrite {
     lower: Box<dyn Write + Send>,
     framing: Framing,
     sealer: crate::proto::seal::Sealer,
+    /// A record, with its length prefix on a byte stream, reused for every
+    /// record.
+    unit: Vec<u8>,
 }
 
 impl Write for SealedWrite {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let sealed = self
-            .sealer
-            .seal(buf)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if buf.is_empty() {
+            // Nothing to write is no record.
+            return Ok(0);
+        }
+        self.unit.clear();
         if self.framing == Framing::ByteStream {
-            let mut unit = Vec::with_capacity(2 + sealed.len());
-            unit.extend_from_slice(&(sealed.len() as u16).to_be_bytes());
-            unit.extend_from_slice(&sealed);
-            self.lower.write_all(&unit)?;
-        } else {
-            self.lower.write_all(&sealed)?;
+            self.unit.extend_from_slice(&[0, 0]);
+        }
+        let pre = self.unit.len();
+        self.sealer
+            .seal_into(buf, &mut self.unit)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if pre > 0 {
+            let len = u16::try_from(self.unit.len() - pre).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sealed record over 65535 bytes",
+                )
+            })?;
+            self.unit[..pre].copy_from_slice(&len.to_be_bytes());
+        }
+        let written = self.lower.write_all(&self.unit);
+        // A record cut or lost, no record may follow it.
+        if let Err(e) = written {
+            self.sealer.fail();
+            return Err(e);
         }
         Ok(buf.len())
     }
@@ -1499,14 +1563,17 @@ trait Expired: Refused {
 }
 
 /// Why a session-wide wait of the std driver failed (`accept_bi`,
-/// `read_datagram`, `ping`, `shutdown`, `closed`, `next_event`): the
-/// session ended, or the call was refused on a thread that drives sessions
-/// and the session is unaffected.
+/// `read_datagram`, `ping`, `shutdown`, `established`, `closing`, `wait`,
+/// `next_event`): the session ended, the session's wait timeout expired
+/// ([`Session::set_wait_timeout`](crate::blocking::Session#method.set_wait_timeout)), or the call was refused on a thread
+/// that drives sessions and the session is unaffected. The tokio driver's
+/// futures return the [`SessionError`] alone, since a future is bounded
+/// by its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WaitError {
     /// The session ended.
-    Closed(SessionError),
+    SessionLost(SessionError),
     /// A blocking call on a thread that drives sessions (inside a tokio
     /// runtime, or on a session's own threads).
     OnDriverThread,
@@ -1517,7 +1584,7 @@ pub enum WaitError {
 impl std::fmt::Display for WaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Closed(e) => e.fmt(f),
+            Self::SessionLost(e) => e.fmt(f),
             Self::OnDriverThread => f.write_str(crate::proto::session::ON_DRIVER_THREAD),
             Self::TimedOut => f.write_str("wait timed out"),
         }
@@ -1527,7 +1594,7 @@ impl std::fmt::Display for WaitError {
 impl std::error::Error for WaitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Closed(e) => Some(e),
+            Self::SessionLost(e) => Some(e),
             Self::OnDriverThread | Self::TimedOut => None,
         }
     }
@@ -1535,14 +1602,14 @@ impl std::error::Error for WaitError {
 
 impl From<SessionError> for WaitError {
     fn from(e: SessionError) -> Self {
-        Self::Closed(e)
+        Self::SessionLost(e)
     }
 }
 
 impl From<WaitError> for io::Error {
     fn from(e: WaitError) -> Self {
         match e {
-            WaitError::Closed(s) => s.into(),
+            WaitError::SessionLost(s) => s.into(),
             WaitError::OnDriverThread => io::Error::new(io::ErrorKind::Deadlock, e),
             WaitError::TimedOut => io::Error::new(io::ErrorKind::TimedOut, e),
         }
@@ -1555,15 +1622,45 @@ impl Refused for WaitError {
     }
 }
 
+impl Expired for WaitError {
+    fn timed_out() -> Self {
+        Self::TimedOut
+    }
+}
+
 impl Refused for OpenError {
     fn on_driver_thread() -> Self {
         Self::OnDriverThread
     }
 }
 
+impl Expired for OpenError {
+    fn timed_out() -> Self {
+        Self::TimedOut
+    }
+}
+
 impl Refused for DatagramError {
     fn on_driver_thread() -> Self {
         Self::OnDriverThread
+    }
+}
+
+impl Expired for DatagramError {
+    fn timed_out() -> Self {
+        Self::TimedOut
+    }
+}
+
+impl Refused for PipeError {
+    fn on_driver_thread() -> Self {
+        Self::OnDriverThread
+    }
+}
+
+impl Expired for PipeError {
+    fn timed_out() -> Self {
+        Self::TimedOut
     }
 }
 
@@ -1948,15 +2045,8 @@ fn timer_thread(shared: Arc<Shared<Blocking>>) {
 impl Session {
     /// Establishes a session as the dialling side of `pipe`.
     pub fn connect(pipe: PipeIo, config: impl Into<Arc<Config>>) -> Result<Session, ConnectError> {
-        Self::start(
-            pipe,
-            config,
-            RoleConfig::Initiator,
-            Some(Role::Initiator),
-            None,
-            |_| {},
-        )
-        .map(Self::redialing)
+        Self::start(pipe, config, Role::Client, Some(Role::Client), None, |_| {})
+            .map(Self::redialing)
     }
 
     /// Establishes a session as the accepting side of `pipe`. Such a
@@ -1965,25 +2055,19 @@ impl Session {
     pub fn accept(pipe: PipeIo, config: impl Into<Arc<Config>>) -> Result<Session, ConnectError> {
         let config = config.into();
         if config.offers_multipath() {
-            return Err(ConnectError::InvalidConfig(
-                "a session accepted without a listener cannot accept joins",
-            ));
+            return Err(ConnectError::InvalidConfig(crate::InvalidConfig::new(
+                "max_pipes",
+                "a session accepted without a listener cannot accept joins: multipath needs a Listener",
+            )));
         }
-        Self::start(
-            pipe,
-            config,
-            RoleConfig::Responder,
-            Some(Role::Responder),
-            None,
-            |_| {},
-        )
+        Self::start(pipe, config, Role::Server, Some(Role::Server), None, |_| {})
     }
 
     /// Establishes a session over a symmetric carrier (`zmux_role` auto).
     pub fn peer(pipe: PipeIo, config: impl Into<Arc<Config>>) -> Result<Session, ConnectError> {
         let config = config.into();
         super::check_peer(&config)?;
-        Self::start(pipe, config, RoleConfig::Auto, None, None, |_| {}).map(Self::redialing)
+        Self::start(pipe, config, Role::Auto, None, None, |_| {}).map(Self::redialing)
     }
 
     /// Starts the redial hook of a dialling session's configuration.
@@ -2011,8 +2095,8 @@ impl Session {
         Self::start(
             pipe,
             config,
-            RoleConfig::Responder,
-            Some(Role::Responder),
+            Role::Server,
+            Some(Role::Server),
             locator,
             register,
         )
@@ -2021,7 +2105,7 @@ impl Session {
     fn start(
         mut pipe: PipeIo,
         config: impl Into<Arc<Config>>,
-        role: RoleConfig,
+        role: Role,
         transport: Option<Role>,
         locator: Option<&[u8]>,
         register: impl FnOnce(&Arc<Shared<Blocking>>),
@@ -2063,62 +2147,77 @@ impl Session {
     /// Opens a bidirectional stream, waiting for stream credit; waiting
     /// openers get credit first come, first served.
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream), OpenError> {
-        call(self.open_bi_wait(None))
+        self.bounded(self.open_bi_wait(None))
     }
 
     /// Opens a bidirectional stream with `preamble`, waiting for stream
     /// credit (see `zmux::Session::open_bi_with`).
     pub fn open_bi_with(&self, preamble: &Preamble) -> Result<(SendStream, RecvStream), OpenError> {
-        call(self.open_bi_wait(Some(preamble)))
+        self.bounded(self.open_bi_wait(Some(preamble)))
     }
 
     /// Opens a unidirectional stream, waiting for stream credit.
     pub fn open_uni(&self) -> Result<SendStream, OpenError> {
-        call(self.open_uni_wait(None))
+        self.bounded(self.open_uni_wait(None))
     }
 
     /// Opens a unidirectional stream with `preamble`, waiting for stream
     /// credit.
     pub fn open_uni_with(&self, preamble: &Preamble) -> Result<SendStream, OpenError> {
-        call(self.open_uni_wait(Some(preamble)))
+        self.bounded(self.open_uni_wait(Some(preamble)))
     }
 
     /// Accepts the next bidirectional stream the peer opened.
     pub fn accept_bi(&self) -> Result<(SendStream, RecvStream), WaitError> {
-        call(async { Ok(self.accept_bi_wait().await?) })
+        self.bounded(async { Ok(self.accept_bi_wait().await?) })
     }
 
     /// Accepts the next unidirectional stream the peer opened.
     pub fn accept_uni(&self) -> Result<RecvStream, WaitError> {
-        call(async { Ok(self.accept_uni_wait().await?) })
+        self.bounded(async { Ok(self.accept_uni_wait().await?) })
     }
 
     /// Queues a session datagram, waiting while the queue is full.
     pub fn send_datagram_with_backpressure(&self, data: Bytes) -> Result<(), DatagramError> {
-        call(self.send_datagram_with_backpressure_op(data))
+        self.bounded(self.send_datagram_with_backpressure_op(data))
     }
 
     /// Receives the next session datagram.
     pub fn read_datagram(&self) -> Result<Bytes, WaitError> {
-        call(async { Ok(self.read_datagram_op().await?) })
+        self.bounded(async { Ok(self.read_datagram_op().await?) })
     }
 
-    /// Closes the session at once with an application error code and
-    /// blocks until CONNECTION_CLOSE has been handed to the carriers and
-    /// their input drained, 1 s at the latest (see `zmux::Session::close`).
-    /// A process may exit once
-    /// it returned. On a thread that drives sessions it starts the close
-    /// without waiting. Dropping the last handle starts the same close
-    /// without waiting; the session's threads then carry it.
-    pub fn close(&self, code: VarInt, reason: &[u8]) {
+    /// Closes the session gracefully with an application close of `code`
+    /// and `reason` and blocks until CONNECTION_CLOSE has been handed to
+    /// the carriers, flushing the streams' written data first, 1 s at the
+    /// latest for the whole call (see `zmux::Session::close_with_error`);
+    /// the half-close and the linger go on on the session's threads. The
+    /// first close or abort decides the code and the reason. A process may
+    /// exit once it returned. On a thread that drives sessions it starts
+    /// the close without waiting.
+    pub fn close_with_error(&self, code: VarInt, reason: &[u8]) {
         self.begin_close(code, reason);
         if !on_driver_thread() {
             run(self.close_handoff_op(), None);
         }
     }
 
+    /// [`Session::close_with_error`](blocking::Session#method.close_with_error)
+    /// with code 0 and an empty reason. Dropping the last handle starts the
+    /// same close without waiting.
+    pub fn close(&self) {
+        self.close_with_error(VarInt::ZERO, b"");
+    }
+
+    /// Ends the session at once with an application close of `code` and
+    /// `reason`, draining nothing (see `zmux::Session::abort`). Never
+    /// blocks.
+    pub fn abort(&self, code: VarInt, reason: &[u8]) {
+        self.abort_op(code, reason);
+    }
+
     /// Adds a pipe and blocks until the peer attached it, or, with
-    /// [`PipeOptions::no_wait_attached`], until the Reply has been
+    /// [`PipeOptions::return_on_reply`], until the Reply has been
     /// verified; the handshake timeout (its default without one) bounds the
     /// call (see `zmux::Session::add_pipe`). A pipe not attached by then is
     /// aborted and the call fails with [`PipeError::TimedOut`]; a failed
@@ -2131,7 +2230,7 @@ impl Session {
             return Err(PipeError::OnDriverThread);
         }
         let deadline = Instant::now() + self.add_pipe_limit();
-        let no_wait = opts.no_wait_attached;
+        let no_wait = opts.return_on_reply;
         let p = self.begin_add_pipe(pipe, opts)?;
         let guard = handle::AbortUnlessAdded(Some(&p));
         run(p.added_op(no_wait), Some(deadline)).unwrap_or(Err(PipeError::TimedOut))?;
@@ -2139,11 +2238,73 @@ impl Session {
         Ok(p)
     }
 
+    /// Replaces every pipe after a suspected leak of a session-level secret, within
+    /// `timeout`: advances the epoch as
+    /// [`advance_epoch`](blocking::Session#method.advance_epoch) does, waits until new
+    /// joins use the new epoch, and then replaces each pipe that existed when it was
+    /// called, one after another: it dials a carrier of the same direction through the
+    /// [`blocking_redial`](Config#structfield.blocking_redial) hook, adds it with the old
+    /// pipe's options, and closes the old pipe gracefully once the new one is attached
+    /// (make before break).
+    ///
+    /// Without the `blocking_redial` hook it fails at once with
+    /// [`PipeError::InvalidOptions`]; outside a multipath session with
+    /// [`PipeError::NotNegotiated`]; on a thread that drives sessions with
+    /// [`PipeError::OnDriverThread`]. When `timeout` passes the call fails with
+    /// [`PipeError::TimedOut`]: the pipes already replaced stay replaced and the others are
+    /// kept as they are; a dial in progress runs to its end first, since the hook cannot be
+    /// interrupted. A dial or join that fails ends the call with its error on the same
+    /// terms. While the previous epoch is still kept, the next exchange waits until it is
+    /// deleted, so a short timeout may end the call before any pipe is replaced. An epoch
+    /// is kept for [`EPOCH_RETENTION`](crate::proto::session::EPOCH_RETENTION) (3 min)
+    /// after this end switched away from it: called within that time after an exchange
+    /// that completed, for example one [`advance_epoch`](Session::advance_epoch) started
+    /// under [`EpochPolicy::MANUAL`](crate::EpochPolicy::MANUAL), it waits that long
+    /// before its own exchange, by design. One called while an exchange is in progress
+    /// takes that exchange's epoch as the new one.
+    pub fn replace_pipes(&self, timeout: Duration) -> Result<(), PipeError> {
+        if on_driver_thread() {
+            return Err(PipeError::OnDriverThread);
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        let Some(redial) = self.shared().lock().core.config().blocking_redial.clone() else {
+            return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
+                "blocking_redial",
+                "replace_pipes needs the redial hook",
+            )));
+        };
+        let (old, before) = self.begin_replace_pipes()?;
+        run(self.epoch_in_use_op(before), deadline).ok_or(PipeError::TimedOut)??;
+        for pipe in old {
+            // Gone meanwhile: nothing to replace.
+            let Some((direction, opts)) = handle::replacement(&pipe) else {
+                continue;
+            };
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(PipeError::TimedOut);
+            }
+            let io = redial
+                .dial(super::DialRequest::new(direction))
+                .map_err(|e| PipeError::Io(std::sync::Arc::new(e)))?;
+            let limit = Instant::now() + self.add_pipe_limit();
+            let p = self.begin_add_pipe(io, opts)?;
+            let guard = handle::AbortUnlessAdded(Some(&p));
+            let until = deadline.map_or(limit, |d| d.min(limit));
+            run(p.added_op(false), Some(until)).unwrap_or(Err(PipeError::TimedOut))?;
+            guard.added();
+            match pipe.close() {
+                Ok(()) | Err(PipeError::UnknownPipe) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Closes gracefully and waits until the session ended: `Ok` when it
     /// closed as requested, otherwise the error that ended it first. On a
     /// thread that drives sessions it fails at once and does nothing.
     pub fn shutdown(&self, code: VarInt, reason: &[u8]) -> Result<(), WaitError> {
-        call(async { Ok(self.shutdown_op(code, reason).await?) })
+        self.bounded(async { Ok(self.shutdown_op(code, reason).await?) })
     }
 
     /// Sends a QX_PING request, or joins the one outstanding, and waits
@@ -2152,79 +2313,83 @@ impl Session {
     /// peer, plain QMux peers included. On a thread that drives sessions
     /// it fails at once.
     pub fn ping(&self) -> Result<Duration, WaitError> {
-        call(async { Ok(self.ping_op().await?) })
+        self.bounded(async { Ok(self.ping_op().await?) })
     }
 
     /// Waits until the peer's parameters arrived (the session is
-    /// established: with early data it is usable before), up to `timeout`
-    /// (`None`: as long as it takes; [`WaitError::TimedOut`] when it
-    /// expires), or fails with the error that ended the session first.
-    pub fn established(&self, timeout: Option<Duration>) -> Result<(), WaitError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(WaitError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.established_op(), deadline).ok_or(WaitError::TimedOut)??;
-        Ok(())
+    /// established: with early data it is usable before), or fails with the
+    /// error that ended the session first.
+    pub fn established(&self) -> Result<(), WaitError> {
+        self.bounded(async { Ok(self.established_op().await?) })
     }
 
-    /// Waits until the session is closing or ended and returns why (its
-    /// carriers may still be draining, see `close`), up to `timeout`
-    /// (`None`: as long as it takes; [`WaitError::TimedOut`] when it
-    /// expires). A zero timeout never waits (and works on any thread).
-    pub fn closed(&self, timeout: Option<Duration>) -> Result<SessionError, WaitError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(WaitError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.closed_op(), deadline).ok_or(WaitError::TimedOut)
+    /// Waits until the session is closing, that is until it began to end,
+    /// and returns why; its carriers may still be draining
+    /// ([`Session::wait`](blocking::Session#method.wait) waits
+    /// for the whole end).
+    pub fn closing(&self) -> Result<SessionError, WaitError> {
+        self.bounded(async { Ok(self.closing_op().await) })
     }
 
-    /// The next session event, waiting up to `timeout` (`None`: as long as
-    /// it takes; [`WaitError::TimedOut`] when it expires); `None` once the
-    /// session ended and every event was read. A zero timeout never waits
-    /// (and works on any thread).
-    pub fn next_event(&self, timeout: Option<Duration>) -> Result<Option<Event>, WaitError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(WaitError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.next_event_op(), deadline).ok_or(WaitError::TimedOut)
+    /// Waits until the session has ended entirely and returns why: every
+    /// pipe's inbound side has ended (the peer read CONNECTION_CLOSE and
+    /// ended its side) or the linger timeout passed, and the session's
+    /// writer threads are done. Returning before the linger timeout thus
+    /// confirms that the peer read the close. The session's wait timeout
+    /// ([`Session::set_wait_timeout`](blocking::Session#method.set_wait_timeout))
+    /// bounds it as "delivered, or given up after it"; a timeout changes
+    /// nothing in the session.
+    pub fn wait(&self) -> Result<SessionError, WaitError> {
+        self.bounded(async { Ok(self.wait_op().await) })
+    }
+
+    /// The next session event; `None` once the session ended and every
+    /// event was read.
+    pub fn next_event(&self) -> Result<Option<Event>, WaitError> {
+        self.bounded(async { Ok(self.next_event_op().await) })
+    }
+
+    /// Bounds every wait of the session and of its pipes, from every
+    /// handle: the session calls that wait return
+    /// [`WaitError::TimedOut`] (or the `TimedOut` variant of their error)
+    /// when it expires; `None` (the default) waits as long as it takes. A
+    /// zero timeout never waits and works on any thread, also on one that
+    /// drives sessions. Streams have their own
+    /// (`set_read_timeout`, `set_write_timeout`).
+    pub fn set_wait_timeout(&self, timeout: Option<Duration>) {
+        self.shared().set_wait_timeout(timeout);
+    }
+
+    /// The bound of the session's waits ([`Session::set_wait_timeout`]).
+    pub fn wait_timeout(&self) -> Option<Duration> {
+        self.shared().wait_timeout()
+    }
+
+    /// Runs a wait of the session under its wait timeout.
+    fn bounded<T, E: Expired>(&self, fut: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+        call_timeout(self.shared().wait_timeout(), fut)
     }
 }
 
 impl Pipe {
     /// Waits until the pipe's join is confirmed or failed (see
-    /// `zmux::Pipe::joined`), up to `timeout` (`None`: as long as it takes;
-    /// [`PipeError::TimedOut`] when it expires).
-    pub fn joined(&self, timeout: Option<Duration>) -> Result<(), PipeError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(PipeError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.joined_op(), deadline).unwrap_or(Err(PipeError::TimedOut))
+    /// `zmux::Pipe::joined`), under the session's wait timeout
+    /// ([`Session::set_wait_timeout`]; [`PipeError::TimedOut`] when it
+    /// expires).
+    pub fn joined(&self) -> Result<(), PipeError> {
+        call_timeout(self.shared().wait_timeout(), self.joined_op())
     }
 
     /// Waits until the peer attached the pipe (see `zmux::Pipe::attached`),
-    /// up to `timeout` (`None`: as long as it takes;
-    /// [`PipeError::TimedOut`] when it expires).
-    pub fn attached(&self, timeout: Option<Duration>) -> Result<(), PipeError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(PipeError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.attached_op(), deadline).unwrap_or(Err(PipeError::TimedOut))
+    /// under the session's wait timeout.
+    pub fn attached(&self) -> Result<(), PipeError> {
+        call_timeout(self.shared().wait_timeout(), self.attached_op())
     }
 
-    /// Waits until the pipe ended (see `zmux::Pipe::closed`), up to
-    /// `timeout` (`None`: as long as it takes; [`PipeError::TimedOut`]
-    /// when it expires).
-    pub fn closed(&self, timeout: Option<Duration>) -> Result<(), PipeError> {
-        if timeout != Some(Duration::ZERO) && on_driver_thread() {
-            return Err(PipeError::OnDriverThread);
-        }
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(self.closed_op(), deadline).unwrap_or(Err(PipeError::TimedOut))
+    /// Waits until the pipe ended (see `zmux::Pipe::closed`), under the
+    /// session's wait timeout.
+    pub fn closed(&self) -> Result<(), PipeError> {
+        call_timeout(self.shared().wait_timeout(), self.closed_op())
     }
 }
 
@@ -2356,3 +2521,24 @@ impl Read for RecvStream {
 }
 
 crate::helpers::duplicate_api!(Blocking, Session, Dial);
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for HandshakeWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeWait").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Io {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Io").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deferred").finish_non_exhaustive()
+    }
+}

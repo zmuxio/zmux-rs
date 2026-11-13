@@ -8,7 +8,7 @@ outbound direction and the response body its inbound direction (the
 server's the other way round). HTTP/3 reaches servers through front ends,
 proxies and load balancers that forward HTTP/3 requests.
 
-- `H3Client` drives an HTTP/3 connection: `open_pipe` makes a pipe on a new
+- `Carrier` drives an HTTP/3 connection: `open_pipe` makes a pipe on a new
   request, and the pipe's lanes are further requests on the same
   connection, opened by zmux as it needs them. Only the client opens lanes:
   an HTTP/3 server cannot open requests, so lanes in both directions need
@@ -20,15 +20,16 @@ proxies and load balancers that forward HTTP/3 requests.
   (`ListenerConfig::admission`, a `zmux::Admission` deciding on the first
   bytes of the request body), when it accepts; without, when the listener first
   writes on the carrier or has taken it. Requests that carry no pipe go to
-  `Options::fallback` (`H3Fallback`, given the request with the body bytes
+  `Options::fallback` (`Fallback`, given the request with the body bytes
   read) or are answered with 404; a stalled or closed request is reset
   without a response.
-- `Options::credential` makes the client write the prefix of a
-  `zmux::Credential`, such as a `zmux::PrefixAuth` token, first on every
+- `Options::carrier_credential` makes the client write the prefix of a
+  `zmux::CarrierCredential`, such as a `zmux::PrefixAuth` token, first on every
   request body, its pipes' and its lanes', given the QUIC connection's
   exporter for bound tokens.
 - `connect(&endpoint, addr, uri, &options, config)` establishes a session
-  over a new connection.
+  over a new connection; `candidate(endpoint, addr, uri, &options)` is a
+  `zmux::Candidate` for carrier modes.
 
 The carriers wire the TLS 1.3 exporter of the QUIC connection (for
 `PipeAuth::exporter()` and Bound joins, declared secure with a Binding of the

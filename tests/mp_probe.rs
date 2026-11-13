@@ -14,7 +14,7 @@ use mp_net::{A, B, MpNet, Observe};
 use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::record::{Event as Rec, RecordReader};
 use zmux::proto::session::{
-    Config, PipeAuth, PipeError, PipeId, PipeOptions, RoleConfig, SessionCore, SessionError,
+    Config, PipeAuth, PipeError, PipeId, PipeOptions, Role, SessionCore, SessionError,
 };
 use zmux::shaping::{Caps, Effects, Event, RecordPlan, RecordView, Shaper};
 
@@ -76,11 +76,11 @@ fn config(edit: &dyn Fn(&mut Config)) -> Config {
     c.max_pipes = 8;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = None;
-    c.probation = Some(Duration::ZERO);
-    c.standby_probe = None;
-    c.probe_jitter = 0.0;
+    c.probation = None;
+    c.liveness.standby_probe = None;
+    c.liveness.probe_jitter = 0.0;
     // Keep-alive would keep idle sessions open and put QX_PINGs on pipe 0.
-    c.keep_alive_period = None;
+    c.liveness.keep_alive_period = None;
     c.test_hooks().probe_seed = Some(7);
     edit(&mut c);
     c
@@ -90,7 +90,7 @@ fn config(edit: &dyn Fn(&mut Config)) -> Config {
 /// PIPE_PINGs are those of its own schedule.
 fn net(a: &dyn Fn(&mut Config), b: &dyn Fn(&mut Config)) -> Net {
     let mut b_cfg = config(&|c| {
-        c.probe_interval = None;
+        c.liveness.probe_interval = None;
         b(c);
     });
     b_cfg.test_hooks().locator = b"server".to_vec();
@@ -129,9 +129,9 @@ fn gaps(times: &[Instant]) -> Vec<Duration> {
 fn probe_settings_are_validated() {
     for j in [-0.1, 1.0, f64::NAN] {
         let mut c = config(&|_| {});
-        c.probe_jitter = j;
+        c.liveness.probe_jitter = j;
         assert!(
-            SessionCore::new(c, RoleConfig::Initiator, None, Instant::now()).is_err(),
+            SessionCore::new(c, Role::Client, None, Instant::now()).is_err(),
             "{j}"
         );
     }
@@ -146,39 +146,63 @@ fn probe_settings_are_validated() {
         (ms(1000), true),
     ] {
         let mut c = config(&|_| {});
-        c.probe_interval = k;
-        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        c.liveness.probe_interval = k;
+        let r = SessionCore::new(c, Role::Client, None, Instant::now());
         assert_eq!(r.is_ok(), ok, "probe_interval {k:?}");
         let mut c = config(&|_| {});
-        c.standby_probe = k;
-        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        c.liveness.standby_probe = k;
+        let r = SessionCore::new(c, Role::Client, None, Instant::now());
         assert_eq!(r.is_ok(), ok, "standby_probe {k:?}");
     }
     let mut n = net(&|_| {}, &|_| {});
     let bs = Some(zmux::proto::record::Framing::ByteStream);
     let bad = [
-        PipeOptions::new().with_probe_interval(Duration::from_millis(999)),
-        PipeOptions::new().with_probe_jitter(1.0),
-        PipeOptions::new().with_probe_jitter(-0.01),
+        PipeOptions::new().with_liveness(zmux::PipeLiveness {
+            probe_interval: zmux::Inherit::Set(Some(Duration::from_millis(999))),
+            ..Default::default()
+        }),
+        PipeOptions::new().with_liveness(zmux::PipeLiveness {
+            probe_jitter: zmux::Inherit::Set(1.0),
+            ..Default::default()
+        }),
+        PipeOptions::new().with_liveness(zmux::PipeLiveness {
+            probe_jitter: zmux::Inherit::Set(-0.01),
+            ..Default::default()
+        }),
     ];
     for opts in bad {
-        let r = n.ends[A].add_pipe(bs, bs, &opts, zmux::proto::seal::Mode::Trusted, None, n.now);
-        assert_eq!(r.err(), Some(PipeError::InvalidOptions), "{opts:?}");
+        let r = n.ends[A].add_pipe(
+            bs,
+            bs,
+            &opts,
+            zmux::proto::seal::RecordMode::Trusted,
+            None,
+            n.now,
+        );
+        assert!(matches!(r, Err(PipeError::InvalidOptions(_))), "{opts:?}");
     }
-    let ok = PipeOptions::new()
-        .with_probe_interval(Duration::from_secs(1))
-        .with_probe_jitter(0.0);
+    let ok = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(1))),
+        probe_jitter: zmux::Inherit::Set(0.0),
+        ..Default::default()
+    });
     assert!(n.add_pipe(&ok).is_some());
     // Off: no idle probes on the pipe; a zero interval is not off.
     assert!(
         PipeOptions::new()
-            .with_probe_interval(zmux::Period::Off)
+            .with_liveness(zmux::PipeLiveness {
+                probe_interval: zmux::Inherit::Set(None),
+                ..Default::default()
+            })
             .validate()
             .is_ok()
     );
     assert!(
         PipeOptions::new()
-            .with_probe_interval(Duration::ZERO)
+            .with_liveness(zmux::PipeLiveness {
+                probe_interval: zmux::Inherit::Set(Some(Duration::ZERO)),
+                ..Default::default()
+            })
             .validate()
             .is_err()
     );
@@ -190,7 +214,7 @@ fn probe_settings_are_validated() {
 fn probe_waits_lie_within_the_jittered_interval() {
     let k = Duration::from_secs(2);
     let slack = Duration::from_millis(3 * STEP);
-    let mut n = net(&|c| c.probe_interval = Some(k), &|_| {});
+    let mut n = net(&|c| c.liveness.probe_interval = Some(k), &|_| {});
     let g = gaps(&ping_times(&mut n, 0, 40_000));
     assert!(g.len() >= 15, "{g:?}");
     for d in &g {
@@ -198,8 +222,8 @@ fn probe_waits_lie_within_the_jittered_interval() {
     }
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(k);
-            c.probe_jitter = 0.5;
+            c.liveness.probe_interval = Some(k);
+            c.liveness.probe_jitter = 0.5;
         },
         &|_| {},
     );
@@ -216,10 +240,12 @@ fn probe_waits_lie_within_the_jittered_interval() {
 /// interval and no jitter is probed every second.
 #[test]
 fn pipe_options_override_the_session_settings() {
-    let mut n = net(&|c| c.probe_jitter = 0.5, &|_| {});
-    let opts = PipeOptions::new()
-        .with_probe_interval(Duration::from_secs(1))
-        .with_probe_jitter(0.0);
+    let mut n = net(&|c| c.liveness.probe_jitter = 0.5, &|_| {});
+    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(1))),
+        probe_jitter: zmux::Inherit::Set(0.0),
+        ..Default::default()
+    });
     let id = n.add_pipe(&opts).unwrap();
     ping_times(&mut n, id, 1000);
     let g = gaps(&ping_times(&mut n, id, 20_000));
@@ -239,7 +265,7 @@ fn pipe_options_override_the_session_settings() {
 fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(Duration::from_secs(2));
+            c.liveness.probe_interval = Some(Duration::from_secs(2));
             c.max_idle_timeout = Some(Duration::from_secs(10));
         },
         &|c| c.max_idle_timeout = Some(Duration::from_secs(10)),
@@ -256,10 +282,10 @@ fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
     let keep_alive = |k: Option<Duration>| {
         let mut n = net(
             &|c| {
-                c.probe_interval = k;
-                c.probe_jitter = 0.3;
+                c.liveness.probe_interval = k;
+                c.liveness.probe_jitter = 0.3;
                 c.max_idle_timeout = Some(Duration::from_secs(60));
-                c.keep_alive_period = Some(Duration::from_secs(3));
+                c.liveness.keep_alive_period = Some(Duration::from_secs(3));
             },
             &|c| c.max_idle_timeout = Some(Duration::from_secs(60)),
         );
@@ -287,8 +313,8 @@ fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
 fn jittered_probes_are_answered_on_their_pipe_pair() {
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(Duration::from_secs(1));
-            c.probe_jitter = 0.4;
+            c.liveness.probe_interval = Some(Duration::from_secs(1));
+            c.liveness.probe_jitter = 0.4;
         },
         &|_| {},
     );
@@ -306,7 +332,7 @@ fn jittered_probes_are_answered_on_their_pipe_pair() {
 #[test]
 fn since_last_traffic_counts_traffic_frames_only() {
     let mut n = net(
-        &|c| c.probe_interval = Some(Duration::from_secs(1)),
+        &|c| c.liveness.probe_interval = Some(Duration::from_secs(1)),
         &|_| {},
     );
     let since = |n: &Net, end: usize| {
@@ -363,8 +389,8 @@ impl Shaper for Delay {
 fn probes_are_shaped_and_a_delay_is_no_stall() {
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(Duration::from_secs(1));
-            c.suspect_floor = Duration::from_millis(100);
+            c.liveness.probe_interval = Some(Duration::from_secs(1));
+            c.liveness.suspect_floor = Duration::from_millis(100);
         },
         &|_| {},
     );
@@ -398,8 +424,8 @@ fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
     let first = |j: f64, seed: u64| {
         let mut n = net(
             &|c| {
-                c.probe_interval = Some(k);
-                c.probe_jitter = j;
+                c.liveness.probe_interval = Some(k);
+                c.liveness.probe_jitter = j;
                 c.test_hooks().probe_seed = Some(seed);
             },
             &|_| {},
@@ -424,7 +450,7 @@ fn probes_reach_the_carrier_within_the_interval_despite_shaping_holds() {
     let k = Duration::from_secs(10);
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(k);
+            c.liveness.probe_interval = Some(k);
             c.shaping_limits.max_delay = Some(Duration::from_secs(3));
         },
         &|_| {},
@@ -468,11 +494,11 @@ fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
     let k = Duration::from_secs(10);
     let mut n = net(
         &|c| {
-            c.probe_interval = Some(k);
-            c.probe_jitter = 0.0;
+            c.liveness.probe_interval = Some(k);
+            c.liveness.probe_jitter = 0.0;
             c.shaping_limits.max_delay = Some(Duration::from_secs(3));
         },
-        &|c| c.probe_jitter = 0.0,
+        &|c| c.liveness.probe_jitter = 0.0,
     );
     n.ends[A].set_shaper(Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
         Some(Box::new(Unplanned) as Box<dyn Shaper>)
@@ -489,10 +515,12 @@ fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
 /// for R_p, even at an end whose idle probes are off.
 #[test]
 fn quiet_answers_stay_on_the_probed_pair_and_probe_back() {
-    let mut n = net(&|c| c.probe_interval = None, &|_| {});
-    let opts = PipeOptions::new()
-        .with_probe_interval(Duration::from_secs(2))
-        .with_probe_jitter(0.0);
+    let mut n = net(&|c| c.liveness.probe_interval = None, &|_| {});
+    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(2))),
+        probe_jitter: zmux::Inherit::Set(0.0),
+        ..Default::default()
+    });
     let id = n.add_pipe(&opts).unwrap();
     // Past the busy window of establishment and of the join.
     ping_times(&mut n, id, 16_000);
@@ -530,8 +558,8 @@ fn quiet_answers_stay_on_the_probed_pair_and_probe_back() {
 fn a_suspicion_and_a_failure_due_together_fire_in_one_pass() {
     let mut n = net(
         &|c| {
-            c.suspect_floor = Duration::from_secs(3);
-            c.dead_timeout = Some(Duration::from_secs(1));
+            c.liveness.suspect_floor = Duration::from_secs(3);
+            c.liveness.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(1));
         },
         &|_| {},
     );
@@ -566,7 +594,10 @@ fn a_suspicion_and_a_failure_due_together_fire_in_one_pass() {
 /// transmit at the later time), so the timer armed after it still fires it.
 #[test]
 fn a_passed_suspicion_stays_pending() {
-    let mut n = net(&|c| c.suspect_floor = Duration::from_secs(1), &|_| {});
+    let mut n = net(
+        &|c| c.liveness.suspect_floor = Duration::from_secs(1),
+        &|_| {},
+    );
     let k = n.ends[A].open(Dir::Bidi).unwrap();
     n.ends[A].write(k, b"stalls").unwrap();
     for f in &mut n.links.get_mut(&0).unwrap().flows {
@@ -599,10 +630,10 @@ fn keep_alive_is_capped_at_half_the_idle_timeout_and_jittered() {
     let qx_times = |j: f64| {
         let mut n = net(
             &|c| {
-                c.probe_interval = None;
-                c.probe_jitter = j;
+                c.liveness.probe_interval = None;
+                c.liveness.probe_jitter = j;
                 c.max_idle_timeout = Some(Duration::from_secs(10));
-                c.keep_alive_period = Some(Duration::from_secs(15));
+                c.liveness.keep_alive_period = Some(Duration::from_secs(15));
             },
             &|c| c.max_idle_timeout = Some(Duration::from_secs(10)),
         );

@@ -7,8 +7,19 @@ mod common;
 
 use std::time::Duration;
 
-use common::{duplex, multi_thread, watchdog};
+use common::{duplex, eventually, multi_thread, watchdog};
 use zmux::{Config, ConnectError, EarlyData, EarlyDataState, Session, SessionError};
+
+/// Waits until the client's early data left: the server, started only
+/// then, cannot get its parameters to the client before it (a client whose
+/// writer runs late would send the stream after the parameters, as no early
+/// data).
+async fn early_sent(client: &Session) {
+    eventually(5, "early data sent", || {
+        client.early_data() == EarlyDataState::Pending
+    })
+    .await;
+}
 
 fn early() -> Config {
     let mut c = Config::default();
@@ -30,6 +41,7 @@ fn early_streams_carry_data_within_and_beyond_the_floor() {
         let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
         send.write_all(&data).await.unwrap();
         send.finish().unwrap();
+        early_sent(&client).await;
         let server = watchdog(5, "accept", Session::accept(b, Config::default()))
             .await
             .unwrap();
@@ -38,7 +50,7 @@ fn early_streams_carry_data_within_and_beyond_the_floor() {
         assert_eq!(got, data);
         assert_eq!(client.early_data(), EarlyDataState::Accepted);
         assert_eq!(server.early_data(), EarlyDataState::NotSent);
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     });
 }
 
@@ -49,12 +61,13 @@ fn a_peer_without_bidirectional_streams_rejects_early_data_unprocessed() {
         let client = Session::connect(a, early()).await.unwrap();
         let (mut send, _recv) = client.open_bi().await.unwrap();
         send.write_all(b"GET /").await.unwrap();
+        early_sent(&client).await;
         let mut server_cfg = Config::default();
         server_cfg.max_incoming_streams = 0;
         // The server fails at the first early STREAM frame; either side
         // may finish establishing first.
         let server = Session::accept(b, server_cfg).await;
-        let e = watchdog(5, "closed", client.closed()).await;
+        let e = watchdog(5, "closed", client.closing()).await;
         assert!(e.is_early_data_rejected(), "{e:?}");
         assert_eq!(e, SessionError::EarlyDataRejected);
         assert_eq!(client.early_data(), EarlyDataState::Rejected);
@@ -103,7 +116,7 @@ fn early_streams_carry_preamble_and_priority() {
         assert_eq!(r.requested_priority(), Some(prio));
         let data = watchdog(5, "read", r.read_to_end(1 << 10)).await.unwrap();
         assert_eq!(data, b"early");
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     });
 }
 
@@ -147,8 +160,8 @@ fn carrier_streams_are_replayable_until_the_handshake_completes() {
             .await
             .unwrap();
         assert!(!recv.is_replayable());
-        client.close(0u32.into(), b"").await;
-        server.close(0u32.into(), b"").await;
+        client.close().await;
+        server.close().await;
     }));
 }
 
@@ -231,7 +244,7 @@ fn parameters_wait_for_the_handshake_that_gives_the_exporter() {
         let server = watchdog(5, "accept", listener.accept()).await.unwrap();
         let (_s, mut r) = watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
         assert_eq!(r.read_to_end(16).await.unwrap(), b"early");
-        client.close(0u32.into(), b"").await;
+        client.close().await;
         listener.close();
     });
 }
@@ -248,7 +261,7 @@ fn a_failed_handshake_under_the_exporter_wait_is_no_internal_error() {
         let client = Session::connect(a.with_exporter(fixed_exporter), exporter_client_config())
             .await
             .unwrap();
-        let e = watchdog(5, "closed", client.closed()).await;
+        let e = watchdog(5, "closed", client.closing()).await;
         assert!(!format!("{e:?}").contains("xporter"), "{e:?}");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), listener.accept())

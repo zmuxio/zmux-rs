@@ -235,7 +235,7 @@ impl UnitPlan {
         if limits.no_pause {
             self.delay = Duration::ZERO;
         }
-        if let Some(m) = limits.wait_bound() {
+        if let Some(m) = limits.max_delay {
             self.delay = self.delay.min(m);
         }
     }
@@ -767,7 +767,7 @@ impl Gate {
 /// counted in [`Stats::clamped`].
 pub const MIN_MAX_LEN: usize = 64;
 
-/// The bound on one wait when [`Limits::max_delay`] is `None`.
+/// The default of [`Limits::max_delay`], the bound on one wait.
 pub const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// The largest [`Account::initial`].
@@ -829,13 +829,13 @@ impl Account {
 
 /// Local bounds over a session, set by the application and never sent. A configuration
 /// cannot widen them. A session whose limits are not [valid](Self::validate) is not created.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
     /// What injections may spend.
     pub wire: Account,
-    /// The bound on one wait, and so on the lowest rate of a gate: `None` is
-    /// [`DEFAULT_MAX_DELAY`] and [`Duration::MAX`] no bound. It is above zero.
+    /// The bound on one wait, and so on the lowest rate of a gate (default
+    /// [`DEFAULT_MAX_DELAY`]; `None`: no bound). A bound is above zero.
     pub max_delay: Option<Duration>,
     /// No padding at all, on handshakes and injections too.
     pub no_padding: bool,
@@ -845,31 +845,39 @@ pub struct Limits {
     pub no_injection: bool,
 }
 
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            wire: Account::default(),
+            max_delay: Some(DEFAULT_MAX_DELAY),
+            no_padding: false,
+            no_pause: false,
+            no_injection: false,
+        }
+    }
+}
+
 impl Limits {
     /// Whether the limits are valid: the account's fields within their maximums and a
     /// set `max_delay` above zero.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         let a = self.wire;
         if a.initial > MAX_ACCOUNT_INITIAL
             || a.per_mb > MAX_ACCOUNT_RATE
             || a.per_sec > MAX_ACCOUNT_RATE
         {
-            return Err("shaping_limits wire field above its maximum");
+            return Err(crate::InvalidConfig::new(
+                "shaping_limits",
+                "a wire account field above its maximum",
+            ));
         }
         if self.max_delay == Some(Duration::ZERO) {
-            return Err("shaping_limits max_delay of zero");
+            return Err(crate::InvalidConfig::new(
+                "shaping_limits",
+                "max_delay of zero",
+            ));
         }
         Ok(())
-    }
-
-    /// The bound on one wait; `None`: no bound.
-    #[must_use]
-    pub fn wait_bound(&self) -> Option<Duration> {
-        match self.max_delay {
-            None => Some(DEFAULT_MAX_DELAY),
-            Some(Duration::MAX) => None,
-            Some(d) => Some(d),
-        }
     }
 
     /// These limits in force under `budget`: the account field by field the smaller where
@@ -889,12 +897,11 @@ impl Limits {
             self.no_injection |= self.wire.is_unset();
         }
         self.no_injection |= budget.no_injection;
-        let bound = match (self.wait_bound(), budget.max_delay.filter(|d| !d.is_zero())) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => Duration::MAX,
+        self.max_delay = match (self.max_delay, budget.max_delay.filter(|d| !d.is_zero())) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) => a,
+            (None, b) => b,
         };
-        self.max_delay = Some(bound);
         self
     }
 }

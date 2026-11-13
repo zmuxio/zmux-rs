@@ -343,7 +343,7 @@ mod core_bulk {
     use bytes::Bytes;
     use zmux::proto::frame::Dir;
     use zmux::proto::record::Framing;
-    use zmux::proto::session::{Config, PipeId, RoleConfig, SessionCore, StreamKey};
+    use zmux::proto::session::{Config, PipeId, Role, SessionCore, StreamKey};
 
     const P0: PipeId = PipeId::new(0);
 
@@ -354,9 +354,8 @@ mod core_bulk {
         let _serial = crate::serial();
         let now = Instant::now();
         let (s, held) = crate::live_bytes(|| {
-            let mut s = Box::new(
-                SessionCore::new(Config::default(), RoleConfig::Initiator, None, now).unwrap(),
-            );
+            let mut s =
+                Box::new(SessionCore::new(Config::default(), Role::Client, None, now).unwrap());
             s.attach_pipe(P0, Framing::ByteStream, now);
             s
         });
@@ -372,7 +371,7 @@ mod core_bulk {
     /// A pair whose B takes four unidirectional streams at once.
     fn pair() -> Pair {
         let mut b = Config::default();
-        b.max_incoming_uni_streams = Some(4);
+        b.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
         Pair::new(Config::default(), b)
     }
 
@@ -563,8 +562,7 @@ mod core_multipath {
     use zmux::proto::listener::{ListenerConfig, ListenerCore};
     use zmux::proto::record::Framing;
     use zmux::proto::session::{
-        Config, PipeAuth, PipeId, PipeOptions, Policy, RoleConfig, SessionCore, StreamKey,
-        TransmitBuf,
+        Config, PipeAuth, PipeId, PipeOptions, Policy, Role, SessionCore, StreamKey, TransmitBuf,
     };
 
     const BS: Framing = Framing::ByteStream;
@@ -584,7 +582,7 @@ mod core_multipath {
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = policy.clone();
         c.max_idle_timeout = Some(Duration::from_secs(600));
-        c.max_incoming_uni_streams = Some(4);
+        c.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
         c
     }
 
@@ -595,9 +593,8 @@ mod core_multipath {
             let now = Instant::now();
             let mut b_cfg = config(&policy);
             b_cfg.test_hooks().locator = b"server".to_vec();
-            let mut a =
-                SessionCore::new(config(&policy), RoleConfig::Initiator, None, now).unwrap();
-            let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, now).unwrap();
+            let mut a = SessionCore::new(config(&policy), Role::Client, None, now).unwrap();
+            let mut b = SessionCore::new(b_cfg, Role::Server, None, now).unwrap();
             a.attach_pipe(PipeId::new(0), BS, now);
             b.attach_pipe(PipeId::new(0), BS, now);
             let mut p = Self {
@@ -615,7 +612,7 @@ mod core_multipath {
                     Some(BS),
                     Some(BS),
                     &PipeOptions::default(),
-                    zmux::proto::seal::Mode::Trusted,
+                    zmux::proto::seal::RecordMode::Trusted,
                     None,
                     now,
                 )
@@ -825,9 +822,9 @@ mod driver {
                     }
                 }
             }
-            client.close(VarInt::from_u32(0), b"").await;
-            client.closed().await;
-            server.closed().await;
+            client.close().await;
+            client.closing().await;
+            server.closing().await;
             echo.await.unwrap();
         });
         drop(rt);
@@ -942,5 +939,136 @@ mod driver {
         lifecycle();
         let ((), grew) = super::live_bytes(lifecycle);
         assert_eq!(grew, 0, "{grew} live bytes left after a driver lifecycle");
+    }
+}
+
+// ---- Sealed records -----------------------------------------------------------
+
+mod sealed_records {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use zmux::proto::seal::{Opener, Sealer, aes_256_gcm, chacha20_poly1305};
+
+    use super::{allocations, serial};
+
+    const KEY: [u8; 32] = [0x33; 32];
+    const RECORD: usize = 16 * 1024;
+
+    fn pair(c: &'static zmux::proto::seal::Cipher) -> (Sealer, Opener) {
+        (Sealer::new(c, KEY.to_vec()), Opener::new(c, KEY.to_vec()))
+    }
+
+    /// Records sealed and opened in place allocate nothing.
+    #[test]
+    fn in_place_records_do_not_allocate() {
+        let _serial = serial();
+        for c in [aes_256_gcm(), chacha20_poly1305()] {
+            let (mut s, mut o) = pair(c);
+            let mut record = vec![7; RECORD + 16];
+            let mut unit = Vec::with_capacity(RECORD + 16);
+            let ((), n) = allocations(|| {
+                for _ in 0..64 {
+                    s.seal_in_place(&mut record).unwrap();
+                    assert_eq!(o.open_in_place(&mut record).unwrap().len(), RECORD);
+                    unit.clear();
+                    s.seal_into(&record[..1024], &mut unit).unwrap();
+                    o.open_in_place(&mut unit).unwrap();
+                }
+            });
+            assert_eq!(n, 0);
+        }
+    }
+
+    /// One record written and read back through the tokio driver's Sealed
+    /// halves, polled on this thread.
+    fn tokio_round(
+        r: &mut Pin<Box<dyn AsyncRead + Send>>,
+        w: &mut Pin<Box<dyn AsyncWrite + Send>>,
+        data: &[u8],
+        out: &mut [u8],
+    ) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok(n)) = w.as_mut().poll_write(&mut cx, data) else {
+            panic!("the record was not taken")
+        };
+        assert_eq!(n, data.len());
+        let mut rb = ReadBuf::new(out);
+        let Poll::Ready(Ok(())) = r.as_mut().poll_read(&mut cx, &mut rb) else {
+            panic!("the record was not read")
+        };
+        assert_eq!(rb.filled().len(), data.len());
+    }
+
+    /// In the steady state the tokio driver's Sealed records allocate
+    /// nothing, on either side.
+    #[test]
+    fn tokio_sealed_records_do_not_allocate() {
+        let _serial = serial();
+        let (s, o) = pair(aes_256_gcm());
+        let (near, far) = tokio::io::duplex(4 * RECORD);
+        let (mut r, _) = zmux::test_hooks::tokio_sealed_halves(far, pair(aes_256_gcm()).0, o);
+        let (_, mut w) = zmux::test_hooks::tokio_sealed_halves(near, s, pair(aes_256_gcm()).1);
+        let data = vec![9; RECORD];
+        let mut out = vec![0; 1 << 16];
+        // Warm-up: the first unit's buffer and the pipe's.
+        for _ in 0..4 {
+            tokio_round(&mut r, &mut w, &data, &mut out);
+        }
+        let ((), n) = allocations(|| {
+            for _ in 0..64 {
+                tokio_round(&mut r, &mut w, &data, &mut out);
+            }
+        });
+        assert_eq!(n, 0);
+    }
+
+    /// An in-memory byte pipe of fixed capacity.
+    #[derive(Clone)]
+    struct Ring(Arc<Mutex<VecDeque<u8>>>);
+
+    impl Read for Ring {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+    }
+
+    impl Write for Ring {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut q = self.0.lock().unwrap();
+            assert!(q.len() + buf.len() <= q.capacity(), "the ring is full");
+            q.extend(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In the steady state the std driver's Sealed records allocate
+    /// nothing, on either side.
+    #[test]
+    fn blocking_sealed_records_do_not_allocate() {
+        let _serial = serial();
+        let (s, o) = pair(chacha20_poly1305());
+        let ring = Ring(Arc::new(Mutex::new(VecDeque::with_capacity(4 * RECORD))));
+        let (mut r, mut w) = zmux::test_hooks::blocking_sealed_halves(ring.clone(), ring, s, o);
+        let data = vec![9; RECORD];
+        let mut out = vec![0; 1 << 16];
+        for _ in 0..4 {
+            w.write_all(&data).unwrap();
+            assert_eq!(r.read(&mut out).unwrap(), RECORD);
+        }
+        let ((), n) = allocations(|| {
+            for _ in 0..64 {
+                w.write_all(&data).unwrap();
+                assert_eq!(r.read(&mut out).unwrap(), RECORD);
+            }
+        });
+        assert_eq!(n, 0);
     }
 }

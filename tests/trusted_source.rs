@@ -52,7 +52,7 @@ async fn admitted_tcp_reads_the_proxy_header() {
             let tx = Arc::new(Mutex::new(tx));
             let admission = zmux::Admission::new(0, move |info, _| {
                 let _ = tx.lock().unwrap().send(info.source.unwrap());
-                zmux::Verdict::Close
+                zmux::AdmissionVerdict::Close
             });
             let mut limits = zmux::ListenerConfig::default();
             limits.trusted_proxies = TrustedProxies::new()

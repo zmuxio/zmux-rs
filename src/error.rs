@@ -8,7 +8,7 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use crate::proto::session::{SessionError, StreamError};
+use crate::proto::session::{InvalidConfig, SessionError, StreamError};
 
 /// Why establishing a session failed.
 #[derive(Debug, Clone)]
@@ -17,11 +17,11 @@ pub enum ConnectError {
     /// The session ended during establishment: among others
     /// [`SessionError::HandshakeTimeout`] when the peer's parameters did not
     /// arrive in time.
-    Closed(SessionError),
+    SessionLost(SessionError),
     /// The carrier failed, or the driver could not start its I/O.
     Io(Arc<io::Error>),
     /// The configuration is invalid.
-    InvalidConfig(&'static str),
+    InvalidConfig(InvalidConfig),
     /// A blocking `connect` was refused on a thread that drives sessions
     /// (std driver only); nothing was started.
     OnDriverThread,
@@ -31,16 +31,16 @@ impl ConnectError {
     /// Whether establishing may succeed if repeated on a new carrier: only
     /// after [`SessionError::EarlyDataRejected`], without early data.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Closed(e) if e.is_retryable())
+        matches!(self, Self::SessionLost(e) if e.is_retryable())
     }
 }
 
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Closed(e) => write!(f, "session closed during establishment: {e}"),
+            Self::SessionLost(e) => write!(f, "session lost during establishment: {e}"),
             Self::Io(e) => write!(f, "carrier error: {e}"),
-            Self::InvalidConfig(e) => write!(f, "invalid configuration: {e}"),
+            Self::InvalidConfig(e) => e.fmt(f),
             Self::OnDriverThread => f.write_str(crate::proto::session::ON_DRIVER_THREAD),
         }
     }
@@ -49,8 +49,9 @@ impl fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Closed(e) => Some(e),
+            Self::SessionLost(e) => Some(e),
             Self::Io(e) => Some(&**e),
+            Self::InvalidConfig(e) => Some(e),
             _ => None,
         }
     }
@@ -59,7 +60,7 @@ impl std::error::Error for ConnectError {
 impl From<ConnectError> for io::Error {
     fn from(e: ConnectError) -> Self {
         let kind = match &e {
-            ConnectError::Closed(s) => io::Error::from(s.clone()).kind(),
+            ConnectError::SessionLost(s) => io::Error::from(s.clone()).kind(),
             ConnectError::Io(io) => io.kind(),
             ConnectError::InvalidConfig(_) => io::ErrorKind::InvalidInput,
             ConnectError::OnDriverThread => io::ErrorKind::Deadlock,

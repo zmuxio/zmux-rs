@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use zmux::{
-    Admission, AdmittedValue, Config, InboundTransform, Listener, ListenerConfig, PipeAuth,
-    PipeHint, PipeIo, PipeOptions, Session, Verdict,
+    Admission, AdmissionVerdict, AdmittedValue, Config, InboundTransform, Listener, ListenerConfig,
+    PipeAuth, PipeHint, PipeIo, PipeOptions, Session,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -53,7 +53,7 @@ async fn the_transform_sees_every_carrier_and_the_value_travels() {
         let mut limits = ListenerConfig::default();
         limits.admission = Some(Admission::new(0, move |_, _| {
             let v = u32::try_from(n.fetch_add(1, Relaxed)).unwrap();
-            Verdict::accept(0).with_value(Arc::new(v))
+            AdmissionVerdict::accept(0).with_value(Arc::new(v))
         }));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();

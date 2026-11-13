@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
-use zmux::proto::session::{self as core, PipeId, RoleConfig};
+use zmux::proto::session::{self as core, PipeId, Role};
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
     Policy, Session,
@@ -170,7 +170,7 @@ fn config() -> Arc<Config> {
     static C: std::sync::LazyLock<Arc<Config>> = std::sync::LazyLock::new(|| {
         let mut c = Config::default();
         c.max_idle_timeout = None;
-        c.keep_alive_period = None;
+        c.liveness.keep_alive_period = None;
         Arc::new(c)
     });
     C.clone()
@@ -180,10 +180,10 @@ fn mp_config() -> Arc<Config> {
     static C: std::sync::LazyLock<Arc<Config>> = std::sync::LazyLock::new(|| {
         let mut c = Config::default();
         c.max_idle_timeout = None;
-        c.keep_alive_period = None;
+        c.liveness.keep_alive_period = None;
         c.max_pipes = 8;
         c.pipe_auth = PipeAuth::psk(*b"footprint-psk---0123456789abcdef").with_end_to_end();
-        c.probation = Some(Duration::ZERO);
+        c.probation = None;
         // As the measurement the bound was set from (`scale` in
         // benches/session.rs).
         c.scheduler = Policy::Affinity;
@@ -199,8 +199,7 @@ fn core_rows() {
     let before = live();
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut s =
-            core::SessionCore::new(config.clone(), RoleConfig::Initiator, None, now).unwrap();
+        let mut s = core::SessionCore::new(config.clone(), Role::Client, None, now).unwrap();
         s.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
         v.push(s);
     }

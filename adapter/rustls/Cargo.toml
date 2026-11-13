@@ -18,6 +18,7 @@ tokio = { version = "1.54", default-features = false, features = ["net"] }
 zmux = { version = "1.2.6", path = "../.." }
 
 [dev-dependencies]
+zmux = { path = "../..", features = ["test-hooks"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.54", features = ["full"] }

@@ -55,8 +55,8 @@ async fn run(downlink_first: bool) {
     ss.write_all(&got).await.unwrap();
     ss.finish().unwrap();
     assert_eq!(r.read_to_end(1 << 10).await.unwrap(), b"over two carriers");
-    session.close(zmux::VarInt::ZERO, b"").await;
-    server.closed().await;
+    session.close().await;
+    server.closing().await;
     // Both halves' handlers end with the session.
     assert!(a.await.unwrap().is_ok());
     assert!(b.await.unwrap().is_ok());

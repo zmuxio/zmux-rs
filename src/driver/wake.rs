@@ -255,3 +255,10 @@ mod tests {
         assert!(Locked::lock(&mutex).wakes.is_empty());
     }
 }
+
+/// Shows no state: it may hold keys or locks.
+impl<T: Defer> std::fmt::Debug for Locked<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Locked").finish_non_exhaustive()
+    }
+}

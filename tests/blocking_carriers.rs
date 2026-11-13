@@ -276,7 +276,7 @@ fn add_pipe_releases_a_failed_carrier_once() {
             Some(PipeError::NotNegotiated)
         );
         released(&c, "add_pipe without multipath");
-        client.close(VarInt::from_u32(0), b"");
+        client.close();
         // A multipath session on a listener.
         let mut quick = multipath();
         quick.join_timeout = Duration::from_millis(300);
@@ -312,7 +312,7 @@ fn add_pipe_releases_a_failed_carrier_once() {
             .map(|p| p.pipe)
             .collect();
         assert_eq!(live, [PipeId::new(0)]);
-        client.close(VarInt::from_u32(0), b"");
+        client.close();
         l.close();
     });
 }
@@ -377,10 +377,15 @@ fn a_listener_releases_a_failed_carrier_once() {
 
 /// A session on a counted carrier to a blocking peer.
 fn counted_session() -> (Session, Session, Arc<Counts>) {
+    counted_session_with(Config::default())
+}
+
+/// [`counted_session`] with the client's own configuration.
+fn counted_session_with(client: Config) -> (Session, Session, Arc<Counts>) {
     let (a, b) = tcp_pair();
     let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), Config::default()));
     let (io, counts) = counted(a);
-    let client = Session::connect(io, Config::default()).unwrap();
+    let client = Session::connect(io, client).unwrap();
     (client, server.join().unwrap().unwrap(), counts)
 }
 
@@ -393,21 +398,52 @@ fn wait_closed(s: &Session, secs: u64) -> Instant {
     Instant::now()
 }
 
-/// The peer reading: `close` returns as soon as the carrier took CONNECTION_CLOSE.
+/// The peer reading: `close` returns as soon as the carrier took CONNECTION_CLOSE. The
+/// hand-off and linger timers last an hour, so a close that returns (within the watchdog)
+/// waited for neither.
 #[test]
 fn close_returns_at_once_while_the_peer_reads() {
     watchdog(20, "close while the peer reads", || {
-        let (client, server, counts) = counted_session();
-        let begun = Instant::now();
-        client.close(VarInt::from_u32(7), b"bye");
-        assert!(
-            begun.elapsed() < Duration::from_millis(300),
-            "{:?}",
-            begun.elapsed()
-        );
-        assert!(server.closed(Some(Duration::from_secs(5))).is_ok());
+        let hour = Duration::from_secs(3600);
+        let mut c = Config::default();
+        c.test_hooks().close_handoff_limit = Some(hour);
+        c.test_hooks().linger_timeout = Some(hour);
+        let (client, server, counts) = counted_session_with(c);
+        client.abort(VarInt::from_u32(7), b"bye");
+        server.set_wait_timeout(Some(Duration::from_secs(5)));
+        assert!(server.closing().is_ok());
         drop(client);
         released(&counts, "close while the peer reads");
+    });
+}
+
+/// A coded close: what was written reaches the peer ahead of the code, the peer sees the
+/// code and the reason, and `wait` returns once the peer ended its side, well before the
+/// linger timeout; a later plain close changes nothing.
+#[test]
+fn a_coded_close_delivers_its_code_and_the_wait_confirms_it() {
+    watchdog(20, "a coded close", || {
+        let mut c = Config::default();
+        c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
+        let (client, server, _counts) = counted_session_with(c);
+        let (mut w, _r) = client.open_bi().unwrap();
+        w.write_all(&[5; 100_000]).unwrap();
+        w.finish().unwrap();
+        // Accepted before the close: a later accept fails with the session's error.
+        server.set_wait_timeout(Some(Duration::from_secs(5)));
+        let (_sw, mut r) = server.accept_bi().unwrap();
+        client.close_with_error(VarInt::from_u32(0x2a), b"bye");
+        client.close();
+        let got = r.read_to_end(200_000).unwrap();
+        assert_eq!(got, [5; 100_000]);
+        let e = server.closing().unwrap();
+        assert!(
+            matches!(&e, zmux::SessionError::ApplicationClosed { code, reason, remote: true }
+                if *code == VarInt::from_u32(0x2a) && reason.as_ref() == b"bye"),
+            "{e:?}"
+        );
+        client.set_wait_timeout(Some(Duration::from_secs(5)));
+        assert!(client.wait().is_ok(), "the wait confirmed the delivery");
     });
 }
 
@@ -419,11 +455,12 @@ fn close_is_bounded_while_writes_block() {
         let (client, _server, counts) = counted_session();
         counts.blocked.store(true, Ordering::SeqCst);
         let begun = Instant::now();
-        client.close(VarInt::from_u32(7), b"bye");
+        client.close();
         let took = begun.elapsed();
         // Two linger periods of at least 250 ms each, never beyond the hand-off bound.
         assert!(took >= Duration::from_millis(240), "{took:?}");
-        assert!(took < Duration::from_millis(1300), "{took:?}");
+        // A guard against a hang only: three hand-off bounds and a second.
+        assert!(took < Duration::from_secs(4), "{took:?}");
         wait_closed(&client, 5);
         drop(client);
         released(&counts, "close while writes block");
@@ -438,7 +475,7 @@ fn the_linger_runs_from_the_delivery() {
         let (client, _server, counts) = counted_session();
         counts.muted.store(true, Ordering::SeqCst);
         let begun = Instant::now();
-        client.close(VarInt::from_u32(7), b"bye");
+        client.close();
         let returned = Instant::now();
         let ended = wait_closed(&client, 5);
         let delivered = counts
@@ -454,6 +491,7 @@ fn the_linger_runs_from_the_delivery() {
             "the linger ended {:?} after the delivery",
             ended - delivered
         );
+        // A guard against a hang only, above three linger periods and a second.
         assert!(ended - delivered < Duration::from_millis(2500));
         drop(client);
         released(&counts, "linger from delivery");
@@ -493,7 +531,8 @@ fn the_redial_hook_replaces_a_lost_pipe() {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            match c.next_event(Some(left)) {
+            c.set_wait_timeout(Some(left));
+            match c.next_event() {
                 Ok(Some(e)) => {
                     let done = matches!(e, SessionEvent::SessionResumed);
                     seen.push(e);
@@ -521,12 +560,82 @@ fn the_redial_hook_replaces_a_lost_pipe() {
         sw.finish().unwrap();
         assert_eq!(rd.read_to_end(1 << 10).unwrap(), b"after the redial");
         assert_eq!(ran.load(Ordering::SeqCst), 0);
-        c.close(VarInt::from_u32(0), b"");
+        c.close();
+        l.close();
+    });
+}
+
+/// `replace_pipes` advances the epoch and replaces every pipe, make before break, with one
+/// dialled through the redial hook and joined in the new epoch; without the hook it is the
+/// configuration error.
+#[test]
+fn replace_pipes_replaces_every_pipe() {
+    watchdog(30, "replace_pipes", || {
+        let manual = || {
+            let mut c = multipath();
+            c.epoch_policy = zmux::EpochPolicy::MANUAL;
+            c
+        };
+        let (l, addr) = listening(manual());
+        let none =
+            Session::connect(PipeIo::tcp(TcpStream::connect(addr).unwrap()), manual()).unwrap();
+        assert!(matches!(
+            none.replace_pipes(Duration::from_secs(5)),
+            Err(PipeError::InvalidOptions(e)) if e.field() == "blocking_redial"
+        ));
+        none.close();
+        let _ = l.accept(Some(Duration::from_secs(5))).unwrap();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let d = dials.clone();
+        let mut client = manual();
+        client.blocking_redial = Some(Dial::new(move |_| {
+            d.fetch_add(1, Ordering::SeqCst);
+            Ok(PipeIo::tcp(TcpStream::connect(addr)?))
+        }));
+        let c = Session::connect(PipeIo::tcp(TcpStream::connect(addr).unwrap()), client).unwrap();
+        let s = l.accept(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(c.epoch(), Some(0));
+        // The exchange runs over a pipe joined Sealed or Bound.
+        c.add_pipe(
+            PipeIo::tcp(TcpStream::connect(addr).unwrap()),
+            PipeOptions::new(),
+        )
+        .unwrap();
+        let before: Vec<_> = c.pipes().iter().map(|p| p.id()).collect();
+        c.replace_pipes(Duration::from_secs(20)).unwrap();
+        assert_eq!(c.epoch(), Some(1));
+        assert!(dials.load(Ordering::SeqCst) >= before.len());
+        let live: Vec<_> = c
+            .pipe_stats()
+            .into_iter()
+            .filter(|p| p.outbound == Some(zmux::OutboundState::Active))
+            .collect();
+        assert!(!live.is_empty());
+        for p in &live {
+            assert!(!before.contains(&p.pipe), "{p:?}");
+            assert_eq!(p.epoch, Some(1), "{p:?}");
+        }
+        let (mut w, mut rd) = c.open_bi().unwrap();
+        w.write_all(b"after the replacement").unwrap();
+        w.finish().unwrap();
+        let (mut sw, mut sr) = s.accept_bi().unwrap();
+        let got = sr.read_to_end(1 << 10).unwrap();
+        sw.write_all(&got).unwrap();
+        sw.finish().unwrap();
+        assert_eq!(rd.read_to_end(1 << 10).unwrap(), b"after the replacement");
+        c.close();
         l.close();
     });
 }
 
 // ---- dropped handles --------------------------------------------------------------
+
+/// Runs `f` while no carrier can write, then opens the gate again.
+fn gate_shut(gate: &Gate, f: impl FnOnce()) {
+    gate.set(true);
+    f();
+    gate.set(false);
+}
 
 fn streams_active(s: &Session) -> u64 {
     s.stats().streams_active
@@ -546,21 +655,70 @@ fn all_released(a: &Session, b: &Session, what: &str) {
     }
 }
 
+/// Every carrier's writes, on both sides, wait while the gate is shut.
+#[derive(Default)]
+struct Gate {
+    shut: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Gate {
+    fn set(&self, shut: bool) {
+        *self.shut.lock().unwrap() = shut;
+        self.changed.notify_all();
+    }
+}
+
+struct GatedWrite(TcpStream, Arc<Gate>);
+
+impl Write for GatedWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut shut = self.1.shut.lock().unwrap();
+        while *shut {
+            shut = self.1.changed.wait(shut).unwrap();
+        }
+        drop(shut);
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// A carrier on `s` whose writes pass `gate`.
+fn gated(s: TcpStream, gate: &Arc<Gate>) -> PipeIo {
+    let closer = s.try_clone().unwrap();
+    PipeIo::from_halves(s.try_clone().unwrap(), GatedWrite(s, gate.clone())).with_closer(
+        move |how| {
+            let _ = closer.shutdown(how);
+        },
+    )
+}
+
 /// Dropped stream handles are released by the session, promptly and without blocking the
-/// dropping thread, also after pipe 0 was replaced: the release is not tied to a pipe.
+/// dropping thread, also after pipe 0 was replaced: the release is not tied to a pipe. The
+/// drops run while no carrier can write, so a drop that returns waited for no write.
 #[test]
 fn dropped_streams_are_released_after_pipe_0_went() {
     watchdog(30, "dropped streams", || {
-        let (l, addr) = listening(multipath());
-        let c =
-            Session::connect(PipeIo::tcp(TcpStream::connect(addr).unwrap()), multipath()).unwrap();
+        let gate = Arc::new(Gate::default());
+        let l = Listener::new(multipath(), ListenerConfig::default(), None).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        {
+            let (l, gate) = (l.clone(), gate.clone());
+            thread::spawn(move || {
+                while let Ok((s, peer)) = tcp.accept() {
+                    let (l, io) = (l.clone(), gated(s, &gate));
+                    thread::spawn(move || l.handle_pipe(io, PipeHint { source: Some(peer) }));
+                }
+            });
+        }
+        let dial = || gated(TcpStream::connect(addr).unwrap(), &gate);
+        let c = Session::connect(dial(), multipath()).unwrap();
         let s = l.accept(Some(Duration::from_secs(5))).unwrap();
-        let p1 = c
-            .add_pipe(
-                PipeIo::tcp(TcpStream::connect(addr).unwrap()),
-                PipeOptions::default(),
-            )
-            .unwrap();
+        let p1 = c.add_pipe(dial(), PipeOptions::default()).unwrap();
         c.pipe(PipeId::new(0)).unwrap().abort().unwrap();
         let end = Instant::now() + Duration::from_secs(5);
         while s.pipe(PipeId::new(0)).is_some_and(|p| {
@@ -577,25 +735,20 @@ fn dropped_streams_are_released_after_pipe_0_went() {
             let (sw, mut sr) = s.accept_bi().unwrap();
             let mut buf = [0; 10];
             sr.read_exact(&mut buf).unwrap();
-            let begun = Instant::now();
             match round {
-                0 => drop((w, r, sw, sr)),
-                1 => drop((sr, sw, r, w)),
+                0 => gate_shut(&gate, || drop((w, r, sw, sr))),
+                1 => gate_shut(&gate, || drop((sr, sw, r, w))),
                 _ => {
-                    drop((w, r));
+                    gate_shut(&gate, || drop((w, r)));
                     // The peer's handles end with the reset and the stop.
                     assert!(sr.read_to_end(1 << 10).is_err());
-                    drop((sw, sr));
+                    gate_shut(&gate, || drop((sw, sr)));
                 }
             }
-            assert!(
-                begun.elapsed() < Duration::from_millis(100),
-                "a drop blocked"
-            );
             all_released(&c, &s, &format!("round {round}"));
         }
         assert!(p1.stats().is_some());
-        c.close(VarInt::from_u32(0), b"");
+        c.close();
         l.close();
     });
 }

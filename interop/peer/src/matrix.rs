@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use zmux::proto::seal::Mode;
+use zmux::RecordMode;
 use zmux::{Listener, ListenerConfig, PipeOptions, Session, SessionError, VarInt};
 
 use super::{NoVerify, SEAL_NODE, provider, seal_keys, tls_server_config, x25519_dalek_public};
@@ -50,9 +50,7 @@ fn session_config(sc: &str) -> zmux::Config {
     let mut c = super::seal_config();
     if sc == "join" || sc == "epoch" {
         c.max_pipes = 4;
-        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-            |_, _, _| true,
-        )));
+        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
     }
     c
 }
@@ -316,17 +314,25 @@ async fn run_server(args: &[String]) -> Res {
                 None => return Err("FIN before 64 KiB".into()),
             }
         }
-        s.close(VarInt::from_u32(CLOSE_CODE), CLOSE_REASON).await;
+        // Completes once CONNECTION_CLOSE has been handed to the carrier, so
+        // the process may exit. An abort returns at once, and a close after
+        // it too: the exit would then race the background write.
+        s.close_with_error(VarInt::from_u32(CLOSE_CODE), CLOSE_REASON)
+            .await;
         println!("CLOSING");
         return Ok(());
     }
     server_exchange(&s).await?;
     if sc == "close-idle" {
-        s.close(VarInt::from_u32(CLOSE_CODE), CLOSE_REASON).await;
+        // Completes once CONNECTION_CLOSE has been handed to the carrier, so
+        // the process may exit. An abort returns at once, and a close after
+        // it too: the exit would then race the background write.
+        s.close_with_error(VarInt::from_u32(CLOSE_CODE), CLOSE_REASON)
+            .await;
         println!("CLOSING");
         return Ok(());
     }
-    let end = s.closed().await;
+    let end = s.closing().await;
     if sc == "epoch" {
         println!("EPOCH {}", epoch_of(&s, *committed.lock().unwrap()));
     }
@@ -361,10 +367,10 @@ async fn run_client(args: &[String]) -> Res {
         cfg.psk = k.psk;
     }
     if sc == "join" || sc == "epoch" {
-        cfg.mode = Some(Mode::Sealed);
+        cfg.record_mode = RecordMode::Sealed;
     }
     if sc == "appdata" {
-        cfg.static_secret = Some(CLIENT_KEY);
+        cfg.static_secret = zmux_seal::StaticSecret::Given(CLIENT_KEY);
         cfg.app_data = Some(app_data(3, b"cli-msg3"));
     }
     let tcp = TcpStream::connect(&addr)
@@ -406,7 +412,7 @@ async fn run_client(args: &[String]) -> Res {
             let pipe = s
                 .begin_add_pipe(
                     zmux_rustls::over_tcp(stream),
-                    PipeOptions::default().with_mode(Mode::Bound),
+                    PipeOptions::default().with_record_mode(RecordMode::Bound),
                 )
                 .map_err(|e| format!("add pipe: {e}"))?;
             pipe.attached().await.map_err(|e| format!("attach: {e}"))?;
@@ -422,7 +428,7 @@ async fn run_client(args: &[String]) -> Res {
             let pipe = s
                 .begin_add_pipe(
                     zmux::PipeIo::tcp(tcp),
-                    PipeOptions::default().with_mode(Mode::Sealed),
+                    PipeOptions::default().with_record_mode(RecordMode::Sealed),
                 )
                 .map_err(|e| format!("add pipe: {e}"))?;
             pipe.attached().await.map_err(|e| format!("attach: {e}"))?;
@@ -436,11 +442,11 @@ async fn run_client(args: &[String]) -> Res {
         let (mut send, _recv) = s.open_bi().await.map_err(|e| format!("open: {e}"))?;
         let chunk = pattern(64 << 10);
         while send.write_all(&chunk).await.is_ok() {}
-        return report_close(s.closed().await);
+        return report_close(s.closing().await);
     }
     client_exchange(&s).await?;
     if sc == "close-idle" {
-        return report_close(s.closed().await);
+        return report_close(s.closing().await);
     }
     graceful_end(&s).await
 }

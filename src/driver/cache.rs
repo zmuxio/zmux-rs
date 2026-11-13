@@ -10,11 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::proto::session::CarrierKind;
 
 /// Which carrier kinds worked, per server and local network
-/// ([`ModePolicy::key`](crate::ModePolicy::key)): a usable kind is
+/// ([`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key)): a usable kind is
 /// remembered for its success TTL (6 h), a failed one is skipped for a
 /// backoff that doubles with every failure in a row, from 1 min to 6 h. A
 /// kind that fails soon after it was chosen
-/// ([`ModePolicy::drop_window`](crate::ModePolicy::drop_window)) counts as
+/// ([`CarrierChoicePolicy::drop_window`](crate::CarrierChoicePolicy::drop_window)) counts as
 /// failed, so that a path that lets a kind through only briefly is not
 /// tried again at once. Cheap to clone: clones share the cache, which is
 /// safe for concurrent use, [`snapshot`](Self::snapshot) and
@@ -129,7 +129,7 @@ impl CarrierCache {
     /// Records an outcome. A usable kind keeps the URL remembered for it;
     /// a failed one starts at its base URL again.
     /// Records an outcome the host learnt after a dial: `key` the
-    /// [`ModePolicy::key`](crate::ModePolicy::key) in use, `variant` the
+    /// [`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key) in use, `variant` the
     /// candidate's ([`Candidate::with_variant`](crate::Candidate::with_variant)).
     /// The same table as the automatic results and under the same rules.
     pub fn report(
@@ -428,7 +428,7 @@ pub struct CacheSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CacheSnapshotEntry {
-    /// The server and local network ([`ModePolicy::key`](crate::ModePolicy::key)).
+    /// The server and local network ([`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key)).
     pub key: String,
     /// The carrier kind.
     pub kind: CarrierKind,
@@ -1094,11 +1094,19 @@ mod tests {
         bad.backoff = Duration::from_secs(60);
         s.entries = vec![good, bad];
         let c = CarrierCache::default();
+        // Judged on the monotonic clock the cache keeps: a snapshot's wall
+        // times come from a second pair of clock reads, whose skew is no
+        // bound of `restore`.
+        let ahead = Duration::from_secs(6 * 3600);
+        let before = Instant::now();
         c.restore(&s);
-        let limit = WallTime::now().saturating_add(Duration::from_secs(6 * 3600));
-        for e in c.snapshot().entries {
+        let after = Instant::now();
+        for (k, e) in c.entries().iter() {
             for t in [e.good_until, e.fail_until].into_iter().flatten() {
-                assert!(t <= limit, "{e:?} beyond its bound");
+                assert!(
+                    t >= before + ahead && t <= after + ahead,
+                    "{k:?} not at its bound"
+                );
             }
         }
         assert!(c.is_usable("g", CarrierKind::Split, None));

@@ -7,20 +7,19 @@ use std::time::{Duration, Instant};
 
 use crate::proto::session::PipeError;
 
-use crate::proto::frame::JoinDirection;
 use crate::proto::keys;
 use crate::proto::params::{Locator, Role, TransportParameters};
 use crate::proto::record::Framing;
-use crate::proto::seal::{Group, Mode, SessionCrypto, Suite, session_crypto};
+use crate::proto::seal::{Group, RecordMode, SessionCrypto, Suite, session_crypto};
 use crate::proto::session::epoch::Epochs;
-use crate::proto::session::join::{JoinKeys, LocalJoin, RecordMode};
+use crate::proto::session::join::{JoinKeys, LocalJoin};
 use crate::proto::session::pipes::{
     Attachment, DirectionState, InPipe, InState, InboundState, OutPipe, OutState, OutboundState,
     PipeHalf, PrioritySource,
 };
 use crate::proto::session::{
-    CloseFrame, CoreEvent, LaneId, Period, PipeEnd, PipeFailure, PipeId, SessionCore, SessionError,
-    State, StreamKey,
+    Cap, CloseFrame, CoreEvent, Inherit, InvalidConfig, LaneId, Liveness, Period, PipeEnd,
+    PipeFailure, PipeId, SessionCore, SessionError, State, StreamKey,
 };
 use crate::proto::{Error, TransportErrorCode as T, VarInt};
 
@@ -116,134 +115,177 @@ pub enum Multipath {
     JoinSecurityUnavailable,
 }
 
-/// A pipe's own liveness settings, the [`PipeOptions`] fields of the same
-/// names ([`SessionCore::set_pipe_liveness`]): `None` follows the session's.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct PipeLiveness {
-    /// [`PipeOptions::suspect_floor`]: at least 50 ms.
-    pub suspect_floor: Option<Duration>,
-    /// [`PipeOptions::dead_timeout`]: at least 1 s.
-    pub dead_timeout: Option<Duration>,
-    /// [`PipeOptions::probe_interval`].
-    pub probe_interval: Option<Period>,
-    /// [`PipeOptions::probe_jitter`]: from 0 to below 1.
-    pub probe_jitter: Option<f64>,
+/// The halves of a pipe from the local endpoint's view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PipeDirection {
+    /// The local endpoint reads (for example an HTTP GET response body).
+    In,
+    /// The local endpoint writes (for example an HTTP POST request body).
+    Out,
+    /// Both (a bidirectional carrier), the default.
+    #[default]
+    Bidi,
 }
 
-/// Per-pipe options: fields for each direction, and
-/// chained setters, of which [`PipeOptions::with_priority`] and
-/// [`PipeOptions::with_standby`] set both directions at once.
+/// A pipe's own liveness settings: the four of [`Liveness`] that apply to
+/// one pipe, each following the session's while it is
+/// [`Inherit::Session`] (the default). Held by [`PipeOptions::liveness`],
+/// by a pool's options, and replaced by [`PipeUpdate::liveness`](crate::PipeUpdate::liveness).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PipeLiveness {
+    /// The floor of T_suspect (at least 50 ms).
+    pub suspect_floor: Inherit<Duration>,
+    /// How long the pipe may stay suspect before it fails (at least 1 s).
+    pub dead_timeout: Inherit<Duration>,
+    /// The idle-probe interval of the outbound pipe (`Set(None)`: no idle
+    /// probes; a period is at least 1 s). An attachment without an outbound
+    /// direction at the peer uses at most 15 s.
+    pub probe_interval: Inherit<Option<Duration>>,
+    /// The idle-probe jitter of the outbound pipe (at least 0, below 1).
+    pub probe_jitter: Inherit<f64>,
+}
+
+impl PipeLiveness {
+    /// Whether the settings are valid: each own value in the range of the
+    /// session's field of the same name.
+    pub fn validate(&self) -> Result<(), InvalidConfig> {
+        let e = InvalidConfig::new;
+        if matches!(self.suspect_floor, Inherit::Set(f) if f < Duration::from_millis(50)) {
+            return Err(e("liveness.suspect_floor", "below 50 ms"));
+        }
+        if matches!(self.dead_timeout, Inherit::Set(d) if d < Duration::from_secs(1)) {
+            return Err(e("liveness.dead_timeout", "below 1 s"));
+        }
+        if matches!(self.probe_interval, Inherit::Set(Some(d)) if d < Duration::from_secs(1)) {
+            return Err(e("liveness.probe_interval", "below 1 s"));
+        }
+        if matches!(self.probe_jitter, Inherit::Set(j) if !(0.0..1.0).contains(&j)) {
+            return Err(e("liveness.probe_jitter", "outside [0, 1)"));
+        }
+        Ok(())
+    }
+
+    /// The probe interval override in the form the pipes keep.
+    pub(crate) fn period(&self) -> Option<Period> {
+        self.probe_interval.own().map(Period::of)
+    }
+}
+
+/// The options of a pipe, fixed when it is added (`direction`,
+/// `record_mode`, `key_group`, `label`, `fate_group`, `return_on_reply`)
+/// or its runtime settings at the start, which [`PipeUpdate`](crate::PipeUpdate) changes
+/// later.
 ///
 /// ```
 /// use zmux::PipeOptions;
 ///
 /// // A relay pipe as the fallback: used only while the preferred pipes are
 /// // saturated or have failed, and the peer is asked to do the same.
-/// let relay = PipeOptions::new().with_priority(10).with_label("relay");
+/// let relay = PipeOptions::new()
+///     .with_send_priority(10)
+///     .with_receive_priority(10)
+///     .with_label("relay");
 /// assert_eq!((relay.send_priority, relay.receive_priority), (Some(10), 10));
 /// assert_eq!(relay.weight, 1);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PipeOptions {
-    /// Fate group; 0 means independent.
-    pub fate_group: u64,
+    /// The halves of the attachment; both by default.
+    pub direction: PipeDirection,
+    /// The carrier's record mode; [`Inherit::Session`] (the default) asks
+    /// [`Config::record_policy`](crate::Config::record_policy), and Sealed
+    /// without one.
+    pub record_mode: Inherit<RecordMode>,
+    /// The key-exchange group of the join's key share, 1 or 2;
+    /// [`Inherit::Session`] (the default) is the session's preference,
+    /// Group 1 when usable. A Group the session cannot use fails the join.
+    pub key_group: Inherit<u64>,
     /// The tier of the local outbound direction, lower preferred; `None`
-    /// follows the peer's request, else
-    /// 0.
+    /// sets none of its own: the peer's latest request, else 0.
     pub send_priority: Option<u64>,
-    /// The tier requested for the peer's outbound direction, sent as
-    /// PIPE_STATUS with the join when not 0.
+    /// The tier requested for the peer's outbound direction (default 0),
+    /// sent in the Hello.
     pub receive_priority: u64,
     /// The local outbound direction takes data only on failover; `None`
-    /// follows the peer's request, else available.
+    /// sets none of its own: the peer's latest request, else available.
     pub send_standby: Option<bool>,
-    /// Asks the peer to use its outbound direction only on failover, with
-    /// PIPE_STATUS sent with the join.
+    /// Asks the peer to use its outbound direction only on failover
+    /// (default false), sent in the Hello.
     pub receive_standby: bool,
     /// The outbound direction's share for `spread-round-robin` and factor
-    /// for `spread-rate-weighted`.
+    /// for `spread-rate-weighted` (default 1; 0 excludes the pipe).
     pub weight: u64,
-    /// The base of the pipe's probation; `None` for the session default,
-    /// zero disables probation.
-    pub probation: Option<Duration>,
-    /// The floor of T_suspect for this pipe (at least 50 ms); the session
-    /// default when `None`.
-    pub suspect_floor: Option<Duration>,
-    /// Replaces the stall limit of the last usable pipe (at least 1 s).
-    pub dead_timeout: Option<Duration>,
-    /// The idle-probe interval of the outbound pipe ([`Period::Off`]: no idle probes, else
-    /// at least 1 s); the session's `probe_interval` when `None`. An attachment without an
-    /// outbound direction at the peer uses at most 15 s.
-    pub probe_interval: Option<Period>,
-    /// The idle-probe jitter of the outbound pipe (at least 0, below 1);
-    /// the session's `probe_jitter` when `None`.
-    pub probe_jitter: Option<f64>,
+    /// The base of the pipe's probation: the session's `probation` by
+    /// default; `Set(None)` turns it off for this pipe; a fixed base is
+    /// above zero.
+    pub probation: Inherit<Option<Cap<Duration>>>,
     /// The application's name for the pipe, reported by its statistics
     /// (local, never sent).
     pub label: Option<Arc<str>>,
-    /// The attachment's direction; bidi by default.
-    pub direction: JoinDirection,
-    /// The carrier's record mode; `None` asks
-    /// [`Config::record_policy`](crate::proto::session::Config::record_policy), and Sealed
-    /// without one.
-    pub mode: Option<Mode>,
-    /// `add_pipe` returns once the Reply has been verified instead of once the peer
-    /// attached the pipe; fixed when the pipe is added. The caller then keeps the
-    /// session's other pipes until [`Pipe::attached`](crate::Pipe#method.attached)
-    /// resolves.
-    pub no_wait_attached: bool,
-    /// The Group of the join's key share; `None` is the local preference, Group 1 when
-    /// usable. A Group the session cannot use fails the join.
-    pub group: Option<u64>,
+    /// The fate group: pipes expected to fail together share one; 0 (the
+    /// default) is independent.
+    pub fate_group: u64,
+    /// The pipe's own liveness settings; by default it follows the
+    /// session's.
+    pub liveness: PipeLiveness,
+    /// `add_pipe` returns once the Reply has been verified instead of once
+    /// the peer attached the pipe (default false). The caller then keeps
+    /// the session's other pipes until
+    /// [`Pipe::attached`](crate::Pipe#method.attached) resolves.
+    pub return_on_reply: bool,
 }
 
 impl PipeOptions {
-    /// The defaults: tier 0 both ways, available, weight 1.
+    /// The defaults: bidirectional, tier 0 both ways, available, weight 1,
+    /// everything else following the session.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The tier of both directions: this endpoint's outbound direction,
-    /// and the one requested of the peer for its outbound direction.
+    /// The halves of the attachment.
     #[must_use]
-    pub fn with_priority(mut self, priority: u64) -> Self {
-        self.send_priority = Some(priority);
-        self.receive_priority = priority;
+    pub fn with_direction(mut self, direction: PipeDirection) -> Self {
+        self.direction = direction;
         self
     }
 
-    /// Standby (data only on failover) for both directions, as
-    /// [`PipeOptions::with_priority`].
+    /// The carrier's record mode.
     #[must_use]
-    pub fn with_standby(mut self, standby: bool) -> Self {
-        self.send_standby = Some(standby);
-        self.receive_standby = standby;
+    pub fn with_record_mode(mut self, mode: RecordMode) -> Self {
+        self.record_mode = Inherit::Set(mode);
         self
     }
 
-    /// The tier of this endpoint's outbound direction only.
+    /// The key-exchange group of the join.
+    #[must_use]
+    pub fn with_key_group(mut self, group: u64) -> Self {
+        self.key_group = Inherit::Set(group);
+        self
+    }
+
+    /// The tier of this endpoint's outbound direction.
     #[must_use]
     pub fn with_send_priority(mut self, priority: u64) -> Self {
         self.send_priority = Some(priority);
         self
     }
 
-    /// The tier requested of the peer for its outbound direction only.
+    /// The tier requested of the peer for its outbound direction.
     #[must_use]
     pub fn with_receive_priority(mut self, priority: u64) -> Self {
         self.receive_priority = priority;
         self
     }
 
-    /// Standby for this endpoint's outbound direction only.
+    /// Standby for this endpoint's outbound direction.
     #[must_use]
     pub fn with_send_standby(mut self, standby: bool) -> Self {
         self.send_standby = Some(standby);
         self
     }
 
-    /// Standby requested of the peer for its outbound direction only.
+    /// Standby requested of the peer for its outbound direction.
     #[must_use]
     pub fn with_receive_standby(mut self, standby: bool) -> Self {
         self.receive_standby = standby;
@@ -257,10 +299,17 @@ impl PipeOptions {
         self
     }
 
-    /// The probation base (zero disables probation).
+    /// The pipe's own probation base; `None` turns probation off for it.
     #[must_use]
-    pub fn with_probation(mut self, probation: Duration) -> Self {
-        self.probation = Some(probation);
+    pub fn with_probation(mut self, probation: Option<Cap<Duration>>) -> Self {
+        self.probation = Inherit::Set(probation);
+        self
+    }
+
+    /// The application's name for the pipe.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.label = Some(label.into());
         self
     }
 
@@ -272,109 +321,59 @@ impl PipeOptions {
         self
     }
 
-    /// The floor of T_suspect (at least 50 ms).
+    /// The pipe's own liveness settings.
     #[must_use]
-    pub fn with_suspect_floor(mut self, floor: Duration) -> Self {
-        self.suspect_floor = Some(floor);
-        self
-    }
-
-    /// The dead timeout (at least 1 s).
-    #[must_use]
-    pub fn with_dead_timeout(mut self, timeout: Duration) -> Self {
-        self.dead_timeout = Some(timeout);
-        self
-    }
-
-    /// The idle-probe interval (at least 1 s), or [`Period::Off`].
-    #[must_use]
-    pub fn with_probe_interval(mut self, interval: impl Into<Period>) -> Self {
-        self.probe_interval = Some(interval.into());
-        self
-    }
-
-    /// The idle-probe jitter (at least 0, below 1).
-    #[must_use]
-    pub fn with_probe_jitter(mut self, jitter: f64) -> Self {
-        self.probe_jitter = Some(jitter);
-        self
-    }
-
-    /// Whether the options are valid: a T_suspect floor of at least 50 ms,
-    /// a dead timeout of at least 1 s, an idle-probe interval off or of at
-    /// least 1 s and a
-    /// jitter in \[0, 1) ([`PipeError::InvalidOptions`] otherwise, which
-    /// adding a pipe with them also returns).
-    pub fn validate(&self) -> Result<(), PipeError> {
-        let secs = |d: Option<Duration>| d.is_some_and(|d| d < Duration::from_secs(1));
-        if !self.probe_interval.is_none_or(Period::off_or_seconds)
-            || secs(self.dead_timeout)
-            || self
-                .suspect_floor
-                .is_some_and(|f| f < Duration::from_millis(50))
-            || self.probe_jitter.is_some_and(|j| !(0.0..1.0).contains(&j))
-        {
-            return Err(PipeError::InvalidOptions);
-        }
-        Ok(())
-    }
-
-    /// The attachment's direction.
-    #[must_use]
-    pub fn with_direction(mut self, direction: JoinDirection) -> Self {
-        self.direction = direction;
-        self
-    }
-
-    /// The carrier's record mode.
-    #[must_use]
-    pub fn with_mode(mut self, mode: Mode) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-
-    /// With the Group of the join's key share.
-    #[must_use]
-    pub fn with_group(mut self, group: u64) -> Self {
-        self.group = Some(group);
+    pub fn with_liveness(mut self, liveness: PipeLiveness) -> Self {
+        self.liveness = liveness;
         self
     }
 
     /// Whether `add_pipe` returns at the verified Reply rather than once
-    /// the peer attached the pipe ([`PipeOptions::no_wait_attached`]).
+    /// the peer attached the pipe.
     #[must_use]
-    pub fn with_no_wait_attached(mut self, no_wait: bool) -> Self {
-        self.no_wait_attached = no_wait;
+    pub fn with_return_on_reply(mut self, on: bool) -> Self {
+        self.return_on_reply = on;
         self
     }
 
-    /// The application's name for the pipe.
-    #[must_use]
-    pub fn with_label(mut self, label: impl Into<Arc<str>>) -> Self {
-        self.label = Some(label.into());
-        self
+    /// Whether the options are valid: the liveness settings in their
+    /// ranges, a fixed probation base above zero and a record mode a pipe can be joined in
+    /// ([`PipeError::InvalidOptions`] otherwise, which adding a pipe with
+    /// them also returns).
+    pub fn validate(&self) -> Result<(), PipeError> {
+        self.liveness
+            .validate()
+            .map_err(PipeError::InvalidOptions)?;
+        let e = |f, r| Err(PipeError::InvalidOptions(InvalidConfig::new(f, r)));
+        if matches!(self.probation, Inherit::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
+            return e("probation", "a base of zero: turn probation off with None");
+        }
+        if self.record_mode == Inherit::Set(RecordMode::Unmanaged) {
+            return e(
+                "record_mode",
+                "Unmanaged is reported only; no pipe is joined in it",
+            );
+        }
+        Ok(())
     }
 }
 
 impl Default for PipeOptions {
     fn default() -> Self {
         Self {
-            fate_group: 0,
+            direction: PipeDirection::Bidi,
+            record_mode: Inherit::Session,
+            key_group: Inherit::Session,
             send_priority: None,
             receive_priority: 0,
             send_standby: None,
             receive_standby: false,
             weight: 1,
-            probation: None,
-            suspect_floor: None,
-            dead_timeout: None,
-            probe_interval: None,
-            probe_jitter: None,
+            probation: Inherit::Session,
             label: None,
-            direction: JoinDirection::Bidi,
-            mode: None,
-            no_wait_attached: false,
-            group: None,
+            fate_group: 0,
+            liveness: PipeLiveness::default(),
+            return_on_reply: false,
         }
     }
 }
@@ -404,8 +403,7 @@ pub struct PipeStats {
     /// The session epoch the attachment joined in (0 for pipe 0).
     pub epoch: Option<u64>,
     /// When the epoch policy wants the carrier replaced by a new join, make before break:
-    /// twice the epoch period after it joined, or, for a carrier of an epoch before a
-    /// forced advance, once the new epoch is in use and at the latest by its deadline.
+    /// twice the epoch period after it joined.
     /// A `PipePool` and the redial hooks replace it then.
     pub replace_by: Option<Instant>,
     /// How often the outbound pipe became suspect.
@@ -618,6 +616,9 @@ pub(crate) struct Mp {
     /// Why the last pipe that failed did (SessionError::PipesLost and
     /// ResumeTimeout report it).
     pub(in crate::proto::session) last_failure: Option<PipeFailure>,
+    /// How often an outbound pipe became suspect, a DRAINING one included
+    /// (whose public state stays DRAINING): for tests.
+    pub(in crate::proto::session) suspects: u64,
     /// The pipe states a pass of the multipath timers started with
     /// ([`SessionCore::mp_timeout`]), kept for its next pass.
     pass_states: Vec<PipeStates>,
@@ -972,7 +973,7 @@ impl SessionCore {
             }
             keys::SecretFlags::Selected(source) => source,
         };
-        let initiator = self.role == Role::Initiator;
+        let initiator = self.role == Role::Client;
         let (i_nonce, r_nonce) = if initiator {
             (l.session_nonce, p.session_nonce)
         } else {
@@ -1051,6 +1052,7 @@ impl SessionCore {
         let mp = Mp {
             pass_states: Vec::new(),
             last_failure: None,
+            suspects: 0,
             keys,
             epochs: Epochs::new(
                 self.local_locator(),
@@ -1118,8 +1120,9 @@ impl SessionCore {
     /// in place of the configured one: a listener gives each of its
     /// sessions its own. Only before the parameters were sent; `Err`
     /// for a locator above 255 bytes.
-    pub fn set_locator(&mut self, locator: &[u8]) -> Result<(), &'static str> {
-        let l = Locator::new(locator).ok_or("locator above 255 bytes")?;
+    pub fn set_locator(&mut self, locator: &[u8]) -> Result<(), crate::InvalidConfig> {
+        let l =
+            Locator::new(locator).ok_or(crate::InvalidConfig::new("locator", "above 255 bytes"))?;
         if let Some(mp) = self.local.multipath.as_mut()
             && self.state == State::Establishing
         {
@@ -1214,10 +1217,11 @@ impl SessionCore {
     /// H)), never below max_pipes + H.
     fn replay_width(&self) -> u64 {
         let held = self.cap() as u64;
-        self.config
-            .replay_window
-            .unwrap_or_else(|| 64.max(held.saturating_mul(2)))
-            .max(held)
+        match self.config.replay_window {
+            crate::proto::session::Cap::Fixed(w) => w,
+            crate::proto::session::Cap::Auto => 64.max(held.saturating_mul(2)),
+        }
+        .max(held)
     }
 
     /// Whether an ID names a retired attachment: our own parity, taken and
@@ -1279,9 +1283,12 @@ impl SessionCore {
     /// Outside suspension there is room only below the cap. While
     /// SUSPENDED, a join that provides a direction the endpoint lacks
     /// displaces one attachment of the same joiner: the oldest failed one
-    /// whose own PIPE_ABANDON is unacknowledged, else the live one with
-    /// the oldest last progress, failed without PIPE_ABANDON; either is
-    /// retired locally at once.
+    /// whose own PIPE_ABANDON was acknowledged, else the oldest failed one
+    /// whose own PIPE_ABANDON was not (dropping it), else the live one with
+    /// the oldest last progress, failed without PIPE_ABANDON; each is
+    /// retired locally at once. Its PIPE_ABANDON goes with its state: one
+    /// still queued is never written, and one in flight is not sent again
+    /// when lost (its loss finds no attachment).
     pub(in crate::proto::session) fn room_predicted(
         &self,
         local: bool,
@@ -1298,10 +1305,7 @@ impl SessionCore {
         }
         self.state == State::Suspended
             && (inbound && !self.atts.any_in_live() || outbound && !self.atts.any_out_live())
-            && self
-                .atts
-                .iter()
-                .any(|a| a.joiner_local() == local && !a.unattached() && !a.deferred())
+            && self.displaceable(local)
     }
 
     /// Makes room at the check that holds (Confirmed, or a local join).
@@ -1330,25 +1334,15 @@ impl SessionCore {
         if !(inbound && lacks_in || outbound && lacks_out) {
             return false;
         }
-        let failed = self
+        let pick = self
             .atts
             .iter()
             .enumerate()
-            .filter(|(_, a)| {
-                a.joiner_local() == local && !a.unattached() && a.failed() && !a.abandon_acked()
+            .filter(|(_, a)| a.joiner_local() == local && !a.unattached() && !a.deferred())
+            .min_by_key(|(_, a)| {
+                displacement_rank(a.failed(), a.abandon_acked(), a.seq(), a.last_progress())
             })
-            .min_by_key(|(_, a)| a.seq())
             .map(|(i, _)| i);
-        let pick = failed.or_else(|| {
-            self.atts
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| {
-                    a.joiner_local() == local && !a.unattached() && !a.failed() && !a.deferred()
-                })
-                .min_by_key(|(_, a)| a.last_progress())
-                .map(|(i, _)| i)
-        });
         let Some(i) = pick else {
             return false;
         };
@@ -1397,7 +1391,7 @@ impl SessionCore {
         inbound: Option<Framing>,
         outbound: Option<Framing>,
         opts: &PipeOptions,
-        mode: Mode,
+        mode: RecordMode,
         binding: Option<&[u8]>,
         now: Instant,
     ) -> Result<PipeId, PipeError> {
@@ -1422,7 +1416,7 @@ impl SessionCore {
         if inbound.is_none() && outbound.is_none() {
             return Err(PipeError::UnknownPipe);
         }
-        if (mode == Mode::Bound) != binding.is_some() {
+        if (mode == RecordMode::Bound) != binding.is_some() {
             return Err(PipeError::InvalidArgument);
         }
         let id = {
@@ -1455,7 +1449,7 @@ impl SessionCore {
         mp.deferred.push(Deferred { id });
         let binding = binding.map(<[u8]>::to_vec).unwrap_or_default();
         mp.local_joins
-            .push(LocalJoin::new(id, mode, binding, opts.group));
+            .push(LocalJoin::new(id, mode, binding, opts.key_group.own()));
         for half in [PipeHalf::Inbound, PipeHalf::Outbound] {
             self.pipe_event(id, half);
         }
@@ -1475,7 +1469,15 @@ impl SessionCore {
         !mp.keys.pending()
             && mp.deferred.is_empty()
             && mp.join_backoff.is_none_or(|t| now >= t)
-            && (self.unretired(true) < self.cap() || self.state == State::Suspended)
+            && (self.unretired(true) < self.cap()
+                || self.state == State::Suspended && self.displaceable(true))
+    }
+
+    /// Whether an attachment of the given joiner could be displaced to make room.
+    fn displaceable(&self, local: bool) -> bool {
+        self.atts
+            .iter()
+            .any(|a| a.joiner_local() == local && !a.unattached() && !a.deferred())
     }
 
     /// Whether this endpoint has room for a join of its own now: one
@@ -1509,8 +1511,11 @@ impl SessionCore {
         self.mp_mut().releasing = false;
     }
 
+    /// Releases the deferred joins the cap now admits, each judged on its own: one that
+    /// brings a missing direction may go while one held before it keeps waiting.
     fn release_deferred(&mut self, now: Instant) {
-        while let Some(&Deferred { id, .. }) = self.mp().deferred.first() {
+        let mut k = 0;
+        while let Some(&Deferred { id, .. }) = self.mp().deferred.get(k) {
             if self.mp().join_backoff.is_some_and(|t| now < t) {
                 return;
             }
@@ -1519,9 +1524,10 @@ impl SessionCore {
                 .att(id)
                 .map_or((false, false), |a| (a.inp().is_some(), a.out().is_some()));
             if !self.room_for_join(true, inbound, outbound, now) {
-                return;
+                k += 1;
+                continue;
             }
-            self.mp_mut().deferred.remove(0);
+            self.mp_mut().deferred.remove(k);
             if let Some(o) = self.out_mut(id) {
                 o.release_join();
             }
@@ -1632,7 +1638,7 @@ impl SessionCore {
 
     /// The first pipe is on the secure carrier with this record mode: the secret comes from
     /// its exporter alone. Before the parameters are sent.
-    pub fn set_secure_first_pipe(&mut self, mode: Mode) {
+    pub fn set_secure_first_pipe(&mut self, mode: RecordMode) {
         self.first_pipe_mode = Some(mode);
         self.announce_bootstrap_exporter();
         if let Some(mp) = self.local.multipath.as_mut() {
@@ -1654,19 +1660,15 @@ impl SessionCore {
             .iter()
             .filter(|a| !a.unattached() && !a.joining_local() && !a.failed())
             .filter_map(Attachment::mode)
-            .map(RecordMode::from)
-            .fold(RecordMode::from(first), Ord::max)
+            .fold(first, Ord::max)
     }
 
     /// The record mode of a pipe.
     pub fn pipe_record_mode(&self, pipe: PipeId) -> Option<RecordMode> {
         if pipe.0 == 0 {
-            return Some(
-                self.first_pipe_mode
-                    .map_or(RecordMode::Unmanaged, RecordMode::from),
-            );
+            return Some(self.first_pipe_mode.unwrap_or(RecordMode::Unmanaged));
         }
-        self.att(pipe.0)?.mode().map(RecordMode::from)
+        self.att(pipe.0)?.mode()
     }
 
     /// Join pending: a deferred key not given yet, or an Unmanaged first pipe not declared
@@ -1703,7 +1705,7 @@ impl SessionCore {
     /// parameter carries the nonces.
     pub fn session_binding(&self) -> Option<[u8; 32]> {
         let (local, peer) = self.session_nonces()?;
-        Some(if self.role == Role::Initiator {
+        Some(if self.role == Role::Client {
             keys::session_binding(&local, &peer)
         } else {
             keys::session_binding(&peer, &local)
@@ -1714,14 +1716,11 @@ impl SessionCore {
     /// `liveness` changes nothing. The keep-alive wait is rearmed at once
     /// (capped at half the effective idle timeout); probe intervals and the
     /// suspicion floor apply to the waits in progress, and every pipe
-    /// follows except for its own settings ([`PipeOptions`]). Nothing is
-    /// sent.
-    pub fn set_liveness(
-        &mut self,
-        liveness: &crate::proto::session::Liveness,
-    ) -> Result<(), &'static str> {
+    /// follows except for its own settings ([`PipeOptions::liveness`]).
+    /// Nothing is sent.
+    pub fn set_liveness(&mut self, liveness: &Liveness) -> Result<(), InvalidConfig> {
         liveness.validate()?;
-        liveness.apply(Arc::make_mut(&mut self.config));
+        Arc::make_mut(&mut self.config).liveness = *liveness;
         if self.is_established() {
             // From the last activity, as the wait always counts; a keep-alive
             // already sent for that activity is not sent again.
@@ -1732,39 +1731,39 @@ impl SessionCore {
                     .and_then(|p| self.last_activity.checked_add(p))
             };
         }
-        let c = self.config.clone();
+        let c = self.config.liveness;
         for a in self.atts.iter_mut() {
-            let own = a.mp_options_liveness();
+            let own = a.own_liveness();
             if let Some(o) = a.out_mut() {
-                o.set_detection_limits(own.0.unwrap_or(c.suspect_floor), own.1.or(c.dead_timeout));
+                o.set_detection_limits(
+                    own.suspect_floor.or(c.suspect_floor),
+                    own.dead_timeout.own().or(c.dead_timeout()),
+                );
             }
         }
         Ok(())
     }
 
-    /// Replaces a pipe's own liveness settings as a whole; `None` fields
-    /// follow the session's. Invalid ones are
+    /// Replaces a pipe's own liveness settings as a whole; fields left at
+    /// [`Inherit::Session`] follow the session's. Invalid ones are
     /// [`PipeError::InvalidOptions`] and change nothing. Nothing is sent.
-    pub fn set_pipe_liveness(
+    pub(in crate::proto::session) fn set_pipe_liveness(
         &mut self,
         pipe: PipeId,
         liveness: &PipeLiveness,
     ) -> Result<(), PipeError> {
+        liveness.validate().map_err(PipeError::InvalidOptions)?;
         let mut opts = self.pipe_options(pipe).ok_or(PipeError::UnknownPipe)?;
-        opts.suspect_floor = liveness.suspect_floor;
-        opts.dead_timeout = liveness.dead_timeout;
-        opts.probe_interval = liveness.probe_interval;
-        opts.probe_jitter = liveness.probe_jitter;
-        opts.validate()?;
-        let c = self.config.clone();
+        opts.liveness = *liveness;
+        let c = self.config.liveness;
         let a = self.att_mut(pipe.0).ok_or(PipeError::UnknownPipe)?;
         a.set_options(&opts);
         if let Some(o) = a.out_mut() {
             o.set_detection_limits(
-                opts.suspect_floor.unwrap_or(c.suspect_floor),
-                opts.dead_timeout.or(c.dead_timeout),
+                liveness.suspect_floor.or(c.suspect_floor),
+                liveness.dead_timeout.own().or(c.dead_timeout()),
             );
-            o.set_probe(opts.probe_interval, opts.probe_jitter);
+            o.set_probe(liveness.period(), liveness.probe_jitter.own());
         }
         Ok(())
     }
@@ -1916,6 +1915,9 @@ impl SessionCore {
         let draining = self.atts.at(i).outside_fate();
         if self.atts.at(i).joining_local() {
             self.stats.join_failures += 1;
+            // The handshake ends with the attachment: a Reply still in flight
+            // can no longer confirm it, and so revive a failed attachment.
+            self.mp_mut().local_joins.retain(|j| j.id != id);
         }
         if !self.atts.at_mut(i).fail() {
             return;
@@ -1986,6 +1988,7 @@ impl SessionCore {
         if !self.out_mut(id).is_some_and(|o| o.suspect(now)) {
             return;
         }
+        self.mp_mut().suspects += 1;
         self.unsettle(id);
         self.probation_suspect(id, now);
         let primary = self.mp().acks().primary() == Some(id);
@@ -2329,6 +2332,12 @@ impl SessionCore {
             .and_then(|a| Self::direction_state(a, half))
     }
 
+    /// How often an outbound pipe became suspect, a DRAINING one included.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn suspects(&self) -> u64 {
+        self.mp.as_deref().map_or(0, |m| m.suspects)
+    }
+
     /// Whether the attachment `pipe` was retired and its state freed.
     pub fn pipe_retired(&self, pipe: PipeId) -> bool {
         self.att(pipe.0).filter(|a| !a.unattached()).is_none()
@@ -2417,7 +2426,7 @@ impl SessionCore {
             None => a.inp().is_some_and(|i| i.state() != InState::Ended),
         };
         (!live).then(|| {
-            Err(PipeError::Failed(
+            Err(PipeError::failed(
                 a.failure().unwrap_or(PipeFailure::Aborted),
             ))
         })
@@ -2425,7 +2434,7 @@ impl SessionCore {
 
     /// Whether the pipe ended: `Ok` once none of its halves is live any
     /// more (closed or ended) or the session no longer knows it,
-    /// [`PipeError::Failed`] when it failed,
+    /// the failure's [`PipeError`] when it failed,
     /// [`PipeError::SessionLost`] when the
     /// session ended while a half was live; `None` while a half is live.
     /// A pipe that failed and was retired since reads as `Ok`.
@@ -2434,7 +2443,7 @@ impl SessionCore {
             return Some(Ok(()));
         };
         if a.failed() {
-            return Some(Err(PipeError::Failed(
+            return Some(Err(PipeError::failed(
                 a.failure().unwrap_or(PipeFailure::Aborted),
             )));
         }
@@ -2916,13 +2925,12 @@ impl SessionCore {
         opts: Option<&PipeOptions>,
     ) -> crate::proto::session::pipes::Detection {
         let c = &self.config;
+        let own = opts.map(|o| o.liveness).unwrap_or_default();
         crate::proto::session::pipes::Detection {
-            suspect_floor: opts
-                .and_then(|o| o.suspect_floor)
-                .unwrap_or(c.suspect_floor),
-            dead_timeout: opts.and_then(|o| o.dead_timeout).or(c.dead_timeout),
-            probe_interval: opts.and_then(|o| o.probe_interval),
-            probe_jitter: opts.and_then(|o| o.probe_jitter),
+            suspect_floor: own.suspect_floor.or(c.liveness.suspect_floor),
+            dead_timeout: own.dead_timeout.own().or(c.liveness.dead_timeout()),
+            probe_interval: own.period(),
+            probe_jitter: own.probe_jitter.own(),
             probe_seed: c
                 .hooks
                 .probe_seed
@@ -2974,7 +2982,7 @@ impl SessionCore {
         // Every interval is at least 1 s (Config::validate, PipeOptions).
         let h = o.probe_hold(|| self.hold_bound(a.id()));
         let k = k.saturating_sub(h).max(Duration::from_secs(1));
-        let j = jitter.unwrap_or(self.config.probe_jitter);
+        let j = jitter.unwrap_or(self.config.liveness.probe_jitter);
         if j <= 0.0 {
             return Some(k);
         }
@@ -3108,12 +3116,12 @@ impl SessionCore {
                         + crate::proto::session::pipes::INITIAL_RTT * 2
                         + self.mp().peer_mad
                 });
-            let t_suspect = self.config.suspect_floor.max(pto * 2);
+            let t_suspect = self.config.liveness.suspect_floor.max(pto * 2);
             let t_fail = Duration::from_secs(2).max(pto * 8);
             let dead = self
                 .idle_timeout()
                 .map_or(crate::proto::session::DEFAULT_IDLE_TIMEOUT / 2, |t| t / 2);
-            let stall = if let Some(dt) = self.config.dead_timeout {
+            let stall = if let Some(dt) = self.config.liveness.dead_timeout() {
                 t_suspect.max(dt)
             } else if self.mp().resume {
                 t_fail
@@ -3328,4 +3336,45 @@ pub(crate) enum CreditCopy {
     Streams(usize),
     /// MAX_STREAM_DATA of a stream.
     Stream(StreamKey),
+}
+
+/// The order in which attachments are displaced at the cap, lowest first: failed ones
+/// whose own PIPE_ABANDON was acknowledged, then failed ones whose own PIPE_ABANDON was
+/// not, each oldest first; only then live ones, the oldest last progress first.
+fn displacement_rank(
+    failed: bool,
+    abandon_acked: bool,
+    seq: u64,
+    last_progress: Option<Instant>,
+) -> (u8, Option<Instant>, u64) {
+    match (failed, abandon_acked) {
+        (true, true) => (0, None, seq),
+        (true, false) => (1, None, seq),
+        (false, _) => (2, last_progress, seq),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::displacement_rank;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn displacement_takes_acknowledged_failures_then_unacknowledged_then_live() {
+        let t = Instant::now();
+        let later = t + Duration::from_secs(1);
+        // (failed, acked, seq, last progress), in the order they are displaced.
+        let order = [
+            (true, true, 5, Some(later)),
+            (true, true, 7, Some(t)),
+            (true, false, 1, Some(t)),
+            (true, false, 2, None),
+            (false, false, 0, Some(t)),
+            (false, true, 0, Some(later)),
+        ];
+        let mut shuffled = order;
+        shuffled.reverse();
+        shuffled.sort_by_key(|&(f, a, s, p)| displacement_rank(f, a, s, p));
+        assert_eq!(shuffled, order);
+    }
 }

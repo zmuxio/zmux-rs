@@ -237,10 +237,14 @@ async fn datagrams_both_ways() {
     // Stream datagrams.
     let (mut send, _recv) = client.open_bi().await.unwrap();
     send.write_all(b"open").await.unwrap();
+    // The Flow counts at its largest until the stream has its ID, which
+    // the driver gives it when it sends the stream's first frame: the peer
+    // accepting the stream shows that it has one.
+    let (_ssend, srecv) = server.accept_bi().await.unwrap();
+    assert!(send.id().is_some());
     assert_eq!(send.max_datagram_size(5), Some(65532));
     send.send_datagram(5, Bytes::from_static(b"on-stream"))
         .unwrap();
-    let (_ssend, srecv) = server.accept_bi().await.unwrap();
     assert_eq!(
         srecv.read_datagram().await.unwrap(),
         (5, Bytes::from_static(b"on-stream"))
@@ -250,8 +254,8 @@ async fn datagrams_both_ways() {
 #[tokio::test]
 async fn close_code_reaches_the_peer() {
     let (client, server) = pair().await;
-    client.close(VarInt::from_u32(42), b"bye").await;
-    let e = server.closed().await;
+    client.abort(VarInt::from_u32(42), b"bye");
+    let e = server.closing().await;
     assert_eq!(
         e,
         SessionError::ApplicationClosed {
@@ -261,7 +265,7 @@ async fn close_code_reaches_the_peer() {
         }
     );
     assert!(matches!(
-        client.closed().await,
+        client.closing().await,
         SessionError::ApplicationClosed { remote: false, .. }
     ));
     assert!(matches!(
@@ -293,7 +297,7 @@ async fn graceful_shutdown_waits_for_streams() {
     drop((send, recv));
     srv.await.unwrap().expect("graceful shutdown");
     assert!(matches!(
-        client.closed().await,
+        client.closing().await,
         SessionError::ApplicationClosed { remote: true, .. }
     ));
 }
@@ -308,7 +312,7 @@ async fn ping_measures_rtt() {
     let (a, b) = (a.unwrap(), b.unwrap());
     assert!(client.rtt().is_some());
     assert!(a <= Duration::from_secs(1) && b <= Duration::from_secs(1));
-    client.close(VarInt::from_u32(0), b"").await;
+    client.close().await;
     assert!(client.ping().await.is_err());
 }
 
@@ -390,9 +394,9 @@ fn blocking_echo_over_tcp() {
     Read::read_to_end(&mut r, &mut back).unwrap();
     assert_eq!(back, data);
     let session = srv.join().unwrap();
-    client.close(VarInt::from_u32(3), b"");
+    client.abort(VarInt::from_u32(3), b"");
     assert!(matches!(
-        session.closed(None),
+        session.closing(),
         Ok(SessionError::ApplicationClosed { remote: true, .. })
     ));
 }
@@ -495,7 +499,7 @@ async fn secret_flags_that_differ_close_the_session() {
     });
     let client = Session::connect(PipeIo::new(a), Config::multipath(psk)).await;
     if let Ok(client) = client {
-        let e = tokio::time::timeout(Duration::from_secs(5), client.closed())
+        let e = tokio::time::timeout(Duration::from_secs(5), client.closing())
             .await
             .expect("closed");
         assert!(
@@ -523,7 +527,7 @@ async fn a_cancelled_shutdown_closes_at_once() {
     )
     .await;
     assert!(r.is_err(), "the open stream holds the shutdown");
-    let e = tokio::time::timeout(Duration::from_secs(5), server.closed())
+    let e = tokio::time::timeout(Duration::from_secs(5), server.closing())
         .await
         .expect("closed at once");
     assert!(
@@ -558,7 +562,7 @@ async fn the_tracer_sees_events_in_order_and_the_end_last() {
     config.tracer = Some(log.clone());
     let (client, server) = pair_with(config, Config::default()).await;
     server.shutdown(VarInt::ZERO, b"").await.unwrap();
-    client.closed().await;
+    client.closing().await;
     let done = || log.0.lock().unwrap().last().map(String::as_str) == Some("closed");
     for _ in 0..500 {
         if done() {
@@ -604,7 +608,7 @@ async fn a_shaper_pads_the_records_of_a_session() {
         }
     }
     let (client, server) = pair().await;
-    client.set_shaper(Some(Arc::new(F)));
+    client.set_shaper(Some(Arc::new(F)), None);
     let (mut send, _recv) = client.open_bi().await.unwrap();
     send.write_all(b"0123456789").await.unwrap();
     send.finish().unwrap();
@@ -707,7 +711,7 @@ fn blocking_a_delayed_first_record_keeps_the_parameters_first() {
         Read::read_to_end(&mut r, &mut back).unwrap();
         assert_eq!(back, b"hello", "all={all}");
         let _session = srv.join().unwrap();
-        client.close(VarInt::from_u32(0), b"");
+        client.close();
     }
 }
 

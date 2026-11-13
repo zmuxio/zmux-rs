@@ -478,9 +478,6 @@ fn truncated(buf: &[u8]) -> Error {
 fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> {
     let mut c = Cursor::new(buf);
     let (ty, width) = c.varint_with_width()?;
-    if width != varint::len(ty) {
-        return Err(Error::protocol_violation(ty, "frame type not minimally encoded").into());
-    }
     let frame = match ty {
         0x00 => Frame::Padding(Padding {
             len: 1 + c.skip_run(0),
@@ -507,23 +504,14 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         0x15 => Frame::StreamDataBlocked(StreamDataBlocked::read(&mut c)?),
         0x16 | 0x17 => Frame::StreamsBlocked(StreamsBlocked::read(&mut c, ty)?),
         0x1c | 0x1d => Frame::ConnectionClose(ConnectionClose::read(&mut c, ty)?),
-        0x24 => {
-            gate(gates.reset_stream_at, ty, "RESET_STREAM_AT not announced")?;
-            Frame::ResetStreamAt(ResetStreamAt::read(&mut c, ty)?)
-        }
+        0x24 => Frame::ResetStreamAt(ResetStreamAt::read(&mut c, ty)?),
         0x30 | 0x31 => {
-            if gates.max_datagram_frame_size == 0 {
-                return Err(Error::protocol_violation(ty, "DATAGRAM not announced").into());
-            }
             let data = if ty == FrameType::DATAGRAM_LEN.0 {
                 let len = c.varint()?;
                 c.bytes(len)?
             } else {
                 c.rest()
             };
-            if c.pos() as u64 > gates.max_datagram_frame_size {
-                return Err(Error::protocol_violation(ty, "DATAGRAM larger than announced").into());
-            }
             Frame::Datagram(Datagram {
                 data,
                 explicit_len: ty == FrameType::DATAGRAM_LEN.0,
@@ -534,40 +522,14 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         }
         QX_TP => Frame::TransportParameters(QxTransportParameters::read(&mut c)?),
         QX_PING_REQ | QX_PING_RESP => Frame::QxPing(QxPing::read(&mut c, ty)?),
-        0x1911_f43e => {
-            gate(gates.goaway, ty, "GOAWAY not in use")?;
-            Frame::GoAway(GoAwayFrame::read(&mut c, ty)?)
-        }
-        0x073d_08cf => {
-            gate(gates.priority, ty, "PRIORITY_UPDATE not in use")?;
-            Frame::PriorityUpdate(PriorityUpdate::read(&mut c, ty)?)
-        }
-        0x0b2b_3eeb => {
-            gate(
-                gates.multipath || gates.pipe_ack,
-                ty,
-                "pipe acknowledgement not in use",
-            )?;
-            Frame::PipeAck(PipeAck::read(&mut c, ty)?)
-        }
-        0x3a05_a1c9 => {
-            gate(gates.lanes, ty, "lanes not available")?;
-            Frame::PipeLane(PipeLane::read(&mut c)?)
-        }
-        0x269b_43e6 => {
-            gate(gates.multipath, ty, "multipath not in use")?;
-            Frame::PipePing
-        }
-        0x23b3_5b74 => {
-            gate(gates.multipath, ty, "multipath not in use")?;
-            Frame::PipeAbandon(PipeAbandon::read(&mut c)?)
-        }
-        0x227b_2811 => {
-            gate(gates.multipath, ty, "multipath not in use")?;
-            Frame::PipeStatus(PipeStatus::read(&mut c, ty)?)
-        }
+        0x1911_f43e => Frame::GoAway(GoAwayFrame::read(&mut c, ty)?),
+        0x073d_08cf => Frame::PriorityUpdate(PriorityUpdate::read(&mut c, ty)?),
+        0x0b2b_3eeb => Frame::PipeAck(PipeAck::read(&mut c, ty)?),
+        0x3a05_a1c9 => Frame::PipeLane(PipeLane::read(&mut c)?),
+        0x269b_43e6 => Frame::PipePing,
+        0x23b3_5b74 => Frame::PipeAbandon(PipeAbandon::read(&mut c)?),
+        0x227b_2811 => Frame::PipeStatus(PipeStatus::read(&mut c, ty)?),
         0x024e_93eb => {
-            gate(gates.multipath, ty, "multipath not in use")?;
             let start = c.pos();
             let mut f = SessionEpoch::read(&mut c, ty)?;
             f.raw = &buf[start..c.pos()];
@@ -575,11 +537,45 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         }
         _ => return Err(Error::frame_encoding(ty, "unknown frame type").into()),
     };
+    // Only a frame that decoded completely is checked against the semantic rules: a
+    // decode error takes precedence over a misplaced, unannounced or oversized frame.
+    if width != varint::len(ty) {
+        return Err(Error::protocol_violation(ty, "frame type not minimally encoded").into());
+    }
+    check_gate(&frame, ty, c.pos(), gates)?;
     Ok((frame, c.pos()))
 }
 
+/// The error for a decoded frame, `len` bytes long, whose feature the receiver does not
+/// accept.
 #[inline]
-fn gate(open: bool, ty: u64, reason: &'static str) -> Result<(), Error> {
+fn check_gate(frame: &Frame<'_>, ty: u64, len: usize, gates: &Gates) -> Result<(), Error> {
+    let (open, reason) = match frame {
+        Frame::ResetStreamAt(_) => (gates.reset_stream_at, "RESET_STREAM_AT not announced"),
+        Frame::Datagram(_) => {
+            if gates.max_datagram_frame_size == 0 {
+                return Err(Error::protocol_violation(ty, "DATAGRAM not announced"));
+            }
+            if len as u64 > gates.max_datagram_frame_size {
+                return Err(Error::protocol_violation(
+                    ty,
+                    "DATAGRAM larger than announced",
+                ));
+            }
+            return Ok(());
+        }
+        Frame::GoAway(_) => (gates.goaway, "GOAWAY not in use"),
+        Frame::PriorityUpdate(_) => (gates.priority, "PRIORITY_UPDATE not in use"),
+        Frame::PipeAck(_) => (
+            gates.multipath || gates.pipe_ack,
+            "pipe acknowledgement not in use",
+        ),
+        Frame::PipeLane(_) => (gates.lanes, "lanes not available"),
+        Frame::PipePing | Frame::PipeAbandon(_) | Frame::PipeStatus(_) | Frame::SessionEpoch(_) => {
+            (gates.multipath, "multipath not in use")
+        }
+        _ => return Ok(()),
+    };
     if open {
         Ok(())
     } else {
@@ -631,5 +627,38 @@ impl<'a> Iterator for Frames<'a> {
                 Some(Err(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frames, Gates};
+    use crate::proto::error::TransportErrorCode as T;
+
+    fn code(body: &[u8], gates: Gates) -> T {
+        Frames::new(body, gates).next().unwrap().unwrap_err().code()
+    }
+
+    #[test]
+    fn decode_errors_precede_semantic_errors() {
+        let none = Gates::default();
+        // A non-minimal frame type: PROTOCOL_VIOLATION only once the frame decoded.
+        assert_eq!(code(&[0x40, 0x10], none), T::FRAME_ENCODING_ERROR);
+        assert_eq!(code(&[0x40, 0x10, 0x05], none), T::PROTOCOL_VIOLATION);
+        // ... and ahead of feature gating, which needs a decoded frame too.
+        let ping = [0xc0, 0, 0, 0, 0x26, 0x9b, 0x43, 0xe6];
+        assert_eq!(code(&ping, none), T::PROTOCOL_VIOLATION);
+        // DATAGRAM whose Length runs past the record, whatever was announced.
+        assert_eq!(code(&[0x31, 0x05, 0xaa], none), T::FRAME_ENCODING_ERROR);
+        let small = Gates {
+            max_datagram_frame_size: 2,
+            ..none
+        };
+        assert_eq!(code(&[0x31, 0x05, 0xaa], small), T::FRAME_ENCODING_ERROR);
+        // A well-formed DATAGRAM not announced, or larger than announced.
+        assert_eq!(code(&[0x31, 0x01, 0xaa], none), T::PROTOCOL_VIOLATION);
+        assert_eq!(code(&[0x31, 0x01, 0xaa], small), T::PROTOCOL_VIOLATION);
+        // A frame of a feature not in use, malformed or not.
+        assert_eq!(code(&[0x24, 0x00], none), T::FRAME_ENCODING_ERROR);
     }
 }

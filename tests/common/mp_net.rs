@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::Framing;
-use zmux::proto::seal::Mode;
+use zmux::proto::seal::RecordMode;
 use zmux::proto::session::{
-    Config, CoreEvent, PickRequest, PipeEnd, PipeHalf, PipeId, PipeOptions, PipeWrite, RoleConfig,
+    Config, CoreEvent, PickRequest, PipeEnd, PipeHalf, PipeId, PipeOptions, PipeWrite, Role,
     SessionCore, State, Transmit, TransmitBuf,
 };
 
@@ -246,8 +246,8 @@ impl<X: Observe, S> MpNet<X, S> {
     /// A dials B on pipe 0 (nothing moved yet).
     pub(crate) fn new(a: Config, b: Config, s: S) -> Self {
         let now = Instant::now();
-        let mut a = SessionCore::new(a, RoleConfig::Initiator, None, now).unwrap();
-        let mut b = SessionCore::new(b, RoleConfig::Responder, None, now).unwrap();
+        let mut a = SessionCore::new(a, Role::Client, None, now).unwrap();
+        let mut b = SessionCore::new(b, Role::Server, None, now).unwrap();
         a.attach_pipe(PipeId::new(0), BS, now);
         b.attach_pipe(PipeId::new(0), BS, now);
         let mut links = BTreeMap::new();
@@ -476,16 +476,6 @@ impl<X: Observe, S> MpNet<X, S> {
             Joined::Pending => {}
             Joined::Refused | Joined::Dropped => self.listener_close(id, fed.joined),
         }
-        if let Some(e) = fed.evicted {
-            let victim = self
-                .links
-                .iter()
-                .find(|(_, l)| l.accepting.carrier == Some(e))
-                .map(|(k, _)| *k);
-            if let Some(v) = victim {
-                self.listener_close(v, Joined::Dropped);
-            }
-        }
     }
 
     /// The end of a flow reached end `r`.
@@ -678,7 +668,7 @@ impl<X: Observe, S> MpNet<X, S> {
     ) -> Option<u64> {
         let (input, output) = (inbound.then_some(BS), outbound.then_some(BS));
         let id = self.ends[A]
-            .add_pipe(input, output, opts, Mode::Trusted, None, self.now)
+            .add_pipe(input, output, opts, RecordMode::Trusted, None, self.now)
             .ok()?
             .get();
         assert!(!self.links.contains_key(&id), "pipe ID {id} reused");

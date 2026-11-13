@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{connect, duplex};
-use zmux::proto::seal::Mode;
+use zmux::proto::seal::RecordMode;
 use zmux::{
     Cap, Config, ConnectError, Listener, ListenerConfig, LogLevel, Logger, PipeAuth, PipeIo,
     Session, SessionEvent,
@@ -15,9 +15,9 @@ use zmux::{
 
 const PSK: [u8; 32] = *b"a pre-shared key of 32 bytes....";
 
-fn invalid(r: Result<Session, ConnectError>) -> &'static str {
+fn invalid(r: Result<Session, ConnectError>) -> String {
     match r {
-        Err(ConnectError::InvalidConfig(why)) => why,
+        Err(ConnectError::InvalidConfig(why)) => why.to_string(),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("a session"),
     }
@@ -54,11 +54,11 @@ async fn a_secure_first_pipe_takes_no_other_source() {
         PipeAuth::exporter(),
     ] {
         let ((a, _), _b) = duplex(1 << 16);
-        let a = a.with_secure_first_pipe(Mode::Sealed);
+        let a = a.with_secure_first_pipe(RecordMode::Sealed);
         invalid(connect_alone(a, Config::multipath(auth)).await);
     }
     let ((a, _), _b) = duplex(1 << 16);
-    let a = a.with_secure_first_pipe(Mode::Sealed);
+    let a = a.with_secure_first_pipe(RecordMode::Sealed);
     let r = connect_alone(a, Config::multipath(PipeAuth::none().with_end_to_end())).await;
     assert!(
         !matches!(r, Err(ConnectError::InvalidConfig(_)) | Ok(_)),
@@ -85,7 +85,7 @@ async fn bounds_are_errors() {
         ("replay_window", |c| {
             c.pipe_auth = PipeAuth::psk(PSK);
             c.max_pipes = 8;
-            c.replay_window = Some(15);
+            c.replay_window = zmux::Cap::Fixed(15);
         }),
     ];
     for (name, f) in cases {
@@ -133,7 +133,18 @@ fn logged() -> (Logs, Logger) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_suspension_without_a_redial_source_is_reported() {
     for hooked in [false, true] {
-        let (logs, logger) = logged();
+        // The warning, as the logger is told it.
+        let warned = Arc::new(tokio::sync::Notify::new());
+        let logs: Logs = Arc::default();
+        let logger = {
+            let (logs, warned) = (logs.clone(), warned.clone());
+            Logger::new(move |level, m| {
+                logs.lock().unwrap().push((level, m.to_owned()));
+                if level == LogLevel::Warn && m.contains("redial") {
+                    warned.notify_one();
+                }
+            })
+        };
         let mut server = Config::default();
         server.pipe_auth = PipeAuth::psk(PSK).with_end_to_end();
         server.resume_timeout = Some(Duration::from_secs(10));
@@ -179,27 +190,36 @@ async fn a_suspension_without_a_redial_source_is_reported() {
             .iter()
             .any(|e| matches!(e, SessionEvent::ResumeUnattended));
         assert_eq!(unattended, !hooked, "{seen:?}");
+        // Unread events coalesce: with a redial hook the resumption may
+        // replace the suspension before it is read; the counter keeps it.
+        assert_eq!(c.stats().suspensions, 1, "{seen:?}");
         assert!(
-            seen.iter()
-                .any(|e| matches!(e, SessionEvent::SessionSuspended))
+            seen.iter().any(|e| matches!(
+                e,
+                SessionEvent::SessionSuspended | SessionEvent::SessionResumed
+            )),
+            "{seen:?}"
         );
-        // The logger runs after the session's lock, so it may follow the event.
-        let warned = || {
-            logs.lock()
-                .unwrap()
-                .iter()
-                .any(|(l, m)| *l == LogLevel::Warn && m.contains("redial"))
-        };
         if !hooked {
-            for _ in 0..200 {
-                if warned() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            assert!(
+                seen.iter()
+                    .any(|e| matches!(e, SessionEvent::SessionSuspended)),
+                "{seen:?}"
+            );
+            // The logger runs after the session's lock, so it may follow
+            // the event.
+            tokio::time::timeout(Duration::from_secs(10), warned.notified())
+                .await
+                .expect("the warning is logged");
         }
-        assert_eq!(warned(), !hooked);
-        c.close(0u32.into(), b"").await;
+        let warns = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, m)| *l == LogLevel::Warn && m.contains("redial"))
+            .count();
+        assert_eq!(warns, usize::from(!hooked));
+        c.close().await;
         listener.close();
     }
 }

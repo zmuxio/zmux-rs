@@ -38,4 +38,4 @@ pub use maintain::{
     RotatePolicy, maintain_pipes,
 };
 #[cfg(feature = "tokio")]
-pub(crate) use maintain::{maintain_mode, maintain_redial};
+pub(crate) use maintain::{maintain_choice, maintain_redial};

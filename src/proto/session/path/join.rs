@@ -14,8 +14,8 @@ use crate::proto::seal::join::{
     Proven, Unconfirmed, key_share_item_len,
 };
 use crate::proto::seal::{
-    self, Group, JoinPipe, JoinRole, Mode, Opener, Payload, Sealer, Secret, Suite, derive_join_psk,
-    encode_payload,
+    self, Group, JoinPipe, JoinRole, Opener, Payload, RecordMode, Sealer, Secret, Suite,
+    derive_join_psk, encode_payload,
 };
 use crate::proto::session::pipes::{
     Attachment, InPipe, InState, OutPipe, OutState, PipeHalf, SentFrame,
@@ -34,30 +34,6 @@ pub const JOIN_READ_BOUND: usize = 2 * 65_535 + 64;
 const JOIN_PIPE_ITEM: u64 = 5;
 const FRAMES_ITEM: u64 = 6;
 const JOIN_DECISION_ITEM: u64 = 7;
-
-/// A session's protection, the order being from strongest to weakest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[non_exhaustive]
-pub enum RecordMode {
-    /// Records protected by the handshake's keys.
-    Sealed,
-    /// Raw records on a carrier whose exporter is bound into the handshake.
-    Bound,
-    /// Raw records by explicit configuration of both ends.
-    Trusted,
-    /// A first pipe outside the secure carrier. No Join has this mode.
-    Unmanaged,
-}
-
-impl From<Mode> for RecordMode {
-    fn from(m: Mode) -> Self {
-        match m {
-            Mode::Sealed => Self::Sealed,
-            Mode::Bound => Self::Bound,
-            Mode::Trusted => Self::Trusted,
-        }
-    }
-}
 
 /// The join keys of one usable Suite in one epoch.
 pub(in crate::proto::session) struct SuiteKeys {
@@ -278,7 +254,7 @@ mod suite_tests {
 #[derive(Default)]
 pub(in crate::proto::session) struct LocalJoin {
     pub(in crate::proto::session) id: u64,
-    pub(in crate::proto::session) mode: Option<Mode>,
+    pub(in crate::proto::session) mode: Option<RecordMode>,
     pub(in crate::proto::session) binding: Vec<u8>,
     /// The Group the host asked for; `None` is the local preference.
     pub(in crate::proto::session) group: Option<u64>,
@@ -303,7 +279,7 @@ impl std::fmt::Debug for LocalJoin {
 impl LocalJoin {
     pub(in crate::proto::session) fn new(
         id: u64,
-        mode: Mode,
+        mode: RecordMode,
         binding: Vec<u8>,
         group: Option<u64>,
     ) -> Self {
@@ -360,7 +336,7 @@ pub enum JoinStep {
         /// Bytes of the input the handshake took.
         consumed: usize,
         /// The record mode: Bound has no confirmation.
-        mode: Mode,
+        mode: RecordMode,
     },
     /// The Reply verified with decision 1: the attachment is retired, close the carrier.
     Declined,
@@ -391,7 +367,7 @@ impl std::fmt::Debug for JoinStep {
 /// claimed.
 pub struct PeerJoin {
     pipe: JoinPipe,
-    mode: Mode,
+    mode: RecordMode,
     /// The epoch of the Hello's key.
     epoch: u64,
     suite: &'static Suite,
@@ -422,7 +398,7 @@ impl PeerJoin {
     }
 
     /// The Mode the joiner chose.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -641,7 +617,7 @@ impl SessionCore {
         let joiner = Joiner::new(JoinConfig {
             suite,
             group,
-            mode: j.mode.unwrap_or(Mode::Sealed),
+            mode: j.mode.unwrap_or(RecordMode::Sealed),
             phase: (epoch & 1) as u8,
             framing,
             locator: locator.as_bytes(),
@@ -833,9 +809,9 @@ impl SessionCore {
         let mode = proven.mode();
         let epoch = self.mp().local_joins[i].epoch.unwrap_or(0);
         let (body, room) = match mode {
-            Mode::Sealed => (suite.tag_len(), u16::MAX as usize - suite.tag_len()),
-            Mode::Trusted => (suite.hash_len(), u16::MAX as usize - suite.hash_len()),
-            Mode::Bound => (0, 0),
+            RecordMode::Sealed => (suite.tag_len(), u16::MAX as usize - suite.tag_len()),
+            RecordMode::Trusted => (suite.hash_len(), u16::MAX as usize - suite.hash_len()),
+            RecordMode::Bound | RecordMode::Unmanaged => (0, 0),
         };
         let w = message_len(framing == Framing::ByteStream, body, overhead);
         let zeros = pad_fill(plan.pad_for(w) as isize - w as isize, room);
@@ -867,9 +843,9 @@ impl SessionCore {
 
     /// A verified Reply with decision 0: Proven, and the attachment ACTIVE. Stall clocks
     /// start here.
-    fn join_proven(&mut self, id: u64, mode: Mode, now: Instant) {
-        let sealed = mode == Mode::Sealed;
-        if mode != Mode::Trusted {
+    fn join_proven(&mut self, id: u64, mode: RecordMode, now: Instant) {
+        let sealed = mode == RecordMode::Sealed;
+        if mode != RecordMode::Trusted {
             self.epoch_first_pipe();
         }
         self.join_confirmed(id);
@@ -960,8 +936,15 @@ impl SessionCore {
         let psk = epoch.and_then(|e| keys.epoch(e)?.psk(hello.suite().value(), peer_initiator));
         // No accepted epoch of this phase: a key no joiner has, so that the Hello fails
         // as any wrong key does.
-        let unknown = unknown_phase_key(hello.suite().hash_len());
-        let psk = psk.unwrap_or(&unknown);
+        // Without randomness there is no such key, and the Hello fails as auth unopened.
+        let psk = match psk.or_else(|| unknown_phase_key(hello.suite().hash_len())) {
+            Some(k) => k,
+            None => {
+                self.stats.join_auth_failures += 1;
+                self.push_event(CoreEvent::JoinAuthFailed { reason: "auth" });
+                return OpenedHello::AuthFailed;
+            }
+        };
         let opened = Acceptor::open(
             hello,
             AcceptorKeys {
@@ -1057,7 +1040,7 @@ impl SessionCore {
             usize::from(carrier.overhead),
         );
         let mut room = (u16::MAX as usize).saturating_sub(plain + join.suite.tag_len());
-        if join.mode != Mode::Trusted {
+        if join.mode != RecordMode::Trusted {
             room = room.min(reply_room(carrier.received, w, 0).1);
         }
         let padding = pad_item(plan.pad_for(w) as isize - w as isize, room);
@@ -1085,7 +1068,7 @@ impl SessionCore {
         }
         join.state = PeerJoinState::AwaitConfirm(wait);
         // A Bound carrier is Confirmed by the Hello having passed.
-        if join.mode == Mode::Bound && !refuse {
+        if join.mode == RecordMode::Bound && !refuse {
             let _ = join.read_confirm(&[]);
         }
         if refuse {
@@ -1120,7 +1103,7 @@ impl SessionCore {
         let seq = self.next_att_seq();
         let mut att = Attachment::accepted(id, j.fate_group, seq);
         att.set_mode(join.mode);
-        let sealed = join.mode == Mode::Sealed;
+        let sealed = join.mode == RecordMode::Sealed;
         let framed = |f: Framing| if sealed { Framing::Records } else { f };
         let max = self.local_tp().max_record_size();
         if want_in && let Some(framing) = carrier.inbound {
@@ -1139,7 +1122,7 @@ impl SessionCore {
         self.stats.pipes_added += 1;
         self.epoch_note_join();
         self.epoch_attached(id, join.epoch, now);
-        if join.mode != Mode::Trusted {
+        if join.mode != RecordMode::Trusted {
             self.epoch_first_pipe();
         }
         if want_out {
@@ -1182,18 +1165,29 @@ impl SessionCore {
 }
 
 /// The process's key for a Hello whose key phase matches no accepted epoch: random, drawn
-/// once, and never a join key.
-fn unknown_phase_key(len: usize) -> Vec<u8> {
+/// once, and never a join key. `None` while the random source fails: nothing is cached
+/// then, so a later Hello draws again. Never a constant, which anyone could compute.
+fn unknown_phase_key(len: usize) -> Option<&'static [u8]> {
     static KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
-    let key = KEY.get_or_init(|| {
-        let mut k = [0; 64];
-        if seal::fill_random(&mut k).is_err() {
-            // Still no joiner's key: the label keeps it apart from every derivation.
-            k[..32].copy_from_slice(&keys::hkdf_extract(b"zmux unknown phase", &[]));
+    unknown_phase_key_in(&KEY, len, |k| seal::fill_random(k).is_ok())
+}
+
+fn unknown_phase_key_in(
+    cell: &'static std::sync::OnceLock<[u8; 64]>,
+    len: usize,
+    fill: impl FnOnce(&mut [u8; 64]) -> bool,
+) -> Option<&'static [u8]> {
+    let key = match cell.get() {
+        Some(k) => k,
+        None => {
+            let mut k = [0; 64];
+            if !fill(&mut k) {
+                return None;
+            }
+            cell.get_or_init(|| k)
         }
-        k
-    });
-    key[..len.min(64)].to_vec()
+    };
+    Some(&key[..len.min(64)])
 }
 
 fn wanted(direction: u8) -> (bool, bool) {
@@ -1290,7 +1284,7 @@ impl SessionCore {
     }
 
     fn is_initiator(&self) -> bool {
-        self.role == crate::proto::params::Role::Initiator
+        self.role == crate::proto::params::Role::Client
     }
 
     fn batch_stream(
@@ -1321,5 +1315,28 @@ impl SessionCore {
     pub fn pipe_directions(&self, pipe: PipeId) -> (bool, bool) {
         self.att(pipe.0)
             .map_or((false, false), |a| (a.inp().is_some(), a.out().is_some()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unknown_phase_key_in;
+    use std::sync::OnceLock;
+
+    #[test]
+    fn unknown_phase_key_never_falls_back_to_a_constant() {
+        static CELL: OnceLock<[u8; 64]> = OnceLock::new();
+        // A failing random source yields no key and caches nothing.
+        assert!(unknown_phase_key_in(&CELL, 32, |_| false).is_none());
+        assert!(CELL.get().is_none());
+        // The next Hello draws again; the drawn key is then kept.
+        let k = unknown_phase_key_in(&CELL, 32, |k| {
+            k.fill(7);
+            true
+        })
+        .unwrap();
+        assert_eq!(k, &[7; 32][..]);
+        let again = unknown_phase_key_in(&CELL, 48, |_| false).unwrap();
+        assert_eq!(again, &[7; 48][..]);
     }
 }

@@ -76,8 +76,8 @@ impl Hop {
     }
 
     fn close(&self) {
-        drop(self.a.close(VarInt::ZERO, b""));
-        drop(self.b.close(VarInt::ZERO, b""));
+        drop(self.a.close());
+        drop(self.b.close());
     }
 }
 
@@ -317,7 +317,7 @@ fn a_lost_session_resets_and_stops_the_other_side_with_carrier_failed() {
             let relay = hop.relay(SpliceOptions::default());
             let ((_s, _r), (fs, mut fr)) = hop.stream(b"x").await;
             // A's session goes away under the relay.
-            hop.a.close(VarInt::from_u32(5), b"").await;
+            hop.a.abort(VarInt::from_u32(5), b"");
             let (_, e) = watchdog(10, "B reads", read_until_end(&mut fr)).await;
             assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == carrier_failed()));
             assert_eq!(

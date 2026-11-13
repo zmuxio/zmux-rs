@@ -199,10 +199,10 @@ impl fmt::Debug for Logger {
     }
 }
 
-/// What a host's record mode check knows of a carrier.
+/// What a [`RecordPolicy`] and an [`AllowRecordMode`] know of a carrier.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct CarrierDescription {
+pub struct RecordPolicyInput {
     /// It has an exporter.
     pub has_exporter: bool,
     /// It declares the Bound contract.
@@ -214,28 +214,82 @@ pub struct CarrierDescription {
 }
 
 /// Chooses each carrier's record mode at the joiner: [`Config::record_policy`].
+/// A choice of [`RecordMode::Unmanaged`](crate::RecordMode::Unmanaged), which
+/// no pipe is joined in, fails the join with the configuration error.
 #[derive(Clone)]
-pub struct RecordPolicy(
-    pub Arc<dyn Fn(&CarrierDescription) -> crate::proto::seal::Mode + Send + Sync>,
-);
+pub struct RecordPolicy(Arc<RecordPolicyFn>);
+
+type RecordPolicyFn = dyn Fn(&RecordPolicyInput) -> crate::proto::seal::RecordMode + Send + Sync;
+
+impl RecordPolicy {
+    /// The policy `f`.
+    pub fn new(
+        f: impl Fn(&RecordPolicyInput) -> crate::proto::seal::RecordMode + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Asks the policy.
+    pub fn choose(&self, input: &RecordPolicyInput) -> crate::proto::seal::RecordMode {
+        (self.0)(input)
+    }
+}
 
 /// The acceptor's check of a Hello's mode, with the session's host value:
 /// [`Config::allow_record_mode`].
 #[derive(Clone)]
-pub struct AllowRecordMode(pub Arc<AllowRecordModeFn>);
+pub struct AllowRecordMode(Arc<AllowRecordModeFn>);
 
-/// The callable behind an [`AllowRecordMode`].
-pub type AllowRecordModeFn = dyn Fn(
-        &CarrierDescription,
-        crate::proto::seal::Mode,
+type AllowRecordModeFn = dyn Fn(
+        &RecordPolicyInput,
+        crate::proto::seal::RecordMode,
         Option<&crate::proto::admission::AdmittedValue>,
     ) -> bool
     + Send
     + Sync;
 
+impl AllowRecordMode {
+    /// The check `f`: given the carrier, the mode its Hello asks for and
+    /// the host value the session's admission attached, if any.
+    pub fn new(
+        f: impl Fn(
+            &RecordPolicyInput,
+            crate::proto::seal::RecordMode,
+            Option<&crate::proto::admission::AdmittedValue>,
+        ) -> bool
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Asks the check.
+    pub fn allows(
+        &self,
+        input: &RecordPolicyInput,
+        mode: crate::proto::seal::RecordMode,
+        admitted: Option<&crate::proto::admission::AdmittedValue>,
+    ) -> bool {
+        (self.0)(input, mode, admitted)
+    }
+}
+
 /// An acceptor's further check of a join: [`Config::authorize_join`].
 #[derive(Clone)]
-pub struct AuthorizeJoin(pub Arc<dyn Fn(u64) -> bool + Send + Sync>);
+pub struct AuthorizeJoin(Arc<dyn Fn(super::PipeId) -> bool + Send + Sync>);
+
+impl AuthorizeJoin {
+    /// The check `f`, given the pipe ID of the join.
+    pub fn new(f: impl Fn(super::PipeId) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Asks the check.
+    pub fn allows(&self, pipe: super::PipeId) -> bool {
+        (self.0)(pipe)
+    }
+}
 
 impl fmt::Debug for RecordPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -255,101 +309,178 @@ impl fmt::Debug for AuthorizeJoin {
     }
 }
 
-/// The liveness settings of a session as a whole, the [`Config`] fields of
-/// the same names ([`SessionCore::set_liveness`](super::SessionCore::set_liveness)).
-/// The default is the defaults of [`Config`].
+/// The liveness settings of a session: the one place of the settings that
+/// judge whether the session and its pipes are alive ([`Config::liveness`],
+/// replaced while the session runs by `Session::set_liveness`). A pipe's
+/// own settings are a [`PipeLiveness`](crate::PipeLiveness).
+///
+/// ```
+/// use std::time::Duration;
+/// use zmux::{Cap, Config, Liveness};
+///
+/// let mut config = Config::default();
+/// config.liveness = Liveness {
+///     keep_alive_period: None,
+///     dead_timeout: Cap::Fixed(Duration::from_secs(5)),
+///     ..Liveness::default()
+/// };
+/// assert!(config.liveness.validate().is_ok());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Liveness {
-    /// [`keep_alive_period`](Config#structfield.keep_alive_period): `None` is off, otherwise at
-    /// least 1 s.
+    /// Send QX_PING after this much silence (default
+    /// [`DEFAULT_KEEP_ALIVE_PERIOD`], 15 s; `None` turns keep-alive off;
+    /// at least 1 s when on). The period in effect is capped at half the
+    /// effective idle timeout, and each wait is drawn from \[k (1 - j), k\]
+    /// with j the [`probe_jitter`](Self::probe_jitter). On, an idle session
+    /// stays open while the peer answers and closes within the idle timeout
+    /// once its carrier dies; off, the idle timeout ends any session without
+    /// application activity.
     pub keep_alive_period: Option<Duration>,
-    /// [`suspect_floor`](Config#structfield.suspect_floor): at least 50 ms.
+    /// The floor of T_suspect for every pipe (default 250 ms, at least
+    /// 50 ms).
     pub suspect_floor: Duration,
-    /// [`dead_timeout`](Config#structfield.dead_timeout): `None` is derived, otherwise at least 1
-    /// s.
-    pub dead_timeout: Option<Duration>,
-    /// [`standby_probe`](Config#structfield.standby_probe): `None` is off, otherwise at least 1 s.
+    /// How long a suspect pipe stays suspect before it fails, effective
+    /// max(T_suspect, dead_timeout). [`Cap::Auto`] (the default) is T_fail
+    /// with resume and max(T_fail, half the idle timeout) without; a fixed
+    /// value is at least 1 s.
+    pub dead_timeout: Cap<Duration>,
+    /// How often standby pipes and pipes of a less-preferred tier get a
+    /// PIPE_PING while the session is busy, a traffic frame having been
+    /// sent or received within the last 15 s (default
+    /// [`DEFAULT_STANDBY_PROBE`], 1 s; `None` turns these faster probes
+    /// off, leaving such pipes at the probe interval; at least 1 s when on).
+    /// A quiet session probes them at the probe interval, and once more
+    /// when traffic resumes.
     pub standby_probe: Option<Duration>,
-    /// [`probe_interval`](Config#structfield.probe_interval): `None` is off, otherwise at least 1
-    /// s.
+    /// How long an outbound pipe of a pipe pair stays without an
+    /// ack-eliciting byte handed to its carrier before it gets a PIPE_PING
+    /// (default [`DEFAULT_PROBE_INTERVAL`], 15 s; `None` turns these idle
+    /// probes off; at least 1 s when on). A longer interval only delays the
+    /// detection of a pipe pair that dies while idle. Off turns off only
+    /// these probes: the PIPE_PING that goes with the answer to the peer's,
+    /// the standby probes and the probes of attachments without an outbound
+    /// direction at the peer stay, and a pipe pair with them off at both
+    /// ends is not judged while the session is quiet. The deadline is
+    /// measured to the carrier: records that shaping may hold for up to
+    /// `max_delay` are built that much earlier (but not more often than
+    /// every second). Pipes whose attachment has no outbound direction at
+    /// the peer are always probed, at most every 15 s.
     pub probe_interval: Option<Duration>,
-    /// [`probe_jitter`](Config#structfield.probe_jitter): from 0 to below 1.
+    /// The probe jitter j (default [`DEFAULT_PROBE_JITTER`], 0.25; at least
+    /// 0 and below 1): each wait for an idle probe is drawn once, when it
+    /// starts, uniformly from \[k (1 - j), k\] for the probe interval k,
+    /// and the first wait of the bootstrap pipe from \[0, k\]; it also
+    /// spreads the keep-alive waits. Zero gives the fixed schedule of
+    /// tests; the standby probes are never jittered.
     pub probe_jitter: f64,
 }
 
 impl Default for Liveness {
     fn default() -> Self {
-        Self::of(&Config::default())
+        Self {
+            keep_alive_period: Some(DEFAULT_KEEP_ALIVE_PERIOD),
+            suspect_floor: DEFAULT_SUSPECT_FLOOR,
+            dead_timeout: Cap::Auto,
+            standby_probe: Some(DEFAULT_STANDBY_PROBE),
+            probe_interval: Some(DEFAULT_PROBE_INTERVAL),
+            probe_jitter: DEFAULT_PROBE_JITTER,
+        }
     }
 }
 
 impl Liveness {
-    /// The liveness settings of `config`.
-    pub fn of(config: &Config) -> Self {
-        Self {
-            keep_alive_period: config.keep_alive_period,
-            suspect_floor: config.suspect_floor,
-            dead_timeout: config.dead_timeout,
-            standby_probe: config.standby_probe,
-            probe_interval: config.probe_interval,
-            probe_jitter: config.probe_jitter,
-        }
-    }
-
-    /// Whether the settings are valid, by the rules of [`Config`].
-    pub fn validate(&self) -> Result<(), &'static str> {
+    /// Whether the settings are valid: each within the range its field
+    /// states.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        let e = crate::InvalidConfig::new;
         let below = |d: Option<Duration>| d.is_some_and(|d| d < Duration::from_secs(1));
         if self.suspect_floor < Duration::from_millis(50) {
-            return Err("suspect_floor below 50 ms");
+            return Err(e("liveness.suspect_floor", "below 50 ms"));
         }
-        if below(self.dead_timeout) {
-            return Err("dead_timeout below 1 s");
+        if matches!(self.dead_timeout, Cap::Fixed(d) if d < Duration::from_secs(1)) {
+            return Err(e("liveness.dead_timeout", "below 1 s"));
         }
         if !(0.0..1.0).contains(&self.probe_jitter) {
-            return Err("probe_jitter outside [0, 1)");
+            return Err(e("liveness.probe_jitter", "outside [0, 1)"));
         }
         if below(self.keep_alive_period) {
-            return Err("keep_alive_period below 1 s");
+            return Err(e("liveness.keep_alive_period", "below 1 s"));
         }
         if below(self.standby_probe) {
-            return Err("standby_probe below 1 s");
+            return Err(e("liveness.standby_probe", "below 1 s"));
         }
         if below(self.probe_interval) {
-            return Err("probe_interval below 1 s");
+            return Err(e("liveness.probe_interval", "below 1 s"));
         }
         Ok(())
     }
 
-    pub(crate) fn apply(&self, config: &mut Config) {
-        config.keep_alive_period = self.keep_alive_period;
-        config.suspect_floor = self.suspect_floor;
-        config.dead_timeout = self.dead_timeout;
-        config.standby_probe = self.standby_probe;
-        config.probe_interval = self.probe_interval;
-        config.probe_jitter = self.probe_jitter;
+    /// The dead timeout of a fixed setting; `None` for the derived one.
+    pub(crate) fn dead_timeout(&self) -> Option<Duration> {
+        match self.dead_timeout {
+            Cap::Fixed(d) => Some(d),
+            Cap::Auto => None,
+        }
     }
 }
 
-/// The role argument of session creation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RoleConfig {
-    /// The dialling side; uses the transport role, sends no `zmux_role`.
-    Initiator,
-    /// The accepting side; uses the transport role, sends no `zmux_role`.
-    Responder,
-    /// A symmetric carrier: sends `zmux_role` auto with a random nonce.
-    Auto,
+/// A pipe or pool setting that follows the session's
+/// ([`Inherit::Session`], the default) or is its own
+/// ([`Inherit::Set`]). `T` may itself be an `Option`, `Set(None)` turning
+/// the feature off for that pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Inherit<T> {
+    /// Follow the session's setting, now and after it changes.
+    #[default]
+    Session,
+    /// This value.
+    Set(T),
 }
 
-/// A per-pipe override of the session's probe interval: a period, or off.
-///
-/// The override fields (`Option<Period>` of
-/// [`PipeOptions`](crate::proto::session::PipeOptions) and of the pool
-/// decision) keep the session's setting when `None`, which is why off needs
-/// a variant of its own here; [`Config`]'s own periods are plain
-/// `Option<Duration>`, `None` being off.
+impl<T> Inherit<T> {
+    /// The own value; `None` when it follows the session's.
+    pub fn own(self) -> Option<T> {
+        match self {
+            Self::Session => None,
+            Self::Set(v) => Some(v),
+        }
+    }
+
+    /// The value in effect: the own one, else `session`.
+    pub fn or(self, session: T) -> T {
+        match self {
+            Self::Session => session,
+            Self::Set(v) => v,
+        }
+    }
+}
+
+/// One field of a [`PipeUpdate`](crate::PipeUpdate): keep the setting
+/// ([`Change::Keep`], the default), clear it back to its default
+/// ([`Change::Clear`]), or set it ([`Change::Set`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Change<T> {
+    /// Leave the setting as it is.
+    #[default]
+    Keep,
+    /// Return the setting to its default, as the field says.
+    Clear,
+    /// This value.
+    Set(T),
+}
+
+impl<T> Change<T> {
+    /// Whether the field changes anything.
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
+/// A per-pipe probe interval: a period, or off; `None` of an override
+/// follows the session's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Period {
+pub(crate) enum Period {
     /// Run with this period.
     Every(Duration),
     /// Turned off.
@@ -359,54 +490,31 @@ pub enum Period {
 impl Period {
     /// The period; `None` when off.
     #[must_use]
-    pub const fn duration(self) -> Option<Duration> {
+    pub(crate) const fn duration(self) -> Option<Duration> {
         match self {
             Self::Every(d) => Some(d),
             Self::Off => None,
         }
     }
 
-    /// Whether this is off or a period of at least 1 s, the range of the
-    /// probe intervals.
-    pub(crate) fn off_or_seconds(self) -> bool {
-        self.duration().is_none_or(|d| d >= Duration::from_secs(1))
+    /// The period of an own setting, `None` being off.
+    pub(crate) fn of(d: Option<Duration>) -> Self {
+        d.map_or(Self::Off, Self::Every)
     }
 }
 
-impl From<Duration> for Period {
-    fn from(d: Duration) -> Self {
-        Self::Every(d)
-    }
-}
+/// The largest stream count credit the encoding allows, 2^60 (RFC 9000
+/// Section 4.6): the value that grants the peer as many streams as the
+/// protocol can count, which is in effect no limit. It is the top of the
+/// range of [`Config::max_incoming_streams`] and
+/// [`UniCredit::Limit`], and of `Session::raise_incoming_streams`; it is a
+/// value of that range, not a setting (those options have no unlimited
+/// setting, and 0 keeps meaning none).
+pub const MAX_STREAM_CREDIT: u64 = crate::proto::frame::MAX_COUNT;
 
-/// A memory budget: a number of bytes, or unlimited.
-///
-/// A budget of `Bytes(0)` is a budget of no byte: nothing grows beyond the
-/// floors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Budget {
-    /// At most this many bytes.
-    Bytes(u64),
-    /// No limit.
-    Unlimited,
-}
-
-impl Budget {
-    /// The bytes; `None` when unlimited.
-    #[must_use]
-    pub const fn bytes(self) -> Option<u64> {
-        match self {
-            Self::Bytes(b) => Some(b),
-            Self::Unlimited => None,
-        }
-    }
-}
-
-impl From<u64> for Budget {
-    fn from(b: u64) -> Self {
-        Self::Bytes(b)
-    }
-}
+/// The default payload bytes of a stream's received datagram queue
+/// ([`Config::datagram_stream_bytes`]): 512 KiB.
+pub(crate) const DEFAULT_DATAGRAM_STREAM_BYTES: usize = 512 * 1024;
 
 /// The default handshake timeout ([`Config::handshake_timeout`]).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -423,21 +531,24 @@ pub const DEFAULT_MIN_BACKOFF: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// The default probe interval of idle pipe pairs
-/// ([`Config::probe_interval`](Config#structfield.probe_interval)).
+/// ([`Liveness::probe_interval`]).
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// The default keep-alive period ([`Config::keep_alive_period`]).
+/// The default keep-alive period ([`Liveness::keep_alive_period`]).
 pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 
 /// The default standby probe interval
-/// ([`Config::standby_probe`](Config#structfield.standby_probe)).
+/// ([`Liveness::standby_probe`]).
 pub const DEFAULT_STANDBY_PROBE: Duration = Duration::from_secs(1);
 
 /// The default idle timeout ([`Config::max_idle_timeout`]).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The default probe jitter j ([`Config::probe_jitter`]).
+/// The default probe jitter j ([`Liveness::probe_jitter`]).
 pub const DEFAULT_PROBE_JITTER: f64 = 0.25;
+
+/// The default floor of T_suspect ([`Liveness::suspect_floor`]).
+pub const DEFAULT_SUSPECT_FLOOR: Duration = Duration::from_millis(250);
 
 /// The default overflow delay D of tier gating.
 pub const DEFAULT_OVERFLOW_DELAY: Duration = Duration::from_secs(1);
@@ -461,18 +572,32 @@ pub const SESSION_WINDOW_FLOOR: u64 = 96 * 1024 * 1024;
 /// The default memory budget of a session without a listener, the same as a listener's.
 pub const DEFAULT_MEMORY_BUDGET: u64 = 1 << 30;
 
-/// A memory bound of the configuration: the window caps and the send
-/// buffer maximum. These are memory
-/// bounds, not protocol limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Cap {
-    /// The default: a floor, and above it as far as the measured rate and
-    /// RTT ask and the memory budget allows, the listener's `MemoryBudget`
-    /// or the session's own `memory_budget`.
+/// A bound or setting of the configuration that is computed unless a
+/// value is given: the window caps and the send buffer maximum (bytes),
+/// the replay window (pipe IDs), the dead timeout and the probation base
+/// (durations). [`Cap::Auto`] is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Cap<T = u64> {
+    /// The default: the value the field derives (a memory cap: a floor,
+    /// and above it as far as the measured rate and RTT ask and the memory
+    /// budget allows).
     #[default]
     Auto,
-    /// A fixed bound.
-    Fixed(u64),
+    /// A fixed value.
+    Fixed(T),
+}
+
+/// The unidirectional streams the peer may open
+/// ([`Config::max_incoming_uni_streams`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UniCredit {
+    /// Staged credit (the default): `initial_max_streams_uni` is 16, and
+    /// MAX_STREAMS 256 is sent when the application first accepts a
+    /// unidirectional stream.
+    #[default]
+    Staged,
+    /// This many at once (0: none; at most [`MAX_STREAM_CREDIT`]).
+    Limit(u64),
 }
 
 /// The `initial_max_streams_uni` of an unset `max_incoming_uni_streams`,
@@ -485,7 +610,19 @@ pub(crate) const STAGED_UNI_STREAMS: (u64, u64) = (16, 256);
 /// session's hook context, never on a
 /// driver thread; a panic counts as a refusal.
 #[derive(Clone)]
-pub struct WindowIncrease(pub Arc<dyn Fn(u64) -> bool + Send + Sync>);
+pub struct WindowIncrease(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+
+impl WindowIncrease {
+    /// The predicate `f`.
+    pub fn new(f: impl Fn(u64) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Asks the predicate.
+    pub fn allows(&self, increase: u64) -> bool {
+        (self.0)(increase)
+    }
+}
 
 impl fmt::Debug for WindowIncrease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -543,14 +680,10 @@ pub struct Config {
     /// is no local limit and announces none). A set duration is at least
     /// 1 ms, the unit of the transport parameter, whose 0 means none.
     pub max_idle_timeout: Option<Duration>,
-    /// Send QX_PING after this much silence (default
-    /// [`DEFAULT_KEEP_ALIVE_PERIOD`], 15 s; `None` turns keep-alive off; a
-    /// period below 1 s, zero included, is not valid).
-    /// The period in effect is capped at half the effective idle timeout, and each wait is drawn
-    /// from \[k (1 - j), k\] with j the [`probe_jitter`](Self::probe_jitter). On, an idle session
-    /// stays open while the peer answers and closes within the idle timeout once its carrier dies;
-    /// off, the idle timeout ends any session without application activity.
-    pub keep_alive_period: Option<Duration>,
+    /// The liveness settings of the session and the defaults of its pipes
+    /// (default [`Liveness::default`]): keep-alive, the suspicion floor, the
+    /// dead timeout and the probes.
+    pub liveness: Liveness,
     /// Initial stream receive window (default 256 KiB; at least 4 KiB,
     /// the early-data floor of [`params::floor`](floor)).
     pub initial_stream_receive_window: u64,
@@ -572,24 +705,25 @@ pub struct Config {
     /// fixed cap or from the floor, never from a grown window.
     pub max_connection_receive_window: Cap,
     /// The `memory_budget` parameter of `max_connection_receive_window`
-    /// (`None`, the default, is [`DEFAULT_MEMORY_BUDGET`], 1 GiB;
-    /// [`Budget::Unlimited`] lifts it): the memory budget of a session
-    /// without a listener, a listener's `MemoryBudget` otherwise. Buffered,
-    /// retained and unread bytes and the session
-    /// window's growth count against it; window and send-buffer growth
-    /// above the floors of [`Cap::Auto`] stops at it.
-    pub memory_budget: Option<Budget>,
+    /// (default [`DEFAULT_MEMORY_BUDGET`], 1 GiB; `None` is unlimited): the
+    /// memory budget of a session without a listener, a listener's
+    /// `memory_budget` otherwise. Buffered, retained and unread bytes and the
+    /// session window's growth count against it; window and send-buffer
+    /// growth above the floors of [`Cap::Auto`] stops at it.
+    pub memory_budget: Option<u64>,
     /// Concurrent bidirectional streams the peer may open (default 256; 0,
-    /// or at least 4, the early-data floor of [`params::floor`](floor)). An
+    /// or from 4, the early-data floor of [`params::floor`](floor), to
+    /// [`MAX_STREAM_CREDIT`], which grants as many as the protocol can
+    /// count). An
     /// application that never accepts peer streams sets 0; a peer's early
     /// data then fails with `EarlyDataRejected` at the peer.
     pub max_incoming_streams: u64,
-    /// Concurrent unidirectional streams the peer may open. `None` (the
-    /// default) stages the credit: `initial_max_streams_uni` is 16 and
+    /// Concurrent unidirectional streams the peer may open (default
+    /// [`UniCredit::Staged`]: `initial_max_streams_uni` is 16 and
     /// MAX_STREAMS 256 is sent when the application first accepts a
-    /// unidirectional stream. A value
-    /// (including 0) is advertised at once.
-    pub max_incoming_uni_streams: Option<u64>,
+    /// unidirectional stream). A [`UniCredit::Limit`], 0 included, is
+    /// advertised at once.
+    pub max_incoming_uni_streams: UniCredit,
     /// Announce datagram support (default false).
     pub enable_datagrams: bool,
     /// Datagrams waiting for a pipe (default 64, at least 1); when the
@@ -601,9 +735,19 @@ pub struct Config {
     /// Received datagrams waiting per stream (default 32, at least 1); the
     /// stream's oldest make room.
     pub datagram_stream_queue: usize,
-    /// Bytes of every received datagram queue together, those held for
-    /// streams not opened yet included (default 1 MiB, at least 1).
+    /// Payload bytes of the received session datagrams and of those held
+    /// for streams not opened yet, together (default 1 MiB, at least 1);
+    /// stream queues are bounded by their own limits and do not count.
     pub datagram_receive_bytes: usize,
+    /// Payload bytes of received datagrams waiting per stream (default
+    /// `Some(512 KiB)`; `None` leaves
+    /// [`Config::datagram_stream_queue`] the only bound; `Some(0)` is a
+    /// configuration error). A datagram that would exceed this or the
+    /// count drops the stream's oldest datagrams until both hold, each
+    /// counted as dropped; a single datagram larger than this is kept
+    /// alone. The default holds the default 32 datagrams up to 9000-byte
+    /// packets without a drop the count would not make.
+    pub datagram_stream_bytes: Option<usize>,
     /// Written-but-unreleased bytes per session before writes wait
     /// (default 4 MiB): unsent on a single pipe, unacknowledged in a
     /// multipath session. Shared fairly between stream directions, each of
@@ -638,11 +782,13 @@ pub struct Config {
     /// whose secret is a TLS exporter's or a pre-shared key's, and once after a
     /// suspension, by default.
     pub epoch_policy: crate::proto::session::EpochPolicy,
-    /// The first batch of a Hello, in bytes (`None` or 0: off; 8 KiB by default): larger ones
-    /// outgrow the first congestion window and delay both the Hello and the Reply.
+    /// The first batch of a Hello, in bytes (default 8 KiB; `None` turns it
+    /// off; a set value is at least 1): larger ones outgrow the first
+    /// congestion window and delay both the Hello and the Reply. A first
+    /// batch has no forward secrecy: a host whose data needs it turns it off.
     pub join_early_hello: Option<usize>,
     /// Chooses the record mode of each carrier this endpoint joins; unset is always
-    /// Sealed. [`PipeOptions::mode`](crate::PipeOptions::mode) wins over it.
+    /// Sealed. [`PipeOptions::record_mode`](crate::PipeOptions::record_mode) wins over it.
     pub record_policy: Option<RecordPolicy>,
     /// Plans the messages of a Join; unset: none. The kind in its view is the carrier's.
     pub handshake_shaper: Option<super::shaping::HandshakeShaper>,
@@ -651,9 +797,9 @@ pub struct Config {
     /// An acceptor's further check of a join; unset passes all.
     pub authorize_join: Option<AuthorizeJoin>,
     /// The replay window W, a parameter of `max_pipes`, in pipe IDs of the
-    /// peer's parity; `None` (the default) is max(64, 2 x (max_pipes + H)),
-    /// and a value must be at least max_pipes + H.
-    pub replay_window: Option<u64>,
+    /// peer's parity; [`Cap::Auto`] (the default) is max(64, 2 x (max_pipes +
+    /// H)), and a fixed value is at least max_pipes + H.
+    pub replay_window: Cap,
     /// The lanes accepted on each inbound pipe, lane 0 included, a
     /// parameter of `max_pipes` that applies to every session, single-pipe
     /// ones included (default 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this
@@ -715,19 +861,12 @@ pub struct Config {
     pub shaper: Option<Arc<dyn super::shaping::Factory>>,
     /// The `spread-eta` chunk size (default 16 KiB).
     pub spread_chunk: usize,
-    /// The floor of T_suspect for every pipe (default 250 ms, at least
-    /// 50 ms).
-    pub suspect_floor: Duration,
-    /// dead_timeout (at least 1 s): how long the last pipe of a direction
-    /// may stall before it fails, effective max(T_suspect, dead_timeout).
-    /// `None`: T_fail with resume, max(T_fail, half the idle timeout)
-    /// without.
-    pub dead_timeout: Option<Duration>,
     /// The base of the probation of pipes that join or return from
-    /// suspicion; `None` (the default) is 4 x smoothed RTT for the first
-    /// join of a path without history and max(1 s, 4 x smoothed RTT)
-    /// otherwise, zero disables probation.
-    pub probation: Option<Duration>,
+    /// suspicion, a parameter of `scheduler` (default `Some(Cap::Auto)`: 4 x
+    /// smoothed RTT for the first join of a path without history and max(1
+    /// s, 4 x smoothed RTT) otherwise; `None` turns probation off; a fixed
+    /// base is above zero).
+    pub probation: Option<Cap<Duration>>,
     /// The overflow delay D of tier gating: a
     /// tier is saturated when the data offered to it and queued on its
     /// pipes would take longer than this to drain at its aggregate rate,
@@ -738,41 +877,6 @@ pub struct Config {
     /// [`Redundancy::Urgent`]): which stream directions have copies of
     /// their chunks sent on a second pipe of the tier; a stream's `set_redundant` overrides it.
     pub redundancy: Redundancy,
-    /// The `standby_probe` parameter of `scheduler` (default
-    /// [`DEFAULT_STANDBY_PROBE`], 1 s; `None` turns these
-    /// faster probes off, leaving such pipes at the probe interval; a
-    /// period below 1 s is not valid): how often standby pipes and pipes of a
-    /// less-preferred tier get a PIPE_PING while the session is busy, a
-    /// traffic frame having been sent or received within the last 15 s. A quiet session probes them
-    /// at the probe interval, and once more when traffic resumes.
-    pub standby_probe: Option<Duration>,
-    /// The `probe_interval` parameter of `scheduler` (default
-    /// [`DEFAULT_PROBE_INTERVAL`], 15 s; `None` turns these
-    /// idle probes off, and a period below 1 s is not valid): how long an outbound pipe
-    /// of a pipe pair stays without an ack-eliciting byte handed to its
-    /// carrier before it gets a PIPE_PING. A
-    /// longer interval only delays the detection of a pipe pair that dies
-    /// while idle. Off turns off only these probes: the PIPE_PING that
-    /// goes with the answer to the peer's, the standby probes and the
-    /// probes of attachments without an outbound direction at the peer
-    /// stay, and a pipe pair with them off at both ends is not judged while the
-    /// session is quiet. The deadline is measured to the carrier: records
-    /// that shaping may hold for up to `max_delay` are built that much
-    /// earlier (but not more often than every second). A pipe's
-    /// [`PipeOptions::probe_interval`](crate::PipeOptions::probe_interval)
-    /// replaces it. Pipes whose attachment has no outbound direction at the
-    /// peer are always probed, at most every 15 s (the protocol constant
-    /// on which the peer's inbound silence rule relies).
-    pub probe_interval: Option<Duration>,
-    /// The `probe_jitter` parameter of `scheduler` (default 0.25, at least
-    /// 0 and below 1): each wait for an idle probe is drawn once, when it
-    /// starts (the pipe becomes ACTIVE, or a PIPE_PING was sent), uniformly
-    /// from \[k (1 - j), k\] for the probe interval k, and the first wait of the bootstrap pipe
-    /// from \[0, k\]; ack-eliciting bytes sent meanwhile move its start without a new
-    /// draw. The interval stays the upper bound. Zero gives the fixed
-    /// schedule of tests; the standby probes are never jittered. The draws
-    /// come from a generator seeded by the operating system's.
-    pub probe_jitter: f64,
     /// `allow_connection_window_increase`: when set,
     /// the session receive window grows only by increases the predicate
     /// approves. The core keeps at most one proposal outstanding; the
@@ -856,7 +960,7 @@ pub struct Config {
 /// let (send, recv) = session.open_bi().await.map_err(|e| zmux::ConnectError::Io(std::sync::Arc::new(e.into())))?;
 /// // ... the request leaves with the parameters, before the peer's arrive ...
 /// # drop((send, recv));
-/// if session.closed().await.is_early_data_rejected() {
+/// if session.closing().await.is_early_data_rejected() {
 ///     // The peer is not a zmux endpoint and processed nothing.
 ///     config.early_data = EarlyData::default();
 ///     let session = Session::connect(again, config).await?;
@@ -934,20 +1038,21 @@ impl Default for Config {
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
             join_timeout: DEFAULT_JOIN_TIMEOUT,
             max_idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
-            keep_alive_period: Some(DEFAULT_KEEP_ALIVE_PERIOD),
+            liveness: Liveness::default(),
             initial_stream_receive_window: 256 * 1024,
             max_stream_receive_window: Cap::Auto,
             latency_budget: DEFAULT_LATENCY_BUDGET,
             initial_connection_receive_window: 1024 * 1024,
             max_connection_receive_window: Cap::Auto,
-            memory_budget: None,
+            memory_budget: Some(DEFAULT_MEMORY_BUDGET),
             max_incoming_streams: 256,
-            max_incoming_uni_streams: None,
+            max_incoming_uni_streams: UniCredit::Staged,
             enable_datagrams: false,
             datagram_send_queue: 64,
             datagram_receive_queue: 128,
             datagram_stream_queue: 32,
             datagram_receive_bytes: 1024 * 1024,
+            datagram_stream_bytes: Some(DEFAULT_DATAGRAM_STREAM_BYTES),
             send_buffer: 4 * 1024 * 1024,
             send_buffer_max: Cap::Auto,
             max_send_record: crate::proto::params::DEFAULT_MAX_RECORD_SIZE as usize,
@@ -960,7 +1065,7 @@ impl Default for Config {
             handshake_shaper: None,
             allow_record_mode: None,
             authorize_join: None,
-            replay_window: None,
+            replay_window: Cap::Auto,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
             redial_min_backoff: DEFAULT_MIN_BACKOFF,
@@ -975,14 +1080,9 @@ impl Default for Config {
             shaping_budget: None,
             shaper: None,
             spread_chunk: 16 * 1024,
-            suspect_floor: Duration::from_millis(250),
-            dead_timeout: None,
-            probation: None,
+            probation: Some(Cap::Auto),
             overflow_delay: DEFAULT_OVERFLOW_DELAY,
             redundancy: Redundancy::Urgent,
-            standby_probe: Some(DEFAULT_STANDBY_PROBE),
-            probe_interval: Some(DEFAULT_PROBE_INTERVAL),
-            probe_jitter: DEFAULT_PROBE_JITTER,
             allow_connection_window_increase: None,
             datagram_limiter: DatagramLimiter::default(),
             pipe_auth: PipeAuth::default(),
@@ -1050,6 +1150,11 @@ pub struct TestHooks {
     /// How long an application close waits for the carriers to take
     /// CONNECTION_CLOSE instead of 1 s.
     pub close_handoff_limit: Option<Duration>,
+    /// The linger timeout instead of three RTTs within 250 ms to 2 s.
+    pub linger_timeout: Option<Duration>,
+    /// Set once a shutdown's GOAWAY phase 2 is done (its final GOAWAY
+    /// sent, or none needed).
+    pub goaway_final: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Config {
@@ -1157,10 +1262,10 @@ impl Config {
             initial_max_stream_data_bidi_remote: Some(window),
             initial_max_stream_data_uni: Some(window),
             initial_max_streams_bidi: Some(self.max_incoming_streams),
-            initial_max_streams_uni: Some(
-                self.max_incoming_uni_streams
-                    .unwrap_or(STAGED_UNI_STREAMS.0),
-            ),
+            initial_max_streams_uni: Some(match self.max_incoming_uni_streams {
+                UniCredit::Limit(n) => n,
+                UniCredit::Staged => STAGED_UNI_STREAMS.0,
+            }),
             reset_stream_at: true,
             max_datagram_frame_size: self.enable_datagrams.then_some(ZMUX_MAX_RECORD_SIZE),
             max_record_size: Some(ZMUX_MAX_RECORD_SIZE),
@@ -1220,54 +1325,70 @@ impl Config {
 
     /// The keep-alive period in effect; `None` when off.
     pub(crate) fn keep_alive(&self) -> Option<Duration> {
-        self.keep_alive_period
+        self.liveness.keep_alive_period
     }
 
     /// The memory budget in effect; `None` when unlimited.
     pub(crate) fn memory_budget(&self) -> Option<u64> {
         self.memory_budget
-            .unwrap_or(Budget::Bytes(DEFAULT_MEMORY_BUDGET))
-            .bytes()
     }
 
     /// The standby probe interval in effect; `None` when off.
     pub(crate) fn standby_probe(&self) -> Option<Duration> {
-        self.standby_probe
+        self.liveness.standby_probe
     }
 
     /// The probe interval of idle pipe pairs in effect.
     pub(crate) fn probe_interval(&self) -> Option<Duration> {
-        self.probe_interval
+        self.liveness.probe_interval
     }
-
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate(&self) -> Result<(), crate::InvalidConfig> {
         if self.own_locator().len() > Locator::MAX_LEN {
-            return Err("locator above 255 bytes");
+            return Err(crate::InvalidConfig::new("locator", "above 255 bytes"));
         }
+        self.epoch_policy.validate()?;
         let fixed = |c: Cap| match c {
             Cap::Auto => u64::MAX,
             Cap::Fixed(v) => v,
         };
         if self.initial_stream_receive_window > fixed(self.max_stream_receive_window) {
-            return Err("initial_stream_receive_window above max_stream_receive_window");
+            return Err(crate::InvalidConfig::new(
+                "initial_stream_receive_window",
+                "above max_stream_receive_window",
+            ));
         }
         if self.initial_connection_receive_window > fixed(self.max_connection_receive_window) {
-            return Err("initial_connection_receive_window above max_connection_receive_window");
+            return Err(crate::InvalidConfig::new(
+                "initial_connection_receive_window",
+                "above max_connection_receive_window",
+            ));
         }
         // Every zmux endpoint advertises at least the early-data floor.
         if self.initial_stream_receive_window < floor::MAX_STREAM_DATA {
-            return Err("initial_stream_receive_window below the 4 KiB early-data floor");
+            return Err(crate::InvalidConfig::new(
+                "initial_stream_receive_window",
+                "below the 4 KiB early-data floor",
+            ));
         }
         if self.initial_connection_receive_window < floor::MAX_DATA {
-            return Err("initial_connection_receive_window below the 16 KiB early-data floor");
+            return Err(crate::InvalidConfig::new(
+                "initial_connection_receive_window",
+                "below the 16 KiB early-data floor",
+            ));
         }
         if self.max_incoming_streams != 0 && self.max_incoming_streams < floor::MAX_STREAMS_BIDI {
-            return Err("max_incoming_streams neither 0 nor at least the early-data floor of 4");
+            return Err(crate::InvalidConfig::new(
+                "max_incoming_streams",
+                "neither 0 nor at least the early-data floor of 4",
+            ));
         }
-        if self.max_incoming_streams > 1 << 60
-            || self.max_incoming_uni_streams.unwrap_or(0) > 1 << 60
+        if self.max_incoming_streams > MAX_STREAM_CREDIT
+            || matches!(self.max_incoming_uni_streams, UniCredit::Limit(n) if n > MAX_STREAM_CREDIT)
         {
-            return Err("stream limits above 2^60");
+            return Err(crate::InvalidConfig::new(
+                "max_incoming_streams",
+                "a stream limit above MAX_STREAM_CREDIT (2^60)",
+            ));
         }
         // Values sent as variable-length integers.
         let varint_max = (1u64 << 62) - 1;
@@ -1282,103 +1403,131 @@ impl Config {
             || self.initial_connection_receive_window > varint_max
             || self.idle_millis() > varint_max
         {
-            return Err("a window or timeout is too large to encode");
+            return Err(crate::InvalidConfig::new(
+                "max_idle_timeout",
+                "a window or timeout is too large to encode",
+            ));
         }
         if !(1024..=65535).contains(&self.max_send_record) {
-            return Err("max_send_record outside 1024..=65535");
+            return Err(crate::InvalidConfig::new(
+                "max_send_record",
+                "outside 1024..=65535",
+            ));
         }
         if self.send_buffer == 0 {
-            return Err("send_buffer is zero");
+            return Err(crate::InvalidConfig::new("send_buffer", "zero"));
         }
         if self.datagram_send_queue == 0
             || self.datagram_receive_queue == 0
             || self.datagram_stream_queue == 0
             || self.datagram_receive_bytes == 0
+            || self.datagram_stream_bytes == Some(0)
         {
-            return Err("a datagram queue or the datagram receive bytes is zero");
+            return Err(crate::InvalidConfig::new(
+                "datagram_send_queue",
+                "a datagram queue or the datagram receive bytes is zero",
+            ));
         }
         if self.max_pipes == 0 {
-            return Err("max_pipes is zero");
+            return Err(crate::InvalidConfig::new("max_pipes", "zero"));
         }
         if self.max_lanes.get() > varint_max {
-            return Err("max_lanes above 2^62 - 1");
+            return Err(crate::InvalidConfig::new("max_lanes", "above 2^62 - 1"));
         }
         if self.own_locator().len() > Locator::MAX_LEN {
-            return Err("locator above 255 bytes");
-        }
-        if self.suspect_floor < Duration::from_millis(50) {
-            return Err("suspect_floor below 50 ms");
+            return Err(crate::InvalidConfig::new("locator", "above 255 bytes"));
         }
         if self
-            .dead_timeout
-            .is_some_and(|d| d < Duration::from_secs(1))
+            .max_idle_timeout
+            .is_some_and(|d| d < Duration::from_millis(1))
         {
-            return Err("dead_timeout below 1 s");
+            return Err(crate::InvalidConfig::new("max_idle_timeout", "below 1 ms"));
         }
-        if !(0.0..1.0).contains(&self.probe_jitter) {
-            return Err("probe_jitter outside [0, 1)");
+        self.liveness.validate()?;
+        if self.join_early_hello == Some(0) {
+            return Err(crate::InvalidConfig::new(
+                "join_early_hello",
+                "zero: turn the first batch off with None",
+            ));
         }
-        let below = |d: Option<Duration>, min| d.is_some_and(|d| d < min);
-        if below(self.max_idle_timeout, Duration::from_millis(1)) {
-            return Err("max_idle_timeout below 1 ms");
-        }
-        if below(self.keep_alive_period, Duration::from_secs(1)) {
-            return Err("keep_alive_period below 1 s");
-        }
-        if below(self.standby_probe, Duration::from_secs(1)) {
-            return Err("standby_probe below 1 s");
-        }
-        if below(self.probe_interval, Duration::from_secs(1)) {
-            return Err("probe_interval below 1 s");
+        if matches!(self.probation, Some(Cap::Fixed(d)) if d.is_zero()) {
+            return Err(crate::InvalidConfig::new(
+                "probation",
+                "a base of zero: turn probation off with None",
+            ));
         }
         self.shaping_limits.validate()?;
         if !(1024..=65535).contains(&self.spread_chunk) {
-            return Err("spread_chunk outside 1024..=65535");
+            return Err(crate::InvalidConfig::new(
+                "spread_chunk",
+                "outside 1024..=65535",
+            ));
         }
         let a = &self.pipe_auth;
         if a.psk.as_ref().is_some_and(|k| k.len() < 16) {
-            return Err("pipe_auth PSK must hold at least 16 bytes");
+            return Err(crate::InvalidConfig::new(
+                "pipe_auth",
+                "a pre-shared key must hold at least 16 bytes",
+            ));
         }
         if self.session_crypto.check_local().is_err() {
-            return Err(
-                "session_crypto must hold Suite 1 and Group 2 and only values of this build, ascending, once each",
-            );
+            return Err(crate::InvalidConfig::new(
+                "session_crypto",
+                "must hold Suite 1 and Group 2 and only values of this build, ascending, once each",
+            ));
         }
         if a.deferred_psk && a.psk.is_some() {
-            return Err("a deferred PSK cannot be combined with a static one");
+            return Err(crate::InvalidConfig::new(
+                "pipe_auth",
+                "a deferred pre-shared key cannot be combined with a static one",
+            ));
         }
-        if self
-            .replay_window
-            .is_some_and(|w| w < u64::from(self.max_pipes) + u64::from(self.pipe_headroom))
+        if matches!(self.replay_window,
+            Cap::Fixed(w) if w < u64::from(self.max_pipes) + u64::from(self.pipe_headroom))
         {
-            return Err("replay_window below max_pipes + pipe_headroom");
+            return Err(crate::InvalidConfig::new(
+                "replay_window",
+                "below max_pipes + pipe_headroom",
+            ));
         }
         if self.resume_timeout.is_some_and(|t| t.is_zero()) {
-            return Err("resume_timeout is zero");
+            return Err(crate::InvalidConfig::new("resume_timeout", "zero"));
         }
         if self
             .protocols
             .as_ref()
             .is_some_and(|p| p.is_empty() || p.iter().any(|n| n.is_empty()))
         {
-            return Err("protocols must hold at least one non-empty name");
+            return Err(crate::InvalidConfig::new(
+                "protocols",
+                "must hold at least one non-empty name",
+            ));
         }
         if self.join_timeout.is_zero() {
-            return Err("join_timeout is zero");
+            return Err(crate::InvalidConfig::new("join_timeout", "zero"));
         }
         if self.join_timeout > super::MAX_JOIN_DEADLINE {
-            return Err("join_timeout above the maximum join deadline of 60 s");
+            return Err(crate::InvalidConfig::new(
+                "join_timeout",
+                "above the maximum join deadline of 60 s",
+            ));
         }
         if let (Cap::Fixed(max), b) = (self.send_buffer_max, self.send_buffer)
             && max < b
         {
-            return Err("send_buffer_max below send_buffer");
+            return Err(crate::InvalidConfig::new(
+                "send_buffer_max",
+                "below send_buffer",
+            ));
         }
         if self.redial_min_backoff > self.redial_max_backoff {
-            return Err("redial_min_backoff above redial_max_backoff");
+            return Err(crate::InvalidConfig::new(
+                "redial_min_backoff",
+                "above redial_max_backoff",
+            ));
         }
         if self.redial_min_backoff.is_zero() {
-            return Err("redial_min_backoff is zero");
+            return Err(crate::InvalidConfig::new("redial_min_backoff", "zero"));
         }
         Ok(())
     }
@@ -1388,19 +1537,19 @@ impl Config {
     /// the secure carrier; on a secure first pipe, no other source.
     /// `EndToEnd` is no source.
     #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
-    pub(crate) fn check_source(&self, secure_first_pipe: bool) -> Result<(), &'static str> {
+    pub(crate) fn check_source(&self, secure_first_pipe: bool) -> Result<(), crate::InvalidConfig> {
         if secure_first_pipe {
             if self.pipe_auth.has_source() {
-                return Err(
-                    "pipe_auth with a PSK or the exporter on a secure first pipe: \
-                     the secure carrier is the source, leave pipe_auth unset",
-                );
+                return Err(crate::InvalidConfig::new(
+                    "pipe_auth",
+                    "a PSK or the exporter on a secure first pipe: the secure carrier is the source, leave pipe_auth unset",
+                ));
             }
         } else if self.offers_multipath() && !self.pipe_auth.has_source() {
-            return Err(
-                "multipath (max_pipes above 1 or resume_timeout) needs a secret source: \
-                 a PSK, a deferred PSK, the exporter, or a secure first pipe",
-            );
+            return Err(crate::InvalidConfig::new(
+                "pipe_auth",
+                "multipath (max_pipes above 1 or resume_timeout) needs a secret source: a PSK, a deferred PSK, the exporter, or a secure first pipe",
+            ));
         }
         Ok(())
     }
@@ -1427,6 +1576,9 @@ mod locator_tests {
         };
         assert_eq!(c.validate(), Ok(()));
         c.locator = vec![1; 256];
-        assert_eq!(c.validate(), Err("locator above 255 bytes"));
+        assert_eq!(
+            c.validate(),
+            Err(crate::InvalidConfig::new("locator", "above 255 bytes"))
+        );
     }
 }

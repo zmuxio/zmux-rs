@@ -5,7 +5,7 @@
 
 use std::io;
 
-use http::header::{CONTENT_LENGTH, HeaderName, UPGRADE};
+use http::header::{CONTENT_LENGTH, HeaderName, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, Method, Version};
 
 /// The request field that pairs the uplink `POST` and the downlink `GET`
@@ -85,16 +85,20 @@ pub enum RequestClass {
     /// An extended `CONNECT` with `:protocol` `webtransport-h3` or
     /// `webtransport`.
     WebTransport,
-    /// A `GET` with the pairing field ([`PairField`]): its response body
-    /// is the downlink.
+    /// A `GET` with the pairing field ([`PairField`]) holding a value (an
+    /// empty value is no pairing field): its response body is the
+    /// downlink.
     Downlink,
     /// A `POST` with the pairing field (a split bootstrap's uplink): its
     /// request body is the uplink.
     Uplink,
-    /// A `POST` with a `Content-Length`: an exchange request.
+    /// A `POST` with a `Content-Length`, or an HTTP/1.x `POST` with
+    /// neither a `Content-Length` nor a `Transfer-Encoding` (a body of
+    /// length zero): an exchange request.
     Exchange,
-    /// A `POST` without a `Content-Length`: the request body is the uplink
-    /// and the response body the downlink.
+    /// Any other `POST` (a chunked HTTP/1.1 body, an HTTP/2 or HTTP/3 body
+    /// of unknown length): the request body is the uplink and the response
+    /// body the downlink.
     Bidirectional,
 }
 
@@ -118,7 +122,8 @@ pub fn classify_head(
     protocol: Option<&str>,
     pair: &PairField,
 ) -> Option<RequestClass> {
-    let pair = headers.contains_key(pair.name());
+    // A field with an empty value is no pairing field.
+    let pair = headers.get(pair.name()).is_some_and(|v| !v.is_empty());
     if *method == Method::CONNECT {
         return match protocol {
             Some(p) if p.eq_ignore_ascii_case("websocket") => Some(RequestClass::WebSocket),
@@ -145,7 +150,10 @@ pub fn classify_head(
     if pair {
         return Some(RequestClass::Uplink);
     }
-    if headers.contains_key(CONTENT_LENGTH) {
+    // HTTP/1.x: a request with neither a `Content-Length` nor a
+    // `Transfer-Encoding` has a body of length zero.
+    let empty_h1 = version <= Version::HTTP_11 && !headers.contains_key(TRANSFER_ENCODING);
+    if headers.contains_key(CONTENT_LENGTH) || empty_h1 {
         return Some(RequestClass::Exchange);
     }
     Some(RequestClass::Bidirectional)
@@ -257,6 +265,25 @@ mod tests {
         // 6.
         assert_eq!(
             class(Method::POST, v11, &[("transfer-encoding", "chunked")]),
+            Some(C::Bidirectional)
+        );
+        // An HTTP/1.x POST without either field has an empty body: an
+        // exchange request. On HTTP/2 the body's length is unknown.
+        assert_eq!(class(Method::POST, v11, &[]), Some(C::Exchange));
+        assert_eq!(
+            class(Method::POST, Version::HTTP_10, &[]),
+            Some(C::Exchange)
+        );
+        assert_eq!(
+            class(Method::POST, Version::HTTP_2, &[]),
+            Some(C::Bidirectional)
+        );
+        // An empty pairing field is none.
+        let empty = ("zmux-pipe-pair", "");
+        assert_eq!(class(Method::GET, v11, &[empty]), None);
+        assert_eq!(class(Method::POST, v11, &[empty, cl]), Some(C::Exchange));
+        assert_eq!(
+            class(Method::POST, Version::HTTP_2, &[empty]),
             Some(C::Bidirectional)
         );
         // 7.

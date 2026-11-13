@@ -6,8 +6,7 @@ use std::time::{Duration, Instant};
 
 use zmux::blocking::{self, InboundTransform, PipeHint, PipeIo};
 use zmux::proto::listener::{OnReject, RejectAction};
-use zmux::proto::seal::Mode;
-use zmux::proto::session::RecordMode;
+use zmux::proto::seal::RecordMode;
 use zmux::{AdmittedValue, Config, HandleError, ListenerConfig, PipeAuth, PipeOptions};
 use zmux_seal::{
     Admission, BoxFuture, ClientConfig, Credential, Gate, HandlePsk, Peer, PinVerifier,
@@ -104,7 +103,7 @@ fn establish_and_join_on_threads() {
         ListenerConfig::default(),
     );
     let (p, peer) = blocking_establish(addr).unwrap();
-    assert_eq!(peer.mode, Mode::Sealed);
+    assert_eq!(peer.record_mode, RecordMode::Sealed);
     let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = asked.clone();
     let mut with_hook = config();
@@ -123,10 +122,10 @@ fn establish_and_join_on_threads() {
     let pipe = c
         .begin_add_pipe(
             PipeIo::tcp(TcpStream::connect(addr).unwrap()),
-            PipeOptions::new().with_mode(Mode::Sealed),
+            PipeOptions::new().with_record_mode(RecordMode::Sealed),
         )
         .unwrap();
-    pipe.joined(Some(Duration::from_secs(5))).unwrap();
+    pipe.joined().unwrap();
     assert_eq!(*asked.lock().unwrap(), ["hello", "confirm"]);
     assert!(c.shaping_stats().wire_spent > 500);
     // Joined here is before the acceptor read the confirmation.
@@ -139,7 +138,7 @@ fn establish_and_join_on_threads() {
     echo(&c, &s, &vec![7; 64 << 10]);
     let st = l.stats();
     assert_eq!((st.sessions, st.joins), (1, 1));
-    c.close(0u32.into(), b"");
+    c.close();
     l.close();
     t.join().unwrap();
 }
@@ -302,7 +301,7 @@ fn drivers_interoperate() {
     };
     assert_eq!(sr.read_to_end(16).unwrap(), b"hi");
     sw.finish().unwrap();
-    rt.block_on(c.close(0u32.into(), b""));
+    rt.block_on(c.close());
     l.close();
     t.join().unwrap();
     // Blocking client, tokio server.
@@ -319,7 +318,7 @@ fn drivers_interoperate() {
     let c = blocking::Session::connect(p, config()).unwrap();
     let s = rt.block_on(tl.accept()).unwrap();
     assert_eq!(s.weakest_record_mode(), RecordMode::Sealed);
-    c.close(0u32.into(), b"");
+    c.close();
     tl.close();
     drop(s);
 }

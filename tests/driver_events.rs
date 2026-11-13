@@ -110,7 +110,7 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
     assert_eq!(recv.read_to_end(16).await.unwrap(), b"");
 
     // Every pipe is accounted for: reported live, or counted as retired.
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     let mut retired = 0;
     let mut seen = std::collections::HashSet::new();
     while let Some(e) = server.next_event().await {
@@ -146,27 +146,30 @@ async fn quality_events_reach_the_application() {
     let pipe = client
         .begin_add_pipe(carrier(&listener), PipeOptions::default())
         .unwrap();
-    pipe.set_quality_band(Some(QualityBand::new(Duration::from_millis(5), 1.5)))
-        .unwrap();
+    pipe.set_quality_band(Some(QualityBand::new(
+        Some(Duration::from_millis(5)),
+        Some(1.5),
+    )))
+    .unwrap();
     client.set_quality_band(None).unwrap();
     // A rate ratio that is not a number, or a negative one, is rejected.
     for bad in [f64::NAN, -1.0] {
-        let band = Some(QualityBand::new(Duration::from_millis(5), bad));
-        assert_eq!(
+        let band = Some(QualityBand::new(Some(Duration::from_millis(5)), Some(bad)));
+        assert!(matches!(
             client.set_quality_band(band),
-            Err(zmux::PipeError::InvalidOptions)
-        );
-        assert_eq!(
+            Err(zmux::PipeError::InvalidOptions(_))
+        ));
+        assert!(matches!(
             pipe.set_quality_band(band),
-            Err(zmux::PipeError::InvalidOptions)
-        );
+            Err(zmux::PipeError::InvalidOptions(_))
+        ));
     }
     let mut nan = CapacityFloor::new(1);
     nan.rate_ratio = f64::NAN;
-    assert_eq!(
+    assert!(matches!(
         client.set_capacity_floor(Some(nan)),
-        Err(zmux::PipeError::InvalidOptions)
-    );
+        Err(zmux::PipeError::InvalidOptions(_))
+    ));
     client
         .set_capacity_floor(Some(CapacityFloor::new(u64::MAX)))
         .unwrap();
@@ -312,10 +315,22 @@ async fn a_refused_join_reports_the_refusal_after_its_retirement() {
         .add_pipe(carrier(&listener), PipeOptions::default())
         .await
         .unwrap();
+    // The acceptor reads this join only once the second handle is taken:
+    // a refusal that came first would retire the pipe before the lookup.
+    let (a, b) = tokio::io::duplex(256 * 1024);
     let refused = client
-        .begin_add_pipe(carrier(&listener), PipeOptions::default())
+        .begin_add_pipe(PipeIo::new(a), PipeOptions::default())
         .unwrap();
     let other = client.pipe(refused.id()).expect("known while joining");
+    let l = listener.clone();
+    tokio::spawn(async move {
+        let _ = l
+            .handle_pipe(
+                PipeIo::new(b),
+                PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+            )
+            .await;
+    });
     assert_eq!(refused.joined().await, Err(PipeError::JoinRefused));
     assert!(refused.stats().is_none(), "retired at once");
     assert_eq!(other.joined().await, Err(PipeError::JoinRefused));

@@ -174,7 +174,7 @@ fn zmux_config() -> zmux::Config {
     let mut c = zmux::Config::default();
     c.enable_datagrams = true;
     // The full unidirectional credit at once.
-    c.max_incoming_uni_streams = Some(256);
+    c.max_incoming_uni_streams = zmux::UniCredit::Limit(256);
     c
 }
 
@@ -541,7 +541,7 @@ async fn close(z: &zmux::Session, q: &qmux::Session, closer: Closer) {
         }
         Closer::Qmux => {
             q.close(7, "done");
-            let err = z.closed().await;
+            let err = z.closing().await;
             assert_eq!(
                 err,
                 SessionError::ApplicationClosed {
@@ -916,7 +916,7 @@ async fn early_data_wrongly_declared() {
     let c = qmux_config();
     let t = QmuxTransport::new(q, c.version, c.max_record_size);
     let target = qmux::Session::accept(t, c).await;
-    let e = tokio::time::timeout(Duration::from_secs(10), client.closed())
+    let e = tokio::time::timeout(Duration::from_secs(10), client.closing())
         .await
         .expect("closed in time");
     assert_eq!(e, SessionError::EarlyDataRejected, "{e:?}");

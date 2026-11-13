@@ -516,7 +516,12 @@ impl SessionCore {
         if send.cold().reset.is_some() || s.goaway.is_some() {
             return Ok(());
         }
-        if self.lost().is_some() {
+        if let Some(e) = self.lost() {
+            // A pending local write after the peer's close fails with the
+            // session's error (SPEC.md Section 6.5).
+            if self.draining_peer_close() {
+                return Err(StreamError::SessionLost(e));
+            }
             return Ok(());
         }
         self.local_reset(key, code.into_inner());
@@ -680,9 +685,12 @@ impl SessionCore {
         }
         let lost = self.lost();
         if !r.buf.is_empty() {
+            // After the peer's close, what arrived stays readable until the
+            // session is CLOSED (SessionCore::peer_close_unread).
             if let Some(e) = lost
                 && r.final_size.is_none()
                 && r.cold().reset.is_none()
+                && !self.draining_peer_close()
             {
                 return Err(StreamError::SessionLost(e));
             }
@@ -787,10 +795,15 @@ impl SessionCore {
         self.meter.add(Count::Read, n as u64);
         let fin =
             r.buf.is_empty() && r.cold().reset.is_none() && r.final_size == Some(r.read_offset);
+        let drained = r.buf.is_empty();
         self.credit_consumed(n as u64);
         self.streams.check_stream_credit(key);
         if fin {
             self.end_read(key);
+        }
+        if drained && self.draining_peer_close() {
+            // The last unread data after the peer's close may hold CLOSED.
+            self.unread_drained();
         }
         Ok(Some((n, fin, out)))
     }
@@ -822,14 +835,28 @@ impl SessionCore {
         if s.recv.is_none() {
             return Err(StreamError::ClosedLocally);
         }
+        // During the read drain after the peer's close: what was unread is
+        // discarded, nothing is sent, and the call fails with the session's
+        // error, as every pending local operation does (SPEC.md Section 6.5).
+        let lost = self.lost().filter(|_| self.draining_peer_close());
         self.local_stop(key, code.into_inner());
-        Ok(())
+        lost.map_or(Ok(()), |e| Err(StreamError::SessionLost(e)))
     }
 
     /// STOP_SENDING on the local receiving part (application stop, release
     /// or rejection). Data still buffered is discarded and counts as
     /// consumed.
     pub(super) fn local_stop(&mut self, key: StreamKey, code: u64) {
+        let counted = self.draining_peer_close() && self.holds_unread(key);
+        self.stop_recv_part(key, code);
+        if counted {
+            self.unread_drained();
+        } else if self.state == super::State::Closing {
+            self.maybe_closed(self.now);
+        }
+    }
+
+    fn stop_recv_part(&mut self, key: StreamKey, code: u64) {
         let Some(Stopped {
             local,
             dropped,
@@ -1426,9 +1453,11 @@ impl SessionCore {
         match s.datagrams.as_mut().and_then(|q| q.queue.pop_front()) {
             Some((context, d)) => {
                 let n = d.len() as u64;
-                s.datagrams_mut().counts.bytes_received += n;
+                let q = s.datagrams_mut();
+                q.counts.bytes_received += n;
+                q.bytes -= d.len();
                 s.count(Count::DatagramReceived, n);
-                self.dgram_mut().recv_bytes -= d.len();
+                self.dgram_mut().stream_bytes -= d.len();
                 self.meter.add(Count::DatagramReceived, n);
                 Ok(Some((context, d)))
             }
@@ -1445,11 +1474,19 @@ impl SessionCore {
     /// or below the current one leaves that type as it is, so 0 raises
     /// nothing. While unidirectional credit is staged, `uni` raises the
     /// value the first accept moves it to. After a GOAWAY no credit is
-    /// sent. A value above 2^60 is refused and changes nothing.
-    pub fn raise_incoming_streams(&mut self, bidi: u64, uni: u64) -> Result<(), &'static str> {
-        const MAX: u64 = 1 << 60;
-        if bidi > MAX || uni > MAX {
-            return Err("raise_incoming_streams above 2^60");
+    /// sent. A value above [`MAX_STREAM_CREDIT`](crate::MAX_STREAM_CREDIT)
+    /// (2^60) is refused and changes nothing.
+    pub fn raise_incoming_streams(
+        &mut self,
+        bidi: u64,
+        uni: u64,
+    ) -> Result<(), crate::InvalidConfig> {
+        use super::config::MAX_STREAM_CREDIT;
+        if bidi > MAX_STREAM_CREDIT || uni > MAX_STREAM_CREDIT {
+            return Err(crate::InvalidConfig::new(
+                "raise_incoming_streams",
+                "a limit above MAX_STREAM_CREDIT (2^60)",
+            ));
         }
         let grant = self.goaway().sent.is_none() && self.lost().is_none();
         self.streams.raise_remote(di(Dir::Bidi), bidi, grant);

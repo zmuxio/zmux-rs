@@ -9,18 +9,24 @@ accepted).
 
 - `connect(url, options, config)` / `dial(request, options)`: a session, or
   a carrier for a further pipe, over a new WebSocket;
-- `serve(listener, tcp, options, fallback)`: WebSocket upgrades on a TCP
+- `serve(listener, tcp, options)`: WebSocket upgrades on a TCP
   listener, handed to a `zmux::Listener`; `serve_tls` the same over TLS
   (`wss://`). Behind intermediaries the listener trusts, the source is the
   client a PROXY protocol header or a forwarding header field reports;
   `accept(io, info, listener,
   options)` upgrades one connection, plain or TLS, or refuses it, `info`
   giving the connection's metadata (address, TLS exporter);
-- `Options`: the subprotocols, `qmux-02[.<application>]` or an
-  application's own identifier, and a client's `zmux::Credential`, presented
+- `Options` (`Options::new()` for the defaults): the subprotocols, `qmux-02[.<application>]` or an
+  application's own identifier, and a client's `zmux::CarrierCredential`, presented
   in a request header field (a `zmux::PrefixAuth` token in
   `Zmux-Prefix-Auth`, bound to the TLS connection with `dial_tls`);
-- `pipe(ws, protocol)`: any established WebSocket stream.
+- `pipe(ws, protocol)`: any established WebSocket stream;
+- `candidate(connect, url, options)` and `candidate_tls(url, tls, options)`:
+  `zmux::Candidate`s for carrier modes, over a connection of the
+  application's or over TLS by rustls.
+
+A request head ends with an empty line after CRLF or bare LF line endings,
+as HTTP/1.1 parsers accept.
 
 Only a request that is a valid upgrade, offers an accepted subprotocol and
 passes the listener's admission (`ListenerConfig::admission`, decided on

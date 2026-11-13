@@ -86,7 +86,10 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let pipe = client
         .begin_add_pipe(
             PipeIo::tcp(second),
-            PipeOptions::new().with_priority(5).with_label("second"),
+            PipeOptions::new()
+                .with_send_priority(5)
+                .with_receive_priority(5)
+                .with_label("second"),
         )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -147,7 +150,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         .expect("the peer's half closed in time")
         .unwrap();
     let zero = client.pipe(zmux::PipeId::new(0)).unwrap();
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     let e = tokio::time::timeout(Duration::from_secs(10), zero.closed())
         .await
         .expect("pipe 0 ended with the session")
@@ -174,7 +177,7 @@ async fn two_pipes_spread() {
     assert_eq!(info.len(), 2, "{info:?}");
     let p = pipe.stats().unwrap();
     assert!(p.bytes_sent > 0, "{p:?}");
-    s.close(0u32.into(), b"").await;
+    s.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,7 +185,7 @@ async fn severed_pipe_fails_over() {
     let (addr, _l) = server(Policy::SpreadEta).await;
     let c = TcpStream::connect(addr).await.unwrap();
     let mut cfg = config(Policy::SpreadEta);
-    cfg.suspect_floor = Duration::from_millis(100);
+    cfg.liveness.suspect_floor = Duration::from_millis(100);
     let s = Session::connect(PipeIo::tcp(c), cfg).await.unwrap();
     let (raddr, cut) = relay(addr).await;
     let c2 = TcpStream::connect(raddr).await.unwrap();
@@ -206,7 +209,7 @@ async fn severed_pipe_fails_over() {
         .await
         .expect("transfer finishes")
         .unwrap();
-    s.close(0u32.into(), b"").await;
+    s.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -239,7 +242,7 @@ async fn blocking_client_two_pipes() {
         let _ = w.join();
         assert!(got == data);
         assert_eq!(s.pipes().len(), 2);
-        s.close(0u32.into(), b"");
+        s.close();
         let _ = done.send(());
     });
     finished.await.expect("the blocking client finished");
@@ -268,5 +271,5 @@ async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
     })
     .await
     .expect("the count reported");
-    s.close(0u32.into(), b"").await;
+    s.close().await;
 }

@@ -1,9 +1,9 @@
 //! The client's Establish.
 
-use std::io;
 use std::sync::{Arc, OnceLock};
+use std::{fmt, io};
 
-use zmux::proto::seal::{Framing, Mode, cut_unit};
+use zmux::proto::seal::{Framing, RecordMode, cut_unit};
 use zmux::shaping::{
     HandshakeShaper, HandshakeView, Limits, PlanAnswer, UnitPlan, ask_handshake,
     establish_hello_len, item_size, message_len, pad_item,
@@ -14,8 +14,8 @@ use zmux_seal_proto::{Error, Initiator, InitiatorConfig, Profile};
 use crate::carrier::Carrier;
 use crate::profiles::{client_default, has_psk};
 use crate::trust::{
-    AppData, AppDataRequest, AppDataSource, ConfigError, Credential, PeerRole, Signer, Verdict,
-    Verifier, VerifyError, VerifyInput, ask_app_data, check_pq_auth, judge,
+    AppData, AppDataRequest, AppDataSource, ConfigError, Credential, Signer, Verifier, VerifyError,
+    VerifyInput, VerifyVerdict, ask_app_data, check_pq_auth, judge,
 };
 use crate::{MAX_UNIT, credential_value, handshake_payload, message_items, proof_placeholder};
 
@@ -72,11 +72,11 @@ pub struct Peer {
     /// The peer's credential, when its message carried one: (type, bytes).
     pub credential: Option<Credential>,
     /// The verifier's verdict on the peer, when it was verified.
-    pub verdict: Option<Verdict>,
+    pub verdict: Option<VerifyVerdict>,
     /// The Profile of the handshake.
     pub profile: u64,
     /// The record mode.
-    pub mode: Mode,
+    pub record_mode: RecordMode,
     /// The application data the peer sent, in message order.
     pub app_data: Vec<AppData>,
     /// The handshake's confidentiality resists a passive quantum adversary.
@@ -109,6 +109,25 @@ impl std::error::Error for NoReply {
     }
 }
 
+/// Where a client's static key comes from.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum StaticSecret {
+    /// A key generated once per process and shared by its clients.
+    #[default]
+    Process,
+    /// This X25519 private scalar.
+    Given([u8; 32]),
+}
+
+impl fmt::Debug for StaticSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Process => f.write_str("Process"),
+            Self::Given(_) => f.write_str("Given(..)"),
+        }
+    }
+}
+
 /// The default of [`ClientConfig::reply_timeout`].
 pub const DEFAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -125,24 +144,25 @@ pub struct ClientConfig {
     pub handle: Vec<u8>,
     /// The pre-shared key.
     pub psk: Vec<u8>,
-    /// The client's static key; unset is a key generated once per process.
-    pub static_secret: Option<[u8; 32]>,
+    /// The client's static key (default [`StaticSecret::Process`]).
+    pub static_secret: StaticSecret,
     /// The Profiles this client may use, the first that fits the pre-shared key being
-    /// used; empty is both ciphers, the one with hardware support
-    /// first. A refusal never makes a client choose another Profile.
+    /// used (default: both ciphers, the one with hardware support first; an empty list
+    /// is the configuration error). A refusal never makes a client choose another
+    /// Profile.
     pub allowed_profiles: Vec<u64>,
-    /// The record mode; `None` is Sealed.
-    pub mode: Option<Mode>,
+    /// The record mode; the default is Sealed.
+    pub record_mode: RecordMode,
     /// The credential sent in message 3, (type, bytes), if any.
     pub credential: Option<Credential>,
     /// The local application's label of this dial, handed to the verifier.
     pub local_context: Vec<u8>,
     /// Supplies the application data of message 1 (Profiles 1 and 3) and message 3.
     pub app_data: Option<AppDataSource>,
-    /// The largest application data of the server's message; 0 is
-    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), and `usize::MAX` sets no
-    /// bound beyond the message: a local safety bound, not a protocol limit.
-    pub max_app_data: usize,
+    /// The largest application data of the server's message, in bytes (default
+    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), 256; `None`: no bound beyond
+    /// the message): a local safety bound, not a protocol limit.
+    pub max_app_data: Option<usize>,
     /// Requires the server's post-quantum authentication: a verifier is then required, and
     /// not a pin of a static key alone.
     pub require_pq_auth: bool,
@@ -165,13 +185,13 @@ impl Default for ClientConfig {
             allow_psk_only: false,
             handle: Vec::new(),
             psk: Vec::new(),
-            static_secret: None,
-            allowed_profiles: Vec::new(),
-            mode: None,
+            static_secret: StaticSecret::Process,
+            allowed_profiles: client_default().to_vec(),
+            record_mode: RecordMode::Sealed,
             credential: None,
             local_context: Vec::new(),
             app_data: None,
-            max_app_data: 0,
+            max_app_data: Some(crate::DEFAULT_MAX_APP_DATA),
             require_pq_auth: false,
             signer: None,
             shaper: None,
@@ -186,7 +206,7 @@ impl std::fmt::Debug for ClientConfig {
         f.debug_struct("ClientConfig")
             .field("handle", &self.handle)
             .field("allow_psk_only", &self.allow_psk_only)
-            .field("mode", &self.mode)
+            .field("record_mode", &self.record_mode)
             .finish_non_exhaustive()
     }
 }
@@ -220,13 +240,12 @@ impl ClientConfig {
                 "allowed_profiles holds an unknown or reserved Profile",
             ));
         }
+        if self.allowed_profiles.is_empty() {
+            return Err(ConfigError("allowed_profiles is empty"));
+        }
         let with_psk = !self.psk.is_empty();
-        let list: &[u64] = if self.allowed_profiles.is_empty() {
-            client_default()
-        } else {
-            &self.allowed_profiles
-        };
-        list.iter()
+        self.allowed_profiles
+            .iter()
             .filter_map(|&v| Profile::from_value(v))
             .find(|&p| has_psk(p) == with_psk)
             .ok_or(ConfigError(if with_psk {
@@ -237,7 +256,7 @@ impl ClientConfig {
     }
 
     /// Runs the verifier on the server, if any.
-    async fn judge(&self, input: VerifyInput<'_>) -> Result<Option<Verdict>, VerifyError> {
+    async fn judge(&self, input: VerifyInput<'_>) -> Result<Option<VerifyVerdict>, VerifyError> {
         match &self.verifier {
             None => Ok(None),
             Some(verifier) => judge(verifier.as_ref(), input).await.map(Some),
@@ -272,8 +291,8 @@ pub(crate) async fn read_frame<C: Carrier>(
     }
 }
 
-pub(crate) fn binding_of<C: Carrier>(p: &C, mode: Mode) -> Result<Vec<u8>, Error> {
-    if mode != Mode::Bound {
+pub(crate) fn binding_of<C: Carrier>(p: &C, mode: RecordMode) -> Result<Vec<u8>, Error> {
+    if mode != RecordMode::Bound {
         return Ok(Vec::new());
     }
     p.binding().ok_or(Error::InvalidConfig)
@@ -306,10 +325,10 @@ pub(crate) async fn run_client<C: Carrier>(
         )));
     }
     let secret = match cfg.static_secret {
-        Some(s) => s,
-        None => process_secret().map_err(invalid)?,
+        StaticSecret::Given(s) => s,
+        StaticSecret::Process => process_secret().map_err(invalid)?,
     };
-    let mode = cfg.mode.unwrap_or(Mode::Sealed);
+    let mode = cfg.record_mode;
     let binding = binding_of(&p, mode).map_err(invalid)?;
     let framing = p.framing();
     let init = Initiator::new(InitiatorConfig {
@@ -388,7 +407,7 @@ pub(crate) async fn run_client<C: Carrier>(
         .collect();
     // The server is judged before anything of this client is written.
     let input = VerifyInput {
-        role: PeerRole::Server,
+        role: zmux::Role::Server,
         profile,
         peer_static: &peer_key,
         psk_identity: psk.then_some(cfg.handle.as_slice()),
@@ -445,7 +464,7 @@ pub(crate) async fn run_client<C: Carrier>(
         credential,
         verdict,
         profile: profile.value(),
-        mode,
+        record_mode: mode,
         app_data: judged,
         pq_confidential: profile.pq_confidentiality(),
         pq_authenticated,

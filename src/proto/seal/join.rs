@@ -20,7 +20,7 @@ use super::payload::{
 };
 use super::wire::{cut_frame, cut_unit, frame, put_varint, read_shortest};
 use super::{
-    Cipher, Error, Framing, Hash, Mode, Opener, Payload, SHA256, Sealer, Secret, export,
+    Cipher, Error, Framing, Hash, Opener, Payload, RecordMode, SHA256, Sealer, Secret, export,
     fill_random,
 };
 
@@ -292,13 +292,13 @@ pub struct Schedule {
 }
 
 /// The ModeByte of a Hello: the Mode in bits 0-1 and the key phase in bit 7.
-pub fn mode_byte(mode: Mode, phase: u8) -> u8 {
+pub fn mode_byte(mode: RecordMode, phase: u8) -> u8 {
     mode.byte() | (phase & 1) << 7
 }
 
 /// Parses a ModeByte: bits 2-6 set, or a reserved Mode, is `bad_flags`.
-pub fn parse_mode_byte(byte: u8) -> Result<(Mode, u8), Error> {
-    Ok((Mode::from_byte(byte & 0x7f)?, byte >> 7))
+pub fn parse_mode_byte(byte: u8) -> Result<(RecordMode, u8), Error> {
+    Ok((RecordMode::from_byte(byte & 0x7f)?, byte >> 7))
 }
 
 /// The key share item a message carries in place of its own, for the vectors and the
@@ -358,7 +358,7 @@ pub struct JoinConfig<'a> {
     /// The Group of the key share.
     pub group: &'static Group,
     /// The record mode.
-    pub mode: Mode,
+    pub mode: RecordMode,
     /// The key phase: the parity of the epoch whose `join_psk` this is.
     pub phase: u8,
     /// The carrier's framing.
@@ -375,7 +375,7 @@ pub struct JoinConfig<'a> {
 pub struct Joiner {
     suite: &'static Suite,
     group: &'static Group,
-    mode: Mode,
+    mode: RecordMode,
     phase: u8,
     framing: Framing,
     locator: Vec<u8>,
@@ -400,12 +400,17 @@ impl Joiner {
             binding,
         } = config;
         let locator_fits = (1..=usize::from(u8::MAX)).contains(&locator.len());
-        let binding_fits = if mode == Mode::Bound {
+        let binding_fits = if mode == RecordMode::Bound {
             binding.len() == BINDING_LEN
         } else {
             binding.is_empty()
         };
-        if !locator_fits || !binding_fits || psk.len() != suite.hash.out_len() || phase > 1 {
+        if !locator_fits
+            || !binding_fits
+            || !mode.joinable()
+            || psk.len() != suite.hash.out_len()
+            || phase > 1
+        {
             return Err(Error::InvalidConfig);
         }
         Ok(Joiner {
@@ -591,7 +596,7 @@ pub fn parse_reply<'a>(
 /// A joiner waiting for the Reply. It holds the private values of its key share.
 pub struct HelloSent {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     psk: Secret,
     th: Vec<u8>,
@@ -646,7 +651,7 @@ impl HelloSent {
 /// A joiner whose Reply passed. Confirm comes next, after any local delay.
 pub struct Proven {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     #[cfg(feature = "test-hooks")]
     th: Vec<u8>,
@@ -658,7 +663,7 @@ pub struct Proven {
 
 impl Proven {
     /// The record mode.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -673,17 +678,19 @@ impl Proven {
         let mut wire = Vec::new();
         let mut records = None;
         match self.mode {
-            Mode::Sealed => {
+            RecordMode::Sealed => {
                 let mut sealer = Sealer::new(suite.cipher, self.keys.key_i2r.clone());
                 frame(self.framing, &mut wire, &sealer.seal(&vec![0; zeros])?)?;
                 records = Some((sealer, Opener::new(suite.cipher, self.keys.key_r2i.clone())));
             }
-            Mode::Trusted => {
+            RecordMode::Trusted => {
                 let mut body = self.keys.confirm_tag(suite);
                 body.resize(body.len() + zeros, 0);
                 frame(self.framing, &mut wire, &body)?;
             }
-            Mode::Bound => {}
+            // Unmanaged never reaches a join: `Joiner::new` refuses it and
+            // no Hello parses to it.
+            RecordMode::Bound | RecordMode::Unmanaged => {}
         }
         let done = Finished {
             suite,
@@ -702,7 +709,7 @@ impl Proven {
 /// A finished Join on either end: the exporter, and the record keys if Sealed.
 pub struct Finished {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     #[cfg(feature = "test-hooks")]
     th: Vec<u8>,
     #[cfg(feature = "test-hooks")]
@@ -713,7 +720,7 @@ pub struct Finished {
 
 impl Finished {
     /// The record mode.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -762,7 +769,7 @@ impl Finished {
 /// The clear head of a Join Hello, through the nonce R.
 struct HelloHead<'a> {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     phase: u8,
     locator: &'a [u8],
     /// The head's length.
@@ -821,7 +828,7 @@ impl<'a> HelloHead<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct JoinHello<'a> {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     phase: u8,
     locator: &'a [u8],
     prefix: &'a [u8],
@@ -874,7 +881,7 @@ impl<'a> JoinHello<'a> {
     }
 
     /// The Mode the joiner chose.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -923,7 +930,7 @@ impl Acceptor {
             return Err(Error::InvalidConfig);
         }
         // A Hello in Bound and no Binding here: refused, unopened.
-        if hello.mode() == Mode::Bound && keys.binding.is_empty() {
+        if hello.mode() == RecordMode::Bound && keys.binding.is_empty() {
             return Err(Error::Auth);
         }
         let th = transcript_start(suite, hello.prefix, keys.binding);
@@ -958,7 +965,7 @@ impl Acceptor {
 /// An acceptor that opened a Hello and owes a Reply.
 pub struct Unconfirmed {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     psk: Secret,
     th: Vec<u8>,
@@ -1079,7 +1086,7 @@ impl Unconfirmed {
 /// acceptor's records wait for.
 pub struct AwaitConfirm {
     suite: &'static Suite,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     #[cfg(feature = "test-hooks")]
     th: Vec<u8>,
@@ -1109,15 +1116,15 @@ impl AwaitConfirm {
     /// Whether `input` holds the whole confirmation: `Incomplete` while it wants more.
     pub fn ready(&self, input: &[u8]) -> Result<(), Error> {
         match (self.mode, self.framing) {
-            (Mode::Bound, _) => Ok(()),
+            (RecordMode::Bound | RecordMode::Unmanaged, _) => Ok(()),
             // The message has not been read yet: nothing on a message carrier is no message.
             (_, Framing::Records) if input.is_empty() => Err(Error::Incomplete { need: 1 }),
             (_, Framing::Records) => Ok(()),
-            (Mode::Trusted, Framing::ByteStream) => {
+            (RecordMode::Trusted, Framing::ByteStream) => {
                 self.short_trusted(input)?;
                 cut_unit(self.framing, input).map(|_| ())
             }
-            (Mode::Sealed, Framing::ByteStream) => cut_unit(self.framing, input).map(|_| ()),
+            (RecordMode::Sealed, Framing::ByteStream) => cut_unit(self.framing, input).map(|_| ()),
         }
     }
 
@@ -1127,8 +1134,8 @@ impl AwaitConfirm {
         let suite = self.suite;
         let mut records = None;
         let consumed = match self.mode {
-            Mode::Bound => 0,
-            Mode::Trusted => {
+            RecordMode::Bound | RecordMode::Unmanaged => 0,
+            RecordMode::Trusted => {
                 self.short_trusted(input)?;
                 let (unit, consumed) = cut_unit(self.framing, input)?;
                 let tag = self.keys.confirm_tag(suite);
@@ -1141,7 +1148,7 @@ impl AwaitConfirm {
                 }
                 consumed
             }
-            Mode::Sealed => {
+            RecordMode::Sealed => {
                 let (unit, consumed) = cut_unit(self.framing, input)?;
                 let mut opener = Opener::new(suite.cipher, self.keys.key_i2r.clone());
                 if opener.open(unit)?.iter().any(|&b| b != 0) {
@@ -1165,6 +1172,69 @@ impl AwaitConfirm {
     }
 }
 
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for JoinConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinConfig").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Joiner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Joiner").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for HelloSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelloSent").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Proven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Proven").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Finished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Finished").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for AcceptorKeys<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptorKeys").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Acceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Acceptor").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Unconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Unconfirmed").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for AwaitConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwaitConfirm").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,7 +1245,7 @@ mod tests {
         let joiner = Joiner::new(JoinConfig {
             suite,
             group: Group::from_value(group).unwrap(),
-            mode: Mode::Trusted,
+            mode: RecordMode::Trusted,
             phase: 1,
             framing: Framing::ByteStream,
             locator: b"L",

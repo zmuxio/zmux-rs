@@ -208,8 +208,8 @@ impl Relay {
     }
 
     async fn close(self) {
-        self.xr.close(VarInt::ZERO, b"").await;
-        self.ry.close(VarInt::ZERO, b"").await;
+        self.xr.close().await;
+        self.ry.close().await;
         let handles: Vec<_> = self.splices.lock().unwrap().drain(..).collect();
         for h in handles {
             let _ = watchdog(10, "splices end", h).await;
@@ -337,7 +337,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
                         );
                     }
                     Event::UpstreamLost => {
-                        relay.rx.close(VarInt::from_u32(1), b"").await;
+                        relay.rx.abort(VarInt::from_u32(1), b"");
                         let s = relay.last().await.expect("a result");
                         ends(
                             &s,
@@ -371,7 +371,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
             let reinjected = n.x.stats().bytes_reinjected + n.y.stats().bytes_reinjected;
             assert!(reinjected > 0, "the nested session reinjected");
             steady.close().await;
-            n.x.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
             n.listener.close();
         }
         settle(base, 20, "relay events").await;
@@ -432,7 +432,7 @@ fn a_stalled_downstream_fails_the_relayed_pipe_and_every_hop_releases_its_credit
             stop.store(true, Ordering::SeqCst);
             watchdog(60, "bulk transfer", transfer).await.unwrap();
             relay.close().await;
-            n.x.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
             n.listener.close();
         }
         settle(base, 20, "stall").await;
@@ -474,7 +474,7 @@ fn splices_cancelled_in_limiter_waits_leave_nothing_and_charge_what_they_forward
             }
             stop.store(true, Ordering::SeqCst);
             watchdog(60, "bulk transfer", transfer).await.unwrap();
-            n.x.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
             n.listener.close();
         }
         settle(base, 20, "cancelled splices").await;

@@ -11,7 +11,7 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use web_transport_quinn::quinn;
 use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeFailure, Session, SessionError};
-use zmux_webtransport::{Options, Url, WebTransportCarrier};
+use zmux_webtransport::{Carrier, Options, Url};
 
 /// A WebTransport server and a client for it over loopback.
 struct Wt {
@@ -134,8 +134,8 @@ async fn connect_and_serve() {
     assert_kind([&client, &server], zmux::CarrierKind::WebTransport);
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(0u32.into(), b"bye").await;
-    let e = tokio::time::timeout(Duration::from_secs(10), server.closed())
+    client.close().await;
+    let e = tokio::time::timeout(Duration::from_secs(10), server.closing())
         .await
         .expect("closed");
     assert!(
@@ -154,8 +154,8 @@ async fn lanes_without_a_listener() {
     let opts = Options::default();
     let mut wt = Wt::new(&opts);
     let (cw, sw) = wt.pair().await;
-    let client = WebTransportCarrier::new(cw, opts.clone());
-    let server = WebTransportCarrier::new(sw, opts);
+    let client = Carrier::new(cw, opts.clone());
+    let server = Carrier::new(sw, opts);
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -172,7 +172,7 @@ async fn lanes_without_a_listener() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(cs.pipe_stats()[0].lanes_out > 1, "no lane was opened");
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
 }
 
 /// The exporter gives the connection's value while it lives, the same at
@@ -197,7 +197,7 @@ async fn the_exporter_does_not_keep_the_connection() {
         client.export_keying_material("app", b"", 16).unwrap(),
         server.export_keying_material("app", b"", 16).unwrap()
     );
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     for s in [&client, &server] {
         tokio::time::timeout(Duration::from_secs(10), async {
             while s.export_keying_material("app", b"", 16) != Err(zmux::ExportError::Unavailable) {
@@ -222,8 +222,8 @@ async fn lanes_through_a_listener() {
     let listener = Listener::new(config.clone(), ListenerConfig::default())
         .expect("valid listener configuration");
     let (cw, sw) = wt.pair().await;
-    let _server = WebTransportCarrier::with_listener(sw, &listener, opts.clone());
-    let client = WebTransportCarrier::new(cw, opts);
+    let _server = Carrier::with_listener(sw, &listener, opts.clone());
+    let client = Carrier::new(cw, opts);
     let cs = Session::connect(client.open_pipe().await.unwrap(), config)
         .await
         .unwrap();
@@ -232,7 +232,7 @@ async fn lanes_through_a_listener() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(cs.pipe_stats()[0].lanes_out > 1, "no lane was opened");
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
 }
 
 /// A Bound join on a further stream of the WebTransport session: the carrier declares the
@@ -243,14 +243,14 @@ async fn a_bound_join_on_a_further_stream() {
     let mut wt = Wt::new(&opts);
     let mut config = Config::multipath(PipeAuth::exporter().with_end_to_end());
     // Bound joins only when the carrier says it is secure.
-    config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-        |c, mode, _| mode != zmux::proto::seal::Mode::Bound || c.secure,
-    )));
+    config.allow_record_mode = Some(zmux::AllowRecordMode::new(|c, mode, _| {
+        mode != zmux::RecordMode::Bound || c.secure
+    }));
     let listener = Listener::new(config.clone(), ListenerConfig::default())
         .expect("valid listener configuration");
     let (cw, sw) = wt.pair().await;
-    let _server = WebTransportCarrier::with_listener(sw, &listener, opts.clone());
-    let client = WebTransportCarrier::new(cw, opts);
+    let _server = Carrier::with_listener(sw, &listener, opts.clone());
+    let client = Carrier::new(cw, opts);
     let cs = Session::connect(client.open_pipe().await.unwrap(), config)
         .await
         .unwrap();
@@ -258,7 +258,7 @@ async fn a_bound_join_on_a_further_stream() {
     let pipe = cs
         .begin_add_pipe(
             client.open_pipe().await.unwrap(),
-            zmux::PipeOptions::new().with_mode(zmux::proto::seal::Mode::Bound),
+            zmux::PipeOptions::new().with_record_mode(zmux::RecordMode::Bound),
         )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -266,7 +266,7 @@ async fn a_bound_join_on_a_further_stream() {
         .expect("joined in time")
         .unwrap();
     transfer(&ss, &cs, 4, 256 << 10).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
 }
 
 /// A WebTransport session that ends under the zmux session is a failure of
@@ -276,8 +276,8 @@ async fn a_lost_session_is_a_failure_not_a_clean_end() {
     let opts = Options::default();
     let mut wt = Wt::new(&opts);
     let (cw, sw) = wt.pair().await;
-    let client = WebTransportCarrier::new(cw, opts.clone());
-    let server = WebTransportCarrier::new(sw, opts);
+    let client = Carrier::new(cw, opts.clone());
+    let server = Carrier::new(sw, opts);
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -293,7 +293,7 @@ async fn a_lost_session_is_a_failure_not_a_clean_end() {
     transfer(&cs, &ss, 2, 64 << 10).await;
     client.session().close(7, b"gone");
     for s in [&cs, &ss] {
-        let e = tokio::time::timeout(Duration::from_secs(10), s.closed())
+        let e = tokio::time::timeout(Duration::from_secs(10), s.closing())
             .await
             .expect("ended");
         assert!(
@@ -321,12 +321,12 @@ async fn an_admission_decides_on_the_session_request() {
             .expect("the request");
         assert!(info.has_exporter());
         match req.url.path() {
-            "/zmux" => zmux::Verdict::accept(0),
-            _ => zmux::Verdict::Fallback,
+            "/zmux" => zmux::AdmissionVerdict::accept(0),
+            _ => zmux::AdmissionVerdict::Fallback,
         }
     });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = zmux_webtransport::WebTransportFallback::new(move |req| {
+    let fallback = zmux_webtransport::Fallback::new(move |req| {
         let tx = tx.clone();
         async move {
             let _ = tx.send(req.url.path().to_owned());
@@ -353,7 +353,7 @@ async fn an_admission_decides_on_the_session_request() {
     other.set_path("/other");
     assert!(wt.client.connect(other).await.is_err());
     assert_eq!(rx.recv().await.unwrap(), "/other");
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
     serving.await.unwrap();
 }
@@ -382,7 +382,7 @@ async fn a_bound_token_in_the_session_request() {
     let limit = Duration::from_secs(10);
     let body = async {
         assert!(wt.client.connect(wt.url.clone()).await.is_err(), "no token");
-        let client_opts = Options::default().with_credential(Arc::new(auth));
+        let client_opts = Options::default().with_carrier_credential(Arc::new(auth));
         let e = zmux_webtransport::dial(&wt.client, wt.url.clone(), &client_opts)
             .await
             .unwrap_err();
@@ -404,7 +404,7 @@ async fn a_bound_token_in_the_session_request() {
         let client = Session::connect(pipe, Config::default()).await.unwrap();
         let server = listener.accept().await.unwrap();
         transfer(&client, &server, 1, 64 << 10).await;
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     };
     tokio::time::timeout(limit, body).await.unwrap();
     listener.close();
@@ -420,7 +420,7 @@ async fn a_request_forwarded_from_early_data_is_answered_425() {
     let counted = decided.clone();
     let admission = zmux::Admission::new(0, move |_, _| {
         counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        zmux::Verdict::accept(0)
+        zmux::AdmissionVerdict::accept(0)
     });
     for admission in [None, Some(admission)] {
         let opts = Options::default();
@@ -488,8 +488,8 @@ async fn datagrams_ride_webtransport_datagrams() {
             (c.datagrams_received_channel, s.datagrams_received_channel),
             (20, 20)
         );
-        client.close(0u32.into(), b"bye").await;
-        let _ = server.closed().await;
+        client.close().await;
+        let _ = server.closing().await;
         listener.close();
         serving.await.unwrap();
     })

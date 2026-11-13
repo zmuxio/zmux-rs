@@ -338,8 +338,8 @@ async fn probes_keep_an_idle_relay_open() {
     // about one in 300 (a draw below 12 s at either end). Pipe 0 probes
     // without jitter, first after 1 h, beyond the test's window.
     let quiet = |c: &mut Config| {
-        c.probe_interval = Some(Duration::from_secs(3600));
-        c.probe_jitter = 0.0;
+        c.liveness.probe_interval = Some(Duration::from_secs(3600));
+        c.liveness.probe_jitter = 0.0;
     };
     let listener = Listener::new(config(quiet), ListenerConfig::default())
         .expect("valid listener configuration");
@@ -351,9 +351,11 @@ async fn probes_keep_an_idle_relay_open() {
         },
     );
     let (client, _server) = direct(&listener, config(quiet)).await;
-    let opts = PipeOptions::new()
-        .with_probe_interval(Duration::from_secs(5))
-        .with_probe_jitter(0.3);
+    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(5))),
+        probe_jitter: zmux::Inherit::Set(0.3),
+        ..Default::default()
+    });
     let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
@@ -364,7 +366,7 @@ async fn probes_keep_an_idle_relay_open() {
     assert_eq!(relay.dial_count(), 1);
     assert_eq!(failed(&client), 0);
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 
     let relay = Relay::new(
         &listener,
@@ -376,9 +378,11 @@ async fn probes_keep_an_idle_relay_open() {
     let (client, _server) = direct(&listener, config(quiet)).await;
     // A fixed schedule: the pool pipe's first probe goes 12 s after the
     // join, so the cut comes 8 s after it, and the probe 4 s later.
-    let opts = PipeOptions::new()
-        .with_probe_interval(Duration::from_secs(12))
-        .with_probe_jitter(0.0);
+    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(12))),
+        probe_jitter: zmux::Inherit::Set(0.0),
+        ..Default::default()
+    });
     let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
@@ -409,7 +413,7 @@ async fn probes_keep_an_idle_relay_open() {
     })
     .await;
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// A relay that takes bytes and forwards none: the idle pipe fails within
@@ -420,7 +424,10 @@ async fn a_black_hole_is_found_by_the_probe() {
         .expect("valid listener configuration");
     let relay = Relay::new(&listener, Faults::default());
     let (client, _server) = direct(&listener, config(|_| {})).await;
-    let opts = PipeOptions::new().with_probe_interval(Duration::from_secs(5));
+    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(5))),
+        ..Default::default()
+    });
     let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
@@ -442,7 +449,7 @@ async fn a_black_hole_is_found_by_the_probe() {
         found - start
     );
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// The policy of the resume tests: redial 1 s after the last dial, reduced
@@ -543,7 +550,7 @@ async fn the_last_pipe_cut_resumes_without_loss() {
     writer.await.unwrap();
     assert!(client.close_reason().is_none());
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// The relay refuses every redial during the grace period: the session
@@ -565,7 +572,7 @@ async fn refused_redials_end_in_resume_timeout() {
         c.cut();
     }
     let start = Instant::now();
-    let e = tokio::time::timeout(Duration::from_secs(30), client.closed())
+    let e = tokio::time::timeout(Duration::from_secs(30), client.closing())
         .await
         .expect("the grace period ends");
     assert!(matches!(e, SessionError::ResumeTimeout { .. }), "{e:?}");
@@ -644,7 +651,7 @@ async fn a_silent_downlink_cut_is_found_and_redialled() {
     assert_eq!(r.read_to_end(64).await.unwrap(), b"after");
     assert!(client.close_reason().is_none());
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// A relay that ends each connection 30 s after it opened (a load
@@ -718,5 +725,5 @@ async fn age_rotation_beats_a_lifetime_limit() {
     assert!(relay.count(|c| c.expired.load(Ordering::SeqCst)) <= 1);
     assert_eq!(client.stats().bytes_reinjected, 0);
     drop(handle);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }

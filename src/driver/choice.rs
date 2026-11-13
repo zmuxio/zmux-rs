@@ -1,5 +1,5 @@
-//! Carrier modes: a client dials a session over the carrier kind a
-//! [`Mode`] selects, explicitly one, or automatically among candidates in
+//! Carrier choice: a client dials a session over the carrier kind a
+//! [`CarrierChoice`] selects, explicitly one, or automatically among candidates in
 //! their order of preference, remembering per server and local network
 //! which kinds the path lets through ([`CarrierCache`]).
 
@@ -15,17 +15,16 @@ use super::cache::{CarrierCache, Known};
 use super::handle;
 use super::tokio::{Pipe, PipeIo, Session, Tokio};
 use crate::ConnectError;
-use crate::proto::params::Role;
 use crate::proto::session::{
     CandidateOutcome, CandidateResult, CarrierKind, Config, EarlyData, Multipath, PipeError,
-    PipeFailure, PipeId, PipeOptions, RoleConfig, SessionError,
+    PipeFailure, PipeId, PipeOptions, Role, SessionError,
 };
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type DialFn = dyn Fn() -> BoxFuture<io::Result<PipeIo>> + Send + Sync;
 type JoinFn = dyn Fn(Session, PipeOptions) -> BoxFuture<io::Result<Vec<Pipe>>> + Send + Sync;
 
-/// One carrier kind a [`Mode`] may use: its kind and how to open a carrier
+/// One carrier kind a [`CarrierChoice`] may use: its kind and how to open a carrier
 /// of it (the adapter's options, with the credential the server's
 /// admission wants, captured in the dial). The adapters' `candidate`
 /// constructors give ready ones. Cheap to clone.
@@ -92,7 +91,7 @@ impl fmt::Debug for Candidate {
 
 impl Candidate {
     /// A candidate of `kind` whose carriers `dial` opens. A carrier must
-    /// live until its pipe ends; the mode bounds the opening.
+    /// live until its pipe ends; the choice bounds the opening.
     pub fn new<F, Fut>(kind: CarrierKind, dial: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -146,7 +145,7 @@ impl Candidate {
 
     /// Names the target its dial opens carriers at, for a kind dialed at a
     /// URL: the dial starts at [`HttpTarget::url`] and records where
-    /// redirects led it ([`HttpTarget::redirected`]); a carrier mode keeps
+    /// redirects led it ([`HttpTarget::redirected`]); a carrier choice keeps
     /// that URL per server in its [`CarrierCache`] while the kind is
     /// usable, and starts the target at its base URL again after a failure.
     #[must_use]
@@ -193,16 +192,16 @@ impl Candidate {
     }
 }
 
-/// How [`dial_mode`], or a pipe pool
-/// ([`PipePool::mode`](crate::helpers::PipePool::mode)), chooses the
+/// How [`dial_choice`], or a pipe pool
+/// ([`PipePool::choice`](crate::helpers::PipePool::choice)), chooses the
 /// carrier.
 #[derive(Debug, Clone)]
-pub struct Mode {
+pub struct CarrierChoice {
     auto: bool,
     candidates: Vec<Candidate>,
 }
 
-impl Mode {
+impl CarrierChoice {
     /// `candidate` only: a failure is reported, never replaced by another
     /// kind.
     pub fn explicit(candidate: Candidate) -> Self {
@@ -221,7 +220,7 @@ impl Mode {
         }
     }
 
-    /// Whether the mode chooses among candidates.
+    /// Whether the choice chooses among candidates.
     pub fn is_auto(&self) -> bool {
         self.auto
     }
@@ -232,11 +231,11 @@ impl Mode {
     }
 }
 
-/// The local policy of [`Mode::auto`]. The defaults are those of each
+/// The local policy of [`CarrierChoice::auto`]. The defaults are those of each
 /// field.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct ModePolicy {
+pub struct CarrierChoicePolicy {
     /// Remembers the outcomes per server and local network across dials
     /// (`None`: a cache private to the session).
     pub cache: Option<CarrierCache>,
@@ -266,7 +265,7 @@ pub struct ModePolicy {
     pub no_join: bool,
 }
 
-impl Default for ModePolicy {
+impl Default for CarrierChoicePolicy {
     fn default() -> Self {
         Self {
             cache: None,
@@ -281,7 +280,7 @@ impl Default for ModePolicy {
     }
 }
 
-impl ModePolicy {
+impl CarrierChoicePolicy {
     /// The defaults.
     pub fn new() -> Self {
         Self::default()
@@ -310,18 +309,18 @@ impl ModePolicy {
     }
 }
 
-/// [`dial_mode`] found no usable candidate: the outcome of every one it
+/// [`dial_choice`] found no usable candidate: the outcome of every one it
 /// tried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ModeError {
+pub struct CarrierChoiceError {
     /// The tries, in order.
     pub results: Vec<CandidateResult>,
-    /// The mode or the policy is invalid (nothing was tried): why.
-    pub invalid: Option<&'static str>,
+    /// The choice or the policy is invalid (nothing was tried): why.
+    pub invalid: Option<crate::InvalidConfig>,
 }
 
-impl ModeError {
+impl CarrierChoiceError {
     fn tried(results: Vec<CandidateResult>) -> Self {
         Self {
             results,
@@ -329,7 +328,7 @@ impl ModeError {
         }
     }
 
-    fn invalid(why: &'static str) -> Self {
+    fn invalid(why: crate::InvalidConfig) -> Self {
         Self {
             results: Vec::new(),
             invalid: Some(why),
@@ -337,10 +336,10 @@ impl ModeError {
     }
 }
 
-impl fmt::Display for ModeError {
+impl fmt::Display for CarrierChoiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(why) = self.invalid {
-            return write!(f, "invalid carrier mode: {why}");
+            return write!(f, "invalid carrier choice: {why}");
         }
         f.write_str("no usable carrier")?;
         for (i, r) in self.results.iter().enumerate() {
@@ -354,26 +353,26 @@ impl fmt::Display for ModeError {
     }
 }
 
-impl std::error::Error for ModeError {}
+impl std::error::Error for CarrierChoiceError {}
 
-/// Dials a client session over the carrier `mode` selects. `policy` is the policy of
-/// [`Mode::auto`].
+/// Dials a client session over the carrier `choice` selects. `policy` is the policy of
+/// [`CarrierChoice::auto`].
 ///
-/// [`Mode::explicit`] dials its one candidate, within the configuration's
-/// handshake timeout. [`Mode::auto`] sends no early data (the
+/// [`CarrierChoice::explicit`] dials its one candidate, within the configuration's
+/// handshake timeout. [`CarrierChoice::auto`] sends no early data (the
 /// configuration's [`EarlyData`] is ignored), so that nothing the
 /// application sends goes out before a carrier is chosen, and races no
 /// candidates. It skips the kinds the cache holds as failed (unless all
 /// are), and a candidate whose session is not established within its
-/// timer ([`ModePolicy::timer`]) is abandoned without CONNECTION_CLOSE.
+/// timer ([`CarrierChoicePolicy::timer`]) is abandoned without CONNECTION_CLOSE.
 /// With `max_pipes` above 1 it establishes the session on the most robust
 /// candidate (a kind the cache holds as usable, else the exchange carrier,
 /// else the last) and, once multipath is in use, runs a pool of one member
-/// over the same mode ([`PipePool::mode`](crate::helpers::PipePool::mode))
+/// over the same choice ([`PipePool::choice`](crate::helpers::PipePool::choice))
 /// that takes the bootstrap pipe as its first member: the pool upgrades it
 /// to a preferred kind, make before break, retries preferred kinds as
 /// their backoff expires, and joins the best kind available again when the
-/// member fails. Without joins (`max_pipes` 1, [`ModePolicy::no_join`], or
+/// member fails. Without joins (`max_pipes` 1, [`CarrierChoicePolicy::no_join`], or
 /// a peer without multipath) it tries the candidates one after another, in
 /// order, and keeps the first usable one.
 ///
@@ -383,22 +382,22 @@ impl std::error::Error for ModeError {}
 /// [`SessionEvent::CarrierChosen`](crate::SessionEvent::CarrierChosen)
 /// (again on every switch), and both in the session's statistics
 /// ([`crate::SessionStats::carrier`]). The background work holds no handle
-/// of the session and ends with it. A mode without candidates or with two
+/// of the session and ends with it. A choice without candidates or with two
 /// of one kind, or a policy with an invalid timer factor, is a
-/// [`ModeError`] with [`ModeError::invalid`](ModeError#structfield.invalid) set.
-pub async fn dial_mode(
-    mode: &Mode,
+/// [`CarrierChoiceError`] with [`CarrierChoiceError::invalid`](CarrierChoiceError#structfield.invalid) set.
+pub async fn dial_choice(
+    choice: &CarrierChoice,
     config: impl Into<Arc<Config>>,
-    policy: &ModePolicy,
-) -> Result<Session, ModeError> {
-    let src = ModeSource::new(mode, policy).map_err(ModeError::invalid)?;
+    policy: &CarrierChoicePolicy,
+) -> Result<Session, CarrierChoiceError> {
+    let src = ChoiceSource::new(choice, policy).map_err(CarrierChoiceError::invalid)?;
     let config = config.into();
-    if !mode.auto {
-        let first = &mode.candidates[0];
+    if !choice.auto {
+        let first = &choice.candidates[0];
         let (session, res) = start(first, &config, None).await;
         let results = vec![res];
         let Some(s) = session else {
-            return Err(ModeError::tried(results));
+            return Err(CarrierChoiceError::tried(results));
         };
         s.report_carrier(&results, Some((first.kind, first.variant.clone())));
         return Ok(s);
@@ -438,7 +437,7 @@ pub async fn dial_mode(
             && s.multipath() == Multipath::InUse
             && let Some(pipe0) = s.pipe(PipeId(0))
         {
-            crate::helpers::maintain_mode(&s, src, i, pipe0, chosen);
+            crate::helpers::maintain_choice(&s, src, i, pipe0, chosen);
         } else if let Some(shared) = s.downgrade().shared() {
             // One carrier: the session ends with it, and counts against
             // its kind when it fails soon after it was chosen.
@@ -451,19 +450,19 @@ pub async fn dial_mode(
         }
         return Ok(s);
     }
-    Err(ModeError::tried(results))
+    Err(CarrierChoiceError::tried(results))
 }
 
 /// The resolved policy.
 #[derive(Clone)]
 struct Params {
-    policy: ModePolicy,
+    policy: CarrierChoicePolicy,
     cache: CarrierCache,
     key: String,
 }
 
 impl Params {
-    fn new(policy: &ModePolicy) -> Self {
+    fn new(policy: &CarrierChoicePolicy) -> Self {
         Self {
             cache: policy.cache.clone().unwrap_or_default(),
             key: policy.key.clone(),
@@ -507,8 +506,8 @@ fn io_outcome(e: &io::Error) -> CandidateOutcome {
 fn connect_outcome(e: &ConnectError) -> CandidateOutcome {
     match e {
         ConnectError::Io(e) => io_outcome(e),
-        ConnectError::Closed(SessionError::HandshakeTimeout) => CandidateOutcome::TimedOut,
-        ConnectError::Closed(SessionError::PipesLost {
+        ConnectError::SessionLost(SessionError::HandshakeTimeout) => CandidateOutcome::TimedOut,
+        ConnectError::SessionLost(SessionError::PipesLost {
             last: Some(PipeFailure::Carrier(kind)),
         }) => io_outcome(&io::Error::from(*kind)),
         _ => CandidateOutcome::Failed,
@@ -523,7 +522,7 @@ fn pipe_outcome(e: &PipeError) -> CandidateOutcome {
 }
 
 /// Opens a carrier of `cand` and starts a session on it, within the
-/// configuration's handshake timeout; with `p` (auto mode) the session
+/// configuration's handshake timeout; with `p` (an auto choice) the session
 /// must be established within the candidate's timer, or it is abandoned
 /// without CONNECTION_CLOSE.
 async fn start(
@@ -559,8 +558,8 @@ async fn start(
     let shared = match handle::Shared::<Tokio>::create(
         io,
         config.clone(),
-        RoleConfig::Initiator,
-        Some(Role::Initiator),
+        Role::Client,
+        Some(Role::Client),
         None,
         |_| {},
     ) {
@@ -694,38 +693,47 @@ pub(crate) fn session_failed(shared: &handle::Shared<Tokio>) -> bool {
     !matches!(error, None | Some(SessionError::ApplicationClosed { .. }))
 }
 
-/// The carrier kinds of a pipe pool dialed by a mode
-/// ([`PipePool::mode`](crate::helpers::PipePool::mode)): stable first,
+/// The carrier kinds of a pipe pool dialed by a carrier choice
+/// ([`PipePool::choice`](crate::helpers::PipePool::choice)): stable first,
 /// then upgrade. A member is dialed over the most robust kind available
-/// ([`ModeSource::pick`]), and a member of a kind that a preferred kind not
-/// backing off could replace is rotated to it ([`ModeSource::better`]).
+/// ([`ChoiceSource::pick`]), and a member of a kind that a preferred kind not
+/// backing off could replace is rotated to it ([`ChoiceSource::better`]).
 /// The pool records the outcomes: a failed join, a replacement that ends
 /// before it settled, and a member that fails within the drop window of
-/// being joined count as failed. Explicit mode dials its one kind, without
+/// being joined count as failed. An explicit choice dials its one kind, without
 /// the cache.
-pub(crate) struct ModeSource {
+pub(crate) struct ChoiceSource {
     cands: Vec<Candidate>,
     auto: bool,
     p: Params,
 }
 
-impl ModeSource {
-    /// Checks `mode` (candidates, no kind twice) and `policy`.
-    pub(crate) fn new(mode: &Mode, policy: &ModePolicy) -> Result<Self, &'static str> {
-        if mode.candidates.is_empty() {
-            return Err("a mode without a candidate");
+impl ChoiceSource {
+    /// Checks `choice` (candidates, no kind twice) and `policy`.
+    pub(crate) fn new(
+        choice: &CarrierChoice,
+        policy: &CarrierChoicePolicy,
+    ) -> Result<Self, crate::InvalidConfig> {
+        if choice.candidates.is_empty() {
+            return Err(crate::InvalidConfig::new("CarrierChoice", "no candidate"));
         }
-        for (i, c) in mode.candidates.iter().enumerate() {
-            if mode.candidates[..i].iter().any(|o| o.kind == c.kind) {
-                return Err("a mode with two candidates of one kind");
+        for (i, c) in choice.candidates.iter().enumerate() {
+            if choice.candidates[..i].iter().any(|o| o.kind == c.kind) {
+                return Err(crate::InvalidConfig::new(
+                    "CarrierChoice",
+                    "two candidates of one kind",
+                ));
             }
         }
         if !(policy.timer_factor >= 0.0 && policy.timer_factor.is_finite()) {
-            return Err("a mode policy with a negative or non-finite timer factor");
+            return Err(crate::InvalidConfig::new(
+                "CarrierChoicePolicy::timer_factor",
+                "negative or not finite",
+            ));
         }
         Ok(Self {
-            cands: mode.candidates.clone(),
-            auto: mode.auto,
+            cands: choice.candidates.clone(),
+            auto: choice.auto,
             p: Params::new(policy),
         })
     }

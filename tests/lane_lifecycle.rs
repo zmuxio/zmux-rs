@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zmux::carrier::CarrierConnId;
 use zmux::proto::session::State;
 use zmux::test_hooks::lane_keys;
-use zmux::{Config, PipeAuth, PipeIo, PipeOptions, Session, VarInt};
+use zmux::{Config, PipeAuth, PipeIo, PipeOptions, Session};
 
 const KEY: [u8; 16] = [0x5a; 16];
 
@@ -118,7 +118,7 @@ fn a_closing_or_closed_session_takes_no_lanes_or_pipes_and_keeps_no_lane_state()
 
         // CLOSING: the server's close frame waits behind a stalled carrier.
         stall.stall(true);
-        drop(server.close(VarInt::ZERO, b""));
+        drop(server.close());
         assert_eq!(server.state(), State::Closing);
         attach_fails(&server).await;
         lane_is_aborted(&sid, &KEY).await;
@@ -134,7 +134,7 @@ fn a_closing_or_closed_session_takes_no_lanes_or_pipes_and_keeps_no_lane_state()
         assert_eq!(server.debug_tables().lane_state, 0, "nothing recreated");
         assert!(!lane_keys().contains(&KEY));
 
-        drop(client.close(VarInt::ZERO, b""));
+        drop(client.close());
         eventually(5, "the client closes", || client.state() == State::Closed).await;
         assert_eq!(client.debug_tables().lane_state, 0);
         assert_eq!(lane_keys().len(), n);
@@ -188,8 +188,8 @@ fn a_lane_openers_unsent_count_is_read() {
             }
         })
         .await;
-        drop(client.close(0u32.into(), b""));
-        drop(server.close(0u32.into(), b""));
+        drop(client.close());
+        drop(server.close());
         drop(writer);
     });
 }

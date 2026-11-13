@@ -40,8 +40,8 @@ fn framing_of(v: &Value) -> Framing {
     }
 }
 
-fn mode_of(v: &Value) -> Result<Mode, Error> {
-    Mode::from_byte(v["mode"].as_u64().unwrap() as u8).map_err(|_| Error::InvalidConfig)
+fn mode_of(v: &Value) -> Result<RecordMode, Error> {
+    RecordMode::from_byte(v["mode"].as_u64().unwrap() as u8).map_err(|_| Error::InvalidConfig)
 }
 
 fn profile_of(v: &Value) -> Profile {
@@ -95,9 +95,14 @@ fn responder(v: &Value, framing: Framing, wire: &[u8]) -> Result<(ResponderReply
     Responder::read_hello_with_ephemeral(&hello, keys, &e, &kem)
 }
 
-/// The receivers' local bound of a vector; absent: the default.
-fn max_app_data(v: &Value) -> usize {
-    v["max_app_data"].as_u64().unwrap_or(0) as usize
+/// The receivers' local bound of a vector: positive is that bound, 0 or absent the
+/// default, negative no bound.
+fn max_app_data(v: &Value) -> Option<usize> {
+    match v.get("max_app_data").map(|n| n.as_i64().unwrap()) {
+        None | Some(0) => Some(DEFAULT_MAX_APP_DATA),
+        Some(n) if n > 0 => Some(n as usize),
+        Some(_) => None,
+    }
 }
 
 fn cut(framing: Framing, wire: &[u8]) -> Result<&[u8], Error> {
@@ -138,7 +143,7 @@ fn check_complete(v: &Value, c: &Complete) {
     assert_eq!(out, hx(x, "output"), "{name}: export");
     assert_eq!(
         v["records_use_split"].as_bool().unwrap(),
-        c.mode() == Mode::Sealed,
+        c.mode() == RecordMode::Sealed,
         "{name}"
     );
 }
@@ -460,7 +465,7 @@ fn config_start(v: &Value) -> Result<(), Error> {
         psk: &psk,
         static_secret: &s,
         binding: &binding,
-        max_app_data: 0,
+        max_app_data: Some(DEFAULT_MAX_APP_DATA),
     })?;
     let data = vec![0; v["app_data_len"].as_u64().unwrap_or(0) as usize];
     let value: Vec<u8> = match v["write_type"].as_u64() {

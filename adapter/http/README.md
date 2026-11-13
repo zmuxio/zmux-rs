@@ -23,7 +23,10 @@ HTTP/1.1 and HTTP/2 carriers of [zmux](../../README.md) pipes over `hyper`.
 The server classifies every request by its head alone (`classify`): an
 upgrade, a `GET` with the pairing field (downlink), a
 `POST` with the pairing field (uplink), a `POST` with a `Content-Length`
-(exchange), a `POST` without one (bidirectional), and everything else for the host's handler. All kinds
+or an HTTP/1.x `POST` with neither a `Content-Length` nor a
+`Transfer-Encoding` (exchange), any other `POST` (bidirectional), and
+everything else for the host's handler. A pairing field with an empty
+value counts as absent. All kinds
 can therefore share one request target (`Options::path`, default
 `/zmux`). Nothing is answered before a carrier is accepted: with an
 admission (the listener's `ListenerConfig::admission`, which every carrier
@@ -55,8 +58,11 @@ error at the other end, never a clean end.
   carries no pipe (`Unhandled::Fallback`, its body bytes read for the
   decision replayed in front of the rest) or one to end without a response
   (`Unhandled::Abort`: an admission's stall, once over, or close). Requests
-  that carry no pipe go to `Options::fallback`, an HTTP handler, or are
-  answered with 404.
+  that carry no pipe go to `Options::fallback`, an HTTP handler
+  (`Fallback`), or are answered with 404. A served connection that has
+  had no request or response in progress for `Options::idle_timeout`
+  (60 s) is closed gracefully, on HTTP/2 as on HTTP/1.1; a carrier's
+  response lasts as long as the carrier.
 - Behind a reverse proxy or CDN: TLS ends at the intermediary, so prefix
   tokens are unbound. A carrier's source, for the listener's per-source
   limits and the admission, is the client that an intermediary the
@@ -68,7 +74,12 @@ error at the other end, never a clean end.
   joins a paired uplink and downlink as one further pipe of a session; a split
   bootstrap's carrier makes pipe pair 0 only, and `Session::add_pipe`
   refuses it. A `zmux::helpers::PipePool::join` keeps such pairs up.
-- Client: `Options::credential` presents a `zmux::Credential`, such as an
+- Candidates for a `zmux::Dial` with several carrier modes: `candidate`
+  (bidirectional), `candidate_split` (split bootstrap and split joins) and
+  `candidate_exchange` (exchange) over HTTP/1.1 connections the caller
+  makes, and `Http2Connection::candidate` and
+  `Http2Connection::candidate_split` on one HTTP/2 connection.
+- Client: `Options::carrier_credential` presents a `zmux::CarrierCredential`, such as an
   unbound `zmux::PrefixAuth` token: its prefix first on every request body
   that carries a pipe or a lane, its header form on a downlink `GET`.
 - Redirects: a carrier request follows a redirect within its origin (the
@@ -89,7 +100,8 @@ it is given.
 use zmux::{Config, Listener, ListenerConfig};
 use zmux_http::Options;
 
-let listener = Listener::new(Config::default(), ListenerConfig::default());
+let listener = Listener::new(Config::default(), ListenerConfig::default())
+    .expect("valid listener configuration");
 let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
 
@@ -111,7 +123,9 @@ requests, each with a `Content-Length`. The client numbers its bytes in
 UP pieces and keeps DOWN requests outstanding, which the server answers
 with numbered pieces of its bytes; requests are repeated until they have
 a result, and a MAC binds every response to the request it answers, so a
-cached or rewritten response is never taken.
+cached or rewritten response is never taken. Every request body starts
+with a fixed-length authentication header (66 bytes, 88 in base64) under
+its own MAC, and ends with a MAC over its data.
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,7 +136,8 @@ let options = ExchangeOptions::default().with_psk(*b"a shared secret");
 
 // Server: POSTs with a Content-Length under /zmux/exchange are exchange
 // requests (with_path("/zmux") shares the carriers' target).
-let listener = Listener::new(Config::default(), ListenerConfig::default());
+let listener = Listener::new(Config::default(), ListenerConfig::default())
+    .expect("valid listener configuration");
 let exchange = ExchangeServer::new(&listener, options.clone())?;
 let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default().with_exchange(exchange)));
@@ -145,12 +160,32 @@ let session = zmux_http::connect_exchange("127.0.0.1:8080", &options, Config::de
   (`ExchangeOptions::https`, `ExchangeOptions::max_redirects`), with its
   body unchanged; the next request starts at the configured path again. A
   refused redirect fails the carrier.
-- A server authenticates a request when its MAC verifies, its Time is
-  within `ExchangeOptions::time_window` (60 s) of the server's clock and
-  its (Carrier ID, Nonce) pair is new; at most
+- Every exchange request takes a place under the listener's limits of
+  pending carriers (`max_pending_per_source` and `max_pending`) when it
+  arrives; one that finds none is answered `503` without a body, its body
+  unread, and does not go to the fallback. Since the request that creates
+  a carrier keeps its place, the carrier's next requests need another:
+  `max_pending_per_source` must be at least 2 (default 8). A closed
+  listener holds no place but still authenticates requests: one of a
+  carrier it does not know is answered GONE, and one whose carrier it
+  refuses because it closed after the request arrived, BUSY. The server reads the authentication
+  header alone, within the listener's `first_record_timeout` (2 s), and
+  authenticates the request when its `Content-Length` agrees with the
+  header's data length and is within the limit of its kind, its header
+  MAC verifies, its Time is within `ExchangeOptions::time_window` (60 s)
+  of the server's clock and its (Carrier ID, Nonce) pair is new; at most
   `ExchangeOptions::max_recorded` (262144) pairs are recorded. Every other
   request, and every request `serve` does not take, goes to
-  `Options::fallback` (status 404 without one).
+  `Options::fallback` (status 404 without one) with the bytes read
+  replayed in front of the rest. A request of a known carrier then gives
+  its place back; one that creates a carrier keeps it until the carrier
+  enters a session, and the listener's admission decides on it.
+- The rest of an authenticated body is read within the listener's
+  `handshake_timeout` and buffered as it arrives, never by its declared
+  length; a body that ends early, arrives late or whose data MAC does not
+  verify changes nothing and is answered `400` without a body (no result
+  for the client). An authenticated request of a kind the carrier does
+  not define (its data limit is 0) fails its carrier and is answered GONE.
 - The request path is a template: `{instance}` is a random token of the
   carrier, `{nonce}` a fresh value in every request; a path without
   `{nonce}` carries it in the query parameter `n`, so a cache keyed on the
@@ -158,11 +193,12 @@ let session = zmux_http::connect_exchange("127.0.0.1:8080", &options, Config::de
 - `ExchangeOptions` documents the local parameters and their defaults:
   outstanding requests, piece sizes (`default_piece_size`: every body
   stays within 1,000,000 bytes after the encoding, below the common 1 MiB
-  request body limit of reverse proxies; 999,938 bytes in binary, 749,938
+  request body limit of reverse proxies; 999,918 bytes in binary, 749,918
   in base64) and acceptance limits (1 MiB or the piece size), hold time
   (20 s, below every intermediary's response timeout), coalescing delay,
-  window, request timeout, carrier deadline, backoff, idle timeout. The
-  bytes a server carrier holds count against the listener's memory budget.
+  window, request timeout, carrier deadline, backoff, idle timeout, and
+  `max_carriers` (none by default). The bytes a server carrier holds count
+  against the listener's memory budget.
 - Both ends must agree on the PSK and on the body encoding (binary, or
   base64 for paths that only pass text).
 

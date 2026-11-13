@@ -175,7 +175,7 @@ impl WindowHook {
 
 /// Asks the predicate (with no zmux lock held); a panic is a refusal.
 pub(crate) fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&Logger>) -> bool {
-    catch_unwind(AssertUnwindSafe(|| predicate.0.as_ref()(delta))).unwrap_or_else(|_| {
+    catch_unwind(AssertUnwindSafe(|| predicate.allows(delta))).unwrap_or_else(|_| {
         if let Some(l) = logger {
             l.log(
                 LogLevel::Error,

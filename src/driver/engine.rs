@@ -535,7 +535,7 @@ impl Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::session::{Config, PipeId, RoleConfig};
+    use crate::proto::session::{Config, PipeId, Role};
 
     /// A batch of `n` records, each of a built part and a referenced
     /// payload (or, on a message-framed pipe with `alone`, the first
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn progress_reports_what_changes_the_cores_write_state() {
         let now = Instant::now();
-        let mut core = Core::new(Config::default(), RoleConfig::Initiator, None, now).unwrap();
+        let mut core = Core::new(Config::default(), Role::Client, None, now).unwrap();
         let id = PipeId(0);
         core.attach_pipe(id, Framing::ByteStream, now);
         let writable = |c: &Core| c.pipe_info(id).is_some_and(|p| p.writable);
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn the_unsent_bytes_count_the_last_call_of_an_earlier_round() {
         let now = Instant::now();
-        let mut core = Core::new(Config::default(), RoleConfig::Initiator, None, now).unwrap();
+        let mut core = Core::new(Config::default(), Role::Client, None, now).unwrap();
         let id = PipeId(0);
         core.attach_pipe(id, Framing::ByteStream, now);
         let mut p = Progress::default();

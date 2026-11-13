@@ -321,14 +321,14 @@ impl<S> Drop for AccountLink<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::session::{Config, RoleConfig};
+    use crate::proto::session::{Config, Role};
 
     /// A report the interval holds back is due at the end of the interval,
     /// so that a session that goes quiet still reports its last charge.
     #[test]
     fn a_report_held_back_by_the_interval_is_due_after_it() {
         let t0 = Instant::now();
-        let mut core = Core::new(Config::default(), RoleConfig::Initiator, None, t0).unwrap();
+        let mut core = Core::new(Config::default(), Role::Client, None, t0).unwrap();
         let account = Account::<()>::new(Some(1 << 20), 4, None);
         let me = Arc::new(());
         let mut link = AccountLink::new(account.clone());

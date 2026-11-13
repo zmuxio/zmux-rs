@@ -65,13 +65,11 @@ use zmux::{
 fn config(multipath: bool) -> Config {
     let mut c = Config::default();
     c.enable_datagrams = true;
-    c.max_incoming_uni_streams = Some(16);
+    c.max_incoming_uni_streams = zmux::UniCredit::Limit(16);
     if multipath {
         c.max_pipes = 4;
         c.pipe_auth = PipeAuth::psk(b"zmux interop pre-shared key 0123".to_vec()).with_end_to_end();
-        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-            |_, _, _| true,
-        )));
+        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
     }
     c
 }
@@ -82,9 +80,7 @@ fn quic_config(exporter: bool) -> Config {
     c.early_data = zmux::EarlyData::for_zmux_peer().with_carrier_early_data(true);
     if exporter {
         c.pipe_auth = PipeAuth::exporter().with_end_to_end();
-        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-            |_, _, _| true,
-        )));
+        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
     }
     c
 }
@@ -165,7 +161,7 @@ async fn run() {
             let pipe = session
                 .begin_add_pipe(
                     zmux::PipeIo::tcp(joined),
-                    PipeOptions::default().with_mode(zmux::proto::seal::Mode::Trusted),
+                    PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Trusted),
                 )
                 .expect("add pipe");
             let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -310,9 +306,7 @@ async fn quic_client(addr: SocketAddr, exporter: bool) {
 fn tls_config() -> Config {
     let mut c = config(true);
     c.pipe_auth = PipeAuth::exporter().with_end_to_end();
-    c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-        |_, _, _| true,
-    )));
+    c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
     c
 }
 
@@ -597,7 +591,7 @@ async fn wss_client(addr: &str) -> Session {
     let pipe = session
         .begin_add_pipe(
             join,
-            PipeOptions::default().with_mode(zmux::proto::seal::Mode::Bound),
+            PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Bound),
         )
         .expect("add pipe");
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -654,7 +648,7 @@ async fn tls_client(addr: &str, split: bool) -> Session {
     let pipe = session
         .begin_add_pipe(
             zmux_rustls::over_tcp(dial(b'J').await),
-            PipeOptions::default().with_mode(zmux::proto::seal::Mode::Bound),
+            PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Bound),
         )
         .expect("add pipe");
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -761,12 +755,10 @@ async fn serve(session: Session) {
             }
         });
     }
-    let reason = session.closed().await;
-    // `closed` resolves as soon as the session is closing: the process
-    // exits only once the close completed (CONNECTION_CLOSE written, the
-    // carriers half-closed and drained), or exiting could reset a carrier
-    // before the peer read CONNECTION_CLOSE.
-    session.close(VarInt::ZERO, b"").await;
+    // `wait` resolves once the session ended entirely (CONNECTION_CLOSE
+    // written, the carriers half-closed and drained): exiting earlier could
+    // reset a carrier before the peer read CONNECTION_CLOSE.
+    let reason = session.wait().await;
     println!("CLOSED {reason}");
 }
 
@@ -920,12 +912,12 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
                 reply(&mut send, "closing").await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            session
-                .close(
-                    VarInt::from_u64(code).unwrap_or(VarInt::ZERO),
-                    reason.as_bytes(),
-                )
-                .await;
+            session.abort(
+                VarInt::from_u64(code).unwrap_or(VarInt::ZERO),
+                reason.as_bytes(),
+            );
+            // Returns once the abort's CONNECTION_CLOSE has been handed over.
+            session.close().await;
         }
         other => {
             reply(&mut send, &format!("unknown={other}")).await;

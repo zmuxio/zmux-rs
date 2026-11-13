@@ -75,8 +75,8 @@ async fn remembered() -> zmux::proto::params::TransportParameters {
     );
     let (client, server) = (client.unwrap(), server.unwrap());
     let tp = client.parameters_to_remember().unwrap();
-    client.close(0u32.into(), b"").await;
-    server.close(0u32.into(), b"").await;
+    client.close().await;
+    server.close().await;
     tp
 }
 
@@ -93,8 +93,8 @@ async fn other_traffic() {
     send.finish().unwrap();
     let (_s, mut r) = server.accept_bi().await.unwrap();
     r.read_to_end(1024).await.unwrap();
-    client.close(0u32.into(), b"").await;
-    server.close(0u32.into(), b"").await;
+    client.close().await;
+    server.close().await;
 }
 
 /// The server speaks before the carrier decided, with less than the client
@@ -146,7 +146,7 @@ fn a_peer_speaking_before_a_rejection_leaves_the_restart() {
         let (_s, mut r) = server.accept_bi().await.unwrap();
         assert_eq!(r.read_to_end(1024).await.unwrap(), b"early request");
         assert_eq!(client.early_data(), EarlyDataState::Rejected);
-        client.close(0u32.into(), b"").await;
-        server.close(0u32.into(), b"").await;
+        client.close().await;
+        server.close().await;
     }));
 }

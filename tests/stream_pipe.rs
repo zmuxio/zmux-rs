@@ -124,8 +124,8 @@ fn a_nested_session_runs_over_a_stream_and_closes_it_cleanly() {
             assert_eq!((p.lanes_out, p.lanes_in), (1, 1));
             // A graceful close ends the outer stream with a FIN each way:
             // both sides read everything written, nothing was reset.
-            nc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "nested closed", ns.closed()).await;
+            nc.close().await;
+            watchdog(10, "nested closed", ns.closing()).await;
             eventually(10, "outer streams released", || {
                 oc.stats().streams_active == 0 && os.stats().streams_active == 0
             })
@@ -133,7 +133,7 @@ fn a_nested_session_runs_over_a_stream_and_closes_it_cleanly() {
             assert_eq!(oc.meter().bytes_written(), os.meter().bytes_read());
             assert_eq!(os.meter().bytes_written(), oc.meter().bytes_read());
             assert!(oc.close_reason().is_none() && os.close_reason().is_none());
-            oc.close(VarInt::ZERO, b"").await;
+            oc.close().await;
         }
         settle(base, 10, "nested over a stream").await;
     });
@@ -325,8 +325,8 @@ fn a_nested_multipath_session_moves_between_stream_pipes_and_a_direct_carrier() 
             // stream pipe fails.
             p1.abort().unwrap();
             watchdog(30, "echo over the rest", echo(&n.x, &n.y, 1 << 20)).await;
-            n.x.close(VarInt::ZERO, b"").await;
-            n.oc.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
+            n.oc.close().await;
             n.listener.close();
         }
         settle(base, 10, "nested multipath").await;
@@ -386,13 +386,13 @@ fn stream_events_map_to_pipe_events() {
             // without CONNECTION_CLOSE, a carrier failure.
             let (x, _y, send, _recv) = single_raw(&oc, &os).await;
             send.with(|s| s.finish()).unwrap();
-            let e = watchdog(10, "closed", x.closed()).await;
+            let e = watchdog(10, "closed", x.closing()).await;
             assert!(matches!(e, zmux::SessionError::PipesLost { .. }), "{e:?}");
 
             // A reset received fails the inbound pipe.
             let (x, _y, send, _recv) = single_raw(&oc, &os).await;
             send.with(|s| s.reset(code)).unwrap();
-            let e = watchdog(10, "closed", x.closed()).await;
+            let e = watchdog(10, "closed", x.closing()).await;
             assert_eq!(
                 e,
                 zmux::SessionError::PipesLost {
@@ -409,7 +409,7 @@ fn stream_events_map_to_pipe_events() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             mute.store(true, Ordering::SeqCst);
             recv.with(|r| r.stop(code)).unwrap();
-            let e = watchdog(2, "closed without a write", x.closed()).await;
+            let e = watchdog(2, "closed without a write", x.closing()).await;
             assert_eq!(
                 e,
                 zmux::SessionError::PipesLost {
@@ -417,7 +417,7 @@ fn stream_events_map_to_pipe_events() {
                 }
             );
             assert!(oc.close_reason().is_none() && os.close_reason().is_none());
-            oc.close(VarInt::ZERO, b"").await;
+            oc.close().await;
 
             // In a multipath session: a pipe aborted locally resets and
             // stops its stream with ZMUX_CARRIER_FAILED (the reset keeps
@@ -437,13 +437,13 @@ fn stream_events_map_to_pipe_events() {
             // The outer session lost: its stream pipes fail, the nested
             // session continues on its direct carrier.
             let p = n.join_stream().await;
-            n.os.close(VarInt::from_u32(3), b"").await;
+            n.os.abort(VarInt::from_u32(3), b"");
             eventually(10, "the stream pipe failed", || {
                 matches!(state(&p).1, Some(OutboundState::Failed) | None)
             })
             .await;
             watchdog(30, "echo on the direct carrier", echo(&n.x, &n.y, 64 << 10)).await;
-            n.x.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
             n.listener.close();
         }
         settle(base, 10, "mapping").await;
@@ -475,8 +475,8 @@ fn a_stream_carrier_takes_no_exporter() {
                 Session::connect(carrier, tls).await,
                 Err(zmux::ConnectError::InvalidConfig(_))
             ));
-            oc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "outer closed", os.closed()).await;
+            oc.close().await;
+            watchdog(10, "outer closed", os.closing()).await;
         }
         settle(base, 10, "stream carrier without exporter").await;
     });
@@ -497,8 +497,8 @@ fn a_stream_carrier_takes_the_parts_of_one_stream() {
             }));
             assert!(mixed.is_err(), "the parts of two streams");
             drop((s2, r1));
-            oc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "closed", os.closed()).await;
+            oc.close().await;
+            watchdog(10, "closed", os.closing()).await;
         }
         settle(base, 10, "mixed parts").await;
     });
@@ -533,8 +533,8 @@ fn a_pipe_never_runs_over_its_own_session() {
                 n.oc.begin_add_pipe(unlooped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             );
-            n.x.close(VarInt::ZERO, b"").await;
-            n.oc.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
+            n.oc.close().await;
             n.listener.close();
         }
         settle(base, 10, "loop check").await;
@@ -574,8 +574,8 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
             .await;
             eventually(10, "the refused pipe retired", || p.stats().is_none()).await;
             assert_eq!(n.y.pipe_stats().len(), 1, "only the direct carrier");
-            n.x.close(VarInt::ZERO, b"").await;
-            n.oc.close(VarInt::ZERO, b"").await;
+            n.x.close().await;
+            n.oc.close().await;
             n.listener.close();
         }
         settle(base, 10, "looped join").await;
@@ -623,8 +623,8 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
             listener.close();
             let _ = watchdog(10, "the held one ended", handled.pop().unwrap()).await;
             drop(held);
-            oc.close(VarInt::ZERO, b"").await;
-            os.closed().await;
+            oc.close().await;
+            os.closing().await;
         }
         settle(base, 10, "pending streams").await;
     });
@@ -689,26 +689,26 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             let _ = watchdog(10, "the slot holder ended", c_handled).await;
             drop((c, d));
             let _ = watchdog(10, "client", client).await;
-            nc.close(VarInt::ZERO, b"").await;
-            ns.closed().await;
-            oc.close(VarInt::ZERO, b"").await;
-            os.closed().await;
+            nc.close().await;
+            ns.closing().await;
+            oc.close().await;
+            os.closing().await;
         }
         settle(base, 10, "exempt streams").await;
     });
 }
 
-/// A carrier evicted for a newer one when every pending slot is taken is
-/// closed at once, not left to its first-record
-/// timeout.
+/// A new carrier that finds every slot of the listener taken, none of them
+/// stalled, is closed at once and counted as rejected; the carrier holding
+/// the slot goes on.
 #[test]
-fn an_evicted_carrier_is_closed_at_once() {
+fn a_carrier_beyond_the_global_bound_is_closed_at_once() {
     multi_thread(async {
         let base = snapshot();
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending = 1;
+            limits.max_pending = Some(1);
             limits.first_record_timeout = Duration::from_secs(60);
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
@@ -726,16 +726,18 @@ fn an_evicted_carrier_is_closed_at_once() {
                 }));
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let first = handled.remove(0);
-            let r = watchdog(10, "the evicted one closed", first).await.unwrap();
-            assert_eq!(r.err(), Some(zmux::HandleError::Refused));
+            let second = handled.pop().unwrap();
+            let r = watchdog(10, "the new one closed", second).await.unwrap();
+            assert_eq!(r.err(), Some(zmux::HandleError::Rejected));
+            assert_eq!(listener.stats().rejected, 1);
+            assert!(!handled[0].is_finished(), "the first keeps its slot");
             listener.close();
-            let _ = watchdog(10, "the second ended", handled.remove(0)).await;
+            let _ = watchdog(10, "the first ended", handled.remove(0)).await;
             drop(held);
-            oc.close(VarInt::ZERO, b"").await;
-            os.closed().await;
+            oc.close().await;
+            os.closing().await;
         }
-        settle(base, 10, "evicted carriers").await;
+        settle(base, 10, "carriers beyond the bound").await;
     });
 }
 
@@ -765,9 +767,9 @@ fn an_outer_session_without_the_preamble_carries_a_pipe_from_offset_zero() {
             ));
             let (nc, ns) = nested_over(&oc, &os, &[]).await;
             watchdog(30, "echo", echo(&nc, &ns, 1 << 20)).await;
-            nc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"").await;
+            nc.close().await;
+            watchdog(10, "nested closed", ns.closing()).await;
+            oc.close().await;
         }
         settle(base, 10, "plain outer").await;
     });
@@ -783,7 +785,7 @@ fn an_unused_carrier_is_aborted_when_dropped() {
         drop(pipe);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(os.stats().streams_opened_remote, 0);
-        oc.close(VarInt::ZERO, b"").await;
+        oc.close().await;
     });
 }
 
@@ -841,10 +843,10 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
             // A stream that names no pipe of a session is refused.
             let (stray, _) = oc.open_bi().await.unwrap();
             drop(stray);
-            nc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "outer closed", os.closed()).await;
+            nc.close().await;
+            watchdog(10, "nested closed", ns.closing()).await;
+            oc.close().await;
+            watchdog(10, "outer closed", os.closing()).await;
             lanes.await.unwrap();
         }
         settle(base, 10, "nested lanes").await;
@@ -888,10 +890,10 @@ fn a_listener_counts_accepted_lanes_as_joins() {
             .await;
             let st = listener.stats();
             assert_eq!((st.sessions, st.rejected, st.refused), (1, 0, 0));
-            nc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "outer closed", os.closed()).await;
+            nc.close().await;
+            watchdog(10, "nested closed", ns.closing()).await;
+            oc.close().await;
+            watchdog(10, "outer closed", os.closing()).await;
             router.await.unwrap();
             listener.close();
         }
@@ -946,10 +948,10 @@ fn stream_carrier_lanes_keep_to_half_the_outer_streams() {
             assert!(out.lanes_out <= 3, "lane 0 and at most two: {out:?}");
             assert_eq!(out.lanes_refused, 0);
             assert!(oc.stats().streams_opened_local <= 3);
-            nc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "nested closed", ns.closed()).await;
-            oc.close(VarInt::ZERO, b"").await;
-            watchdog(10, "outer closed", os.closed()).await;
+            nc.close().await;
+            watchdog(10, "nested closed", ns.closing()).await;
+            oc.close().await;
+            watchdog(10, "outer closed", os.closing()).await;
             lanes.await.unwrap();
         }
         settle(base, 10, "outer lane share").await;
@@ -994,6 +996,7 @@ fn lanes_ended_at_any_point_wake_nothing_under_a_core_lock() {
         let _ = recv.read_to_end(len).await;
         let _ = echo.await;
     }
+    let before = common::fds_before_runtime();
     for i in 0..40u64 {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -1032,14 +1035,15 @@ fn lanes_ended_at_any_point_wake_nothing_under_a_core_lock() {
             }
             tokio::time::sleep(Duration::from_millis(5 + (i * 37) % 120)).await;
             match i % 3 {
-                0 => nc.close(VarInt::ZERO, b"").await,
-                1 => oc.close(VarInt::ZERO, b"").await,
+                0 => nc.close().await,
+                1 => oc.close().await,
                 _ => {}
             }
             tokio::time::sleep(Duration::from_millis((i * 13) % 7)).await;
         });
         rt.shutdown_timeout(Duration::from_secs(5));
     }
+    common::runtime_gone(before);
     // The default hook again for the tests that run after this one.
     drop(std::panic::take_hook());
     assert_eq!(

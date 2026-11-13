@@ -10,9 +10,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
-    Admission, AdmissionStats, Admit, CarrierInfo, Config, Decide, DecideFuture, Fallback,
-    HandleError, JoinPrefix, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth,
-    PrefixAuthVerifier, Session, Verdict,
+    Admission, AdmissionStats, AdmissionVerdict, Admit, CarrierInfo, Config, Decide, DecideFuture,
+    Fallback, HandleError, JoinPrefix, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth,
+    PrefixAuthVerifier, Session,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -119,7 +119,7 @@ async fn fallback_receives_every_byte_read() {
 
 #[tokio::test]
 async fn stall_sends_nothing_and_ends_with_the_peer() {
-    let admission = Admission::new(4, |_, _| Verdict::Stall)
+    let admission = Admission::new(4, |_, _| AdmissionVerdict::Stall)
         .with_stall_interval(Duration::from_secs(60), Duration::from_secs(60));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
@@ -136,7 +136,7 @@ async fn stall_sends_nothing_and_ends_with_the_peer() {
 
 #[tokio::test]
 async fn fallback_without_a_target_stalls() {
-    let admission = Admission::new(4, |_, _| Verdict::Fallback)
+    let admission = Admission::new(4, |_, _| AdmissionVerdict::Fallback)
         .with_stall_interval(Duration::from_millis(50), Duration::from_millis(100));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
@@ -155,8 +155,9 @@ async fn every_outcome_is_counted_once() {
     // Close, an Accept beyond the prefix, and a decision that panics are
     // all closed.
     for decide in [
-        (|_: &CarrierInfo<'_>, _: &[u8]| Verdict::Close) as fn(&CarrierInfo<'_>, &[u8]) -> Verdict,
-        |_, _| Verdict::accept(5),
+        (|_: &CarrierInfo<'_>, _: &[u8]| AdmissionVerdict::Close)
+            as fn(&CarrierInfo<'_>, &[u8]) -> AdmissionVerdict,
+        |_, _| AdmissionVerdict::accept(5),
         |_, _| panic!("a failing decision"),
     ] {
         let (listener, addr) = serve(Admission::new(4, decide), None).await;
@@ -192,7 +193,7 @@ async fn every_outcome_is_counted_once() {
 }
 
 /// A decision that waits, as a lookup would.
-struct Slow(Duration, Verdict);
+struct Slow(Duration, AdmissionVerdict);
 
 impl Decide for Slow {
     fn decide<'a>(&'a self, _: &'a CarrierInfo<'a>, _: &'a [u8]) -> DecideFuture<'a> {
@@ -205,8 +206,11 @@ impl Decide for Slow {
 
 #[tokio::test]
 async fn an_async_decision_within_the_peek_timeout() {
-    let admission = Admission::with_decider(1, Slow(Duration::from_millis(20), Verdict::accept(1)))
-        .with_peek_timeout(LIMIT);
+    let admission = Admission::with_decider(
+        1,
+        Slow(Duration::from_millis(20), AdmissionVerdict::accept(1)),
+    )
+    .with_peek_timeout(LIMIT);
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"z").await.unwrap();
@@ -229,8 +233,11 @@ async fn an_async_decision_within_the_peek_timeout() {
 #[tokio::test]
 async fn a_late_decision_is_a_peek_timeout() {
     // The peek timeout covers the prefix and the decision.
-    let admission = Admission::with_decider(0, Slow(Duration::from_secs(3600), Verdict::accept(0)))
-        .with_peek_timeout(Duration::from_millis(50));
+    let admission = Admission::with_decider(
+        0,
+        Slow(Duration::from_secs(3600), AdmissionVerdict::accept(0)),
+    )
+    .with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     assert!(ended(&mut tcp).await.is_empty());
@@ -242,7 +249,8 @@ async fn a_late_decision_is_a_peek_timeout() {
 #[tokio::test]
 async fn a_late_prefix_is_closed_or_falls_back() {
     // Two of four bytes, then silence: the decision is never asked.
-    let never = |_: &CarrierInfo<'_>, _: &[u8]| -> Verdict { panic!("decided a late prefix") };
+    let never =
+        |_: &CarrierInfo<'_>, _: &[u8]| -> AdmissionVerdict { panic!("decided a late prefix") };
     let late = || Admission::new(4, never).with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(late(), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
@@ -279,8 +287,11 @@ async fn a_late_prefix_is_closed_or_falls_back() {
 
 #[tokio::test]
 async fn closing_the_listener_cancels_a_decision() {
-    let admission = Admission::with_decider(0, Slow(Duration::from_secs(3600), Verdict::accept(0)))
-        .with_peek_timeout(Duration::from_secs(3600));
+    let admission = Admission::with_decider(
+        0,
+        Slow(Duration::from_secs(3600), AdmissionVerdict::accept(0)),
+    )
+    .with_peek_timeout(Duration::from_secs(3600));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -292,7 +303,7 @@ async fn closing_the_listener_cancels_a_decision() {
 #[tokio::test]
 async fn the_source_slot_is_taken_before_any_handshake() {
     let mut limits = limits(
-        Admission::with_decider(0, Slow(Duration::from_secs(3600), Verdict::Close))
+        Admission::with_decider(0, Slow(Duration::from_secs(3600), AdmissionVerdict::Close))
             .with_peek_timeout(Duration::from_secs(3600)),
         None,
     );
@@ -331,7 +342,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
 #[tokio::test(start_paused = true)]
 async fn stall_duration_is_a_function_of_the_source() {
     let (min, max) = (Duration::from_secs(1), Duration::from_secs(1000));
-    let admission = Admission::new(0, |_, _| Verdict::Stall).with_stall_interval(min, max);
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall).with_stall_interval(min, max);
     let listener = Listener::new(Config::default(), limits(admission, None))
         .expect("valid listener configuration");
     let d = async |s: &str| {
@@ -352,7 +363,7 @@ async fn stall_duration_is_a_function_of_the_source() {
 
 #[tokio::test(start_paused = true)]
 async fn a_source_stalls_at_most_its_share_less_one() {
-    let admission = Admission::new(0, |_, _| Verdict::Stall)
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall)
         .with_stall_interval(Duration::from_secs(1), Duration::from_secs(1));
     let mut config = limits(admission, None);
     config.max_pending_per_source = 3;
@@ -393,9 +404,102 @@ async fn a_source_stalls_at_most_its_share_less_one() {
     listener.close();
 }
 
+/// With `source_prefix_v4` 24 and `source_prefix_v6` 56, two sources of one
+/// /24 or one /56 share the per-source bound, the stalled-carrier count and
+/// the stall duration, while sources of different prefixes do not; 33, 129
+/// and 0 are the configuration error.
+#[tokio::test(start_paused = true)]
+async fn source_prefixes_aggregate_every_per_source_limit() {
+    for (v4, v6) in [(0, 64), (33, 64), (32, 0), (32, 129)] {
+        let mut c = ListenerConfig::default();
+        c.source_prefix_v4 = v4;
+        c.source_prefix_v6 = v6;
+        assert!(Listener::new(Config::default(), c).is_err(), "{v4} {v6}");
+    }
+    let (min, max) = (Duration::from_secs(1), Duration::from_secs(1000));
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall).with_stall_interval(min, max);
+    let mut config = limits(admission, None);
+    config.max_pending_per_source = 3;
+    config.source_prefix_v4 = 24;
+    config.source_prefix_v6 = 56;
+    let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
+    let enter = |s: &str| listener.enter(s.parse().unwrap(), None);
+    async fn admit(e: &mut zmux::Entry) -> Admit {
+        e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+            .await
+    }
+    let d = async |s: &str| {
+        let mut e = listener.enter(s.parse().unwrap(), None).unwrap();
+        let start = tokio::time::Instant::now();
+        e.stall(None::<&mut tokio::io::Empty>).await;
+        start.elapsed()
+    };
+    for (a, b, c, other) in [
+        (
+            "192.0.2.1:1",
+            "192.0.2.77:2",
+            "192.0.2.200:3",
+            "192.0.3.1:1",
+        ),
+        (
+            "[2001:db8:0:a1::1]:1",
+            "[2001:db8:0:a2::1]:2",
+            "[2001:db8:0:ff::1]:3",
+            "[2001:db8:0:1a1::1]:1",
+        ),
+    ] {
+        // One stall duration per prefix.
+        assert_eq!(d(a).await, d(b).await);
+        assert_eq!(d(a).await, d(c).await);
+        // The stalled-carrier count: two of the prefix stall, the third is
+        // closed at once.
+        let overflow = || listener.stats().admission.stall_overflow;
+        let before = overflow();
+        let mut ea = enter(a).unwrap();
+        let mut eb = enter(b).unwrap();
+        assert!(matches!(admit(&mut ea).await, Admit::Stall));
+        assert!(matches!(admit(&mut eb).await, Admit::Stall));
+        let mut ec = enter(c).unwrap();
+        assert!(matches!(admit(&mut ec).await, Admit::Close));
+        assert_eq!(overflow(), before + 1);
+        // The bound: the prefix's three slots are taken.
+        assert!(enter(a).is_none() && enter(c).is_none());
+        // Another prefix has its own share, stalls and duration.
+        let mut eo = enter(other).unwrap();
+        assert!(matches!(admit(&mut eo).await, Admit::Stall));
+        drop((ea, eb, ec, eo));
+    }
+    // The defaults, /32 and /64, tell these apart.
+    let listener = Listener::new(Config::default(), ListenerConfig::default())
+        .expect("valid listener configuration");
+    let mut held = Vec::new();
+    for s in ["192.0.2.1:1", "[2001:db8:0:a1::1]:1"] {
+        for _ in 0..8 {
+            held.push(listener.enter(s.parse().unwrap(), None).unwrap());
+        }
+    }
+    assert!(
+        listener
+            .enter("192.0.2.2:1".parse().unwrap(), None)
+            .is_some()
+    );
+    assert!(
+        listener
+            .enter("[2001:db8:0:a2::1]:1".parse().unwrap(), None)
+            .is_some()
+    );
+    assert!(
+        listener
+            .enter("192.0.2.1:2".parse().unwrap(), None)
+            .is_none()
+    );
+    drop(held);
+    listener.close();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_share_of_one_closes_every_stall() {
-    let admission = Admission::new(0, |_, _| Verdict::Stall);
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall);
     let mut config = limits(admission, None);
     config.max_pending_per_source = 1;
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
@@ -410,14 +514,65 @@ async fn a_share_of_one_closes_every_stall() {
     listener.close();
 }
 
+/// The listener's bound holds every carrier from its entry: stalls take at most half of
+/// it (beyond, `stall_overflow`); with every slot taken a new carrier evicts the stall
+/// that began first and proceeds, or is refused, counted as rejected, when none is
+/// stalled. A released entry gives its slots back without counting anything.
+#[tokio::test(start_paused = true)]
+async fn the_global_bound_evicts_the_oldest_stall() {
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall)
+        .with_stall_interval(Duration::from_secs(3600), Duration::from_secs(3600));
+    let mut config = limits(admission, None);
+    config.max_pending = Some(4);
+    let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
+    let enter = |n: u8| listener.enter(SocketAddr::from(([192, 0, 2, n], 1)), None);
+    async fn admit(e: &mut zmux::Entry) -> Admit {
+        e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+            .await
+    }
+    let none = || None::<&mut tokio::io::Empty>;
+    let mut a = enter(1).unwrap();
+    let mut b = enter(2).unwrap();
+    assert!(matches!(admit(&mut a).await, Admit::Stall));
+    assert!(matches!(admit(&mut b).await, Admit::Stall));
+    let mut c = enter(3).unwrap();
+    assert!(matches!(admit(&mut c).await, Admit::Close));
+    assert_eq!(listener.stats().admission.stall_overflow, 1);
+    // `a` stalls first, then `b`; `c` and `d` hold the other slots.
+    let sa = tokio::spawn(async move { a.stall(none()).await });
+    tokio::task::yield_now().await;
+    let sb = tokio::spawn(async move { b.stall(none()).await });
+    tokio::task::yield_now().await;
+    let d = enter(4).unwrap();
+    // Every slot taken: the oldest stall ends, and the new carrier holds its slot.
+    let e = enter(5).unwrap();
+    tokio::time::timeout(LIMIT, sa).await.unwrap().unwrap();
+    assert!(!sb.is_finished());
+    let f = enter(6).unwrap();
+    tokio::time::timeout(LIMIT, sb).await.unwrap().unwrap();
+    let before = listener.stats();
+    assert!(enter(7).is_none());
+    assert_eq!(listener.stats().rejected, before.rejected + 1);
+    // Released, a slot is free again, and nothing is counted.
+    c.release();
+    let g = enter(8).unwrap();
+    let after = listener.stats();
+    assert_eq!(
+        (after.admission.handshake_failed, after.setup_failures),
+        (before.admission.handshake_failed, before.setup_failures)
+    );
+    drop((d, e, f, g));
+    listener.close();
+}
+
 #[tokio::test]
 async fn accept_keeps_the_bytes_after_the_skipped_ones() {
     // Accept(1) of a one-byte marker: the session's records follow it.
     let admission = Admission::new(1, |_, p| {
         if p == b"z" {
-            Verdict::accept(1)
+            AdmissionVerdict::accept(1)
         } else {
-            Verdict::Close
+            AdmissionVerdict::Close
         }
     });
     let (listener, addr) = serve(admission, None).await;
@@ -447,9 +602,9 @@ async fn handle_pipe_applies_the_admission() {
     let admission = Admission::new(1, move |info, p| {
         let _ = tx.send((info.source, info.peer));
         if p == b"z" {
-            Verdict::accept(1)
+            AdmissionVerdict::accept(1)
         } else {
-            Verdict::Close
+            AdmissionVerdict::Close
         }
     });
     let listener = Listener::new(Config::default(), limits(admission, None))
@@ -516,11 +671,11 @@ async fn no_admission_counts_nothing() {
 async fn more_reads_on_in_the_serve_loop() {
     let admission = Admission::new(2, |_, p| {
         if p.len() < 5 {
-            Verdict::More { need: 5 }
+            AdmissionVerdict::More { need: 5 }
         } else if p == b"token" {
-            Verdict::accept(5)
+            AdmissionVerdict::accept(5)
         } else {
-            Verdict::Close
+            AdmissionVerdict::Close
         }
     })
     .with_max_peek(8);
@@ -555,9 +710,9 @@ async fn more_reads_on_in_the_serve_loop() {
 async fn more_past_the_end_of_the_carrier_closes() {
     let admission = Admission::new(2, |_, p| {
         if p.len() < 5 {
-            Verdict::More { need: 5 }
+            AdmissionVerdict::More { need: 5 }
         } else {
-            Verdict::accept(5)
+            AdmissionVerdict::accept(5)
         }
     })
     .with_max_peek(8);

@@ -36,7 +36,7 @@ fn dial(
 async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
     let mut limits = ListenerConfig::default();
     // Below one idle session's charge.
-    limits.memory_budget = zmux::Budget::Bytes(1024);
+    limits.memory_budget = Some(1024);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     limits.on_memory_pressure = Some(zmux::OnMemoryPressure(std::sync::Arc::new(
@@ -64,8 +64,8 @@ async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
             // CONNECTION_REFUSED after the listener's parameters, so that the
             // peer reads why, as the Go listener sends it.
             let error = match watchdog(10, "refused dialer", dialer).await.unwrap() {
-                Ok(s) => watchdog(10, "refused session", s.closed()).await,
-                Err(zmux::ConnectError::Closed(e)) => e,
+                Ok(s) => watchdog(10, "refused session", s.closing()).await,
+                Err(zmux::ConnectError::SessionLost(e)) => e,
                 Err(e) => panic!("not refused: {e:?}"),
             };
             assert!(
@@ -87,8 +87,8 @@ async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
         seen.lock().unwrap().first() == Some(&true)
     })
     .await;
-    client.close(zmux::VarInt::from_u32(0), b"").await;
-    watchdog(10, "server closed", server.closed()).await;
+    client.close().await;
+    watchdog(10, "server closed", server.closing()).await;
     drop((client, server));
     // The ended session's charge left the account: the end of the
     // pressure is reported once, after its start (wait for it before a
@@ -120,7 +120,7 @@ fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"account-test-psk-0123456789abcd!").with_end_to_end();
-    c.suspect_floor = Duration::from_millis(100);
+    c.liveness.suspect_floor = Duration::from_millis(100);
     c.resume_timeout = Some(Duration::from_secs(30));
     c
 }
@@ -154,7 +154,7 @@ async fn the_oldest_suspended_session_beyond_the_limit_is_closed() {
         pairs[1].1.state() == State::Suspended
     })
     .await;
-    watchdog(30, "the oldest closed", pairs[0].1.closed()).await;
+    watchdog(30, "the oldest closed", pairs[0].1.closing()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         pairs[1].1.state(),
@@ -171,7 +171,7 @@ async fn the_oldest_suspended_session_beyond_the_limit_is_closed() {
 async fn a_join_under_pressure_goes_to_the_reject_policy() {
     let mut limits = ListenerConfig::default();
     // Below one idle session's charge.
-    limits.memory_budget = zmux::Budget::Bytes(1024);
+    limits.memory_budget = Some(1024);
     let reasons = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     limits.on_reject = Some(zmux::OnReject(std::sync::Arc::new(move |i| {

@@ -25,6 +25,7 @@ tokio = { version = "1.54", default-features = false, features = ["rt", "sync", 
 zmux = { version = "1.2.6", path = "../.." }
 
 [dev-dependencies]
+zmux = { path = "../..", features = ["test-hooks"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 bytes = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }

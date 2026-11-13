@@ -29,6 +29,7 @@ mod wire;
 use std::io;
 
 use std::time::Duration;
+use zmux::Cap;
 pub use zmux::helpers::Backoff;
 
 pub use client::{
@@ -50,15 +51,15 @@ pub enum BodyEncoding {
 }
 
 /// The default piece size of both directions for `encoding`: the largest
-/// that keeps every request and response body, with the longest request
-/// header, at most 1,000,000 bytes after the encoding (999,938 bytes in
-/// binary, 749,938 in base64), below the request body limit of 1 MiB that
+/// that keeps every request and response body, with the request's
+/// authentication header and Data MAC, at most 1,000,000 bytes after the encoding (999,918 bytes in
+/// binary, 749,918 in base64), below the request body limit of 1 MiB that
 /// reverse proxies commonly apply.
 pub const fn default_piece_size(encoding: BodyEncoding) -> usize {
     const BODY: usize = 1_000_000;
     match encoding {
-        BodyEncoding::Binary => BODY - wire::MAX_PREFIX,
-        BodyEncoding::Base64 => BODY / 4 * 3 - wire::MAX_PREFIX,
+        BodyEncoding::Binary => BODY - wire::REQUEST_OVERHEAD,
+        BodyEncoding::Base64 => BODY / 4 * 3 - wire::REQUEST_OVERHEAD,
     }
 }
 
@@ -80,10 +81,10 @@ pub struct ExchangeOptions {
     /// by default, which must be set unless
     /// [`unauthenticated`](Self::unauthenticated) is).
     pub psk: Vec<u8>,
-    /// Client: the credential whose prefix ([`zmux::Credential::prefix`],
+    /// Client: the credential whose prefix ([`zmux::CarrierCredential::prefix`],
     /// given no metadata) the uplink starts with, for a server's admission
     /// ([`zmux::ListenerConfig::admission`]; none by default).
-    pub credential: Option<std::sync::Arc<dyn zmux::Credential>>,
+    pub carrier_credential: Option<std::sync::Arc<dyn zmux::CarrierCredential>>,
     /// Runs without a PSK, explicitly (false by default): the MACs then
     /// only bind responses to requests, and the carrier ID is a bearer
     /// secret. On the wire it is the empty PSK. Set with a PSK, it is an
@@ -100,8 +101,8 @@ pub struct ExchangeOptions {
     /// part before the first placeholder or `?` are exchanges.
     pub path: String,
     /// Client: the path of DOWN requests, a template like
-    /// [`path`](Self::path) (default: `path`).
-    pub down_path: Option<String>,
+    /// [`path`](Self::path) ([`Cap::Auto`], the default: `path`).
+    pub down_path: Cap<String>,
     /// Client: the query parameter that carries the fresh value when the
     /// path has no `{nonce}` (default `n`).
     pub query: String,
@@ -110,13 +111,14 @@ pub struct ExchangeOptions {
     pub down_requests: usize,
     /// Client: UP requests outstanding at most (default 2, at least 1).
     pub up_requests: usize,
-    /// Client: the largest UP piece (`None`: [`default_piece_size`] of the
-    /// encoding; [`up_piece_size`](Self::up_piece_size)).
-    pub up_piece: Option<usize>,
-    /// Client: the largest DOWN piece accepted (`None`: the larger of 1 MiB
-    /// and the default piece size); a larger response fails the carrier. At
-    /// least the server's [`down_piece`](Self::down_piece).
-    pub max_down_piece: Option<usize>,
+    /// Client: the largest UP piece ([`Cap::Auto`], the default:
+    /// [`default_piece_size`] of the encoding;
+    /// [`up_piece_size`](Self::up_piece_size)).
+    pub up_piece: Cap<usize>,
+    /// Client: the largest DOWN piece accepted ([`Cap::Auto`], the default:
+    /// the larger of 1 MiB and the DOWN piece size); a larger response fails
+    /// the carrier. At least the server's [`down_piece`](Self::down_piece).
+    pub max_down_piece: Cap<usize>,
     /// Client: the delays between repetitions of a request that had no
     /// result (default from 20 ms to at most 2 s, each between half and
     /// all of its value).
@@ -148,16 +150,18 @@ pub struct ExchangeOptions {
     /// Server: a DOWN piece is closed this long after its first byte
     /// (default 2 ms).
     pub coalesce: Duration,
-    /// Server: the largest DOWN piece (`None`: [`default_piece_size`] of the
-    /// encoding); also the bytes zmux may write ahead of the pieces.
-    pub down_piece: Option<usize>,
+    /// Server: the largest DOWN piece ([`Cap::Auto`], the default:
+    /// [`default_piece_size`] of the encoding); also the bytes zmux may
+    /// write ahead of the pieces.
+    pub down_piece: Cap<usize>,
     /// Server: DOWN pieces assigned beyond the client's acknowledgement at
     /// most (default 32).
     pub down_window: u64,
-    /// Server: the largest UP piece accepted (`None`: the larger of 1 MiB
-    /// and the default piece size); a request with a larger one is not
-    /// authenticated. At least the client's [`up_piece`](Self::up_piece).
-    pub max_up_piece: Option<usize>,
+    /// Server: the largest UP piece accepted ([`Cap::Auto`], the default:
+    /// the larger of 1 MiB and the UP piece size); a request with a larger
+    /// one is not authenticated. At least the client's
+    /// [`up_piece`](Self::up_piece).
+    pub max_up_piece: Cap<usize>,
     /// Server: uplink bytes held for zmux, and out of order, each at most
     /// (default 4 MiB); a piece beyond it is answered BUSY. Each piece held
     /// out of order also counts a fixed 64 bytes, which bounds how many are
@@ -190,7 +194,7 @@ impl std::fmt::Debug for ExchangeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExchangeOptions")
             .field("psk", &if self.psk.is_empty() { "none" } else { "set" })
-            .field("credential", &self.credential.is_some())
+            .field("carrier_credential", &self.carrier_credential.is_some())
             .field("unauthenticated", &self.unauthenticated)
             .field("encoding", &self.encoding)
             .field("path", &self.path)
@@ -205,16 +209,16 @@ impl Default for ExchangeOptions {
     fn default() -> Self {
         Self {
             psk: Vec::new(),
-            credential: None,
+            carrier_credential: None,
             unauthenticated: false,
             encoding: BodyEncoding::Binary,
             path: "/zmux/exchange".into(),
-            down_path: None,
+            down_path: Cap::Auto,
             query: "n".into(),
             down_requests: 2,
             up_requests: 2,
-            up_piece: None,
-            max_down_piece: None,
+            up_piece: Cap::Auto,
+            max_down_piece: Cap::Auto,
             backoff: Backoff::new(Duration::from_millis(20), Duration::from_secs(2))
                 .with_jitter(0.5),
             request_timeout: Duration::from_secs(25),
@@ -223,9 +227,9 @@ impl Default for ExchangeOptions {
             max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
             hold: Duration::from_secs(20),
             coalesce: Duration::from_millis(2),
-            down_piece: None,
+            down_piece: Cap::Auto,
             down_window: 32,
-            max_up_piece: None,
+            max_up_piece: Cap::Auto,
             up_store: 4 << 20,
             idle_timeout: Duration::from_secs(60),
             gone_memory: Duration::from_secs(60),
@@ -239,8 +243,11 @@ impl Default for ExchangeOptions {
 impl ExchangeOptions {
     /// Client: starts the uplink with the prefix of `credential`.
     #[must_use]
-    pub fn with_credential(mut self, credential: std::sync::Arc<dyn zmux::Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(
+        mut self,
+        credential: std::sync::Arc<dyn zmux::CarrierCredential>,
+    ) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 
@@ -251,28 +258,37 @@ impl ExchangeOptions {
 
     /// The UP piece size in use.
     pub fn up_piece_size(&self) -> usize {
-        self.up_piece
-            .unwrap_or(default_piece_size(self.encoding))
-            .max(1)
+        match self.up_piece {
+            Cap::Auto => default_piece_size(self.encoding),
+            Cap::Fixed(n) => n,
+        }
+        .clamp(1, wire::MAX_DATA)
     }
 
     /// The DOWN piece size in use.
     pub fn down_piece_size(&self) -> usize {
-        self.down_piece
-            .unwrap_or(default_piece_size(self.encoding))
-            .max(1)
+        match self.down_piece {
+            Cap::Auto => default_piece_size(self.encoding),
+            Cap::Fixed(n) => n,
+        }
+        .max(1)
     }
 
     /// The largest UP piece a server accepts.
     pub fn max_up_piece_size(&self) -> usize {
-        self.max_up_piece
-            .unwrap_or_else(|| MIN_PIECE_LIMIT.max(self.up_piece_size()))
+        match self.max_up_piece {
+            Cap::Auto => MIN_PIECE_LIMIT.max(self.up_piece_size()),
+            Cap::Fixed(n) => n,
+        }
+        .min(wire::MAX_DATA)
     }
 
     /// The largest DOWN piece a client accepts.
     pub fn max_down_piece_size(&self) -> usize {
-        self.max_down_piece
-            .unwrap_or_else(|| MIN_PIECE_LIMIT.max(self.down_piece_size()))
+        match self.max_down_piece {
+            Cap::Auto => MIN_PIECE_LIMIT.max(self.down_piece_size()),
+            Cap::Fixed(n) => n,
+        }
     }
 
     /// With this pre-shared key.
@@ -353,7 +369,7 @@ impl ExchangeOptions {
     /// With this path template for DOWN requests.
     #[must_use]
     pub fn with_down_path(mut self, path: impl Into<String>) -> Self {
-        self.down_path = Some(path.into());
+        self.down_path = Cap::Fixed(path.into());
         self
     }
 
@@ -364,23 +380,25 @@ impl ExchangeOptions {
         self
     }
 
+    /// The path template of DOWN requests.
+    fn down_path(&self) -> &str {
+        match &self.down_path {
+            Cap::Auto => &self.path,
+            Cap::Fixed(p) => p,
+        }
+    }
+
     /// The fixed starts of the path templates (UP and DOWN), before the
     /// first placeholder or `?`.
     pub(crate) fn path_prefixes<'a>(&'a self) -> [&'a str; 2] {
         let fixed = |p: &'a str| &p[..p.find(['{', '?']).unwrap_or(p.len())];
-        [
-            fixed(&self.path),
-            fixed(self.down_path.as_deref().unwrap_or(&self.path)),
-        ]
+        [fixed(&self.path), fixed(self.down_path())]
     }
 
     /// The request target of one request: the path with `instance` and
     /// `nonce` in its placeholders, or `nonce` in the query parameter.
     pub(crate) fn target(&self, down: bool, instance: &str, nonce: &str) -> String {
-        let path = match &self.down_path {
-            Some(p) if down => p,
-            _ => &self.path,
-        };
+        let path = if down { self.down_path() } else { &self.path };
         let mut t = path.replace("{instance}", instance);
         if t.contains("{nonce}") {
             t = t.replace("{nonce}", nonce);
@@ -421,15 +439,14 @@ mod tests {
     fn default_bodies_fit_common_proxy_limits() {
         for e in [BodyEncoding::Binary, BodyEncoding::Base64] {
             let piece = default_piece_size(e);
-            let request = wire::encoded_len(e, wire::MAX_PREFIX + piece);
+            let request = wire::encoded_len(e, wire::REQUEST_OVERHEAD + piece);
             let response = wire::encoded_len(e, wire::RESPONSE_HEAD + piece);
             assert!(request <= 1_000_000 && response <= 1_000_000, "{e:?}");
             // The largest such piece.
-            assert!(wire::encoded_len(e, wire::MAX_PREFIX + piece + 1) > 1_000_000);
+            assert!(wire::encoded_len(e, wire::REQUEST_OVERHEAD + piece + 1) > 1_000_000);
         }
-        assert_eq!(default_piece_size(BodyEncoding::Binary), 999_938);
-        assert_eq!(default_piece_size(BodyEncoding::Base64), 749_938);
-        {}
+        assert_eq!(default_piece_size(BodyEncoding::Binary), 999_918);
+        assert_eq!(default_piece_size(BodyEncoding::Base64), 749_918);
     }
 
     #[test]

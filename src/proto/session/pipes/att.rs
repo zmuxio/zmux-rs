@@ -47,7 +47,7 @@ struct AttMp {
     /// Creation order, for "oldest".
     seq: u64,
     /// The record mode, fixed by its handshake.
-    mode: Option<crate::proto::seal::Mode>,
+    mode: Option<crate::proto::seal::RecordMode>,
     /// Our joins refused in a row before this one was confirmed: they
     /// continue if the peer abandons it for a resource limit.
     refusals_at_join: u32,
@@ -341,12 +341,12 @@ impl Attachment {
     }
 
     /// The record mode, fixed by its handshake.
-    pub(crate) fn mode(&self) -> Option<crate::proto::seal::Mode> {
+    pub(crate) fn mode(&self) -> Option<crate::proto::seal::RecordMode> {
         self.mp().mode
     }
 
     /// Fixes the record mode.
-    pub(crate) fn set_mode(&mut self, mode: crate::proto::seal::Mode) {
+    pub(crate) fn set_mode(&mut self, mode: crate::proto::seal::RecordMode) {
         self.mp_mut().mode = Some(mode);
     }
 
@@ -442,12 +442,13 @@ impl Attachment {
     }
 
     /// The options the application added the pipe with.
-    /// The pipe's own T_suspect floor and dead timeout, if it has them.
-    pub(crate) fn mp_options_liveness(&self) -> (Option<Duration>, Option<Duration>) {
+    /// The pipe's own liveness settings.
+    pub(crate) fn own_liveness(&self) -> crate::proto::session::PipeLiveness {
         self.mp
             .as_deref()
             .and_then(|m| m.options.as_deref())
-            .map_or((None, None), |o| (o.suspect_floor, o.dead_timeout))
+            .map(|o| o.liveness)
+            .unwrap_or_default()
     }
 
     pub(crate) fn options(&self) -> Option<&crate::proto::session::PipeOptions> {

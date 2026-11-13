@@ -31,6 +31,7 @@ pub(crate) use basics::{Rng, open_fds, seeds, serial, small_windows, soak};
 /// are part of no other test's baseline.
 pub(crate) fn multi_thread<F: Future>(f: F) -> F::Output {
     let _g = serial();
+    let before = fds_before_runtime();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -38,7 +39,46 @@ pub(crate) fn multi_thread<F: Future>(f: F) -> F::Output {
         .unwrap();
     let r = rt.block_on(f);
     drop(rt);
+    runtime_gone(before);
     r
+}
+
+static WARM: std::sync::Once = std::sync::Once::new();
+
+/// The descriptors open before a runtime is built. The first runtime of
+/// the process opens descriptors it keeps for the next ones (the signal
+/// driver's socket pair): a first one, built and dropped here once, opens
+/// them.
+pub(crate) fn fds_before_runtime() -> usize {
+    WARM.call_once(|| {
+        drop(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+    });
+    open_fds()
+}
+
+/// Waits until the descriptors of a runtime just dropped are closed. Its
+/// driver (its epoll, eventfd and signal descriptors) goes with the last
+/// handle of the runtime, which a waker of one of its tasks holds: a thread
+/// in the middle of waking one keeps it past `drop`, for as long as the
+/// scheduler holds that thread off. Every descriptor the runtime opened
+/// closes then, unless something kept a handle of it for good, which fails
+/// here, in the test that made the runtime.
+pub(crate) fn runtime_gone(before: usize) {
+    assert!(WARM.is_completed());
+    let start = std::time::Instant::now();
+    while open_fds() > before {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the runtime's descriptors outlived it: {before} before it, {} now",
+            open_fds()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Runs `f` on a fresh single-thread runtime whose clock is paused (it
@@ -46,6 +86,7 @@ pub(crate) fn multi_thread<F: Future>(f: F) -> F::Output {
 /// real time.
 pub(crate) fn paused<F: Future>(f: F) -> F::Output {
     let _g = serial();
+    let before = fds_before_runtime();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -53,6 +94,7 @@ pub(crate) fn paused<F: Future>(f: F) -> F::Output {
         .unwrap();
     let r = rt.block_on(f);
     drop(rt);
+    runtime_gone(before);
     r
 }
 
@@ -270,7 +312,9 @@ pub(crate) async fn accept(pipe: PipeIo, config: Config) -> Result<Session, zmux
     listener
         .accept()
         .await
-        .ok_or(zmux::ConnectError::InvalidConfig("listener closed"))
+        .ok_or(zmux::ConnectError::InvalidConfig(zmux::InvalidConfig::new(
+            "listener", "closed",
+        )))
 }
 
 /// A session pair over TCP or in-memory carriers (with their controls).

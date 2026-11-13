@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-use zmux::proto::seal::{Framing, Mode};
+use zmux::proto::seal::{Framing, RecordMode};
 use zmux::{AdmittedValue, CarrierKind};
 
 use crate::establish::read_frame;
@@ -40,7 +40,7 @@ pub(crate) trait Carrier: Sized + Send {
         limit: Duration,
     ) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
     /// The carrier of a finished handshake; `rest` is what was read beyond it.
-    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: Mode) -> Self;
+    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: RecordMode) -> Self;
     fn admitted(self, value: AdmittedValue) -> Self;
     /// With the padding bytes the handshake added.
     fn padded(self, bytes: u64) -> Self;
@@ -85,7 +85,7 @@ impl Carrier for zmux::PipeIo {
             .await
             .unwrap_or_else(|_| Err(timed_out()))
     }
-    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: Mode) -> Self {
+    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: RecordMode) -> Self {
         let keep = complete.exporter_only();
         let p = self.with_prefix(rest);
         let p = match complete.into_records() {
@@ -150,7 +150,7 @@ impl Carrier for zmux::blocking::PipeIo {
         }
         r
     }
-    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: Mode) -> Self {
+    fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: RecordMode) -> Self {
         let keep = complete.exporter_only();
         let p = self.with_prefix(rest);
         let p = match complete.into_records() {

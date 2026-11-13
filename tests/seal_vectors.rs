@@ -74,8 +74,8 @@ fn config<'a>(
     psk: &'a [u8],
     binding: &'a [u8],
 ) -> Result<JoinConfig<'a>, Error> {
-    let mode =
-        Mode::from_byte(v["mode"].as_u64().unwrap() as u8).map_err(|_| Error::InvalidConfig)?;
+    let mode = RecordMode::from_byte(v["mode"].as_u64().unwrap() as u8)
+        .map_err(|_| Error::InvalidConfig)?;
     Ok(JoinConfig {
         suite: suite_of(v),
         group: Group::from_value(v["group"].as_u64().unwrap_or(1)).ok_or(Error::InvalidConfig)?,

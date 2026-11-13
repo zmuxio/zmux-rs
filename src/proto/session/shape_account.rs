@@ -203,11 +203,12 @@ mod tests {
         }
     }
 
-    fn side(v: &J) -> (Account, Option<Duration>) {
-        let d = v["max_delay"].as_i64().unwrap_or(0);
-        let d = match d {
-            0 => None,
-            d if d < 0 => Some(Duration::MAX),
+    /// A side of a vector: its `max_delay` of 0 is the default (the local
+    /// limits') or none (the configuration's), a negative one no bound.
+    fn side(v: &J, default: Option<Duration>) -> (Account, Option<Duration>) {
+        let d = match v["max_delay"].as_i64().unwrap_or(0) {
+            0 => default,
+            d if d < 0 => None,
             d => Some(Duration::from_micros(d as u64)),
         };
         (acct(&v["wire"]), d)
@@ -216,19 +217,19 @@ mod tests {
     #[test]
     fn merge_vectors() {
         for c in vectors()["merge"].as_array().unwrap() {
-            let (wire, max_delay) = side(&c["local"]);
+            let (wire, max_delay) = side(&c["local"], Limits::default().max_delay);
             let l = Limits {
                 wire,
                 max_delay,
                 ..Limits::default()
             };
-            let (wire, max_delay) = side(&c["config"]);
+            let (wire, max_delay) = side(&c["config"], None);
             let set = !l.wire.is_unset() && !wire.is_unset();
             let e = l.under(&Budget::new(wire, max_delay, false));
             assert_eq!(e.no_injection, set && e.wire.is_unset(), "{c}");
             assert_eq!(e.wire, acct(&c["want"]["wire"]), "{c}");
             let want = c["want"]["max_delay"].as_i64().unwrap();
-            let got = e.wait_bound().map_or(-1, |d| d.as_micros() as i64);
+            let got = e.max_delay.map_or(-1, |d| d.as_micros() as i64);
             assert_eq!(got, want, "{c}");
         }
     }

@@ -31,14 +31,14 @@ async fn exchange(client: Session, server: Session) {
         let got = r.read_to_end(1 << 20).await.unwrap();
         s.write_all(&got).await.unwrap();
         s.finish().unwrap();
-        server.closed().await
+        server.closing().await
     });
     let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let (mut s, mut r) = client.open_bi().await.unwrap();
     s.write_all(&data).await.unwrap();
     s.finish().unwrap();
     assert_eq!(r.read_to_end(1 << 20).await.unwrap(), data);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     tokio::time::timeout(Duration::from_secs(5), echo)
         .await
         .unwrap()
@@ -64,7 +64,7 @@ async fn split_bootstrap_over_http1_and_http2() {
             let mut limits = ListenerConfig::default();
             let client_opts = if admitted {
                 limits.admission = Some(admission);
-                Options::default().with_credential(Arc::new(auth))
+                Options::default().with_carrier_credential(Arc::new(auth))
             } else {
                 Options::default()
             };
@@ -279,7 +279,7 @@ async fn a_trusted_intermediary_reports_the_source() {
             let s = seen.clone();
             let admission = zmux::Admission::new(0, move |info, _| {
                 *s.lock().unwrap() = info.source;
-                zmux::Verdict::accept(0)
+                zmux::AdmissionVerdict::accept(0)
             });
             let mut limits = ListenerConfig::default();
             limits.trusted_proxies = TrustedProxies::new()

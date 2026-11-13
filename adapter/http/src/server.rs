@@ -6,8 +6,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode};
@@ -44,9 +45,9 @@ pub enum Unhandled<B> {
 /// before given back in front ([`ReplayBody`]), and the client's address.
 /// Cheap to clone.
 #[derive(Clone)]
-pub struct HttpFallback(Arc<FallbackFn>);
+pub struct Fallback(Arc<FallbackFn>);
 
-/// The request an [`HttpFallback`] serves.
+/// The request an [`Fallback`] serves.
 pub type FallbackRequest = Request<ReplayBody<Incoming>>;
 
 type FallbackFn = dyn Fn(
@@ -56,13 +57,13 @@ type FallbackFn = dyn Fn(
     + Send
     + Sync;
 
-impl std::fmt::Debug for HttpFallback {
+impl std::fmt::Debug for Fallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("HttpFallback(..)")
+        f.write_str("Fallback(..)")
     }
 }
 
-impl HttpFallback {
+impl Fallback {
     /// The handler `f`.
     pub fn new<F, Fut>(f: F) -> Self
     where
@@ -88,7 +89,7 @@ const NO_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// A response without a body.
-fn status(code: StatusCode) -> Response<PipeBody> {
+pub(crate) fn status(code: StatusCode) -> Response<PipeBody> {
     let mut r = Response::new(PipeBody::empty());
     *r.status_mut() = code;
     r
@@ -425,9 +426,9 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
 /// Serves the connections `accept` yields until `listener` is closed: each
 /// is set up by `setup` (for example a TLS handshake, whose ALPN may offer
 /// `h2` and `http/1.1`) within the listener's `handshake_timeout`, then
-/// served in a task of its own ([`serve_connection`]). At most the
-/// listener's `max_pending` connections are in setup at once (as with
-/// [`Listener::serve_connections`]): one beyond them ends the oldest setup.
+/// served in a task of its own ([`serve_connection`]). A connection's
+/// setup holds no listener slot (each request that carries a pipe takes
+/// its own, [`Listener::enter`]); it is bounded by the handshake timeout.
 /// A connection whose setup fails, is ended or carries no pipe counts in
 /// [`Listener::stats`]. Run it in a task of its own; it ends with
 /// [`Listener::close`].
@@ -553,7 +554,10 @@ pub async fn serve_proxied_with<T, IO, A, AF, F, SF, H, HF>(
 /// that sends no request header within the listener's `handshake_timeout`
 /// (HTTP/1.1), or neither a pipe request nor one the fallback handler
 /// serves within it (either version), is closed and counted as a setup
-/// failure ([`Listener::stats`]). `peer` is the client's address (or the
+/// failure ([`Listener::stats`]). Once it served one, it is closed
+/// gracefully after [`Options::idle_timeout`] without a request or a
+/// response in progress (a carrier's response lasts as long as the
+/// carrier), on both versions. `peer` is the client's address (or the
 /// client a PROXY protocol header reported); a trusted intermediary's
 /// forwarding header field is applied on top ([`request_source`]).
 pub async fn serve_connection<IO>(
@@ -596,7 +600,8 @@ pub async fn serve_connection_with<IO, H, HF>(
     let tag = Arc::new(ConnTag);
     let conn = CarrierConnId::new(&tag);
     let used = Arc::new(AtomicBool::new(false));
-    let (seen, l) = (used.clone(), listener.clone());
+    let activity = Arc::new(Activity::new());
+    let (seen, l, act) = (used.clone(), listener.clone(), activity.clone());
     let service = service_fn(move |req: Request<Incoming>| {
         let (seen, l, fallback, route, conn) = (
             seen.clone(),
@@ -605,12 +610,22 @@ pub async fn serve_connection_with<IO, H, HF>(
             route.clone(),
             conn.clone(),
         );
+        // Active from now until the response body is dropped.
+        let active = Active::new(act.clone());
         async move {
             let source = request_source(&l, req.headers(), peer);
+            // An HTTP/2 extended CONNECT whose tunnel outlives its response
+            // body.
+            let tunnel = req.method() == http::Method::CONNECT
+                && req.extensions().get::<hyper::ext::Protocol>().is_some();
             let req = match route(req, peer, conn).await {
                 Ok(resp) => {
                     seen.store(true, Ordering::Relaxed);
-                    return Ok(resp);
+                    active.tunnel_opened(tunnel && resp.status().is_success());
+                    return Ok(resp.map(|body| Tracked {
+                        body,
+                        _active: active,
+                    }));
                 }
                 Err(Unhandled::Fallback(req)) => *req,
                 Err(Unhandled::Abort) => {
@@ -621,13 +636,18 @@ pub async fn serve_connection_with<IO, H, HF>(
                     ));
                 }
             };
-            Ok(match &fallback {
+            let resp = match &fallback {
                 Some(f) => {
                     seen.store(true, Ordering::Relaxed);
                     f.serve(req, source).await
                 }
                 None => status(StatusCode::NOT_FOUND),
-            })
+            };
+            active.tunnel_opened(tunnel && resp.status().is_success());
+            Ok(resp.map(|body| Tracked {
+                body,
+                _active: active,
+            }))
         }
     });
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -638,13 +658,38 @@ pub async fn serve_connection_with<IO, H, HF>(
     builder.http2().enable_connect_protocol();
     let served = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     let mut served = std::pin::pin!(served);
-    // A connection that carries no pipe within the limit is closed.
-    if tokio::time::timeout(limit, served.as_mut()).await.is_err() {
-        if used.load(Ordering::Relaxed) {
-            let _ = served.await;
+    // A connection that carries no pipe within the limit is closed; one
+    // that did, once it has been idle for the idle timeout.
+    let setup_end = tokio::time::Instant::now() + limit;
+    loop {
+        // Before its first request is served, both ends are looked at:
+        // the setup's, and the idle timeout's once it served one.
+        let idle_end = options
+            .idle_timeout
+            .map_or_else(far_future, |idle| activity.idle_end(idle));
+        let wake = if used.load(Ordering::Relaxed) {
+            idle_end
+        } else if idle_end > tokio::time::Instant::now() {
+            setup_end.min(idle_end)
         } else {
+            setup_end
+        };
+        tokio::select! {
+            _ = served.as_mut() => break,
+            () = tokio::time::sleep_until(wake) => {}
+        }
+        let now = tokio::time::Instant::now();
+        let close = if used.load(Ordering::Relaxed) {
+            options
+                .idle_timeout
+                .is_some_and(|idle| activity.idle_end(idle) <= now)
+        } else {
+            now >= setup_end
+        };
+        if close {
             served.as_mut().graceful_shutdown();
             let _ = tokio::time::timeout(limit, served).await;
+            break;
         }
     }
     if !used.load(Ordering::Relaxed) {
@@ -699,3 +744,102 @@ fn exchange_on(exchange: Option<&ExchangeServer>, path: &str) -> bool {
 
 /// The identity of a served connection.
 struct ConnTag;
+
+/// A time beyond every timer of a connection.
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(86_400 * 365)
+}
+
+/// The requests of a connection in progress, and when the last ended.
+struct Activity {
+    start: tokio::time::Instant,
+    active: AtomicUsize,
+    /// An extended CONNECT tunnel was opened: the connection is in use
+    /// until it ends, as an upgraded HTTP/1.1 connection is, since hyper
+    /// does not tell when a tunnel ends.
+    tunnel: AtomicBool,
+    /// When the last request ended, in milliseconds from `start`.
+    last: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            active: AtomicUsize::new(0),
+            tunnel: AtomicBool::new(false),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn ended(&self) {
+        let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last.fetch_max(ms, Ordering::Relaxed);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// When the connection is idle for `idle`: `idle` after the last
+    /// request ended, or `idle` from now while one is in progress, to look
+    /// again then.
+    fn idle_end(&self, idle: Duration) -> tokio::time::Instant {
+        if self.tunnel.load(Ordering::Relaxed) {
+            return far_future();
+        }
+        let since = if self.active.load(Ordering::Acquire) > 0 {
+            tokio::time::Instant::now()
+        } else {
+            self.start + Duration::from_millis(self.last.load(Ordering::Relaxed))
+        };
+        since.checked_add(idle).unwrap_or_else(far_future)
+    }
+}
+
+/// A request in progress, from its arrival until its response body is
+/// dropped.
+struct Active(Arc<Activity>);
+
+impl Active {
+    fn new(a: Arc<Activity>) -> Self {
+        a.active.fetch_add(1, Ordering::AcqRel);
+        Self(a)
+    }
+
+    /// Marks the connection as carrying a tunnel when `opened`.
+    fn tunnel_opened(&self, opened: bool) {
+        if opened {
+            self.0.tunnel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.ended();
+    }
+}
+
+/// A response body that keeps its request in progress while it lives.
+struct Tracked {
+    body: PipeBody,
+    _active: Active,
+}
+
+impl http_body::Body for Tracked {
+    type Data = <PipeBody as http_body::Body>::Data;
+    type Error = <PipeBody as http_body::Body>::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}

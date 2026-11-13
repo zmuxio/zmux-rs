@@ -5,14 +5,14 @@
 use std::time::{Duration, Instant};
 
 use crate::proto::frame::{Dir, Priority};
-use crate::proto::listener::{Classified, ListenerConfig, ListenerCore, Opened};
+use crate::proto::listener::{Classified, ListenerConfig, ListenerCore};
 use crate::proto::record::Framing;
-use crate::proto::seal::Mode;
+use crate::proto::seal::RecordMode;
 use crate::proto::seal::join::JoinHello;
 use crate::proto::session::pipes::{Estimator, INITIAL_RTT};
 use crate::proto::session::{
     ClaimedHello, Config, ConfirmedJoin, JoinStep, OpenedHello, PeerCarrier, PipeAuth, PipeId,
-    PipeOptions, Policy, RoleConfig, SessionCore, StreamKey, TransmitBuf,
+    PipeOptions, Policy, Role, SessionCore, StreamKey, TransmitBuf,
 };
 
 const BS: Framing = Framing::ByteStream;
@@ -26,10 +26,10 @@ fn config(policy: Policy) -> Config {
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end(),
         scheduler: policy,
         max_idle_timeout: Some(Duration::from_secs(600)),
-        probation: Some(Duration::ZERO),
+        probation: None,
         ..Config::default()
     };
-    c.probe_jitter = 0.0;
+    c.liveness.probe_jitter = 0.0;
     c
 }
 
@@ -40,9 +40,7 @@ fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, now: Ins
     a.join_prepare(id, now).unwrap().expect("not deferred");
     let plan = crate::shaping::UnitPlan::default();
     let hello = a.join_hello(id, (BS, 0), &plan, now).unwrap();
-    let Opened::Accepted { id: c, .. } = l.open(2, BS, now) else {
-        panic!("refused");
-    };
+    let c = l.open(None, BS, now);
     let Classified::Join { hello, .. } = l.data(c, &hello, now) else {
         panic!("not a Hello");
     };
@@ -116,10 +114,10 @@ pub(in crate::proto::session) fn two_pipes(
     ready: usize,
 ) -> (SessionCore, StreamKey) {
     let mut now = Instant::now();
-    let mut a = SessionCore::new(config(policy.clone()), RoleConfig::Initiator, None, now).unwrap();
+    let mut a = SessionCore::new(config(policy.clone()), Role::Client, None, now).unwrap();
     let mut b_cfg = config(policy);
     b_cfg.locator = b"server".to_vec();
-    let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, now).unwrap();
+    let mut b = SessionCore::new(b_cfg, Role::Server, None, now).unwrap();
     let mut l = ListenerCore::new(ListenerConfig::default());
     a.attach_pipe(PipeId(0), BS, now);
     b.attach_pipe(PipeId(0), BS, now);
@@ -129,7 +127,7 @@ pub(in crate::proto::session) fn two_pipes(
             Some(BS),
             Some(BS),
             &PipeOptions::default(),
-            Mode::Trusted,
+            RecordMode::Trusted,
             None,
             now,
         )

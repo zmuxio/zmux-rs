@@ -246,7 +246,7 @@ type FallbackFn = dyn Fn(Prefixed<Box<dyn FallbackStream>>, SocketAddr) -> Pin<B
 /// The fallback target of byte-stream carriers
 /// ([`crate::ListenerConfig::fallback`]): a connection handler given the
 /// connection that the admission decided on with
-/// [`crate::Verdict::Fallback`], every byte the admission read replayed in
+/// [`crate::AdmissionVerdict::Fallback`], every byte the admission read replayed in
 /// front ([`Prefixed`]), and its source. Cheap to clone.
 #[derive(Clone)]
 pub struct Fallback(Arc<FallbackFn>);

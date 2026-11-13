@@ -1,3 +1,4 @@
+#![warn(missing_debug_implementations)]
 //! The Establish handshake of the zmux secure carrier, sans-IO: Profiles, Noise
 //! and its payloads. Join, Sealed records, the payload codec, `Export`
 //! and the error classes are the core's, in [`zmux::proto::seal`].
@@ -38,4 +39,6 @@ pub use profile::{HANDSHAKE_ESTABLISH, Profile};
 pub use proof::{SigningKey, check_pin_pq_auth, check_proof};
 pub use wire::{HANDLE_LEN, Hello};
 
-pub use zmux::proto::seal::{Error, Framing, Mode, Opener, Payload, Proof, Sealer, encode_payload};
+pub use zmux::proto::seal::{
+    Error, Framing, Opener, Payload, Proof, RecordMode, Sealer, encode_payload,
+};

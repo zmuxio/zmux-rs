@@ -29,7 +29,7 @@ use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::{Event as R, Framing, RecordReader};
 use zmux::proto::session::{
-    Backing, Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, RoleConfig, SessionCore,
+    Backing, Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, Role, SessionCore,
     StreamKey, TransmitBuf,
 };
 
@@ -142,8 +142,8 @@ impl Net {
         let start = Instant::now();
         let mut b_cfg = config(policy);
         b_cfg.test_hooks().locator = b"server".to_vec();
-        let mut a = SessionCore::new(config(policy), RoleConfig::Initiator, None, start).unwrap();
-        let mut b = SessionCore::new(b_cfg, RoleConfig::Responder, None, start).unwrap();
+        let mut a = SessionCore::new(config(policy), Role::Client, None, start).unwrap();
+        let mut b = SessionCore::new(b_cfg, Role::Server, None, start).unwrap();
         a.attach_pipe(PipeId::new(0), BS, start);
         b.attach_pipe(PipeId::new(0), BS, start);
         a.set_pipe_low_water(PipeId::new(0), true);
@@ -181,7 +181,7 @@ impl Net {
                     Some(BS),
                     Some(BS),
                     &PipeOptions::default(),
-                    zmux::proto::seal::Mode::Trusted,
+                    zmux::proto::seal::RecordMode::Trusted,
                     None,
                     n.now(),
                 )

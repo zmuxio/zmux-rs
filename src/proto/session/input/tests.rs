@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 use super::super::stream::{RECV_KEEP, make_id};
 use bytes::Bytes;
 
-use super::super::{
-    Backing, Config, PipeAuth, PipeId, RoleConfig, SessionCore, StreamKey, TransmitBuf,
-};
+use super::super::{Backing, Config, PipeAuth, PipeId, Role, SessionCore, StreamKey, TransmitBuf};
 use crate::proto::frame::{Dir, Stream};
 use crate::proto::payload::WirePreamble;
 use crate::proto::record::Framing;
@@ -22,7 +20,7 @@ fn config() -> Config {
         max_pipes: 4,
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef"),
         max_idle_timeout: Some(Duration::from_secs(600)),
-        max_incoming_uni_streams: Some(4),
+        max_incoming_uni_streams: crate::proto::session::UniCredit::Limit(4),
         ..Config::default()
     }
 }
@@ -30,8 +28,8 @@ fn config() -> Config {
 /// A multipath pair on pipe 0, established.
 fn pair() -> (SessionCore, SessionCore, Instant) {
     let now = Instant::now();
-    let mut a = SessionCore::new(config(), RoleConfig::Initiator, None, now).unwrap();
-    let mut b = SessionCore::new(config(), RoleConfig::Responder, None, now).unwrap();
+    let mut a = SessionCore::new(config(), Role::Client, None, now).unwrap();
+    let mut b = SessionCore::new(config(), Role::Server, None, now).unwrap();
     a.attach_pipe(PipeId(0), Framing::ByteStream, now);
     b.attach_pipe(PipeId(0), Framing::ByteStream, now);
     pump(&mut a, &mut b, now);
@@ -320,8 +318,8 @@ fn fin_only_frames_go_without_credit() {
     let mut small = config();
     small.initial_stream_receive_window = 4096;
     small.max_stream_receive_window = super::super::Cap::Fixed(4096);
-    let mut a = SessionCore::new(config(), RoleConfig::Initiator, None, now).unwrap();
-    let mut b = SessionCore::new(small, RoleConfig::Responder, None, now).unwrap();
+    let mut a = SessionCore::new(config(), Role::Client, None, now).unwrap();
+    let mut b = SessionCore::new(small, Role::Server, None, now).unwrap();
     a.attach_pipe(PipeId(0), Framing::ByteStream, now);
     b.attach_pipe(PipeId(0), Framing::ByteStream, now);
     pump(&mut a, &mut b, now);
@@ -360,8 +358,8 @@ fn fin_only_frames_go_without_session_credit() {
     let mut small = config();
     small.initial_connection_receive_window = 16 * 1024;
     small.max_connection_receive_window = super::super::Cap::Fixed(16 * 1024);
-    let mut a = SessionCore::new(config(), RoleConfig::Initiator, None, now).unwrap();
-    let mut b = SessionCore::new(small, RoleConfig::Responder, None, now).unwrap();
+    let mut a = SessionCore::new(config(), Role::Client, None, now).unwrap();
+    let mut b = SessionCore::new(small, Role::Server, None, now).unwrap();
     a.attach_pipe(PipeId(0), Framing::ByteStream, now);
     b.attach_pipe(PipeId(0), Framing::ByteStream, now);
     pump(&mut a, &mut b, now);

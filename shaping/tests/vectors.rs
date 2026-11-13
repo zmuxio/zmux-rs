@@ -197,10 +197,11 @@ fn unit_len(m: &J) -> (usize, &'static str) {
     }
 }
 
+/// A local `max_delay` of a vector: 0 the default, a negative one no bound.
 fn max_delay(us: i64) -> Option<Duration> {
     match us {
-        0 => None,
-        n if n < 0 => Some(Duration::MAX),
+        0 => Limits::default().max_delay,
+        n if n < 0 => None,
         n => Some(Duration::from_micros(n as u64)),
     }
 }

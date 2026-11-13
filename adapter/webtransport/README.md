@@ -3,7 +3,7 @@
 WebTransport sessions as [zmux](../../README.md) carriers over
 `web-transport-quinn`.
 
-A `WebTransportCarrier` takes a whole established WebTransport session. A
+A `Carrier` takes a whole established WebTransport session. A
 pipe is one bidirectional stream of it (`open_pipe`, `accept_pipe`); the
 pipe's lanes are unidirectional streams that zmux opens as it needs them, in
 both directions, so that a loss on one lane does not hold back the others.
@@ -19,12 +19,13 @@ WebTransport sessions on a QUIC endpoint, within the listener's setup
 limits, and hands their streams to a listener. With the listener's
 admission (`ListenerConfig::admission`), each session request is decided on before it is
 answered (`admit`, without a prefix): accepted requests get 200, the
-others go to `Options::fallback` (`WebTransportFallback`) or get 404, or
-are stalled or closed without a response. A client's `zmux::Credential`
-(`Options::with_credential`) travels in a request header field, such as a
+others go to `Options::fallback` (`Fallback`) or get 404, or
+are stalled or closed without a response. A client's `zmux::CarrierCredential`
+(`Options::with_carrier_credential`) travels in a request header field, such as a
 `zmux::PrefixAuth` token in `Zmux-Prefix-Auth`; `dial_over` makes the
 session on a QUIC connection of the application's, whose exporter binds
-the token.
+the token. `candidate(client, url, &options)` is a `zmux::Candidate` for
+carrier modes.
 
 The carrier wires:
 
@@ -32,7 +33,7 @@ The carrier wires:
   `PipeAuth::exporter()` and Bound joins, declared secure with a Binding of the
   connection, not the stream (behind a front end that
   terminates TLS, use a PSK);
-- flow control for lanes: the peer may open `Options::lanes` lanes at once,
+- flow control for lanes: the peer may open `LaneWindows::lanes` lanes at once,
   and the connection's receive window covers that many stream windows and a
   pipe's own, charged to the listener's memory budget, or to the zmux
   session's own without a listener; `Options::transport_config` gives the
@@ -61,4 +62,5 @@ let session = zmux_webtransport::connect(&client, url, &options, config).await?;
 ```
 
 The endpoints use the HTTP/3 ALPN identifier `h3`. The crypto provider is
-ring by default (feature `ring`), or aws-lc-rs (feature `aws-lc-rs`).
+ring by default (feature `rustls-ring`), or aws-lc-rs (feature
+`rustls-aws-lc-rs`).

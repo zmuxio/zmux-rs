@@ -152,8 +152,8 @@ pub(crate) struct Engine {
     re1: Option<Vec<u8>>,
     /// A fixed KEM seed (initiator) or encapsulation randomness (responder).
     fixed_kem: Option<Secret>,
-    /// The largest application data of a received message.
-    max_app_data: usize,
+    /// The largest application data of a received message; `None`: no bound.
+    max_app_data: Option<usize>,
     /// `h` after the last token of the message being read or written: `h_p`.
     h_p: Vec<u8>,
     /// The proof of the peer's last message.
@@ -193,7 +193,7 @@ impl Engine {
             dk: None,
             re1: None,
             fixed_kem,
-            max_app_data: crate::DEFAULT_MAX_APP_DATA,
+            max_app_data: Some(crate::DEFAULT_MAX_APP_DATA),
             h_p: Vec::new(),
             peer_proof: None,
         }
@@ -405,14 +405,10 @@ impl Engine {
         Ok(payload)
     }
 
-    /// Sets the largest application data of a received message; 0 is the default and
-    /// `usize::MAX` no bound beyond the message.
-    pub(crate) fn set_max_app_data(&mut self, max: usize) {
-        self.max_app_data = if max == 0 {
-            crate::DEFAULT_MAX_APP_DATA
-        } else {
-            max
-        };
+    /// Sets the largest application data of a received message; `None`: no bound
+    /// beyond the message.
+    pub(crate) fn set_max_app_data(&mut self, max: Option<usize>) {
+        self.max_app_data = max;
     }
 
     /// Validates a received payload: the types its message knows, application data
@@ -425,10 +421,18 @@ impl Engine {
         let max = self.max_app_data;
         let payload = Payload::validate_with(raw, known, |kind, value| match kind {
             APP_DATA if unkeyed => Err(Error::Malformed),
-            APP_DATA if known.contains(&APP_DATA) && value.len() > max => Err(Error::TooLarge),
+            APP_DATA if known.contains(&APP_DATA) && max.is_some_and(|m| value.len() > m) => {
+                Err(Error::TooLarge)
+            }
             _ => Ok(()),
         })?;
-        self.peer_proof = payload.proof().map(|p| ReceivedProof {
+        // A proof counts only in a message that knows the type: elsewhere it is an
+        // unknown even item, skipped unparsed.
+        let proof = known
+            .contains(&Proof::ITEM)
+            .then(|| payload.proof())
+            .flatten();
+        self.peer_proof = proof.map(|p| ReceivedProof {
             key_alg: p.key_alg,
             key: p.key.to_vec(),
             sig: p.sig.to_vec(),
@@ -475,5 +479,35 @@ impl Engine {
             peer_static: self.rs,
             peer_proof: self.peer_proof,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+    use crate::Profile;
+    use zmux::proto::seal::Proof;
+
+    fn engine() -> Engine {
+        let params = Profile::all().next().unwrap().0;
+        let mut engine = Engine::new(params, true, b"", vec![].into(), vec![].into(), None, None);
+        // As after reading message 2.
+        engine.next_message = 2;
+        engine
+    }
+
+    #[test]
+    fn a_proof_is_read_only_where_its_message_knows_the_type() {
+        // Item 8, a proof: KeyAlg 3, a one-byte Pub and a one-byte Sig.
+        let payload = vec![8, 4, 3, 1, 0xaa, 0xbb];
+        for (known, read) in [(&[][..], false), (&[Proof::ITEM][..], true)] {
+            let mut engine = engine();
+            engine.validate(payload.clone(), known).unwrap();
+            assert_eq!(engine.peer_proof().is_some(), read);
+        }
+        // An unknown proof is skipped unparsed, malformed or not.
+        let mut engine = engine();
+        engine.validate(vec![8, 1, 0x40], &[]).unwrap();
+        assert!(engine.peer_proof().is_none());
     }
 }

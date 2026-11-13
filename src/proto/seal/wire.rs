@@ -41,31 +41,47 @@ pub fn cut_unit(framing: Framing, input: &[u8]) -> Result<(&[u8], usize), Error>
     Ok((input, input.len()))
 }
 
-/// The record mode of a carrier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Mode {
-    /// Records are protected.
+/// How a pipe's records are protected, ordered from the strongest to the
+/// weakest. A pipe is joined `Sealed`, `Bound` or `Trusted`; `Unmanaged`
+/// is only reported, for a first pipe outside the secure carrier, and no
+/// Hello carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RecordMode {
+    /// Records protected by the handshake's keys.
     Sealed = 0,
-    /// Raw records on a carrier whose exporter is bound in.
+    /// Raw records on a carrier whose exporter is bound into the handshake.
     Bound = 1,
     /// Raw records by explicit configuration of both ends.
     Trusted = 2,
+    /// A first pipe outside the secure carrier: reported only, never
+    /// chosen for a join.
+    Unmanaged = 3,
 }
 
-impl Mode {
-    /// The Mode of a wire byte; any other value is `bad_flags`.
-    pub fn from_byte(byte: u8) -> Result<Mode, Error> {
+impl RecordMode {
+    /// The mode of a Mode field on the wire: `Sealed`, `Bound` or
+    /// `Trusted`; any other value, `Unmanaged`'s included, is `bad_flags`.
+    pub fn from_byte(byte: u8) -> Result<RecordMode, Error> {
         match byte {
-            0 => Ok(Mode::Sealed),
-            1 => Ok(Mode::Bound),
-            2 => Ok(Mode::Trusted),
+            0 => Ok(RecordMode::Sealed),
+            1 => Ok(RecordMode::Bound),
+            2 => Ok(RecordMode::Trusted),
             _ => Err(Error::BadFlags),
         }
     }
 
-    /// The wire byte.
+    /// The value of the Mode field. `Unmanaged` has none that a peer
+    /// accepts: its 3 is the reserved value [`Self::from_byte`] refuses;
+    /// a configuration that chooses it for a join is refused before
+    /// anything is sent.
     pub fn byte(self) -> u8 {
         self as u8
+    }
+
+    /// Whether a pipe may be joined in this mode: every mode but
+    /// `Unmanaged`.
+    pub fn joinable(self) -> bool {
+        self != RecordMode::Unmanaged
     }
 }
 

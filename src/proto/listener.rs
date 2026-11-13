@@ -3,7 +3,7 @@
 //! yet. It never touches session state: the driver looks up the session by locator and
 //! offers the Hello to it ([`crate::proto::session::SessionCore::open_hello`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,6 @@ use crate::proto::oob::PAIRING_TOKEN_LEN;
 use crate::proto::record::Framing;
 use crate::proto::seal::Error as SealError;
 use crate::proto::seal::join::JoinHello;
-use crate::proto::session::Budget;
 use crate::proto::varint;
 
 /// A change of a listener's memory pressure: it
@@ -47,11 +46,39 @@ impl std::fmt::Debug for OnMemoryPressure {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ListenerConfig {
-    /// Carriers being classified or verified at once (default 64); a new
-    /// carrier evicts the oldest when full.
-    pub max_pending: usize,
-    /// Pending carriers per source (default 8).
+    /// The listener's bound on carriers before they belong to a session
+    /// (default [`DEFAULT_MAX_PENDING`]; `None` is unlimited): a carrier
+    /// holds one of these slots with its source slot, from the moment it
+    /// is taken, through its outer handshake, admission, inbound
+    /// transform, a split half's wait for its pair, classification,
+    /// verification and a new session's transport parameters, and through
+    /// a stall, until it enters a session or is closed. A new carrier that
+    /// finds every slot taken closes the oldest stalled carrier to take
+    /// its slot, or is closed at once (counted as rejected) when none is
+    /// stalled. Stalled carriers hold at most half of the slots (rounded
+    /// down).
+    pub max_pending: Option<usize>,
+    /// Carriers before a session per source (default 8; a source counted
+    /// by its prefix, [`ListenerConfig::source_prefix_v4`] and
+    /// [`ListenerConfig::source_prefix_v6`]), held as
+    /// [`ListenerConfig::max_pending`] says. A source stalls at most one
+    /// fewer, so that it always keeps a slot for a new attempt.
     pub max_pending_per_source: usize,
+    /// The prefix an IPv4 source is counted by: its first this many bits
+    /// (default 32, the address on its own; 1 to 32, another value being
+    /// the configuration error). An IPv4-mapped IPv6 address counts as
+    /// IPv4, and ports are ignored. This one aggregation serves everything
+    /// the listener keeps per source, and nothing else: the per-source
+    /// bound, the count of a source's stalled carriers, the stall duration
+    /// and so the limit on failed join verifications, which hold source
+    /// slots. A shorter prefix groups more clients into one share, which
+    /// tightens the bound against one network and also lets its clients
+    /// crowd each other out; the defaults suit public listeners.
+    pub source_prefix_v4: u8,
+    /// The prefix an IPv6 source is counted by: its first this many bits
+    /// (default 64; 1 to 128, another value being the configuration
+    /// error), as [`ListenerConfig::source_prefix_v4`] says.
+    pub source_prefix_v6: u8,
     /// Unconfirmed carriers per session: joins that passed authentication and wait for the
     /// joiner's confirmation (default 4). A new authenticated Hello beyond it evicts the one
     /// Unconfirmed longest and is never refused for lack of room.
@@ -66,9 +93,9 @@ pub struct ListenerConfig {
     pub accept_sessions: bool,
     /// Suspended sessions held at once (default 1024).
     pub max_suspended: usize,
-    /// Bytes the sessions may hold together (default 1 GiB;
-    /// [`Budget::Unlimited`] lifts the limit).
-    pub memory_budget: Budget,
+    /// Bytes the sessions may hold together (default 1 GiB; `None` is
+    /// unlimited).
+    pub memory_budget: Option<u64>,
     /// Called when memory pressure starts and ends (unset by default).
     pub on_memory_pressure: Option<OnMemoryPressure>,
     /// Bytes at the start of every session locator, for load-balancer
@@ -87,7 +114,7 @@ pub struct ListenerConfig {
     /// (none by default: every carrier is accepted).
     pub admission: Option<super::admission::Admission>,
     /// Where byte-stream carriers (TCP, TLS, Unix) that the admission
-    /// decided on with [`crate::Verdict::Fallback`] go, every byte read
+    /// decided on with [`crate::AdmissionVerdict::Fallback`] go, every byte read
     /// replayed in front; without one they are stalled. HTTP and QUIC
     /// carriers have the fallback of their adapter's options. It never
     /// decides whether the admission runs.
@@ -119,7 +146,7 @@ pub struct RejectInfo {
     /// The Profile, 2 for a Join; `None` when the first bytes named none.
     pub profile: Option<u64>,
     /// The record mode the carrier asked for, when it named one.
-    pub mode: Option<crate::proto::seal::Mode>,
+    pub record_mode: Option<crate::proto::seal::RecordMode>,
     /// The reason: a secure-carrier error class, or `unknown_locator`.
     pub reason: &'static str,
     /// The carrier's source.
@@ -130,13 +157,13 @@ impl RejectInfo {
     /// A refusal for `reason`.
     pub fn new(
         profile: Option<u64>,
-        mode: Option<crate::proto::seal::Mode>,
+        record_mode: Option<crate::proto::seal::RecordMode>,
         reason: &'static str,
         source: Option<std::net::SocketAddr>,
     ) -> Self {
         Self {
             profile,
-            mode,
+            record_mode,
             reason,
             source,
         }
@@ -151,7 +178,7 @@ pub struct RejectError {
     /// The Profile, when the first bytes named one.
     pub profile: Option<u64>,
     /// The record mode, when they named one.
-    pub mode: Option<crate::proto::seal::Mode>,
+    pub record_mode: Option<crate::proto::seal::RecordMode>,
     /// The reason: `profile_disabled`, `unknown_handle`, `auth`,
     /// `binding_unavailable`, `record_mode`, `early_data`, `gate_error`, or another error
     /// class of the secure carrier. Every reason gets the same response: no byte, and the
@@ -165,12 +192,12 @@ impl RejectError {
     /// A refusal for `reason`.
     pub fn new(
         profile: Option<u64>,
-        mode: Option<crate::proto::seal::Mode>,
+        record_mode: Option<crate::proto::seal::RecordMode>,
         reason: &'static str,
     ) -> Self {
         Self {
             profile,
-            mode,
+            record_mode,
             reason,
             err: None,
         }
@@ -385,6 +412,9 @@ impl std::fmt::Debug for SessionConfigFn {
 /// `max_record_size`.
 pub const MAX_HELLO: usize = 2 + 8 + 1 + 1 + 255 + 64 + 2 + 65_535;
 
+/// The default of [`ListenerConfig::max_pending`].
+pub const DEFAULT_MAX_PENDING: usize = 1024;
+
 /// The longest [`ListenerConfig::instance_id`], so that at least 8 random
 /// bytes remain in the 16-byte session locator.
 pub const MAX_INSTANCE_ID_LEN: usize = 8;
@@ -392,15 +422,17 @@ pub const MAX_INSTANCE_ID_LEN: usize = 8;
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
-            max_pending: 64,
+            max_pending: Some(DEFAULT_MAX_PENDING),
             max_pending_per_source: 8,
+            source_prefix_v4: 32,
+            source_prefix_v6: 64,
             max_pending_per_session: 4,
             first_record_timeout: Duration::from_secs(2),
             handshake_timeout: Duration::from_secs(10),
             max_record_size: 65535,
             accept_sessions: true,
             max_suspended: 1024,
-            memory_budget: Budget::Bytes(super::session::DEFAULT_MEMORY_BUDGET),
+            memory_budget: Some(super::session::DEFAULT_MEMORY_BUDGET),
             on_memory_pressure: None,
             instance_id: Vec::new(),
             trusted_proxies: super::trusted::TrustedProxies::new(),
@@ -420,19 +452,27 @@ impl Default for ListenerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CarrierId(pub u64);
 
-/// The result of opening a carrier.
+/// The source slot and listener slot one carrier holds
+/// ([`ListenerCore::enter`]) until [`ListenerCore::release`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Slot(pub u64);
+
+/// The result of [`ListenerCore::enter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Opened {
-    /// Tracked; `evicted` is the oldest pending carrier that made room and
-    /// must be closed.
-    Accepted {
-        /// The new carrier.
-        id: CarrierId,
-        /// A carrier to close.
-        evicted: Option<CarrierId>,
+pub enum Entered {
+    /// The carrier holds `slot`; `evicted` is the stalled carrier whose
+    /// slot it took, to be closed now (its slot is already free).
+    Taken {
+        /// The new carrier's slot.
+        slot: Slot,
+        /// The stalled carrier to close.
+        evicted: Option<Slot>,
     },
-    /// The source has too many pending carriers: close it.
-    Refused,
+    /// The source holds its share: close the carrier at once (refused).
+    SourceFull,
+    /// Every slot of the listener is taken and none is stalled: close
+    /// the carrier at once (rejected).
+    Full,
 }
 
 /// What a carrier turned out to be.
@@ -493,7 +533,9 @@ pub enum Paired {
 #[derive(Debug)]
 struct Pending {
     id: CarrierId,
-    source: u64,
+    /// The slot it gives back when it leaves the listener, if the core
+    /// holds it for the carrier ([`ListenerCore::open`]).
+    slot: Option<Slot>,
     opened: Instant,
     framing: Framing,
     classifier: Classifier,
@@ -503,11 +545,13 @@ struct Pending {
     /// The session's locator once a verified Hello made it Unconfirmed, with the order in
     /// which carriers became Unconfirmed.
     unconfirmed: Option<(Vec<u8>, u64)>,
-    /// A new stream of a connection that already carries a pipe of the
-    /// endpoint: not an unauthenticated carrier (the connection's stream
-    /// credit bounds them), so outside the source and pending limits, and
-    /// only the first-record timeout applies.
-    stream: bool,
+}
+
+/// A held slot: its source, and its place among the stalls while stalled.
+#[derive(Debug)]
+struct SlotState {
+    source: u64,
+    stall: Option<u64>,
 }
 
 /// A sans-IO listener.
@@ -519,26 +563,68 @@ pub struct ListenerCore {
     pending: VecDeque<Pending>,
     /// Split-bootstrap pairing: token -> (carrier, inbound half?, opened).
     pairs: HashMap<[u8; PAIRING_TOKEN_LEN], (CarrierId, bool, Instant, bool)>,
-    /// Source slots held per source ([`ListenerCore::hold`]).
-    held: HashMap<u64, usize>,
-    /// Stalled carriers by source, a subset of `held`
-    /// ([`ListenerCore::stall`]).
-    stalled: HashMap<u64, usize>,
+    /// The slots held ([`ListenerCore::enter`]).
+    slots: HashMap<Slot, SlotState>,
+    /// Slots held per source.
+    by_source: HashMap<u64, usize>,
+    /// Stalled slots per source ([`ListenerCore::stall`]).
+    stalled_by: HashMap<u64, usize>,
+    /// The stalled slots by the order their stall began, oldest first.
+    stalls: BTreeMap<u64, Slot>,
+    /// The order of the next stall.
+    stall_seq: u64,
+    /// The next slot.
+    next_slot: u64,
     /// The order of the next carrier to become Unconfirmed.
     unconfirmed_seq: u64,
 }
 
-/// A source key from a remote address, aggregated to /64 for IPv6; an
-/// IPv4-mapped address (a dual-stack socket's IPv4 client) counts as
-/// its IPv4 address: the key
-/// [`ListenerCore::hold`] and [`ListenerCore::stall`] take.
-pub fn source_key(addr: std::net::IpAddr) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    match addr.to_canonical() {
-        std::net::IpAddr::V4(a) => a.octets().hash(&mut h),
-        std::net::IpAddr::V6(a) => a.octets()[..8].hash(&mut h),
+impl ListenerConfig {
+    /// The checks every listener makes of its limits.
+    pub(crate) fn check(&self) -> Result<(), crate::InvalidConfig> {
+        let e = crate::InvalidConfig::new;
+        if self.instance_id.len() > MAX_INSTANCE_ID_LEN {
+            return Err(e(
+                "ListenerConfig::instance_id",
+                "longer than MAX_INSTANCE_ID_LEN",
+            ));
+        }
+        if self.max_pending == Some(0)
+            || self.max_pending_per_source == 0
+            || self.max_pending_per_session == 0
+        {
+            return Err(e(
+                "ListenerConfig::max_pending",
+                "max_pending, max_pending_per_source and max_pending_per_session must be at least 1",
+            ));
+        }
+        if !(1..=32).contains(&self.source_prefix_v4) {
+            return Err(e("ListenerConfig::source_prefix_v4", "outside 1..=32"));
+        }
+        if !(1..=128).contains(&self.source_prefix_v6) {
+            return Err(e("ListenerConfig::source_prefix_v6", "outside 1..=128"));
+        }
+        Ok(())
     }
-    h.finish()
+
+    /// The key the listener counts `addr` under, the one aggregation of
+    /// every per-source limit ([`ListenerConfig::source_prefix_v4`]): its
+    /// prefix, an IPv4-mapped IPv6 address (a dual-stack socket's IPv4
+    /// client) as its IPv4 address. The key [`ListenerCore::enter`] takes.
+    pub(crate) fn source_key(&self, addr: std::net::IpAddr) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match addr.to_canonical() {
+            std::net::IpAddr::V4(a) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.source_prefix_v4.min(32)));
+                (4u8, u32::from(a) & mask.unwrap_or(0)).hash(&mut h);
+            }
+            std::net::IpAddr::V6(a) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(self.source_prefix_v6.min(128)));
+                (6u8, u128::from(a) & mask.unwrap_or(0)).hash(&mut h);
+            }
+        }
+        h.finish()
+    }
 }
 
 /// A source key from an opaque name.
@@ -556,8 +642,12 @@ impl ListenerCore {
             next: 1,
             pending: VecDeque::new(),
             pairs: HashMap::new(),
-            held: HashMap::new(),
-            stalled: HashMap::new(),
+            slots: HashMap::new(),
+            by_source: HashMap::new(),
+            stalled_by: HashMap::new(),
+            stalls: BTreeMap::new(),
+            stall_seq: 0,
+            next_slot: 1,
             unconfirmed_seq: 0,
         }
     }
@@ -577,189 +667,188 @@ impl ListenerCore {
     /// pipes let wait for their first record unlimited (which the caller
     /// counts): its first record may begin a lane, which takes no slot;
     /// one that turns out a join or a new session takes a slot then
-    /// ([`ListenerCore::admit`]).
+    /// ([`ListenerCore::enter`]).
     pub fn open_stream(&mut self, framing: Framing, now: Instant) -> CarrierId {
-        let id = CarrierId(self.next);
-        self.next += 1;
-        self.pending.push_back(Pending {
-            id,
-            source: 0,
-            opened: now,
-            framing,
-            classifier: Classifier::new(
-                self.config.max_record_size,
-                self.config.accept_sessions,
-                true,
-            )
-            .with_lanes(),
-            buf: Vec::new(),
-            first: false,
-            unconfirmed: None,
-            stream: true,
-        });
-        id
+        self.push(None, framing, now, true)
     }
 
-    /// A new carrier from `source`.
-    pub fn open(&mut self, source: u64, framing: Framing, now: Instant) -> Opened {
-        let evicted = match self.make_slot(source) {
-            Ok(evicted) => evicted,
-            Err(()) => return Opened::Refused,
-        };
-        self.push(source, framing, now, evicted)
-    }
-
-    /// A new carrier from `source` that holds a source slot
-    /// ([`ListenerCore::hold`]): the slot becomes its pending slot, so the
-    /// source's limit does not refuse it; the oldest pending carrier is
-    /// evicted when all pending slots are taken.
-    pub fn open_held(&mut self, source: u64, framing: Framing, now: Instant) -> Opened {
-        self.release(source);
-        let carriers = self.pending.iter().filter(|p| !p.stream).count();
-        let evicted = if carriers >= self.config.max_pending
-            && let Some(i) = self.pending.iter().position(|p| !p.stream)
-        {
-            self.pending.remove(i).map(|p| p.id)
-        } else {
-            None
-        };
-        self.push(source, framing, now, evicted)
+    /// A carrier to classify, holding `slot` ([`ListenerCore::enter`]):
+    /// given here, the slot is released when the carrier leaves the
+    /// listener ([`ListenerCore::done`], its timeout, an eviction);
+    /// without one, its holder releases it.
+    pub fn open(&mut self, slot: Option<Slot>, framing: Framing, now: Instant) -> CarrierId {
+        self.push(slot, framing, now, false)
     }
 
     fn push(
         &mut self,
-        source: u64,
+        slot: Option<Slot>,
         framing: Framing,
         now: Instant,
-        evicted: Option<CarrierId>,
-    ) -> Opened {
+        stream: bool,
+    ) -> CarrierId {
         let id = CarrierId(self.next);
         self.next += 1;
+        let classifier = Classifier::new(
+            self.config.max_record_size,
+            self.config.accept_sessions,
+            true,
+        );
         self.pending.push_back(Pending {
             id,
-            source,
+            slot,
             opened: now,
             framing,
-            classifier: Classifier::new(
-                self.config.max_record_size,
-                self.config.accept_sessions,
-                true,
-            ),
+            classifier: if stream {
+                classifier.with_lanes()
+            } else {
+                classifier
+            },
             buf: Vec::new(),
             first: false,
             unconfirmed: None,
-            stream: false,
         });
-        Opened::Accepted { id, evicted }
+        id
     }
 
-    /// A slot for a carrier from `source`: refused when the source has
-    /// its share, else the oldest pending carrier evicted when all are
-    /// taken.
-    fn make_slot(&mut self, source: u64) -> Result<Option<CarrierId>, ()> {
-        if self.per_source(source) >= self.config.max_pending_per_source {
-            return Err(());
+    /// A source slot and a listener slot for a new carrier from `source`,
+    /// taken before anything else is done with it and held until
+    /// [`ListenerCore::release`]. With every listener slot taken, the
+    /// oldest stalled carrier gives its slot up ([`Entered::Taken`]'s
+    /// `evicted`, to be closed now), or the carrier is refused
+    /// ([`Entered::Full`]) when none is stalled.
+    pub fn enter(&mut self, source: u64) -> Entered {
+        if self.held_by(source) >= self.config.max_pending_per_source {
+            return Entered::SourceFull;
         }
-        let carriers = || self.pending.iter().filter(|p| !p.stream);
-        if carriers().count() >= self.config.max_pending
-            && let Some(i) = self.pending.iter().position(|p| !p.stream)
+        let mut evicted = None;
+        if self
+            .config
+            .max_pending
+            .is_some_and(|max| self.slots.len() >= max)
         {
-            return Ok(self.pending.remove(i).map(|p| p.id));
+            let Some((_, &oldest)) = self.stalls.first_key_value() else {
+                return Entered::Full;
+            };
+            self.release(oldest);
+            evicted = Some(oldest);
         }
-        Ok(None)
+        let slot = Slot(self.next_slot);
+        self.next_slot += 1;
+        self.slots.insert(
+            slot,
+            SlotState {
+                source,
+                stall: None,
+            },
+        );
+        *self.by_source.entry(source).or_default() += 1;
+        Entered::Taken { slot, evicted }
     }
 
-    /// The carriers that count against the per-source limit of `source`:
-    /// its pending carriers and its held source slots.
-    fn per_source(&self, source: u64) -> usize {
-        let pending = self
-            .pending
-            .iter()
-            .filter(|p| !p.stream && p.source == source)
-            .count();
-        pending + self.held.get(&source).copied().unwrap_or(0)
+    fn held_by(&self, source: u64) -> usize {
+        self.by_source.get(&source).copied().unwrap_or(0)
     }
 
-    /// A source slot for a carrier from `source` that entered the
-    /// listener and is not pending yet (in its outer handshake, under
-    /// admission, or stalled): it counts against the source's limit of
-    /// pending carriers until [`ListenerCore::release`] or
-    /// [`ListenerCore::open_held`], without a pending slot (it is neither
-    /// evicted nor timed out). `false` when the source has its share:
-    /// close the carrier.
-    pub fn hold(&mut self, source: u64) -> bool {
-        if self.per_source(source) >= self.config.max_pending_per_source {
+    /// Gives `slot` back, ending its stall. A slot released already, or
+    /// evicted, is ignored.
+    pub fn release(&mut self, slot: Slot) {
+        self.unstall(slot);
+        if let Some(s) = self.slots.remove(&slot) {
+            decrement(&mut self.by_source, s.source);
+        }
+    }
+
+    /// Moves `slot` to `source`, the client a trusted intermediary
+    /// reported: `false` when that source holds its share, or the slot is
+    /// stalled and that source holds its share of stalls
+    /// ([`ListenerCore::stall`]), and the slot stays where it was.
+    pub fn move_slot(&mut self, slot: Slot, source: u64) -> bool {
+        let Some((from, stalled)) = self.slots.get(&slot).map(|s| (s.source, s.stall.is_some()))
+        else {
             return false;
-        }
-        *self.held.entry(source).or_default() += 1;
-        true
-    }
-
-    /// A slot [`ListenerCore::hold`] counted is given back.
-    pub fn release(&mut self, source: u64) {
-        if let Some(n) = self.held.get_mut(&source) {
-            *n -= 1;
-            if *n == 0 {
-                self.held.remove(&source);
-            }
-        }
-    }
-
-    /// A carrier from `source` holding a source slot starts to stall:
-    /// `false` when the source already has `max_pending_per_source - 1`
-    /// stalled carriers, so that it always keeps a slot for a new attempt;
-    /// close the carrier at once. Until [`ListenerCore::unstall`].
-    pub fn stall(&mut self, source: u64) -> bool {
-        let n = self.stalled.entry(source).or_default();
-        if *n + 1 >= self.config.max_pending_per_source {
-            if *n == 0 {
-                self.stalled.remove(&source);
-            }
-            return false;
-        }
-        *n += 1;
-        true
-    }
-
-    /// The carriers of `source` counted against its pending limit now.
-    #[cfg(test)]
-    pub(crate) fn pending_of(&self, source: u64) -> usize {
-        self.per_source(source)
-    }
-
-    /// The carriers of `source` stalled now.
-    #[cfg(test)]
-    pub(crate) fn stalled(&self, source: u64) -> usize {
-        self.stalled.get(&source).copied().unwrap_or(0)
-    }
-
-    /// A stall [`ListenerCore::stall`] counted ended.
-    pub fn unstall(&mut self, source: u64) {
-        if let Some(n) = self.stalled.get_mut(&source) {
-            *n -= 1;
-            if *n == 0 {
-                self.stalled.remove(&source);
-            }
-        }
-    }
-
-    /// A stream opened by [`ListenerCore::open_stream`] turned out a join or a
-    /// new session: it takes a slot from `source` now, like any carrier.
-    /// `Refused`: close it.
-    pub fn admit(&mut self, id: CarrierId, source: u64) -> Opened {
-        if self.find(id).is_none() {
-            return Opened::Refused;
-        }
-        let evicted = match self.make_slot(source) {
-            Ok(evicted) => evicted,
-            Err(()) => return Opened::Refused,
         };
-        if let Some(i) = self.find(id) {
-            let p = &mut self.pending[i];
-            p.stream = false;
-            p.source = source;
+        if from == source {
+            return true;
         }
-        Opened::Accepted { id, evicted }
+        if self.held_by(source) >= self.config.max_pending_per_source
+            || stalled
+                && self.stalled_by.get(&source).copied().unwrap_or(0) + 1
+                    >= self.config.max_pending_per_source
+        {
+            return false;
+        }
+        decrement(&mut self.by_source, from);
+        *self.by_source.entry(source).or_default() += 1;
+        if let Some(s) = self.slots.get_mut(&slot) {
+            s.source = source;
+            if s.stall.is_some() {
+                decrement(&mut self.stalled_by, from);
+                *self.stalled_by.entry(source).or_default() += 1;
+            }
+        }
+        true
+    }
+
+    /// The carrier holding `slot` starts to stall: `false` when its source
+    /// already has `max_pending_per_source - 1` stalled carriers (so that
+    /// it always keeps a slot for a new attempt), the listener's stalled
+    /// carriers hold half of `max_pending` (rounded down), or the slot is
+    /// not held; the carrier is then closed at once (`stall_overflow`).
+    /// Until [`ListenerCore::unstall`] or [`ListenerCore::release`]; a new
+    /// carrier may evict it meanwhile ([`ListenerCore::enter`]).
+    pub fn stall(&mut self, slot: Slot) -> bool {
+        let Some(s) = self.slots.get(&slot) else {
+            return false;
+        };
+        if s.stall.is_some() {
+            return true;
+        }
+        let source = s.source;
+        let per = self.stalled_by.get(&source).copied().unwrap_or(0);
+        if per + 1 >= self.config.max_pending_per_source
+            || self
+                .config
+                .max_pending
+                .is_some_and(|max| self.stalls.len() >= max / 2)
+        {
+            return false;
+        }
+        let seq = self.stall_seq;
+        self.stall_seq += 1;
+        self.stalls.insert(seq, slot);
+        *self.stalled_by.entry(source).or_default() += 1;
+        if let Some(s) = self.slots.get_mut(&slot) {
+            s.stall = Some(seq);
+        }
+        true
+    }
+
+    /// The stall of `slot` ended: `true` when the slot is still held,
+    /// `false` when it was evicted or released meanwhile.
+    pub fn unstall(&mut self, slot: Slot) -> bool {
+        let Some(s) = self.slots.get_mut(&slot) else {
+            return false;
+        };
+        if let Some(seq) = s.stall.take() {
+            let source = s.source;
+            self.stalls.remove(&seq);
+            decrement(&mut self.stalled_by, source);
+        }
+        true
+    }
+
+    /// The slots held now: the listener's, and `source`'s.
+    pub fn held(&self, source: u64) -> (usize, usize) {
+        (self.slots.len(), self.held_by(source))
+    }
+
+    /// The carriers stalled now: the listener's, and `source`'s.
+    pub fn stalled(&self, source: u64) -> (usize, usize) {
+        (
+            self.stalls.len(),
+            self.stalled_by.get(&source).copied().unwrap_or(0),
+        )
     }
 
     fn find(&mut self, id: CarrierId) -> Option<usize> {
@@ -894,14 +983,23 @@ impl ListenerCore {
             .filter(|(_, p)| p.id != id)
             .filter_map(|(i, p)| of(p).map(|seq| (i, seq)))
             .min_by_key(|&(_, seq)| seq)?;
-        self.pending.remove(i).map(|p| p.id)
+        self.remove(i)
     }
 
-    /// The carrier left the listener (attached, rejected or closed).
+    /// The carrier left the listener (attached, rejected or closed); a
+    /// slot it was opened with is released.
     pub fn done(&mut self, id: CarrierId) {
         if let Some(i) = self.find(id) {
-            self.pending.remove(i);
+            self.remove(i);
         }
+    }
+
+    fn remove(&mut self, i: usize) -> Option<CarrierId> {
+        let p = self.pending.remove(i)?;
+        if let Some(slot) = p.slot {
+            self.release(slot);
+        }
+        Some(p.id)
     }
 
     /// The bytes held for a carrier that waits for its session.
@@ -939,13 +1037,8 @@ impl ListenerCore {
         self.pairs
             .retain(|_, v| now.saturating_duration_since(v.2) < limit);
         match self.pairs.get_mut(&token) {
+            // The halves waiting hold slots, which bound the table.
             None => {
-                if self.pairs.len() >= self.config.max_pending {
-                    // Drop the oldest entry: the table stays bounded.
-                    if let Some(old) = self.pairs.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| *k) {
-                        self.pairs.remove(&old);
-                    }
-                }
                 self.pairs.insert(token, (id, inbound, now, false));
                 Paired::Waiting
             }
@@ -986,19 +1079,30 @@ impl ListenerCore {
         let first_timeout = self.config.first_record_timeout;
         let handshake = self.config.handshake_timeout;
         let mut out = Vec::new();
-        self.pending.retain(|p| {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let p = &self.pending[i];
             let limit = if p.first { handshake } else { first_timeout };
             if p.opened.checked_add(limit).is_some_and(|t| now >= t) {
-                out.push(p.id);
-                false
+                out.extend(self.remove(i));
             } else {
-                true
+                i += 1;
             }
-        });
+        }
         let pairs_limit = handshake;
         self.pairs
             .retain(|_, v| now.saturating_duration_since(v.2) < pairs_limit);
         out
+    }
+}
+
+/// Takes one from `source`'s count, forgetting it at 0.
+fn decrement(counts: &mut HashMap<u64, usize>, source: u64) {
+    if let Some(n) = counts.get_mut(&source) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(&source);
+        }
     }
 }
 
@@ -1134,24 +1238,25 @@ impl MemoryBudget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AdmissionStats {
-    /// Decided with [`crate::Verdict::Accept`]; each then counts once more as a
+    /// Decided with [`crate::AdmissionVerdict::Accept`]; each then counts once more as a
     /// pipe input in the other fields of [`ListenerStats`].
     pub accepted: u64,
-    /// Decided with [`crate::Verdict::Fallback`] (stalled without a fallback
+    /// Decided with [`crate::AdmissionVerdict::Fallback`] (stalled without a fallback
     /// target, still counted here), or taken to the fallback by a peek
     /// timeout ([`crate::Admission::with_fallback_on_peek_timeout`], also
     /// counted in `peek_timed_out`).
     pub fallback: u64,
-    /// Decided with [`crate::Verdict::Stall`], counted when the stall starts.
+    /// Decided with [`crate::AdmissionVerdict::Stall`], counted when the stall starts.
     pub stalled: u64,
-    /// Decided with [`crate::Verdict::Close`], an `Accept` beyond the prefix, a
+    /// Decided with [`crate::AdmissionVerdict::Close`], an `Accept` beyond the prefix, a
     /// decision that panicked, or one cancelled because the listener
     /// closed.
     pub closed: u64,
-    /// Decided with [`crate::Verdict::Stall`] when the listener could not stall
-    /// it: its source already stalled `max_pending_per_source - 1`
-    /// carriers ([`ListenerConfig::max_pending_per_source`]), or the
-    /// listener closed meanwhile. Closed at once.
+    /// A Stall, decided by the admission or by [`ListenerConfig::on_reject`], that the
+    /// listener could not carry out: its source already stalled
+    /// `max_pending_per_source - 1` carriers
+    /// ([`ListenerConfig::max_pending_per_source`]), the listener's stalls held half of
+    /// [`ListenerConfig::max_pending`], or the listener closed meanwhile. Closed at once.
     pub stall_overflow: u64,
     /// The prefix or the decision did not come before the end of the peek
     /// timeout.
@@ -1190,8 +1295,10 @@ pub struct ListenerStats {
     pub setup_failures: u64,
     /// Inputs closed without a distinguishable reason: unknown,
     /// unauthenticated or replayed joins, lanes that name no pipe, or not
-    /// zmux at all ([`HandleError::Rejected`]). An admission's decisions
-    /// count in [`ListenerStats::admission`] only.
+    /// zmux at all ([`HandleError::Rejected`]); and new carriers closed at once
+    /// because every slot of [`ListenerConfig::max_pending`] was taken and none
+    /// was stalled. An admission's decisions count in [`ListenerStats::admission`]
+    /// only, and a stalled carrier closed to make room is not counted again.
     pub rejected: u64,
     /// Inputs refused at a limit: of the listener, of its source (a
     /// carrier refused its source slot, before any handshake), of the
@@ -1264,56 +1371,123 @@ pub(crate) fn random_locator(prefix: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn taken(e: Entered) -> (Slot, Option<Slot>) {
+        match e {
+            Entered::Taken { slot, evicted } => (slot, evicted),
+            other => panic!("not taken: {other:?}"),
+        }
+    }
+
     #[test]
     fn per_source_and_first_record_limits() {
         let mut l = ListenerCore::new(ListenerConfig::default());
         let now = Instant::now();
         let a = source_name("a");
         for _ in 0..8 {
-            assert!(matches!(
-                l.open(a, Framing::ByteStream, now),
-                Opened::Accepted { .. }
-            ));
+            let (slot, _) = taken(l.enter(a));
+            l.open(Some(slot), Framing::ByteStream, now);
         }
-        assert_eq!(l.open(a, Framing::ByteStream, now), Opened::Refused);
-        assert!(matches!(
-            l.open(source_name("b"), Framing::ByteStream, now),
-            Opened::Accepted { .. }
-        ));
+        assert_eq!(l.enter(a), Entered::SourceFull);
+        let (slot, _) = taken(l.enter(source_name("b")));
+        l.open(Some(slot), Framing::ByteStream, now);
         assert!(l.expired(now + Duration::from_millis(1999)).is_empty());
         assert_eq!(l.expired(now + Duration::from_secs(2)).len(), 9);
+        // The carriers' slots went with them.
+        assert_eq!(l.held(a), (0, 0));
     }
 
     #[test]
-    fn held_slots_count_per_source() {
+    fn slots_are_held_until_released() {
         let mut l = ListenerCore::new(ListenerConfig {
             max_pending_per_source: 2,
             ..ListenerConfig::default()
         });
         let now = Instant::now();
         let (a, b) = (source_name("a"), source_name("b"));
-        assert!(l.hold(a));
-        assert!(matches!(
-            l.open(a, Framing::ByteStream, now),
-            Opened::Accepted { .. }
-        ));
-        assert!(!l.hold(a));
-        assert_eq!(l.open(a, Framing::ByteStream, now), Opened::Refused);
-        assert!(l.hold(b));
-        // A held slot takes no pending slot and does not expire.
-        assert_eq!(l.pending(), 1);
+        let (s1, _) = taken(l.enter(a));
+        let (s2, _) = taken(l.enter(a));
+        assert_eq!(l.enter(a), Entered::SourceFull);
+        // A slot its holder keeps does not expire with the classification.
+        l.open(None, Framing::ByteStream, now);
         assert_eq!(l.expired(now + Duration::from_secs(60)).len(), 1);
-        l.release(a);
-        assert!(l.hold(a) && l.hold(a));
-        assert!(!l.hold(a));
-        // A held slot becomes the pending slot: the source's limit does not
-        // refuse it.
-        assert!(matches!(
-            l.open_held(b, Framing::ByteStream, now),
-            Opened::Accepted { .. }
-        ));
-        // The first expired above.
-        assert_eq!(l.pending(), 1);
+        assert_eq!(l.held(a), (2, 2));
+        l.release(s1);
+        l.release(s1);
+        assert_eq!(l.held(a), (1, 1));
+        // Moved to another source, it frees its share of the first.
+        assert!(l.move_slot(s2, b));
+        assert_eq!(l.held(a), (1, 0));
+        taken(l.enter(a));
+        taken(l.enter(a));
+        assert!(!l.move_slot(s2, a), "a holds its share");
+    }
+
+    /// A stalled slot moves only to a source with room for one more stall.
+    #[test]
+    fn a_stalled_slot_moves_within_the_stall_share() {
+        let mut l = ListenerCore::new(ListenerConfig {
+            max_pending: None,
+            max_pending_per_source: 3,
+            ..ListenerConfig::default()
+        });
+        let (a, b) = (source_name("a"), source_name("b"));
+        let (b1, _) = taken(l.enter(b));
+        let (b2, _) = taken(l.enter(b));
+        assert!(l.stall(b1) && l.stall(b2));
+        let (a1, _) = taken(l.enter(a));
+        let (a2, _) = taken(l.enter(a));
+        assert!(l.stall(a1));
+        // b holds two stalls, its share: a third would be one too many.
+        assert!(!l.move_slot(a1, b));
+        assert_eq!(l.stalled(b), (3, 2));
+        assert_eq!(l.stalled(a), (3, 1));
+        // A slot that does not stall still moves.
+        assert!(l.move_slot(a2, b));
+        l.release(b1);
+        assert!(l.move_slot(a1, b));
+        assert_eq!(l.stalled(b), (2, 2));
+    }
+
+    /// The listener's bound: a stall holds at most half of it; a new carrier with every
+    /// slot taken evicts the oldest stall, and is refused when none is stalled.
+    #[test]
+    fn the_global_bound_evicts_the_oldest_stall() {
+        let mut l = ListenerCore::new(ListenerConfig {
+            max_pending: Some(4),
+            ..ListenerConfig::default()
+        });
+        let slots: Vec<_> = (0..4).map(|n| taken(l.enter(n)).0).collect();
+        assert_eq!(l.enter(9), Entered::Full);
+        assert!(l.stall(slots[1]) && l.stall(slots[0]));
+        assert!(!l.stall(slots[2]), "stalls hold at most half");
+        assert_eq!(l.stalled(0), (2, 1));
+        let (_, evicted) = taken(l.enter(9));
+        assert_eq!(evicted, Some(slots[1]), "the stall that began first");
+        assert!(!l.unstall(slots[1]), "evicted: its slot is gone");
+        assert_eq!(l.stalled(0), (1, 1));
+        let (_, evicted) = taken(l.enter(9));
+        assert_eq!(evicted, Some(slots[0]));
+        assert_eq!(l.enter(9), Entered::Full);
+        assert_eq!(l.held(9), (4, 2));
+    }
+
+    /// A source stalls at most `max_pending_per_source - 1` carriers; unlimited, the
+    /// listener never refuses for its own bound.
+    #[test]
+    fn a_source_keeps_a_slot_and_unlimited_never_fills() {
+        let mut l = ListenerCore::new(ListenerConfig {
+            max_pending: None,
+            max_pending_per_source: 3,
+            ..ListenerConfig::default()
+        });
+        let a: Vec<_> = (0..3).map(|_| taken(l.enter(1)).0).collect();
+        assert!(l.stall(a[0]) && l.stall(a[1]));
+        assert!(!l.stall(a[2]));
+        assert!(l.unstall(a[0]));
+        assert!(l.stall(a[2]));
+        for n in 0..10_000 {
+            taken(l.enter(100 + n));
+        }
     }
 
     /// Beyond the session's limit the carrier Unconfirmed longest goes, by when it became
@@ -1323,9 +1497,9 @@ mod tests {
         let mut l = ListenerCore::new(ListenerConfig::default());
         let now = Instant::now();
         let ids: Vec<_> = (0..6)
-            .map(|n| match l.open(n, Framing::ByteStream, now) {
-                Opened::Accepted { id, .. } => id,
-                Opened::Refused => panic!("refused"),
+            .map(|n| {
+                let (slot, _) = taken(l.enter(n));
+                l.open(Some(slot), Framing::ByteStream, now)
             })
             .collect();
         // The first to arrive is the slowest to be verified.
@@ -1340,20 +1514,56 @@ mod tests {
 
     #[test]
     fn source_keys() {
-        let ip = |s: &str| source_key(s.parse().unwrap());
+        let c = ListenerConfig::default();
+        let ip = |s: &str| c.source_key(s.parse().unwrap());
         assert_eq!(ip("2001:db8:1:2::1"), ip("2001:db8:1:2:ffff::9"));
         assert_ne!(ip("2001:db8:1:2::1"), ip("2001:db8:1:3::1"));
         assert_eq!(ip("::ffff:192.0.2.1"), ip("192.0.2.1"));
         assert_ne!(ip("::ffff:192.0.2.1"), ip("::ffff:192.0.2.2"));
+        // Shorter prefixes: one /24, one /56.
+        let mut c = ListenerConfig {
+            source_prefix_v4: 24,
+            source_prefix_v6: 56,
+            ..ListenerConfig::default()
+        };
+        let ip = |s: &str| c.source_key(s.parse().unwrap());
+        assert_eq!(ip("192.0.2.1"), ip("192.0.2.200"));
+        assert_eq!(ip("::ffff:192.0.2.1"), ip("192.0.2.9"));
+        assert_ne!(ip("192.0.2.1"), ip("192.0.3.1"));
+        assert_eq!(ip("2001:db8:0:a1::1"), ip("2001:db8:0:a2::1"));
+        assert_ne!(ip("2001:db8:0:a1::1"), ip("2001:db8:0:1a1::1"));
+        // The extremes: one address, every address of a family.
+        c.source_prefix_v4 = 1;
+        c.source_prefix_v6 = 128;
+        let ip = |s: &str| c.source_key(s.parse().unwrap());
+        assert_eq!(ip("1.0.0.0"), ip("127.255.0.1"));
+        assert_ne!(ip("1.0.0.0"), ip("128.0.0.1"));
+        assert_ne!(ip("2001:db8::1"), ip("2001:db8::2"));
+        // Families never share.
+        assert_ne!(ip("0.0.0.0"), ip("::"));
+    }
+
+    #[test]
+    fn source_prefixes_are_checked() {
+        let with = |v4: u8, v6: u8| {
+            ListenerConfig {
+                source_prefix_v4: v4,
+                source_prefix_v6: v6,
+                ..ListenerConfig::default()
+            }
+            .check()
+        };
+        assert!(with(32, 64).is_ok() && with(1, 1).is_ok() && with(32, 128).is_ok());
+        for (v4, v6) in [(0, 64), (33, 64), (32, 0), (32, 129)] {
+            assert!(with(v4, v6).is_err(), "{v4} {v6}");
+        }
     }
 
     #[test]
     fn garbage_is_rejected() {
         let mut l = ListenerCore::new(ListenerConfig::default());
         let now = Instant::now();
-        let Opened::Accepted { id, .. } = l.open(1, Framing::ByteStream, now) else {
-            panic!()
-        };
+        let id = l.open(None, Framing::ByteStream, now);
         assert_eq!(l.data(id, b"GET / HTTP/1.1\r\n", now), Classified::Reject);
     }
 

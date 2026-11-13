@@ -41,7 +41,7 @@ use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
     Policy, Priority, Session,
 };
-use zmux_quinn::{Options, QuicCarrier};
+use zmux_quinn::{Carrier, Options};
 
 fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -570,8 +570,8 @@ async fn quic_pair(loss: f64, lanes: bool, seed: u64) -> (Session, Session, Quic
         sc.set_send_window(w);
     }
     *CLIENT_CONN.lock().unwrap() = Some(cc.clone());
-    let client = QuicCarrier::new(cc, options());
-    let server = QuicCarrier::new(sc, options());
+    let client = Carrier::new(cc, options());
+    let server = Carrier::new(sc, options());
     let accept = tokio::spawn(async move {
         let io = server.accept_pipe().await.unwrap().with_lanes(lanes);
         Session::accept(io, mp_config()).await.unwrap()
@@ -637,8 +637,8 @@ async fn run_flows(loss: f64, lanes: bool, seed: u64, secs: f64) {
 
 /// Closes a run's sessions, then its endpoints.
 async fn end(cs: Session, ss: Session, quic: Quic) {
-    cs.close(0u32.into(), b"").await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ss.closed()).await;
+    cs.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ss.closing()).await;
     drop((cs, ss));
     quic.client.close(0u32.into(), b"");
     quic.server.close(0u32.into(), b"");
@@ -748,8 +748,8 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
     )
     .await;
     let (cc, sc) = quic.connect(relay).await;
-    let _server_quic = QuicCarrier::with_listener(sc, &listener, options());
-    let client_quic = QuicCarrier::new(cc, options());
+    let _server_quic = Carrier::with_listener(sc, &listener, options());
+    let client_quic = Carrier::new(cc, options());
     let pipe = client
         .begin_add_pipe(
             client_quic.open_pipe().await.unwrap(),

@@ -196,7 +196,8 @@ impl Payload {
         parse_credential(self.value(CREDENTIALS)?).ok()
     }
 
-    /// The proof, where the message knows the type.
+    /// The proof item, parsed. Whether the message knows the type is the caller's to
+    /// judge: an unknown proof is skipped, never read.
     pub fn proof(&self) -> Option<Proof<'_>> {
         Proof::parse(self.value(PROOF)?).ok()
     }

@@ -132,8 +132,8 @@ async fn the_handshake_timeout_releases_it() {
 #[tokio::test]
 async fn a_close_does_not_wait_for_the_release() {
     let (c, server, writes) = pair(held()).await;
-    c.close(9u32.into(), b"bye").await;
-    tokio::time::timeout(Duration::from_secs(5), c.closed())
+    c.abort(9u32.into(), b"bye");
+    tokio::time::timeout(Duration::from_secs(5), c.closing())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;

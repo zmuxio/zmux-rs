@@ -17,7 +17,9 @@ use crate::proto::frame::{Frame, PipeStatus, PipeStatusValue};
 use crate::proto::session::output::Records;
 use crate::proto::session::pipes::{Attachment, History, OutPipe, OutState, SentFrame, TierState};
 use crate::proto::session::sched::NOTSENT_LOWAT;
-use crate::proto::session::{CoreEvent, PipeError, PipeId, Policy, SessionCore};
+use crate::proto::session::{
+    Cap, Change, CoreEvent, Inherit, PipeError, PipeId, PipeLiveness, Policy, SessionCore,
+};
 
 /// The floor of the probation base for a path with history.
 const PROBATION_FLOOR: Duration = Duration::from_secs(1);
@@ -865,31 +867,6 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Sets the priority of both directions of a pipe at once: the local
-    /// outbound one and the one requested of the peer (sent at once as
-    /// PIPE_STATUS).
-    pub fn set_pipe_priority(&mut self, pipe: PipeId, priority: u64) -> Result<(), PipeError> {
-        let i = self.tier_att(pipe)?;
-        self.change_tier(i, |t| {
-            t.set_send_priority(Some(priority));
-            t.set_receive(None, Some(priority));
-        });
-        self.request_status(i);
-        Ok(())
-    }
-
-    /// Makes both directions of a pipe standby or available at once, as
-    /// [`Self::set_pipe_priority`] does for the priority.
-    pub fn set_pipe_standby(&mut self, pipe: PipeId, standby: bool) -> Result<(), PipeError> {
-        let i = self.tier_att(pipe)?;
-        self.change_tier(i, |t| {
-            t.set_send_standby(Some(standby));
-            t.set_receive(Some(standby), None);
-        });
-        self.request_status(i);
-        Ok(())
-    }
-
     /// Sets the whole request for the peer's outbound direction of a pipe,
     /// standby flag and priority, sent at once as one PIPE_STATUS.
     pub fn set_pipe_receive_status(
@@ -904,31 +881,66 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Applies the changes of `update` to a pipe together: one PIPE_STATUS
-    /// carries both receive fields when either changes.
+    /// Applies the changes of `update` to a pipe together: an invalid
+    /// value is [`PipeError::InvalidOptions`] and changes nothing, and one
+    /// PIPE_STATUS carries both receive fields when the request in force
+    /// changes.
     pub fn update_pipe(&mut self, pipe: PipeId, update: &PipeUpdate) -> Result<(), PipeError> {
         let i = self.tier_att(pipe)?;
         let u = update;
-        let receive = u.receive_priority.is_some() || u.receive_standby.is_some();
+        if let Change::Set(l) = &u.liveness {
+            l.validate().map_err(PipeError::InvalidOptions)?;
+        }
+        if matches!(u.probation, Change::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
+            return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
+                "probation",
+                "a base of zero: turn probation off with None",
+            )));
+        }
+        let t = self.atts.at(i).tier();
+        let before = (t.receive_standby(), t.receive_priority());
+        let after = (
+            match u.receive_standby {
+                Change::Keep => before.0,
+                Change::Clear => false,
+                Change::Set(s) => s,
+            },
+            match u.receive_priority {
+                Change::Keep => before.1,
+                Change::Clear => 0,
+                Change::Set(p) => p,
+            },
+        );
         self.change_tier(i, |t| {
-            if let Some(p) = u.send_priority {
-                t.set_send_priority(p);
+            match u.send_priority {
+                Change::Keep => {}
+                Change::Clear => t.set_send_priority(None),
+                Change::Set(p) => t.set_send_priority(Some(p)),
             }
-            if let Some(s) = u.send_standby {
-                t.set_send_standby(s);
+            match u.send_standby {
+                Change::Keep => {}
+                Change::Clear => t.set_send_standby(None),
+                Change::Set(s) => t.set_send_standby(Some(s)),
             }
-            if receive {
-                t.set_receive(u.receive_standby, u.receive_priority);
-            }
-            if let Some(w) = u.weight {
-                t.set_weight(w);
+            t.set_receive(Some(after.0), Some(after.1));
+            match u.weight {
+                Change::Keep => {}
+                Change::Clear => t.set_weight(1),
+                Change::Set(w) => t.set_weight(w),
             }
         });
-        if receive {
+        if after != before {
             self.request_status(i);
         }
-        if let Some(p) = u.probation {
-            self.set_pipe_probation(pipe, p)?;
+        match u.probation {
+            Change::Keep => {}
+            Change::Clear => self.set_pipe_probation(pipe, Inherit::Session)?,
+            Change::Set(p) => self.set_pipe_probation(pipe, Inherit::Set(p))?,
+        }
+        match u.liveness {
+            Change::Keep => {}
+            Change::Clear => self.set_pipe_liveness(pipe, &PipeLiveness::default())?,
+            Change::Set(l) => self.set_pipe_liveness(pipe, &l)?,
         }
         Ok(())
     }
@@ -1003,12 +1015,12 @@ impl SessionCore {
         }
     }
 
-    /// Sets the probation base of a pipe; `None` for the session default,
-    /// zero disables probation. Applies from the pipe's next probation.
-    pub fn set_pipe_probation(
+    /// Sets the probation base of a pipe, or makes it follow the session's.
+    /// Applies from the pipe's next probation.
+    fn set_pipe_probation(
         &mut self,
         pipe: PipeId,
-        probation: Option<Duration>,
+        probation: Inherit<Option<Cap<Duration>>>,
     ) -> Result<(), PipeError> {
         let i = self.tier_att(pipe)?;
         self.atts.at_mut(i).tier_mut().set_probation(probation);
@@ -1164,11 +1176,10 @@ impl SessionCore {
     /// smoothed_rtt) otherwise; `None` when probation is disabled.
     fn probation_base(&self, a: &Attachment) -> Option<Duration> {
         let srtt = a.out()?.est().srtt;
-        match a.tier().probation().or(self.config.probation) {
-            Some(d) if d.is_zero() => None,
-            Some(d) => Some(d),
-            None if self.history(a).trouble() => Some(PROBATION_FLOOR.max(srtt * 4)),
-            None => Some(srtt * 4),
+        match a.tier().probation().or(self.config.probation)? {
+            Cap::Fixed(d) => Some(d),
+            Cap::Auto if self.history(a).trouble() => Some(PROBATION_FLOOR.max(srtt * 4)),
+            Cap::Auto => Some(srtt * 4),
         }
     }
 
@@ -1177,7 +1188,7 @@ impl SessionCore {
     fn backoff_base(&self, a: &Attachment) -> Duration {
         let srtt = a.out().map_or_else(Duration::default, |o| o.est().srtt);
         match a.tier().probation().or(self.config.probation) {
-            Some(d) if !d.is_zero() => d,
+            Some(Cap::Fixed(d)) => d,
             _ => PROBATION_FLOOR.max(srtt * 4),
         }
     }
@@ -1460,25 +1471,45 @@ fn effective(a: &Attachment) -> (u64, bool, u64) {
     (a.send_tier(), a.standby(), a.tier().weight())
 }
 
-/// Changes to the settings of a pipe that [`SessionCore::update_pipe`]
-/// applies together; each `None` keeps its field. `send_priority` and
-/// `send_standby` take `Some(None)` to clear the local setting (follow the
-/// peer's request); `probation` takes `Some(None)` for the session
-/// default.
-#[derive(Debug, Clone, Default, PartialEq)]
-#[non_exhaustive]
+/// A batch change of a live pipe's runtime settings, applied together by
+/// `Pipe::update`: each field is a [`Change`], [`Change::Keep`] by default.
+///
+/// | field | [`Change::Clear`] | [`Change::Set`] |
+/// |---|---|---|
+/// | `send_priority`, `send_standby` | follow the peer's latest request, else 0 and available | this value, which wins over the peer's request |
+/// | `receive_priority`, `receive_standby` | request 0 and available again | request this value |
+/// | `weight` | 1 | this value (0 excludes the pipe) |
+/// | `probation`, `liveness` | follow the session's | this value (`probation` `None`: off) |
+///
+/// A changed request for the peer's outbound direction is sent as one
+/// PIPE_STATUS, only when it differs from the request in force.
+///
+/// ```
+/// use zmux::{Change, PipeUpdate};
+///
+/// // Make the pipe a fallback both ways.
+/// let update = PipeUpdate {
+///     send_priority: Change::Set(10),
+///     receive_priority: Change::Set(10),
+///     ..Default::default()
+/// };
+/// assert_eq!(update.weight, Change::Keep);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PipeUpdate {
-    /// The priority of the local outbound direction.
-    pub send_priority: Option<Option<u64>>,
-    /// The priority requested for the peer's outbound direction.
-    pub receive_priority: Option<u64>,
+    /// The tier of the local outbound direction.
+    pub send_priority: Change<u64>,
+    /// The tier requested for the peer's outbound direction.
+    pub receive_priority: Change<u64>,
     /// Whether the local outbound direction is standby.
-    pub send_standby: Option<Option<bool>>,
+    pub send_standby: Change<bool>,
     /// Whether the peer is asked to use its outbound direction only on
     /// failover.
-    pub receive_standby: Option<bool>,
+    pub receive_standby: Change<bool>,
     /// The outbound direction's weight.
-    pub weight: Option<u64>,
-    /// The probation base.
-    pub probation: Option<Option<Duration>>,
+    pub weight: Change<u64>,
+    /// The probation base (`Set(None)`: off).
+    pub probation: Change<Option<Cap<Duration>>>,
+    /// The pipe's own liveness settings, as a whole.
+    pub liveness: Change<PipeLiveness>,
 }

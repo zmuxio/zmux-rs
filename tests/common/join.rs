@@ -7,7 +7,7 @@
 use std::time::Instant;
 use zmux::shaping::UnitPlan;
 
-use zmux::proto::listener::{CarrierId, Classified, ListenerCore, Opened};
+use zmux::proto::listener::{CarrierId, Classified, Entered, ListenerCore};
 use zmux::proto::record::Framing;
 use zmux::proto::seal::join::JoinHello;
 use zmux::proto::session::{
@@ -43,8 +43,6 @@ pub(crate) struct Accepting {
 /// [`feed_join`]'s outcome.
 pub(crate) struct Fed {
     pub(crate) joined: Joined,
-    /// A carrier the listener evicted to take this one.
-    pub(crate) evicted: Option<CarrierId>,
     /// The Reply to write on the carrier, empty when there is none.
     pub(crate) reply: Vec<u8>,
 }
@@ -62,19 +60,18 @@ pub(crate) fn feed_join(
 ) -> Fed {
     let mut fed = Fed {
         joined: Joined::Pending,
-        evicted: None,
         reply: Vec::new(),
     };
     if st.hello.is_none() && st.join.is_none() {
         let c = match st.carrier {
             Some(c) => c,
-            None => match listener.open(tag, BS, now) {
-                Opened::Accepted { id, evicted } => {
-                    fed.evicted = evicted;
+            None => match listener.enter(tag) {
+                Entered::Taken { slot, .. } => {
+                    let id = listener.open(Some(slot), BS, now);
                     st.carrier = Some(id);
                     id
                 }
-                Opened::Refused => {
+                Entered::SourceFull | Entered::Full => {
                     fed.joined = Joined::Dropped;
                     return fed;
                 }

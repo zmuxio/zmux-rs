@@ -3,7 +3,7 @@
 //! order, reports every try, abandons a silent candidate at its timer and
 //! skips kinds the cache holds as failed; with multipath it establishes on
 //! the exchange candidate and moves to a preferred kind that joins; pools
-//! dialed by a mode pick the cached kind, back failed upgrades off and
+//! dialed by a carrier choice pick the cached kind, back failed upgrades off and
 //! count early member failures.
 
 use std::io;
@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use zmux::helpers::{Backoff, PipePool, maintain_pipes};
 use zmux::{
-    CacheSnapshot, CacheSnapshotEntry, Candidate, CandidateOutcome, CarrierCache, CarrierKind,
-    Config, Listener, ListenerConfig, Mode, ModePolicy, PipeAuth, PipeHint, PipeIo, SessionEvent,
-    dial_mode,
+    CacheSnapshot, CacheSnapshotEntry, Candidate, CandidateOutcome, CarrierCache, CarrierChoice,
+    CarrierChoicePolicy, CarrierKind, Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo,
+    SessionEvent, dial_choice,
 };
 
 /// A candidate whose carriers reach `listener`.
@@ -60,8 +60,8 @@ fn silent(kind: CarrierKind) -> Candidate {
     })
 }
 
-fn quick() -> ModePolicy {
-    let mut p = ModePolicy::default();
+fn quick() -> CarrierChoicePolicy {
+    let mut p = CarrierChoicePolicy::default();
     p.timer_min = Duration::from_millis(300);
     p.timer_max = Duration::from_millis(300);
     p.settle = Duration::from_millis(200);
@@ -73,8 +73,8 @@ async fn explicit_never_falls_back() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let listener = Listener::new(Config::default(), ListenerConfig::default())
             .expect("valid listener configuration");
-        let e = dial_mode(
-            &Mode::explicit(refused(CarrierKind::WebSocket)),
+        let e = dial_choice(
+            &CarrierChoice::explicit(refused(CarrierKind::WebSocket)),
             Config::default(),
             &quick(),
         )
@@ -82,8 +82,8 @@ async fn explicit_never_falls_back() {
         .unwrap_err();
         assert_eq!(e.results.len(), 1);
         assert_eq!(e.results[0].outcome, CandidateOutcome::Refused);
-        let s = dial_mode(
-            &Mode::explicit(served(CarrierKind::Streaming, &listener)),
+        let s = dial_choice(
+            &CarrierChoice::explicit(served(CarrierKind::Streaming, &listener)),
             Config::default(),
             &quick(),
         )
@@ -103,13 +103,15 @@ async fn auto_keeps_the_first_usable_and_reports_every_try() {
             .expect("valid listener configuration");
         let cache = CarrierCache::default();
         let policy = quick().with_cache(cache.clone(), "server|net");
-        let mode = Mode::auto([
+        let mode = CarrierChoice::auto([
             refused(CarrierKind::WebSocket),
             silent(CarrierKind::Streaming),
             served(CarrierKind::Split, &listener),
             served(CarrierKind::Exchange, &listener),
         ]);
-        let s = dial_mode(&mode, Config::default(), &policy).await.unwrap();
+        let s = dial_choice(&mode, Config::default(), &policy)
+            .await
+            .unwrap();
         let stats = s.stats();
         assert_eq!(stats.carrier, Some(CarrierKind::Split));
         let tries: Vec<_> = stats
@@ -143,11 +145,13 @@ async fn auto_keeps_the_first_usable_and_reports_every_try() {
                 .is_some()
         );
         assert!(cache.is_usable("server|net", CarrierKind::Split, None));
-        let s2 = dial_mode(&mode, Config::default(), &policy).await.unwrap();
+        let s2 = dial_choice(&mode, Config::default(), &policy)
+            .await
+            .unwrap();
         assert_eq!(s2.stats().carrier_candidates.len(), 1);
         // Nothing usable: every try in the error.
-        let e = dial_mode(
-            &Mode::auto([
+        let e = dial_choice(
+            &CarrierChoice::auto([
                 refused(CarrierKind::WebSocket),
                 silent(CarrierKind::Exchange),
             ]),
@@ -175,12 +179,12 @@ async fn auto_with_joins_moves_to_a_preferred_kind() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let listener = Listener::new(multipath(), ListenerConfig::default())
             .expect("valid listener configuration");
-        let mode = Mode::auto([
+        let mode = CarrierChoice::auto([
             refused(CarrierKind::WebSocket),
             served(CarrierKind::Streaming, &listener),
             served(CarrierKind::Exchange, &listener),
         ]);
-        let s = dial_mode(&mode, multipath(), &quick()).await.unwrap();
+        let s = dial_choice(&mode, multipath(), &quick()).await.unwrap();
         let server = listener.accept().await.unwrap();
         // Established on the exchange candidate.
         assert_eq!(
@@ -281,12 +285,12 @@ async fn mode_pool_dials_the_cached_usable_kind() {
         snap.entries = vec![failed, good];
         let cache = CarrierCache::default();
         cache.restore(&snap);
-        let mode = Mode::auto([
+        let mode = CarrierChoice::auto([
             served(CarrierKind::Quic, &listener),
             served(CarrierKind::Streaming, &listener),
             served(CarrierKind::Exchange, &listener),
         ]);
-        let pool = PipePool::mode(&mode, &quick().with_cache(cache, "k")).unwrap();
+        let pool = PipePool::choice(&mode, &quick().with_cache(cache, "k")).unwrap();
         let _keep = maintain_pipes(&client, pool).expect("valid pool");
         until("no member", || client.pipes().len() == 2).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -315,11 +319,11 @@ async fn mode_pool_upgrade_failures_back_off() {
             Duration::from_millis(200),
             Duration::from_secs(10),
         );
-        let mode = Mode::auto([
+        let mode = CarrierChoice::auto([
             refused(CarrierKind::WebSocket),
             served(CarrierKind::Streaming, &listener),
         ]);
-        let pool = PipePool::mode(&mode, &quick().with_cache(cache.clone(), "k"))
+        let pool = PipePool::choice(&mode, &quick().with_cache(cache.clone(), "k"))
             .unwrap()
             .with_backoff(Backoff::new(
                 Duration::from_millis(50),
@@ -374,19 +378,19 @@ async fn mode_pool_upgrade_failures_back_off() {
 async fn invalid_modes_are_rejected() {
     let listener = Listener::new(multipath(), ListenerConfig::default())
         .expect("valid listener configuration");
-    let twice = Mode::auto([
+    let twice = CarrierChoice::auto([
         refused(CarrierKind::Split),
         served(CarrierKind::Split, &listener),
     ]);
-    for mode in [Mode::auto([]), twice] {
-        assert!(PipePool::mode(&mode, &quick()).is_err());
-        let e = dial_mode(&mode, Config::default(), &quick())
+    for mode in [CarrierChoice::auto([]), twice] {
+        assert!(PipePool::choice(&mode, &quick()).is_err());
+        let e = dial_choice(&mode, Config::default(), &quick())
             .await
             .unwrap_err();
         assert!(e.invalid.is_some() && e.results.is_empty(), "{e}");
     }
     let mut nan = quick();
     nan.timer_factor = f64::NAN;
-    let one = Mode::explicit(served(CarrierKind::Split, &listener));
-    assert!(PipePool::mode(&one, &nan).is_err());
+    let one = CarrierChoice::explicit(served(CarrierKind::Split, &listener));
+    assert!(PipePool::choice(&one, &nan).is_err());
 }

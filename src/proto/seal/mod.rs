@@ -25,6 +25,8 @@ pub use join::{JoinRole, Suite, derive_join_psk, expand_join_psk, has_aes_hardwa
 pub use payload::{CredentialEntry, JoinPipe, Payload, Proof, encode_payload, get_item_varint};
 pub use record::{Opener, Sealer};
 pub use secret::{Secret, fill_random};
-pub use wire::{Dispatch, Mode, cut_frame, cut_unit, dispatch, frame, put_varint, read_shortest};
+pub use wire::{
+    Dispatch, RecordMode, cut_frame, cut_unit, dispatch, frame, put_varint, read_shortest,
+};
 
 pub use super::record::Framing;

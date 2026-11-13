@@ -7,6 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+use zmux::Role;
 use zmux_seal_proto::{KEYALG_X25519, KeyId, Profile, SigningKey, key_id};
 
 /// A boxed future of a host's trust decision.
@@ -15,20 +16,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// A credential: its type and its bytes, opaque to the core. Type 0 is reserved.
 pub type Credential = (u64, Vec<u8>);
 
-/// The role of the peer being verified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PeerRole {
-    /// The server, verified by a client from message 2.
-    Server,
-    /// The client, verified by a server from message 3.
-    Client,
-}
-
 /// What a [`Verifier`] is told about a peer.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyInput<'a> {
-    /// The peer's role.
-    pub role: PeerRole,
+    /// The role expected of the peer: [`Role::Server`] when a client verifies message 2,
+    /// [`Role::Client`] when a server verifies message 3; never [`Role::Auto`].
+    pub role: Role,
     /// The Profile of the handshake.
     pub profile: Profile,
     /// The peer's static key of the handshake.
@@ -96,7 +89,7 @@ pub struct AppDataRequest<'a> {
     pub peer: Option<&'a VerifyInput<'a>>,
     /// For the client's message 3, the verdict of its verifier on the server; `None`
     /// otherwise, and without a verifier.
-    pub verdict: Option<&'a Verdict>,
+    pub verdict: Option<&'a VerifyVerdict>,
 }
 
 /// Supplies the application data of the messages an end sends. An error ends the
@@ -128,7 +121,7 @@ pub enum Principal {
 
 /// A verifier's acceptance.
 #[derive(Clone)]
-pub struct Verdict {
+pub struct VerifyVerdict {
     /// Who the peer is.
     pub principal: Principal,
     /// The KeyId of the peer's proof key: the message must then carry a proof under it
@@ -139,9 +132,9 @@ pub struct Verdict {
     pub value: Option<zmux::AdmittedValue>,
 }
 
-impl std::fmt::Debug for Verdict {
+impl std::fmt::Debug for VerifyVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Verdict")
+        f.debug_struct("VerifyVerdict")
             .field("principal", &self.principal)
             .field("proof_key", &self.proof_key)
             .field("value", &self.value.as_ref().map(|_| ".."))
@@ -149,7 +142,7 @@ impl std::fmt::Debug for Verdict {
     }
 }
 
-impl Verdict {
+impl VerifyVerdict {
     /// A verdict on `principal` that names no proof key and holds no value.
     pub fn new(principal: Principal) -> Self {
         Self {
@@ -205,7 +198,10 @@ impl std::error::Error for VerifyError {}
 /// names. A panic counts as a rejection.
 pub trait Verifier: Send + Sync {
     /// Judges a peer.
-    fn verify<'a>(&'a self, input: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>>;
+    fn verify<'a>(
+        &'a self,
+        input: VerifyInput<'a>,
+    ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>>;
 
     /// Whether this verifier trusts an X25519 static key alone, naming no proof key: an
     /// end that requires PQ authentication refuses it as a configuration error.
@@ -219,7 +215,7 @@ pub trait Verifier: Send + Sync {
 pub(crate) async fn judge(
     verifier: &dyn Verifier,
     input: VerifyInput<'_>,
-) -> Result<Verdict, VerifyError> {
+) -> Result<VerifyVerdict, VerifyError> {
     let panicked = || VerifyError::rejected("the verifier panicked");
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verifier.verify(input))) {
         Ok(f) => CatchUnwind(f).await.unwrap_or_else(|| Err(panicked())),
@@ -274,14 +270,17 @@ impl PinVerifier {
 }
 
 impl Verifier for PinVerifier {
-    fn verify<'a>(&'a self, input: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+    fn verify<'a>(
+        &'a self,
+        input: VerifyInput<'a>,
+    ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
         Box::pin(async move {
             if static_key_id(input.peer_static) != self.pin {
                 return Err(VerifyError::rejected(
                     "the static key is not the pinned one",
                 ));
             }
-            Ok(Verdict {
+            Ok(VerifyVerdict {
                 principal: Principal::StaticKey(input.peer_static.to_vec()),
                 proof_key: self.proof_key,
                 value: None,

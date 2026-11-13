@@ -8,10 +8,10 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::AsyncReadExt;
 use zmux::{
-    Admission, Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeOptions, PrefixAuth,
-    PrefixAuthVerifier, Session, Verdict,
+    Admission, AdmissionVerdict, Config, Listener, ListenerConfig, OutboundState, PipeAuth,
+    PipeOptions, PrefixAuth, PrefixAuthVerifier, Session,
 };
-use zmux_quinn::{Options, QuicCarrier, QuicFallback};
+use zmux_quinn::{Carrier, Fallback, Options};
 
 const LIMIT: Duration = Duration::from_secs(20);
 
@@ -23,13 +23,13 @@ struct Server {
 }
 
 impl Server {
-    fn new(admission: Admission, fallback: Option<QuicFallback>) -> Self {
+    fn new(admission: Admission, fallback: Option<Fallback>) -> Self {
         Self::with(admission, fallback, false)
     }
 
     /// With `one_by_one`, the host accepts each connection itself and
     /// hands it over with `serve_connection`.
-    fn with(admission: Admission, fallback: Option<QuicFallback>, one_by_one: bool) -> Self {
+    fn with(admission: Admission, fallback: Option<Fallback>, one_by_one: bool) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = CertificateDer::from(cert.cert.der().to_vec());
@@ -163,7 +163,7 @@ async fn a_bound_token_is_accepted_and_the_connection_carries_further_pipes() {
 
 async fn bound_token(server: Server) {
     let conn = server.connect().await;
-    let carrier = QuicCarrier::new(conn.clone(), Options::default());
+    let carrier = Carrier::new(conn.clone(), Options::default());
     let pipe = carrier.open_pipe_with_prefix(&token(&conn)).await.unwrap();
     let mut config = Config::default();
     config.max_pipes = 4;
@@ -187,14 +187,14 @@ async fn bound_token(server: Server) {
     }
     transfer(&client, &accepted, 4, 1 << 18).await;
     assert_eq!(server.listener.stats().setup_failures, 0);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_token_goes_to_the_fallback_with_every_byte() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = QuicFallback::new(move |conn, _send, mut recv| {
+    let fallback = Fallback::new(move |conn, _send, mut recv| {
         let tx = tx.clone();
         async move {
             let mut got = Vec::new();
@@ -238,9 +238,9 @@ async fn without_a_fallback_a_wrong_token_closes_the_connection() {
 async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
     let admission = Admission::new(4, |_, prefix| {
         if prefix == b"open" {
-            Verdict::accept(4)
+            AdmissionVerdict::accept(4)
         } else {
-            Verdict::Close
+            AdmissionVerdict::Close
         }
     })
     .with_peek_timeout(Duration::from_secs(10));
@@ -249,7 +249,7 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
     // Stream 0: the first bidirectional stream, its prefix not sent yet.
     let (mut first, _first_recv) = conn.open_bi().await.unwrap();
     // A session started on stream 4, and a unidirectional stream.
-    let carrier = QuicCarrier::new(conn.clone(), Options::default());
+    let carrier = Carrier::new(conn.clone(), Options::default());
     let mut config = Config::default();
     config.max_pipes = 4;
     config.pipe_auth = PipeAuth::exporter().with_end_to_end();
@@ -272,14 +272,14 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
         .unwrap();
     let client = connecting.await.unwrap().unwrap();
     transfer(&client, &accepted, 2, 1 << 16).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_credential_writes_a_bound_token_on_the_first_stream() {
     let server = Server::new(admission(), None);
-    let options = Options::default().with_credential(Arc::new(auth()));
+    let options = Options::default().with_carrier_credential(Arc::new(auth()));
     let mut config = Config::default();
     config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let client = zmux_quinn::connect(&server.client, server.addr, "localhost", &options, config)
@@ -290,6 +290,6 @@ async fn a_credential_writes_a_bound_token_on_the_first_stream() {
         .unwrap()
         .unwrap();
     transfer(&client, &accepted, 2, 1 << 16).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     server.stop().await;
 }

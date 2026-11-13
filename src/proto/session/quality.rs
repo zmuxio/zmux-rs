@@ -25,12 +25,13 @@ use super::{CoreEvent, PipeError, PipeId, SessionCore};
 /// measured after the band is set are the first report, without an event.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QualityBand {
-    /// The half-width of the RTT band; zero turns the RTT half off.
-    pub rtt: Duration,
-    /// The ratio of the rate band; zero turns the rate half off, and a
-    /// ratio of 1 or less reports every change of the rate. A negative one,
-    /// or one that is not a number, is not valid.
-    pub rate_ratio: f64,
+    /// The half-width of the RTT band (zero reports every change of the
+    /// RTT); `None`: the RTT half off.
+    pub rtt: Option<Duration>,
+    /// The ratio of the rate band (1 or less reports every change of the
+    /// rate); `None`: the rate half off. A negative one, or one that is
+    /// not a number, is not valid.
+    pub rate_ratio: Option<f64>,
     /// At most one event per pipe in this interval, the latest values
     /// winning (default 1 s); zero sets no minimum.
     pub min_interval: Duration,
@@ -40,9 +41,9 @@ impl QualityBand {
     /// The default minimum interval between two events of a pipe.
     pub const DEFAULT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-    /// A band of ±`rtt` and [last / `rate_ratio`, last × `rate_ratio`],
-    /// with the default minimum interval.
-    pub fn new(rtt: Duration, rate_ratio: f64) -> Self {
+    /// A band of ±`rtt` and [last / `rate_ratio`, last × `rate_ratio`]
+    /// (`None`: that half off), with the default minimum interval.
+    pub fn new(rtt: Option<Duration>, rate_ratio: Option<f64>) -> Self {
         Self {
             rtt,
             rate_ratio,
@@ -50,28 +51,27 @@ impl QualityBand {
         }
     }
 
-    /// Whether the band is valid: `rate_ratio` a number of at least 0.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.rate_ratio.is_nan() || self.rate_ratio < 0.0 {
-            return Err("QualityBand rate_ratio negative or not a number");
+    /// Whether the band is valid: a set `rate_ratio` a number of at least 0.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        if self.rate_ratio.is_some_and(|r| r.is_nan() || r < 0.0) {
+            return Err(crate::InvalidConfig::new(
+                "QualityBand::rate_ratio",
+                "negative or not a number",
+            ));
         }
         Ok(())
     }
 
     /// Whether the band reports anything.
     fn reports(&self) -> bool {
-        !self.rtt.is_zero() || self.rate_on()
-    }
-
-    fn rate_on(&self) -> bool {
-        self.rate_ratio > 0.0
+        self.rtt.is_some() || self.rate_ratio.is_some()
     }
 }
 
 impl Default for QualityBand {
     /// Both halves off, the default minimum interval.
     fn default() -> Self {
-        Self::new(Duration::ZERO, 0.0)
+        Self::new(None, None)
     }
 }
 
@@ -97,9 +97,12 @@ impl CapacityFloor {
     pub const DEFAULT_RATE_RATIO: f64 = 1.25;
 
     /// Whether the floor is valid: `rate_ratio` a number of at least 0.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         if self.rate_ratio.is_nan() || self.rate_ratio < 0.0 {
-            return Err("CapacityFloor rate_ratio negative or not a number");
+            return Err(crate::InvalidConfig::new(
+                "CapacityFloor::rate_ratio",
+                "negative or not a number",
+            ));
         }
         Ok(())
     }
@@ -191,8 +194,8 @@ impl Quality {
 /// `k` as a ratio of at least 1.
 fn check_band(band: Option<QualityBand>) -> Result<(), PipeError> {
     match band {
-        Some(b) if b.validate().is_err() => Err(PipeError::InvalidOptions),
-        _ => Ok(()),
+        Some(b) => b.validate().map_err(PipeError::InvalidOptions),
+        None => Ok(()),
     }
 }
 
@@ -252,8 +255,8 @@ impl SessionCore {
     /// [valid](CapacityFloor::validate) changes nothing:
     /// [`PipeError::InvalidOptions`].
     pub fn set_capacity_floor(&mut self, floor: Option<CapacityFloor>) -> Result<(), PipeError> {
-        if floor.is_some_and(|f| f.validate().is_err()) {
-            return Err(PipeError::InvalidOptions);
+        if let Some(f) = floor {
+            f.validate().map_err(PipeError::InvalidOptions)?;
         }
         let q = self.quality.get_or_insert_default();
         q.floor = floor.map(|floor| Floor {
@@ -327,13 +330,17 @@ impl SessionCore {
         let mut out = false;
         match (p.rtt, rtt) {
             (None, Some(r)) => p.rtt = Some(r),
-            (Some(last), Some(r)) if !band.rtt.is_zero() => out |= r.abs_diff(last) > band.rtt,
+            (Some(last), Some(r)) => {
+                if let Some(w) = band.rtt {
+                    out |= r.abs_diff(last) > w;
+                }
+            }
             _ => {}
         }
         match (p.rate, rate) {
             (None, Some(r)) => p.rate = Some(r),
-            (Some(last), Some(r)) if band.rate_on() => {
-                let k = at_least_one(band.rate_ratio);
+            (Some(last), Some(r)) if band.rate_ratio.is_some() => {
+                let k = at_least_one(band.rate_ratio.unwrap_or(1.0));
                 let (r, last) = (r as f64, last as f64);
                 out |= r < last / k || r > last * k;
             }
@@ -588,7 +595,8 @@ mod tests {
         let now = a.now;
         a.quality_sample(0, now);
         assert!(a.quality.is_none() && events(&mut a).is_empty());
-        a.set_quality_band(Some(QualityBand::new(MS, 1.5))).unwrap();
+        a.set_quality_band(Some(QualityBand::new(Some(MS), Some(1.5))))
+            .unwrap();
         a.set_pipe_quality_band(PipeId(2), Some(QualityBand::default()))
             .unwrap();
         a.set_capacity_floor(Some(CapacityFloor::new(1))).unwrap();
@@ -614,7 +622,7 @@ mod tests {
         let now = a.now;
         a.set_quality_band(Some(QualityBand {
             min_interval: Duration::ZERO,
-            ..QualityBand::new(5 * MS, 2.0)
+            ..QualityBand::new(Some(5 * MS), Some(2.0))
         }))
         .unwrap();
         a.quality_sample(0, now);
@@ -651,7 +659,7 @@ mod tests {
     fn min_interval_holds_reports_back_with_the_latest_values() {
         let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
         let t0 = a.now;
-        a.set_quality_band(Some(QualityBand::new(5 * MS, 0.0)))
+        a.set_quality_band(Some(QualityBand::new(Some(5 * MS), None)))
             .unwrap();
         a.quality_sample(0, t0);
         set_srtt(&mut a, 0, 30 * MS);

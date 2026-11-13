@@ -24,7 +24,8 @@
 //! ([`zmux::ListenerConfig::fallback`]) with the bytes read replayed, or
 //! neither. Nothing is written on the connection above TLS
 //! before it is accepted, and the server refuses TLS early data. A client
-//! presents a [`Credential`] to such a server ([`dial`]), such as
+//! presents a [`CarrierCredential`] to such a server ([`Options::with_carrier_credential`],
+//! used by [`dial`] and [`connect`]), such as
 //! [`zmux::PrefixAuth`] tokens.
 //!
 //! [`pipe`] turns an established tokio-rustls stream, client or server,
@@ -62,7 +63,7 @@
 //!
 //! let mut config = Config::default();
 //! config.pipe_auth = PipeAuth::exporter();
-//! let session = zmux_rustls::connect("example.com:443", "example.com", tls, None, config).await?;
+//! let session = zmux_rustls::connect("example.com:443", "example.com", tls, &zmux_rustls::Options::new(), config).await?;
 //! # drop(session);
 //! # Ok(())
 //! # }
@@ -102,11 +103,12 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, ProtocolVersion, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
-use zmux::{CarrierInfo, ConnectError, Credential, Listener, PipeIo, Session};
+use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeIo, Session};
 
 /// A pipe carrier from an established TLS stream over any transport: the
 /// exporter (TLS 1.3, handshake complete), partial reads and the ALPN
-/// identifier wired (see the crate documentation).
+/// identifier wired (see the crate documentation). A stream still
+/// handshaking (early data) is neither secure nor has an exporter.
 pub fn pipe<IO>(stream: impl Into<TlsStream<IO>>) -> PipeIo
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -129,7 +131,9 @@ where
     if done {
         io = io.with_terminated_tls(move || Some(state.clone()));
     }
-    if tls13 {
+    // Secure only once the handshake completed: before it, the version and
+    // the peer's authentication are not settled (early data).
+    if done && tls13 {
         io = io
             .with_carrier_secure()
             .with_exporter(move |label, context, out| {
@@ -167,9 +171,33 @@ pub fn over_tcp(stream: impl Into<TlsStream<TcpStream>>) -> PipeIo {
     io
 }
 
+/// What a client sends first on a connection: the per-connection options of
+/// [`dial`] and [`connect`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Options {
+    /// The credential presented to a server's admission (none by default;
+    /// [`Options::with_carrier_credential`]).
+    pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
+}
+
+impl Options {
+    /// The defaults: no credential.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// With `credential`, presented to a server that admits connections.
+    #[must_use]
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
+        self
+    }
+}
+
 /// A TLS carrier over a new TCP connection to `addr`, verified for
 /// `server_name`: for [`Session::connect`], or as a further pipe of a
-/// session. With `credential`, its prefix ([`Credential::prefix`], given
+/// session. With [`Options::carrier_credential`], its prefix ([`CarrierCredential::prefix`], given
 /// the server's address, the negotiated ALPN identifier, `server_name`
 /// and the TLS exporter) is written as the connection's first bytes after
 /// the handshake: the carrier of a server that admits connections
@@ -178,10 +206,10 @@ pub async fn dial(
     addr: impl ToSocketAddrs,
     server_name: &str,
     tls: Arc<ClientConfig>,
-    credential: Option<&dyn Credential>,
+    options: &Options,
 ) -> io::Result<PipeIo> {
     let mut stream = handshake(addr, server_name, tls).await?;
-    if let Some(credential) = credential {
+    if let Some(credential) = &options.carrier_credential {
         let prefix = credential.prefix(&client_carrier_info(&stream, server_name))?;
         stream.write_all(&prefix).await?;
     }
@@ -205,10 +233,10 @@ pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
     tls: Arc<ClientConfig>,
-    credential: Option<&dyn Credential>,
+    options: &Options,
     config: impl Into<Arc<zmux::Config>>,
 ) -> Result<Session, ConnectError> {
-    let io = dial(addr, server_name, tls, credential)
+    let io = dial(addr, server_name, tls, options)
         .await
         .map_err(|e| ConnectError::Io(Arc::new(e)))?;
     Session::connect(io, config).await
@@ -262,7 +290,7 @@ pub fn carrier_info<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Carrier
 }
 
 /// The metadata of a client's TLS connection over TCP to `server_name`,
-/// for its [`Credential`]: the server's address, the negotiated ALPN
+/// for its [`CarrierCredential`]: the server's address, the negotiated ALPN
 /// identifier, the server name and the TLS exporter.
 fn client_carrier_info<'a>(
     stream: &'a tokio_rustls::client::TlsStream<TcpStream>,

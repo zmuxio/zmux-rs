@@ -200,7 +200,7 @@ async fn kinds_reach_the_factories_of_both_ends() {
     .await
     .expect("an event in time");
     assert_eq!(kind, Some(CarrierKind::Quic));
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
 }
 
@@ -228,7 +228,7 @@ async fn raw_tcp_has_no_kind() {
     assert_eq!(server_shaper.kind_of(zero), Some(None));
     assert_eq!(client_shaper.kind_of(zero), Some(None));
     assert_eq!(server.pipe(zero).unwrap().stats().unwrap().carrier, None);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
 }
 

@@ -13,7 +13,7 @@
 //! A carrier decided on its HTTP request head carries the token in a
 //! request header field instead, in base64url without padding.
 //!
-//! [`PrefixAuth`] makes tokens, and is a client's [`Credential`];
+//! [`PrefixAuth`] makes tokens, and is a client's [`CarrierCredential`];
 //! [`PrefixAuthVerifier`] checks them within a number of slots of its own
 //! clock and accepts each Nonce once.
 
@@ -21,7 +21,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::admission::{CarrierInfo, Credential, Verdict};
+use super::admission::{AdmissionVerdict, CarrierCredential, CarrierInfo};
 use super::oob;
 use super::replay::{ReplayFilter, ReplayVerdict};
 use crate::util::HmacSha256;
@@ -59,7 +59,7 @@ impl std::error::Error for InvalidPrefixAuth {}
 /// The parameters both ends of prefix authentication share: the key, the
 /// slot length, whether tokens are bound to the carrier's TLS
 /// handshake, and the request header field of
-/// the header form. Makes tokens; as a [`Credential`], a fresh one for
+/// the header form. Makes tokens; as a [`CarrierCredential`], a fresh one for
 /// each carrier. Cheap to clone.
 #[derive(Clone)]
 pub struct PrefixAuth {
@@ -255,20 +255,20 @@ impl PrefixAuthVerifier {
         })
     }
 
-    /// An admission decision: [`Verdict::Accept`] of the token when it
+    /// An admission decision: [`AdmissionVerdict::Accept`] of the token when it
     /// verifies, with the binding of `info`'s exporter when tokens are
-    /// bound, and [`Verdict::Fallback`] for every other outcome. The token
+    /// bound, and [`AdmissionVerdict::Fallback`] for every other outcome. The token
     /// is the prefix ([`PREFIX_TOKEN_LEN`] bytes, accepted with them), or,
     /// on a carrier decided on its request head ([`CarrierInfo::head`]),
     /// the one value of the request header field
     /// ([`PrefixAuth::header_name`]), 43 base64url characters (accepted with
     /// no prefix): a missing, repeated or malformed field fails like a
     /// wrong token.
-    pub fn decide(&self, info: &CarrierInfo<'_>, prefix: &[u8]) -> Verdict {
+    pub fn decide(&self, info: &CarrierInfo<'_>, prefix: &[u8]) -> AdmissionVerdict {
         let header;
         let (token, accept) = if info.head {
             let Some(t) = self.header_token(info) else {
-                return Verdict::Fallback;
+                return AdmissionVerdict::Fallback;
             };
             header = t;
             (&header[..], 0)
@@ -276,12 +276,12 @@ impl PrefixAuthVerifier {
             (prefix, PREFIX_TOKEN_LEN)
         };
         let Ok(binding) = self.auth.binding(info) else {
-            return Verdict::Fallback;
+            return AdmissionVerdict::Fallback;
         };
         if self.verify(token, binding.as_ref()) {
-            Verdict::accept(accept)
+            AdmissionVerdict::accept(accept)
         } else {
-            Verdict::Fallback
+            AdmissionVerdict::Fallback
         }
     }
 
@@ -304,7 +304,7 @@ impl PrefixAuthVerifier {
     }
 }
 
-impl Credential for PrefixAuth {
+impl CarrierCredential for PrefixAuth {
     /// A fresh token, bound to the carrier when tokens are bound.
     fn prefix(&self, info: &CarrierInfo<'_>) -> io::Result<Vec<u8>> {
         Ok(self.token(self.binding(info)?.as_ref())?.to_vec())
@@ -435,34 +435,38 @@ mod tests {
         let tok = a.token_at(None, unix_now(), NONCE);
         let val = PrefixAuth::header_value(&tok);
         let ok = [("zmux-prefix-auth", val.as_str())];
-        assert_eq!(v.decide(&upgrade(&ok), &[]), Verdict::accept(0));
+        assert_eq!(v.decide(&upgrade(&ok), &[]), AdmissionVerdict::accept(0));
         assert_eq!(
             v.decide(&upgrade(&ok), &[]),
-            Verdict::Fallback,
+            AdmissionVerdict::Fallback,
             "Nonce used"
         );
         // The token as a prefix is not looked at on an upgrade.
-        assert_eq!(v.decide(&upgrade(&[]), &tok), Verdict::Fallback);
+        assert_eq!(v.decide(&upgrade(&[]), &tok), AdmissionVerdict::Fallback);
         let tok = a.token_at(None, unix_now(), [7; 16]);
         let val = PrefixAuth::header_value(&tok);
         let twice = [
             (PREFIX_AUTH_HEADER, val.as_str()),
             (PREFIX_AUTH_HEADER, val.as_str()),
         ];
-        assert_eq!(v.decide(&upgrade(&twice), &[]), Verdict::Fallback);
+        assert_eq!(v.decide(&upgrade(&twice), &[]), AdmissionVerdict::Fallback);
         let (padded, plus) = (format!("{val}="), format!("+{}", &val[1..]));
         for bad in [&val[..42], padded.as_str(), plus.as_str()] {
             let f = [(PREFIX_AUTH_HEADER, bad)];
-            assert_eq!(v.decide(&upgrade(&f), &[]), Verdict::Fallback, "{bad}");
+            assert_eq!(
+                v.decide(&upgrade(&f), &[]),
+                AdmissionVerdict::Fallback,
+                "{bad}"
+            );
         }
         let other = PrefixAuthVerifier::new(a.clone().with_header("X-Auth"), 1, 16);
         assert_eq!(
             v.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
-            Verdict::Fallback
+            AdmissionVerdict::Fallback
         );
         assert_eq!(
             other.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
-            Verdict::accept(0)
+            AdmissionVerdict::accept(0)
         );
 
         let bound = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), true).unwrap();
@@ -477,11 +481,11 @@ mod tests {
         let f = [(PREFIX_AUTH_HEADER, value.as_str())];
         assert_eq!(
             v.decide(&upgrade(&f), &[]),
-            Verdict::Fallback,
+            AdmissionVerdict::Fallback,
             "no exporter"
         );
         let info = upgrade(&f).with_exporter(exported);
-        assert_eq!(v.decide(&info, &[]), Verdict::accept(0));
+        assert_eq!(v.decide(&info, &[]), AdmissionVerdict::accept(0));
         assert!(
             bound.prefix(&CarrierInfo::new()).is_err(),
             "bound needs an exporter"

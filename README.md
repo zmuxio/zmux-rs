@@ -27,13 +27,17 @@ roles, GOAWAY, stream preambles, priorities and datagram flows.
 
 ## Usage
 
-```rust
-let tcp = tokio::net::TcpStream::connect("127.0.0.1:4433").await?;
-let session = zmux::Session::connect(zmux::PipeIo::tcp(tcp), zmux::Config::default()).await?;
-let (mut send, mut recv) = session.open_bi().await?;
-send.write_all(b"hello").await?;
-send.finish()?;
-let reply = recv.read_to_end(1 << 20).await?;
+```rust,no_run
+async fn hello() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let tcp = tokio::net::TcpStream::connect("127.0.0.1:4433").await?;
+    let session = zmux::Session::connect(zmux::PipeIo::tcp(tcp), zmux::Config::default()).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    send.write_all(b"hello").await?;
+    send.finish()?;
+    let reply = recv.read_to_end(1 << 20).await?;
+    session.close().await;
+    Ok(reply)
+}
 ```
 
 The accepting side calls `Session::accept`, then `accept_bi` / `accept_uni`.
@@ -42,27 +46,33 @@ finished resets it (and stops reading) with code 0. A bidirectional stream
 can itself carry a pipe of another session (`Session::open_pipe_stream`,
 `PipeIo::from_stream`): a nested session whose pipes cross relays.
 
-Errors are one type per kind of operation, the same for both drivers and
-the sans-IO core: `SessionError` (why a session ended), `StreamError` (every
-stream operation), `OpenError`, `DatagramError`, `PipeError`, and
-`ConnectError`, `ReadExactError`, `ReadToEndError` for the compound calls.
-Each tells whether the operation may be retried (`is_retryable`) and
-converts into `std::io::Error`.
+Errors are one type per kind of operation: `SessionError` (why a session
+ended), `StreamError` (every stream operation), `OpenError`,
+`DatagramError`, `PipeError`, and `ConnectError`, `ReadExactError`,
+`ReadToEndError` for the compound calls; a setting that cannot work is an
+`InvalidConfig`, which names the setting. The std driver (`zmux::blocking`)
+returns the same types, with a `TimedOut` variant when its wait timeout
+expires, and its session-wide waits return a `WaitError` where the tokio
+driver's futures return the `SessionError` alone. Each tells whether the
+operation may be retried (`is_retryable`) and converts into
+`std::io::Error`. The session-ended variant is `SessionLost` everywhere.
 
-```rust
+```rust,no_run
 use std::error::Error as _;
 use zmux::SessionError;
 
-match session.closed().await {
-    SessionError::ApplicationClosed { code, remote: true, .. } => println!("peer closed: {code}"),
-    SessionError::ApplicationClosed { .. } => println!("closed here"),
-    // Resume ran out of time, or every pipe was lost without resume: the
-    // last pipe's failure is the source, for example a refused rejoin.
-    e @ (SessionError::ResumeTimeout { .. } | SessionError::PipesLost { .. }) => {
-        println!("{e}; last pipe: {:?}", e.source());
+async fn report(session: &zmux::Session) {
+    match session.closing().await {
+        SessionError::ApplicationClosed { code, remote: true, .. } => println!("peer closed: {code}"),
+        SessionError::ApplicationClosed { .. } => println!("closed here"),
+        // Resume ran out of time, or every pipe was lost without resume: the
+        // last pipe's failure is the source, for example a refused rejoin.
+        e @ (SessionError::ResumeTimeout { .. } | SessionError::PipesLost { .. }) => {
+            println!("{e}; last pipe: {:?}", e.source());
+        }
+        SessionError::ResumeFailed { .. } => println!("resume diverged; data in flight is lost"),
+        e => println!("{e}"),
     }
-    SessionError::ResumeFailed { .. } => println!("resume diverged; data in flight is lost"),
-    e => println!("{e}"),
 }
 ```
 
@@ -78,16 +88,26 @@ before any byte. A first pipe that is not on the secure carrier gives join
 keys only once the host states that it proved the pipe end to end:
 `with_end_to_end` in the configuration, or `declare_end_to_end` later.
 
-```rust
+```rust,no_run
+use tokio::net::TcpStream;
 use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Session};
 
-let auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
-let config = Config::multipath(auth);
-// Server: a Listener routes joins to their session.
-let listener = Listener::new(config.clone(), ListenerConfig::default())?;
-// Client: a second TCP connection becomes a second pipe.
-let session = Session::connect(PipeIo::tcp(first), config).await?;
-let pipe = session.add_pipe(PipeIo::tcp(second), PipeOptions::default()).await?;
+async fn two_pipes(first: TcpStream, second: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
+    let config = Config::multipath(auth);
+    // Server: a Listener routes joins to their session.
+    let _listener = Listener::new(config.clone(), ListenerConfig::default())?;
+    // Client: a second TCP connection becomes a second pipe.
+    let session = Session::connect(PipeIo::tcp(first), config).await?;
+    let pipe = session.add_pipe(PipeIo::tcp(second), PipeOptions::default()).await?;
+    // Make it a fallback for both directions.
+    pipe.update(&zmux::PipeUpdate {
+        send_priority: zmux::Change::Set(10),
+        receive_priority: zmux::Change::Set(10),
+        ..Default::default()
+    })?;
+    Ok(())
+}
 ```
 
 `add_pipe` waits at most `Config::join_timeout` (10 s) for the peer to
@@ -103,32 +123,54 @@ again. Something has to dial: the `redial` hook (a session on one pipe at a
 time), a pipe pool, or the application's own `add_pipe`. A suspension with
 none of them is reported as `SessionEvent::ResumeUnattended` and logged.
 
-```rust
+```rust,no_run
 use std::time::Duration;
 use zmux::{Config, Dial, PipeAuth, PipeIo, Session};
 
-let mut config = Config::default();
-config.pipe_auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
-config.resume_timeout = Some(Duration::from_secs(60));
-// Replaces the lost pipe, with backoff from 1 s doubling up to 60 s.
-config.redial = Some(Dial::new(|_req| async {
-    Ok(PipeIo::tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
-}));
-config.logger = Some(zmux::Logger::new(|level, msg| eprintln!("{level:?}: {msg}")));
-let session = Session::connect(PipeIo::tcp(first), config).await?;
+async fn resumable(first: tokio::net::TcpStream) -> Result<Session, zmux::ConnectError> {
+    let mut config = Config::default();
+    config.pipe_auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
+    config.resume_timeout = Some(Duration::from_secs(60));
+    // Replaces the lost pipe, with backoff from 1 s doubling up to 60 s.
+    config.redial = Some(Dial::new(|_req| async {
+        Ok(PipeIo::tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
+    }));
+    config.logger = Some(zmux::Logger::new(|level, msg| eprintln!("{level:?}: {msg}")));
+    Session::connect(PipeIo::tcp(first), config).await
+}
 ```
 
 The server side needs a `Listener` with `resume_timeout` set as well.
 
 ## Closing
 
-`session.close(code, reason).await` sends CONNECTION_CLOSE at once,
-shuts the carriers' write sides and keeps reading until the peer ends
-them or the linger timeout passes, and returns then, after 1 s at the
-latest; a process may exit then. Dropping the last handle closes with
-code 0 without waiting. `session.closed().await` returns why the session
-ended as soon as it is closing; a process that exits there awaits
-`close` first.
+`session.close_with_error(code, reason).await` closes gracefully with an
+application error code: what the streams have written and not yet sent
+goes out first, as far as flow control and the carriers allow within the
+bound, then CONNECTION_CLOSE with the code is handed to the carriers, and
+the call returns, after 1 s at the latest for the whole call; a process
+may exit then. The peer reads what was written before the code, and sees
+`SessionError::ApplicationClosed` with that code and reason.
+`session.close().await` is the same close with code 0 and no reason. The
+carriers' write sides are then shut and their input read until the peer
+ends it or the linger timeout passes, in the background.
+`session.abort(code, reason)` ends the session at once with an
+application error code, discarding what was not sent, and returns at
+once; an abort during a close's flush ends the flush. The first close or
+abort decides the code and reason; both are idempotent. Dropping the last
+handle starts `close` without waiting. A peer that receives a close can
+still read what arrived on its open streams until it has read it, within
+the linger timeout.
+
+`session.closing().await` returns why the session ended as soon as it is
+closing, and `session.wait().await` once it has ended entirely: every
+pipe's input ended (the peer read the close and ended its side) or the
+linger timeout passed, and the session's task released its carriers. A
+wait that returns before the linger timeout confirms the peer read the
+close; "delivered or given up after `d`" is
+`tokio::time::timeout(d, session.wait())`, which changes nothing in the
+session. Over QUIC, the adapter closes the QUIC connection only after
+that, with the same application error code.
 
 ## Servers, carrier choice and shaping
 
@@ -137,22 +179,44 @@ ended as soon as it is closing; a process that exits there awaits
   is sent on it: from its first bytes and its metadata (`CarrierInfo`) it
   accepts the carrier, hands it to the fallback of its kind with the bytes
   read replayed (`ListenerConfig::fallback`), stalls it, or closes it
-  (`Verdict`). `PrefixAuth` is a ready-made credential check, bound to the
+  (`AdmissionVerdict`). `PrefixAuth` is a ready-made credential check, bound to the
   TLS connection where the carrier has an exporter; a client presents it
-  as a `Credential`. `TrustedProxies` names the intermediaries whose report
+  as a `CarrierCredential`. `TrustedProxies` names the intermediaries whose report
   of the client address (PROXY protocol, a forwarding header field) is
   believed.
-- **Choosing a carrier.** `dial_mode` takes a `Mode`: `Mode::explicit` uses
-  one `Candidate`, `Mode::auto` tries several in order of preference and,
+- **Carriers before a session.** Every carrier holds a slot of its source
+  (`ListenerConfig::max_pending_per_source`, default 8) and one of the
+  listener (`ListenerConfig::max_pending`, default 1024, `None` for
+  unlimited) from the moment it is taken, through its handshake,
+  admission, transform, pairing and classification, and through a stall,
+  until it enters a session or is closed. A source is counted by its
+  prefix, `ListenerConfig::source_prefix_v4` (default 32, 1 to 32) and
+  `source_prefix_v6` (default 64, 1 to 128), for the slots, the stalls and
+  the stall duration alike. A source without a free slot has
+  its carrier closed at once (`refused`). With every listener slot taken, a
+  new carrier closes the carrier stalled longest to take its slot, or is
+  closed at once (`rejected`) when none is stalled. Stalls hold at most
+  half of the listener's slots and one fewer than a source's; a Stall
+  beyond them is closed at once (`stall_overflow`).
+- **Choosing a carrier.** `dial_choice` takes a `CarrierChoice`: `CarrierChoice::explicit` uses
+  one `Candidate`, `CarrierChoice::auto` tries several in order of preference and,
   with `Config::max_pipes` above 1, moves the session to preferred kinds by
-  joining them as further pipes. A `CarrierCache` in the `ModePolicy`
+  joining them as further pipes. A `CarrierCache` in the `CarrierChoicePolicy`
   remembers which kinds worked per server and network; `snapshot` and
   `restore` carry it across restarts.
 - **Shaping.** `zmux::shaping` holds the hooks for record sizes and timing
-  (`Config::shaper`, `Session::set_shaper`, `shaping::Limits`); the
+  (`Config::shaper`, `Session::set_shaper`, `Pipe::set_shaper`,
+  `shaping::Limits`); the
   `zmux-shaping` crate offers a factory for them.
 
 ## Memory and allocators
+
+What a peer can make a session hold is bounded per kind: received
+datagrams by `Config::datagram_receive_bytes` (the session queue, 1 MiB) and,
+per stream, by `datagram_stream_queue` (32) and `datagram_stream_bytes`
+(512 KiB, `None` for no byte bound); peer streams by
+`max_incoming_streams`, whose range ends at `zmux::MAX_STREAM_CREDIT`
+(2^60, as many as the protocol can count).
 
 zmux gives memory back as load goes away: idle pipes return their read and
 write buffers after a second, a process-wide pool keeps a bounded number of
@@ -181,7 +245,7 @@ the resident set, under any allocator given by `LD_PRELOAD`.
 
 | Part | Content | Feature |
 |---|---|---|
-| `zmux::proto` | the sans-IO layer: wire format (`varint`, `frame`, `record`, `params`, `ident`, `payload`, `keys`, `oob`, `error`) and the session state machine `proto::session` | always |
+| `zmux::proto` (hidden) | the sans-IO layer: wire format and the session state machine, which the drivers, carrier crates and bindings build on; no stable API, and the crate root re-exports what applications use | always |
 | crate root | `Session`, `SendStream`, `RecvStream`, `PipeIo`, `Listener`: one tokio task per session | `tokio` (default) |
 | `zmux::blocking` | the same handles for threads: the calls that wait block instead of returning a future; streams implement `std::io::Read` / `Write` | `blocking` |
 | `zmux::helpers` | helpers above the public API: `maintain_pipes` (keeping pipes up), `splice` (relaying a stream into another), `resolve_duplicate` (two sessions between the same endpoints) | `tokio`; `resolve_duplicate` either driver |

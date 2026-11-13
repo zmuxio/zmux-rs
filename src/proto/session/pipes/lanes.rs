@@ -756,6 +756,13 @@ impl OutLanes {
         self.zero.floor().is_some_and(|f| f < self.before)
     }
 
+    /// The pipe's lanes began within a lane 0 batch that ends at
+    /// send-order position `end`, after its frames went unnoted: that
+    /// batch counts as written before the pipe had lanes.
+    pub(crate) fn lanes_began_after(&mut self, end: u64) {
+        self.before = self.before.max(end);
+    }
+
     /// The lane `key` is bound to, if any.
     #[inline]
     pub(crate) fn bound(&self, key: StreamKey) -> Option<u64> {

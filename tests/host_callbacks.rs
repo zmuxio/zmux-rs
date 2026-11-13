@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
 #[cfg(unix)]
 use zmux::blocking as b;
 use zmux::proto::listener::{OnReject, RejectAction};
-use zmux::proto::seal::Mode;
+use zmux::proto::seal::RecordMode;
 use zmux::proto::session::{AllowRecordMode, AuthorizeJoin, RecordPolicy};
 use zmux::shaping::{HandshakeShaper, UnitPlan};
 use zmux::{
@@ -50,7 +50,7 @@ async fn record_policy_runs_without_the_session_lock() {
         let (tx, rx) = mpsc::channel();
         let (h, tx) = (holder.clone(), Mutex::new(tx));
         let mut c = config();
-        c.record_policy = Some(RecordPolicy(Arc::new(move |_| {
+        c.record_policy = Some(RecordPolicy::new(move |_| {
             // Another thread asks the session something while the policy waits for it.
             let h = h.clone();
             let (done, finished) = mpsc::channel();
@@ -60,8 +60,8 @@ async fn record_policy_runs_without_the_session_lock() {
             });
             let free = finished.recv_timeout(Duration::from_secs(5)).is_ok();
             tx.lock().unwrap().send(free).unwrap();
-            Mode::Sealed
-        })));
+            RecordMode::Sealed
+        }));
         let (s, _srv, _l) = sessions(c, config()).await;
         holder.set(s.clone()).ok();
         let (x, _y) = duplex(1 << 16);
@@ -76,7 +76,7 @@ async fn record_policy_runs_without_the_session_lock() {
 async fn a_panicking_record_policy_leaves_sealed() {
     timed(async {
         let mut c = config();
-        c.record_policy = Some(RecordPolicy(Arc::new(|_| panic!("the policy"))));
+        c.record_policy = Some(RecordPolicy::new(|_| panic!("the policy")));
         let (s, _srv, _l) = sessions(c, config()).await;
         let (x, _y) = duplex(1 << 16);
         s.begin_add_pipe(PipeIo::new(x), PipeOptions::default())
@@ -103,9 +103,9 @@ async fn panicking_join_policies_refuse() {
         for allow in [true, false] {
             let mut server = config();
             if allow {
-                server.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| panic!("a"))));
+                server.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| panic!("a")));
             } else {
-                server.authorize_join = Some(AuthorizeJoin(Arc::new(|_| panic!("b"))));
+                server.authorize_join = Some(AuthorizeJoin::new(|_| panic!("b")));
             }
             let (s, _srv, l) = sessions(config(), server).await;
             while !s.join_ready() {
@@ -205,7 +205,7 @@ async fn sessions_with(limits: ListenerConfig) -> (Session, Session, Listener) {
 }
 
 fn bound() -> PipeOptions {
-    PipeOptions::new().with_mode(Mode::Bound)
+    PipeOptions::new().with_record_mode(RecordMode::Bound)
 }
 
 fn bound_carrier(io: DuplexStream) -> PipeIo {
@@ -227,7 +227,7 @@ fn bound_listener() -> (ListenerConfig, Config, Arc<Mutex<Vec<String>>>) {
         RejectAction::Close
     })));
     let mut server = config();
-    server.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| true)));
+    server.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     (limits, server, reasons)
 }
 
@@ -358,12 +358,10 @@ impl AsyncWrite for LastWrite {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.watched.writes.fetch_add(1, Ordering::SeqCst) == 1 {
-            drop(
-                self.session
-                    .get()
-                    .unwrap()
-                    .close(VarInt::from_u32(1), b"during the last message"),
-            );
+            self.session
+                .get()
+                .unwrap()
+                .abort(VarInt::from_u32(1), b"during the last message");
         }
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
@@ -433,7 +431,7 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
     impl Write for W {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if self.1.writes.fetch_add(1, Ordering::SeqCst) == 1 {
-                self.2.get().unwrap().close(VarInt::from_u32(1), b"last");
+                self.2.get().unwrap().abort(VarInt::from_u32(1), b"last");
             }
             self.0.write(buf)
         }
@@ -463,10 +461,17 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
         l3.handle_pipe(b::PipeIo::from_halves(q, q2), b::PipeHint::default())
     });
     let seen = Arc::new(Seen::default());
+    let ended = Arc::new(AtomicUsize::new(0));
+    let e = ended.clone();
     let carrier = b::PipeIo::from_halves(
         R(p.try_clone().unwrap(), seen.clone()),
         W(p, seen.clone(), holder),
-    );
+    )
+    .with_closer(move |how| {
+        if how == std::net::Shutdown::Both {
+            e.fetch_add(1, Ordering::SeqCst);
+        }
+    });
     let _pipe = s.begin_add_pipe(carrier, PipeOptions::default()).unwrap();
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while seen.writes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < end {
@@ -475,6 +480,9 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(seen.writes.load(Ordering::SeqCst), 2);
     assert_eq!(seen.reads_after_last.load(Ordering::SeqCst), 0);
+    // The carrier no thread took was ended all the same, as the session's
+    // end ends every carrier.
+    assert!(ended.load(Ordering::SeqCst) >= 1);
     drop(srv);
 }
 
@@ -525,11 +533,16 @@ fn paired_join_on_the_std_driver() {
         let _keep = f2;
         l3.handle_pipe(b::PipeIo::from_halves(up_far, df), b::PipeHint::default())
     });
-    pipe.joined(Some(Duration::from_secs(10))).unwrap();
+    pipe.session()
+        .set_wait_timeout(Some(Duration::from_secs(10)));
+    pipe.joined().unwrap();
     let echo = std::thread::spawn(move || {
         let (mut send, mut recv) = srv.accept_bi().unwrap();
         let mut got = [0; 5];
         recv.read_exact(&mut got).unwrap();
+        // To the FIN: a receiver dropped before it stops the sender, whose
+        // finish can come after.
+        assert_eq!(recv.read(&mut [0; 1]).unwrap(), None);
         send.write_all(&got).unwrap();
         send.finish().unwrap();
         srv
@@ -541,7 +554,7 @@ fn paired_join_on_the_std_driver() {
     recv.read_exact(&mut got).unwrap();
     assert_eq!(&got, b"hello");
     let srv = echo.join().unwrap();
-    s.close(VarInt::ZERO, b"");
+    s.close();
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while closed.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(5));
@@ -550,7 +563,7 @@ fn paired_join_on_the_std_driver() {
     drop((srv, down_far));
     // A pair of which a half has no contract declares none.
     let mut with_mode = PipeOptions::new();
-    with_mode = with_mode.with_mode(Mode::Bound);
+    with_mode = with_mode.with_record_mode(RecordMode::Bound);
     let (g, _h) = UnixStream::pair().unwrap();
     let (i, _j) = UnixStream::pair().unwrap();
     let up = b::PipeIo::writer(g)

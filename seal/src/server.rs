@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use zmux::InboundTransform;
 use zmux::proto::listener::RejectError;
-use zmux::proto::seal::{Dispatch, Framing, Mode, dispatch};
+use zmux::proto::seal::{Dispatch, Framing, RecordMode, dispatch};
 use zmux::shaping::{HandshakeShaper, Limits, message_len};
 use zmux_seal_proto::{Error, Hello, Profile, Responder, ResponderKeys};
 
@@ -14,20 +14,21 @@ use crate::carrier::Carrier;
 use crate::establish::{Peer, binding_of, plan_of, read_frame, shaped_payload};
 use crate::profiles::{SERVER_DEFAULT, has_psk};
 use crate::trust::{
-    Admission, AppData, AppDataRequest, AppDataSource, ConfigError, Gate, PeerRole, Signer,
-    Verifier, VerifyError, VerifyInput, ask_app_data, check_pq_auth, judge,
+    Admission, AppData, AppDataRequest, AppDataSource, ConfigError, Gate, Signer, Verifier,
+    VerifyError, VerifyInput, ask_app_data, check_pq_auth, judge,
 };
 use crate::{credential_value, message_items, proof_placeholder};
 
 /// The callable of [`ServerOptions::allow_record_mode`].
-pub type ModeCheck = dyn Fn(Mode, &Peer) -> bool + Send + Sync;
+pub type ModeCheck = dyn Fn(RecordMode, &Peer) -> bool + Send + Sync;
 
 /// The options of a [`ServerConfig`]; the default accepts Profiles 1 and 3.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ServerOptions {
-    /// The accepted Establish Profiles; empty is the default set, 1 and 3, which holds no
-    /// Profile without a pre-shared key. Listing 4 or 5 is the only way to accept a
-    /// Profile without one, which sends the node's credentials to anonymous clients.
+    /// The accepted Establish Profiles (default 1 and 3, which hold no Profile without a
+    /// pre-shared key; an empty list is the configuration error). Listing 4 or 5 is the
+    /// only way to accept a Profile without one, which sends the node's credentials to
+    /// anonymous clients.
     pub accepted_profiles: Vec<u64>,
     /// The check of a Hello's mode; unset passes only Sealed. Joins have their own,
     /// `Config::allow_record_mode`.
@@ -51,10 +52,44 @@ pub struct ServerOptions {
     /// the client's data of message 1 and the local context: the client's static key
     /// comes only with message 3.
     pub app_data: Option<AppDataSource>,
-    /// The largest application data of a client's message; 0 is
-    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), and `usize::MAX` sets no
-    /// bound beyond the message: a local safety bound, not a protocol limit.
-    pub max_app_data: usize,
+    /// The largest application data of a client's message, in bytes (default
+    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), 256; `None`: no bound beyond
+    /// the message): a local safety bound, not a protocol limit.
+    pub max_app_data: Option<usize>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            accepted_profiles: SERVER_DEFAULT.to_vec(),
+            allow_record_mode: None,
+            shaper: None,
+            shaping_limits: None,
+            client_verifier: None,
+            local_context: Vec::new(),
+            require_pq_auth: false,
+            signer: None,
+            app_data: None,
+            max_app_data: Some(crate::DEFAULT_MAX_APP_DATA),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerOptions")
+            .field("accepted_profiles", &self.accepted_profiles)
+            .field("allow_record_mode", &self.allow_record_mode.is_some())
+            .field("shaper", &self.shaper.is_some())
+            .field("shaping_limits", &self.shaping_limits.is_some())
+            .field("client_verifier", &self.client_verifier.is_some())
+            .field("local_context", &self.local_context)
+            .field("require_pq_auth", &self.require_pq_auth)
+            .field("signer", &self.signer.is_some())
+            .field("app_data", &self.app_data.is_some())
+            .field("max_app_data", &self.max_app_data)
+            .finish()
+    }
 }
 
 /// The server's side of Establish, validated when it is made ([`ServerConfig::new`]).
@@ -90,11 +125,10 @@ impl ServerConfig {
         if static_secret == [0; 32] {
             return Err(ConfigError("ServerConfig without a static secret"));
         }
-        let listed: &[u64] = if options.accepted_profiles.is_empty() {
-            &SERVER_DEFAULT
-        } else {
-            &options.accepted_profiles
-        };
+        let listed = &options.accepted_profiles;
+        if listed.is_empty() {
+            return Err(ConfigError("accepted_profiles is empty"));
+        }
         if listed.iter().any(|&v| Profile::from_value(v).is_none()) {
             return Err(ConfigError(
                 "accepted_profiles holds an unknown or reserved Profile",
@@ -121,7 +155,7 @@ pub fn reject_reason(e: &Error) -> &'static str {
     e.class()
 }
 
-fn reject(profile: Option<u64>, mode: Option<Mode>, reason: &'static str) -> io::Error {
+fn reject(profile: Option<u64>, mode: Option<RecordMode>, reason: &'static str) -> io::Error {
     io::Error::other(RejectError::new(profile, mode, reason))
 }
 
@@ -221,7 +255,7 @@ impl ServerConfig {
         if !self.accepted.contains(&profile.value()) {
             return Err(refuse("profile_disabled"));
         }
-        if mode != Mode::Sealed && self.options.allow_record_mode.is_none() {
+        if mode != RecordMode::Sealed && self.options.allow_record_mode.is_none() {
             return Err(refuse("record_mode"));
         }
         let handle = parsed.handle().to_vec();
@@ -235,7 +269,7 @@ impl ServerConfig {
         };
         // A Hello in Bound is never carrier early data. A carrier without the Bound contract
         // has no Binding to check it with.
-        if mode == Mode::Bound && p.early_data_possible() {
+        if mode == RecordMode::Bound && p.early_data_possible() {
             return Err(refuse("early_data"));
         }
         let binding = binding_of(&*p, mode).map_err(|_| refuse("binding_unavailable"))?;
@@ -251,7 +285,7 @@ impl ServerConfig {
         .map_err(|e| refuse(e.class()))?;
         let mut app_data: Vec<AppData> = AppData::of(1, first.app_data()).into_iter().collect();
         let known = VerifyInput {
-            role: PeerRole::Client,
+            role: zmux::Role::Client,
             profile,
             peer_static: &[],
             psk_identity: with_psk.then_some(handle.as_slice()),
@@ -321,7 +355,7 @@ impl ServerConfig {
             Some(v) => {
                 let credential = payload.credential();
                 let input = VerifyInput {
-                    role: PeerRole::Client,
+                    role: zmux::Role::Client,
                     profile,
                     peer_static: &client,
                     psk_identity: with_psk.then_some(handle.as_slice()),
@@ -350,7 +384,7 @@ impl ServerConfig {
                 .map(|e| (e.kind, e.credential.to_vec())),
             verdict: verdict.clone(),
             profile: profile.value(),
-            mode,
+            record_mode: mode,
             app_data: app_data.clone(),
             pq_confidential: profile.pq_confidentiality(),
             pq_authenticated,
@@ -490,7 +524,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
         }
-        fn finish(self, _: Vec<u8>, _: zmux_seal_proto::Complete, _: Mode) -> Self {
+        fn finish(self, _: Vec<u8>, _: zmux_seal_proto::Complete, _: RecordMode) -> Self {
             self
         }
         fn admitted(self, _: AdmittedValue) -> Self {

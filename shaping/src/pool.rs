@@ -487,15 +487,16 @@ impl zmux::helpers::PoolPolicy for MachinePoolPolicy {
         }
         // Both are within bounds: the interval was validated above, the jitter when the
         // policy was built. A file's 0 turns the probes off.
-        if let Some(i) = d.probe_interval {
-            let _ = out.set_probe_interval(if i == 0 {
-                zmux::proto::session::Period::Off
-            } else {
-                zmux::proto::session::Period::Every(Duration::from_micros(i))
-            });
-        }
-        if let Some(j) = d.probe_jitter {
-            let _ = out.set_probe_jitter(f64::from(j) / 1e6);
+        if d.probe_interval.is_some() || d.probe_jitter.is_some() {
+            let mut live = zmux::PipeLiveness::default();
+            if let Some(i) = d.probe_interval {
+                live.probe_interval =
+                    zmux::Inherit::Set((i != 0).then(|| Duration::from_micros(i)));
+            }
+            if let Some(j) = d.probe_jitter {
+                live.probe_jitter = zmux::Inherit::Set(f64::from(j) / 1e6);
+            }
+            let _ = out.set_liveness(live);
         }
     }
 }

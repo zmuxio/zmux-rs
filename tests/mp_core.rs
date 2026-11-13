@@ -275,7 +275,7 @@ fn a_ping_lost_with_its_pipe_asks_again() {
 #[test]
 fn a_new_keep_alive_counts_from_the_last_activity() {
     let mut n = net(Policy::SpreadEta, false);
-    let mut l = zmux::Liveness::of(n.ends[A].config());
+    let mut l = n.ends[A].config().liveness;
     l.keep_alive_period = None;
     l.probe_interval = None;
     l.probe_jitter = 0.0;
@@ -292,8 +292,8 @@ fn a_new_keep_alive_counts_from_the_last_activity() {
 #[test]
 fn a_suspect_pipe_keeps_its_dead_timeout() {
     let mut n = net(Policy::SpreadEta, false);
-    let mut l = zmux::Liveness::of(n.ends[A].config());
-    l.dead_timeout = Some(Duration::from_secs(50));
+    let mut l = n.ends[A].config().liveness;
+    l.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(50));
     n.ends[A].set_liveness(&l).unwrap();
     n.open_and_write(200_000, true);
     n.step(4000);
@@ -311,7 +311,7 @@ fn a_suspect_pipe_keeps_its_dead_timeout() {
         n.advance(10);
     }
     assert!(suspect(&n));
-    l.dead_timeout = Some(Duration::from_secs(1));
+    l.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(1));
     n.ends[A].set_liveness(&l).unwrap();
     for _ in 0..500 {
         n.pump(1);
@@ -380,7 +380,7 @@ fn acknowledgements_drive_quality_events() {
     n.ends[A]
         .set_quality_band(Some(QualityBand {
             min_interval: Duration::ZERO,
-            ..QualityBand::new(Duration::from_millis(2), 0.0)
+            ..QualityBand::new(Some(Duration::from_millis(2)), None)
         }))
         .unwrap();
     n.open_and_write(50_000, false);
@@ -1035,4 +1035,190 @@ fn the_end_of_the_bootstrap_pair_is_no_failed_join() {
         n.now,
     );
     assert_eq!(n.ends[A].stats().join_failures, 0);
+}
+
+/// At the cap of unretired attachments, joins held back are judged one by one: while
+/// suspended for want of an outbound pipe, a held outbound join displaces a failed
+/// attachment and goes, although an inbound join held before it keeps waiting.
+/// `join_ready` asks for a displaceable attachment only once the cap is reached.
+#[test]
+fn held_joins_are_judged_one_by_one_at_the_cap() {
+    let mut a_cfg = config(Policy::SpreadEta, true);
+    a_cfg.max_pipes = 1;
+    a_cfg.pipe_headroom = 1;
+    let mut b_cfg = config(Policy::SpreadEta, true);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    assert!(n.ends[A].join_ready(n.now), "below the cap");
+    let inbound = n
+        .add_pipe_directed(true, false, &PipeOptions::default())
+        .unwrap();
+    n.pump(10);
+    assert!(!n.ends[A].join_deferred(PipeId::new(inbound)));
+    // The bootstrap pair and the inbound pipe: the cap of 2 is reached.
+    assert!(!n.ends[A].join_ready(n.now), "at the cap, not suspended");
+    let held_in = n
+        .add_pipe_directed(true, false, &PipeOptions::default())
+        .unwrap();
+    let held_out = n
+        .add_pipe_directed(false, true, &PipeOptions::default())
+        .unwrap();
+    assert!(n.ends[A].join_deferred(PipeId::new(held_in)));
+    assert!(n.ends[A].join_deferred(PipeId::new(held_out)));
+    // The bootstrap pair fails: no outbound pipe is left.
+    n.fail(0);
+    assert_eq!(n.ends[A].state(), State::Suspended);
+    n.advance(1);
+    assert!(
+        n.ends[A].join_deferred(PipeId::new(held_in)),
+        "brings no missing direction"
+    );
+    assert!(
+        !n.ends[A].join_deferred(PipeId::new(held_out)),
+        "displaced the failed pair"
+    );
+}
+
+/// PIPE_ABANDON frames A wrote, by Pipe ID.
+struct Abandons {
+    reader: zmux::proto::record::RecordReader,
+    sent: Vec<u64>,
+}
+
+impl Default for Abandons {
+    fn default() -> Self {
+        Self {
+            reader: zmux::proto::record::RecordReader::new(1 << 20),
+            sent: Vec::new(),
+        }
+    }
+}
+
+impl mp_net::Observe for Abandons {
+    fn a_batch(&mut self, mut input: &[u8]) {
+        use zmux::proto::frame::Gates;
+        use zmux::proto::record::Event as Rec;
+        while let Ok(Some(ev)) = self.reader.read(&mut input, &Gates::ALL) {
+            if let Rec::Frame(Frame::PipeAbandon(f)) = ev {
+                self.sent.push(f.pipe_id);
+            }
+        }
+    }
+}
+
+/// A at the cap of 2 attachments on the bootstrap pair and an outbound-only
+/// pipe 1, then the bootstrap pair fails: A is SUSPENDED for want of an
+/// inbound pipe and owes PIPE_ABANDON(0), which it may write only on pipe 1.
+/// `hold` keeps pipe 1 from taking it (queued); otherwise pipe 1 takes it and
+/// loses it in flight (sent, awaiting acknowledgement). An inbound join then
+/// displaces the failed pair (MULTIPATH.md Section 5.4), or, with `displace`
+/// false, finds room under a cap of 3. Returns the PIPE_ABANDON(0) frames A
+/// wrote in all.
+fn abandons_written(hold: bool, displace: bool) -> usize {
+    let mut a_cfg = config(Policy::SpreadEta, true);
+    a_cfg.max_pipes = 1;
+    a_cfg.pipe_headroom = if displace { 1 } else { 2 };
+    let mut b_cfg = config(Policy::SpreadEta, true);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    let mut n = MpNet::<Abandons, Book>::new(a_cfg, b_cfg, Book::default());
+    for _ in 0..10 {
+        n.step(usize::MAX);
+    }
+    let out = n
+        .add_pipe_directed(false, true, &PipeOptions::default())
+        .unwrap();
+    for _ in 0..10 {
+        n.step(usize::MAX);
+    }
+    assert!(n.links[&out].attached());
+    if hold {
+        n.links.get_mut(&out).unwrap().flows[A].takes = false;
+    } else {
+        n.links.get_mut(&out).unwrap().flows[A].blackhole = true;
+    }
+    n.fail(0);
+    assert_eq!(n.ends[A].state(), State::Suspended);
+    n.step(usize::MAX);
+    assert_eq!(
+        n.links[&out].sent.iter().filter(|&&p| p == 0).count(),
+        usize::from(!hold),
+        "PIPE_ABANDON(0) written before the displacement"
+    );
+    let inbound = n
+        .add_pipe_directed(true, false, &PipeOptions::default())
+        .unwrap();
+    assert!(!n.ends[A].join_deferred(PipeId::new(inbound)));
+    assert_eq!(
+        n.ends[A].pipes().iter().any(|p| p.pipe == PipeId::new(0)),
+        !displace,
+        "the failed pair displaced"
+    );
+    let l = n.links.get_mut(&out).unwrap();
+    l.flows[A].takes = true;
+    l.flows[A].blackhole = false;
+    // Long past every retransmission timeout.
+    for _ in 0..100 {
+        n.step(usize::MAX);
+        n.advance(100);
+    }
+    assert!(n.links[&inbound].attached());
+    n.links
+        .values()
+        .map(|l| l.sent.iter().filter(|&&p| p == 0).count())
+        .sum()
+}
+
+/// Displacing an attachment drops the PIPE_ABANDON it still has queued: it
+/// is never sent. Without the displacement it is.
+#[test]
+fn displacement_drops_a_queued_abandon() {
+    assert_eq!(abandons_written(true, false), 1, "sent without it");
+    assert_eq!(abandons_written(true, true), 0);
+}
+
+/// Displacing an attachment drops the PIPE_ABANDON it sent and awaits the
+/// acknowledgement of: lost, it is not sent again. Without the
+/// displacement it is.
+#[test]
+fn displacement_drops_a_retained_abandon() {
+    assert!(abandons_written(false, false) > 1, "re-sent without it");
+    assert_eq!(abandons_written(false, true), 1);
+}
+
+/// A join removed abruptly after its Hello was written stays failed: the
+/// Reply that arrives later confirms nothing (found by
+/// `exactly_once_under_pipe_churn`, where the revived attachment was ACTIVE
+/// with no carrier, held a place under the attachment cap and kept the
+/// healing join deferred).
+#[test]
+fn a_reply_after_an_abrupt_removal_revives_nothing() {
+    let mut n = net(Policy::Affinity, false);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    // The Hello goes out; nothing arrives yet.
+    n.links.get_mut(&id).unwrap().stall(true);
+    n.step(usize::MAX);
+    assert!(n.links[&id].flows[A].queued > 0, "the Hello is in flight");
+    n.ends[A]
+        .remove_pipe(PipeId::new(id), false, n.now)
+        .unwrap();
+    // The Hello reaches B before the PIPE_ABANDON does, and B accepts it.
+    n.links.get_mut(&0).unwrap().flows[A].stalled = true;
+    n.links.get_mut(&id).unwrap().stall(false);
+    n.pump(4);
+    assert_eq!(
+        n.ends[A].pipe_state(PipeId::new(id), PipeHalf::Outbound),
+        Some(DirectionState::Outbound(OutboundState::Failed))
+    );
+    n.links.get_mut(&0).unwrap().flows[A].stalled = false;
+    // The session goes on, and a new pipe joins.
+    let healed = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.open_and_write(10_000, true);
+    n.settle();
+    assert_eq!(
+        n.ends[A].pipe_state(PipeId::new(healed), PipeHalf::Outbound),
+        Some(DirectionState::Outbound(OutboundState::Active))
+    );
+    assert_eq!(n.s.recv[&0].len(), 10_000);
+    assert!(n.alive());
 }

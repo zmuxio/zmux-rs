@@ -452,3 +452,10 @@ fn finish_stream(mut w: StreamWriter) {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let _ = AsyncWrite::poll_shutdown(Pin::new(&mut w), &mut cx);
 }
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Lane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lane").finish_non_exhaustive()
+    }
+}

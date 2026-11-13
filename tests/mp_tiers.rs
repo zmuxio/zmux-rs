@@ -9,7 +9,7 @@ use std::time::Duration;
 mod mp_net;
 
 use mp_net::{A, B, MpNet, Observe};
-use zmux::proto::frame::{Dir, Frame, Gates, JoinDirection};
+use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::record::{Event as Rec, RecordReader};
 use zmux::proto::session::{
     Config, CoreEvent, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, StreamKey,
@@ -100,11 +100,11 @@ fn config(edit: impl Fn(&mut Config)) -> Config {
     c.initial_connection_receive_window = 24 << 20;
     c.max_connection_receive_window = zmux::Cap::Fixed(24 << 20);
     c.send_buffer = 64 << 20;
-    c.probation = Some(Duration::ZERO);
+    c.probation = None;
     // Without probe jitter the probe times are deterministic.
-    c.probe_jitter = 0.0;
+    c.liveness.probe_jitter = 0.0;
     // Keep-alive would put a QX_PING on the control pipe every 15 s.
-    c.keep_alive_period = None;
+    c.liveness.keep_alive_period = None;
     edit(&mut c);
     c
 }
@@ -181,7 +181,7 @@ fn two_tiers(edit: impl Fn(&mut Config)) -> Net {
 fn a_burst_that_drains_within_the_overflow_delay_stays_in_its_tier() {
     let mut n = two_tiers(|c| {
         c.overflow_delay = Duration::from_millis(100);
-        c.suspect_floor = Duration::from_secs(5);
+        c.liveness.suspect_floor = Duration::from_secs(5);
     });
     // Pipe 0 refuses bytes for a while (a full carrier): a burst it can
     // drain within D waits for it.
@@ -289,7 +289,7 @@ fn a_standby_takeover_is_announced_and_withdrawn() {
 fn a_down_attachment_states_its_request_on_another_pipe_after_its_first_record() {
     let mut n = net(|_| {});
     let mut opts = PipeOptions::default();
-    opts.direction = JoinDirection::Down;
+    opts.direction = zmux::PipeDirection::In;
     opts.receive_priority = 6;
     let down = n.add_pipe_directed(true, false, &opts).unwrap();
     let pipe = PipeId::new(down);
@@ -336,7 +336,7 @@ fn a_down_attachment_states_its_request_on_another_pipe_after_its_first_record()
     );
     // An up attachment has no inbound direction to ask about: no PIPE_STATUS ever.
     let mut opts = PipeOptions::default();
-    opts.direction = JoinDirection::Up;
+    opts.direction = zmux::PipeDirection::Out;
     let up = n.add_pipe_directed(false, true, &opts).unwrap();
     n.run_for(100);
     let before = on_any(&n).len();
@@ -368,7 +368,7 @@ fn a_fate_group_keeps_the_probation_backoff_across_rejoins() {
     };
     for (group, factor) in [(0, 1), (7, 2)] {
         let mut n = net(|c| {
-            c.probation = Some(base);
+            c.probation = Some(zmux::Cap::Fixed(base));
             c.resume_timeout = Some(Duration::from_secs(30));
         });
         let mut opts = PipeOptions::default();
@@ -538,18 +538,30 @@ fn wait_answers_are_not_counted() {
 fn probation_settings_take_effect_safely() {
     let mut n = net(|c| c.resume_timeout = Some(Duration::from_secs(30)));
     let mut opts = PipeOptions::default();
-    opts.probation = Some(Duration::from_secs(10));
+    opts.probation = zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_secs(10))));
     let id = n.add_pipe(&opts).unwrap();
     n.run_for(200);
     assert!(n.ends[A].pipe_info(PipeId::new(id)).unwrap().in_probation);
     n.ends[A]
-        .set_pipe_probation(PipeId::new(id), Some(Duration::ZERO))
+        .update_pipe(
+            PipeId::new(id),
+            &zmux::PipeUpdate {
+                probation: zmux::Change::Set(None),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(!n.ends[A].pipe_info(PipeId::new(id)).unwrap().in_probation);
     // A huge base: in probation, without overflow, for as long as it runs.
     let other = n.add_pipe(&PipeOptions::default()).unwrap();
     n.ends[A]
-        .set_pipe_probation(PipeId::new(other), Some(Duration::MAX))
+        .update_pipe(
+            PipeId::new(other),
+            &zmux::PipeUpdate {
+                probation: zmux::Change::Set(Some(zmux::Cap::Fixed(Duration::MAX))),
+                ..Default::default()
+            },
+        )
         .unwrap();
     n.run_for(500);
     let info = n.ends[A].pipe_info(PipeId::new(other)).unwrap();
@@ -564,7 +576,7 @@ fn probation_settings_take_effect_safely() {
 #[test]
 fn a_ping_answer_on_a_quiet_pipe_carries_a_liveness_ping() {
     let mut n = two_tiers(|c| {
-        c.standby_probe = None;
+        c.liveness.standby_probe = None;
         c.redundancy = zmux::Redundancy::Off;
     });
     n.run_for(3000);
@@ -609,11 +621,11 @@ fn quiet_sessions_probe_at_the_probe_interval() {
     for pings in quiet_minute(&mut n) {
         assert!((3..=5).contains(&pings), "{pings} probes");
     }
-    let mut n = two_tiers(|c| c.probe_interval = Some(Duration::from_secs(60)));
+    let mut n = two_tiers(|c| c.liveness.probe_interval = Some(Duration::from_secs(60)));
     for pings in quiet_minute(&mut n) {
         assert!((1..=2).contains(&pings), "{pings} probes");
     }
-    let mut n = two_tiers(|c| c.probe_interval = None);
+    let mut n = two_tiers(|c| c.liveness.probe_interval = None);
     assert_eq!(quiet_minute(&mut n), [0, 0]);
     // Traffic resumes: the less-preferred pipe is probed at once.
     let before = n.links[&2].a_pings;
@@ -630,8 +642,8 @@ fn intermittent_traffic_does_not_bring_probes_forward() {
     let mut n = two_tiers(|c| {
         c.scheduler = Policy::Affinity;
         c.redundancy = zmux::Redundancy::Off;
-        c.standby_probe = None;
-        c.probe_jitter = 0.25;
+        c.liveness.standby_probe = None;
+        c.liveness.probe_jitter = 0.25;
     });
     let message = |n: &mut Net| {
         n.write(100);
@@ -660,24 +672,24 @@ fn huge_timer_settings_never_overflow_the_clock() {
     let huge = Duration::MAX;
     let settings: [&dyn Fn(&mut Config); 4] = [
         &|c| {
-            c.probe_interval = Some(huge);
-            c.standby_probe = Some(huge);
+            c.liveness.probe_interval = Some(huge);
+            c.liveness.standby_probe = Some(huge);
         },
         &|c| {
-            c.probe_interval = Some(huge - Duration::from_secs(1));
-            c.standby_probe = Some(huge - Duration::from_secs(1));
-            c.probe_jitter = 0.99;
+            c.liveness.probe_interval = Some(huge - Duration::from_secs(1));
+            c.liveness.standby_probe = Some(huge - Duration::from_secs(1));
+            c.liveness.probe_jitter = 0.99;
         },
         &|c| {
             c.handshake_timeout = Some(huge);
             c.max_idle_timeout = None;
-            c.keep_alive_period = Some(huge);
+            c.liveness.keep_alive_period = Some(huge);
             c.overflow_delay = huge;
         },
         &|c| {
-            c.suspect_floor = huge;
-            c.dead_timeout = Some(huge);
-            c.probation = Some(huge);
+            c.liveness.suspect_floor = huge;
+            c.liveness.dead_timeout = zmux::Cap::Fixed(huge);
+            c.probation = Some(zmux::Cap::Fixed(huge));
         },
     ];
     for edit in settings {

@@ -95,7 +95,7 @@ async fn multipath_pipes_get_32_kib() {
         .begin_add_pipe(PipeIo::tcp(stream), PipeOptions::default())
         .unwrap();
     expect_lowat(&added, 32 * 1024).await;
-    session.close(0u32.into(), b"").await;
+    session.close().await;
     drop(listener);
 }
 
@@ -166,6 +166,6 @@ fn blocking_multipath_pipes_get_32_kib() {
         .begin_add_pipe(zmux::blocking::PipeIo::tcp(stream), PipeOptions::default())
         .unwrap();
     assert_eq!(lowat(&added), 32 * 1024);
-    session.close(0u32.into(), b"");
+    session.close();
     rt.shutdown_timeout(Duration::from_secs(2));
 }

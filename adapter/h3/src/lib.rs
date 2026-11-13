@@ -5,7 +5,7 @@
 //! through front ends, proxies and load balancers that forward HTTP/3
 //! requests, where a plain QUIC carrier may not.
 //!
-//! The client ([`H3Client`]) reports the QUIC connection as the carrier
+//! The client ([`Carrier`]) reports the QUIC connection as the carrier
 //! connection of its pipes and opens their lanes as further requests on it
 //! (one lane per independently delivered carrier stream): the request streams of one
 //! connection are delivered independently, so a loss on one lane does not
@@ -23,7 +23,7 @@
 //! taking the carrier. Requests that carry no pipe go to
 //! [`Options::fallback`]. A client writes the prefix of its credential,
 //! such as a prefix authentication token, first on each request body
-//! ([`Options::credential`]).
+//! ([`Options::carrier_credential`]).
 //!
 //! What the carriers have:
 //!
@@ -97,7 +97,7 @@ use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, ReadBuf};
 use zmux::carrier::{CarrierConnId, ChunkBuf, ChunkWrite};
 use zmux::proto::ApplicationErrorCode;
-use zmux::{Admit, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo, Session};
+use zmux::{Admit, CarrierCredential, ConnectError, Entry, Listener, PipeHint, PipeIo, Session};
 pub use zmux_quinn::LaneWindows;
 use zmux_quinn::{ConnectionDatagrams, QuicChannel};
 
@@ -123,13 +123,13 @@ pub struct Options {
     /// Server: the handler of the requests that carry no pipe: those the
     /// listener's admission hands to the fallback and those the listener does not
     /// take (none by default: such requests are answered with 404).
-    pub fallback: Option<H3Fallback>,
-    /// Client: the credential whose prefix ([`Credential::prefix`], given
+    pub fallback: Option<Fallback>,
+    /// Client: the credential whose prefix ([`CarrierCredential::prefix`], given
     /// the connection's [`zmux_quinn::Handshake::carrier_info`]) is written
     /// first on each request body that carries a pipe or a lane, for a
     /// server with an admission ([`zmux::ListenerConfig::admission`]; none
     /// by default).
-    pub credential: Option<Arc<dyn Credential>>,
+    pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
 }
 
 impl Options {
@@ -147,15 +147,15 @@ impl Options {
 
     /// Serves the requests that carry no pipe with `fallback`.
     #[must_use]
-    pub fn with_fallback(mut self, fallback: H3Fallback) -> Self {
+    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
         self.fallback = Some(fallback);
         self
     }
 
     /// Writes the prefix of `credential` first on each request body.
     #[must_use]
-    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 
@@ -250,13 +250,13 @@ fn h3_error(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
 /// is alive; once none is, its driver stops.
 #[derive(Clone)]
 #[must_use = "the connection is driven while the client and its pipes are alive"]
-pub struct H3Client {
+pub struct Carrier {
     inner: Arc<ClientInner>,
 }
 
-impl std::fmt::Debug for H3Client {
+impl std::fmt::Debug for Carrier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H3Client")
+        f.debug_struct("Carrier")
             .field("connection", &self.inner.conn.stable_id())
             .finish()
     }
@@ -271,7 +271,7 @@ struct ClientInner {
     window: u64,
     /// The credential of each request, and the connection's handshake it
     /// is given.
-    credential: Option<(Arc<dyn Credential>, zmux_quinn::Handshake)>,
+    carrier_credential: Option<(Arc<dyn CarrierCredential>, zmux_quinn::Handshake)>,
     driver: tokio::task::AbortHandle,
     /// The connection's HTTP Datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
@@ -283,17 +283,17 @@ impl Drop for ClientInner {
     }
 }
 
-impl H3Client {
+impl Carrier {
     /// The HTTP/3 client of `conn`, an established QUIC connection with
     /// the ALPN identifier `h3`, whose pipes and lanes are requests to
     /// `uri` (inside a tokio runtime): it exchanges the HTTP/3 settings and
     /// starts driving the connection. The connection's receive window is
     /// set for the lanes and charged to the zmux session the pipes carry.
-    /// With [`Options::credential`], each request body starts with its
+    /// With [`Options::carrier_credential`], each request body starts with its
     /// prefix.
     pub async fn new(conn: Connection, uri: http::Uri, options: &Options) -> io::Result<Self> {
-        let credential = options
-            .credential
+        let carrier_credential = options
+            .carrier_credential
             .clone()
             .map(|c| (c, zmux_quinn::Handshake::of(&conn)));
         let window = options.windows.receive_window();
@@ -314,7 +314,7 @@ impl H3Client {
             uri,
             id: OnceLock::new(),
             window,
-            credential,
+            carrier_credential,
             driver,
         });
         let _ = inner.id.set(CarrierConnId::new(&inner));
@@ -388,7 +388,7 @@ impl ClientInner {
             .await
             .map_err(h3_error)?;
         let (mut send, recv) = stream.split();
-        if let Some((credential, handshake)) = &self.credential {
+        if let Some((credential, handshake)) = &self.carrier_credential {
             let prefix = credential.prefix(&handshake.carrier_info(&self.conn))?;
             let mut data = ChunkBuf::new();
             data.take_from(&mut [Bytes::from(prefix)]);
@@ -402,7 +402,7 @@ impl ClientInner {
 /// client configuration, with the ALPN identifier `h3`: [`client_config`])
 /// to `addr`, verified for the host of `uri`: a request to `uri`. For
 /// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to open more pipes
-/// on one connection, make an [`H3Client`] instead.
+/// on one connection, make a [`Carrier`] instead.
 pub async fn dial(
     endpoint: &Endpoint,
     addr: SocketAddr,
@@ -415,7 +415,7 @@ pub async fn dial(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
         .await
         .map_err(io::Error::other)?;
-    H3Client::new(conn, uri, options).await?.open_pipe().await
+    Carrier::new(conn, uri, options).await?.open_pipe().await
 }
 
 /// Establishes a session over a new HTTP/3 connection ([`dial`], then
@@ -565,7 +565,7 @@ struct Served {
     id: CarrierConnId,
     handshake: zmux_quinn::Handshake,
     conn: Connection,
-    fallback: Option<H3Fallback>,
+    fallback: Option<Fallback>,
     /// The connection's HTTP Datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
 }
@@ -756,15 +756,15 @@ type FallbackFn = dyn Fn(FallbackRequest) -> Pin<Box<dyn Future<Output = ()> + S
 /// The handler of the requests that carry no pipe ([`Options::fallback`]).
 /// Cheap to clone.
 #[derive(Clone)]
-pub struct H3Fallback(Arc<FallbackFn>);
+pub struct Fallback(Arc<FallbackFn>);
 
-impl std::fmt::Debug for H3Fallback {
+impl std::fmt::Debug for Fallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("H3Fallback(..)")
+        f.write_str("Fallback(..)")
     }
 }
 
-impl H3Fallback {
+impl Fallback {
     /// The handler `f`.
     pub fn new<F, Fut>(f: F) -> Self
     where
@@ -1279,7 +1279,7 @@ impl AsyncRead for BodyReader {
 /// A [`zmux::Candidate`] of [`zmux::CarrierKind::Http3`] for carrier
 /// modes: a request to `uri` on a new HTTP/3 connection of `endpoint` to
 /// `addr` ([`dial`]).
-pub fn http3_candidate(
+pub fn candidate(
     endpoint: Endpoint,
     addr: SocketAddr,
     uri: http::Uri,
@@ -1332,7 +1332,7 @@ mod tests {
                 async { server.accept().await.unwrap().await },
             );
             let (c, s) = (c.unwrap(), s.unwrap());
-            let client = H3Client::new(
+            let client = Carrier::new(
                 c.clone(),
                 "https://localhost/".parse().unwrap(),
                 &Options::default(),

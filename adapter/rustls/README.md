@@ -6,7 +6,8 @@ TLS 1.3 pipe carriers for [zmux](../../README.md) over `tokio-rustls`.
 server, into a `zmux::PipeIo`; `zmux_rustls::over_tcp(stream)` does the same for
 TLS over TCP and adds the socket's capabilities. The carrier has:
 
-- the TLS 1.3 exporter for both labels zmux uses: the session secret of a
+- once the handshake completed over TLS 1.3, the secure-carrier declaration
+  and the TLS exporter for both labels zmux uses: the session secret of a
   bootstrap carrier with `PipeAuth::exporter()`, and the binding of Bound
   joins, so that a Hello copied to another connection does not verify.
   TLS 1.2 connections and connections still in their handshake (early data)
@@ -29,8 +30,10 @@ its metadata (source and peer, ALPN identifier, server name, TLS exporter)
 decide whether it reaches the listener, the listener's fallback connection
 handler (`ListenerConfig::fallback`) with the bytes read replayed, or
 neither. Nothing is written above TLS before acceptance, and
-TLS early data is refused. `zmux_rustls::dial` with a `zmux::Credential`,
-such as `zmux::PrefixAuth`, writes its prefix as a client's first bytes.
+TLS early data is refused. `zmux_rustls::dial` and `zmux_rustls::connect`
+take a `zmux_rustls::Options`: with `Options::with_carrier_credential` (a
+`zmux::CarrierCredential` such as `zmux::PrefixAuth`), its prefix goes as the
+client's first bytes.
 
 ```rust,no_run
 # async fn example(

@@ -57,9 +57,9 @@ async fn echo(client: &Session, server: &Session) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bound_join_over_wss() {
     let mut config = Config::multipath(PipeAuth::exporter().with_end_to_end());
-    config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-        |c, mode, _| mode != zmux::proto::seal::Mode::Bound || c.secure,
-    )));
+    config.allow_record_mode = Some(zmux::AllowRecordMode::new(|c, mode, _| {
+        mode != zmux::RecordMode::Bound || c.secure
+    }));
     let (acceptor, connector) = tls();
     let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -86,7 +86,7 @@ async fn a_bound_join_over_wss() {
     let pipe = cs
         .begin_add_pipe(
             io,
-            PipeOptions::new().with_mode(zmux::proto::seal::Mode::Bound),
+            PipeOptions::new().with_record_mode(zmux::RecordMode::Bound),
         )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -94,7 +94,7 @@ async fn a_bound_join_over_wss() {
         .expect("joined in time")
         .unwrap();
     echo(&cs, &ss).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     listener.close();
     serving.await.unwrap();
 }
@@ -185,7 +185,7 @@ async fn a_same_host_redirect_is_followed() {
         .await
         .unwrap_err();
     assert_eq!(redirect_error(&e).reason, "too many redirects");
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     front.abort();
     serving.abort();
 }
@@ -256,7 +256,7 @@ async fn a_candidate_starts_at_the_redirected_url() {
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
     for (cs, _) in &sessions {
-        cs.close(0u32.into(), b"").await;
+        cs.close().await;
     }
     front.abort();
     serving.abort();
@@ -269,7 +269,7 @@ async fn a_carrier_mode_caches_the_redirected_url() {
     let (backend, listener, serving) = ws_server().await;
     let (addr, count, front) = front(backend, &[("/old", "/zmux")]).await;
     let cache = zmux::CarrierCache::default();
-    let mut policy = zmux::ModePolicy::new();
+    let mut policy = zmux::CarrierChoicePolicy::new();
     policy.cache = Some(cache.clone());
     policy.key = "server".into();
     let mut sessions = Vec::new();
@@ -279,9 +279,9 @@ async fn a_carrier_mode_caches_the_redirected_url() {
             &format!("ws://{addr}/old"),
             &Default::default(),
         );
-        let mode = zmux::Mode::auto([candidate]);
+        let mode = zmux::CarrierChoice::auto([candidate]);
         let (cs, ss) = tokio::join!(
-            zmux::dial_mode(&mode, Config::default(), &policy),
+            zmux::dial_choice(&mode, Config::default(), &policy),
             listener.accept()
         );
         sessions.push((cs.unwrap(), ss.unwrap()));
@@ -295,7 +295,7 @@ async fn a_carrier_mode_caches_the_redirected_url() {
     // The second candidate started at the cached URL: one redirect in all.
     assert_eq!(count.load(Ordering::SeqCst), 1);
     for (cs, _) in &sessions {
-        cs.close(0u32.into(), b"").await;
+        cs.close().await;
     }
     front.abort();
     serving.abort();

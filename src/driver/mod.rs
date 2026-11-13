@@ -49,6 +49,8 @@ pub(crate) mod blocking_listen;
 pub(crate) mod cache;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod channel;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod choice;
 #[cfg(all(feature = "blocking", not(loom)))]
 mod context;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -65,8 +67,6 @@ pub(crate) mod lanes;
 pub(crate) mod listen;
 #[cfg(all(test, loom))]
 mod loom;
-#[cfg(all(feature = "tokio", not(loom)))]
-pub(crate) mod mode;
 #[cfg(all(feature = "tokio", not(loom)))]
 mod precise;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -272,9 +272,9 @@ impl StreamId {
     /// Which role opened the stream.
     pub fn initiator(self) -> Role {
         if self.0 & 1 == 0 {
-            Role::Initiator
+            Role::Client
         } else {
-            Role::Responder
+            Role::Server
         }
     }
 }
@@ -297,16 +297,7 @@ impl fmt::Display for StreamId {
     }
 }
 
-/// The halves of a pipe from the local endpoint's view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PipeDirection {
-    /// The local endpoint reads (for example an HTTP GET response body).
-    In,
-    /// The local endpoint writes (for example an HTTP POST request body).
-    Out,
-    /// Both (a bidirectional carrier).
-    Bidi,
-}
+pub use crate::proto::session::PipeDirection;
 
 /// What a dial is for: the halves the carrier provides. The argument of a
 /// [`Dial`](crate::Dial) function.
@@ -335,13 +326,18 @@ impl DialRequest {
 pub(crate) fn check_peer(config: &crate::Config) -> Result<(), crate::ConnectError> {
     if config.early_data.zmux_peer {
         return Err(crate::ConnectError::InvalidConfig(
-            "early_data needs a role that does not depend on the peer: not with role auto",
+            crate::InvalidConfig::new(
+                "early_data",
+                "needs a role that does not depend on the peer: not with role auto",
+            ),
         ));
     }
     if config.resume_timeout.is_some() {
         return Err(crate::ConnectError::InvalidConfig(
-            "resume_timeout on a symmetric session without a listener: \
-             the accepting side of a resume needs a Listener",
+            crate::InvalidConfig::new(
+                "resume_timeout",
+                "a symmetric session without a listener: the accepting side of a resume needs a Listener",
+            ),
         ));
     }
     Ok(())

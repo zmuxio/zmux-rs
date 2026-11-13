@@ -233,7 +233,7 @@ impl<'a> Reader<'a> {
     pub(crate) fn use_slots(&self, n: u32) -> Result<(), Error> {
         let used = self.slots.get() + u64::from(n);
         self.slots.set(used);
-        let bound = self.limits.slots_bound().unwrap_or(u64::from(u32::MAX));
+        let bound = self.limits.max_slots.unwrap_or(u64::from(u32::MAX));
         if used > bound {
             return Err(err(
                 "limit",

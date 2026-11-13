@@ -1,7 +1,7 @@
 //! The handshake as states that consume themselves.
 
 use zmux::proto::seal::{
-    Error, Framing, Mode, Opener, Payload, Sealer, Secret, export, frame, put_varint,
+    Error, Framing, Opener, Payload, RecordMode, Sealer, Secret, export, frame, put_varint,
 };
 
 use crate::derive::exporter_secret;
@@ -14,7 +14,7 @@ const BINDING_LEN: usize = 32;
 
 /// The Noise prologue. A sender's `binding` is present exactly when `mode` is Bound;
 /// a responder mixes what it has, and any disagreement is `auth`.
-pub fn prologue(profile: Profile, mode: Mode, handle: &[u8], binding: &[u8]) -> Vec<u8> {
+pub fn prologue(profile: Profile, mode: RecordMode, handle: &[u8], binding: &[u8]) -> Vec<u8> {
     let mut out = b"zmux-seal".to_vec();
     put_varint(&mut out, profile.value());
     out.push(mode.byte());
@@ -103,13 +103,17 @@ fn check_received(
 /// before any byte is sent.
 fn check_sender(
     profile: Profile,
-    mode: Mode,
+    mode: RecordMode,
     handle: &[u8],
     psk: &[u8],
     static_secret: &[u8],
     binding: &[u8],
 ) -> Result<(), Error> {
-    let binding_len = if mode == Mode::Bound { BINDING_LEN } else { 0 };
+    let binding_len = if mode == RecordMode::Bound {
+        BINDING_LEN
+    } else {
+        0
+    };
     let fits = handle_fits(profile, handle)
         && psk.len() == profile.psk_len().unwrap_or(0)
         && static_secret.len() == profile.0.dh.private_len
@@ -138,7 +142,7 @@ pub struct InitiatorConfig<'a> {
     /// The Profile.
     pub profile: Profile,
     /// The record mode.
-    pub mode: Mode,
+    pub mode: RecordMode,
     /// The carrier's framing.
     pub framing: Framing,
     /// The Handle, empty for a Profile without one.
@@ -149,17 +153,17 @@ pub struct InitiatorConfig<'a> {
     pub static_secret: &'a [u8],
     /// The Binding in Bound mode, otherwise empty.
     pub binding: &'a [u8],
-    /// The largest application data of a received message; 0 is
-    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), and `usize::MAX` sets no
-    /// bound beyond the message: a local safety bound, not a protocol limit.
-    pub max_app_data: usize,
+    /// The largest application data of a received message, in bytes; `None` sets no
+    /// bound beyond the message. A local safety bound, not a protocol limit; the usual
+    /// value is [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA).
+    pub max_app_data: Option<usize>,
 }
 
 /// A client before its Hello.
 pub struct Initiator {
     engine: Engine,
     profile: Profile,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     handle: Vec<u8>,
 }
@@ -238,7 +242,7 @@ impl Initiator {
 /// A client waiting for the Reply.
 pub struct AwaitReply {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
 }
 
@@ -268,7 +272,7 @@ impl AwaitReply {
 /// Dropping this value rejects the server.
 pub struct Verify {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     payload: Payload,
 }
@@ -317,7 +321,7 @@ impl Verify {
 /// A client ready to write the third message.
 pub struct Finish {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
 }
 
@@ -352,7 +356,7 @@ impl Finish {
 /// A Finish waiting for the signature of its proof.
 pub struct SignFinish {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     pending: Pending,
 }
@@ -373,7 +377,7 @@ impl SignFinish {
 }
 
 /// What a server looks up once it has parsed a Hello.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ResponderKeys<'a> {
     /// The pre-shared key, empty for a Profile without one.
     pub psk: &'a [u8],
@@ -381,13 +385,82 @@ pub struct ResponderKeys<'a> {
     pub static_secret: &'a [u8],
     /// The Binding in Bound mode, otherwise empty.
     pub binding: &'a [u8],
-    /// The largest application data of a received message; 0 is
-    /// [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA), and `usize::MAX` sets no
-    /// bound beyond the message: a local safety bound, not a protocol limit.
-    pub max_app_data: usize,
+    /// The largest application data of a received message, in bytes; `None` sets no
+    /// bound beyond the message. A local safety bound, not a protocol limit; the usual
+    /// value is [`DEFAULT_MAX_APP_DATA`](crate::DEFAULT_MAX_APP_DATA).
+    pub max_app_data: Option<usize>,
+}
+
+impl Default for ResponderKeys<'_> {
+    /// No keys and the default bound on application data.
+    fn default() -> Self {
+        ResponderKeys {
+            psk: &[],
+            static_secret: &[],
+            binding: &[],
+            max_app_data: Some(crate::DEFAULT_MAX_APP_DATA),
+        }
+    }
+}
+
+/// A redacted `Debug` of a handshake state: its mode and framing, never its keys.
+macro_rules! redacted_debug {
+    ($($t:ident { $($f:ident),* }),* $(,)?) => {$(
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($t))
+                    $(.field(stringify!($f), &self.$f))*
+                    .finish_non_exhaustive()
+            }
+        }
+    )*};
+}
+
+redacted_debug! {
+    Initiator { profile, mode, framing },
+    AwaitReply { mode, framing },
+    Verify { mode, framing },
+    Finish { mode, framing },
+    SignFinish { mode, framing },
+    ResponderReply { mode, framing },
+    SignReply { mode, framing },
+    AwaitFinish { mode },
+    Complete { mode, initiator },
+}
+
+impl std::fmt::Debug for InitiatorConfig<'_> {
+    /// The pre-shared key and the static key are redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitiatorConfig")
+            .field("profile", &self.profile)
+            .field("mode", &self.mode)
+            .field("framing", &self.framing)
+            .field("handle", &self.handle)
+            .field("binding", &self.binding)
+            .field("max_app_data", &self.max_app_data)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResponderKeys<'_> {
+    /// The pre-shared key and the static key are redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponderKeys")
+            .field("binding", &self.binding)
+            .field("max_app_data", &self.max_app_data)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for HandshakeExporter {
+    /// The exporter secret is redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeExporter").finish_non_exhaustive()
+    }
 }
 
 /// A server entrance.
+#[derive(Debug)]
 pub struct Responder;
 
 impl Responder {
@@ -419,13 +492,16 @@ impl Responder {
         kem: Option<Secret>,
     ) -> Result<(ResponderReply, Payload), Error> {
         let (profile, mode) = (hello.profile, hello.mode);
+        // A Binding is empty or BINDING_LEN bytes; whether it suits the received Mode
+        // is not judged here, and any disagreement is auth.
         if keys.psk.len() != profile.psk_len().unwrap_or(keys.psk.len())
             || keys.static_secret.len() != profile.0.dh.private_len
+            || !matches!(keys.binding.len(), 0 | BINDING_LEN)
         {
             return Err(Error::InvalidConfig);
         }
         // A first message in Bound and no Binding here: refused, unread.
-        if mode == Mode::Bound && keys.binding.is_empty() {
+        if mode == RecordMode::Bound && keys.binding.is_empty() {
             return Err(Error::Auth);
         }
         let prologue = prologue(profile, mode, hello.handle, keys.binding);
@@ -456,7 +532,7 @@ impl Responder {
 /// A server ready to write the Reply.
 pub struct ResponderReply {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
 }
 
@@ -497,7 +573,7 @@ impl ResponderReply {
 /// A Reply waiting for the signature of its proof.
 pub struct SignReply {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
     framing: Framing,
     pending: Pending,
 }
@@ -526,7 +602,7 @@ impl SignReply {
 /// A server waiting for the Finish.
 pub struct AwaitFinish {
     engine: Engine,
-    mode: Mode,
+    mode: RecordMode,
 }
 
 impl AwaitFinish {
@@ -556,12 +632,12 @@ impl AwaitFinish {
 pub struct Complete {
     finished: Finished,
     exporter_secret: Secret,
-    mode: Mode,
+    mode: RecordMode,
     initiator: bool,
 }
 
 impl Complete {
-    fn new(engine: Engine, mode: Mode, initiator: bool) -> Result<Complete, Error> {
+    fn new(engine: Engine, mode: RecordMode, initiator: bool) -> Result<Complete, Error> {
         let finished = engine.finish();
         let exporter_secret = Secret::from(exporter_secret(
             Profile(finished.params),
@@ -577,7 +653,7 @@ impl Complete {
     }
 
     /// The record mode.
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
@@ -626,7 +702,7 @@ impl Complete {
 
     /// The record keys in Sealed mode; `None` otherwise, where records are raw.
     pub fn into_records(self) -> Option<(Sealer, Opener)> {
-        if self.mode != Mode::Sealed {
+        if self.mode != RecordMode::Sealed {
             return None;
         }
         let cipher = (self.finished.params.cipher)();

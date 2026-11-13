@@ -159,7 +159,7 @@ async fn echoed_with(config: Config, first: Link, joined: Link) -> (usize, u64, 
         .iter()
         .find(|p| p.pipe.get() == 0)
         .map_or(0, |p| p.bytes_sent);
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     (
         got,
         stats.bytes_reinjected,

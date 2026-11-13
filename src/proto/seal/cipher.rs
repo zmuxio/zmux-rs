@@ -1,7 +1,7 @@
 //! The AEADs and the hash named by the Suite and Profile tables.
 
 use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
+use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Nonce, Payload, Tag};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
 
@@ -11,6 +11,10 @@ use crate::proto::keys::{hkdf_expand, hkdf_extract};
 type SealFn = fn(&[u8], u64, &[u8], &[u8]) -> Vec<u8>;
 type ExpandFn = fn(&[u8], &[u8], usize) -> Result<Vec<u8>, Error>;
 type OpenFn = fn(&[u8], u64, &[u8], &[u8]) -> Result<Vec<u8>, Error>;
+type KeyedFn = fn(&[u8]) -> Keyed;
+
+/// The tag length of every AEAD of the tables.
+pub(crate) const TAG_LEN: usize = 16;
 
 /// An AEAD with its parameters.
 #[derive(Debug)]
@@ -20,6 +24,7 @@ pub struct Cipher {
     rekey_interval: u64,
     seal: SealFn,
     open: OpenFn,
+    keyed: KeyedFn,
 }
 
 impl Cipher {
@@ -58,6 +63,73 @@ impl Cipher {
     ) -> Result<Vec<u8>, Error> {
         (self.open)(key, n, aad, ciphertext)
     }
+
+    /// The AEAD with `key` expanded, for the records of one key.
+    pub(crate) fn keyed(&self, key: &[u8]) -> Keyed {
+        (self.keyed)(key)
+    }
+}
+
+/// An AEAD instance with its key expanded: built once per key, it seals and
+/// opens records in place. Dropped, its key schedule is overwritten.
+pub(crate) enum Keyed {
+    /// Boxed: its key schedule is large, and it is built once per key.
+    Aes(Box<Aes256Gcm>),
+    #[cfg(feature = "seal-chacha")]
+    ChaCha(chacha20poly1305::ChaCha20Poly1305),
+}
+
+impl Keyed {
+    /// Encrypts `msg` in place with counter `n` and no AAD; the tag.
+    pub(crate) fn seal_in_place(&self, n: u64, msg: &mut [u8]) -> [u8; TAG_LEN] {
+        match self {
+            Self::Aes(c) => seal_in_place_with(&**c, nonce_be(n), msg),
+            #[cfg(feature = "seal-chacha")]
+            Self::ChaCha(c) => seal_in_place_with(c, chacha::nonce_le(n), msg),
+        }
+    }
+
+    /// Decrypts `msg` in place with counter `n` and no AAD against `tag`.
+    /// On failure `msg` holds no plaintext the caller may use.
+    pub(crate) fn open_in_place(
+        &self,
+        n: u64,
+        msg: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Error> {
+        match self {
+            Self::Aes(c) => open_in_place_with(&**c, nonce_be(n), msg, tag),
+            #[cfg(feature = "seal-chacha")]
+            Self::ChaCha(c) => open_in_place_with(c, chacha::nonce_le(n), msg, tag),
+        }
+    }
+}
+
+fn seal_in_place_with<C: AeadInOut>(cipher: &C, nonce: [u8; 12], msg: &mut [u8]) -> [u8; TAG_LEN]
+where
+    Nonce<C>: From<[u8; 12]>,
+{
+    let tag = cipher
+        .encrypt_inout_detached(&Nonce::<C>::from(nonce), b"", msg.into())
+        .expect("record limits are below the AEAD limit");
+    let mut out = [0; TAG_LEN];
+    out.copy_from_slice(&tag);
+    out
+}
+
+fn open_in_place_with<C: AeadInOut>(
+    cipher: &C,
+    nonce: [u8; 12],
+    msg: &mut [u8],
+    tag: &[u8; TAG_LEN],
+) -> Result<(), Error>
+where
+    Nonce<C>: From<[u8; 12]>,
+{
+    let tag = Tag::<C>::try_from(&tag[..]).map_err(|_| Error::InvalidConfig)?;
+    cipher
+        .decrypt_inout_detached(&Nonce::<C>::from(nonce), b"", msg.into(), &tag)
+        .map_err(|_| Error::Auth)
 }
 
 fn seal_with<C: Aead + KeyInit>(key: &[u8], nonce: [u8; 12], aad: &[u8], msg: &[u8]) -> Vec<u8>
@@ -99,6 +171,11 @@ pub(super) static AES_256_GCM: Cipher = Cipher {
     rekey_interval: 1 << 20,
     seal: |k, n, a, m| seal_with::<Aes256Gcm>(k, nonce_be(n), a, m),
     open: |k, n, a, m| open_with::<Aes256Gcm>(k, nonce_be(n), a, m),
+    keyed: |k| {
+        Keyed::Aes(Box::new(
+            Aes256Gcm::new_from_slice(k).expect("key length comes from the table"),
+        ))
+    },
 };
 
 /// AES-256-GCM with a big-endian counter.
@@ -110,9 +187,11 @@ pub fn aes_256_gcm() -> &'static Cipher {
 pub(super) mod chacha {
     use chacha20poly1305::ChaCha20Poly1305;
 
-    use super::{Cipher, open_with, seal_with};
+    use chacha20poly1305::aead::KeyInit;
 
-    fn nonce_le(n: u64) -> [u8; 12] {
+    use super::{Cipher, Keyed, open_with, seal_with};
+
+    pub(super) fn nonce_le(n: u64) -> [u8; 12] {
         let mut nonce = [0; 12];
         nonce[4..].copy_from_slice(&n.to_le_bytes());
         nonce
@@ -124,6 +203,11 @@ pub(super) mod chacha {
         rekey_interval: 1 << 20,
         seal: |k, n, a, m| seal_with::<ChaCha20Poly1305>(k, nonce_le(n), a, m),
         open: |k, n, a, m| open_with::<ChaCha20Poly1305>(k, nonce_le(n), a, m),
+        keyed: |k| {
+            Keyed::ChaCha(
+                ChaCha20Poly1305::new_from_slice(k).expect("key length comes from the table"),
+            )
+        },
     };
 }
 

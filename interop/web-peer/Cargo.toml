@@ -1,0 +1,27 @@
+[package]
+name = "zmux-web-peer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Scripted zmux WebSocket and HTTP streaming peers for cross-implementation interoperability tests"
+
+# Standalone: not a member of the zmux workspace.
+#   cargo build --release --locked --manifest-path interop/web-peer/Cargo.toml
+[workspace]
+
+[dependencies]
+bytes = "1"
+http = "1"
+tokio = { version = "1.54", features = ["full"] }
+zmux = { path = "../.." }
+zmux-http = { path = "../../adapter/http" }
+zmux-websocket = { path = "../../adapter/websocket" }
+
+[[bin]]
+name = "zmux-ws-peer"
+path = "src/bin/ws.rs"
+
+[[bin]]
+name = "zmux-http-peer"
+path = "src/bin/http.rs"

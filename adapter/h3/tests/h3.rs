@@ -11,10 +11,10 @@ use std::time::Duration;
 use bytes::Buf;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zmux::{
-    Admission, Config, Listener, ListenerConfig, PipeAuth, PipeFailure, PipeOptions, PrefixAuth,
-    PrefixAuthVerifier, Session, SessionError, Verdict,
+    Admission, AdmissionVerdict, Config, Listener, ListenerConfig, PipeAuth, PipeFailure,
+    PipeOptions, PrefixAuth, PrefixAuthVerifier, Session, SessionError,
 };
-use zmux_h3::{H3Client, H3Fallback, Options};
+use zmux_h3::{Carrier, Fallback, Options};
 
 /// A served HTTP/3 endpoint and a client endpoint for it over loopback.
 struct H3 {
@@ -76,14 +76,14 @@ impl H3 {
     }
 
     /// A client of a new connection.
-    async fn h3_client(&self, opts: &Options) -> H3Client {
+    async fn h3_client(&self, opts: &Options) -> Carrier {
         let conn = self
             .client
             .connect(self.addr, "127.0.0.1")
             .unwrap()
             .await
             .unwrap();
-        H3Client::new(conn, self.uri.clone(), opts).await.unwrap()
+        Carrier::new(conn, self.uri.clone(), opts).await.unwrap()
     }
 
     async fn stop(self) {
@@ -149,8 +149,8 @@ async fn connect_and_serve() {
     assert_kind([&client, &server], zmux::CarrierKind::Http3);
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(0u32.into(), b"bye").await;
-    let e = tokio::time::timeout(Duration::from_secs(10), server.closed())
+    client.close().await;
+    let e = tokio::time::timeout(Duration::from_secs(10), server.closing())
         .await
         .expect("closed");
     assert!(
@@ -188,7 +188,7 @@ async fn client_lanes_and_a_second_pipe_on_further_requests() {
         .expect("joined in time")
         .unwrap();
     transfer(&ss, &cs, 4, 256 << 10).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     h3.stop().await;
 }
 
@@ -199,9 +199,9 @@ async fn a_bound_join_on_a_further_request() {
     let opts = Options::default();
     let mut config = Config::multipath(PipeAuth::exporter().with_end_to_end());
     // Bound joins only when the carrier says it is secure.
-    config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(Arc::new(
-        |c, mode, _| mode != zmux::proto::seal::Mode::Bound || c.secure,
-    )));
+    config.allow_record_mode = Some(zmux::AllowRecordMode::new(|c, mode, _| {
+        mode != zmux::RecordMode::Bound || c.secure
+    }));
     let h3 = H3::new(config.clone(), &opts);
     let client = h3.h3_client(&opts).await;
     let cs = Session::connect(client.open_pipe().await.unwrap(), config)
@@ -211,7 +211,7 @@ async fn a_bound_join_on_a_further_request() {
     let pipe = cs
         .begin_add_pipe(
             client.open_pipe().await.unwrap(),
-            PipeOptions::new().with_mode(zmux::proto::seal::Mode::Bound),
+            PipeOptions::new().with_record_mode(zmux::RecordMode::Bound),
         )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
@@ -219,7 +219,7 @@ async fn a_bound_join_on_a_further_request() {
         .expect("joined in time")
         .unwrap();
     transfer(&ss, &cs, 4, 256 << 10).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     h3.stop().await;
 }
 
@@ -252,7 +252,7 @@ async fn the_exporter_does_not_keep_the_connection() {
         ss.export_keying_material("app", b"", 16).unwrap()
     );
     drop(client);
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     exporter_goes_away(&cs).await;
     exporter_goes_away(&ss).await;
     h3.stop().await;
@@ -272,7 +272,7 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     transfer(&cs, &ss, 2, 64 << 10).await;
     client.connection().close(7u32.into(), b"gone");
     for s in [&cs, &ss] {
-        let e = tokio::time::timeout(Duration::from_secs(10), s.closed())
+        let e = tokio::time::timeout(Duration::from_secs(10), s.closing())
             .await
             .expect("ended");
         assert!(
@@ -355,7 +355,7 @@ async fn admitted_requests_with_tokens_on_pipes_and_lanes() {
         Config::multipath(PipeAuth::psk(*b"zmux-h3-adapter-test-psk-0123456").with_end_to_end());
     let h3 = H3::admitted(config.clone(), admission(), &Options::default());
     let client = h3
-        .h3_client(&Options::default().with_credential(Arc::new(auth())))
+        .h3_client(&Options::default().with_carrier_credential(Arc::new(auth())))
         .await;
     let cs = Session::connect(client.open_pipe().await.unwrap(), config)
         .await
@@ -367,7 +367,7 @@ async fn admitted_requests_with_tokens_on_pipes_and_lanes() {
     transfer(&cs, &ss, 8, 1 << 20).await;
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
     transfer(&ss, &cs, 2, 64 << 10).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     h3.stop().await;
 }
 
@@ -376,7 +376,7 @@ async fn admitted_requests_with_tokens_on_pipes_and_lanes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_without_a_token_goes_to_the_fallback_with_its_bytes() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = H3Fallback::new(move |mut req| {
+    let fallback = Fallback::new(move |mut req| {
         let tx = tx.clone();
         async move {
             let mut body = req.prefix.to_vec();
@@ -403,7 +403,7 @@ async fn a_request_without_a_token_goes_to_the_fallback_with_its_bytes() {
 /// without a response once the stall is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_request_ends_without_a_response() {
-    let adm = Admission::new(4, |_, _| Verdict::Stall)
+    let adm = Admission::new(4, |_, _| AdmissionVerdict::Stall)
         .with_peek_timeout(Duration::from_secs(5))
         .with_stall_interval(Duration::from_millis(300), Duration::from_millis(300));
     let h3 = H3::admitted(Config::default(), adm, &Options::default());
@@ -464,8 +464,8 @@ async fn datagrams_ride_http_datagrams_of_the_request() {
         assert_eq!(s.datagrams_sent_channel, 20);
         assert_eq!(c.datagrams_received_channel, 20);
         assert_eq!(s.datagrams_received_channel, c.datagrams_sent_channel);
-        client.close(0u32.into(), b"bye").await;
-        let _ = server.closed().await;
+        client.close().await;
+        let _ = server.closing().await;
         h3.stop().await;
     })
     .await
@@ -479,7 +479,7 @@ async fn the_source_behind_a_trusted_proxy_is_the_forwarded_client() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let admission = Admission::new(0, move |info, _| {
         let _ = tx.send(info.source);
-        Verdict::Close
+        AdmissionVerdict::Close
     });
     let mut lc = ListenerConfig::default();
     lc.trusted_proxies = zmux::TrustedProxies::new()

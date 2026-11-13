@@ -1,10 +1,9 @@
-//! The exchange carrier's bodies: the request prefix, the response, their
-//! MACs and the body encoding.
+//! The exchange carrier's bodies: the request's authentication header and
+//! Data MAC, the response, their MACs and the body encoding.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::{BufMut, Bytes, BytesMut};
-use zmux::proto::varint;
 use zmux::util::HmacSha256;
 
 use super::BodyEncoding;
@@ -13,12 +12,20 @@ use super::BodyEncoding;
 const KEY_LABEL: &[u8] = b"zmux-http-exchange/1";
 /// The length of a truncated MAC.
 pub(crate) const MAC_LEN: usize = 16;
+/// The header fields the Header MAC covers: Carrier ID, Kind, Flags,
+/// Sequence, Down Ack, Time, Nonce and Data Length.
+const SIGNED_LEN: usize = 16 + 1 + 1 + 8 + 8 + 4 + 8 + 4;
+/// The length of a request's authentication header.
+pub(crate) const HEADER_LEN: usize = SIGNED_LEN + MAC_LEN;
+/// What a request body holds besides its Data: the authentication header
+/// and the Data MAC.
+pub(crate) const REQUEST_OVERHEAD: usize = HEADER_LEN + MAC_LEN;
 /// The length of a response's MAC and flags.
 pub(crate) const RESPONSE_HEAD: usize = MAC_LEN + 1;
-/// The longest request prefix: two 8-byte variable-length integers.
-pub(crate) const MAX_PREFIX: usize = 16 + 1 + 1 + 8 + 8 + 4 + 8 + MAC_LEN;
 /// The longest CLOSE reason.
 pub(crate) const MAX_REASON: usize = 256;
+/// The longest Data a request can declare.
+pub(crate) const MAX_DATA: usize = u32::MAX as usize;
 
 /// The clock in seconds since 1970-01-01T00:00:00Z.
 pub(crate) fn unix_seconds() -> u64 {
@@ -41,6 +48,12 @@ pub(crate) enum Kind {
     Up = 1,
     Down = 2,
     Close = 3,
+}
+
+impl From<Kind> for u8 {
+    fn from(k: Kind) -> u8 {
+        k as u8
+    }
 }
 
 impl Kind {
@@ -85,9 +98,22 @@ impl Key {
         self.0.verify(parts, tag)
     }
 
-    /// The MAC of a response to the request `to`.
+    /// The parts the MAC of a response with `flags` and `data` to `to`
+    /// covers, given `seq` as `to.seq` encoded.
+    fn response_parts<'a>(
+        to: &'a Answering<'a>,
+        seq: &'a [u8; 8],
+        flags: &'a [u8; 1],
+        kind: &'a [u8; 1],
+        data: &'a [u8],
+    ) -> [&'a [u8]; 7] {
+        [b"R", to.cid, kind, seq, to.nonce, flags, data]
+    }
+
+    /// The MAC of a response with `flags` and `data` to the request `to`.
     fn response_tag(&self, to: &Answering<'_>, flags: u8, data: &[u8]) -> [u8; MAC_LEN] {
-        self.tag(&[b"R", to.cid, &[to.kind], to.seq, to.nonce, &[flags], data])
+        let seq = to.seq.to_be_bytes();
+        self.tag(&Self::response_parts(to, &seq, &[flags], &[to.kind], data))
     }
 }
 
@@ -96,27 +122,27 @@ pub(crate) struct Answering<'a> {
     pub(crate) cid: &'a CarrierId,
     /// The Kind byte as sent.
     pub(crate) kind: u8,
-    /// The Sequence in its variable-length encoding as sent.
-    pub(crate) seq: &'a [u8],
+    pub(crate) seq: u64,
     pub(crate) nonce: &'a [u8; 8],
 }
 
-/// A request to send: its prefix (everything before Data) and what its
-/// response must be bound to.
+/// A request to send: its authentication header, its Data MAC, and what
+/// its response must be bound to.
 pub(crate) struct Outgoing {
-    pub(crate) prefix: Bytes,
-    seq: [u8; 8],
-    seq_len: usize,
+    pub(crate) header: Bytes,
+    pub(crate) data_mac: Bytes,
+    seq: u64,
     nonce: [u8; 8],
 }
 
 impl Outgoing {
-    /// The request prefix for `data`, its MAC computed with `key`.
+    /// The header and Data MAC of a request carrying `data` (at most
+    /// [`MAX_DATA`] bytes), computed with `key`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key: &Key,
         cid: &CarrierId,
-        kind: Kind,
+        kind: impl Into<u8>,
         flags: u8,
         seq: u64,
         ack: u64,
@@ -124,56 +150,53 @@ impl Outgoing {
         nonce: [u8; 8],
         data: &[u8],
     ) -> Self {
-        let mut s = [0; 8];
-        let seq_len = varint::encode(seq, &mut s).expect("piece numbers stay below 2^62");
-        let mut a = [0; 8];
-        let ack_len = varint::encode(ack, &mut a).expect("piece numbers stay below 2^62");
-        let mut p = BytesMut::with_capacity(MAX_PREFIX);
-        p.put_slice(cid);
-        p.put_u8(kind as u8);
-        p.put_u8(flags);
-        p.put_slice(&s[..seq_len]);
-        p.put_slice(&a[..ack_len]);
-        p.put_u32(time);
-        p.put_slice(&nonce);
-        let tag = key.tag(&[b"Q", &p, data]);
-        p.put_slice(&tag);
+        let len = u32::try_from(data.len()).expect("pieces stay within MAX_DATA");
+        let mut h = BytesMut::with_capacity(HEADER_LEN);
+        h.put_slice(cid);
+        h.put_u8(kind.into());
+        h.put_u8(flags);
+        h.put_u64(seq);
+        h.put_u64(ack);
+        h.put_u32(time);
+        h.put_slice(&nonce);
+        h.put_u32(len);
+        let header_mac = key.tag(&[b"Q", &h]);
+        h.put_slice(&header_mac);
+        let data_mac = key.tag(&[b"D", &header_mac, data]);
         Self {
-            prefix: p.freeze(),
-            seq: s,
-            seq_len,
+            header: h.freeze(),
+            data_mac: Bytes::copy_from_slice(&data_mac),
+            seq,
             nonce,
         }
     }
 
     /// Whether `resp` is a response to this request, by its MAC.
-    pub(crate) fn verifies(&self, key: &Key, cid: &CarrierId, kind: Kind, resp: &Response) -> bool {
+    pub(crate) fn verifies(
+        &self,
+        key: &Key,
+        cid: &CarrierId,
+        kind: impl Into<u8>,
+        resp: &Response,
+    ) -> bool {
         let to = Answering {
             cid,
-            kind: kind as u8,
-            seq: &self.seq[..self.seq_len],
+            kind: kind.into(),
+            seq: self.seq,
             nonce: &self.nonce,
         };
-        key.check(
-            &[
-                b"R",
-                to.cid,
-                &[to.kind],
-                to.seq,
-                to.nonce,
-                &[resp.flags],
-                &resp.data,
-            ],
-            &resp.mac,
-        )
+        let seq = to.seq.to_be_bytes();
+        let (flags, kind) = ([resp.flags], [to.kind]);
+        let parts = Key::response_parts(&to, &seq, &flags, &kind, &resp.data);
+        key.check(&parts, &resp.mac)
     }
 }
 
-/// A received request, before its MAC is checked.
+/// A received authentication header, before its MAC is checked.
 #[derive(Debug)]
-pub(crate) struct Request {
+pub(crate) struct Header {
     pub(crate) cid: CarrierId,
-    /// The Kind byte as received (validated after the MAC).
+    /// The Kind byte as received (validated after the MACs).
     kind: u8,
     pub(crate) flags: u8,
     pub(crate) seq: u64,
@@ -181,69 +204,75 @@ pub(crate) struct Request {
     /// The client's clock in seconds modulo 2^32.
     pub(crate) time: u32,
     pub(crate) nonce: [u8; 8],
-    /// The body up to the MAC, as received.
-    signed: Bytes,
-    /// The Sequence's encoding within `signed`.
-    seq_at: (usize, usize),
-    mac: [u8; MAC_LEN],
-    pub(crate) data: Bytes,
+    /// The declared length of Data.
+    pub(crate) data_len: u32,
+    /// The header as received.
+    raw: [u8; HEADER_LEN],
 }
 
-impl Request {
-    /// Parses the binary body of a request; `None` when it does not hold a
-    /// complete request header.
-    pub(crate) fn parse(body: Bytes) -> Option<Self> {
-        let mut at = 16 + 2;
-        if body.len() < at {
-            return None;
-        }
+impl Header {
+    /// The fields of the binary header `raw`.
+    pub(crate) fn parse(raw: [u8; HEADER_LEN]) -> Self {
+        let u64_at = |at: usize| u64::from_be_bytes(raw[at..at + 8].try_into().expect("8 bytes"));
+        let u32_at = |at: usize| u32::from_be_bytes(raw[at..at + 4].try_into().expect("4 bytes"));
         let mut cid = [0; 16];
-        cid.copy_from_slice(&body[..16]);
-        let (kind, flags) = (body[16], body[17]);
-        let (seq, n) = varint::decode(&body[at..])?;
-        let seq_at = (at, n);
-        at += n;
-        let (ack, n) = varint::decode(&body[at..])?;
-        at += n;
-        let time = body
-            .get(at..at + 4)
-            .map(|s| u32::from_be_bytes(s.try_into().expect("4 bytes")))?;
-        at += 4;
-        let nonce: [u8; 8] = body.get(at..at + 8).and_then(|s| s.try_into().ok())?;
-        at += 8;
-        let mac: [u8; MAC_LEN] = body.get(at..at + MAC_LEN).and_then(|s| s.try_into().ok())?;
-        Some(Self {
+        cid.copy_from_slice(&raw[..16]);
+        let mut nonce = [0; 8];
+        nonce.copy_from_slice(&raw[38..46]);
+        Self {
             cid,
-            kind,
-            flags,
-            seq,
-            ack,
-            time,
+            kind: raw[16],
+            flags: raw[17],
+            seq: u64_at(18),
+            ack: u64_at(26),
+            time: u32_at(34),
             nonce,
-            signed: body.slice(..at),
-            seq_at,
-            mac,
-            data: body.slice(at + MAC_LEN..),
-        })
+            data_len: u32_at(46),
+            raw,
+        }
     }
 
-    /// Whether the request MAC verifies with `key` (constant time).
+    /// The Header MAC as received.
+    fn mac(&self) -> &[u8] {
+        &self.raw[SIGNED_LEN..]
+    }
+
+    /// Whether the Header MAC verifies with `key` (constant time).
     pub(crate) fn authentic(&self, key: &Key) -> bool {
-        key.check(&[b"Q", &self.signed, &self.data], &self.mac)
+        key.check(&[b"Q", &self.raw[..SIGNED_LEN]], self.mac())
+    }
+
+    /// Whether `tag` is the Data MAC of `data` after this header
+    /// (constant time).
+    pub(crate) fn data_authentic(&self, key: &Key, data: &[u8], tag: &[u8]) -> bool {
+        key.check(&[b"D", self.mac(), data], tag)
+    }
+
+    /// The longest Data the request's Kind allows, `up` for UP and 0 for a
+    /// Kind the binding does not define.
+    pub(crate) fn data_limit(&self, up: usize) -> usize {
+        match Kind::from_byte(self.kind) {
+            Some(Kind::Up) => up,
+            Some(Kind::Down) => 0,
+            Some(Kind::Close) => MAX_REASON,
+            // An undefined Kind carries no Data: one with none is
+            // authenticated, and then malformed.
+            None => 0,
+        }
     }
 
     /// The request's kind, or `None` when its Kind, Flags, Sequence or
-    /// Data break the rules of the binding.
-    pub(crate) fn valid_kind(&self) -> Option<Kind> {
+    /// `data` break the rules of the binding.
+    pub(crate) fn valid_kind(&self, data: &[u8]) -> Option<Kind> {
         let kind = Kind::from_byte(self.kind)?;
         let valid = match kind {
             Kind::Up => self.flags & !REQ_FIN == 0,
-            Kind::Down => self.flags == 0 && self.data.is_empty(),
+            Kind::Down => self.flags == 0 && data.is_empty(),
             Kind::Close => {
                 self.flags == 0
                     && self.seq == 0
-                    && self.data.len() <= MAX_REASON
-                    && std::str::from_utf8(&self.data).is_ok()
+                    && data.len() <= MAX_REASON
+                    && std::str::from_utf8(data).is_ok()
             }
         };
         valid.then_some(kind)
@@ -254,7 +283,7 @@ impl Request {
         Answering {
             cid: &self.cid,
             kind: self.kind,
-            seq: &self.signed[self.seq_at.0..self.seq_at.0 + self.seq_at.1],
+            seq: self.seq,
             nonce: &self.nonce,
         }
     }
@@ -302,25 +331,38 @@ impl Response {
     }
 }
 
-/// An HTTP body of the binary body `head` then `tail`, in `encoding`.
-pub(crate) fn encode_body(encoding: BodyEncoding, head: Bytes, tail: Bytes) -> (Bytes, Bytes) {
+/// An HTTP body of the binary body made of `parts`, in `encoding`: the
+/// parts as they are, or their base64 form in the first part.
+pub(crate) fn encode_body<const N: usize>(encoding: BodyEncoding, parts: [Bytes; N]) -> [Bytes; N] {
     match encoding {
-        BodyEncoding::Binary => (head, tail),
+        BodyEncoding::Binary => parts,
         BodyEncoding::Base64 => {
-            let mut bin = Vec::with_capacity(head.len() + tail.len());
-            bin.extend_from_slice(&head);
-            bin.extend_from_slice(&tail);
-            (Bytes::from(BASE64.encode(bin)), Bytes::new())
+            let mut bin = Vec::with_capacity(parts.iter().map(Bytes::len).sum());
+            for p in &parts {
+                bin.extend_from_slice(p);
+            }
+            let mut out: [Bytes; N] = std::array::from_fn(|_| Bytes::new());
+            if let Some(first) = out.first_mut() {
+                *first = Bytes::from(BASE64.encode(bin));
+            }
+            out
         }
     }
 }
 
-/// The binary body of an HTTP body in `encoding`.
+/// The binary form of `body`, in `encoding`: a whole HTTP body, or a part
+/// of one that starts at a multiple of 4 characters in base64.
 pub(crate) fn decode_body(encoding: BodyEncoding, body: Bytes) -> Option<Bytes> {
     match encoding {
         BodyEncoding::Binary => Some(body),
         BodyEncoding::Base64 => BASE64.decode(&body).ok().map(Bytes::from),
     }
+}
+
+/// Decodes base64 `encoded` into `out` without allocating: the length
+/// decoded, or `None` when it is not base64 or does not fit.
+pub(crate) fn decode_base64_into(encoded: &[u8], out: &mut [u8]) -> Option<usize> {
+    BASE64.decode_slice(encoded, out).ok()
 }
 
 /// The length of an HTTP body in `encoding` whose binary form has `len`
@@ -336,6 +378,22 @@ pub(crate) fn encoded_len(encoding: BodyEncoding, len: usize) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn base64_decodes_into_a_slice() {
+        let mut out = [0; HEADER_LEN];
+        let bin: Vec<u8> = (0..HEADER_LEN as u8).collect();
+        let enc = BASE64.encode(&bin);
+        assert_eq!(
+            decode_base64_into(enc.as_bytes(), &mut out),
+            Some(HEADER_LEN)
+        );
+        assert_eq!(out[..], bin[..]);
+        // Too long for the slice, or not base64.
+        let long = BASE64.encode([0; HEADER_LEN + 3]);
+        assert_eq!(decode_base64_into(long.as_bytes(), &mut out), None);
+        assert_eq!(decode_base64_into(&[b'!'; 88], &mut out), None);
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -345,46 +403,53 @@ mod tests {
 
     use zmux::util::hex as to_hex;
 
-    #[derive(Debug, PartialEq)]
-    enum Verdict {
-        Mac,
-        Invalid,
-    }
-
-    impl Request {
-        fn verify(&self, key: &Key) -> Result<Kind, Verdict> {
-            if !self.authentic(key) {
-                return Err(Verdict::Mac);
-            }
-            self.valid_kind().ok_or(Verdict::Invalid)
-        }
-    }
-
     const CID: CarrierId = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const NONCE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const TIME: u32 = 1_767_225_600;
 
-    /// The test vectors of the binding: both requests and both
-    /// responses as each side builds them, and as the other parses and
-    /// verifies them.
+    /// A received request body as the server takes it apart: its header,
+    /// then its Data and Data MAC, both MACs checked, then its kind.
+    fn verify(key: &Key, body: &[u8]) -> Result<(Header, Kind), &'static str> {
+        let h = Header::parse(body[..HEADER_LEN].try_into().unwrap());
+        if !h.authentic(key) {
+            return Err("header mac");
+        }
+        if body.len() != REQUEST_OVERHEAD + h.data_len as usize {
+            return Err("length");
+        }
+        let (data, tag) = body[HEADER_LEN..].split_at(h.data_len as usize);
+        if !h.data_authentic(key, data, tag) {
+            return Err("data mac");
+        }
+        let kind = h.valid_kind(data).ok_or("invalid")?;
+        Ok((h, kind))
+    }
+
+    fn body(out: &Outgoing, data: &[u8]) -> Vec<u8> {
+        [&out.header[..], data, &out.data_mac[..]].concat()
+    }
+
+    /// The test vectors of the binding: both requests and both responses
+    /// as each side builds them, and as the other parses and verifies
+    /// them.
     #[test]
     fn test_vectors() {
         let cases = [
             (
                 Vec::new(),
                 "8e08f7810b828921459c8d8c4f1be67963269408f5e7179f7f0df94d417723ef",
-                "000102030405060708090a0b0c0d0e0f010000006955b9000102030405060708507a0b4c9f35406fc018ecb298ac332068656c6c6f",
-                "477e5b04a29e7fc80fd53eb36fd0715400",
-                "000102030405060708090a0b0c0d0e0f0200412c412b6955b9000102030405060708e285ca274bac052e7c0a98cf3174ee5b",
-                "0ccf05f246c40f075271dd7e52d2420401776f726c64",
+                "000102030405060708090a0b0c0d0e0f0100000000000000000000000000000000006955b90001020304050607080000000500178e3775404d528a25094a591bf36468656c6c6fdd1ab741da654edc8e365e51e9f7ebe6",
+                "cf0b72020d0c5d8827e1131a6ad3ff8300",
+                "000102030405060708090a0b0c0d0e0f0200000000000000012c000000000000012b6955b9000102030405060708000000000f8a9597942e2aeca56c93dd9cd643a2ba220cca8f1bbd9f8cdb4b22b0265607",
+                "19df1f7aab49142d7b4919e2cd68942701776f726c64",
             ),
             (
                 vec![0x6b; 32],
                 "68489b10ee27b348be274432395cb2107dcfc8cf3f9f69f2cd4cf7cd7a0f8c95",
-                "000102030405060708090a0b0c0d0e0f010000006955b90001020304050607089b83951cb9d54b75d8d0785f3eb2d3d668656c6c6f",
-                "c5b18d1988c3d46dbfee70883026026000",
-                "000102030405060708090a0b0c0d0e0f0200412c412b6955b9000102030405060708d48a0293326ba2533431172737bc96a7",
-                "f900c6512f2edcc31275640df468edf201776f726c64",
+                "000102030405060708090a0b0c0d0e0f0100000000000000000000000000000000006955b9000102030405060708000000055a69b4f32b1258b63968abe73831a16d68656c6c6fa9d13425b6115dfcf7677ee22d70535c",
+                "58696a7a658e71acfa63777f9655fbdb00",
+                "000102030405060708090a0b0c0d0e0f0200000000000000012c000000000000012b6955b900010203040506070800000000b3f9c1b72105e61b0331705b811d47d29afea042a48e16233bfc597f178a49c5",
+                "52774f4b737d7bd0a5f69989ff1fafd001776f726c64",
             ),
         ];
         for (psk, k, up, up_r, down, down_r) in cases {
@@ -394,26 +459,20 @@ mod tests {
 
             // The client's requests.
             let up_out = Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, NONCE, b"hello");
-            assert_eq!(to_hex(&up_out.prefix) + &to_hex(b"hello"), up);
+            assert_eq!(to_hex(&body(&up_out, b"hello")), up);
             let down_out = Outgoing::new(&key, &CID, Kind::Down, 0, 300, 299, TIME, NONCE, b"");
-            assert_eq!(to_hex(&down_out.prefix), down);
+            assert_eq!(to_hex(&body(&down_out, b"")), down);
 
-            // The server parses them and answers.
-            let up_req = Request::parse(Bytes::from(hex(up))).unwrap();
-            assert_eq!(up_req.verify(&key), Ok(Kind::Up));
-            assert_eq!(
-                (up_req.seq, up_req.ack, &up_req.data[..]),
-                (0, 0, &b"hello"[..])
-            );
-            let head = response_head(&key, &up_req.answering(), 0, b"");
+            // The server takes them apart and answers.
+            let (h, kind) = verify(&key, &hex(up)).unwrap();
+            assert_eq!(kind, Kind::Up);
+            assert_eq!((h.seq, h.ack, h.data_len), (0, 0, 5));
+            let head = response_head(&key, &h.answering(), 0, b"");
             assert_eq!(to_hex(&head), up_r);
-            let down_req = Request::parse(Bytes::from(hex(down))).unwrap();
-            assert_eq!(down_req.verify(&key), Ok(Kind::Down));
-            assert_eq!(
-                (down_req.seq, down_req.ack, down_req.time),
-                (300, 299, TIME)
-            );
-            let head = response_head(&key, &down_req.answering(), FIN, b"world");
+            let (h, kind) = verify(&key, &hex(down)).unwrap();
+            assert_eq!(kind, Kind::Down);
+            assert_eq!((h.seq, h.ack, h.time), (300, 299, TIME));
+            let head = response_head(&key, &h.answering(), FIN, b"world");
             assert_eq!(to_hex(&head) + &to_hex(b"world"), down_r);
 
             // The client verifies the responses.
@@ -433,7 +492,7 @@ mod tests {
     fn mac_catches_replayed_responses() {
         let key = Key::new(b"", &CID);
         let first = Outgoing::new(&key, &CID, Kind::Down, 0, 7, 7, TIME, NONCE, b"");
-        let req = Request::parse(first.prefix.clone()).unwrap();
+        let (req, _) = verify(&key, &body(&first, b"")).unwrap();
         let mut cached = BytesMut::new();
         cached.put(response_head(&key, &req.answering(), 0, b"stale"));
         cached.put_slice(b"stale");
@@ -452,13 +511,29 @@ mod tests {
         cid2[0] ^= 1;
         assert!(!first.verifies(&Key::new(b"", &cid2), &cid2, Kind::Down, &cached));
         assert!(!first.verifies(&Key::new(b"x", &CID), &CID, Kind::Down, &cached));
-        // A request whose data was rewritten.
-        let mut forged = BytesMut::from(
-            &Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, NONCE, b"a").prefix[..],
-        );
-        forged.put_slice(b"b");
-        let forged = Request::parse(forged.freeze()).unwrap();
-        assert_eq!(forged.verify(&key), Err(Verdict::Mac));
+    }
+
+    /// The Header MAC covers every header field, the Data MAC the Data and
+    /// the header it follows.
+    #[test]
+    fn macs_bind_header_and_data() {
+        let key = Key::new(b"", &CID);
+        let out = Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, NONCE, b"a");
+        let good = body(&out, b"a");
+        assert!(verify(&key, &good).is_ok());
+        for at in 0..HEADER_LEN {
+            let mut b = good.clone();
+            b[at] ^= 1;
+            assert_eq!(verify(&key, &b).err(), Some("header mac"), "{at}");
+        }
+        // Rewritten Data, or a Data MAC of another header.
+        let mut b = good.clone();
+        b[HEADER_LEN] ^= 1;
+        assert_eq!(verify(&key, &b).err(), Some("data mac"));
+        let other = Outgoing::new(&key, &CID, Kind::Up, 0, 0, 0, TIME, [7; 8], b"a");
+        let mut b = good.clone();
+        b[HEADER_LEN + 1..].copy_from_slice(&other.data_mac);
+        assert_eq!(verify(&key, &b).err(), Some("data mac"));
     }
 
     /// Requests that verify but break the rules, and response flags.
@@ -466,46 +541,32 @@ mod tests {
     fn validation() {
         let key = Key::new(b"", &CID);
         let req = |kind: u8, flags: u8, seq: u64, data: &[u8]| {
-            let mut p = BytesMut::new();
-            p.put_slice(&CID);
-            p.put_u8(kind);
-            p.put_u8(flags);
-            let mut s = [0; 8];
-            let len = varint::encode(seq, &mut s).unwrap();
-            p.put_slice(&s[..len]);
-            p.put_u8(0);
-            p.put_u32(TIME);
-            p.put_slice(&NONCE);
-            let tag = key.tag(&[b"Q", &p, data]);
-            p.put_slice(&tag);
-            p.put_slice(data);
-            Request::parse(p.freeze()).unwrap().verify(&key)
+            let mut h = BytesMut::new();
+            h.put_slice(&CID);
+            h.put_u8(kind);
+            h.put_u8(flags);
+            h.put_u64(seq);
+            h.put_u64(0);
+            h.put_u32(TIME);
+            h.put_slice(&NONCE);
+            h.put_u32(data.len() as u32);
+            let tag = key.tag(&[b"Q", &h]);
+            h.put_slice(&tag);
+            let dtag = key.tag(&[b"D", &tag, data]);
+            h.put_slice(data);
+            h.put_slice(&dtag);
+            verify(&key, &h).map(|(_, k)| k)
         };
         assert_eq!(req(1, 1, 3, b"x"), Ok(Kind::Up));
-        assert_eq!(req(1, 2, 3, b"x"), Err(Verdict::Invalid));
+        assert_eq!(req(1, 2, 3, b"x"), Err("invalid"));
         assert_eq!(req(2, 0, 3, b""), Ok(Kind::Down));
-        assert_eq!(req(2, 1, 3, b""), Err(Verdict::Invalid));
-        assert_eq!(req(2, 0, 3, b"x"), Err(Verdict::Invalid));
+        assert_eq!(req(2, 1, 3, b""), Err("invalid"));
+        assert_eq!(req(2, 0, 3, b"x"), Err("invalid"));
         assert_eq!(req(3, 0, 0, b"bye"), Ok(Kind::Close));
-        assert_eq!(req(3, 0, 0, &[0xff]), Err(Verdict::Invalid));
-        assert_eq!(req(3, 0, 0, &[b'a'; MAX_REASON + 1]), Err(Verdict::Invalid));
-        assert_eq!(req(4, 0, 0, b""), Err(Verdict::Invalid));
-        assert_eq!(
-            Request::parse(Bytes::from_static(&[0; 40])).map(|_| ()),
-            None
-        );
-
-        // A non-minimal Sequence encoding is bound as sent.
-        let mut p = BytesMut::new();
-        p.put_slice(&CID);
-        p.put_slice(&[2, 0, 0x40, 0x05, 0]);
-        p.put_u32(TIME);
-        p.put_slice(&NONCE);
-        let tag = key.tag(&[b"Q", &p]);
-        p.put_slice(&tag);
-        let r = Request::parse(p.freeze()).unwrap();
-        assert_eq!((r.verify(&key), r.seq), (Ok(Kind::Down), 5));
-        assert_eq!(r.answering().seq, &[0x40, 0x05]);
+        assert_eq!(req(3, 0, 1, b"bye"), Err("invalid"));
+        assert_eq!(req(3, 0, 0, &[0xff]), Err("invalid"));
+        assert_eq!(req(3, 0, 0, &[b'a'; MAX_REASON + 1]), Err("invalid"));
+        assert_eq!(req(4, 0, 0, b""), Err("invalid"));
 
         let resp = |flags: u8, data: &'static [u8]| Response {
             mac: [0; MAC_LEN],
@@ -524,15 +585,17 @@ mod tests {
 
     #[test]
     fn base64_bodies() {
-        let (h, t) = encode_body(
+        let [h, t] = encode_body(
             BodyEncoding::Base64,
-            Bytes::from_static(b"he"),
-            Bytes::from_static(b"llo"),
+            [Bytes::from_static(b"he"), Bytes::from_static(b"llo")],
         );
         assert!(t.is_empty());
         assert_eq!(&h[..], b"aGVsbG8=");
         assert_eq!(encoded_len(BodyEncoding::Base64, 5), h.len());
         assert_eq!(&decode_body(BodyEncoding::Base64, h).unwrap()[..], b"hello");
         assert!(decode_body(BodyEncoding::Base64, Bytes::from_static(b"aGVsbG8")).is_none());
+        // The header is whole base64 groups: it decodes on its own.
+        assert_eq!(encoded_len(BodyEncoding::Base64, HEADER_LEN), 88);
+        assert_eq!(HEADER_LEN % 3, 0);
     }
 }

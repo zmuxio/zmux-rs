@@ -268,7 +268,7 @@ async fn run(sc: &Scenario) {
         client.rtt().map(|r| r.as_micros()),
         stats.bytes_sent as f64 / 1e6,
     );
-    client.close(zmux::VarInt::from_u32(0), b"").await;
+    client.close().await;
 }
 
 fn main() {

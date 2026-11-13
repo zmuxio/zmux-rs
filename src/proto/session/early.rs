@@ -131,8 +131,8 @@ impl SessionCore {
         let independent = match (local.zmux_role, transport_role) {
             (_, None) => false,
             (None, Some(_)) => true,
-            (Some(RoleParameter::Initiator), Some(t)) => t == Role::Initiator,
-            (Some(RoleParameter::Responder), Some(t)) => t == Role::Responder,
+            (Some(RoleParameter::Initiator), Some(t)) => t == Role::Client,
+            (Some(RoleParameter::Responder), Some(t)) => t == Role::Server,
             (Some(RoleParameter::Auto { .. }), Some(_)) => false,
         };
         if !self.config.early_data.zmux_peer || !independent {
@@ -176,8 +176,8 @@ impl SessionCore {
         let independent = match (local.zmux_role, self.transport_role) {
             (_, None) => false,
             (None, Some(_)) => true,
-            (Some(RoleParameter::Initiator), Some(t)) => t == Role::Initiator,
-            (Some(RoleParameter::Responder), Some(t)) => t == Role::Responder,
+            (Some(RoleParameter::Initiator), Some(t)) => t == Role::Client,
+            (Some(RoleParameter::Responder), Some(t)) => t == Role::Server,
             (Some(RoleParameter::Auto { .. }), Some(_)) => false,
         };
         if !independent {

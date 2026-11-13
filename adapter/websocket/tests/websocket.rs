@@ -61,9 +61,9 @@ async fn connect_and_serve() {
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     assert_eq!(server.protocol().as_deref(), Some("qmux-02"));
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"bye").await;
+    client.close().await;
     assert!(matches!(
-        server.closed().await,
+        server.closing().await,
         SessionError::ApplicationClosed { remote: true, .. }
     ));
     listener.close();
@@ -148,7 +148,7 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     round_trip(&client, &server).await;
     proxy.abort();
     for s in [&client, &server] {
-        let e = tokio::time::timeout(Duration::from_secs(10), s.closed())
+        let e = tokio::time::timeout(Duration::from_secs(10), s.closing())
             .await
             .expect("ended");
         assert!(
@@ -200,7 +200,7 @@ async fn application_subprotocols() {
         let server = listener.accept().await.unwrap();
         assert_eq!(client.protocol().as_deref(), expect);
         assert_eq!(server.protocol().as_deref(), expect);
-        client.close(0u32.into(), b"").await;
+        client.close().await;
         listener.close();
         serving.await.unwrap();
     }
@@ -278,7 +278,7 @@ async fn empty_messages_count_in_pipe_positions() {
     .await
     .unwrap();
     // The relay writes the empty messages one by one: slow on a loaded host.
-    let e = tokio::time::timeout(Duration::from_secs(60), client.closed())
+    let e = tokio::time::timeout(Duration::from_secs(60), client.closing())
         .await
         .expect("closed");
     assert!(
@@ -340,20 +340,20 @@ async fn connect_over_tls() {
     assert!(refused.is_err());
     // Unbound tokens do not verify where bound ones are configured.
     let unbound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let options = zmux_websocket::Options::default().with_credential(Arc::new(unbound));
+    let options = zmux_websocket::Options::default().with_carrier_credential(Arc::new(unbound));
     assert!(
         zmux_websocket::dial_tls(url.as_str(), &connector, &options)
             .await
             .is_err()
     );
-    let options = zmux_websocket::Options::default().with_credential(Arc::new(auth));
+    let options = zmux_websocket::Options::default().with_carrier_credential(Arc::new(auth));
     let client = zmux_websocket::connect_tls(url.as_str(), &connector, &options, Config::default())
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"bye").await;
+    client.close().await;
     listener.close();
     serving.await.unwrap();
 }
@@ -387,7 +387,7 @@ async fn a_second_connection_joins() {
         .unwrap()
         .unwrap();
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"bye").await;
+    client.close().await;
     serving.abort();
 }
 
@@ -486,7 +486,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
     .unwrap();
     let server = listener.accept().await.unwrap();
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
     serving.await.unwrap();
 }
@@ -495,7 +495,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
 /// request's parts, its header fields and the client's address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admission_decides_on_the_request_head() {
-    use zmux::{Admission, Verdict};
+    use zmux::{Admission, AdmissionVerdict};
     let admission = Admission::new(0, |info, prefix| {
         assert!(prefix.is_empty());
         assert!(info.source.is_some());
@@ -508,9 +508,9 @@ async fn an_admission_decides_on_the_request_head() {
             .and_then(|r| r.downcast_ref::<http::request::Parts>())
             .expect("the request head");
         if parts.headers.contains_key("x-pass") {
-            Verdict::accept(0)
+            AdmissionVerdict::accept(0)
         } else {
-            Verdict::Fallback
+            AdmissionVerdict::Fallback
         }
     });
     let mut limits = ListenerConfig::default();
@@ -534,7 +534,7 @@ async fn an_admission_decides_on_the_request_head() {
         .unwrap();
     let server = listener.accept().await.unwrap();
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     listener.close();
     serving.await.unwrap();
 }
@@ -562,15 +562,16 @@ async fn prefix_auth_in_the_request_header() {
     let refused = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
     assert!(refused.starts_with(b"HTTP/1.1 404"));
 
-    let options = zmux_websocket::Options::default().with_credential(Arc::new(auth.clone()));
+    let options =
+        zmux_websocket::Options::default().with_carrier_credential(Arc::new(auth.clone()));
     let client = zmux_websocket::connect(url.as_str(), &options, Config::default())
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 
-    let (name, value) = zmux::Credential::header(&auth, &zmux::CarrierInfo::new()).unwrap();
+    let (name, value) = zmux::CarrierCredential::header(&auth, &zmux::CarrierInfo::new()).unwrap();
     assert_eq!(name, zmux::PREFIX_AUTH_HEADER);
     let mut request = format!("ws://{addr}/zmux").into_client_request().unwrap();
     request
@@ -587,7 +588,7 @@ async fn prefix_auth_in_the_request_header() {
     );
 
     let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let options = zmux_websocket::Options::default().with_credential(Arc::new(bound));
+    let options = zmux_websocket::Options::default().with_carrier_credential(Arc::new(bound));
     let e = zmux_websocket::dial(url.as_str(), &options)
         .await
         .unwrap_err();
@@ -604,7 +605,7 @@ async fn prefix_auth_in_the_request_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_intermediaries_report_the_source() {
     use std::sync::Mutex;
-    use zmux::{Admission, TrustedProxies, Verdict};
+    use zmux::{Admission, AdmissionVerdict, TrustedProxies};
     let forwarded = |proxy: &str| {
         let mut r = format!("PROXY TCP4 {proxy} 10.0.0.1 4000 443\r\n").into_bytes();
         let up = upgrade_request(Some("qmux-02"));
@@ -621,7 +622,7 @@ async fn trusted_intermediaries_report_the_source() {
     let tx = Mutex::new(tx);
     let admission = Admission::new(0, move |info, _| {
         let _ = tx.lock().unwrap().send(info.source.unwrap());
-        Verdict::Close
+        AdmissionVerdict::Close
     });
     let serve = async |admission| {
         let mut limits = ListenerConfig::default();
@@ -722,7 +723,7 @@ async fn wss_with_the_feature() {
     .unwrap();
     let server = listener.accept().await.unwrap();
     round_trip(&client, &server).await;
-    client.close(0u32.into(), b"bye").await;
+    client.close().await;
     listener.close();
     serving.abort();
 }
@@ -735,4 +736,101 @@ async fn wss_without_the_feature_is_invalid_input() {
         .await
         .expect_err("refused");
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// ---- N16: close delivery ---------------------------------------------------------------
+
+/// N16 on one carrier class: the client writes 1 MiB on a stream it
+/// finishes and a few bytes on a second one it leaves open, then closes
+/// with `code` and `reason` (code 0 and no reason: the plain close) and
+/// waits for the whole end. The server reads the whole 1 MiB in order and
+/// ends with the client's code and reason; the close returned within its
+/// guard; the wait, under a client linger of an hour, returned once the
+/// server read the close and ended its side; the open
+/// stream failed locally with the session's error. `slow`: the server starts
+/// reading only after a pause, so the close arrives before it read everything.
+/// `c` with a linger of an hour: a session that ends ended at the peer's end
+/// of its side.
+fn lingering(mut c: Config) -> Config {
+    c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
+    c
+}
+
+async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
+    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let reader = {
+        let (server, data) = (server.clone(), data.clone());
+        tokio::spawn(async move {
+            let (_s, mut r) = server.accept_bi().await.unwrap();
+            if slow {
+                // A slow reader: the close arrives while data waits unread.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            assert_eq!(r.read_to_end(2 << 20).await.unwrap(), data);
+            server.closing().await
+        })
+    };
+    let (mut w, _r) = client.open_bi().await.unwrap();
+    w.write_all(&data).await.unwrap();
+    w.finish().unwrap();
+    let (mut open, _r2) = client.open_bi().await.unwrap();
+    open.write_all(b"left open").await.unwrap();
+    let start = std::time::Instant::now();
+    let code = zmux::VarInt::from_u32(code);
+    if code == zmux::VarInt::ZERO && reason.is_empty() {
+        client.close().await;
+    } else {
+        client.close_with_error(code, reason).await;
+    }
+    // A guard only: the server's delivery below shows the close completed
+    // normally.
+    let closed = start.elapsed();
+    assert!(closed < Duration::from_secs(3), "{closed:?}");
+    // The client lingers an hour (`lingering`): a wait that returns within
+    // its guard returned at the server's end of its side, after it read the
+    // close.
+    let end = tokio::time::timeout(Duration::from_secs(5), client.wait())
+        .await
+        .expect("the server ended its side after the close");
+    assert!(
+        matches!(&end, zmux::SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
+        "{end:?}"
+    );
+    let seen = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the server read everything")
+        .unwrap();
+    assert!(
+        matches!(&seen, zmux::SessionError::ApplicationClosed { code: c, reason: r, remote: true }
+            if *c == code && r.as_ref() == reason),
+        "{seen:?}"
+    );
+    let e = open.write_all(b"more").await.unwrap_err();
+    assert!(
+        matches!(&e, zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
+        "{e:?}"
+    );
+}
+
+/// N16 over WebSocket, through the adapter's `connect` and `serve`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_is_delivered_with_its_code() {
+    for (code, reason, slow) in [
+        (0x2a, &b"bye"[..], false),
+        (0, &b""[..], false),
+        (0x2a, &b"bye"[..], true),
+    ] {
+        let (addr, listener, serving) = server().await;
+        let client = zmux_websocket::connect(
+            format!("ws://{addr}/zmux"),
+            &Default::default(),
+            lingering(Config::default()),
+        )
+        .await
+        .unwrap();
+        let server = listener.accept().await.unwrap();
+        close_delivery(&client, &server, code, reason, slow).await;
+        listener.close();
+        serving.await.unwrap();
+    }
 }

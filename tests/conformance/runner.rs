@@ -11,7 +11,7 @@ use zmux::proto::error::{APPLICATION_ERRORS, TRANSPORT_ERRORS};
 use zmux::proto::frame::{Dir, Priority};
 use zmux::proto::keys::lane_key_eq;
 use zmux::proto::listener::{
-    CarrierId, Classified, ListenerConfig, ListenerCore, Opened, Paired, source_name,
+    CarrierId, Classified, Entered, ListenerConfig, ListenerCore, Paired, source_name,
 };
 use zmux::proto::params::{Features, Role, TransportParameters};
 use zmux::proto::record::{self, Framing};
@@ -19,8 +19,8 @@ use zmux::proto::seal::{self, join as seal_join};
 use zmux::proto::session::{
     ClaimedHello, Config, ConfirmedJoin, CoreEvent, DEFAULT_OVERFLOW_DELAY, DatagramError,
     JoinStep, LaneAccept, LaneId, OpenError, OpenedHello, PeerCarrier, PipeAuth, PipeEnd,
-    PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Policy, Preamble, Redundancy, RoleConfig,
-    SessionCore, SessionError, State, StreamError, StreamKey, Transmit, TransmitBuf,
+    PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Policy, Preamble, Redundancy, SessionCore,
+    SessionError, State, StreamError, StreamKey, Transmit, TransmitBuf,
 };
 use zmux::proto::{Gates, VarInt, varint};
 
@@ -295,14 +295,15 @@ impl Runner {
         if let Some(ms) = cfg.handshake_timeout {
             config.handshake_timeout = Some(Duration::from_millis(ms));
         }
-        config.keep_alive_period = period(cfg.keep_alive_period.unwrap_or(0));
+        config.liveness.keep_alive_period = period(cfg.keep_alive_period.unwrap_or(0));
         config.max_idle_timeout = period(tp.max_idle_timeout.unwrap_or(0));
         config.enable_datagrams = cfg.enable_datagrams.unwrap_or(false);
         // Absent from the profile means configured eagerly (the traces of
         // earlier revisions); `null` means unset, lazy.
         config.max_incoming_uni_streams = match cfg.max_incoming_uni_streams {
-            Some(v) => v,
-            None => Some(tp_uni),
+            Some(Some(v)) => zmux::UniCredit::Limit(v),
+            Some(None) => zmux::UniCredit::Staged,
+            None => zmux::UniCredit::Limit(tp_uni),
         };
         if let Some(m) = cfg.max_pipes {
             config.max_pipes = m;
@@ -332,22 +333,29 @@ impl Runner {
             config.session_crypto = c.clone();
         }
         let modes = cfg.record_modes.clone().unwrap_or_default();
-        config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode(
-            std::sync::Arc::new(move |_, m, _| {
+        config.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(
+            move |_, m, _| {
                 let name = match m {
-                    seal::Mode::Sealed => "sealed",
-                    seal::Mode::Bound => "bound",
-                    seal::Mode::Trusted => "trusted",
+                    seal::RecordMode::Sealed => "sealed",
+                    seal::RecordMode::Bound => "bound",
+                    seal::RecordMode::Trusted => "trusted",
+                    seal::RecordMode::Unmanaged => "unmanaged",
                 };
                 modes.iter().any(|x| x == name)
-            }),
+            },
         ));
         config.resume_timeout = cfg.resume_timeout.map(Duration::from_millis);
         if let Some(f) = cfg.suspect_floor {
-            config.suspect_floor = Duration::from_millis(f);
+            config.liveness.suspect_floor = Duration::from_millis(f);
         }
-        config.dead_timeout = cfg.dead_timeout.map(Duration::from_millis);
-        config.probation = cfg.probation.flatten().map(Duration::from_millis);
+        config.liveness.dead_timeout = cfg.dead_timeout.map_or(zmux::Cap::Auto, |t| {
+            zmux::Cap::Fixed(Duration::from_millis(t))
+        });
+        config.probation = match cfg.probation.flatten() {
+            None => Some(zmux::Cap::Auto),
+            Some(0) => None,
+            Some(ms) => Some(zmux::Cap::Fixed(Duration::from_millis(ms))),
+        };
         if let Some(d) = cfg.overflow_delay {
             config.overflow_delay = d.map_or(DEFAULT_OVERFLOW_DELAY, Duration::from_millis);
         }
@@ -359,10 +367,10 @@ impl Runner {
             };
         }
         if let Some(p) = cfg.standby_probe {
-            config.standby_probe = period(p);
+            config.liveness.standby_probe = period(p);
         }
         if let Some(j) = cfg.probe_jitter {
-            config.probe_jitter = j;
+            config.liveness.probe_jitter = j;
         }
         if let Some(e) = &cfg.early_data {
             config.early_data =
@@ -404,16 +412,17 @@ impl Runner {
             .map(|k| k.0.try_into().map_err(|_| "lane_key length"))
             .transpose()?;
         let transport = match h.local_role {
-            TransportRole::Initiator => Role::Initiator,
-            TransportRole::Responder => Role::Responder,
+            TransportRole::Initiator => Role::Client,
+            TransportRole::Responder => Role::Server,
         };
         let role = match cfg.role {
-            Some(RoleName::Auto) => RoleConfig::Auto,
-            Some(RoleName::Initiator) => RoleConfig::Initiator,
-            Some(RoleName::Responder) => RoleConfig::Responder,
+            Some(RoleName::Auto) => Role::Auto,
+            Some(RoleName::Initiator) => Role::Client,
+            Some(RoleName::Responder) => Role::Server,
             None => match transport {
-                Role::Initiator => RoleConfig::Initiator,
-                Role::Responder => RoleConfig::Responder,
+                Role::Client => Role::Client,
+                Role::Server => Role::Server,
+                Role::Auto => Role::Auto,
             },
         };
         let base = Instant::now();
@@ -532,6 +541,10 @@ impl Runner {
                     let stream_len = self.out.stream_len();
                     if !bytes.is_empty() {
                         progress = true;
+                        // The simulated carrier takes each batch whole at
+                        // once, and says so as a driver does: the core's
+                        // hand-off and linger follow what carriers took.
+                        self.session.pipe_written(at, bytes.len() as u64, now);
                     }
                     self.decode_out(id, lane, &bytes, &lens, stream_len)?;
                     if let Some(infos) = infos
@@ -1043,8 +1056,8 @@ impl Runner {
             .allow_record_mode
             .clone()
             .is_none_or(|f| {
-                (f.0)(
-                    &zmux::proto::session::CarrierDescription::default(),
+                f.allows(
+                    &zmux::proto::session::RecordPolicyInput::default(),
                     join.mode(),
                     None,
                 )
@@ -1244,7 +1257,7 @@ impl Runner {
         let local = self.session.local_parameters();
         let own = local.zmux_multipath.expect("multipath").session_nonce;
         let own_set = local.zmux_session_crypto.clone().expect("multipath");
-        let local_init = self.session.role() == Role::Initiator;
+        let local_init = self.session.role() == Role::Client;
         let (their, their_set) = match (
             self.session.session_nonces(),
             self.session.peer_session_crypto(),
@@ -1270,7 +1283,7 @@ impl Runner {
     }
 
     fn peer_is_initiator(&self) -> bool {
-        self.session.role() != Role::Initiator
+        self.session.role() != Role::Client
     }
 
     fn check_outcome(&self, name: &str, want: &str) -> Result<(), String> {
@@ -1549,19 +1562,12 @@ impl Runner {
                     return Ok(());
                 }
                 let src = source_name(source.as_deref().unwrap_or("default"));
-                match self.listener.open(src, framing, now) {
-                    Opened::Accepted { id, evicted } => {
-                        c.id = Some(id);
-                        if let Some(e) = evicted {
-                            for x in self.carriers.values_mut() {
-                                if x.id == Some(e) {
-                                    x.rejected = true;
-                                    x.id = None;
-                                }
-                            }
-                        }
+                match self.listener.enter(src) {
+                    // Nothing stalls here, so no carrier is evicted.
+                    Entered::Taken { slot, .. } => {
+                        c.id = Some(self.listener.open(Some(slot), framing, now));
                     }
-                    Opened::Refused => c.rejected = true,
+                    Entered::SourceFull | Entered::Full => c.rejected = true,
                 }
                 self.carriers.insert(name, c);
                 self.flush()
@@ -1648,9 +1654,9 @@ impl Runner {
                 let c = self.carriers.get(carrier).ok_or("unknown carrier")?;
                 let framing = c.framing;
                 let mode = match mode.as_deref() {
-                    Some("sealed") => seal::Mode::Sealed,
-                    Some("bound") => seal::Mode::Bound,
-                    _ => seal::Mode::Trusted,
+                    Some("sealed") => seal::RecordMode::Sealed,
+                    Some("bound") => seal::RecordMode::Bound,
+                    _ => seal::RecordMode::Trusted,
                 };
                 let suite = seal_join::Suite::from_value(1).expect("Suite 1");
                 let empty = Vec::new();
@@ -2487,12 +2493,18 @@ impl Runner {
                 if let Some(w) = a.weight {
                     opts.weight = w;
                 }
-                opts.probation = a.probation.map(Duration::from_millis);
+                opts.probation = match a.probation {
+                    None => zmux::Inherit::Session,
+                    Some(0) => zmux::Inherit::Set(None),
+                    Some(ms) => {
+                        zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_millis(ms))))
+                    }
+                };
                 match s.add_pipe(
                     read.then_some(framing),
                     write.then_some(framing),
                     &opts,
-                    seal::Mode::Trusted,
+                    seal::RecordMode::Trusted,
                     None,
                     now,
                 ) {
@@ -2805,8 +2817,9 @@ fn match_event(
         CoreEvent::Established { role, features, .. } => {
             if let Some(want) = fields.role {
                 let have = match role {
-                    Role::Initiator => TransportRole::Initiator,
-                    Role::Responder => TransportRole::Responder,
+                    Role::Client => TransportRole::Initiator,
+                    Role::Server => TransportRole::Responder,
+                    Role::Auto => return Err("role auto after establishment".into()),
                 };
                 if have != want {
                     return Err(format!("role {have:?}, expected {want:?}"));

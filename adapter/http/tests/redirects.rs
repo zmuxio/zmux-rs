@@ -10,7 +10,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
-    CarrierCache, CarrierKind, Config, Listener, ListenerConfig, Mode, ModePolicy, Session,
+    CarrierCache, CarrierChoice, CarrierChoicePolicy, CarrierKind, Config, Listener,
+    ListenerConfig, Session,
 };
 use zmux_http::Options;
 
@@ -125,12 +126,13 @@ async fn a_redirect_is_followed_with_the_uplink_repeated() {
     let (backend, listener, serving) = origin().await;
     let (addr, count, front) = front(backend, &[("/old", "/new")]).await;
     let options = Options::default().with_path("/old");
-    let candidate = zmux_http::streaming_candidate(connect(addr), &addr.to_string(), &options);
+    let candidate = zmux_http::candidate(connect(addr), &addr.to_string(), &options);
     let cache = CarrierCache::default();
-    let policy = ModePolicy::new().with_cache(cache.clone(), "k");
-    let mode = Mode::auto([candidate.clone()]);
+    let policy = CarrierChoicePolicy::new().with_cache(cache.clone(), "k");
+    let mode = CarrierChoice::auto([candidate.clone()]);
     let (cs, ss) =
-        within(async { tokio::join!(dial_mode_session(&mode, &policy), listener.accept()) }).await;
+        within(async { tokio::join!(dial_choice_session(&mode, &policy), listener.accept()) })
+            .await;
     let (cs, ss) = (cs, ss.unwrap());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     echo(&cs, &ss).await;
@@ -145,13 +147,13 @@ async fn a_redirect_is_followed_with_the_uplink_repeated() {
             .await;
     assert_eq!(count.load(Ordering::SeqCst), 1);
     echo(&c2.unwrap(), &s2.unwrap()).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
     front.abort();
     serving.abort();
 }
 
-async fn dial_mode_session(mode: &Mode, policy: &ModePolicy) -> Session {
-    zmux::dial_mode(mode, Config::default(), policy)
+async fn dial_choice_session(mode: &CarrierChoice, policy: &CarrierChoicePolicy) -> Session {
+    zmux::dial_choice(mode, Config::default(), policy)
         .await
         .unwrap()
 }
@@ -277,7 +279,7 @@ async fn http2_requests_follow_redirects_within_the_origin() {
     let (cs, ss) = (cs.unwrap(), ss.unwrap());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     echo(&cs, &ss).await;
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
 
     let conn = within(zmux_http::Http2Connection::connect(
         &addr.to_string(),
@@ -330,7 +332,7 @@ async fn exchange_requests_follow_redirects_per_request() {
     // Every request was redirected: the path is not remembered.
     let n = count.load(Ordering::SeqCst);
     assert!(n >= 3, "{n}");
-    cs.close(0u32.into(), b"").await;
+    cs.close().await;
 
     for (path, hops) in [
         ("/moved/exchange", 1),

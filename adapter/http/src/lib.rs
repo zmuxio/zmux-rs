@@ -92,14 +92,14 @@ mod server;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zmux::Credential;
+use zmux::CarrierCredential;
 
 pub use body::{PipeBody, ReplayBody};
 pub use classify::{PairField, RequestClass, classify, classify_head, forwarded_early_data};
 pub use client::{
-    Http2Connection, connect_http1, connect_http1_split, connect_http2, dial_http1,
-    dial_http1_carrier_over, dial_http1_over, dial_http1_split, dial_http1_split_with,
-    exchange_candidate, http1_dial, join_http1_split_with, split_candidate, streaming_candidate,
+    Http2Connection, candidate, candidate_exchange, candidate_split, connect_http1,
+    connect_http1_split, connect_http2, dial_http1, dial_http1_carrier_over, dial_http1_over,
+    dial_http1_split, dial_http1_split_with, http1_dial, join_http1_split_with,
 };
 pub use endpoint::Endpoint;
 pub use exchange::{
@@ -107,7 +107,7 @@ pub use exchange::{
     default_piece_size, dial_exchange, dial_exchange_split, dial_exchange_with,
 };
 pub use server::{
-    FallbackRequest, HttpFallback, Unhandled, handle_request, request_source, route_request, serve,
+    Fallback, FallbackRequest, Unhandled, handle_request, request_source, route_request, serve,
     serve_connection, serve_connection_with, serve_proxied, serve_proxied_with, serve_with,
     too_early,
 };
@@ -136,16 +136,16 @@ pub struct Options {
     /// fallback, and those
     /// the listener does not take (none by default: such requests are
     /// answered with 404).
-    pub fallback: Option<HttpFallback>,
+    pub fallback: Option<Fallback>,
     /// Client: the credential presented for a server's admission
     /// ([`zmux::ListenerConfig::admission`], none by default): its prefix
-    /// ([`Credential::prefix`]) is written first on each request body that
+    /// ([`CarrierCredential::prefix`]) is written first on each request body that
     /// carries a pipe or a lane, and a downlink `GET`, which has no body,
-    /// carries its header form ([`Credential::header`]). The adapter does
+    /// carries its header form ([`CarrierCredential::header`]). The adapter does
     /// not see the TLS layer of its connections (they are the caller's
     /// byte streams): the credential is given no exporter, so a bound one
     /// fails each request.
-    pub credential: Option<Arc<dyn Credential>>,
+    pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
     /// Client: the connections carry TLS, so the carriers' URL is
     /// `https://` (default `false`, `http://`): the scheme redirects are
     /// checked against and HTTP/2 requests name.
@@ -167,6 +167,13 @@ pub struct Options {
     /// and the server classifies by it ([`classify`]). Both ends must
     /// agree.
     pub pair_field: PairField,
+    /// Server: a served connection that carried a pipe or a request of the
+    /// fallback is closed gracefully once it has had no request or
+    /// response in progress for this long (default 60 s; `None`: never).
+    /// A carrier's response lasts as long as the carrier, so a connection
+    /// is idle only once its carriers ended. HTTP/2 has no idle timeout of
+    /// its own, and on HTTP/1.1 it bounds the wait for the next request.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for Options {
@@ -177,10 +184,11 @@ impl Default for Options {
             timeout: Duration::from_secs(10),
             exchange: None,
             fallback: None,
-            credential: None,
+            carrier_credential: None,
             https: false,
             max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
             pair_field: PairField::default(),
+            idle_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -221,7 +229,7 @@ impl Options {
 
     /// Serves the requests that carry no pipe with `fallback`.
     #[must_use]
-    pub fn with_fallback(mut self, fallback: HttpFallback) -> Self {
+    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
         self.fallback = Some(fallback);
         self
     }
@@ -247,10 +255,18 @@ impl Options {
         self
     }
 
+    /// With this idle timeout of served connections
+    /// ([`Options::idle_timeout`]).
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.idle_timeout = idle;
+        self
+    }
+
     /// Presents `credential` on each carrier.
     #[must_use]
-    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 }

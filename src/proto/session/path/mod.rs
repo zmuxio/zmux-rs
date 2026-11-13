@@ -471,7 +471,7 @@ impl SessionCore {
         eliciting: Option<u64>,
         now: Instant,
     ) {
-        let lane = self.tx_lane;
+        let (lane, tx_lanes) = (self.tx_lane, self.tx_lanes);
         let total = out.stream_len();
         let mp = self.mp.is_some();
         let peer_mad = self
@@ -510,7 +510,15 @@ impl SessionCore {
         }
         o.batch_sent(lane, total, out.record_ends().len() as u64, eliciting);
         if let Some(l) = o.lanes_mut() {
-            l.bind_batch(lane, base + total);
+            if tx_lanes {
+                l.bind_batch(lane, base + total);
+            } else {
+                // The batch asked for the pipe's first lane on the way: its
+                // directions noted no binding, so like the bytes before it
+                // the batch holds every direction on lane 0 until it is
+                // acknowledged.
+                l.lanes_began_after(base + total);
+            }
         }
         let eliciting = eliciting.is_some();
         if !mp {
@@ -748,8 +756,10 @@ impl SessionCore {
         if let Some(send) = &s.send {
             self.release_retained(send.unacked());
         }
-        for (_, d) in s.datagrams.iter().flat_map(|d| &d.queue) {
-            self.dgram_mut().recv_bytes -= d.len();
+        if let Some(d) = &s.datagrams
+            && d.bytes > 0
+        {
+            self.dgram_mut().stream_bytes -= d.bytes;
         }
         if !s.local {
             self.stream_count_credit(di(s.dir));
@@ -831,7 +841,7 @@ impl SessionCore {
         self.streams.recv_flow().buffered
             + self.streams.send_flow().buffered
             + kept
-            + (self.dgram().recv_bytes + self.dgram().held_bytes) as u64
+            + (self.dgram().recv_bytes + self.dgram().stream_bytes + self.dgram().held_bytes) as u64
     }
 
     /// Heap and inline bytes the core holds, for memory accounting.

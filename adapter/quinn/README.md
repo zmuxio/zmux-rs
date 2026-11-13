@@ -2,7 +2,7 @@
 
 QUIC connections as [zmux](../../README.md) carriers over `quinn`.
 
-A `QuicCarrier` takes a whole established `quinn::Connection`. A pipe is one
+A `Carrier` takes a whole established `quinn::Connection`. A pipe is one
 bidirectional stream of it (`open_pipe`, `accept_pipe`); the pipe's lanes
 are further unidirectional streams that zmux opens as it needs them, so that
 a loss on one lane does not hold back the streams on the others. The carrier
@@ -17,7 +17,7 @@ The carrier wires:
 - the connection's TLS 1.3 exporter, for `PipeAuth::exporter()` and for
   Bound joins (none when the handshake was not complete, as with
   0-RTT);
-- flow control for lanes: the peer may open `Options::lanes` lanes at once,
+- flow control for lanes: the peer may open `LaneWindows::lanes` lanes at once,
   and the connection's receive window covers that many stream windows and a
   pipe's own; with a listener the window is charged to its memory budget;
 - QUIC datagrams as the datagram channel of its pipes: a session with
@@ -26,13 +26,16 @@ The carrier wires:
   datagram rather than delaying the ones after it; `Options::transport_config`
   enables them;
 - failure signalling: a stream zmux drops without ending it is reset (or
-  stopped) with `ZMUX_CARRIER_FAILED`.
+  stopped) with `ZMUX_CARRIER_FAILED`, never ended with a FIN.
+
+`candidate(endpoint, addr, server_name, &options)` is a `zmux::Candidate` for
+carrier modes.
 
 ```rust,no_run
 # async fn example(conn: quinn::Connection) -> Result<(), Box<dyn std::error::Error>> {
-use zmux_quinn::{Options, QuicCarrier};
+use zmux_quinn::{Carrier, Options};
 
-let quic = QuicCarrier::new(conn, Options::default());
+let quic = Carrier::new(conn, Options::default());
 let mut config = zmux::Config::default();
 config.pipe_auth = zmux::PipeAuth::exporter();
 let session = zmux::Session::connect(quic.open_pipe().await?, config).await?;
@@ -54,13 +57,13 @@ the end of the handshake. Only once that
 stream is accepted does it become the connection's first pipe, the rest of
 its prefix in front, and do the connection's other streams reach the
 listener. A connection that is not accepted goes to an optional
-`QuicFallback` handler with that stream, every byte read replayed;
+`Fallback` handler with that stream, every byte read replayed;
 without one it is closed (after a stall, or at once). Admitted connections
 never take 0-RTT data: the server configuration must refuse early data. A
-client presents a `zmux::Credential` (such as `zmux::PrefixAuth`) with
-`Options::with_credential`: `dial` and `connect` write its prefix on the
+client presents a `zmux::CarrierCredential` (such as `zmux::PrefixAuth`) with
+`Options::with_carrier_credential`: `dial` and `connect` write its prefix on the
 first stream once the handshake completed, and send no 0-RTT data; or it
-writes the prefix itself with `QuicCarrier::open_pipe_with_prefix`.
+writes the prefix itself with `Carrier::open_pipe_with_prefix`.
 
 The adapter enables no crypto provider of quinn's: the application's endpoint
 configuration chooses it.

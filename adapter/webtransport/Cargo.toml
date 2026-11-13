@@ -11,10 +11,11 @@ keywords = ["zmux", "webtransport", "http3", "quic", "multipath"]
 categories = ["network-programming"]
 
 [features]
-# The crypto provider of the WebTransport stack: ring (default) or aws-lc-rs.
-default = ["ring"]
-ring = ["web-transport-quinn/ring", "zmux-quinn/rustls-ring"]
-aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
+# The crypto provider of the WebTransport stack: rustls with ring (default)
+# or with aws-lc-rs.
+default = ["rustls-ring"]
+rustls-ring = ["web-transport-quinn/ring", "zmux-quinn/rustls-ring"]
+rustls-aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-rs"]
 
 [dependencies]
 bytes = "1"

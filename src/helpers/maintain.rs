@@ -21,11 +21,11 @@
 //! old member and retries with backoff.
 //! Nothing rotates while the session lacks a usable outbound or a live
 //! inbound pipe or is suspended, and redials never wait for rotations.
-//! A pool dialed by a mode ([`PipePool::mode`]) picks each member's
+//! A pool dialed by a carrier choice ([`PipePool::choice`]) picks each member's
 //! carrier kind through the carrier cache and upgrades members to a
 //! preferred kind by the same make-before-break replacement, the
 //! replacement settling before the old member is closed; it is also the
-//! only upgrade logic of a session dialed in auto mode.
+//! only upgrade logic of a session dialed with an auto choice.
 //!
 //! It looks at the pipes' statistics at once when a pipe changes state or
 //! the session is suspended or resumed, and at least every [`POLL`]; the
@@ -54,14 +54,17 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::driver::choice::ChoiceSource;
 use crate::driver::handle::{self, WeakSession, dead, usable};
-use crate::driver::mode::ModeSource;
 use crate::driver::resources::{Kind, Live};
 use crate::driver::tokio::Tokio;
 use crate::proto::session::{
-    InboundState, OutboundState, Period, PipeError, PipeId, PipeOptions, PipeStats, State,
+    InboundState, Inherit, OutboundState, PipeError, PipeId, PipeLiveness, PipeOptions, PipeStats,
+    State,
 };
-use crate::{ConnectError, Dial, DialRequest, Mode, ModePolicy, Pipe, PipeIo, Session};
+use crate::{
+    CarrierChoice, CarrierChoicePolicy, ConnectError, Dial, DialRequest, Pipe, PipeIo, Session,
+};
 use atomic_waker::AtomicWaker;
 
 use super::POLL;
@@ -85,7 +88,7 @@ pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
 /// let pool = PipePool::new(2, |_req| async {
 ///     Ok(zmux::PipeIo::tcp(tokio::net::TcpStream::connect("10.0.0.2:4433").await?))
 /// })
-/// .with_options(PipeOptions::new().with_priority(10).with_label("relay"))
+/// .with_options(PipeOptions::new().with_send_priority(10).with_receive_priority(10).with_label("relay"))
 /// .with_rotate(RotatePolicy::new().with_max_age(Duration::from_secs(600)));
 /// let _keep = maintain_pipes(&session, pool).expect("valid pool");
 /// # }
@@ -122,8 +125,8 @@ enum Source {
     Dial(Dial),
     /// Pipes the function joins itself.
     Join(JoinFn),
-    /// Pipes joined over a carrier kind a mode chooses.
-    Mode(Arc<ModeSource>),
+    /// Pipes joined over a carrier kind a carrier choice chooses.
+    Choice(Arc<ChoiceSource>),
 }
 
 impl PipePool {
@@ -160,8 +163,8 @@ impl PipePool {
         )
     }
 
-    /// A pool of one member dialed over the carrier kinds of `mode`, under `policy` (its
-    /// [`no_join`](ModePolicy::no_join) does not apply); set
+    /// A pool of one member dialed over the carrier kinds of `choice`, under `policy` (its
+    /// [`no_join`](CarrierChoicePolicy::no_join) does not apply); set
     /// [`count`](Self::count) for more. Stable first, then upgrade: a
     /// member is dialed over the most robust kind available (a kind the
     /// policy's cache holds as usable, else the exchange carrier, else the
@@ -170,21 +173,24 @@ impl PipePool {
     /// member of a kind that a preferred kind not backing off could replace
     /// is rotated to it, make before break, one such upgrade at a time and
     /// only with room within `max_pipes`; the replacement takes over once
-    /// it has stayed usable for [`ModePolicy::settle`], and the old member
+    /// it has stayed usable for [`CarrierChoicePolicy::settle`], and the old member
     /// is then closed gracefully. A kind whose join fails, whose
     /// replacement ends before it settled, or whose member (or session)
-    /// fails within [`ModePolicy::drop_window`] of being joined is recorded
+    /// fails within [`CarrierChoicePolicy::drop_window`] of being joined is recorded
     /// as failed; a joined or settled one as usable. Each try is reported as
     /// a [`SessionEvent::CarrierCandidate`](crate::SessionEvent::CarrierCandidate),
     /// and a member joined over a kind other than the session's carrier as
     /// a [`SessionEvent::CarrierChosen`](crate::SessionEvent::CarrierChosen).
-    /// [`Mode::explicit`] dials its one kind, without the cache. Several
-    /// pools may share a cache. A mode without candidates or with two of
+    /// [`CarrierChoice::explicit`] dials its one kind, without the cache. Several
+    /// pools may share a cache. A choice without candidates or with two of
     /// one kind, or a policy with a negative or non-finite timer factor, is
     /// [`ConnectError::InvalidConfig`].
-    pub fn mode(mode: &Mode, policy: &ModePolicy) -> Result<Self, ConnectError> {
-        let src = ModeSource::new(mode, policy).map_err(ConnectError::InvalidConfig)?;
-        Ok(Self::of(1, Source::Mode(Arc::new(src))))
+    pub fn choice(
+        choice: &CarrierChoice,
+        policy: &CarrierChoicePolicy,
+    ) -> Result<Self, ConnectError> {
+        let src = ChoiceSource::new(choice, policy).map_err(ConnectError::InvalidConfig)?;
+        Ok(Self::of(1, Source::Choice(Arc::new(src))))
     }
 
     fn of(count: usize, source: Source) -> Self {
@@ -248,7 +254,7 @@ impl fmt::Debug for PipePool {
                 &match self.source {
                     Source::Dial(_) => "dial",
                     Source::Join(_) => "join",
-                    Source::Mode(_) => "mode",
+                    Source::Choice(_) => "choice",
                 },
             )
             .field("count", &self.count)
@@ -415,8 +421,7 @@ pub struct PoolDecision {
     /// pool (`None`: no such need; the pool's own looks go on). It is
     /// lengthened to [`RECHECK_FLOOR`] at least and is not capped.
     pub recheck: Option<Duration>,
-    probe_interval: Option<Period>,
-    probe_jitter: Option<f64>,
+    liveness: Option<PipeLiveness>,
     rejected: Option<String>,
 }
 
@@ -435,38 +440,21 @@ impl PoolDecision {
         self.rejected.as_deref()
     }
 
-    /// Sets the idle-probe interval of the pipes the pool adds after this
-    /// decision, in place of [`PipePool::options`]'
-    /// [`probe_interval`](PipeOptions::probe_interval); pipes already added
-    /// keep theirs. [`Period::Off`] turns their idle probes off; a period
-    /// below 1 s is [`PipeError::InvalidOptions`], as for the pipe option.
-    pub fn set_probe_interval(&mut self, interval: impl Into<Period>) -> Result<(), PipeError> {
-        let interval = interval.into();
-        if !interval.off_or_seconds() {
-            return Err(PipeError::InvalidOptions);
-        }
-        self.probe_interval = Some(interval);
+    /// Sets the liveness settings of the pipes the pool adds after this
+    /// decision: each field set here replaces the one of
+    /// [`PipePool::options`]' [`liveness`](PipeOptions::liveness); pipes
+    /// already added keep theirs. Settings out of range are
+    /// [`PipeError::InvalidOptions`], as for the pipe option, and change
+    /// nothing.
+    pub fn set_liveness(&mut self, liveness: PipeLiveness) -> Result<(), PipeError> {
+        liveness.validate().map_err(PipeError::InvalidOptions)?;
+        self.liveness = Some(liveness);
         Ok(())
     }
 
-    /// Likewise their idle-probe jitter; outside \[0, 1) is
-    /// [`PipeError::InvalidOptions`].
-    pub fn set_probe_jitter(&mut self, jitter: f64) -> Result<(), PipeError> {
-        if !(0.0..1.0).contains(&jitter) {
-            return Err(PipeError::InvalidOptions);
-        }
-        self.probe_jitter = Some(jitter);
-        Ok(())
-    }
-
-    /// The idle-probe interval set, if any.
-    pub fn probe_interval(&self) -> Option<Period> {
-        self.probe_interval
-    }
-
-    /// The idle-probe jitter set, if any.
-    pub fn probe_jitter(&self) -> Option<f64> {
-        self.probe_jitter
+    /// The liveness settings set, if any.
+    pub fn liveness(&self) -> Option<PipeLiveness> {
+        self.liveness
     }
 }
 
@@ -574,12 +562,12 @@ pub(crate) fn maintain_redial(session: &Session, dial: Dial, backoff: Backoff, p
     );
 }
 
-/// The pool of a session dialed by [`crate::dial_mode`]: one member over
+/// The pool of a session dialed by [`crate::dial_choice`]: one member over
 /// `src`, first `pipe0`, of kind `kind`, chosen at `chosen`. It holds no
 /// handle of the session between its looks and ends with it.
-pub(crate) fn maintain_mode(
+pub(crate) fn maintain_choice(
     session: &Session,
-    src: Arc<ModeSource>,
+    src: Arc<ChoiceSource>,
     kind: usize,
     pipe0: Pipe,
     chosen: std::time::Instant,
@@ -587,7 +575,7 @@ pub(crate) fn maintain_mode(
     let mut first = Member::new(vec![pipe0], Some(kind));
     first.joined = chosen;
     first.was_usable = true;
-    let pool = PipePool::of(1, Source::Mode(src));
+    let pool = PipePool::of(1, Source::Choice(src));
     Maintainer::spawn(
         Link::Weak(session.downgrade()),
         pool,
@@ -633,7 +621,7 @@ struct Member {
     replaced: bool,
     /// It was usable once.
     was_usable: bool,
-    /// With a mode: the candidate it was joined over, and when (for the
+    /// With a carrier choice: the candidate it was joined over, and when (for the
     /// cache's drop window).
     kind: Option<usize>,
     joined: std::time::Instant,
@@ -681,7 +669,7 @@ type MadeFuture = Pin<Box<dyn Future<Output = Made> + Send>>;
 /// A dial under way and why.
 struct Dialing {
     purpose: Purpose,
-    /// With a mode: the candidate dialed, and whether it is an upgrade.
+    /// With a carrier choice: the candidate dialed, and whether it is an upgrade.
     kind: Option<usize>,
     upgrade: bool,
     future: MadeFuture,
@@ -706,7 +694,7 @@ struct Maintainer {
     /// The policy's next dial; `None`: the backoff's.
     dial_gate: Option<Instant>,
     /// The policy's idle-probe interval and jitter for pipes added now.
-    probe: (Option<Period>, Option<f64>),
+    liveness: Option<PipeLiveness>,
     /// When the last dial started.
     last_dial_at: Option<Instant>,
     /// When the maintainer started: waits count from it before the first
@@ -743,7 +731,7 @@ impl Maintainer {
             rotate_delay: Duration::ZERO,
             count: 0,
             dial_gate: None,
-            probe: (None, None),
+            liveness: None,
             last_dial_at: None,
             started: now,
             recheck_at: None,
@@ -758,10 +746,10 @@ impl Maintainer {
         tokio::spawn(task.run());
     }
 
-    /// The pool's mode, if it dials by one.
-    fn mode(&self) -> Option<&Arc<ModeSource>> {
+    /// The pool's carrier choice, if it dials by one.
+    fn choice(&self) -> Option<&Arc<ChoiceSource>> {
         match &self.pool.source {
-            Source::Mode(m) => Some(m),
+            Source::Choice(m) => Some(m),
             _ => None,
         }
     }
@@ -834,10 +822,10 @@ impl Maintainer {
         for m in self.members.iter().filter(|m| m.replaces.is_some()) {
             m.close();
         }
-        // With a mode, a session that failed counts against the kinds of
+        // With a carrier choice, a session that failed counts against the kinds of
         // the members joined less than the drop window ago.
-        if let (Some(src), Some(sh)) = (self.mode(), shared)
-            && crate::driver::mode::session_failed(&sh)
+        if let (Some(src), Some(sh)) = (self.choice(), shared)
+            && crate::driver::choice::session_failed(&sh)
         {
             for m in &self.members {
                 if let Some(k) = m.kind {
@@ -875,7 +863,7 @@ impl Maintainer {
     fn consult(&mut self, session: &Session, infos: &[Vec<Option<PipeStats>>], now: Instant) {
         self.count = self.pool.count;
         self.dial_gate = None;
-        self.probe = (None, None);
+        self.liveness = None;
         self.recheck_at = None;
         let Some(policy) = self.pool.policy.clone() else {
             return;
@@ -920,7 +908,7 @@ impl Maintainer {
             self.count = c.max(1);
         }
         self.dial_gate = d.next_dial_at.map(Instant::from_std);
-        self.probe = (d.probe_interval, d.probe_jitter);
+        self.liveness = d.liveness;
         self.recheck_at = d
             .recheck
             .and_then(|r| now.checked_add(r.max(RECHECK_FLOOR)));
@@ -994,10 +982,10 @@ impl Maintainer {
     }
 
     /// Looks at the pool's members: failures, usable replacements (with a
-    /// mode, once they stayed usable for the settle time).
+    /// choice, once they stayed usable for the settle time).
     fn observe(&mut self, session: &Session, now: Instant) {
         let infos = self.infos();
-        let settle = self.mode().map(|m| m.settle());
+        let settle = self.choice().map(|m| m.settle());
         let mut gone = Vec::new();
         let mut close = Vec::new();
         let mut settled = Vec::new();
@@ -1034,7 +1022,7 @@ impl Maintainer {
             self.rotate_failures = 0;
             self.rotate_delay = self.backoff_wait(0);
         }
-        let mode = self.mode().cloned();
+        let mode = self.choice().cloned();
         let ending = session.close_reason().is_some();
         for id in gone {
             let Some(i) = self.members.iter().position(|m| m.id() == id) else {
@@ -1080,9 +1068,9 @@ impl Maintainer {
     }
 
     /// Dials replacements of the usable members that reached a limit and,
-    /// with a mode, one of a member a preferred kind could replace.
+    /// with a carrier choice, one of a member a preferred kind could replace.
     fn rotate(&mut self, session: &Session, infos: &[Vec<Option<PipeStats>>], now: Instant) {
-        let mode = self.mode().cloned();
+        let mode = self.choice().cloned();
         let mut upgrading = self.dials.iter().any(|d| d.upgrade)
             || self
                 .members
@@ -1165,7 +1153,7 @@ impl Maintainer {
             return;
         }
         for _ in self.slots()..self.count {
-            let kind = self.mode().map(|m| m.pick());
+            let kind = self.choice().map(|m| m.pick());
             self.dial(session, Purpose::Redial, kind, false);
         }
     }
@@ -1184,7 +1172,7 @@ impl Maintainer {
                 let f = j(session.clone(), self.options());
                 Box::pin(async move { Made::Joined(f.await) })
             }
-            Source::Mode(m) => {
+            Source::Choice(m) => {
                 let f = m.join(session.clone(), kind.unwrap_or(0), self.options());
                 Box::pin(async move { Made::Joined(f.await) })
             }
@@ -1198,16 +1186,28 @@ impl Maintainer {
     }
 
     /// The options of a pipe added now: the pool's, with the policy's
-    /// idle-probe settings, and `no_wait_attached` set: a replacement
+    /// idle-probe settings, and `return_on_reply` set: a replacement
     /// closes its old pipe only once the peer attached it (the member's own
     /// judgement), and a redial must not wait for a PIPE_ACK that only the
     /// direction it restores could carry.
     fn options(&self) -> PipeOptions {
         let mut o = self.pool.options.clone();
-        o.no_wait_attached = true;
-        let (interval, jitter) = self.probe;
-        o.probe_interval = interval.or(o.probe_interval);
-        o.probe_jitter = jitter.or(o.probe_jitter);
+        o.return_on_reply = true;
+        if let Some(l) = self.liveness {
+            fn own<T>(d: Inherit<T>, p: Inherit<T>) -> Inherit<T> {
+                match d {
+                    Inherit::Session => p,
+                    d => d,
+                }
+            }
+            let p = o.liveness;
+            o.liveness = PipeLiveness {
+                suspect_floor: own(l.suspect_floor, p.suspect_floor),
+                dead_timeout: own(l.dead_timeout, p.dead_timeout),
+                probe_interval: own(l.probe_interval, p.probe_interval),
+                probe_jitter: own(l.probe_jitter, p.probe_jitter),
+            };
+        }
         o
     }
 
@@ -1249,10 +1249,10 @@ impl Maintainer {
                 // The member waits for the Reply and the attachment itself.
                 session.begin_add_pipe(*io, self.options()).map(|p| vec![p])
             }
-            Made::Carrier(Err(e)) => Err(PipeError::Io(e.kind())),
+            Made::Carrier(Err(e)) => Err(PipeError::Io(std::sync::Arc::new(e))),
             Made::Joined(Ok(pipes)) if !pipes.is_empty() => Ok(pipes),
             Made::Joined(Ok(_)) => Err(PipeError::InvalidArgument),
-            Made::Joined(Err(e)) => Err(PipeError::Io(e.kind())),
+            Made::Joined(Err(e)) => Err(PipeError::Io(std::sync::Arc::new(e))),
         };
         let pipes = match pipes {
             Ok(p) => p,
@@ -1270,7 +1270,7 @@ impl Maintainer {
         m.upgrade = dialing.upgrade;
         set_limits(&mut m, self.pool.rotate.as_ref(), now);
         if replaces.is_none()
-            && let (Some(src), Some(k)) = (self.mode(), m.kind)
+            && let (Some(src), Some(k)) = (self.choice(), m.kind)
         {
             src.established(session, k);
         }
@@ -1339,6 +1339,6 @@ mod tests {
         let n = dials.load(Ordering::SeqCst) as u64;
         // One at each dial's start, one at its failure.
         assert!(draws <= 2 * n, "{draws} draws for {n} dials");
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     }
 }

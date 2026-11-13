@@ -87,8 +87,8 @@ fn mp_config() -> Config {
 const STILL_WINDOW: u64 = 32 << 20;
 
 fn still_sender(mut c: Config) -> Config {
-    c.probation = Some(Duration::ZERO);
-    c.suspect_floor = Duration::from_secs(600);
+    c.probation = None;
+    c.liveness.suspect_floor = Duration::from_secs(600);
     c
 }
 
@@ -175,7 +175,7 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
         "{:?}",
         client.close_reason()
     );
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     (stats, policy)
 }
 
@@ -222,7 +222,7 @@ fn predicate(
     calls: Arc<AtomicU64>,
     session: Arc<Mutex<Option<Session>>>,
 ) -> WindowIncrease {
-    WindowIncrease(Arc::new(move |delta| {
+    WindowIncrease::new(move |delta| {
         assert!(delta > 0);
         calls.fetch_add(1, Ordering::SeqCst);
         let s = session.lock().unwrap().clone();
@@ -233,7 +233,7 @@ fn predicate(
         }
         assert!(!panic, "predicate panics");
         approve
-    }))
+    })
 }
 
 /// One stream of `len` bytes into a receiver whose session window growth
@@ -281,8 +281,8 @@ async fn window_transfer(approve: bool, panic: bool) -> (u64, u64) {
     writer.await.unwrap();
     let growth = receiver.window_growth();
     slot.lock().unwrap().take();
-    sender.close(0u32.into(), b"").await;
-    receiver.closed().await;
+    sender.close().await;
+    receiver.closing().await;
     (growth, calls.load(Ordering::SeqCst))
 }
 
@@ -347,7 +347,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     let stats = client.stats();
     assert!(stats.scheduler_answers > 0, "{stats:?}");
     assert!(policy.refused.load(Ordering::SeqCst));
-    client.close(0u32.into(), b"");
+    client.close();
     drop(listener);
 
     // The predicate on the blocking receiver's hook thread.
@@ -362,17 +362,17 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
         let calls = calls.clone();
         let blocked = blocked.clone();
         let slot = slot.clone();
-        config.allow_connection_window_increase = Some(WindowIncrease(Arc::new(move |_| {
+        config.allow_connection_window_increase = Some(WindowIncrease::new(move |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             let s = slot.lock().unwrap().clone();
             if let Some(s) = s {
                 blocked.store(
-                    s.closed(None) == Err(zmux::blocking::WaitError::OnDriverThread),
+                    s.closing() == Err(zmux::blocking::WaitError::OnDriverThread),
                     Ordering::SeqCst,
                 );
             }
             true
-        })));
+        }));
     }
     let receiver = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
@@ -407,7 +407,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     assert!(receiver.window_growth() > 0);
     assert!(blocked.load(Ordering::SeqCst));
     slot.lock().unwrap().take();
-    sender.close(0u32.into(), b"");
-    receiver.closed(None).unwrap();
+    sender.close();
+    receiver.closing().unwrap();
     drop(rt);
 }

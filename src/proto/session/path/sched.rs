@@ -1467,7 +1467,9 @@ impl SessionCore {
             return;
         }
         mp.out.clear();
-        let current = mp.out_gen == req.generation && req.generation == mp.generation;
+        // The answers are for the request handed out last, and nothing changed
+        // since it was.
+        let current = req.generation == mp.out_gen && mp.out_gen == mp.generation;
         let epoch = mp.input_epoch;
         let generation = req.generation;
         for (i, &key) in req.keys.iter().enumerate() {

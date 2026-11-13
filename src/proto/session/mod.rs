@@ -76,26 +76,27 @@ use bytes::Bytes;
 use crate::proto::frame::Dir;
 use crate::proto::ident::Classifier;
 use crate::proto::meter::{Count, Meter};
-use crate::proto::params::{Features, Role, TransportParameters};
+pub use crate::proto::params::Role;
+use crate::proto::params::{Features, TransportParameters};
 use crate::proto::record::Framing;
 use crate::proto::{ApplicationErrorCode, Error, TransportErrorCode, VarInt};
 
+pub use crate::proto::seal::RecordMode;
 pub use api::{SendCapacity, SendOutcomeKind};
 pub use app_event::{
     CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, Support, Tracer,
 };
+pub(crate) use config::Period;
 #[cfg(feature = "test-hooks")]
 pub use config::TestHooks;
+pub use config::{AllowRecordMode, AuthorizeJoin, RecordPolicy, RecordPolicyInput};
 pub use config::{
-    AllowRecordMode, AllowRecordModeFn, AuthorizeJoin, CarrierDescription, RecordPolicy,
-};
-pub use config::{
-    Budget, Cap, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
+    Cap, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
     DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MEMORY_BUDGET,
     DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
-    DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, EarlyData, Liveness, LogFn, LogLevel, Logger,
-    Period, PipeAuth, Redundancy, RoleConfig, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR,
-    WindowIncrease,
+    DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, EarlyData, Inherit,
+    Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT, PipeAuth, Redundancy,
+    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, UniCredit, WindowIncrease,
 };
 pub use early::EarlyDataState;
 pub use epoch::{
@@ -103,15 +104,18 @@ pub use epoch::{
 };
 pub(crate) use error::ON_DRIVER_THREAD;
 pub use error::{
-    DatagramError, JoinMissing, OpenError, PipeError, PipeFailure, SessionError, StreamError,
+    DatagramError, InvalidConfig, JoinMissing, OpenError, PipeError, PipeFailure, SessionError,
+    StreamError,
 };
 pub use event::CoreEvent;
 pub use join::{
     ClaimedHello, ConfirmedJoin, JOIN_READ_BOUND, JoinFinished, JoinRecords, JoinStep, OpenedHello,
-    PeerCarrier, PeerJoin, RecordMode,
+    PeerCarrier, PeerJoin,
 };
 pub use lanes::LaneAccept;
-pub use mpath::{LaneStats, Multipath, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource};
+pub use mpath::{
+    LaneStats, Multipath, PipeDirection, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource,
+};
 pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
 pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Policy};
 pub use preamble::Preamble;
@@ -528,8 +532,13 @@ pub(super) struct DatagramState {
     early: VecDeque<(Option<(StreamKey, u64)>, Bytes)>,
     /// Received session datagrams.
     recv: VecDeque<Bytes>,
-    /// Bytes held in every receive queue.
+    /// Bytes held in the session queue and, with an entry cost each, for
+    /// streams not opened yet (`waiting`): what
+    /// [`Config::datagram_receive_bytes`] bounds.
     recv_bytes: usize,
+    /// Bytes held in every stream's queue together, each bounded by its own
+    /// limits: for the memory accounting only.
+    stream_bytes: usize,
     /// Received datagrams held for the receive limiter, which the driver
     /// asks outside the lock.
     held: VecDeque<ReceivedDatagram>,
@@ -586,6 +595,7 @@ impl DatagramState {
             + self.send.iter().map(|(_, b)| b.len()).sum::<usize>()
             + self.early.iter().map(|(_, b)| b.len()).sum::<usize>()
             + self.recv_bytes
+            + self.stream_bytes
             + self.held_bytes
     }
 }
@@ -596,6 +606,7 @@ static NO_DGRAM: DatagramState = DatagramState {
     early: VecDeque::new(),
     recv: VecDeque::new(),
     recv_bytes: 0,
+    stream_bytes: 0,
     held: VecDeque::new(),
     held_bytes: 0,
     waiting: VecDeque::new(),
@@ -754,7 +765,7 @@ enum CloseFrame {
 /// use std::time::Instant;
 /// use zmux::proto::frame::Dir;
 /// use zmux::proto::record::Framing;
-/// use zmux::proto::session::{Config, PipeId, RoleConfig, SessionCore, TransmitBuf};
+/// use zmux::proto::session::{Config, PipeId, Role, SessionCore, TransmitBuf};
 ///
 /// /// Moves what `from` has to write on pipe 0 to `to`.
 /// fn pump(from: &mut SessionCore, to: &mut SessionCore, buf: &mut TransmitBuf, now: Instant) {
@@ -770,8 +781,8 @@ enum CloseFrame {
 /// }
 ///
 /// let now = Instant::now();
-/// let mut client = SessionCore::new(Config::default(), RoleConfig::Initiator, None, now)?;
-/// let mut server = SessionCore::new(Config::default(), RoleConfig::Responder, None, now)?;
+/// let mut client = SessionCore::new(Config::default(), Role::Client, None, now)?;
+/// let mut server = SessionCore::new(Config::default(), Role::Server, None, now)?;
 /// client.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
 /// server.attach_pipe(PipeId::new(0), Framing::ByteStream, now);
 ///
@@ -854,7 +865,7 @@ pub struct SessionCore {
     /// are processed, or at the close.
     exporter: Option<Box<Option<Vec<u8>>>>,
     /// The record mode of a first pipe on the secure carrier; `None` is Unmanaged.
-    first_pipe_mode: Option<crate::proto::seal::Mode>,
+    first_pipe_mode: Option<crate::proto::seal::RecordMode>,
     /// The host declared pipe 0 end to end.
     declared: bool,
     /// The length of the instance identifier at the start of the local Locators.
@@ -918,14 +929,25 @@ pub struct SessionCore {
     /// When an application close stops waiting for the carriers to take
     /// CONNECTION_CLOSE ([`SessionCore::close_handed_off`]).
     handoff_deadline: Option<Instant>,
-    /// The hand-off limit passed with CONNECTION_CLOSE taken by the
-    /// carriers: the close no longer waits for the drain, which goes on
-    /// until the session is CLOSED ([`SessionCore::close_completed`]).
+    /// The hand-off limit passed: a close no longer waits for the
+    /// carriers ([`SessionCore::close_returned`]).
     handoff_expired: bool,
+    /// A graceful close sends what the streams wrote before its
+    /// CONNECTION_CLOSE: its code and reason while it does.
+    close_flush: Option<Box<(VarInt, Bytes)>>,
+    /// An abort was called: a close returns at once.
+    close_aborted: bool,
     stats: SessionStats,
     /// The linger deadline was extended once because the close was not
     /// written yet.
     linger_extended: bool,
+    /// The peer's CONNECTION_CLOSE was processed: what arrived before it
+    /// stays readable while the session is closing.
+    peer_close_processed: bool,
+    /// After the peer's close: the streams the application holds (opened or
+    /// accepted) whose received data is not read yet; CLOSED waits for 0 or
+    /// the linger deadline.
+    peer_close_unread: usize,
     /// The linger was restarted when the carriers took CONNECTION_CLOSE.
     pub(in crate::proto::session) linger_from_delivery: bool,
     /// The application byte counters.
@@ -979,18 +1001,18 @@ fn random_key() -> [u8; 16] {
 
 impl SessionCore {
     /// A session before any pipe is attached. `role` is the session-creation
-    /// role: [`RoleConfig::Initiator`] and
-    /// [`RoleConfig::Responder`] are transport roles; [`RoleConfig::Auto`]
+    /// role: [`Role::Client`] and
+    /// [`Role::Server`] are transport roles; [`Role::Auto`]
     /// sends `zmux_role` auto. `transport_role` is who dialled pipe 0 when
     /// the carrier tells (it overrides the transport role implied by
     /// `role`); a symmetric carrier passes `None`, and the roles are then
     /// resolved from `zmux_role` alone.
     pub fn new(
         config: impl Into<Arc<Config>>,
-        role: RoleConfig,
+        role: Role,
         transport_role: Option<Role>,
         now: Instant,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, crate::InvalidConfig> {
         let config: Arc<Config> = config.into();
         let keep_alive_rng = config
             .hooks
@@ -998,7 +1020,7 @@ impl SessionCore {
             .map_or_else(random_u64, |s| s ^ 0x6b65_6570_616c_6976);
         config.validate()?;
         let role_nonce =
-            (role == RoleConfig::Auto).then(|| config.hooks.role_nonce.unwrap_or_else(random_u64));
+            (role == Role::Auto).then(|| config.hooks.role_nonce.unwrap_or_else(random_u64));
         let session_nonce = config.hooks.session_nonce.unwrap_or_else(|| {
             let mut n = [0u8; 16];
             n[..8].copy_from_slice(&random_u64().to_le_bytes());
@@ -1007,15 +1029,15 @@ impl SessionCore {
         });
         let lane_key = config.hooks.lane_key.unwrap_or_else(random_key);
         let local_tp = config.transport_parameters(role_nonce, session_nonce, lane_key);
-        local_tp
-            .validate()
-            .map_err(|_| "configuration gives invalid transport parameters")?;
+        local_tp.validate().map_err(|_| {
+            crate::InvalidConfig::new("Config", "gives transport parameters that are not valid")
+        })?;
         let local = tp::LocalTp::of(&local_tp);
         let grease = config.grease_parameter(random_u64());
         let transport_role = transport_role.or(match role {
-            RoleConfig::Initiator => Some(Role::Initiator),
-            RoleConfig::Responder => Some(Role::Responder),
-            RoleConfig::Auto => None,
+            Role::Client => Some(Role::Client),
+            Role::Server => Some(Role::Server),
+            Role::Auto => None,
         });
         let window = local_tp.initial_max_data.unwrap_or(0);
         let stream_limits = [
@@ -1024,17 +1046,20 @@ impl SessionCore {
         ];
         // Unidirectional credit grows on the first accept unless the
         // application configured it (or the test parameters set more).
-        let staged_uni = config.max_incoming_uni_streams.is_none()
+        let staged_uni = config.max_incoming_uni_streams == config::UniCredit::Staged
             && stream_limits[UNI] < config::STAGED_UNI_STREAMS.1;
         let streams = Streams::new(config.send_buffer, stream_limits, staged_uni, window);
         let ping_start = config.hooks.ping_seq_start.unwrap_or(0);
         let srtt = config.hooks.rtt;
         let hold = config.early_data.hold_first_flight;
         if hold
-            && (role != RoleConfig::Initiator
+            && (role != Role::Client
                 || !config.early_data.zmux_peer && !config.early_data.carrier_early_data)
         {
-            return Err("EarlyData::hold_first_flight without client early data");
+            return Err(crate::InvalidConfig::new(
+                "early_data",
+                "hold_first_flight without client early data",
+            ));
         }
         let start_timeout = now.checked_add(config.handshake_wait());
         let mut session = Self {
@@ -1044,7 +1069,7 @@ impl SessionCore {
             first_held: hold.then(|| Box::new(start_timeout)),
             config,
             transport_role,
-            role: transport_role.unwrap_or(Role::Initiator),
+            role: transport_role.unwrap_or(Role::Client),
             state: State::Establishing,
             local,
             grease,
@@ -1099,8 +1124,12 @@ impl SessionCore {
             linger_deadline: None,
             handoff_deadline: None,
             handoff_expired: false,
+            close_flush: None,
+            close_aborted: false,
             stats: SessionStats::default(),
             linger_extended: false,
+            peer_close_processed: false,
+            peer_close_unread: 0,
             linger_from_delivery: false,
             meter: Arc::new(Meter::new()),
             streams,
@@ -1393,7 +1422,7 @@ impl SessionCore {
         let rtt = self.initial_rtt(0);
         let detection = self.detection(0, None);
         if self.atts.first().is_none_or(|a| a.id() != 0) {
-            let joiner = self.transport_role != Some(Role::Responder);
+            let joiner = self.transport_role != Some(Role::Server);
             // Room for this one alone: a single-pipe session has no other.
             self.atts.insert(Attachment::bootstrap(joiner));
             self.views_changed();
@@ -1623,7 +1652,22 @@ impl SessionCore {
         if self.handoff_deadline.is_some_and(|d| now >= d) {
             self.handoff_deadline = None;
             self.handoff_expired = true;
+            if let Some(f) = self.close_flush.take() {
+                // The flush took the whole bound: what is left is
+                // discarded, and CONNECTION_CLOSE goes out in the background
+                // within one more limit, as an abort's.
+                self.close_with(f.0, &f.1, now);
+                self.handoff_deadline = Some(now + self.handoff_limit());
+                return;
+            }
             if !self.close_handed_off() {
+                if self.peer_close_unread > 0 {
+                    // The application still reads what arrived before the
+                    // peer's close: the linger deadline bounds it.
+                    self.linger_deadline
+                        .get_or_insert(now + self.linger_timeout());
+                    return;
+                }
                 // A carrier did not take CONNECTION_CLOSE in time: the
                 // session ends locally, every carrier closed.
                 self.closed_now();
@@ -1631,6 +1675,14 @@ impl SessionCore {
             }
         }
         if self.linger_deadline.is_some_and(|d| now >= d) {
+            // The linger runs from the delivery of CONNECTION_CLOSE: while
+            // a carrier is still taking it, the hand-off limit bounds the
+            // wait, and the delivery starts the linger
+            // ([`Self::pipe_written`]).
+            if let Some(h) = self.handoff_deadline.filter(|_| !self.close_handed_off()) {
+                self.linger_deadline = Some(h);
+                return;
+            }
             // The deadline may come from a stale clock (a command without a
             // time ended the session): give the close one linger period
             // from now to be written.
@@ -1728,6 +1780,9 @@ impl SessionCore {
     }
 
     fn linger_timeout(&self) -> Duration {
+        if let Some(t) = self.config.hooks.linger_timeout {
+            return t;
+        }
         (self.rtt_or_default() * 3)
             .max(Duration::from_millis(250))
             .min(Duration::from_secs(2))
@@ -1883,9 +1938,58 @@ impl SessionCore {
             let out_done = a.out().is_none_or(OutPipe::write_done);
             in_done && out_done
         });
-        if done {
-            self.closed_now();
+        if !done {
+            return;
         }
+        if self.peer_close_unread > 0 {
+            // The application still reads what arrived before the peer's
+            // close: CLOSED once it has, or at the linger deadline.
+            if self.linger_deadline.is_none() {
+                self.linger_deadline = Some(self.now + self.linger_timeout());
+            }
+            return;
+        }
+        self.closed_now();
+    }
+
+    /// The peer's CONNECTION_CLOSE was processed: counts the streams the
+    /// application holds (opened or accepted) with received data unread,
+    /// which stays readable until read, or until the linger deadline ends
+    /// the session as for every close. Nothing arrives after it, so the
+    /// count only falls ([`Self::unread_drained`]).
+    pub(super) fn peer_close_received(&mut self) {
+        self.peer_close_processed = true;
+        self.peer_close_unread = self
+            .streams
+            .keys()
+            .filter(|&k| self.holds_unread(k))
+            .count();
+    }
+
+    /// Whether `key` counts in [`Self::peer_close_unread`]: the application
+    /// holds it and it has received data unread.
+    pub(super) fn holds_unread(&self, key: StreamKey) -> bool {
+        self.streams.get(key).is_some_and(|s| {
+            matches!(s.offer, stream::Offer::Local | stream::Offer::Accepted)
+                && s.recv
+                    .as_ref()
+                    .is_some_and(|r| !r.buf.is_empty() && r.cold().stopped.is_none())
+        })
+    }
+
+    /// A counted stream's unread data was read or discarded after the peer's
+    /// close: the session may be CLOSED now.
+    pub(super) fn unread_drained(&mut self) {
+        if self.peer_close_unread > 0 {
+            self.peer_close_unread -= 1;
+            self.maybe_closed(self.now);
+        }
+    }
+
+    /// Whether the session is closing for the peer's CONNECTION_CLOSE, while
+    /// what arrived before it stays readable.
+    pub(super) fn draining_peer_close(&self) -> bool {
+        self.state == State::Closing && self.peer_close_processed
     }
 
     /// CLOSED: release everything.
@@ -1939,18 +2043,92 @@ impl SessionCore {
         }
     }
 
-    /// Closes the session immediately with an application CONNECTION_CLOSE,
-    /// which waits for the carriers at most the hand-off limit (1 s):
-    /// then the session is CLOSED, its carriers closed
-    /// ([`SessionCore::close_handed_off`]). A session already closing
-    /// keeps its close; the limit then runs from the first call.
+    /// Closes the session gracefully with an application CONNECTION_CLOSE:
+    /// the stream data written and not yet sent goes out first, as far as
+    /// flow control and the carriers allow within the hand-off limit (data
+    /// waiting for the peer's credit waits for it), then CONNECTION_CLOSE. The
+    /// whole close, the flush included, is bounded by the hand-off limit
+    /// (1 s) from this call: what has not left by then is discarded and the
+    /// close goes on in the background as an abort's
+    /// ([`SessionCore::close_returned`]). The first close or abort decides
+    /// what is sent; a later call sends nothing more.
     pub fn close(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         self.tick(now);
+        if self.close_flush.is_some() {
+            return;
+        }
+        if self.state >= State::Closing {
+            // Closing already (a shutdown's close, which has no hand-off
+            // limit, or a protocol error's): this call is still bounded.
+            if self.state == State::Closing
+                && self.handoff_deadline.is_none()
+                && !self.handoff_expired
+            {
+                self.handoff_deadline = Some(now.max(self.now) + self.handoff_limit());
+            }
+            return;
+        }
+        self.handoff_deadline = Some(now.max(self.now) + self.handoff_limit());
+        self.close_flush = Some(Box::new((
+            code,
+            Bytes::copy_from_slice(clip_reason(reason)),
+        )));
+        self.check_close_flush(now);
+    }
+
+    /// Ends the session at once with an application CONNECTION_CLOSE: data
+    /// not yet sent is discarded, and CONNECTION_CLOSE is handed to the
+    /// carriers in the background, bounded by the hand-off limit (1 s), then
+    /// their write sides are shut and their input drained until the peer
+    /// ends it or the linger timeout passes. An abort during a graceful
+    /// close's flush ends the flush: the close's CONNECTION_CLOSE goes out
+    /// at once. A session already closing keeps its close.
+    pub fn abort(&mut self, code: VarInt, reason: &[u8], now: Instant) {
+        self.tick(now);
+        // A close returns at once after an abort that came first or ended its
+        // flush; one already handing over CONNECTION_CLOSE keeps its wait.
+        if self.state < State::Closing {
+            self.close_aborted = true;
+        }
+        if let Some(f) = self.close_flush.take() {
+            self.close_with(f.0, &f.1, now);
+            return;
+        }
         if self.state <= State::Closing && self.handoff_deadline.is_none() && !self.handoff_expired
         {
             self.handoff_deadline = Some(now.max(self.now) + self.handoff_limit());
         }
         self.close_with(code, reason, now);
+    }
+
+    /// Ends the flush of a graceful close once every stream has sent what
+    /// it was given ([`Self::close_flushed`]); the hand-off limit ends it
+    /// otherwise.
+    pub(super) fn check_close_flush(&mut self, now: Instant) {
+        if self.close_flush.is_none() || !self.close_flushed() {
+            return;
+        }
+        if let Some(f) = self.close_flush.take() {
+            self.close_with(f.0, &f.1, now);
+        }
+    }
+
+    /// Whether every stream has sent what it was given: its buffer is
+    /// empty or it was reset, or no outbound pipe can carry anything. Data
+    /// that waits for the peer's credit (flow control, a stream ID) holds
+    /// the flush, which the hand-off limit bounds: a peer that reads gets
+    /// it ahead of CONNECTION_CLOSE.
+    fn close_flushed(&self) -> bool {
+        if !self.atts.outs().any(OutPipe::is_live) {
+            return true;
+        }
+        self.streams.keys().all(|k| {
+            let Some(send) = self.streams.send(k) else {
+                return true;
+            };
+            send.outcome == Some(stream::SendOutcome::Reset)
+                || send.buf.is_empty() && send.preamble_left == 0
+        })
     }
 
     /// The application CONNECTION_CLOSE of a close or of a completed
@@ -1998,16 +2176,16 @@ impl SessionCore {
         }
     }
 
-    /// Whether an application close has completed: the session is CLOSED
-    /// (CONNECTION_CLOSE handed to the carriers, their write sides shut and
-    /// their input drained until the peer ended it or the linger timeout),
-    /// or the hand-off limit passed with CONNECTION_CLOSE taken by every
-    /// carrier, the drain then going on while the session runs. Until then
-    /// a process must not exit: closing a carrier that still has unread
-    /// input resets it (a TCP RST), and the peer discards what it has not
-    /// read yet, CONNECTION_CLOSE included.
-    pub fn close_completed(&self) -> bool {
-        self.state == State::Closed || (self.handoff_expired && self.close_handed_off())
+    /// Whether a close or abort no longer holds its caller: CONNECTION_CLOSE
+    /// was handed to every carrier that can take it, the hand-off limit
+    /// passed, an abort was called, or the session is CLOSED. The
+    /// half-close and the drain then go on in the background until the
+    /// session is CLOSED.
+    pub fn close_returned(&self) -> bool {
+        self.state == State::Closed
+            || self.close_aborted
+            || self.handoff_expired
+            || self.close_flush.is_none() && self.close_handed_off()
     }
 
     /// The session error as seen by stream operations.
@@ -2041,9 +2219,7 @@ impl SessionCore {
             return Ok(());
         }
         let protocol = match (&self.config.protocols, &tp.application_protocols) {
-            (Some(ours), Some(theirs)) => {
-                select_protocol(ours, theirs, self.role == Role::Responder)
-            }
+            (Some(ours), Some(theirs)) => select_protocol(ours, theirs, self.role == Role::Server),
             _ => None,
         };
         // Send-side limits come from the peer's parameters.
@@ -2131,7 +2307,7 @@ impl SessionCore {
         if let Some(idle) = self.idle_timeout() {
             k = k.min(idle / 2);
         }
-        let j = self.config.probe_jitter;
+        let j = self.config.liveness.probe_jitter;
         if j <= 0.0 {
             return Some(k);
         }
@@ -2200,6 +2376,9 @@ impl SessionCore {
         let b2 = self.streams.remote_dir(BIDI).offered.min(b1);
         let u2 = self.streams.remote_dir(UNI).offered.min(u1);
         self.goaway_mut().final_sent = true;
+        if let Some(f) = &self.config.hooks.goaway_final {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if b2 < b1 || u2 < u1 {
             self.goaway_mut().pending = Some((b2, u2, code));
             self.streams.set_goaway_watermark(BIDI, b2);

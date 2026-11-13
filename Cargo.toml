@@ -43,8 +43,8 @@ test-hooks = []
 
 [dependencies]
 # Suite 1 of Join, always present.
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
-chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"], optional = true }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"], optional = true }
 # The tokio driver's single-waker slots (a pipe's read waker, a maintainer's stop).
 atomic-waker = { version = "1.1", optional = true }
 bytes = "1.12"
@@ -116,4 +116,8 @@ harness = false
 
 [[bench]]
 name = "autotune"
+harness = false
+
+[[bench]]
+name = "seal"
 harness = false

@@ -17,12 +17,12 @@ use crate::value::{ALL_SCOPES, Family, Reader, Sampler, Scope, Value, int, parse
 
 type NewSource = Arc<dyn Fn() -> Box<dyn Source> + Send + Sync>;
 
-/// The bound of a candidate's counters and timers when [`SizeLimits::max_slots`] is 0.
+/// The default of [`SizeLimits::max_slots`].
 pub const DEFAULT_MAX_SLOTS: u64 = 4096;
 
-/// Bounds of a definition's size. Each `Option` field is `None` by default, no bound; a set
-/// one bounds as it is, zero allowing none.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Bounds of a definition's size. A set bound bounds as it is, zero allowing none; `None`
+/// is no bound, the default of every field but [`max_slots`](Self::max_slots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SizeLimits {
     /// Input bytes.
@@ -37,23 +37,29 @@ pub struct SizeLimits {
     pub max_transitions: Option<usize>,
     /// Segments per value or table.
     pub max_segments: Option<usize>,
-    /// Counters and timers of all machines of a candidate together. They are declared by a
-    /// number and allocated for each pipe, so a short document could otherwise ask for any
-    /// amount of memory. 0 is [`DEFAULT_MAX_SLOTS`] and a negative value is no bound.
-    pub max_slots: i64,
+    /// Counters and timers of all machines of a candidate together (default
+    /// [`DEFAULT_MAX_SLOTS`]). They are declared by a number and allocated for each pipe,
+    /// so a short document could otherwise ask for any amount of memory.
+    pub max_slots: Option<u64>,
+}
+
+impl Default for SizeLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: None,
+            max_machines: None,
+            max_states: None,
+            max_actions: None,
+            max_transitions: None,
+            max_segments: None,
+            max_slots: Some(DEFAULT_MAX_SLOTS),
+        }
+    }
 }
 
 impl SizeLimits {
     pub(crate) fn input(&self, n: usize) -> Result<(), Error> {
         over(n, self.max_bytes, "input bytes")
-    }
-
-    /// The bound of a candidate's counters and timers; `None`: no bound.
-    pub(crate) fn slots_bound(&self) -> Option<u64> {
-        match self.max_slots {
-            0 => Some(DEFAULT_MAX_SLOTS),
-            n => u64::try_from(n).ok(),
-        }
     }
 }
 
@@ -1277,7 +1283,7 @@ mod size_tests {
         Options::default().with_limits(l)
     }
 
-    fn max_slots(n: i64) -> SizeLimits {
+    fn max_slots(n: Option<u64>) -> SizeLimits {
         SizeLimits {
             max_slots: n,
             ..SizeLimits::default()
@@ -1286,21 +1292,26 @@ mod size_tests {
 
     #[test]
     fn max_slots_bounds_counters_and_timers() {
-        let cases: [(u64, u64, i64, &str); 6] = [
-            (1 << 25, 1 << 25, 0, "limit"),
-            (DEFAULT_MAX_SLOTS, 0, 0, ""),
-            (DEFAULT_MAX_SLOTS, 1, 0, "limit"),
-            (2, 2, 3, "limit"),
-            (DEFAULT_MAX_SLOTS, 1, -1, ""),
-            (1 << 30, 1 << 30, 3, "limit"),
+        let default = SizeLimits::default().max_slots;
+        let cases: [(u64, u64, Option<u64>, &str); 8] = [
+            (1 << 25, 1 << 25, default, "limit"),
+            (DEFAULT_MAX_SLOTS, 0, default, ""),
+            (DEFAULT_MAX_SLOTS, 1, default, "limit"),
+            (2, 2, Some(3), "limit"),
+            (DEFAULT_MAX_SLOTS, 1, None, ""),
+            (1 << 30, 1 << 30, Some(3), "limit"),
+            // None at all.
+            (0, 0, Some(0), ""),
+            (1, 0, Some(0), "limit"),
         ];
         for (c, t, l, want) in cases {
             let r = MachineFactory::from_json(slots(c, t).as_bytes(), with(max_slots(l)));
-            assert_eq!(class(r), want, "{c} {t} {l}");
+            assert_eq!(class(r), want, "{c} {t} {l:?}");
         }
         // Before anything is allocated, even with no bound asked for: beyond what a slot
         // number holds.
-        let r = MachineFactory::from_json(slots(1 << 31, 1 << 31).as_bytes(), with(max_slots(-1)));
+        let r =
+            MachineFactory::from_json(slots(1 << 31, 1 << 31).as_bytes(), with(max_slots(None)));
         assert_eq!(class(r), "limit");
     }
 

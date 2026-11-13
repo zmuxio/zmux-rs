@@ -372,7 +372,7 @@ mod tests {
     }
 
     fn session(c: super::super::Config) -> SessionCore {
-        let role = super::super::RoleConfig::Initiator;
+        let role = super::super::Role::Client;
         SessionCore::new(c, role, None, Instant::now()).unwrap()
     }
 
@@ -380,7 +380,7 @@ mod tests {
     fn automatic_caps_grow_beyond_the_floors_within_the_budget() {
         const MIB: u64 = 1 << 20;
         let mut c = super::super::Config {
-            memory_budget: Some(crate::proto::session::Budget::Bytes(256 * MIB)),
+            memory_budget: Some(256 * MIB),
             ..Default::default()
         };
         let mut s = session(c.clone());
@@ -392,7 +392,7 @@ mod tests {
         // grow with the window.
         assert_eq!(s.buffer_cap(), 96 * MIB);
         // A budget below the floors leaves the floors.
-        c.memory_budget = Some(crate::proto::session::Budget::Bytes(MIB));
+        c.memory_budget = Some(MIB);
         let mut s = session(c.clone());
         s.grow_session_window(1 << 40);
         assert_eq!(s.streams.recv_flow().window, 96 * MIB);
@@ -404,7 +404,7 @@ mod tests {
         // The window took what the listener had left.
         assert_eq!(s.send_buffer_limit(), 64 * MIB);
         // Fixed caps are fixed, whatever the budget.
-        c.memory_budget = Some(crate::proto::session::Budget::Unlimited);
+        c.memory_budget = None;
         c.max_connection_receive_window = Cap::Fixed(8 * MIB);
         c.send_buffer_max = Cap::Fixed(2 * MIB);
         c.send_buffer = 2 * MIB;

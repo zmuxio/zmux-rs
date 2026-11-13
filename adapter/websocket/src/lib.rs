@@ -34,8 +34,8 @@
 //!   fallback ([`zmux::ListenerConfig::fallback`]), with the bytes read replayed, or answers
 //!   it with `404 Not Found` ([`not_found`]).
 //! - An admission decides on the request head, so a client's credential
-//!   travels in a request header field ([`Options::with_credential`],
-//!   [`Credential::header`]): a prefix authentication token in
+//!   travels in a request header field ([`Options::with_carrier_credential`],
+//!   [`CarrierCredential::header`]): a prefix authentication token in
 //!   `Zmux-Prefix-Auth`, bound to the TLS connection under it where the
 //!   adapter holds that ([`dial_tls`], and [`accept`] with the
 //!   connection's exporter).
@@ -112,8 +112,8 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 use zmux::carrier::ChunkWrite;
 use zmux::{
-    Admit, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo, Prefixed,
-    Session,
+    Admit, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint, PipeIo,
+    Prefixed, Session,
 };
 
 pub(crate) const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
@@ -145,7 +145,7 @@ where
 /// A carrier over a new WebSocket to `request` (a `ws://` URL, or a request
 /// with headers of the host's): the subprotocols default to
 /// [`zmux::alpn_protocols`], and the header field of
-/// [`Options::with_credential`] is added (given no exporter: there is no TLS).
+/// [`Options::with_carrier_credential`] is added (given no exporter: there is no TLS).
 /// Over plain TCP, a pipe that zmux fails is aborted without a Close
 /// frame. A `wss://` request goes over TLS as with [`dial_tls`], with the
 /// default [`tls_connector`] (feature `wss`); without the feature it is
@@ -602,7 +602,7 @@ pub async fn connect_tls(
 }
 
 /// The request with the offered subprotocols unless it names its own, and
-/// the header field of [`Options::with_credential`] for a carrier with metadata
+/// the header field of [`Options::with_carrier_credential`] for a carrier with metadata
 /// `info`.
 fn offer(
     request: impl IntoClientRequest + Unpin,
@@ -616,7 +616,7 @@ fn offer(
         let value = HeaderValue::from_str(&offer).map_err(io::Error::other)?;
         request.headers_mut().insert(PROTOCOL_HEADER, value);
     }
-    if let Some(c) = &options.credential {
+    if let Some(c) = &options.carrier_credential {
         let (name, value) = c.header(info)?;
         let name = http::HeaderName::from_bytes(name.as_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -844,15 +844,31 @@ async fn read_head<S: AsyncRead + Unpin>(
         if n == 0 {
             return Ok((buf, None));
         }
-        let from = buf.len().saturating_sub(3);
+        let from = buf.len().saturating_sub(2);
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(i) = buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
-            return Ok((buf, Some(from + i + 4)));
+        if let Some(end) = head_end(&buf, from) {
+            return Ok((buf, Some(end)));
         }
         if buf.len() >= limit {
             return Ok((buf, None));
         }
     }
+}
+
+/// The end of a request head in `buf`, searched from `from`: the empty
+/// line after its fields, ended by CRLF or by a bare LF as HTTP/1.1
+/// parsers accept (`\n\n` or `\n\r\n`).
+fn head_end(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
+        let lf = i + p;
+        match buf.get(lf + 1..) {
+            Some([b'\n', ..]) => return Some(lf + 2),
+            Some([b'\r', b'\n', ..]) => return Some(lf + 3),
+            _ => i = lf + 1,
+        }
+    }
+    None
 }
 
 /// A request head that upgrades.
@@ -865,7 +881,8 @@ struct UpgradeRequest {
 /// The upgrade of `head` (a complete request head), when it is a
 /// WebSocket upgrade request offering a subprotocol `options` accepts.
 fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
-    let lines = head.windows(2).filter(|w| w == b"\r\n").count();
+    // Every field ends with a LF, with or without CR.
+    let lines = head.iter().filter(|&&b| b == b'\n').count();
     let mut headers = vec![httparse::EMPTY_HEADER; lines];
     let mut req = httparse::Request::new(&mut headers);
     if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) || req.version != Some(1) {
@@ -915,7 +932,7 @@ fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
 /// Serves WebSocket upgrades on a TCP listener until `listener` is
 /// closed: each connection, in a task of its own and as a setup of
 /// [`Listener::serve_connections`] (within the listener's
-/// `handshake_timeout` and `max_pending`), has the PROXY protocol header
+/// `handshake_timeout`), has the PROXY protocol header
 /// of an intermediary the listener trusts to send it read first
 /// ([`zmux::proxied_source`]: the client it reports is the source, a
 /// forwarding header field then applies on top), takes its source slot
@@ -1050,7 +1067,7 @@ async fn serve_over<C, S, SF>(
 pub struct Options {
     protocols: Vec<String>,
     no_subprotocol: bool,
-    credential: Option<Arc<dyn Credential>>,
+    carrier_credential: Option<Arc<dyn CarrierCredential>>,
     max_request_head: usize,
     max_redirects: usize,
 }
@@ -1066,6 +1083,11 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The defaults: `qmux-02`, with its alias `qmux-01`; no credential.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// `qmux-02.<application>` (and its alias `qmux-01.<application>`).
     pub fn for_application(application: &str) -> Self {
         Self::for_protocol(format!(
@@ -1080,17 +1102,17 @@ impl Options {
         Self {
             protocols: vec![id.into()],
             no_subprotocol: false,
-            credential: None,
+            carrier_credential: None,
             max_request_head: DEFAULT_MAX_REQUEST_HEAD,
             max_redirects: DEFAULT_MAX_REDIRECTS,
         }
     }
 
     /// With the credential a client presents in a request header field
-    /// ([`Credential::header`]), such as a prefix authentication token.
+    /// ([`CarrierCredential::header`]), such as a prefix authentication token.
     #[must_use]
-    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 
@@ -1282,6 +1304,30 @@ struct Writer<S> {
     started: (usize, usize),
 }
 
+impl<S: AsyncRead + AsyncWrite + Unpin> Writer<S> {
+    /// [`ChunkWrite::poll_write_message_batch`], `started` counting the
+    /// messages already in the sink across `Pending`.
+    fn write_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+        messages: &mut [Bytes],
+    ) -> Poll<io::Result<usize>> {
+        while let Some(msg) = messages.get(self.started.0) {
+            ready!(Pin::new(&mut self.sink).poll_ready(cx)).map_err(ws_error)?;
+            // Shared with the sink; taken from `messages` once flushed.
+            Pin::new(&mut self.sink)
+                .start_send(Message::Binary(msg.clone()))
+                .map_err(ws_error)?;
+            self.started.0 += 1;
+            self.started.1 += msg.len();
+        }
+        ready!(Pin::new(&mut self.sink).poll_flush(cx)).map_err(ws_error)?;
+        let bytes = self.started.1;
+        messages.fill(Bytes::new());
+        Poll::Ready(Ok(bytes))
+    }
+}
+
 fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionReset, e)
 }
@@ -1307,19 +1353,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
         messages: &mut [Bytes],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        while let Some(msg) = messages.get(this.started.0) {
-            ready!(Pin::new(&mut this.sink).poll_ready(cx)).map_err(ws_error)?;
-            // Shared with the sink; taken from `messages` once flushed.
-            Pin::new(&mut this.sink)
-                .start_send(Message::Binary(msg.clone()))
-                .map_err(ws_error)?;
-            this.started.0 += 1;
-            this.started.1 += msg.len();
+        let r = this.write_batch(cx, messages);
+        if r.is_ready() {
+            // Done or failed: the next batch starts from its first message.
+            this.started = (0, 0);
         }
-        ready!(Pin::new(&mut this.sink).poll_flush(cx)).map_err(ws_error)?;
-        let (_, bytes) = std::mem::take(&mut this.started);
-        messages.fill(Bytes::new());
-        Poll::Ready(Ok(bytes))
+        r
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1441,6 +1480,21 @@ mod tests {
         );
         assert_eq!(o.select(&offer(&["qmux-01"])).as_deref(), Some("qmux-01"));
         assert_eq!(o.select(&offer(&["qmux-00", "other"])), None);
+    }
+
+    #[test]
+    fn a_head_ends_with_crlf_or_bare_lf() {
+        use super::head_end;
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\nA: b\r\n\r\nx", 0), Some(24));
+        assert_eq!(head_end(b"GET / HTTP/1.1\nA: b\n\nx", 0), Some(21));
+        assert_eq!(head_end(b"GET / HTTP/1.1\nA: b\n\r\nx", 0), Some(22));
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\nA: b\r\n", 0), None);
+        let head = b"GET / HTTP/1.1\nHost: h\nConnection: Upgrade\nUpgrade: websocket\n\
+            Sec-WebSocket-Version: 13\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\n\
+            Sec-WebSocket-Protocol: qmux-02\n\n";
+        let end = head_end(head, 0).unwrap();
+        assert_eq!(end, head.len());
+        assert!(super::parse_upgrade(&head[..end], &Options::new()).is_some());
     }
 
     #[test]

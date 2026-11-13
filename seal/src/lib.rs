@@ -1,3 +1,4 @@
+#![warn(missing_debug_implementations)]
 //! The zmux secure carrier over zmux carriers (see the zmux specification): the client's
 //! [`establish`] and the server's [`ServerConfig::transform`], the trust of [`Verifier`] and
 //! [`Gate`], with the built-in [`PinVerifier`]. The result is a carrier
@@ -12,12 +13,12 @@ mod profiles;
 mod server;
 mod trust;
 
-pub use establish::{ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, establish};
+pub use establish::{ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticSecret, establish};
 pub use server::{ModeCheck, ServerConfig, ServerOptions, reject_reason};
 pub use trust::{
     Admission, AppData, AppDataRequest, AppDataSource, BoxFuture, ConfigError, Credential, Gate,
-    KeySigner, PeerRole, PinVerifier, Principal, Signer, Verdict, Verifier, VerifyError,
-    VerifyInput, static_key_id, static_public,
+    KeySigner, PinVerifier, Principal, Signer, Verifier, VerifyError, VerifyInput, VerifyVerdict,
+    static_key_id, static_public,
 };
 pub use zmux_seal_proto::{
     DEFAULT_MAX_APP_DATA, Error, HandlePsk, KEYALG_MLDSA44, KEYALG_X25519, KeyAlg, KeyId, KeyUse,

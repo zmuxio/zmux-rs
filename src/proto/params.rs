@@ -750,7 +750,11 @@ impl TransportParameters {
             return Err(err("max_record_size below 16382"));
         }
         let max_streams = [self.initial_max_streams_bidi, self.initial_max_streams_uni];
-        if max_streams.iter().flatten().any(|&v| v > 1 << 60) {
+        if max_streams
+            .iter()
+            .flatten()
+            .any(|&v| v > super::frame::MAX_COUNT)
+        {
             return Err(err("initial_max_streams above 2^60"));
         }
         if let Some(preamble) = self.zmux_preamble {
@@ -843,13 +847,22 @@ impl<'a> Iterator for RawParameters<'a> {
     }
 }
 
-/// The two session roles.
+/// The role of an endpoint. A session is `Client` or `Server` once
+/// established; `Auto` is only asked for, on a carrier without transport
+/// roles, and negotiated with `zmux_role`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Role {
-    /// Uses client-initiated stream IDs and even pipe IDs.
-    Initiator,
-    /// Uses server-initiated stream IDs and odd pipe IDs.
-    Responder,
+    /// The initiator: the transport client of the bootstrap carrier. Uses
+    /// client-initiated stream IDs and even pipe IDs; sends no `zmux_role`
+    /// when asked for.
+    Client = 1,
+    /// The responder. Uses server-initiated stream IDs and odd pipe IDs;
+    /// sends no `zmux_role` when asked for.
+    Server = 2,
+    /// Negotiated with the peer: sends `zmux_role` auto with a random
+    /// nonce.
+    Auto = 3,
 }
 
 /// Resolves the local role.
@@ -865,14 +878,14 @@ pub fn resolve_role(
     let conflict = Error::new(TransportErrorCode::ZMUX_ROLE_CONFLICT, 0, "role conflict");
     match (local, peer) {
         (Some(l), Some(p)) => match (l, p) {
-            (I, R) | (I, Auto { .. }) | (Auto { .. }, R) => Ok(Role::Initiator),
-            (R, I) | (R, Auto { .. }) | (Auto { .. }, I) => Ok(Role::Responder),
-            (Auto { nonce: a }, Auto { nonce: b }) if a > b => Ok(Role::Initiator),
-            (Auto { nonce: a }, Auto { nonce: b }) if a < b => Ok(Role::Responder),
+            (I, R) | (I, Auto { .. }) | (Auto { .. }, R) => Ok(Role::Client),
+            (R, I) | (R, Auto { .. }) | (Auto { .. }, I) => Ok(Role::Server),
+            (Auto { nonce: a }, Auto { nonce: b }) if a > b => Ok(Role::Client),
+            (Auto { nonce: a }, Auto { nonce: b }) if a < b => Ok(Role::Server),
             _ => Err(conflict),
         },
         (Some(l), None) => match (l, transport) {
-            (_, None) | (I, Some(Role::Responder)) | (R, Some(Role::Initiator)) => Err(conflict),
+            (_, None) | (I, Some(Role::Server)) | (R, Some(Role::Client)) => Err(conflict),
             (_, Some(t)) => Ok(t),
         },
         (None, _) => transport.ok_or(conflict),
@@ -1022,11 +1035,11 @@ mod tests {
         let ok = |l, p, t| resolve_role(l, p, t).ok();
         assert_eq!(
             ok(Some(Initiator), Some(Responder), None),
-            Some(Role::Initiator)
+            Some(Role::Client)
         );
         assert_eq!(
             ok(Some(Auto { nonce: 5 }), Some(Auto { nonce: 4 }), None),
-            Some(Role::Initiator)
+            Some(Role::Client)
         );
         assert_eq!(
             ok(Some(Auto { nonce: 4 }), Some(Auto { nonce: 4 }), None),
@@ -1034,13 +1047,13 @@ mod tests {
         );
         assert_eq!(ok(Some(Responder), Some(Responder), None), None);
         assert_eq!(
-            ok(Some(Auto { nonce: 1 }), None, Some(Role::Responder)),
-            Some(Role::Responder)
+            ok(Some(Auto { nonce: 1 }), None, Some(Role::Server)),
+            Some(Role::Server)
         );
-        assert_eq!(ok(Some(Initiator), None, Some(Role::Responder)), None);
+        assert_eq!(ok(Some(Initiator), None, Some(Role::Server)), None);
         assert_eq!(
-            ok(None, Some(Initiator), Some(Role::Responder)),
-            Some(Role::Responder)
+            ok(None, Some(Initiator), Some(Role::Server)),
+            Some(Role::Server)
         );
     }
 

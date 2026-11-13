@@ -114,7 +114,7 @@ async fn write_through_on_a_message_carrier() {
     let (_s, mut recv) = server.accept_bi().await.unwrap();
     let got = recv.read_to_end(8 << 20).await.unwrap();
     assert_eq!(got, expect);
-    writer.await.unwrap().close(0u32.into(), b"").await;
+    writer.await.unwrap().close().await;
 }
 
 /// A writer that takes batches of messages, counting its calls.
@@ -200,7 +200,7 @@ async fn a_batch_of_messages_is_one_write_call() {
                 "no call held several messages: {calls:?}"
             );
         }
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     })
     .await
     .unwrap();

@@ -141,8 +141,8 @@ async fn client(o: ExchangeOptions) -> Result<(), Error> {
         return Err(format!("echo: {} of {n} bytes, or a different hash", got.len()).into());
     }
     eprintln!("echoed {n} bytes");
-    session.close(0u32.into(), b"done").await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.closed()).await;
+    session.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), session.closing()).await;
     Ok(())
 }
 

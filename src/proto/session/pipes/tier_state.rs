@@ -6,6 +6,10 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use super::PrioritySource;
+use crate::proto::session::{Cap, Inherit};
+
+/// A probation setting: the session's, or the pipe's own (`None`: off).
+pub(crate) type Probation = Inherit<Option<Cap<Duration>>>;
 
 /// An attachment's tier settings.
 #[derive(Debug, Clone)]
@@ -32,7 +36,7 @@ pub(crate) struct TierState {
     weight: u64,
     /// The base of the outbound direction's probation; `None` for the
     /// session default.
-    probation: Option<Duration>,
+    probation: Probation,
 }
 
 impl Default for TierState {
@@ -58,7 +62,7 @@ impl TierState {
             seq: 0,
             owed: VecDeque::new(),
             weight: 1,
-            probation: None,
+            probation: Inherit::Session,
         }
     }
 
@@ -121,7 +125,7 @@ impl TierState {
 
     /// The local settings: send priority and standby (`None`: follow the
     /// peer), the receive request, weight and probation base.
-    pub(crate) fn settings(&self) -> (Option<u64>, Option<bool>, u64, bool, u64, Option<Duration>) {
+    pub(crate) fn settings(&self) -> (Option<u64>, Option<bool>, u64, bool, u64, Probation) {
         (
             self.send_priority,
             self.send_standby,
@@ -141,7 +145,7 @@ impl TierState {
     /// The outbound direction's probation base; `None` for the session
     /// default.
     #[inline]
-    pub(crate) fn probation(&self) -> Option<Duration> {
+    pub(crate) fn probation(&self) -> Probation {
         self.probation
     }
 
@@ -168,7 +172,7 @@ impl TierState {
         receive_priority: u64,
         receive_standby: bool,
         weight: u64,
-        probation: Option<Duration>,
+        probation: Probation,
     ) {
         self.send_priority = send_priority;
         self.send_standby = send_standby;
@@ -205,7 +209,7 @@ impl TierState {
         self.weight = weight;
     }
 
-    pub(crate) fn set_probation(&mut self, probation: Option<Duration>) {
+    pub(crate) fn set_probation(&mut self, probation: Probation) {
         self.probation = probation;
     }
 

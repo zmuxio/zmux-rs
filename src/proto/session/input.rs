@@ -585,7 +585,7 @@ impl SessionCore {
         let dir = stream::dir_of(id);
         let d = di(dir);
         let client = stream::client_initiated(id);
-        let local = client == matches!(self.role, crate::proto::params::Role::Initiator);
+        let local = client == matches!(self.role, crate::proto::params::Role::Client);
         let index = stream::index(id);
         if local {
             if index >= self.streams.local_dir(d).next_index {
@@ -1235,6 +1235,7 @@ impl SessionCore {
     fn on_connection_close(&mut self, f: ConnectionClose<'_>, now: Instant) {
         // An orderly close waiting for the other lanes goes now.
         self.end_close_wait();
+        let first = self.state < super::State::Closing;
         let reason = Bytes::copy_from_slice(f.reason);
         let err = if !f.application && self.acknowledged() && f.error_code == T::ZMUX_IDLE_TIMEOUT.0
         {
@@ -1262,6 +1263,9 @@ impl SessionCore {
             }
         };
         self.set_error(err);
+        if first {
+            self.peer_close_received();
+        }
         // Answer with at most one CONNECTION_CLOSE.
         self.enter_closing(
             Some(CloseFrame::Transport {
@@ -1446,7 +1450,7 @@ impl SessionCore {
             }
             Flow::Stream { stream_id, context } => {
                 let client = stream::client_initiated(stream_id);
-                let local = client == matches!(self.role, crate::proto::params::Role::Initiator);
+                let local = client == matches!(self.role, crate::proto::params::Role::Client);
                 let index = stream::index(stream_id);
                 if local {
                     if index >= self.streams.local_dir(BIDI).next_index {
@@ -1607,11 +1611,14 @@ impl SessionCore {
     /// one that still does not fit is dropped.
     fn datagram_arrived(&mut self, stream: Option<(StreamKey, u64)>, data: Bytes) {
         let recv_bytes_cap = self.config.datagram_receive_bytes;
-        self.trim_waiting(data.len());
         if self.config.datagram_limiter.receive.is_none() {
+            if stream.is_none() {
+                self.trim_waiting(data.len());
+            }
             self.queue_received_datagram(stream, data);
             return;
         }
+        self.trim_waiting(data.len());
         let len = data.len();
         let mut dropped = Vec::new();
         {
@@ -1690,12 +1697,15 @@ impl SessionCore {
         }
     }
 
-    /// Queues a stream datagram: the stream's oldest datagrams make room
-    /// (32 at most); one that still does not fit within the session's
-    /// datagram bytes is dropped, so every queue together stays bounded.
+    /// Queues a stream datagram within the stream's own two bounds, the
+    /// count ([`Config::datagram_stream_queue`]) and the bytes
+    /// ([`Config::datagram_stream_bytes`]): the stream's oldest datagrams
+    /// make room until both hold, each counted as dropped; one larger than
+    /// the bytes alone is kept alone. Stream queues do not count in the
+    /// session's datagram bytes.
     fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) {
         let stream_queue = self.config.datagram_stream_queue;
-        let recv_bytes_cap = self.config.datagram_receive_bytes;
+        let stream_bytes = self.config.datagram_stream_bytes;
         let mut dropped = 0;
         let len = data.len();
         let Some(s) = self.streams.get_mut(key) else {
@@ -1703,22 +1713,18 @@ impl SessionCore {
         };
         let s = s.datagrams_mut();
         let dgram = self.dgram.get_or_insert_with(Box::default);
-        let held = dgram.held_bytes;
-        while (s.queue.len() >= stream_queue || dgram.recv_bytes + held + len > recv_bytes_cap)
+        while (s.queue.len() >= stream_queue || stream_bytes.is_some_and(|cap| s.bytes + len > cap))
             && let Some((_, old)) = s.queue.pop_front()
         {
-            dgram.recv_bytes -= old.len();
+            s.bytes -= old.len();
+            dgram.stream_bytes -= old.len();
             dropped += 1;
-        }
-        if dgram.recv_bytes + held + len > recv_bytes_cap {
-            s.counts.dropped_recv += dropped + 1;
-            self.count_dropped(dropped + 1);
-            return;
         }
         s.counts.dropped_recv += dropped;
         let was_empty = s.queue.is_empty();
         s.queue.push_back((context, data));
-        dgram.recv_bytes += len;
+        s.bytes += len;
+        dgram.stream_bytes += len;
         if dropped > 0 {
             self.count_dropped(dropped);
         }

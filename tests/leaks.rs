@@ -329,7 +329,7 @@ async fn stream_churn(tcp_carrier: bool, seed: u64) {
             );
         }
     }
-    client.close(VarInt::from_u32(0), b"").await;
+    client.close().await;
     drop(client);
     drop(server);
     watchdog(10, "server loop", served).await.unwrap();
@@ -373,7 +373,7 @@ const ENDS: [End; 7] = [
 
 fn timeouts(mut c: Config) -> Config {
     // The idle timeout ends idle sessions only without keep-alive.
-    c.keep_alive_period = None;
+    c.liveness.keep_alive_period = None;
     c.max_idle_timeout = Some(Duration::from_millis(400));
     c.handshake_timeout = Some(Duration::from_millis(300));
     c
@@ -407,8 +407,8 @@ async fn session_life(end: End, tcp_carrier: bool) {
     });
     tokio::time::sleep(Duration::from_millis(1)).await;
     match end {
-        End::ClientClose => client.close(VarInt::from_u32(1), b"client").await,
-        End::ServerClose => server.close(VarInt::from_u32(2), b"server").await,
+        End::ClientClose => client.abort(VarInt::from_u32(1), b"client"),
+        End::ServerClose => server.abort(VarInt::from_u32(2), b"server"),
         End::Shutdown => {
             let c = client.clone();
             let sd = tokio::spawn(async move { c.shutdown(VarInt::from_u32(0), b"").await });
@@ -422,25 +422,25 @@ async fn session_life(end: End, tcp_carrier: bool) {
             drop(send);
             blocked.abort();
             reader.abort();
-            let e = watchdog(10, "idle timeout", client.closed()).await;
+            let e = watchdog(10, "idle timeout", client.closing()).await;
             assert!(
                 matches!(e, SessionError::IdleTimeout { .. }),
                 "idle timeout ended with {e:?}"
             );
-            watchdog(10, "server idle timeout", server.closed()).await;
+            watchdog(10, "server idle timeout", server.closing()).await;
             served.abort();
             return;
         }
         End::DropAll => {}
         End::StuckClose => {
             ca.stall(true);
-            client.close(VarInt::from_u32(4), b"stuck").await;
+            client.abort(VarInt::from_u32(4), b"stuck");
         }
     }
     drop(send);
     if !matches!(end, End::DropAll) {
-        watchdog(10, &format!("{end:?}: client closed"), client.closed()).await;
-        watchdog(10, &format!("{end:?}: server closed"), server.closed()).await;
+        watchdog(10, &format!("{end:?}: client closed"), client.closing()).await;
+        watchdog(10, &format!("{end:?}: server closed"), server.closing()).await;
     }
     blocked.abort();
     reader.abort();
@@ -462,7 +462,10 @@ async fn failed_handshakes() {
     )
     .await;
     assert!(
-        matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
+        matches!(
+            r,
+            Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+        ),
         "{r:?}"
     );
     drop(b);
@@ -513,7 +516,7 @@ fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"leak-test-psk-0123456789abcdef!!").with_end_to_end();
-    c.suspect_floor = Duration::from_millis(100);
+    c.liveness.suspect_floor = Duration::from_millis(100);
     c.resume_timeout = Some(Duration::from_secs(5));
     c
 }
@@ -664,7 +667,7 @@ async fn mp_churn() {
     ctl.fail();
     resumed_ctl.fail();
     drop((resumed, extra));
-    let e = watchdog(30, "client resume timeout", client.closed()).await;
+    let e = watchdog(30, "client resume timeout", client.closing()).await;
     // The end names the expiry and why the last pipe was lost.
     assert!(
         matches!(
@@ -675,7 +678,7 @@ async fn mp_churn() {
         ),
         "{e:?}"
     );
-    watchdog(30, "server resume timeout", server.closed()).await;
+    watchdog(30, "server resume timeout", server.closing()).await;
     drop((client, server));
     watchdog(30, "server loop", served).await.unwrap();
     // The accept loop holds a clone: closing ends it, and the listener.
@@ -743,7 +746,7 @@ async fn listener_shutdown(accept_some: bool) {
         let _ = watchdog(10, "handler after close", h).await.unwrap();
     }
     for c in &clients {
-        let e = watchdog(10, "unaccepted session closed", c.closed()).await;
+        let e = watchdog(10, "unaccepted session closed", c.closing()).await;
         assert!(matches!(e, SessionError::ApplicationClosed { .. }), "{e:?}");
     }
     let _ = watchdog(10, "late session", late).await.unwrap();
@@ -796,7 +799,10 @@ async fn stuck_carrier(how: Stuck) {
             ca.stall(true);
             let r = Session::connect(a, cfg).await;
             assert!(
-                matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
+                matches!(
+                    r,
+                    Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+                ),
                 "{r:?}"
             );
             start = Instant::now();
@@ -817,18 +823,18 @@ async fn stuck_carrier(how: Stuck) {
                     // Both ends go silent: the server's writes block too.
                     cb.stall(true);
                 }
-                Stuck::AppClose => client.close(VarInt::from_u32(1), b"app").await,
+                Stuck::AppClose => client.abort(VarInt::from_u32(1), b"app"),
                 // The peer's handles go: it closes and ends its carrier.
                 Stuck::PeerEndsPipe => drop(server.take()),
                 Stuck::ReadFails => ca.fail_reads(),
                 Stuck::HandshakeTimeout => unreachable!(),
             }
-            let e = watchdog(30, &format!("{how:?}: closed"), client.closed()).await;
+            let e = watchdog(30, &format!("{how:?}: closed"), client.closing()).await;
             if matches!(how, Stuck::IdleTimeout) {
                 assert!(matches!(e, SessionError::IdleTimeout { .. }), "{e:?}");
             }
             if let Some(s) = server.take() {
-                watchdog(30, &format!("{how:?}: server closed"), s.closed()).await;
+                watchdog(30, &format!("{how:?}: server closed"), s.closing()).await;
             }
             drop(send);
             drop(client);

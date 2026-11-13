@@ -6,13 +6,13 @@
 //! load balancers that forward WebTransport, where a plain QUIC carrier may
 //! not; the session's own features (datagrams, statistics, close) and the
 //! QUIC connection under it stay the application's
-//! ([`WebTransportCarrier::session`]).
+//! ([`Carrier::session`]).
 //!
 //! One step from a client to a zmux session, and from a server to the
 //! sessions it accepts: [`connect`] and [`serve`]; with
 //! [`ListenerConfig::admission`](zmux::ListenerConfig::admission), [`serve`] decides on each session request before
 //! it answers it ([`admit`]), on the request head: a client's credential
-//! travels in a request header field ([`Options::with_credential`]), such
+//! travels in a request header field ([`Options::with_carrier_credential`]), such
 //! as a prefix authentication token in `Zmux-Prefix-Auth`, bound to the
 //! QUIC connection with [`dial_over`]. The QUIC endpoints carry the HTTP/3
 //! ALPN identifier `h3` ([`web_transport_quinn::ALPN`]), which names the
@@ -20,13 +20,13 @@
 //! configuration with [`Options::transport_config`], so that the stream
 //! window has one source.
 //!
-//! A [`WebTransportCarrier`] takes a whole established session: a pipe is
-//! one bidirectional stream of it ([`WebTransportCarrier::open_pipe`],
-//! [`WebTransportCarrier::accept_pipe`]), and the pipe's lanes are further
+//! A [`Carrier`] takes a whole established session: a pipe is
+//! one bidirectional stream of it ([`Carrier::open_pipe`],
+//! [`Carrier::accept_pipe`]), and the pipe's lanes are further
 //! unidirectional streams, which zmux opens itself as it needs them. The
 //! carrier runs the session's accept loop: every stream the peer opens is a
 //! carrier, handed to the [`Listener`] given, or else a lane to
-//! [`zmux::carrier::handle_lane`] and a pipe to [`WebTransportCarrier::accept_pipe`];
+//! [`zmux::carrier::handle_lane`] and a pipe to [`Carrier::accept_pipe`];
 //! zmux routes lanes by their Lane Key and checks that they are on the
 //! session of their pipe, whose identity is the carrier. One WebTransport
 //! session owns its QUIC connection, so the session's streams belong to
@@ -38,7 +38,7 @@
 //!   session with datagrams enabled sends each datagram that fits one there rather than in a record when
 //!   the peer negotiated it. Each WebTransport datagram starts with the
 //!   pipe's QUIC stream ID; one receive loop per WebTransport session
-//!   routes them to its pipes ([`WebTransportCarrier::channel_dropped`]
+//!   routes them to its pipes ([`Carrier::channel_dropped`]
 //!   counts those that named none), so the session's datagrams belong to
 //!   zmux;
 //! - the TLS 1.3 exporter of its QUIC connection (RFC 9001 Section 4), for
@@ -52,7 +52,7 @@
 //!   the HTTP/3 control streams), and the connection's receive window
 //!   covers that many stream windows and a pipe's own, charged to the
 //!   memory budget for as long as the carrier lives: the listener's
-//!   ([`WebTransportCarrier::with_listener`]), or else the zmux session's
+//!   ([`Carrier::with_listener`]), or else the zmux session's
 //!   own.
 //!
 //! A stream's sending part that zmux drops without ending it gracefully
@@ -97,7 +97,8 @@ use zmux::carrier::{
 };
 use zmux::proto::ApplicationErrorCode;
 use zmux::{
-    Admit, Admitted, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo,
+    Admit, Admitted, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint,
+    PipeIo,
 };
 pub use zmux_quinn::LaneWindows;
 
@@ -117,11 +118,11 @@ pub struct Options {
     /// Server: the handler of the session requests the listener's
     /// admission hands to the fallback or that are not upgraded (none by default: such
     /// requests are answered with 404).
-    pub fallback: Option<WebTransportFallback>,
+    pub fallback: Option<Fallback>,
     /// Client: the credential whose header field
-    /// ([`Credential::header`]) goes on each session request (none by
+    /// ([`CarrierCredential::header`]) goes on each session request (none by
     /// default).
-    pub credential: Option<Arc<dyn Credential>>,
+    pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
 }
 
 impl Options {
@@ -140,14 +141,14 @@ impl Options {
     /// Client: with `credential`, presented in a header field of each
     /// session request.
     #[must_use]
-    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 
     /// Serves the session requests that are not accepted with `fallback`.
     #[must_use]
-    pub fn with_fallback(mut self, fallback: WebTransportFallback) -> Self {
+    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
         self.fallback = Some(fallback);
         self
     }
@@ -170,8 +171,8 @@ impl Options {
 /// URL): a stream of the session, which carries the pipe's lanes and stays
 /// open while the pipe is used. For [`zmux::helpers::PipePool`] and
 /// [`zmux::Session::add_pipe`]; to reach the WebTransport session itself,
-/// make it and its carrier ([`WebTransportCarrier::new`]) instead. The
-/// header field of [`Options::credential`] goes on the request, the
+/// make it and its carrier ([`Carrier::new`]) instead. The
+/// header field of [`Options::carrier_credential`] goes on the request, the
 /// credential given no exporter (the client makes the QUIC connection and
 /// sends the request in one step): a bound one needs [`dial_over`].
 pub async fn dial(
@@ -181,9 +182,7 @@ pub async fn dial(
 ) -> io::Result<PipeIo> {
     let request = credential_header(request.into(), options, &CarrierInfo::new())?;
     let session = client.connect(request).await.map_err(io::Error::other)?;
-    WebTransportCarrier::new(session, options.clone())
-        .open_pipe()
-        .await
+    Carrier::new(session, options.clone()).open_pipe().await
 }
 
 /// [`dial`] on `conn`, an established QUIC connection with the ALPN
@@ -200,19 +199,17 @@ pub async fn dial_over(
     let session = Session::connect(conn, request)
         .await
         .map_err(io::Error::other)?;
-    WebTransportCarrier::new(session, options.clone())
-        .open_pipe()
-        .await
+    Carrier::new(session, options.clone()).open_pipe().await
 }
 
-/// `request` with the header field of [`Options::credential`] for a
+/// `request` with the header field of [`Options::carrier_credential`] for a
 /// carrier with metadata `info`.
 fn credential_header(
     mut request: ConnectRequest,
     options: &Options,
     info: &CarrierInfo<'_>,
 ) -> io::Result<ConnectRequest> {
-    if let Some(c) = &options.credential {
+    if let Some(c) = &options.carrier_credential {
         let (name, value) = c.header(info)?;
         let invalid = |e| io::Error::new(io::ErrorKind::InvalidInput, e);
         let name = wt::http::HeaderName::from_bytes(name.as_bytes())
@@ -286,7 +283,7 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 /// the client it reports in a forwarding header field
 /// ([`Entry::set_source`]). Then:
 ///
-/// - `Accept`: 200 OK, and the session is a [`WebTransportCarrier`] of
+/// - `Accept`: 200 OK, and the session is a [`Carrier`] of
 ///   `listener` for as long as it is open, its streams admitted with it;
 /// - `Fallback`:
 ///   [`Options::fallback`] is given the request, or it is answered with
@@ -336,7 +333,7 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
             let Ok(session) = request.ok().await else {
                 return;
             };
-            let carrier = WebTransportCarrier::start(
+            let carrier = Carrier::start(
                 session.clone(),
                 Some(listener.clone()),
                 options.clone(),
@@ -411,15 +408,15 @@ type FallbackFn = dyn Fn(wt::Request) -> Pin<Box<dyn Future<Output = ()> + std::
 /// ([`Options::fallback`]), given the request, not answered yet. Cheap to
 /// clone.
 #[derive(Clone)]
-pub struct WebTransportFallback(Arc<FallbackFn>);
+pub struct Fallback(Arc<FallbackFn>);
 
-impl std::fmt::Debug for WebTransportFallback {
+impl std::fmt::Debug for Fallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WebTransportFallback(..)")
+        f.write_str("Fallback(..)")
     }
 }
 
-impl WebTransportFallback {
+impl Fallback {
     /// The handler `f`.
     pub fn new<F, Fut>(f: F) -> Self
     where
@@ -439,17 +436,27 @@ impl WebTransportFallback {
 /// A WebTransport session whose streams carry zmux pipes and lanes (see
 /// the crate documentation). Cheap to clone; the accept loop runs while the
 /// session is open and any clone, or any pipe made from it, is alive.
-/// Once none is, the loop stops and the carrier's hold on the connection
-/// ends: keep a clone while the peer may still open pipes on it.
+/// Once none is, the loop stops and the WebTransport session is closed:
+/// keep a clone while the peer may still open pipes on it.
+///
+/// A pipe holds the session until its zmux session is done with it (every
+/// pipe's inbound side ended or its linger timeout passed), so that the
+/// WebTransport close never cuts off the zmux close before it. The
+/// WebTransport session is then closed with the application error code of
+/// the CONNECTION_CLOSE that ended the last zmux session on it, when it
+/// fits the 32-bit WebTransport code, and 0 otherwise, after any other end
+/// and for a session that never carried one. On a WebTransport session
+/// several zmux sessions share, the pipe zmux is done with last decides the
+/// code, 0 for one removed while its zmux session goes on.
 #[derive(Clone)]
 #[must_use = "the accept loop stops once the carrier and its pipes are gone"]
-pub struct WebTransportCarrier {
+pub struct Carrier {
     inner: Arc<Inner>,
 }
 
-impl std::fmt::Debug for WebTransportCarrier {
+impl std::fmt::Debug for Carrier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebTransportCarrier")
+        f.debug_struct("Carrier")
             .field("connection", &self.inner.conn.stable_id())
             .finish()
     }
@@ -471,6 +478,9 @@ struct Inner {
     _charge: Option<MemoryCharge>,
     /// The session's datagrams, the channels of its pipes.
     datagrams: Arc<Datagrams>,
+    /// The application error code of the last zmux session on it that
+    /// ended, which the WebTransport session's close carries.
+    close_code: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -480,18 +490,22 @@ struct Accepted {
 }
 
 impl Drop for Inner {
+    /// No carrier and no pipe holds the session any more: it closes with
+    /// the last zmux session's code (a no-op on one already closed).
     fn drop(&mut self) {
         if let Some(t) = self.accept_task.get() {
             t.abort();
         }
+        let code = self.close_code.load(std::sync::atomic::Ordering::Relaxed);
+        self.conn.close(u32::try_from(code).unwrap_or(0), b"");
     }
 }
 
-impl WebTransportCarrier {
+impl Carrier {
     /// The carrier of `session`, an established WebTransport session,
     /// without a listener; its accept loop starts here (inside a tokio
     /// runtime). The peer's pipes go to
-    /// [`WebTransportCarrier::accept_pipe`], and the connection's receive
+    /// [`Carrier::accept_pipe`], and the connection's receive
     /// window is charged to the zmux session its pipes carry. Make one
     /// carrier per session: its lanes are recognised by it.
     pub fn new(session: Session, options: Options) -> Self {
@@ -532,6 +546,7 @@ impl WebTransportCarrier {
                 demux: ChannelDemux::new(),
                 receiving: OnceLock::new(),
             }),
+            close_code: std::sync::atomic::AtomicU64::new(0),
         });
         let _ = inner.id.set(CarrierConnId::new(&inner));
         let source = listener.as_ref().map(|l| session_source(&conn, l));
@@ -607,6 +622,9 @@ impl Inner {
     fn pipe(self: &Arc<Self>, mut send: Send, mut recv: Recv) -> PipeIo {
         send.keep = Some(self.clone());
         recv.keep = Some(self.clone());
+        // Holds the session until the zmux session is done with the pipe,
+        // and gives the session's close its code.
+        let closer = self.clone();
         let opener = self.clone();
         // Does not keep the connection: gives no value once it is gone.
         let exporter = Arc::downgrade(self);
@@ -618,7 +636,12 @@ impl Inner {
             .with_carrier(zmux::CarrierKind::WebTransport)
             .with_carrier_conn(self.id())
             .with_connection_memory(self.own_charge)
-            .with_datagram_channel(channel);
+            .with_datagram_channel(channel)
+            .with_close_code(move |code| {
+                closer
+                    .close_code
+                    .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
+            });
         io.with_lane_opener(move || {
             let inner = opener.clone();
             async move {

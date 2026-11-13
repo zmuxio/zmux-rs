@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use basics::{small_windows, tcp};
 use zmux::blocking::{PipeIo, Session};
-use zmux::{Config, PipeAuth, PipeOptions, Policy, VarInt};
+use zmux::{Config, PipeAuth, PipeOptions, Policy};
 
 /// Runs `f` on a thread and fails when it does not finish within `secs`.
 fn watchdog<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -139,12 +139,12 @@ fn carrier_ends_mid_batch(eof: bool) {
     for j in jobs {
         j.join().expect("no panic");
     }
-    client.closed(None).unwrap();
+    client.closing().unwrap();
     // A failed carrier from halves keeps its reader until the peer ends it
     // (nothing interrupts a generic read): the server closes rather than
     // waiting for its idle timeout.
-    server.close(VarInt::from_u32(0), b"");
-    server.closed(None).unwrap();
+    server.close();
+    server.closing().unwrap();
     let _ = server_task.join();
 }
 
@@ -165,7 +165,7 @@ fn mp_config() -> Config {
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"blocking-race-psk-0123456789abcd").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
-    c.suspect_floor = Duration::from_millis(100);
+    c.liveness.suspect_floor = Duration::from_millis(100);
     c
 }
 
@@ -296,8 +296,8 @@ fn multipath_pipe_loss_during_traffic() {
         stop.store(true, Ordering::SeqCst);
         let echoes: usize = jobs.into_iter().map(|j| j.join().expect("echo")).sum();
         assert!(echoes > 0);
-        client.close(VarInt::from_u32(0), b"");
-        client.closed(None).unwrap();
+        client.close();
+        client.closing().unwrap();
         rt.shutdown_timeout(Duration::from_secs(5));
     });
 }
@@ -321,8 +321,8 @@ fn idle_readers_resume_with_a_new_buffer() {
             assert!(client.ping().is_ok());
             assert!(echo_once(&client, 300 * 1024 + 7, seed));
         }
-        client.close(VarInt::from_u32(0), b"");
-        let _ = server.closed(None);
+        client.close();
+        let _ = server.closing();
         task.join().unwrap();
     });
 }

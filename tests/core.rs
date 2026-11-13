@@ -71,8 +71,8 @@ fn memory_pressure_rejects_new_streams_and_keeps_credit_flowing() {
 fn keep_alive_counts_sent_records_as_activity() {
     let mut cfg = Config::default();
     cfg.max_idle_timeout = Some(Duration::from_secs(10));
-    cfg.keep_alive_period = Some(Duration::from_secs(4));
-    cfg.max_incoming_uni_streams = Some(4);
+    cfg.liveness.keep_alive_period = Some(Duration::from_secs(4));
+    cfg.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
     let mut p = Pair::with_events(cfg.clone(), cfg);
     // A only sends: its own records postpone its keep-alive as they
     // restart its idle timer.
@@ -93,15 +93,15 @@ fn keep_alive_counts_sent_records_as_activity() {
 /// The default keep-alive is 15 s; None turns it off.
 #[test]
 fn keep_alive_default_and_off() {
-    let default = Config::default().keep_alive_period;
+    let default = Config::default().liveness.keep_alive_period;
     assert_eq!(default, Some(Duration::from_secs(15)));
     for (period, pings) in [(default, true), (None, false)] {
         let mut cfg = Config::default();
         cfg.max_idle_timeout = Some(Duration::from_secs(60));
-        cfg.probe_jitter = 0.0;
+        cfg.liveness.probe_jitter = 0.0;
         let mut b = cfg.clone();
-        b.keep_alive_period = None;
-        cfg.keep_alive_period = period;
+        b.liveness.keep_alive_period = None;
+        cfg.liveness.keep_alive_period = period;
         let mut p = Pair::with_events(cfg, b);
         let step = |p: &mut Pair, s| {
             p.now += Duration::from_secs(s);
@@ -127,10 +127,10 @@ fn keep_alive_default_and_off() {
 fn keep_alive_pings_once_per_activity() {
     let mut cfg = Config::default();
     cfg.max_idle_timeout = Some(Duration::from_secs(60));
-    cfg.keep_alive_period = Some(Duration::from_secs(4));
-    cfg.probe_jitter = 0.0;
+    cfg.liveness.keep_alive_period = Some(Duration::from_secs(4));
+    cfg.liveness.probe_jitter = 0.0;
     let mut b = cfg.clone();
-    b.keep_alive_period = None;
+    b.liveness.keep_alive_period = None;
     let mut p = Pair::with_events(cfg, b);
     let sent = |p: &Pair| p.a.stats().records_sent;
     let t0 = p.now;
@@ -559,14 +559,13 @@ fn single_pipe_sessions_report_pipe_zero() {
 #[test]
 fn no_timeout_and_off_settings() {
     use std::time::Instant;
-    use zmux::Budget;
-    use zmux::proto::session::RoleConfig;
+    use zmux::proto::session::Role;
     let far = Duration::from_secs(1 << 30);
     for (timeout, establishing) in [(Config::default().handshake_timeout, false), (None, true)] {
         let mut c = Config::default();
         c.handshake_timeout = timeout;
         let t0 = Instant::now();
-        let mut s = SessionCore::new(c, RoleConfig::Initiator, None, t0).unwrap();
+        let mut s = SessionCore::new(c, Role::Client, None, t0).unwrap();
         s.handle_timeout(t0 + far);
         assert_eq!(
             s.state() == State::Establishing,
@@ -576,8 +575,8 @@ fn no_timeout_and_off_settings() {
     }
     let mut cfg = Config::default();
     cfg.max_idle_timeout = None;
-    cfg.keep_alive_period = None;
-    cfg.memory_budget = Some(Budget::Unlimited);
+    cfg.liveness.keep_alive_period = None;
+    cfg.memory_budget = None;
     let mut p = Pair::with_events(cfg.clone(), cfg);
     p.pump();
     p.now += far;
@@ -588,14 +587,14 @@ fn no_timeout_and_off_settings() {
     for (d, ok) in [(0, false), (999, false), (1000, true)] {
         let mut c = Config::default();
         c.max_idle_timeout = Some(Duration::from_micros(d));
-        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        let r = SessionCore::new(c, Role::Client, None, Instant::now());
         assert_eq!(r.is_ok(), ok, "{d} us");
     }
     // A keep-alive period is at least 1 s; zero has no meaning.
     for (ms, ok) in [(0, false), (999, false), (1000, true)] {
         let mut c = Config::default();
-        c.keep_alive_period = Some(Duration::from_millis(ms));
-        let r = SessionCore::new(c, RoleConfig::Initiator, None, Instant::now());
+        c.liveness.keep_alive_period = Some(Duration::from_millis(ms));
+        let r = SessionCore::new(c, Role::Client, None, Instant::now());
         assert_eq!(r.is_ok(), ok, "{ms} ms");
     }
 }

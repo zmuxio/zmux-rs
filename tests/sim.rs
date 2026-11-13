@@ -65,7 +65,7 @@ fn config(multipath: bool, rng: &mut Rng) -> Config {
     c.enable_datagrams = true;
     c.max_idle_timeout = Some(Duration::from_secs(5));
     c.max_incoming_streams = 4 + rng.below(5);
-    c.max_incoming_uni_streams = Some(1 + rng.below(8));
+    c.max_incoming_uni_streams = zmux::UniCredit::Limit(1 + rng.below(8));
     if rng.below(2) == 0 {
         c = small_windows(c);
     }
@@ -79,7 +79,7 @@ fn config(multipath: bool, rng: &mut Rng) -> Config {
         c.test_hooks().locator = b"sim".to_vec();
         c.max_pipes = 4;
         c.pipe_auth = PipeAuth::psk(*b"sim-test-psk-0123456789abcdef!!!").with_end_to_end();
-        c.suspect_floor = Duration::from_millis(100);
+        c.liveness.suspect_floor = Duration::from_millis(100);
     }
     c
 }
@@ -244,7 +244,7 @@ impl Sim {
             95 if self.rng.below(30) == 0 => {
                 let side = self.rng.below(2) as usize;
                 self.note(|| format!("close side {side}"));
-                self.ends[side].close(VarInt::from_u32(3), b"sim").await;
+                self.ends[side].abort(VarInt::from_u32(3), b"sim");
             }
             _ => tokio::task::yield_now().await,
         }
@@ -479,10 +479,10 @@ impl Sim {
             );
         }
         for s in &self.ends {
-            s.close(VarInt::from_u32(0), b"end").await;
+            s.abort(VarInt::from_u32(0), b"end");
         }
         for s in &self.ends {
-            watchdog(30, "closed", s.closed()).await;
+            watchdog(30, "closed", s.closing()).await;
         }
         for h in self.shutdowns.drain(..) {
             watchdog(30, "shutdown", h).await.unwrap();

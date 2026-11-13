@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::time::timeout;
-use zmux::proto::seal::Mode;
-use zmux::proto::session::AllowRecordMode;
+use zmux::AllowRecordMode;
+use zmux::RecordMode;
 use zmux::{
     AdmittedValue, Config, Listener, ListenerConfig, PipeAuth, PipeId, PipeOptions, Session,
 };
@@ -54,7 +54,7 @@ fn config() -> Config {
     c.max_pipes = 4;
     c.resume_timeout = Some(LIMIT);
     c.pipe_auth = PipeAuth::none();
-    c.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| true)));
+    c.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     c
 }
 
@@ -100,7 +100,7 @@ async fn echo(client: &Session, server: &Session, data: &[u8]) {
 /// aborted, whichever way the Join's Confirm travels.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
-    for mode in [Mode::Sealed, Mode::Trusted] {
+    for mode in [RecordMode::Sealed, RecordMode::Trusted] {
         let keys = derive_handle_psk(&[9; 32], b"tests", b"").unwrap();
         let mut limits = ListenerConfig::default();
         limits.inbound_transform = Some(
@@ -131,14 +131,14 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
                 .await
                 .unwrap();
             let pipe = client
-                .begin_add_pipe(io, PipeOptions::new().with_mode(mode))
+                .begin_add_pipe(io, PipeOptions::new().with_record_mode(mode))
                 .unwrap();
             pipe.joined().await.unwrap();
             client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
             echo(&client, &server, &[5; 128 << 10]).await;
             assert_eq!(listener.stats().joins, 1, "{mode:?}");
             assert_eq!(listener.stats().rejected, 0, "{mode:?}");
-            client.close(0u32.into(), b"").await;
+            client.close().await;
         })
         .await
         .unwrap_or_else(|_| panic!("{mode:?} within the limit"));
@@ -155,7 +155,7 @@ async fn a_large_first_message_is_read_whole() {
     config.max_pipes = 4;
     config.resume_timeout = Some(LIMIT);
     config.pipe_auth = PipeAuth::psk(vec![7u8; 32]).with_end_to_end();
-    config.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| true)));
+    config.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     let listener = Listener::new(config.clone(), ListenerConfig::default())
         .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -182,7 +182,7 @@ async fn a_large_first_message_is_read_whole() {
             .await
             .unwrap();
         client
-            .begin_add_pipe(io, PipeOptions::new().with_mode(Mode::Sealed))
+            .begin_add_pipe(io, PipeOptions::new().with_record_mode(RecordMode::Sealed))
             .unwrap()
             .joined()
             .await
@@ -191,7 +191,7 @@ async fn a_large_first_message_is_read_whole() {
         assert_eq!(r.read_to_end(1 << 20).await.unwrap().len(), 24 << 10);
         s.finish().unwrap();
         assert!(b.read_to_end(16).await.unwrap().is_empty());
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     })
     .await
     .expect("within the limit");

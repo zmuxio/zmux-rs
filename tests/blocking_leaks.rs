@@ -72,7 +72,7 @@ fn settle(base: Snapshot, secs: u64, what: &str) {
 
 fn timeouts(mut c: Config) -> Config {
     // The idle timeout ends idle sessions only without keep-alive.
-    c.keep_alive_period = None;
+    c.liveness.keep_alive_period = None;
     c.max_idle_timeout = Some(Duration::from_millis(400));
     c.handshake_timeout = Some(Duration::from_millis(300));
     c
@@ -310,8 +310,8 @@ fn session_life(end: End) {
     });
     thread::sleep(Duration::from_millis(1));
     match end {
-        End::ClientClose => client.close(VarInt::from_u32(1), b"client"),
-        End::ServerClose => server.close(VarInt::from_u32(2), b"server"),
+        End::ClientClose => client.abort(VarInt::from_u32(1), b"client"),
+        End::ServerClose => server.abort(VarInt::from_u32(2), b"server"),
         End::Shutdown => {
             let c = client.clone();
             let sd = thread::spawn(move || c.shutdown(VarInt::from_u32(0), b""));
@@ -329,12 +329,12 @@ fn session_life(end: End) {
         End::DropAll => {}
         End::StuckClose => {
             relay.stall.store(true, Ordering::SeqCst);
-            client.close(VarInt::from_u32(4), b"stuck");
+            client.abort(VarInt::from_u32(4), b"stuck");
         }
     }
     drop(send);
     if matches!(end, End::IdleTimeout) {
-        let e = client.closed(None).unwrap();
+        let e = client.closing().unwrap();
         assert!(
             matches!(
                 e,
@@ -344,8 +344,8 @@ fn session_life(end: End) {
         );
     }
     if !matches!(end, End::DropAll) {
-        client.closed(None).unwrap();
-        server.closed(None).unwrap();
+        client.closing().unwrap();
+        server.closing().unwrap();
     } else {
         drop((client.clone(), server.clone()));
     }
@@ -361,7 +361,10 @@ fn failed_handshakes() {
     let (a, b) = tcp();
     let r = Session::connect(PipeIo::tcp(a), timeouts(Config::default()));
     assert!(
-        matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
+        matches!(
+            r,
+            Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+        ),
         "{r:?}"
     );
     drop(b);
@@ -432,7 +435,10 @@ fn stuck_carrier(how: Stuck) {
         let peer = thread::spawn(move || l.accept().map(|(c, _)| c));
         let r = Session::connect(PipeIo::tcp(TcpStream::connect(relay.addr).unwrap()), cfg);
         assert!(
-            matches!(r, Err(ConnectError::Closed(SessionError::HandshakeTimeout))),
+            matches!(
+                r,
+                Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+            ),
             "{r:?}"
         );
         start = Instant::now();
@@ -455,7 +461,7 @@ fn stuck_carrier(how: Stuck) {
         start = Instant::now();
         match how {
             Stuck::IdleTimeout => {}
-            Stuck::AppClose => client.close(VarInt::from_u32(1), b"app"),
+            Stuck::AppClose => client.abort(VarInt::from_u32(1), b"app"),
             Stuck::PeerEndsPipe => {
                 // The relay ends the client's socket.
                 relay.cut.store(true, Ordering::SeqCst);
@@ -465,11 +471,11 @@ fn stuck_carrier(how: Stuck) {
             }
             Stuck::HandshakeTimeout => unreachable!(),
         }
-        let e = client.closed(None).unwrap();
+        let e = client.closing().unwrap();
         if matches!(how, Stuck::IdleTimeout) {
             assert!(matches!(e, SessionError::IdleTimeout { .. }), "{e:?}");
         }
-        server.closed(None).unwrap();
+        server.closing().unwrap();
         drop((send, client, server, control));
     }
     let deadline = start + RELEASE_BOUND;
@@ -570,7 +576,7 @@ fn race_config() -> Config {
     let mut c = small_windows(Config::default());
     c.enable_datagrams = true;
     c.max_incoming_streams = 4;
-    c.max_incoming_uni_streams = Some(1);
+    c.max_incoming_uni_streams = zmux::UniCredit::Limit(1);
     c.max_idle_timeout = Some(Duration::from_secs(5));
     c
 }
@@ -624,8 +630,11 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
                 s.send_datagram_with_backpressure(Bytes::from_static(b"w"))
             )
         }),
-        Kind::SessionEvent => thread::spawn(move || format!("{:?}", s.next_event(deadline))),
-        Kind::Closed => thread::spawn(move || format!("{:?}", s.closed(None))),
+        Kind::SessionEvent => thread::spawn(move || {
+            s.set_wait_timeout(deadline);
+            format!("{:?}", s.next_event())
+        }),
+        Kind::Closed => thread::spawn(move || format!("{:?}", s.closing())),
         Kind::Shutdown => {
             thread::spawn(move || format!("{:?}", s.shutdown(VarInt::from_u32(0), b"")))
         }
@@ -643,8 +652,8 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
         thread::sleep(Duration::from_micros(rng.below(2000)));
     }
     match race {
-        Race::LocalClose => local.close(VarInt::from_u32(1), b"local"),
-        Race::PeerClose => peer.close(VarInt::from_u32(2), b"peer"),
+        Race::LocalClose => local.abort(VarInt::from_u32(1), b"local"),
+        Race::PeerClose => peer.abort(VarInt::from_u32(2), b"peer"),
         Race::StreamReset => {
             let _ = p_send.reset(VarInt::from_u32(3));
         }
@@ -664,36 +673,37 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
             let _ = control.shutdown(Shutdown::Both);
         }
     }
-    // Waits the race does not end end with the session.
-    let grace = Instant::now() + Duration::from_millis(30);
-    while !wait.is_finished() && Instant::now() < grace {
-        thread::sleep(Duration::from_millis(1));
-    }
-    if !wait.is_finished() {
-        assert!(
-            !matches!(
-                race,
-                Race::LocalClose | Race::PeerClose | Race::CarrierFails
-            ),
-            "seed {seed}: {kind:?} raced with {race:?}: the session ended, the wait did not"
-        );
-        local.close(VarInt::from_u32(9), b"end");
+    // A race that ends the session resolves every wait, however late the
+    // waiting thread runs; the waits another race leaves are ended with the
+    // session.
+    let ends = matches!(
+        race,
+        Race::LocalClose | Race::PeerClose | Race::CarrierFails
+    );
+    if !ends {
+        let grace = Instant::now() + Duration::from_millis(30);
+        while !wait.is_finished() && Instant::now() < grace {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if !wait.is_finished() {
+            local.abort(VarInt::from_u32(9), b"end");
+        }
     }
     let limit = Instant::now() + Duration::from_secs(10);
     while !wait.is_finished() {
         assert!(
             Instant::now() < limit,
-            "seed {seed}: {kind:?} raced with {race:?}: the wait did not resolve after the close"
+            "seed {seed}: {kind:?} raced with {race:?}: the session ended, the wait did not resolve"
         );
         thread::sleep(Duration::from_millis(1));
     }
     if let Err(e) = wait.join() {
         std::panic::resume_unwind(e);
     }
-    local.close(VarInt::from_u32(0), b"");
-    peer.close(VarInt::from_u32(0), b"");
-    local.closed(None).unwrap();
-    peer.closed(None).unwrap();
+    local.close();
+    peer.close();
+    local.closing().unwrap();
+    peer.closing().unwrap();
     drop((l_send, l_recv, p_send, p_recv, control));
 }
 

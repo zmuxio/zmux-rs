@@ -1621,6 +1621,8 @@ impl StreamExtra {
 pub(crate) struct StreamDatagrams {
     /// Received datagrams, not yet read.
     pub(crate) queue: VecDeque<(u64, Bytes)>,
+    /// Payload bytes in `queue` ([`Config::datagram_stream_bytes`](super::Config::datagram_stream_bytes)).
+    pub(crate) bytes: usize,
     /// Counts.
     pub(crate) counts: DatagramCounts,
 }

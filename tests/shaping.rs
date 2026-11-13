@@ -805,7 +805,7 @@ fn an_injection_beyond_the_batch_room_waits_whole() {
 
 #[test]
 fn shaping_limits_are_validated() {
-    use zmux::proto::session::{RoleConfig, SessionCore};
+    use zmux::proto::session::{Role, SessionCore};
     let now = std::time::Instant::now();
     for (initial, ok) in [(0, true), (1 << 53, true), ((1 << 53) + 1, false)] {
         let mut cfg = Config::default();
@@ -813,7 +813,7 @@ fn shaping_limits_are_validated() {
         limits.wire = Account::new(initial, 0, 0);
         cfg.shaping_limits = limits;
         assert_eq!(limits.validate().is_ok(), ok, "{initial}");
-        let r = SessionCore::new(cfg, RoleConfig::Initiator, None, now);
+        let r = SessionCore::new(cfg, Role::Client, None, now);
         assert_eq!(r.is_ok(), ok, "{initial}");
     }
 }

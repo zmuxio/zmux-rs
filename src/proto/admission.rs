@@ -1,8 +1,8 @@
 //! Carrier admission: the configuration a listener applies to every new
 //! carrier ([`Admission`], [`crate::ListenerConfig::admission`]), the
 //! metadata of a carrier ([`CarrierInfo`]), the decision taken on it
-//! ([`Decide`], [`Verdict`]), and what a client presents to it
-//! ([`Credential`]).
+//! ([`Decide`], [`AdmissionVerdict`]), and what a client presents to it
+//! ([`CarrierCredential`]).
 
 use std::any::Any;
 use std::future::Future;
@@ -24,7 +24,7 @@ pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 /// dropped) when that ends or when the listener stops taking carriers; the
 /// carrier is then closed. `prefix` is valid only during the call.
 ///
-/// A synchronous function `Fn(&CarrierInfo, &[u8]) -> Verdict` is a
+/// A synchronous function `Fn(&CarrierInfo, &[u8]) -> AdmissionVerdict` is a
 /// `Decide`; implement the trait for one that waits.
 pub trait Decide: Send + Sync + 'static {
     /// The decision on the carrier `info` describes, whose first bytes are
@@ -147,8 +147,8 @@ impl Admission {
         self
     }
 
-    /// The largest prefix a decision may ask for with [`Verdict::More`].
-    /// 0, the default: the peek length, so that [`Verdict::More`] is not
+    /// The largest prefix a decision may ask for with [`AdmissionVerdict::More`].
+    /// 0, the default: the peek length, so that [`AdmissionVerdict::More`] is not
     /// valid.
     #[must_use]
     pub fn with_max_peek(mut self, bytes: usize) -> Self {
@@ -176,8 +176,8 @@ impl Admission {
     }
 
     /// Takes a byte-stream carrier whose prefix has not arrived when the
-    /// peek timeout ends, in the first read or in a [`Verdict::More`]
-    /// round, to [`Verdict::Fallback`] with every byte read replayed,
+    /// peek timeout ends, in the first read or in a [`AdmissionVerdict::More`]
+    /// round, to [`AdmissionVerdict::Fallback`] with every byte read replayed,
     /// instead of closing it (default off). Without a fallback target it
     /// is stalled, as for any fallback. It is counted in both
     /// `peek_timed_out` and `fallback`. A carrier read without a reader
@@ -239,13 +239,14 @@ fn draw(lo: Duration, hi: Duration) -> Duration {
     if hi <= lo {
         return hi;
     }
-    let span = (hi - lo).as_nanos() + 1;
+    let span = hi.saturating_sub(lo).as_nanos().saturating_add(1);
     let r = u128::from(crate::util::random_u64()) % span;
-    lo + Duration::from_nanos(u64::try_from(r).unwrap_or(u64::MAX))
+    lo.saturating_add(Duration::from_nanos(u64::try_from(r).unwrap_or(u64::MAX)))
+        .min(hi)
 }
 
 /// A host's value attached to a carrier by the admission that accepted
-/// it ([`Verdict::Accept`]): opaque to zmux, which neither inspects,
+/// it ([`AdmissionVerdict::Accept`]): opaque to zmux, which neither inspects,
 /// compares nor drops it early. The transform of a listener sees it
 /// ([`crate::PipeHint::admitted`]), the session it bootstraps keeps it
 /// (`Session::admitted`, the uplink's for a split bootstrap) and each pipe
@@ -257,10 +258,10 @@ pub type AdmittedValue = Arc<dyn Any + Send + Sync>;
 
 /// The decision on a carrier under admission.
 #[derive(Debug, Clone)]
-pub enum Verdict {
+pub enum AdmissionVerdict {
     /// The first `skip` bytes of the prefix are removed; the rest of the
     /// prefix, then the rest of the carrier, go to the listener. A `skip`
-    /// beyond the prefix is [`Verdict::Close`]. `value` is the host's
+    /// beyond the prefix is [`AdmissionVerdict::Close`]. `value` is the host's
     /// value for the carrier ([`AdmittedValue`]).
     Accept {
         /// Prefix bytes removed.
@@ -287,27 +288,27 @@ pub enum Verdict {
     /// exceed [`Admission::max_peek`], and the carrier must be a byte
     /// stream read by [`crate::Entry::admit`] or
     /// [`crate::Entry::decide_reading`]; otherwise it counts as
-    /// [`Verdict::Close`], as it does when the carrier ended short.
+    /// [`AdmissionVerdict::Close`], as it does when the carrier ended short.
     More {
         /// The total prefix length wanted.
         need: usize,
     },
 }
 
-/// A decision on a carrier: its [`Verdict`] and the host's label of the kind
+/// A decision on a carrier: its [`AdmissionVerdict`] and the host's label of the kind
 /// of carrier. A label counts the verdict per label
 /// ([`crate::AdmissionVariants::variants`]); on an accepted carrier it becomes
 /// the carrier's variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// What to do.
-    pub verdict: Verdict,
+    pub verdict: AdmissionVerdict,
     /// The carrier's label; `None` for none.
     pub variant: Option<Arc<str>>,
 }
 
-impl From<Verdict> for Decision {
-    fn from(verdict: Verdict) -> Self {
+impl From<AdmissionVerdict> for Decision {
+    fn from(verdict: AdmissionVerdict) -> Self {
         Self {
             verdict,
             variant: None,
@@ -316,7 +317,7 @@ impl From<Verdict> for Decision {
 }
 
 /// Values compare by identity.
-impl PartialEq for Verdict {
+impl PartialEq for AdmissionVerdict {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Accept { skip: a, value: x }, Self::Accept { skip: b, value: y }) => {
@@ -330,15 +331,16 @@ impl PartialEq for Verdict {
             (Self::Fallback, Self::Fallback)
             | (Self::Stall, Self::Stall)
             | (Self::Close, Self::Close) => true,
+            (Self::More { need: a }, Self::More { need: b }) => a == b,
             _ => false,
         }
     }
 }
 
-impl Eq for Verdict {}
+impl Eq for AdmissionVerdict {}
 
-impl Verdict {
-    /// [`Verdict::Accept`] removing `skip` prefix bytes, without a value.
+impl AdmissionVerdict {
+    /// [`AdmissionVerdict::Accept`] removing `skip` prefix bytes, without a value.
     pub const fn accept(skip: usize) -> Self {
         Self::Accept { skip, value: None }
     }
@@ -366,7 +368,7 @@ impl Verdict {
     }
 
     /// The verdict with `Accept` bounded by a prefix of `len` bytes: a
-    /// `skip` beyond it is [`Verdict::Close`].
+    /// `skip` beyond it is [`AdmissionVerdict::Close`].
     #[must_use]
     pub fn bounded(self, len: usize) -> Self {
         match self {
@@ -386,7 +388,7 @@ type HeadersFn<'a> = dyn Fn(&mut dyn FnMut(&str, &[u8])) + Send + Sync + 'a;
 
 /// The metadata of a carrier, read-only, as far as its adapter has it: a
 /// server's admission decides with it, and a
-/// client's [`Credential`] is given it. Fields that do not apply are
+/// client's [`CarrierCredential`] is given it. Fields that do not apply are
 /// `None`.
 #[derive(Default)]
 #[non_exhaustive]
@@ -539,7 +541,7 @@ impl<'a> CarrierInfo<'a> {
 /// of that handshake among them where the adapter holds the TLS layer (for
 /// a credential bound to it). An error fails the dial.
 /// [`crate::PrefixAuth`] is one.
-pub trait Credential: Send + Sync + std::fmt::Debug {
+pub trait CarrierCredential: Send + Sync + std::fmt::Debug {
     /// The bytes a byte-stream carrier, an HTTP request body carrier or a
     /// QUIC carrier's first stream starts with.
     fn prefix(&self, info: &CarrierInfo<'_>) -> io::Result<Vec<u8>>;
@@ -557,13 +559,13 @@ mod tests {
     #[test]
     fn drawn_bounds() {
         for _ in 0..64 {
-            let a = Admission::new(0, |_, _| Verdict::Close);
+            let a = Admission::new(0, |_, _| AdmissionVerdict::Close);
             assert!((PEEK_TIMEOUT_DRAWN.0..=PEEK_TIMEOUT_DRAWN.1).contains(&a.peek_timeout()));
             let (min, max) = a.stall_interval();
             assert!((STALL_MAX_DRAWN.0..=STALL_MAX_DRAWN.1).contains(&max));
             assert!(min >= max / 4 && min <= max * 3 / 4);
         }
-        let a = Admission::new(0, |_, _| Verdict::Close)
+        let a = Admission::new(0, |_, _| AdmissionVerdict::Close)
             .with_stall_interval(Duration::from_secs(3), Duration::from_secs(1));
         assert_eq!(
             a.stall_interval(),
@@ -573,9 +575,15 @@ mod tests {
 
     #[test]
     fn accept_beyond_prefix_is_close() {
-        assert_eq!(Verdict::accept(3).bounded(3), Verdict::accept(3));
-        assert_eq!(Verdict::accept(4).bounded(3), Verdict::Close);
-        assert_eq!(Verdict::Stall.bounded(0), Verdict::Stall);
+        assert_eq!(
+            AdmissionVerdict::accept(3).bounded(3),
+            AdmissionVerdict::accept(3)
+        );
+        assert_eq!(
+            AdmissionVerdict::accept(4).bounded(3),
+            AdmissionVerdict::Close
+        );
+        assert_eq!(AdmissionVerdict::Stall.bounded(0), AdmissionVerdict::Stall);
     }
 
     #[test]

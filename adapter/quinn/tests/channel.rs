@@ -17,7 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::UdpSocket;
 use zmux::shaping::{Caps, Shaper};
 use zmux::{Config, PipeId, Session};
-use zmux_quinn::{Options, QuicCarrier};
+use zmux_quinn::{Carrier, Options};
 
 /// Every test has a hard deadline.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -160,9 +160,9 @@ fn dgram_config() -> Config {
 }
 
 /// A session over one QUIC connection: the client's and the server's.
-async fn sessions(cc: quinn::Connection, sc: quinn::Connection) -> (Session, Session, QuicCarrier) {
-    let client = QuicCarrier::new(cc, Options::default());
-    let server = QuicCarrier::new(sc, Options::default());
+async fn sessions(cc: quinn::Connection, sc: quinn::Connection) -> (Session, Session, Carrier) {
+    let client = Carrier::new(cc, Options::default());
+    let server = Carrier::new(sc, Options::default());
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -237,7 +237,10 @@ async fn channel_datagrams_are_not_held_behind_lost_packets() {
 
         // In records (the pipe is shaped): every one arrives, and those
         // after a lost packet wait for its retransmission.
-        assert!(cs.set_pipe_shaper(PipeId::new(0), Some(Box::new(Plain))));
+        cs.pipe(PipeId::new(0))
+            .expect("the first pipe")
+            .set_shaper(Some(Box::new(Plain)))
+            .unwrap();
         let lat = paced(&cs, &ss, 100).await;
         let max = lat.iter().max().copied().unwrap();
         assert_eq!(lat.len(), 100, "reliable in records");
@@ -247,7 +250,7 @@ async fn channel_datagrams_are_not_held_behind_lost_packets() {
             100,
             "none more on the channel"
         );
-        cs.close(zmux::VarInt::from_u32(0), b"").await;
+        cs.close().await;
     })
     .await
     .expect("deadline");
@@ -282,7 +285,7 @@ async fn quic_datagrams_disabled_locally_fall_back_to_records() {
         );
         assert!(c.datagrams_dropped_send == 0 && s.datagrams_dropped_send == 0);
         assert_eq!((c.datagrams_received, s.datagrams_received), (20, 20));
-        cs.close(zmux::VarInt::from_u32(0), b"").await;
+        cs.close().await;
     })
     .await
     .expect("deadline");
@@ -293,8 +296,8 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
     tokio::time::timeout(DEADLINE, async {
         let quic = Quic::new(true);
         let (cc, sc) = quic.connect(quic.server.local_addr().unwrap()).await;
-        let client = QuicCarrier::new(cc, Options::default());
-        let server = QuicCarrier::new(sc, Options::default());
+        let client = Carrier::new(cc, Options::default());
+        let server = Carrier::new(sc, Options::default());
         let mut pairs = Vec::new();
         for _ in 0..3 {
             let accept = {
@@ -332,9 +335,9 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
         // A closed session's pipe names no pipe any more: the peer's
         // datagrams for it are dropped and counted by the connection.
         let (cs, ss) = pairs.remove(0);
-        cs.close(zmux::VarInt::from_u32(0), b"").await;
-        let _ = ss.closed().await;
-        let _ = cs.closed().await;
+        cs.close().await;
+        let _ = ss.closing().await;
+        let _ = cs.closing().await;
         let mut tries = 0;
         while server.datagrams().dropped() == 0 && tries < 100 {
             // A raw datagram that names the closed pipe (QUIC stream 0).

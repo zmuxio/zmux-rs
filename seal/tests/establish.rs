@@ -8,8 +8,7 @@ use std::time::Duration;
 use zmux::shaping::{HandshakeShaper, Limits, UnitPlan};
 
 use tokio::io::duplex;
-use zmux::proto::seal::{Framing, Mode, cut_unit};
-use zmux::proto::session::RecordMode;
+use zmux::proto::seal::{Framing, RecordMode, cut_unit};
 use zmux::{
     AdmittedValue, Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Session,
 };
@@ -141,13 +140,16 @@ async fn a_session_joins_a_sealed_pipe() {
         let ll = l.clone();
         tokio::spawn(async move { ll.handle_pipe(PipeIo::new(b), Default::default()).await });
         let pipe = c
-            .begin_add_pipe(PipeIo::new(a), PipeOptions::new().with_mode(Mode::Sealed))
+            .begin_add_pipe(
+                PipeIo::new(a),
+                PipeOptions::new().with_record_mode(RecordMode::Sealed),
+            )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), pipe.joined())
             .await
             .unwrap()
             .unwrap();
-        c.close(0u32.into(), b"").await;
+        c.close().await;
     }
 }
 
@@ -229,14 +231,14 @@ async fn a_split_carrier_is_established_after_pairing() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(peer.mode, Mode::Sealed);
+        assert_eq!(peer.record_mode, RecordMode::Sealed);
         let c = Session::connect(p, config()).await.unwrap();
         let s = l.accept().await.unwrap();
         assert_eq!(s.weakest_record_mode(), RecordMode::Sealed);
         assert!(s.admitted().is_some(), "the gate decided on the pair");
         echo_once(&c, &s).await;
-        c.close(0u32.into(), b"").await;
-        s.closed().await;
+        c.close().await;
+        s.closing().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), first)
             .await
             .unwrap();
@@ -322,7 +324,7 @@ fn bound_listener() -> Listener {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bound_on_a_split_carrier_binds_both_halves() {
     let mut cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
-    cfg.mode = Some(Mode::Bound);
+    cfg.record_mode = RecordMode::Bound;
     // A refused carrier is stalled: the client stops waiting first.
     cfg.reply_timeout = Some(Duration::from_millis(500));
     // Agreeing exporters.
@@ -333,12 +335,12 @@ async fn bound_on_a_split_carrier_binds_both_halves() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(peer.mode, Mode::Bound);
+    assert_eq!(peer.record_mode, RecordMode::Bound);
     let c = Session::connect(p, config()).await.unwrap();
     let s = l.accept().await.unwrap();
     assert_eq!(s.weakest_record_mode(), RecordMode::Bound);
     echo_once(&c, &s).await;
-    c.close(0u32.into(), b"").await;
+    c.close().await;
     // The server's halves swapped by a relay: a third party, and auth.
     let l = bound_listener();
     let (mine, up, down) = {
@@ -470,7 +472,7 @@ async fn the_handshake_shaper_plans_each_message() {
         let c = Session::connect(p, config()).await.unwrap();
         let s = l.accept().await.unwrap();
         echo_once(&c, &s).await;
-        c.close(0u32.into(), b"").await;
+        c.close().await;
         assert_eq!(*client_log.lock().unwrap(), ["hello", "finish"]);
         assert_eq!(*server_log.lock().unwrap(), ["reply"]);
         let unit_len =
@@ -577,7 +579,10 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
         let ll = l.clone();
         tokio::spawn(async move { ll.handle_pipe(PipeIo::new(b), Default::default()).await });
         let pipe = c
-            .begin_add_pipe(PipeIo::new(a), PipeOptions::new().with_mode(Mode::Sealed))
+            .begin_add_pipe(
+                PipeIo::new(a),
+                PipeOptions::new().with_record_mode(RecordMode::Sealed),
+            )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), pipe.joined())
             .await
@@ -592,7 +597,7 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
             (Some(_), true) => assert_eq!(st.faults, 2, "{st:?}"),
         }
         echo_once(&c, &s).await;
-        c.close(0u32.into(), b"").await;
+        c.close().await;
     }
 }
 
@@ -651,7 +656,9 @@ fn a_server_configuration_is_checked_when_it_is_made() {
             },
         )
     };
-    assert_eq!(made(Vec::new()).unwrap().accepted_profiles(), &[1, 3]);
+    let default = ServerOptions::default().accepted_profiles;
+    assert_eq!(made(default).unwrap().accepted_profiles(), &[1, 3]);
+    assert!(made(Vec::new()).is_err(), "no Profile");
     assert_eq!(made(vec![4, 5]).unwrap().accepted_profiles(), &[4, 5]);
     assert!(
         made(vec![1, 6]).is_err(),
@@ -679,6 +686,9 @@ async fn a_client_configuration_names_its_mistake() {
     cfg.allowed_profiles = vec![1, 6];
     let e = run(&l, &cfg).await.unwrap_err();
     assert!(e.to_string().contains("unknown or reserved Profile"), "{e}");
+    cfg.allowed_profiles = Vec::new();
+    let e = run(&l, &cfg).await.unwrap_err();
+    assert!(e.to_string().contains("allowed_profiles is empty"), "{e}");
 }
 
 /// Profile 4 is refused by default and accepted once listed; the client of a refused
@@ -755,14 +765,17 @@ async fn profiles_pq_facts_and_no_fallback() {
 async fn the_verifier_sees_one_credential_and_tells_its_errors_apart() {
     struct Check(bool);
     impl Verifier for Check {
-        fn verify<'a>(&'a self, i: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+        fn verify<'a>(
+            &'a self,
+            i: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
             Box::pin(async move {
-                assert_eq!(i.role, PeerRole::Server);
+                assert_eq!(i.role, zmux::Role::Server);
                 assert_eq!(i.credential, Some((7, &[1, 2][..])));
                 assert_eq!(i.psk_identity, Some(&keys().handle[..]));
                 assert_eq!(i.local_context, b"ctx");
                 if self.0 {
-                    let mut v = Verdict::new(Principal::Other(1, vec![1, 2]));
+                    let mut v = VerifyVerdict::new(Principal::Other(1, vec![1, 2]));
                     v.value = Some(Arc::new(7u32));
                     Ok(v)
                 } else {
@@ -773,7 +786,10 @@ async fn the_verifier_sees_one_credential_and_tells_its_errors_apart() {
     }
     struct Panics;
     impl Verifier for Panics {
-        fn verify<'a>(&'a self, _: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+        fn verify<'a>(
+            &'a self,
+            _: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
             panic!("a host's bug")
         }
     }
@@ -808,7 +824,10 @@ async fn the_verifier_sees_one_credential_and_tells_its_errors_apart() {
 async fn application_data_in_messages_1_2_and_3() {
     struct SeesClientData;
     impl Verifier for SeesClientData {
-        fn verify<'a>(&'a self, i: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+        fn verify<'a>(
+            &'a self,
+            i: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
             Box::pin(async move {
                 let got: Vec<(u8, &[u8], bool)> = i
                     .peer_app_data
@@ -818,7 +837,9 @@ async fn application_data_in_messages_1_2_and_3() {
                 // Nothing is authenticated while the verification runs.
                 assert!(i.peer_app_data.iter().all(|a| !a.authenticated));
                 assert_eq!(got, vec![(1, &b"m1"[..], false), (3, &b"m3"[..], true)]);
-                Ok(Verdict::new(Principal::StaticKey(i.peer_static.to_vec())))
+                Ok(VerifyVerdict::new(Principal::StaticKey(
+                    i.peer_static.to_vec(),
+                )))
             })
         }
     }
@@ -910,10 +931,10 @@ async fn application_data_in_messages_1_2_and_3() {
         .collect();
     assert_eq!(seen, [(1, false, false), (3, true, true)]);
     // No bound beyond the message.
-    c.max_app_data = usize::MAX;
+    c.max_app_data = None;
     run(&l, &c).await.expect("no bound beyond the message");
     // The server's data above this client's bound fails the handshake.
-    c.max_app_data = 1;
+    c.max_app_data = Some(1);
     assert!(run(&l, &c).await.is_err());
 }
 
@@ -923,13 +944,19 @@ async fn application_data_in_messages_1_2_and_3() {
 async fn panicking_client_verifier_rejects() {
     struct Panics;
     impl Verifier for Panics {
-        fn verify<'a>(&'a self, _: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+        fn verify<'a>(
+            &'a self,
+            _: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
             panic!("a host's bug")
         }
     }
     struct PanicsLater;
     impl Verifier for PanicsLater {
-        fn verify<'a>(&'a self, _: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+        fn verify<'a>(
+            &'a self,
+            _: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
             Box::pin(async { panic!("a host's bug") })
         }
     }
@@ -1009,9 +1036,12 @@ fn proving_listener(
 struct NamesProofKey(KeyId);
 
 impl Verifier for NamesProofKey {
-    fn verify<'a>(&'a self, i: VerifyInput<'a>) -> BoxFuture<'a, Result<Verdict, VerifyError>> {
+    fn verify<'a>(
+        &'a self,
+        i: VerifyInput<'a>,
+    ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
         Box::pin(async move {
-            Ok(Verdict {
+            Ok(VerifyVerdict {
                 principal: Principal::StaticKey(i.peer_static.to_vec()),
                 proof_key: Some(self.0),
                 value: None,
@@ -1103,4 +1133,103 @@ fn the_public_key_of_a_static_secret() {
         *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(NODE)).as_bytes()
     );
     assert_eq!(static_key_id(&public), key_id(KEYALG_X25519, &public));
+}
+
+/// The refusals a reject policy saw: reason and record mode.
+type Seen = Arc<std::sync::Mutex<Vec<(&'static str, Option<RecordMode>)>>>;
+
+/// A Bound listener whose reject policy records each refusal and answers
+/// `action`, or the default for it.
+fn mismatch_listener(action: Option<zmux::RejectAction>, seen: Seen) -> Listener {
+    let server = ServerConfig::new(
+        Arc::new(TestGate {
+            psk: keys().psk,
+            cred: None,
+        }),
+        NODE,
+        ServerOptions {
+            allow_record_mode: Some(Arc::new(|_, _| true)),
+            ..Default::default()
+        },
+    )
+    .expect("valid server configuration");
+    let mut lc = ListenerConfig::default();
+    lc.inbound_transform = Some(server.transform());
+    lc.handshake_timeout = Duration::from_millis(1500);
+    lc.on_reject = Some(zmux::OnReject(Arc::new(move |i| {
+        seen.lock().unwrap().push((i.reason, i.record_mode));
+        action.unwrap_or_else(|| zmux::RejectAction::default_for(i))
+    })));
+    Listener::new(config(), lc).expect("valid listener configuration")
+}
+
+/// A Bound Establish whose two ends see different exporters (a terminating
+/// intermediary): refused as `auth` in Bound, and by default stalled
+/// without a byte, the carrier still open after the decision and ended
+/// within the stall bound; with the policy's Close, closed at once without
+/// a byte and counted as rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_establish_with_another_binding_is_refused_by_the_policy() {
+    let mut cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
+    cfg.record_mode = RecordMode::Bound;
+    cfg.reply_timeout = Some(Duration::from_millis(300));
+    let exporter = |v: u8, io: PipeIo| {
+        io.with_carrier_secure().with_exporter(move |_, _, out| {
+            out.fill(v);
+            true
+        })
+    };
+    for action in [None, Some(zmux::RejectAction::Close)] {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = mismatch_listener(action, seen.clone());
+        let (a, b) = duplex(1 << 20);
+        let start = tokio::time::Instant::now();
+        let served = {
+            let l = l.clone();
+            tokio::spawn(async move {
+                let r = l
+                    .handle_pipe(exporter(2, PipeIo::new(b)), Default::default())
+                    .await;
+                (r, start.elapsed())
+            })
+        };
+        let e = establish(exporter(1, PipeIo::new(a)), &cfg)
+            .await
+            .unwrap_err();
+        // No byte came back either way.
+        assert!(e.get_ref().is_some_and(|e| e.is::<NoReply>()), "{e}");
+        let gave_up = start.elapsed();
+        match action {
+            None => {
+                // The client gave up at its reply timeout, and the carrier
+                // is still held.
+                assert!(gave_up >= Duration::from_millis(290), "{gave_up:?}");
+                assert!(!served.is_finished(), "a stall holds the carrier");
+                let (r, took) = tokio::time::timeout(Duration::from_secs(5), served)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(r.is_err());
+                assert!(
+                    took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
+                    "{took:?}"
+                );
+            }
+            Some(_) => {
+                // The carrier ended before the client's reply timeout.
+                assert!(gave_up < Duration::from_millis(290), "{gave_up:?}");
+                let (r, took) = tokio::time::timeout(Duration::from_secs(1), served)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(r, Err(zmux::HandleError::Rejected));
+                assert!(took < Duration::from_millis(500), "{took:?}");
+            }
+        }
+        assert_eq!(*seen.lock().unwrap(), [("auth", Some(RecordMode::Bound))]);
+        assert_eq!(l.stats().sessions, 0);
+        if action.is_some() {
+            assert_eq!(l.stats().rejected, 1);
+        }
+    }
 }

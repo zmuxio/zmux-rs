@@ -139,8 +139,8 @@ pub fn parse_limits(json: &[u8]) -> Result<Limits, Error> {
             return Err(err("range", format!("max_delay: {n}")));
         }
         l.max_delay = match n {
-            0 => None,
-            n if n < 0 => Some(Duration::MAX),
+            0 => Limits::default().max_delay,
+            n if n < 0 => None,
             n => Some(Duration::from_micros(n as u64)),
         };
     }

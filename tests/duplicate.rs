@@ -85,7 +85,7 @@ async fn drained(e1: &End, e2: &End, kept_1s: bool) {
         ([&e1.theirs, &e2.mine], [&e1.mine, &e2.theirs])
     };
     for s in lose {
-        let e = watchdog(10, "the loser closes", s.closed()).await;
+        let e = watchdog(10, "the loser closes", s.closing()).await;
         assert!(
             matches!(e, SessionError::ApplicationClosed { code, .. } if code == VarInt::ZERO),
             "{e:?}"
@@ -100,7 +100,7 @@ async fn drained(e1: &End, e2: &End, kept_1s: bool) {
         );
     }
     for s in keep {
-        s.close(VarInt::ZERO, b"").await;
+        s.close().await;
     }
 }
 
@@ -305,7 +305,7 @@ fn the_rule_does_not_apply_without_a_race_or_a_deciding_value() {
             assert!(s.open_bi().await.is_ok());
         }
         for s in all {
-            s.close(VarInt::ZERO, b"").await;
+            s.close().await;
         }
     });
 }

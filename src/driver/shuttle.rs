@@ -152,7 +152,7 @@ fn read(s: &Session, stream: usize) -> Option<u8> {
     run(read, &Expiry::default()).flatten()
 }
 
-/// A blocking `closed()` (`Session::closed_op`).
+/// A blocking `closing()` (`Session::closing_op`).
 fn closed(s: &Session) {
     let wait = Wait::new(&**s, List::State, |i: &mut Inner| i.closed.then_some(()));
     run(wait, &Expiry::default());

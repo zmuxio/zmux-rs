@@ -132,7 +132,7 @@ impl ExchangeEndpoint {
 
 /// An exchange carrier whose UP and CLOSE requests go to `up` and whose
 /// DOWN requests go to `down`, which may differ in host, port, scheme and
-/// path ([`ExchangeOptions::down_path`]) as long as all requests of the
+/// path (`ExchangeOptions::down_path`) as long as all requests of the
 /// carrier reach the same server. A few connections of each are kept open
 /// for the next requests; a request whose connection fails is repeated on
 /// another. A redirect of a request is followed within its endpoint's
@@ -177,7 +177,7 @@ pub fn dial_exchange_split(
         options: o.clone(),
     });
     let shared = Arc::new(Halves::default());
-    if let Some(c) = &o.credential {
+    if let Some(c) = &o.carrier_credential {
         let prefix = c.prefix(&zmux::CarrierInfo::new())?;
         shared.lock().up.extend_from_slice(&prefix);
     }
@@ -393,8 +393,7 @@ impl Http {
     async fn send(
         &self,
         target: &str,
-        head: Bytes,
-        tail: Bytes,
+        body: [Bytes; 3],
         limit: usize,
         https: bool,
         max: usize,
@@ -411,7 +410,7 @@ impl Http {
                 .header(header::HOST, self.authority.as_str())
                 .header(header::CACHE_CONTROL, "no-store")
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(PipeBody::fixed(head.clone(), tail.clone()))
+                .body(PipeBody::fixed(body.clone()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let resp = sender.send_request(req).await.map_err(io::Error::other)?;
             let status = resp.status().as_u16();
@@ -540,12 +539,12 @@ async fn attempt(
         nonce,
         &data,
     );
-    let (head, tail) = wire::encode_body(o.encoding, out.prefix.clone(), data);
+    let body = wire::encode_body(o.encoding, [out.header.clone(), data, out.data_mac.clone()]);
     let target = o.target(kind == Kind::Down, &ctx.instance, &hex(&nonce));
     let limit = wire::encoded_len(o.encoding, RESPONSE_HEAD + o.max_down_piece_size());
     let sent = tokio::time::timeout(
         o.request_timeout,
-        http.send(&target, head, tail, limit, o.https, o.max_redirects),
+        http.send(&target, body, limit, o.https, o.max_redirects),
     )
     .await;
     let body = match sent {

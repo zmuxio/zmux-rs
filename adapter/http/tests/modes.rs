@@ -15,8 +15,8 @@ use std::time::Duration;
 use proxy::Profile;
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
-    Admission, CandidateOutcome, CarrierKind, Config, Listener, ListenerConfig, Mode, ModePolicy,
-    PipeAuth, PrefixAuth, PrefixAuthVerifier, Session, dial_mode,
+    Admission, CandidateOutcome, CarrierChoice, CarrierChoicePolicy, CarrierKind, Config, Listener,
+    ListenerConfig, PipeAuth, PrefixAuth, PrefixAuthVerifier, Session, dial_choice,
 };
 use zmux_http::{Endpoint, ExchangeOptions, ExchangeServer, Options};
 
@@ -79,21 +79,21 @@ fn connect(
 
 /// The candidates of every HTTP kind through `addr`, by kind.
 fn candidate(kind: CarrierKind, addr: &str) -> zmux::Candidate {
-    let credential: Arc<dyn zmux::Credential> = Arc::new(auth());
+    let credential: Arc<dyn zmux::CarrierCredential> = Arc::new(auth());
     let http = Options::default()
-        .with_credential(credential.clone())
+        .with_carrier_credential(credential.clone())
         .with_timeout(Duration::from_secs(3));
     match kind {
         CarrierKind::WebSocket => zmux_websocket::candidate(
             connect(addr),
             &format!("ws://{addr}/zmux"),
-            &zmux_websocket::Options::default().with_credential(credential),
+            &zmux_websocket::Options::default().with_carrier_credential(credential),
         ),
-        CarrierKind::Streaming => zmux_http::streaming_candidate(connect(addr), addr, &http),
-        CarrierKind::Split => zmux_http::split_candidate(connect(addr), addr, &http),
+        CarrierKind::Streaming => zmux_http::candidate(connect(addr), addr, &http),
+        CarrierKind::Split => zmux_http::candidate_split(connect(addr), addr, &http),
         CarrierKind::Exchange => {
-            let options = exchange_options().with_credential(credential);
-            zmux_http::exchange_candidate(connect(addr), addr, &options)
+            let options = exchange_options().with_carrier_credential(credential);
+            zmux_http::candidate_exchange(connect(addr), addr, &options)
         }
         _ => unreachable!(),
     }
@@ -106,8 +106,8 @@ const ORDER: [CarrierKind; 4] = [
     CarrierKind::Exchange,
 ];
 
-fn auto(order: &[CarrierKind], addr: &str) -> Mode {
-    Mode::auto(order.iter().map(|&k| candidate(k, addr)))
+fn auto(order: &[CarrierKind], addr: &str) -> CarrierChoice {
+    CarrierChoice::auto(order.iter().map(|&k| candidate(k, addr)))
 }
 
 fn config() -> Config {
@@ -140,7 +140,7 @@ async fn auto_picks_the_best_kind_each_path_passes() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (origin, _listener) = origin(config()).await;
         let direct = origin.to_string();
-        let policy = ModePolicy::default().without_join();
+        let policy = CarrierChoicePolicy::default().without_join();
         let cases: Vec<(&str, Option<Profile>, &[CarrierKind], Vec<_>)> = vec![
             ("direct", None, &ORDER, vec![(WebSocket, Usable)]),
             (
@@ -194,12 +194,12 @@ async fn auto_picks_the_best_kind_each_path_passes() {
                 Some(p) => proxy::start(p, origin).await.0,
                 None => direct.clone(),
             };
-            let client = dial_mode(&auto(order, &addr), config(), &policy)
+            let client = dial_choice(&auto(order, &addr), config(), &policy)
                 .await
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(tries(&client), expect, "{name}");
             works(&client).await;
-            client.close(0u32.into(), b"").await;
+            client.close().await;
         }
     })
     .await
@@ -212,34 +212,34 @@ async fn explicit_never_falls_back() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let (origin, listener) = origin(config()).await;
         let (addr, _p) = proxy::start(Profile::REVERSE_PROXY, origin).await;
-        let e = dial_mode(
-            &Mode::explicit(candidate(CarrierKind::WebSocket, &addr)),
+        let e = dial_choice(
+            &CarrierChoice::explicit(candidate(CarrierKind::WebSocket, &addr)),
             config(),
-            &ModePolicy::default(),
+            &CarrierChoicePolicy::default(),
         )
         .await
         .unwrap_err();
         assert_eq!(e.results.len(), 1);
         assert_eq!(e.results[0].outcome, CandidateOutcome::Refused);
-        let e = dial_mode(
-            &Mode::explicit(candidate(CarrierKind::Streaming, &addr)),
+        let e = dial_choice(
+            &CarrierChoice::explicit(candidate(CarrierKind::Streaming, &addr)),
             config(),
-            &ModePolicy::default(),
+            &CarrierChoicePolicy::default(),
         )
         .await
         .unwrap_err();
         assert_eq!(e.results.len(), 1, "{e}");
         assert_eq!(listener.stats().sessions, 0);
         // The kind that passes works explicitly too.
-        let client = dial_mode(
-            &Mode::explicit(candidate(CarrierKind::Exchange, &addr)),
+        let client = dial_choice(
+            &CarrierChoice::explicit(candidate(CarrierKind::Exchange, &addr)),
             config(),
-            &ModePolicy::default(),
+            &CarrierChoicePolicy::default(),
         )
         .await
         .unwrap();
         works(&client).await;
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     })
     .await
     .unwrap();
@@ -260,9 +260,9 @@ async fn auto_with_joins_moves_off_the_exchange() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let (origin, _listener) = origin(multipath()).await;
         let (addr, _p) = proxy::start(Profile::HALF_DUPLEX, origin).await;
-        let mut policy = ModePolicy::default();
+        let mut policy = CarrierChoicePolicy::default();
         policy.settle = Duration::from_millis(300);
-        let client = dial_mode(&auto(&ORDER, &addr), multipath(), &policy)
+        let client = dial_choice(&auto(&ORDER, &addr), multipath(), &policy)
             .await
             .unwrap();
         assert_eq!(client.stats().carrier, Some(CarrierKind::Exchange));
@@ -283,7 +283,7 @@ async fn auto_with_joins_moves_off_the_exchange() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         works(&client).await;
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     })
     .await
     .unwrap();

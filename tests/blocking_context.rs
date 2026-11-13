@@ -85,15 +85,20 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
             send.write(b"x").err(),
             send.write_all(b"x").err(),
             send.stopped().err(),
-            c.closed(None).err(),
-            c.next_event(None).err(),
+            c.closing().err(),
+            c.next_event().err(),
             c.shutdown(0u32.into(), b"").err(),
         );
         // What never waits works on any thread.
         let nonblocking = (
             // An event, or none in time: not refused.
             matches!(
-                c.next_event(Some(Duration::ZERO)),
+                {
+                    c.set_wait_timeout(Some(Duration::ZERO));
+                    let r = c.next_event();
+                    c.set_wait_timeout(None);
+                    r
+                },
                 Ok(_) | Err(zmux::blocking::WaitError::TimedOut)
             ),
             c.try_open_bi().is_ok(),
@@ -133,8 +138,8 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
         io::Error::from(StreamError::OnDriverThread).kind(),
         io::ErrorKind::Deadlock
     );
-    client.close(0u32.into(), b"");
-    server.closed(None).unwrap();
+    client.close();
+    server.closing().unwrap();
 }
 
 #[test]
@@ -160,10 +165,7 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
         );
         assert_eq!(recv.read(&mut buf), Err(StreamError::OnDriverThread));
         assert_eq!(send.write(b"x"), Err(StreamError::OnDriverThread));
-        assert_eq!(
-            c.closed(None),
-            Err(zmux::blocking::WaitError::OnDriverThread)
-        );
+        assert_eq!(c.closing(), Err(zmux::blocking::WaitError::OnDriverThread));
         assert_eq!(
             c.shutdown(0u32.into(), b""),
             Err(zmux::blocking::WaitError::OnDriverThread)
@@ -182,10 +184,7 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
         c2();
         tokio::spawn(async move { check() }).await.unwrap();
         tokio::task::spawn_blocking(move || {
-            assert_eq!(
-                c3.closed(None),
-                Err(zmux::blocking::WaitError::OnDriverThread)
-            );
+            assert_eq!(c3.closing(), Err(zmux::blocking::WaitError::OnDriverThread));
         })
         .await
         .unwrap();
@@ -193,5 +192,5 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
     drop(rt);
     drop(spare);
     still_works(&client, &server);
-    client.close(0u32.into(), b"");
+    client.close();
 }

@@ -3,7 +3,7 @@
 //! datagrams may go as QUIC datagrams of the connection, the pipes'
 //! datagram channel. The connection's own features (statistics, path, close)
 //! stay the application's, through the raw [`Connection`]
-//! ([`QuicCarrier::connection`]).
+//! ([`Carrier::connection`]).
 //!
 //! One step from an endpoint to a session, and from an endpoint to the
 //! sessions it accepts: [`connect`] and [`serve`]. With the `rustls-ring`
@@ -18,18 +18,18 @@
 //! ([`zmux::ListenerConfig::admission`]) when it has one: the decision is
 //! taken on the first bytes of the connection's first bidirectional
 //! stream, and the connection's streams reach the listener only once it
-//! accepted. A client presents its [`Credential`] there
-//! ([`Options::with_credential`], used by [`dial`] and [`connect`]), or
-//! sends those bytes itself with [`QuicCarrier::open_pipe_with_prefix`].
+//! accepted. A client presents its [`CarrierCredential`] there
+//! ([`Options::with_carrier_credential`], used by [`dial`] and [`connect`]), or
+//! sends those bytes itself with [`Carrier::open_pipe_with_prefix`].
 //!
-//! A [`QuicCarrier`] takes a whole established connection: a pipe is one
-//! bidirectional stream of it ([`QuicCarrier::open_pipe`],
-//! [`QuicCarrier::accept_pipe`]), and the pipe's lanes are further
+//! A [`Carrier`] takes a whole established connection: a pipe is one
+//! bidirectional stream of it ([`Carrier::open_pipe`],
+//! [`Carrier::accept_pipe`]), and the pipe's lanes are further
 //! unidirectional streams, which zmux
 //! opens itself as it needs them. The carrier runs the connection's accept
 //! loop: every stream the peer opens is a carrier, handed to the
 //! [`Listener`] given, or else a lane to [`zmux::carrier::handle_lane`] and a
-//! pipe to [`QuicCarrier::accept_pipe`]; zmux routes lanes by their Lane Key
+//! pipe to [`Carrier::accept_pipe`]; zmux routes lanes by their Lane Key
 //! and checks that they are on the connection of their pipe, whose identity
 //! is the carrier. The connection's streams therefore belong to zmux.
 //!
@@ -56,7 +56,7 @@
 //!   pipe's own, so that a lane blocked by a loss never holds the others
 //!   back at the connection level. The window is charged to the memory
 //!   budget for as long as the carrier lives: the listener's
-//!   ([`QuicCarrier::with_listener`]), or else the session's own
+//!   ([`Carrier::with_listener`]), or else the session's own
 //!   ([`PipeIo::with_connection_memory`]). The stream window has one
 //!   source, [`LaneWindows::stream_window`]: build the endpoint's transport
 //!   configuration with [`Options::transport_config`]. Opening a lane waits
@@ -107,8 +107,8 @@ use zmux::carrier::{
 };
 use zmux::proto::ApplicationErrorCode;
 use zmux::{
-    Admit, Admitted, CarrierInfo, ConnectError, Credential, Entry, Listener, PipeHint, PipeIo,
-    Prefixed, Session,
+    Admit, Admitted, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint,
+    PipeIo, Prefixed, Session,
 };
 
 /// How a QUIC connection's flow control is sized for lanes: the base of
@@ -203,8 +203,8 @@ pub struct Options {
     /// QUIC 0-RTT (off by default; [`Options::with_zero_rtt`]).
     pub zero_rtt: Option<ParameterMemory>,
     /// Client: the credential presented to a server's admission
-    /// (none by default; [`Options::with_credential`]).
-    pub credential: Option<Arc<dyn Credential>>,
+    /// (none by default; [`Options::with_carrier_credential`]).
+    pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
 }
 
 /// The servers' transport parameters a client keeps for QUIC 0-RTT, by
@@ -377,15 +377,15 @@ impl Options {
         self
     }
 
-    /// Client: with `credential`, whose prefix ([`Credential::prefix`],
+    /// Client: with `credential`, whose prefix ([`CarrierCredential::prefix`],
     /// given the connection's [`Handshake::carrier_info`]) [`dial`] and
     /// [`connect`] write first on the connection's first stream, as 1-RTT
     /// data once the handshake completed: the carrier of a server that
     /// admits connections ([`serve`]). Such a connection sends no
     /// 0-RTT data.
     #[must_use]
-    pub fn with_credential(mut self, credential: Arc<dyn Credential>) -> Self {
-        self.credential = Some(credential);
+    pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
+        self.carrier_credential = Some(credential);
         self
     }
 
@@ -459,9 +459,9 @@ pub fn server_config(
 /// A carrier over a new connection of `endpoint` (its default client
 /// configuration) to `addr`, verified for `server_name`: a stream of the
 /// connection, which carries the pipe's lanes and stays open while the
-/// pipe is used, starting with the prefix of [`Options::credential`]. For
+/// pipe is used, starting with the prefix of [`Options::carrier_credential`]. For
 /// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to reach the
-/// connection itself, make it and its carrier ([`QuicCarrier::new`])
+/// connection itself, make it and its carrier ([`Carrier::new`])
 /// instead.
 pub async fn dial(
     endpoint: &Endpoint,
@@ -480,11 +480,11 @@ pub async fn dial(
 /// The first pipe of an established connection, the credential's prefix
 /// first.
 async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
-    let prefix = match &options.credential {
+    let prefix = match &options.carrier_credential {
         Some(c) => Some(c.prefix(&Handshake::of(&conn).carrier_info(&conn))?),
         None => None,
     };
-    let carrier = QuicCarrier::new(conn, options.clone());
+    let carrier = Carrier::new(conn, options.clone());
     match prefix {
         Some(p) => carrier.open_pipe_with_prefix(&p).await,
         None => carrier.open_pipe().await,
@@ -493,7 +493,7 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 
 /// Establishes a session over a new connection ([`dial`], then
 /// [`Session::connect`]). With [`Options::with_zero_rtt`], no
-/// [`Options::credential`] and carrier
+/// [`Options::carrier_credential`] and carrier
 /// early data allowed in `config`, a connection that resumes a TLS session
 /// with a server whose parameters the memory holds sends the session's
 /// first records as 0-RTT data and returns at once; if the server rejects
@@ -528,7 +528,7 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 ///
 /// // A peer that is not a zmux endpoint processed none of it: retry
 /// // without declaring it one.
-/// if session.closed().await.is_early_data_rejected() {
+/// if session.closing().await.is_early_data_rejected() {
 ///     config.early_data = EarlyData::default();
 ///     let _again = zmux_quinn::connect(&endpoint, addr, "example.com", &options, config).await?;
 /// }
@@ -560,14 +560,14 @@ pub async fn connect_with_report(
     let memory = options
         .zero_rtt
         .clone()
-        .filter(|_| config.early_data.carrier_early_data && options.credential.is_none());
+        .filter(|_| config.early_data.carrier_early_data && options.carrier_credential.is_none());
     let mut connecting = endpoint
         .connect(addr, server_name)
         .map_err(|e| io_err(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
     if let Some(remembered) = memory.as_ref().and_then(|m| m.get(server_name)) {
         match connecting.into_0rtt() {
             Ok((conn, accepted)) => {
-                let carrier = QuicCarrier::new(conn.clone(), options.clone());
+                let carrier = Carrier::new(conn.clone(), options.clone());
                 let (send, recv) = conn
                     .open_bi()
                     .await
@@ -659,7 +659,7 @@ fn remember(
 /// peer's address) before its handshake, which runs as a setup of
 /// [`Listener::serve_connections`]. Without an admission
 /// ([`zmux::ListenerConfig::admission`]), each connection is then a
-/// [`QuicCarrier`] of `listener` ([`QuicCarrier::with_listener`]) for as
+/// [`Carrier`] of `listener` ([`Carrier::with_listener`]) for as
 /// long as it is open, so that its streams start sessions
 /// ([`Listener::accept`]) and join them.
 ///
@@ -673,7 +673,7 @@ fn remember(
 /// identifier, the client's server name and the connection's TLS
 /// exporter. Then:
 ///
-/// - `Accept(k)`: the connection becomes a [`QuicCarrier`] of `listener`;
+/// - `Accept(k)`: the connection becomes a [`Carrier`] of `listener`;
 ///   its first stream is its first pipe, the prefix after `k` bytes in
 ///   front, and only from then on do its other streams, bidirectional and
 ///   unidirectional, opened before or after, reach the listener, each
@@ -694,7 +694,7 @@ pub async fn serve(
     listener: Listener,
     endpoint: Endpoint,
     options: Options,
-    fallback: Option<QuicFallback>,
+    fallback: Option<Fallback>,
 ) {
     let admitted = listener.admission().is_some();
     // 0-RTT data is taken before the handshake completes only when the
@@ -719,8 +719,12 @@ pub async fn serve(
                         Ok((conn, done)) => {
                             let (tx, rx) = tokio::sync::watch::channel(false);
                             tokio::spawn(async move {
-                                let _ = done.await;
-                                let _ = tx.send(true);
+                                // Resolves false when the handshake failed:
+                                // the streams opened in 0-RTT stay replayable
+                                // and the connection is closing.
+                                if done.await {
+                                    let _ = tx.send(true);
+                                }
                             });
                             Ok::<_, ()>((conn, Some(rx), entry))
                         }
@@ -756,7 +760,7 @@ pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
     options: &Options,
-    fallback: Option<&QuicFallback>,
+    fallback: Option<&Fallback>,
 ) -> io::Result<()> {
     let Some(entry) = listener.enter(conn.remote_address(), None) else {
         conn.close(VarInt::from_u32(0), b"");
@@ -775,7 +779,7 @@ async fn serve_entered(
     entry: Entry,
     listener: Listener,
     options: &Options,
-    fallback: Option<&QuicFallback>,
+    fallback: Option<&Fallback>,
 ) {
     if listener.admission().is_some() {
         admit(conn, entry, listener, options, fallback).await;
@@ -785,7 +789,7 @@ async fn serve_entered(
     let mut entry = entry;
     let _ = entry.decide(CarrierInfo::new(), Vec::new()).await;
     drop(entry);
-    let carrier = QuicCarrier::start(conn.clone(), Some(listener), options.clone(), handshake);
+    let carrier = Carrier::start(conn.clone(), Some(listener), options.clone(), handshake);
     // Held while the connection is open: its accept loop serves it.
     conn.closed().await;
     drop(carrier);
@@ -797,7 +801,7 @@ async fn admit(
     mut entry: Entry,
     listener: Listener,
     options: &Options,
-    fallback: Option<&QuicFallback>,
+    fallback: Option<&Fallback>,
 ) {
     let wait = listener
         .admission()
@@ -817,7 +821,7 @@ async fn admit(
         Admit::Accept(rest) => {
             let admitted = entry.admitted();
             let hint = PipeHint::from_entry(entry);
-            let carrier = QuicCarrier::make(conn.clone(), Some(&listener), options.clone(), None);
+            let carrier = Carrier::make(conn.clone(), Some(&listener), options.clone(), None);
             let first = carrier
                 .inner
                 .pipe(Send::new(send), Recv::new(recv))
@@ -859,15 +863,15 @@ type QuicFallbackFn = dyn Fn(
 /// is the handler's: it closes when the handler has dropped every handle of
 /// it and of its streams. Cheap to clone.
 #[derive(Clone)]
-pub struct QuicFallback(Arc<QuicFallbackFn>);
+pub struct Fallback(Arc<QuicFallbackFn>);
 
-impl std::fmt::Debug for QuicFallback {
+impl std::fmt::Debug for Fallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("QuicFallback(..)")
+        f.write_str("Fallback(..)")
     }
 }
 
-impl QuicFallback {
+impl Fallback {
     /// The handler `f`.
     pub fn new<F, Fut>(f: F) -> Self
     where
@@ -895,17 +899,29 @@ impl QuicFallback {
 /// A QUIC connection whose streams carry zmux pipes and lanes (see the
 /// crate documentation). Cheap to clone; the accept loop runs while the
 /// connection is open and any clone, or any pipe made from it, is alive.
-/// Once none is, the loop stops and the carrier's hold on the connection
-/// ends: keep a clone while the peer may still open pipes on it.
+/// Once none is, the loop stops and the connection is closed: keep a clone
+/// while the peer may still open pipes on it.
+///
+/// A pipe holds the connection until its session is done with it: every
+/// pipe's inbound side ended (the peer read the zmux CONNECTION_CLOSE and
+/// ended its stream) or its linger timeout passed, so a QUIC close, which
+/// discards what the peer has not acknowledged, never cuts off the zmux
+/// close or the data before it. The connection is then closed with the
+/// application error code of the CONNECTION_CLOSE that ended the last
+/// session on it (sent or received), so that what sees only QUIC sees that
+/// code; 0 after any other end, and for a connection that never carried a
+/// session. zmux tells the code of every pipe it is done with, 0 for a pipe
+/// removed while its session goes on or one that never carried a session;
+/// on a connection several sessions share, the last of them decides.
 #[derive(Clone)]
 #[must_use = "the accept loop stops once the carrier and its pipes are gone"]
-pub struct QuicCarrier {
+pub struct Carrier {
     inner: Arc<Inner>,
 }
 
-impl std::fmt::Debug for QuicCarrier {
+impl std::fmt::Debug for Carrier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuicCarrier")
+        f.debug_struct("Carrier")
             .field("connection", &self.inner.conn.stable_id())
             .finish()
     }
@@ -932,6 +948,9 @@ struct Inner {
     handshake: Option<tokio::sync::watch::Receiver<bool>>,
     /// The connection's QUIC datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
+    /// The application error code of the last session on the connection
+    /// that ended, which the connection's close carries.
+    close_code: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -941,17 +960,22 @@ struct Accepted {
 }
 
 impl Drop for Inner {
+    /// No carrier and no pipe holds the connection any more: it closes with
+    /// the last session's code (a no-op on one already closed).
     fn drop(&mut self) {
         if let Some(t) = self.accept_task.get() {
             t.abort();
         }
+        let code = self.close_code.load(std::sync::atomic::Ordering::Relaxed);
+        self.conn
+            .close(VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0)), b"");
     }
 }
 
-impl QuicCarrier {
+impl Carrier {
     /// The carrier of `conn`, an established connection, without a
     /// listener; its accept loop starts here (inside a tokio runtime). The
-    /// peer's pipes go to [`QuicCarrier::accept_pipe`], and the
+    /// peer's pipes go to [`Carrier::accept_pipe`], and the
     /// connection's receive window is charged to the session its pipes
     /// carry. Make one carrier per connection: its lanes are recognised by
     /// it.
@@ -1000,6 +1024,7 @@ impl QuicCarrier {
             _charge: listener.map(|l| l.charge_memory(window)),
             handshake,
             datagrams: ConnectionDatagrams::new(conn.clone()),
+            close_code: std::sync::atomic::AtomicU64::new(0),
         });
         let _ = inner.id.set(CarrierConnId::new(&inner));
         Self { inner }
@@ -1026,9 +1051,9 @@ impl QuicCarrier {
         Ok(self.inner.pipe(Send::new(send), Recv::new(recv)))
     }
 
-    /// [`QuicCarrier::open_pipe`] with `prefix` written first on the
+    /// [`Carrier::open_pipe`] with `prefix` written first on the
     /// stream, before any zmux record: the bytes a server's admission reads
-    /// ([`serve`]), such as a [`Credential::prefix`] for the
+    /// ([`serve`]), such as a [`CarrierCredential::prefix`] for the
     /// connection's [`Handshake::carrier_info`]. Written as 1-RTT data on
     /// an established connection.
     pub async fn open_pipe_with_prefix(&self, prefix: &[u8]) -> io::Result<PipeIo> {
@@ -1065,7 +1090,7 @@ impl QuicCarrier {
 
 impl Inner {
     /// Starts the accept loop, which hands the peer's streams to
-    /// `listener`, or else keeps them for [`QuicCarrier::accept_pipe`].
+    /// `listener`, or else keeps them for [`Carrier::accept_pipe`].
     fn listen(self: &Arc<Self>, listener: Option<Listener>, admitted: Option<Admitted>) {
         let task = tokio::spawn(accept_loop(
             self.conn.clone(),
@@ -1101,6 +1126,9 @@ impl Inner {
     ) -> PipeIo {
         send.keep = Some(self.clone());
         recv.keep = Some(self.clone());
+        // Holds the connection until the session is done with the pipe,
+        // and gives the connection's close the session's code.
+        let closer = self.clone();
         let opener = self.clone();
         // Does not keep the connection: gives no value once it is gone.
         let exporter = Arc::downgrade(self);
@@ -1112,7 +1140,12 @@ impl Inner {
             .with_retransmitted(move || Some(stats.stats().path.lost_bytes))
             .with_carrier_conn(self.id())
             .with_connection_memory(self.own_charge)
-            .with_datagram_channel(channel);
+            .with_datagram_channel(channel)
+            .with_close_code(move |code| {
+                closer
+                    .close_code
+                    .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
+            });
         let done = self.handshake.clone();
         let state = zmux::TlsState::new(self.alpn.clone().map(String::into_bytes), None);
         let io = io.with_terminated_tls(move || {
@@ -1367,6 +1400,11 @@ impl ConnectionDatagrams {
     }
 }
 
+/// Larger than any QUIC datagram: the probe of whether the connection
+/// disables them ([`QuicChannel::max_datagram_size`]). Zeroes in a static,
+/// so that the probe neither allocates nor takes stack.
+static OVERSIZED_DATAGRAM: [u8; 1 << 16] = [0; 1 << 16];
+
 /// The datagram channel of one pipe of a QUIC connection
 /// ([`ConnectionDatagrams::channel`]).
 pub struct QuicChannel {
@@ -1410,7 +1448,8 @@ impl DatagramChannel for QuicChannel {
             // Larger than any QUIC datagram: refused without being sent,
             // and refused first when the local configuration disables them.
             matches!(
-                d.conn.send_datagram(Bytes::from_static(&[0; 1 << 16])),
+                d.conn
+                    .send_datagram(Bytes::from_static(&OVERSIZED_DATAGRAM)),
                 Err(quinn::SendDatagramError::Disabled)
             )
         });
@@ -1550,6 +1589,10 @@ struct RetryState {
     switched: bool,
     send: Option<quinn::SendStream>,
     recv: Option<quinn::RecvStream>,
+    /// The pipe's halves dropped: the 1-RTT stream's half of each is
+    /// reset or stopped rather than kept (the report holds this state).
+    send_dropped: bool,
+    recv_dropped: bool,
     wakers: Vec<std::task::Waker>,
 }
 
@@ -1563,9 +1606,19 @@ impl Retry {
         let wakers = {
             let mut st = self.lock();
             st.accepted = Some(accepted);
-            if let Some((s, r)) = streams {
-                st.send = Some(s);
-                st.recv = Some(r);
+            if let Some((mut s, mut r)) = streams {
+                // A half whose owner is gone fails at once, never kept for
+                // as long as the report lives.
+                if st.send_dropped {
+                    let _ = s.reset(carrier_failed());
+                } else {
+                    st.send = Some(s);
+                }
+                if st.recv_dropped {
+                    let _ = r.stop(carrier_failed());
+                } else {
+                    st.recv = Some(r);
+                }
             }
             std::mem::take(&mut st.wakers)
         };
@@ -1604,6 +1657,31 @@ impl Retry {
         Ok(Some(id))
     }
 
+    /// The pipe's sending half is gone: its 1-RTT stream, if any, is reset.
+    fn drop_send(&self) {
+        let pending = {
+            let mut st = self.lock();
+            st.send_dropped = true;
+            st.send.take()
+        };
+        if let Some(mut s) = pending {
+            let _ = s.reset(carrier_failed());
+        }
+    }
+
+    /// The pipe's receiving half is gone: its 1-RTT stream, if any, is
+    /// stopped.
+    fn drop_recv(&self) {
+        let pending = {
+            let mut st = self.lock();
+            st.recv_dropped = true;
+            st.recv.take()
+        };
+        if let Some(mut r) = pending {
+            let _ = r.stop(carrier_failed());
+        }
+    }
+
     /// The 1-RTT half, once the pipe switched to it.
     fn take<T>(&self, f: impl FnOnce(&mut RetryState) -> Option<T>) -> Option<T> {
         let mut st = self.lock();
@@ -1626,7 +1704,10 @@ impl Retry {
             }),
             (Some(false), false) if write => Poll::Ready(After::Swallow),
             _ => {
-                st.wakers.push(cx.waker().clone());
+                // Polled again before the outcome: one waker per task.
+                if !st.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    st.wakers.push(cx.waker().clone());
+                }
                 Poll::Pending
             }
         }
@@ -1675,6 +1756,16 @@ impl ChunkWrite for Send {
 impl Drop for Send {
     fn drop(&mut self) {
         if !self.finished {
+            // quinn ends a dropped stream gracefully: a failure is a reset.
+            // (A no-op on a rejected 0-RTT stream, whose ID quinn reuses.)
+            self.follow();
+            let _ = self.stream.reset(carrier_failed());
+        }
+        // A 1-RTT stream the pipe never moved to carries nothing: reset.
+        if let Some(r) = self.retry.take() {
+            r.drop_send();
+        }
+        if !self.finished {
             return;
         }
         // Resolves once the peer acknowledged the stream, stopped it, or
@@ -1709,6 +1800,9 @@ impl Recv {
 impl Drop for Recv {
     fn drop(&mut self) {
         let _ = self.stream.stop(carrier_failed());
+        if let Some(r) = self.retry.take() {
+            r.drop_recv();
+        }
     }
 }
 

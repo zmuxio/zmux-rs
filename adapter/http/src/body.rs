@@ -272,7 +272,7 @@ impl PipeBody {
 
     /// A body of `data`, of known length.
     pub fn full(data: impl Into<Bytes>) -> Self {
-        Self::fixed(data.into(), Bytes::new())
+        Self::fixed([data.into()])
     }
 
     /// `body` as it is: its frames, its end and its errors.
@@ -309,11 +309,12 @@ impl PipeBody {
         Self(Inner::Boxed(Box::pin(MapErr(Box::pin(body)))))
     }
 
-    /// A body of `head` then `tail`, of known length.
-    pub(crate) fn fixed(head: Bytes, tail: Bytes) -> Self {
+    /// A body of `parts` one after the other, of known length.
+    pub(crate) fn fixed<const N: usize>(parts: [Bytes; N]) -> Self {
         let mut b = ChunkBuf::new();
-        b.push(head);
-        b.push(tail);
+        for p in parts {
+            b.push(p);
+        }
         Self(Inner::Fixed((!b.is_empty()).then_some(b)))
     }
 }
@@ -612,9 +613,8 @@ where
         } else if first.is_empty() {
             first = data;
         } else if !data.is_empty() {
-            // Room for what the body says is left.
-            let left = usize::try_from(body.size_hint().upper().unwrap_or(0)).unwrap_or(limit);
-            let mut r = bytes::BytesMut::with_capacity(have.saturating_add(left).min(limit));
+            // Sized by what arrived, never by what the peer declares.
+            let mut r = bytes::BytesMut::with_capacity(have);
             r.extend_from_slice(&std::mem::take(&mut first));
             r.extend_from_slice(&data);
             rest = Some(r);
@@ -626,50 +626,77 @@ where
     Ok(Ok(rest.map_or(first, bytes::BytesMut::freeze)))
 }
 
-/// Reads the first `len` bytes of `body` until `deadline`, without reading
-/// beyond the frame that completes them. Returns the bytes read (one data
-/// frame is taken as it is, several are joined) and whether they are `len`
-/// bytes; a body that ends, fails or passes the deadline first gives what
-/// was read. A trailers frame read on the way ends the reading and is lost.
-pub(crate) async fn read_len<B>(
+/// Bytes read from a body: one data frame as it is, several joined in a
+/// buffer that grows with what arrives, never with a length the peer
+/// declares.
+#[derive(Default)]
+pub(crate) struct Gathered {
+    first: Bytes,
+    joined: Option<bytes::BytesMut>,
+}
+
+impl Gathered {
+    /// The bytes gathered.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match &self.joined {
+            Some(j) => j,
+            None => &self.first,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn push(&mut self, data: Bytes) {
+        match &mut self.joined {
+            Some(j) => j.extend_from_slice(&data),
+            None if self.first.is_empty() => self.first = data,
+            None => {
+                let mut j = bytes::BytesMut::with_capacity(self.first.len() + data.len());
+                j.extend_from_slice(&self.first);
+                j.extend_from_slice(&data);
+                self.first = Bytes::new();
+                self.joined = Some(j);
+            }
+        }
+    }
+
+    /// The bytes gathered, without a copy.
+    pub(crate) fn freeze(self) -> Bytes {
+        self.joined.map_or(self.first, bytes::BytesMut::freeze)
+    }
+}
+
+/// Reads `body` into `read` until it holds at least `len` bytes, or until
+/// `deadline`, without reading beyond the frame that completes them.
+/// Whether it does; a body that ends, fails or passes the deadline first
+/// leaves what was read. A trailers frame read on the way ends the reading
+/// and is lost.
+pub(crate) async fn read_to<B>(
     body: &mut B,
+    read: &mut Gathered,
     len: usize,
     deadline: tokio::time::Instant,
-) -> (Bytes, bool)
+) -> bool
 where
     B: Body + Unpin,
     B::Data: Buf,
 {
-    let mut first = Bytes::new();
-    let mut joined: Option<bytes::BytesMut> = None;
-    let mut have = 0;
-    while have < len {
+    while read.len() < len {
         let next = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx));
         let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, next).await else {
-            break;
+            return false;
         };
         let Ok(mut data) = frame.into_data() else {
-            break;
+            return false;
         };
         let data = data.copy_to_bytes(data.remaining());
-        if data.is_empty() {
-            continue;
-        }
-        have += data.len();
-        match &mut joined {
-            Some(j) => j.extend_from_slice(&data),
-            None if first.is_empty() => first = data,
-            None => {
-                let mut j = bytes::BytesMut::with_capacity(len.max(have));
-                j.extend_from_slice(&first);
-                j.extend_from_slice(&data);
-                joined = Some(j);
-            }
+        if !data.is_empty() {
+            read.push(data);
         }
     }
-    let read = joined.map_or(first, bytes::BytesMut::freeze);
-    let complete = read.len() == len;
-    (read, complete)
+    true
 }
 
 #[cfg(test)]

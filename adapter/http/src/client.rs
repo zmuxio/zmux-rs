@@ -70,7 +70,7 @@ struct Sent<F> {
 impl Options {
     /// The request of a carrier: a `GET` for a downlink, a `POST` whose
     /// body is fed by the returned writer otherwise, the prefix of
-    /// [`Options::credential`] first on a body and its header form on a
+    /// [`Options::carrier_credential`] first on a body and its header form on a
     /// `GET`. Neither body has a
     /// `Content-Length`.
     ///
@@ -99,13 +99,13 @@ impl Options {
             req = req.header(self.pair_field.name(), p.as_str());
         }
         let (body, writer) = if get {
-            if let Some(c) = &self.credential {
+            if let Some(c) = &self.carrier_credential {
                 let (name, value) = c.header(&CarrierInfo::new().with_head())?;
                 req = req.header(name, value);
             }
             (PipeBody::empty(), None)
         } else {
-            let prefix = match &self.credential {
+            let prefix = match &self.carrier_credential {
                 Some(c) => Some(bytes::Bytes::from(c.prefix(&CarrierInfo::new())?)),
                 None => None,
             };
@@ -629,7 +629,7 @@ where
 /// one Join across a `POST` and a `GET` paired by a token, one attachment of the
 /// two directions, `pipe_options` choosing its direction. Returns the pipe as
 /// [`Session::add_pipe`] does: once the peer attached it, or with
-/// [`PipeOptions::no_wait_attached`] once its join is confirmed. A [`zmux::helpers::PipePool::join`] keeps such carriers up.
+/// [`PipeOptions::return_on_reply`] once its join is confirmed. A [`zmux::helpers::PipePool::join`] keeps such carriers up.
 pub async fn join_http1_split_with<C, F, IO>(
     session: &Session,
     connect: C,
@@ -970,7 +970,7 @@ pub async fn connect_http2(
 /// `POST` over a new HTTP/1.1 connection that `connect` makes
 /// ([`dial_http1_over`]). It passes intermediaries that forward both bodies
 /// at once.
-pub fn streaming_candidate<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
+pub fn candidate<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
 where
     C: Fn() -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<IO>> + Send + 'static,
@@ -1006,7 +1006,7 @@ where
 /// ([`join_http1_split_with`]). Its
 /// carriers must be confidential to the server or to a trusted
 /// TLS-terminating intermediary.
-pub fn split_candidate<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
+pub fn candidate_split<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
 where
     C: Fn() -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<IO>> + Send + 'static,
@@ -1053,8 +1053,8 @@ where
 /// whose requests go over HTTP/1.1 connections that `connect` makes
 /// ([`crate::dial_exchange_with`]). It passes intermediaries that buffer
 /// whole bodies; it authenticates with the exchange's PSK, and
-/// [`Options::credential`] is not presented on it.
-pub fn exchange_candidate<C, F, IO>(
+/// [`Options::carrier_credential`] is not presented on it.
+pub fn candidate_exchange<C, F, IO>(
     connect: C,
     authority: &str,
     options: &crate::ExchangeOptions,
@@ -1075,7 +1075,7 @@ where
 impl Http2Connection {
     /// A [`Candidate`] of [`CarrierKind::Streaming`] on new requests
     /// of this connection ([`Http2Connection::open_pipe`]).
-    pub fn streaming_candidate(&self) -> Candidate {
+    pub fn candidate(&self) -> Candidate {
         let conn = self.clone();
         let target = Arc::new(self.target());
         let named = target.clone();
@@ -1102,8 +1102,8 @@ impl Http2Connection {
 
     /// A [`Candidate`] of [`CarrierKind::Split`] on new requests of
     /// this connection ([`Http2Connection::open_split`]; see
-    /// [`split_candidate`]).
-    pub fn split_candidate(&self) -> Candidate {
+    /// [`candidate_split`]).
+    pub fn candidate_split(&self) -> Candidate {
         let conn = self.clone();
         let joining = self.clone();
         let target = Arc::new(self.target());

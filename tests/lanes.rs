@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{
-    Config, CoreEvent, LaneAccept, LaneId, PipeId, RoleConfig, SessionCore, State, StreamKey,
-    TransmitBuf,
+    Config, CoreEvent, LaneAccept, LaneId, PipeId, Role, SessionCore, State, StreamKey, TransmitBuf,
 };
 
 const P0: PipeId = PipeId::new(0);
@@ -40,13 +39,16 @@ struct LanePair {
     /// Refuse every lane the sides open (an intermediary that splits the
     /// connection).
     refuse: bool,
+    /// Holds A's lane 0 batches instead of delivering them (a carrier that
+    /// delays one stream of the connection), in order.
+    hold_a0: Option<Vec<Vec<u8>>>,
 }
 
 impl LanePair {
     fn new(a: Config, b: Config) -> Self {
         let now = Instant::now();
-        let mut a = SessionCore::new(a, RoleConfig::Initiator, None, now).unwrap();
-        let mut b = SessionCore::new(b, RoleConfig::Responder, None, now).unwrap();
+        let mut a = SessionCore::new(a, Role::Client, None, now).unwrap();
+        let mut b = SessionCore::new(b, Role::Server, None, now).unwrap();
         for s in [&mut a, &mut b] {
             s.attach_pipe(P0, Framing::ByteStream, now);
             s.set_pipe_low_water(P0, true);
@@ -63,6 +65,7 @@ impl LanePair {
             reverse: true,
             first_a: std::collections::HashMap::new(),
             refuse: false,
+            hold_a0: None,
         };
         p.run(Duration::from_millis(100));
         assert!(p.a.is_established() && p.b.is_established());
@@ -118,6 +121,14 @@ impl LanePair {
                 self.out.copy_to_vec(&mut self.wire);
                 if a_to_b && lane != 0 {
                     first_a.entry(lane).or_insert(self.wire.len());
+                }
+                if a_to_b
+                    && lane == 0
+                    && let Some(held) = self.hold_a0.as_mut()
+                {
+                    held.push(self.wire.clone());
+                    moved += self.wire.len();
+                    continue;
                 }
                 let used = to.receive_in_place(at, &self.wire, self.now);
                 assert_eq!(used, self.wire.len(), "a batch is whole records");
@@ -223,6 +234,65 @@ fn bulk_streams_spread_over_lanes_and_keep_their_order_without_multipath() {
     assert!(info.lanes_out > 1, "lanes opened: {info:?}");
     assert_eq!(info.lanes_refused, 0);
     assert_eq!(p.b.pipe_info(P0).unwrap().lanes_in, info.lanes_out);
+}
+
+/// A stream's data written on lane 0 in the very batch whose scheduling
+/// asked for the pipe's first lane stays bound to lane 0: the stream moves
+/// to the new lane only once a PIPE_ACK covers that batch, however long
+/// the carrier holds lane 0 back while the new lane runs ahead.
+#[test]
+fn data_of_the_batch_that_opens_the_first_lane_stays_on_lane_zero() {
+    let mut p = LanePair::new(Config::default(), Config::default());
+    p.reverse = false;
+    let key = p.a.open(Dir::Uni).unwrap();
+    const LEN: usize = 256 * 1024;
+    let data = pattern(0, LEN);
+    // The first batch carries the stream's data on lane 0 and asks for
+    // lane 1 on the way; the carrier holds that lane 0 batch back.
+    let mut written = p.a.write(key, &data[..16 * 1024]).unwrap();
+    p.hold_a0 = Some(Vec::new());
+    // Nothing more of the stream until lane 1 is confirmed, so that no
+    // later lane 0 batch binds the stream there.
+    p.run(Duration::from_millis(100));
+    let mut got = Vec::new();
+    let mut peer = None;
+    for _ in 0..2_000 {
+        if written < LEN
+            && let Ok(n) = p.a.write(key, &data[written..(written + 8192).min(LEN)])
+        {
+            written += n;
+            if written == LEN {
+                p.a.finish(key).unwrap();
+            }
+        }
+        p.run(Duration::from_millis(1));
+        if written == LEN || p.b.state() != State::Active {
+            break;
+        }
+    }
+    assert!(!p.lanes_a.is_empty(), "lane 1 opened");
+    // Lane 0 catches up now.
+    let held = p.hold_a0.take().unwrap();
+    assert!(!held.is_empty(), "lane 0 was held");
+    for w in held {
+        let used = p.b.receive_in_place(P0.lane(0), &w, p.now);
+        assert_eq!(used, w.len());
+    }
+    for _ in 0..2_000 {
+        p.run(Duration::from_millis(1));
+        if peer.is_none() {
+            peer = p.b.accept(Dir::Uni).ok().flatten();
+        }
+        if let Some(k) = peer
+            && LanePair::read_all(&mut p.b, k, &mut got)
+        {
+            break;
+        }
+    }
+    assert_eq!(p.b.state(), State::Active, "{:?}", p.b.error());
+    assert_eq!(p.a.state(), State::Active, "{:?}", p.a.error());
+    assert!(got == data, "the stream arrived whole and in order");
+    assert!(p.a.pipe_info(P0).unwrap().lanes_out > 1);
 }
 
 /// A lane that ends before it is confirmed is refused: the pipe goes on,

@@ -136,7 +136,7 @@ async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
     let (all, bounded) = take_write_call_bytes();
     assert_eq!(got, total);
     drop(writer.await.unwrap());
-    client.close(0u32.into(), b"").await;
+    client.close().await;
     bounded as f64 / all as f64
 }
 

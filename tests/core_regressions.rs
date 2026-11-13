@@ -9,7 +9,7 @@ use zmux::VarInt;
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{
-    Cap, Config, OpenError, Preamble, RoleConfig, SessionCore, State, StreamKey, TransmitBuf,
+    Cap, Config, OpenError, Preamble, Role, SessionCore, State, StreamKey, TransmitBuf,
 };
 
 #[path = "common/core_pair.rs"]
@@ -75,7 +75,7 @@ fn session_credit_stall_does_not_spin() {
     let mut b_cfg = Config::default();
     b_cfg.initial_stream_receive_window = 65_436;
     b_cfg.initial_connection_receive_window = 65_536;
-    b_cfg.max_incoming_uni_streams = Some(4);
+    b_cfg.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
     let mut p = Pair::new(a_cfg, b_cfg);
     let k1 = p.a.open(Dir::Uni).unwrap();
     let data = vec![1u8; 70_000];
@@ -117,7 +117,7 @@ fn small_send_records_still_carry_stream_data() {
     let mut a_cfg = Config::default();
     a_cfg.max_send_record = 1024; // accepted by Config::validate
     let mut b_cfg = Config::default();
-    b_cfg.max_incoming_uni_streams = Some(4);
+    b_cfg.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
     let mut p = Pair::new(a_cfg, b_cfg);
     let k = p.a.open(Dir::Uni).unwrap();
     p.a.write(k, &[5u8; 5000]).unwrap();
@@ -136,7 +136,7 @@ fn small_send_records_still_carry_stream_data() {
 fn memory_pressure_rejects_before_offering() {
     let now = Instant::now();
     let tp = {
-        let s = SessionCore::new(Config::default(), RoleConfig::Initiator, None, now).unwrap();
+        let s = SessionCore::new(Config::default(), Role::Client, None, now).unwrap();
         let mut tp = s.local_parameters();
         tp.zmux_preamble = None;
         tp
@@ -222,10 +222,14 @@ fn no_stream_opens_after_a_goaway() {
     assert_eq!(p.b.stats().streams_opened_remote, 1);
 }
 
+/// Unread stream datagrams stay within each stream's own byte bound
+/// (`datagram_stream_bytes`, 512 KiB by default); the session's receive bytes
+/// bound the session queue only.
 #[test]
-fn stream_datagrams_stay_within_session_limit() {
+fn stream_datagrams_stay_within_their_stream_bound() {
     let mut cfg = Config::default();
     cfg.enable_datagrams = true;
+    cfg.datagram_stream_queue = 64;
     let mut p = Pair::new(cfg.clone(), cfg);
     let mut keys = Vec::new();
     for _ in 0..4 {
@@ -241,22 +245,24 @@ fn stream_datagrams_stay_within_session_limit() {
     assert_eq!(peer.len(), 4);
     let payload = Bytes::from(vec![9u8; 16_000]);
     for &k in &keys {
-        for _ in 0..32 {
+        for _ in 0..64 {
             p.a.send_stream_datagram(k, 0, payload.clone(), true)
                 .unwrap();
             p.pump();
         }
     }
-    let mut held = 0usize;
+    let mut total = 0usize;
     for &s in &peer {
+        let mut held = 0usize;
         while let Ok(Some((_, d))) = p.b.recv_stream_datagram(s) {
             held += d.len();
         }
+        // 32 of 16000 bytes fit 512 KiB, the 33rd does not.
+        assert_eq!(held, 32 * 16_000, "one stream's unread datagrams");
+        total += held;
     }
-    assert!(
-        held <= 1 << 20,
-        "held {held} bytes of unread datagrams, above the 1 MiB session limit"
-    );
+    // Together above the session's 1 MiB, which does not bound them.
+    assert!(total > 1 << 20);
 }
 
 #[test]
@@ -324,13 +330,13 @@ fn config_out_of_varint_range_is_rejected() {
     let now = Instant::now();
     let mut cfg = Config::default();
     cfg.max_idle_timeout = Some(Duration::MAX);
-    assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
+    assert!(SessionCore::new(cfg, Role::Client, None, now).is_err());
     let mut cfg = Config::default();
     cfg.max_connection_receive_window = Cap::Fixed(1 << 62);
-    assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
+    assert!(SessionCore::new(cfg, Role::Client, None, now).is_err());
     let mut cfg = Config::default();
     cfg.send_buffer = 0;
-    assert!(SessionCore::new(cfg, RoleConfig::Initiator, None, now).is_err());
+    assert!(SessionCore::new(cfg, Role::Client, None, now).is_err());
 }
 
 #[test]
@@ -501,7 +507,7 @@ impl Line {
             }
         };
         let mut l = Self {
-            ends: [end(RoleConfig::Initiator), end(RoleConfig::Responder)],
+            ends: [end(Role::Client), end(Role::Server)],
             out: TransmitBuf::default(),
             start: now,
             now,
@@ -866,4 +872,122 @@ fn a_reset_of_a_pinned_stream_does_not_wait_for_the_opening_frame() {
         .stream_key(id)
         .expect("the identifier reached the peer");
     assert!(pair.b.received_reset(at_peer).is_ok());
+}
+
+/// A carrier that takes CONNECTION_CLOSE later than two linger periods
+/// after it was queued, within the hand-off limit: the session stays
+/// CLOSING until the delivery and lingers a whole period from it.
+#[test]
+fn a_slow_close_delivery_keeps_its_linger() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    p.pump();
+    p.a.close(VarInt::ZERO, b"", p.now);
+    p.a.poll_transmit(P0, p.now, &mut p.out);
+    assert!(!p.out.is_empty(), "CONNECTION_CLOSE queued for the carrier");
+    let len = p.out.len() as u64;
+    assert!(!p.a.close_handed_off());
+    // The carrier is still writing it, 600 ms on (the linger is 250 ms).
+    for _ in 0..60 {
+        p.now += Duration::from_millis(10);
+        p.a.handle_timeout(p.now);
+    }
+    assert_eq!(p.a.state(), State::Closing, "ended before the delivery");
+    p.a.pipe_written(P0, len, p.now);
+    assert!(p.a.close_handed_off());
+    let delivered = p.now;
+    while p.a.state() != State::Closed {
+        p.now += Duration::from_millis(1);
+        p.a.handle_timeout(p.now);
+        assert!(p.now - delivered < Duration::from_secs(3), "never closed");
+    }
+    assert!(
+        p.now - delivered >= Duration::from_millis(250),
+        "the linger ended {:?} after the delivery",
+        p.now - delivered
+    );
+}
+
+/// Rewrites the byte-stream records of `bytes`, the peer's parameters
+/// without `zmux_pipe_ack`: a peer that does not acknowledge pipes.
+fn without_pipe_ack(bytes: &[u8]) -> Vec<u8> {
+    use zmux::proto::frame::{Frame, Gates, QxTransportParameters};
+    use zmux::proto::params::TransportParameters;
+    use zmux::proto::varint;
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while let Some((len, width)) = varint::decode(rest) {
+        let end = width + usize::try_from(len).unwrap();
+        let mut body = &rest[width..end];
+        let mut rec = Vec::new();
+        while !body.is_empty() {
+            let (f, n) = Frame::decode(body, &Gates::ALL).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let m = match f {
+                Frame::TransportParameters(t) => {
+                    let mut tp = TransportParameters::decode(t.block).unwrap();
+                    tp.zmux_pipe_ack = false;
+                    tp.zmux_ack_threshold = None;
+                    tp.zmux_max_ack_delay = None;
+                    tp.zmux_max_lanes = None;
+                    let mut block = vec![0u8; 4096];
+                    let k = tp.encode(None, &mut block).unwrap();
+                    Frame::TransportParameters(QxTransportParameters { block: &block[..k] })
+                        .encode(&mut buf)
+                        .unwrap()
+                }
+                other => other.encode(&mut buf).unwrap(),
+            };
+            rec.extend_from_slice(&buf[..m]);
+            body = &body[n..];
+        }
+        let mut head = [0u8; 8];
+        let w = varint::encode(rec.len() as u64, &mut head).unwrap();
+        out.extend_from_slice(&head[..w]);
+        out.extend_from_slice(&rec);
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// A peer that ends its carrier without a close (a plain peer's idle end,
+/// `IdleTimeout { remote: true }` like a processed idle close) gives no read
+/// drain: unread data of an unfinished stream fails with the session's
+/// error at once. Only a processed CONNECTION_CLOSE keeps it readable.
+#[test]
+fn a_peer_s_idle_end_drains_nothing() {
+    let mut p = Pair::attached(Config::default(), Config::default());
+    let mut first = Vec::new();
+    while p.a.wants_write(P0) {
+        p.a.poll_transmit(P0, p.now, &mut p.out);
+        if p.out.is_empty() {
+            break;
+        }
+        let mut wire = Vec::new();
+        p.out.copy_to_vec(&mut wire);
+        p.a.pipe_written(P0, wire.len() as u64, p.now);
+        first.extend_from_slice(&wire);
+    }
+    let wire = without_pipe_ack(&first);
+    assert_eq!(p.b.receive_in_place(P0, &wire, p.now), wire.len());
+    p.pump();
+    assert!(p.b.is_established());
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"unread").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
+    let now = p.now;
+    p.b.pipe_ended(P0, zmux::proto::session::PipeEnd::Eof, now);
+    let e = p.b.error().cloned().expect("ended");
+    assert!(
+        matches!(e, zmux::SessionError::IdleTimeout { remote: true }),
+        "{e:?}"
+    );
+    let mut buf = [0u8; 16];
+    assert!(
+        matches!(
+            p.b.read(s, &mut buf),
+            Err(zmux::StreamError::SessionLost(_))
+        ),
+        "{e:?}"
+    );
 }

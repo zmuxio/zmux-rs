@@ -13,9 +13,7 @@ use zmux::proto::frame::{
 };
 use zmux::proto::params::TransportParameters;
 use zmux::proto::record::Framing;
-use zmux::proto::session::{
-    Config, PipeEnd, PipeId, RoleConfig, SessionCore, StreamKey, TransmitBuf,
-};
+use zmux::proto::session::{Config, PipeEnd, PipeId, Role, SessionCore, StreamKey, TransmitBuf};
 use zmux::proto::{VarInt, varint};
 
 const P0: PipeId = PipeId::new(0);
@@ -373,15 +371,11 @@ fn run(ops: &[Op], preamble: bool, datagrams: bool, role: bool) {
     let now = Instant::now();
     let mut config = Config::default();
     config.max_incoming_streams = 4;
-    config.max_incoming_uni_streams = Some(4);
+    config.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
     config.initial_stream_receive_window = 4096;
     config.initial_connection_receive_window = 20_000;
     config.enable_datagrams = datagrams;
-    let r = if role {
-        RoleConfig::Initiator
-    } else {
-        RoleConfig::Responder
-    };
+    let r = if role { Role::Client } else { Role::Server };
     let mut s = SessionCore::new(config, r, None, now).unwrap();
     s.attach_pipe(P0, Framing::ByteStream, now);
     let mut h = Harness {

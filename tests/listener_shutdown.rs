@@ -43,6 +43,12 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         let (listener, addr) = serve().await;
         let client = connect(addr).await.unwrap();
         let server = listener.accept().await.unwrap();
+        // A stream both ends hold keeps the session's graceful close waiting
+        // (a session with none ends as soon as its GOAWAY completes, and the
+        // listener with it).
+        let (mut send, recv) = client.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let held = server.accept_bi().await.unwrap();
         let l = listener.clone();
         let shutdown = tokio::spawn(async move {
             l.shutdown(VarInt::from_u32(0), b"bye").await;
@@ -53,7 +59,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         // Refused with CONNECTION_REFUSED after the listener's parameters,
         // which may establish the session at the client first.
         if let Some(refused) = connect(addr).await {
-            let e = tokio::time::timeout(Duration::from_secs(3), refused.closed())
+            let e = tokio::time::timeout(Duration::from_secs(3), refused.closing())
                 .await
                 .expect("refused in time");
             assert!(
@@ -85,6 +91,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         assert_eq!(listener.stats().joins, joins + 1);
         assert!(!shutdown.is_finished());
         // The session ends: the listener closes.
+        drop((send, recv, held));
         drop(server);
         drop(client);
         shutdown.await.unwrap();

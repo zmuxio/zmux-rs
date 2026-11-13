@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::timeout;
 use zmux::proto::record::Framing;
-use zmux::proto::seal::Mode;
+use zmux::proto::seal::RecordMode;
 use zmux::proto::seal::join::JoinHello;
 use zmux::proto::session::{
     AllowRecordMode, ClaimedHello, Config, CoreEvent, OpenedHello, PeerCarrier, PipeId,
@@ -26,7 +26,7 @@ use zmux::{
 fn config() -> Config {
     let mut c =
         Config::multipath(PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end());
-    c.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| true)));
+    c.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     c
 }
 
@@ -80,19 +80,19 @@ async fn a_third_party_reads_one_hello_and_nothing_else() {
         ),
         ("A5 garbage", Some(vec![2, 0xff, 0xff])),
     ];
-    for mode in [Mode::Sealed, Mode::Bound, Mode::Trusted] {
+    for mode in [RecordMode::Sealed, RecordMode::Bound, RecordMode::Trusted] {
         for (name, answer) in &answers {
             let (client, server, _listener) = sessions().await;
             let (near, mut far) = duplex(1 << 20);
             let mut io = PipeIo::new(near);
-            if mode == Mode::Bound {
+            if mode == RecordMode::Bound {
                 io = io.with_carrier_secure().with_exporter(|_, _, out| {
                     out.fill(9);
                     true
                 });
             }
             let pipe = client
-                .begin_add_pipe(io, PipeOptions::new().with_mode(mode))
+                .begin_add_pipe(io, PipeOptions::new().with_record_mode(mode))
                 .unwrap();
             let mut hello = vec![0; 4096];
             let n = far.read(&mut hello).await.unwrap();
@@ -125,7 +125,7 @@ async fn a_third_party_reads_one_hello_and_nothing_else() {
             let mut b = [0; 4];
             r.read_exact(&mut b).await.unwrap();
             assert_eq!(&b, b"real", "{mode:?} {name}");
-            client.close(0u32.into(), b"").await;
+            client.close().await;
         }
     }
 }
@@ -151,7 +151,7 @@ async fn a_bound_join_through_a_relay_fails_at_the_acceptor() {
         .with_carrier_secure()
         .with_exporter(exporter(2));
     let pipe = client
-        .begin_add_pipe(near, PipeOptions::new().with_mode(Mode::Bound))
+        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     assert!(
         timeout(Duration::from_secs(5), pipe.joined())
@@ -161,6 +161,49 @@ async fn a_bound_join_through_a_relay_fails_at_the_acceptor() {
     );
     assert_eq!(server.stats().join_auth_failures, 1);
     let _ = CarrierExporter::new(|_, _, _| false);
+}
+
+/// A Bound join whose two ends see different exporters is closed at once by default, as
+/// every refused join is, without a byte and long before the join timeout a stall would
+/// last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_join_with_another_binding_is_closed_at_once_by_default() {
+    let (client, _server, listener) = sessions().await;
+    let exporter = |v: u8| {
+        move |_: &str, _: &[u8], out: &mut [u8]| {
+            out.fill(v);
+            true
+        }
+    };
+    let (near, far) = duplex(1 << 16);
+    let l = listener.clone();
+    let far = PipeIo::new(far)
+        .with_carrier_secure()
+        .with_exporter(exporter(1));
+    let start = tokio::time::Instant::now();
+    let served = tokio::spawn(async move {
+        let r = l.handle_pipe(far, Default::default()).await;
+        (r, start.elapsed())
+    });
+    let near = PipeIo::new(near)
+        .with_carrier_secure()
+        .with_exporter(exporter(2));
+    let pipe = client
+        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .unwrap();
+    let (r, took) = timeout(Duration::from_secs(5), served)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r, Err(zmux::HandleError::Rejected));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert!(
+        timeout(Duration::from_secs(5), pipe.joined())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(listener.stats().rejected, 1);
 }
 
 /// A Sealed join passes through a relay that reads every byte: it needs no carrier
@@ -291,10 +334,7 @@ async fn a_sealed_end_at_a_record_boundary_is_a_failure() {
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
     let pipe = client
-        .begin_add_pipe(
-            PipeIo::new(near),
-            PipeOptions::new().with_probation(Duration::ZERO),
-        )
+        .begin_add_pipe(PipeIo::new(near), PipeOptions::new().with_probation(None))
         .unwrap();
     timeout(Duration::from_secs(5), pipe.joined())
         .await
@@ -391,7 +431,7 @@ async fn a_bound_hello_without_a_binding_is_refused_as_auth() {
         },
     );
     let e = client
-        .begin_add_pipe(near, PipeOptions::new().with_mode(Mode::Bound))
+        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     let joined = timeout(Duration::from_secs(10), e.joined()).await.unwrap();
     assert!(joined.is_err());
@@ -410,7 +450,7 @@ fn pair(a: Config, mut b: Config) -> core_pair::CorePair {
 fn trusted_hello(core: &mut SessionCore, now: Instant) -> (PipeId, Vec<u8>) {
     let f = Some(Framing::ByteStream);
     let id = core
-        .add_pipe(f, f, &PipeOptions::new(), Mode::Trusted, None, now)
+        .add_pipe(f, f, &PipeOptions::new(), RecordMode::Trusted, None, now)
         .unwrap();
     core.join_prepare(id, now).unwrap().unwrap();
     (
@@ -477,8 +517,15 @@ fn a_bound_hello_does_not_verify_on_another_carrier() {
     let f = Some(Framing::ByteStream);
     let binding = [5; 32];
     let id =
-        p.a.add_pipe(f, f, &PipeOptions::new(), Mode::Bound, Some(&binding), now)
-            .unwrap();
+        p.a.add_pipe(
+            f,
+            f,
+            &PipeOptions::new(),
+            RecordMode::Bound,
+            Some(&binding),
+            now,
+        )
+        .unwrap();
     p.a.join_prepare(id, now).unwrap().unwrap();
     let hello =
         p.a.join_hello(id, (Framing::ByteStream, 0), &Default::default(), now)
@@ -572,7 +619,7 @@ fn a_suite_outside_the_session_is_unknown_suite() {
 
 // ---- plans of the messages ---------------------------------------------------------------
 
-fn prepared(core: &mut SessionCore, mode: Mode, now: Instant) -> (PipeId, &'static str) {
+fn prepared(core: &mut SessionCore, mode: RecordMode, now: Instant) -> (PipeId, &'static str) {
     let f = Some(Framing::ByteStream);
     let id = core
         .add_pipe(f, f, &PipeOptions::new(), mode, None, now)
@@ -586,7 +633,7 @@ fn prepared(core: &mut SessionCore, mode: Mode, now: Instant) -> (PipeId, &'stat
 fn plans_reach_the_wire() {
     use zmux::proto::session::JoinStep;
     use zmux::shaping::UnitPlan;
-    for mode in [Mode::Sealed, Mode::Trusted] {
+    for mode in [RecordMode::Sealed, RecordMode::Trusted] {
         let mut p = pair(config(), config());
         let now = p.now;
         let (id, name) = prepared(&mut p.a, mode, now);
@@ -604,7 +651,7 @@ fn plans_reach_the_wire() {
         let ClaimedHello::Accept(reply) = p.b.claim_hello(&mut join, c, &reply_plan, now) else {
             panic!("not accepted");
         };
-        if mode == Mode::Trusted {
+        if mode == RecordMode::Trusted {
             assert_eq!(reply.len(), 5000);
         } else {
             assert!(
@@ -631,8 +678,8 @@ fn a_closing_session_ends_a_prepared_join() {
     use zmux::shaping::UnitPlan;
     let mut p = pair(config(), config());
     let now = p.now;
-    let (id, _) = prepared(&mut p.a, Mode::Trusted, now);
-    p.a.close(0u32.into(), b"", now);
+    let (id, _) = prepared(&mut p.a, RecordMode::Trusted, now);
+    p.a.abort(0u32.into(), b"", now);
     let r =
         p.a.join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now);
     assert!(r.is_err());
@@ -652,7 +699,7 @@ fn an_early_limit_beyond_the_ciphertext_keeps_the_join() {
     let k = p.a.open(zmux::proto::frame::Dir::Bidi).unwrap();
     assert!(p.a.write(k, &vec![7; 128 << 10]).unwrap() >= 66_000);
     p.a.write_failed(PipeId::new(0), std::io::ErrorKind::BrokenPipe, now);
-    let (id, name) = prepared(&mut p.a, Mode::Sealed, now);
+    let (id, name) = prepared(&mut p.a, RecordMode::Sealed, now);
     assert_eq!(name, "hello_early");
     let plan = UnitPlan::default();
     let hello =
@@ -716,18 +763,17 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
         },
     );
     let _join = client
-        .begin_add_pipe(near, PipeOptions::new().with_mode(Mode::Bound))
+        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     let (failed, took) = task.await.unwrap();
     assert!(failed && in_range(took), "{took:?}");
     assert_eq!(*reasons.lock().unwrap(), ["malformed", "auth"]);
 }
 
-/// A carrier over its source's pending-carrier limit, checked before anything is read,
-/// goes to the reject policy like every refusal before authentication: the policy sees
-/// `pending_limit` and a stall holds it without a byte, bounded by the handshake timeout.
+/// A carrier from a source that holds its share is closed at once, before anything is
+/// read and without the reject policy, and counted as refused.
 #[tokio::test(start_paused = true)]
-async fn a_carrier_over_the_pending_limit_goes_to_the_reject_policy() {
+async fn a_carrier_over_its_source_limit_is_closed_at_once() {
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     let mut lc = ListenerConfig::default();
@@ -739,7 +785,7 @@ async fn a_carrier_over_the_pending_limit_goes_to_the_reject_policy() {
         RejectAction::Stall
     })));
     let listener = Listener::new(config(), lc).expect("valid listener configuration");
-    // Three silent carriers hold the source's pending slots; the fourth is over.
+    // Three silent carriers hold the source's slots; the fourth is over.
     let start = tokio::time::Instant::now();
     let mut held = Vec::new();
     for _ in 0..4 {
@@ -752,20 +798,13 @@ async fn a_carrier_over_the_pending_limit_goes_to_the_reject_policy() {
         tokio::task::yield_now().await;
     }
     let (mut near, task) = held.pop().unwrap();
-    let r = task.await.unwrap();
-    assert!(r.is_err());
-    let took = start.elapsed();
-    assert!(
-        took >= Duration::from_millis(500) && took < Duration::from_secs(1),
-        "{took:?}"
-    );
+    assert_eq!(task.await.unwrap(), Err(zmux::HandleError::Refused));
+    assert_eq!(start.elapsed(), Duration::ZERO);
     // Nothing was sent on the refused carrier.
     let mut buf = [0u8; 1];
     assert_eq!(near.read(&mut buf).await.unwrap(), 0);
-    assert_eq!(
-        *reasons.lock().unwrap(),
-        [(None, "pending_limit".to_string())]
-    );
+    assert!(reasons.lock().unwrap().is_empty());
+    assert_eq!(listener.stats().refused, 1);
 }
 
 /// At the listener, a Hello whose Suite is outside its session's set goes to the reject

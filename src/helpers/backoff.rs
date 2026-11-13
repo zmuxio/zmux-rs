@@ -46,15 +46,18 @@ impl Backoff {
 
     /// Whether the bounds are valid: `initial` not zero and not above
     /// `max`, and the jitter in \[0, 1\].
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         if self.initial.is_zero() {
-            return Err("backoff initial delay is zero");
+            return Err(crate::InvalidConfig::new("Backoff::initial", "zero"));
         }
         if self.initial > self.max {
-            return Err("backoff initial delay above its max");
+            return Err(crate::InvalidConfig::new("Backoff::initial", "above max"));
         }
         if !(0.0..=1.0).contains(&self.jitter) {
-            return Err("backoff jitter outside [0, 1]");
+            return Err(crate::InvalidConfig::new(
+                "Backoff::jitter",
+                "outside [0, 1]",
+            ));
         }
         Ok(())
     }

@@ -12,15 +12,17 @@ pub fn export(
 ) -> Result<Vec<u8>, Error> {
     let label_len = u8::try_from(label.len()).map_err(|_| Error::InvalidConfig)?;
     let context_len = u16::try_from(context.len()).map_err(|_| Error::InvalidConfig)?;
-    if len == 0 || len > 255 * hash.out_len() {
-        return Err(Error::InvalidConfig);
-    }
+    // HKDF bounds `len` by 255 hash lengths, at most 16320 bytes, within a u16.
+    let out_len = match u16::try_from(len) {
+        Ok(n) if n != 0 && len <= 255 * hash.out_len() => n,
+        _ => return Err(Error::InvalidConfig),
+    };
     let mut info = Vec::with_capacity(5 + label.len() + context.len());
     info.push(label_len);
     info.extend_from_slice(label);
     info.extend_from_slice(&context_len.to_be_bytes());
     info.extend_from_slice(context);
-    info.extend_from_slice(&(len as u16).to_be_bytes());
+    info.extend_from_slice(&out_len.to_be_bytes());
     hash.expand(secret, &info, len)
 }
 

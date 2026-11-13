@@ -105,7 +105,7 @@ mod tests {
     fn write_calls_are_bounded_only_while_latency_sensitive_work_waits() {
         let now = Instant::now();
         let config = super::super::Config::default();
-        let role = super::super::RoleConfig::Initiator;
+        let role = super::super::Role::Client;
         let mut s = SessionCore::new(config, role, None, now).unwrap();
         let pipe = super::super::PipeId(0);
         let batch = 256 * 1024;

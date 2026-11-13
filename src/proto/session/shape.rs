@@ -142,7 +142,7 @@ impl Shaping {
         if self.limits.no_pause {
             return Duration::ZERO;
         }
-        self.limits.wait_bound().unwrap_or(Duration::ZERO)
+        self.limits.max_delay.unwrap_or(Duration::ZERO)
     }
 
     /// H_p of `pipe`: [`Self::hold_bound`] for a
@@ -206,7 +206,7 @@ impl Shaping {
     fn set_rate(&mut self, i: usize) {
         let md = self
             .limits
-            .wait_bound()
+            .max_delay
             .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
         let (rate, clamped) = rate_floor(self.pipes[i].rate_asked, md);
         if clamped {
@@ -402,7 +402,7 @@ impl Shaping {
             self.stats.clamped += 1;
             return None;
         }
-        if let Some(m) = self.limits.wait_bound().filter(|&m| d > m) {
+        if let Some(m) = self.limits.max_delay.filter(|&m| d > m) {
             d = m;
             self.stats.clamped += 1;
         }
@@ -817,7 +817,7 @@ impl SessionCore {
 
     /// Replaces the session's local limits, tighter or looser; invalid ones change
     /// nothing. The account's spending carries over.
-    pub fn set_shaping_limits(&mut self, limits: Limits) -> Result<(), &'static str> {
+    pub fn set_shaping_limits(&mut self, limits: Limits) -> Result<(), crate::InvalidConfig> {
         limits.validate()?;
         Arc::make_mut(&mut self.config).shaping_limits = limits;
         let eff = self.shaping_limits_in_force();
@@ -909,7 +909,7 @@ impl SessionCore {
     }
 
     /// Keeps the host's value of the admission that accepted pipe `pipe`'s
-    /// carrier ([`crate::Verdict::Accept`]), opaque to the core, for as
+    /// carrier ([`crate::AdmissionVerdict::Accept`]), opaque to the core, for as
     /// long as the pipe's state. `false` when there is no such pipe.
     pub fn set_pipe_admitted(
         &mut self,
@@ -1272,13 +1272,11 @@ mod tests {
             ..Limits::default()
         };
         let ms = Duration::from_millis;
-        assert_eq!(shaping(limits(None, false)).hold_bound(), ms(1000));
+        let default = Limits::default().max_delay;
+        assert_eq!(shaping(limits(default, false)).hold_bound(), ms(1000));
         assert_eq!(shaping(limits(Some(ms(300)), false)).hold_bound(), ms(300));
-        assert_eq!(
-            shaping(limits(Some(Duration::MAX), false)).hold_bound(),
-            ms(0)
-        );
-        assert_eq!(shaping(limits(None, true)).hold_bound(), ms(0));
+        assert_eq!(shaping(limits(None, false)).hold_bound(), ms(0));
+        assert_eq!(shaping(limits(default, true)).hold_bound(), ms(0));
     }
 
     #[test]

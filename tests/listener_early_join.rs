@@ -43,7 +43,7 @@ async fn an_early_join_whose_handshake_never_completes_is_a_setup_failure() {
             (st.sessions, st.joins, st.rejected, st.refused, st.timed_out),
             (1, 0, 0, 0, 0)
         );
-        client.close(0u32.into(), b"").await;
+        client.close().await;
         listener.close();
     })
     .await
@@ -70,7 +70,7 @@ async fn an_early_join_goes_on_once_the_handshake_completed() {
         pipe.joined().await.unwrap();
         assert_eq!(listener.stats().joins, 1);
         assert_eq!(listener.stats().setup_failures, 0);
-        client.close(0u32.into(), b"").await;
+        client.close().await;
         listener.close();
     })
     .await

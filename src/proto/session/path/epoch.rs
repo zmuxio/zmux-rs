@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use crate::proto::Error;
 use crate::proto::frame::{EpochPhase, Frame, SessionEpoch};
 use crate::proto::params::{Locator, Role};
-use crate::proto::seal::{Group, GroupInitiator, Mode, Secret, derive_epoch_secret};
+use crate::proto::seal::{Group, GroupInitiator, RecordMode, Secret, derive_epoch_secret};
 #[cfg(feature = "test-hooks")]
 use crate::proto::session::PipeId;
 use crate::proto::session::join::EpochKeys;
@@ -48,11 +48,12 @@ pub const EPOCH_RETENTION: Duration = MAX_JOIN_DEADLINE.saturating_mul(3);
 /// nor relies on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochPolicy {
-    /// After this long in Stable; zero is the default of one hour, `None` never by time. A
-    /// carrier lives at most twice as long before it is to be replaced by a new join.
+    /// After this long in Stable (default [`DEFAULT_EPOCH_PERIOD`], one hour; `None`: never
+    /// by time; zero is the configuration error). A carrier lives at most twice as long
+    /// before it is to be replaced by a new join.
     pub period: Option<Duration>,
-    /// After this many joins of the session in the epoch; zero is the default of 2^16,
-    /// `None` never by count.
+    /// After this many joins of the session in the epoch (default [`DEFAULT_EPOCH_JOINS`],
+    /// 2^16; `None`: never by count; zero is the configuration error).
     pub joins: Option<u64>,
     /// Once as soon as the first Sealed or Bound pipe exists, in a session whose secret
     /// comes from a TLS exporter or a pre-shared key.
@@ -73,19 +74,18 @@ impl Default for EpochPolicy {
 }
 
 impl EpochPolicy {
-    /// The period in effect: zero is the default.
-    fn period_in_effect(&self) -> Option<Duration> {
-        self.period
-            .map(|p| if p.is_zero() { DEFAULT_EPOCH_PERIOD } else { p })
+    /// Whether the policy is valid: a set period and join count above zero.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        if self.period.is_some_and(|p| p.is_zero()) {
+            return Err(crate::InvalidConfig::new("epoch_policy.period", "zero"));
+        }
+        if self.joins == Some(0) {
+            return Err(crate::InvalidConfig::new("epoch_policy.joins", "zero"));
+        }
+        Ok(())
     }
 
-    /// The join count in effect: zero is the default.
-    fn joins_in_effect(&self) -> Option<u64> {
-        self.joins
-            .map(|n| if n == 0 { DEFAULT_EPOCH_JOINS } else { n })
-    }
-
-    /// No exchange starts on its own; only `advance_epoch` and a forced advance do.
+    /// No exchange starts on its own; only `advance_epoch` does.
     pub const MANUAL: Self = Self {
         period: None,
         joins: None,
@@ -117,20 +117,6 @@ impl Own {
     fn body(&self) -> Vec<u8> {
         self.frame().body()
     }
-}
-
-/// A forced advance (`force_epoch_advance`).
-#[derive(Clone, Copy, Debug)]
-struct Forced {
-    /// The first epoch of new keys: carriers joined with an older one are replaced.
-    target: u64,
-    /// When this end started using `target`; replacements are due from then.
-    ready: Option<Instant>,
-    /// When the advance was asked for.
-    at: Instant,
-    /// The latest time of a replacement: until `ready`, a carrier that joined after `at`
-    /// used the old epoch too, and replacing it again would not help.
-    by: Instant,
 }
 
 enum St {
@@ -173,8 +159,6 @@ pub(in crate::proto::session) struct Epochs {
     instance: usize,
     /// An exchange is wanted as soon as this end may offer.
     wanted: bool,
-    /// A forced advance: carriers of an epoch before its target are to be replaced.
-    forced: Option<Forced>,
     stable_at: Instant,
     joins: u64,
     first_pipe_done: bool,
@@ -207,7 +191,6 @@ impl Epochs {
             peer: vec![(0, peer)],
             instance: instance.min(local.len()),
             wanted: false,
-            forced: None,
             stable_at: now,
             joins: 0,
             first_pipe_done: false,
@@ -319,39 +302,6 @@ impl SessionCore {
         Ok(())
     }
 
-    /// For a suspected leak of a session-level secret: advances as soon as this end may
-    /// offer, and every carrier joined with an older epoch is to be replaced by a new join
-    /// once the new epoch is in use, within `deadline`
-    /// ([`PipeStats::replace_by`](crate::proto::session::PipeStats::replace_by); a
-    /// `PipePool` or a redial hook replaces it, else the host).
-    /// A revoked peer identity closes the session instead.
-    pub fn force_epoch_advance(
-        &mut self,
-        deadline: Duration,
-        now: Instant,
-    ) -> Result<(), crate::proto::session::PipeError> {
-        self.tick(now);
-        if self.mp.is_none() {
-            return Err(crate::proto::session::PipeError::NotNegotiated);
-        }
-        let ep = self.epochs_mut();
-        ep.wanted = true;
-        // An exchange already committed counts as begun before the advance: the target is
-        // the one after it.
-        let target = match ep.st {
-            St::Stable | St::Offering { .. } => ep.d + 1,
-            St::Answered | St::Switched { .. } => ep.d + 2,
-        };
-        ep.forced = Some(Forced {
-            target,
-            ready: None,
-            at: now,
-            by: now.checked_add(deadline).unwrap_or(now),
-        });
-        self.epoch_progress(now);
-        Ok(())
-    }
-
     /// Counts a join of the session in the current epoch, for the policy.
     pub(in crate::proto::session) fn epoch_note_join(&mut self) {
         if let Some(mp) = self.mp.as_deref_mut() {
@@ -372,28 +322,14 @@ impl SessionCore {
     }
 
     /// When the carrier of attachment `id` is to be replaced by a new join: twice the
-    /// epoch period after it joined, and, when it joined with an epoch older than a forced
-    /// advance's, as soon as this end uses the new epoch and at the latest by the
-    /// deadline. `None`: not by the epoch policy.
+    /// epoch period after it joined. `None`: not by the epoch policy.
     pub(in crate::proto::session) fn pipe_replace_by(&self, id: u64) -> Option<Instant> {
         let ep = self.epochs()?;
-        let &(_, epoch, at) = ep.joined.iter().find(|(p, _, _)| *p == id)?;
-        let age = self
-            .config
+        let &(_, _, at) = ep.joined.iter().find(|(p, _, _)| *p == id)?;
+        self.config
             .epoch_policy
-            .period_in_effect()
-            .and_then(|p| at.checked_add(p.saturating_mul(2)));
-        let forced = ep
-            .forced
-            .filter(|f| epoch < f.target)
-            .and_then(|f| match f.ready {
-                Some(r) => Some(r.min(f.by)),
-                None => (at <= f.at).then_some(f.by),
-            });
-        match (age, forced) {
-            (Some(a), Some(f)) => Some(a.min(f)),
-            (a, f) => a.or(f),
-        }
+            .period
+            .and_then(|p| at.checked_add(p.saturating_mul(2)))
     }
 
     /// The epoch attachment `id` joined with.
@@ -434,7 +370,7 @@ impl SessionCore {
     }
 
     /// The record mode of pipe `id`, `None` for an Unmanaged first pipe.
-    fn pipe_mode(&self, id: u64) -> Option<Mode> {
+    fn pipe_mode(&self, id: u64) -> Option<RecordMode> {
         if id == 0 {
             return self.first_pipe_mode;
         }
@@ -443,7 +379,10 @@ impl SessionCore {
 
     /// Whether SESSION_EPOCH may go on, or come from, pipe `id`.
     fn epoch_pipe(&self, id: u64) -> bool {
-        matches!(self.pipe_mode(id), Some(Mode::Sealed | Mode::Bound))
+        matches!(
+            self.pipe_mode(id),
+            Some(RecordMode::Sealed | RecordMode::Bound)
+        )
     }
 
     /// Moves the exchange on by time: the old epoch's deletion, a wanted offer, the
@@ -467,9 +406,9 @@ impl SessionCore {
                 let ep = &self.mp().epochs;
                 let due = ep.wanted
                     || policy
-                        .period_in_effect()
+                        .period
                         .is_some_and(|p| now.saturating_duration_since(ep.stable_at) >= p)
-                    || policy.joins_in_effect().is_some_and(|n| ep.joins >= n);
+                    || policy.joins.is_some_and(|n| ep.joins >= n);
                 if due && self.atts.iter().any(|a| self.epoch_pipe(a.id())) {
                     self.send_offer();
                 }
@@ -599,13 +538,7 @@ impl SessionCore {
         let ep = self.epochs_mut();
         ep.st = St::Switched { since: now };
         let e = ep.d + 1;
-        if let Some(f) = ep
-            .forced
-            .as_mut()
-            .filter(|f| f.ready.is_none() && e >= f.target)
-        {
-            f.ready = Some(now);
-        }
+        self.push_event(CoreEvent::EpochInUse(e));
     }
 
     /// R passed: deletes epoch d, then moves on to an offer the policy wants.
@@ -675,7 +608,7 @@ impl SessionCore {
                 ));
             }
         }
-        let initiator = self.role == Role::Initiator;
+        let initiator = self.role == Role::Client;
         match (&self.mp().epochs.st, f.phase) {
             (St::Stable, EpochPhase::Offer) => self.on_offer(f),
             (St::Stable, EpochPhase::Answer) => Err(Error::protocol_violation(
@@ -839,7 +772,7 @@ impl SessionCore {
         match ep.st {
             St::Switched { since } => at(since.checked_add(EPOCH_RETENTION)),
             St::Stable => {
-                if let Some(p) = self.config.epoch_policy.period_in_effect() {
+                if let Some(p) = self.config.epoch_policy.period {
                     at(ep.stable_at.checked_add(p));
                 }
             }
@@ -897,24 +830,32 @@ impl SessionCore {
 mod policy_tests {
     use super::*;
 
-    /// Zero is the default, `None` never, any other value itself.
+    /// A period or join count of zero is the configuration error; `None` is
+    /// never, the default and any other value valid.
     #[test]
-    fn zero_period_and_joins_are_the_defaults() {
-        let zero = EpochPolicy {
-            period: Some(Duration::ZERO),
-            joins: Some(0),
-            ..EpochPolicy::default()
-        };
-        assert_eq!(zero.period_in_effect(), Some(DEFAULT_EPOCH_PERIOD));
-        assert_eq!(zero.joins_in_effect(), Some(DEFAULT_EPOCH_JOINS));
-        assert_eq!(EpochPolicy::MANUAL.period_in_effect(), None);
-        assert_eq!(EpochPolicy::MANUAL.joins_in_effect(), None);
-        let set = EpochPolicy {
-            period: Some(Duration::from_secs(5)),
-            joins: Some(3),
-            ..EpochPolicy::MANUAL
-        };
-        assert_eq!(set.period_in_effect(), Some(Duration::from_secs(5)));
-        assert_eq!(set.joins_in_effect(), Some(3));
+    fn zero_period_and_joins_are_errors() {
+        for zero in [
+            EpochPolicy {
+                period: Some(Duration::ZERO),
+                ..EpochPolicy::default()
+            },
+            EpochPolicy {
+                joins: Some(0),
+                ..EpochPolicy::default()
+            },
+        ] {
+            assert!(zero.validate().is_err(), "{zero:?}");
+        }
+        for ok in [
+            EpochPolicy::default(),
+            EpochPolicy::MANUAL,
+            EpochPolicy {
+                period: Some(Duration::from_secs(5)),
+                joins: Some(3),
+                ..EpochPolicy::MANUAL
+            },
+        ] {
+            assert!(ok.validate().is_ok(), "{ok:?}");
+        }
     }
 }

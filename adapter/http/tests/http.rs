@@ -67,8 +67,8 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
 async fn round_trip_and_close(client: Session, server: Session) {
     transfer(&client, &server, 2, 256 << 10).await;
     transfer(&server, &client, 2, 256 << 10).await;
-    client.close(3u32.into(), b"bye").await;
-    let e = tokio::time::timeout(Duration::from_secs(5), server.closed())
+    client.close().await;
+    let e = tokio::time::timeout(Duration::from_secs(5), server.closing())
         .await
         .expect("closed");
     assert!(
@@ -138,7 +138,7 @@ async fn one_exchange_carries_both_directions() {
     transfer(&client, &server, 1, 1 << 20).await;
     transfer(&server, &client, 1, 1 << 20).await;
     assert_eq!(requests.load(Ordering::SeqCst), 1, "one exchange");
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 fn multipath() -> Config {
@@ -176,7 +176,7 @@ async fn http2_pipes_share_a_connection_and_lanes_only_when_enabled() {
         } else {
             assert_eq!(most, 1, "a lane was opened while lanes are off");
         }
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     }
     listener.close();
     serving.await.unwrap();
@@ -213,7 +213,7 @@ async fn a_cut_connection_is_a_failure_not_a_clean_end() {
         transfer(&client, &server, 1, 64 << 10).await;
         cut.abort();
         for s in [&client, &server] {
-            let e = tokio::time::timeout(Duration::from_secs(10), s.closed())
+            let e = tokio::time::timeout(Duration::from_secs(10), s.closing())
                 .await
                 .expect("ended");
             assert!(
@@ -324,46 +324,6 @@ async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
     }
 }
 
-/// A full setup limit ends the oldest handshake rather than refusing the
-/// new client.
-#[tokio::test]
-async fn a_stalled_handshake_yields_its_setup_slot() {
-    let (connector, acceptor) = tls(b"http/1.1");
-    let mut limits = ListenerConfig::default();
-    limits.max_pending = 1;
-    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = tcp.local_addr().unwrap();
-    let l = listener.clone();
-    let serving = tokio::spawn(async move {
-        zmux_http::serve_with(
-            l,
-            || tcp.accept(),
-            move |conn, _| acceptor.accept(conn),
-            Options::default(),
-        )
-        .await
-    });
-    // Connected, silent: its TLS handshake holds the only setup slot.
-    let stalled = TcpStream::connect(addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let conn = connector
-        .connect(name, TcpStream::connect(addr).await.unwrap())
-        .await
-        .unwrap();
-    let io = zmux_http::dial_http1_over(conn, "localhost", &Options::default())
-        .await
-        .unwrap();
-    let client = Session::connect(io, Config::default()).await.unwrap();
-    let server = listener.accept().await.unwrap();
-    round_trip_and_close(client, server).await;
-    assert_eq!(listener.stats().setup_failures, 1);
-    drop(stalled);
-    listener.close();
-    serving.await.unwrap();
-}
-
 // ---- admission -----------------------------------------------------------------------
 
 /// A listener served on loopback with `options`.
@@ -467,8 +427,8 @@ fn fixed(data: &'static [u8]) -> StreamBody<&'static [u8]> {
 const BODY: &[u8] = b"0123456789abcdef0123456789abcdef-and-the-rest-of-the-request-body";
 
 /// A fallback handler that answers with the body it was given.
-fn echo() -> zmux_http::HttpFallback {
-    zmux_http::HttpFallback::new(|req: zmux_http::FallbackRequest, _| async move {
+fn echo() -> zmux_http::Fallback {
+    zmux_http::Fallback::new(|req: zmux_http::FallbackRequest, _| async move {
         http::Response::new(zmux_http::PipeBody::full(collect(req.into_body()).await))
     })
 }
@@ -522,7 +482,7 @@ async fn an_admitted_request_carries_a_session() {
     let server = listener.accept().await.unwrap();
     transfer(&client, &server, 1, 64 << 10).await;
     transfer(&server, &client, 1, 64 << 10).await;
-    client.close(0u32.into(), b"").await;
+    client.close().await;
 }
 
 /// A fallback decision hands the request to the fallback handler with
@@ -530,7 +490,7 @@ async fn an_admitted_request_carries_a_session() {
 /// it is answered with 404.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fallback_request_reaches_the_handler_with_its_whole_body() {
-    let admission = || zmux::Admission::new(32, |_, _| zmux::Verdict::Fallback);
+    let admission = || zmux::Admission::new(32, |_, _| zmux::AdmissionVerdict::Fallback);
     let (addr, _l) =
         serve_admitted(Options::default().with_fallback(echo()), Some(admission())).await;
     let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
@@ -550,8 +510,8 @@ async fn a_fallback_request_reaches_the_handler_with_its_whole_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_or_closed_request_gets_no_response() {
     for (verdict, at_least) in [
-        (zmux::Verdict::Stall, Duration::from_millis(300)),
-        (zmux::Verdict::Close, Duration::ZERO),
+        (zmux::AdmissionVerdict::Stall, Duration::from_millis(300)),
+        (zmux::AdmissionVerdict::Close, Duration::ZERO),
     ] {
         let v = verdict.clone();
         let admission = zmux::Admission::new(32, move |_, _| v.clone())
@@ -579,9 +539,10 @@ async fn a_stalled_or_closed_request_gets_no_response() {
 /// fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_late_prefix_on_a_request_is_closed() {
-    let admission = zmux::Admission::new(32, |_, _| -> zmux::Verdict { panic!("decided") })
-        .with_peek_timeout(Duration::from_millis(100))
-        .with_fallback_on_peek_timeout(true);
+    let admission =
+        zmux::Admission::new(32, |_, _| -> zmux::AdmissionVerdict { panic!("decided") })
+            .with_peek_timeout(Duration::from_millis(100))
+            .with_fallback_on_peek_timeout(true);
     let (addr, l) = serve_admitted(Options::default().with_fallback(echo()), Some(admission)).await;
     // Four bytes of 32, then a body that does not end.
     let (_ours, theirs) = tokio::io::duplex(1024);
@@ -619,7 +580,7 @@ async fn a_client_writes_its_token_first_on_the_request_body() {
     let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
     let admission = zmux::Admission::prefix_auth(verifier);
     let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
-    let client_opts = Options::default().with_credential(Arc::new(auth));
+    let client_opts = Options::default().with_carrier_credential(Arc::new(auth));
     for client in [
         zmux_http::connect_http1(&addr, &client_opts, Config::default())
             .await
@@ -631,12 +592,15 @@ async fn a_client_writes_its_token_first_on_the_request_body() {
         let server = listener.accept().await.unwrap();
         transfer(&client, &server, 1, 64 << 10).await;
         transfer(&server, &client, 1, 64 << 10).await;
-        client.close(0u32.into(), b"").await;
+        client.close().await;
     }
     let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let e = zmux_http::dial_http1(&addr, &Options::default().with_credential(Arc::new(bound)))
-        .await
-        .unwrap_err();
+    let e = zmux_http::dial_http1(
+        &addr,
+        &Options::default().with_carrier_credential(Arc::new(bound)),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
 
@@ -646,4 +610,107 @@ fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));
     }
+}
+
+/// An HTTP/2 extended CONNECT tunnel keeps its connection in use after
+/// its response: the idle timeout does not close the connection under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extended_connect_tunnel_is_not_idle() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut limits = ListenerConfig::default();
+    limits.handshake_timeout = Duration::from_millis(200);
+    let listener = Listener::new(Config::default(), limits).unwrap();
+    let options = Options::default().with_idle_timeout(Some(Duration::from_millis(100)));
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let l = listener.clone();
+    tokio::spawn(async move {
+        let (conn, peer) = tcp.accept().await.unwrap();
+        zmux_http::serve_connection_with(
+            &l,
+            conn,
+            Some(peer),
+            &options,
+            |mut req, _, _| async move {
+                let up = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    // An echo over the tunnel.
+                    let mut io = hyper_util::rt::TokioIo::new(up.await.unwrap());
+                    let mut b = [0u8; 64];
+                    while let Ok(n @ 1..) = io.read(&mut b).await {
+                        io.write_all(&b[..n]).await.unwrap();
+                    }
+                });
+                Ok(http::Response::new(zmux_http::PipeBody::empty()))
+            },
+        )
+        .await;
+    });
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tcp),
+    )
+    .await
+    .unwrap();
+    let conn = tokio::spawn(conn);
+    let mut req = http::Request::connect(format!("http://{addr}/ws"))
+        .body(zmux_http::PipeBody::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let mut resp = sender.send_request(req).await.unwrap();
+    assert!(resp.status().is_success());
+    let mut io = hyper_util::rt::TokioIo::new(hyper::upgrade::on(&mut resp).await.unwrap());
+    // Past the idle timeout and the close's own limit, many times over.
+    for round in 0..4u8 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        io.write_all(&[round; 3]).await.unwrap();
+        let mut b = [0u8; 3];
+        io.read_exact(&mut b).await.unwrap();
+        assert_eq!(b, [round; 3]);
+    }
+    assert!(!conn.is_finished());
+}
+
+/// A connection that served a request is closed once it has been idle
+/// for the idle timeout, also on HTTP/2, which has no idle timeout of its
+/// own; a request in progress keeps it open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_connection_is_closed_after_it_was_used() {
+    let options = Options::default()
+        .with_fallback(echo())
+        .with_idle_timeout(Some(Duration::from_millis(300)));
+    let (addr, _l) = server_with(options).await;
+    let tcp = TcpStream::connect(&addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tcp),
+    )
+    .await
+    .unwrap();
+    let conn = tokio::spawn(conn);
+    // A request whose body is still arriving is in progress past the
+    // idle timeout.
+    let (mut w, r) = tokio::io::duplex(64);
+    let req = http::Request::post(format!("http://{addr}/other"))
+        .body(StreamBody(r))
+        .unwrap();
+    let pending = sender.send_request(req);
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::io::AsyncWriteExt::write_all(&mut w, BODY)
+            .await
+            .unwrap();
+    });
+    let resp = pending.await.unwrap();
+    late.await.unwrap();
+    assert_eq!(read_all(resp).await, BODY);
+    assert!(!conn.is_finished());
+    // Then idle: the server closes the connection.
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the idle connection is closed")
+        .unwrap()
+        .unwrap();
 }

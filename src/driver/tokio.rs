@@ -31,11 +31,10 @@ use super::wait::PipeDone;
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES, READ_BUFFER};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
 use crate::proto::VarInt;
-use crate::proto::params::Role;
 use crate::proto::record::Framing;
 use crate::proto::session::{
     Backing, Config, DatagramError, LaneAccept, LaneId, OpenError, PickRequest, PieceCursor,
-    PipeEnd, PipeError, PipeHalf, PipeId, PipeOptions, Preamble, RoleConfig, SessionError,
+    PipeEnd, PipeError, PipeHalf, PipeId, PipeOptions, Preamble, Role, SessionError,
     State as CoreState, StreamError,
 };
 
@@ -330,7 +329,7 @@ pub struct PipeIo {
     pub(crate) split: bool,
     /// The record mode of an Establish this carrier ran
     /// ([`PipeIo::with_secure_first_pipe`]).
-    pub(crate) first_mode: Option<crate::proto::seal::Mode>,
+    pub(crate) first_mode: Option<crate::proto::seal::RecordMode>,
     /// The value of the admission that accepted the carrier, set by the
     /// listener ([`crate::AdmittedValue`]).
     pub(crate) admitted: Option<Box<crate::AdmittedValue>>,
@@ -356,6 +355,40 @@ pub struct PipeIo {
     /// A split bootstrap ([`PipeIo::split_bootstrap`]): its pairing makes
     /// pipe pair 0 only, so it cannot join a session.
     pub(crate) split_bootstrap: bool,
+    /// Told the session's close code once the session is done with the
+    /// carrier ([`PipeIo::with_close_code`]).
+    pub(crate) close_code: Option<TellCloseCode>,
+}
+
+/// The hook of [`PipeIo::with_close_code`].
+pub(crate) type CloseCode = Box<dyn FnOnce(VarInt) + Send>;
+
+/// The application error code a carrier's own close carries for a session
+/// that ended with `e`: the code of the CONNECTION_CLOSE 0x1d that ended
+/// it, sent or received, and 0 for every other end.
+fn close_code_of(e: Option<&SessionError>) -> VarInt {
+    match e {
+        Some(SessionError::ApplicationClosed { code, .. }) => *code,
+        _ => VarInt::ZERO,
+    }
+}
+
+/// A [`PipeIo::with_close_code`] hook, called with its code (dropped
+/// uncalled without one) when this is dropped, after the core lock.
+pub(crate) struct TellCloseCode(Option<CloseCode>, VarInt);
+
+impl TellCloseCode {
+    fn new(f: impl FnOnce(VarInt) + Send + 'static) -> Self {
+        Self(Some(Box::new(f)), VarInt::ZERO)
+    }
+}
+
+impl Drop for TellCloseCode {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f(self.1);
+        }
+    }
 }
 
 /// The carrier's early data: a client sending it under remembered
@@ -610,6 +643,7 @@ impl PipeIo {
             early: None,
             taken: None,
             split_bootstrap: false,
+            close_code: None,
             max_record: None,
             secure: false,
             split: false,
@@ -696,6 +730,7 @@ impl PipeIo {
             early: None,
             taken: None,
             split_bootstrap: false,
+            close_code: None,
             max_record: None,
             secure: false,
             split: false,
@@ -824,7 +859,7 @@ impl PipeIo {
     /// The carrier ran an Establish with this record mode: a session's first pipe is then
     /// on the secure carrier, its exporter being the handshake's.
     #[must_use]
-    pub fn with_secure_first_pipe(mut self, mode: crate::proto::seal::Mode) -> Self {
+    pub fn with_secure_first_pipe(mut self, mode: crate::proto::seal::RecordMode) -> Self {
         self.first_mode = Some(mode);
         self
     }
@@ -921,6 +956,16 @@ impl PipeIo {
                 b();
             })),
             (a, b) => a.or(b),
+        };
+        up.close_code = match (
+            up.close_code.as_mut().and_then(|t| t.0.take()),
+            down.close_code.as_mut().and_then(|t| t.0.take()),
+        ) {
+            (Some(a), Some(b)) => Some(TellCloseCode::new(move |code| {
+                a(code);
+                b(code);
+            })),
+            (a, b) => a.or(b).map(|f| TellCloseCode(Some(f), VarInt::ZERO)),
         };
         up.taken = match (up.taken.take(), down.taken.take()) {
             (Some(a), Some(b)) => Some(Box::new(Box::new(move || {
@@ -1149,6 +1194,30 @@ impl PipeIo {
         self
     }
 
+    /// Calls `close_code` once, whenever zmux is done with the carrier,
+    /// after the session's lock: with the application error code of the
+    /// CONNECTION_CLOSE (0x1d) that ended its session, sent or received,
+    /// once that session has ended (every pipe's inbound side ended or its
+    /// linger timeout passed, and the session's task released its
+    /// carriers); with 0 for every other end (a transport error, an idle
+    /// timeout, lost carriers, a carrier that never became a pipe of a
+    /// session, one dropped unused) and for a pipe removed while its session
+    /// goes on.
+    ///
+    /// For an adapter whose carriers share a connection that has a close of
+    /// its own with an application code (a QUIC connection): it records each
+    /// code it is told and closes the connection with the last one once none
+    /// of its pipes is in use, so that the connection's close never cuts off
+    /// the zmux close before it.
+    /// On a connection several sessions share, the one that ends last
+    /// decides, 0 included: a pipe removed after another session's coded
+    /// close sets 0 again, the code being that of the connection's end.
+    #[must_use]
+    pub fn with_close_code(mut self, close_code: impl FnOnce(VarInt) + Send + 'static) -> Self {
+        self.close_code = Some(TellCloseCode::new(close_code));
+        self
+    }
+
     /// Calls `taken` once a listener takes the carrier
     /// ([`crate::Listener::handle_pipe`]): its first record made it a new
     /// session, a join or a lane. Not called for a carrier the listener
@@ -1258,6 +1327,8 @@ pub struct Io {
     repoll: bool,
     /// The session task has ended: carriers attached now are dropped.
     task_ended: bool,
+    /// The session task has dropped its carriers, after it ended.
+    released: bool,
     /// A read left bytes in its carrier that the core has not processed
     /// yet ("input"): new batches are smaller
     /// and write calls bounded, so that writes do not hold the reads back.
@@ -1492,6 +1563,10 @@ impl Driver for Tokio {
         release_lanes(state);
     }
 
+    fn released(state: &State<Self>) -> bool {
+        state.io.released
+    }
+
     fn wake_driver(state: &mut State<Self>) {
         state.wake_task();
     }
@@ -1607,7 +1682,7 @@ impl Driver for Tokio {
     fn check_carrier(shared: &Arc<Shared<Self>>, carrier: &PipeIo) -> Result<(), PipeError> {
         if carrier.split_bootstrap {
             // It makes pipe pair 0 only; a join takes `paired_join`.
-            return Err(PipeError::InvalidOptions);
+            return Err(PipeError::InvalidArgument);
         }
         match carrier.outer.as_ref().and_then(Weak::upgrade) {
             Some(outer) if runs_over(&outer, shared) => Err(PipeError::CarrierLoop),
@@ -1814,7 +1889,7 @@ async fn join_carrier(shared: Arc<Shared<Tokio>>, id: PipeId, mut pipe: PipeIo) 
                     };
                 }
                 JoinStep::Verified { consumed, mode } => {
-                    let plan = if mode == crate::proto::seal::Mode::Bound {
+                    let plan = if mode == crate::proto::seal::RecordMode::Bound {
                         crate::shaping::UnitPlan::default()
                     } else {
                         let plan = shared_ref.join_plan(kind, "confirm");
@@ -1919,7 +1994,7 @@ impl Shared<Tokio> {
     pub(crate) fn create(
         mut pipe: PipeIo,
         config: Arc<Config>,
-        role: RoleConfig,
+        role: Role,
         transport: Option<Role>,
         locator: Option<&[u8]>,
         before_start: impl FnOnce(&Arc<Self>),
@@ -1951,6 +2026,7 @@ impl Shared<Tokio> {
             bootstrap_done: first.done.clone(),
             repoll: false,
             task_ended: false,
+            released: false,
             input_pending: false,
             through: Vec::new(),
             account: None,
@@ -2827,6 +2903,9 @@ pub(crate) struct PipeTask {
     /// the session task closes).
     write_closed: bool,
     abort: Option<Box<dyn FnOnce() + Send>>,
+    /// The carrier's [`PipeIo::with_close_code`] hook: told 0 when the task
+    /// goes without [`PipeTask::tell_close_code`].
+    close_code: Option<TellCloseCode>,
     /// The last write.
     active: Instant,
     done: Arc<PipeDone>,
@@ -3063,6 +3142,18 @@ impl LaneTask {
 }
 
 impl PipeTask {
+    /// The session is done with this pipe's carrier: its close-code hook
+    /// gets the session's code once the session is closing, and 0 for a
+    /// pipe that left a session that goes on, after the lock.
+    fn tell_close_code(&mut self, st: &mut State<Tokio>) {
+        if let Some(mut t) = self.close_code.take() {
+            if st.core.state() >= CoreState::Closing {
+                t.1 = close_code_of(st.core.error());
+            }
+            st.deferred.push(t);
+        }
+    }
+
     /// The first bytes wait until the returned sender is used or dropped.
     fn hold_reads_for_verdict(&mut self) -> tokio::sync::oneshot::Sender<()> {
         let (tx, applied) = tokio::sync::oneshot::channel();
@@ -3124,6 +3215,7 @@ impl PipeTask {
                 blocked: false,
             })),
             abort: io.abort,
+            close_code: io.close_code,
             active: now(),
             done: Arc::new(PipeDone::default()),
             read_skipped: false,
@@ -3783,9 +3875,20 @@ fn end(pipes: &mut Vec<PipeTask>, st: &mut State<Tokio>, shared: &Shared<Tokio>)
     st.io.through.clear();
     pipes.append(&mut st.io.new_pipes);
     release_lanes(st);
-    for p in pipes.iter() {
+    for p in pipes.iter_mut() {
         p.done.finish_into(&mut st.wakes);
+        p.tell_close_code(st);
     }
+}
+
+/// The session task has released its carriers, the last of the session's
+/// work: [`Session::wait`] resolves.
+fn released(pipes: &mut Vec<PipeTask>, shared: &Shared<Tokio>) {
+    pipes.clear();
+    let mut st = shared.lock();
+    st.io.released = true;
+    let s = &mut *st;
+    s.waiters.wake_list(super::wait::List::Close, &mut s.wakes);
 }
 
 /// Releases the session's lane state, lanes handed over but not taken
@@ -3822,9 +3925,11 @@ impl Drop for Task {
         if st.io.task_ended {
             return;
         }
-        st.core.close(VarInt::ZERO, b"session task stopped", now());
+        st.core.abort(VarInt::ZERO, b"session task stopped", now());
         st.dispatch();
         end(&mut self.pipes, &mut st, &self.shared);
+        drop(st);
+        released(&mut self.pipes, &self.shared);
     }
 }
 
@@ -3937,8 +4042,9 @@ impl Future for Task {
             // them, the lanes' streams included, is dropped after the lock,
             // and then their waits resolve.
             let s = &mut *st;
-            for p in this.pipes.extract_if(.., |p| p.finished()) {
+            for mut p in this.pipes.extract_if(.., |p| p.finished()) {
                 p.done.finish_into(&mut s.wakes);
+                p.tell_close_code(s);
                 // Its stream carrier, if any, carries this session no more.
                 release_carriers(shared, Some(p.id.0));
                 s.io.through.retain(|t| t.id != p.id);
@@ -3967,6 +4073,7 @@ impl Future for Task {
                     for s in closing.drain(..) {
                         s.close_suspended();
                     }
+                    released(&mut this.pipes, shared);
                     return Poll::Ready(());
                 }
             }
@@ -4090,7 +4197,7 @@ impl Session {
         pipe: PipeIo,
         config: impl Into<Arc<Config>>,
     ) -> Result<Session, ConnectError> {
-        Self::start(pipe, config, RoleConfig::Initiator, Some(Role::Initiator)).await
+        Self::start(pipe, config, Role::Client, Some(Role::Client)).await
     }
 
     /// Establishes a session as the accepting side of `pipe`, without a
@@ -4109,7 +4216,7 @@ impl Session {
     ) -> Result<Session, ConnectError> {
         let config = config.into();
         check_accept(&config)?;
-        Self::start(pipe, config, RoleConfig::Responder, Some(Role::Responder)).await
+        Self::start(pipe, config, Role::Server, Some(Role::Server)).await
     }
 
     /// Establishes a session over a symmetric carrier: the roles are
@@ -4125,13 +4232,13 @@ impl Session {
     ) -> Result<Session, ConnectError> {
         let config = config.into();
         super::check_peer(&config)?;
-        Self::start(pipe, config, RoleConfig::Auto, None).await
+        Self::start(pipe, config, Role::Auto, None).await
     }
 
     async fn start(
         pipe: PipeIo,
         config: impl Into<Arc<Config>>,
-        role: RoleConfig,
+        role: Role,
         transport: Option<Role>,
     ) -> Result<Session, ConnectError> {
         let config = config.into();
@@ -4248,38 +4355,66 @@ impl Session {
         self.read_datagram_op().await
     }
 
-    /// Closes the session at once with an application error code: data not
-    /// yet sent is discarded and every later operation fails. CONNECTION_CLOSE
-    /// is handed to the carrier of every usable outbound pipe (the write
-    /// that carries it completed; for a socket, the bytes are in the
-    /// kernel's send buffer), their write sides are shut, and what the peer
-    /// still sends is read and discarded, so that unread input does not
-    /// turn the final close into a reset that could destroy
-    /// CONNECTION_CLOSE at the peer. Completes once the session has ended:
-    /// the peer ended the carriers' input, or the linger timeout passed;
-    /// at once when no pipe can carry the close; and after 1 s at the
-    /// latest. At that bound the carriers that have not taken
-    /// CONNECTION_CLOSE are closed and the session ends locally; if all
-    /// took it, the drain goes on while the runtime keeps running. A process
-    /// may exit once it completed. A repeated or concurrent call sends
-    /// nothing more and completes no later than the first; on an ended
-    /// session it completes at once.
+    /// Closes the session gracefully with an application close of `code`
+    /// and `reason` (CONNECTION_CLOSE 0x1d, the reason cut to the length
+    /// SPEC.md allows): the data the streams have written and not yet sent
+    /// goes out first, as far as flow control and the carriers allow, then
+    /// CONNECTION_CLOSE is handed to the carrier of every usable outbound
+    /// pipe (written to it; for a socket, taken into the kernel's send
+    /// buffer), so that the peer reads everything written before the call
+    /// ahead of the code. Streams still open are not waited for: they fail
+    /// locally with the session's error. Completes once CONNECTION_CLOSE
+    /// has been handed over, without waiting for anything from the peer;
+    /// at once when no pipe can carry it; and after 1 s at the latest, a
+    /// bound of the whole call, flushing included: what has not been
+    /// handed over by then is discarded. Each pipe's write side is then
+    /// shut down and its input read until the peer ends it or the linger
+    /// timeout passes, in the background while the runtime keeps running
+    /// ([`Session::wait`](Session#method.wait) waits for that end). A
+    /// process may exit once it completed.
     ///
-    /// The close starts when this is called; the future only waits for
-    /// its completion. Dropping it, or dropping the last handle of the
-    /// session (which closes with code 0), closes without waiting:
-    /// CONNECTION_CLOSE then leaves only while the runtime keeps running.
-    /// [`Session::closed`](Session#method.closed) resolves as soon as the
-    /// session is closing, before its carriers are drained: a process that
-    /// learnt of the end there exits after awaiting `close`.
-    pub fn close(&self, code: VarInt, reason: &[u8]) -> impl Future<Output = ()> + Send + '_ {
+    /// The peer sees [`SessionError::ApplicationClosed`] with this code and
+    /// reason; code 0 is allowed. Idempotent with
+    /// [`Session::abort`](Session#method.abort): the first call of either
+    /// decides what is sent, code and reason included, and a later call
+    /// completes no later than the first and sends nothing more, except an
+    /// abort during the flush, which discards what remains and completes
+    /// the close at once. On an ended session it completes at once. The
+    /// close starts when this is called; dropping the future does not undo
+    /// it.
+    pub fn close_with_error(
+        &self,
+        code: VarInt,
+        reason: &[u8],
+    ) -> impl Future<Output = ()> + Send + '_ {
         self.begin_close(code, reason);
         self.close_handoff_op()
     }
 
+    /// [`Session::close_with_error`](Session#method.close_with_error) with
+    /// code 0 and an empty reason, the one plain close. Dropping the last
+    /// handle of the session starts the same close without waiting:
+    /// CONNECTION_CLOSE then leaves only while the runtime keeps running.
+    pub fn close(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.close_with_error(VarInt::ZERO, b"")
+    }
+
+    /// Ends the session at once with an application close of `code` and
+    /// `reason`, draining nothing: data not yet sent is discarded, open
+    /// streams fail locally with the session's error, and CONNECTION_CLOSE
+    /// is written on each usable outbound pipe whose carrier takes it,
+    /// in the background; the carriers are then shut down there too.
+    /// Returns at once. Code 0 is allowed; an abort differs from
+    /// [`Session::close_with_error`](Session#method.close_with_error) with
+    /// the same code only in what is drained. The carriers still end as a
+    /// close's do: after the peer ended their input, or the linger timeout.
+    pub fn abort(&self, code: VarInt, reason: &[u8]) {
+        self.abort_op(code, reason);
+    }
+
     /// Adds a pipe and waits until the peer attached it (see
     /// [`Pipe::attached`](Pipe#method.attached)), or, with
-    /// [`PipeOptions::no_wait_attached`], until the Reply has been verified
+    /// [`PipeOptions::return_on_reply`], until the Reply has been verified
     /// ([`Pipe::joined`](Pipe#method.joined)). The local endpoint runs the
     /// Join handshake on the carrier, which needs both of its directions;
     /// the options choose the attachment's direction and record mode;
@@ -4297,14 +4432,14 @@ impl Session {
     /// [`PipeError::SessionLost`]. A failed call leaves no pipe behind.
     /// A send-only pipe is attached by a PIPE_ACK, which arrives on an
     /// inbound direction: without another pipe that receives, the wait
-    /// lasts until the bound. With `no_wait_attached` the peer may not have
+    /// lasts until the bound. With `return_on_reply` the peer may not have
     /// attached the pipe yet: closing the session's last other pipes
     /// before it has loses the session unless it resumes.
     /// [`Session::begin_add_pipe`](Session#method.begin_add_pipe) starts
     /// the join without waiting.
     pub async fn add_pipe(&self, pipe: PipeIo, opts: PipeOptions) -> Result<Pipe, PipeError> {
         let deadline = tokio::time::Instant::now() + self.add_pipe_limit();
-        let no_wait = opts.no_wait_attached;
+        let no_wait = opts.return_on_reply;
         let p = self.begin_add_pipe(pipe, opts)?;
         let guard = handle::AbortUnlessAdded(Some(&p));
         let r = tokio::time::timeout_at(deadline, p.added_op(no_wait))
@@ -4338,11 +4473,90 @@ impl Session {
         self.established_op().await
     }
 
-    /// Resolves once the session is closing or has ended, with the reason;
-    /// its carriers may still be draining (see
-    /// [`Session::close`](Session#method.close)). Cancel-safe.
-    pub async fn closed(&self) -> SessionError {
-        self.closed_op().await
+    /// Resolves once the session is closing, that is once it began to end,
+    /// with the reason; its carriers may still be draining
+    /// ([`Session::wait`](Session#method.wait) waits for the whole end).
+    /// Cancel-safe.
+    pub async fn closing(&self) -> SessionError {
+        self.closing_op().await
+    }
+
+    /// Resolves once the session has ended entirely, with the reason it
+    /// ended: every pipe's inbound side has ended, that is the peer read
+    /// CONNECTION_CLOSE and ended its side of the carrier, or the linger
+    /// timeout passed, and the session's task has released its carriers.
+    /// Resolving before the linger timeout thus confirms that the peer read
+    /// the close. Cancel-safe.
+    ///
+    /// "Delivered, or given up after `d`" is this future under the caller's
+    /// own bound; a timeout of the wait changes nothing in the session (the
+    /// linger goes on and ends the carriers):
+    ///
+    /// ```no_run
+    /// # async fn f(session: zmux::Session) {
+    /// use std::time::Duration;
+    ///
+    /// session.close_with_error(zmux::VarInt::from_u32(0x2a), b"replaced").await;
+    /// match tokio::time::timeout(Duration::from_secs(5), session.wait()).await {
+    ///     Ok(end) => println!("ended: {end}"),
+    ///     Err(_) => println!("not confirmed within 5 s; the linger goes on"),
+    /// }
+    /// # }
+    /// ```
+    pub async fn wait(&self) -> SessionError {
+        self.wait_op().await
+    }
+
+    /// Replaces every pipe after a suspected leak of a session-level
+    /// secret: advances the epoch as [`advance_epoch`](Session#method.advance_epoch)
+    /// does, waits until new joins use the new epoch, and then replaces each
+    /// pipe that existed when it was called, one after another: it dials a
+    /// carrier of the same direction through the
+    /// [`redial`](Config#structfield.redial) hook, adds it with the old
+    /// pipe's options, and closes the old pipe gracefully once the new one
+    /// is attached (make before break).
+    ///
+    /// Without the `redial` hook it fails at once with
+    /// [`PipeError::InvalidOptions`]; outside a multipath session with
+    /// [`PipeError::NotNegotiated`]. The caller bounds the whole call, for
+    /// example with `tokio::time::timeout`: dropped, it stops where it is,
+    /// the pipes already replaced staying replaced and the others kept as
+    /// they are. A dial or join that fails ends the call with its error on
+    /// the same terms. While the previous epoch is still kept, the next
+    /// exchange waits until it is deleted, so a short bound may end the
+    /// call before any pipe is replaced. An epoch is kept for
+    /// [`EPOCH_RETENTION`](crate::proto::session::EPOCH_RETENTION) (3 min)
+    /// after this end switched away from it (MULTIPATH.md Section 10.7):
+    /// called within that time after an exchange that completed, for
+    /// example one [`advance_epoch`](Session#method.advance_epoch) started
+    /// under [`EpochPolicy::MANUAL`](crate::EpochPolicy::MANUAL), it waits
+    /// that long before its own exchange, by design. One called while an
+    /// exchange is in progress takes that exchange's epoch as the new one.
+    pub async fn replace_pipes(&self) -> Result<(), PipeError> {
+        let Some(redial) = self.shared().lock().core.config().redial.clone() else {
+            return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
+                "redial",
+                "replace_pipes needs the redial hook",
+            )));
+        };
+        let (old, before) = self.begin_replace_pipes()?;
+        self.epoch_in_use_op(before).await?;
+        for pipe in old {
+            // Gone meanwhile: nothing to replace.
+            let Some((direction, opts)) = handle::replacement(&pipe) else {
+                continue;
+            };
+            let io = redial
+                .dial(super::DialRequest::new(direction))
+                .await
+                .map_err(|e| PipeError::Io(Arc::new(e)))?;
+            self.add_pipe(io, opts).await?;
+            match pipe.close() {
+                Ok(()) | Err(PipeError::UnknownPipe) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Sends a QX_PING request, or joins the one outstanding, and returns
@@ -4428,7 +4642,7 @@ impl Pipe {
     /// ```no_run
     /// # async fn example(session: zmux::Session) -> Result<(), Box<dyn std::error::Error>> {
     /// let tcp = tokio::net::TcpStream::connect("10.0.0.2:4433").await?;
-    /// let options = zmux::PipeOptions::new().with_priority(10);
+    /// let options = zmux::PipeOptions::new().with_send_priority(10).with_receive_priority(10);
     /// let pipe = session.begin_add_pipe(zmux::PipeIo::tcp(tcp), options)?;
     /// pipe.joined().await?;
     /// # Ok(())
@@ -4468,9 +4682,10 @@ impl Pipe {
 /// listener.
 pub(crate) fn check_accept(config: &Config) -> Result<(), ConnectError> {
     if config.offers_multipath() {
-        return Err(ConnectError::InvalidConfig(
+        return Err(ConnectError::InvalidConfig(crate::InvalidConfig::new(
+            "max_pipes",
             "a session accepted without a listener cannot accept joins: multipath needs a Listener",
-        ));
+        )));
     }
     Ok(())
 }
@@ -4628,6 +4843,27 @@ impl AsyncRead for RecvStream {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Io {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Io").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Through {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Through").finish_non_exhaustive()
+    }
+}
+
+/// Shows no state: it may hold keys or locks.
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deferred").finish_non_exhaustive()
     }
 }
 

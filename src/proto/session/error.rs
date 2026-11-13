@@ -45,6 +45,50 @@ use bytes::Bytes;
 
 use crate::proto::{DetailKey, TransportErrorCode, VarInt};
 
+/// A setting that cannot work as given: a value outside its range, a
+/// combination that is excluded, or a feature enabled without what it
+/// needs. It names the setting ([`InvalidConfig::field`]) and says why
+/// ([`InvalidConfig::reason`]); nothing was changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct InvalidConfig {
+    field: &'static str,
+    reason: &'static str,
+}
+
+impl InvalidConfig {
+    /// The error for the setting `field`, invalid for `reason`. Carrier
+    /// adapters and helpers report their own options with it.
+    pub const fn new(field: &'static str, reason: &'static str) -> Self {
+        Self { field, reason }
+    }
+
+    /// The setting, by its field or option name (`max_pipes`,
+    /// `ListenerConfig::instance_id`, ...).
+    pub const fn field(&self) -> &'static str {
+        self.field
+    }
+
+    /// Why the value cannot be used.
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for InvalidConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {}: {}", self.field, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidConfig {}
+
+impl From<InvalidConfig> for io::Error {
+    fn from(e: InvalidConfig) -> Self {
+        io::Error::new(io::ErrorKind::InvalidInput, e)
+    }
+}
+
 /// Why a session ended. The first cause wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -212,7 +256,7 @@ impl SessionError {
         if let Some(PipeError::SessionLost(s)) = inner.downcast_ref() {
             return Some(s);
         }
-        if let Some(crate::ConnectError::Closed(s)) = inner.downcast_ref() {
+        if let Some(crate::ConnectError::SessionLost(s)) = inner.downcast_ref() {
             return Some(s);
         }
         None
@@ -498,6 +542,8 @@ pub enum OpenError {
     /// A blocking call was refused on a thread that drives sessions
     /// (drivers only).
     OnDriverThread,
+    /// A blocking wait's timeout expired (drivers only).
+    TimedOut,
 }
 
 impl OpenError {
@@ -524,6 +570,7 @@ impl fmt::Display for OpenError {
             Self::InvalidArgument => f.write_str("preamble not valid for this stream"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
+            Self::TimedOut => f.write_str("open wait timed out"),
         }
     }
 }
@@ -547,6 +594,7 @@ impl From<OpenError> for io::Error {
             OpenError::PreambleTooLarge | OpenError::InvalidArgument => io::ErrorKind::InvalidInput,
             OpenError::SessionLost(s) => s.kind(),
             OpenError::OnDriverThread => io::ErrorKind::Deadlock,
+            OpenError::TimedOut => io::ErrorKind::TimedOut,
         };
         io::Error::new(kind, e)
     }
@@ -572,6 +620,8 @@ pub enum DatagramError {
     /// A blocking call was refused on a thread that drives sessions
     /// (drivers only).
     OnDriverThread,
+    /// A blocking wait's timeout expired (drivers only).
+    TimedOut,
 }
 
 impl DatagramError {
@@ -590,6 +640,7 @@ impl fmt::Display for DatagramError {
             Self::ClosedStream => f.write_str("stream cannot carry datagrams"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
+            Self::TimedOut => f.write_str("datagram wait timed out"),
         }
     }
 }
@@ -611,6 +662,7 @@ impl From<DatagramError> for io::Error {
             DatagramError::ClosedStream => io::ErrorKind::NotConnected,
             DatagramError::SessionLost(s) => s.kind(),
             DatagramError::OnDriverThread => io::ErrorKind::Deadlock,
+            DatagramError::TimedOut => io::ErrorKind::TimedOut,
         };
         io::Error::new(kind, e)
     }
@@ -643,8 +695,9 @@ impl fmt::Display for JoinMissing {
     }
 }
 
-/// Why a pipe operation failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a pipe operation failed. Errors compare by variant and value, an
+/// [`PipeError::Io`] by identity.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PipeError {
     /// Multipath is not in use in this session.
@@ -663,7 +716,7 @@ pub enum PipeError {
     /// interval above 0 and below 1 s or a jitter outside \[0, 1); or a
     /// [`QualityBand`](crate::QualityBand) or
     /// [`CapacityFloor`](crate::CapacityFloor) is not valid.
-    InvalidOptions,
+    InvalidOptions(InvalidConfig),
     /// The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined)).
     Failed(PipeFailure),
     /// The peer refused the join in its Reply: the carrier was closed and
@@ -681,14 +734,30 @@ pub enum PipeError {
     TimedOut,
     /// The session ended.
     SessionLost(SessionError),
-    /// The std driver could not start the pipe's threads (drivers only);
-    /// the pipe failed.
-    Io(io::ErrorKind),
+    /// Dialling or starting the pipe's I/O failed (drivers only): the
+    /// carrier's dial, or the std driver's threads; the pipe failed.
+    Io(std::sync::Arc<io::Error>),
     /// The carrier is a stream of a session that runs, directly or through
     /// other sessions of the process, over a pipe of this session
     /// (drivers only).
     CarrierLoop,
 }
+
+impl PartialEq for PipeError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InvalidOptions(a), Self::InvalidOptions(b)) => a == b,
+            (Self::Failed(a), Self::Failed(b)) => a == b,
+            (Self::JoinPending(a), Self::JoinPending(b)) => a == b,
+            (Self::SessionLost(a), Self::SessionLost(b)) => a == b,
+            (Self::Io(a), Self::Io(b)) => std::sync::Arc::ptr_eq(a, b),
+            // The other variants carry nothing.
+            (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+        }
+    }
+}
+
+impl Eq for PipeError {}
 
 impl PipeError {
     /// Whether the operation may succeed if retried: once the session is
@@ -720,13 +789,13 @@ impl fmt::Display for PipeError {
             Self::Deferred => f.write_str("joining is deferred"),
             Self::UnknownPipe => f.write_str("unknown pipe"),
             Self::InvalidArgument => f.write_str("carrier not usable as this pipe"),
-            Self::InvalidOptions => f.write_str("pipe options not valid"),
+            Self::InvalidOptions(e) => write!(f, "pipe options not valid: {e}"),
             Self::Failed(e) => write!(f, "pipe failed: {e}"),
             Self::JoinRefused => f.write_str("join refused by the peer"),
             Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
             Self::TimedOut => f.write_str("pipe wait timed out"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
-            Self::Io(kind) => write!(f, "starting the pipe's I/O failed: {kind}"),
+            Self::Io(e) => write!(f, "the pipe's I/O failed: {e}"),
             Self::CarrierLoop => f.write_str("the carrier runs over this session"),
         }
     }
@@ -736,6 +805,8 @@ impl std::error::Error for PipeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SessionLost(e) => Some(e),
+            Self::InvalidOptions(e) => Some(e),
+            Self::Io(e) => Some(&**e),
             _ => None,
         }
     }
@@ -749,7 +820,7 @@ impl From<PipeError> for io::Error {
             PipeError::Deferred | PipeError::JoinPending(_) => io::ErrorKind::WouldBlock,
             PipeError::JoinSecretSet => io::ErrorKind::AlreadyExists,
             PipeError::UnknownPipe => io::ErrorKind::NotFound,
-            PipeError::InvalidArgument | PipeError::InvalidOptions | PipeError::CarrierLoop => {
+            PipeError::InvalidArgument | PipeError::InvalidOptions(_) | PipeError::CarrierLoop => {
                 io::ErrorKind::InvalidInput
             }
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
@@ -757,7 +828,7 @@ impl From<PipeError> for io::Error {
             PipeError::OnDriverThread => io::ErrorKind::Deadlock,
             PipeError::TimedOut => io::ErrorKind::TimedOut,
             PipeError::SessionLost(s) => s.kind(),
-            PipeError::Io(kind) => *kind,
+            PipeError::Io(e) => e.kind(),
         };
         io::Error::new(kind, e)
     }
@@ -777,12 +848,12 @@ mod tests {
         assert!(!SessionError::HandshakeTimeout.is_retryable());
         assert!(StreamError::SessionLost(rejected.clone()).is_retryable());
         assert!(OpenError::SessionLost(rejected.clone()).is_retryable());
-        assert!(crate::ConnectError::Closed(rejected.clone()).is_retryable());
+        assert!(crate::ConnectError::SessionLost(rejected.clone()).is_retryable());
         for e in [
             io::Error::from(rejected.clone()),
             io::Error::from(StreamError::SessionLost(rejected.clone())),
             io::Error::from(OpenError::SessionLost(rejected.clone())),
-            io::Error::from(crate::ConnectError::Closed(rejected)),
+            io::Error::from(crate::ConnectError::SessionLost(rejected)),
         ] {
             assert!(SessionError::in_io(&e).is_some_and(SessionError::is_early_data_rejected));
         }

@@ -4,8 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use std::sync::Arc;
-
 use zmux::helpers::PipePool;
 use zmux::proto::session::WindowIncrease;
 use zmux::test_hooks::resources;
@@ -15,7 +13,7 @@ use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, Session
 /// long auto-tuning RTT so that it wants to grow.
 fn hooked() -> Config {
     let mut c = Config::default();
-    c.allow_connection_window_increase = Some(WindowIncrease(Arc::new(|_| true)));
+    c.allow_connection_window_increase = Some(WindowIncrease::new(|_| true));
     c.test_hooks().rtt = Some(Duration::from_millis(5));
     // A small window that a transfer outgrows, so that the first proposal
     // (which starts the hook task) comes early.
@@ -59,9 +57,9 @@ fn tasks_and_threads_end_with_their_sessions() {
             let (mut send, _recv) = client.open_bi().await.unwrap();
             send.write_all(b"x").await.unwrap();
             match i % 3 {
-                0 => client.close(0u32.into(), b"").await,
+                0 => client.close().await,
                 1 => drop((client, send)),
-                _ => server.close(1u32.into(), b"bye").await,
+                _ => server.abort(1u32.into(), b"bye"),
             }
         }
     });
@@ -94,11 +92,11 @@ fn tasks_and_threads_end_with_their_sessions() {
             let _ = recv.read_to_end(usize::MAX).await;
             assert!(resources().hooks > hooks, "a hook task runs");
             if i.is_multiple_of(2) {
-                receiver.close(0u32.into(), b"").await;
+                receiver.close().await;
             } else {
                 // The last handle gone closes the session.
                 drop((receiver, recv, s2));
-                sender.closed().await;
+                sender.closing().await;
             }
         }
         let mut c = Config::default();
@@ -136,7 +134,7 @@ fn tasks_and_threads_end_with_their_sessions() {
                 0 => drop(handle),
                 1 => handle.stop(),
                 _ => {
-                    client.close(0u32.into(), b"").await;
+                    client.close().await;
                     drop(client);
                     while !handle.is_finished() {
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -144,7 +142,7 @@ fn tasks_and_threads_end_with_their_sessions() {
                     continue;
                 }
             }
-            client.close(0u32.into(), b"").await;
+            client.close().await;
         }
         drop(listener);
     });
@@ -177,11 +175,11 @@ fn tasks_and_threads_end_with_their_sessions() {
             std::thread::sleep(Duration::from_millis(1));
         }
         if i.is_multiple_of(2) {
-            client.close(0u32.into(), b"");
+            client.close();
             drop(server);
         } else {
             drop(client);
-            server.closed(None).unwrap();
+            server.closing().unwrap();
         }
     }
     settle("driver threads", base, || resources().threads);
@@ -212,8 +210,8 @@ fn tasks_and_threads_end_with_their_sessions() {
     recv.read_to_end(usize::MAX).unwrap();
     w.join().unwrap();
     assert!(resources().hooks > hooks, "a hook thread runs");
-    sender.close(0u32.into(), b"");
-    receiver.closed(None).unwrap();
+    sender.close();
+    receiver.closing().unwrap();
     drop((receiver, recv));
     settle("hook threads", hooks, || resources().hooks);
     settle("driver threads", base, || resources().threads);

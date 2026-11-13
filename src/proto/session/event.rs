@@ -22,6 +22,8 @@ pub enum CoreEvent {
     /// The session committed this epoch: its secret is known, and joins of it are
     /// accepted.
     EpochCommitted(u64),
+    /// New joins of this end use this epoch from now.
+    EpochInUse(u64),
     /// This epoch, its keys and its Locators were deleted.
     EpochDeleted(u64),
     /// The peer's parameters were processed; roles and features are fixed.

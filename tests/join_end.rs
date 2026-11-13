@@ -23,7 +23,7 @@ use zmux::{
 fn config() -> Config {
     let mut c =
         Config::multipath(PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end());
-    c.allow_record_mode = Some(AllowRecordMode(Arc::new(|_, _, _| true)));
+    c.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     c
 }
 
@@ -87,7 +87,7 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
             .await
             .unwrap();
         if session_ends {
-            server.close(0u32.into(), b"").await;
+            server.close().await;
         } else {
             listener.close();
         }
@@ -192,7 +192,7 @@ async fn no_pipe_starts_after_its_end_during_the_confirm() {
         if abort {
             pipe.abort().unwrap();
         } else {
-            client.close(0u32.into(), b"").await;
+            client.close().await;
         }
         release.store(true, SeqCst);
         gate.notify_waiters();

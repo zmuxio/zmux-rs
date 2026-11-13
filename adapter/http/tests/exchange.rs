@@ -14,7 +14,7 @@ use exchange_proxy::{Faults, Proxy, Rng, Stats};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use zmux::test_hooks::{Resources, resources};
-use zmux::{Config, Listener, ListenerConfig, Session};
+use zmux::{Cap, Config, Listener, ListenerConfig, Session};
 use zmux_http::{BodyEncoding, ExchangeOptions, ExchangeServer, Options};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -52,8 +52,8 @@ fn quick() -> ExchangeOptions {
     o.deadline = Duration::from_secs(20);
     o.backoff.initial = Duration::from_millis(5);
     o.backoff.max = Duration::from_millis(100);
-    o.up_piece = Some(64 << 10);
-    o.down_piece = Some(64 << 10);
+    o.up_piece = Cap::Fixed(64 << 10);
+    o.down_piece = Cap::Fixed(64 << 10);
     o
 }
 
@@ -176,8 +176,8 @@ async fn finish(
     base: Snapshot,
     ready: Snapshot,
 ) {
-    client.close(0u32.into(), b"done").await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), client.closed()).await;
+    client.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), client.closing()).await;
     drop(client);
     // The server's carriers end (complete or idle) without a close.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -460,11 +460,11 @@ fn oversized_piece_fails_at_the_deadline() {
     run(30, async {
         let base = snapshot();
         let mut so = quick();
-        so.max_up_piece = Some(16 << 10);
+        so.max_up_piece = Cap::Fixed(16 << 10);
         let srv = server(so).await;
         let ready = snapshot();
         let mut o = quick();
-        o.up_piece = Some(1 << 20);
+        o.up_piece = Cap::Fixed(1 << 20);
         o.deadline = Duration::from_secs(1);
         let client = zmux_http::connect_exchange(&srv.addr, &o, Config::default())
             .await
@@ -472,9 +472,10 @@ fn oversized_piece_fails_at_the_deadline() {
         let started = tokio::time::Instant::now();
         let (mut send, recv) = client.open_bi().await.unwrap();
         let _ = send.write_all(&vec![7u8; 1 << 20]).await;
-        let e = tokio::time::timeout(Duration::from_secs(10), client.closed())
+        let e = tokio::time::timeout(Duration::from_secs(10), client.closing())
             .await
             .expect("the session ends with its only carrier");
+        // The upper bound guards against a hang only (above three deadlines and a second).
         assert!(
             started.elapsed() >= o.deadline / 2 && started.elapsed() < o.deadline * 5,
             "{e:?} after {:?}",
@@ -497,20 +498,19 @@ fn fallback_gets_requests_with_their_bodies() {
         let listener = Listener::new(Config::default(), ListenerConfig::default())
             .expect("valid listener configuration");
         let exchange = ExchangeServer::new(&listener, quick()).unwrap();
-        let fallback =
-            zmux_http::HttpFallback::new(|req: zmux_http::FallbackRequest, _| async move {
-                let line = format!("{} {} ", req.method(), req.uri().path());
-                let mut body = req.into_body();
-                let mut got = line.into_bytes();
-                while let Some(Ok(f)) =
-                    std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
-                {
-                    if let Ok(d) = f.into_data() {
-                        got.extend_from_slice(&d);
-                    }
+        let fallback = zmux_http::Fallback::new(|req: zmux_http::FallbackRequest, _| async move {
+            let line = format!("{} {} ", req.method(), req.uri().path());
+            let mut body = req.into_body();
+            let mut got = line.into_bytes();
+            while let Some(Ok(f)) =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+            {
+                if let Ok(d) = f.into_data() {
+                    got.extend_from_slice(&d);
                 }
-                http::Response::new(zmux_http::PipeBody::full(got))
-            });
+            }
+            http::Response::new(zmux_http::PipeBody::full(got))
+        });
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let serving = tokio::spawn(zmux_http::serve(

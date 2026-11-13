@@ -14,9 +14,9 @@ use std::time::Duration;
 use common::{duplex, multi_thread, watchdog};
 use zmux::proto::record::Framing;
 use zmux::{
-    Admission, CacheOutcome, CarrierCache, CarrierKind, Config, ExportError, FirstBytes, Listener,
-    ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter, ReplayVerdict, Session,
-    SessionError, Verdict, classify_first_bytes,
+    Admission, AdmissionVerdict, CacheOutcome, CarrierCache, CarrierKind, Config, ExportError,
+    FirstBytes, Listener, ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter,
+    ReplayVerdict, Session, SessionError, classify_first_bytes,
 };
 
 fn exported(p: PipeIo, reads: Option<Arc<AtomicUsize>>) -> PipeIo {
@@ -152,8 +152,10 @@ fn a_held_join_counts_once_and_wakes_with_the_key() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(server.stats().join_pending, 1);
         server.set_join_secret(&key).unwrap();
+        // The listener counts a join once it handed the attached pipe its
+        // task, just after the session shows the pipe.
         watchdog(5, "joined", async {
-            while server.pipe_stats().len() < 2 {
+            while server.pipe_stats().len() < 2 || listener.stats().joins == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -179,12 +181,12 @@ fn dropping_a_stream_while_unwinding_leaves_the_session_alive() {
         assert!(r.is_err());
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            tokio::time::timeout(Duration::ZERO, client.closed())
+            tokio::time::timeout(Duration::ZERO, client.closing())
                 .await
                 .is_err()
         );
         assert!(
-            tokio::time::timeout(Duration::ZERO, server.closed())
+            tokio::time::timeout(Duration::ZERO, server.closing())
                 .await
                 .is_err()
         );
@@ -229,9 +231,12 @@ fn a_secret_the_negotiation_did_not_select_is_dropped() {
         let c = Config::multipath(PipeAuth::deferred_psk().with_end_to_end());
         // The other end offers no multipath.
         let ((a, _), (b, _)) = duplex(1 << 20);
-        let client = watchdog(5, "connect", async {
-            let _server = tokio::spawn(Session::accept(b, Config::default()));
-            Session::connect(a, c).await.unwrap()
+        // The server session is kept: dropping it would close the session,
+        // and the client would see the close instead of the negotiation.
+        let (client, _server) = watchdog(5, "connect", async {
+            let server = tokio::spawn(Session::accept(b, Config::default()));
+            let client = Session::connect(a, c).await.unwrap();
+            (client, server.await.unwrap().unwrap())
         })
         .await;
         client.set_join_secret(&[7; 32]).ok();
@@ -434,9 +439,9 @@ fn admission_timeouts_beyond_the_clock_do_not_panic() {
         use zmux::{Listener, ListenerConfig};
         let adm = Admission::new(2, |_: &zmux::CarrierInfo<'_>, prefix: &[u8]| {
             if prefix.len() < 5 {
-                Verdict::More { need: 5 }.labelled("x")
+                AdmissionVerdict::More { need: 5 }.labelled("x")
             } else {
-                Verdict::accept(5).labelled("x")
+                AdmissionVerdict::accept(5).labelled("x")
             }
         })
         .with_max_peek(8)
@@ -474,7 +479,7 @@ fn a_panic_under_the_lock_closes_with_internal_error() {
             c.panic_under_lock();
         }));
         assert!(panicked.is_err());
-        let e = watchdog(5, "closed", server.closed()).await;
+        let e = watchdog(5, "closed", server.closing()).await;
         assert!(
             matches!(
                 &e,
@@ -490,7 +495,7 @@ fn a_panic_under_the_lock_closes_with_internal_error() {
 #[test]
 fn a_join_has_a_deadline_without_a_handshake_timeout() {
     use zmux::proto::record::Framing;
-    use zmux::proto::seal::Mode;
+    use zmux::proto::seal::RecordMode;
     use zmux::proto::session::{Config as CoreConfig, PipeFailure, PipeOptions};
     let mut c = CoreConfig::multipath(
         PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end(),
@@ -502,7 +507,7 @@ fn a_join_has_a_deadline_without_a_handshake_timeout() {
     let now = p.now;
     let f = Some(Framing::ByteStream);
     let id =
-        p.a.add_pipe(f, f, &PipeOptions::new(), Mode::Trusted, None, now)
+        p.a.add_pipe(f, f, &PipeOptions::new(), RecordMode::Trusted, None, now)
             .unwrap();
     p.a.join_prepare(id, now).unwrap().unwrap();
     let later = now + Duration::from_secs(9);

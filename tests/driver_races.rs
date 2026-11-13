@@ -139,7 +139,7 @@ async fn random_op(session: &Session, rng: &mut Rng, kept: &mut Vec<(SendStream,
             }
         }
         3 => {
-            let _ = tokio::time::timeout(t, session.closed()).await;
+            let _ = tokio::time::timeout(t, session.closing()).await;
         }
         4 => {
             let _ = tokio::time::timeout(t, session.accept_bi()).await;
@@ -185,7 +185,7 @@ async fn random_op(session: &Session, rng: &mut Rng, kept: &mut Vec<(SendStream,
 async fn random_cancellation_storm() {
     let mut server_config = small_windows(Config::default());
     server_config.max_incoming_streams = 12;
-    server_config.max_incoming_uni_streams = Some(6);
+    server_config.max_incoming_uni_streams = zmux::UniCredit::Limit(6);
     let (client, server) = tcp_pair(small_windows(Config::default()), server_config).await;
     let server_task = serve(server.clone());
     watchdog(60, "random operations", async {
@@ -217,8 +217,8 @@ async fn random_cancellation_storm() {
         }
     })
     .await;
-    client.close(VarInt::from_u32(7), b"done").await;
-    watchdog(10, "server sees the close", server.closed()).await;
+    client.abort(VarInt::from_u32(7), b"done");
+    watchdog(10, "server sees the close", server.closing()).await;
     watchdog(10, "server tasks end", server_task).await.unwrap();
 }
 
@@ -268,8 +268,8 @@ async fn carrier_eof_mid_batch() {
         }
     })
     .await;
-    watchdog(40, "client closed", client.closed()).await;
-    watchdog(40, "server closed", server.closed()).await;
+    watchdog(40, "client closed", client.closing()).await;
+    watchdog(40, "server closed", server.closing()).await;
     let _ = watchdog(10, "server tasks", server_task).await;
 }
 
@@ -362,8 +362,8 @@ async fn carrier_write_error_mid_batch() {
         }
     })
     .await;
-    watchdog(40, "client closed", client.closed()).await;
-    watchdog(40, "server closed", server.closed()).await;
+    watchdog(40, "client closed", client.closing()).await;
+    watchdog(40, "server closed", server.closing()).await;
     let _ = watchdog(10, "server tasks", server_task).await;
 }
 
@@ -417,12 +417,12 @@ fn session_task_dropped_with_its_runtime() {
         ))
         .unwrap();
     assert!(read && accept);
-    main.block_on(async_watch(5, "closed", client.closed()));
+    main.block_on(async_watch(5, "closed", client.closing()));
     drop((send, client));
     main.block_on(async_watch(
         40,
         "server sees the carrier end",
-        server.closed(),
+        server.closing(),
     ));
 }
 
@@ -433,7 +433,7 @@ fn mp_config() -> Config {
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"driver-race-psk-0123456789abcdef").with_end_to_end();
     c.scheduler = Policy::SpreadEta;
-    c.suspect_floor = Duration::from_millis(100);
+    c.liveness.suspect_floor = Duration::from_millis(100);
     c
 }
 
@@ -530,8 +530,8 @@ async fn multipath_pipe_loss_under_concurrency() {
     })
     .await;
     assert!(echoes > 12, "{echoes} echoes");
-    client.close(VarInt::from_u32(0), b"").await;
-    watchdog(10, "server sees the close", server.closed()).await;
+    client.close().await;
+    watchdog(10, "server sees the close", server.closing()).await;
 }
 
 /// Send-capacity waits end on the peer's credit, and
@@ -576,7 +576,7 @@ async fn send_capacity_waits_end_on_credit_stop_close_and_cancellation() {
         send2.write_all(&vec![3; window as usize]).await.unwrap();
         let close = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            server.close(VarInt::from_u32(0), b"").await;
+            server.close().await;
         };
         let (closed, ()) = tokio::join!(send2.wait_send_capacity(1), close);
         assert!(closed.is_err(), "{closed:?}");
@@ -623,7 +623,7 @@ async fn application_bytes_read_concurrently_are_monotonic_and_exact() {
         let s = server.meter().get();
         assert_eq!((s.bytes_written, s.bytes_read), (len as u64, len as u64));
         assert_eq!(client.meter().bytes_written(), len as u64);
-        client.close(VarInt::from_u32(0), b"").await;
+        client.close().await;
     })
     .await;
 }
