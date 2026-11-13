@@ -1,6 +1,6 @@
 [package]
 name = "zmux-websocket"
-version = "1.3.0"
+version = "1.2.6"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ hyper = { version = "1.12", optional = true, default-features = false, features 
 hyper-util = { version = "0.1.21", optional = true, default-features = false, features = ["tokio"] }
 # wss:// in dial and connect (feature `wss`): the Mozilla roots.
 webpki-roots = { version = "1", optional = true }
-zmux = { version = "1.3.0", path = "../.." }
+zmux = { version = "1.2.6", path = "../.." }
 # serve_tls: the admission metadata of a TLS connection.
 
 [features]

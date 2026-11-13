@@ -2852,7 +2852,7 @@ fn match_event(
             }
         }
         CoreEvent::Suspended | CoreEvent::Resumed => Ok(()),
-        CoreEvent::PipeRetired { pipe } => {
+        CoreEvent::PipeRetired { pipe, .. } => {
             if fields.pipe.is_some_and(|p| p != pipe.get()) {
                 return Err(format!("pipe_state pipe {}", pipe.get()));
             }

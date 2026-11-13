@@ -5,7 +5,7 @@ use crate::proto::params::{Features, Role};
 
 use super::pipes::{DirectionState, PipeHalf, PrioritySource};
 use super::stream::StreamKey;
-use super::{LaneId, PipeId, SessionError};
+use super::{LaneId, PipeFailure, PipeId, SessionError};
 
 /// An event for the driver or the application.
 ///
@@ -88,6 +88,10 @@ pub enum CoreEvent {
     PipeRetired {
         /// The attachment.
         pipe: PipeId,
+        /// Why one of our joins ended before it was confirmed (a refused
+        /// join among them): the outcome its handles keep
+        /// ([`super::SessionCore::pipe_joined`] no longer knows the pipe).
+        join_failure: Option<PipeFailure>,
     },
     /// The effective priority, standby flag or weight of a pipe's outbound
     /// direction changed.

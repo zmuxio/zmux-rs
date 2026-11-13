@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -336,6 +336,9 @@ pub struct State<D: Driver> {
     /// The last state of each unretired pipe's outbound direction, which tells
     /// `PipeAdded` (first seen) and `PipeRecovered` (active after suspect).
     out_seen: std::collections::HashMap<u64, OutboundState>,
+    /// The outcome slots of the unretired pipes that have handles
+    /// ([`Pipe::end`]).
+    pipe_ends: std::collections::HashMap<u64, Weak<OnceLock<PipeError>>>,
     protocol: Option<String>,
     /// The bootstrap carrier's TLS handshake, when this process ran it.
     tls: Option<crate::TlsState>,
@@ -521,6 +524,7 @@ impl<D: Driver> State<D> {
             pipe_changes: 0,
             locator_hook: None,
             out_seen: std::collections::HashMap::new(),
+            pipe_ends: std::collections::HashMap::new(),
             protocol: carrier.protocol,
             tls: carrier.tls,
             window_hook,
@@ -539,6 +543,16 @@ impl<D: Driver> State<D> {
     }
 
     /// Drains the core's events and wakes the operations they concern.
+    /// The outcome slot that the handles of pipe `id` share.
+    fn pipe_end(&mut self, id: PipeId) -> Arc<OnceLock<PipeError>> {
+        if let Some(end) = self.pipe_ends.get(&id.0).and_then(Weak::upgrade) {
+            return end;
+        }
+        let end = Arc::new(OnceLock::new());
+        self.pipe_ends.insert(id.0, Arc::downgrade(&end));
+        end
+    }
+
     pub(crate) fn dispatch(&mut self) {
         self.dispatch_events();
         // A close's hand-off follows the carriers' writes, which raise no
@@ -604,8 +618,15 @@ impl<D: Driver> State<D> {
                     self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
-                CoreEvent::PipeRetired { pipe } => {
+                CoreEvent::PipeRetired { pipe, join_failure } => {
                     self.pipe_changes += 1;
+                    // Set before the waits wake: a join that ended unconfirmed
+                    // (refused, say) keeps its error for its handles.
+                    if let Some(end) = self.pipe_ends.remove(&pipe.0).and_then(|w| w.upgrade())
+                        && let Some(f) = join_failure
+                    {
+                        let _ = end.set(PipeError::failed(f));
+                    }
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
                     if self.traces.is_some() {
@@ -1562,11 +1583,11 @@ impl<D: Driver> Session<D> {
         self.command(|st| st.core.close(code, reason, D::now()));
     }
 
-    /// Waits until the carriers took CONNECTION_CLOSE, or the core gave up
-    /// on them at its hand-off limit (the core's `close_handed_off`).
+    /// Waits until the close completed: the session drained and ended, or
+    /// its hand-off limit passed (the core's `close_completed`).
     pub(crate) fn close_handoff_op(&self) -> impl Future<Output = ()> + '_ {
         Wait::new(&self.conn.inner, List::Close, |st: &mut State<D>| {
-            st.core.close_handed_off().then_some(())
+            st.core.close_completed().then_some(())
         })
     }
 
@@ -1648,9 +1669,11 @@ impl<D: Driver> Session<D> {
             });
             return Err(e);
         }
+        let end = self.conn.lock().pipe_end(id);
         Ok(Pipe {
             conn: self.conn.clone(),
             id,
+            end,
         })
     }
 
@@ -1698,6 +1721,9 @@ impl<D: Driver> Session<D> {
 pub struct Pipe<D: Driver> {
     conn: ConnRef<D>,
     id: PipeId,
+    /// How the pipe's join ended when it ended unconfirmed, kept past its
+    /// retirement, when the core no longer knows the pipe.
+    end: Arc<OnceLock<PipeError>>,
 }
 
 impl<D: Driver> Clone for Pipe<D> {
@@ -1705,6 +1731,7 @@ impl<D: Driver> Clone for Pipe<D> {
         Self {
             conn: self.conn.clone(),
             id: self.id,
+            end: self.end.clone(),
         }
     }
 }
@@ -1714,6 +1741,18 @@ impl<D: Driver> std::fmt::Debug for Pipe<D> {
         f.debug_struct("Pipe")
             .field("id", &self.id)
             .finish_non_exhaustive()
+    }
+}
+
+/// What the core says of a pipe's join, or, once it no longer knows the
+/// pipe, how its join ended when it ended unconfirmed.
+fn ended(
+    end: &OnceLock<PipeError>,
+    r: Option<Result<(), PipeError>>,
+) -> Option<Result<(), PipeError>> {
+    match (r, end.get()) {
+        (Some(Err(PipeError::UnknownPipe)), Some(e)) => Some(Err(e.clone())),
+        (r, _) => r,
     }
 }
 
@@ -1748,9 +1787,9 @@ impl<D: Driver> Pipe<D> {
     /// join failed or timed out ([`PipeError::Failed`]), the pipe is gone,
     /// the session ended. Adding a pipe never waits; this does.
     pub(crate) fn joined_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
-        let id = self.id;
+        let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            st.core.pipe_joined(id)
+            ended(end, st.core.pipe_joined(id))
         })
     }
 }
@@ -1759,9 +1798,9 @@ impl<D: Driver> Pipe<D> {
     /// Waits until the peer attached the pipe (see the core's
     /// `pipe_attached`).
     pub(crate) fn attached_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
-        let id = self.id;
+        let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            st.core.pipe_attached(id)
+            ended(end, st.core.pipe_attached(id))
         })
     }
 
@@ -1773,14 +1812,14 @@ impl<D: Driver> Pipe<D> {
         &self,
         no_wait_attached: bool,
     ) -> impl Future<Output = Result<(), PipeError>> + '_ {
-        let id = self.id;
+        let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
             let r = if no_wait_attached {
                 st.core.pipe_joined(id)
             } else {
                 st.core.pipe_attached(id)
             };
-            match r? {
+            match ended(end, r)? {
                 Err(PipeError::Failed(core::PipeFailure::JoinTimedOut)) => {
                     Some(Err(PipeError::TimedOut))
                 }
@@ -3052,21 +3091,30 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn pipes(&self) -> Vec<Pipe<D>> {
-        let ids = self.conn.lock().core.pipe_ids();
+        let ids: Vec<_> = {
+            let mut st = self.conn.lock();
+            let ids = st.core.pipe_ids();
+            ids.into_iter().map(|id| (id, st.pipe_end(id))).collect()
+        };
         // The handles after the lock: cloning one takes it.
         ids.into_iter()
-            .map(|id| Pipe {
+            .map(|(id, end)| Pipe {
                 conn: self.conn.clone(),
                 id,
+                end,
             })
             .collect()
     }
 
     fn pipe(&self, id: PipeId) -> Option<Pipe<D>> {
-        let known = self.conn.lock().core.has_pipe(id);
-        known.then(|| Pipe {
+        let end = {
+            let mut st = self.conn.lock();
+            st.core.has_pipe(id).then(|| st.pipe_end(id))
+        };
+        end.map(|end| Pipe {
             conn: self.conn.clone(),
             id,
+            end,
         })
     }
 

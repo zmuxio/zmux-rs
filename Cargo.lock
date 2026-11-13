@@ -3270,7 +3270,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zmux"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "aes-gcm",
  "atomic-waker",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-h3"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "bytes",
  "h3",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-http"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-quinn"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "bytes",
  "quinn",
@@ -3345,7 +3345,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-rustls"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "rcgen",
  "rustls",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "tokio",
  "x25519-dalek",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal-proto"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "libcrux-ml-dsa",
  "libcrux-sha3",
@@ -3378,7 +3378,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-shaping"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "getrandom 0.4.3",
  "rand_chacha 0.10.0",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-websocket"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-webtransport"
-version = "1.3.0"
+version = "1.2.6"
 dependencies = [
  "bytes",
  "rcgen",

@@ -2104,8 +2104,9 @@ impl Session {
     }
 
     /// Closes the session at once with an application error code and
-    /// blocks until CONNECTION_CLOSE has been handed to the carriers, 1 s
-    /// at the latest (see `zmux::Session::close`). A process may exit once
+    /// blocks until CONNECTION_CLOSE has been handed to the carriers and
+    /// their input drained, 1 s at the latest (see `zmux::Session::close`).
+    /// A process may exit once
     /// it returned. On a thread that drives sessions it starts the close
     /// without waiting. Dropping the last handle starts the same close
     /// without waiting; the session's threads then carry it.
@@ -2167,7 +2168,8 @@ impl Session {
         Ok(())
     }
 
-    /// Waits until the session ended and returns why, up to `timeout`
+    /// Waits until the session is closing or ended and returns why (its
+    /// carriers may still be draining, see `close`), up to `timeout`
     /// (`None`: as long as it takes; [`WaitError::TimedOut`] when it
     /// expires). A zero timeout never waits (and works on any thread).
     pub fn closed(&self, timeout: Option<Duration>) -> Result<SessionError, WaitError> {

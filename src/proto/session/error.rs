@@ -699,6 +699,15 @@ impl PipeError {
             Self::NotEstablished | Self::Deferred | Self::JoinPending(_)
         )
     }
+
+    /// The error of a failed pipe: [`PipeError::JoinRefused`] for a refused
+    /// join, else [`PipeError::Failed`].
+    pub(crate) fn failed(f: PipeFailure) -> Self {
+        match f {
+            PipeFailure::JoinRefused => Self::JoinRefused,
+            f => Self::Failed(f),
+        }
+    }
 }
 
 impl fmt::Display for PipeError {

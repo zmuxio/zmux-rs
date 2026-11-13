@@ -918,6 +918,10 @@ pub struct SessionCore {
     /// When an application close stops waiting for the carriers to take
     /// CONNECTION_CLOSE ([`SessionCore::close_handed_off`]).
     handoff_deadline: Option<Instant>,
+    /// The hand-off limit passed with CONNECTION_CLOSE taken by the
+    /// carriers: the close no longer waits for the drain, which goes on
+    /// until the session is CLOSED ([`SessionCore::close_completed`]).
+    handoff_expired: bool,
     stats: SessionStats,
     /// The linger deadline was extended once because the close was not
     /// written yet.
@@ -1094,6 +1098,7 @@ impl SessionCore {
             keep_alive_rng,
             linger_deadline: None,
             handoff_deadline: None,
+            handoff_expired: false,
             stats: SessionStats::default(),
             linger_extended: false,
             linger_from_delivery: false,
@@ -1617,6 +1622,7 @@ impl SessionCore {
         }
         if self.handoff_deadline.is_some_and(|d| now >= d) {
             self.handoff_deadline = None;
+            self.handoff_expired = true;
             if !self.close_handed_off() {
                 // A carrier did not take CONNECTION_CLOSE in time: the
                 // session ends locally, every carrier closed.
@@ -1728,7 +1734,7 @@ impl SessionCore {
     }
 
     fn push_event(&mut self, e: CoreEvent) {
-        if let CoreEvent::PipeRetired { pipe } = e {
+        if let CoreEvent::PipeRetired { pipe, .. } = e {
             self.quality_retired(pipe.0);
         }
         if matches!(
@@ -1940,7 +1946,8 @@ impl SessionCore {
     /// keeps its close; the limit then runs from the first call.
     pub fn close(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         self.tick(now);
-        if self.state <= State::Closing && self.handoff_deadline.is_none() {
+        if self.state <= State::Closing && self.handoff_deadline.is_none() && !self.handoff_expired
+        {
             self.handoff_deadline = Some(now.max(self.now) + self.handoff_limit());
         }
         self.close_with(code, reason, now);
@@ -1989,6 +1996,18 @@ impl SessionCore {
             }
             _ => false,
         }
+    }
+
+    /// Whether an application close has completed: the session is CLOSED
+    /// (CONNECTION_CLOSE handed to the carriers, their write sides shut and
+    /// their input drained until the peer ended it or the linger timeout),
+    /// or the hand-off limit passed with CONNECTION_CLOSE taken by every
+    /// carrier, the drain then going on while the session runs. Until then
+    /// a process must not exit: closing a carrier that still has unread
+    /// input resets it (a TCP RST), and the peer discards what it has not
+    /// read yet, CONNECTION_CLOSE included.
+    pub fn close_completed(&self) -> bool {
+        self.state == State::Closed || (self.handoff_expired && self.close_handed_off())
     }
 
     /// The session error as seen by stream operations.

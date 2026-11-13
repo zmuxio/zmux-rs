@@ -1,6 +1,6 @@
 [package]
 name = "zmux-seal-proto"
-version = "1.3.0"
+version = "1.2.6"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ test-vectors = ["zmux/test-hooks"]
 [dependencies]
 # The ML-DSA-44 of proofs (KeyAlg 3), on its portable code.
 libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["std", "mldsa44"] }
-zmux = { version = "1.3.0", path = "..", default-features = false, features = ["seal-chacha"] }
+zmux = { version = "1.2.6", path = "..", default-features = false, features = ["seal-chacha"] }
 
 [dev-dependencies]
 libcrux-sha3 = "=0.0.11"

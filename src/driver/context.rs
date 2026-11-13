@@ -44,13 +44,16 @@ impl Drop for DriverThread {
 
 /// Whether the current thread drives sessions.
 pub(crate) fn on_driver_thread() -> bool {
-    if DRIVER.try_with(Cell::get).unwrap_or(0) > 0 {
-        return true;
-    }
-    #[cfg(feature = "tokio")]
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return true;
-    }
+    DRIVER.try_with(Cell::get).unwrap_or(0) > 0 || in_tokio_runtime()
+}
+
+#[cfg(feature = "tokio")]
+fn in_tokio_runtime() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
+}
+
+#[cfg(not(feature = "tokio"))]
+fn in_tokio_runtime() -> bool {
     false
 }
 

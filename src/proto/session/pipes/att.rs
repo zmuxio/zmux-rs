@@ -378,6 +378,14 @@ impl Attachment {
         self.mp().failure
     }
 
+    /// Why our join ended before it was confirmed, if it did.
+    pub(crate) fn join_failure(&self) -> Option<crate::proto::session::PipeFailure> {
+        if !self.joiner_local() || self.joined() {
+            return None;
+        }
+        self.failure()
+    }
+
     /// The carrier's kind.
     pub(crate) fn carrier(&self) -> Option<crate::proto::session::CarrierKind> {
         self.carrier

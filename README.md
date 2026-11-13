@@ -122,12 +122,13 @@ The server side needs a `Listener` with `resume_timeout` set as well.
 
 ## Closing
 
-`session.close(code, reason).await` sends CONNECTION_CLOSE at once and
-returns once it has been handed to the carriers (for a socket, in the
-kernel's send buffer), after 1 s at the latest; a process may exit then.
-Dropping the last handle closes with code 0 without waiting.
-`session.closed().await` waits for the session's whole end and returns
-why it ended.
+`session.close(code, reason).await` sends CONNECTION_CLOSE at once,
+shuts the carriers' write sides and keeps reading until the peer ends
+them or the linger timeout passes, and returns then, after 1 s at the
+latest; a process may exit then. Dropping the last handle closes with
+code 0 without waiting. `session.closed().await` returns why the session
+ended as soon as it is closing; a process that exits there awaits
+`close` first.
 
 ## Servers, carrier choice and shaping
 

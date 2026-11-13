@@ -93,7 +93,7 @@ impl Net {
                         let outbound = state.half() == PipeHalf::Outbound;
                         self.s.seen[side].insert((pipe.get(), outbound));
                     }
-                    CoreEvent::PipeRetired { pipe } => {
+                    CoreEvent::PipeRetired { pipe, .. } => {
                         self.s.log.push(format!("{end} {} Retired", pipe.get()));
                         for outbound in [false, true] {
                             if self.s.seen[side].contains(&(pipe.get(), outbound)) {

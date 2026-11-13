@@ -762,6 +762,11 @@ async fn serve(session: Session) {
         });
     }
     let reason = session.closed().await;
+    // `closed` resolves as soon as the session is closing: the process
+    // exits only once the close completed (CONNECTION_CLOSE written, the
+    // carriers half-closed and drained), or exiting could reset a carrier
+    // before the peer read CONNECTION_CLOSE.
+    session.close(VarInt::ZERO, b"").await;
     println!("CLOSED {reason}");
 }
 

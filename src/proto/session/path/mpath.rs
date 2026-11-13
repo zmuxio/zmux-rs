@@ -1563,7 +1563,10 @@ impl SessionCore {
             }
         }
         if a.inp().is_some() || a.out().is_some() {
-            self.push_event(CoreEvent::PipeRetired { pipe: PipeId(id) });
+            self.push_event(CoreEvent::PipeRetired {
+                pipe: PipeId(id),
+                join_failure: a.join_failure(),
+            });
         }
     }
 
@@ -2075,7 +2078,10 @@ impl SessionCore {
             });
         }
         if a.inp().is_some() || a.out().is_some() {
-            self.push_event(CoreEvent::PipeRetired { pipe: PipeId(id) });
+            self.push_event(CoreEvent::PipeRetired {
+                pipe: PipeId(id),
+                join_failure: a.join_failure(),
+            });
         }
         if !peer && a.joined() && !a.limit_abandoned() {
             // An attachment the peer had attached is gone: a join waiting
@@ -2371,10 +2377,9 @@ impl SessionCore {
             return Some(Err(PipeError::UnknownPipe));
         };
         if a.failed() {
-            return Some(Err(match a.failure() {
-                Some(PipeFailure::JoinRefused) => PipeError::JoinRefused,
-                f => PipeError::Failed(f.unwrap_or(PipeFailure::Aborted)),
-            }));
+            return Some(Err(PipeError::failed(
+                a.failure().unwrap_or(PipeFailure::Aborted),
+            )));
         }
         if pipe.0 == 0 {
             // The bootstrap pair joins with establishment.
@@ -2382,7 +2387,9 @@ impl SessionCore {
         }
         match (a.out(), a.inp()) {
             (Some(o), _) if o.confirmed() => Some(Ok(())),
-            (Some(o), _) => (!o.is_live()).then(|| Err(PipeError::Failed(PipeFailure::Aborted))),
+            (Some(o), _) => {
+                (!o.live_or_held()).then(|| Err(PipeError::Failed(PipeFailure::Aborted)))
+            }
             (None, Some(i)) => {
                 (!matches!(i.state(), InState::Joining | InState::Deferred)).then_some(Ok(()))
             }

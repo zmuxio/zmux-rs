@@ -1,5 +1,6 @@
 //! `Session::close` returns once CONNECTION_CLOSE is handed to the
-//! carriers, within its bound, and `Session::add_pipe` returns once the
+//! carriers and their input drained, within its bound, and
+//! `Session::add_pipe` returns once the
 //! peer attached the pipe unless `no_wait_attached`.
 
 use std::io;
@@ -46,6 +47,8 @@ struct Stall {
     slow_shutdown: AtomicBool,
     /// The write side was shut.
     shut: AtomicBool,
+    /// The end of input never arrives: the peer keeps its write side open.
+    mute: AtomicBool,
 }
 
 impl Stall {
@@ -63,7 +66,18 @@ impl AsyncRead for Held {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.io).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(())))
+            && buf.filled().len() == before
+            && buf.remaining() > 0
+            && self.stall.mute.load(Ordering::SeqCst)
+        {
+            // The peer's end of input never arrives: the session's linger
+            // timer ends the wait.
+            return Poll::Pending;
+        }
+        r
     }
 }
 
@@ -292,6 +306,24 @@ async fn close_returns_after_the_write_side_is_shut() {
         assert!(closed_by_peer(&e, 4), "{e:?}");
         listener.close();
     }
+}
+
+/// `close` returns only once the input was drained: while the peer keeps
+/// its write side open, until the linger timeout (at least 250 ms). A
+/// process that exited at the hand-off would close a carrier that may
+/// still hold unread input, which resets it, and the peer would lose
+/// CONNECTION_CLOSE with what it had not read yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_waits_for_the_drain() {
+    let (client, _server, listener, stall) = setup(config()).await;
+    stall.mute.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    client.close(VarInt::from_u32(4), b"bye").await;
+    let took = start.elapsed();
+    assert!(stall.shut.load(Ordering::SeqCst));
+    assert!(took >= Duration::from_millis(240), "{took:?}");
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    listener.close();
 }
 
 /// The graceful shutdown's fallback after cancellation is the same close:

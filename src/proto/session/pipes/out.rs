@@ -641,6 +641,13 @@ impl OutPipe {
         self.state.is_live() && !self.out_closed
     }
 
+    /// Live, or a local join held before it is sent ([`OutState::Deferred`]):
+    /// a held join is pending, not failed.
+    #[inline]
+    pub(crate) fn live_or_held(&self) -> bool {
+        (self.state.is_live() || self.state == OutState::Deferred) && !self.out_closed
+    }
+
     /// Usable for new stream data: never before its handshake.
     #[inline]
     pub(crate) fn takes_new_data(&self) -> bool {

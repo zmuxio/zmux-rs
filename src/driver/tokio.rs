@@ -4249,23 +4249,29 @@ impl Session {
     }
 
     /// Closes the session at once with an application error code: data not
-    /// yet sent is discarded and every later operation fails. Completes
-    /// once CONNECTION_CLOSE has been handed to the carrier of every usable
-    /// outbound pipe (the write that carries it completed; for a socket,
-    /// the bytes are in the kernel's send buffer), without waiting for
-    /// anything from the peer; at once when no pipe can carry it; and after
-    /// 1 s at the latest, when the carriers that have not taken it are
-    /// closed and the session ends locally. A process may exit once it
-    /// completed. A repeated or concurrent call sends nothing more and
-    /// completes no later than the first; on an ended session it completes
-    /// at once.
+    /// yet sent is discarded and every later operation fails. CONNECTION_CLOSE
+    /// is handed to the carrier of every usable outbound pipe (the write
+    /// that carries it completed; for a socket, the bytes are in the
+    /// kernel's send buffer), their write sides are shut, and what the peer
+    /// still sends is read and discarded, so that unread input does not
+    /// turn the final close into a reset that could destroy
+    /// CONNECTION_CLOSE at the peer. Completes once the session has ended:
+    /// the peer ended the carriers' input, or the linger timeout passed;
+    /// at once when no pipe can carry the close; and after 1 s at the
+    /// latest. At that bound the carriers that have not taken
+    /// CONNECTION_CLOSE are closed and the session ends locally; if all
+    /// took it, the drain goes on while the runtime keeps running. A process
+    /// may exit once it completed. A repeated or concurrent call sends
+    /// nothing more and completes no later than the first; on an ended
+    /// session it completes at once.
     ///
     /// The close starts when this is called; the future only waits for
-    /// the hand-off. Dropping it, or dropping the last handle of the
+    /// its completion. Dropping it, or dropping the last handle of the
     /// session (which closes with code 0), closes without waiting:
     /// CONNECTION_CLOSE then leaves only while the runtime keeps running.
-    /// [`Session::closed`](Session#method.closed) waits for the session's
-    /// whole end.
+    /// [`Session::closed`](Session#method.closed) resolves as soon as the
+    /// session is closing, before its carriers are drained: a process that
+    /// learnt of the end there exits after awaiting `close`.
     pub fn close(&self, code: VarInt, reason: &[u8]) -> impl Future<Output = ()> + Send + '_ {
         self.begin_close(code, reason);
         self.close_handoff_op()
@@ -4320,7 +4326,7 @@ impl Session {
     /// (the future dropped after its first poll, for example by
     /// `tokio::time::timeout`), it starts the close of
     /// [`Session::close`](Session#method.close) with the same code and
-    /// reason; awaiting `close` then waits for that close's hand-off.
+    /// reason; awaiting `close` then waits for that close's completion.
     pub async fn shutdown(&self, code: VarInt, reason: &[u8]) -> Result<(), SessionError> {
         self.shutdown_op(code, reason).await
     }
@@ -4332,7 +4338,9 @@ impl Session {
         self.established_op().await
     }
 
-    /// Resolves when the session has ended, with the reason. Cancel-safe.
+    /// Resolves once the session is closing or has ended, with the reason;
+    /// its carriers may still be draining (see
+    /// [`Session::close`](Session#method.close)). Cancel-safe.
     pub async fn closed(&self) -> SessionError {
         self.closed_op().await
     }
