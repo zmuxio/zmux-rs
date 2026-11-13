@@ -50,8 +50,8 @@ jobs:
             args: -p zmux-quinn --no-default-features
           - name: HTTP/3 adapter without a crypto provider
             args: -p zmux-h3 --no-default-features
-          - name: WebTransport adapter with aws-lc-rs
-            args: -p zmux-webtransport --no-default-features --features aws-lc-rs
+          - name: WebTransport adapter with rustls-aws-lc-rs
+            args: -p zmux-webtransport --no-default-features --features rustls-aws-lc-rs
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust

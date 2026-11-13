@@ -35,6 +35,7 @@ use basics::small_windows;
 use bytes::Bytes;
 use mp_net::{A, B, Joined, MpNet, Observe};
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 use zmux::proto::frame::{Dir, Frame, Frames, Gates};
 use zmux::proto::session::{
     Config, CoreEvent, FrameInfo, InboundState, OutboundState, Pick, PickAnswer, PipeAuth, PipeId,
@@ -599,10 +600,14 @@ impl Net {
         let r = 1 - s.writer(h);
         let key = s.keys[r].expect("reader handle");
         let code = stop_code(tag);
-        self.ends[r]
-            .stop(key, VarInt::from_u32(code as u32))
-            .unwrap_or_else(|e| panic!("stop on stream {tag}/{h}: {e:?}"));
-        self.s.streams[tag].halves[h].stopped = Some(code);
+        match self.ends[r].stop(key, VarInt::from_u32(code as u32)) {
+            // During the read drain after the peer's close the stop fails
+            // with the session's error, but still discards the part.
+            Ok(()) | Err(StreamError::SessionLost(_)) => {
+                self.s.streams[tag].halves[h].stopped = Some(code);
+            }
+            Err(e) => panic!("stop on stream {tag}/{h}: {e:?}"),
+        }
     }
 
     /// End `side` drops its handle: an unfinished sending part is reset and
@@ -1515,6 +1520,9 @@ proptest! {
     #![proptest_config(ProptestConfig {
         cases: cases(),
         max_shrink_iters: 20_000,
+        // Seeds go to tests/mp_fuzz.proptest-regressions (an integration
+        // test has no lib.rs beside it for the default to find).
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         ..ProptestConfig::default()
     })]
 
@@ -2177,6 +2185,56 @@ fn takeover_follows_the_reinjection_penalty() {
             sel: 0,
             max: 1,
         },
+    ];
+    run_case(&setup, &ops);
+}
+
+/// A graceful removal of the bootstrap pipe while the added pipe's link is
+/// delayed must not end the session for want of a viable path: STOP_SENDING
+/// afterwards found it lost with NO_VIABLE_PATH. Found by
+/// `exactly_once_under_churn` (minimized).
+#[test]
+fn graceful_removal_during_a_delayed_join_keeps_the_session() {
+    let setup = Setup {
+        resume: false,
+        policies: [Policy::Affinity, Policy::Affinity],
+        tight_windows: false,
+        suspect_floor: Duration::from_millis(250),
+        probation: None,
+        spread_chunk: 16 * 1024,
+        max_pipes: 2,
+        dead_timeout: None,
+        cap: 16 * 1024,
+        rst: false,
+        seed: 0,
+    };
+    let ops = [
+        Op::Add {
+            opts: PipeOptions::default(),
+            cap: 16 * 1024,
+            rst: false,
+        },
+        Op::Delay {
+            sel: 151,
+            which: 0,
+            ms: 21,
+        },
+        Op::Remove {
+            side: A,
+            sel: 30,
+            graceful: true,
+        },
+        Op::Open {
+            side: B,
+            bidi: false,
+            len: 0,
+            commit: true,
+        },
+        Op::Run {
+            ms: 31,
+            per_tick: 21,
+        },
+        Op::Stop { side: A, sel: 0 },
     ];
     run_case(&setup, &ops);
 }

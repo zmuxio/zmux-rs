@@ -45,15 +45,16 @@ pub(crate) fn seal_carrier(mut p: PipeIo, sealer: Sealer, opener: Opener) -> Pip
     p.reader = p
         .reader
         .take()
-        .map(|r| Reader::Io(Box::pin(SealedRead::new(r, lower, opener, prefix))));
+        .map(|r| Reader::Sealed(Box::pin(SealedRead::new(r, lower, opener, prefix))));
     p.writer = p.writer.take().map(|w| {
-        Writer::Io(Box::pin(SealedWrite {
+        Writer::Sealed(Box::pin(SealedWrite {
             lower: w,
             framing: lower,
             sealer,
             pending: Bytes::new(),
             taken: 0,
             unit: BytesMut::new(),
+            held: false,
         }))
     });
     p.write_overhead = p
@@ -79,19 +80,20 @@ where
     T: AsyncRead + AsyncWrite + Send + 'static,
 {
     let p = seal_carrier(PipeIo::new(io), sealer, opener);
-    let (Some(Reader::Io(r)), Some(Writer::Io(w))) = (p.reader, p.writer) else {
+    let (Some(Reader::Sealed(r)), Some(Writer::Sealed(w))) = (p.reader, p.writer) else {
         unreachable!("Sealed halves are boxed")
     };
     (r, w)
 }
 
-struct SealedRead {
+pub(crate) struct SealedRead {
     lower: Reader,
     framing: Framing,
     opener: Opener,
     /// The bytes read from the carrier and not opened yet are `buf[start..end]`; on a
-    /// message carrier they are one message. Allocated once, at its full size, and
-    /// reused for every record.
+    /// message carrier they are one message. Allocated at its full size when a read
+    /// starts and reused for every record, until the driver finds the pipe idle with
+    /// nothing in it ([`SealedRead::release_idle`]).
     buf: Vec<u8>,
     start: usize,
     end: usize,
@@ -102,7 +104,9 @@ impl SealedRead {
     fn new(lower: Reader, framing: Framing, opener: Opener, prefix: Vec<u8>) -> Self {
         let end = prefix.len();
         let mut buf = prefix;
-        buf.resize(end.max(READ_BUF), 0);
+        if end > 0 {
+            buf.resize(end.max(READ_BUF), 0);
+        }
         Self {
             lower,
             framing,
@@ -111,6 +115,21 @@ impl SealedRead {
             start: 0,
             end,
             failed: false,
+        }
+    }
+
+    /// Whether the buffer is held with no record bytes in it.
+    pub(crate) fn idle_buffer(&self) -> bool {
+        self.start == self.end && self.buf.capacity() > 0
+    }
+
+    /// Frees the buffer of an idle pipe when it holds no record bytes: the next read
+    /// allocates it again.
+    pub(crate) fn release_idle(&mut self) {
+        if self.start == self.end {
+            self.buf = Vec::new();
+            (self.start, self.end) = (0, 0);
+            self.opener.release_idle();
         }
     }
 
@@ -169,6 +188,9 @@ impl AsyncRead for SealedRead {
                 this.buf.copy_within(this.start..this.end, 0);
                 (this.start, this.end) = (0, this.end - this.start);
             }
+            if this.buf.is_empty() {
+                this.buf.resize(READ_BUF, 0);
+            }
             let mut rb = ReadBuf::new(&mut this.buf[this.end..]);
             ready!(Pin::new(&mut this.lower).poll_read(cx, &mut rb))?;
             let n = rb.filled().len();
@@ -188,7 +210,7 @@ impl AsyncRead for SealedRead {
     }
 }
 
-struct SealedWrite {
+pub(crate) struct SealedWrite {
     lower: Writer,
     framing: Framing,
     sealer: Sealer,
@@ -199,9 +221,26 @@ struct SealedWrite {
     /// Where units are built: once a unit is written and dropped below, its
     /// allocation is taken back for the next one.
     unit: BytesMut,
+    /// `unit`'s allocation or the sealer's expanded key may be held.
+    held: bool,
 }
 
 impl SealedWrite {
+    /// Whether an idle pipe would free something.
+    pub(crate) fn idle_held(&self) -> bool {
+        self.held && self.pending.is_empty()
+    }
+
+    /// Frees the unit's allocation and the expanded key with nothing
+    /// pending: the next write takes them again.
+    pub(crate) fn release_idle(&mut self) {
+        if self.pending.is_empty() {
+            self.unit = BytesMut::new();
+            self.sealer.release_idle();
+            self.held = false;
+        }
+    }
+
     /// Writes what is pending; it is one write of the carrier below. A failed write
     /// leaves a record cut or lost, after which no record may follow: it fails the
     /// direction.
@@ -209,6 +248,7 @@ impl SealedWrite {
         while !self.pending.is_empty() {
             let wrote = match &mut self.lower {
                 Writer::Io(w) => w.as_mut().poll_write(cx, &self.pending),
+                Writer::Sealed(w) => w.as_mut().poll_write(cx, &self.pending),
                 Writer::Chunks(w) => {
                     let mut c = [self.pending.clone()];
                     w.as_mut().poll_write_chunks(cx, &mut c)
@@ -265,6 +305,7 @@ impl AsyncWrite for SealedWrite {
                 u[..pre].copy_from_slice(&prefix);
             }
             this.pending = u.split().freeze();
+            this.held = true;
             this.taken = buf.len();
         }
         ready!(this.poll_pending(cx))?;
@@ -298,6 +339,7 @@ pub(crate) async fn write_unit(p: &mut PipeIo, unit: &[u8]) -> io::Result<()> {
         while !rest.is_empty() {
             let n = match &mut *w {
                 Writer::Io(w) => ready!(w.as_mut().poll_write(cx, &rest))?,
+                Writer::Sealed(w) => ready!(w.as_mut().poll_write(cx, &rest))?,
                 Writer::Chunks(w) => {
                     let mut c = [rest.clone()];
                     ready!(w.as_mut().poll_write_chunks(cx, &mut c))?
@@ -380,7 +422,7 @@ mod tests {
         let (s, mut o) = keys();
         let (near, mut far) = duplex(64);
         let mut p = seal_carrier(PipeIo::new(near), s, keys().1);
-        let Some(Writer::Io(w)) = p.writer.as_mut() else {
+        let Some(Writer::Sealed(w)) = p.writer.as_mut() else {
             panic!("sealed")
         };
         let mut cx = Context::from_waker(Waker::noop());
@@ -407,12 +449,36 @@ mod tests {
 
     /// The records written are the allocating AEAD's, with their length
     /// prefixes, and read back whole.
+    /// An idle pipe's halves free their buffers and expanded keys, and the
+    /// records after continue the counters.
+    #[tokio::test]
+    async fn idle_halves_release_and_resume() {
+        let (near, far) = duplex(1 << 20);
+        let mut p = seal_carrier(PipeIo::new(near), keys().0, keys().1);
+        let mut q = seal_carrier(PipeIo::new(far), keys().0, keys().1);
+        let (Some(Writer::Sealed(w)), Some(Reader::Sealed(r))) =
+            (p.writer.as_mut(), q.reader.as_mut())
+        else {
+            panic!("sealed")
+        };
+        let mut buf = vec![0; 1 << 16];
+        for round in 0..3u8 {
+            w.write_all(&[round; 300]).await.unwrap();
+            assert_eq!(r.read(&mut buf).await.unwrap(), 300);
+            assert!(buf[..300].iter().all(|&b| b == round));
+            assert!(w.idle_held() && r.idle_buffer());
+            w.as_mut().get_mut().release_idle();
+            r.as_mut().get_mut().release_idle();
+            assert!(!w.idle_held() && !r.idle_buffer());
+        }
+    }
+
     #[tokio::test]
     async fn written_units_match_the_aead() {
         let key = [7; 32];
         let (near, mut far) = duplex(1 << 20);
         let mut p = seal_carrier(PipeIo::new(near), keys().0, keys().1);
-        let Some(Writer::Io(w)) = p.writer.as_mut() else {
+        let Some(Writer::Sealed(w)) = p.writer.as_mut() else {
             panic!("sealed")
         };
         let lens = [1, 2, 100, 4096, SEALED_MAX_RECORD];
@@ -431,7 +497,7 @@ mod tests {
         let (near, mut far) = duplex(1 << 20);
         let mut q = seal_carrier(PipeIo::new(near), keys().0, keys().1);
         far.write_all(&got).await.unwrap();
-        let Some(Reader::Io(r)) = q.reader.as_mut() else {
+        let Some(Reader::Sealed(r)) = q.reader.as_mut() else {
             panic!("sealed")
         };
         let mut buf = vec![0; 1 << 16];
@@ -450,7 +516,7 @@ mod tests {
         far.write_all(&unit(&mut s, b"one")).await.unwrap();
         far.write_all(&[0, 40, 1]).await.unwrap();
         drop(far);
-        let Some(Reader::Io(r)) = p.reader.as_mut() else {
+        let Some(Reader::Sealed(r)) = p.reader.as_mut() else {
             panic!("sealed")
         };
         let mut buf = vec![0; 64];
@@ -468,7 +534,7 @@ mod tests {
         let mut p = seal_carrier(PipeIo::new(near), keys().0, o);
         far.write_all(&unit(&mut s, b"")).await.unwrap();
         far.write_all(&unit(&mut s, b"next")).await.unwrap();
-        let Some(Reader::Io(r)) = p.reader.as_mut() else {
+        let Some(Reader::Sealed(r)) = p.reader.as_mut() else {
             panic!("sealed")
         };
         let mut buf = vec![0; 64];
@@ -489,7 +555,7 @@ mod tests {
         wire.extend(unit(&mut s, b"bc"));
         let (one, two) = wire.split_at(40_000);
         far.write_all(one).await.unwrap();
-        let Some(Reader::Io(r)) = p.reader.as_mut() else {
+        let Some(Reader::Sealed(r)) = p.reader.as_mut() else {
             panic!("sealed")
         };
         let mut buf = vec![0; 1 << 16];

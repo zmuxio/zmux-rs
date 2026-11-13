@@ -11,6 +11,7 @@ mod mp_net;
 
 use mp_net::{A, B, MpNet};
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 use zmux::proto::frame::{Dir, Frame, Padding, Priority, Stream};
 use zmux::proto::record::RecordBuilder;
 use zmux::proto::session::{
@@ -594,7 +595,12 @@ fn policy() -> impl Strategy<Value = Policy> {
 static COMPLETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 96, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        // Seeds go to tests/mp_core.proptest-regressions.
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        ..ProptestConfig::default()
+    })]
 
     /// Random pipe failures, joins and removals: no panic, and every byte a
     /// stream delivers is the byte that was sent at that offset; with a

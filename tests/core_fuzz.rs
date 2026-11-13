@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 use zmux::proto::frame::{
     ConnectionClose, DataBlocked, Datagram, Dir, Frame, GoAwayFrame, MaxData, MaxStreamData,
     MaxStreams, Priority, PriorityUpdate, QxPing, ResetStream, ResetStreamAt, StopSending, Stream,
@@ -513,7 +514,12 @@ fn run(ops: &[Op], preamble: bool, datagrams: bool, role: bool) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: 2000,
+        // Seeds go to tests/core_fuzz.proptest-regressions.
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn random_sessions_never_panic(

@@ -46,6 +46,23 @@ type BoxWrite = Pin<Box<dyn AsyncWrite + Send>>;
 pub(crate) enum Reader {
     Io(BoxRead),
     Stream(StreamReader),
+    /// Sealed records over another reader, whose buffer an idle pipe frees.
+    Sealed(Pin<Box<super::sealed::SealedRead>>),
+}
+
+impl Reader {
+    /// Whether the reader holds a buffer with nothing in it.
+    fn idle_buffer(&self) -> bool {
+        matches!(self, Self::Sealed(r) if r.idle_buffer())
+    }
+
+    /// Frees the buffer of an idle pipe's reader, if it holds one with
+    /// nothing in it.
+    fn release_idle(&mut self) {
+        if let Self::Sealed(r) = self {
+            r.as_mut().get_mut().release_idle();
+        }
+    }
 }
 
 impl AsyncRead for Reader {
@@ -57,6 +74,7 @@ impl AsyncRead for Reader {
         match self.get_mut() {
             Self::Io(r) => r.as_mut().poll_read(cx, buf),
             Self::Stream(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Sealed(r) => r.as_mut().poll_read(cx, buf),
         }
     }
 }
@@ -228,12 +246,38 @@ pub(crate) enum Writer {
     Io(BoxWrite),
     Chunks(BoxChunkWrite),
     Stream(StreamWriter),
+    /// Sealed records over another writer, whose buffer and key an idle
+    /// pipe frees.
+    Sealed(Pin<Box<super::sealed::SealedWrite>>),
 }
 
 impl Writer {
+    /// The writer as an `AsyncWrite` of slices, unless it takes chunks or is
+    /// a stream.
+    fn io(&mut self) -> Option<Pin<&mut (dyn AsyncWrite + Send)>> {
+        match self {
+            Self::Io(w) => Some(w.as_mut()),
+            Self::Sealed(w) => Some(w.as_mut()),
+            Self::Chunks(_) | Self::Stream(_) => None,
+        }
+    }
+
+    /// Whether the writer holds state an idle pipe frees.
+    fn idle_held(&self) -> bool {
+        matches!(self, Self::Sealed(w) if w.idle_held())
+    }
+
+    /// Frees what an idle pipe's writer holds with nothing pending.
+    fn release_idle(&mut self) {
+        if let Self::Sealed(w) = self {
+            w.as_mut().get_mut().release_idle();
+        }
+    }
+
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self {
             Self::Io(w) => w.as_mut().poll_flush(cx),
+            Self::Sealed(w) => w.as_mut().poll_flush(cx),
             Self::Chunks(w) => w.as_mut().poll_flush(cx),
             Self::Stream(w) => Pin::new(w).poll_flush(cx),
         }
@@ -242,6 +286,7 @@ impl Writer {
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self {
             Self::Io(w) => w.as_mut().poll_shutdown(cx),
+            Self::Sealed(w) => w.as_mut().poll_shutdown(cx),
             Self::Chunks(w) => w.as_mut().poll_shutdown(cx),
             Self::Stream(w) => Pin::new(w).poll_shutdown(cx),
         }
@@ -2283,12 +2328,14 @@ impl WriteSide {
                 }
                 poll
             }
-            (Framing::ByteStream, Writer::Io(w)) => {
+            (Framing::ByteStream, w @ (Writer::Io(_) | Writer::Sealed(_))) => {
+                let mut w = w.io().expect("a writer of slices");
                 let mut slices = [IoSlice::new(&[]); MAX_SLICES];
                 let n = self.out.slices(limit, &mut slices);
                 w.as_mut().poll_write_vectored(cx, &slices[..n])
             }
-            (Framing::Records, Writer::Io(w)) => {
+            (Framing::Records, w @ (Writer::Io(_) | Writer::Sealed(_))) => {
+                let mut w = w.io().expect("a writer of slices");
                 // One write call per message.
                 let msg = self.out.message();
                 let len = msg.len();
@@ -3433,7 +3480,9 @@ impl PipeTask {
         let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
         if let Some(mut rs) = self.read.try_side()
             && rs.buf.is_empty()
-            && (rs.buf.capacity() > 0 || !rs.retired.is_empty())
+            && (rs.buf.capacity() > 0
+                || !rs.retired.is_empty()
+                || rs.reader.as_ref().is_some_and(Reader::idle_buffer))
         {
             let due = rs.active + BURST;
             if now < due {
@@ -3446,6 +3495,9 @@ impl PipeTask {
                 }
                 rs.backing = Backing { id: 0, size: 0 };
                 rs.lent = false;
+                if let Some(r) = rs.reader.as_mut() {
+                    r.release_idle();
+                }
             }
         }
         if let Some(mut ws) = self.write.try_side()
@@ -3461,6 +3513,19 @@ impl PipeTask {
                 at(due);
             } else {
                 ws.out.release();
+            }
+        }
+        // A Sealed writer's unit and expanded key go after the same idle
+        // time: a pipe of small batches keeps them while it writes.
+        if let Some(mut ws) = self.write.try_side()
+            && ws.out.is_empty()
+            && ws.writer.as_ref().is_some_and(Writer::idle_held)
+        {
+            let due = self.active + IDLE_RELEASE;
+            if now < due {
+                at(due);
+            } else if let Some(w) = ws.writer.as_mut() {
+                w.release_idle();
             }
         }
         next

@@ -142,7 +142,7 @@ const STREAM: Row = Row {
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
     bound: 18_432.0,
-    baseline: base(18_114.0),
+    baseline: base(18_336.0),
     noise: 0.005,
 };
 
@@ -150,7 +150,7 @@ const PAIR_MEMORY: Row = Row {
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
     bound: 18_432.0,
-    baseline: base(17_569.0),
+    baseline: base(17_746.0),
     noise: 0.01,
 };
 
@@ -160,7 +160,7 @@ const PAIR_TCP: Row = Row {
 const MULTIPATH: Row = Row {
     name: "idle multipath session pair, two pipes",
     bound: 57_344.0,
-    baseline: base(53_400.0),
+    baseline: base(54_626.0),
     noise: 0.02,
 };
 

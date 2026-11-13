@@ -581,6 +581,7 @@ pub struct ListenerCore {
 
 impl ListenerConfig {
     /// The checks every listener makes of its limits.
+    #[cfg(any(test, all(any(feature = "tokio", feature = "blocking"), not(loom))))]
     pub(crate) fn check(&self) -> Result<(), crate::InvalidConfig> {
         let e = crate::InvalidConfig::new;
         if self.instance_id.len() > MAX_INSTANCE_ID_LEN {
@@ -611,6 +612,7 @@ impl ListenerConfig {
     /// every per-source limit ([`ListenerConfig::source_prefix_v4`]): its
     /// prefix, an IPv4-mapped IPv6 address (a dual-stack socket's IPv4
     /// client) as its IPv4 address. The key [`ListenerCore::enter`] takes.
+    #[cfg(any(test, all(any(feature = "tokio", feature = "blocking"), not(loom))))]
     pub(crate) fn source_key(&self, addr: std::net::IpAddr) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match addr.to_canonical() {

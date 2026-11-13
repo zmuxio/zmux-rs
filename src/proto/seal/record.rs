@@ -8,8 +8,10 @@ const RESERVED_NONCE: u64 = u64::MAX;
 struct Direction {
     cipher: &'static Cipher,
     key: Secret,
-    /// The AEAD with `key` expanded: rebuilt at a rekey only.
-    keyed: Keyed,
+    /// The AEAD with `key` expanded: built for the first record of a key and
+    /// kept for the next ones; an idle carrier drops it
+    /// ([`Opener::release_idle`]).
+    keyed: Option<Keyed>,
     n: u64,
     failed: Option<Error>,
 }
@@ -18,7 +20,7 @@ impl Direction {
     fn new(cipher: &'static Cipher, key: Secret, n: u64) -> Direction {
         Direction {
             cipher,
-            keyed: cipher.keyed(&key),
+            keyed: None,
             key,
             n,
             failed: None,
@@ -37,10 +39,16 @@ impl Direction {
             let zeros = vec![0; self.cipher.key_len()];
             let mut key = Secret::from(self.cipher.seal(&self.key, RESERVED_NONCE, b"", &zeros));
             key.truncate(self.cipher.key_len());
-            self.keyed = self.cipher.keyed(&key);
+            self.keyed = None;
             self.key = key;
         }
         Ok(())
+    }
+
+    /// The AEAD with the current key expanded.
+    fn keyed(&mut self) -> &Keyed {
+        self.keyed
+            .get_or_insert_with(|| self.cipher.keyed(&self.key))
     }
 }
 
@@ -91,9 +99,17 @@ impl Sealer {
         }
         d.prepare()?;
         let (msg, tag) = record.split_at_mut(len);
-        tag.copy_from_slice(&d.keyed.seal_in_place(d.n, msg));
+        let n = d.n;
+        tag.copy_from_slice(&d.keyed().seal_in_place(n, msg));
         d.n += 1;
         Ok(())
+    }
+
+    /// Drops the expanded key of an idle carrier; the next record expands it
+    /// again.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn release_idle(&mut self) {
+        self.0.keyed = None;
     }
 
     /// A short write happened: the carrier has failed for good.
@@ -143,7 +159,8 @@ impl Opener {
         };
         let (msg, tag) = record.split_at_mut(len);
         let tag: &[u8; TAG_LEN] = (&*tag).try_into().expect("split at the tag");
-        match d.keyed.open_in_place(d.n, msg, tag) {
+        let n = d.n;
+        match d.keyed().open_in_place(n, msg, tag) {
             Ok(()) => {
                 d.n += 1;
                 Ok(msg)
@@ -153,6 +170,13 @@ impl Opener {
                 Err(error)
             }
         }
+    }
+
+    /// Drops the expanded key of an idle carrier; the next record expands it
+    /// again.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn release_idle(&mut self) {
+        self.0.keyed = None;
     }
 
     /// A direction at an arbitrary state, for the vectors.

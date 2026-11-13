@@ -971,6 +971,9 @@ mod sealed_records {
             let (mut s, mut o) = pair(c);
             let mut record = vec![7; RECORD + 16];
             let mut unit = Vec::with_capacity(RECORD + 16);
+            // The first record of a key expands it.
+            s.seal_in_place(&mut record).unwrap();
+            o.open_in_place(&mut record).unwrap();
             let ((), n) = allocations(|| {
                 for _ in 0..64 {
                     s.seal_in_place(&mut record).unwrap();

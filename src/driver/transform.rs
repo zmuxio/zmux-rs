@@ -167,6 +167,7 @@ impl AsyncWrite for PipeStream {
         let records = this.framing == Framing::Records;
         let n = match w {
             Writer::Io(w) => ready!(w.as_mut().poll_write(cx, buf))?,
+            Writer::Sealed(w) => ready!(w.as_mut().poll_write(cx, buf))?,
             Writer::Chunks(w) => {
                 let mut chunk = [Bytes::copy_from_slice(buf)];
                 ready!(w.as_mut().poll_write_chunks(cx, &mut chunk))?
