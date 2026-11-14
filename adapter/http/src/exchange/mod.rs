@@ -126,7 +126,9 @@ pub struct ExchangeOptions {
     pub backoff: Backoff,
     /// Client: one attempt of a request, from connecting to its whole
     /// response, has no result after this (default 25 s). It must exceed
-    /// the server's hold time and the path's round trip.
+    /// the server's hold time and the path's round trip. The CLOSE sent when
+    /// the carrier ends is bounded by the shorter of this and the largest
+    /// backoff delay.
     pub request_timeout: Duration,
     /// Client: a request that has had no result for this long fails the
     /// carrier (default 30 s).

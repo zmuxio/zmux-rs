@@ -571,8 +571,15 @@ async fn attempt(
     let body = wire::encode_body(o.encoding, [out.header.clone(), data, out.data_mac.clone()]);
     let target = o.target(kind == Kind::Down, &ctx.instance, &hex(&nonce));
     let limit = wire::encoded_len(o.encoding, RESPONSE_HEAD + o.max_down_piece_size());
+    // The server answers a CLOSE at once and nothing waits for it: against a server that is
+    // gone it must not outlive the carrier by a whole request timeout.
+    let bound = if kind == Kind::Close {
+        o.request_timeout.min(o.backoff.max)
+    } else {
+        o.request_timeout
+    };
     let sent = tokio::time::timeout(
-        o.request_timeout,
+        bound,
         http.send(&target, body, limit, o.https, o.max_redirects),
     )
     .await;
