@@ -1,15 +1,15 @@
-//! The key algorithms of long-term public keys and their one name, the KeyId, by which a
+//! The key algorithms of long-term public keys and their one name, the `KeyId`, by which a
 //! pin and a verdict name a key. A new algorithm is a new row of the table.
 
 use libcrux_ml_dsa::ml_dsa_44;
 use zmux::proto::seal::{SHA256, put_varint};
 
-/// A KeyId: SHA-256 of a key with its KeyAlg.
+/// A `KeyId`: SHA-256 of a key with its `KeyAlg`.
 pub type KeyId = [u8; 32];
 
-/// KeyAlg 1, X25519: the static key of Establish.
+/// `KeyAlg` 1, X25519: the static key of Establish.
 pub const KEYALG_X25519: u64 = 1;
-/// KeyAlg 3, ML-DSA-44: a proof key.
+/// `KeyAlg` 3, ML-DSA-44: a proof key.
 pub const KEYALG_MLDSA44: u64 = 3;
 
 /// FIPS 204 lengths of ML-DSA-44.
@@ -28,7 +28,7 @@ pub enum KeyUse {
 /// `verify(key, message, sig)` of a signing algorithm.
 type VerifyFn = fn(&[u8], &[u8], &[u8]) -> bool;
 
-/// One row of the KeyAlg table.
+/// One row of the `KeyAlg` table.
 #[derive(Debug)]
 pub struct KeyAlg {
     value: u64,
@@ -63,48 +63,56 @@ static KEYALGS: [KeyAlg; 2] = [
 ];
 
 impl KeyAlg {
-    /// The KeyAlg with this value; `None` for 0, an unassigned and a private value.
+    /// The `KeyAlg` with this value; `None` for 0, an unassigned and a private value.
+    #[must_use]
     pub fn from_value(value: u64) -> Option<&'static KeyAlg> {
         KEYALGS.iter().find(|a| a.value == value)
     }
 
-    /// Every KeyAlg, ascending.
+    /// Every `KeyAlg`, ascending.
     pub fn all() -> impl Iterator<Item = &'static KeyAlg> {
         KEYALGS.iter()
     }
 
     /// The value.
+    #[must_use]
     pub fn value(&self) -> u64 {
         self.value
     }
 
     /// The name of the table.
+    #[must_use]
     pub fn name(&self) -> &'static str {
         self.name
     }
 
     /// The length of the canonical key encoding.
+    #[must_use]
     pub fn key_len(&self) -> usize {
         self.key_len
     }
 
     /// The length of a signature; 0 for a key that does not sign.
+    #[must_use]
     pub fn sig_len(&self) -> usize {
         self.sig_len
     }
 
     /// Whether the algorithm resists a quantum adversary: the PQ column.
+    #[must_use]
     pub fn pq(&self) -> bool {
         self.pq
     }
 
     /// The use of the column.
+    #[must_use]
     pub fn key_use(&self) -> KeyUse {
         self.key_use
     }
 
     /// Verifies `sig` over `message` with `key`: `false` for a key or a signature of
     /// another length than the table's, and for an algorithm that does not sign.
+    #[must_use]
     pub fn verify(&self, key: &[u8], message: &[u8], sig: &[u8]) -> bool {
         match self.verify {
             Some(f) if key.len() == self.key_len && sig.len() == self.sig_len => {
@@ -133,6 +141,7 @@ fn mldsa44_verify(key: &[u8], message: &[u8], sig: &[u8]) -> bool {
 }
 
 /// `KeyId(KeyAlg, key) = SHA-256("zmux-seal key" ‖ varint(KeyAlg) ‖ key)`.
+#[must_use]
 pub fn key_id(key_alg: u64, key: &[u8]) -> KeyId {
     let mut head = b"zmux-seal key".to_vec();
     put_varint(&mut head, key_alg);

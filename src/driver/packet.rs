@@ -44,7 +44,7 @@ pub struct PacketOptions {
     /// [`DEFAULT_MAX_PACKET`]). A received DATAGRAM capsule with a larger
     /// payload, or a capsule of any type whose Length exceeds it by more
     /// than 8 (the largest Context ID), ends the stream with
-    /// ZMUX_PACKET_ERROR.
+    /// `ZMUX_PACKET_ERROR`.
     pub max_packet: usize,
 }
 
@@ -59,6 +59,7 @@ impl Default for PacketOptions {
 
 impl PacketOptions {
     /// The defaults with `policy`.
+    #[must_use]
     pub fn with_policy(policy: SendPolicy) -> Self {
         Self {
             policy,
@@ -105,7 +106,7 @@ pub enum PacketError {
     NotNegotiated,
     /// The peer's bytes were malformed (a capsule above the bound, or the
     /// stream ended inside one): the stream was reset and stopped with
-    /// ZMUX_PACKET_ERROR.
+    /// `ZMUX_PACKET_ERROR`.
     Malformed,
     /// The stream failed.
     Stream(StreamError),
@@ -226,11 +227,13 @@ pub struct PacketStream {
 
 impl PacketStream {
     /// Wraps a bidirectional stream with the default options.
+    #[must_use]
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
         Self::with_options(send, recv, PacketOptions::default())
     }
 
     /// Wraps a bidirectional stream.
+    #[must_use]
     pub fn with_options(send: SendStream, recv: RecvStream, opts: PacketOptions) -> Self {
         Self {
             tx: PacketSender {
@@ -254,12 +257,20 @@ impl PacketStream {
     }
 
     /// Sends a packet with Context ID 0. See [`PacketSender::send`].
+    ///
+    /// # Errors
+    ///
+    /// As [`PacketSender::send_with_context`].
     pub async fn send(&mut self, payload: Bytes) -> Result<Sent, PacketError> {
         self.tx.send(payload).await
     }
 
     /// Sends a packet with Context ID `context`. See
     /// [`PacketSender::send_with_context`].
+    ///
+    /// # Errors
+    ///
+    /// As [`PacketSender::send_with_context`].
     pub async fn send_with_context(
         &mut self,
         context: u64,
@@ -269,11 +280,19 @@ impl PacketStream {
     }
 
     /// The next packet. See [`PacketReceiver::recv`].
+    ///
+    /// # Errors
+    ///
+    /// As [`PacketReceiver::recv`].
     pub async fn recv(&mut self) -> Result<Option<Packet>, PacketError> {
         self.rx.recv().await
     }
 
     /// Ends the sending direction. See [`PacketSender::close`].
+    ///
+    /// # Errors
+    ///
+    /// As [`PacketSender::close`].
     pub async fn close(&mut self) -> Result<(), PacketError> {
         self.tx.close().await
     }
@@ -307,6 +326,10 @@ pub struct PacketSender {
 
 impl PacketSender {
     /// Sends a packet with Context ID 0.
+    ///
+    /// # Errors
+    ///
+    /// As [`send_with_context`](Self::send_with_context).
     pub async fn send(&mut self, payload: Bytes) -> Result<Sent, PacketError> {
         self.send_with_context(0, payload).await
     }
@@ -436,6 +459,11 @@ impl PacketSender {
 
     /// Ends the sending direction cleanly once a capsule in progress was
     /// written: the peer's [`PacketReceiver::recv`] then returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// The stream's error, while completing a pending capsule or finishing
+    /// (a stream already finished or reset locally is not an error).
     pub async fn close(&mut self) -> Result<(), PacketError> {
         self.finish_pending().await?;
         match self.send.finish() {
@@ -486,7 +514,7 @@ impl PacketReceiver {
     /// # Errors
     ///
     /// [`PacketError::Malformed`] when the peer's bytes were malformed:
-    /// the stream is then reset and stopped with ZMUX_PACKET_ERROR, and
+    /// the stream is then reset and stopped with `ZMUX_PACKET_ERROR`, and
     /// later calls fail the same way. The stream's error, for example its
     /// reset by the peer.
     pub async fn recv(&mut self) -> Result<Option<Packet>, PacketError> {
@@ -596,19 +624,19 @@ impl PacketReceiver {
 /// A datagram already queued for the stream, without waiting; `None`, and
 /// the end, once there is none.
 fn drain<F>(
-    datagram: std::pin::Pin<&mut F>,
+    next_datagram: std::pin::Pin<&mut F>,
     cx: &mut Context<'_>,
     datagrams_done: &mut bool,
     state: &mut RecvState,
-    stats: &mut PacketStats,
+    counts: &mut PacketStats,
 ) -> Option<Packet>
 where
     F: Future<Output = Result<crate::StreamDatagram, StreamError>>,
 {
     if !*datagrams_done {
-        match datagram.poll(cx) {
+        match next_datagram.poll(cx) {
             Poll::Ready(Ok(d)) => {
-                stats.received_datagrams += 1;
+                counts.received_datagrams += 1;
                 return Some(Packet {
                     context: d.context,
                     payload: d.payload,

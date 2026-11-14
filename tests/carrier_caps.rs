@@ -2,6 +2,15 @@
 //! overhead a shaper factory sees, and the carrier's retransmission count
 //! behind a pipe's loss statistics.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

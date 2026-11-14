@@ -20,7 +20,7 @@ async fn server() -> (std::net::SocketAddr, Listener, tokio::task::JoinHandle<()
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     (addr, listener, serving)
 }
@@ -28,7 +28,9 @@ async fn server() -> (std::net::SocketAddr, Listener, tokio::task::JoinHandle<()
 /// A stream each way between the two sessions.
 async fn round_trip(client: &Session, server: &Session) {
     let (mut send, mut recv) = client.open_bi().await.unwrap();
-    let data: Vec<u8> = (0..(256 << 10)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(256 << 10))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     let writer = {
         let data = data.clone();
         tokio::spawn(async move {
@@ -51,7 +53,7 @@ async fn connect_and_serve() {
     let (addr, listener, serving) = server().await;
     let client = zmux_websocket::connect(
         format!("ws://{addr}/zmux"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -71,7 +73,7 @@ async fn connect_and_serve() {
 }
 
 /// Message boundaries: a plain WebSocket peer receives every record as one
-/// binary message, the first holding QX_TRANSPORT_PARAMETERS from its
+/// binary message, the first holding `QX_TRANSPORT_PARAMETERS` from its
 /// first byte, and none of them holds two records.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::result_large_err)]
@@ -96,9 +98,12 @@ async fn every_record_is_one_message() {
             m => panic!("{m:?}"),
         }
     });
-    let io = zmux_websocket::dial(format!("ws://{addr}/zmux"), &Default::default())
-        .await
-        .unwrap();
+    let io = zmux_websocket::dial(
+        format!("ws://{addr}/zmux"),
+        &zmux_websocket::Options::default(),
+    )
+    .await
+    .unwrap();
     // The peer never answers: establishment waits; the first record went
     // out as one message.
     let client = tokio::spawn(async move {
@@ -139,7 +144,7 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     let (front, proxy) = proxy(addr).await;
     let client = zmux_websocket::connect(
         format!("ws://{front}/zmux"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -183,8 +188,8 @@ async fn application_subprotocols() {
         ),
         // Neither offered nor selected: no application protocol.
         (
-            Options::default().with_no_subprotocol(true),
-            Options::default().with_no_subprotocol(true),
+            zmux_websocket::Options::default().with_no_subprotocol(true),
+            zmux_websocket::Options::default().with_no_subprotocol(true),
             None,
         ),
     ] {
@@ -243,7 +248,13 @@ async fn empty_injector(
                 }
                 if std::mem::take(&mut first) {
                     for _ in 0..empties {
-                        if ss.send(Message::Binary(Default::default())).await.is_err() {
+                        if ss
+                            .send(Message::Binary(
+                                tokio_tungstenite::tungstenite::Bytes::default(),
+                            ))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -265,14 +276,14 @@ async fn empty_injector(
 /// Empty messages are empty records: the server counts each in its pipe
 /// positions and does not charge it against the no-effect budget. The
 /// injected messages are bytes the client never sent, so the client sees a
-/// PIPE_ACK above what it sent and closes the session.
+/// `PIPE_ACK` above what it sent and closes the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_messages_count_in_pipe_positions() {
     let (addr, listener, _serving) = server().await;
     let (front, relay) = empty_injector(addr, 100_000).await;
     let client = zmux_websocket::connect(
         format!("ws://{front}/zmux"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -332,11 +343,16 @@ async fn connect_over_tls() {
         listener.clone(),
         tcp,
         acceptor,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let url = format!("wss://localhost:{port}/zmux");
     // Without the token: refused.
-    let refused = zmux_websocket::dial_tls(url.as_str(), &connector, &Default::default()).await;
+    let refused = zmux_websocket::dial_tls(
+        url.as_str(),
+        &connector,
+        &zmux_websocket::Options::default(),
+    )
+    .await;
     assert!(refused.is_err());
     // Unbound tokens do not verify where bound ones are configured.
     let unbound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
@@ -371,14 +387,18 @@ async fn a_second_connection_joins() {
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
-    let client = zmux_websocket::connect(format!("ws://{addr}/zmux"), &Default::default(), config)
-        .await
-        .unwrap();
+    let client = zmux_websocket::connect(
+        format!("ws://{addr}/zmux"),
+        &zmux_websocket::Options::default(),
+        config,
+    )
+    .await
+    .unwrap();
     let server = listener.accept().await.unwrap();
     let req = IntoClientRequest::into_client_request(format!("ws://{addr}/zmux")).unwrap();
-    let io = zmux_websocket::dial(req, &Default::default())
+    let io = zmux_websocket::dial(req, &zmux_websocket::Options::default())
         .await
         .unwrap();
     let pipe = client.begin_add_pipe(io, zmux::PipeOptions::new()).unwrap();
@@ -411,7 +431,9 @@ fn upgrade_request(protocol: Option<&str>) -> Vec<u8> {
          Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
     );
     if let Some(p) = protocol {
-        r.push_str(&format!("Sec-WebSocket-Protocol: {p}\r\n"));
+        r += "Sec-WebSocket-Protocol: ";
+        r += p;
+        r += "\r\n";
     }
     r.push_str("\r\n");
     r.into_bytes()
@@ -466,7 +488,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let plain = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nbody".to_vec();
     let mut other = upgrade_request(Some("other-1"));
@@ -479,7 +501,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
     // An accepted upgrade still makes a session.
     let client = zmux_websocket::connect(
         format!("ws://{addr}/zmux"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -521,7 +543,7 @@ async fn an_admission_decides_on_the_request_head() {
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let response = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
     assert!(response.starts_with(b"HTTP/1.1 404"));
@@ -529,9 +551,13 @@ async fn an_admission_decides_on_the_request_head() {
     request
         .headers_mut()
         .insert("x-pass", http::HeaderValue::from_static("1"));
-    let client = zmux_websocket::connect(request, &Default::default(), Config::default())
-        .await
-        .unwrap();
+    let client = zmux_websocket::connect(
+        request,
+        &zmux_websocket::Options::default(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     let server = listener.accept().await.unwrap();
     round_trip(&client, &server).await;
     client.close().await;
@@ -556,7 +582,7 @@ async fn prefix_auth_in_the_request_header() {
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let url = format!("ws://{addr}/zmux");
     let refused = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
@@ -577,11 +603,11 @@ async fn prefix_auth_in_the_request_header() {
     request
         .headers_mut()
         .insert(zmux::PREFIX_AUTH_HEADER, value.parse().unwrap());
-    zmux_websocket::dial(request.clone(), &Default::default())
+    zmux_websocket::dial(request.clone(), &zmux_websocket::Options::default())
         .await
         .unwrap();
     assert!(
-        zmux_websocket::dial(request, &Default::default())
+        zmux_websocket::dial(request, &zmux_websocket::Options::default())
             .await
             .is_err(),
         "a replayed token"
@@ -635,7 +661,7 @@ async fn trusted_intermediaries_report_the_source() {
         let task = tokio::spawn(zmux_websocket::serve(
             listener.clone(),
             tcp,
-            Default::default(),
+            zmux_websocket::Options::default(),
         ));
         (addr, listener, task)
     };
@@ -703,10 +729,10 @@ async fn wss_with_the_feature() {
         listener.clone(),
         tcp,
         acceptor,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let url = format!("wss://localhost:{port}/zmux");
-    let e = zmux_websocket::dial(url.as_str(), &Default::default())
+    let e = zmux_websocket::dial(url.as_str(), &zmux_websocket::Options::default())
         .await
         .expect_err("a self-signed certificate is not trusted");
     assert!(e.to_string().contains("certificate"), "{e}");
@@ -716,7 +742,7 @@ async fn wss_with_the_feature() {
     let client = zmux_websocket::connect_tls(
         url.as_str(),
         &connector,
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -757,7 +783,9 @@ fn lingering(mut c: Config) -> Config {
 }
 
 async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(1 << 20))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     let reader = {
         let (server, data) = (server.clone(), data.clone());
         tokio::spawn(async move {
@@ -823,7 +851,7 @@ async fn a_close_is_delivered_with_its_code() {
         let (addr, listener, serving) = server().await;
         let client = zmux_websocket::connect(
             format!("ws://{addr}/zmux"),
-            &Default::default(),
+            &zmux_websocket::Options::default(),
             lingering(Config::default()),
         )
         .await

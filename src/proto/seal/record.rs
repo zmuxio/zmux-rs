@@ -119,12 +119,14 @@ impl Sealer {
 
     /// A direction at an arbitrary state, for the vectors.
     #[cfg(feature = "test-hooks")]
+    #[must_use]
     pub fn at(cipher: &'static Cipher, key: &[u8], n: u64) -> Sealer {
         Sealer(Direction::new(cipher, key.into(), n))
     }
 
     /// The key in effect and the next counter.
     #[cfg(feature = "test-hooks")]
+    #[must_use]
     pub fn state(&self) -> (&[u8], u64) {
         (&self.0.key, self.0.n)
     }
@@ -181,12 +183,14 @@ impl Opener {
 
     /// A direction at an arbitrary state, for the vectors.
     #[cfg(feature = "test-hooks")]
+    #[must_use]
     pub fn at(cipher: &'static Cipher, key: &[u8], n: u64) -> Opener {
         Opener(Direction::new(cipher, key.into(), n))
     }
 
     /// The key in effect and the next counter.
     #[cfg(feature = "test-hooks")]
+    #[must_use]
     pub fn state(&self) -> (&[u8], u64) {
         (&self.0.key, self.0.n)
     }

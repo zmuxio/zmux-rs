@@ -1,6 +1,6 @@
 //! Close races of the tokio driver: each kind of wait raced, at a
 //! random point, against session close, the peer's close, stream reset,
-//! STOP_SENDING, the peer's GOAWAY, local shutdown, cancellation, deadline
+//! `STOP_SENDING`, the peer's GOAWAY, local shutdown, cancellation, deadline
 //! expiry and carrier failure. Every call returns a defined outcome (no
 //! hang, no panic), a cancellation racing with completion never loses or
 //! duplicates data, streams or credit, and several waiters on one handle
@@ -10,6 +10,24 @@
 //! names its seed; `ZMUX_SEED=<n>` replays one iteration), plus a
 //! multi-thread variant for real interleavings. `ZMUX_SOAK=50` runs the
 //! 10^4 iterations per wait kind of the conformance plan.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_futures,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
 
 mod common;
 
@@ -226,26 +244,26 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
     // one) end with the session.
     let outcome = {
         let mut wait = wait;
-        match tokio::time::timeout(grace, &mut wait).await {
-            Ok(r) => r,
-            Err(_) => {
-                // A race that ends the session must have ended the wait.
-                assert!(
-                    !matches!(
-                        race,
-                        Race::LocalClose | Race::PeerClose | Race::CarrierFails
-                    ),
-                    "seed {seed}: {kind:?} raced with {race:?}: the session ended, the wait did not"
-                );
-                local.abort(VarInt::from_u32(9), b"end");
-                match tokio::time::timeout(Duration::from_secs(10), wait).await {
-                    Ok(r) => r,
-                    Err(_) => panic!(
+        if let Ok(r) = tokio::time::timeout(grace, &mut wait).await {
+            r
+        } else {
+            // A race that ends the session must have ended the wait.
+            assert!(
+                !matches!(
+                    race,
+                    Race::LocalClose | Race::PeerClose | Race::CarrierFails
+                ),
+                "seed {seed}: {kind:?} raced with {race:?}: the session ended, the wait did not"
+            );
+            local.abort(VarInt::from_u32(9), b"end");
+            tokio::time::timeout(Duration::from_secs(10), wait)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
                         "seed {seed}: {kind:?} raced with {race:?}: the wait did not resolve \
                          after the session closed"
-                    ),
-                }
-            }
+                    )
+                })
         }
     };
     match outcome {
@@ -315,9 +333,9 @@ fn cancelled_reads_and_writes_lose_nothing() {
         let base = snapshot();
         let ((a, _), (b, _)) = duplex(8 * 1024);
         let (client, server) = connect(a, b, config(), config()).await;
-        let (mut send, _r) = client.open_bi().await.unwrap();
+        let (mut send, r_end) = client.open_bi().await.unwrap();
         send.write_all(b"\0").await.unwrap();
-        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        let (s_end, mut recv) = server.accept_bi().await.unwrap();
         let total = soak(4 << 20) as u64;
         let pat = |o: u64| (o ^ (o >> 9)) as u8;
         let writer = tokio::spawn(async move {
@@ -370,7 +388,7 @@ fn cancelled_reads_and_writes_lose_nothing() {
         );
         let t = (client.debug_tables(), server.debug_tables());
         assert!(t.0.waits == 0 && t.1.waits == 0, "stale waits: {t:?}");
-        drop((recv, _r, _s));
+        drop((recv, r_end, s_end));
         client.close().await;
         drop((client, server));
         settle(base, 10, "end").await;

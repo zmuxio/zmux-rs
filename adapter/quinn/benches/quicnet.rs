@@ -26,6 +26,11 @@
 //! `QN_WORKERS` (4), `QN_SEED0` (the first seed, 1); `QN_TRACE=1` prints the pipe's and the connection's
 //! estimates during `bulk`.
 
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "throughput and timing arithmetic in f64"
+)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -221,7 +226,7 @@ where
 /// emulated bottleneck holds back stays in the sender's socket, where its
 /// unsent count and low-water mark see it, rather than in a deep loopback
 /// buffer no real path has.
-async fn tcp_relay(server: SocketAddr, link: Link) -> SocketAddr {
+fn tcp_relay(server: SocketAddr, link: Link) -> SocketAddr {
     const BUF: u32 = 64 * 1024;
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(BUF).unwrap();
@@ -478,13 +483,13 @@ async fn flows(s: Session, t0: Instant, end: f64, load: f64, seed: u64) {
         };
         let s = s.clone();
         tokio::spawn(async move {
-            let Ok(mut send) = s.open_uni().await else {
+            let Ok(mut stream) = s.open_uni().await else {
                 return;
             };
             let mut data = header(FLOW, t0);
             data.resize(size, 0x46);
-            let _ = send.write_chunk(Bytes::from(data)).await;
-            let _ = send.finish();
+            let _ = stream.write_chunk(Bytes::from(data)).await;
+            let _ = stream.finish();
         });
         next += -rng.unit().max(1e-12).ln() / rate;
     }
@@ -516,6 +521,11 @@ async fn bulk(s: Session, t0: Instant, end: f64, n: usize) {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the rank is clamped to 1..=len"
+)]
 fn pct(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return f64::NAN;
@@ -732,7 +742,7 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
             }
         });
     }
-    let tcp_addr = tcp_relay(tcp_server, tcp_link).await;
+    let tcp_addr = tcp_relay(tcp_server, tcp_link);
     let client = Session::connect(
         PipeIo::from_tcp(TcpStream::connect(tcp_addr).await.unwrap()),
         mp_config(),

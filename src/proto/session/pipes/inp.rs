@@ -1,5 +1,5 @@
 //! The inbound pipe of an attachment: its state, the record reader and
-//! the receive position with what PIPE_ACK reports of it.
+//! the receive position with what `PIPE_ACK` reports of it.
 
 use std::time::{Duration, Instant};
 
@@ -11,14 +11,18 @@ use crate::proto::record::{Framing, RecordReader};
 /// The receive state of one record stream: lane 0 of an inbound pipe, or
 /// another lane of it.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 pub(crate) struct RecvLane {
     reader: Option<RecordReader>,
     /// The driver holds bytes of an incomplete record (in-place receiving).
     partial: bool,
     frames_in: u64,
     /// The record being received: ack-eliciting, carries an activity
-    /// frame, carries PIPE_PING, carries an ack-eliciting frame other than
-    /// PIPE_PING.
+    /// frame, carries `PIPE_PING`, carries an ack-eliciting frame other than
+    /// `PIPE_PING`.
     rec_eliciting: bool,
     rec_activity: bool,
     rec_ping: bool,
@@ -75,7 +79,7 @@ impl RecvLane {
     }
 
     /// The record ended: its marks are taken (ack-eliciting, activity,
-    /// PIPE_PING, ack-eliciting beyond PIPE_PING).
+    /// `PIPE_PING`, ack-eliciting beyond `PIPE_PING`).
     fn take_marks(&mut self) -> (bool, bool, bool, bool) {
         (
             std::mem::replace(&mut self.rec_eliciting, false),
@@ -89,7 +93,7 @@ impl RecvLane {
 /// Where an inbound lane other than lane 0 stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaneIn {
-    /// Its first record, PIPE_LANE and PADDING, has not ended yet.
+    /// Its first record, `PIPE_LANE` and PADDING, has not ended yet.
     First,
     /// Reading.
     Open,
@@ -131,6 +135,10 @@ pub(crate) enum LaneEnd {
 
 /// The inbound pipe of an attachment.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 pub(crate) struct InPipe {
     framing: Framing,
     /// First-record check of a bootstrap pipe, until decided.
@@ -142,36 +150,52 @@ pub(crate) struct InPipe {
     /// Lane 0 ended at a record boundary while other lanes were open.
     zero_ended: bool,
     state: InState,
-    /// Ack-eliciting bytes since the last PIPE_ACK that listed the pipe,
+    /// Ack-eliciting bytes since the last `PIPE_ACK` that listed the pipe,
     /// summed over its lanes, and when the first of them arrived; and
-    /// whether frames other than PIPE_PING were among them.
+    /// whether frames other than `PIPE_PING` were among them.
     elicit: u64,
     elicit_since: Option<Instant>,
     elicit_other: bool,
-    /// When a PIPE_ACK last listed the pipe (`None`: none did yet), and
+    /// When a `PIPE_ACK` last listed the pipe (`None`: none did yet), and
     /// whether an ack-eliciting record arrived after a quiet
     /// `zmux_max_ack_delay` since then: acknowledged at once.
     /// (milliseconds after `opened_at` modulo 2^32, `u32::MAX` before the
     /// first: four bytes instead of an `Option<Instant>`, as the idle
     /// footprint counts. Compared by wrapping difference, it never
-    /// saturates; only a PIPE_ACK more than 49.7 days ago can read as
+    /// saturates; only a `PIPE_ACK` more than 49.7 days ago can read as
     /// recent, which delays one acknowledgement by at most the delay.)
     acked_ms: u32,
     prompt: bool,
     last_record: Instant,
-    /// G_p: the longest interval between two complete records.
+    /// `G_p`: the longest interval between two complete records.
     gap: Duration,
     records: u64,
     opened_at: Instant,
     /// Duplicate stream bytes received on the pipe.
     dup_bytes: u64,
-    /// Linger deadline after the PIPE_ABANDON exchange.
+    /// Linger deadline after the `PIPE_ABANDON` exchange.
     linger_until: Option<Instant>,
     /// The driver was told to close the carrier half.
     close_reported: bool,
+    /// What a closing endpoint found of the peer's `CONNECTION_CLOSE` here.
+    peer_close: PeerClose,
     /// The lanes other than lane 0, in number order, allocated with the
     /// first one.
     lanes: Option<Box<InLanes>>,
+}
+
+/// Whether the peer's `CONNECTION_CLOSE` was read on an inbound pipe: the
+/// peer sends nothing after it. A closing endpoint looks for it in what it
+/// otherwise discards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerClose {
+    /// Not read yet.
+    Unseen,
+    /// Read.
+    Read,
+    /// The input could not be scanned for it (not a valid record sequence):
+    /// the pipe ends with the peer's end or the linger.
+    Unscannable,
 }
 
 /// The lanes of an inbound pipe other than lane 0, in number order.
@@ -210,14 +234,18 @@ pub(crate) enum Classified {
 
 /// What the end of a record on a pipe of a multipath session brings.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 pub(crate) struct RecordEnd {
     /// The record carried an activity frame.
     pub(crate) activity: bool,
-    /// It carried PIPE_PING.
+    /// It carried `PIPE_PING`.
     pub(crate) ping: bool,
-    /// A PIPE_ACK is due at once (a PIPE_PING, or the ack threshold).
+    /// A `PIPE_ACK` is due at once (a `PIPE_PING`, or the ack threshold).
     pub(crate) immediate: bool,
-    /// The pipe's first record carried a PIPE_PING.
+    /// The pipe's first record carried a `PIPE_PING`.
     pub(crate) first_ping: bool,
 }
 
@@ -242,6 +270,7 @@ impl InPipe {
             dup_bytes: 0,
             linger_until: None,
             close_reported: false,
+            peer_close: PeerClose::Unseen,
             lanes: None,
         }
     }
@@ -324,7 +353,7 @@ impl InPipe {
         self.last_record.max(self.opened_at)
     }
 
-    /// G_p: the longest interval between two complete records.
+    /// `G_p`: the longest interval between two complete records.
     #[inline]
     pub(crate) fn gap(&self) -> Duration {
         self.gap
@@ -522,7 +551,7 @@ impl InPipe {
     }
 
     /// A frame of the current record of lane `li`: its kind marks the record (ack-eliciting,
-    /// an activity frame, PIPE_PING: `ping`). Whether it is the lane's first frame.
+    /// an activity frame, `PIPE_PING`: `ping`). Whether it is the lane's first frame.
     pub(crate) fn frame_in(
         &mut self,
         li: usize,
@@ -538,7 +567,7 @@ impl InPipe {
         r.frames_in == 1
     }
 
-    /// The current record of lane `li` carries a PIPE_PING.
+    /// The current record of lane `li` carries a `PIPE_PING`.
     pub(crate) fn ping_in(&mut self, li: usize) {
         self.recv_mut(li).rec_ping = true;
     }
@@ -568,9 +597,9 @@ impl InPipe {
     }
 
     /// Lane `li`'s position was processed now; ack-eliciting bytes of the
-    /// record wait for a PIPE_ACK. Whether a PIPE_ACK is due at once: the
+    /// record wait for a `PIPE_ACK`. Whether a `PIPE_ACK` is due at once: the
     /// bytes waiting, summed over the lanes, reach `threshold`, or the
-    /// record came more than `delay` after the last PIPE_ACK that listed
+    /// record came more than `delay` after the last `PIPE_ACK` that listed
     /// the pipe (or before its first).
     pub(crate) fn await_ack(
         &mut self,
@@ -595,7 +624,7 @@ impl InPipe {
 
     /// A record of `len` bytes ended on lane `li` of a pipe of a multipath
     /// session: the position and the record statistics count it, a joining
-    /// pipe opens, and its ack-eliciting bytes wait for a PIPE_ACK, due at
+    /// pipe opens, and its ack-eliciting bytes wait for a `PIPE_ACK`, due at
     /// once from `threshold` bytes or after a quiet `delay`.
     pub(crate) fn mp_record(
         &mut self,
@@ -627,7 +656,7 @@ impl InPipe {
 
     // ---- acknowledging ------------------------------------------------------------------
 
-    /// Ack-eliciting bytes received since the last PIPE_ACK listed the
+    /// Ack-eliciting bytes received since the last `PIPE_ACK` listed the
     /// pipe.
     #[inline]
     pub(crate) fn unacked(&self) -> u64 {
@@ -640,7 +669,7 @@ impl InPipe {
         self.elicit_since
     }
 
-    /// Whether a PIPE_ACK lists the pipe: a position above 0 on a lane.
+    /// Whether a `PIPE_ACK` lists the pipe: a position above 0 on a lane.
     pub(crate) fn listed(&self) -> bool {
         self.zero.position > 0
             || self
@@ -649,7 +678,7 @@ impl InPipe {
                 .is_some_and(|l| l.iter().any(|x| x.recv.position > 0))
     }
 
-    /// The entries the pipe, numbered `pipe_id`, adds to a PIPE_ACK at
+    /// The entries the pipe, numbered `pipe_id`, adds to a `PIPE_ACK` at
     /// `now`, in lane order: every lane with a position above 0, or with
     /// `!complete` only those whose position changed since the last
     /// complete snapshot. How many.
@@ -675,12 +704,12 @@ impl InPipe {
         out.len() - before
     }
 
-    /// Lane 0's PIPE_ACK entry, numbered `pipe_id`, at `now`.
+    /// Lane 0's `PIPE_ACK` entry, numbered `pipe_id`, at `now`.
     pub(crate) fn ack_entry(&self, pipe_id: u64, now: Instant) -> PipeAckEntry {
         self.zero.entry(pipe_id, 0, now)
     }
 
-    /// Whether no PIPE_ACK listed the pipe during the last `delay` (or ever).
+    /// Whether no `PIPE_ACK` listed the pipe during the last `delay` (or ever).
     fn quiet_since_ack(&self, delay: Duration, now: Instant) -> bool {
         self.acked_ms == u32::MAX
             || Duration::from_millis(u64::from(
@@ -689,12 +718,15 @@ impl InPipe {
     }
 
     /// Milliseconds from `opened_at` to `now`, modulo 2^32.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "truncation is the modulo 2^32"
+    )]
     fn ms_since_open(&self, now: Instant) -> u32 {
-        // Truncation is the modulo.
         now.saturating_duration_since(self.opened_at).as_millis() as u32
     }
 
-    /// A PIPE_ACK listing the positions went out: nothing waits for one.
+    /// A `PIPE_ACK` listing the positions went out: nothing waits for one.
     pub(crate) fn ack_sent(&mut self, now: Instant) {
         self.acked_ms = self.ms_since_open(now).min(u32::MAX - 1);
         self.prompt = false;
@@ -703,14 +735,14 @@ impl InPipe {
         self.elicit_other = false;
     }
 
-    /// Whether ack-eliciting frames other than PIPE_PING wait for a
-    /// PIPE_ACK.
+    /// Whether ack-eliciting frames other than `PIPE_PING` wait for a
+    /// `PIPE_ACK`.
     #[inline]
     pub(crate) fn unacked_other(&self) -> bool {
         self.elicit_other
     }
 
-    /// Whether the PIPE_ACK of a pipe with lanes outside multipath must be
+    /// Whether the `PIPE_ACK` of a pipe with lanes outside multipath must be
     /// a complete snapshot: none went out in the last second.
     pub(crate) fn complete_due(&self, now: Instant) -> bool {
         self.lanes.as_deref().is_none_or(|l| {
@@ -739,12 +771,12 @@ impl InPipe {
 
     // ---- ending -----------------------------------------------------------------------
 
-    /// The linger deadline after the PIPE_ABANDON exchange.
+    /// The linger deadline after the `PIPE_ABANDON` exchange.
     pub(crate) fn linger_until(&self) -> Option<Instant> {
         self.linger_until
     }
 
-    /// Starts the linger after the PIPE_ABANDON exchange, unless it
+    /// Starts the linger after the `PIPE_ABANDON` exchange, unless it
     /// runs or the pipe is not live.
     pub(crate) fn start_linger(&mut self, until: Instant) {
         if self.is_live() && self.linger_until.is_none() {
@@ -842,6 +874,31 @@ impl InPipe {
     pub(crate) fn close_unreported(&self) -> bool {
         !self.close_reported
     }
+
+    /// The peer's `CONNECTION_CLOSE` was read on the pipe.
+    pub(crate) fn peer_close_read(&self) -> bool {
+        self.peer_close == PeerClose::Read
+    }
+
+    /// Notes that the peer's `CONNECTION_CLOSE` was read on the pipe.
+    pub(crate) fn mark_peer_close(&mut self) {
+        self.peer_close = PeerClose::Read;
+    }
+
+    /// What arrives is no valid record sequence: no more looking for the
+    /// peer's `CONNECTION_CLOSE`.
+    pub(crate) fn stop_scan(&mut self) {
+        if self.peer_close == PeerClose::Unseen {
+            self.peer_close = PeerClose::Unscannable;
+        }
+    }
+
+    /// Whether a closing endpoint still looks for the peer's
+    /// `CONNECTION_CLOSE` in what arrives: the pipe is live, its first
+    /// record was checked, and nothing ruled it out.
+    pub(crate) fn scannable(&self) -> bool {
+        self.peer_close == PeerClose::Unseen && self.classifier.is_none() && self.is_live()
+    }
 }
 
 #[cfg(test)]
@@ -872,7 +929,7 @@ mod tests {
     }
 
     /// Past 49.7 days (the end of a u32 of milliseconds) a record within
-    /// the delay of the last PIPE_ACK still waits.
+    /// the delay of the last `PIPE_ACK` still waits.
     #[test]
     fn a_long_lived_pipe_keeps_delaying_acknowledgements() {
         let t0 = Instant::now();

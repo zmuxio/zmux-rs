@@ -2,6 +2,11 @@
 //! to sessions, data spreads over the pipes, and a severed pipe fails over
 //! without losing a byte.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 use std::sync::atomic::Ordering;
@@ -173,7 +178,7 @@ async fn two_pipes_spread() {
     let s = Session::connect(PipeIo::from_tcp(c), config(Scheduler::SpreadEta))
         .await
         .unwrap();
-    assert!(s.multipath() == zmux::Multipath::InUse);
+    assert_eq!(s.multipath(), zmux::Multipath::InUse);
     let c2 = TcpStream::connect(addr).await.unwrap();
     let pipe = s
         .begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
@@ -231,7 +236,7 @@ async fn blocking_client_two_pipes() {
             config(Scheduler::SpreadEta),
         )
         .unwrap();
-        assert!(s.multipath() == zmux::Multipath::InUse);
+        assert_eq!(s.multipath(), zmux::Multipath::InUse);
         let c2 = std::net::TcpStream::connect(addr).unwrap();
         s.begin_add_pipe(zmux::blocking::PipeIo::from_tcp(c2), PipeOptions::default())
             .unwrap();
@@ -246,7 +251,7 @@ async fn blocking_client_two_pipes() {
         });
         let got = recv.read_to_end(len + 1).unwrap();
         let _ = w.join();
-        assert!(got == data);
+        assert_eq!(got, data);
         assert_eq!(s.pipes().len(), 2);
         s.close();
         let _ = done.send(());

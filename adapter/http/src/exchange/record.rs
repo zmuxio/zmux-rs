@@ -37,7 +37,7 @@ impl Record {
         // The window spans 2 * window + 1 times, which touch at most three
         // buckets of `width`; two more keep the ring free of live buckets
         // when it wraps.
-        let n = ((2 * window + width) / width) as usize + 2;
+        let n = usize::try_from((2 * window + width) / width).unwrap_or(1) + 2;
         Self {
             width,
             max,
@@ -56,6 +56,12 @@ impl Record {
     /// Records `pair` sent at `time` while times below `low` are outside
     /// the window. False when the pair is recorded already or the record
     /// is full.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "the ring holds at most five buckets and rem_euclid yields 0..n"
+    )]
     pub(crate) fn insert(&self, pair: Pair, time: i64, low: i64) -> bool {
         let index = time.div_euclid(self.width);
         let low_index = low.div_euclid(self.width);

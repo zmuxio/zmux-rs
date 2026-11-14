@@ -3,7 +3,7 @@
 //! peer opens there to the session and pipe they are lanes of.
 //!
 //! The routing table holds every session of the process that accepts
-//! lanes, by its Lane Key; a stream is looked up by the key its PIPE_LANE
+//! lanes, by its Lane Key; a stream is looked up by the key its `PIPE_LANE`
 //! carries, compared in constant time, and then must be on the connection
 //! of its pipe's lane 0. The table is a leaf lock, taken when a session
 //! starts or ends and when a lane arrives, never on the I/O paths.
@@ -188,7 +188,7 @@ pub(crate) struct LaneWriter {
 
 /// A lane that is a stream of an outer session, counted there while it
 /// lives: the nested pipes of the process hold at most half of the outer
-/// peer's initial_max_streams_bidi as lanes.
+/// peer's `initial_max_streams_bidi` as lanes.
 pub(crate) struct OuterLane(CarrierConnId);
 
 impl OuterLane {
@@ -269,7 +269,7 @@ where
 }
 
 /// The opener of a stream carrier: a further stream of the outer session,
-/// with PIPE_CARRIER and the application TLVs of the pipe's own stream
+/// with `PIPE_CARRIER` and the application TLVs of the pipe's own stream
 /// (which a relay routes it by), whose sending part carries the lane.
 pub(crate) fn stream_opener(outer: Weak<Shared<Tokio>>, preamble: crate::Preamble) -> LaneOpener {
     Arc::new(move || {
@@ -357,13 +357,19 @@ const FIRST_RECORD: Duration = Duration::from_secs(2);
 
 /// Hands a stream the peer opened on a lane-capable connection to the
 /// session and pipe it is a lane of: by the Lane Key
-/// its first record's PIPE_LANE carries, among the sessions of the
+/// its first record's `PIPE_LANE` carries, among the sessions of the
 /// process, on an endpoint without a [`crate::Listener`] (whose
 /// [`crate::Listener::handle_pipe`] routes such streams the same way). The
 /// carrier must report its connection ([`PipeIo::with_carrier_conn`]; a
 /// stream carrier does). A stream that names no pipe of a session with
 /// its lane 0 on the same connection is aborted, and nothing else
 /// happens.
+///
+/// # Errors
+///
+/// [`HandleError::TimedOut`] without a first record within the first-record
+/// timeout; [`HandleError::Rejected`] when the stream names no such pipe or
+/// its first record is not a lane's.
 pub async fn handle_lane(mut io: PipeIo) -> Result<(), HandleError> {
     let framing = io.framing;
     let mut probe = LaneProbe::new(ZMUX_MAX_RECORD_SIZE, framing);
@@ -396,7 +402,7 @@ pub async fn handle_lane(mut io: PipeIo) -> Result<(), HandleError> {
 }
 
 /// Offers the stream `io`, whose first bytes `prefix` begin with a
-/// PIPE_LANE carrying `key` for lane `at`, to the session with that key.
+/// `PIPE_LANE` carrying `key` for lane `at`, to the session with that key.
 pub(crate) fn route(
     mut io: PipeIo,
     key: &[u8; 16],

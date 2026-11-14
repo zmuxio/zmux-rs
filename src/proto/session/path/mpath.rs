@@ -15,8 +15,8 @@ use crate::proto::seal::{Group, RecordMode, SessionCrypto, Suite, session_crypto
 use crate::proto::session::epoch::Epochs;
 use crate::proto::session::join::{JoinKeys, LocalJoin};
 use crate::proto::session::pipes::{
-    Attachment, DirectionState, InPipe, InState, InboundState, OutPipe, OutState, OutboundState,
-    PipeHalf, PrioritySource,
+    Attachment, DirectionState, InPipe, InState, InboundState, OutLanes, OutPipe, OutState,
+    OutboundState, PipeHalf, PrioritySource,
 };
 use crate::proto::session::{
     Cap, CloseFrame, CoreEvent, Inherit, InvalidConfig, LaneId, Liveness, Period, PipeEnd,
@@ -74,6 +74,7 @@ pub struct PipeWrite {
 
 impl PipeWrite {
     /// A call handed `bytes` at `start` and has not returned.
+    #[must_use]
     pub fn started(start: Instant, bytes: u64) -> Self {
         Self {
             start,
@@ -86,6 +87,7 @@ impl PipeWrite {
 
     /// A call that ran from `start` to `end`: the carrier took `bytes`,
     /// held `unsent` unsent then, and `refused` the rest.
+    #[must_use]
     pub fn returned(start: Instant, end: Instant, bytes: u64, unsent: u64, refused: bool) -> Self {
         Self {
             start,
@@ -134,7 +136,7 @@ pub enum PipeDirection {
 /// by a pool's options, and replaced by [`PipeUpdate::liveness`](crate::PipeUpdate::liveness).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PipeLiveness {
-    /// The floor of T_suspect (at least 50 ms).
+    /// The floor of `T_suspect` (at least 50 ms).
     pub suspect_floor: Inherit<Duration>,
     /// How long the pipe may stay suspect before it fails (at least 1 s).
     pub dead_timeout: Inherit<Duration>,
@@ -238,13 +240,18 @@ pub struct PipeOptions {
     /// `add_pipe` returns once the Reply has been verified instead of once
     /// the peer attached the pipe (default false). The caller then keeps
     /// the session's other pipes until
-    /// [`Pipe::attached`](crate::Pipe#method.attached) resolves.
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " [`Pipe::attached`](crate::Pipe#method.attached) resolves."
+    )]
+    #[cfg_attr(not(feature = "tokio"), doc = " `Pipe::attached` resolves.")]
     pub return_on_reply: bool,
 }
 
 impl PipeOptions {
     /// The defaults: bidirectional, tier 0 both ways, available, weight 1,
     /// everything else following the session.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -405,8 +412,8 @@ fn own<T>(c: Change<T>) -> Option<T> {
 }
 
 /// A [`Change`] for [`PipeOptions`] reporting `v`: `Keep` for the default.
-fn reported<T: PartialEq>(v: T, default: T) -> Change<T> {
-    if v == default {
+fn reported<T: PartialEq>(v: T, default: &T) -> Change<T> {
+    if v == *default {
         Change::Keep
     } else {
         Change::Set(v)
@@ -461,15 +468,15 @@ impl PipeOptions {
     ) {
         self.send_priority = sp.map_or(Change::Keep, Change::Set);
         self.send_standby = ss.map_or(Change::Keep, Change::Set);
-        self.receive_priority = reported(rp, 0);
-        self.receive_standby = reported(rs, false);
-        self.weight = reported(w, 1);
+        self.receive_priority = reported(rp, &0);
+        self.receive_standby = reported(rs, &false);
+        self.weight = reported(w, &1);
         self.probation = pr.own().map_or(Change::Keep, Change::Set);
     }
 
     /// Records the pipe's own liveness settings.
     pub(crate) fn report_liveness(&mut self, liveness: PipeLiveness) {
-        self.liveness = reported(liveness, PipeLiveness::default());
+        self.liveness = reported(liveness, &PipeLiveness::default());
     }
 }
 
@@ -478,13 +485,17 @@ impl PipeOptions {
 /// fields are exact counts or settings.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "public statistics: each bool reports an independent pipe condition"
+)]
 pub struct PipeStats {
     /// The pipe ID.
     pub pipe: PipeId,
     /// Whether the local endpoint joined it.
     pub local: bool,
     /// Whether the peer attached it: pipe 0 and the peer's joins always; a
-    /// local join once a PIPE_ACK covered a byte of its outbound pipe or,
+    /// local join once a `PIPE_ACK` covered a byte of its outbound pipe or,
     /// inbound-only, once a record arrived on it.
     pub peer_attached: bool,
     /// The fate group.
@@ -558,15 +569,15 @@ pub struct PipeStats {
     /// The one-way delay (estimate); needs
     /// acknowledgements.
     pub one_way_delay: Option<Duration>,
-    /// Delivery rate R_p in bytes per second (estimate); needs
+    /// Delivery rate `R_p` in bytes per second (estimate); needs
     /// acknowledgements (absent with a plain QMux peer).
     pub delivery_rate: Option<u64>,
     /// Bytes handed to the outbound carrier that it still holds unsent:
     /// the adapter's unsent count, summed over the lanes; `None` where the
-    /// adapter reports none. It is the carrier's part of Q_p only: the
+    /// adapter reports none. It is the carrier's part of `Q_p` only: the
     /// bytes of write calls in progress are not reported separately.
     pub queued_bytes: Option<u64>,
-    /// queued_bytes / R_p (estimate); `None` when either is.
+    /// `queued_bytes` / `R_p` (estimate); `None` when either is.
     pub queue_delay: Option<Duration>,
     /// The outbound pipe's carrier takes bytes now.
     pub writable: bool,
@@ -616,16 +627,16 @@ pub struct PipeStats {
     pub bytes_opportunistic: u64,
     /// Redundant copies sent on the outbound pipe.
     pub bytes_redundant: u64,
-    /// PIPE_PING frames sent, and answered by an acknowledgement.
+    /// `PIPE_PING` frames sent, and answered by an acknowledgement.
     pub pings_sent: u64,
-    /// PIPE_PING frames answered.
+    /// `PIPE_PING` frames answered.
     pub pings_answered: u64,
     /// Since the outbound pipe's acknowledged position last advanced.
     pub since_last_ack: Option<Duration>,
     /// Since the inbound pipe last completed a record.
     pub since_last_receive: Option<Duration>,
-    /// Since a record carrying a traffic frame (STREAM, RESET_STREAM,
-    /// RESET_STREAM_AT, STOP_SENDING or DATAGRAM) was last sent or
+    /// Since a record carrying a traffic frame (STREAM, `RESET_STREAM`,
+    /// `RESET_STREAM_AT`, `STOP_SENDING` or DATAGRAM) was last sent or
     /// received on the pipe, or since it was attached when none was;
     /// probes, acknowledgements, other control frames and padding do not
     /// count. `None` while neither direction is live.
@@ -663,18 +674,18 @@ pub struct LaneStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RttSource {
-    /// PIPE_ACK samples: multipath sessions, and single-pipe sessions
+    /// `PIPE_ACK` samples: multipath sessions, and single-pipe sessions
     /// between zmux endpoints (pipe acknowledgement).
     Ack,
     /// The carrier's own estimate (`TCP_INFO`), for adapters that report
     /// it.
     Kernel,
-    /// QX_PING requests and responses, with the early credit-loop RTT
+    /// `QX_PING` requests and responses, with the early credit-loop RTT
     /// samples: every session, plain QMux peers included.
     Ping,
 }
 
-/// A PIPE_STATUS request.
+/// A `PIPE_STATUS` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PipeRequest {
@@ -708,8 +719,8 @@ type PipeStates = (u64, Option<OutboundState>, Option<InboundState>);
 /// behind its own operations.
 #[derive(Debug)]
 pub(crate) struct Mp {
-    /// Why the last pipe that failed did (SessionError::PipesLost and
-    /// ResumeTimeout report it).
+    /// Why the last pipe that failed did (`SessionError::PipesLost` and
+    /// `ResumeTimeout` report it).
     pub(in crate::proto::session) last_failure: Option<PipeFailure>,
     /// How often an outbound pipe became suspect, a DRAINING one included
     /// (whose public state stays DRAINING): for tests.
@@ -733,7 +744,7 @@ pub(crate) struct Mp {
     next_id: u64,
     /// The replay window over the peer's pipe IDs.
     replay: ReplayWindow,
-    /// Our joins refused with ZMUX_PIPE_RESOURCE_LIMIT in a row, and until
+    /// Our joins refused with `ZMUX_PIPE_RESOURCE_LIMIT` in a row, and until
     /// when the next join waits.
     refusals: u32,
     join_backoff: Option<Instant>,
@@ -758,7 +769,7 @@ pub(crate) struct Mp {
     /// The session is busy until this time: the last traffic frame, or
     /// establishment, plus the busy window.
     busy_until: Instant,
-    /// PIPE_ACK generation (`ack.rs`).
+    /// `PIPE_ACK` generation (`ack.rs`).
     acks: crate::proto::session::ack::AckState,
     /// What the batch being written logs (`output.rs`).
     batch: crate::proto::session::output::BatchLog,
@@ -825,7 +836,7 @@ impl ReplayWindow {
 
     /// The word and bit of a pipe number at or above the base.
     fn place(&self, n: u64) -> (usize, u64) {
-        ((n / 64 - self.base) as usize, 1 << (n % 64))
+        (crate::util::usize_sat(n / 64 - self.base), 1 << (n % 64))
     }
 
     /// Without attachment state, an ID whose bit is set or that is stale
@@ -939,13 +950,13 @@ impl Mp {
 
     // ---- the PIPE_PING limit --------------------------------------------------------
 
-    /// PIPE_PING frames the limit lets go at `now`.
+    /// `PIPE_PING` frames the limit lets go at `now`.
     #[inline]
     pub(crate) fn ping_slots(&self, now: Instant) -> usize {
         self.pings.available(now)
     }
 
-    /// A PIPE_PING was written at `now`.
+    /// A `PIPE_PING` was written at `now`.
     pub(crate) fn ping_sent(&mut self, now: Instant) {
         self.pings.record(now);
     }
@@ -960,7 +971,7 @@ impl Mp {
     }
 
     /// An inbound pipe is live (`true`) or none is: detection by
-    /// acknowledgement resumes, with t_ref reset, or the interval without
+    /// acknowledgement resumes, with `t_ref` reset, or the interval without
     /// one starts.
     fn inbound(&mut self, live: bool, now: Instant) {
         if live && !self.inbound_live {
@@ -1234,9 +1245,8 @@ impl SessionCore {
     /// in place of the configured one: a listener gives each of its
     /// sessions its own. Only before the parameters were sent; `Err`
     /// for a locator above 255 bytes.
-    pub fn set_locator(&mut self, locator: &[u8]) -> Result<(), crate::InvalidConfig> {
-        let l =
-            Locator::new(locator).ok_or(crate::InvalidConfig::new("locator", "above 255 bytes"))?;
+    pub fn set_locator(&mut self, locator: &[u8]) -> Result<(), InvalidConfig> {
+        let l = Locator::new(locator).ok_or(InvalidConfig::new("locator", "above 255 bytes"))?;
         if let Some(mp) = self.local.multipath.as_mut()
             && self.state == State::Establishing
         {
@@ -1327,13 +1337,13 @@ impl SessionCore {
 
     // ---- pipe IDs -------------------------------------------------------------------
 
-    /// W of the replay window: the setting, else max(64, 2 x (max_pipes +
-    /// H)), never below max_pipes + H.
+    /// W of the replay window: the setting, else max(64, 2 x (`max_pipes` +
+    /// H)), never below `max_pipes` + H.
     fn replay_width(&self) -> u64 {
         let held = self.cap() as u64;
         match self.config.replay_window {
-            crate::proto::session::Cap::Fixed(w) => w,
-            crate::proto::session::Cap::Auto => 64.max(held.saturating_mul(2)),
+            Cap::Fixed(w) => w,
+            Cap::Auto => 64.max(held.saturating_mul(2)),
         }
         .max(held)
     }
@@ -1355,7 +1365,7 @@ impl SessionCore {
 
     /// Whether a pipe ID of the local parity was taken by a local join;
     /// the bootstrap pair is the initiator's attachment 0. A frame naming
-    /// one that was not is a PROTOCOL_VIOLATION.
+    /// one that was not is a `PROTOCOL_VIOLATION`.
     pub(in crate::proto::session) fn local_id_taken(&self, id: u64) -> bool {
         let mp = self.mp();
         // A deferred join's ID is not taken until its Hello
@@ -1366,7 +1376,7 @@ impl SessionCore {
 
     /// Records a peer-parity ID as used: its bit is set, and a verified
     /// join raises h. When the window slides, used IDs that fall below it
-    /// lose their pending PIPE_ABANDON.
+    /// lose their pending `PIPE_ABANDON`.
     pub(in crate::proto::session) fn use_peer_id(&mut self, id: u64, verified_join: bool) {
         let mp = self.mp_mut();
         if verified_join {
@@ -1378,7 +1388,7 @@ impl SessionCore {
         self.views_changed();
     }
 
-    /// The cap of unretired attachments per joiner: max_pipes + H.
+    /// The cap of unretired attachments per joiner: `max_pipes` + H.
     pub(in crate::proto::session) fn cap(&self) -> usize {
         let held = u64::from(self.config.max_pipes.max(1))
             .saturating_add(u64::from(self.config.pipe_headroom));
@@ -1397,10 +1407,10 @@ impl SessionCore {
     /// Outside suspension there is room only below the cap. While
     /// SUSPENDED, a join that provides a direction the endpoint lacks
     /// displaces one attachment of the same joiner: the oldest failed one
-    /// whose own PIPE_ABANDON was acknowledged, else the oldest failed one
-    /// whose own PIPE_ABANDON was not (dropping it), else the live one with
-    /// the oldest last progress, failed without PIPE_ABANDON; each is
-    /// retired locally at once. Its PIPE_ABANDON goes with its state: one
+    /// whose own `PIPE_ABANDON` was acknowledged, else the oldest failed one
+    /// whose own `PIPE_ABANDON` was not (dropping it), else the live one with
+    /// the oldest last progress, failed without `PIPE_ABANDON`; each is
+    /// retired locally at once. Its `PIPE_ABANDON` goes with its state: one
     /// still queued is never written, and one in flight is not sent again
     /// when lost (its loss finds no attachment).
     pub(in crate::proto::session) fn room_predicted(
@@ -1460,7 +1470,9 @@ impl SessionCore {
         let Some(i) = pick else {
             return false;
         };
-        if !self.atts.at(i).failed() {
+        if self.atts.at(i).failed() {
+            self.retire_at_index(i, now);
+        } else {
             let id = self.atts.at(i).id();
             self.fail_attachment(id, PipeFailure::Aborted, now);
             let Some(i) = self.att_index(id) else {
@@ -1468,8 +1480,6 @@ impl SessionCore {
             };
             // Retired at once: no PIPE_ABANDON.
             self.atts.at_mut(i).drop_abandon();
-            self.retire_at_index(i, now);
-        } else {
             self.retire_at_index(i, now);
         }
         self.unretired(local) < cap
@@ -1496,7 +1506,7 @@ impl SessionCore {
 
     /// Adds a pipe that the local endpoint joins: `inbound`/`outbound` name the carrier's
     /// directions, `mode` its record mode, and `binding` the carrier's Binding exactly when
-    /// Bound. Each call takes a fresh pipe ID. While the endpoint has max_pipes + H
+    /// Bound. Each call takes a fresh pipe ID. While the endpoint has `max_pipes` + H
     /// unretired attachments of its own, or after a refusal until the join backoff has
     /// elapsed, the join is deferred ([`SessionCore::join_deferred`]);
     /// [`SessionCore::join_hello`] writes its Hello once allowed.
@@ -1905,7 +1915,7 @@ impl SessionCore {
     }
 
     /// The Reply said decision 1: the attachment is retired at once without any
-    /// PIPE_ABANDON and the join backoff begins.
+    /// `PIPE_ABANDON` and the join backoff begins.
     pub(in crate::proto::session) fn join_declined(&mut self, id: u64, now: Instant) {
         self.join_refused(now);
         self.fail_attachment(id, PipeFailure::JoinRefused, now);
@@ -1940,7 +1950,7 @@ impl SessionCore {
     }
 
     /// A peer-parity ID used without attachment state, with our
-    /// PIPE_ABANDON for it pending.
+    /// `PIPE_ABANDON` for it pending.
     pub(in crate::proto::session) fn add_unattached(
         &mut self,
         id: u64,
@@ -1953,8 +1963,8 @@ impl SessionCore {
 
     // ---- removal --------------------------------------------------------------------
 
-    /// Removes a pipe: gracefully (drain, PIPE_ABANDON(NO_ERROR)) or
-    /// abruptly (failure, reinjection, PIPE_ABANDON(ZMUX_PIPE_FAILED)).
+    /// Removes a pipe: gracefully (drain, `PIPE_ABANDON(NO_ERROR)`) or
+    /// abruptly (failure, reinjection, `PIPE_ABANDON(ZMUX_PIPE_FAILED)`).
     pub fn remove_pipe(
         &mut self,
         pipe: PipeId,
@@ -1990,7 +2000,7 @@ impl SessionCore {
 
     /// Removes `pipe` abruptly for a local resource limit or a carrier loop
     /// found after it was attached: it fails with
-    /// PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT), which makes the joiner back
+    /// `PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT)`, which makes the joiner back
     /// off, and affects no other attachment of its fate group.
     pub fn abandon_pipe_for_limit(&mut self, pipe: PipeId, now: Instant) {
         self.tick(now);
@@ -2015,7 +2025,7 @@ impl SessionCore {
     }
 
     /// Fails an attachment: reinjection, carriers closed,
-    /// PIPE_ABANDON(ZMUX_PIPE_FAILED) unless one was sent.
+    /// `PIPE_ABANDON(ZMUX_PIPE_FAILED)` unless one was sent.
     pub(in crate::proto::session) fn fail_attachment(
         &mut self,
         id: u64,
@@ -2215,7 +2225,7 @@ impl SessionCore {
 
     // ---- received pipe frames ---------------------------------------------------
 
-    /// PIPE_ABANDON.
+    /// `PIPE_ABANDON`.
     pub(in crate::proto::session) fn on_pipe_abandon(
         &mut self,
         id: u64,
@@ -2308,13 +2318,13 @@ impl SessionCore {
                 // Its carrier ended: nothing to close.
                 p.end_gracefully();
             }
-            if !closing {
+            if closing {
+                self.maybe_closed(now);
+            } else {
                 self.mp_mut().acks_mut().owe_now();
                 self.pipe_event(id, PipeHalf::Inbound);
                 self.try_retire(now);
                 self.after_pipe_change(now);
-            } else {
-                self.maybe_closed(now);
             }
             return;
         }
@@ -2340,7 +2350,7 @@ impl SessionCore {
         self.after_pipe_change(now);
     }
 
-    /// The exchange of PIPE_ABANDON frames progressed for an attachment:
+    /// The exchange of `PIPE_ABANDON` frames progressed for an attachment:
     /// start the inbound linger, close a drained pipe, retire.
     pub(in crate::proto::session) fn exchange_progress(&mut self, id: u64, now: Instant) {
         let linger = self.linger_timeout();
@@ -2458,7 +2468,7 @@ impl SessionCore {
 
     /// Whether the attachment `pipe` was retired and its state freed.
     pub fn pipe_retired(&self, pipe: PipeId) -> bool {
-        self.att(pipe.0).filter(|a| !a.unattached()).is_none()
+        self.att(pipe.0).is_none_or(Attachment::unattached)
             && self.mp.is_some()
             && self.is_retired(pipe.0)
     }
@@ -2765,7 +2775,7 @@ impl SessionCore {
                 .then(|| since(a.traffic_at().unwrap_or(created).max(created))),
             lanes_out: o.map_or(0, OutPipe::lane_count),
             lanes_in: i.map_or(0, InPipe::lane_count),
-            lanes_refused: o.and_then(OutPipe::lanes).map_or(0, |l| l.refused()),
+            lanes_refused: o.and_then(OutPipe::lanes).map_or(0, OutLanes::refused),
             lanes: crate::proto::session::lanes::lane_infos(o, i),
         }
     }
@@ -2802,7 +2812,7 @@ impl SessionCore {
     }
 
     /// Declares whether the pipe's carrier has a low-water mark
-    /// (TCP_NOTSENT_LOWAT, [`SessionCore::notsent_lowat`]), an optional carrier
+    /// (`TCP_NOTSENT_LOWAT`, [`SessionCore::notsent_lowat`]), an optional carrier
     /// capability: the carrier queue limiter does not pace it. When it stops
     /// taking bytes it may still hold up to the mark plus the last write, which
     /// the driver reports as U ([`SessionCore::pipe_write`]); carriers that
@@ -2848,15 +2858,16 @@ impl SessionCore {
     /// The carrier of lane `at` took `bytes` of the batch being written
     /// there (the driver tells the bytes of its write calls, at the latest
     /// before it takes the lane's next batch): what is left of the batch
-    /// stays in Q_p, the bytes of the write calls in progress, until the
+    /// stays in `Q_p`, the bytes of the write calls in progress, until the
     /// carrier took it all. `now` is when the carrier took them: the linger
-    /// of a close runs from the delivery of CONNECTION_CLOSE.
+    /// of a close runs from the delivery of `CONNECTION_CLOSE`.
     pub fn pipe_written(&mut self, at: impl Into<LaneId>, bytes: u64, now: Instant) {
         self.tick(now);
         let at = at.into();
         if let Some(o) = self.out_mut(at.pipe.0) {
             o.written(at.lane.0, bytes);
         }
+        self.settle_pipe(at.pipe.0, now);
         // The linger runs from the delivery of CONNECTION_CLOSE to the
         // carriers, not from its queueing.
         if self.state == State::Closing && !self.linger_from_delivery && self.close_handed_off() {
@@ -2867,7 +2878,7 @@ impl SessionCore {
 
     // ---- failure detection ----------------------------------------------------------
 
-    /// T_suspect, T_fail and D of an outbound pipe.
+    /// `T_suspect`, `T_fail` and D of an outbound pipe.
     pub(in crate::proto::session) fn limits(&self, o: &OutPipe) -> (Duration, Duration, Duration) {
         let mad = self.mp().peer_mad;
         let base = o.est().pto(mad) + o.queue_term();
@@ -3062,7 +3073,7 @@ impl SessionCore {
         }
     }
 
-    /// When the outbound pipe `o` of `a` is due for a PIPE_PING, measured
+    /// When the outbound pipe `o` of `a` is due for a `PIPE_PING`, measured
     /// from its last ack-eliciting byte or from when it became ACTIVE;
     /// `None` when it is never probed for idleness.
     ///
@@ -3087,11 +3098,15 @@ impl SessionCore {
     /// The current idle-probe wait of the outbound pipe `o` of `a`; `None` when it is not probed
     /// for idleness. k is the pipe's interval, else the session's (zero: none); an attachment
     /// without an outbound direction at the peer uses at most the 15 s constant, and is always
-    /// probed. The deadline is measured to the carrier: k_eff = max(1 s, k - H_p), H_p the longest
+    /// probed. The deadline is measured to the carrier: `k_eff` = max(1 s, k - `H_p`), `H_p` the longest
     /// shaping delay of one record as bounded when the wait starts. With the jitter j and the
-    /// wait's draw u the wait is k_eff (1 - j u), and k_eff u for the first wait of a bootstrap
-    /// pipe (no PIPE_PING sent on it by either end) when j > 0; a joined pipe carried the joiner's
-    /// PIPE_PING, so both of its ends draw as usual.
+    /// wait's draw u the wait is `k_eff` (1 - j u), and `k_eff` u for the first wait of a bootstrap
+    /// pipe (no `PIPE_PING` sent on it by either end) when j > 0; a joined pipe carried the joiner's
+    /// `PIPE_PING`, so both of its ends draw as usual.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "names follow the probe-wait formula: k interval, j jitter, u draw, h hold, f factor"
+    )]
     fn probe_wait(&self, a: &Attachment, o: &OutPipe) -> Option<Duration> {
         let (interval, jitter, u, usual) = o.probe_settings();
         // The pipe's interval, else the session's; off: no idle probes.
@@ -3112,7 +3127,7 @@ impl SessionCore {
         Some(Duration::try_from_secs_f64(k.as_secs_f64() * f).unwrap_or(k))
     }
 
-    /// H_p of pipe `pipe`: the longest time one record that carries no
+    /// `H_p` of pipe `pipe`: the longest time one record that carries no
     /// urgent frame may be held between being built and being handed to
     /// the carrier, as bounded now (when a probe wait starts): the shaping
     /// limits' bound on one delay and on the rest of the total; zero
@@ -3140,8 +3155,8 @@ impl SessionCore {
                 .is_some_and(|t| a.send_tier() > t.priority)
     }
 
-    /// A traffic frame (STREAM, RESET_STREAM, RESET_STREAM_AT,
-    /// STOP_SENDING or DATAGRAM) was sent or received on pipe `id`: the
+    /// A traffic frame (STREAM, `RESET_STREAM`, `RESET_STREAM_AT`,
+    /// `STOP_SENDING` or DATAGRAM) was sent or received on pipe `id`: the
     /// pipe's traffic clock restarts, and the session is busy for the
     /// busy window. A quiet session that becomes busy probes at once
     /// each backup pipe without an ack-eliciting byte for
@@ -3180,9 +3195,9 @@ impl SessionCore {
         }
     }
 
-    /// The T_fail and D limits that apply to a suspect pipe: T_fail only
+    /// The `T_fail` and D limits that apply to a suspect pipe: `T_fail` only
     /// with another ACTIVE pipe or with resume; the last usable pipe uses
-    /// max(T_suspect, DeadTimeout) when set.
+    /// `max(T_suspect`, `DeadTimeout`) when set.
     ///
     /// Under the floor and dead timeout in force when the pipe turned
     /// suspect: a later change applies from its next suspicion.
@@ -3206,14 +3221,16 @@ impl SessionCore {
         }
     }
 
-    /// The inbound silence limit L_in of an attachment's inbound pipe, when
+    /// The inbound silence limit `L_in` of an attachment's inbound pipe, when
     /// the rule applies.
     fn silence_limit(&self, a: &Attachment) -> Option<Duration> {
         let p = a.inp()?;
         if p.state() != InState::Open || a.out().is_some() {
             return None;
         }
-        let n_in = self.atts.iter().filter(|x| x.in_live()).count() as u32;
+        let n_in =
+            u32::try_from(self.atts.iter().filter(|x| x.in_live()).count()).unwrap_or(u32::MAX);
+
         let srtt_max = self
             .atts
             .outs()
@@ -3452,16 +3469,16 @@ impl SessionCore {
 /// A credit frame owed again on a second pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreditCopy {
-    /// MAX_DATA.
+    /// `MAX_DATA`.
     Session,
-    /// MAX_STREAMS of a direction index.
+    /// `MAX_STREAMS` of a direction index.
     Streams(usize),
-    /// MAX_STREAM_DATA of a stream.
+    /// `MAX_STREAM_DATA` of a stream.
     Stream(StreamKey),
 }
 
 /// The order in which attachments are displaced at the cap, lowest first: failed ones
-/// whose own PIPE_ABANDON was acknowledged, then failed ones whose own PIPE_ABANDON was
+/// whose own `PIPE_ABANDON` was acknowledged, then failed ones whose own `PIPE_ABANDON` was
 /// not, each oldest first; only then live ones, the oldest last progress first.
 fn displacement_rank(
     failed: bool,

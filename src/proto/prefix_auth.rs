@@ -107,11 +107,13 @@ impl PrefixAuth {
     }
 
     /// Whether tokens are bound to the carrier's TLS handshake.
+    #[must_use]
     pub fn binds_tls(&self) -> bool {
         self.bind_tls
     }
 
     /// The request header field of the header form.
+    #[must_use]
     pub fn header_name(&self) -> &str {
         &self.header
     }
@@ -158,11 +160,13 @@ impl PrefixAuth {
 
     /// `token` in the header form: base64url without padding, 43
     /// characters.
+    #[must_use]
     pub fn header_value(token: &[u8; PREFIX_TOKEN_LEN]) -> String {
         oob::encode_string(token)
     }
 
     /// The token for time `unix` (seconds since the epoch) and `nonce`.
+    #[must_use]
     pub fn token_at(
         &self,
         binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>,
@@ -201,6 +205,7 @@ impl PrefixAuthVerifier {
     /// A verifier of `auth`'s tokens that accepts the slots within `skew`
     /// of its current one and records at most `max_nonces` Nonces; a token
     /// that finds the record full is not accepted.
+    #[must_use]
     pub fn new(auth: PrefixAuth, skew: u32, max_nonces: usize) -> Self {
         let skew = u64::from(skew);
         let slot = auth.slot;
@@ -319,6 +324,10 @@ impl CarrierCredential for PrefixAuth {
 }
 
 /// Slot (64) || Binding Length (8).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a binding is PREFIX_AUTH_BINDING_LEN (32) bytes or empty"
+)]
 fn slot_header(slot: u64, binding_len: usize) -> [u8; 9] {
     let mut h = [0u8; 9];
     h[..8].copy_from_slice(&slot.to_be_bytes());
@@ -351,7 +360,7 @@ mod tests {
     ];
 
     fn binding() -> [u8; 32] {
-        std::array::from_fn(|i| i as u8)
+        std::array::from_fn(|i| u8::try_from(i).unwrap())
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The QMux-02 frames QX_TRANSPORT_PARAMETERS (Section 4.2) and QX_PING
+//! The QMux-02 frames `QX_TRANSPORT_PARAMETERS` (Section 4.2) and `QX_PING`
 //! (Section 4.3).
 
 use super::{Fail, FrameType};
@@ -7,7 +7,7 @@ use crate::proto::error::EncodeError;
 use crate::proto::params::TransportParameters;
 use crate::proto::varint::len as vlen;
 
-/// QX_TRANSPORT_PARAMETERS (0x3f5153300d0a0d0a in QMux-02,
+/// `QX_TRANSPORT_PARAMETERS` (0x3f5153300d0a0d0a in QMux-02,
 /// [`crate::proto::draft`]), carrying an encoded
 /// transport-parameter block.
 ///
@@ -21,6 +21,7 @@ pub struct QxTransportParameters<'a> {
 
 impl<'a> QxTransportParameters<'a> {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         8 + vlen(self.block.len() as u64) + self.block.len()
     }
@@ -46,7 +47,7 @@ impl<'a> QxTransportParameters<'a> {
     }
 }
 
-/// QX_PING (0x348c67529ef8c7bd request, 0x348c67529ef8c7be response in
+/// `QX_PING` (0x348c67529ef8c7bd request, 0x348c67529ef8c7be response in
 /// QMux-02, [`crate::proto::draft`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QxPing {
@@ -66,6 +67,7 @@ impl QxPing {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         8 + vlen(self.sequence)
     }

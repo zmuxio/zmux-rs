@@ -37,7 +37,7 @@ impl Wt {
             .with_no_client_auth()
             .with_single_cert(vec![der.clone()], key)
             .unwrap();
-        tls.alpn_protocols = alpn.clone();
+        tls.alpn_protocols.clone_from(&alpn);
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
         ));
@@ -93,11 +93,19 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
             for r in readers {
                 let data = r.await.unwrap();
                 assert_eq!(data.len(), len);
-                assert!(data.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+                assert!(
+                    data.iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
+                );
             }
         })
     };
-    let data = bytes::Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let data = bytes::Bytes::from(
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>(),
+    );
     let mut writers = Vec::new();
     for _ in 0..n {
         let mut send = from.open_uni().await.unwrap();

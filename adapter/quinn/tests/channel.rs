@@ -199,13 +199,21 @@ async fn paced(from: &Session, to: &Session, n: usize) -> Vec<Duration> {
                 tokio::time::timeout(Duration::from_millis(1500), to.read_datagram()).await
             {
                 let sent = u64::from_be_bytes(d[..8].try_into().unwrap());
-                lat.push(start.elapsed() - Duration::from_micros(sent));
+                lat.push(
+                    start
+                        .elapsed()
+                        .checked_sub(Duration::from_micros(sent))
+                        .unwrap(),
+                );
             }
             lat
         })
     };
     for _ in 0..n {
-        let mut d = (start.elapsed().as_micros() as u64).to_be_bytes().to_vec();
+        let mut d = u64::try_from(start.elapsed().as_micros())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
         d.resize(200, 1);
         from.send_datagram(Bytes::from(d)).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -315,15 +323,16 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
         }
         for round in 0..10u8 {
             for (i, (cs, ss)) in pairs.iter().enumerate() {
-                cs.send_datagram(Bytes::from(vec![i as u8, round])).unwrap();
-                ss.send_datagram(Bytes::from(vec![i as u8, round, 1]))
+                cs.send_datagram(Bytes::from(vec![u8::try_from(i).unwrap(), round]))
+                    .unwrap();
+                ss.send_datagram(Bytes::from(vec![u8::try_from(i).unwrap(), round, 1]))
                     .unwrap();
             }
             for (i, (cs, ss)) in pairs.iter().enumerate() {
                 let d = ss.read_datagram().await.unwrap();
-                assert_eq!(&d[..], [i as u8, round]);
+                assert_eq!(&d[..], [u8::try_from(i).unwrap(), round]);
                 let d = cs.read_datagram().await.unwrap();
-                assert_eq!(&d[..], [i as u8, round, 1]);
+                assert_eq!(&d[..], [u8::try_from(i).unwrap(), round, 1]);
             }
         }
         for (cs, ss) in &pairs {

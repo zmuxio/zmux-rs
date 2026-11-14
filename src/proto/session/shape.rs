@@ -26,7 +26,9 @@ use super::{CarrierKind, PipeId, SessionCore};
 static ZERO: [u8; 65535] = [0; 65535];
 
 /// No release is scheduled closer than this.
-const GRANULARITY: Duration = Duration::from_millis(1);
+const GRANULARITY: Duration = Duration::from_micros(GRANULARITY_US);
+/// [`GRANULARITY`] in microseconds, the shaper clock.
+const GRANULARITY_US: u64 = 1_000;
 
 pub(crate) struct Shaping {
     factory: Option<Arc<dyn Factory>>,
@@ -69,7 +71,7 @@ struct PipeShape {
     /// Of those, what the account already metered.
     added_paid: usize,
     /// The planned record's earliest send time (`RecordPlan::delay`):
-    /// until then the pipe sends nothing but CONNECTION_CLOSE, and the
+    /// until then the pipe sends nothing but `CONNECTION_CLOSE`, and the
     /// frames owed meanwhile wait in that record.
     delay_until: Option<Instant>,
     /// Stream data waits until then (a gate's pause).
@@ -124,7 +126,7 @@ impl PipeShape {
     }
 
     /// Whether the planned record waits for its delay: it has not passed,
-    /// and `ack` (the deadline of a PIPE_ACK the record carries, see
+    /// and `ack` (the deadline of a `PIPE_ACK` the record carries, see
     /// [`SessionCore::ack_release`]) has not either.
     fn delayed(&self, now: Instant, ack: Option<Instant>) -> bool {
         self.shaper.is_some()
@@ -141,7 +143,7 @@ impl PipeShape {
 }
 
 impl Shaping {
-    /// H_p: the longest the next pause may
+    /// `H_p`: the longest the next pause may
     /// last; zero when none may or nothing bounds one.
     pub(super) fn hold_bound(&self) -> Duration {
         if self.limits.no_pause {
@@ -150,7 +152,7 @@ impl Shaping {
         self.limits.max_delay.unwrap_or(Duration::ZERO)
     }
 
-    /// H_p of `pipe`: [`Self::hold_bound`] for a
+    /// `H_p` of `pipe`: [`Self::hold_bound`] for a
     /// pipe whose shaper plans its records, zero for any other.
     pub(super) fn probe_hold(&self, pipe: u64) -> Duration {
         let planned = self.index(pipe).is_some_and(|i| {
@@ -247,7 +249,7 @@ impl Shaping {
     /// instance when it has none of the current generation.
     pub(super) fn active(
         &mut self,
-        shaped: ShapedPipe,
+        shaped: &ShapedPipe,
         now: Instant,
         record: usize,
     ) -> Option<usize> {
@@ -256,7 +258,7 @@ impl Shaping {
             Some(i) if self.pipes[i].generation == self.generation => i,
             _ => {
                 let x = self.factory.clone().and_then(|f| {
-                    catch_unwind(AssertUnwindSafe(|| f.shaper(&shaped))).unwrap_or_else(|_| {
+                    catch_unwind(AssertUnwindSafe(|| f.shaper(shaped))).unwrap_or_else(|_| {
                         self.stats.faults += 1;
                         None
                     })
@@ -274,18 +276,15 @@ impl Shaping {
         now: Instant,
         record: usize,
     ) -> usize {
-        let i = match self.index(pipe) {
-            Some(i) => {
-                let e = Event::new(EventKind::Replaced, PipeId(pipe), self.micros(now));
-                self.event(i, e, record);
-                self.settle_held(i, self.micros(now));
-                self.pipes[i] = PipeShape::new(pipe, self.generation);
-                i
-            }
-            None => {
-                self.pipes.push(PipeShape::new(pipe, self.generation));
-                self.pipes.len() - 1
-            }
+        let i = if let Some(i) = self.index(pipe) {
+            let e = Event::new(EventKind::Replaced, PipeId(pipe), self.micros(now));
+            self.event(i, e, record);
+            self.settle_held(i, self.micros(now));
+            self.pipes[i] = PipeShape::new(pipe, self.generation);
+            i
+        } else {
+            self.pipes.push(PipeShape::new(pipe, self.generation));
+            self.pipes.len() - 1
         };
         let Some(x) = x else {
             return i;
@@ -362,7 +361,7 @@ impl Shaping {
             let (burst, raised) = burst_floor(g.burst, record as u64);
             let p = &self.pipes[i];
             let rate = g.rate.min(MAX_ACCOUNT_RATE);
-            let rated = p.rate_asked != rate || p.bucket.burst != burst as i64;
+            let rated = p.rate_asked != rate || p.bucket.burst != burst.cast_signed();
             // Only what extends the pauses asked for so far counts: an answer repeats its
             // pause_until, and a limit may have shortened that pause.
             let asked = p.paused_until;
@@ -384,7 +383,7 @@ impl Shaping {
                 self.pipes[i].bucket.fill(us);
                 self.settle_held(i, us);
                 self.pipes[i].rate_asked = rate;
-                self.pipes[i].bucket.burst = burst as i64;
+                self.pipes[i].bucket.burst = burst.cast_signed();
                 self.set_rate(i);
                 self.pipes[i].bucket.reset(us);
             }
@@ -422,7 +421,7 @@ impl Shaping {
         self.pipes[i].inject_due = false;
         let e = Event::new(EventKind::InjectDropped, PipeId(self.pipes[i].pipe), us);
         self.event(i, e, record);
-        let next = us.saturating_add(GRANULARITY.as_micros() as u64);
+        let next = us.saturating_add(GRANULARITY_US);
         if let Some(x) = self.pipes[i].inject.as_mut().filter(|x| x.at < next) {
             x.at = next;
         }
@@ -472,6 +471,12 @@ impl Shaping {
         t.max(now + GRANULARITY)
     }
 
+    /// The shaper weight of `pipe`: `None` when the pipe has no shaper, `Some(None)` when
+    /// its shaper sets no weight.
+    #[allow(
+        clippy::option_option,
+        reason = "no shaper and a shaper without a weight differ for the scheduler"
+    )]
     pub(super) fn weight(&self, pipe: u64) -> Option<Option<u32>> {
         let p = &self.pipes[self.index(pipe)?];
         p.shaper.is_some().then_some(p.weight)
@@ -498,11 +503,11 @@ impl Shaping {
         if p.bucket.rate == 0 {
             return None;
         }
-        Some(p.bucket.tokens.max(0) as u64)
+        Some(p.bucket.tokens.max(0).cast_unsigned())
     }
 
     /// The earliest shaping deadline; `data` whether stream data waits,
-    /// `ack` the deadline of a PIPE_ACK a pipe's next record carries.
+    /// `ack` the deadline of a `PIPE_ACK` a pipe's next record carries.
     pub(super) fn deadline(
         &self,
         now: Instant,
@@ -551,7 +556,7 @@ impl Shaping {
                 // Not replaced: not again at once, or the deadline stays in the past.
                 let p = &mut self.pipes[i];
                 if p.wake == Some(w) {
-                    p.wake = Some(t.saturating_add(GRANULARITY.as_micros() as u64));
+                    p.wake = Some(t.saturating_add(GRANULARITY_US));
                 }
             }
             let p = &mut self.pipes[i];
@@ -600,7 +605,7 @@ pub(super) struct ShapeTx {
     now: Instant,
     /// The carrier's write overhead.
     overhead: usize,
-    /// The deadline of a PIPE_ACK the batch's records carry: a shaping
+    /// The deadline of a `PIPE_ACK` the batch's records carry: a shaping
     /// delay ends there.
     ack: Option<Instant>,
     /// The largest frames length of the open plan; 0: none.
@@ -836,7 +841,7 @@ impl SessionCore {
             .collect();
         let s = self.shape.as_deref_mut().expect("present");
         for p in pipes {
-            s.active(p, now, record);
+            s.active(&p, now, record);
         }
     }
 
@@ -958,7 +963,7 @@ impl SessionCore {
 
     /// The kind of pipe `pipe`'s carrier ([`SessionCore::set_pipe_carrier`]).
     pub fn pipe_carrier(&self, pipe: PipeId) -> Option<CarrierKind> {
-        self.att(pipe.0).and_then(|a| a.carrier())
+        self.att(pipe.0).and_then(Attachment::carrier)
     }
 
     /// Installs `shaper` on an outbound pipe until the next
@@ -1006,7 +1011,7 @@ impl SessionCore {
             .map_or(ShapedPipe::new(PipeId(id), None), Attachment::shaped);
         let overhead = usize::from(shaped.write_overhead);
         let mut s = self.shape.take()?;
-        let Some(i) = s.active(shaped, now, limit) else {
+        let Some(i) = s.active(&shaped, now, limit) else {
             self.shape = Some(s);
             return None;
         };
@@ -1034,13 +1039,17 @@ impl SessionCore {
     }
 
     /// Takes the shaping state back from a batch.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the batch notation: w the records, t the lent state, s the shaper, p its pipe, e an event"
+    )]
     pub(super) fn shape_return(&mut self, w: &mut Records<'_>) {
         let Some(mut t) = w.shape.take() else {
             return;
         };
         let p = &mut t.s.pipes[t.i];
         if p.bucket.rate > 0 {
-            p.bucket.tokens -= (t.spent - t.gate_spent) as i64;
+            p.bucket.tokens -= (t.spent - t.gate_spent).cast_signed();
         }
         let record = w.max_record();
         let mut s = t.s;
@@ -1055,6 +1064,10 @@ impl SessionCore {
     /// or as a record of PADDING only within the limit on such records (16 per second) toward
     /// a peer not known to be a zmux endpoint. What a limit, the account or that rule refuses is
     /// dropped; only a batch without room defers it, before anything is charged.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the batch notation: w the records, t the lent state, i the pipe index, p the pipe, x the injection"
+    )]
     pub(super) fn shape_inject(&mut self, w: &mut Records<'_>) {
         let record = w.max_record();
         let Some(t) = w.shape.as_mut() else {
@@ -1171,7 +1184,7 @@ impl SessionCore {
     }
 
     /// Whether the planned record of pipe `id` waits for its delay: the
-    /// pipe sends nothing but CONNECTION_CLOSE until then.
+    /// pipe sends nothing but `CONNECTION_CLOSE` until then.
     pub(super) fn shape_delayed(&self, id: u64) -> bool {
         self.shape
             .as_deref()

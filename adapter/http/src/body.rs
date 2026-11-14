@@ -266,6 +266,7 @@ enum Inner {
 
 impl PipeBody {
     /// A body without data.
+    #[must_use]
     pub fn empty() -> Self {
         Self(Inner::Fixed(None))
     }
@@ -360,10 +361,7 @@ impl Body for PipeBody {
                     "request redirected",
                 ))));
             }
-            if !s.chunks.is_empty() {
-                let c = std::mem::take(&mut s.chunks);
-                (Poll::Ready(Some(Ok(Frame::data(c)))), s.writer.take())
-            } else {
+            if s.chunks.is_empty() {
                 match s.end {
                     Some(End::Finish) => (Poll::Ready(None), None),
                     Some(End::Abort) => (
@@ -378,6 +376,9 @@ impl Body for PipeBody {
                         (Poll::Pending, None)
                     }
                 }
+            } else {
+                let c = std::mem::take(&mut s.chunks);
+                (Poll::Ready(Some(Ok(Frame::data(c)))), s.writer.take())
             }
         };
         if let Some(w) = waker {

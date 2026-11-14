@@ -12,7 +12,7 @@
 //! without copying; and charges the limiter with what `w` took. Every wait
 //! also watches both parts, so that an end or an error never waits behind
 //! capacity: the waits register the task with `r` (data, FIN, reset, the
-//! session's end) and with `w` (STOP_SENDING, the session's end) at once.
+//! session's end) and with `w` (`STOP_SENDING`, the session's end) at once.
 //!
 //! At most one chunk per direction is held, between the read and the
 //! moment `w` takes it; the backlog stays in `r`'s receive buffer, where
@@ -68,6 +68,8 @@ pub struct SpliceOptions {
     pub a_to_b: Option<Arc<dyn Limiter>>,
     /// Limits what is forwarded from `b` to `a`.
     pub b_to_a: Option<Arc<dyn Limiter>>,
+    /// Ends the splice with a chosen code when aborted ([`SpliceAbort`]).
+    pub abort: Option<SpliceAbort>,
 }
 
 impl Default for SpliceOptions {
@@ -76,6 +78,7 @@ impl Default for SpliceOptions {
             chunk: CHUNK,
             a_to_b: None,
             b_to_a: None,
+            abort: None,
         }
     }
 }
@@ -86,6 +89,7 @@ impl fmt::Debug for SpliceOptions {
             .field("chunk", &self.chunk)
             .field("a_to_b", &self.a_to_b.is_some())
             .field("b_to_a", &self.b_to_a.is_some())
+            .field("abort", &self.abort)
             .finish()
     }
 }
@@ -102,14 +106,116 @@ pub enum SpliceEnd {
     Reset(VarInt),
     /// The downstream part was stopped with this code; the upstream part
     /// was stopped with it. A downstream stream refused after the peer's
-    /// GOAWAY counts as stopped with ZMUX_REJECTED.
+    /// GOAWAY counts as stopped with `ZMUX_REJECTED`.
     Stopped(VarInt),
     /// The upstream session ended: the downstream part was reset with
-    /// ZMUX_CARRIER_FAILED.
+    /// `ZMUX_CARRIER_FAILED`.
     UpstreamLost,
     /// The downstream session ended: the upstream part was stopped with
-    /// ZMUX_CARRIER_FAILED.
+    /// `ZMUX_CARRIER_FAILED`.
     DownstreamLost,
+    /// The splice was aborted with this code ([`SpliceAbort::abort`]): the
+    /// downstream part was reset and the upstream part stopped with it.
+    Cancelled(VarInt),
+}
+
+/// Aborts splices with a chosen application error code: what dropping the
+/// splice's future does, but with that code, and with a result.
+///
+/// Created with [`SpliceAbort::new`] and given to one or more splices in
+/// [`SpliceOptions::abort`]; clones share the handle. The first
+/// [`abort`](Self::abort) decides the code; later calls change nothing. A
+/// splice given an aborted handle, at its start or later, resets both
+/// downstream sending parts and stops both upstream receiving parts with
+/// the code, in each direction still running, discards what it holds and
+/// completes with [`SpliceEnd::Cancelled`] for those directions (one that
+/// had already ended keeps its end). Dropping the future instead still
+/// resets the streams with `ZMUX_CANCELLED` and stops them with code 0,
+/// and gives no result.
+#[derive(Clone, Default)]
+pub struct SpliceAbort(Arc<Mutex<AbortState>>);
+
+#[derive(Default)]
+struct AbortState {
+    code: Option<VarInt>,
+    next: u64,
+    wakers: Vec<(u64, Waker)>,
+}
+
+impl SpliceAbort {
+    /// A handle not aborted yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Aborts every splice given this handle with `code` (any code, 0
+    /// included); idempotent, the first code stays.
+    pub fn abort(&self, code: VarInt) {
+        let wakers = {
+            let mut st = lock_abort(&self.0);
+            if st.code.is_some() {
+                return;
+            }
+            st.code = Some(code);
+            std::mem::take(&mut st.wakers)
+        };
+        for (_, w) in wakers {
+            w.wake();
+        }
+    }
+
+    /// The code of the abort, once aborted.
+    #[must_use]
+    pub fn code(&self) -> Option<VarInt> {
+        lock_abort(&self.0).code
+    }
+
+    /// The code once aborted; otherwise registers the waker of the splice
+    /// `slot` (assigned on its first call).
+    fn poll(&self, slot: &mut Option<u64>, waker: &Waker) -> Option<VarInt> {
+        let mut st = lock_abort(&self.0);
+        if st.code.is_some() {
+            return st.code;
+        }
+        let id = *slot.get_or_insert_with(|| {
+            st.next += 1;
+            st.next
+        });
+        match st.wakers.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, w)) => w.clone_from(waker),
+            None => st.wakers.push((id, waker.clone())),
+        }
+        None
+    }
+
+    fn forget(&self, slot: Option<u64>) {
+        if let Some(id) = slot {
+            lock_abort(&self.0).wakers.retain(|(i, _)| *i != id);
+        }
+    }
+}
+
+impl fmt::Debug for SpliceAbort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SpliceAbort").field(&self.code()).finish()
+    }
+}
+
+fn lock_abort(m: &Mutex<AbortState>) -> MutexGuard<'_, AbortState> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes a splice's waker from its abort handle when the splice ends or
+/// is dropped.
+struct AbortSlot<'a>(Option<&'a SpliceAbort>, Option<u64>);
+
+impl Drop for AbortSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(a) = self.0 {
+            a.forget(self.1);
+        }
+    }
 }
 
 /// What one direction forwarded (Result).
@@ -181,17 +287,18 @@ impl std::error::Error for SpliceError {}
 ///
 /// The application opens the outbound stream with the inbound stream's
 /// preamble ([`RecvStream::preamble`](RecvStream#method.preamble), [`Session::open_bi_with`](crate::Session#method.open_bi_with)),
-/// adjusted as its conventions say (PIPE_CARRIER and the application TLVs
+/// adjusted as its conventions say (`PIPE_CARRIER` and the application TLVs
 /// come with it). Ends and errors propagate per direction, codes
 /// unchanged:
 ///
 /// | Event | Action |
 /// |---|---|
 /// | FIN read upstream | finish downstream after the data before it |
-/// | upstream reset (code c, Reliable Size s) | the bytes below s are forwarded without waiting for capacity, made reliable downstream, and the downstream part reset with c; towards a peer without RESET_STREAM_AT, once they were passed to its carrier |
+/// | upstream reset (code c, Reliable Size s) | the bytes below s are forwarded without waiting for capacity, made reliable downstream, and the downstream part reset with c; towards a peer without `RESET_STREAM_AT`, once they were passed to its carrier |
 /// | downstream stopped with c | stop upstream with c |
-/// | either session ends | reset and stop the other side's stream with ZMUX_CARRIER_FAILED |
-/// | the future is dropped | reset both streams with ZMUX_CANCELLED and stop them with code 0 |
+/// | either session ends | reset and stop the other side's stream with `ZMUX_CARRIER_FAILED` |
+/// | the future is dropped | reset both streams with `ZMUX_CANCELLED` and stop them with code 0 |
+/// | [`SpliceOptions::abort`] aborted with c | reset both streams and stop them with c; the result reports [`SpliceEnd::Cancelled`] |
 ///
 /// Stream datagrams are forwarded to the other stream with their context,
 /// without waiting and without a queue of the helper's own: the
@@ -209,6 +316,11 @@ impl std::error::Error for SpliceError {}
 ///
 /// Refuses ([`SpliceError::SameStream`]) a direction from a stream into
 /// itself; the streams are then released (code 0).
+///
+/// # Errors
+///
+/// [`SpliceError::SameStream`], as above; how each direction ended is in
+/// the [`Spliced`] result, not an error.
 pub async fn splice(
     a: (SendStream, RecvStream),
     b: (SendStream, RecvStream),
@@ -240,6 +352,10 @@ pub async fn splice(
 ///
 /// A capsule is never turned into a datagram: what was sent reliably stays
 /// reliable.
+///
+/// # Errors
+///
+/// As [`splice`].
 pub async fn splice_packets(
     a: (SendStream, RecvStream),
     b: (SendStream, RecvStream),
@@ -290,7 +406,18 @@ async fn splice_with(
         ));
         let (mut dg_ab_done, mut dg_ba_done) = (false, false);
         let (mut ab_end, mut ba_end) = (None, None);
+        let mut slot = AbortSlot(opts.abort.as_ref(), None);
         poll_fn(|cx| {
+            if let Some(a) = slot.0
+                && let Some(c) = a.poll(&mut slot.1, cx.waker())
+            {
+                for (d, end) in [(&mut ab, &mut ab_end), (&mut ba, &mut ba_end)] {
+                    if end.is_none() {
+                        d.abort(c);
+                        *end = Some(SpliceEnd::Cancelled(c));
+                    }
+                }
+            }
             // Datagrams first: a capsule they queued is written by the
             // direction in the same poll.
             if !dg_ab_done {
@@ -345,6 +472,10 @@ fn charge(limiter: Option<&dyn Limiter>, n: usize) {
 }
 
 /// The largest datagram payload a session carries.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the largest record size is 65535, inside usize"
+)]
 const MAX_DATAGRAM: usize = crate::proto::params::ZMUX_MAX_RECORD_SIZE as usize;
 
 /// The datagrams of one direction.
@@ -410,7 +541,7 @@ impl Inserts {
 }
 
 fn lock(m: &Mutex<Inserts>) -> MutexGuard<'_, Inserts> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Forwards the stream datagrams of `r` to `w` until `r` can carry no more
@@ -482,7 +613,7 @@ enum Phase {
         code: VarInt,
         reliable: u64,
     },
-    /// Towards a peer without RESET_STREAM_AT: the reset waits until the
+    /// Towards a peer without `RESET_STREAM_AT`: the reset waits until the
     /// forwarded bytes were passed to the carrier.
     Flush {
         code: VarInt,
@@ -598,7 +729,7 @@ impl<'a> Direction<'a> {
             }
             Poll::Ready(Ok(Upstream::Readable(n))) => n,
             Poll::Ready(Err(e)) => {
-                self.upstream_failed(e);
+                self.upstream_failed(&e);
                 return Poll::Ready(());
             }
             Poll::Pending => {
@@ -610,7 +741,7 @@ impl<'a> Direction<'a> {
         let capacity = match self.w.poll_capacity_with(waker, m as u64) {
             Poll::Ready(Ok(c)) => usize::try_from(c).unwrap_or(usize::MAX),
             Poll::Ready(Err(e)) => {
-                self.downstream_failed(e);
+                self.downstream_failed(&e);
                 return Poll::Ready(());
             }
             Poll::Pending => return Poll::Pending,
@@ -636,7 +767,7 @@ impl<'a> Direction<'a> {
             // The end, seen again by the next step.
             Poll::Ready(Ok(None)) => Poll::Ready(()),
             Poll::Ready(Err(e)) => {
-                self.upstream_failed(e);
+                self.upstream_failed(&e);
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
@@ -714,7 +845,7 @@ impl<'a> Direction<'a> {
                     }
                 }
             }
-            Poll::Ready(Err(e)) => self.downstream_failed(e),
+            Poll::Ready(Err(e)) => self.downstream_failed(&e),
             Poll::Pending => return Poll::Pending,
         }
         Poll::Ready(())
@@ -726,7 +857,7 @@ impl<'a> Direction<'a> {
         match self.w.watch(waker) {
             Ok(()) => Poll::Pending,
             Err(e) => {
-                self.downstream_failed(e);
+                self.downstream_failed(&e);
                 Poll::Ready(())
             }
         }
@@ -742,7 +873,7 @@ impl<'a> Direction<'a> {
                 true
             }
             Err(e) => {
-                self.upstream_failed(e);
+                self.upstream_failed(&e);
                 true
             }
         }
@@ -761,9 +892,9 @@ impl<'a> Direction<'a> {
         let _ = self.r.poll_read_chunk(waker, 1);
         match self.w.finish_shared() {
             Ok(()) | Err(StreamError::ClosedLocally) => {
-                self.phase = Phase::Done(SpliceEnd::Finished)
+                self.phase = Phase::Done(SpliceEnd::Finished);
             }
-            Err(e) => self.downstream_failed(e),
+            Err(e) => self.downstream_failed(&e),
         }
     }
 
@@ -815,7 +946,7 @@ impl<'a> Direction<'a> {
             let capacity = match self.w.poll_capacity_with(waker, m as u64) {
                 Poll::Ready(Ok(c)) => usize::try_from(c).unwrap_or(usize::MAX),
                 Poll::Ready(Err(e)) => {
-                    self.downstream_failed(e);
+                    self.downstream_failed(&e);
                     return Poll::Ready(());
                 }
                 Poll::Pending => return Poll::Pending,
@@ -832,7 +963,7 @@ impl<'a> Direction<'a> {
                 // the session ended before it arrived.
                 Poll::Ready(Ok(None) | Err(StreamError::Reset { .. } | StreamError::Rejected)) => {}
                 Poll::Ready(Err(e)) => {
-                    self.upstream_failed(e);
+                    self.upstream_failed(&e);
                     return Poll::Ready(());
                 }
                 Poll::Pending => return self.watch_downstream(waker),
@@ -856,12 +987,12 @@ impl<'a> Direction<'a> {
         Poll::Ready(())
     }
 
-    /// Without RESET_STREAM_AT: the reset once the forwarded bytes were
+    /// Without `RESET_STREAM_AT`: the reset once the forwarded bytes were
     /// passed to the carrier.
     fn flush(&mut self, waker: &Waker, code: VarInt) -> Poll<()> {
         match self.w.poll_sent(waker) {
             Poll::Ready(Ok(())) => self.reset_downstream(code),
-            Poll::Ready(Err(e)) => self.downstream_failed(e),
+            Poll::Ready(Err(e)) => self.downstream_failed(&e),
             Poll::Pending => return Poll::Pending,
         }
         Poll::Ready(())
@@ -872,9 +1003,19 @@ impl<'a> Direction<'a> {
         self.phase = Phase::Done(SpliceEnd::Reset(code));
     }
 
+    /// The splice was aborted with `code`: both parts end with it, and
+    /// what the direction holds is released.
+    fn abort(&mut self, code: VarInt) {
+        let _ = self.w.reset_shared(code);
+        let _ = self.r.stop_shared(code);
+        self.close_inserts();
+        self.phase = Phase::Done(SpliceEnd::Cancelled(code));
+        let _ = self.poll(&mut Context::from_waker(Waker::noop()));
+    }
+
     /// `r` ended other than by a FIN or a reset seen as such.
-    fn upstream_failed(&mut self, e: StreamError) {
-        let (c, end) = match e {
+    fn upstream_failed(&mut self, e: &StreamError) {
+        let (c, end) = match *e {
             StreamError::Reset { code, .. } => (code, SpliceEnd::Reset(code)),
             // ZMUX_REJECTED, or a stream refused after the peer's GOAWAY.
             StreamError::Rejected | StreamError::GoingAway => {
@@ -891,8 +1032,8 @@ impl<'a> Direction<'a> {
     }
 
     /// `w` ended: stopped by its peer, refused, or its session ended.
-    fn downstream_failed(&mut self, e: StreamError) {
-        let (c, end) = match e {
+    fn downstream_failed(&mut self, e: &StreamError) {
+        let (c, end) = match *e {
             StreamError::Stopped(c) => (c, SpliceEnd::Stopped(c)),
             StreamError::Rejected | StreamError::GoingAway => {
                 let c = code(ApplicationErrorCode::ZMUX_REJECTED);

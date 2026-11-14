@@ -3,6 +3,11 @@
 //! successful decodes re-encode consistently, and the incremental record
 //! reader agrees with whole-record decoding for every split of the input.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::sync::LazyLock;
 
 use proptest::prelude::*;
@@ -55,7 +60,7 @@ fn gates_from(bits: u8) -> Gates {
         multipath: bits & 8 != 0,
         pipe_ack: bits & 16 != 0,
         // Lanes go with either acknowledgement feature.
-        lanes: bits & 24 != 0 && bits & 1 != 0,
+        lanes: bits & 0x18 != 0 && bits & 1 != 0,
     }
 }
 

@@ -41,7 +41,8 @@ fn framing_of(v: &Value) -> Framing {
 }
 
 fn mode_of(v: &Value) -> Result<RecordMode, Error> {
-    RecordMode::from_byte(v["mode"].as_u64().unwrap() as u8).map_err(|_| Error::InvalidConfig)
+    RecordMode::from_byte(u8::try_from(v["mode"].as_u64().unwrap()).unwrap())
+        .map_err(|_| Error::InvalidConfig)
 }
 
 fn profile_of(v: &Value) -> Profile {
@@ -100,7 +101,7 @@ fn responder(v: &Value, framing: Framing, wire: &[u8]) -> Result<(ResponderReply
 fn max_app_data(v: &Value) -> Option<usize> {
     match v.get("max_app_data").map(|n| n.as_i64().unwrap()) {
         None | Some(0) => Some(DEFAULT_MAX_APP_DATA),
-        Some(n) if n > 0 => Some(n as usize),
+        Some(n) if n > 0 => Some(usize::try_from(n).unwrap()),
         Some(_) => None,
     }
 }
@@ -137,7 +138,7 @@ fn check_complete(v: &Value, c: &Complete) {
         .export(
             label,
             &hx(x, "context"),
-            x["length"].as_u64().unwrap() as usize,
+            usize::try_from(x["length"].as_u64().unwrap()).unwrap(),
         )
         .unwrap();
     assert_eq!(out, hx(x, "output"), "{name}: export");
@@ -344,11 +345,11 @@ fn written(step: &Value) -> Vec<u8> {
     let pad = step
         .get("padding")
         .and_then(Value::as_u64)
-        .map(|n| vec![0; n as usize]);
+        .map(|n| vec![0; usize::try_from(n).unwrap()]);
     let data = step
         .get("app_data_len")
         .and_then(Value::as_u64)
-        .map(|n| vec![0; n as usize]);
+        .map(|n| vec![0; usize::try_from(n).unwrap()]);
     let mut items: Vec<(u64, &[u8])> = Vec::new();
     if let Some(p) = &pad {
         items.push((0, p));
@@ -467,7 +468,7 @@ fn config_start(v: &Value) -> Result<(), Error> {
         binding: &binding,
         max_app_data: Some(DEFAULT_MAX_APP_DATA),
     })?;
-    let data = vec![0; v["app_data_len"].as_u64().unwrap_or(0) as usize];
+    let data = vec![0; usize::try_from(v["app_data_len"].as_u64().unwrap_or(0)).unwrap()];
     let value: Vec<u8> = match v["write_type"].as_u64() {
         Some(1) if v["cred_type_0"] == true => vec![0],
         Some(1) => vec![1],
@@ -490,7 +491,7 @@ fn config_start(v: &Value) -> Result<(), Error> {
 fn config_establish() {
     let all = load("config");
     let mut count = 0;
-    for v in all.as_array().unwrap().iter() {
+    for v in all.as_array().unwrap() {
         let got = match v["kind"].as_str().unwrap() {
             "establish" => config_start(v),
             // A pin that names no proof key.
@@ -520,7 +521,10 @@ fn hello_establish() {
     {
         let name = v["name"].as_str().unwrap();
         let mut input = hx(v, "header");
-        input.resize(input.len() + v["fill"].as_u64().unwrap() as usize, 0x5a);
+        input.resize(
+            input.len() + usize::try_from(v["fill"].as_u64().unwrap()).unwrap(),
+            0x5a,
+        );
         match Hello::parse(framing_of(v), &input) {
             Ok(h) => assert_eq!(
                 h.consumed() as u64,
@@ -551,18 +555,17 @@ fn derive_establish() {
     let mut count = 1;
     for h in v["handle_psk"].as_array().unwrap() {
         let got = derive_handle_psk(&hx(h, "secret"), &hx(h, "domain"), &hx(h, "salt"));
-        match h.get("error") {
-            Some(e) => assert_eq!(
+        if let Some(e) = h.get("error") {
+            assert_eq!(
                 got.unwrap_err().class(),
                 e.as_str().unwrap(),
                 "{}",
                 h["name"]
-            ),
-            None => {
-                let got = got.unwrap();
-                assert_eq!(got.handle, hx(h, "handle"), "{}", h["name"]);
-                assert_eq!(got.psk, hx(h, "psk"), "{}", h["name"]);
-            }
+            );
+        } else {
+            let got = got.unwrap();
+            assert_eq!(got.handle, hx(h, "handle"), "{}", h["name"]);
+            assert_eq!(got.psk, hx(h, "psk"), "{}", h["name"]);
         }
         count += 1;
     }

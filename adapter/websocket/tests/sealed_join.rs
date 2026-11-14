@@ -68,7 +68,7 @@ async fn established(url: &str, listener: &Listener) -> (Session, Session) {
         psk: keys.psk,
         ..Default::default()
     };
-    let io = zmux_websocket::dial(url, &Default::default())
+    let io = zmux_websocket::dial(url, &zmux_websocket::Options::default())
         .await
         .unwrap();
     let (io, _) = establish(io, &client).await.unwrap();
@@ -123,11 +123,11 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
         let serving = tokio::spawn(zmux_websocket::serve(
             listener.clone(),
             tcp,
-            Default::default(),
+            zmux_websocket::Options::default(),
         ));
         timeout(LIMIT, async {
             let (client, server) = established(&url, &listener).await;
-            let io = zmux_websocket::dial(url.as_str(), &Default::default())
+            let io = zmux_websocket::dial(url.as_str(), &zmux_websocket::Options::default())
                 .await
                 .unwrap();
             let pipe = client
@@ -135,7 +135,7 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
                 .unwrap();
             pipe.joined().await.unwrap();
             client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
-            echo(&client, &server, &[5; 128 << 10]).await;
+            echo(&client, &server, &vec![5; 128 << 10]).await;
             assert_eq!(listener.stats().joins, 1, "{mode:?}");
             assert_eq!(listener.stats().rejected, 0, "{mode:?}");
             client.close().await;
@@ -163,22 +163,23 @@ async fn a_large_first_message_is_read_whole() {
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let mut joining = config.clone();
     joining.join_early_hello = Some(32 << 10);
     timeout(LIMIT, async {
-        let client = zmux_websocket::connect(url.as_str(), &Default::default(), joining)
-            .await
-            .unwrap();
+        let client =
+            zmux_websocket::connect(url.as_str(), &zmux_websocket::Options::default(), joining)
+                .await
+                .unwrap();
         let server = listener.accept().await.unwrap();
         let pipe = client.pipe(PipeId::new(0)).unwrap();
         // Data waits for a pipe, so that the Hello takes it.
         let (mut a, mut b) = client.open_bi().await.unwrap();
         pipe.abort().unwrap();
-        a.write_all(&[3; 24 << 10]).await.unwrap();
+        a.write_all(&vec![3; 24 << 10]).await.unwrap();
         a.finish().unwrap();
-        let io = zmux_websocket::dial(url.as_str(), &Default::default())
+        let io = zmux_websocket::dial(url.as_str(), &zmux_websocket::Options::default())
             .await
             .unwrap();
         client

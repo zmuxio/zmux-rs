@@ -6,6 +6,11 @@
 //! per read (as a TLS layer hands over one record) and says so
 //! (`PipeIo::with_partial_reads`).
 
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 use std::io;
@@ -78,19 +83,16 @@ impl AsyncWrite for Chunked {
 
 /// A carrier pair: loopback TCP, or chunked in-memory pipes.
 async fn carriers(tcp: bool, l: Option<&TcpListener>) -> (PipeIo, PipeIo) {
-    match l.filter(|_| tcp) {
-        Some(l) => {
-            let addr = l.local_addr().unwrap();
-            let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
-            (PipeIo::from_tcp(a.unwrap()), PipeIo::from_tcp(b.unwrap().0))
-        }
-        None => {
-            let (a, b) = tokio::io::duplex(256 * 1024);
-            (
-                PipeIo::new(Chunked(a)).with_partial_reads(),
-                PipeIo::new(Chunked(b)).with_partial_reads(),
-            )
-        }
+    if let Some(l) = l.filter(|_| tcp) {
+        let addr = l.local_addr().unwrap();
+        let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+        (PipeIo::from_tcp(a.unwrap()), PipeIo::from_tcp(b.unwrap().0))
+    } else {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        (
+            PipeIo::new(Chunked(a)).with_partial_reads(),
+            PipeIo::new(Chunked(b)).with_partial_reads(),
+        )
     }
 }
 

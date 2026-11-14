@@ -35,7 +35,7 @@ pub use crate::driver::packet::{
 /// with the drivers' own low-level stream operations.
 #[cfg(feature = "tokio")]
 pub use crate::driver::splice::{
-    Forwarded, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice, splice_packets,
+    Forwarded, SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice, splice_packets,
 };
 pub use duplicate::{DuplicateError, DuplicateRule};
 pub(crate) use duplicate::{duplicate_api, resolve};

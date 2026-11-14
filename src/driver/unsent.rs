@@ -1,6 +1,6 @@
 //! The carrier's unsent count: an optional query of the sending half of
 //! each lane, which the drivers call without the core lock and hand to
-//! the core under it. The core's Q_p is the bytes of the write calls in
+//! the core under it. The core's `Q_p` is the bytes of the write calls in
 //! progress plus this count.
 
 use std::time::Instant;

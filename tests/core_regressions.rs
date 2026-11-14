@@ -1,6 +1,17 @@
 //! Regression tests from the review of the session core: two cores
 //! connected in memory.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -393,7 +404,7 @@ fn shutdown_before_establishment_drains_after_it() {
 /// With pipe acknowledgement on a single pipe, the sender's sample state is
 /// bounded: past its limit a batch joins the latest entry. An endpoint
 /// that only acknowledges for a long time fills it with batches nobody
-/// acknowledges (PIPE_ACK alone elicits nothing); its next data must not
+/// acknowledges (`PIPE_ACK` alone elicits nothing); its next data must not
 /// inherit their old send time, which made an RTT sample of seconds: after 120 s of receiving only,
 /// every sample of a 1 MiB write and the smoothed RTT stay within one
 /// acknowledgement delay (25 ms) and one 30 ms step.
@@ -643,8 +654,8 @@ impl Line {
 /// A single paced pipe on a long fat path keeps its rate. The drivers'
 /// timers let a pipe that the limiter's bucket holds back go later than its
 /// release time; when that lateness was lost to the bucket's depth, the
-/// pipe sent below its pacing rate, its bottleneck samples fell below R_p,
-/// and R_p decayed round by round to a fraction of the path while the RTT
+/// pipe sent below its pacing rate, its bottleneck samples fell below `R_p`,
+/// and `R_p` decayed round by round to a fraction of the path while the RTT
 /// stayed at the base (100 Mbit/s x 100 ms: 33 Mbit/s after 12 s, with a
 /// timer half a millisecond late). Timers 0.5 and
 /// 2 ms late.
@@ -677,7 +688,7 @@ fn paced_single_pipe_keeps_the_rate_of_a_long_fat_path() {
 }
 
 /// The in-flight cap of the carrier queue limiter counts what the peer
-/// acknowledges. An endpoint that only receives sends records of PIPE_ACK
+/// acknowledges. An endpoint that only receives sends records of `PIPE_ACK`
 /// alone, which elicit no acknowledgement; counted in flight, they filled
 /// the cap after a few seconds of receiving at 1 Gbit/s (the rate estimate
 /// of a pipe that sent nothing is the initial 1 MB/s), and the pipe was
@@ -874,7 +885,7 @@ fn a_reset_of_a_pinned_stream_does_not_wait_for_the_opening_frame() {
     assert!(pair.b.received_reset(at_peer).is_ok());
 }
 
-/// A carrier that takes CONNECTION_CLOSE later than two linger periods
+/// A carrier that takes `CONNECTION_CLOSE` later than two linger periods
 /// after it was queued, within the hand-off limit: the session stays
 /// CLOSING until the delivery and lingers a whole period from it.
 #[test]
@@ -952,7 +963,7 @@ fn without_pipe_ack(bytes: &[u8]) -> Vec<u8> {
 /// A peer that ends its carrier without a close (a plain peer's idle end,
 /// `IdleTimeout { remote: true }` like a processed idle close) gives no read
 /// drain: unread data of an unfinished stream fails with the session's
-/// error at once. Only a processed CONNECTION_CLOSE keeps it readable.
+/// error at once. Only a processed `CONNECTION_CLOSE` keeps it readable.
 #[test]
 fn a_peer_s_idle_end_drains_nothing() {
     let mut p = Pair::attached(Config::default(), Config::default());

@@ -2,7 +2,7 @@
 //! dialed each other keep the same session at
 //! both ends, by identities, by the dialers' Session Nonces or by their
 //! role nonces, and drain the other one: no new streams, GOAWAY, and a
-//! close with NO_ERROR once its streams have ended.
+//! close with `NO_ERROR` once its streams have ended.
 
 mod common;
 
@@ -134,7 +134,7 @@ fn session_nonces_decide_between_multipath_sessions() {
         let base = snapshot();
         for (n1, n2) in [(1, 2), (9, 3)] {
             let (e1, e2) = race(multipath(n1), multipath(n2)).await;
-            assert!(e1.mine.multipath() == zmux::Multipath::InUse);
+            assert_eq!(e1.mine.multipath(), zmux::Multipath::InUse);
             let none = DuplicateOptions::default();
             let (dials, o1) = failing_rejoin();
             let (kept, rejoin) = both_ends(&e1, &e2, &o1, &none, DuplicateRule::SessionNonce);
@@ -178,7 +178,7 @@ fn a_rejoin_without_room_is_not_started() {
                 c
             };
             let (e1, e2) = race(one_pipe(9), one_pipe(3)).await;
-            assert!(e1.mine.multipath() == zmux::Multipath::InUse);
+            assert_eq!(e1.mine.multipath(), zmux::Multipath::InUse);
             let none = DuplicateOptions::default();
             let (dials, o1) = failing_rejoin();
             let (kept, rejoin) = both_ends(&e1, &e2, &o1, &none, DuplicateRule::SessionNonce);

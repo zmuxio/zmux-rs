@@ -2,6 +2,11 @@
 //! channel that is a pair of in-process queues, so that what the driver
 //! sends and how it hands received datagrams to the session can be seen.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;

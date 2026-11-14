@@ -53,7 +53,7 @@ impl SessionCore {
 
     /// Feeds an acknowledgement of pipe `id` to its limiter, after the
     /// estimator took the samples: the one call per acknowledgement, from
-    /// a multipath session's PIPE_ACK and from the single pipe's; then the
+    /// a multipath session's `PIPE_ACK` and from the single pipe's; then the
     /// quality reports judge the new estimates.
     pub(super) fn pace_ack(&mut self, id: u64, sample: &AckSample, now: Instant) {
         let p = self.pacing_params();

@@ -1,6 +1,19 @@
 //! End-to-end tests of the drivers: two zmux sessions over in-memory and
 //! TCP carriers.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -478,8 +491,8 @@ async fn multipath_configuration_errors_are_reported() {
 }
 
 /// Secret Flags state a choice and never negotiate it: flags
-/// that differ close the session with TRANSPORT_PARAMETER_ERROR. (A side without a source
-/// is the trace multipath.negotiation.no_secret_source.)
+/// that differ close the session with `TRANSPORT_PARAMETER_ERROR`. (A side without a source
+/// is the trace `multipath.negotiation.no_secret_source`.)
 #[tokio::test]
 async fn secret_flags_that_differ_close_the_session() {
     let (a, b) = tokio::io::duplex(256 * 1024);
@@ -496,7 +509,7 @@ async fn secret_flags_that_differ_close_the_session() {
                 out.fill(1);
                 true
             }),
-            Default::default(),
+            zmux::PipeHint::default(),
         )
         .await
     });
@@ -822,7 +835,7 @@ async fn opens_waiting_for_stream_credit_are_counted() {
 
 /// The negotiation results that are reported by
 /// their own calls: establishment, QMux version, TLS state, DATAGRAM and
-/// RESET_STREAM_AT support per side, pipe acknowledgement and resume.
+/// `RESET_STREAM_AT` support per side, pipe acknowledgement and resume.
 #[tokio::test]
 async fn negotiation_results_are_reported() {
     let (a, b) = tokio::io::duplex(256 * 1024);

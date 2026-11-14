@@ -3,6 +3,7 @@
 //! 512).
 
 #![allow(missing_docs)]
+#![allow(clippy::cast_precision_loss, reason = "throughput arithmetic in f64")]
 
 use std::time::Instant;
 

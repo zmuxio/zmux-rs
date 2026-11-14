@@ -1,6 +1,13 @@
 //! The codepoint tables of `zmux::proto` against assets/registry.json, in
 //! both directions: a value added, removed or changed on either side fails.
 
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
+
+use std::fmt::Write as _;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zmux::proto::error::{APPLICATION_ERRORS, ApplicationErrorCode, TRANSPORT_ERRORS};
@@ -341,7 +348,7 @@ fn zmux_codepoints_follow_the_allocation_method() {
             .unwrap_or(0);
         let mut s = format!("zmux {kind} {name}");
         if suffix != 0 {
-            s.push_str(&format!("#{suffix}"));
+            write!(s, "#{suffix}").unwrap();
         }
         let digest = Sha256::digest(s.as_bytes());
         let h = u64::from_be_bytes(digest[..8].try_into().unwrap());

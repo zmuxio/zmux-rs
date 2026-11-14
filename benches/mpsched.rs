@@ -2,7 +2,7 @@
 //! cores joined by in-memory pipes of fixed rate and delay, the sender
 //! keeping every stream's send buffer full. Reports the sender's time per
 //! STREAM frame it writes (the chunk decisions, with everything else
-//! `wants_write` and `poll_transmit` do) and per PIPE_ACK it processes,
+//! `wants_write` and `poll_transmit` do) and per `PIPE_ACK` it processes,
 //! and the receiver's time per MB of stream data: its reads of the pipes
 //! into read buffers of 128 KiB that received data references, as the
 //! driver's, and apart the application's reads (`MPSCHED_RECV=copy`: received
@@ -16,6 +16,12 @@
 
 // Reading the thread CPU clock is a libc call.
 #![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -42,7 +48,7 @@ fn cpu() -> Duration {
         tv_nsec: 0,
     };
     // SAFETY: `ts` is a valid timespec for the call to write.
-    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 const STEP: Duration = Duration::from_millis(1);
@@ -236,7 +242,7 @@ impl Net {
                 if wants {
                     self.a.poll_transmit(id, now, &mut self.out);
                 }
-                self.cost.send += cpu() - t;
+                self.cost.send += cpu().checked_sub(t).unwrap();
                 if !wants || self.out.is_empty() {
                     break;
                 }
@@ -284,7 +290,7 @@ impl Net {
                 }
                 let t = cpu();
                 self.a.receive(id, &rev, now);
-                self.cost.ack += cpu() - t;
+                self.cost.ack += cpu().checked_sub(t).unwrap();
             }
         }
         self.read_b();
@@ -292,7 +298,7 @@ impl Net {
         let now = self.now();
         let t = cpu();
         self.a.handle_timeout(now);
-        self.cost.timers += cpu() - t;
+        self.cost.timers += cpu().checked_sub(t).unwrap();
         self.b.handle_timeout(now);
         while self.a.poll_event().is_some() {}
     }
@@ -327,7 +333,7 @@ impl Net {
                     p.rbuf.extend_from_slice(&data[used..]);
                 }
             }
-            self.cost.recv += cpu() - t;
+            self.cost.recv += cpu().checked_sub(t).unwrap();
         }
     }
 
@@ -345,7 +351,7 @@ impl Net {
                 self.cost.read_bytes += n as u64;
             }
         }
-        self.cost.app_read += cpu() - t;
+        self.cost.app_read += cpu().checked_sub(t).unwrap();
         while self.b.poll_event().is_some() {}
     }
 }

@@ -55,6 +55,7 @@ pub enum BodyEncoding {
 /// authentication header and Data MAC, at most 1,000,000 bytes after the encoding (999,918 bytes in
 /// binary, 749,918 in base64), below the request body limit of 1 MiB that
 /// reverse proxies commonly apply.
+#[must_use]
 pub const fn default_piece_size(encoding: BodyEncoding) -> usize {
     const BODY: usize = 1_000_000;
     match encoding {
@@ -255,11 +256,13 @@ impl ExchangeOptions {
     }
 
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The UP piece size in use.
+    #[must_use]
     pub fn up_piece_size(&self) -> usize {
         match self.up_piece {
             Cap::Auto => default_piece_size(self.encoding),
@@ -269,6 +272,7 @@ impl ExchangeOptions {
     }
 
     /// The DOWN piece size in use.
+    #[must_use]
     pub fn down_piece_size(&self) -> usize {
         match self.down_piece {
             Cap::Auto => default_piece_size(self.encoding),
@@ -278,6 +282,7 @@ impl ExchangeOptions {
     }
 
     /// The largest UP piece a server accepts.
+    #[must_use]
     pub fn max_up_piece_size(&self) -> usize {
         match self.max_up_piece {
             Cap::Auto => MIN_PIECE_LIMIT.max(self.up_piece_size()),
@@ -287,6 +292,7 @@ impl ExchangeOptions {
     }
 
     /// The largest DOWN piece a client accepts.
+    #[must_use]
     pub fn max_down_piece_size(&self) -> usize {
         match self.max_down_piece {
             Cap::Auto => MIN_PIECE_LIMIT.max(self.down_piece_size()),

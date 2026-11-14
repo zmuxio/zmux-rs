@@ -1,5 +1,10 @@
 //! Establish and the listener of the std driver, together and against the tokio driver.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "l, c, a and b name the listener, client config and duplex ends throughout"
+)]
+
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,8 +60,12 @@ fn config() -> Config {
 }
 
 fn server(psk: Vec<u8>) -> ServerConfig {
-    ServerConfig::new(Arc::new(TestGate(psk)), NODE, Default::default())
-        .expect("valid server configuration")
+    ServerConfig::new(
+        Arc::new(TestGate(psk)),
+        NODE,
+        zmux_seal::ServerOptions::default(),
+    )
+    .expect("valid server configuration")
 }
 
 fn client_config() -> ClientConfig {
@@ -237,7 +246,8 @@ fn the_reply_timeout_ends_a_silent_handshake() {
     let e = zmux_seal::blocking::establish(PipeIo::from_tcp(conn), &cfg, None).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
     assert!(
-        e.get_ref().is_some_and(|e| e.is::<zmux_seal::NoReply>()),
+        e.get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<zmux_seal::NoReply>),
         "{e}"
     );
     assert!(begun.elapsed() >= Duration::from_millis(140));
@@ -261,7 +271,8 @@ fn a_refused_establish_is_stalled_by_default() {
     )
     .unwrap_err();
     assert!(
-        e.get_ref().is_some_and(|e| e.is::<zmux_seal::NoReply>()),
+        e.get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<zmux_seal::NoReply>),
         "{e}"
     );
     assert_eq!(
@@ -370,4 +381,83 @@ fn a_shaper_wait_ends_with_the_timeout() {
         assert!(r.is_err());
         assert!(began.elapsed() < Duration::from_secs(10));
     }
+}
+
+/// One socket for both directions, read and written through clones, whose write side cannot
+/// be shut alone: the closer ignores [`std::net::Shutdown::Write`].
+#[cfg(unix)]
+fn no_half_close(s: std::os::unix::net::UnixStream) -> PipeIo {
+    let w = s.try_clone().unwrap();
+    let c = s.try_clone().unwrap();
+    PipeIo::from_halves(s, w).with_closer(move |how| {
+        if how != std::net::Shutdown::Write {
+            let _ = c.shutdown(how);
+        }
+    })
+}
+
+/// On a Sealed carrier without a half-close, the closing side's shutdown of its write side
+/// leaves the carrier open: the peer, still reading and then finishing a stream, receives
+/// the close code.
+#[cfg(unix)]
+#[test]
+fn a_sealed_close_without_half_close_keeps_its_code() {
+    let l = blocking::Listener::new(
+        config(),
+        ListenerConfig::default(),
+        Some(server(keys().psk).blocking_transform()),
+    )
+    .expect("valid listener configuration");
+    let mut closing = Vec::new();
+    for i in 0..200 {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ll = l.clone();
+        let t = std::thread::spawn(move || ll.handle_pipe(no_half_close(b), PipeHint::default()));
+        let (p, peer) = zmux_seal::blocking::establish(
+            no_half_close(a),
+            &client_config(),
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(peer.record_mode, RecordMode::Sealed);
+        let c = blocking::Session::connect(p, config()).unwrap();
+        t.join().unwrap().unwrap();
+        let s = l
+            .accept_timeout(Duration::from_secs(5))
+            .ok()
+            .flatten()
+            .expect("a session");
+        let (mut w, mut r) = c.open_bi().unwrap();
+        r.set_read_timeout(Some(Duration::from_secs(5)));
+        w.write_all(b"request").unwrap();
+        std::io::Write::flush(&mut w).unwrap();
+        let (_sw, mut sr) = s.accept_bi().unwrap();
+        sr.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut got = [0; 7];
+        std::io::Read::read_exact(&mut sr, &mut got).unwrap();
+        // The close's wait for the hand-off runs on: without a half-close neither side sees
+        // the other end its carrier before the linger.
+        closing.push(std::thread::spawn(move || {
+            s.close_with_error(zmux::VarInt::from_u32(42), b"done");
+        }));
+        let e = r.read_to_end(1 << 10).unwrap_err();
+        let _ = w.finish();
+        match e {
+            blocking::WaitError::Failed(zmux::ReadToEndError::Read(
+                zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed {
+                    code,
+                    remote,
+                    ..
+                }),
+            )) => {
+                assert_eq!(code, zmux::VarInt::from_u32(42));
+                assert!(remote);
+            }
+            e => panic!("iteration {i}: {e:?}"),
+        }
+    }
+    for t in closing {
+        t.join().unwrap();
+    }
+    l.close();
 }

@@ -67,7 +67,7 @@ impl TcpSocket {
     }
 
     /// Shuts the socket down both ways: the carrier fails without the
-    /// graceful end of a layer above it (no TLS close_notify), and a read
+    /// graceful end of a layer above it (no TLS `close_notify`), and a read
     /// or write blocked on it returns.
     #[cfg(feature = "tokio")]
     pub(crate) fn shut_down(&self) {
@@ -76,6 +76,11 @@ impl TcpSocket {
 
     /// Queries the socket once (one system call where the platform reports
     /// anything).
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the socket is queried only on the platforms that report it"
+    )]
     pub(crate) fn info(&self) -> TcpInfo {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -112,6 +117,11 @@ impl TcpSocket {
 
     /// The carrier's unsent-count query of this socket, where the platform
     /// reports one (Linux, Android: `tcpi_notsent_bytes`).
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the socket is queried only on the platforms that report it"
+    )]
     pub(crate) fn unsent_query(&self) -> Option<super::unsent::Unsent> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -127,6 +137,11 @@ impl TcpSocket {
     /// 4.19 and later), Apple platforms `tcpi_txretransmitbytes`, Windows
     /// `BytesRetrans` of `SIO_TCP_INFO` (32 bits, widened here: a count
     /// queried less than 4 GiB of retransmissions apart).
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the socket is queried only on the platforms that report it"
+    )]
     pub(crate) fn retransmitted_query(&self) -> Option<super::unsent::Unsent> {
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         {

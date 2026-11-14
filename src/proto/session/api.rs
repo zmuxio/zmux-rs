@@ -12,11 +12,13 @@ use super::stream::{
     StreamKey,
 };
 use super::streams::Stopped;
+use super::tp::TpValues;
 use super::{DatagramError, OpenError, SessionCore, SessionError, StreamError, di, dir_of_index};
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::meter::Count;
 use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
 use crate::proto::{ApplicationErrorCode, VarInt, varint};
+use crate::util::usize_sat;
 
 /// The preamble limit before the peer's parameters without remembered
 /// ones.
@@ -43,7 +45,7 @@ pub enum SendOutcomeKind {
     /// The FIN was written (on a single pipe: acknowledged). Delivery ends
     /// at the peer's zmux endpoint, not its application.
     Finished,
-    /// The peer sent STOP_SENDING with this code.
+    /// The peer sent `STOP_SENDING` with this code.
     Stopped(VarInt),
     /// The application reset the stream.
     Reset,
@@ -68,6 +70,7 @@ impl SendCapacity {
     /// least `min` (taken as 1 at least), or above
     /// 0 while the part holds nothing unsent, since a peer window smaller
     /// than `min` would otherwise never satisfy it.
+    #[must_use]
     pub fn reaches(&self, min: u64) -> bool {
         self.capacity >= min.max(1) || (self.capacity > 0 && self.unsent == 0)
     }
@@ -341,7 +344,7 @@ impl SessionCore {
     /// count; 0 means wait for [`super::CoreEvent::StreamWritable`].
     pub fn write(&mut self, key: StreamKey, data: &[u8]) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
-        let n = room.min(data.len() as u64) as usize;
+        let n = usize_sat(room.min(data.len() as u64));
         if n == 0 {
             if !data.is_empty() {
                 self.wait_writable(key);
@@ -359,7 +362,7 @@ impl SessionCore {
     /// `data`, a prefix when the buffers are nearly full, or 0.
     pub fn write_chunk(&mut self, key: StreamKey, data: Bytes) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
-        let n = room.min(data.len() as u64) as usize;
+        let n = usize_sat(room.min(data.len() as u64));
         if n == 0 {
             if !data.is_empty() {
                 self.wait_writable(key);
@@ -427,8 +430,12 @@ impl SessionCore {
     /// is in use. [`SessionCore::flushed`] tells when it left.
     ///
     /// A finished or reset part flushes as usual: only a part the peer
-    /// stopped or a lost session reports an error.
+    /// stopped or a lost session reports an error, and a stop only before
+    /// everything the flush waits for was passed on ([`SessionCore::flushed`]).
     pub fn flush(&mut self, key: StreamKey) -> Result<(), StreamError> {
+        if self.sent_before_stop(key) {
+            return Ok(());
+        }
         let reset = self.flushable_part(key)?.outcome == Some(SendOutcome::Reset);
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
         if s.id.is_none() && !reset {
@@ -443,7 +450,15 @@ impl SessionCore {
     /// in the held first flight, which leaves with them; if not,
     /// registers for [`super::CoreEvent::StreamWritable`] once that is so or
     /// the part ends.
+    ///
+    /// A `STOP_SENDING` that arrives once the opening frame and every byte
+    /// written were passed on does not fail the flush: what it waited for
+    /// happened, and the next write or finish reports the stop. A stop
+    /// before that fails it.
     pub fn flushed(&mut self, key: StreamKey) -> Result<bool, StreamError> {
+        if self.sent_before_stop(key) {
+            return Ok(true);
+        }
         let send = self.flushable_part(key)?;
         if send.outcome == Some(SendOutcome::Reset) {
             return Ok(true);
@@ -458,6 +473,24 @@ impl SessionCore {
         }
         self.send_part(key).sent_waiting = true;
         Ok(false)
+    }
+
+    /// Whether the peer stopped a sending part only after its opening frame
+    /// and every byte written were passed to a carrier.
+    fn sent_before_stop(&self, key: StreamKey) -> bool {
+        let Some(s) = self.streams.get(key) else {
+            return false;
+        };
+        let Some(send) = s.send.as_ref() else {
+            return false;
+        };
+        matches!(send.outcome, Some(SendOutcome::Stopped(_)))
+            && s.goaway.is_none()
+            && self.lost().is_none()
+            && s.id.is_some()
+            && !s.open_pending
+            && send.preamble_left == 0
+            && send.offset.saturating_sub(send.base) >= send.written
     }
 
     /// The sending part as a flush sees it: finishing or resetting it is no
@@ -505,7 +538,7 @@ impl SessionCore {
     }
 
     /// Resets the sending part. Data below the reliable boundary is still
-    /// delivered (RESET_STREAM_AT); a stream that has
+    /// delivered (`RESET_STREAM_AT`); a stream that has
     /// sent nothing yet consumes no identifier.
     pub fn reset(&mut self, key: StreamKey, code: VarInt) -> Result<(), StreamError> {
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
@@ -638,7 +671,7 @@ impl SessionCore {
         self.notify_writable(key);
     }
 
-    /// Answers the peer's STOP_SENDING with a reset carrying its code; the
+    /// Answers the peer's `STOP_SENDING` with a reset carrying its code; the
     /// reset keeps nothing reliable.
     pub(super) fn respond_to_stop(&mut self, key: StreamKey, code: u64) {
         let Some(send) = self.streams.send_mut(key) else {
@@ -828,7 +861,7 @@ impl SessionCore {
         self.try_discard(key);
     }
 
-    /// Stops reading: STOP_SENDING with `code`, and unread data is
+    /// Stops reading: `STOP_SENDING` with `code`, and unread data is
     /// discarded.
     pub fn stop(&mut self, key: StreamKey, code: VarInt) -> Result<(), StreamError> {
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
@@ -843,7 +876,7 @@ impl SessionCore {
         lost.map_or(Ok(()), |e| Err(StreamError::SessionLost(e)))
     }
 
-    /// STOP_SENDING on the local receiving part (application stop, release
+    /// `STOP_SENDING` on the local receiving part (application stop, release
     /// or rejection). Data still buffered is discarded and counts as
     /// consumed.
     pub(super) fn local_stop(&mut self, key: StreamKey, code: u64) {
@@ -879,7 +912,7 @@ impl SessionCore {
     // ---- releasing -------------------------------------------------------------
 
     /// The application dropped every handle of the stream without finishing
-    /// it: an unfinished sending part is reset with ZMUX_CANCELLED and an
+    /// it: an unfinished sending part is reset with `ZMUX_CANCELLED` and an
     /// unread receiving part stopped with code 0. The stream's
     /// state is discarded once both parts end.
     pub fn release(&mut self, key: StreamKey) {
@@ -901,7 +934,7 @@ impl SessionCore {
             .as_ref()
             .is_some_and(|x| x.outcome.is_none() && !x.state.is_terminal());
         if unfinished {
-            self.local_reset(key, crate::proto::ApplicationErrorCode::ZMUX_CANCELLED.0);
+            self.local_reset(key, ApplicationErrorCode::ZMUX_CANCELLED.0);
         }
         self.mark_released(key);
     }
@@ -933,8 +966,8 @@ impl SessionCore {
         }
     }
 
-    /// Declines an accepted stream before reading it: STOP_SENDING with
-    /// ZMUX_REJECTED, and RESET_STREAM with ZMUX_REJECTED on a sending
+    /// Declines an accepted stream before reading it: `STOP_SENDING` with
+    /// `ZMUX_REJECTED`, and `RESET_STREAM` with `ZMUX_REJECTED` on a sending
     /// part not written to. Releases the
     /// receiving handle, and the sending handle when it was reset.
     pub fn reject(&mut self, key: StreamKey) -> Result<(), StreamError> {
@@ -1057,7 +1090,7 @@ impl SessionCore {
 
     /// Asks the peer to schedule its sending part of the stream with
     /// `priority`: the PRIORITY TLV of a local stream's preamble before its
-    /// first frame, PRIORITY_UPDATE otherwise.
+    /// first frame, `PRIORITY_UPDATE` otherwise.
     pub fn set_peer_priority(
         &mut self,
         key: StreamKey,
@@ -1067,7 +1100,7 @@ impl SessionCore {
         // Before the peer's parameters only the preamble's PRIORITY TLV of
         // an early stream can carry the request.
         let early = self.early_open();
-        if !self.features.priority && !(early && preamble) {
+        if !(self.features.priority || early && preamble) {
             return Err(StreamError::NotNegotiated);
         }
         let s = self
@@ -1154,7 +1187,7 @@ impl SessionCore {
     /// most [`MAX_LOCAL_PREAMBLE`] and whole in one of our records.
     pub(super) fn preamble_limit(&self) -> u64 {
         self.send_tp()
-            .map_or(MIN_PREAMBLE_FLOOR, |t| t.preamble())
+            .map_or(MIN_PREAMBLE_FLOOR, TpValues::preamble)
             .min(MAX_LOCAL_PREAMBLE)
             .min((self.max_record() - 25) as u64)
     }
@@ -1291,7 +1324,7 @@ impl SessionCore {
             .outs()
             .filter_map(super::pipes::OutPipe::max_record)
             .min();
-        Some(carriers.map_or(frame, |c| frame.min(c as u64)) as usize)
+        Some(usize_sat(carriers.map_or(frame, |c| frame.min(c as u64))))
     }
 
     /// Queues a session datagram (Flow 0 with datagram flows). Never waits:
@@ -1528,7 +1561,7 @@ impl SessionCore {
 
     /// Raises the number of bidirectional and of unidirectional streams the
     /// peer may have open to `bidi` and `uni`, sending the credit as
-    /// MAX_STREAMS. The credit only grows: a value at
+    /// `MAX_STREAMS`. The credit only grows: a value at
     /// or below the current one leaves that type as it is, so 0 raises
     /// nothing. While unidirectional credit is staged, `uni` raises the
     /// value the first accept moves it to. After a GOAWAY no credit is
@@ -1554,7 +1587,7 @@ impl SessionCore {
 
     // ---- liveness ----------------------------------------------------------------
 
-    /// Sends a QX_PING request, or joins the one outstanding, with every peer, plain QMux peers
+    /// Sends a `QX_PING` request, or joins the one outstanding, with every peer, plain QMux peers
     /// included. The response updates the RTT estimate. Returns the
     /// request's ticket for [`SessionCore::ping_rtt`]. Until the ticket is
     /// answered, a request that stops being outstanding without its
@@ -1589,7 +1622,7 @@ fn s_id(s: &SessionCore, key: StreamKey) -> Result<u64, StreamError> {
         .ok_or(StreamError::ClosedLocally)
 }
 
-/// The write error for a peer's STOP_SENDING code.
+/// The write error for a peer's `STOP_SENDING` code.
 fn stopped_error(code: u64) -> StreamError {
     if code == ApplicationErrorCode::ZMUX_REJECTED.0 {
         StreamError::Rejected

@@ -7,7 +7,7 @@
 //! the first of them is opened (outbound) or accepted (inbound).
 //!
 //! Outbound, the pipe numbers the bytes it hands to its lanes in one send
-//! order (the first record of a lane, its PIPE_LANE, excluded); the
+//! order (the first record of a lane, its `PIPE_LANE`, excluded); the
 //! pipe's acknowledged position is the cumulative acknowledgement point,
 //! the send-order number of its oldest unacknowledged byte, so that
 //! everything that sees the pipe as a whole works with lanes as without.
@@ -29,10 +29,10 @@ pub(crate) enum LaneState {
     /// Asked of the driver, which has not attached a stream yet (it may
     /// wait for the carrier's stream credit).
     Requested,
-    /// Attached: its first record holds PIPE_LANE alone, and nothing else
+    /// Attached: its first record holds `PIPE_LANE` alone, and nothing else
     /// goes on it until it is confirmed; since when.
     Opening(Instant),
-    /// A PIPE_ACK acknowledged a position above 0 on it.
+    /// A `PIPE_ACK` acknowledged a position above 0 on it.
     Confirmed,
     /// Ended, reset or failed before it was confirmed, or not confirmed
     /// within the handshake timeout: no event of the pipe, and the pipe
@@ -147,11 +147,15 @@ impl LaneTx {
 
 /// An outbound lane other than lane 0.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 pub(crate) struct OutLane {
     state: LaneState,
     framing: Framing,
     tx: LaneTx,
-    /// The first record, PIPE_LANE alone, is still to be written.
+    /// The first record, `PIPE_LANE` alone, is still to be written.
     first_owed: bool,
     /// The frames it carried that are retained, with the send-order
     /// position after their record.
@@ -208,10 +212,10 @@ pub(crate) struct OutLanes {
     copy_lane: Option<u64>,
     copy_wanted: bool,
     copies: VecDeque<QueuedCopy>,
-    /// Outside multipath, the orderly CONNECTION_CLOSE waits until a PIPE_ACK
+    /// Outside multipath, the orderly `CONNECTION_CLOSE` waits until a `PIPE_ACK`
     /// covers the other lanes, at most until then.
     close_wait: Option<Instant>,
-    /// The held bytes and their minimum over the last RTT_base_p.
+    /// The held bytes and their minimum over the last `RTT_base_p`.
     held: HeldBytes,
 }
 
@@ -500,7 +504,7 @@ impl OutLanes {
         }
     }
 
-    /// The first record of lane `n`, PIPE_LANE alone, was written: `len`
+    /// The first record of lane `n`, `PIPE_LANE` alone, was written: `len`
     /// bytes of the lane outside the send order.
     pub(crate) fn wrote_first(&mut self, n: u64, len: u64) {
         if let Some(l) = self.get_mut(n) {
@@ -590,7 +594,7 @@ impl OutLanes {
         self.closed = true;
     }
 
-    /// Whether a PIPE_ACK covers every record written on the lanes other
+    /// Whether a `PIPE_ACK` covers every record written on the lanes other
     /// than lane 0 (refused ones aside).
     pub(crate) fn others_covered(&self) -> bool {
         self.lanes
@@ -616,7 +620,7 @@ impl OutLanes {
 
     // ---- write progress of the lanes ---------------------------------------------
 
-    /// What lane `n`'s carrier holds unsent; returns the pipe's sum (Q_p).
+    /// What lane `n`'s carrier holds unsent; returns the pipe's sum (`Q_p`).
     pub(crate) fn set_unsent(&mut self, n: u64, bytes: u64) -> u64 {
         if n == 0 {
             self.zero_unsent = bytes;
@@ -810,17 +814,14 @@ impl OutLanes {
         if self.by_lane.len() <= i {
             self.by_lane.resize_with(i + 1, Vec::new);
         }
-        match self.lane_of.get(&key) {
-            Some(&lane) => {
-                debug_assert_eq!(lane, n, "a bound direction moved");
-                if let Some(b) = self.by_lane[i].iter_mut().find(|b| b.0 == key) {
-                    b.1 = b.1.max(until);
-                }
+        if let Some(&lane) = self.lane_of.get(&key) {
+            debug_assert_eq!(lane, n, "a bound direction moved");
+            if let Some(b) = self.by_lane[i].iter_mut().find(|b| b.0 == key) {
+                b.1 = b.1.max(until);
             }
-            None => {
-                self.lane_of.insert(key, n);
-                self.by_lane[i].push((key, until));
-            }
+        } else {
+            self.lane_of.insert(key, n);
+            self.by_lane[i].push((key, until));
         }
     }
 

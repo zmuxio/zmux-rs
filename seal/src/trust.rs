@@ -124,7 +124,7 @@ pub enum Principal {
 pub struct VerifyVerdict {
     /// Who the peer is.
     pub principal: Principal,
-    /// The KeyId of the peer's proof key: the message must then carry a proof under it
+    /// The `KeyId` of the peer's proof key: the message must then carry a proof under it
     /// that verifies over the transcript, or the handshake fails. `None`: a proof is not
     /// looked at.
     pub proof_key: Option<KeyId>,
@@ -144,6 +144,7 @@ impl std::fmt::Debug for VerifyVerdict {
 
 impl VerifyVerdict {
     /// A verdict on `principal` that names no proof key and holds no value.
+    #[must_use]
     pub fn new(principal: Principal) -> Self {
         Self {
             principal,
@@ -177,6 +178,7 @@ impl VerifyError {
     }
 
     /// Whether this is a rejection of the peer.
+    #[must_use]
     pub fn is_rejection(&self) -> bool {
         matches!(self, Self::Rejected(_))
     }
@@ -242,7 +244,7 @@ impl<F: Future + Unpin> Future for CatchUnwind<F> {
     }
 }
 
-/// Trusts the one static key with this KeyId (of KeyAlg 1, X25519): the key itself; a
+/// Trusts the one static key with this `KeyId` (of `KeyAlg` 1, X25519): the key itself; a
 /// credential is not looked at. With a proof key, the peer must also prove the transcript
 /// with that key.
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +255,7 @@ pub struct PinVerifier {
 
 impl PinVerifier {
     /// Trusts the key of `pin`.
+    #[must_use]
     pub fn new(pin: KeyId) -> Self {
         Self {
             pin,
@@ -261,6 +264,7 @@ impl PinVerifier {
     }
 
     /// Trusts the key of `pin` with a proof under the key of `proof_key`.
+    #[must_use]
     pub fn with_proof_key(pin: KeyId, proof_key: KeyId) -> Self {
         Self {
             pin,
@@ -296,10 +300,10 @@ impl Verifier for PinVerifier {
 /// Makes the proof of a handshake message (a signature over its transcript) once per
 /// handshake; the key may live in another process. Signatures are hedged.
 pub trait Signer: Send + Sync {
-    /// The KeyAlg and the public key of the signing key.
+    /// The `KeyAlg` and the public key of the signing key.
     fn proof_key(&self) -> (u64, &[u8]);
 
-    /// Signs `message`, the M of the proof; the signature has the KeyAlg's length.
+    /// Signs `message`, the M of the proof; the signature has the `KeyAlg`'s length.
     fn sign<'a>(&'a self, message: &'a [u8]) -> BoxFuture<'a, std::io::Result<Vec<u8>>>;
 }
 
@@ -336,6 +340,11 @@ pub(crate) fn check_pq_auth(
 
 /// The X25519 public key of a static secret, as the peer sees it and
 /// [`static_key_id`] names it.
+///
+/// # Panics
+///
+/// Never: X25519 maps every 32-byte secret to a 32-byte public key.
+#[must_use]
 pub fn static_public(secret: &[u8; 32]) -> [u8; 32] {
     zmux::proto::seal::kex::x25519_public(secret)
         .ok()
@@ -343,7 +352,8 @@ pub fn static_public(secret: &[u8; 32]) -> [u8; 32] {
         .expect("a 32-byte X25519 secret has a 32-byte public key")
 }
 
-/// The KeyId of a static key (KeyAlg 1), for a pin.
+/// The `KeyId` of a static key (`KeyAlg` 1), for a pin.
+#[must_use]
 pub fn static_key_id(public: &[u8]) -> KeyId {
     key_id(KEYALG_X25519, public)
 }

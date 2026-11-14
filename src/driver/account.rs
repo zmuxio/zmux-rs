@@ -175,6 +175,10 @@ impl<S> Account<S> {
 }
 
 /// A session's link to its listener's account, under the session's lock.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state of the link, not one state machine"
+)]
 pub(crate) struct AccountLink<S> {
     account: Arc<Account<S>>,
     /// What this session last added to the sum.

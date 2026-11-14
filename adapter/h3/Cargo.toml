@@ -36,10 +36,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.54", features = ["full"] }
 
-[lints.rust]
-missing_docs = "warn"
-unsafe_code = "forbid"
-unreachable_pub = "warn"
+[lints]
+workspace = true
 
 [[bench]]
 name = "bulk"

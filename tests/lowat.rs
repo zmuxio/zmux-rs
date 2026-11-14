@@ -1,4 +1,4 @@
-//! TCP_NOTSENT_LOWAT of TCP carriers: at idle the floors, 128 KiB on a single pipe
+//! `TCP_NOTSENT_LOWAT` of TCP carriers: at idle the floors, 128 KiB on a single pipe
 //! and 32 KiB per pipe once a session is multipath, the bootstrap pipe
 //! included, in both drivers.
 
@@ -16,7 +16,7 @@ const NOTSENT_LOWAT: libc::c_int = 0x201;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
 
-/// The socket's TCP_NOTSENT_LOWAT.
+/// The socket's `TCP_NOTSENT_LOWAT`.
 fn lowat(socket: &impl AsRawFd) -> u32 {
     let mut value: libc::c_int = 0;
     let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
@@ -88,7 +88,7 @@ async fn multipath_pipes_get_32_kib() {
     let session = Session::connect(PipeIo::from_tcp(stream), mp_config())
         .await
         .unwrap();
-    assert!(session.multipath() == zmux::Multipath::InUse);
+    assert_eq!(session.multipath(), zmux::Multipath::InUse);
     expect_lowat(&bootstrap, 32 * 1024).await;
     let (stream, added) = connect(addr).await;
     session
@@ -114,7 +114,7 @@ async fn single_pipe_keeps_128_kib() {
         .await
         .unwrap();
     let _server = server.await.unwrap();
-    assert!(session.multipath() != zmux::Multipath::InUse);
+    assert_ne!(session.multipath(), zmux::Multipath::InUse);
     // Established, and it stays at the single-pipe value.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(lowat(&socket), 128 * 1024);
@@ -149,7 +149,7 @@ fn blocking_multipath_pipes_get_32_kib() {
     let session =
         zmux::blocking::Session::connect(zmux::blocking::PipeIo::from_tcp(stream), mp_config())
             .unwrap();
-    assert!(session.multipath() == zmux::Multipath::InUse);
+    assert_eq!(session.multipath(), zmux::Multipath::InUse);
     let start = Instant::now();
     // The writer thread lowers it when it next writes, at most every 20 ms: make it write.
     while lowat(&bootstrap) != 32 * 1024 {

@@ -2,6 +2,11 @@
 //! every case's steps restored in order into a new cache, then its
 //! snapshot compared with the expected entries; and the JSON round trip.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;

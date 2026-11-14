@@ -1,6 +1,11 @@
 //! Establish over zmux carriers: trust, the credential rules of the secure
 //! carrier, and a session with a joined Sealed pipe on top.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "l, c, a and b name the listener, client config and duplex ends throughout"
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -87,7 +92,10 @@ fn client(verifier: Arc<dyn Verifier>) -> ClientConfig {
 async fn run(l: &Listener, cfg: &ClientConfig) -> std::io::Result<(PipeIo, Peer)> {
     let (a, b) = duplex(1 << 20);
     let l = l.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), cfg))
         .await
         .expect("in time")
@@ -117,7 +125,11 @@ async fn a_wrong_key_is_refused_without_an_answer() {
     // The server stalls a refusal before authentication by default.
     pin.reply_timeout = Some(Duration::from_millis(300));
     let e = run(&l, &pin).await.unwrap_err();
-    assert!(e.get_ref().is_some_and(|e| e.is::<NoReply>()), "{e}");
+    assert!(
+        e.get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<NoReply>),
+        "{e}"
+    );
     assert_eq!(l.stats().sessions, 0);
 }
 
@@ -138,7 +150,10 @@ async fn a_session_joins_a_sealed_pipe() {
         assert_eq!(admitted.downcast_ref::<&str>(), Some(&"client 1"));
         let (a, b) = duplex(1 << 20);
         let ll = l.clone();
-        tokio::spawn(async move { ll.handle_pipe(PipeIo::new(b), Default::default()).await });
+        tokio::spawn(async move {
+            ll.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+                .await
+        });
         let pipe = c
             .begin_add_pipe(
                 PipeIo::new(a),
@@ -459,7 +474,10 @@ async fn the_handshake_shaper_plans_each_message() {
         relay(br, cw, up.clone());
         relay(cr, bw, down.clone());
         let ll = l.clone();
-        tokio::spawn(async move { ll.handle_pipe(PipeIo::new(d), Default::default()).await });
+        tokio::spawn(async move {
+            ll.handle_pipe(PipeIo::new(d), zmux::PipeHint::default())
+                .await
+        });
         let begun = std::time::Instant::now();
         let (p, _) = tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), &cfg))
             .await
@@ -577,7 +595,10 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
         c.established().await.unwrap();
         let (a, b) = duplex(1 << 20);
         let ll = l.clone();
-        tokio::spawn(async move { ll.handle_pipe(PipeIo::new(b), Default::default()).await });
+        tokio::spawn(async move {
+            ll.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+                .await
+        });
         let pipe = c
             .begin_add_pipe(
                 PipeIo::new(a),
@@ -617,7 +638,7 @@ async fn an_establish_on_a_stream_carrier_keeps_its_exporter() {
         tokio::spawn(async move {
             let (send, recv) = outer_server.accept_bi().await.unwrap();
             let _ = ll
-                .handle_pipe(PipeIo::from_stream(send, recv), Default::default())
+                .handle_pipe(PipeIo::from_stream(send, recv), zmux::PipeHint::default())
                 .await;
             outer_server
         });
@@ -843,13 +864,6 @@ async fn application_data_in_messages_1_2_and_3() {
             })
         }
     }
-    let server_source: AppDataSource = Arc::new(|r: &AppDataRequest<'_>| {
-        assert_eq!(r.message, 2);
-        let peer = r.peer.expect("what is known of the client");
-        assert_eq!(peer.peer_app_data[0].data, b"m1");
-        assert!(peer.peer_static.is_empty());
-        Box::pin(async { Ok(b"m2".to_vec()) })
-    });
     // The gate's Admission holds the client's data, authenticated once it passed.
     struct SeesAdmission(std::sync::Mutex<Vec<AppData>>);
     impl Gate for SeesAdmission {
@@ -878,6 +892,13 @@ async fn application_data_in_messages_1_2_and_3() {
             Box::pin(async { Ok(Arc::new(()) as AdmittedValue) })
         }
     }
+    let server_source: AppDataSource = Arc::new(|r: &AppDataRequest<'_>| {
+        assert_eq!(r.message, 2);
+        let peer = r.peer.expect("what is known of the client");
+        assert_eq!(peer.peer_app_data[0].data, b"m1");
+        assert!(peer.peer_static.is_empty());
+        Box::pin(async { Ok(b"m2".to_vec()) })
+    });
     let gate = Arc::new(SeesAdmission(std::sync::Mutex::new(Vec::new())));
     let server = ServerConfig::new(
         gate.clone(),
@@ -986,9 +1007,12 @@ async fn panicking_client_verifier_rejects() {
         }));
         let l = Listener::new(config(), lc).expect("valid listener configuration");
         let (a, b) = duplex(1 << 20);
-        let served = tokio::spawn({
+        let handled = tokio::spawn({
             let l = l.clone();
-            async move { l.handle_pipe(PipeIo::new(b), Default::default()).await }
+            async move {
+                l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+                    .await
+            }
         });
         // Message 3 is sent; the server's refusal comes after it.
         drop(
@@ -996,7 +1020,7 @@ async fn panicking_client_verifier_rejects() {
                 .await
                 .expect("message 3 is sent"),
         );
-        let r = tokio::time::timeout(Duration::from_secs(5), served)
+        let r = tokio::time::timeout(Duration::from_secs(5), handled)
             .await
             .expect("in time")
             .expect("no panic escapes");
@@ -1124,7 +1148,7 @@ fn pq_authentication_needs_a_proof_key() {
     );
 }
 
-/// The public key of a static secret is X25519's, and its KeyId the pin's.
+/// The public key of a static secret is X25519's, and its `KeyId` the pin's.
 #[test]
 fn the_public_key_of_a_static_secret() {
     let public = static_public(&NODE);
@@ -1188,7 +1212,7 @@ async fn a_bound_establish_with_another_binding_is_refused_by_the_policy() {
             let l = l.clone();
             tokio::spawn(async move {
                 let r = l
-                    .handle_pipe(exporter(2, PipeIo::new(b)), Default::default())
+                    .handle_pipe(exporter(2, PipeIo::new(b)), zmux::PipeHint::default())
                     .await;
                 (r, start.elapsed())
             })
@@ -1197,39 +1221,126 @@ async fn a_bound_establish_with_another_binding_is_refused_by_the_policy() {
             .await
             .unwrap_err();
         // No byte came back either way.
-        assert!(e.get_ref().is_some_and(|e| e.is::<NoReply>()), "{e}");
+        assert!(
+            e.get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<NoReply>),
+            "{e}"
+        );
         let gave_up = start.elapsed();
-        match action {
-            None => {
-                // The client gave up at its reply timeout, and the carrier
-                // is still held.
-                assert!(gave_up >= Duration::from_millis(290), "{gave_up:?}");
-                assert!(!served.is_finished(), "a stall holds the carrier");
-                let (r, took) = tokio::time::timeout(Duration::from_secs(5), served)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(r.is_err());
-                assert!(
-                    took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
-                    "{took:?}"
-                );
-            }
-            Some(_) => {
-                // The carrier ended before the client's reply timeout.
-                assert!(gave_up < Duration::from_millis(290), "{gave_up:?}");
-                let (r, took) = tokio::time::timeout(Duration::from_secs(1), served)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(r, Err(zmux::HandleError::Rejected));
-                assert!(took < Duration::from_millis(500), "{took:?}");
-            }
+        if action.is_none() {
+            // The client gave up at its reply timeout, and the carrier
+            // is still held.
+            assert!(gave_up >= Duration::from_millis(290), "{gave_up:?}");
+            assert!(!served.is_finished(), "a stall holds the carrier");
+            let (r, took) = tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.is_err());
+            assert!(
+                took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
+                "{took:?}"
+            );
+        } else {
+            // The carrier ended before the client's reply timeout.
+            assert!(gave_up < Duration::from_millis(290), "{gave_up:?}");
+            let (r, took) = tokio::time::timeout(Duration::from_secs(1), served)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r, Err(zmux::HandleError::Rejected));
+            assert!(took < Duration::from_millis(500), "{took:?}");
         }
         assert_eq!(*seen.lock().unwrap(), [("auth", Some(RecordMode::Bound))]);
         assert_eq!(l.stats().sessions, 0);
         if action.is_some() {
             assert_eq!(l.stats().rejected, 1);
         }
+    }
+}
+
+/// One object for both directions whose write side cannot be shut alone: a shutdown does
+/// nothing, and the carrier closes only when it is dropped.
+struct NoHalfClose(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for NoHalfClose {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for NoHalfClose {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// On a Sealed carrier without a half-close, the closing side's shutdown of its write side
+/// leaves the carrier open: the peer, still reading and then finishing a stream, receives
+/// the close code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_close_without_half_close_keeps_its_code() {
+    let l = listener(None, keys().psk);
+    let cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
+    for i in 0..200 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (a, b) = duplex(1 << 16);
+            let ll = l.clone();
+            tokio::spawn(async move {
+                ll.handle_pipe(PipeIo::new(NoHalfClose(b)), zmux::PipeHint::default())
+                    .await
+            });
+            let (p, peer) = establish(PipeIo::new(NoHalfClose(a)), &cfg).await.unwrap();
+            assert_eq!(peer.record_mode, RecordMode::Sealed);
+            let c = Session::connect(p, config()).await.unwrap();
+            let s = l.accept().await.unwrap();
+            let (mut w, mut r) = c.open_bi().await.unwrap();
+            w.write_all(b"request").await.unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut w).await.unwrap();
+            let (_sw, mut sr) = s.accept_bi().await.unwrap();
+            let mut got = [0; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut sr, &mut got)
+                .await
+                .unwrap();
+            // The close's wait for the hand-off runs on: without a half-close neither side
+            // sees the other end its carrier before the linger.
+            tokio::spawn(async move {
+                s.close_with_error(zmux::VarInt::from_u32(42), b"done")
+                    .await;
+            });
+            let e = r.read_to_end(1 << 10).await.unwrap_err();
+            let _ = w.finish();
+            match e {
+                zmux::ReadToEndError::Read(zmux::StreamError::SessionLost(
+                    zmux::SessionError::ApplicationClosed { code, remote, .. },
+                )) => {
+                    assert_eq!(code, zmux::VarInt::from_u32(42));
+                    assert!(remote);
+                }
+                e => panic!("iteration {i}: {e}"),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("iteration {i} in time"));
     }
 }

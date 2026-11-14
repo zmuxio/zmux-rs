@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 
 use super::pipes::OutPipe;
 use super::{CoreEvent, PipeError, PipeId, SessionCore};
+use crate::util::f64_of;
 
 /// The band of [`SessionCore::set_quality_band`] (`QualityBand`):
 /// `PipeQualityChanged` is reported for an outbound pipe
 /// when its smoothed RTT leaves ±`rtt` around the last reported value, or
-/// its delivery rate R_p leaves [last / `rate_ratio`, last × `rate_ratio`];
+/// its delivery rate `R_p` leaves [last / `rate_ratio`, last × `rate_ratio`];
 /// the band then recentres on the reported values. The first estimates
 /// measured after the band is set are the first report, without an event.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +44,7 @@ impl QualityBand {
 
     /// A band of ±`rtt` and [last / `rate_ratio`, last × `rate_ratio`]
     /// (`None`: that half off), with the default minimum interval.
+    #[must_use]
     pub fn new(rtt: Option<Duration>, rate_ratio: Option<f64>) -> Self {
         Self {
             rtt,
@@ -108,6 +110,7 @@ impl CapacityFloor {
     }
 
     /// A floor of `rate` bytes per second with the default ratio.
+    #[must_use]
     pub fn new(rate: u64) -> Self {
         Self {
             rate,
@@ -158,7 +161,8 @@ impl PipeQuality {
 
 #[derive(Debug)]
 struct Floor {
-    floor: CapacityFloor,
+    /// The floor asked for.
+    asked: CapacityFloor,
     /// `CapacityBelow` was reported last.
     below: bool,
     /// The sum of the counted pipes' rates.
@@ -231,7 +235,7 @@ impl SessionCore {
 
     /// The floor under the session's outbound capacity; `None`: none.
     pub fn capacity_floor(&self) -> Option<CapacityFloor> {
-        self.quality.as_deref()?.floor.as_ref().map(|f| f.floor)
+        self.quality.as_deref()?.floor.as_ref().map(|f| f.asked)
     }
 
     /// Sets the quality band of one pipe; `None` returns it to the
@@ -270,8 +274,8 @@ impl SessionCore {
             f.validate().map_err(PipeError::InvalidOptions)?;
         }
         let q = self.quality.get_or_insert_default();
-        q.floor = floor.map(|floor| Floor {
-            floor,
+        q.floor = floor.map(|asked| Floor {
+            asked,
             below: false,
             sum: 0,
             generation: None,
@@ -326,6 +330,10 @@ impl SessionCore {
     }
 
     /// Judges pipe `id`'s estimates against its band.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "o the pipe, q the quality state, p its pipe entry, r a sample, w and k the band"
+    )]
     fn band_check(&mut self, id: u64, now: Instant) {
         let Some(band) = self.quality.as_deref().and_then(|q| q.band(id)) else {
             return;
@@ -352,7 +360,7 @@ impl SessionCore {
             (None, Some(r)) => p.rate = Some(r),
             (Some(last), Some(r)) if band.rate_ratio.is_some() => {
                 let k = at_least_one(band.rate_ratio.unwrap_or(1.0));
-                let (r, last) = (r as f64, last as f64);
+                let (r, last) = (f64_of(r), f64_of(last));
                 out |= r < last / k || r > last * k;
             }
             _ => {}
@@ -451,9 +459,10 @@ impl SessionCore {
             return;
         };
         let rate = f.sum;
-        let event = if !f.below && rate < f.floor.rate {
+        let event = if !f.below && rate < f.asked.rate {
             CoreEvent::CapacityBelow { rate }
-        } else if f.below && rate as f64 >= f.floor.rate as f64 * at_least_one(f.floor.rate_ratio) {
+        } else if f.below && f64_of(rate) >= f64_of(f.asked.rate) * at_least_one(f.asked.rate_ratio)
+        {
             CoreEvent::CapacityRestored { rate }
         } else {
             return;
@@ -663,7 +672,7 @@ mod tests {
         assert!(events(&mut a).is_empty());
     }
 
-    /// At most one event per pipe per MinInterval, with the latest values
+    /// At most one event per pipe per `MinInterval`, with the latest values
     /// when the interval ends; a pipe that went back into its band by
     /// then reports nothing.
     #[test]

@@ -4,6 +4,11 @@
 //! a session, so a call under the session's lock could deadlock against a
 //! thread that holds the limiter's lock and calls the session.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};

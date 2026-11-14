@@ -41,6 +41,11 @@ pub struct Value {
 impl Value {
     /// Reads a value of the widest family: an integer in \[0, 2^53\] or
     /// `{"t": segments, "scope": ...}`. Table names need a bundle.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `json` is not valid JSON, or the value is out of range, malformed, or
+    /// names a table.
     pub fn from_json(json: &[u8]) -> Result<Self, Error> {
         parse_value(
             &crate::json::parse(json)?,
@@ -191,6 +196,26 @@ pub(crate) const FREE_SCOPES: &[Scope] = &[Scope::Each, Scope::Shared];
 /// The scope of a budget's values.
 pub(crate) const BUDGET_SCOPES: &[Scope] = &[Scope::Session];
 
+/// A parsed integer already range-checked by the caller, as `u64`; out of range saturates.
+pub(crate) fn to_u64(n: i128) -> u64 {
+    u64::try_from(n).unwrap_or(if n < 0 { 0 } else { u64::MAX })
+}
+
+/// A parsed integer already range-checked by the caller, as `u32`; out of range saturates.
+pub(crate) fn to_u32(n: i128) -> u32 {
+    u32::try_from(n).unwrap_or(if n < 0 { 0 } else { u32::MAX })
+}
+
+/// A drawn value as `usize`; saturates on a target narrower than 64 bits.
+pub(crate) fn to_usize(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// An index or count as `u32`; saturates (counts are bounded by the size limits).
+pub(crate) fn idx32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn int(x: &Json) -> Option<i128> {
     match x {
         Json::Int(v) => Some(*v),
@@ -281,13 +306,13 @@ fn segments(t: &Json, what: &str, limits: &SizeLimits) -> Result<Table, Error> {
         if !(0..=(1 << 32) - 1).contains(&w) || lo < 0 || lo > hi || hi > i128::from(P53) {
             return Err(err("range", format!("{what}: segment")));
         }
-        acc += w as u64;
-        low = low.min(lo as u64);
-        high = high.max(hi as u64);
+        acc += to_u64(w);
+        low = low.min(to_u64(lo));
+        high = high.max(to_u64(hi));
         segs.push(Segment {
             acc,
-            lo: lo as u64,
-            hi: hi as u64,
+            lo: to_u64(lo),
+            hi: to_u64(hi),
         });
     }
     if acc == 0 {
@@ -314,7 +339,7 @@ pub(crate) fn parse_value(
             if *v < i128::from(min) || *v > i128::from(max) {
                 return Err(err("range", format!("{what}: {v}")));
             }
-            Ok(Value::constant(*v as u64))
+            Ok(Value::constant(to_u64(*v)))
         }
         Json::Obj(members) => {
             if let Some((k, _)) = members.iter().find(|(k, _)| k != "t" && k != "scope") {

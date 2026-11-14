@@ -1,11 +1,12 @@
 //! Resume: the SUSPENDED state and the grace timer. Positions after a
-//! rejoin travel in PIPE_ACK snapshots (`ack.rs`).
+//! rejoin travel in `PIPE_ACK` snapshots (`ack.rs`).
 
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
 use crate::proto::TransportErrorCode as T;
+use crate::proto::session::pipes::Attachment;
 use crate::proto::session::{CloseFrame, CoreEvent, SessionCore, SessionError, State};
 
 /// The SUSPENDED state of a multipath session.
@@ -121,7 +122,7 @@ impl SessionCore {
         true
     }
 
-    /// Ends a suspended session for a listener limit: ZMUX_RESUME_TIMEOUT, as
+    /// Ends a suspended session for a listener limit: `ZMUX_RESUME_TIMEOUT`, as
     /// at grace expiry.
     pub fn close_suspended(&mut self, now: Instant) {
         self.tick(now);
@@ -135,7 +136,7 @@ impl SessionCore {
         self.mp.as_deref().and_then(|m| m.suspension().since)
     }
 
-    /// Closes with ZMUX_RESUME_FAILED or ZMUX_RESUME_TIMEOUT: CONNECTION_CLOSE
+    /// Closes with `ZMUX_RESUME_FAILED` or `ZMUX_RESUME_TIMEOUT`: `CONNECTION_CLOSE`
     /// on any live outbound pipe, otherwise locally.
     pub(in crate::proto::session) fn close_resume(
         &mut self,
@@ -156,7 +157,7 @@ impl SessionCore {
                 remote: false,
             }
         });
-        if self.atts.iter().any(|a| a.out_live()) {
+        if self.atts.iter().any(Attachment::out_live) {
             self.enter_closing(
                 Some(CloseFrame::Transport {
                     code: code.0,

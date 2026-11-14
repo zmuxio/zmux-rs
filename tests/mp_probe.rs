@@ -22,13 +22,13 @@ use zmux::shaping::{Caps, Effects, Event, RecordPlan, RecordView, Shaper};
 struct Seen {
     a_reader: RecordReader,
     b_reader: RecordReader,
-    /// PIPE_PING frames A wrote.
+    /// `PIPE_PING` frames A wrote.
     a_pings: u64,
-    /// QX_PING frames A wrote.
+    /// `QX_PING` frames A wrote.
     a_qx_pings: u64,
-    /// PIPE_ACK frames B wrote.
+    /// `PIPE_ACK` frames B wrote.
     b_acks: u64,
-    /// PIPE_PING frames B wrote.
+    /// `PIPE_PING` frames B wrote.
     b_pings: u64,
 }
 
@@ -87,7 +87,7 @@ fn config(edit: &dyn Fn(&mut Config)) -> Config {
 }
 
 /// A multipath pair on pipe 0; B never probes of its own, so that A's
-/// PIPE_PINGs are those of its own schedule.
+/// `PIPE_PINGs` are those of its own schedule.
 fn net(a: &dyn Fn(&mut Config), b: &dyn Fn(&mut Config)) -> Net {
     let mut b_cfg = config(&|c| {
         c.liveness.probe_interval = None;
@@ -103,7 +103,7 @@ fn net(a: &dyn Fn(&mut Config), b: &dyn Fn(&mut Config)) -> Net {
     n
 }
 
-/// Runs for `ms`, returning the times at which A wrote a PIPE_PING on
+/// Runs for `ms`, returning the times at which A wrote a `PIPE_PING` on
 /// link `id`.
 fn ping_times(n: &mut Net, id: u64, ms: u64) -> Vec<Instant> {
     let mut times = Vec::new();
@@ -233,7 +233,10 @@ fn probe_waits_lie_within_the_jittered_interval() {
         assert!(*d + slack >= k / 2 && *d <= k + slack, "{g:?}");
     }
     let (lo, hi) = (g.iter().min().unwrap(), g.iter().max().unwrap());
-    assert!(*hi - *lo >= Duration::from_millis(400), "{g:?}");
+    assert!(
+        (*hi).checked_sub(*lo).unwrap() >= Duration::from_millis(400),
+        "{g:?}"
+    );
 }
 
 /// A pipe's own settings override the session's: a pipe added with a 1 s
@@ -260,7 +263,7 @@ fn pipe_options_override_the_session_settings() {
 
 /// Idle probes and the idle timeout: a session with nothing but probes and their answers
 /// still closes on its idle timeout; probes do not move keep-alive, whose
-/// QX_PINGs (ack-eliciting) only move the start of the probes' waits.
+/// `QX_PINGs` (ack-eliciting) only move the start of the probes' waits.
 #[test]
 fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
     let mut n = net(
@@ -307,8 +310,8 @@ fn probes_neither_keep_the_session_alive_nor_follow_keep_alive() {
     assert_eq!(with, keep_alive(None));
 }
 
-/// Probe answers: with jitter, each PIPE_PING on a pipe pair is answered by
-/// a PIPE_ACK on the same pair's other direction.
+/// Probe answers: with jitter, each `PIPE_PING` on a pipe pair is answered by
+/// a `PIPE_ACK` on the same pair's other direction.
 #[test]
 fn jittered_probes_are_answered_on_their_pipe_pair() {
     let mut n = net(
@@ -383,7 +386,7 @@ impl Shaper for Delay {
 }
 
 /// Probes and shaping: probe records pass through the shaper; a delay longer
-/// than T_suspect's floor holds them, and the stall clock starts when the
+/// than `T_suspect`'s floor holds them, and the stall clock starts when the
 /// record goes, so the pipe is never suspected.
 #[test]
 fn probes_are_shaped_and_a_delay_is_no_stall() {
@@ -417,7 +420,7 @@ fn probes_are_shaped_and_a_delay_is_no_stall() {
 }
 
 /// The first probe wait: the first wait of the bootstrap pipe, which has sent no
-/// PIPE_PING, is drawn from [0, k] when j > 0, and is k with j = 0.
+/// `PIPE_PING`, is drawn from [0, k] when j > 0, and is k with j = 0.
 #[test]
 fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
     let k = Duration::from_secs(10);
@@ -443,7 +446,7 @@ fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
 
 /// The probe deadline: it is measured to the carrier. Records
 /// that shaping may hold for up to `max_delay` (here held 2 s each) are
-/// built that much before the interval ends, so that each PIPE_PING is
+/// built that much before the interval ends, so that each `PIPE_PING` is
 /// handed to the carrier at most k after the previous one.
 #[test]
 fn probes_reach_the_carrier_within_the_interval_despite_shaping_holds() {
@@ -470,7 +473,7 @@ fn probes_reach_the_carrier_within_the_interval_despite_shaping_holds() {
     assert!(g.iter().all(|d| *d <= k), "{g:?}");
     let longest = *g.iter().max().unwrap();
     assert!(
-        longest + Duration::from_millis(3 * STEP) >= k - Duration::from_secs(1),
+        longest + Duration::from_millis(3 * STEP) >= k.checked_sub(Duration::from_secs(1)).unwrap(),
         "{g:?}"
     );
 }
@@ -486,7 +489,7 @@ impl Shaper for Unplanned {
     fn on_event(&mut self, _: &Event, _: &mut Effects) {}
 }
 
-/// H_p is nonzero only for a pipe whose shaper plans its records: a
+/// `H_p` is nonzero only for a pipe whose shaper plans its records: a
 /// shaper that plans none holds nothing, so the probes keep the full
 /// interval k although `max_delay` is set.
 #[test]
@@ -509,10 +512,10 @@ fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
     assert!(g.iter().all(|d| d.abs_diff(k) <= slack), "{g:?}");
 }
 
-/// Probe answers in a quiet session: in a quiet session the answer to a PIPE_PING
+/// Probe answers in a quiet session: in a quiet session the answer to a `PIPE_PING`
 /// goes only on the probed pipe pair, never on the primary pipe, and
-/// carries a PIPE_PING of its own once the answering pipe has been idle
-/// for R_p, even at an end whose idle probes are off.
+/// carries a `PIPE_PING` of its own once the answering pipe has been idle
+/// for `R_p`, even at an end whose idle probes are off.
 #[test]
 fn quiet_answers_stay_on_the_probed_pair_and_probe_back() {
     let mut n = net(&|c| c.liveness.probe_interval = None, &|_| {});
@@ -551,7 +554,7 @@ fn quiet_answers_stay_on_the_probed_pair_and_probe_back() {
     );
 }
 
-/// When `DeadTimeout` is below T_suspect, the
+/// When `DeadTimeout` is below `T_suspect`, the
 /// suspicion and the failure of the last pipe fall due together, and the
 /// timer pass that suspects the pipe also fails it.
 #[test]
@@ -666,7 +669,7 @@ fn keep_alive_is_capped_at_half_the_idle_timeout_and_jittered() {
     );
 }
 
-/// Runs for `ms`; the PIPE_PING frames both ends wrote on link `id`
+/// Runs for `ms`; the `PIPE_PING` frames both ends wrote on link `id`
 /// meanwhile.
 fn pings_in(n: &mut Net, id: u64, ms: u64) -> u64 {
     let count = |n: &Net| n.links[&id].a_pings + n.links[&id].b_pings;
@@ -676,15 +679,15 @@ fn pings_in(n: &mut Net, id: u64, ms: u64) -> u64 {
 }
 
 /// An idle exchange of A probing every 15 s, each probe answered by B's
-/// PIPE_ACK with at most one PIPE_PING of its own: at most 8 PIPE_PING
+/// `PIPE_ACK` with at most one `PIPE_PING` of its own: at most 8 `PIPE_PING`
 /// frames a minute, and the window's edges.
 const PING_STORM_LIMIT: u64 = 10;
 
 /// Both ends shape every record with a 2 s delay. A record that carries a
-/// PIPE_ACK goes no later than `zmux_max_ack_delay` after the first byte it
+/// `PIPE_ACK` goes no later than `zmux_max_ack_delay` after the first byte it
 /// reports, so the peer's RTT samples hold no shaping delay and its working
 /// pipe never turns suspect. Held for the whole delay, the first exchanges
-/// made the pipes suspect, and the samples (each a suspicion's PIPE_PING
+/// made the pipes suspect, and the samples (each a suspicion's `PIPE_PING`
 /// held as long) took the delay into the estimate.
 #[test]
 fn a_shaping_delay_keeps_acknowledgements_in_time() {
@@ -715,9 +718,9 @@ fn a_shaping_delay_keeps_acknowledgements_in_time() {
     assert!(n.ends[A].error().is_none() && n.ends[B].error().is_none());
 }
 
-/// A path whose round trip grows to 4 s, far above the T_suspect of the
+/// A path whose round trip grows to 4 s, far above the `T_suspect` of the
 /// estimate learned before: every probe turns the pipe suspect before its
-/// answer. The PIPE_PING of the suspicion gives a sample even though the
+/// answer. The `PIPE_PING` of the suspicion gives a sample even though the
 /// pipe became suspect again before its acknowledgement, so the estimate
 /// learns the path and the suspicions stop. Discarded, every sample of the
 /// pipe was of bytes sent before its latest suspicion, the estimate stayed

@@ -586,14 +586,13 @@ impl<W: Outbox> WritePath<W> {
         run: bool,
         take: impl FnOnce(&mut W, &mut C) -> bool,
     ) -> bool {
-        match try_lock_side(&self.side) {
-            Some(mut side) => take(&mut side, core) || skipped || run,
-            None => {
-                if run {
-                    self.contended.store(RUN, Ordering::Relaxed);
-                }
-                false
+        if let Some(mut side) = try_lock_side(&self.side) {
+            take(&mut side, core) || skipped || run
+        } else {
+            if run {
+                self.contended.store(RUN, Ordering::Relaxed);
             }
+            false
         }
     }
 }

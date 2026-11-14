@@ -51,7 +51,7 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
-    assert!(client.multipath() == zmux::Multipath::InUse);
+    assert_eq!(client.multipath(), zmux::Multipath::InUse);
     // Unretired attachments per joiner: max_pipes + H (8); per attachment
     // two directions and a priority slot, plus the summary.
     let bound = 3 * (2 * (4 + 8) + 1) + 1;

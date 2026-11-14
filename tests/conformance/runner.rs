@@ -2,6 +2,27 @@
 //! single-pipe groups against the sans-IO session core with a virtual
 //! clock, and lists the multipath and resume traces it skips.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
+#![allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-pipe and per-carrier flags of the scripted scenario"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -150,7 +171,7 @@ struct Runner {
     carriers: HashMap<String, Carrier>,
     listener: ListenerCore,
     out: TransmitBuf,
-    /// Every CONNECTION_CLOSE written.
+    /// Every `CONNECTION_CLOSE` written.
     closes: Vec<Value>,
     /// Events not consumed by an expectation.
     events: Vec<CoreEvent>,
@@ -771,18 +792,15 @@ impl Runner {
                     return;
                 }
                 let at = PipeId::new(pipe).lane(lane);
-                match self.session.accept_lane(at, framing, now) {
-                    LaneAccept::Accepted => {
-                        if let Some(c) = self.carriers.get_mut(name) {
-                            c.lane = Some(at);
-                            c.id = None;
-                        }
-                        self.read_lane(name, &bytes);
+                if self.session.accept_lane(at, framing, now) == LaneAccept::Accepted {
+                    if let Some(c) = self.carriers.get_mut(name) {
+                        c.lane = Some(at);
+                        c.id = None;
                     }
-                    _ => {
-                        self.drain_events();
-                        reject(self);
-                    }
+                    self.read_lane(name, &bytes);
+                } else {
+                    self.drain_events();
+                    reject(self);
                 }
             }
             _ => reject(self),
@@ -1066,9 +1084,9 @@ impl Runner {
             return self.close_carrier(name, "reject"); // the Pipe ID's bit stays clear
         }
         let carrier = self.peer_carrier(name);
-        let claimed = self
-            .session
-            .claim_hello(&mut join, carrier, &Default::default(), now);
+        let claimed =
+            self.session
+                .claim_hello(&mut join, carrier, &zmux::shaping::UnitPlan::default(), now);
         self.drain_events();
         match claimed {
             ClaimedHello::Accept(reply) => {
@@ -1172,8 +1190,7 @@ impl Runner {
             .iter()
             .rev()
             .find(|(e, _)| *e & 1 == u64::from(phase))
-            .map(|(_, s)| s.clone())
-            .unwrap_or(secret0);
+            .map_or(secret0, |(_, s)| s.clone());
         let suite = seal_join::Suite::from_value(1).expect("Suite 1");
         let role = if initiator_role {
             seal::JoinRole::Initiator
@@ -1191,7 +1208,7 @@ impl Runner {
         self.epochs.secrets.get(&e).cloned()
     }
 
-    /// A local SESSION_EPOCH: marks whether it repeats the first of its phase and epoch,
+    /// A local `SESSION_EPOCH`: marks whether it repeats the first of its phase and epoch,
     /// and derives the epoch an answer completes.
     fn local_epoch_frame(&mut self, f: &mut Value) -> Result<(), String> {
         let phase = f["phase"].as_str().unwrap_or("").to_string();
@@ -1321,8 +1338,12 @@ impl Runner {
             let pipe = PipeId::new(id);
             let r = self.session.join_prepare(pipe, now).map(|ready| {
                 ready.map(|_| {
-                    self.session
-                        .join_hello(pipe, (framing, 0), &Default::default(), now)
+                    self.session.join_hello(
+                        pipe,
+                        (framing, 0),
+                        &zmux::shaping::UnitPlan::default(),
+                        now,
+                    )
                 })
             });
             self.drain_events();
@@ -1386,7 +1407,9 @@ impl Runner {
                 }
                 JoinStep::Verified { consumed, .. } => {
                     let pipe = PipeId::new(id);
-                    let done = self.session.join_finish(pipe, &Default::default(), now);
+                    let done =
+                        self.session
+                            .join_finish(pipe, &zmux::shaping::UnitPlan::default(), now);
                     self.drain_events();
                     assert!(done.is_ok(), "pipe {id}: join_finish");
                     let p = self.pipes.get_mut(&id).expect("pipe");
@@ -1478,7 +1501,7 @@ impl Runner {
                         );
                     }
                     if conn.is_some() {
-                        self.pipe_mut(pipe).conn = conn.clone();
+                        self.pipe_mut(pipe).conn.clone_from(conn);
                     }
                     self.attach(pipe, None, read, write, framing);
                     // A driver writes the first record at once.
@@ -2568,18 +2591,15 @@ impl Runner {
             }
             Call::SetScheduler(a) => {
                 let p = policy(&a.policy)?;
-                match &a.stream {
-                    Some(st) => {
-                        let key = self.key(st)?;
-                        match self.session.set_stream_scheduler(key, Some(p)) {
-                            Ok(()) => ok,
-                            Err(e) => stream_error(&e),
-                        }
+                if let Some(st) = &a.stream {
+                    let key = self.key(st)?;
+                    match self.session.set_stream_scheduler(key, Some(p)) {
+                        Ok(()) => ok,
+                        Err(e) => stream_error(&e),
                     }
-                    None => {
-                        self.session.set_scheduler(p);
-                        ok
-                    }
+                } else {
+                    self.session.set_scheduler(p);
+                    ok
                 }
             }
             Call::SetRedundant(a) => {
@@ -3030,7 +3050,7 @@ fn frame_matches(pattern: &Value, frame: &Value) -> bool {
     true
 }
 
-/// Matches a STREAM_DATA pseudo-frame against the STREAM frames of its
+/// Matches a `STREAM_DATA` pseudo-frame against the STREAM frames of its
 /// stream at indices `from..`; returns the index of the last frame it
 /// covers.
 fn stream_data_match(pattern: &Value, frames: &[Value], from: usize) -> Result<usize, String> {
@@ -3198,8 +3218,8 @@ fn match_unordered(patterns: &[Value], frames: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-/// Credit coalescing: at most one MAX_DATA, one MAX_STREAM_DATA
-/// per stream and one MAX_STREAMS per type in a record.
+/// Credit coalescing: at most one `MAX_DATA`, one `MAX_STREAM_DATA`
+/// per stream and one `MAX_STREAMS` per type in a record.
 fn check_one_credit(records: &[Vec<Value>]) -> Result<(), String> {
     for r in records {
         let mut seen = std::collections::HashSet::new();

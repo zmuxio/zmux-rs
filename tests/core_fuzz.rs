@@ -2,6 +2,11 @@
 //! application calls never panic, and the transmit path always settles
 //! (`wants_write` never stays true while `poll_transmit` produces nothing).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -110,7 +115,7 @@ fn stream_id(s: u8, peer_client: bool) -> u64 {
     if s >= 240 {
         return u64::from(s % 40);
     }
-    (index << 2) | if uni { 2 } else { 0 } | if client { 0 } else { 1 }
+    (index << 2) | if uni { 2 } else { 0 } | u64::from(!client)
 }
 
 fn peer_frame() -> impl Strategy<Value = PeerFrame> {

@@ -3,6 +3,15 @@
 //! others reach the fallback with every byte read replayed, or are
 //! stalled; each outcome is counted once in the admission statistics.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

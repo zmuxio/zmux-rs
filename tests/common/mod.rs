@@ -126,9 +126,10 @@ pub(crate) async fn settle(base: Snapshot, secs: u64, what: &str) {
         if now == base {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("{what}: resources not released\n  baseline {base:?}\n  now      {now:?}");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: resources not released\n  baseline {base:?}\n  now      {now:?}"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -144,10 +145,9 @@ pub(crate) async fn eventually(secs: u64, what: &str, mut f: impl FnMut() -> boo
 
 /// Fails the test when `f` does not finish within `secs` seconds.
 pub(crate) async fn watchdog<T>(secs: u64, what: &str, f: impl Future<Output = T>) -> T {
-    match tokio::time::timeout(Duration::from_secs(secs), f).await {
-        Ok(v) => v,
-        Err(_) => panic!("{what}: did not resolve within {secs} s"),
-    }
+    tokio::time::timeout(Duration::from_secs(secs), f)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: did not resolve within {secs} s"))
 }
 
 // ---- carriers ------------------------------------------------------------------------
@@ -215,6 +215,10 @@ impl Carrier {
         )
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "called on a carrier handle by the tests"
+    )]
     pub(crate) fn failed(&self) -> io::Error {
         io::Error::new(io::ErrorKind::ConnectionReset, "carrier failed")
     }
@@ -344,7 +348,7 @@ async fn pump(
     let mut buf = vec![0u8; 16 * 1024];
     while !cut.load(Ordering::SeqCst) {
         match tokio::time::timeout(Duration::from_millis(10), r.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(0) | Err(_)) => break,
             Ok(Ok(n)) => {
                 if w.write_all(&buf[..n]).await.is_err() {
                     break;

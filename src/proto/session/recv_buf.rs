@@ -236,19 +236,16 @@ impl RecvBuf {
     pub(crate) fn copy_to(&mut self, dst: &mut [u8]) -> usize {
         let mut done = 0;
         while done < dst.len() && self.len > 0 {
-            match self.pieces.front_mut() {
-                Some(front) => {
-                    let k = (dst.len() - done).min(front.bytes.len());
-                    dst[done..done + k].copy_from_slice(&front.bytes[..k]);
-                    let _ = self.take(k);
-                    done += k;
-                }
-                None => {
-                    let k = (dst.len() - done).min(self.tail.len());
-                    dst[done..done + k].copy_from_slice(&self.tail[..k]);
-                    self.consume_tail(k);
-                    done += k;
-                }
+            if let Some(front) = self.pieces.front_mut() {
+                let k = (dst.len() - done).min(front.bytes.len());
+                dst[done..done + k].copy_from_slice(&front.bytes[..k]);
+                let _ = self.take(k);
+                done += k;
+            } else {
+                let k = (dst.len() - done).min(self.tail.len());
+                dst[done..done + k].copy_from_slice(&self.tail[..k]);
+                self.consume_tail(k);
+                done += k;
             }
         }
         done
@@ -258,19 +255,16 @@ impl RecvBuf {
     pub(crate) fn append_to(&mut self, out: &mut Vec<u8>, max: usize) -> usize {
         let mut done = 0;
         while done < max && self.len > 0 {
-            match self.pieces.front() {
-                Some(front) => {
-                    let k = (max - done).min(front.bytes.len());
-                    out.extend_from_slice(&front.bytes[..k]);
-                    let _ = self.take(k);
-                    done += k;
-                }
-                None => {
-                    let k = (max - done).min(self.tail.len());
-                    out.extend_from_slice(&self.tail[..k]);
-                    self.consume_tail(k);
-                    done += k;
-                }
+            if let Some(front) = self.pieces.front() {
+                let k = (max - done).min(front.bytes.len());
+                out.extend_from_slice(&front.bytes[..k]);
+                let _ = self.take(k);
+                done += k;
+            } else {
+                let k = (max - done).min(self.tail.len());
+                out.extend_from_slice(&self.tail[..k]);
+                self.consume_tail(k);
+                done += k;
             }
         }
         done
@@ -357,7 +351,7 @@ mod tests {
 
     fn buffer(id: u64, len: usize) -> (Bytes, Backing) {
         (
-            Bytes::from(vec![id as u8; len]),
+            Bytes::from(vec![id.to_le_bytes()[0]; len]),
             Backing {
                 id,
                 size: 128 * 1024,

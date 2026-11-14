@@ -39,7 +39,7 @@ pub(crate) type Closer = Box<dyn Fn(Shutdown) + Send + Sync>;
 pub type Session = handle::Session<Blocking>;
 /// The sending part of a stream of a blocking session; implements
 /// `std::io::Write`. Dropping it without `finish` resets the stream with
-/// ZMUX_CANCELLED.
+/// `ZMUX_CANCELLED`.
 pub type SendStream = handle::SendStream<Blocking>;
 /// The receiving part of a stream of a blocking session; implements
 /// `std::io::Read`. Dropping it before the end stops the stream with code
@@ -129,7 +129,11 @@ impl HandshakeWait {
     /// Waits for `d`, at most until the carrier's shutdown or the deadline.
     pub fn sleep(&self, d: Duration) {
         let asked = Instant::now().checked_add(d);
-        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             let end = match (asked, st.1) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -147,21 +151,33 @@ impl HandshakeWait {
                     self.0
                         .changed
                         .wait_timeout(st, left)
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .0
                 }
-                None => self.0.changed.wait(st).unwrap_or_else(|e| e.into_inner()),
+                None => self
+                    .0
+                    .changed
+                    .wait(st)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
             };
         }
     }
 
     fn shut(&self) {
-        self.0.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = true;
         self.0.changed.notify_all();
     }
 
     fn limit(&self, timeout: Duration) {
-        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.1 = Instant::now().checked_add(timeout);
         self.0.changed.notify_all();
     }
@@ -208,6 +224,7 @@ pub struct PipeIo {
 
 impl PipeIo {
     /// One carrier of two one-way ones, the local endpoint's uplink and downlink.
+    #[must_use]
     pub fn paired_join(mut uplink: PipeIo, mut downlink: PipeIo) -> PipeIo {
         uplink.reader = downlink.reader.take();
         uplink.split = true;
@@ -247,12 +264,18 @@ impl PipeIo {
     }
 
     /// The framing of the carrier's handshake units.
+    #[must_use]
     pub fn handshake_framing(&self) -> Framing {
         self.framing
     }
 
     /// Reads once from the carrier for a transform's handshake, appending to `into`: one
     /// message on a message carrier; 0 is its end.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::UnexpectedEof`] for a carrier without a readable
+    /// half, or the read's error.
     pub fn read_handshake(&mut self, into: &mut Vec<u8>) -> io::Result<usize> {
         let r = self
             .reader
@@ -266,6 +289,11 @@ impl PipeIo {
     }
 
     /// Writes one handshake unit in one write.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::BrokenPipe`] for a carrier without a writable half,
+    /// or the write's or flush's error.
     pub fn write_handshake(&mut self, unit: &[u8]) -> io::Result<()> {
         let w = self
             .writer
@@ -278,6 +306,7 @@ impl PipeIo {
     /// The Binding of an Establish on this carrier, when it declares the Bound
     /// contract. The std driver has an exporter of one connection only: a paired
     /// carrier has no Binding.
+    #[must_use]
     pub fn bound_exporter(&self) -> Option<Vec<u8>> {
         if !self.secure || self.split {
             return None;
@@ -347,6 +376,7 @@ impl PipeIo {
     }
 
     /// What a handshake's waits on this carrier end with.
+    #[must_use]
     pub fn handshake_wait(&self) -> HandshakeWait {
         self.wait.clone()
     }
@@ -386,6 +416,7 @@ impl PipeIo {
     }
 
     /// The carrier's write overhead ([`PipeIo::with_write_overhead`]).
+    #[must_use]
     pub fn write_overhead(&self) -> u16 {
         self.write_overhead
     }
@@ -531,7 +562,7 @@ impl PipeIo {
     /// not transmitted yet, `None` while it has no count. The writer
     /// thread calls it at most every 20 ms, outside the session lock; it
     /// must not block. It is the pipe's `queued_bytes` and, with the
-    /// bytes of the write call in progress, its Q_p. [`PipeIo::from_tcp`]
+    /// bytes of the write call in progress, its `Q_p`. [`PipeIo::from_tcp`]
     /// installs the socket's query where the platform has one (Linux,
     /// Android).
     #[must_use]
@@ -621,9 +652,23 @@ impl PipeIo {
     }
 
     /// The host's short label of the transform the carrier runs (the
-    /// label a [`crate::Candidate`] or an admission gives; about 32 bytes at
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " label a [`crate::Candidate`] or an admission gives; about 32 bytes at"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " label a `Candidate` or an admission gives; about 32 bytes at"
+    )]
     /// most). zmux only reports it: in pipe statistics and events, to the
-    /// shaper factory and in the [`crate::CarrierCache`] keys.
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " shaper factory and in the [`crate::CarrierCache`] keys."
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " shaper factory and in the `CarrierCache` keys."
+    )]
     #[must_use]
     pub fn with_variant(mut self, variant: impl Into<Arc<str>>) -> Self {
         self.variant = Some(variant.into());
@@ -631,6 +676,7 @@ impl PipeIo {
     }
 
     /// The carrier's variant ([`PipeIo::with_variant`]).
+    #[must_use]
     pub fn variant(&self) -> Option<&Arc<str>> {
         self.variant.as_ref()
     }
@@ -647,6 +693,7 @@ impl PipeIo {
     }
 
     /// The carrier's kind ([`PipeIo::with_carrier`]).
+    #[must_use]
     pub fn carrier(&self) -> Option<crate::CarrierKind> {
         self.carrier
     }
@@ -742,6 +789,10 @@ impl Dial {
     }
 
     /// Dials a carrier for `req`.
+    ///
+    /// # Errors
+    ///
+    /// The dial function's error.
     pub fn dial(&self, req: super::DialRequest) -> io::Result<PipeIo> {
         self.0.as_ref()(req)
     }
@@ -783,10 +834,6 @@ impl Driver for Blocking {
         }
     }
 
-    fn wake_driver(state: &mut State<Self>) {
-        state.wake_timer();
-    }
-
     /// The writer threads have ended: the last of what goes out on the
     /// carriers is written or given up (each ends at most
     /// [`engine::FINAL_WRITE`] after CLOSED). A reader thread may stay in a
@@ -794,6 +841,10 @@ impl Driver for Blocking {
     /// ends; it delivers nothing more.
     fn released(state: &State<Self>) -> bool {
         state.io.writers_alive == 0
+    }
+
+    fn wake_driver(state: &mut State<Self>) {
+        state.wake_timer();
     }
 
     fn kick(state: &mut State<Self>) {
@@ -854,7 +905,7 @@ impl Driver for Blocking {
         let s = shared.clone();
         thread::Builder::new()
             .name("zmux-join".into())
-            .spawn(move || join_thread(s, PipeId(id), carrier, closer.is_some()))
+            .spawn(move || join_thread(&s, PipeId(id), carrier, closer.is_some()))
             .map(drop)
             .map_err(|e| PipeError::Io(Arc::new(e)))
     }
@@ -1117,7 +1168,7 @@ impl Queries {
 const JOIN_HOLD_POLL: Duration = Duration::from_millis(50);
 
 /// Runs the joiner's handshake, then the pipe's threads.
-fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, closer: bool) {
+fn join_thread(shared: &Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, closer: bool) {
     let _driver = DriverThread::enter();
     let done = |shared: &Arc<Shared<Blocking>>, failed: bool| {
         let mut st = shared.lock();
@@ -1142,12 +1193,12 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
         match r {
             Ok(Some(message)) => break message,
             Ok(None) => thread::sleep(JOIN_HOLD_POLL),
-            Err(_) => return done(&shared, false),
+            Err(_) => return done(shared, false),
         }
     };
     let plan = shared.join_plan(kind, message);
-    if join_wait(&shared, id, plan.delay) {
-        return done(&shared, false);
+    if join_wait(shared, id, plan.delay) {
+        return done(shared, false);
     }
     let hello = {
         let mut st = shared.lock();
@@ -1158,13 +1209,13 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
         r
     };
     let Ok(hello) = hello else {
-        return done(&shared, false);
+        return done(shared, false);
     };
     let (Some(mut r), Some(mut w)) = (pipe.reader.take(), pipe.writer.take()) else {
-        return done(&shared, true);
+        return done(shared, true);
     };
     if w.write_all(&hello).and_then(|()| w.flush()).is_err() {
-        return done(&shared, true);
+        return done(shared, true);
     }
     let mut input = Vec::new();
     let mut want = 1;
@@ -1175,7 +1226,7 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                 Ok(n @ 1..) if input.len() + n <= crate::proto::session::JOIN_READ_BOUND => {
                     input.extend_from_slice(&chunk[..n]);
                 }
-                _ => return done(&shared, true),
+                _ => return done(shared, true),
             }
         }
         let step = {
@@ -1199,8 +1250,8 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                     crate::shaping::UnitPlan::default()
                 } else {
                     let plan = shared.join_plan(kind, "confirm");
-                    if join_wait(&shared, id, plan.delay) {
-                        return done(&shared, false);
+                    if join_wait(shared, id, plan.delay) {
+                        return done(shared, false);
                     }
                     plan
                 };
@@ -1214,10 +1265,10 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                     confirm, records, ..
                 }) = finished
                 else {
-                    return done(&shared, false);
+                    return done(shared, false);
                 };
                 if !confirm.is_empty() && w.write_all(&confirm).and_then(|()| w.flush()).is_err() {
-                    return done(&shared, true);
+                    return done(shared, true);
                 }
                 input.drain(..consumed);
                 let (inbound, outbound) = {
@@ -1259,7 +1310,7 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                     }
                     return;
                 }
-                let spawned = spawn_pipe(&shared, id.0, pipe);
+                let spawned = spawn_pipe(shared, id.0, pipe);
                 // The join's hold on the closer ends only once the pipe's threads hold
                 // it: the session's end, whenever it comes, finds the closer.
                 let mut st = shared.lock();
@@ -1274,7 +1325,7 @@ fn join_thread(shared: Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clos
                 return;
             }
             crate::proto::session::JoinStep::Declined | crate::proto::session::JoinStep::Failed => {
-                return done(&shared, false);
+                return done(shared, false);
             }
         }
     }
@@ -1339,12 +1390,17 @@ impl Watchdog {
     }
 
     /// Whether the deadline passed and the carrier was shut down.
+    #[must_use]
     pub fn fired(&self) -> bool {
         self.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 /// Byte-stream halves as Sealed records, for allocation tests.
+///
+/// # Panics
+///
+/// Never: both halves are given.
 #[cfg(feature = "test-hooks")]
 pub fn sealed_halves<R, W>(
     reader: R,
@@ -1513,7 +1569,7 @@ pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) 
         let late_exporter = exporter.filter(|_| id == 0);
         let spawned = thread::Builder::new()
             .name("zmux-read".into())
-            .spawn(move || reader_thread(s, PipeId(id), r, framing, late_exporter));
+            .spawn(move || reader_thread(&s, PipeId(id), r, framing, late_exporter));
         if let Err(e) = spawned {
             let mut st = shared.lock();
             st.thread_done(PipeId(id));
@@ -1534,7 +1590,7 @@ pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) 
         }
         let spawned = thread::Builder::new()
             .name("zmux-write".into())
-            .spawn(move || writer_thread(s, PipeId(id), w, c, abort, framing, queries));
+            .spawn(move || writer_thread(&s, PipeId(id), w, c, abort, framing, queries));
         if let Err(e) = spawned {
             let mut st = shared.lock();
             st.io.writers_alive -= 1;
@@ -1687,7 +1743,7 @@ fn wait_for<T>(
 }
 
 fn reader_thread(
-    shared: Arc<Shared<Blocking>>,
+    shared: &Arc<Shared<Blocking>>,
     id: PipeId,
     mut reader: Box<dyn Read + Send>,
     framing: Framing,
@@ -1698,20 +1754,19 @@ fn reader_thread(
     let mut filled = 0;
     loop {
         let started = Instant::now();
-        let result = match &mut buf {
-            Some(b) => reader.read(&mut b[filled..]),
-            None => {
-                // An idle byte stream waits for its next record in a small
-                // stack buffer.
-                let mut small = [0u8; IDLE_READ];
-                let r = reader.read(&mut small);
-                if let Ok(n @ 1..) = r {
-                    let mut b = super::read_pool::take_initialized();
-                    b[..n].copy_from_slice(&small[..n]);
-                    buf = Some(b);
-                }
-                r
+        let result = if let Some(b) = &mut buf {
+            reader.read(&mut b[filled..])
+        } else {
+            // An idle byte stream waits for its next record in a small
+            // stack buffer.
+            let mut small = [0u8; IDLE_READ];
+            let r = reader.read(&mut small);
+            if let Ok(n @ 1..) = r {
+                let mut b = super::read_pool::take_initialized();
+                b[..n].copy_from_slice(&small[..n]);
+                buf = Some(b);
             }
+            r
         };
         // Pipe 0's exporter, with its first bytes: without the lock (it is
         // the host's code), for the core to have before the peer's
@@ -1813,7 +1868,7 @@ fn write_batch(
 }
 
 fn writer_thread(
-    shared: Arc<Shared<Blocking>>,
+    shared: &Arc<Shared<Blocking>>,
     id: PipeId,
     mut writer: Box<dyn Write + Send>,
     closer: Option<Arc<Closer>>,
@@ -1930,14 +1985,14 @@ fn writer_thread(
     // The pipe is done: end the carrier half so its reader thread returns
     // once the session ended.
     drop(writer);
-    let closed = {
+    let session_closed = {
         let mut st = shared.lock();
         st.io.writers_alive -= 1;
         st.thread_done(id);
         st.wake_timer();
         st.core.state() == CoreState::Closed
     };
-    if closed && let Some(c) = closer {
+    if session_closed && let Some(c) = closer {
         c(Shutdown::Both);
     }
 }
@@ -1946,7 +2001,7 @@ fn writer_thread(
 /// batches had [`FINAL_WRITE`] to be written, ends every carrier with a
 /// closer, so that no thread stays blocked in a read or write of a peer that
 /// went silent. Starts the session's hook thread when the core needs it.
-fn timer_thread(shared: Arc<Shared<Blocking>>) {
+fn timer_thread(shared: &Arc<Shared<Blocking>>) {
     let _driver = DriverThread::enter();
     let me = thread_waker();
     loop {
@@ -2104,7 +2159,7 @@ impl Session {
         let s = shared.clone();
         thread::Builder::new()
             .name("zmux-timer".into())
-            .spawn(move || timer_thread(s))
+            .spawn(move || timer_thread(&s))
             .map_err(|e| ConnectError::Io(Arc::new(e)))?;
         spawn_pipe(&shared, 0, pipe).map_err(|e| ConnectError::Io(Arc::new(e)))?;
         drop(shared);
@@ -2224,7 +2279,7 @@ impl Session {
     }
 
     /// Closes the session gracefully with an application close of `code`
-    /// and `reason` and blocks until CONNECTION_CLOSE has been handed to
+    /// and `reason` and blocks until `CONNECTION_CLOSE` has been handed to
     /// the carriers, flushing the streams' written data first, 1 s at the
     /// latest for the whole call (see `zmux::Session::close_with_error`);
     /// the half-close and the linger go on on the session's threads. The
@@ -2336,7 +2391,7 @@ impl Session {
             let guard = handle::AbortUnlessAdded(Some(&p));
             match deadline {
                 Some(d) if d < limit => {
-                    run(p.added_op(false), Some(d)).ok_or(WaitError::TimedOut)??
+                    run(p.added_op(false), Some(d)).ok_or(WaitError::TimedOut)??;
                 }
                 _ => run(p.added_op(false), Some(limit)).unwrap_or(Err(JOIN_TIMED_OUT))?,
             }
@@ -2367,7 +2422,7 @@ impl Session {
         call_timeout(Some(timeout), self.shutdown_op(code, reason))
     }
 
-    /// Sends a QX_PING request, or joins the one outstanding, and waits
+    /// Sends a `QX_PING` request, or joins the one outstanding, and waits
     /// for the round-trip time it measured; the sample
     /// also updates [`Session::rtt`](blocking::Session#method.rtt) and the statistics. Works with every
     /// peer, plain QMux peers included. On a thread that drives sessions
@@ -2409,7 +2464,7 @@ impl Session {
     }
 
     /// Waits until the session has ended entirely and returns why: every
-    /// pipe's inbound side has ended (the peer read CONNECTION_CLOSE and
+    /// pipe's inbound side has ended (the peer read `CONNECTION_CLOSE` and
     /// ended its side) or the linger timeout passed, and the session's
     /// writer threads are done. Returning before the linger timeout thus
     /// confirms that the peer read the close.
@@ -2506,7 +2561,7 @@ impl SendStream {
     }
 
     /// Waits until the sending part ended: `None` when the FIN was written,
-    /// or the peer's STOP_SENDING code. `None` says the data reached the
+    /// or the peer's `STOP_SENDING` code. `None` says the data reached the
     /// peer's zmux endpoint at most, not its application.
     pub fn stopped(&self) -> Result<Option<VarInt>, WaitError<StreamError>> {
         call(self.stopped_op())
@@ -2515,7 +2570,7 @@ impl SendStream {
     /// Waits for send capacity of at least `min`
     /// bytes, or of any while the part holds nothing unsent, and returns
     /// it; returns at once with the error that ended the part (a reset or
-    /// finish, the peer's STOP_SENDING, the session's end). The write
+    /// finish, the peer's `STOP_SENDING`, the session's end). The write
     /// timeout bounds the wait.
     pub fn wait_send_capacity(&self, min: u64) -> Result<u64, WaitError<StreamError>> {
         call_timeout(self.timeout, self.send_capacity_op(min))
@@ -2535,6 +2590,10 @@ impl Write for SendStream {
     /// that is in use; while the first flight is held it returns at once
     /// and the frames leave with the flight. The write timeout bounds the
     /// wait.
+    ///
+    /// A `STOP_SENDING` from the peer fails the flush only if it arrives
+    /// before all that left; once it left, the flush succeeds and the next
+    /// write or finish reports the stop. A lost session fails it.
     fn flush(&mut self) -> io::Result<()> {
         let this = &*self;
         call_timeout(

@@ -35,6 +35,10 @@ pub(crate) fn unix_seconds() -> u64 {
 }
 
 /// The clock as a request's Time: [`unix_seconds`] modulo 2^32.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a Time is the clock modulo 2^32"
+)]
 pub(crate) fn unix_time() -> u32 {
     unix_seconds() as u32
 }
@@ -253,11 +257,10 @@ impl Header {
     pub(crate) fn data_limit(&self, up: usize) -> usize {
         match Kind::from_byte(self.kind) {
             Some(Kind::Up) => up,
-            Some(Kind::Down) => 0,
             Some(Kind::Close) => MAX_REASON,
             // An undefined Kind carries no Data: one with none is
             // authenticated, and then malformed.
-            None => 0,
+            Some(Kind::Down) | None => 0,
         }
     }
 
@@ -308,6 +311,10 @@ pub(crate) struct Response {
 
 impl Response {
     /// Parses the binary body of a response.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "consumes the decoded body in an Option pipeline"
+    )]
     pub(crate) fn parse(body: Bytes) -> Option<Self> {
         let mac = body.get(..MAC_LEN)?.try_into().ok()?;
         let flags = *body.get(MAC_LEN)?;
@@ -381,7 +388,7 @@ mod tests {
     #[test]
     fn base64_decodes_into_a_slice() {
         let mut out = [0; HEADER_LEN];
-        let bin: Vec<u8> = (0..HEADER_LEN as u8).collect();
+        let bin: Vec<u8> = (0..u8::try_from(HEADER_LEN).unwrap()).collect();
         let enc = BASE64.encode(&bin);
         assert_eq!(
             decode_base64_into(enc.as_bytes(), &mut out),
@@ -549,7 +556,7 @@ mod tests {
             h.put_u64(0);
             h.put_u32(TIME);
             h.put_slice(&NONCE);
-            h.put_u32(data.len() as u32);
+            h.put_u32(u32::try_from(data.len()).unwrap());
             let tag = key.tag(&[b"Q", &h]);
             h.put_slice(&tag);
             let dtag = key.tag(&[b"D", &tag, data]);

@@ -19,7 +19,7 @@ fn narrow(v: u64) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
-/// What a session reads of a zmux_multipath value; the Locator stays in the
+/// What a session reads of a `zmux_multipath` value; the Locator stays in the
 /// parameters, so that reading these allocates nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MultipathValues {
@@ -41,33 +41,33 @@ impl MultipathValues {
 /// valid value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TpValues {
-    /// initial_max_stream_data_bidi_local.
+    /// `initial_max_stream_data_bidi_local`.
     pub(super) window_bidi_local: u64,
-    /// initial_max_stream_data_bidi_remote.
+    /// `initial_max_stream_data_bidi_remote`.
     pub(super) window_bidi_remote: u64,
-    /// initial_max_stream_data_uni.
+    /// `initial_max_stream_data_uni`.
     pub(super) window_uni: u64,
-    /// initial_max_streams_bidi.
+    /// `initial_max_streams_bidi`.
     pub(super) streams_bidi: u64,
-    /// max_idle_timeout in milliseconds (0: none).
+    /// `max_idle_timeout` in milliseconds (0: none).
     pub(super) max_idle_timeout: u64,
     /// The nonce of `zmux_role` auto.
     pub(super) role_nonce: Option<u64>,
-    /// zmux_multipath (the local one as the session sends it: its locator
+    /// `zmux_multipath` (the local one as the session sends it: its locator
     /// and Secret Flags may change before the parameters are sent).
     pub(super) multipath: Option<MultipathValues>,
-    /// The Lane Key of zmux_max_lanes.
+    /// The Lane Key of `zmux_max_lanes`.
     pub(super) lane_key: Option<[u8; 16]>,
     max_record_size: u32,
     max_datagram_frame_size: u32,
     preamble: u32,
     ack_threshold: u32,
     max_lanes: u32,
-    /// zmux_max_ack_delay in milliseconds (below 2^14).
+    /// `zmux_max_ack_delay` in milliseconds (below 2^14).
     max_ack_delay: u16,
-    /// reset_stream_at.
+    /// `reset_stream_at`.
     pub(super) reset_stream_at: bool,
-    /// zmux_pipe_ack.
+    /// `zmux_pipe_ack`.
     pub(super) pipe_ack: bool,
     /// None of the zmux parameters is present.
     pub(super) plain_qmux: bool,
@@ -132,32 +132,32 @@ impl TpValues {
         }
     }
 
-    /// max_record_size, or its default.
+    /// `max_record_size`, or its default.
     pub(super) fn max_record_size(&self) -> u64 {
         u64::from(self.max_record_size)
     }
 
-    /// max_datagram_frame_size (0: no datagrams).
+    /// `max_datagram_frame_size` (0: no datagrams).
     pub(super) fn max_datagram_frame_size(&self) -> u64 {
         u64::from(self.max_datagram_frame_size)
     }
 
-    /// zmux_preamble (0 when absent).
+    /// `zmux_preamble` (0 when absent).
     pub(super) fn preamble(&self) -> u64 {
         u64::from(self.preamble)
     }
 
-    /// zmux_ack_threshold, or its default.
+    /// `zmux_ack_threshold`, or its default.
     pub(super) fn ack_threshold(&self) -> u64 {
         u64::from(self.ack_threshold)
     }
 
-    /// zmux_max_ack_delay in milliseconds, or its default.
+    /// `zmux_max_ack_delay` in milliseconds, or its default.
     pub(super) fn max_ack_delay(&self) -> u64 {
         u64::from(self.max_ack_delay)
     }
 
-    /// Max Lanes L of zmux_max_lanes, 1 when absent.
+    /// Max Lanes L of `zmux_max_lanes`, 1 when absent.
     pub(super) fn max_lanes(&self) -> u64 {
         u64::from(self.max_lanes)
     }
@@ -167,14 +167,14 @@ impl TpValues {
 /// comes from the shared configuration ([`TpValues::local`]).
 #[derive(Debug, Clone)]
 pub(super) struct LocalTp {
-    /// zmux_multipath as the session sends it (its locator and Secret
+    /// `zmux_multipath` as the session sends it (its locator and Secret
     /// Flags may change before the parameters are sent).
     pub(super) multipath: Option<MultipathParameter>,
     /// The nonce of `zmux_role` auto.
     pub(super) role_nonce: Option<u64>,
-    /// The Lane Key of zmux_max_lanes.
+    /// The Lane Key of `zmux_max_lanes`.
     pub(super) lane_key: [u8; 16],
-    /// zmux_carrier_datagrams is sent although the configuration alone
+    /// `zmux_carrier_datagrams` is sent although the configuration alone
     /// does not send it: the bootstrap carrier has a datagram channel.
     pub(super) carrier_datagrams: bool,
 }

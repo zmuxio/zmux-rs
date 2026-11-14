@@ -38,13 +38,14 @@ pub struct SecretSource {
 pub enum SecretFlags {
     /// A side has no source: multipath is not in use.
     NoSource,
-    /// Both non-zero and different: a TRANSPORT_PARAMETER_ERROR.
+    /// Both non-zero and different: a `TRANSPORT_PARAMETER_ERROR`.
     Differ,
     /// Equal flags select these sources.
     Selected(SecretSource),
 }
 
 /// Compares both endpoints' Secret Flags; reserved bits are ignored.
+#[must_use]
 pub const fn select_secret_source(local: u8, peer: u8) -> SecretFlags {
     let (local, peer) = (
         local & !secret_flags::RESERVED,
@@ -64,6 +65,7 @@ pub const fn select_secret_source(local: u8, peer: u8) -> SecretFlags {
 
 /// The public binding value of a session: HKDF-Extract with SHA-256 of the
 /// two Session Nonces under a fixed label.
+#[must_use]
 pub fn session_binding(initiator: &[u8; 16], responder: &[u8; 16]) -> [u8; 32] {
     hmac(b"zmux session binding", &[initiator, responder])
 }
@@ -82,6 +84,7 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// HKDF-Extract with SHA-256 (RFC 5869 Section 2.2).
+#[must_use]
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     hmac(salt, &[ikm])
 }
@@ -91,9 +94,9 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 /// unwritten. zmux only derives 32-byte keys.
 pub fn hkdf_expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
     let mut prev: [u8; 32] = [0; 32];
-    for (i, chunk) in out.chunks_mut(32).enumerate().take(255) {
-        let counter = [i as u8 + 1];
-        let t: &[u8] = if i == 0 { &[] } else { &prev };
+    for (chunk, counter) in out.chunks_mut(32).zip(1..=u8::MAX) {
+        let counter = [counter];
+        let t: &[u8] = if counter[0] == 1 { &[] } else { &prev };
         prev = hmac(prk, &[t, info, &counter]);
         chunk.copy_from_slice(&prev[..chunk.len()]);
     }
@@ -103,6 +106,7 @@ pub fn hkdf_expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
 /// responder nonce, exporter value || psk). Pass empty slices for absent
 /// inputs; the exporter value has a fixed length per bootstrap form, so the
 /// concatenation is unambiguous.
+#[must_use]
 pub fn session_secret(
     initiator_nonce: &[u8; 16],
     responder_nonce: &[u8; 16],
@@ -120,6 +124,7 @@ pub fn session_secret(
 
 /// Whether two Lane Keys are equal, compared in constant time: a reader
 /// looks a lane's key up among its sessions this way.
+#[must_use]
 pub fn lane_key_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
     std::hint::black_box(diff) == 0
@@ -130,7 +135,11 @@ mod tests {
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 
     #[test]

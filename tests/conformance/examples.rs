@@ -2,6 +2,11 @@
 //! decodes back, the key-schedule vectors match, and the foreign prefixes are
 //! rejected at the byte shown.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -133,7 +138,7 @@ fn examples_semantics() {
     };
     let (preamble, size) = WirePreamble::parse(s.data, 4096).unwrap();
     assert_eq!(preamble.open_info, Some(&b"example.com:443"[..]));
-    assert_eq!(preamble.priority.map(|p| p.urgency()), Some(1));
+    assert_eq!(preamble.priority.map(zmux::Priority::urgency), Some(1));
     assert_eq!(&s.data[size..], b"hello");
 
     // 3.3 and 3.4: datagram flow prefixes.

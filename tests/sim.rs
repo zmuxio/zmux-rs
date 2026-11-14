@@ -11,6 +11,11 @@
 //! it (with `ZMUX_SIM_LOG=1` it prints each step). `ZMUX_SOAK=<k>` runs
 //! k times the seeds.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 use std::collections::BTreeMap;
@@ -31,6 +36,10 @@ fn pattern(id: u64, dir: usize, off: u64) -> u8 {
 
 /// One direction of a stream.
 #[derive(Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent progress flags the invariants check one by one"
+)]
 struct Half {
     /// The writing end (A = 0, B = 1).
     writer: usize,
@@ -227,7 +236,7 @@ impl Sim {
                     ctl.stall(false);
                 });
             }
-            89..=92 if self.listener.is_some() => self.pipe_op().await,
+            89..=92 if self.listener.is_some() => self.pipe_op(),
             93 if self.rng.below(40) == 0 => {
                 let side = self.rng.below(2) as usize;
                 self.note(|| format!("shutdown side {side}"));
@@ -351,7 +360,7 @@ impl Sim {
             let Ok(r) = tokio::time::timeout(t, recv.read(&mut buf)).await else {
                 return;
             };
-            Self::got(seed, k, h, r, &buf);
+            Self::got(seed, k, h, &r, &buf);
         }
     }
 
@@ -360,10 +369,10 @@ impl Sim {
         seed: u64,
         k: (u64, usize),
         h: &mut Half,
-        r: Result<Option<usize>, StreamError>,
+        r: &Result<Option<usize>, StreamError>,
         buf: &[u8],
     ) {
-        match r {
+        match *r {
             Ok(Some(n)) => {
                 for (i, &b) in buf[..n].iter().enumerate() {
                     let off = h.read + i as u64;
@@ -387,7 +396,7 @@ impl Sim {
         }
     }
 
-    async fn pipe_op(&mut self) {
+    fn pipe_op(&mut self) {
         let listener = self.listener.clone().expect("multipath");
         match self.rng.below(3) {
             0 if self.pipes.len() < 3 => {

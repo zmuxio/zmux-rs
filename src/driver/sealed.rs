@@ -431,6 +431,10 @@ mod tests {
     /// An empty write seals nothing and leaves nothing pending: a later
     /// write, after one that was pending, reports its own bytes.
     #[tokio::test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "test: keys, carrier and writer of the usual short names"
+    )]
     async fn an_empty_write_is_no_record() {
         use std::task::{Context, Poll, Waker};
         let (s, mut o) = keys();
@@ -517,7 +521,7 @@ mod tests {
         let lens = [1, 2, 100, 4096, SEALED_MAX_RECORD];
         let mut want = Vec::new();
         for (n, &len) in lens.iter().enumerate() {
-            let plain = vec![n as u8; len];
+            let plain = vec![u8::try_from(n).unwrap(); len];
             w.write_all(&plain).await.unwrap();
             let c = aes_256_gcm().seal(&key, n as u64, b"", &plain);
             want.extend_from_slice(&length_prefix(&c).unwrap());
@@ -536,7 +540,7 @@ mod tests {
         let mut buf = vec![0; 1 << 16];
         for (n, &len) in lens.iter().enumerate() {
             assert_eq!(r.read(&mut buf).await.unwrap(), len);
-            assert!(buf[..len].iter().all(|&b| b == n as u8));
+            assert!(buf[..len].iter().all(|&b| usize::from(b) == n));
         }
     }
 

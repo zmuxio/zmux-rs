@@ -14,6 +14,7 @@ use crate::proto::session::{
     ClaimedHello, Config, ConfirmedJoin, JoinStep, OpenedHello, PeerCarrier, PipeAuth, PipeId,
     PipeOptions, Role, Scheduler, SessionCore, StreamKey, TransmitBuf,
 };
+use crate::util::f64_of;
 
 const BS: Framing = Framing::ByteStream;
 const MS: Duration = Duration::from_millis(1);
@@ -229,7 +230,7 @@ fn rate_weights_use_the_placement_rate() {
     let (a, k) = two_pipes(Scheduler::SpreadRateWeighted, None, 1 << 20);
     let gate = a.gate().unwrap();
     let w: Vec<(u64, f64)> = a.rr_weights(k, &gate, 0).collect();
-    assert_eq!(w, [(0, FAST as f64), (2, FAST as f64)]);
+    assert_eq!(w, [(0, f64_of(FAST)), (2, f64_of(FAST))]);
 }
 
 #[test]
@@ -367,7 +368,7 @@ fn bytes_the_limiter_holds_back_do_not_wait_for_the_carrier() {
     assert!(!a.bytes_wait_for(0), "held by the limiter");
 }
 
-/// T_suspect includes queue_p on a carrier that reports no unsent count:
+/// `T_suspect` includes `queue_p` on a carrier that reports no unsent count:
 /// the oldest ack-eliciting batch went out behind a batch whose write call
 /// on another lane had not returned.
 #[test]
@@ -386,7 +387,8 @@ fn t_suspect_includes_the_write_calls_in_progress_ahead() {
     o.mp_batch_sent(1, true, mad, now);
     let o = a.out_ref(2).unwrap();
     assert_eq!(o.oldest_eliciting_batch().unwrap().unsent_ahead, 50_000);
-    let queue = Duration::from_secs_f64(50_000.0 / o.est().rate as f64).min(Duration::from_secs(1));
+    let queue =
+        Duration::from_secs_f64(50_000.0 / f64_of(o.est().rate)).min(Duration::from_secs(1));
     assert!(queue >= 100 * MS, "{queue:?}");
     let pto = o.est().pto(mad);
     let floor = o.detection().0;

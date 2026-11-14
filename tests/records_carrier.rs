@@ -2,6 +2,11 @@
 //! application's write-through writes whole messages, which may pass its
 //! byte budget (a regression: the budget arithmetic underflowed).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;

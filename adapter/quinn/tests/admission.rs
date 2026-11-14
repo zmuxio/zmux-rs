@@ -142,10 +142,18 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
             let mut recv = to.accept_uni().await.unwrap();
             let data = recv.read_to_end(len + 1).await.unwrap();
             assert_eq!(data.len(), len);
-            assert!(data.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+            assert!(
+                data.iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
+            );
         }
     });
-    let data = bytes::Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let data = bytes::Bytes::from(
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>(),
+    );
     for _ in 0..n {
         let mut send = from.open_uni().await.unwrap();
         send.write_chunk(data.clone()).await.unwrap();
@@ -206,14 +214,14 @@ async fn a_wrong_token_goes_to_the_fallback_with_every_byte() {
     let server = Server::new(admission(), Some(fallback));
     let conn = server.connect().await;
     let (mut send, _recv) = conn.open_bi().await.unwrap();
-    let sent: Vec<u8> = (0..100u8).collect();
-    send.write_all(&sent).await.unwrap();
+    let payload: Vec<u8> = (0..100u8).collect();
+    send.write_all(&payload).await.unwrap();
     send.finish().unwrap();
     let got = tokio::time::timeout(LIMIT, rx.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(got, sent);
+    assert_eq!(got, payload);
     tokio::time::timeout(LIMIT, conn.closed()).await.unwrap();
     assert_eq!(server.listener.stats().sessions, 0);
     server.stop().await;

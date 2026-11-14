@@ -5,6 +5,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::util::{f64_of, u64_sat};
+
 use crate::proto::session::ledger::{Expected, Tag};
 use crate::proto::session::mpath::Mp;
 use crate::proto::session::pipes::{Attachment, Attachments, OutPipe};
@@ -27,7 +29,7 @@ const SMALL_STREAM: u64 = 256 * 1024;
 const PLACEMENT_ROUNDS: u64 = 4;
 
 /// Bulk `affinity` directions are rebalanced at most once per
-/// max(this, 4 x RTT_max).
+/// max(this, 4 x `RTT_max`).
 const REBALANCE: Duration = Duration::from_secs(1);
 /// A bulk direction moves only for at least this much more share.
 const REBALANCE_GAIN: f64 = 1.25;
@@ -194,6 +196,10 @@ impl Decision {
     /// Debug builds: what the decision keeps across chunks equals a fresh
     /// decision's.
     #[cfg(debug_assertions)]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "names follow the scheduler's notation: p the decision's pipe, f the fastest, d the decision"
+    )]
     pub(in crate::proto::session) fn check_renewed(&self, s: &SessionCore) {
         let fresh = s.decision(self.id, self.gate);
         let core = |d: &Self| (d.id, d.gate, d.open, d.tier, d.usable, d.takes, d.fastest);
@@ -231,8 +237,8 @@ impl Decision {
     }
 }
 
-/// What ETA_p(L) needs of a pipe at a
-/// decision: Q_p, R_p as divided by (at least 1), R_p as estimated, and
+/// What `ETA_p(L)` needs of a pipe at a
+/// decision: `Q_p`, `R_p` as divided by (at least 1), `R_p` as estimated, and
 /// the one-way delay in seconds.
 #[derive(Debug, Clone, Copy)]
 struct Eta {
@@ -243,9 +249,9 @@ struct Eta {
 }
 
 impl Eta {
-    /// ETA_p(L) in seconds.
+    /// `ETA_p(L)` in seconds.
     fn of(&self, len: u64) -> f64 {
-        (self.queued + len) as f64 / self.rate as f64 + self.owd
+        f64_of(self.queued + len) / f64_of(self.rate) + self.owd
     }
 }
 
@@ -282,13 +288,13 @@ impl SessionCore {
             .unwrap_or(u64::MAX)
     }
 
-    /// ETA_p(L) in seconds of an attachment's
+    /// `ETA_p(L)` in seconds of an attachment's
     /// outbound pipe `o`.
     pub(in crate::proto::session) fn eta(&self, a: &Attachment, o: &OutPipe, len: u64) -> f64 {
         self.eta_inputs(a, o).of(len)
     }
 
-    /// What ETA_p(L) needs of a pipe now.
+    /// What `ETA_p(L)` needs of a pipe now.
     fn eta_inputs(&self, a: &Attachment, o: &OutPipe) -> Eta {
         let rate = self.placement_rate(a, o);
         Eta {
@@ -305,19 +311,19 @@ impl SessionCore {
         Some(self.eta_inputs(a, a.out()?))
     }
 
-    /// The rate at which the spreading policies place data on a pipe: R_p,
+    /// The rate at which the spreading policies place data on a pipe: `R_p`,
     /// except for a usable pipe without a
     /// bottleneck sample while another usable pipe of its tier with the
     /// same standby flag has one (or was penalized): that pipe counts as
     /// fast as the fastest such pipe, for four of its own round trips from
-    /// the first time that is more than R_p, or until its first bottleneck
+    /// the first time that is more than `R_p`, or until its first bottleneck
     /// sample or a penalty. A pipe that joins while the others carry the
     /// load would otherwise get nothing but urgent copies on a fast path:
     /// its 1 MB/s start fails BLEST, and the application-limited samples
     /// of the copies keep it there. Only the arrival estimate (and with it
     /// ECF, BLEST and the redundant pair) and the rate weights use it;
     /// bindings, tier gating, failure detection, the limiter and the
-    /// budgets keep R_p.
+    /// budgets keep `R_p`.
     fn placement_rate(&self, a: &Attachment, o: &OutPipe) -> u64 {
         placement_rate(&self.atts, a, o, self.config.hooks.no_placement_rate)
     }
@@ -601,7 +607,7 @@ impl SessionCore {
                     *left = left.saturating_sub(n);
                     *left == 0
                 }
-                Some(Picked::Pipe { left: None, .. }) | Some(Picked::Wait { .. }) | None => false,
+                Some(Picked::Pipe { left: None, .. } | Picked::Wait { .. }) | None => false,
                 Some(Picked::Affinity) => true,
             };
             if used {
@@ -672,7 +678,12 @@ impl SessionCore {
             .iter()
             .any(|a| class.usable(a) && !seen.contains(&a.id()));
         seen.clear();
-        seen.extend(self.atts.iter().filter(|a| class.usable(a)).map(|a| a.id()));
+        seen.extend(
+            self.atts
+                .iter()
+                .filter(|a| class.usable(a))
+                .map(Attachment::id),
+        );
         let mp = self.mp_mut().affinity_mut();
         mp.usable_seen = seen;
         if grew {
@@ -749,8 +760,8 @@ impl SessionCore {
     /// pipe has no rate sample) would be permanent. At most once per
     /// interval, bulk directions move, through the idle point the sender
     /// creates, from the pipe where each gets the smallest share of
-    /// capacity (R_p / n_p) to the one where it would get the largest
-    /// (R_q / (n_q + 1)) while that is at least 25 % more. A move to a
+    /// capacity (`R_p` / `n_p`) to the one where it would get the largest
+    /// (`R_q` / (`n_q` + 1)) while that is at least 25 % more. A move to a
     /// less-preferred tier keeps a bulk direction on the donor pipe, so
     /// that the preferred tier stays fully used and only the excess goes
     /// down; a pipe without bulk directions (whose rate is not measured
@@ -814,7 +825,7 @@ impl SessionCore {
                 p.3 += 1;
             }
         }
-        let share = |rate: u64, n: u64| rate as f64 / n.max(1) as f64;
+        let share = |rate: u64, n: u64| f64_of(rate) / f64_of(n.max(1));
         // The pipe whose bulk directions get the smallest share.
         let donor = |pipes: &[(u64, u64, u64, u64, bool)]| {
             (0..pipes.len())
@@ -879,7 +890,7 @@ impl SessionCore {
         Expected::of(send).bytes(self.session_send_buffer())
     }
 
-    /// The most-preferred tier whose binding wait (Q_t + A_t) / R_t is at
+    /// The most-preferred tier whose binding wait (`Q_t` + `A_t`) / `R_t` is at
     /// most the overflow delay for a stream direction, with
     /// the session send buffer `sb` in force.
     fn passing_tier(&self, key: StreamKey, sb: u64) -> Option<u64> {
@@ -897,7 +908,7 @@ impl SessionCore {
                     rate = rate.saturating_add(o.est().rate.max(1));
                 }
             }
-            wait as f64 / rate as f64 <= d
+            f64_of(wait) / f64_of(rate) <= d
         })
     }
 
@@ -938,7 +949,7 @@ impl SessionCore {
                     let load = Self::queued(o)
                         .saturating_add(ledger.load(a.id(), key, sb))
                         .saturating_add(expected);
-                    score += load as f64 / o.est().rate.max(1) as f64;
+                    score += f64_of(load) / f64_of(o.est().rate.max(1));
                 }
                 Some((score, a.id()))
             })
@@ -947,6 +958,10 @@ impl SessionCore {
     }
 
     /// `spread-eta`.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "names follow the scheduler's notation: p the decision's pipe, f the fastest, d the decision"
+    )]
     fn spread_eta_ok(&self, d: &Decision, send: &SendPart) -> bool {
         let Some(gate) = d.gate else {
             return false;
@@ -1006,12 +1021,12 @@ impl SessionCore {
 
     /// BLEST: the fast pipe `f` does not stall on
     /// the window while a chunk arrives at `eta_p` over the slower pipe.
-    /// All of F = R_f x (ETA_p - OWD_f) must fit the session's credit and
+    /// All of F = `R_f` x (`ETA_p` - `OWD_f`) must fit the session's credit and
     /// the reorder budget; the stream's own credit takes F / n, its share
     /// of f among the `n` directions of its level served in turns.
     fn blest_ok(&self, d: &Decision, f: Eta, eta_p: f64, stream_room: u64, n: u64) -> bool {
-        let need = f.estimate as f64 * (eta_p - f.owd).max(0.0);
-        need <= self.blest_room(d) as f64 && need / n as f64 <= stream_room as f64
+        let need = f64_of(f.estimate) * (eta_p - f.owd).max(0.0);
+        need <= f64_of(self.blest_room(d)) && need / f64_of(n) <= f64_of(stream_room)
     }
 
     /// W of BLEST but for the stream's credit: the smaller of the session's
@@ -1028,6 +1043,10 @@ impl SessionCore {
     /// (at least a chunk here, at most all of the level), and BLEST's
     /// stream term takes F / n <= F against a stream credit of at least a
     /// chunk; the other conditions are the same for all.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "names follow the scheduler's notation: p the decision's pipe, f the fastest, d the decision"
+    )]
     fn whole_chunk_on(&self, d: &Decision, key: StreamKey) -> Option<bool> {
         let whole = self.config.spread_chunk as u64;
         let send = self.streams.get(key)?.send.as_ref()?;
@@ -1047,11 +1066,11 @@ impl SessionCore {
         if !ecf(None) {
             return Some(false);
         }
-        let need = f.estimate as f64 * (eta_p - f.owd).max(0.0);
+        let need = f64_of(f.estimate) * (eta_p - f.owd).max(0.0);
         let w = self.blest_room(d);
-        if need > w as f64 {
+        if need > f64_of(w) {
             Some(false)
-        } else if need <= w.min(whole) as f64
+        } else if need <= f64_of(w.min(whole))
             && (self.config.hooks.no_ecf_share || ecf(Some(whole)))
         {
             // The smallest backlog passes too.
@@ -1065,7 +1084,7 @@ impl SessionCore {
     /// beta: min(session send credit, U + the
     /// level's part) - len, where U is the ready data of the more urgent
     /// levels and the level's part is, for a direction served in turns with
-    /// `share` = Some(r) bytes ready, the sum over the level of min(ready_j,
+    /// `share` = Some(r) bytes ready, the sum over the level of `min(ready_j`,
     /// r), else all ready data of the level. Urgency 0 to 2 counts only the
     /// more urgent levels: min(session send credit, U), beta 0.
     fn ecf_backlog(&self, d: &Decision, u: u8, share: Option<u64>, len: u64) -> (u64, f64) {
@@ -1123,8 +1142,9 @@ impl SessionCore {
             }
         }
         let spread = max_owd.saturating_sub(min_owd.unwrap_or_default());
-        let budget = 2.0 * sum_rate as f64 * spread.as_secs_f64() + self.config.spread_chunk as f64;
-        session_room.min(budget as u64)
+        let budget =
+            2.0 * f64_of(sum_rate) * spread.as_secs_f64() + f64_of(self.config.spread_chunk as u64);
+        session_room.min(u64_sat(budget))
     }
 
     /// Whether a stream direction has a round-robin policy of its own (its
@@ -1139,7 +1159,7 @@ impl SessionCore {
     }
 
     /// The weights of the round-robin engine:
-    /// Weight for `spread-round-robin`, Weight x R_q for
+    /// Weight for `spread-round-robin`, Weight x `R_q` for
     /// `spread-rate-weighted`.
     fn rr_weights<'a>(
         &'a self,
@@ -1166,9 +1186,9 @@ impl SessionCore {
         by_rate: bool,
         off: bool,
     ) -> f64 {
-        let w = w as f64;
+        let w = f64_of(w);
         if by_rate {
-            w * placement_rate(atts, a, o, off).max(1) as f64
+            w * f64_of(placement_rate(atts, a, o, off).max(1))
         } else {
             w
         }
@@ -1281,7 +1301,7 @@ impl SessionCore {
         };
         // A sticky answer holds only while its pipe exists and takes new
         // data.
-        let holds = |pipe: u64| self.out_ref(pipe).is_some_and(|o| o.takes_new_data());
+        let holds = |pipe: u64| self.out_ref(pipe).is_some_and(OutPipe::takes_new_data);
         match send.mp().picked {
             Some(Picked::Pipe {
                 pipe, generation, ..
@@ -1445,11 +1465,7 @@ impl SessionCore {
                 probation: o.in_probation(),
                 eligible: gate.admits(a),
                 weight: a.tier().weight(),
-                shaping: self
-                    .shape
-                    .as_deref()
-                    .and_then(|s| s.weight(a.id()))
-                    .map(|w| w.map(u64::from)),
+                shaping: self.shape.as_deref().and_then(|s| s.weight(a.id())),
             })
         }));
         let generation = self.mp().picks().generation;
@@ -1491,7 +1507,7 @@ impl SessionCore {
                     .get(index)
                     .filter(|p| {
                         self.atts.iter().any(|a| {
-                            a.id() == p.pipe.0 && a.out().is_some_and(|o| o.takes_new_data())
+                            a.id() == p.pipe.0 && a.out().is_some_and(OutPipe::takes_new_data)
                         })
                     })
                     .map_or(Picked::Affinity, |p| Picked::Pipe {
@@ -1556,10 +1572,10 @@ impl SessionCore {
         let mut sum = 0.0;
         for a in &self.atts {
             if let Some(o) = a.out().filter(|o| o.is_live()) {
-                sum += o.est().rate as f64 * (o.est().srtt + mad).as_secs_f64();
+                sum += f64_of(o.est().rate) * (o.est().srtt + mad).as_secs_f64();
             }
         }
-        let budget = (4.0 * sum) as u64;
+        let budget = u64_sat(4.0 * sum);
         // Capped by the `max` of `send_buffer` (no fixed cap).
         let max = self
             .send_buffer_limit()

@@ -1,6 +1,6 @@
 //! An attachment's tier settings: the local settings of its outbound
 //! direction, the request for the peer's, the peer's request, and the
-//! PIPE_STATUS frames owed.
+//! `PIPE_STATUS` frames owed.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -27,7 +27,7 @@ pub(crate) struct TierState {
     /// The peer's latest request (standby, priority) and its sequence.
     peer: Option<(bool, u64)>,
     peer_seq: u64,
-    /// The last PIPE_STATUS sequence number assigned, and the requests
+    /// The last `PIPE_STATUS` sequence number assigned, and the requests
     /// owed: each change is one frame with the next number, and a lost
     /// frame is sent again only if it is the latest.
     seq: u64,
@@ -122,7 +122,7 @@ impl TierState {
         self.peer
     }
 
-    /// The last PIPE_STATUS sequence number assigned.
+    /// The last `PIPE_STATUS` sequence number assigned.
     pub(crate) fn seq(&self) -> u64 {
         self.seq
     }
@@ -153,13 +153,13 @@ impl TierState {
         self.probation
     }
 
-    /// The oldest PIPE_STATUS owed: sequence, standby, priority.
+    /// The oldest `PIPE_STATUS` owed: sequence, standby, priority.
     #[inline]
     pub(crate) fn owed(&self) -> Option<(u64, bool, u64)> {
         self.owed.front().copied()
     }
 
-    /// A PIPE_STATUS is owed.
+    /// A `PIPE_STATUS` is owed.
     #[inline]
     pub(crate) fn status_owed(&self) -> bool {
         !self.owed.is_empty()
@@ -223,13 +223,13 @@ impl TierState {
         self.peer = Some((standby, priority));
     }
 
-    /// Whether a PIPE_STATUS with sequence number `seq` is newer than the
+    /// Whether a `PIPE_STATUS` with sequence number `seq` is newer than the
     /// last one taken.
     pub(crate) fn newer(&self, seq: u64) -> bool {
         seq > self.peer_seq
     }
 
-    /// The peer's PIPE_STATUS request with sequence number `seq`.
+    /// The peer's `PIPE_STATUS` request with sequence number `seq`.
     pub(crate) fn peer_status(&mut self, seq: u64, standby: bool, priority: u64) {
         self.peer_seq = seq;
         self.peer = Some((standby, priority));
@@ -246,7 +246,7 @@ impl TierState {
         self.receive_standby && !self.takeover
     }
 
-    /// The current request as a new PIPE_STATUS with the next sequence
+    /// The current request as a new `PIPE_STATUS` with the next sequence
     /// number.
     pub(crate) fn request(&mut self) {
         self.seq += 1;
@@ -272,7 +272,7 @@ impl TierState {
         }
     }
 
-    /// The oldest PIPE_STATUS owed was written.
+    /// The oldest `PIPE_STATUS` owed was written.
     pub(crate) fn status_written(&mut self) {
         self.owed.pop_front();
     }

@@ -192,38 +192,45 @@ impl Profile {
     }
 
     /// The Profile value.
+    #[must_use]
     pub fn value(self) -> u64 {
         self.0.value
     }
 
     /// The Noise protocol name.
+    #[must_use]
     pub fn noise_name(self) -> &'static str {
         self.0.noise_name
     }
 
     /// Whether the Hello carries a Handle.
+    #[must_use]
     pub fn has_handle(self) -> bool {
         self.0.has_handle
     }
 
     /// The PQ confidentiality column: whether the handshake's confidentiality and the
     /// keys it yields resist a passive quantum adversary.
+    #[must_use]
     pub fn pq_confidentiality(self) -> bool {
         self.0.pq_confidentiality
     }
 
     /// The AEAD of the Profile.
+    #[must_use]
     pub fn cipher(self) -> &'static Cipher {
         (self.0.cipher)()
     }
 
     /// The handshake name a shaper is told for this Profile's messages.
+    #[must_use]
     pub fn handshake_name(self) -> &'static str {
         HANDSHAKE_ESTABLISH
     }
 
     /// The Noise length of message `index` (0 to 2) with an empty payload: the
     /// shortest valid form, which a shaper pads from.
+    #[must_use]
     pub fn empty_message_len(self, index: usize) -> usize {
         let params = self.0;
         let tag = (params.cipher)().tag_len();
@@ -255,6 +262,7 @@ impl Profile {
     }
 
     /// The length of the pre-shared key, or `None` without one.
+    #[must_use]
     pub fn psk_len(self) -> Option<usize> {
         self.0.shape.messages[0]
             .contains(&Psk)

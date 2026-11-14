@@ -71,6 +71,10 @@ impl Rng {
     }
 
     /// A value in [0, 1).
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a 53-bit value and 2^53 are exact in f64"
+    )]
     pub(crate) fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -132,7 +136,7 @@ impl Proxy {
 /// body.
 async fn read_message(conn: &mut TcpStream, to_close: bool) -> Option<(String, Vec<u8>)> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
+    let mut chunk = vec![0u8; 16 * 1024];
     let end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break i + 4;
@@ -232,8 +236,9 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
     if replay {
         let cached = {
             let cache = shared.cache.lock().unwrap();
-            let i = shared.rng.lock().unwrap().next() as usize;
-            (!cache.is_empty()).then(|| cache[i % cache.len()].clone())
+            let r = shared.rng.lock().unwrap().next();
+            (!cache.is_empty())
+                .then(|| cache[usize::try_from(r % cache.len() as u64).unwrap()].clone())
         };
         if let Some(c) = cached {
             st.replays.fetch_add(1, Ordering::Relaxed);
@@ -253,13 +258,14 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
     }
     let fwd = forward(&shared.origin, &target, &body);
     let resp = match f.cut {
-        Some(cut) => match tokio::time::timeout(cut, fwd).await {
-            Ok(r) => r,
-            Err(_) => {
+        Some(cut) => {
+            if let Ok(r) = tokio::time::timeout(cut, fwd).await {
+                r
+            } else {
                 st.cuts.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        },
+        }
         None => fwd.await,
     };
     let Some((code, resp)) = resp else {

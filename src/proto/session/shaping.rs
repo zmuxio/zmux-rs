@@ -60,6 +60,7 @@ pub struct ShapedPipe {
 
 impl ShapedPipe {
     /// Pipe `id` on a carrier of kind `carrier`, without write overhead.
+    #[must_use]
     pub const fn new(id: PipeId, carrier: Option<CarrierKind>) -> Self {
         Self {
             id,
@@ -324,7 +325,7 @@ pub fn ask_handshake(
     view: &HandshakeView,
     limits: &Limits,
 ) -> PlanAnswer {
-    match catch_unwind(AssertUnwindSafe(|| (shaper.0)(view))) {
+    match catch_unwind(AssertUnwindSafe(|| shaper.0(view))) {
         Ok(Some(mut plan)) => {
             plan.apply_limits(limits);
             PlanAnswer::Plan(plan)
@@ -372,7 +373,7 @@ pub const fn pad_item(gap: isize, room: usize) -> Option<usize> {
     if gap <= 0 {
         return None;
     }
-    let gap = gap as usize;
+    let gap = gap.cast_unsigned();
     let mut v = gap.saturating_sub(2);
     while v > 0 && item_size(v - 1) >= gap {
         v -= 1;
@@ -392,10 +393,10 @@ pub const fn pad_fill(gap: isize, room: usize) -> usize {
     if gap <= 0 {
         return 0;
     }
-    if gap as usize > room {
+    if gap.cast_unsigned() > room {
         room
     } else {
-        gap as usize
+        gap.cast_unsigned()
     }
 }
 
@@ -944,7 +945,7 @@ impl ShapingBudget {
     /// One session's budget.
     #[must_use]
     pub fn ask(&self) -> Budget {
-        catch_unwind(AssertUnwindSafe(|| (self.0)())).unwrap_or_default()
+        catch_unwind(AssertUnwindSafe(|| self.0())).unwrap_or_default()
     }
 }
 

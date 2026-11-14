@@ -52,6 +52,10 @@ impl Factory for Recording {
 }
 
 impl Recording {
+    #[allow(
+        clippy::option_option,
+        reason = "unseen, no carrier and a carrier are three different outcomes"
+    )]
     fn kind_of(&self, id: PipeId) -> Option<Option<CarrierKind>> {
         let seen = self.seen.lock().unwrap();
         seen.iter().find(|p| p.id == id).map(|p| p.carrier)

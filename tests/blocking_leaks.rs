@@ -1,6 +1,6 @@
 //! Leak and liveness tests of the std driver (`zmux::blocking`) over TCP:
 //! every way a session ends, carriers stuck in a blocked write, and each
-//! kind of wait raced against close, reset, STOP_SENDING, GOAWAY,
+//! kind of wait raced against close, reset, `STOP_SENDING`, GOAWAY,
 //! shutdown, deadline and carrier failure. Driver threads, sessions and
 //! the process's open file descriptors return to their baseline
 //! (`zmux::test_hooks`).
@@ -8,6 +8,15 @@
 //! The counts are process-wide: the tests of this binary run one at a
 //! time ([`serial`]). Each runs under a watchdog. `ZMUX_SOAK=<k>`
 //! multiplies the rounds.
+
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
 
 #[path = "common/basics.rs"]
 mod basics;
@@ -63,9 +72,10 @@ fn settle(base: Snapshot, secs: u64, what: &str) {
         if now == base {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("{what}: resources not released\n  baseline {base:?}\n  now      {now:?}");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: resources not released\n  baseline {base:?}\n  now      {now:?}"
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -323,10 +333,8 @@ fn session_life(end: End) {
         End::CarrierFails => {
             let _ = control.shutdown(Shutdown::Both);
         }
-        End::IdleTimeout => {
-            // Nothing flows: the blocked writer's stream ended at the server.
-        }
-        End::DropAll => {}
+        // IdleTimeout: nothing flows, the blocked writer's stream ended at the server.
+        End::IdleTimeout | End::DropAll => {}
         End::StuckClose => {
             relay.stall.store(true, Ordering::SeqCst);
             client.abort(VarInt::from_u32(4), b"stuck");
@@ -343,11 +351,11 @@ fn session_life(end: End) {
             "{e:?}"
         );
     }
-    if !matches!(end, End::DropAll) {
+    if matches!(end, End::DropAll) {
+        drop((client.clone(), server.clone()));
+    } else {
         client.closing().unwrap();
         server.closing().unwrap();
-    } else {
-        drop((client.clone(), server.clone()));
     }
     let _ = blocked.join();
     let _ = reader.join();

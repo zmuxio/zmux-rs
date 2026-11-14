@@ -47,6 +47,10 @@ impl Observe for () {}
 
 /// One direction of a carrier (a TCP connection's byte stream).
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent fault switches a scenario sets one by one"
+)]
 pub(crate) struct Flow {
     /// Bytes in flight, each with the time it may arrive (in order).
     pub(crate) chunks: VecDeque<(Instant, Vec<u8>)>,
@@ -313,7 +317,12 @@ impl<X: Observe, S> MpNet<X, S> {
                     return;
                 }
                 match core.join_prepare(pipe, now) {
-                    Ok(Some(_)) => match core.join_hello(pipe, (BS, 0), &Default::default(), now) {
+                    Ok(Some(_)) => match core.join_hello(
+                        pipe,
+                        (BS, 0),
+                        &zmux::shaping::UnitPlan::default(),
+                        now,
+                    ) {
                         Ok(hello) => {
                             l.flows[A].push(now, &hello);
                             l.joining = Joining::Reply;

@@ -3397,6 +3397,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zmux-web-peer"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "http",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "zmux",
+ "zmux-http",
+ "zmux-rustls",
+ "zmux-websocket",
+]
+
+[[package]]
 name = "zmux-websocket"
 version = "1.2.7"
 dependencies = [

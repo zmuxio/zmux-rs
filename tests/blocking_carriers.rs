@@ -1,7 +1,16 @@
 //! The std driver and the carriers handed to it: each is released exactly once on every
 //! failure path of `connect`, `accept`, `add_pipe` and a listener's new session; the close's
-//! linger runs from the delivery of CONNECTION_CLOSE to a carrier whose writes block; and
+//! linger runs from the delivery of `CONNECTION_CLOSE` to a carrier whose writes block; and
 //! the redial hook replaces a lost pipe. Every test runs under a watchdog.
+
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -143,7 +152,7 @@ impl Drop for CountedRead {
     }
 }
 
-/// How long each write of a muted carrier takes. CONNECTION_CLOSE is the second write
+/// How long each write of a muted carrier takes. `CONNECTION_CLOSE` is the second write
 /// (a frame of 10 bytes goes first), and the wait for a carrier that does not take it is
 /// bounded by two linger timeouts (250 ms at least each): both writes together stay well
 /// within the first one, so a late scheduler does not end the wait before the delivery.
@@ -321,7 +330,7 @@ fn add_pipe_releases_a_failed_carrier_once() {
         let live: Vec<_> = client
             .pipes()
             .iter()
-            .filter_map(|p| p.stats())
+            .filter_map(zmux::blocking::Pipe::stats)
             .filter(|p| p.outbound != Some(zmux::OutboundState::Failed))
             .map(|p| p.pipe)
             .collect();
@@ -412,7 +421,7 @@ fn wait_closed(s: &Session, secs: u64) -> Instant {
     Instant::now()
 }
 
-/// The peer reading: `close` returns as soon as the carrier took CONNECTION_CLOSE. The
+/// The peer reading: `close` returns as soon as the carrier took `CONNECTION_CLOSE`. The
 /// hand-off and linger timers last an hour, so a close that returns (within the watchdog)
 /// waited for neither.
 #[test]
@@ -461,7 +470,7 @@ fn a_coded_close_delivers_its_code_and_the_wait_confirms_it() {
     });
 }
 
-/// Writes that block: CONNECTION_CLOSE waits at most the linger timeout for the carrier
+/// Writes that block: `CONNECTION_CLOSE` waits at most the linger timeout for the carrier
 /// and the linger follows, so `close` returns within its 1 s bound and the session ends.
 #[test]
 fn close_is_bounded_while_writes_block() {
@@ -481,7 +490,7 @@ fn close_is_bounded_while_writes_block() {
     });
 }
 
-/// Writes that block: an abort queues CONNECTION_CLOSE behind a write the carrier never
+/// Writes that block: an abort queues `CONNECTION_CLOSE` behind a write the carrier never
 /// completes; the hand-off limit (1 s) and the linger still end the session, closing the
 /// carrier, which releases the stuck write.
 #[test]
@@ -507,7 +516,7 @@ fn abort_ends_while_writes_block() {
     });
 }
 
-/// Writes that block: the idle timeout's CONNECTION_CLOSE never reaches the carrier, and
+/// Writes that block: the idle timeout's `CONNECTION_CLOSE` never reaches the carrier, and
 /// the session still ends within the close bounds.
 #[test]
 fn idle_close_ends_while_writes_block() {
@@ -532,7 +541,7 @@ fn idle_close_ends_while_writes_block() {
     });
 }
 
-/// A slow carrier delivers CONNECTION_CLOSE late, to a peer that stays silent: the linger
+/// A slow carrier delivers `CONNECTION_CLOSE` late, to a peer that stays silent: the linger
 /// (250 ms at least) runs from that delivery, not from the call.
 #[test]
 fn the_linger_runs_from_the_delivery() {
@@ -549,7 +558,7 @@ fn the_linger_runs_from_the_delivery() {
             .unwrap()
             .expect("CONNECTION_CLOSE written");
         // `close` returned at the delivery, the slow write's time after the call.
-        assert!(returned - begun >= SLOW - Duration::from_millis(50));
+        assert!(returned - begun >= SLOW.saturating_sub(Duration::from_millis(50)));
         assert!(returned >= delivered);
         assert!(
             ended - delivered >= Duration::from_millis(240),
@@ -682,7 +691,7 @@ fn replace_pipes_replaces_every_pipe() {
             PipeOptions::new(),
         )
         .unwrap();
-        let before: Vec<_> = c.pipes().iter().map(|p| p.id()).collect();
+        let before: Vec<_> = c.pipes().iter().map(zmux::blocking::Pipe::id).collect();
         c.replace_pipes_timeout(Duration::from_secs(20)).unwrap();
         assert_eq!(c.epoch(), Some(1));
         assert!(dials.load(Ordering::SeqCst) >= before.len());

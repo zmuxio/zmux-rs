@@ -127,7 +127,7 @@ pub enum CoreEvent {
         pipe: PipeId,
         /// The smoothed RTT; `None` before the first sample.
         smoothed_rtt: Option<std::time::Duration>,
-        /// The delivery rate R_p in bytes per second; `None` before it was
+        /// The delivery rate `R_p` in bytes per second; `None` before it was
         /// measured, or without pipe acknowledgement.
         delivery_rate: Option<u64>,
     },
@@ -173,7 +173,7 @@ pub enum CoreEvent {
     Suspended,
     /// The session left SUSPENDED.
     Resumed,
-    /// A QX_PING request was answered with this RTT sample
+    /// A `QX_PING` request was answered with this RTT sample
     /// ([`super::SessionCore::ping_rtt`]).
     PingAnswered {
         /// The round-trip time measured.

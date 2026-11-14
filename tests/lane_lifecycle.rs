@@ -4,6 +4,11 @@
 //! whose further streams are duplex pairs handed to the peer's
 //! `handle_lane`, as a QUIC adapter's accept loop would.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 use std::sync::Arc;
@@ -44,7 +49,7 @@ fn lane_carrier(io: Carrier, conn: &CarrierConnId, peer: CarrierConnId) -> PipeI
         })
 }
 
-/// The first record of a lane: PIPE_LANE for `key`, pipe 0, lane 7.
+/// The first record of a lane: `PIPE_LANE` for `key`, pipe 0, lane 7.
 fn pipe_lane_record(key: &[u8; 16]) -> Vec<u8> {
     let mut frame = 0x3a05_a1c9u32.to_be_bytes().to_vec();
     frame[0] |= 0x80;

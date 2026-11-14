@@ -11,6 +11,15 @@
 //! after every step and a failure names its seed (`ZMUX_SEED=<n>` replays
 //! it, `ZMUX_SOAK=<k>` runs k times the seeds).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -34,7 +43,7 @@ struct Seen {
     /// Halves each end reported retired: (pipe, outbound).
     retired: [BTreeSet<(u64, bool)>; 2],
     /// Halves each end reported a state of: (pipe, outbound).
-    seen: [BTreeSet<(u64, bool)>; 2],
+    reported: [BTreeSet<(u64, bool)>; 2],
     streams: Vec<StreamKey>,
     rng: Rng,
     log: Vec<String>,
@@ -57,7 +66,7 @@ fn net(seed: u64) -> Net {
     let seen = Seen {
         in_closed: Default::default(),
         retired: Default::default(),
-        seen: Default::default(),
+        reported: Default::default(),
         streams: Vec::new(),
         rng: Rng::new(seed),
         log: Vec::new(),
@@ -91,12 +100,12 @@ impl Net {
                     CoreEvent::PipeState { pipe, state } => {
                         self.s.log.push(format!("{end} {} {state:?}", pipe.get()));
                         let outbound = state.half() == PipeHalf::Outbound;
-                        self.s.seen[side].insert((pipe.get(), outbound));
+                        self.s.reported[side].insert((pipe.get(), outbound));
                     }
                     CoreEvent::PipeRetired { pipe, .. } => {
                         self.s.log.push(format!("{end} {} Retired", pipe.get()));
                         for outbound in [false, true] {
-                            if self.s.seen[side].contains(&(pipe.get(), outbound)) {
+                            if self.s.reported[side].contains(&(pipe.get(), outbound)) {
                                 self.s.retired[side].insert((pipe.get(), outbound));
                             }
                         }

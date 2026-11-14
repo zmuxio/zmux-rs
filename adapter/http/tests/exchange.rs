@@ -112,20 +112,20 @@ async fn server(options: ExchangeOptions) -> Server {
 /// Sends `len` bytes on a new stream and checks the echo by its hash.
 async fn echo(session: &Session, len: usize, seed: u64) {
     let mut rng = Rng::new(seed);
-    let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+    let data: Vec<u8> = (0..len).map(|_| rng.next().to_le_bytes()[0]).collect();
     let sent = Sha256::digest(&data);
-    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let (mut tx, mut rx) = session.open_bi().await.unwrap();
     let writer = tokio::spawn(async move {
         for c in data.chunks(100_000) {
-            send.write_all(c).await.unwrap();
+            tx.write_all(c).await.unwrap();
         }
-        send.finish().unwrap();
-        send
+        tx.finish().unwrap();
+        tx
     });
     let mut hash = Sha256::new();
     let mut got = 0;
     let mut buf = vec![0u8; 64 << 10];
-    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+    while let Some(n) = rx.read(&mut buf).await.unwrap() {
         hash.update(&buf[..n]);
         got += n;
     }
@@ -449,6 +449,49 @@ fn wrong_psk_fails_the_carrier() {
                 snapshot()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+}
+
+/// A graceful close of a client whose server is gone ends its carrier at
+/// once: with both halves closed by zmux, the first attempt of the last UP
+/// piece (with its FIN) that has no result ends the carrier, not the
+/// deadline (here far away).
+#[test]
+fn a_close_without_a_server_ends_the_carrier() {
+    run(60, async {
+        // The server runs on a runtime of its own, which ends with it.
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let srv = server_rt.spawn(server(quick())).await.unwrap();
+        let base = snapshot();
+        let mut o = quick();
+        o.deadline = Duration::from_secs(300);
+        o.request_timeout = Duration::from_secs(300);
+        let client = zmux_http::connect_exchange(&srv.addr, &o, Config::default())
+            .await
+            .unwrap();
+        echo(&client, 10_000, 1).await;
+        server_rt.shutdown_background();
+        drop(srv);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.closing()).await;
+        drop(client);
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        // The server's listener went with its runtime: only the client's
+        // tasks and pipes are compared.
+        let gone = |s: &Snapshot| s.tasks == base.tasks && s.res.pipes == 0 && s.res.sessions == 0;
+        while !gone(&snapshot()) {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the carrier outlived its session\n  baseline {base:?}\n  now      {:?}",
+                snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     });
 }

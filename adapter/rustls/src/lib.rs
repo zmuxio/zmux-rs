@@ -48,7 +48,7 @@
 //! [`over_tcp`] does the same for TLS over TCP, and adds the TCP socket
 //! below it: its minimum RTT, unsent bytes and low-water mark are used as
 //! for a plain TCP carrier, and a pipe that zmux fails is aborted by
-//! shutting the socket down without TLS close_notify, so that the peer sees
+//! shutting the socket down without TLS `close_notify`, so that the peer sees
 //! a failure rather than a graceful end ([`PipeIo::with_tcp_socket`];
 //! one duplicate of the socket serves both).
 //!
@@ -98,6 +98,7 @@
 //! never accepts it. Early data under the zmux floor
 //! ([`zmux::EarlyData::zmux_peer`]) goes after the handshake and needs
 //! none.
+#![forbid(unsafe_code)]
 
 use std::io;
 use std::pin::Pin;
@@ -158,7 +159,7 @@ where
 
 /// A pipe carrier from an established TLS stream over TCP: [`pipe`], plus
 /// the TCP socket's capabilities and an abort that shuts the socket down
-/// without TLS close_notify.
+/// without TLS `close_notify`.
 pub fn over_tcp(stream: impl Into<TlsStream<TcpStream>>) -> PipeIo {
     let stream = stream.into();
     let tcp = stream.get_ref().0;
@@ -191,6 +192,7 @@ pub struct Options {
 
 impl Options {
     /// The defaults: no credential.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -210,6 +212,12 @@ impl Options {
 /// and the TLS exporter) is written as the connection's first bytes after
 /// the handshake: the carrier of a server that admits connections
 /// ([`serve`] with an admission).
+///
+/// # Errors
+///
+/// `InvalidInput` for a `server_name` that is not a valid server name, the
+/// TCP connect's and TLS handshake's errors, the carrier credential's
+/// error when its prefix cannot be made, and a failed write of it.
 pub async fn dial(
     addr: impl ToSocketAddrs,
     server_name: &str,
@@ -237,6 +245,11 @@ async fn handshake(
 
 /// Establishes a session over a new TLS connection to `addr` ([`dial`],
 /// then [`Session::connect`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial`], and the errors of
+/// [`Session::connect`].
 pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,

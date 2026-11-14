@@ -12,7 +12,8 @@
 
 use std::time::Instant;
 
-use super::pipes::{LaneEnd, LaneState, OutPipe};
+use super::pipes::{Attachment, LaneEnd, LaneState, OutLane, OutLanes, OutPipe};
+use super::tp::TpValues;
 use super::{CoreEvent, LaneId, PipeEnd, SessionCore, SessionError, State, StreamKey};
 
 use crate::proto::Error;
@@ -34,7 +35,7 @@ pub enum LaneAccept {
 }
 
 impl SessionCore {
-    /// The Lane Key every PIPE_LANE toward this endpoint carries: the key by which a driver routes
+    /// The Lane Key every `PIPE_LANE` toward this endpoint carries: the key by which a driver routes
     /// the streams the peer opens to the session, comparing it in constant
     /// time ([`crate::proto::keys::lane_key_eq`]).
     pub fn lane_key(&self) -> Option<[u8; 16]> {
@@ -51,7 +52,7 @@ impl SessionCore {
     }
 
     /// The driver attached the stream of a lane it was asked to open with
-    /// [`CoreEvent::OpenLane`]: its first record, PIPE_LANE alone, goes out
+    /// [`CoreEvent::OpenLane`]: its first record, `PIPE_LANE` alone, goes out
     /// with the next [`SessionCore::poll_transmit`] for it. `false` when the
     /// lane was not asked for (or no longer is).
     pub fn lane_opened(&mut self, lane: LaneId, framing: Framing, now: Instant) -> bool {
@@ -82,7 +83,7 @@ impl SessionCore {
         self.out_ref(pipe.0)?.lanes()?.copy_lane()
     }
 
-    /// The peer's initial_max_streams_bidi, once its parameters arrived: a
+    /// The peer's `initial_max_streams_bidi`, once its parameters arrived: a
     /// stream carrier's lanes on this session are at most half of it.
     pub fn peer_initial_streams_bidi(&self) -> Option<u64> {
         self.peer_tp.as_ref().map(|t| t.streams_bidi)
@@ -100,13 +101,13 @@ impl SessionCore {
     }
 
     /// A new stream that the peer opened on the carrier connection of the
-    /// pipe's lane 0, whose first record begins with PIPE_LANE naming this
+    /// pipe's lane 0, whose first record begins with `PIPE_LANE` naming this
     /// session's Lane Key, the pipe and the lane (the driver checked the key and the connection).
     /// Its bytes, from its first, go to the receive calls once it is accepted.
     pub fn accept_lane(&mut self, lane: LaneId, framing: Framing, now: Instant) -> LaneAccept {
         self.tick(now);
         let (pipe, number) = (lane.pipe.0, lane.lane.0);
-        if self.state >= State::Closing || !self.att(pipe).is_some_and(|a| a.in_live()) {
+        if self.state >= State::Closing || !self.att(pipe).is_some_and(Attachment::in_live) {
             return LaneAccept::Refused;
         }
         let ty = FrameType::PIPE_LANE.0;
@@ -139,7 +140,7 @@ impl SessionCore {
         LaneAccept::Accepted
     }
 
-    /// A frame of the first record of an inbound lane: PIPE_LANE naming
+    /// A frame of the first record of an inbound lane: `PIPE_LANE` naming
     /// the lane, then PADDING only.
     pub(super) fn on_lane_first_frame(&mut self, frame: &Frame<'_>) -> Result<(), Error> {
         let (id, li) = (self.rx, self.rx_lane);
@@ -203,7 +204,7 @@ impl SessionCore {
         let confirmed = o
             .lanes()
             .and_then(|l| l.get(n))
-            .is_some_and(|l| l.confirmed());
+            .is_some_and(OutLane::confirmed);
         if let Some(l) = o.lanes_mut() {
             l.lane_closed(n);
         }
@@ -232,7 +233,7 @@ impl SessionCore {
     /// allows it, its carrier offers lanes, lane 0 has an acknowledged
     /// position and no lane is unconfirmed or was refused.
     pub(super) fn request_lane(&mut self, pipe: u64) {
-        let Some(max) = self.peer_tp.as_ref().map(|t| t.max_lanes()) else {
+        let Some(max) = self.peer_tp.as_ref().map(TpValues::max_lanes) else {
             return;
         };
         if self.state >= State::Closing || self.peer_lane_key().is_none() {
@@ -257,7 +258,7 @@ impl SessionCore {
             })
     }
 
-    /// The peer's Lane Key, which our PIPE_LANE frames carry, while lanes
+    /// The peer's Lane Key, which our `PIPE_LANE` frames carry, while lanes
     /// are available toward it.
     pub(super) fn peer_lane_key(&self) -> Option<[u8; 16]> {
         if !self.features.lanes_out {
@@ -366,8 +367,8 @@ impl SessionCore {
 
     // ---- the orderly close outside multipath ---------------
 
-    /// Whether an orderly CONNECTION_CLOSE of a session without multipath
-    /// waits for a PIPE_ACK to cover the other lanes of its pipe: the peer would otherwise discard
+    /// Whether an orderly `CONNECTION_CLOSE` of a session without multipath
+    /// waits for a `PIPE_ACK` to cover the other lanes of its pipe: the peer would otherwise discard
     /// data that a written FIN or reset counts as delivered.
     pub(super) fn close_waiting(&self) -> bool {
         !self.is_multipath()
@@ -398,7 +399,7 @@ impl SessionCore {
     }
 
     /// The close waits no longer: the other lanes are covered, the wait
-    /// is over, or the peer's CONNECTION_CLOSE arrived.
+    /// is over, or the peer's `CONNECTION_CLOSE` arrived.
     pub(super) fn end_close_wait(&mut self) {
         if let Some(l) = self.out_mut(0).and_then(OutPipe::lanes_mut) {
             l.end_close_wait();
@@ -417,7 +418,7 @@ impl SessionCore {
         let released = self
             .out_mut(0)
             .and_then(OutPipe::lanes_mut)
-            .map(|l| l.take_released())
+            .map(OutLanes::take_released)
             .unwrap_or_default();
         for key in released {
             if self.send_ctrl_owed(key) {
@@ -434,8 +435,8 @@ impl SessionCore {
     }
 
     /// Outside multipath, whether the control frames of `key`'s sending
-    /// part (STREAM_DATA_BLOCKED, its reset) wait because its frames are
-    /// on another lane than the batch's until a PIPE_ACK covers them.
+    /// part (`STREAM_DATA_BLOCKED`, its reset) wait because its frames are
+    /// on another lane than the batch's until a `PIPE_ACK` covers them.
     pub(super) fn send_ctrl_elsewhere(&self, key: StreamKey) -> bool {
         self.tx_lanes
             && !self.is_multipath()
@@ -447,7 +448,7 @@ impl SessionCore {
     }
 
     /// Whether `key`'s sending part owes a control frame: a
-    /// STREAM_DATA_BLOCKED or its reset.
+    /// `STREAM_DATA_BLOCKED` or its reset.
     fn send_ctrl_owed(&self, key: StreamKey) -> bool {
         self.streams.send(key).is_some_and(|send| {
             send.blocked_at.is_some() || send.cold().reset.is_some_and(|r| !r.written)
@@ -461,12 +462,6 @@ pub(super) fn lane_infos(
     o: Option<&OutPipe>,
     i: Option<&super::pipes::InPipe>,
 ) -> Vec<super::LaneStats> {
-    let out = o.and_then(OutPipe::lanes);
-    let inp = i.filter(|p| p.lane_count() > 1);
-    if out.is_none() && inp.is_none() {
-        return Vec::new();
-    }
-    let mut lanes: Vec<super::LaneStats> = Vec::new();
     fn at(lanes: &mut Vec<super::LaneStats>, n: u64) -> &mut super::LaneStats {
         let k = match lanes.binary_search_by_key(&n, |l| l.lane.0) {
             Ok(k) => k,
@@ -485,6 +480,12 @@ pub(super) fn lane_infos(
         };
         &mut lanes[k]
     }
+    let out = o.and_then(OutPipe::lanes);
+    let inp = i.filter(|p| p.lane_count() > 1);
+    if out.is_none() && inp.is_none() {
+        return Vec::new();
+    }
+    let mut lanes: Vec<super::LaneStats> = Vec::new();
     if let Some(o) = o {
         let numbers =
             std::iter::once(0).chain(out.into_iter().flat_map(|l| l.iter().map(|(n, _)| n)));

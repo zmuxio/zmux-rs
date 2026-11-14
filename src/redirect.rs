@@ -47,6 +47,7 @@ impl From<RedirectError> for io::Error {
 
 /// Whether `status` is a redirect a carrier considers (301, 302, 303, 307,
 /// 308).
+#[must_use]
 pub fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -140,6 +141,7 @@ impl Url<'_> {
 
 /// Whether `a` and `b` are URLs of one origin: the same scheme (`ws` and
 /// `http` as one, `wss` and `https` as one), host and port.
+#[must_use]
 pub fn same_origin(a: &str, b: &str) -> bool {
     match (parse(a), parse(b)) {
         (Some(a), Some(b)) => {
@@ -160,6 +162,12 @@ pub fn same_origin(a: &str, b: &str) -> bool {
 /// location, and a 301, 302 or 303 of a request other than `GET` or
 /// `HEAD` unless it is a pure scheme upgrade (the same host, path and
 /// query over the secure scheme). `status` must satisfy [`is_redirect`].
+///
+/// # Errors
+///
+/// [`RedirectError`] with the reason for a redirect refused as above, and
+/// for an invalid `from`, a missing or invalid `location`, or an unknown
+/// scheme.
 pub fn check(
     from: &str,
     method: &str,

@@ -36,7 +36,10 @@ async fn sessions(rejects: Arc<AtomicUsize>) -> (Session, Session, Listener) {
     }));
     let listener = Listener::new(config(), limits).expect("valid listener configuration");
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let server = listener.accept().await.unwrap();
     client.established().await.unwrap();
@@ -78,8 +81,10 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
         let replied = Arc::new(Notify::new());
         hold_confirm(relay_a, relay_b, replied.clone());
         let l = listener.clone();
-        let handled =
-            tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
+        let handled = tokio::spawn(async move {
+            l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+                .await
+        });
         let _pipe = client
             .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
             .unwrap();
@@ -168,7 +173,10 @@ async fn no_pipe_starts_after_its_end_during_the_confirm() {
         let (client, _server, listener) = sessions(Arc::default()).await;
         let (near, far) = duplex(1 << 16);
         let l = listener.clone();
-        tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
+        tokio::spawn(async move {
+            l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+                .await
+        });
         let (release, gate, at_gate, dropped) = (
             Arc::new(AtomicBool::new(false)),
             Arc::new(Notify::new()),

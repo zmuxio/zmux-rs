@@ -2,6 +2,15 @@
 //! replace: the same records, the same counters and rekeys, the same
 //! failures.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use zmux::proto::seal::*;
 
 fn ciphers() -> Vec<&'static Cipher> {

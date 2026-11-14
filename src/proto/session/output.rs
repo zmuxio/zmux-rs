@@ -10,6 +10,7 @@ use super::pipes::{BatchStart, OutPipe};
 use super::sched::Decision;
 use super::stream::{self, RecvState, SendPart, SendState, StreamKey};
 use super::tier::GateInputs;
+use super::tp::TpValues;
 use super::transmit::{COPY_THRESHOLD, TransmitBuf};
 use super::{
     BIDI, CloseFrame, LaneId, SessionCore, State, Transmit, UNI, config, di, dir_of_index, mpath,
@@ -23,6 +24,7 @@ use crate::proto::frame::{
 use crate::proto::params::{DEFAULT_MAX_RECORD_SIZE, Role};
 use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
 use crate::proto::record::Framing;
+use crate::util::usize_sat;
 
 /// The deficit round robin quantum.
 const QUANTUM: i64 = 16 * 1024;
@@ -33,6 +35,9 @@ const MAX_STREAM_HEADER: usize = 1 + 8 + 8 + 8;
 /// Data smaller than this does not start a STREAM frame at the end of a
 /// nearly full record when it could go whole into the next one.
 const MIN_FRAGMENT: usize = 1024;
+/// [`MIN_FRAGMENT`] in the units of the deficit counter.
+#[allow(clippy::cast_possible_wrap, reason = "a small constant")]
+const MIN_FRAGMENT_DEFICIT: i64 = MIN_FRAGMENT as i64;
 
 /// The smallest message of a message-framed pipe the write-call bound
 /// leaves (the smallest `max_send_record`).
@@ -205,7 +210,7 @@ impl Pick for MpPick<'_> {
 
 /// What the batch being written logs in a multipath session: the retained
 /// frames with the index of their record in the batch, the records that
-/// carry an activity frame, the PIPE_ABANDON frames it carries; and the
+/// carry an activity frame, the `PIPE_ABANDON` frames it carries; and the
 /// credit copies owed and the tier loads of its gates.
 #[derive(Debug, Default)]
 pub(crate) struct BatchLog {
@@ -220,7 +225,7 @@ pub(crate) struct BatchLog {
     /// The current batch holds new stream data: later new data in it is
     /// not the first after an idle period.
     pub(super) new_data: bool,
-    /// Pipes whose PIPE_ABANDON the current batch carries.
+    /// Pipes whose `PIPE_ABANDON` the current batch carries.
     abandons_sent: Vec<u64>,
     /// Credit frames sent while the window was the bottleneck, with the
     /// pipe that carried them: a copy goes on a second pipe.
@@ -246,7 +251,7 @@ impl BatchLog {
 
 impl SessionCore {
     /// Whether the pipe's output waits for
-    /// [`Self::release_first_flight`] (a CONNECTION_CLOSE does not wait).
+    /// [`Self::release_first_flight`] (a `CONNECTION_CLOSE` does not wait).
     pub(super) fn holds_first_flight(&self, pipe: u64) -> bool {
         pipe == 0
             && self.first_held.is_some()
@@ -294,8 +299,8 @@ impl SessionCore {
                 .any(|(f, d)| self.datagram_pipe(*f).is_none() && !self.channel_takes(*f, d.len()))
     }
 
-    /// A credit update (MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA) waits:
-    /// a PIPE_ACK goes in the same batch.
+    /// A credit update (`MAX_DATA`, `MAX_STREAMS`, `MAX_STREAM_DATA`) waits:
+    /// a `PIPE_ACK` goes in the same batch.
     pub(super) fn credit_update_pending(&self) -> bool {
         self.streams.credit_update_pending()
     }
@@ -304,7 +309,7 @@ impl SessionCore {
     /// call: input not yet processed
     /// (`input_pending`, which the driver knows); frames queued that go
     /// ahead of bulk data, control frames or stream data of urgency 0 to 2
-    /// or of a small direction; or within the last max(10 x B, RTT_min) an
+    /// or of a small direction; or within the last max(10 x B, `RTT_min`) an
     /// exchange of anything but acknowledgements and credit. All of it is
     /// local state that exists on every carrier.
     pub(super) fn latency_work(&self, id: u64, input_pending: bool, now: Instant) -> bool {
@@ -484,14 +489,14 @@ impl SessionCore {
     pub(super) fn max_record(&self) -> usize {
         let peer = self
             .send_tp()
-            .map_or(DEFAULT_MAX_RECORD_SIZE, |t| t.max_record_size());
-        (self.config.max_send_record as u64).min(peer) as usize
+            .map_or(DEFAULT_MAX_RECORD_SIZE, TpValues::max_record_size);
+        self.config.max_send_record.min(usize_sat(peer))
     }
 
     /// Fills `out` with the next batch for a pipe (a lane of it) that can
     /// take bytes. The driver writes the whole batch before calling this
     /// again for the lane, telling the bytes the carrier took with
-    /// [`SessionCore::pipe_written`] (until then they count in Q_p, the
+    /// [`SessionCore::pipe_written`] (until then they count in `Q_p`, the
     /// write calls in progress); on [`Transmit::Shutdown`] it then shuts the
     /// lane's write side down.
     pub fn poll_transmit(
@@ -757,7 +762,7 @@ impl SessionCore {
     }
 
     /// The next batch of lane `n` (not 0) of pipe `id`: its first record,
-    /// PIPE_LANE alone; then, once it is confirmed, the stream data placed
+    /// `PIPE_LANE` alone; then, once it is confirmed, the stream data placed
     /// on it; its shutdown with the pipe's.
     fn poll_lane(&mut self, id: u64, n: u64, now: Instant, out: &mut TransmitBuf) -> Transmit {
         self.tick(now);
@@ -960,7 +965,7 @@ impl SessionCore {
 
     // ---- pipe-layer frames (multipath) -------------------------------------------
 
-    /// PIPE_PING, PIPE_ACK, PIPE_ABANDON and PIPE_STATUS for pipe `id`.
+    /// `PIPE_PING`, `PIPE_ACK`, `PIPE_ABANDON` and `PIPE_STATUS` for pipe `id`.
     pub(super) fn write_pipe_frames(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {
         if !self.write_epoch(id, w, now) {
             return;
@@ -990,7 +995,7 @@ impl SessionCore {
         }
     }
 
-    /// Writes the PIPE_PING pipe `id` wants, when the rate limits allow.
+    /// Writes the `PIPE_PING` pipe `id` wants, when the rate limits allow.
     pub(super) fn write_pipe_ping(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {
         if self.ping_due(id, now) && w.try_frame(&Frame::PipePing) {
             self.mp_mut().ping_sent(now);
@@ -1001,7 +1006,7 @@ impl SessionCore {
         }
     }
 
-    /// Writes the pending PIPE_ABANDON frames (only that of `only` when
+    /// Writes the pending `PIPE_ABANDON` frames (only that of `only` when
     /// given).
     fn write_abandon(&mut self, w: &mut Records<'_>, only: Option<u64>) {
         let mut i = 0;
@@ -1205,7 +1210,7 @@ impl SessionCore {
     }
 
     /// Writes the control frames a stream owes, in this order:
-    /// STOP_SENDING, MAX_STREAM_DATA, PRIORITY_UPDATE, STREAM_DATA_BLOCKED,
+    /// `STOP_SENDING`, `MAX_STREAM_DATA`, `PRIORITY_UPDATE`, `STREAM_DATA_BLOCKED`,
     /// and its reset.
     fn write_one_control(
         &mut self,
@@ -1427,7 +1432,7 @@ impl SessionCore {
             explicit_offset: false,
             explicit_len: true,
         };
-        if !w.ensure(header.encoded_len() + len as usize) {
+        if !w.ensure(header.encoded_len() + usize_sat(len)) {
             return Err(Full);
         }
         w.stream_header(&header);
@@ -1702,6 +1707,10 @@ impl SessionCore {
     /// data under it (reinjected information, opportunistic copies); the
     /// next direction for new data on the pipe, or how the batch's stream
     /// data ends.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the batch notation: p the pick, w the records, d the decision, g its generation"
+    )]
     fn next_mp(&mut self, pipe: u64, p: &mut MpPick<'_>, w: &mut Records<'_>) -> Next {
         loop {
             // The gate of this decision: one per chunk.
@@ -1732,7 +1741,7 @@ impl SessionCore {
                 if let Step::Full = self.write_lost_frame(key, w) {
                     return Next::Stop;
                 }
-                let pending = self.streams.send(key).is_some_and(|x| x.has_pending());
+                let pending = self.streams.send(key).is_some_and(SendPart::has_pending);
                 if !pending {
                     self.streams.dequeue(u, key);
                     self.after_stream_frame(key);
@@ -1961,12 +1970,12 @@ impl SessionCore {
         }
         let min_of = |max_data: usize| {
             if start == 0 && base > 0 {
-                (base as usize).min(max_data)
+                usize_sat(base).min(max_data)
             } else {
-                1.min((end - start) as usize)
+                1.min(usize_sat(end - start))
             }
         };
-        let want = (end - start) as usize;
+        let want = usize_sat(end - start);
         if (self.pace_left == Some(0) || w.gate_out()) && want > 0 {
             // The carrier queue limiter's room,
             // which lets whole frames go.
@@ -1996,15 +2005,15 @@ impl SessionCore {
         let stop = start + n;
         if at < base {
             if let Some(p) = &send.preamble {
-                let k = (base.min(stop) - at) as usize;
-                w.out.push_bytes(&p[at as usize..at as usize + k]);
+                let (from, k) = (usize_sat(at), usize_sat(base.min(stop) - at));
+                w.out.push_bytes(&p[from..from + k]);
             }
             at = base.min(stop);
         }
         if at < stop {
             send.mp_mut().resent += stop - at;
             let off = at - send.mp().buf_floor;
-            let len = (stop - at) as usize;
+            let len = usize_sat(stop - at);
             if let Some(b) = send
                 .buf
                 .shared_kept(off, len)
@@ -2174,7 +2183,7 @@ impl SessionCore {
         }
         let stream_room = send.max_data.saturating_sub(send.offset);
         let credit = available.min(stream_room).min(session_room);
-        let credit = if credit as usize >= send.preamble_left {
+        let credit = if usize_sat(credit) >= send.preamble_left {
             credit.min(cap.max(send.preamble_left as u64))
         } else {
             credit
@@ -2226,7 +2235,7 @@ impl SessionCore {
             return Step::SessionBlocked;
         }
         let pre = send.preamble_left;
-        if (credit as usize) < pre {
+        if usize_sat(credit) < pre {
             // The preamble goes whole into the frame at offset 0; report
             // the limit that holds it back.
             if stream_room < pre as u64 {
@@ -2250,10 +2259,9 @@ impl SessionCore {
         }
         // At least the whole preamble, and no tiny fragment when a larger
         // one fits in the next record; never more than a record holds.
-        let min_of =
-            |max_data: usize| pre.max((credit.min(MIN_FRAGMENT as u64) as usize).min(max_data));
+        let min_of = |max_data: usize| pre.max(usize_sat(credit).min(MIN_FRAGMENT).min(max_data));
         let Some((room, _)) = w
-            .stream_room(min_of, credit as usize)
+            .stream_room(min_of, usize_sat(credit))
             .filter(|&(r, least)| r >= least)
         else {
             return Step::Full;
@@ -2274,7 +2282,7 @@ impl SessionCore {
         };
         w.stream_header(&header);
         w.exchange |= exchange;
-        let mut left = n as usize;
+        let mut left = usize_sat(n);
         if pre > 0 {
             if let Some(p) = &send.preamble {
                 let start = p.len() - pre;
@@ -2299,7 +2307,7 @@ impl SessionCore {
         let off = send.offset;
         send.offset += n;
         send.open_want = false;
-        send.deficit -= n as i64;
+        send.deficit -= n.cast_signed();
         let lanes = self.tx_lanes;
         if send.state == SendState::Ready {
             send.state = SendState::Send;
@@ -2347,9 +2355,9 @@ impl SessionCore {
         // The quantum is used up, up to less than a small fragment that
         // would not finish the stream's data: the remainder carries over
         // instead of a tiny frame of its own.
-        let left = send.buf.len() as i64;
+        let left = send.buf.len().cast_signed();
         let rotate =
-            send.deficit <= 0 || (send.deficit < MIN_FRAGMENT as i64 && left > send.deficit);
+            send.deficit <= 0 || (send.deficit < MIN_FRAGMENT_DEFICIT && left > send.deficit);
         if rotate {
             send.deficit += QUANTUM;
         }
@@ -2453,6 +2461,10 @@ impl SessionCore {
 
     /// Allocates the next identifier of a local stream's type and builds
     /// its preamble.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "s the stream, p its preamble, g its GREASE TLV, as in the wire format"
+    )]
     pub(super) fn assign_id(&mut self, key: StreamKey) {
         let client = matches!(self.role, Role::Client);
         let mp = self.retains();
@@ -2511,6 +2523,10 @@ impl SessionCore {
 
     /// The GREASE TLV of the session's first preamble: the test hook's, or
     /// a random one.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "takes 5-bit-spaced bytes of a random value"
+    )]
     fn grease_tlv(&self) -> (u64, Vec<u8>) {
         if let Some(g) = &self.config.hooks.grease_tlv {
             return g.clone();
@@ -2525,7 +2541,7 @@ impl SessionCore {
     ///
     /// A capacity wait may be over now: it is also over with any capacity
     /// once nothing is unsent, and sending changes no
-    /// credit, so no MAX_DATA or MAX_STREAM_DATA would end it.
+    /// credit, so no `MAX_DATA` or `MAX_STREAM_DATA` would end it.
     pub(super) fn after_send_progress(&mut self, key: StreamKey) {
         let mut sent = false;
         if let Some(send) = self.streams.send_mut(key) {
@@ -2558,11 +2574,15 @@ impl SessionCore {
 
 /// Builds records in a batch: frames go into records of at most
 /// `max_record` bytes, and the batch stays within its limit.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about the batch, read separately by the callers"
+)]
 pub(super) struct Records<'a> {
     pub(super) out: &'a mut TransmitBuf,
     max_record: usize,
-    records: u64,
-    /// A frame other than a QX_PING request (or PADDING) was written: the
+    count: u64,
+    /// A frame other than a `QX_PING` request (or PADDING) was written: the
     /// batch restarts the idle timer.
     pub(super) activity: bool,
     /// The record of the last ack-eliciting frame written, by its index in the batch: the bytes in
@@ -2571,10 +2591,10 @@ pub(super) struct Records<'a> {
     /// A frame that goes ahead of bulk data was written, other than an
     /// acknowledgement or credit.
     pub(super) exchange: bool,
-    /// A traffic frame was written: STREAM, RESET_STREAM,
-    /// RESET_STREAM_AT, STOP_SENDING or DATAGRAM (the busy window).
+    /// A traffic frame was written: STREAM, `RESET_STREAM`,
+    /// `RESET_STREAM_AT`, `STOP_SENDING` or DATAGRAM (the busy window).
     pub(super) traffic: bool,
-    /// A QX_PING was written: with `traffic`, the activity a PIPE_ACK
+    /// A `QX_PING` was written: with `traffic`, the activity a `PIPE_ACK`
     /// confirms in a session with acknowledgement.
     ping: bool,
     /// The pipe's shaping state, lent for the batch.
@@ -2588,7 +2608,7 @@ impl<'a> Records<'a> {
         Self {
             out,
             max_record,
-            records: 0,
+            count: 0,
             activity: false,
             eliciting: None,
             exchange: false,
@@ -2606,7 +2626,7 @@ impl<'a> Records<'a> {
             // Each message is a write call; a byte stream's batch is one.
             Some(t) if !self.out.in_record() => {
                 let records = self.out.is_records();
-                t.prep(self.max_record, self.records == 0 || records, !records)
+                t.prep(self.max_record, self.count == 0 || records, !records)
             }
             Some(t) => t.cut_or(self.max_record),
             None => self.max_record,
@@ -2643,7 +2663,7 @@ impl<'a> Records<'a> {
     /// Ends the open record without a plan.
     pub(super) fn end_plain(&mut self) {
         if self.out.end_record() {
-            self.records += 1;
+            self.count += 1;
         }
     }
 
@@ -2654,13 +2674,13 @@ impl<'a> Records<'a> {
 
     /// The index in the batch of the record being built.
     pub(super) fn record_index(&self) -> u32 {
-        self.records as u32
+        u32::try_from(self.count).unwrap_or(u32::MAX)
     }
 
     /// The frame just written to the open record elicits an
     /// acknowledgement (raw frames written directly mark it themselves).
     pub(super) fn elicit(&mut self) {
-        self.eliciting = Some(self.records);
+        self.eliciting = Some(self.count);
     }
 
     /// Where the last ack-eliciting byte of the batch ends, in the batch's
@@ -2748,9 +2768,10 @@ impl<'a> Records<'a> {
         if self.out.is_empty() && !open {
             return usize::MAX;
         }
-        let total = match open {
-            true => self.out.record_len() + self.out.room(),
-            false => self.out.room().saturating_sub(self.size_width()),
+        let total = if open {
+            self.out.record_len() + self.out.room()
+        } else {
+            self.out.room().saturating_sub(self.size_width())
         };
         // An open record whose target never fitted (the batch's first)
         // takes what the batch holds.
@@ -2775,7 +2796,7 @@ impl<'a> Records<'a> {
     }
 
     /// Like [`Records::ensure`], but always opens room: the first frame and
-    /// CONNECTION_CLOSE go out even beyond the batch limit.
+    /// `CONNECTION_CLOSE` go out even beyond the batch limit.
     pub(super) fn force(&mut self, n: usize) {
         self.activity = true;
         if !self.ensure(n) {
@@ -2865,7 +2886,7 @@ impl<'a> Records<'a> {
                         .saturating_sub(self.out.record_len()),
                 );
             if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
-                left = left.min((r as usize).saturating_add(MAX_STREAM_HEADER).max(min));
+                left = left.min(usize_sat(r).saturating_add(MAX_STREAM_HEADER).max(min));
             }
             if left >= min.max(want.min(MAX_STREAM_HEADER + MIN_FRAGMENT)) {
                 return Some((left - MAX_STREAM_HEADER, least));
@@ -2883,7 +2904,7 @@ impl<'a> Records<'a> {
             .min(cap.max(min).min(self.max_record))
             .min(self.frames_bound(false));
         if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
-            fits = fits.min((r as usize).saturating_add(MAX_STREAM_HEADER).max(min));
+            fits = fits.min(usize_sat(r).saturating_add(MAX_STREAM_HEADER).max(min));
         }
         if fits < min {
             // The batch is full: no record is open, so nothing may be
@@ -2921,6 +2942,6 @@ impl<'a> Records<'a> {
     /// Closes the open record; returns the number of records written.
     pub(super) fn finish(mut self) -> u64 {
         self.end_record();
-        self.records
+        self.count
     }
 }

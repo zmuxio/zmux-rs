@@ -3,6 +3,13 @@
 //! in-memory pipes, with the harness deciding when each of A's carriers
 //! takes bytes, and counting what A puts on each pipe.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::time::Duration;
 
 #[path = "common/mp_net.rs"]
@@ -21,16 +28,16 @@ struct Seen {
     b_reader: RecordReader,
     /// Stream payload bytes A wrote on the pipe.
     stream_bytes: u64,
-    /// PIPE_STATUS frames A wrote: (pipe, seq, standby, priority).
+    /// `PIPE_STATUS` frames A wrote: (pipe, seq, standby, priority).
     statuses: Vec<(u64, u64, bool, u64)>,
-    /// PIPE_ACK frames B wrote: the number of entries of each.
+    /// `PIPE_ACK` frames B wrote: the number of entries of each.
     b_acks: Vec<usize>,
-    /// For each batch of B's that holds a PIPE_ACK: whether it also holds
-    /// a PIPE_PING.
+    /// For each batch of B's that holds a `PIPE_ACK`: whether it also holds
+    /// a `PIPE_PING`.
     b_ack_pings: Vec<bool>,
-    /// DATA_BLOCKED frames A wrote.
+    /// `DATA_BLOCKED` frames A wrote.
     a_data_blocked: usize,
-    /// PIPE_PING frames A wrote.
+    /// `PIPE_PING` frames A wrote.
     a_pings: usize,
 }
 
@@ -308,10 +315,10 @@ fn a_down_attachment_states_its_request_on_another_pipe_after_its_first_record()
     assert!(n.links[&down].attached());
     n.links.get_mut(&down).unwrap().flows[B].stalled = true;
     n.run_for(100);
-    assert_eq!(on_any(&n), [], "before the first record");
+    assert!(on_any(&n).is_empty(), "before the first record");
     n.links.get_mut(&down).unwrap().flows[B].stalled = false;
     n.run_for(200);
-    assert_eq!(n.links[&down].statuses, [], "A writes nothing on it");
+    assert!(n.links[&down].statuses.is_empty(), "A writes nothing on it");
     assert_eq!(n.links[&0].statuses, [(down, 1, false, 3)], "on pipe 0");
     assert_eq!(
         n.ends[B]
@@ -355,7 +362,7 @@ fn a_bidi_attachment_states_its_request_on_itself() {
         .unwrap();
     n.run_for(100);
     assert_eq!(n.links[&id].statuses, [(id, 1, false, 3)]);
-    assert_eq!(n.links[&0].statuses, []);
+    assert!(n.links[&0].statuses.is_empty());
 }
 
 #[test]
@@ -417,9 +424,9 @@ fn large_acknowledgement_snapshots_omit_unchanged_pipes() {
 }
 
 /// BUG (reinjection hold): a new pipe may reinject one chunk until the first
-/// PIPE_ACK; a stream with nothing but reinjected data was still chosen for
+/// `PIPE_ACK`; a stream with nothing but reinjected data was still chosen for
 /// it after that chunk, found no new data and reported the session window
-/// as the bottleneck (a false DATA_BLOCKED, which also masked a later real
+/// as the bottleneck (a false `DATA_BLOCKED`, which also masked a later real
 /// one).
 #[test]
 fn a_reinjection_hold_reports_no_false_blocked() {
@@ -568,9 +575,9 @@ fn probation_settings_take_effect_safely() {
     assert!(info.probation_until.is_none() || info.in_probation);
 }
 
-/// A PIPE_ACK on a pipe that has carried nothing ack-eliciting for more
-/// than max(1 s, T_suspect) brings a PIPE_PING in the same record
-/// also when it is the answer to a PIPE_PING
+/// A `PIPE_ACK` on a pipe that has carried nothing ack-eliciting for more
+/// than max(1 s, `T_suspect`) brings a `PIPE_PING` in the same record
+/// also when it is the answer to a `PIPE_PING`
 /// on that pipe pair rather than the primary acknowledgement: the peer's
 /// return path is probed while it is in use.
 #[test]
@@ -635,7 +642,7 @@ fn quiet_sessions_probe_at_the_probe_interval() {
 }
 
 /// A session busy with a message every 10 s keeps the 15 s probe interval
-/// of the pipe carrying them, not a PIPE_PING after each message, with the
+/// of the pipe carrying them, not a `PIPE_PING` after each message, with the
 /// default probe jitter.
 #[test]
 fn intermittent_traffic_does_not_bring_probes_forward() {
@@ -676,8 +683,8 @@ fn huge_timer_settings_never_overflow_the_clock() {
             c.liveness.standby_probe = Some(huge);
         },
         &|c| {
-            c.liveness.probe_interval = Some(huge - Duration::from_secs(1));
-            c.liveness.standby_probe = Some(huge - Duration::from_secs(1));
+            c.liveness.probe_interval = Some(huge.checked_sub(Duration::from_secs(1)).unwrap());
+            c.liveness.standby_probe = Some(huge.checked_sub(Duration::from_secs(1)).unwrap());
             c.liveness.probe_jitter = 0.99;
         },
         &|c| {

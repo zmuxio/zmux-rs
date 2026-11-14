@@ -13,7 +13,7 @@ use crate::json::{Json, parse};
 use crate::limits::parse_budget;
 use crate::machine::{MachineFactory, Options, compile, parse_machines};
 use crate::pool::{MachinePoolPolicy, PoolSpec};
-use crate::value::{FREE_SCOPES, Family, Reader, Sampler, Value, parse_value};
+use crate::value::{FREE_SCOPES, Family, Reader, Sampler, Value, parse_value, to_usize};
 
 const KINDS: &[&str] = &[
     "default",
@@ -176,11 +176,14 @@ impl Compiled {
         let e = self
             .plans
             .get(&(handshake.to_owned(), message.to_owned()))?;
-        let mut s = self.source.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = self
+            .source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut draw = |v: &Option<Value>| v.as_ref().map_or(0, |v| s.draw(v));
-        let pad_to = draw(&e.pad_to) as usize;
-        let pad_multiple = draw(&e.pad_multiple) as usize;
-        let pad = draw(&e.pad) as usize;
+        let pad_to = to_usize(draw(&e.pad_to));
+        let pad_multiple = to_usize(draw(&e.pad_multiple));
+        let pad = to_usize(draw(&e.pad));
         let mut delay = Duration::from_micros(draw(&e.delay));
         if let Some(m) = self.max_delay {
             delay = delay.min(m);
@@ -226,6 +229,11 @@ pub struct Bundle {
 impl Bundle {
     /// Reads a bundle. Any error in what it reads fails the whole document: only a
     /// candidate requiring a feature this reader lacks is skipped, unread.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the document exceeds the input limit, is not valid JSON, or has a
+    /// malformed, out-of-range or inconsistent member.
     pub fn from_json(b: &[u8], options: &Options) -> Result<Self, Error> {
         options.limits.input(b.len())?;
         let doc = parse(b)?;

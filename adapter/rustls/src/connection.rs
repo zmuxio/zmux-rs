@@ -15,6 +15,7 @@ use zmux::{CarrierInfo, PipeIo, TlsState};
 /// ([`PipeIo::with_carrier_secure`]): its handshake is complete and it
 /// negotiated TLS 1.3. Every carrier this crate and the HTTP and WebSocket
 /// adapters declare secure over TLS passes it.
+#[must_use]
 pub fn is_bound(conn: &CommonState) -> bool {
     !conn.is_handshaking() && conn.protocol_version() == Some(ProtocolVersion::TLSv1_3)
 }
@@ -99,6 +100,7 @@ impl TlsConnection {
 
     /// The metadata for an admission or a credential: the exporter, the
     /// negotiated ALPN identifier and a server's client-given name.
+    #[must_use]
     pub fn info(&self) -> CarrierInfo<'_> {
         let stream = &self.stream;
         CarrierInfo::new()
@@ -108,6 +110,7 @@ impl TlsConnection {
     }
 
     /// The binding the connection's carriers declare.
+    #[must_use]
     pub fn binding(&self) -> TlsBinding {
         TlsBinding {
             stream: Arc::downgrade(&self.stream),
@@ -178,6 +181,7 @@ impl std::fmt::Debug for TlsBinding {
 impl TlsBinding {
     /// Whether the connection meets the Bound contract now ([`is_bound`]):
     /// false while it is still handshaking (early data) and once it is gone.
+    #[must_use]
     pub fn is_bound(&self) -> bool {
         self.stream
             .upgrade()
@@ -195,6 +199,7 @@ impl TlsBinding {
 
     /// The handshake's results once it is complete; `None` before, and once
     /// the connection is gone.
+    #[must_use]
     pub fn terminated_tls(&self) -> Option<TlsState> {
         let s = self.stream.upgrade()?;
         let done = !lock(&s).common().is_handshaking();
@@ -204,6 +209,7 @@ impl TlsBinding {
     /// `io` as a carrier on the connection: with the TLS terminated here
     /// once the handshake is complete, and, when the connection is bound
     /// now, declared secure with its exporter ([`TlsBinding::export`]).
+    #[must_use]
     pub fn apply(&self, io: PipeIo) -> PipeIo {
         let Some(state) = self.terminated_tls() else {
             return io;

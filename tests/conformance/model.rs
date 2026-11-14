@@ -5,6 +5,10 @@
 //! fails loudly here instead of being ignored by the runner. The trace runner
 //! of the sans-IO core reads the fields that only these tests parse today.
 #![allow(dead_code)]
+#![allow(
+    clippy::option_option,
+    reason = "absent, `null` and a value are three different fixture states"
+)]
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -112,7 +116,7 @@ pub struct MultipathValue {
     pub locator: Hex,
 }
 
-/// One entry of a QX_TRANSPORT_PARAMETERS `params` list.
+/// One entry of a `QX_TRANSPORT_PARAMETERS` `params` list.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
@@ -1080,7 +1084,7 @@ pub struct PrefixPattern {
     pub prefix: Hex,
 }
 
-/// A PIPE_ACK entry pattern.
+/// A `PIPE_ACK` entry pattern.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPattern {

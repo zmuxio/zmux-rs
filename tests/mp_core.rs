@@ -3,6 +3,11 @@
 //! joins, removals and suspension: every stream is delivered exactly once,
 //! in order, and nothing panics.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -122,8 +127,7 @@ impl Net {
                 .a_streams
                 .iter()
                 .find(|(ak, _)| self.ends[A].peek_stream_id(*ak) == Some(id))
-                .map(|(_, t)| *t)
-                .unwrap_or(u64::MAX - id);
+                .map_or(u64::MAX - id, |(_, t)| *t);
             self.s.b_streams.insert(tag, k);
         }
         let keys: Vec<(u64, StreamKey)> = self.s.b_streams.iter().map(|(a, b)| (*a, *b)).collect();
@@ -423,7 +427,7 @@ fn acknowledgements_drive_quality_events() {
 /// Carrier liveness and zmux's timers: a
 /// carrier's own verdict, reported by the adapter as a read error, an
 /// unexpected end or a write error, fails the pipe at once, while another
-/// pipe is ACTIVE, without waiting for T_suspect or T_fail: no time
+/// pipe is ACTIVE, without waiting for `T_suspect` or `T_fail`: no time
 /// passes between the report and the failure.
 #[test]
 fn a_carrier_verdict_fails_the_pipe_at_once() {
@@ -433,7 +437,7 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
                 PipeId::new(id),
                 PipeEnd::Error(std::io::ErrorKind::ConnectionReset),
                 n.now,
-            )
+            );
         },
         |n, id| n.ends[A].pipe_ended(PipeId::new(id), PipeEnd::Eof, n.now),
         |n, id| n.ends[A].write_failed(PipeId::new(id), std::io::ErrorKind::BrokenPipe, n.now),
@@ -620,7 +624,7 @@ proptest! {
 fn run_churn(policy: Scheduler, resume: bool, ops: Vec<Op>) {
     let mut n = net(policy, resume);
     for op in ops {
-        n.apply(op);
+        n.apply(&op);
         n.check_prefix();
     }
     // Heal: a fresh pipe, then run to completion.
@@ -648,8 +652,8 @@ fn run_churn(policy: Scheduler, resume: bool, ops: Vec<Op>) {
 }
 
 impl Net {
-    fn apply(&mut self, op: Op) {
-        match op {
+    fn apply(&mut self, op: &Op) {
+        match *op {
             Op::Open(len) => self.open_and_write(len as usize, false),
             Op::Write(s, len) => {
                 let i = s as usize % self.s.a_streams.len().max(1);
@@ -685,7 +689,7 @@ impl Net {
 }
 
 /// A churn under session affinity with resume (found by
-/// `exactly_once_under_pipe_churn`): a record of PIPE_ACK alone,
+/// `exactly_once_under_pipe_churn`): a record of `PIPE_ACK` alone,
 /// acknowledged late with the next acknowledgement, gave a delivery-rate
 /// sample of a few hundred bytes a second, and the limiter then held the
 /// active pipe past the end of the run.
@@ -1086,7 +1090,7 @@ fn held_joins_are_judged_one_by_one_at_the_cap() {
     );
 }
 
-/// PIPE_ABANDON frames A wrote, by Pipe ID.
+/// `PIPE_ABANDON` frames A wrote, by Pipe ID.
 struct Abandons {
     reader: zmux::proto::record::RecordReader,
     sent: Vec<u64>,
@@ -1115,11 +1119,11 @@ impl mp_net::Observe for Abandons {
 
 /// A at the cap of 2 attachments on the bootstrap pair and an outbound-only
 /// pipe 1, then the bootstrap pair fails: A is SUSPENDED for want of an
-/// inbound pipe and owes PIPE_ABANDON(0), which it may write only on pipe 1.
+/// inbound pipe and owes `PIPE_ABANDON(0)`, which it may write only on pipe 1.
 /// `hold` keeps pipe 1 from taking it (queued); otherwise pipe 1 takes it and
 /// loses it in flight (sent, awaiting acknowledgement). An inbound join then
 /// displaces the failed pair (MULTIPATH.md Section 5.4), or, with `displace`
-/// false, finds room under a cap of 3. Returns the PIPE_ABANDON(0) frames A
+/// false, finds room under a cap of 3. Returns the `PIPE_ABANDON(0)` frames A
 /// wrote in all.
 fn abandons_written(hold: bool, displace: bool) -> usize {
     let mut a_cfg = config(Scheduler::SpreadEta, true);
@@ -1175,7 +1179,7 @@ fn abandons_written(hold: bool, displace: bool) -> usize {
         .sum()
 }
 
-/// Displacing an attachment drops the PIPE_ABANDON it still has queued: it
+/// Displacing an attachment drops the `PIPE_ABANDON` it still has queued: it
 /// is never sent. Without the displacement it is.
 #[test]
 fn displacement_drops_a_queued_abandon() {
@@ -1183,7 +1187,7 @@ fn displacement_drops_a_queued_abandon() {
     assert_eq!(abandons_written(true, true), 0);
 }
 
-/// Displacing an attachment drops the PIPE_ABANDON it sent and awaits the
+/// Displacing an attachment drops the `PIPE_ABANDON` it sent and awaits the
 /// acknowledgement of: lost, it is not sent again. Without the
 /// displacement it is.
 #[test]

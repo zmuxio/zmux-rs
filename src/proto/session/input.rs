@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::pipes::{Attachment, Classified};
+use super::pipes::{Attachment, Classified, InPipe};
 use super::stream::{self, Offer, RecvPart, RecvState, SendOutcome, SendState, Stream, StreamKey};
 use super::{
     BIDI, CloseFrame, CoreEvent, InState, LaneId, SessionCore, SessionError, State, UNI, di,
@@ -18,15 +18,16 @@ use crate::proto::params::TransportParameters;
 use crate::proto::payload::{Flow, WirePreamble};
 use crate::proto::record::{Event as RecordEvent, Framing};
 use crate::proto::{DetailKey, Error, Gates, TransportErrorCode as T};
+use crate::util::usize_sat;
 
 /// Which part of a stream a frame refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
-    /// The local receiving part: STREAM, RESET_STREAM(_AT),
-    /// STREAM_DATA_BLOCKED.
+    /// The local receiving part: STREAM, `RESET_STREAM`(_AT),
+    /// `STREAM_DATA_BLOCKED`.
     Recv,
-    /// The local sending part: MAX_STREAM_DATA, STOP_SENDING,
-    /// PRIORITY_UPDATE.
+    /// The local sending part: `MAX_STREAM_DATA`, `STOP_SENDING`,
+    /// `PRIORITY_UPDATE`.
     Send,
 }
 
@@ -198,12 +199,13 @@ impl SessionCore {
         let pipe = at.pipe.0;
         self.tick(now);
         self.pick_input();
-        if self.discarding() {
-            return;
-        }
+        let scanning = self.discarding();
         let Some(p) = self.inp_mut(pipe) else {
             return;
         };
+        if scanning && !p.scannable() {
+            return;
+        }
         let Some(li) = p.lane_index(at.lane.0) else {
             return;
         };
@@ -239,13 +241,15 @@ impl SessionCore {
         let pipe = at.pipe.0;
         self.tick(now);
         self.pick_input();
-        if self.discarding() {
-            // Lingering discards what it reads.
-            return data.len();
-        }
+        // Lingering discards what it reads, looking only for the peer's
+        // `CONNECTION_CLOSE` ([`Self::drain_reader`]).
+        let scanning = self.discarding();
         let Some(p) = self.inp_mut(pipe) else {
             return data.len();
         };
+        if scanning && !p.scannable() {
+            return data.len();
+        }
         // A lane not accepted reads nothing (the driver aborts it).
         let Some(li) = p.lane_index(at.lane.0) else {
             return data.len();
@@ -276,7 +280,7 @@ impl SessionCore {
         let ended = self
             .inp_mut(pipe)
             .is_none_or(|p| p.return_reader(li, reader));
-        let used = if self.discarding() || ended {
+        let used = if ended || self.discarding() && !self.scanning(pipe) {
             data.len()
         } else {
             data.len() - input.len()
@@ -311,6 +315,27 @@ impl SessionCore {
             // after frames of other pipes changed it.
             self.rx = pipe;
             self.rx_lane = lane;
+            if self.discarding() {
+                // Closing: nothing is processed. The peer's
+                // CONNECTION_CLOSE ends the pipe's linger; what is no valid
+                // record sequence ends the look for it.
+                match event {
+                    Ok(Some(RecordEvent::Frame(Frame::ConnectionClose(_)))) => {
+                        self.peer_close_read(pipe, now);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(_) => {
+                        if let Some(p) = self.inp_mut(pipe) {
+                            p.stop_scan();
+                        }
+                    }
+                }
+                if !self.scanning(pipe) {
+                    return;
+                }
+                continue;
+            }
             let result = match event {
                 Ok(Some(RecordEvent::Frame(f))) => {
                     framed |= !matches!(f, Frame::Padding(_));
@@ -319,7 +344,7 @@ impl SessionCore {
                 Ok(Some(RecordEvent::RecordEnd { len })) => {
                     let r = self.on_record_end(len, now);
                     if self.shape.is_some() {
-                        self.shape_record_in(pipe, lane as u64, len as usize, !framed);
+                        self.shape_record_in(pipe, lane as u64, usize_sat(len), !framed);
                     }
                     framed = false;
                     r
@@ -330,15 +355,25 @@ impl SessionCore {
             if let Err(e) = result {
                 self.protocol_error(e, now);
             }
-            if self.discarding()
-                || self
-                    .att(pipe)
-                    .and_then(|a| a.inp())
-                    .is_none_or(|p| p.state() == InState::Ended)
+            if self
+                .att(pipe)
+                .and_then(|a| a.inp())
+                .is_none_or(|p| p.state() == InState::Ended)
+                || self.discarding() && !self.scanning(pipe)
             {
                 return;
             }
         }
+    }
+
+    /// Whether what arrives on `pipe` is looked through for the peer's
+    /// `CONNECTION_CLOSE`: the session is closing and nothing ruled it out.
+    fn scanning(&self, pipe: u64) -> bool {
+        self.discarding()
+            && self
+                .att(pipe)
+                .and_then(Attachment::inp)
+                .is_some_and(InPipe::scannable)
     }
 
     /// Whether what arrives is discarded: the session is closing, unless its orderly close waits
@@ -456,7 +491,7 @@ impl SessionCore {
                 }
                 let tp = TransportParameters::decode(f.block)
                     .map_err(|e| Error::new(e.code(), ty, e.reason()))?;
-                self.on_peer_parameters(tp, now)
+                self.on_peer_parameters(&tp, now)
             }
             Frame::Stream(s) => self.on_stream(s, ty, now),
             Frame::ResetStream(f) => {
@@ -692,6 +727,10 @@ impl SessionCore {
         self.streams.offer(key, preamble, &mut self.events);
     }
 
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "f the frame, r its receiving part, k and n byte counts, as in the receive path"
+    )]
     pub(super) fn on_stream(
         &mut self,
         f: crate::proto::frame::Stream<'_>,
@@ -860,7 +899,7 @@ impl SessionCore {
         {
             // A repeated frame at offset 0 (multipath): its preamble part is
             // known already.
-            let skip = ((size - data_offset) as usize).min(data.len());
+            let skip = usize_sat(size - data_offset).min(data.len());
             data = &data[skip..];
             data_offset += skip as u64;
         }
@@ -870,7 +909,7 @@ impl SessionCore {
         // Bytes at or beyond a peer's Reliable Size are never delivered.
         let keep = match r.cold().reset {
             Some((_, reliable)) => {
-                reliable.saturating_sub(data_offset).min(data.len() as u64) as usize
+                usize_sat(reliable.saturating_sub(data_offset).min(data.len() as u64))
             }
             None => data.len(),
         };
@@ -1235,7 +1274,7 @@ impl SessionCore {
     fn on_connection_close(&mut self, f: ConnectionClose<'_>, now: Instant) {
         // An orderly close waiting for the other lanes goes now.
         self.end_close_wait();
-        let first = self.state < super::State::Closing;
+        let first = self.state < State::Closing;
         let reason = Bytes::copy_from_slice(f.reason);
         let err = if !f.application && self.acknowledged() && f.error_code == T::ZMUX_IDLE_TIMEOUT.0
         {
@@ -1275,6 +1314,7 @@ impl SessionCore {
             }),
             now,
         );
+        self.peer_close_read(self.rx, now);
     }
 
     fn on_qx_ping(&mut self, p: QxPing, ty: u64, now: Instant) -> Result<(), Error> {
@@ -1780,7 +1820,7 @@ fn make_peer_id(index: u64, dir: Dir, client: bool) -> u64 {
 }
 
 impl RecvPart {
-    /// The largest MAX_STREAM_DATA advertised.
+    /// The largest `MAX_STREAM_DATA` advertised.
     pub(crate) fn limit_sent_max(&self) -> u64 {
         self.limit
     }

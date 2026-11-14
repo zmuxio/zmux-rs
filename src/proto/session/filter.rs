@@ -6,8 +6,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::util::{f64_of, u64_sat};
+
 /// The span of the RTT minima: the credit-loop minimum and each pipe's
-/// min_rtt.
+/// `min_rtt`.
 pub(super) const LOOP_SPAN: Duration = Duration::from_secs(300);
 
 /// A windowed minimum (`MAX` false) or maximum (`MAX` true) over a span
@@ -163,9 +165,9 @@ impl IntervalRate {
             return false;
         }
         let cur = usize::from(self.cur);
-        self.rates[cur] = (total.saturating_sub(n0) as f64 / span.as_secs_f64()) as u64;
+        self.rates[cur] = u64_sat(f64_of(total.saturating_sub(n0)) / span.as_secs_f64());
         self.filled = (self.filled + 1).min(4);
-        self.cur = ((cur + 1) % 4) as u8;
+        self.cur = (self.cur + 1) % 4;
         self.start = Some((now, total));
         true
     }

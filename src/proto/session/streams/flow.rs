@@ -36,15 +36,15 @@ pub(in super::super) struct LocalDir {
     pub(in super::super) next_index: u64,
     /// Streams opened by the application, with or without an identifier.
     pub(in super::super) reserved: u64,
-    /// The peer's MAX_STREAMS.
+    /// The peer's `MAX_STREAMS`.
     pub(in super::super) peer_max: u64,
-    /// STREAMS_BLOCKED limit already reported.
+    /// `STREAMS_BLOCKED` limit already reported.
     pub(in super::super) blocked_reported: Option<u64>,
-    /// STREAMS_BLOCKED to send.
+    /// `STREAMS_BLOCKED` to send.
     pub(in super::super) blocked_pending: bool,
     /// Whether an opener waits for credit.
     pub(in super::super) waiting: bool,
-    /// STREAMS_BLOCKED was lost with a pipe and is still true.
+    /// `STREAMS_BLOCKED` was lost with a pipe and is still true.
     pub(in super::super) blocked_resend: bool,
     /// Minimum GOAWAY watermark received.
     pub(in super::super) goaway: Option<u64>,
@@ -52,7 +52,7 @@ pub(in super::super) struct LocalDir {
 
 impl LocalDir {
     /// Takes stream credit for a new stream: `false`, with the opener
-    /// noted as waiting and STREAMS_BLOCKED owed, when an established
+    /// noted as waiting and `STREAMS_BLOCKED` owed, when an established
     /// session has none left.
     pub(super) fn reserve(&mut self, established: bool) -> bool {
         if established && self.reserved >= self.peer_max {
@@ -64,14 +64,14 @@ impl LocalDir {
         true
     }
 
-    /// Owes STREAMS_BLOCKED at the current limit, unless it was reported.
+    /// Owes `STREAMS_BLOCKED` at the current limit, unless it was reported.
     pub(super) fn report_blocked(&mut self) {
         if self.blocked_reported != Some(self.peer_max) {
             self.blocked_pending = true;
         }
     }
 
-    /// MAX_STREAMS raised the limit to `max`; `false` when it did not.
+    /// `MAX_STREAMS` raised the limit to `max`; `false` when it did not.
     pub(super) fn raise(&mut self, max: u64) -> bool {
         if max <= self.peer_max {
             return false;
@@ -82,19 +82,19 @@ impl LocalDir {
         true
     }
 
-    /// STREAMS_BLOCKED was written at `limit`.
+    /// `STREAMS_BLOCKED` was written at `limit`.
     pub(super) fn blocked_written(&mut self, limit: u64) {
         self.blocked_reported = Some(limit);
         self.blocked_pending = false;
     }
 
-    /// STREAMS_BLOCKED is no longer owed.
+    /// `STREAMS_BLOCKED` is no longer owed.
     pub(super) fn blocked_settled(&mut self) {
         self.blocked_pending = false;
         self.blocked_resend = false;
     }
 
-    /// STREAMS_BLOCKED was lost with a pipe: sent again while still true.
+    /// `STREAMS_BLOCKED` was lost with a pipe: sent again while still true.
     pub(super) fn blocked_lost(&mut self) {
         if self.blocked_reported == Some(self.peer_max) && self.reserved >= self.peer_max {
             self.blocked_resend = true;
@@ -118,24 +118,24 @@ pub(in super::super) struct RemoteDir {
     pub(in super::super) opened: u64,
     /// The initial limit (our transport parameter).
     pub(in super::super) initial: u64,
-    /// The limit written in MAX_STREAMS (or the initial one).
+    /// The limit written in `MAX_STREAMS` (or the initial one).
     pub(in super::super) limit_sent: u64,
     /// Streams discarded so far.
     pub(in super::super) discarded: u64,
-    /// MAX_STREAMS to send.
+    /// `MAX_STREAMS` to send.
     pub(in super::super) update_pending: bool,
     /// Streams ready for accept, in identifier order.
     pub(in super::super) accept: VecDeque<StreamKey>,
     /// Highest index offered to the application, plus one.
     pub(in super::super) offered: u64,
-    /// Largest STREAMS_BLOCKED limit reported (NE-4).
+    /// Largest `STREAMS_BLOCKED` limit reported (NE-4).
     pub(in super::super) blocked_seen: Option<u64>,
     /// Lowest GOAWAY watermark sent.
     pub(in super::super) goaway_sent: Option<u64>,
     /// More credit is granted on the first accept (staged unidirectional
     /// credit).
     pub(in super::super) staged: bool,
-    /// MAX_STREAMS was lost with a pipe: send the current limit again.
+    /// `MAX_STREAMS` was lost with a pipe: send the current limit again.
     pub(in super::super) resend: bool,
 }
 
@@ -149,7 +149,7 @@ impl RemoteDir {
         }
     }
 
-    /// The limit MAX_STREAMS would carry now: the initial one plus the
+    /// The limit `MAX_STREAMS` would carry now: the initial one plus the
     /// streams discarded, within the encodable count.
     pub(in super::super) fn limit_due(&self, max_count: u64) -> u64 {
         (self.initial + self.discarded).min(max_count)
@@ -161,7 +161,7 @@ impl RemoteDir {
         self.goaway_sent.is_some_and(|w| index >= w)
     }
 
-    /// MAX_STREAMS was written with `value`: whether the peer was blocked
+    /// `MAX_STREAMS` was written with `value`: whether the peer was blocked
     /// at the previous limit (a bottleneck, copied in a multipath session).
     pub(super) fn update_written(&mut self, value: u64) -> bool {
         let bottleneck = self.blocked_seen == Some(self.limit_sent);
@@ -169,7 +169,7 @@ impl RemoteDir {
         bottleneck
     }
 
-    /// MAX_STREAMS is no longer owed.
+    /// `MAX_STREAMS` is no longer owed.
     pub(super) fn update_settled(&mut self) {
         self.update_pending = false;
         self.resend = false;
@@ -179,7 +179,7 @@ impl RemoteDir {
 /// Session-level receive flow control.
 #[derive(Debug)]
 pub(in super::super) struct RecvFlow {
-    /// The MAX_DATA value last written (or the initial one): L.
+    /// The `MAX_DATA` value last written (or the initial one): L.
     pub(in super::super) limit_sent: u64,
     /// The session window W (auto-tuned).
     pub(in super::super) window: u64,
@@ -194,11 +194,11 @@ pub(in super::super) struct RecvFlow {
     pub(in super::super) at_cap: bool,
     pub(in super::super) tuner: Tuner,
     pub(in super::super) update_pending: bool,
-    /// Largest DATA_BLOCKED limit reported (NE-4).
+    /// Largest `DATA_BLOCKED` limit reported (NE-4).
     pub(in super::super) blocked_seen: Option<u64>,
     /// Unread bytes buffered in streams.
     pub(in super::super) buffered: u64,
-    /// MAX_DATA was lost with a pipe: send the current limit again.
+    /// `MAX_DATA` was lost with a pipe: send the current limit again.
     pub(in super::super) resend: bool,
 }
 
@@ -220,7 +220,7 @@ impl RecvFlow {
         }
     }
 
-    /// The credit MAX_DATA would carry now (C).
+    /// The credit `MAX_DATA` would carry now (C).
     #[inline]
     pub(in super::super) fn credit(&self) -> u64 {
         self.released + self.window
@@ -276,7 +276,7 @@ impl RecvFlow {
         self.check_credit();
     }
 
-    /// Decides whether MAX_DATA is due.
+    /// Decides whether `MAX_DATA` is due.
     pub(super) fn check_credit(&mut self) {
         let c = self.credit();
         if c <= self.limit_sent {
@@ -293,7 +293,7 @@ impl RecvFlow {
         }
     }
 
-    /// MAX_DATA was written with `value`: the credit loop's entry when it
+    /// `MAX_DATA` was written with `value`: the credit loop's entry when it
     /// raised the limit, and whether the peer was (nearly) blocked at the
     /// previous limit (a bottleneck, copied in a multipath session).
     pub(super) fn update_written(&mut self, value: u64, now: Instant) -> bool {
@@ -307,7 +307,7 @@ impl RecvFlow {
         bottleneck
     }
 
-    /// MAX_DATA is no longer owed.
+    /// `MAX_DATA` is no longer owed.
     pub(super) fn update_settled(&mut self) {
         self.update_pending = false;
         self.resend = false;
@@ -329,18 +329,18 @@ impl RecvFlow {
 /// Session-level send flow control.
 #[derive(Debug, Default)]
 pub(in super::super) struct SendFlow {
-    /// The peer's MAX_DATA.
+    /// The peer's `MAX_DATA`.
     pub(in super::super) max: u64,
     /// Bytes counted against it.
     pub(in super::super) used: u64,
-    /// DATA_BLOCKED limit already reported.
+    /// `DATA_BLOCKED` limit already reported.
     pub(in super::super) blocked_reported: Option<u64>,
     pub(in super::super) blocked_pending: bool,
-    /// DATA_BLOCKED was lost with a pipe and is still true.
+    /// `DATA_BLOCKED` was lost with a pipe and is still true.
     pub(in super::super) blocked_resend: bool,
     /// Bytes written by the application and not yet sent.
     pub(in super::super) buffered: u64,
-    /// When MAX_DATA last raised the limit after the session was stalled
+    /// When `MAX_DATA` last raised the limit after the session was stalled
     /// on it (the age test).
     pub(in super::super) credit_at: Option<Instant>,
 }
@@ -358,7 +358,7 @@ impl SendFlow {
         self.used >= self.max
     }
 
-    /// MAX_DATA raised the limit to `max` (`stalled`: data waited for it,
+    /// `MAX_DATA` raised the limit to `max` (`stalled`: data waited for it,
     /// dated `now`); `false` when it did not.
     pub(super) fn raise(&mut self, max: u64, stalled: bool, now: Instant) -> bool {
         if max <= self.max {
@@ -373,7 +373,7 @@ impl SendFlow {
         true
     }
 
-    /// The limit to report in DATA_BLOCKED when it was not reported yet
+    /// The limit to report in `DATA_BLOCKED` when it was not reported yet
     /// (it is then owed).
     pub(super) fn report_blocked(&mut self) -> Option<u64> {
         if self.blocked_reported == Some(self.max) {
@@ -383,19 +383,19 @@ impl SendFlow {
         Some(self.max)
     }
 
-    /// DATA_BLOCKED was written at `limit`.
+    /// `DATA_BLOCKED` was written at `limit`.
     pub(super) fn blocked_written(&mut self, limit: u64) {
         self.blocked_reported = Some(limit);
         self.blocked_pending = false;
     }
 
-    /// DATA_BLOCKED is no longer owed.
+    /// `DATA_BLOCKED` is no longer owed.
     pub(super) fn blocked_settled(&mut self) {
         self.blocked_pending = false;
         self.blocked_resend = false;
     }
 
-    /// DATA_BLOCKED was lost with a pipe: sent again while still true.
+    /// `DATA_BLOCKED` was lost with a pipe: sent again while still true.
     pub(super) fn blocked_lost(&mut self) {
         if self.blocked_reported == Some(self.max) {
             self.blocked_resend = true;
@@ -409,82 +409,82 @@ pub(in super::super) struct Stopped {
     pub(in super::super) local: bool,
     /// Buffered bytes dropped (consumed).
     pub(in super::super) dropped: u64,
-    /// STOP_SENDING is owed.
+    /// `STOP_SENDING` is owed.
     pub(in super::super) stop_pending: bool,
 }
 
 impl Streams {
     // ---- credit frames -------------------------------------------------------
 
-    /// MAX_DATA was written with `value` at `now`: whether the limit it
+    /// `MAX_DATA` was written with `value` at `now`: whether the limit it
     /// raised was a bottleneck.
     pub(in super::super) fn max_data_written(&mut self, value: u64, now: Instant) -> bool {
         self.recv_flow.update_written(value, now)
     }
 
-    /// MAX_DATA is no longer owed.
+    /// `MAX_DATA` is no longer owed.
     pub(in super::super) fn max_data_settled(&mut self) {
         self.recv_flow.update_settled();
     }
 
-    /// MAX_DATA was lost with a pipe.
+    /// `MAX_DATA` was lost with a pipe.
     pub(in super::super) fn max_data_lost(&mut self) {
         self.recv_flow.resend = true;
     }
 
-    /// MAX_STREAMS of type `d` was written with `value`: whether the limit
+    /// `MAX_STREAMS` of type `d` was written with `value`: whether the limit
     /// it raised was a bottleneck.
     pub(in super::super) fn max_streams_written(&mut self, d: usize, value: u64) -> bool {
         self.remote_dirs[d].update_written(value)
     }
 
-    /// MAX_STREAMS of type `d` is no longer owed.
+    /// `MAX_STREAMS` of type `d` is no longer owed.
     pub(in super::super) fn max_streams_settled(&mut self, d: usize) {
         self.remote_dirs[d].update_settled();
     }
 
-    /// MAX_STREAMS of type `d` was lost with a pipe.
+    /// `MAX_STREAMS` of type `d` was lost with a pipe.
     pub(in super::super) fn max_streams_lost(&mut self, d: usize) {
         self.remote_dirs[d].resend = true;
     }
 
-    /// The limit to report in DATA_BLOCKED when it was not reported yet
+    /// The limit to report in `DATA_BLOCKED` when it was not reported yet
     /// (it is then owed).
     pub(in super::super) fn report_data_blocked(&mut self) -> Option<u64> {
         self.send_flow.report_blocked()
     }
 
-    /// DATA_BLOCKED was written at `limit`.
+    /// `DATA_BLOCKED` was written at `limit`.
     pub(in super::super) fn data_blocked_written(&mut self, limit: u64) {
         self.send_flow.blocked_written(limit);
     }
 
-    /// DATA_BLOCKED is no longer owed.
+    /// `DATA_BLOCKED` is no longer owed.
     pub(in super::super) fn data_blocked_settled(&mut self) {
         self.send_flow.blocked_settled();
     }
 
-    /// DATA_BLOCKED was lost with a pipe.
+    /// `DATA_BLOCKED` was lost with a pipe.
     pub(in super::super) fn data_blocked_lost(&mut self) {
         self.send_flow.blocked_lost();
     }
 
-    /// STREAMS_BLOCKED of type `d` was written at `limit`.
+    /// `STREAMS_BLOCKED` of type `d` was written at `limit`.
     pub(in super::super) fn streams_blocked_written(&mut self, d: usize, limit: u64) {
         self.local_dirs[d].blocked_written(limit);
     }
 
-    /// STREAMS_BLOCKED of type `d` is no longer owed.
+    /// `STREAMS_BLOCKED` of type `d` is no longer owed.
     pub(in super::super) fn streams_blocked_settled(&mut self, d: usize) {
         self.local_dirs[d].blocked_settled();
     }
 
-    /// STREAMS_BLOCKED of type `d` was lost with a pipe.
+    /// `STREAMS_BLOCKED` of type `d` was lost with a pipe.
     pub(in super::super) fn streams_blocked_lost(&mut self, d: usize) {
         self.local_dirs[d].blocked_lost();
     }
 
-    /// Sets a stream's MAX_STREAM_DATA update as owed or not, counting the
+    /// Sets a stream's `MAX_STREAM_DATA` update as owed or not, counting the
     /// owed ones.
     pub(in super::super) fn mark_stream_update(&mut self, key: StreamKey, on: bool) {
         let Some(r) = self.recv_mut(key) else {
@@ -522,7 +522,7 @@ impl Streams {
         self.recv_flow.consumed(cap, n, pressure);
     }
 
-    /// Decides whether MAX_DATA is due.
+    /// Decides whether `MAX_DATA` is due.
     pub(in super::super) fn check_session_credit(&mut self) {
         self.recv_flow.check_credit();
     }
@@ -546,7 +546,7 @@ impl Streams {
         self.recv_flow.used += increase;
     }
 
-    /// DATA_BLOCKED from the peer at `limit`, new: auto-tuning learns of
+    /// `DATA_BLOCKED` from the peer at `limit`, new: auto-tuning learns of
     /// it and credit may be due.
     pub(in super::super) fn data_blocked_received(&mut self, limit: u64) {
         self.recv_flow.blocked_seen = Some(limit);
@@ -592,14 +592,14 @@ impl Streams {
         }
     }
 
-    /// STREAM_DATA_BLOCKED at `limit` for a stream.
+    /// `STREAM_DATA_BLOCKED` at `limit` for a stream.
     pub(in super::super) fn autotune_blocked(&mut self, key: StreamKey, limit: u64) {
         if let Some(r) = self.recv_mut(key) {
             r.tuner.on_blocked(limit);
         }
     }
 
-    /// Decides whether MAX_STREAM_DATA is due for a stream and queues it.
+    /// Decides whether `MAX_STREAM_DATA` is due for a stream and queues it.
     pub(in super::super) fn check_stream_credit(&mut self, key: StreamKey) {
         let Some(r) = self.recv_mut(key) else {
             return;
@@ -623,7 +623,7 @@ impl Streams {
         }
     }
 
-    /// STOP_SENDING on the local receiving part: data still buffered is
+    /// `STOP_SENDING` on the local receiving part: data still buffered is
     /// discarded and counts as consumed, and an owed update is owed no
     /// more. `None` when the part is gone, stopped or terminal already.
     pub(in super::super) fn stop_recv(&mut self, key: StreamKey, code: u64) -> Option<Stopped> {
@@ -656,7 +656,7 @@ impl Streams {
         })
     }
 
-    /// MAX_DATA from the peer raised the limit to `max` at `now`; `false`
+    /// `MAX_DATA` from the peer raised the limit to `max` at `now`; `false`
     /// when it did not. Streams waiting for session credit (and pinned
     /// openings) may send again.
     pub(in super::super) fn max_data_received(&mut self, max: u64, now: Instant) -> bool {

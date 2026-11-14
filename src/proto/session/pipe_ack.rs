@@ -3,7 +3,7 @@
 //! not use multipath, for the sender's estimates
 //! and its carrier queue limiter only. Nothing
 //! is retained: the sender keeps the sample state of each write batch in
-//! flight, which the next PIPE_ACK releases, and the receiver a few
+//! flight, which the next `PIPE_ACK` releases, and the receiver a few
 //! counters of pipe 0. Every path here is O(1) per record, batch or
 //! acknowledgement and allocates nothing beyond the reused batch queue.
 
@@ -27,7 +27,7 @@ const SAMPLE_ENTRIES: usize = 256;
 #[derive(Debug, Clone)]
 pub(crate) struct PipeAckState {
     /// Our own `zmux_ack_threshold`: ack-eliciting bytes that make a
-    /// PIPE_ACK due at once.
+    /// `PIPE_ACK` due at once.
     pub(crate) threshold: u64,
     /// Our own `zmux_max_ack_delay`.
     pub(crate) local_mad: Duration,
@@ -37,10 +37,10 @@ pub(crate) struct PipeAckState {
     /// The peer's `zmux_max_ack_delay`, the cap of the ACK Delay that RTT
     /// samples subtract.
     pub(crate) peer_mad: Duration,
-    /// The threshold was reached: a PIPE_ACK goes with the next records.
+    /// The threshold was reached: a `PIPE_ACK` goes with the next records.
     due: bool,
     /// The send-order ends of batches that carried an activity frame and
-    /// wait for the PIPE_ACK that restarts the idle timer: the oldest and the newest (0: none). The
+    /// wait for the `PIPE_ACK` that restarts the idle timer: the oldest and the newest (0: none). The
     /// ones between count as the newest, which can only make the timer restart later, never
     /// keep a session alive longer.
     activity_first: u64,
@@ -132,20 +132,20 @@ impl SessionCore {
     }
 
     /// The acknowledgement deadline of pipe 0, which a shaping delay of the
-    /// record carrying the PIPE_ACK never passes (see
+    /// record carrying the `PIPE_ACK` never passes (see
     /// [`SessionCore::ack_release`]).
     pub(super) fn single_ack_release(&self) -> Option<Instant> {
         self.single_ack_deadline(self.pipe_ack.as_ref()?)
     }
 
-    /// Whether a PIPE_ACK is due on pipe 0.
+    /// Whether a `PIPE_ACK` is due on pipe 0.
     pub(super) fn single_pipe_ack_due(&self, now: Instant) -> bool {
         self.pipe_ack
             .as_ref()
             .is_some_and(|pa| pa.due || self.single_ack_deadline(pa).is_some_and(|t| now >= t))
     }
 
-    /// The acknowledgement timer, while a PIPE_ACK is not due yet.
+    /// The acknowledgement timer, while a `PIPE_ACK` is not due yet.
     pub(super) fn single_pipe_ack_timer(&self) -> Option<Instant> {
         let pa = self.pipe_ack.as_ref()?;
         if pa.due || self.state >= super::State::Closing {
@@ -154,7 +154,7 @@ impl SessionCore {
         self.single_ack_deadline(pa).filter(|&t| t > self.now)
     }
 
-    /// Writes the PIPE_ACK of pipe 0 when it is due, or when the batch
+    /// Writes the `PIPE_ACK` of pipe 0 when it is due, or when the batch
     /// carries a credit update anyway while received bytes wait for it: a record of its own only
     /// when the deadline passed with nothing else to send.
     pub(super) fn write_single_pipe_ack(&mut self, w: &mut Records<'_>, now: Instant) {
@@ -202,7 +202,7 @@ impl SessionCore {
         }
     }
 
-    /// PIPE_ACK while pipe acknowledgement is in use: one entry, for pipe
+    /// `PIPE_ACK` while pipe acknowledgement is in use: one entry, for pipe
     /// 0, at most the bytes sent on it.
     pub(super) fn on_single_pipe_ack(
         &mut self,
@@ -255,16 +255,16 @@ impl SessionCore {
         Ok(())
     }
 
-    /// The response to a QX_PING request came back after `rtt`: on the
+    /// The response to a `QX_PING` request came back after `rtt`: on the
     /// single pipe with pipe acknowledgement whose carrier the limiter
     /// paces, the pipe's first RTT sample, for its estimators and the
-    /// limiter's base, while no PIPE_ACK gave one. That is the request of
+    /// limiter's base, while no `PIPE_ACK` gave one. That is the request of
     /// the first record, which waited behind nothing and was answered at
     /// once (the scheduler takes a new pipe's first sample from
-    /// its first record), whereas the first PIPE_ACK may come a whole
+    /// its first record), whereas the first `PIPE_ACK` may come a whole
     /// `zmux_max_ack_delay` late with nothing to subtract it from, a delay
-    /// that would stay in min_rtt and the base. Later responses feed
-    /// neither: the limiter's inputs come from PIPE_ACK.
+    /// that would stay in `min_rtt` and the base. Later responses feed
+    /// neither: the limiter's inputs come from `PIPE_ACK`.
     pub(super) fn single_ping_sample(&mut self, rtt: Duration, now: Instant) {
         if self.pipe_ack.is_none()
             || !self

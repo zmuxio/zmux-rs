@@ -144,6 +144,10 @@ impl OpenQueue {
     /// Settles a waiting opener's poll: `attempt` is what opening did, or
     /// `None` when it was not its turn. A blocked opener queues (or keeps
     /// its place); one that is done leaves the queue.
+    #[allow(
+        clippy::similar_names,
+        reason = "`waker` and `wakes` are the driver's names for the two"
+    )]
     pub(crate) fn settle<K, E>(
         &mut self,
         ticket: &mut Option<Ticket>,
@@ -224,9 +228,9 @@ pub(crate) enum List<K> {
     Events,
     /// Pipe state changes (`Pipe::joined`).
     Pipes,
-    /// `close` calls waiting for the carriers to take CONNECTION_CLOSE.
+    /// `close` calls waiting for the carriers to take `CONNECTION_CLOSE`.
     Close,
-    /// `ping` calls (a QX_PING response arrived).
+    /// `ping` calls (a `QX_PING` response arrived).
     Ping,
     /// The session's hook task (a hook's input arrived).
     Hook,
@@ -295,12 +299,11 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
         if matches!(list, List::Stopped(_) | List::StreamDatagrams(_)) {
             return self.streams.entry(list).or_default();
         }
-        let i = match self.session.iter().position(|(l, _)| *l == list) {
-            Some(i) => i,
-            None => {
-                self.session.push((list, WaitList::default()));
-                self.session.len() - 1
-            }
+        let i = if let Some(i) = self.session.iter().position(|(l, _)| *l == list) {
+            i
+        } else {
+            self.session.push((list, WaitList::default()));
+            self.session.len() - 1
         };
         &mut self.session[i].1
     }
@@ -500,19 +503,16 @@ impl<T: Waiting, R, F: FnMut(&mut T) -> Option<R> + Unpin> Future for Wait<'_, T
         let mut state = Locked::lock(this.mutex);
         let r = (this.step)(&mut *state);
         let (waiters, _) = state.waits();
-        match r {
-            Some(r) => {
-                if let Some(t) = this.ticket.take() {
-                    waiters.remove(this.list, t);
-                }
-                Poll::Ready(r)
+        if let Some(r) = r {
+            if let Some(t) = this.ticket.take() {
+                waiters.remove(this.list, t);
             }
-            None => {
-                // Under the lock that checked the condition: whoever changes
-                // it next sees this wait.
-                waiters.register(this.list, &mut this.ticket, cx.waker());
-                Poll::Pending
-            }
+            Poll::Ready(r)
+        } else {
+            // Under the lock that checked the condition: whoever changes
+            // it next sees this wait.
+            waiters.register(this.list, &mut this.ticket, cx.waker());
+            Poll::Pending
         }
     }
 }
@@ -526,15 +526,15 @@ impl<T: Waiting, F> Drop for Wait<'_, T, F> {
 }
 
 /// Opening a stream of type `dir` (0 bidirectional, 1 unidirectional),
-/// waiting for stream credit in arrival order: `open` opens in the core,
+/// waiting for stream credit in arrival order: `attempt` opens in the core,
 /// `after` ends the command (a blocked open may owe the peer a
-/// STREAMS_BLOCKED), told whether this open just began waiting for credit. Dropped while waiting, it leaves the queue and passes
+/// `STREAMS_BLOCKED`), told whether this open just began waiting for credit. Dropped while waiting, it leaves the queue and passes
 /// its turn on.
 pub(crate) struct Open<'a, T: Waiting, F, A> {
     mutex: &'a Mutex<T>,
     dir: usize,
     ticket: Option<Ticket>,
-    open: F,
+    attempt: F,
     after: A,
 }
 
@@ -544,7 +544,7 @@ impl<'a, T: Waiting, F, A> Open<'a, T, F, A> {
             mutex,
             dir,
             ticket: None,
-            open,
+            attempt: open,
             after,
         }
     }
@@ -562,7 +562,7 @@ where
         let this = self.get_mut();
         let mut state = Locked::lock(this.mutex);
         let turn = state.waits().0.open[this.dir].turn(this.ticket);
-        let attempt = turn.then(|| (this.open)(&mut *state));
+        let attempt = turn.then(|| (this.attempt)(&mut *state));
         let queued = this.ticket.is_some();
         let (waiters, wakes) = state.waits();
         let r = waiters.open[this.dir].settle(&mut this.ticket, attempt, cx.waker(), wakes);
@@ -813,19 +813,19 @@ mod tests {
         w.register(List::Accept(0), &mut t1, &waker);
         w.register(List::Stopped(1), &mut t2, &waker);
         w.register(List::State, &mut t3, &waker);
-        let mut to = None;
-        let mut wakes = WakeList::default();
+        let mut opener = None;
+        let mut deferred = WakeList::default();
         assert!(
             w.open[0]
-                .settle::<(), ()>(&mut to, Some(Attempt::Blocked), &waker, &mut wakes)
+                .settle::<(), ()>(&mut opener, Some(Attempt::Blocked), &waker, &mut deferred)
                 .is_pending()
         );
-        w.close(&mut wakes);
-        drop(wakes);
+        w.close(&mut deferred);
+        drop(deferred);
         assert_eq!(woken(&c), 6);
         // The opener leaves when it fails; the rest left already.
         assert!(!w.is_idle());
-        w.open[0].leave(to.unwrap(), &mut WakeList::default());
+        w.open[0].leave(opener.unwrap(), &mut WakeList::default());
         assert!(w.is_idle());
     }
 
@@ -834,17 +834,17 @@ mod tests {
         let done = PipeDone::default();
         let (c, waker) = counter();
         let cx = Context::from_waker(&waker);
-        let mut t = None;
-        assert!(done.poll_done(&mut t, &cx).is_pending());
+        let mut ticket = None;
+        assert!(done.poll_done(&mut ticket, &cx).is_pending());
         assert_eq!(done.waiting(), 1);
-        done.cancel(t.take().unwrap());
+        done.cancel(ticket.take().unwrap());
         assert_eq!(done.waiting(), 0);
-        assert!(done.poll_done(&mut t, &cx).is_pending());
-        let mut wakes = WakeList::default();
-        done.finish_into(&mut wakes);
+        assert!(done.poll_done(&mut ticket, &cx).is_pending());
+        let mut deferred = WakeList::default();
+        done.finish_into(&mut deferred);
         assert_eq!(woken(&c), 0, "woken only after the caller's lock");
-        drop(wakes);
+        drop(deferred);
         assert_eq!(woken(&c), 1);
-        assert!(done.poll_done(&mut t, &cx).is_ready());
+        assert!(done.poll_done(&mut ticket, &cx).is_ready());
     }
 }

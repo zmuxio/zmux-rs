@@ -61,6 +61,7 @@ impl CarrierKind {
 
     /// The kind's name: `websocket`, `streaming`, `split`, `exchange`,
     /// `quic`, `http3`, `webtransport`.
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::WebSocket => "websocket",
@@ -74,6 +75,7 @@ impl CarrierKind {
     }
 
     /// The kind of a name ([`CarrierKind::name`]).
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.name() == name)
     }
@@ -103,6 +105,7 @@ pub enum CandidateOutcome {
 
 impl CandidateOutcome {
     /// The outcome's name: `usable`, `timed_out`, `refused`, `failed`.
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Usable => "usable",
@@ -138,7 +141,11 @@ pub struct CandidateResult {
 /// A session event: pipe state changes,
 /// pipe quality and priority reports, and the session's own events
 /// (GOAWAY, suspension, capacity), read with
-/// [`Session::next_event`](crate::Session#method.next_event).
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`Session::next_event`](crate::Session#method.next_event)."
+)]
+#[cfg_attr(not(feature = "tokio"), doc = " `Session::next_event`.")]
 ///
 /// The queue is bounded however many pipes a session goes through: unread
 /// events coalesce (a pipe direction reports its latest state event among
@@ -232,7 +239,7 @@ pub enum SessionEvent {
         pipe: PipeId,
         /// The smoothed RTT; `None` before the first sample.
         smoothed_rtt: Option<std::time::Duration>,
-        /// The delivery rate R_p in bytes per second; `None` before it was
+        /// The delivery rate `R_p` in bytes per second; `None` before it was
         /// measured, or without pipe acknowledgement.
         delivery_rate: Option<u64>,
     },
@@ -309,7 +316,14 @@ pub enum SessionEvent {
         last: Vec<PipeId>,
     },
     /// The session committed an epoch: its secret is known, and joins of it are
-    /// accepted ([`Session`](crate::Session)`::advance_epoch`). The latest
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " accepted ([`Session`](crate::Session)`::advance_epoch`). The latest"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " accepted (`Session``::advance_epoch`). The latest"
+    )]
     /// when several were not read.
     EpochCommitted {
         /// The epoch.

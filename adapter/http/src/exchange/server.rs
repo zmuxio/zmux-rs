@@ -132,6 +132,11 @@ impl ExchangeServer {
     /// ([`io::ErrorKind::InvalidInput`]) on options without a PSK
     /// that do not choose to run unauthenticated
     /// ([`ExchangeOptions::unauthenticated`]), or that set both.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` on options without a PSK that do not choose to run
+    /// unauthenticated, or that set both.
     pub fn new(listener: &Listener, options: ExchangeOptions) -> io::Result<Self> {
         options.mac_psk()?;
         // A difference of Times is a signed 32-bit value: a wider window
@@ -161,11 +166,13 @@ impl ExchangeServer {
     }
 
     /// The options.
+    #[must_use]
     pub fn options(&self) -> &ExchangeOptions {
         &self.inner.options
     }
 
     /// Carriers with state now (not those only remembered as ended).
+    #[must_use]
     pub fn carriers(&self) -> usize {
         lock(&self.inner.table).live.len()
     }
@@ -219,6 +226,11 @@ impl ExchangeServer {
     /// the connection's remote address; the request's source is the client
     /// a trusted intermediary reports in a forwarding header field on top
     /// ([`crate::request_source`]). Must be called inside a tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// The request back, with every body byte read in front of the rest, when
+    /// it is not an exchange request this server takes.
     #[allow(
         clippy::result_large_err,
         reason = "the request is handed back by value, as a host server routes it"
@@ -289,14 +301,13 @@ impl ExchangeServer {
         };
         // A request of a known carrier gives its place back now; one that
         // may create a carrier keeps it.
-        let entry = match lookup {
-            Lookup::New => entry,
-            _ => {
-                if let Some(e) = entry {
-                    e.release();
-                }
-                None
+        let entry = if let Lookup::New = lookup {
+            entry
+        } else {
+            if let Some(e) = entry {
+                e.release();
             }
+            None
         };
 
         // Data and the Data MAC, within the handshake timeout.
@@ -366,6 +377,12 @@ fn content_length(h: &http::HeaderMap) -> Option<usize> {
 /// The time in seconds that the Time `time` stands for when the clock is
 /// `now`, or `None` when the two differ by more than `window`: the
 /// difference is taken modulo 2^32 as a signed 32-bit value.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "Time arithmetic is modulo 2^32 by definition"
+)]
 fn within_window(time: u32, now: i64, window: i64) -> Option<i64> {
     let d = i64::from(time.wrapping_sub(now as u32) as i32);
     (d.abs() <= window).then_some(now + d)
@@ -592,6 +609,10 @@ struct Piece {
 }
 
 #[derive(Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent flags of the carrier's state machine"
+)]
 struct State {
     /// Failed or closed: every request is answered GONE.
     failed: bool,
@@ -604,7 +625,7 @@ struct State {
     up_next: u64,
     /// Pieces received above `up_next`.
     up_ooo: BTreeMap<u64, Bytes>,
-    /// Their bytes, and PIECE_COST for each.
+    /// Their bytes, and `PIECE_COST` for each.
     up_ooo_bytes: usize,
     up_fin: Option<u64>,
     /// The highest uplink number received.
@@ -934,7 +955,7 @@ impl Carrier {
                 let mut t = lock(&server.table);
                 if t.live
                     .get(&self.cid)
-                    .is_some_and(|c| std::ptr::eq(&**c, self))
+                    .is_some_and(|c| std::ptr::eq(&raw const **c, self))
                 {
                     t.live.remove(&self.cid);
                 }
@@ -990,17 +1011,16 @@ impl Carrier {
                 self.apply(st, fx);
                 Ok(Answer::flags(0))
             }
-            Kind::Up => match st.up(req.seq, req.flags & REQ_FIN != 0, data, &self.limits) {
-                Ok((a, fx)) => {
+            Kind::Up => {
+                if let Ok((a, fx)) = st.up(req.seq, req.flags & REQ_FIN != 0, data, &self.limits) {
                     self.apply(st, fx);
                     Ok(a)
-                }
-                Err(()) => {
+                } else {
                     let fx = st.fail();
                     self.apply(st, fx);
                     Ok(Answer::flags(GONE))
                 }
-            },
+            }
             Kind::Down => {
                 let n = req.seq;
                 if n < st.ack {
@@ -1353,7 +1373,7 @@ mod tests {
         listener.close();
     }
 
-    /// Out-of-order UP pieces count PIECE_COST each against the uplink
+    /// Out-of-order UP pieces count `PIECE_COST` each against the uplink
     /// store, so empty ones are bounded too; the piece the carrier waits for
     /// is still taken.
     #[tokio::test]
@@ -1712,6 +1732,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the clock is reduced modulo 2^32 like a request's Time"
+    )]
     fn time_window_arithmetic() {
         let now = 1_000_000;
         assert_eq!(within_window(now as u32, now, 60), Some(now));
@@ -1743,7 +1768,15 @@ mod tests {
             server(ExchangeOptions::default().with_time_window(Duration::from_secs(30)));
         let now = wire::unix_time();
         for time in [now.wrapping_add(40), now.wrapping_sub(40)] {
-            let (_, req) = request(&[1; 16], Kind::Up, 0, 0, time, [time as u8; 8], b"hi");
+            let (_, req) = request(
+                &[1; 16],
+                Kind::Up,
+                0,
+                0,
+                time,
+                [time.to_le_bytes()[0]; 8],
+                b"hi",
+            );
             let body = http_body::Body::size_hint(req.body()).exact().unwrap();
             let back = server
                 .handle(req, None, &PairField::default())

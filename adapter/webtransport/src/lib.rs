@@ -75,6 +75,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -125,6 +126,7 @@ pub struct Options {
 
 impl Options {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -156,6 +158,7 @@ impl Options {
     /// unidirectional streams the peer may open (the lanes and HTTP/3's
     /// own); the rest quinn's defaults. Build the endpoints' client and
     /// server configurations with it.
+    #[must_use]
     pub fn transport_config(&self) -> quinn::TransportConfig {
         let mut t = self.windows.transport_config();
         t.max_concurrent_uni_streams(VarInt::from_u32(
@@ -173,6 +176,12 @@ impl Options {
 /// header field of [`Options::carrier_credential`] goes on the request, the
 /// credential given no exporter (the client makes the QUIC connection and
 /// sends the request in one step): a bound one needs [`dial_over`].
+///
+/// # Errors
+///
+/// The credential's error, or `InvalidInput`, when its header cannot be
+/// made; `Other` when the connection, the WebTransport session or its
+/// stream cannot be opened.
 pub async fn dial(
     client: &wt::Client,
     request: impl Into<ConnectRequest>,
@@ -187,6 +196,12 @@ pub async fn dial(
 /// identifier `h3` and nothing else on it: the credential is given the
 /// connection's metadata ([`zmux_quinn::Handshake::carrier_info`]), its
 /// exporter for a bound one among them.
+///
+/// # Errors
+///
+/// The credential's error, or `InvalidInput`, when its header cannot be
+/// made; `Other` when the WebTransport session or its stream cannot be
+/// opened.
 pub async fn dial_over(
     conn: quinn::Connection,
     request: impl Into<ConnectRequest>,
@@ -220,6 +235,11 @@ fn credential_header(
 
 /// Establishes a zmux session over a new WebTransport session ([`dial`],
 /// then [`zmux::Session::connect`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial`], and the errors of
+/// [`zmux::Session::connect`].
 pub async fn connect(
     client: &wt::Client,
     request: impl Into<ConnectRequest>,
@@ -331,12 +351,8 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
             let Ok(session) = request.ok().await else {
                 return;
             };
-            let carrier = Carrier::start(
-                session.clone(),
-                Some(listener.clone()),
-                options.clone(),
-                admitted,
-            );
+            let carrier =
+                Carrier::start(session.clone(), Some(listener.clone()), options, admitted);
             // Held while the session is open: its accept loop serves it.
             session.closed().await;
             drop(carrier);
@@ -441,7 +457,7 @@ impl Fallback {
 /// pipe's inbound side ended or its linger timeout passed), so that the
 /// WebTransport close never cuts off the zmux close before it. The
 /// WebTransport session is then closed with the application error code of
-/// the CONNECTION_CLOSE that ended the last zmux session on it, when it
+/// the `CONNECTION_CLOSE` that ended the last zmux session on it, when it
 /// fits the 32-bit WebTransport code, and 0 otherwise, after any other end
 /// and for a session that never carried one. On a WebTransport session
 /// several zmux sessions share, the pipe zmux is done with last decides the
@@ -506,22 +522,30 @@ impl Carrier {
     /// [`Carrier::accept_pipe`], and the connection's receive
     /// window is charged to the zmux session its pipes carry. Make one
     /// carrier per session: its lanes are recognised by it.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor API that takes its arguments by value"
+    )]
     pub fn new(session: Session, options: Options) -> Self {
-        Self::start(session, None, options, None)
+        Self::start(session, None, &options, None)
     }
 
     /// The carrier of `session` for `listener`: every stream the peer
     /// opens goes to [`Listener::handle_pipe`], and the connection's
     /// receive window is charged to the listener's budget while the
     /// carrier lives.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor API that takes its arguments by value"
+    )]
     pub fn with_listener(session: Session, listener: &Listener, options: Options) -> Self {
-        Self::start(session, Some(listener.clone()), options, None)
+        Self::start(session, Some(listener.clone()), &options, None)
     }
 
     fn start(
         conn: Session,
         listener: Option<Listener>,
-        options: Options,
+        options: &Options,
         admitted: Option<Admitted>,
     ) -> Self {
         let window = options.windows.receive_window();
@@ -562,12 +586,14 @@ impl Carrier {
     /// The WebTransport session, for its own features (statistics,
     /// close) and, through it, the QUIC connection. Its streams and
     /// datagrams belong to zmux.
+    #[must_use]
     pub fn session(&self) -> &Session {
         &self.inner.conn
     }
 
     /// The session's datagrams received that named no pipe attached to a
     /// zmux session (an unknown, not yet attached or closed one).
+    #[must_use]
     pub fn channel_dropped(&self) -> u64 {
         self.inner.datagrams.demux.dropped()
     }
@@ -575,6 +601,10 @@ impl Carrier {
     /// A new pipe on a bidirectional stream of the session: the
     /// bootstrap carrier of a session this endpoint starts, or a pipe it
     /// joins. Waits for the peer's stream credit.
+    ///
+    /// # Errors
+    ///
+    /// `Other` when the stream cannot be opened.
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
         let (send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
         Ok(self.inner.pipe(Send::new(send), Recv::new(recv)))
@@ -584,7 +614,7 @@ impl Carrier {
     /// [`zmux::Session::accept`]); `None` once the connection is closed.
     /// With a listener, the listener takes them. Pipes nobody takes wait,
     /// as many as the connection lets the peer open bidirectional streams
-    /// (QUIC MAX_STREAMS).
+    /// (QUIC `MAX_STREAMS`).
     pub async fn accept_pipe(&self) -> Option<PipeIo> {
         let inner = &self.inner;
         loop {
@@ -856,7 +886,7 @@ impl Drop for Send {
 /// Keeps a finished stream, and with it the QUIC connection, until the
 /// peer acknowledged all of it, stopped it, or the connection ended: QUIC
 /// closes a connection whose last handle is dropped, and discards the data
-/// still in flight, so a carrier's last records (a CONNECTION_CLOSE) would
+/// still in flight, so a carrier's last records (a `CONNECTION_CLOSE`) would
 /// be lost with it.
 fn linger(stream: wt::SendStream) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -935,6 +965,7 @@ impl AsyncRead for Recv {
 
 /// A [`zmux::Candidate`] of [`zmux::CarrierKind::WebTransport`] for carrier
 /// modes: a WebTransport session to `url` made by `client` ([`dial`]).
+#[must_use]
 pub fn candidate(client: wt::Client, url: Url, options: &Options) -> zmux::Candidate {
     let options = Arc::new(options.clone());
     zmux::Candidate::new(zmux::CarrierKind::WebTransport, move || {

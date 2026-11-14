@@ -87,6 +87,7 @@ pub struct Resources {
 
 /// A snapshot of the live driver resources of this process.
 #[cfg(feature = "test-hooks")]
+#[must_use]
 pub fn resources() -> Resources {
     let n = |k: Kind| COUNTS[k as usize].load(Ordering::Relaxed);
     Resources {

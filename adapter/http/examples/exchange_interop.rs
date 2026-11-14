@@ -128,16 +128,16 @@ async fn client(o: ExchangeOptions) -> Result<(), Error> {
     let session = Session::connect(pipe, Config::default()).await?;
     let mut msg = vec![0u8; n];
     getrandom::fill(&mut msg)?;
-    let sent = Sha256::digest(&msg);
+    let digest = Sha256::digest(&msg);
     let (mut send, mut recv) = session.open_bi().await?;
     let writer = tokio::spawn(async move {
         let r = send.write_all(&msg).await;
         let _ = send.finish();
-        r.map(|_| send)
+        r.map(|()| send)
     });
     let got = recv.read_to_end(n + 1).await?;
     drop(writer.await?);
-    if got.len() != n || Sha256::digest(&got) != sent {
+    if got.len() != n || Sha256::digest(&got) != digest {
         return Err(format!("echo: {} of {n} bytes, or a different hash", got.len()).into());
     }
     eprintln!("echoed {n} bytes");

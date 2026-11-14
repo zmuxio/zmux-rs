@@ -259,6 +259,7 @@ impl PipeIo {
     /// a stream ([`PipeStream`]); bytes a listener already read from it
     /// come first. Every other property of the carrier is dropped:
     /// [`PipeIo::wrap`] keeps them.
+    #[must_use]
     pub fn into_stream(mut self) -> PipeStream {
         self.take_stream()
     }

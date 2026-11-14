@@ -11,14 +11,14 @@ pub struct Draft {
     pub number: u8,
     /// The version's name in negotiation results (`draft-02`).
     pub name: &'static str,
-    /// The QX_TRANSPORT_PARAMETERS frame type, which also starts every
+    /// The `QX_TRANSPORT_PARAMETERS` frame type, which also starts every
     /// bootstrap pipe (the first-record check).
     pub transport_parameters: u64,
-    /// The QX_PING request frame type.
+    /// The `QX_PING` request frame type.
     pub ping_request: u64,
-    /// The QX_PING response frame type.
+    /// The `QX_PING` response frame type.
     pub ping_response: u64,
-    /// The max_record_size transport parameter id.
+    /// The `max_record_size` transport parameter id.
     pub max_record_size: u64,
     /// The ALPN identifier without an application.
     pub alpn: &'static str,
@@ -46,8 +46,9 @@ pub const QMUX_02: Draft = Draft {
 pub const CURRENT: Draft = QMUX_02;
 
 impl Draft {
-    /// The encoded QX_TRANSPORT_PARAMETERS type: the eight bytes that
+    /// The encoded `QX_TRANSPORT_PARAMETERS` type: the eight bytes that
     /// start a session (an eight-byte variable-length integer).
+    #[must_use]
     pub const fn session_prefix(&self) -> [u8; 8] {
         (self.transport_parameters | 0xc000_0000_0000_0000).to_be_bytes()
     }

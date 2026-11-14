@@ -8,8 +8,22 @@
 //!
 //! One step from an endpoint to a session, and from an endpoint to the
 //! sessions it accepts: [`connect`] and [`serve`]. With the `rustls-ring`
-//! (default) or `rustls-aws-lc-rs` feature, [`client_config`] and
-//! [`server_config`] make quinn configurations from rustls ones with the
+#![cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " (default) or `rustls-aws-lc-rs` feature, [`client_config`] and"
+)]
+#![cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " (default) or `rustls-aws-lc-rs` feature, `client_config` and"
+)]
+#![cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " [`server_config`] make quinn configurations from rustls ones with the"
+)]
+#![cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " `server_config` make quinn configurations from rustls ones with the"
+)]
 //! transport parameters the carrier needs ([`Options::transport_config`]);
 //! without them, configure the endpoint with [`Options::transport_config`]
 //! yourself. The ALPN identifiers are the rustls configurations' own: none
@@ -140,6 +154,7 @@ impl Default for LaneWindows {
 
 impl LaneWindows {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -160,6 +175,7 @@ impl LaneWindows {
 
     /// The connection receive window these windows ask for: a stream
     /// window for each lane and one for a pipe.
+    #[must_use]
     pub fn receive_window(&self) -> u64 {
         self.stream_window
             .saturating_mul(u64::from(self.lanes) + 1)
@@ -174,6 +190,7 @@ impl LaneWindows {
     /// sessions' datagram queues drop their oldest datagrams rather than
     /// the connection holding them for long; the rest quinn's defaults. A
     /// carrier's options add their stream limits to it.
+    #[must_use]
     pub fn transport_config(&self) -> quinn::TransportConfig {
         let mut t = quinn::TransportConfig::default();
         t.stream_receive_window(VarInt::from_u64(self.stream_window).unwrap_or(VarInt::MAX))
@@ -197,7 +214,7 @@ pub const DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 #[non_exhaustive]
 pub struct Options {
     /// The windows; [`LaneWindows::lanes`] is the lanes the peer may open
-    /// at once (QUIC MAX_STREAMS for unidirectional streams).
+    /// at once (QUIC `MAX_STREAMS` for unidirectional streams).
     pub windows: LaneWindows,
     /// QUIC 0-RTT (off by default; [`Options::with_zero_rtt`]).
     pub zero_rtt: Option<ParameterMemory>,
@@ -213,7 +230,14 @@ pub struct Options {
 /// them. Cheap to clone; share one between the connections to a server.
 /// (quinn keeps no data of the application with its tickets: this stands
 /// for it, and relies on the server obligation described at
-/// [`server_config`].)
+#[cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " [`server_config`].)"
+)]
+#[cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " `server_config`.)"
+)]
 ///
 /// The memory lives in this process only, as long as a clone of it does;
 /// nothing expires by time (a server that changed its parameters rejects
@@ -237,12 +261,14 @@ struct Memory {
 
 impl ParameterMemory {
     /// An empty memory that keeps every name.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// An empty memory that keeps at most `names` names (at least one),
     /// forgetting the one set longest ago to make room.
+    #[must_use]
     pub fn with_capacity(names: usize) -> Self {
         let m = Self::default();
         m.lock().capacity = Some(names.max(1));
@@ -250,6 +276,7 @@ impl ParameterMemory {
     }
 
     /// The parameters kept for `server_name`.
+    #[must_use]
     pub fn get(&self, server_name: &str) -> Option<zmux::proto::params::TransportParameters> {
         self.lock()
             .by_name
@@ -288,11 +315,13 @@ impl ParameterMemory {
     }
 
     /// The number of names kept.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.lock().by_name.len()
     }
 
     /// Whether no name is kept.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -315,12 +344,14 @@ impl ZeroRtt {
     /// options and configuration allowed it, the memory held the server's
     /// parameters, the TLS session was resumed, and the handshake had not
     /// completed when the session's first stream was opened).
+    #[must_use]
     pub fn sent(&self) -> bool {
         self.retry.is_some()
     }
 
     /// Whether the server accepted the 0-RTT data: `None` when none was
     /// sent, or while the handshake has not completed.
+    #[must_use]
     pub fn accepted(&self) -> Option<bool> {
         self.retry.as_ref().and_then(|r| r.lock().accepted)
     }
@@ -328,6 +359,7 @@ impl ZeroRtt {
     /// Whether the server rejected the 0-RTT data and the session wrote
     /// everything again on a 1-RTT stream (no stream failed: the round
     /// trip 0-RTT would have saved was spent).
+    #[must_use]
     pub fn rewritten(&self) -> bool {
         self.retry.as_ref().is_some_and(|r| r.lock().switched)
     }
@@ -345,6 +377,7 @@ impl std::fmt::Debug for ZeroRtt {
 
 impl Options {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -361,8 +394,22 @@ impl Options {
     /// configuration allows carrier early data
     /// ([`zmux::EarlyData::carrier_early_data`]) and it resumes a TLS
     /// session with a server whose parameters `memory` holds: such data may
-    /// be replayed by an attacker. A server ([`client_config`],
-    /// [`server_config`] and [`serve`] with these options) accepts 0-RTT
+    #[cfg_attr(
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+        doc = " be replayed by an attacker. A server ([`client_config`],"
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+        doc = " be replayed by an attacker. A server (`client_config`,"
+    )]
+    #[cfg_attr(
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+        doc = " [`server_config`] and [`serve`] with these options) accepts 0-RTT"
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+        doc = " `server_config` and [`serve`] with these options) accepts 0-RTT"
+    )]
     /// data only when its listener's configuration allows carrier early
     /// data, and the streams opened in it are replayable until the
     /// handshake completes ([`zmux::RecvStream::is_replayable`]); without
@@ -396,6 +443,7 @@ impl Options {
     /// count, so zmux's carrier queue limiter paces the pipe, and a send
     /// window below its in-flight cap would cap the pipe's rate on paths
     /// that change.
+    #[must_use]
     pub fn transport_config(&self) -> quinn::TransportConfig {
         let mut t = self.windows.transport_config();
         t.max_concurrent_uni_streams(VarInt::from_u32(self.windows.lanes));
@@ -407,6 +455,11 @@ impl Options {
 /// identifiers as they are, early data enabled with
 /// [`Options::with_zero_rtt`], and the transport configuration of
 /// `options` ([`Options::transport_config`]).
+///
+/// # Errors
+///
+/// [`NoInitialCipherSuite`](quinn::crypto::rustls::NoInitialCipherSuite)
+/// when `tls` offers no cipher suite QUIC can use for its Initial packets.
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn client_config(
     mut tls: rustls::ClientConfig,
@@ -438,6 +491,11 @@ pub fn client_config(
 /// older tickets when it binds no version to them, for example by
 /// rotating its ticket keys); it never accepts early data under limits it
 /// no longer honours. Raising a value needs nothing.
+///
+/// # Errors
+///
+/// [`NoInitialCipherSuite`](quinn::crypto::rustls::NoInitialCipherSuite)
+/// when `tls` offers no cipher suite QUIC can use for its Initial packets.
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn server_config(
     mut tls: rustls::ServerConfig,
@@ -462,6 +520,12 @@ pub fn server_config(
 /// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to reach the
 /// connection itself, make it and its carrier ([`Carrier::new`])
 /// instead.
+///
+/// # Errors
+///
+/// `InvalidInput` when the endpoint refuses the connection's parameters,
+/// `Other` when the QUIC handshake or the stream fails, and the carrier
+/// credential's error when its prefix cannot be made.
 pub async fn dial(
     endpoint: &Endpoint,
     addr: std::net::SocketAddr,
@@ -533,6 +597,11 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 /// }
 /// # Ok(()) }
 /// ```
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] when the connection or its first stream fails (as
+/// [`dial`]), and the errors of [`Session::connect`].
 pub async fn connect(
     endpoint: &Endpoint,
     addr: std::net::SocketAddr,
@@ -546,6 +615,11 @@ pub async fn connect(
 }
 
 /// [`connect`], also returning what became of its 0-RTT data.
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] when the connection or its first stream fails (as
+/// [`dial`]), and the errors of [`Session::connect`].
 pub async fn connect_with_report(
     endpoint: &Endpoint,
     addr: std::net::SocketAddr,
@@ -696,7 +770,14 @@ fn remember(
 /// With an admission, early data is never taken: the handshake is awaited
 /// in full, never through `into_0rtt`; the endpoint's server configuration
 /// should refuse early data (rustls `max_early_data_size` 0), as
-/// [`server_config`] does with options without [`Options::with_zero_rtt`].
+#[cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " [`server_config`] does with options without [`Options::with_zero_rtt`]."
+)]
+#[cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " `server_config` does with options without [`Options::with_zero_rtt`]."
+)]
 pub async fn serve(
     listener: Listener,
     endpoint: Endpoint,
@@ -796,7 +877,7 @@ async fn serve_entered(
     let mut entry = entry;
     let _ = entry.decide(CarrierInfo::new(), Vec::new()).await;
     drop(entry);
-    let carrier = Carrier::start(conn.clone(), Some(listener), options.clone(), handshake);
+    let carrier = Carrier::start(&conn, Some(listener), options, handshake);
     // Held while the connection is open: its accept loop serves it.
     conn.closed().await;
     drop(carrier);
@@ -829,7 +910,7 @@ async fn admit(
         Admit::Accept(rest) => {
             let admitted = entry.admitted();
             let hint = PipeHint::from_entry(entry);
-            let carrier = Carrier::make(conn.clone(), Some(&listener), options.clone(), None);
+            let carrier = Carrier::make(&conn, Some(&listener), options, None);
             let first = carrier
                 .inner
                 .pipe(Send::new(send), Recv::new(recv))
@@ -911,11 +992,11 @@ impl Fallback {
 /// while the peer may still open pipes on it.
 ///
 /// A pipe holds the connection until its session is done with it: every
-/// pipe's inbound side ended (the peer read the zmux CONNECTION_CLOSE and
+/// pipe's inbound side ended (the peer read the zmux `CONNECTION_CLOSE` and
 /// ended its stream) or its linger timeout passed, so a QUIC close, which
 /// discards what the peer has not acknowledged, never cuts off the zmux
 /// close or the data before it. The connection is then closed with the
-/// application error code of the CONNECTION_CLOSE that ended the last
+/// application error code of the `CONNECTION_CLOSE` that ended the last
 /// session on it (sent or received), so that what sees only QUIC sees that
 /// code; 0 after any other end, and for a connection that never carried a
 /// session. zmux tells the code of every pipe it is done with, 0 for a pipe
@@ -987,22 +1068,30 @@ impl Carrier {
     /// connection's receive window is charged to the session its pipes
     /// carry. Make one carrier per connection: its lanes are recognised by
     /// it.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor API that takes its arguments by value"
+    )]
     pub fn new(conn: Connection, options: Options) -> Self {
-        Self::start(conn, None, options, None)
+        Self::start(&conn, None, &options, None)
     }
 
     /// The carrier of `conn` for `listener`: every stream the peer opens
     /// goes to [`Listener::handle_pipe`], and the connection's receive
     /// window is charged to the listener's budget while the carrier lives.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor API that takes its arguments by value"
+    )]
     pub fn with_listener(conn: Connection, listener: &Listener, options: Options) -> Self {
-        Self::start(conn, Some(listener.clone()), options, None)
+        Self::start(&conn, Some(listener.clone()), &options, None)
     }
 
     /// The carrier with its accept loop started.
     fn start(
-        conn: Connection,
+        conn: &Connection,
         listener: Option<Listener>,
-        options: Options,
+        options: &Options,
         handshake: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Self {
         let carrier = Self::make(conn, listener.as_ref(), options, handshake);
@@ -1012,9 +1101,9 @@ impl Carrier {
 
     /// The carrier, its accept loop not started yet ([`Inner::listen`]).
     fn make(
-        conn: Connection,
+        conn: &Connection,
         listener: Option<&Listener>,
-        options: Options,
+        options: &Options,
         handshake: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Self {
         let window = options.windows.receive_window();
@@ -1025,7 +1114,7 @@ impl Carrier {
             conn: conn.clone(),
             id: OnceLock::new(),
             own_charge,
-            alpn: alpn(&conn),
+            alpn: alpn(conn),
             accepted: Mutex::default(),
             notify: Notify::new(),
             accept_task: OnceLock::new(),
@@ -1041,6 +1130,7 @@ impl Carrier {
     /// The QUIC connection, for its statistics and path. The carrier owns
     /// it: its streams and datagrams belong to zmux, and it is closed once
     /// no carrier clone and no pipe made from it is left.
+    #[must_use]
     pub fn connection(&self) -> &Connection {
         &self.inner.conn
     }
@@ -1048,6 +1138,7 @@ impl Carrier {
     /// The connection's QUIC datagrams as the datagram channels of its
     /// pipes: [`ConnectionDatagrams::dropped`] counts those that named no
     /// pipe.
+    #[must_use]
     pub fn datagrams(&self) -> &Arc<ConnectionDatagrams> {
         &self.inner.datagrams
     }
@@ -1055,6 +1146,10 @@ impl Carrier {
     /// A new pipe on a bidirectional stream of the connection: the
     /// bootstrap carrier of a session this endpoint starts, or a pipe it
     /// joins. Waits for the peer's stream credit.
+    ///
+    /// # Errors
+    ///
+    /// `Other` when the stream cannot be opened.
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
         self.open_pipe_with_prefix(&[]).await
     }
@@ -1064,6 +1159,10 @@ impl Carrier {
     /// ([`serve`]), such as a [`CarrierCredential::prefix`] for the
     /// connection's [`Handshake::carrier_info`]. Written as 1-RTT data on
     /// an established connection.
+    ///
+    /// # Errors
+    ///
+    /// `Other` when the stream cannot be opened or the prefix written.
     pub async fn open_pipe_with_prefix(&self, prefix: &[u8]) -> io::Result<PipeIo> {
         let (mut send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
         if !prefix.is_empty() {
@@ -1076,7 +1175,7 @@ impl Carrier {
     /// [`Session::accept`]); `None` once the connection is closed.
     /// With a listener, the listener takes them. Pipes nobody takes wait,
     /// as many as the connection lets the peer open bidirectional streams
-    /// (QUIC MAX_STREAMS): an endpoint that never accepts pipes sets that
+    /// (QUIC `MAX_STREAMS)`: an endpoint that never accepts pipes sets that
     /// to zero in its transport configuration.
     pub async fn accept_pipe(&self) -> Option<PipeIo> {
         let inner = &self.inner;
@@ -1144,10 +1243,10 @@ impl Inner {
         let exporter = Arc::downgrade(self);
         // The connection's lost bytes: what it retransmits, the same for
         // every pipe of the connection.
-        let stats = self.conn.clone();
+        let conn = self.conn.clone();
         let io = PipeIo::from_chunk_halves(recv, send)
             .with_carrier(zmux::CarrierKind::Quic)
-            .with_retransmitted(move || Some(stats.stats().path.lost_bytes))
+            .with_retransmitted(move || Some(conn.stats().path.lost_bytes))
             .with_carrier_conn(self.id())
             .with_connection_memory(self.own_charge)
             .with_datagram_channel(channel)
@@ -1213,6 +1312,7 @@ pub struct Handshake {
 
 impl Handshake {
     /// The handshake of `conn`.
+    #[must_use]
     pub fn of(conn: &Connection) -> Self {
         #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
         if let Some(data) = conn
@@ -1232,6 +1332,7 @@ impl Handshake {
     /// the peer's address (also the source, which a listener sets), this
     /// handshake's ALPN identifier and server name, and the connection's
     /// TLS exporter.
+    #[must_use]
     pub fn carrier_info<'a>(&'a self, conn: &'a Connection) -> CarrierInfo<'a> {
         CarrierInfo::new()
             .with_source(conn.remote_address())
@@ -1342,7 +1443,7 @@ impl std::fmt::Debug for ConnectionDatagrams {
         f.debug_struct("ConnectionDatagrams")
             .field("connection", &self.conn.stable_id())
             .field("demux", &self.demux)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1357,6 +1458,7 @@ impl Drop for ConnectionDatagrams {
 impl ConnectionDatagrams {
     /// The datagrams of `conn`. Make one per connection: its receive loop
     /// takes every datagram of the connection.
+    #[must_use]
     pub fn new(conn: Connection) -> Arc<Self> {
         Arc::new(Self {
             conn,
@@ -1508,7 +1610,7 @@ fn carrier_failed() -> VarInt {
 /// its carrier alive. A finished one keeps the connection until the peer
 /// acknowledged all of it: QUIC closes a connection whose last handle is
 /// dropped, and discards the data still in flight, so a carrier's last
-/// records (a CONNECTION_CLOSE) would be lost with it.
+/// records (a `CONNECTION_CLOSE`) would be lost with it.
 struct Send {
     stream: quinn::SendStream,
     finished: bool,
@@ -1565,7 +1667,7 @@ impl Send {
                 Poll::Ready(Err(e)) => match &self.retry {
                     Some(r) => match r.after_error(cx, true) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(After::Again) => continue,
+                        Poll::Ready(After::Again) => {}
                         Poll::Ready(After::Swallow) => {
                             let n = chunks.iter_mut().map(|c| std::mem::take(c).len()).sum();
                             return Poll::Ready(Ok(n));
@@ -1831,7 +1933,7 @@ impl AsyncRead for Recv {
                 Poll::Ready(Err(e)) => match &self.retry {
                     Some(r) => match r.after_error(cx, false) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(After::Again) => continue,
+                        Poll::Ready(After::Again) => {}
                         Poll::Ready(After::Swallow | After::Fail) => return Poll::Ready(Err(e)),
                     },
                     None => return Poll::Ready(Err(e)),
@@ -1845,6 +1947,7 @@ impl AsyncRead for Recv {
 /// A [`zmux::Candidate`] of [`zmux::CarrierKind::Quic`] for carrier modes,
 /// where the client reaches the server directly: a new connection of
 /// `endpoint` to `addr` ([`dial`]).
+#[must_use]
 pub fn candidate(
     endpoint: Endpoint,
     addr: std::net::SocketAddr,

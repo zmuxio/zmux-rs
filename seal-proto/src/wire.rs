@@ -23,6 +23,12 @@ pub struct Hello<'a> {
 impl<'a> Hello<'a> {
     /// Parses a Hello in wire order; the first failure is the result. A byte
     /// past it is `trailing_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// The first failure in wire order: `incomplete` for a truncated byte
+    /// stream (`malformed` in records), `unknown_profile`, `bad_flags`,
+    /// `bad_handle`, `malformed` for a bad encoding, `trailing_bytes`.
     pub fn parse(framing: Framing, input: &'a [u8]) -> Result<Hello<'a>, Error> {
         let stream = framing == Framing::ByteStream;
         let cut = |need| {
@@ -86,21 +92,25 @@ impl<'a> Hello<'a> {
     }
 
     /// The Profile the client chose.
+    #[must_use]
     pub fn profile(&self) -> Profile {
         self.profile
     }
 
     /// The record mode the client chose.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
     /// The Handle, empty for a Profile without one.
+    #[must_use]
     pub fn handle(&self) -> &'a [u8] {
         self.handle
     }
 
     /// The bytes of the Hello.
+    #[must_use]
     pub fn consumed(&self) -> usize {
         self.consumed
     }
@@ -123,8 +133,10 @@ pub(crate) fn write_hello(
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(noise.len() + handle.len() + 8);
     let value = profile.value();
-    if value < u64::from(ESCAPE) {
-        out.push(value as u8);
+    if let Ok(b) = u8::try_from(value)
+        && b < ESCAPE
+    {
+        out.push(b);
     } else {
         out.push(ESCAPE);
         put_varint(&mut out, value);

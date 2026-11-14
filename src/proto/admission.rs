@@ -191,37 +191,44 @@ impl Admission {
 
     /// Whether a late prefix goes to the fallback
     /// ([`Admission::with_fallback_on_peek_timeout`]).
+    #[must_use]
     pub fn fallback_on_peek_timeout(&self) -> bool {
         self.fallback_on_peek_timeout
     }
 
     /// The number of bytes read before the decision.
+    #[must_use]
     pub fn peek(&self) -> usize {
         self.peek
     }
 
     /// The largest prefix: [`Admission::with_max_peek`], at least the peek
     /// length.
+    #[must_use]
     pub fn max_peek(&self) -> usize {
         self.max_peek.max(self.peek)
     }
 
     /// The peek timeout.
+    #[must_use]
     pub fn peek_timeout(&self) -> Duration {
         self.peek_timeout
     }
 
     /// The stall interval, `(min, max)`.
+    #[must_use]
     pub fn stall_interval(&self) -> (Duration, Duration) {
         self.stall
     }
 
     /// The read size of a stall's discarding.
+    #[must_use]
     pub fn discard_buffer(&self) -> usize {
         self.discard_buffer
     }
 
     /// The decider, for a driver that applies the admission.
+    #[must_use]
     pub fn decider(&self) -> &dyn Decide {
         &*self.decide
     }
@@ -248,7 +255,14 @@ fn draw(lo: Duration, hi: Duration) -> Duration {
 /// A host's value attached to a carrier by the admission that accepted
 /// it ([`AdmissionVerdict::Accept`]): opaque to zmux, which neither inspects,
 /// compares nor drops it early. The transform of a listener sees it
-/// ([`crate::PipeHint::admitted`]), the session it bootstraps keeps it
+#[cfg_attr(
+    feature = "tokio",
+    doc = " ([`crate::PipeHint::admitted`]), the session it bootstraps keeps it"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " (`PipeHint::admitted`), the session it bootstraps keeps it"
+)]
 /// (`Session::admitted`, the uplink's for a split bootstrap) and each pipe
 /// the value of the carrier that joined it (`Pipe::admitted`); a further
 /// stream of an admitted QUIC connection carries the connection's. A join
@@ -286,8 +300,22 @@ pub enum AdmissionVerdict {
     /// ends, or the peek timeout passes, all rounds sharing it), then decide
     /// again with the longer prefix. `need` must exceed the prefix and not
     /// exceed [`Admission::max_peek`], and the carrier must be a byte
-    /// stream read by [`crate::adapter::Entry::admit`] or
-    /// [`crate::adapter::Entry::decide_reading`]; otherwise it counts as
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " stream read by [`crate::adapter::Entry::admit`] or"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " stream read by `adapter::Entry::admit` or"
+    )]
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " [`crate::adapter::Entry::decide_reading`]; otherwise it counts as"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " `adapter::Entry::decide_reading`; otherwise it counts as"
+    )]
     /// [`AdmissionVerdict::Close`], as it does when the carrier ended short.
     More {
         /// The total prefix length wanted.
@@ -297,7 +325,14 @@ pub enum AdmissionVerdict {
 
 /// A decision on a carrier: its [`AdmissionVerdict`] and the host's label of the kind
 /// of carrier. A label counts the verdict per label
-/// ([`crate::AdmissionVariants::variants`]); on an accepted carrier it becomes
+#[cfg_attr(
+    feature = "tokio",
+    doc = " ([`crate::AdmissionVariants::variants`]); on an accepted carrier it becomes"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " (`AdmissionVariants::variants`); on an accepted carrier it becomes"
+)]
 /// the carrier's variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
@@ -341,6 +376,7 @@ impl Eq for AdmissionVerdict {}
 
 impl AdmissionVerdict {
     /// [`AdmissionVerdict::Accept`] removing `skip` prefix bytes, without a value.
+    #[must_use]
     pub const fn accept(skip: usize) -> Self {
         Self::Accept { skip, value: None }
     }
@@ -396,7 +432,14 @@ pub struct CarrierInfo<'a> {
     /// The carrier's source: the client a trusted intermediary reports
     /// ([`crate::TrustedProxies::source`], a reported port of 0 when it
     /// reported none), the source a host gave the listener
-    /// ([`crate::PipeHint::source`]), or otherwise the peer. The one
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " ([`crate::PipeHint::source`]), or otherwise the peer. The one"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " (`PipeHint::source`), or otherwise the peer. The one"
+    )]
     /// source of the carrier: its per-source limits and stall duration go
     /// by it too.
     pub source: Option<SocketAddr>,
@@ -438,6 +481,7 @@ impl std::fmt::Debug for CarrierInfo<'_> {
 
 impl<'a> CarrierInfo<'a> {
     /// No metadata.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -521,12 +565,14 @@ impl<'a> CarrierInfo<'a> {
     }
 
     /// Whether the carrier has an exporter.
+    #[must_use]
     pub fn has_exporter(&self) -> bool {
         self.exporter.is_some()
     }
 
     /// `len` bytes of the exporter for `label` and `context`; `None` without
     /// an exporter or when it fails.
+    #[must_use]
     pub fn export(&self, label: &[u8], context: &[u8], len: usize) -> Option<Vec<u8>> {
         let export = self.exporter.as_ref()?;
         let mut out = vec![0u8; len];
@@ -591,7 +637,7 @@ mod tests {
         let info = CarrierInfo::new();
         assert!(info.export(b"l", b"", 32).is_none());
         let info = CarrierInfo::new().with_exporter(|l, _, out| {
-            out.fill(l.len() as u8);
+            out.fill(u8::try_from(l.len()).unwrap());
             true
         });
         assert_eq!(info.export(b"abc", b"", 2), Some(vec![3, 3]));

@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 /// One write call handed to the carrier: its
 /// send time and the delivery-rate state at that moment.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about the pipe, not one mode an enum would encode"
+)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Batch {
     /// Position of the batch's first byte: bytes before it that no batch
@@ -35,18 +39,18 @@ pub(crate) struct Batch {
     /// Sent while an application-limited bubble was in flight (BBR's
     /// `app_limited` mark).
     pub(crate) in_bubble: bool,
-    /// unsent_ahead: Q_p when the batch was
+    /// `unsent_ahead`: `Q_p` when the batch was
     /// handed over, without the batch itself: the bytes of the write calls
     /// in progress on the pipe's lanes plus the carrier's unsent count.
     pub(crate) unsent_ahead: u64,
-    /// queue_p, min(1 s, unsent_ahead / R_p),
-    /// with R_p taken with unsent_ahead, when the batch was handed over.
+    /// `queue_p`, min(1 s, `unsent_ahead` / `R_p`),
+    /// with `R_p` taken with `unsent_ahead`, when the batch was handed over.
     pub(crate) queue: Duration,
     /// The lane of the pipe it went on; its
     /// positions are the pipe's send order.
     pub(crate) lane: u32,
     /// The acknowledgement time expected at sending, the E of opportunistic
-    /// reinjection: (unsent_ahead + L) / R_p + min_rtt_p + the peer's
+    /// reinjection: (`unsent_ahead` + L) / `R_p` + `min_rtt_p` + the peer's
     /// max ACK delay, with the estimates of that moment.
     pub(crate) expect: Duration,
 }
@@ -59,24 +63,28 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 const RATE_ROUNDS: u64 = 10;
 
 /// RTT and delivery-rate estimates of an outbound pipe.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about the pipe, not one mode an enum would encode"
+)]
 #[derive(Debug, Clone)]
 pub(crate) struct Estimator {
     pub(crate) srtt: Duration,
     pub(crate) rttvar: Duration,
     pub(crate) latest: Option<Duration>,
-    /// min_rtt: the minimum over the last 300 s, kept while no sample was
-    /// taken in that window; also the pipe_min_rtt of auto-tuning and of
+    /// `min_rtt`: the minimum over the last 300 s, kept while no sample was
+    /// taken in that window; also the `pipe_min_rtt` of auto-tuning and of
     /// the low-water mark without a carrier minimum.
     pub(crate) min_rtt: super::filter::MinFilter,
     /// Whether an RTT sample was taken (else the initial values apply).
     pub(crate) sampled: bool,
     pub(crate) last_sample: Option<Instant>,
-    /// Delivery rate R_p in bytes per second: `peak`, or the carrier queue
+    /// Delivery rate `R_p` in bytes per second: `peak`, or the carrier queue
     /// limiter's rate bound below it.
     pub(crate) rate: u64,
     /// The maximum of the delivery-rate samples in the window.
     pub(crate) peak: u64,
-    /// The limiter's rate bound R_lo.
+    /// The limiter's rate bound `R_lo`.
     pub(crate) rate_lo: Option<u64>,
     pub(crate) rate_sampled: bool,
     /// A sample was taken while the pipe was the bottleneck: the rate is
@@ -86,7 +94,7 @@ pub(crate) struct Estimator {
     /// a bottleneck sample, it ends the placement rate.
     pub(crate) penalized: bool,
     /// The round trip in which the placement rate first counted for more
-    /// than R_p: it lasts four of the pipe's round trips from then. Set
+    /// than `R_p`: it lasts four of the pipe's round trips from then. Set
     /// where a spreading policy places data, which reads the estimates
     /// only.
     pub(crate) placed_from: Cell<Option<u64>>,
@@ -124,7 +132,7 @@ impl Estimator {
     /// An RTT sample (RFC 9002 Section 5.3) with the peer's ACK Delay,
     /// already capped; returns the adjusted RTT. A `quiet` sample (taken
     /// while a multipath session is quiet)
-    /// enters min_rtt only while it has no value.
+    /// enters `min_rtt` only while it has no value.
     pub(crate) fn rtt_sample(
         &mut self,
         latest: Duration,
@@ -164,13 +172,13 @@ impl Estimator {
         self.expire_rates(now);
     }
 
-    /// Sets the limiter's rate bound R_lo (`None` drops it).
+    /// Sets the limiter's rate bound `R_lo` (`None` drops it).
     pub(crate) fn set_rate_lo(&mut self, lo: Option<u64>) {
         self.rate_lo = lo;
         self.bound();
     }
 
-    /// R_p: the windowed maximum within the rate bound.
+    /// `R_p`: the windowed maximum within the rate bound.
     fn bound(&mut self) {
         self.rate = self.rate_lo.map_or(self.peak, |lo| lo.min(self.peak));
     }
@@ -178,7 +186,7 @@ impl Estimator {
     /// Drops the samples older than 10 rounds or 10 s, as time and the
     /// rounds pass, not only when a new sample comes: the maximum is then
     /// that of the samples left. An empty window keeps the last value of
-    /// R_p, so idle periods never lower it, and a sample that left the
+    /// `R_p`, so idle periods never lower it, and a sample that left the
     /// window never comes back when the rate bound is dropped.
     pub(crate) fn expire_rates(&mut self, now: Instant) {
         let round = self.round;
@@ -220,14 +228,14 @@ impl Estimator {
 /// An RTT sample.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RttSample {
-    /// latest_rtt: from handing the batch to the carrier to the
+    /// `latest_rtt`: from handing the batch to the carrier to the
     /// acknowledgement.
     pub(crate) latest: Duration,
-    /// latest_rtt minus the capped ACK Delay, when that stays at or above
-    /// min_rtt.
+    /// `latest_rtt` minus the capped ACK Delay, when that stays at or above
+    /// `min_rtt`.
     pub(crate) adjusted: Duration,
     /// The bytes queued ahead of the batch when it was handed on
-    /// (unsent_ahead: write calls in progress and the carrier's unsent
+    /// (`unsent_ahead`: write calls in progress and the carrier's unsent
     /// count).
     pub(crate) unsent_ahead: u64,
     /// When the sampled byte was handed to the carrier.
@@ -246,7 +254,7 @@ pub(crate) struct AckSample {
     pub(crate) rate: Option<(u64, bool)>,
     /// A round trip ended.
     pub(crate) round_end: bool,
-    /// min_rtt changed.
+    /// `min_rtt` changed.
     pub(crate) min_moved: bool,
 }
 
@@ -255,7 +263,7 @@ mod tests {
     use super::*;
 
     /// A sample that left the window is gone for good: once the old
-    /// maximum of a pipe that slowed down ages out, R_p is the maximum of
+    /// maximum of a pipe that slowed down ages out, `R_p` is the maximum of
     /// the samples left, and dropping the limiter's rate bound then does
     /// not bring the old maximum back.
     #[test]
@@ -277,7 +285,7 @@ mod tests {
     }
 
     /// Quiet samples: a sample taken while the session is quiet enters
-    /// min_rtt only while it has none; smoothed_rtt takes it.
+    /// `min_rtt` only while it has none; `smoothed_rtt` takes it.
     #[test]
     fn quiet_samples_keep_out_of_min_rtt() {
         let ms = Duration::from_millis;

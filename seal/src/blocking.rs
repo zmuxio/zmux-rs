@@ -36,6 +36,10 @@ fn block_on<F: Future>(f: F) -> F::Output {
 
 /// Runs the client's handshake on `p`, as [`crate::establish`] does. Past `timeout` the
 /// carrier is shut down, which needs a carrier with a closer.
+///
+/// # Errors
+///
+/// As [`crate::establish`], and `TimedOut` once `timeout` has passed.
 pub fn establish(
     mut p: PipeIo,
     cfg: &ClientConfig,
@@ -55,6 +59,7 @@ pub fn establish(
 impl ServerConfig {
     /// The transform of a `zmux::blocking::Listener`, as [`ServerConfig::transform`] is of
     /// a tokio one.
+    #[must_use]
     pub fn blocking_transform(self) -> InboundTransform {
         InboundTransform::new(move |p, hint| block_on(self.accept(p, hint.source)))
     }

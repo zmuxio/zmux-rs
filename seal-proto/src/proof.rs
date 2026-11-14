@@ -18,10 +18,16 @@ pub(crate) fn proof_message(index: usize, h_p: &[u8]) -> Vec<u8> {
 }
 
 /// The core's check of a message's proof: when the verdict names
-/// `proof_key`, the message has a proof, its key has that KeyId and a proof key's KeyAlg,
+/// `proof_key`, the message has a proof, its key has that `KeyId` and a proof key's `KeyAlg`,
 /// and its signature verifies over `message`, the M of the message. The result is PQ
 /// authentication; with `require_pq_auth` its absence fails too. Every
 /// failure is `credentials_failed`.
+///
+/// # Errors
+///
+/// `credentials_failed` when the proof the verdict requires is missing,
+/// under another key or invalid, or when required PQ authentication
+/// does not hold.
 pub fn check_proof(
     proof_key: Option<&KeyId>,
     proof: Option<Proof<'_>>,
@@ -47,6 +53,11 @@ pub fn check_proof(
 
 /// The rule of an end that requires PQ authentication: a pin of an X25519 key alone,
 /// without a proof key, is `invalid_config`.
+///
+/// # Errors
+///
+/// `invalid_config` when PQ authentication is required and the pin names
+/// no proof key.
 pub fn check_pin_pq_auth(require_pq_auth: bool, has_proof_key: bool) -> Result<(), Error> {
     if require_pq_auth && !has_proof_key {
         return Err(Error::InvalidConfig);
@@ -54,7 +65,7 @@ pub fn check_pin_pq_auth(require_pq_auth: bool, has_proof_key: bool) -> Result<(
     Ok(())
 }
 
-/// A proof key's signing half: ML-DSA-44 (KeyAlg 3) from its 32-byte seed ξ.
+/// A proof key's signing half: ML-DSA-44 (`KeyAlg` 3) from its 32-byte seed ξ.
 pub struct SigningKey {
     key: Box<ml_dsa_44::MLDSA44SigningKey>,
     public: Vec<u8>,
@@ -69,8 +80,12 @@ impl std::fmt::Debug for SigningKey {
 }
 
 impl SigningKey {
-    /// The key of `key_alg` from its seed; a KeyAlg that is not a proof key's, or a seed
+    /// The key of `key_alg` from its seed; a `KeyAlg` that is not a proof key's, or a seed
     /// of another length, is `invalid_config`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for another `KeyAlg` or a seed that is not 32 bytes.
     pub fn from_seed(key_alg: u64, seed: &[u8]) -> Result<SigningKey, Error> {
         if key_alg != KEYALG_MLDSA44 {
             return Err(Error::InvalidConfig);
@@ -84,6 +99,11 @@ impl SigningKey {
     }
 
     /// A new key of `key_alg` from the operating system's random source.
+    ///
+    /// # Errors
+    ///
+    /// `random_failed` when the random source fails, `invalid_config` for a
+    /// `KeyAlg` that is not a proof key's.
     pub fn generate(key_alg: u64) -> Result<SigningKey, Error> {
         let mut seed = [0u8; 32];
         fill_random(&mut seed)?;
@@ -92,22 +112,30 @@ impl SigningKey {
         key
     }
 
-    /// The KeyAlg.
+    /// The `KeyAlg`.
+    #[must_use]
     pub fn key_alg(&self) -> u64 {
         KEYALG_MLDSA44
     }
 
     /// The public key in its canonical encoding.
+    #[must_use]
     pub fn public(&self) -> &[u8] {
         &self.public
     }
 
-    /// The KeyId of the public key: what a verdict names.
+    /// The `KeyId` of the public key: what a verdict names.
+    #[must_use]
     pub fn key_id(&self) -> KeyId {
         key_id(KEYALG_MLDSA44, &self.public)
     }
 
     /// Signs `message` hedged, as production signers must.
+    ///
+    /// # Errors
+    ///
+    /// `random_failed` when the random source fails, `invalid_config` when
+    /// signing fails.
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let mut rnd = [0u8; 32];
         fill_random(&mut rnd)?;
@@ -115,6 +143,10 @@ impl SigningKey {
     }
 
     /// Signs with the deterministic variant (zero randomness), for the vectors.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when signing fails.
     #[cfg(feature = "test-vectors")]
     pub fn sign_deterministic(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         self.sign_with(message, [0; 32])

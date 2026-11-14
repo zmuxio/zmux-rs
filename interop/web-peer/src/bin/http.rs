@@ -17,11 +17,9 @@
 //! its own, in Bound. The server prints `MODE <mode>` for each joined pipe
 //! after a stream.
 
-#[path = "../common.rs"]
-mod common;
-
 use std::sync::Arc;
 use std::time::Duration;
+use zmux_web_peer::common;
 
 use tokio::net::TcpListener;
 use zmux::{Listener, Session};
@@ -43,7 +41,7 @@ async fn main() {
                 addr,
                 if mode == "client" { b"right" } else { b"wrong" },
             )
-            .await
+            .await;
         }
         (other, _) => panic!("unknown mode {other}"),
     }
@@ -338,6 +336,7 @@ async fn join(
 /// The session configuration of the TLS peers: multipath with a pre-shared
 /// join key of 32 bytes 7, joins in Bound only on a carrier that declares
 /// the contract.
+#[must_use]
 pub fn mp_config() -> zmux::Config {
     let mut c = zmux::Config::multipath(zmux::PipeAuth::psk([7u8; 32]).with_end_to_end());
     c.max_pipes = 4;
@@ -349,6 +348,7 @@ pub fn mp_config() -> zmux::Config {
 }
 
 /// The record mode as the peers print it.
+#[must_use]
 pub fn mode_name(m: Option<zmux::RecordMode>) -> String {
     m.map_or_else(|| "none".to_owned(), |m| format!("{m:?}").to_lowercase())
 }

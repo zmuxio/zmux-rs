@@ -1,5 +1,5 @@
 //! QUIC version 1 frames (RFC 9000 Section 19) and the QUIC extension frames
-//! RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset-11) and DATAGRAM
+//! `RESET_STREAM_AT` (draft-ietf-quic-reliable-stream-reset-11) and DATAGRAM
 //! (RFC 9221) as zmux uses them.
 
 use super::{Dir, Fail, FrameType};
@@ -7,7 +7,7 @@ use crate::proto::codec::{Cursor, Writer};
 use crate::proto::error::{EncodeError, Error};
 use crate::proto::varint::{self, len as vlen};
 
-/// The largest value of a stream count (MAX_STREAMS, STREAMS_BLOCKED, GOAWAY
+/// The largest value of a stream count (`MAX_STREAMS`, `STREAMS_BLOCKED`, GOAWAY
 /// watermarks) and of pipe ID limits: 2^60.
 pub const MAX_COUNT: u64 = 1 << 60;
 
@@ -25,11 +25,12 @@ pub struct Padding {
 
 impl Padding {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn write(&self, w: &mut Writer<'_>) -> Result<(), EncodeError> {
+    pub(crate) fn write(self, w: &mut Writer<'_>) -> Result<(), EncodeError> {
         if self.len == 0 {
             return Err(EncodeError::ValueOutOfRange);
         }
@@ -37,7 +38,7 @@ impl Padding {
     }
 }
 
-/// RESET_STREAM (0x04).
+/// `RESET_STREAM` (0x04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetStream {
     /// Stream ID.
@@ -50,6 +51,7 @@ pub struct ResetStream {
 
 impl ResetStream {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.stream_id) + vlen(self.error_code) + vlen(self.final_size)
     }
@@ -70,7 +72,7 @@ impl ResetStream {
     }
 }
 
-/// STOP_SENDING (0x05).
+/// `STOP_SENDING` (0x05).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StopSending {
     /// Stream ID.
@@ -81,6 +83,7 @@ pub struct StopSending {
 
 impl StopSending {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.stream_id) + vlen(self.error_code)
     }
@@ -123,6 +126,7 @@ pub struct StreamHeader {
 
 impl StreamHeader {
     /// The frame type with the OFF, LEN and FIN bits.
+    #[must_use]
     pub const fn frame_type(&self) -> u64 {
         let mut ty = FrameType::STREAM.0;
         if self.explicit_offset || self.offset != 0 {
@@ -138,6 +142,7 @@ impl StreamHeader {
     }
 
     /// Length of the header encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         let ty = self.frame_type();
         let mut n = 1 + vlen(self.stream_id);
@@ -166,6 +171,10 @@ impl StreamHeader {
             return Err(EncodeError::ValueOutOfRange);
         }
         let ty = self.frame_type();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a STREAM frame type is 0x08 to 0x0f"
+        )]
         w.u8(ty as u8)?;
         w.varint(self.stream_id)?;
         if ty & STREAM_OFF != 0 {
@@ -248,6 +257,7 @@ pub struct Stream<'a> {
 impl<'a> Stream<'a> {
     /// A STREAM frame with a Length field, and an Offset field when `offset`
     /// is not 0.
+    #[must_use]
     pub const fn new(stream_id: u64, offset: u64, data: &'a [u8], fin: bool) -> Self {
         Self {
             stream_id,
@@ -260,6 +270,7 @@ impl<'a> Stream<'a> {
     }
 
     /// The header of this frame.
+    #[must_use]
     pub const fn header(&self) -> StreamHeader {
         StreamHeader {
             stream_id: self.stream_id,
@@ -272,6 +283,7 @@ impl<'a> Stream<'a> {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         self.header().encoded_len() + self.data.len()
     }
@@ -282,14 +294,14 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// MAX_DATA (0x10).
+/// `MAX_DATA` (0x10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxData {
     /// Maximum Data: the session flow-control limit.
     pub maximum: u64,
 }
 
-/// MAX_STREAM_DATA (0x11).
+/// `MAX_STREAM_DATA` (0x11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxStreamData {
     /// Stream ID.
@@ -298,7 +310,7 @@ pub struct MaxStreamData {
     pub maximum: u64,
 }
 
-/// MAX_STREAMS (0x12 bidirectional, 0x13 unidirectional).
+/// `MAX_STREAMS` (0x12 bidirectional, 0x13 unidirectional).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxStreams {
     /// Stream type.
@@ -307,14 +319,14 @@ pub struct MaxStreams {
     pub maximum: u64,
 }
 
-/// DATA_BLOCKED (0x14).
+/// `DATA_BLOCKED` (0x14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataBlocked {
     /// The session limit at which the sender is blocked.
     pub limit: u64,
 }
 
-/// STREAM_DATA_BLOCKED (0x15).
+/// `STREAM_DATA_BLOCKED` (0x15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamDataBlocked {
     /// Stream ID.
@@ -323,7 +335,7 @@ pub struct StreamDataBlocked {
     pub limit: u64,
 }
 
-/// STREAMS_BLOCKED (0x16 bidirectional, 0x17 unidirectional).
+/// `STREAMS_BLOCKED` (0x16 bidirectional, 0x17 unidirectional).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamsBlocked {
     /// Stream type.
@@ -367,6 +379,7 @@ impl DataBlocked {
 
 impl MaxStreamData {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.stream_id) + vlen(self.maximum)
     }
@@ -387,6 +400,7 @@ impl MaxStreamData {
 
 impl StreamDataBlocked {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.stream_id) + vlen(self.limit)
     }
@@ -414,6 +428,7 @@ impl MaxStreams {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.maximum)
     }
@@ -447,6 +462,7 @@ impl StreamsBlocked {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.limit)
     }
@@ -471,7 +487,7 @@ impl StreamsBlocked {
     }
 }
 
-/// CONNECTION_CLOSE (0x1c transport, 0x1d application).
+/// `CONNECTION_CLOSE` (0x1c transport, 0x1d application).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionClose<'a> {
     /// Type 0x1d: the code is an application error code. Type 0x1c: a
@@ -488,6 +504,7 @@ pub struct ConnectionClose<'a> {
 
 impl<'a> ConnectionClose<'a> {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         let mut n = 1 + vlen(self.error_code) + vlen(self.reason.len() as u64) + self.reason.len();
         if !self.application {
@@ -524,7 +541,7 @@ impl<'a> ConnectionClose<'a> {
     }
 }
 
-/// RESET_STREAM_AT (0x24).
+/// `RESET_STREAM_AT` (0x24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetStreamAt {
     /// Stream ID.
@@ -540,6 +557,7 @@ pub struct ResetStreamAt {
 
 impl ResetStreamAt {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         1 + vlen(self.stream_id)
             + vlen(self.error_code)
@@ -597,6 +615,7 @@ impl<'a> Datagram<'a> {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         let n = 1 + self.data.len();
         if self.explicit_len {

@@ -3,12 +3,21 @@
 //! deterministically: the unsent
 //! count of a pipe is the sum of its lanes', a stream direction never
 //! moves to another lane before its frames there are acknowledged without
-//! multipath, only PIPE_LANE goes on a lane until it is confirmed and
+//! multipath, only `PIPE_LANE` goes on a lane until it is confirmed and
 //! a lane refused costs its pipe nothing, and a lane reserves no
 //! record buffer. The traces of the `core.lanes` and
 //! `multipath.lanes` groups cover the wire rules; the cumulative
 //! acknowledgement point that every whole-pipe consumer uses is
 //! checked where it is computed (`pipes/lanes.rs`).
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
 
 use std::time::{Duration, Instant};
 
@@ -183,7 +192,7 @@ fn pattern(stream: usize, len: usize) -> Vec<u8> {
 /// Bulk streams of a session without multipath spread over lanes, which
 /// the "driver" delivers out of order across lanes: every stream arrives
 /// whole and in order (a frame of a stream direction that overtook an
-/// earlier one would be a PROTOCOL_VIOLATION), and
+/// earlier one would be a `PROTOCOL_VIOLATION`), and
 /// the writer opened lanes for them.
 #[test]
 fn bulk_streams_spread_over_lanes_and_keep_their_order_without_multipath() {
@@ -238,7 +247,7 @@ fn bulk_streams_spread_over_lanes_and_keep_their_order_without_multipath() {
 
 /// A stream's data written on lane 0 in the very batch whose scheduling
 /// asked for the pipe's first lane stays bound to lane 0: the stream moves
-/// to the new lane only once a PIPE_ACK covers that batch, however long
+/// to the new lane only once a `PIPE_ACK` covers that batch, however long
 /// the carrier holds lane 0 back while the new lane runs ahead.
 #[test]
 fn data_of_the_batch_that_opens_the_first_lane_stays_on_lane_zero() {
@@ -444,7 +453,7 @@ impl zmux::shaping::Shaper for DelayAll {
     fn on_event(&mut self, _: &zmux::shaping::Event, _: &mut zmux::shaping::Effects) {}
 }
 
-/// The first record of a lane, PIPE_LANE, is a
+/// The first record of a lane, `PIPE_LANE`, is a
 /// record of its pipe: it is planned by the pipe's shaper and waits for
 /// the delay of the pipe's planned record like every other record: it
 /// carries the plan's PADDING.

@@ -2,6 +2,11 @@
 //! each bounds its queue as configured, the oldest making
 //! room, and zero is not a configuration.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::time::Instant;
 
 use bytes::Bytes;

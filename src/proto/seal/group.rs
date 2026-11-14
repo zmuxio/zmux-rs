@@ -8,7 +8,7 @@ use super::kex::{
 };
 use super::{Error, Hash, Secret};
 
-/// The values of the Profile, payload type, CredType, Suite, Group and KeyAlg spaces that
+/// The values of the Profile, payload type, `CredType`, Suite, Group and `KeyAlg` spaces that
 /// are private: never assigned, never interpreted, an unknown value of their space.
 pub const PRIVATE: std::ops::RangeInclusive<u64> = (1 << 30)..=((1 << 31) - 1);
 
@@ -40,6 +40,7 @@ static GROUPS: [Group; 2] = [
 
 impl Group {
     /// The Group with this value, if this implementation has it.
+    #[must_use]
     pub fn from_value(value: u64) -> Option<&'static Group> {
         GROUPS.iter().find(|g| g.value == value)
     }
@@ -50,26 +51,31 @@ impl Group {
     }
 
     /// The Group value.
+    #[must_use]
     pub fn value(&self) -> u64 {
         self.value
     }
 
     /// The priority: higher is preferred.
+    #[must_use]
     pub fn priority(&self) -> u8 {
         self.priority
     }
 
     /// The length of the initiator's share.
+    #[must_use]
     pub fn initiator_share_len(&self) -> usize {
         X25519_LEN + if self.kem { MLKEM768_EK_LEN } else { 0 }
     }
 
     /// The length of the responder's share.
+    #[must_use]
     pub fn responder_share_len(&self) -> usize {
         X25519_LEN + if self.kem { MLKEM768_CT_LEN } else { 0 }
     }
 
     /// The share length of a role: `initiator` for the joiner or the offering end.
+    #[must_use]
     pub fn share_len(&self, initiator: bool) -> usize {
         if initiator {
             self.initiator_share_len()
@@ -79,6 +85,7 @@ impl Group {
     }
 
     /// The usable Group of highest priority among `usable` values.
+    #[must_use]
     pub fn highest(usable: &[u64]) -> Option<&'static Group> {
         usable
             .iter()
@@ -193,6 +200,7 @@ impl std::fmt::Debug for GroupInitiator {
 
 impl GroupInitiator {
     /// The Group.
+    #[must_use]
     pub fn group(&self) -> &'static Group {
         self.group
     }
@@ -217,6 +225,7 @@ pub struct SharedSecrets(Vec<Secret>);
 
 impl SharedSecrets {
     /// The secrets in order.
+    #[must_use]
     pub fn as_slice(&self) -> &[Secret] {
         &self.0
     }

@@ -11,6 +11,20 @@
 //! time (`common::serial`). Each runs under a watchdog. `ZMUX_SOAK=<k>`
 //! multiplies the rounds.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_futures,
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 mod common;
 
 use std::sync::Arc;
@@ -349,7 +363,7 @@ fn stream_churn_returns_to_baseline() {
 enum End {
     ClientClose,
     ServerClose,
-    /// GOAWAY, then CONNECTION_CLOSE once the open streams finished.
+    /// GOAWAY, then `CONNECTION_CLOSE` once the open streams finished.
     Shutdown,
     /// The client's carrier fails (reads and writes error).
     CarrierFails,
@@ -587,10 +601,10 @@ fn progress(what: &str) {
 async fn mp_churn() {
     let base = snapshot();
     let (listener, mut sessions) = mp_listener();
-    let (a, _bootstrap) = dial(&listener, PipeHint::default());
+    let (a, bootstrap) = dial(&listener, PipeHint::default());
     let client = Session::connect(a, mp_config()).await.expect("connect");
     let server = sessions.recv().await.expect("server session");
-    assert!(client.multipath() == zmux::Multipath::InUse);
+    assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let served = serve(server.clone());
     let opts = PipeOptions::default();
 
@@ -644,7 +658,7 @@ async fn mp_churn() {
     let p = client.begin_add_pipe(io, opts.clone()).expect("add");
     echo(&client, 16 * 1024).await;
     ctl.fail();
-    _bootstrap.fail();
+    bootstrap.fail();
     eventually(30, "suspended", || {
         client.state() == zmux::SessionState::Suspended
     })
@@ -793,52 +807,48 @@ async fn stuck_carrier(how: Stuck) {
     let ((a, ca), (b, cb)) = duplex(16 * 1024);
     let cfg = timeouts(Config::default());
     let start;
-    match how {
-        Stuck::HandshakeTimeout => {
-            // The client's very first write blocks.
-            ca.stall(true);
-            let r = Session::connect(a, cfg).await;
-            assert!(
-                matches!(
-                    r,
-                    Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
-                ),
-                "{r:?}"
-            );
-            start = Instant::now();
-            drop(b);
+    if let Stuck::HandshakeTimeout = how {
+        // The client's very first write blocks.
+        ca.stall(true);
+        let r = Session::connect(a, cfg).await;
+        assert!(
+            matches!(
+                r,
+                Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+            ),
+            "{r:?}"
+        );
+        start = Instant::now();
+        drop(b);
+    } else {
+        let (client, server) = connect(a, b, cfg.clone(), cfg).await;
+        // A write the carrier never takes.
+        ca.stall(true);
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(1), send.write_all(&[5u8; 128 * 1024]))
+            .await;
+        start = Instant::now();
+        let mut server = Some(server);
+        match how {
+            Stuck::IdleTimeout => {
+                // Both ends go silent: the server's writes block too.
+                cb.stall(true);
+            }
+            Stuck::AppClose => client.abort(VarInt::from_u32(1), b"app"),
+            // The peer's handles go: it closes and ends its carrier.
+            Stuck::PeerEndsPipe => drop(server.take()),
+            Stuck::ReadFails => ca.fail_reads(),
+            Stuck::HandshakeTimeout => unreachable!(),
         }
-        _ => {
-            let (client, server) = connect(a, b, cfg.clone(), cfg).await;
-            // A write the carrier never takes.
-            ca.stall(true);
-            let (mut send, _recv) = client.open_bi().await.unwrap();
-            let _ =
-                tokio::time::timeout(Duration::from_millis(1), send.write_all(&[5u8; 128 * 1024]))
-                    .await;
-            start = Instant::now();
-            let mut server = Some(server);
-            match how {
-                Stuck::IdleTimeout => {
-                    // Both ends go silent: the server's writes block too.
-                    cb.stall(true);
-                }
-                Stuck::AppClose => client.abort(VarInt::from_u32(1), b"app"),
-                // The peer's handles go: it closes and ends its carrier.
-                Stuck::PeerEndsPipe => drop(server.take()),
-                Stuck::ReadFails => ca.fail_reads(),
-                Stuck::HandshakeTimeout => unreachable!(),
-            }
-            let e = watchdog(30, &format!("{how:?}: closed"), client.closing()).await;
-            if matches!(how, Stuck::IdleTimeout) {
-                assert!(matches!(e, SessionError::IdleTimeout { .. }), "{e:?}");
-            }
-            if let Some(s) = server.take() {
-                watchdog(30, &format!("{how:?}: server closed"), s.closing()).await;
-            }
-            drop(send);
-            drop(client);
+        let e = watchdog(30, &format!("{how:?}: closed"), client.closing()).await;
+        if matches!(how, Stuck::IdleTimeout) {
+            assert!(matches!(e, SessionError::IdleTimeout { .. }), "{e:?}");
         }
+        if let Some(s) = server.take() {
+            watchdog(30, &format!("{how:?}: server closed"), s.closing()).await;
+        }
+        drop(send);
+        drop(client);
     }
     let deadline = start
         + RELEASE_BOUND

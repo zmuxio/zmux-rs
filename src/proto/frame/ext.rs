@@ -1,4 +1,4 @@
-//! zmux extension frames GOAWAY and PRIORITY_UPDATE.
+//! zmux extension frames GOAWAY and `PRIORITY_UPDATE`.
 
 use super::quic::MAX_COUNT;
 use super::{Fail, FrameType};
@@ -19,6 +19,7 @@ pub struct GoAwayFrame {
 
 impl GoAwayFrame {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         4 + vlen(self.max_bidi) + vlen(self.max_uni) + vlen(self.error_code)
     }
@@ -84,6 +85,7 @@ impl Priority {
     };
 
     /// Creates a priority; `None` if `urgency` is above 7.
+    #[must_use]
     pub const fn new(urgency: u8, incremental: bool) -> Option<Self> {
         if urgency > 7 {
             None
@@ -96,21 +98,25 @@ impl Priority {
     }
 
     /// Urgency, 0 to 7.
+    #[must_use]
     pub const fn urgency(self) -> u8 {
         self.urgency
     }
 
     /// Whether the stream is incremental.
+    #[must_use]
     pub const fn incremental(self) -> bool {
         self.incremental
     }
 
     /// The wire byte.
+    #[must_use]
     pub const fn to_byte(self) -> u8 {
         (self.urgency << 5) | if self.incremental { 0x10 } else { 0 }
     }
 
     /// Parses the wire byte; `None` if a reserved low bit is set.
+    #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         if b & 0x0f != 0 {
             None
@@ -123,7 +129,7 @@ impl Priority {
     }
 }
 
-/// PRIORITY_UPDATE (0x073d08cf).
+/// `PRIORITY_UPDATE` (0x073d08cf).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PriorityUpdate {
     /// Stream ID.
@@ -136,6 +142,7 @@ pub struct PriorityUpdate {
 
 impl PriorityUpdate {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         4 + vlen(self.stream_id) + vlen(self.sequence) + 1
     }

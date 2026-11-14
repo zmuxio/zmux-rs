@@ -122,7 +122,14 @@ pub struct ListenerConfig {
     pub trusted_proxies: super::trusted::TrustedProxies,
     /// The admission of every new carrier, at every entry of the listener
     /// (its byte-stream, HTTP, WebSocket, WebTransport and QUIC adapters,
-    /// and [`crate::Listener::handle_pipe`] for joins and resumptions as
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " and [`crate::Listener::handle_pipe`] for joins and resumptions as"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " and `Listener::handle_pipe` for joins and resumptions as"
+    )]
     /// for new sessions): read its prefix, decide, act on the decision
     /// (none by default: every carrier is accepted).
     pub admission: Option<super::admission::Admission>,
@@ -168,6 +175,7 @@ pub struct RejectInfo {
 
 impl RejectInfo {
     /// A refusal for `reason`.
+    #[must_use]
     pub fn new(
         profile: Option<u64>,
         record_mode: Option<crate::proto::seal::RecordMode>,
@@ -203,6 +211,7 @@ pub struct RejectError {
 
 impl RejectError {
     /// A refusal for `reason`.
+    #[must_use]
     pub fn new(
         profile: Option<u64>,
         record_mode: Option<crate::proto::seal::RecordMode>,
@@ -305,6 +314,7 @@ impl RejectAction {
     /// The answer without [`ListenerConfig::on_reject`]: `Stall` for an
     /// Establish (a Profile other than 2), `Close` for a Join and for a
     /// refusal that named no Profile.
+    #[must_use]
     pub fn default_for(info: &RejectInfo) -> Self {
         match info.profile {
             Some(p) if p != 2 => Self::Stall,
@@ -335,7 +345,7 @@ impl OnReject {
         info: &RejectInfo,
         logger: Option<&crate::proto::session::Logger>,
     ) -> RejectAction {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(info))).unwrap_or_else(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0(info))).unwrap_or_else(
             |_| {
                 if let Some(l) = logger {
                     l.log(
@@ -405,8 +415,7 @@ impl SessionConfigFn {
         carrier: &SessionCarrier<'_>,
         logger: Option<&crate::proto::session::Logger>,
     ) -> Result<Option<crate::Config>, ()> {
-        let why = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(carrier)))
-        {
+        let why = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0(carrier))) {
             Ok(Ok(None)) => return Ok(None),
             Ok(Ok(Some(c))) => match c.validate() {
                 Ok(()) => return Ok(Some(c)),
@@ -667,6 +676,7 @@ impl ListenerConfig {
 }
 
 /// A source key from an opaque name.
+#[must_use]
 pub fn source_name(name: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut h);
@@ -675,6 +685,7 @@ pub fn source_name(name: &str) -> u64 {
 
 impl ListenerCore {
     /// A listener with these limits.
+    #[must_use]
     pub fn new(config: ListenerConfig) -> Self {
         Self {
             config,
@@ -692,11 +703,13 @@ impl ListenerCore {
     }
 
     /// The limits.
+    #[must_use]
     pub fn config(&self) -> &ListenerConfig {
         &self.config
     }
 
     /// Carriers pending.
+    #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
@@ -878,11 +891,13 @@ impl ListenerCore {
     }
 
     /// The slots held now: the listener's, and `source`'s.
+    #[must_use]
     pub fn held(&self, source: u64) -> (usize, usize) {
         (self.slots.len(), self.held_by(source))
     }
 
     /// The carriers stalled now: the listener's, and `source`'s.
+    #[must_use]
     pub fn stalled(&self, source: u64) -> (usize, usize) {
         (
             self.stalls.len(),
@@ -1046,6 +1061,7 @@ impl ListenerCore {
     }
 
     /// The bytes held for a carrier that waits for its session.
+    #[must_use]
     pub fn held_bytes(&self, id: CarrierId) -> &[u8] {
         self.pending
             .iter()
@@ -1054,6 +1070,7 @@ impl ListenerCore {
     }
 
     /// The framing of a pending carrier.
+    #[must_use]
     pub fn framing(&self, id: CarrierId) -> Option<Framing> {
         self.pending.iter().find(|p| p.id == id).map(|p| p.framing)
     }
@@ -1102,6 +1119,7 @@ impl ListenerCore {
     }
 
     /// The next timeout.
+    #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
         self.pending
             .iter()
@@ -1149,9 +1167,9 @@ fn decrement(counts: &mut HashMap<u64, usize>, source: u64) {
     }
 }
 
-/// The PIPE_LANE that begins the first record held in `buf` (byte-stream
+/// The `PIPE_LANE` that begins the first record held in `buf` (byte-stream
 /// framing), once it decodes: the lane, with the bytes (taken), or a
-/// rejection when the record holds no valid PIPE_LANE first.
+/// rejection when the record holds no valid `PIPE_LANE` first.
 fn lane_record(buf: &mut Vec<u8>) -> Classified {
     let Some((size, width)) = varint::decode(buf) else {
         return Classified::NeedMore;
@@ -1170,7 +1188,7 @@ fn lane_record(buf: &mut Vec<u8>) -> Classified {
     }
 }
 
-/// The PIPE_LANE that begins the first message of a message-framed
+/// The `PIPE_LANE` that begins the first message of a message-framed
 /// stream.
 fn lane_message(message: &[u8]) -> Classified {
     match PipeLane::decode(message) {
@@ -1199,6 +1217,7 @@ pub struct LaneProbe {
 impl LaneProbe {
     /// A probe for a stream with `framing`; `max_record_size` is the
     /// receiver's own limit.
+    #[must_use]
     pub const fn new(max_record_size: u64, framing: Framing) -> Self {
         Self {
             classifier: Classifier::new(max_record_size, false, false).with_lanes(),
@@ -1246,6 +1265,7 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     /// A budget of `bytes`; `None` is unlimited.
+    #[must_use]
     pub fn new(bytes: Option<u64>) -> Self {
         Self {
             budget: bytes,
@@ -1269,6 +1289,7 @@ impl MemoryBudget {
     }
 
     /// Whether the sessions are above the budget.
+    #[must_use]
     pub fn pressure(&self) -> bool {
         self.pressure
     }
@@ -1311,7 +1332,14 @@ pub struct AdmissionStats {
 }
 
 /// What happened to the pipe inputs handed to a listener
-/// ([`crate::Listener::stats`]): counts since it was made.
+#[cfg_attr(
+    feature = "tokio",
+    doc = " ([`crate::Listener::stats`]): counts since it was made."
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " (`Listener::stats`): counts since it was made."
+)]
 ///
 /// The unit is the pipe input: a carrier, a lane, or the two carriers of a
 /// split pipe once paired (a half never paired is an input of its own).
@@ -1323,7 +1351,14 @@ pub struct AdmissionStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ListenerStats {
-    /// Sessions started: bootstraps offered to [`crate::Listener::accept`], a
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " Sessions started: bootstraps offered to [`crate::Listener::accept`], a"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " Sessions started: bootstraps offered to `Listener::accept`, a"
+    )]
     /// split bootstrap once.
     pub sessions: u64,
     /// Joins accepted into existing sessions, and lanes accepted into
@@ -1332,7 +1367,14 @@ pub struct ListenerStats {
     /// Connections never made a pipe input: a failed TLS handshake or its
     /// timeout (also the handshake a join sent in early data waits for), a
     /// failed HTTP or WebSocket upgrade, or the setup limit
-    /// ([`ListenerAdapter::count_setup_failure`](crate::adapter::ListenerAdapter::count_setup_failure)). With an admission, a carrier's
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " ([`ListenerAdapter::count_setup_failure`](crate::adapter::ListenerAdapter::count_setup_failure)). With an admission, a carrier's"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " (`ListenerAdapter::count_setup_failure`). With an admission, a carrier's"
+    )]
     /// failed outer handshake counts in [`AdmissionStats::handshake_failed`]
     /// instead.
     pub setup_failures: u64,
@@ -1345,8 +1387,15 @@ pub struct ListenerStats {
     pub rejected: u64,
     /// Inputs refused at a limit: of the listener, of its source (a
     /// carrier refused its source slot, before any handshake), of the
-    /// session (a join closed with ZMUX_PIPE_RESOURCE_LIMIT), new sessions
-    /// during [`crate::Listener::shutdown`], or anything after [`crate::Listener::close`]
+    /// session (a join closed with `ZMUX_PIPE_RESOURCE_LIMIT`), new sessions
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " during [`crate::Listener::shutdown`], or anything after [`crate::Listener::close`]"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " during `Listener::shutdown`, or anything after `Listener::close`"
+    )]
     /// ([`HandleError::Refused`]).
     pub refused: u64,
     /// Inputs without a first record, or join, in time, and split halves
@@ -1364,7 +1413,7 @@ pub enum HandleError {
     /// or replayed, a lane that names no pipe, or not zmux at all.
     Rejected,
     /// At a limit: of the listener for this source, of the session (a
-    /// join closed with ZMUX_PIPE_RESOURCE_LIMIT), or the listener closed.
+    /// join closed with `ZMUX_PIPE_RESOURCE_LIMIT`), or the listener closed.
     Refused,
     /// No first record (or join) in time, or a split half whose other half
     /// did not arrive in time.

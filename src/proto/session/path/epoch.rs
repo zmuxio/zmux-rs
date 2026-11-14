@@ -1,4 +1,4 @@
-//! Session epochs: the two-message exchange of SESSION_EPOCH,
+//! Session epochs: the two-message exchange of `SESSION_EPOCH`,
 //! the epoch a local join uses, the epochs and Locators the acceptor takes, and when a
 //! carrier joined in an older epoch is to be replaced.
 //!
@@ -24,11 +24,13 @@ use crate::proto::Error;
 use crate::proto::frame::{EpochPhase, Frame, SessionEpoch};
 use crate::proto::params::{Locator, Role};
 use crate::proto::seal::{Group, GroupInitiator, RecordMode, Secret, derive_epoch_secret};
+use crate::proto::session::Period;
 #[cfg(feature = "test-hooks")]
 use crate::proto::session::PipeId;
 use crate::proto::session::join::EpochKeys;
 use crate::proto::session::output::Records;
-use crate::proto::session::pipes::SentFrame;
+use crate::proto::session::pipes::{Attachment, SentFrame};
+
 use crate::proto::session::rtt::PROBE_INTERVAL;
 use crate::proto::session::{CoreEvent, SessionCore, State};
 
@@ -260,15 +262,14 @@ impl SessionCore {
     /// The Session Locators this end accepts now: the current one, and during an exchange
     /// also the next. A listener finds the session by any of them.
     pub fn accepted_locators(&self) -> Vec<Vec<u8>> {
-        match self.epochs() {
-            Some(e) => e.local.iter().map(|(_, l)| l.clone()).collect(),
-            None => {
-                let l = self.local_locator();
-                if l.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![l.to_vec()]
-                }
+        if let Some(e) = self.epochs() {
+            e.local.iter().map(|(_, l)| l.clone()).collect()
+        } else {
+            let l = self.local_locator();
+            if l.is_empty() {
+                Vec::new()
+            } else {
+                vec![l.to_vec()]
             }
         }
     }
@@ -311,7 +312,7 @@ impl SessionCore {
 
     /// Notes the epoch and time of a new attachment.
     pub(in crate::proto::session) fn epoch_attached(&mut self, id: u64, epoch: u64, now: Instant) {
-        let live: Vec<u64> = self.atts.iter().map(|a| a.id()).collect();
+        let live: Vec<u64> = self.atts.iter().map(Attachment::id).collect();
         if let Some(mp) = self.mp.as_deref_mut() {
             // Retired attachments leave the list.
             mp.epochs
@@ -374,10 +375,10 @@ impl SessionCore {
         if id == 0 {
             return self.first_pipe_mode;
         }
-        self.att(id).and_then(|a| a.mode())
+        self.att(id).and_then(Attachment::mode)
     }
 
-    /// Whether SESSION_EPOCH may go on, or come from, pipe `id`.
+    /// Whether `SESSION_EPOCH` may go on, or come from, pipe `id`.
     fn epoch_pipe(&self, id: u64) -> bool {
         matches!(
             self.pipe_mode(id),
@@ -478,7 +479,7 @@ impl SessionCore {
         let own = self
             .out_ref(id)
             .and_then(|o| o.probe_settings().0)
-            .map(|p| p.duration());
+            .map(Period::duration);
         match own {
             Some(d) => d.unwrap_or(PROBE_INTERVAL),
             None => self.session_probe_interval(),
@@ -574,7 +575,7 @@ impl SessionCore {
         self.push_event(CoreEvent::EpochDeleted(d - 1));
     }
 
-    /// A received SESSION_EPOCH on the pipe being read.
+    /// A received `SESSION_EPOCH` on the pipe being read.
     pub(in crate::proto::session) fn on_session_epoch(
         &mut self,
         f: SessionEpoch<'_>,
@@ -640,7 +641,7 @@ impl SessionCore {
         self.delete_previous(now);
     }
 
-    fn check_share(&self, group: &Group, share: &[u8], initiator: bool) -> Result<(), Error> {
+    fn check_share(group: &Group, share: &[u8], initiator: bool) -> Result<(), Error> {
         if share.len() != group.share_len(initiator) {
             return Err(Error::protocol_violation(
                 TYPE,
@@ -656,7 +657,7 @@ impl SessionCore {
         let group = self
             .epoch_group()
             .ok_or_else(|| Error::protocol_violation(TYPE, "no Group"))?;
-        self.check_share(group, f.share, true)?;
+        Self::check_share(group, f.share, true)?;
         let (share, secrets) = group
             .respond(f.share)
             .map_err(|_| Error::protocol_violation(TYPE, "SESSION_EPOCH share refused"))?;
@@ -689,7 +690,7 @@ impl SessionCore {
         let Some(offer) = self.mp().epochs.own.clone() else {
             return Ok(());
         };
-        self.check_share(kex.group(), f.share, false)?;
+        Self::check_share(kex.group(), f.share, false)?;
         let secrets = kex
             .finish(f.share)
             .map_err(|_| Error::protocol_violation(TYPE, "SESSION_EPOCH share refused"))?;

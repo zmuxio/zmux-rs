@@ -9,6 +9,7 @@ use crate::json::{Json, parse};
 use crate::machine::Options;
 use crate::value::{
     ALL_SCOPES, FREE_SCOPES, Family, Reader, Sampler, Scope, Value, int, jitter_with, parse_value,
+    to_u32,
 };
 
 /// A member of a pool as a [`MachinePoolPolicy`] sees it.
@@ -62,6 +63,10 @@ pub struct MemberDecision {
 impl MemberDecision {
     /// Whether the decision is valid: an idle-probe interval, if set, of 0 or in
     /// \[10^6, 10^15\] microseconds. A pool rejects one that is not as a whole.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the probe interval is set and outside that range.
     pub fn validate(&self) -> Result<(), Error> {
         match self.probe_interval {
             Some(x) if x != 0 && !(1_000_000..=1_000_000_000_000_000).contains(&x) => {
@@ -123,7 +128,7 @@ fn jitter(x: &Json, what: &str) -> Result<u32, Error> {
     if !(0..1_000_000).contains(&v) {
         return Err(err("range", what.to_owned()));
     }
-    Ok(v as u32)
+    Ok(to_u32(v))
 }
 
 impl PoolSpec {
@@ -291,12 +296,25 @@ impl fmt::Debug for MachinePoolPolicy {
 
 /// Reads a pool policy: a JSON object with the optional members `count`, `dial_after`,
 /// `dial_jitter`, `retire` (`metric`, `above`, `jitter`), `probe_interval`, `probe_jitter`.
+///
+/// # Errors
+///
+/// See [`MachinePoolPolicy::from_json`].
 pub fn pool_policy(json: &[u8], options: Options) -> Result<MachinePoolPolicy, Error> {
     MachinePoolPolicy::from_json(json, options)
 }
 
 impl MachinePoolPolicy {
     /// See [`pool_policy`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if `json` exceeds the input limit, is not valid JSON, or has an unknown,
+    /// mistyped or out-of-range member.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public signature; `pool_policy` hands its options over"
+    )]
     pub fn from_json(json: &[u8], options: Options) -> Result<Self, Error> {
         options.limits.input(json.len())?;
         let mut spec = PoolSpec::parse(&parse(json)?, &Reader::new(None, options.limits))?;

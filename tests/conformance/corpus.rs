@@ -1,6 +1,11 @@
 //! The wire corpus: every valid case round-trips
 //! byte for byte and every invalid case fails with exactly its error.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use serde_json::Value;
 use zmux::proto::record::{Event, Framing, RecordReader};
 use zmux::proto::{Error, Frame, Gates};

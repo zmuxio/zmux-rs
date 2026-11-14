@@ -3,6 +3,10 @@
 //! descriptor counts and small flow-control windows.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
 
 use std::ops::Range;
 use std::sync::{Mutex, MutexGuard, PoisonError};

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 const SECOND: u64 = 1_000_000_000;
 
 /// At most `N` frames of a kind in any one-second interval at a sustained
-/// `N` per second: 8 PIPE_PING frames.
+/// `N` per second: 8 `PIPE_PING` frames.
 ///
 /// A sliding window, not a token bucket: a bucket of `N` tokens refilled at
 /// `N` per second lets almost `2N` frames into one second. The window keeps
@@ -110,6 +110,7 @@ impl<const N: usize> TokenBucket<N> {
     }
 
     /// When the next token is there.
+    #[allow(clippy::cast_possible_truncation, reason = "BURST is a small constant")]
     pub(crate) fn next_slot(&self, now: Instant) -> Option<Instant> {
         if self.available(now) > 0 {
             return Some(now);
@@ -130,7 +131,7 @@ impl<const N: usize> TokenBucket<N> {
 mod tests {
     use super::*;
 
-    /// The window of the QX_PING and PIPE_PING sender limit: 16 frames at
+    /// The window of the `QX_PING` and `PIPE_PING` sender limit: 16 frames at
     /// once, then each slot frees exactly one second after the frame that
     /// took it, so no one-second interval holds more than 16.
     #[test]

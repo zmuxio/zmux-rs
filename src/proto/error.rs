@@ -49,8 +49,8 @@ macro_rules! codes {
 }
 
 codes! {
-    /// A transport error code, carried in CONNECTION_CLOSE (type 0x1c) and
-    /// PIPE_ABANDON.
+    /// A transport error code, carried in `CONNECTION_CLOSE` (type 0x1c) and
+    /// `PIPE_ABANDON`.
     TransportErrorCode, TRANSPORT_ERRORS, bool;
     /// No error.
     NO_ERROR = 0x00, true;
@@ -82,9 +82,9 @@ codes! {
     ZMUX_RESUME_TIMEOUT = 0x0eb8_7167, true;
     /// A resume could not be completed safely.
     ZMUX_RESUME_FAILED = 0x0f05_f74e, true;
-    /// PIPE_ABANDON reason: the pipe failed or was removed abruptly.
+    /// `PIPE_ABANDON` reason: the pipe failed or was removed abruptly.
     ZMUX_PIPE_FAILED = 0x296a_5bf5, true;
-    /// PIPE_ABANDON reason: the endpoint cannot keep the pipe.
+    /// `PIPE_ABANDON` reason: the endpoint cannot keep the pipe.
     ZMUX_PIPE_RESOURCE_LIMIT = 0x0b4f_a113, true;
     /// A join failed authentication; reported locally, never sent.
     ZMUX_PIPE_AUTH_FAILED = 0x0961_3938, false;
@@ -95,18 +95,19 @@ codes! {
 impl TransportErrorCode {
     /// Whether this code may appear on the wire. Unknown codes are treated as
     /// sendable; only [`Self::ZMUX_PIPE_AUTH_FAILED`] is local-only.
+    #[must_use]
     pub const fn is_sent_on_wire(self) -> bool {
         self.0 != Self::ZMUX_PIPE_AUTH_FAILED.0
     }
 }
 
 codes! {
-    /// An application error code, carried in CONNECTION_CLOSE (type 0x1d),
-    /// RESET_STREAM, RESET_STREAM_AT, STOP_SENDING and GOAWAY. The block
+    /// An application error code, carried in `CONNECTION_CLOSE` (type 0x1d),
+    /// `RESET_STREAM`, `RESET_STREAM_AT`, `STOP_SENDING` and GOAWAY. The block
     /// 0x5a4d0000 to 0x5a4d0fff holds the zmux conventions; the extra table
     /// column is the matching SOCKS5 reply code.
     ApplicationErrorCode, APPLICATION_ERRORS, Option<u8>;
-    /// No error; for STOP_SENDING, "no more data wanted".
+    /// No error; for `STOP_SENDING`, "no more data wanted".
     NO_ERROR = 0x00, None;
     /// The endpoint abandoned the stream or operation.
     ZMUX_CANCELLED = 0x5a4d_0001, None;
@@ -151,6 +152,7 @@ impl ApplicationErrorCode {
 
     /// The SOCKS5 reply code (RFC 1928 Section 6) that a proxy open-failure
     /// code maps to.
+    #[must_use]
     pub fn socks5_reply(self) -> Option<u8> {
         APPLICATION_ERRORS
             .iter()
@@ -159,6 +161,7 @@ impl ApplicationErrorCode {
     }
 
     /// The proxy open-failure code for a SOCKS5 reply code 0x01 to 0x08.
+    #[must_use]
     pub const fn from_socks5_reply(rep: u8) -> Option<Self> {
         match rep {
             0x01..=0x08 => Some(Self(0x5a4d_0100 + rep as u64)),
@@ -202,6 +205,7 @@ impl DetailKey {
     ];
 
     /// The key as it appears in the diagnostic line.
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Stream => "stream",
@@ -216,6 +220,7 @@ impl DetailKey {
     }
 
     /// The defined key of that name.
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.name() == name)
     }
@@ -225,7 +230,7 @@ impl DetailKey {
 const MAX_DETAILS: usize = 4;
 
 /// A violation found while decoding peer input. A session that encounters
-/// one closes with CONNECTION_CLOSE carrying [`Error::code`], its reason
+/// one closes with `CONNECTION_CLOSE` carrying [`Error::code`], its reason
 /// and, after a line feed, its [`Error::details`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Error {
@@ -240,6 +245,7 @@ pub struct Error {
 impl Error {
     /// Creates an error with a transport code, the type of the offending
     /// frame (0 when there is none) and a short reason.
+    #[must_use]
     pub const fn new(code: TransportErrorCode, frame_type: u64, reason: &'static str) -> Self {
         Self {
             code,
@@ -276,17 +282,20 @@ impl Error {
     }
 
     /// The transport error code to close the session with.
+    #[must_use]
     pub const fn code(&self) -> TransportErrorCode {
         self.code
     }
 
-    /// The Frame Type field of CONNECTION_CLOSE: the type of the frame that
+    /// The Frame Type field of `CONNECTION_CLOSE`: the type of the frame that
     /// caused the error, or 0.
+    #[must_use]
     pub const fn frame_type(&self) -> u64 {
         self.frame_type
     }
 
     /// A short description, the human-readable part of the Reason Phrase.
+    #[must_use]
     pub const fn reason(&self) -> &'static str {
         self.reason
     }
@@ -302,6 +311,7 @@ impl Error {
 
     /// The Reason Phrase: the reason, then a line feed and the pairs when
     /// there are any.
+    #[must_use]
     pub fn reason_phrase(&self) -> String {
         use fmt::Write as _;
         let mut s = String::from(self.reason);

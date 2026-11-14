@@ -28,6 +28,7 @@ pub struct TrustedProxies {
 
 impl TrustedProxies {
     /// Trusts nobody.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -61,23 +62,27 @@ impl TrustedProxies {
     }
 
     /// The trusted networks.
+    #[must_use]
     pub fn nets(&self) -> &[IpNet] {
         &self.nets
     }
 
     /// The forwarding header field, if HTTP carriers report their client
     /// in one.
+    #[must_use]
     pub fn forwarded_header(&self) -> Option<&str> {
         self.header.as_deref()
     }
 
     /// Whether trusted TCP connections start with a PROXY protocol header.
+    #[must_use]
     pub fn proxy_protocol(&self) -> bool {
         self.proxy_protocol
     }
 
     /// Whether `addr` (an IPv4-mapped address as its IPv4 address) is
     /// trusted.
+    #[must_use]
     pub fn trusts(&self, addr: IpAddr) -> bool {
         let addr = addr.to_canonical();
         self.nets.iter().any(|n| n.contains(addr))
@@ -225,16 +230,19 @@ impl IpNet {
     }
 
     /// The network's address.
+    #[must_use]
     pub fn addr(&self) -> IpAddr {
         self.addr
     }
 
     /// The prefix length.
+    #[must_use]
     pub fn prefix(&self) -> u8 {
         self.prefix
     }
 
     /// Whether `addr` is in the network.
+    #[must_use]
     pub fn contains(&self, addr: IpAddr) -> bool {
         match (self.addr, addr.to_canonical()) {
             (IpAddr::V4(n), IpAddr::V4(a)) => {
@@ -320,6 +328,7 @@ pub enum ProxyHeader {
 /// Parses the PROXY protocol header (version 1 or 2) at the start of
 /// `buf`. Never reads beyond the header: a caller that reads exactly the
 /// bytes [`ProxyHeader::Incomplete`] asks for consumes nothing after it.
+#[must_use]
 pub fn parse_proxy_header(buf: &[u8]) -> ProxyHeader {
     // Enough to tell the versions apart: "PROXY " or the first bytes of
     // the version 2 signature.
@@ -344,7 +353,7 @@ pub fn parse_proxy_header(buf: &[u8]) -> ProxyHeader {
         return ProxyHeader::Incomplete(len);
     }
     let body = &buf[PROXY_V2_HEAD..len];
-    if ver_cmd & 0x0f == 0 {
+    if ver_cmd.trailing_zeros() >= 4 {
         // LOCAL: the intermediary's own connection.
         return ProxyHeader::Complete { len, source: None };
     }

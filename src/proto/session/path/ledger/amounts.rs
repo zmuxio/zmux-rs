@@ -1,6 +1,6 @@
 //! A multiset of amounts kept in order with subtree counts and sums, so that
 //! the capped sum (the sum over a level's stream
-//! directions of min(ready_j, r)) costs O(log n) for any r.
+//! directions of `min(ready_j`, r)) costs O(log n) for any r.
 //!
 //! A treap: one node per distinct amount, with its multiplicity; node
 //! priorities come from a process-wide random seed, so the expected depth is
@@ -32,7 +32,7 @@ pub(super) struct Amounts {
     draws: u64,
 }
 
-/// SplitMix64, for the node priorities.
+/// `SplitMix64`, for the node priorities.
 fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -91,16 +91,13 @@ impl Amounts {
             sum: u128::from(amount),
         };
         self.draws = self.draws.wrapping_add(1);
-        let i = match self.free.pop() {
-            Some(i) => {
-                self.nodes[i as usize] = node;
-                i
-            }
-            None => {
-                let i = u32::try_from(self.nodes.len()).expect("a node index fits 32 bits");
-                self.nodes.push(node);
-                i
-            }
+        let i = if let Some(i) = self.free.pop() {
+            self.nodes[i as usize] = node;
+            i
+        } else {
+            let i = u32::try_from(self.nodes.len()).expect("a node index fits 32 bits");
+            self.nodes.push(node);
+            i
         };
         let (lo, hi) = self.split(self.root, amount);
         let lo = self.merge(lo, Some(i));
@@ -214,6 +211,10 @@ impl Amounts {
         }
     }
 
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "treap notation: i, j nodes, l, r children, n counts"
+    )]
     fn pull(&mut self, i: u32) {
         let (l, r) = {
             let x = &self.nodes[i as usize];
@@ -244,6 +245,10 @@ impl Amounts {
     }
 
     /// Joins two subtrees, every amount of `a` below every amount of `b`.
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "treap notation: i, j nodes, l, r children, n counts"
+    )]
     fn merge(&mut self, a: Link, b: Link) -> Link {
         match (a, b) {
             (None, x) | (x, None) => x,

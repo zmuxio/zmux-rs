@@ -180,7 +180,9 @@ async fn transfer(client: &Session, server: &Session) {
         send.finish().unwrap();
     });
     let (mut send, mut recv) = client.open_bi().await.unwrap();
-    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(1 << 20))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     let d = data.clone();
     let writer = tokio::spawn(async move {
         send.write_all(&d).await.unwrap();
@@ -298,7 +300,7 @@ async fn connect_and_serve_with_zmux_alpn() {
     serving.await.unwrap();
 }
 
-/// A TLS connection that ends without close_notify (here a proxy that
+/// A TLS connection that ends without `close_notify` (here a proxy that
 /// drops both sockets) is a carrier failure: the session ends with
 /// `PipesLost`, never with the peer's clean idle close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -531,7 +533,7 @@ async fn admission_by_bound_prefix_auth() {
             );
             let lasted = start.elapsed();
             assert!(
-                lasted >= STALL_MIN - Duration::from_millis(10),
+                lasted >= STALL_MIN.checked_sub(Duration::from_millis(10)).unwrap(),
                 "{name}: closed after {lasted:?}"
             );
         }
@@ -686,7 +688,9 @@ fn lingering(mut c: Config) -> Config {
 }
 
 async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(1 << 20))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     let reader = {
         let (server, data) = (server.clone(), data.clone());
         tokio::spawn(async move {

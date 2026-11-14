@@ -16,7 +16,7 @@
 //! `is_retryable` means one thing on every type: the peer did not act on
 //! the operation, so repeating it cannot duplicate anything. Where it must
 //! be repeated depends on the error: on the same session (credit,
-//! ZMUX_REJECTED, a pipe operation before establishment) or on a new one
+//! `ZMUX_REJECTED`, a pipe operation before establishment) or on a new one
 //! (GOAWAY, and [`SessionError::EarlyDataRejected`], where the new session
 //! must not send early data). A session that ended for any other reason is
 //! not retryable: the peer may have processed some of its data.
@@ -60,17 +60,20 @@ pub struct InvalidConfig {
 impl InvalidConfig {
     /// The error for the setting `field`, invalid for `reason`. Carrier
     /// adapters and helpers report their own options with it.
+    #[must_use]
     pub const fn new(field: &'static str, reason: &'static str) -> Self {
         Self { field, reason }
     }
 
     /// The setting, by its field or option name (`max_pipes`,
     /// `ListenerConfig::instance_id`, ...).
+    #[must_use]
     pub const fn field(&self) -> &'static str {
         self.field
     }
 
     /// Why the value cannot be used.
+    #[must_use]
     pub const fn reason(&self) -> &'static str {
         self.reason
     }
@@ -94,7 +97,7 @@ impl From<InvalidConfig> for io::Error {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionError {
-    /// CONNECTION_CLOSE type 0x1d, sent by either application.
+    /// `CONNECTION_CLOSE` type 0x1d, sent by either application.
     ApplicationClosed {
         /// The application error code.
         code: VarInt,
@@ -103,7 +106,7 @@ pub enum SessionError {
         /// Whether the peer closed.
         remote: bool,
     },
-    /// CONNECTION_CLOSE type 0x1c: a protocol error found by either side.
+    /// `CONNECTION_CLOSE` type 0x1c: a protocol error found by either side.
     TransportClosed {
         /// The transport error code.
         code: TransportErrorCode,
@@ -119,7 +122,7 @@ pub enum SessionError {
         remote: bool,
     },
     /// The idle timer expired; `remote` when the peer ended the session by
-    /// shutting down its pipe without CONNECTION_CLOSE.
+    /// shutting down its pipe without `CONNECTION_CLOSE`.
     IdleTimeout {
         /// Caused by the peer.
         remote: bool,
@@ -135,8 +138,8 @@ pub enum SessionError {
     /// [`SessionError::in_io`].
     EarlyDataRejected,
     /// The resume grace period expired while the session was suspended, or a listener limit ended
-    /// the suspended session: CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT) when a pipe remains.
-    /// A peer's ZMUX_RESUME_TIMEOUT is [`SessionError::TransportClosed`].
+    /// the suspended session: `CONNECTION_CLOSE(ZMUX_RESUME_TIMEOUT)` when a pipe remains.
+    /// A peer's `ZMUX_RESUME_TIMEOUT` is [`SessionError::TransportClosed`].
     ResumeTimeout {
         /// The most recent pipe failure of the session, when a pipe failed.
         last: Option<PipeFailure>,
@@ -150,7 +153,7 @@ pub enum SessionError {
     },
     /// Resume could not continue safely: the two endpoints' states
     /// diverged, so the data in flight is in an unknown state
-    /// (CONNECTION_CLOSE with ZMUX_RESUME_FAILED, sent or received).
+    /// (`CONNECTION_CLOSE` with `ZMUX_RESUME_FAILED`, sent or received).
     ResumeFailed {
         /// The reason phrase.
         reason: Bytes,
@@ -175,15 +178,22 @@ pub enum PipeFailure {
     /// The join was not confirmed within `join_timeout`: the peer
     /// refused it or never saw it.
     JoinTimedOut,
-    /// The peer abandoned the pipe with this error code (PIPE_ABANDON).
+    /// The peer abandoned the pipe with this error code (`PIPE_ABANDON`).
     Abandoned(VarInt),
-    /// This endpoint removed it abruptly: [`Pipe::abort`](crate::Pipe#method.abort), a resource
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " This endpoint removed it abruptly: [`Pipe::abort`](crate::Pipe#method.abort), a resource"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " This endpoint removed it abruptly: `Pipe::abort`, a resource"
+    )]
     /// limit, or room for a new join.
     Aborted,
     /// The carrier broke the protocol for its state.
     Protocol,
     /// The acceptor closed the carrier of this endpoint's join before
-    /// confirming it, with a CONNECTION_CLOSE of this error code; ZMUX_RESUME_FAILED: it has no
+    /// confirming it, with a `CONNECTION_CLOSE` of this error code; `ZMUX_RESUME_FAILED`: it has no
     /// session for the locator.
     JoinFailed,
     /// The peer refused the join in its Reply.
@@ -240,6 +250,7 @@ impl SessionError {
     /// one: how a caller that only sees [`io::Error`]s tells, for example,
     /// a rejection of early data ([`SessionError::is_early_data_rejected`])
     /// from other failures.
+    #[must_use]
     pub fn in_io(e: &io::Error) -> Option<&SessionError> {
         let inner = e.get_ref()?;
         if let Some(s) = inner.downcast_ref::<SessionError>() {
@@ -389,7 +400,7 @@ fn parse_pair(pair: &[u8]) -> Option<(&[u8], u64)> {
         Some(hex) => (hex, 16),
         None => (value, 10),
     };
-    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_hexdigit()) {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
     let value = u64::from_str_radix(std::str::from_utf8(digits).ok()?, radix).ok()?;
@@ -407,7 +418,7 @@ impl From<SessionError> for io::Error {
 #[non_exhaustive]
 pub enum StreamError {
     /// The peer reset its sending part (reads): its code and the Reliable
-    /// Size in application bytes (0 for RESET_STREAM). Data below it was
+    /// Size in application bytes (0 for `RESET_STREAM`). Data below it was
     /// delivered first; a reset stream never reads as complete.
     Reset {
         /// The application error code.
@@ -415,7 +426,7 @@ pub enum StreamError {
         /// Application bytes delivered before the reset took effect.
         reliable_size: u64,
     },
-    /// The peer sent STOP_SENDING (writes).
+    /// The peer sent `STOP_SENDING` (writes).
     Stopped(VarInt),
     /// The stream was not processed by the peer and may be retried: the peer
     /// rejected it, or it is above a GOAWAY watermark.
@@ -438,7 +449,7 @@ pub enum StreamError {
     /// identifier.
     NotEstablished,
     /// The stream was opened before establishment beyond the peer's stream
-    /// limit; its identifier follows a MAX_STREAMS.
+    /// limit; its identifier follows a `MAX_STREAMS`.
     Blocked,
     /// The session ended.
     SessionLost(SessionError),
@@ -446,7 +457,7 @@ pub enum StreamError {
 
 impl StreamError {
     /// Whether the stream may be opened again, its data unprocessed by the
-    /// peer: ZMUX_REJECTED, a GOAWAY (on another session), or a session
+    /// peer: `ZMUX_REJECTED`, a GOAWAY (on another session), or a session
     /// lost to [`SessionError::EarlyDataRejected`] (on a new session
     /// without early data).
     pub fn is_retryable(&self) -> bool {
@@ -524,7 +535,7 @@ pub enum OpenError {
     PreambleTooLarge,
     /// The preamble is not valid for the stream: a TLV type outside the
     /// application range (0x1000 to 0x3fff) or a GREASE value, or
-    /// PIPE_CARRIER on a unidirectional stream.
+    /// `PIPE_CARRIER` on a unidirectional stream.
     InvalidArgument,
     /// The session ended.
     SessionLost(SessionError),
@@ -676,7 +687,7 @@ pub enum PipeError {
     NotNegotiated,
     /// The session is not established yet.
     NotEstablished,
-    /// The endpoint may not join now: it has max_pipes + H unretired
+    /// The endpoint may not join now: it has `max_pipes` + H unretired
     /// attachments of its own, or a join was refused recently; retry later.
     Deferred,
     /// No such pipe (it was retired).
@@ -689,7 +700,11 @@ pub enum PipeError {
     /// [`QualityBand`](crate::QualityBand) or
     /// [`CapacityFloor`](crate::CapacityFloor) is not valid.
     InvalidOptions(InvalidConfig),
-    /// The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined)).
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined))."
+    )]
+    #[cfg_attr(not(feature = "tokio"), doc = " The pipe failed (`Pipe::joined`).")]
     Failed(PipeFailure),
     /// The session is join pending: it has no join keys until what this
     /// names is in place.

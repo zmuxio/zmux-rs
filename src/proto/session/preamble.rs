@@ -15,14 +15,46 @@ use super::OpenError;
 /// A stream's preamble: its open info, its application TLVs in order, and
 /// whether it carries a pipe pair of a nested session.
 ///
-/// Given when the stream is opened ([`Session::open_bi_with`](crate::Session#method.open_bi_with),
-/// [`Session::open_uni_with`](crate::Session#method.open_uni_with),
-/// [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream)), so that it cannot come
+#[cfg_attr(
+    feature = "tokio",
+    doc = " Given when the stream is opened ([`Session::open_bi_with`](crate::Session#method.open_bi_with),"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " Given when the stream is opened (`Session::open_bi_with`,"
+)]
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`Session::open_uni_with`](crate::Session#method.open_uni_with),"
+)]
+#[cfg_attr(not(feature = "tokio"), doc = " `Session::open_uni_with`,")]
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream)), so that it cannot come"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " `Session::open_pipe_stream`), so that it cannot come"
+)]
 /// too late; for a stream the peer opened,
-/// [`RecvStream::preamble`](crate::RecvStream#method.preamble) returns the same type, and a relay
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`RecvStream::preamble`](crate::RecvStream#method.preamble) returns the same type, and a relay"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " `RecvStream::preamble` returns the same type, and a relay"
+)]
 /// opens the next hop's stream with it, adjusted as its conventions say. The stream's requested
 /// priority is not part of it:
-/// [`RecvStream::set_peer_priority`](crate::RecvStream#method.set_peer_priority) may be called at
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`RecvStream::set_peer_priority`](crate::RecvStream#method.set_peer_priority) may be called at"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " `RecvStream::set_peer_priority` may be called at"
+)]
 /// any time.
 ///
 /// Values share the buffers they came in; cloning is cheap.
@@ -55,11 +87,12 @@ pub struct Preamble {
 
 impl Preamble {
     /// An empty preamble: no open info, no TLV, not a carrier.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// With `info` as the open info (OPEN_INFO).
+    /// With `info` as the open info (`OPEN_INFO`).
     #[must_use]
     pub fn with_info(mut self, info: impl Into<Bytes>) -> Self {
         self.info = Some(info.into());
@@ -77,8 +110,15 @@ impl Preamble {
     }
 
     /// Marked as the carrier of a pipe pair of a nested session
-    /// (PIPE_CARRIER; bidirectional streams
-    /// only). [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream) sets it itself.
+    /// (`PIPE_CARRIER`; bidirectional streams
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " only). [`Session::open_pipe_stream`](crate::Session#method.open_pipe_stream) sets it itself."
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " only). `Session::open_pipe_stream` sets it itself."
+    )]
     #[must_use]
     pub fn with_pipe_carrier(mut self) -> Self {
         self.pipe_carrier = true;
@@ -198,7 +238,7 @@ impl Preamble {
     }
 
     /// Checks the preamble for a stream of type `dir`: every TLV whole and
-    /// of an application type, PIPE_CARRIER only on a bidirectional
+    /// of an application type, `PIPE_CARRIER` only on a bidirectional
     /// stream.
     pub(crate) fn check(&self, dir: Dir) -> Result<(), OpenError> {
         if self.unencodable || (self.pipe_carrier && dir != Dir::Bidi) {

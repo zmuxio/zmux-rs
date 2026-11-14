@@ -5,11 +5,12 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::filter::IntervalRate;
+use crate::util::{f64_of, u64_sat};
 
 /// Credit-loop samples a scope keeps pending at most; a full queue drops
 /// samples, never credit.
 const PENDING: usize = 17;
-/// K of auto-tuning: windows target K x RTT_min of the arrival rate.
+/// K of auto-tuning: windows target K x `RTT_min` of the arrival rate.
 const K: u32 = 4;
 
 /// An update sent at `sent_at` that raised the limit from `old_limit`;
@@ -25,12 +26,12 @@ struct Loop {
 /// the session):
 /// the window is the arrival rate (the
 /// largest of the last 4 intervals of max(RTT, 1 ms)) times max(K x
-/// RTT_min, B), and never shrinks.
+/// `RTT_min`, B), and never shrinks.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Tuner {
     /// The arrival rate over intervals of max(RTT, 1 ms).
     rate: IntervalRate,
-    /// Multipath: per interval, the largest pipe_min_rtt (us) of the pipes
+    /// Multipath: per interval, the largest `pipe_min_rtt` (us) of the pipes
     /// the scope's data arrived on.
     seen: [u32; 4],
     /// Updates whose credit-loop sample is pending.
@@ -109,7 +110,7 @@ impl Tuner {
         self.rate.get()
     }
 
-    /// Multipath RTT_max: the largest pipe_min_rtt over the current and the
+    /// Multipath `RTT_max`: the largest `pipe_min_rtt` over the current and the
     /// last 3 intervals; `None` before data arrived on a pipe with an RTT.
     pub(super) fn rtt_seen(&self) -> Option<Duration> {
         let us = self.seen.iter().copied().max().unwrap_or(0);
@@ -117,7 +118,7 @@ impl Tuner {
     }
 
     /// New data up to offset `off` arrived at `now` (on a pipe whose
-    /// pipe_min_rtt is `pipe_rtt`, multipath). `interval_rtt` is the RTT of
+    /// `pipe_min_rtt` is `pipe_rtt`, multipath). `interval_rtt` is the RTT of
     /// the scope, which sets the rate interval. Returns a credit-loop
     /// sample when the first byte beyond a limit the peer was blocked at
     /// arrived.
@@ -156,7 +157,7 @@ impl Tuner {
         sample
     }
 
-    /// DATA_BLOCKED or STREAM_DATA_BLOCKED at `limit`.
+    /// `DATA_BLOCKED` or `STREAM_DATA_BLOCKED` at `limit`.
     pub(super) fn on_blocked(&mut self, limit: u64) {
         for p in &mut self.pending {
             if p.old_limit == limit {
@@ -166,11 +167,11 @@ impl Tuner {
     }
 
     /// The window growth of auto-tuning: the target for `rtt` (the scope's
-    /// RTT_min, `None` before a sample) and the latency budget `b`.
+    /// `RTT_min`, `None` before a sample) and the latency budget `b`.
     pub(super) fn target(&self, rtt: Option<Duration>, b: Duration) -> Option<u64> {
         let rate = self.rate()?;
         let span = rtt.map_or(b, |r| (r * K).max(b));
-        Some((rate as f64 * span.as_secs_f64()) as u64)
+        Some(u64_sat(f64_of(rate) * span.as_secs_f64()))
     }
 
     /// An update raised the advertised limit from `old_limit`.

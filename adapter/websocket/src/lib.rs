@@ -49,7 +49,14 @@
 //!   `tokio_rustls::TlsConnector`, or [`dial_over`] on a TLS stream the
 //!   application established. [`dial`] and [`connect`] take `ws://`, and
 //!   with the `wss` feature also `wss://`, through [`dial_tls`] with
-//!   [`tls_connector`] of the Mozilla roots (webpki-roots) and the ring
+#![cfg_attr(
+    feature = "wss",
+    doc = "   [`tls_connector`] of the Mozilla roots (webpki-roots) and the ring"
+)]
+#![cfg_attr(
+    not(feature = "wss"),
+    doc = "   `tls_connector` of the Mozilla roots (webpki-roots) and the ring"
+)]
 //!   provider; without the feature a `wss://` URL is refused as invalid input.
 //!   Over TLS 1.3 a carrier of [`dial_tls`] or [`serve_tls`] has the
 //!   connection's exporter and is declared secure, for Bound joins.
@@ -146,9 +153,24 @@ where
 /// [`Options::with_carrier_credential`] is added (given no exporter: there is no TLS).
 /// Over plain TCP, a pipe that zmux fails is aborted without a Close
 /// frame. A `wss://` request goes over TLS as with [`dial_tls`], with the
-/// default [`tls_connector`] (feature `wss`); without the feature it is
+#[cfg_attr(
+    feature = "wss",
+    doc = " default [`tls_connector`] (feature `wss`); without the feature it is"
+)]
+#[cfg_attr(
+    not(feature = "wss"),
+    doc = " default `tls_connector` (feature `wss`); without the feature it is"
+)]
 /// refused with [`io::ErrorKind::InvalidInput`]. Redirects of the upgrade
 /// are followed as [`Options::with_max_redirects`] says.
+///
+/// # Errors
+///
+/// `InvalidInput` for a request that is not a valid client request, or a
+/// credential header that cannot be sent (also a `wss://` request without
+/// the feature `wss`); the connect's and TLS handshake's errors;
+/// `ConnectionRefused` when the server answers without upgrading, after
+/// the redirects followed; `Other` for a failed handshake.
 pub async fn dial(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
@@ -351,6 +373,12 @@ async fn dial_once(
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// `InvalidInput` for a credential header that cannot be sent,
+/// `ConnectionRefused` when the server answers without upgrading or
+/// redirects, `Other` for an invalid request or a failed handshake.
 pub async fn dial_over<S>(
     io: S,
     request: impl IntoClientRequest + Unpin,
@@ -405,6 +433,14 @@ where
 /// exporter. A pipe that zmux fails is aborted without a Close frame.
 /// Redirects of the upgrade are followed as [`Options::with_max_redirects`]
 /// says, each over a new connection with the credential presented anew.
+///
+/// # Errors
+///
+/// `InvalidInput` for a request that is not a valid client request, or a
+/// credential header that cannot be sent; the connect's and TLS
+/// handshake's errors; `ConnectionRefused` when the server answers
+/// without upgrading, after the redirects followed; `Other` for a failed
+/// handshake.
 pub async fn dial_tls(
     request: impl IntoClientRequest + Unpin,
     tls: &tokio_rustls::TlsConnector,
@@ -419,7 +455,13 @@ pub async fn dial_tls(
 /// A TLS connector for `wss://` that trusts `roots`, with rustls's ring provider, its
 /// safe default protocol versions and the ALPN identifier `http/1.1`, as [`serve_tls`]
 /// expects; [`dial`] uses the one of the Mozilla roots.
+///
+/// # Panics
+///
+/// Only if rustls's ring provider lacks its safe default protocol
+/// versions, which it does not.
 #[cfg(feature = "wss")]
+#[must_use]
 pub fn tls_connector(roots: tokio_rustls::rustls::RootCertStore) -> tokio_rustls::TlsConnector {
     use tokio_rustls::rustls;
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -446,6 +488,11 @@ fn default_tls_connector() -> &'static tokio_rustls::TlsConnector {
 
 /// Establishes a session over a new WebSocket over TLS ([`dial_tls`], then
 /// [`Session::connect`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial_tls`], and the errors of
+/// [`Session::connect`].
 pub async fn connect_tls(
     request: impl IntoClientRequest + Unpin,
     tls: &tokio_rustls::TlsConnector,
@@ -506,6 +553,11 @@ fn with_socket(io: PipeIo, socket: Option<SocketDup>) -> PipeIo {
 
 /// Establishes a session over a new WebSocket ([`dial`], then
 /// [`Session::connect`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial`], and the errors of
+/// [`Session::connect`].
 pub async fn connect(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
@@ -600,6 +652,11 @@ pub enum Upgrade<S> {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// A read or write error of `io` while the request head is read or the
+/// response written.
 pub async fn accept<S, I>(
     mut io: S,
     mut entry: Entry,
@@ -682,6 +739,10 @@ where
 /// Answers a refused request with `404 Not Found` and ends the
 /// connection's write side: the answer of a server without an HTTP
 /// handler for requests it does not upgrade.
+///
+/// # Errors
+///
+/// The write or shutdown error of `io`.
 pub async fn not_found<S: AsyncWrite + Unpin + ?Sized>(io: &mut S) -> io::Result<()> {
     io.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await?;
@@ -740,6 +801,10 @@ struct UpgradeRequest {
 
 /// The upgrade of `head` (a complete request head), when it is a
 /// WebSocket upgrade request offering a subprotocol `options` accepts.
+#[allow(
+    clippy::naive_bytecount,
+    reason = "a single request head; not worth a counting dependency"
+)]
 fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
     // Every field ends with a LF, with or without CR.
     let lines = head.iter().filter(|&&b| b == b'\n').count();
@@ -897,17 +962,16 @@ async fn serve_over<C, S, SF>(
                     };
                     let _ = l.handle_pipe(io, hint).await;
                 }
-                Upgrade::Refused(conn) => match l.limits().fallback {
-                    Some(f) => {
+                Upgrade::Refused(conn) => {
+                    if let Some(f) = l.limits().fallback {
                         let (conn, prefix) = conn.into_parts();
                         let conn: Box<dyn zmux::adapter::FallbackStream> = Box::new(conn);
                         f.serve(Prefixed::new(conn, prefix), source).await;
-                    }
-                    None => {
+                    } else {
                         let mut conn = conn;
                         let _ = not_found(&mut conn).await;
                     }
-                },
+                }
                 Upgrade::Ended => {}
             }
         };
@@ -950,11 +1014,13 @@ impl Default for Options {
 
 impl Options {
     /// The defaults: `qmux-02`, with its alias `qmux-01`; no credential.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// `qmux-02.<application>` (and its alias `qmux-01.<application>`).
+    #[must_use]
     pub fn for_application(application: &str) -> Self {
         Self::for_protocol(format!(
             "{}.{application}",
@@ -991,6 +1057,7 @@ impl Options {
     }
 
     /// The bound on a request head a server reads.
+    #[must_use]
     pub fn max_request_head(&self) -> usize {
         self.max_request_head
     }
@@ -1009,6 +1076,7 @@ impl Options {
     }
 
     /// The bound on the redirects of the upgrade a client follows.
+    #[must_use]
     pub fn max_redirects(&self) -> usize {
         self.max_redirects
     }
@@ -1048,6 +1116,10 @@ impl Options {
     /// Whether a server upgrades a request offering `offered` (empty
     /// tokens ignored), and with which subprotocol: `Some(None)` for one
     /// that offers none, with [`Options::with_no_subprotocol`].
+    #[allow(
+        clippy::option_option,
+        reason = "refusal, and acceptance with or without a subprotocol, are three distinct outcomes"
+    )]
     pub(crate) fn accept(&self, offered: &[String]) -> Option<Option<String>> {
         if offered.iter().all(String::is_empty) {
             return self.no_subprotocol.then_some(None);
@@ -1077,10 +1149,11 @@ impl Options {
 /// field, so that a peer cannot make the stack buffer much more than a
 /// record before the carrier sees it, and a message above the session's
 /// `max_record_size` reaches it as the record above the limit that it is
-/// (FRAME_ENCODING_ERROR) rather than as a carrier failure. The session's
+/// (`FRAME_ENCODING_ERROR`) rather than as a carrier failure. The session's
 /// read buffer holds every message this lets through.
 pub(crate) fn ws_config() -> WebSocketConfig {
-    let max = zmux::proto::params::ZMUX_MAX_RECORD_SIZE as usize + 1;
+    let max = usize::try_from(zmux::proto::params::ZMUX_MAX_RECORD_SIZE)
+        .map_or(usize::MAX, |m| m.saturating_add(1));
     WebSocketConfig::default()
         .max_message_size(Some(max))
         .max_frame_size(Some(max))
@@ -1293,6 +1366,7 @@ where
 /// `wss://` `url` ([`dial_tls`]): later carriers start at the URL
 /// redirects led the last one to, and one that fails starts at `url`
 /// again.
+#[must_use]
 pub fn candidate_tls(
     url: &str,
     tls: tokio_rustls::TlsConnector,

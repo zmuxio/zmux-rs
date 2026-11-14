@@ -44,7 +44,9 @@ async fn echo(client: &Session, server: &Session) {
         send.finish().unwrap();
     });
     let (mut send, mut recv) = client.open_bi().await.unwrap();
-    let data: Vec<u8> = (0..(64 << 10)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(64 << 10))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     send.write_all(&data).await.unwrap();
     send.finish().unwrap();
     assert_eq!(recv.read_to_end(1 << 20).await.unwrap(), data);
@@ -68,7 +70,7 @@ async fn a_bound_join_over_wss() {
         listener.clone(),
         tcp,
         acceptor,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let url = format!("wss://localhost:{port}/zmux");
     let options = zmux_websocket::Options::default();
@@ -154,7 +156,7 @@ async fn ws_server() -> (std::net::SocketAddr, Listener, tokio::task::JoinHandle
     let serving = tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     (addr, listener, serving)
 }
@@ -171,7 +173,7 @@ async fn a_same_host_redirect_is_followed() {
     let (addr, count, front) = front(backend, &[("/old", "/zmux")]).await;
     let cs = zmux_websocket::connect(
         format!("ws://{addr}/old"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await
@@ -203,9 +205,12 @@ async fn redirects_to_another_host_or_port_are_refused() {
     )
     .await;
     for (path, reason) in [("/host", "another host"), ("/port", "another port")] {
-        let e = zmux_websocket::dial(format!("ws://{addr}{path}"), &Default::default())
-            .await
-            .unwrap_err();
+        let e = zmux_websocket::dial(
+            format!("ws://{addr}{path}"),
+            &zmux_websocket::Options::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused);
         assert_eq!(redirect_error(&e).reason, reason);
     }
@@ -218,9 +223,12 @@ async fn redirects_to_another_host_or_port_are_refused() {
 async fn redirects_stop_at_the_bound() {
     let (backend, _listener, serving) = ws_server().await;
     let (addr, count, front) = front(backend, &[("/loop", "/loop")]).await;
-    let e = zmux_websocket::dial(format!("ws://{addr}/loop"), &Default::default())
-        .await
-        .unwrap_err();
+    let e = zmux_websocket::dial(
+        format!("ws://{addr}/loop"),
+        &zmux_websocket::Options::default(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(redirect_error(&e).reason, "too many redirects");
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -246,7 +254,7 @@ async fn a_candidate_starts_at_the_redirected_url() {
     let candidate = zmux_websocket::candidate(
         move || TcpStream::connect(addr),
         &format!("ws://{addr}/old"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
     );
     let mut sessions = Vec::new();
     for _ in 0..2 {
@@ -277,7 +285,7 @@ async fn a_carrier_mode_caches_the_redirected_url() {
         let candidate = zmux_websocket::candidate(
             move || TcpStream::connect(addr),
             &format!("ws://{addr}/old"),
-            &Default::default(),
+            &zmux_websocket::Options::default(),
         );
         let mode = zmux::CarrierChoice::auto([candidate]);
         let (cs, ss) = tokio::join!(

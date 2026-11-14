@@ -85,9 +85,8 @@ fn a_responder_binding_of_another_length_is_invalid_config() {
         match Responder::read_hello(&parsed, keys) {
             Err(Error::InvalidConfig) => assert!(!ok),
             // A Binding of the right length is mixed in, not judged; a disagreement is auth.
-            Err(Error::Auth) => assert!(ok),
+            Err(Error::Auth) | Ok(_) => assert!(ok),
             Err(e) => panic!("{e:?}"),
-            Ok(_) => assert!(ok),
         }
     }
 }

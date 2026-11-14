@@ -1,6 +1,12 @@
 //! Host code in the driver: called with no zmux lock held, a panic in it means no plan or a
 //! refusal, and the checks around a join's last message and a Bound Hello.
 
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -93,9 +99,7 @@ async fn join_through(s: &Session, l: &Listener) -> Result<(), HandleError> {
     let _pipe = s
         .begin_add_pipe(PipeIo::new(x), PipeOptions::default())
         .unwrap();
-    l.handle_pipe(PipeIo::new(y), PipeHint::default())
-        .await
-        .map(|_| ())
+    l.handle_pipe(PipeIo::new(y), PipeHint::default()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -707,9 +711,7 @@ async fn a_failing_session_config_is_logged() {
             sink.lock().unwrap().push(m.to_string());
         }));
         limits.session_config = Some(zmux::proto::listener::SessionConfigFn::new(move |_| {
-            if panics {
-                panic!("the chooser");
-            }
+            assert!(!panics, "the chooser");
             Err("no configuration".to_string())
         }));
         let l = Listener::new(config(), limits).expect("valid listener configuration");

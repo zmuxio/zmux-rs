@@ -2,6 +2,11 @@
 //! reads a Hello and answers whatever it likes; a downgrade of the Secret Flags; a replayed
 //! Hello on another path.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test values are small and bounded; checked conversions would only add noise"
+)]
+
 #[path = "common/core_pair.rs"]
 mod core_pair;
 
@@ -19,6 +24,7 @@ use zmux::proto::session::{
     AllowRecordMode, ClaimedHello, Config, CoreEvent, OpenedHello, PeerCarrier, PipeId,
     SessionCore, State,
 };
+use zmux::shaping::UnitPlan;
 use zmux::{
     Listener, ListenerConfig, OnReject, PipeAuth, PipeIo, PipeOptions, RejectAction, Session,
 };
@@ -35,7 +41,10 @@ async fn sessions() -> (Session, Session, Listener) {
     let listener =
         Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let server = listener.accept().await.unwrap();
     client.established().await.unwrap();
@@ -146,7 +155,7 @@ async fn a_bound_join_through_a_relay_fails_at_the_acceptor() {
     let far = PipeIo::new(far)
         .with_carrier_secure()
         .with_exporter(exporter(1));
-    tokio::spawn(async move { l.handle_pipe(far, Default::default()).await });
+    tokio::spawn(async move { l.handle_pipe(far, zmux::PipeHint::default()).await });
     let near = PipeIo::new(near)
         .with_carrier_secure()
         .with_exporter(exporter(2));
@@ -182,7 +191,7 @@ async fn a_bound_join_with_another_binding_is_closed_at_once_by_default() {
         .with_exporter(exporter(1));
     let start = tokio::time::Instant::now();
     let served = tokio::spawn(async move {
-        let r = l.handle_pipe(far, Default::default()).await;
+        let r = l.handle_pipe(far, zmux::PipeHint::default()).await;
         (r, start.elapsed())
     });
     let near = PipeIo::new(near)
@@ -233,7 +242,10 @@ async fn a_sealed_join_passes_a_relay_that_sees_no_plaintext() {
         }
     });
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+            .await
+    });
     let pipe = client
         .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
         .unwrap();
@@ -282,7 +294,7 @@ async fn unit_relay<R, W>(
             return;
         }
         match timeout(Duration::from_millis(5), from.read(&mut b)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(0) | Err(_)) => return,
             Ok(Ok(n)) => buf.extend_from_slice(&b[..n]),
             Err(_) => {}
         }
@@ -309,7 +321,7 @@ async fn unit_relay<R, W>(
     }
 }
 
-/// A carrier that ends at a record boundary with no PIPE_ABANDON fails its pipe: the data it
+/// A carrier that ends at a record boundary with no `PIPE_ABANDON` fails its pipe: the data it
 /// lost is sent again and no stream sees an end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sealed_end_at_a_record_boundary_is_a_failure() {
@@ -332,7 +344,10 @@ async fn a_sealed_end_at_a_record_boundary_is_a_failure() {
         let _ = tokio::io::copy(&mut b_read, &mut a_write).await;
     });
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+            .await
+    });
     let pipe = client
         .begin_add_pipe(PipeIo::new(near), PipeOptions::new().with_probation(None))
         .unwrap();
@@ -420,13 +435,19 @@ async fn a_bound_hello_without_a_binding_is_refused_as_auth() {
     }));
     let listener = Listener::new(config(), lc).expect("valid listener configuration");
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let server = listener.accept().await.unwrap();
     client.established().await.unwrap();
     let (near, far) = duplex(1 << 16);
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+            .await
+    });
     let near = PipeIo::new(near).with_carrier_secure().with_exporter(
         |_: &str, _: &[u8], out: &mut [u8]| {
             out.fill(1);
@@ -458,7 +479,7 @@ fn trusted_hello(core: &mut SessionCore, now: Instant) -> (PipeId, Vec<u8>) {
     core.join_prepare(id, now).unwrap().unwrap();
     (
         id,
-        core.join_hello(id, (Framing::ByteStream, 0), &Default::default(), now)
+        core.join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now)
             .unwrap(),
     )
 }
@@ -492,7 +513,7 @@ fn a_replay_on_another_path_moves_nothing() {
         panic!("the Hello verifies at ciphertext level");
     };
     assert!(matches!(
-        p.b.claim_hello(&mut replay, carrier(), &Default::default(), now),
+        p.b.claim_hello(&mut replay, carrier(), &UnitPlan::default(), now),
         ClaimedHello::Accept(_)
     ));
     assert_eq!(
@@ -531,7 +552,7 @@ fn a_bound_hello_does_not_verify_on_another_carrier() {
         .unwrap();
     p.a.join_prepare(id, now).unwrap().unwrap();
     let hello =
-        p.a.join_hello(id, (Framing::ByteStream, 0), &Default::default(), now)
+        p.a.join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now)
             .unwrap();
     assert!(matches!(
         open(&mut p.b, &hello, &[6; 32], now),
@@ -635,7 +656,6 @@ fn prepared(core: &mut SessionCore, mode: RecordMode, now: Instant) -> (PipeId, 
 #[test]
 fn plans_reach_the_wire() {
     use zmux::proto::session::JoinStep;
-    use zmux::shaping::UnitPlan;
     for mode in [RecordMode::Sealed, RecordMode::Trusted] {
         let mut p = pair(config(), config());
         let now = p.now;
@@ -678,7 +698,6 @@ fn plans_reach_the_wire() {
 /// message whose plan it waited for.
 #[test]
 fn a_closing_session_ends_a_prepared_join() {
-    use zmux::shaping::UnitPlan;
     let mut p = pair(config(), config());
     let now = p.now;
     let (id, _) = prepared(&mut p.a, RecordMode::Trusted, now);
@@ -691,7 +710,6 @@ fn a_closing_session_ends_a_prepared_join() {
 /// A first batch above what a Hello's ciphertext holds does not fail the join.
 #[test]
 fn an_early_limit_beyond_the_ciphertext_keeps_the_join() {
-    use zmux::shaping::UnitPlan;
     let mut a = config();
     a.join_early_hello = Some(1 << 20);
     a.resume_timeout = Some(Duration::from_secs(60));
@@ -736,7 +754,10 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
     let listener = Listener::new(base, lc).expect("valid listener configuration");
     let (a, b) = duplex(1 << 20);
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let _server = listener.accept().await.unwrap();
     client.established().await.unwrap();
@@ -744,7 +765,7 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
         let l = listener.clone();
         let start = tokio::time::Instant::now();
         tokio::spawn(async move {
-            let r = l.handle_pipe(far, Default::default()).await;
+            let r = l.handle_pipe(far, zmux::PipeHint::default()).await;
             (r.is_err(), start.elapsed())
         })
     };
@@ -796,7 +817,10 @@ async fn a_carrier_over_its_source_limit_is_closed_at_once() {
         let l = listener.clone();
         held.push((
             near,
-            tokio::spawn(async move { l.handle_pipe(PipeIo::new(far), Default::default()).await }),
+            tokio::spawn(async move {
+                l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+                    .await
+            }),
         ));
         tokio::task::yield_now().await;
     }
@@ -826,7 +850,10 @@ async fn the_listener_refuses_a_suite_outside_the_session_as_unknown_suite() {
     let listener = Listener::new(base, lc).expect("valid listener configuration");
     let (a, b) = duplex(1 << 20);
     let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
     let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let _server = listener.accept().await.unwrap();
     client.established().await.unwrap();
@@ -843,7 +870,7 @@ async fn the_listener_refuses_a_suite_outside_the_session_as_unknown_suite() {
     let (mut lnear, lfar) = duplex(1 << 16);
     let l = listener.clone();
     let task = tokio::spawn(async move {
-        l.handle_pipe(PipeIo::new(lfar).records(), Default::default())
+        l.handle_pipe(PipeIo::new(lfar).records(), zmux::PipeHint::default())
             .await
     });
     lnear.write_all(&hello).await.unwrap();

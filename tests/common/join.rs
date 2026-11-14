@@ -2,7 +2,9 @@
 //! Confirm, until the session attaches the pipe. The shared step of the sans-IO multipath
 //! harnesses (tests and benches).
 
-#![allow(dead_code)]
+// The items are `pub` because the benches (separate crates) use them; the
+// lint cannot see that from the including crate.
+#![allow(dead_code, unreachable_pub)]
 
 use std::time::Instant;
 use zmux::shaping::UnitPlan;
@@ -18,7 +20,7 @@ const BS: Framing = Framing::ByteStream;
 
 /// What became of a pipe's bytes fed through the listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Joined {
+pub enum Joined {
     /// The handshake goes on: more bytes are wanted, or the session holds the Hello.
     Pending,
     /// The session attached the pipe and took the bytes after the Confirm.
@@ -31,26 +33,26 @@ pub(crate) enum Joined {
 
 /// The accepting end's handshake of one carrier.
 #[derive(Debug, Default)]
-pub(crate) struct Accepting {
-    pub(crate) carrier: Option<CarrierId>,
+pub struct Accepting {
+    pub carrier: Option<CarrierId>,
     /// A Hello the session holds, offered again.
-    pub(crate) hello: Option<Vec<u8>>,
+    pub hello: Option<Vec<u8>>,
     join: Option<Box<PeerJoin>>,
     /// Bytes after the Hello.
     buf: Vec<u8>,
 }
 
 /// [`feed_join`]'s outcome.
-pub(crate) struct Fed {
-    pub(crate) joined: Joined,
+pub struct Fed {
+    pub joined: Joined,
     /// The Reply to write on the carrier, empty when there is none.
-    pub(crate) reply: Vec<u8>,
+    pub reply: Vec<u8>,
 }
 
 /// Feeds `bytes` of the carrier tagged `tag` (byte-stream framed) to the accepting end:
 /// the listener classifies the Hello, the session verifies it and writes the Reply, and
 /// attaches the pipe once the Confirm arrived. Empty `bytes` offer a held Hello again.
-pub(crate) fn feed_join(
+pub fn feed_join(
     listener: &mut ListenerCore,
     session: &mut SessionCore,
     st: &mut Accepting,
@@ -171,7 +173,7 @@ impl Accepting {
 type Finished = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Joining {
+pub enum Joining {
     /// The Hello is not written yet.
     Hello,
     /// The Reply is awaited.
@@ -185,7 +187,7 @@ pub(crate) enum Joining {
 /// Feeds `input` to the joining end: `Some((confirm, rest))` once the Reply is proven,
 /// with what to write and the records that followed it. Leaves bytes it still wants in
 /// `input`; `Err` when the attachment is gone.
-pub(crate) fn feed_reply(
+pub fn feed_reply(
     session: &mut SessionCore,
     pipe: PipeId,
     input: &mut Vec<u8>,
@@ -215,7 +217,7 @@ pub(crate) fn feed_reply(
 
 /// The whole handshake of `joiner`'s added pipe with nothing lost on the way, at one
 /// instant: the pipe is attached at both ends when it returns `Joined::Attached`.
-pub(crate) fn join_at_once(
+pub fn join_at_once(
     listener: &mut ListenerCore,
     joiner: &mut SessionCore,
     acceptor: &mut SessionCore,

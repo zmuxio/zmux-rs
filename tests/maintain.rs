@@ -3,6 +3,11 @@
 //! before break (nothing reinjected), and ends when stopped or when the
 //! session closes.
 
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1158,7 +1163,7 @@ async fn replace_pipes_replaces_every_pipe() {
         .add_pipe(dialer.carrier(), zmux::PipeOptions::new())
         .await
         .expect("joined");
-    let before: Vec<_> = client.pipes().iter().map(|p| p.id()).collect();
+    let before: Vec<_> = client.pipes().iter().map(zmux::Pipe::id).collect();
     tokio::time::timeout(Duration::from_secs(20), client.replace_pipes())
         .await
         .expect("replaced in time")

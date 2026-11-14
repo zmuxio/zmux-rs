@@ -1,12 +1,12 @@
 //! Multipath acknowledgement and reinjection: receive positions and
-//! PIPE_ACK generation, PIPE_ACK processing with RTT and delivery-rate
+//! `PIPE_ACK` generation, `PIPE_ACK` processing with RTT and delivery-rate
 //! sampling, and re-sending the information of suspect and failed pipes.
 
 use std::time::{Duration, Instant};
 
 use crate::proto::frame::{Frame, PipeAck, PipeAckEntry};
 use crate::proto::session::output::Records;
-use crate::proto::session::pipes::{Attachment, Batch, OutPipe, OutState, SentFrame};
+use crate::proto::session::pipes::{Attachment, Batch, InPipe, OutPipe, OutState, SentFrame};
 use crate::proto::session::stream::{RecvState, SendState};
 use crate::proto::session::{BIDI, CoreEvent, PipeId, SessionCore, StreamKey, UNI};
 use crate::proto::{DetailKey, Error};
@@ -18,18 +18,22 @@ const PARTIAL_SNAPSHOT: usize = 8;
 /// sent.
 const COMPLETE_SNAPSHOT: Duration = Duration::from_secs(1);
 
-/// The acknowledgement state of a multipath session: what PIPE_ACK owes,
+/// The acknowledgement state of a multipath session: what `PIPE_ACK` owes,
 /// the primary pipe and its redundant copy, and the scratch of snapshots
 /// and acknowledged frames.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 pub(crate) struct AckState {
     /// Our own `zmux_max_ack_delay` and `zmux_ack_threshold`.
     local_mad: Duration,
     threshold: u64,
-    /// A PIPE_ACK is owed now (PIPE_PING received, a pipe ended).
+    /// A `PIPE_ACK` is owed now (`PIPE_PING` received, a pipe ended).
     ack_now: bool,
     /// The primary pipe owes it whatever the session's activity: a pipe
-    /// ended, or a PIPE_PING arrived on a pipe pair without a usable
+    /// ended, or a `PIPE_PING` arrived on a pipe pair without a usable
     /// outbound direction to answer on.
     primary_owed: bool,
     /// Inbound positions changed since the last snapshot on the primary
@@ -38,12 +42,12 @@ pub(crate) struct AckState {
     snapshot_dirty: bool,
     copy_due: Option<Instant>,
     primary: Option<u64>,
-    /// The next primary snapshot must be complete: it answers a PIPE_PING
+    /// The next primary snapshot must be complete: it answers a `PIPE_PING`
     /// in the first record of a newly attached inbound pipe.
     complete_owed: bool,
-    /// When the last complete PIPE_ACK snapshot was sent.
+    /// When the last complete `PIPE_ACK` snapshot was sent.
     complete_ack_at: Option<Instant>,
-    /// Scratch for PIPE_ACK entries and acknowledged frames.
+    /// Scratch for `PIPE_ACK` entries and acknowledged frames.
     scratch: Vec<PipeAckEntry>,
     frames: Vec<SentFrame>,
 }
@@ -71,7 +75,7 @@ impl AckState {
             + self.scratch.capacity() * size_of::<PipeAckEntry>()
     }
 
-    /// A PIPE_ACK is owed now (a pipe ended).
+    /// A `PIPE_ACK` is owed now (a pipe ended).
     pub(in crate::proto::session) fn owe_now(&mut self) {
         self.ack_now = true;
         self.primary_owed = true;
@@ -180,7 +184,7 @@ impl SessionCore {
         }
     }
 
-    /// The acknowledgement timer: when a PIPE_ACK becomes due, while it is
+    /// The acknowledgement timer: when a `PIPE_ACK` becomes due, while it is
     /// in the future (a due one is the transmit path's business).
     pub(in crate::proto::session) fn ack_timer(&self) -> Option<Instant> {
         if self.mp.as_deref()?.acks().ack_now {
@@ -189,7 +193,7 @@ impl SessionCore {
         self.ack_deadline().filter(|&t| t > self.now)
     }
 
-    /// When a PIPE_ACK is due on the primary pipe; never while the answers
+    /// When a `PIPE_ACK` is due on the primary pipe; never while the answers
     /// on the probed pairs acknowledge everything owed.
     pub(in crate::proto::session) fn ack_deadline(&self) -> Option<Instant> {
         let acks = self.mp.as_deref()?.acks();
@@ -208,10 +212,10 @@ impl SessionCore {
     }
 
     /// When a shaping delay of `pipe`'s next record ends because the record
-    /// carries a pending PIPE_ACK: our `zmux_max_ack_delay` after the first
+    /// carries a pending `PIPE_ACK`: our `zmux_max_ack_delay` after the first
     /// ack-eliciting byte it reports (MULTIPATH.md Section 6.3), on any
-    /// inbound pipe, not only those the primary PIPE_ACK owes. The peer's
-    /// T_suspect counts on that bound: held longer, its working pipe turns
+    /// inbound pipe, not only those the primary `PIPE_ACK` owes. The peer's
+    /// `T_suspect` counts on that bound: held longer, its working pipe turns
     /// suspect at every exchange. `None` when the record carries none.
     pub(in crate::proto::session) fn ack_release(&self, pipe: u64) -> Option<Instant> {
         let Some(mp) = self.mp.as_deref() else {
@@ -235,8 +239,8 @@ impl SessionCore {
         self.ack_deadline().is_some_and(|t| now >= t)
     }
 
-    /// Whether, in a quiet session, everything a PIPE_ACK owes is
-    /// PIPE_PING frames answered on their own pipe pairs: such an answer
+    /// Whether, in a quiet session, everything a `PIPE_ACK` owes is
+    /// `PIPE_PING` frames answered on their own pipe pairs: such an answer
     /// goes only there, neither on the primary pipe nor as the redundant
     /// copy.
     fn pairs_answer_all(&self) -> bool {
@@ -250,7 +254,7 @@ impl SessionCore {
             && !self
                 .atts
                 .iter()
-                .any(|a| a.inp().is_some_and(|p| p.unacked_other()))
+                .any(|a| a.inp().is_some_and(InPipe::unacked_other))
     }
 
     // ---- pipe choice --------------------------------------------------------------
@@ -264,7 +268,7 @@ impl SessionCore {
         }
     }
 
-    /// The pipe that carries control frames and PIPE_ACK first, optionally
+    /// The pipe that carries control frames and `PIPE_ACK` first, optionally
     /// excluding one (for the redundant copy): the first in the
     /// acknowledgement control order (ACTIVE first, then the most preferred
     /// tier, non-standby, then the lowest priority, then the lowest one-way
@@ -289,7 +293,7 @@ impl SessionCore {
 
     // ---- writing PIPE_ACK --------------------------------------------------------
 
-    /// Whether `pipe` has a PIPE_ACK to write now.
+    /// Whether `pipe` has a `PIPE_ACK` to write now.
     pub(in crate::proto::session) fn wants_pipe_ack(&self, pipe: u64, now: Instant) -> bool {
         let Some(mp) = self.mp.as_deref() else {
             return false;
@@ -319,7 +323,7 @@ impl SessionCore {
             && self
                 .atts
                 .iter()
-                .any(|a| a.inp().is_some_and(|p| p.listed()))
+                .any(|a| a.inp().is_some_and(InPipe::listed))
     }
 
     /// Builds the current snapshot into `entries`; returns whether it is
@@ -336,7 +340,7 @@ impl SessionCore {
         snapshot_of(&self.atts, entries, complete, now)
     }
 
-    /// Writes PIPE_ACK on `pipe` when it is due there (primary), the
+    /// Writes `PIPE_ACK` on `pipe` when it is due there (primary), the
     /// redundant copy is due there, or it is the first record on a new
     /// outbound pipe (a complete snapshot). Returns whether it wrote the
     /// redundant copy, with which the credit copies go.
@@ -444,11 +448,11 @@ impl SessionCore {
         copy
     }
 
-    /// A PIPE_ACK written on a pipe whose last ack-eliciting byte (or its
-    /// becoming live) is more than R_p = max(1 s, T_suspect) ago gets a
-    /// PIPE_PING in the same record: the answer on a probed pair, which
+    /// A `PIPE_ACK` written on a pipe whose last ack-eliciting byte (or its
+    /// becoming live) is more than `R_p` = max(1 s, `T_suspect`) ago gets a
+    /// `PIPE_PING` in the same record: the answer on a probed pair, which
     /// starts the pipe's next probe wait, and in a busy session the primary
-    /// PIPE_ACK and its redundant copy (return-pipe liveness).
+    /// `PIPE_ACK` and its redundant copy (return-pipe liveness).
     fn liveness_ping(&mut self, pipe: u64, w: &mut Records<'_>, now: Instant) {
         let t_suspect = self.out_ref(pipe).map(|o| self.limits(o).0);
         if let Some(o) = self.out_mut(pipe) {
@@ -458,7 +462,7 @@ impl SessionCore {
         self.write_pipe_ping(pipe, w, now);
     }
 
-    /// Writes a snapshot: one PIPE_ACK, or several with strictly increasing
+    /// Writes a snapshot: one `PIPE_ACK`, or several with strictly increasing
     /// subsets when one does not fit in a record. `false` when the batch
     /// could not take all of it.
     pub(in crate::proto::session) fn write_snapshot(
@@ -480,7 +484,7 @@ impl SessionCore {
 
     // ---- receiving PIPE_ACK --------------------------------------------------------
 
-    /// Processes a received PIPE_ACK.
+    /// Processes a received `PIPE_ACK`.
     pub(in crate::proto::session) fn on_pipe_ack(
         &mut self,
         f: &PipeAck<'_>,

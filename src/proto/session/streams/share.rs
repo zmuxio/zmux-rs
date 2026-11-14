@@ -8,7 +8,7 @@
 //! `send_buffer_max`). Every direction may always hold 64 KiB. A direction
 //! within that floor and with no write waiting keeps what it holds; the
 //! other n directions share the rest: each may hold max(64 KiB,
-//! (send_buffer - the small holdings) / n). A message of up to 64 KiB is
+//! (`send_buffer` - the small holdings) / n). A message of up to 64 KiB is
 //! never blocked behind bulk data, bulk streams progress at similar rates,
 //! and a small message stream does not halve a bulk stream's share.
 //!
@@ -26,6 +26,16 @@ use std::time::{Duration, Instant};
 use super::super::CoreEvent;
 use super::super::stream::{Age, SendPart, StreamKey};
 use super::Streams;
+
+/// Entry `at` of the waiting writers as a stream records it: one entry per
+/// stream slot at most, and slots are `u32`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bounded by the number of stream slots, which are u32"
+)]
+const fn entry(at: usize) -> u32 {
+    at as u32
+}
 
 /// Every stream direction may hold this much whatever the others hold.
 pub(in super::super) const SHARE_FLOOR: u64 = 64 * 1024;
@@ -229,7 +239,7 @@ impl Streams {
     pub(in super::super) fn add_send_waiter(&mut self, key: StreamKey) {
         let waits = self.send(key).is_some_and(|s| s.waiter.is_some());
         if !waits && let Some(send) = self.slab.get_mut(key).and_then(|s| s.send.as_mut()) {
-            send.waiter = Some(self.send_waiters.len() as u32);
+            send.waiter = Some(entry(self.send_waiters.len()));
             self.send_waiters.push(key);
         }
     }
@@ -318,10 +328,10 @@ impl Streams {
         let mut kept = 0;
         for at in 0..waiters.len() {
             let k = waiters[at];
-            if self.wake_key(k, at as u32, buffer, events) {
+            if self.wake_key(k, entry(at), buffer, events) {
                 continue;
             }
-            let current = self.send(k).is_some_and(|s| s.waiter == Some(at as u32));
+            let current = self.send(k).is_some_and(|s| s.waiter == Some(entry(at)));
             if current {
                 waiters[kept] = k;
                 self.renumber_waiter(k, kept);
@@ -340,7 +350,7 @@ impl Streams {
 
     /// Moves a waiting writer's entry to `at`.
     fn renumber_waiter(&mut self, key: StreamKey, at: usize) {
-        let at = Some(at as u32);
+        let at = Some(entry(at));
         let moved = self
             .send(key)
             .is_some_and(|s| s.waiter.is_some() && s.waiter != at);
@@ -355,7 +365,7 @@ impl Streams {
     pub(in super::super) fn has_room_at(&self, at: usize, buffer: SendBuffer) -> bool {
         let k = self.send_waiters[at];
         self.send(k).is_some_and(|s| {
-            s.waiter == Some(at as u32) && (s.outcome.is_some() || self.send_room(k, buffer) > 0)
+            s.waiter == Some(entry(at)) && (s.outcome.is_some() || self.send_room(k, buffer) > 0)
         })
     }
 

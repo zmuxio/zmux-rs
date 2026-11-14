@@ -56,7 +56,7 @@ pub(crate) fn saturating_secs(secs: f64) -> Duration {
 /// The time `bytes` take at `rate` bytes per second (a rate of 0 counts
 /// as 1), saturating at `Duration::MAX`.
 pub(crate) fn drain_time(bytes: u64, rate: u64) -> Duration {
-    saturating_secs(bytes as f64 / rate.max(1) as f64)
+    saturating_secs(f64_of(bytes) / f64_of(rate.max(1)))
 }
 
 /// A random `u64` from the system's source; should that fail, from a
@@ -66,6 +66,40 @@ pub(crate) fn random_u64() -> u64 {
         use std::hash::BuildHasher;
         std::collections::hash_map::RandomState::new().hash_one(0x5a4d_u64)
     })
+}
+
+/// `v` as a `usize`, saturating at `usize::MAX` on targets where `usize` is
+/// narrower than 64 bits; the identity (no code) on 64-bit targets. For
+/// counts and lengths that index or size memory, where a value beyond the
+/// address space can only mean "more than fits".
+#[inline]
+pub(crate) fn usize_sat(v: u64) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+/// `v` as an `f64`, rounded to the nearest representable value. For rates,
+/// ratios and estimates, where 53 bits of mantissa are more precision than
+/// the inputs carry.
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "estimates only; values above 2^53 round to the nearest f64"
+)]
+pub(crate) fn f64_of(v: u64) -> f64 {
+    v as f64
+}
+
+/// `v` as a `u64`, truncated toward zero and saturating: a negative or NaN
+/// value is 0, one at or above 2^64 is `u64::MAX`. The clamp an estimate
+/// converted back to bytes or nanoseconds wants.
+#[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "`as` from f64 saturates and maps NaN to 0, which is the intended clamp"
+)]
+pub(crate) fn u64_sat(v: f64) -> u64 {
+    v as u64
 }
 
 #[cfg(test)]

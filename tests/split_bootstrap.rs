@@ -3,6 +3,11 @@
 //! a third carrier with the token, two of one direction, and a half whose
 //! partner never comes are refused.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::time::Duration;
 
 use tokio::io::{DuplexStream, duplex};

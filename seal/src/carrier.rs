@@ -107,6 +107,10 @@ impl Carrier for zmux::PipeIo {
 }
 
 #[cfg(feature = "blocking")]
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the trait is async; the blocking pipe completes each call in place"
+)]
 impl Carrier for zmux::blocking::PipeIo {
     fn framing(&self) -> Framing {
         self.handshake_framing()

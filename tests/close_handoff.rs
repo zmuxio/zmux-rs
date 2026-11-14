@@ -1,7 +1,16 @@
-//! `Session::close` returns once CONNECTION_CLOSE is handed to the
+//! `Session::close` returns once `CONNECTION_CLOSE` is handed to the
 //! carriers and their input drained, within its bound, and
 //! `Session::add_pipe` returns once the
 //! peer attached the pipe unless `return_on_reply`.
+
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
 
 use std::io;
 use std::pin::Pin;
@@ -59,11 +68,12 @@ struct Held {
 struct Stall {
     on: AtomicBool,
     writer: Mutex<Option<Waker>>,
-    /// The write side's shutdown takes 50 ms (a TLS close_notify, say).
+    /// The write side's shutdown takes 50 ms (a TLS `close_notify`, say).
     slow_shutdown: AtomicBool,
     /// The write side was shut.
     shut: AtomicBool,
-    /// The end of input never arrives: the peer keeps its write side open.
+    /// Nothing arrives any more, the end of input included: the peer keeps its write side
+    /// open and sends no more.
     mute: AtomicBool,
     /// The held writes go on now, however long their hold.
     released: AtomicBool,
@@ -93,13 +103,10 @@ impl AsyncRead for Held {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.io).poll_read(cx, buf);
-        if matches!(r, Poll::Ready(Ok(())))
-            && buf.filled().len() == before
-            && buf.remaining() > 0
-            && self.stall.mute.load(Ordering::SeqCst)
-        {
-            // The peer's end of input never arrives: the session's linger
-            // timer ends the wait.
+        if matches!(r, Poll::Ready(Ok(()))) && self.stall.mute.load(Ordering::SeqCst) {
+            // The peer sends nothing more, neither its `CONNECTION_CLOSE` (which would end
+            // the linger) nor the end of input: the session's linger timer ends the wait.
+            buf.set_filled(before);
             return Poll::Pending;
         }
         r
@@ -277,7 +284,7 @@ async fn close_is_bounded_when_a_carrier_takes_nothing() {
         let second = Instant::now();
         let first = first.await.unwrap();
         assert!(
-            first - start >= bound - Duration::from_millis(20),
+            first - start >= bound.checked_sub(Duration::from_millis(20)).unwrap(),
             "{:?}",
             first - start
         );
@@ -322,7 +329,7 @@ async fn close_returns_once_the_carrier_took_it() {
     listener.close();
 }
 
-/// `close` returns once CONNECTION_CLOSE was handed to the carrier, without
+/// `close` returns once `CONNECTION_CLOSE` was handed to the carrier, without
 /// waiting for the peer; the write side is then shut in the background, and
 /// `wait` returns once that and the drain are done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -434,7 +441,7 @@ async fn add_pipe_waits_for_the_attachment() {
         .add_pipe(carrier(&listener, &stall, Some(hold)), PipeOptions::new())
         .await
         .unwrap();
-    assert!(start.elapsed() >= hold - Duration::from_millis(20));
+    assert!(start.elapsed() >= hold.checked_sub(Duration::from_millis(20)).unwrap());
     assert!(
         tokio::time::timeout(Duration::ZERO, pipe.attached())
             .await
@@ -558,7 +565,7 @@ async fn add_pipe_fails_when_the_pipe_or_the_session_goes() {
     listener.close();
 }
 
-/// A session already closing, by a shutdown whose CONNECTION_CLOSE has no
+/// A session already closing, by a shutdown whose `CONNECTION_CLOSE` has no
 /// hand-off limit, still bounds `close` by the hand-off limit when the
 /// carrier takes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -951,7 +958,7 @@ async fn a_peer_close_during_a_flush_keeps_the_read_drain() {
 
 /// A carrier whose writes never complete, a stream write queued ahead of
 /// the close: an abort and an idle timeout's close each end the session
-/// within the close bounds, though CONNECTION_CLOSE never leaves.
+/// within the close bounds, though `CONNECTION_CLOSE` never leaves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_behind_a_stuck_write_still_ends() {
     for idle in [false, true] {

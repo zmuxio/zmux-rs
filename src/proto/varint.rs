@@ -16,6 +16,7 @@ pub const MAX: u64 = (1 << 62) - 1;
 ///
 /// Values above [`MAX`] report 8; encoding them fails.
 #[inline]
+#[must_use]
 pub const fn len(value: u64) -> usize {
     if value < 1 << 6 {
         1
@@ -30,6 +31,7 @@ pub const fn len(value: u64) -> usize {
 
 /// Returns the encoded width announced by the first byte of a varint.
 #[inline]
+#[must_use]
 pub const fn width(first: u8) -> usize {
     1 << (first >> 6)
 }
@@ -39,6 +41,7 @@ pub const fn width(first: u8) -> usize {
 /// Returns the value and the number of bytes it occupied, or `None` when
 /// `buf` ends before the varint does.
 #[inline]
+#[must_use]
 pub fn decode(buf: &[u8]) -> Option<(u64, usize)> {
     let &first = buf.first()?;
     match first >> 6 {
@@ -62,6 +65,10 @@ pub fn decode(buf: &[u8]) -> Option<(u64, usize)> {
 ///
 /// Returns the number of bytes written.
 #[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "each branch narrows a value it just bounded to its width"
+)]
 pub fn encode(value: u64, buf: &mut [u8]) -> Result<usize, EncodeError> {
     if value < 1 << 6 {
         *buf.first_mut().ok_or(EncodeError::BufferTooShort)? = value as u8;
@@ -117,6 +124,7 @@ impl VarInt {
 
     /// Creates a `VarInt` from a `u32`, which always fits.
     #[inline]
+    #[must_use]
     pub const fn from_u32(value: u32) -> Self {
         Self(value as u64)
     }
@@ -133,12 +141,14 @@ impl VarInt {
 
     /// Returns the value.
     #[inline]
+    #[must_use]
     pub const fn into_inner(self) -> u64 {
         self.0
     }
 
     /// Returns the length of the shortest encoding.
     #[inline]
+    #[must_use]
     pub const fn size(self) -> usize {
         len(self.0)
     }

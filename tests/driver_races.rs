@@ -7,6 +7,20 @@
 //! under a watchdog: it fails, rather than hangs, when anything does not
 //! resolve in time.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_futures,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 mod common;
 
 use std::future::Future;
@@ -474,7 +488,7 @@ async fn multipath_pipe_loss_under_concurrency() {
     )
     .await
     .unwrap();
-    assert!(client.multipath() == zmux::Multipath::InUse);
+    assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let server = watchdog(5, "listener accepts", accepted).await.unwrap();
     let (raddr, cut) = relay(target).await;
     client
@@ -536,7 +550,7 @@ async fn multipath_pipe_loss_under_concurrency() {
 }
 
 /// Send-capacity waits end on the peer's credit, and
-/// at once on STOP_SENDING and on the session's end, so a relay never
+/// at once on `STOP_SENDING` and on the session's end, so a relay never
 /// waits behind capacity for an error; a cancelled wait leaves nothing
 /// registered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

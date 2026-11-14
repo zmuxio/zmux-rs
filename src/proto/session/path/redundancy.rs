@@ -14,7 +14,7 @@ use crate::proto::session::stream::SendPart;
 use crate::proto::session::tier::Gate;
 use crate::proto::session::{Redundancy, Scheduler, SessionCore, StreamKey};
 
-/// An idle period lasts at least max(this, T_suspect).
+/// An idle period lasts at least max(this, `T_suspect`).
 const IDLE: Duration = Duration::from_secs(1);
 
 /// The policy that schedules a direction.
@@ -51,7 +51,7 @@ impl SessionCore {
         redundant(send, self.config.redundancy, &self.config.scheduler)
     }
 
-    /// The two pipes of `tier` under `gate` with the smallest ETA_p(len),
+    /// The two pipes of `tier` under `gate` with the smallest `ETA_p(len)`,
     /// `except` left out, the earliest first.
     fn earliest_two(
         &self,
@@ -119,14 +119,14 @@ impl SessionCore {
         self.earliest_two(gate, tier, len, Some(writer))[0]
     }
 
-    /// The bound on the copy bytes outstanding: max(spread_chunk,
+    /// The bound on the copy bytes outstanding: `max(spread_chunk`,
     /// retransmit budget / 64).
     fn copy_bound(&self) -> u64 {
         (self.config.spread_chunk as u64).max(self.retransmit_budget() / 64)
     }
 
     /// Whether a pipe is idle: nothing ack-eliciting unacknowledged and no
-    /// acknowledgement progress for max(1 s, T_suspect), counted from when
+    /// acknowledgement progress for max(1 s, `T_suspect`), counted from when
     /// it became usable if it never had any.
     fn idle(&self, o: &OutPipe) -> bool {
         let quiet = self.now.saturating_duration_since(o.last_advance());

@@ -16,6 +16,15 @@
 
 // A global allocator can only be implemented with unsafe code.
 #![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
 
 #[path = "common/core_pair.rs"]
 mod core_pair;
@@ -254,12 +263,11 @@ async fn tcp_pair(l: &tokio::net::TcpListener) -> (PipeIo, PipeIo) {
 async fn pairs(n: usize, tcp: Option<&tokio::net::TcpListener>) -> Vec<(Session, Session)> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        let (a, b) = match tcp {
-            Some(l) => tcp_pair(l).await,
-            None => {
-                let (a, b) = tokio::io::duplex(1 << 20);
-                (PipeIo::new(a), PipeIo::new(b))
-            }
+        let (a, b) = if let Some(l) = tcp {
+            tcp_pair(l).await
+        } else {
+            let (a, b) = tokio::io::duplex(1 << 20);
+            (PipeIo::new(a), PipeIo::new(b))
         };
         let server = tokio::spawn(Session::accept(b, config()));
         let client = Session::connect(a, config()).await.unwrap();
@@ -336,9 +344,10 @@ async fn mp_pairs(
     n: usize,
     tcp: Option<&tokio::net::TcpListener>,
 ) -> Vec<(Session, Session)> {
-    let carriers = async || match tcp {
-        Some(l) => tcp_pair(l).await,
-        None => {
+    let carriers = async || {
+        if let Some(l) = tcp {
+            tcp_pair(l).await
+        } else {
             let (a, b) = tokio::io::duplex(64 * 1024);
             (PipeIo::new(a), PipeIo::new(b))
         }

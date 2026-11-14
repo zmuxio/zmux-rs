@@ -1,5 +1,5 @@
 //! Frames: QUIC version 1 frames, the QMux-02 frames, the QUIC
-//! extension frames RESET_STREAM_AT and DATAGRAM, and the zmux
+//! extension frames `RESET_STREAM_AT` and DATAGRAM, and the zmux
 //! extension and multipath frames.
 //!
 //! Decoding borrows from the input: payloads (STREAM data, DATAGRAM data,
@@ -48,62 +48,63 @@ impl FrameType {
     pub const PADDING: Self = Self(0x00);
     /// PING (prohibited).
     pub const PING: Self = Self(0x01);
-    /// RESET_STREAM.
+    /// `RESET_STREAM`.
     pub const RESET_STREAM: Self = Self(0x04);
-    /// STOP_SENDING.
+    /// `STOP_SENDING`.
     pub const STOP_SENDING: Self = Self(0x05);
     /// STREAM without the OFF, LEN and FIN bits.
     pub const STREAM: Self = Self(0x08);
-    /// MAX_DATA.
+    /// `MAX_DATA`.
     pub const MAX_DATA: Self = Self(0x10);
-    /// MAX_STREAM_DATA.
+    /// `MAX_STREAM_DATA`.
     pub const MAX_STREAM_DATA: Self = Self(0x11);
-    /// MAX_STREAMS for bidirectional streams.
+    /// `MAX_STREAMS` for bidirectional streams.
     pub const MAX_STREAMS_BIDI: Self = Self(0x12);
-    /// MAX_STREAMS for unidirectional streams.
+    /// `MAX_STREAMS` for unidirectional streams.
     pub const MAX_STREAMS_UNI: Self = Self(0x13);
-    /// DATA_BLOCKED.
+    /// `DATA_BLOCKED`.
     pub const DATA_BLOCKED: Self = Self(0x14);
-    /// STREAM_DATA_BLOCKED.
+    /// `STREAM_DATA_BLOCKED`.
     pub const STREAM_DATA_BLOCKED: Self = Self(0x15);
-    /// STREAMS_BLOCKED for bidirectional streams.
+    /// `STREAMS_BLOCKED` for bidirectional streams.
     pub const STREAMS_BLOCKED_BIDI: Self = Self(0x16);
-    /// STREAMS_BLOCKED for unidirectional streams.
+    /// `STREAMS_BLOCKED` for unidirectional streams.
     pub const STREAMS_BLOCKED_UNI: Self = Self(0x17);
-    /// CONNECTION_CLOSE with a transport error code.
+    /// `CONNECTION_CLOSE` with a transport error code.
     pub const CONNECTION_CLOSE: Self = Self(0x1c);
-    /// CONNECTION_CLOSE with an application error code.
+    /// `CONNECTION_CLOSE` with an application error code.
     pub const CONNECTION_CLOSE_APPLICATION: Self = Self(0x1d);
-    /// RESET_STREAM_AT.
+    /// `RESET_STREAM_AT`.
     pub const RESET_STREAM_AT: Self = Self(0x24);
     /// DATAGRAM without a Length field.
     pub const DATAGRAM: Self = Self(0x30);
     /// DATAGRAM with a Length field.
     pub const DATAGRAM_LEN: Self = Self(0x31);
-    /// QX_TRANSPORT_PARAMETERS ([`draft`]).
+    /// `QX_TRANSPORT_PARAMETERS` ([`draft`]).
     pub const QX_TRANSPORT_PARAMETERS: Self = Self(draft::CURRENT.transport_parameters);
-    /// QX_PING request ([`draft`]).
+    /// `QX_PING` request ([`draft`]).
     pub const QX_PING_REQUEST: Self = Self(draft::CURRENT.ping_request);
-    /// QX_PING response ([`draft`]).
+    /// `QX_PING` response ([`draft`]).
     pub const QX_PING_RESPONSE: Self = Self(draft::CURRENT.ping_response);
     /// GOAWAY.
     pub const GOAWAY: Self = Self(0x1911_f43e);
-    /// PRIORITY_UPDATE.
+    /// `PRIORITY_UPDATE`.
     pub const PRIORITY_UPDATE: Self = Self(0x073d_08cf);
-    /// PIPE_ACK.
+    /// `PIPE_ACK`.
     pub const PIPE_ACK: Self = Self(0x0b2b_3eeb);
-    /// PIPE_LANE.
+    /// `PIPE_LANE`.
     pub const PIPE_LANE: Self = Self(0x3a05_a1c9);
-    /// PIPE_PING.
+    /// `PIPE_PING`.
     pub const PIPE_PING: Self = Self(0x269b_43e6);
-    /// PIPE_ABANDON.
+    /// `PIPE_ABANDON`.
     pub const PIPE_ABANDON: Self = Self(0x23b3_5b74);
-    /// PIPE_STATUS.
+    /// `PIPE_STATUS`.
     pub const PIPE_STATUS: Self = Self(0x227b_2811);
-    /// SESSION_EPOCH.
+    /// `SESSION_EPOCH`.
     pub const SESSION_EPOCH: Self = Self(0x024e_93eb);
 
     /// The registry name, if the type is in the registry, prohibited QUIC types included.
+    #[must_use]
     pub const fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x00 => "PADDING",
@@ -143,6 +144,7 @@ impl FrameType {
     }
 
     /// Whether this is one of the STREAM types 0x08 to 0x0f.
+    #[must_use]
     pub const fn is_stream(self) -> bool {
         self.0 >= 0x08 && self.0 <= 0x0f
     }
@@ -158,7 +160,7 @@ impl fmt::Debug for FrameType {
 }
 
 /// The type of a stream: the second least significant bit of its ID, and the
-/// low bit of the MAX_STREAMS and STREAMS_BLOCKED types.
+/// low bit of the `MAX_STREAMS` and `STREAMS_BLOCKED` types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dir {
     /// Bidirectional.
@@ -179,9 +181,13 @@ impl Dir {
 
 /// What a receiver accepts beyond the frames that are always available.
 /// A frame whose gate is closed is an unknown frame:
-/// FRAME_ENCODING_ERROR, or PROTOCOL_VIOLATION for DATAGRAM (RFC 9221
+/// `FRAME_ENCODING_ERROR`, or `PROTOCOL_VIOLATION` for DATAGRAM (RFC 9221
 /// Section 3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent negotiated features, each a public flag"
+)]
 pub struct Gates {
     /// The receiver announced `reset_stream_at`.
     pub reset_stream_at: bool,
@@ -190,13 +196,13 @@ pub struct Gates {
     pub max_datagram_frame_size: u64,
     /// GOAWAY is in use.
     pub goaway: bool,
-    /// PRIORITY_UPDATE is in use.
+    /// `PRIORITY_UPDATE` is in use.
     pub priority: bool,
     /// Multipath is in use (PIPE_* frames).
     pub multipath: bool,
-    /// Pipe acknowledgement without multipath is in use (PIPE_ACK only).
+    /// Pipe acknowledgement without multipath is in use (`PIPE_ACK` only).
     pub pipe_ack: bool,
-    /// Lanes are available toward the receiver (PIPE_LANE).
+    /// Lanes are available toward the receiver (`PIPE_LANE`).
     pub lanes: bool,
 }
 
@@ -230,49 +236,49 @@ impl Gates {
 pub enum Frame<'a> {
     /// A run of PADDING frames.
     Padding(Padding),
-    /// RESET_STREAM.
+    /// `RESET_STREAM`.
     ResetStream(ResetStream),
-    /// STOP_SENDING.
+    /// `STOP_SENDING`.
     StopSending(StopSending),
     /// STREAM.
     Stream(Stream<'a>),
-    /// MAX_DATA.
+    /// `MAX_DATA`.
     MaxData(MaxData),
-    /// MAX_STREAM_DATA.
+    /// `MAX_STREAM_DATA`.
     MaxStreamData(MaxStreamData),
-    /// MAX_STREAMS.
+    /// `MAX_STREAMS`.
     MaxStreams(MaxStreams),
-    /// DATA_BLOCKED.
+    /// `DATA_BLOCKED`.
     DataBlocked(DataBlocked),
-    /// STREAM_DATA_BLOCKED.
+    /// `STREAM_DATA_BLOCKED`.
     StreamDataBlocked(StreamDataBlocked),
-    /// STREAMS_BLOCKED.
+    /// `STREAMS_BLOCKED`.
     StreamsBlocked(StreamsBlocked),
-    /// CONNECTION_CLOSE.
+    /// `CONNECTION_CLOSE`.
     ConnectionClose(ConnectionClose<'a>),
-    /// RESET_STREAM_AT.
+    /// `RESET_STREAM_AT`.
     ResetStreamAt(ResetStreamAt),
     /// DATAGRAM.
     Datagram(Datagram<'a>),
-    /// QX_TRANSPORT_PARAMETERS.
+    /// `QX_TRANSPORT_PARAMETERS`.
     TransportParameters(QxTransportParameters<'a>),
-    /// QX_PING.
+    /// `QX_PING`.
     QxPing(QxPing),
     /// GOAWAY.
     GoAway(GoAwayFrame),
-    /// PRIORITY_UPDATE.
+    /// `PRIORITY_UPDATE`.
     PriorityUpdate(PriorityUpdate),
-    /// PIPE_ACK.
+    /// `PIPE_ACK`.
     PipeAck(PipeAck<'a>),
-    /// PIPE_LANE.
+    /// `PIPE_LANE`.
     PipeLane(PipeLane),
-    /// PIPE_PING.
+    /// `PIPE_PING`.
     PipePing,
-    /// PIPE_ABANDON.
+    /// `PIPE_ABANDON`.
     PipeAbandon(PipeAbandon),
-    /// PIPE_STATUS.
+    /// `PIPE_STATUS`.
     PipeStatus(PipeStatus),
-    /// SESSION_EPOCH.
+    /// `SESSION_EPOCH`.
     SessionEpoch(SessionEpoch<'a>),
 }
 
@@ -304,7 +310,7 @@ impl<'a> Frame<'a> {
     /// bit, DATAGRAM type 0x30) extends to the end of `buf`.
     ///
     /// Returns the frame and the number of bytes it occupied. A frame that
-    /// does not fit in `buf` is truncated (FRAME_ENCODING_ERROR).
+    /// does not fit in `buf` is truncated (`FRAME_ENCODING_ERROR`).
     pub fn decode(buf: &'a [u8], gates: &Gates) -> Result<(Self, usize), Error> {
         match decode(buf, gates) {
             Ok(r) => Ok(r),
@@ -314,6 +320,7 @@ impl<'a> Frame<'a> {
     }
 
     /// The frame type value this frame encodes with.
+    #[must_use]
     pub fn frame_type(&self) -> FrameType {
         FrameType(match self {
             Self::Padding(_) => FrameType::PADDING.0,
@@ -352,7 +359,8 @@ impl<'a> Frame<'a> {
     }
 
     /// Whether the frame is ack-eliciting: anything but PADDING,
-    /// PIPE_ACK and CONNECTION_CLOSE.
+    /// `PIPE_ACK` and `CONNECTION_CLOSE`.
+    #[must_use]
     pub const fn is_ack_eliciting(&self) -> bool {
         !matches!(
             self,
@@ -361,6 +369,7 @@ impl<'a> Frame<'a> {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Padding(f) => f.encoded_len(),
@@ -594,6 +603,7 @@ pub struct Frames<'a> {
 
 impl<'a> Frames<'a> {
     /// Iterates over `body`, the Frames field of one record.
+    #[must_use]
     pub const fn new(body: &'a [u8], gates: Gates) -> Self {
         Self { rest: body, gates }
     }
@@ -605,6 +615,7 @@ impl<'a> Frames<'a> {
     }
 
     /// The bytes not yet decoded.
+    #[must_use]
     pub const fn remaining(&self) -> &'a [u8] {
         self.rest
     }

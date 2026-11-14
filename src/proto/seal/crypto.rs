@@ -34,6 +34,7 @@ impl SessionCrypto {
     }
 
     /// Whether both sets follow the rules of the parameter.
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         valid_set(&self.suites, 1) && valid_set(&self.groups, GROUP_X25519_MLKEM768)
     }
@@ -49,6 +50,7 @@ impl SessionCrypto {
     }
 
     /// The parameter's value: `SuiteSet ‖ GroupSet`.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -65,6 +67,7 @@ impl SessionCrypto {
     }
 
     /// The encoded length of the value.
+    #[must_use]
     pub fn encoded_len(&self) -> usize {
         self.encode().len()
     }
@@ -97,6 +100,7 @@ impl SessionCrypto {
     }
 
     /// The usable values: the intersection of two sets, ascending.
+    #[must_use]
     pub fn usable(own: &[u64], peer: &[u64]) -> Vec<u64> {
         own.iter().copied().filter(|v| peer.contains(v)).collect()
     }
@@ -118,6 +122,7 @@ pub fn session_crypto(
 }
 
 /// `SHA-256(session_crypto)`, which the join keys and epoch secrets take.
+#[must_use]
 pub fn session_crypto_hash(session_crypto: &[u8]) -> Vec<u8> {
     SHA256.hash(&[session_crypto])
 }

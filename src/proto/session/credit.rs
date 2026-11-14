@@ -76,7 +76,7 @@ impl SessionCore {
         self.streams.credit_consumed(cap, n);
     }
 
-    /// The MAX_DATA value to send now, after auto-tuning.
+    /// The `MAX_DATA` value to send now, after auto-tuning.
     pub(super) fn session_credit_value(&mut self, now: Instant) -> u64 {
         let paused = self.streams.growth_paused();
         if !paused {
@@ -260,7 +260,7 @@ impl SessionCore {
             .saturating_sub(self.config.initial_connection_receive_window)
     }
 
-    /// The MAX_STREAM_DATA value to send now for a stream, after
+    /// The `MAX_STREAM_DATA` value to send now for a stream, after
     /// auto-tuning; a grown stream window raises the session
     /// window to 1.5 times it.
     pub(super) fn stream_credit_value(&mut self, key: StreamKey, now: Instant) -> Option<u64> {
@@ -293,7 +293,7 @@ impl SessionCore {
         Some(value)
     }
 
-    /// MAX_STREAMS for a discarded peer stream.
+    /// `MAX_STREAMS` for a discarded peer stream.
     pub(super) fn stream_count_credit(&mut self, d: usize) {
         // An endpoint that sent GOAWAY raises MAX_STREAMS no more.
         let raise = !self.goaway_announced();

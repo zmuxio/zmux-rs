@@ -111,20 +111,17 @@ impl Options {
                 Some(c) => Some(bytes::Bytes::from(c.prefix(&CarrierInfo::new())?)),
                 None => None,
             };
-            match repeat {
-                Some(a) => {
-                    let body = a.repeat(prefix).ok_or_else(|| {
-                        io::Error::other("the uplink is past the bound of a repeat")
-                    })?;
-                    (body, None)
+            if let Some(a) = repeat {
+                let body = a
+                    .repeat(prefix)
+                    .ok_or_else(|| io::Error::other("the uplink is past the bound of a repeat"))?;
+                (body, None)
+            } else {
+                let (writer, body, abort) = body::body();
+                if let Some(p) = prefix {
+                    writer.preload(p);
                 }
-                None => {
-                    let (writer, body, abort) = body::body();
-                    if let Some(p) = prefix {
-                        writer.preload(p);
-                    }
-                    (body, Some((writer, abort)))
-                }
+                (body, Some((writer, abort)))
             }
         };
         let req = req
@@ -439,6 +436,10 @@ fn split_heads() -> io::Result<(Head, Head)> {
 /// (`host:port`, also the `Host` header): one request, its request and
 /// response bodies streamed at the same time ([`dial_http1_over`] on a TCP
 /// connection).
+///
+/// # Errors
+///
+/// The TCP connect's error, and those of [`dial_http1_carrier_over`].
 pub async fn dial_http1(addr: &str, options: &Options) -> io::Result<PipeIo> {
     let addr: Arc<str> = addr.into();
     let a = addr.clone();
@@ -473,6 +474,10 @@ async fn tcp(addr: &str) -> io::Result<TcpStream> {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// As [`dial_http1_carrier_over`].
 pub async fn dial_http1_over<IO>(io: IO, authority: &str, options: &Options) -> io::Result<PipeIo>
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -490,6 +495,13 @@ where
 /// response, which must arrive within [`Options::timeout`] (a read error
 /// otherwise, and for a status other than 200). The connection's HTTP
 /// handshake is bounded by the same limit.
+///
+/// # Errors
+///
+/// `TimedOut` when the HTTP handshake exceeds [`Options::timeout`], `Other`
+/// for an HTTP failure, and the carrier credential's error when its
+/// prefix or header cannot be made. The response is checked by the
+/// carrier's reads.
 pub async fn dial_http1_carrier_over<IO>(
     io: IO,
     authority: &str,
@@ -583,6 +595,12 @@ where
 /// until the session is established: the connections must be confidential
 /// to the server or to an intermediary the deployment entrusts with the
 /// carriers' contents (TLS).
+///
+/// # Errors
+///
+/// `Other` when the pairing token cannot be drawn, an error of
+/// `connect`, and those of [`dial_http1_carrier_over`] for either
+/// request.
 pub async fn dial_http1_split_with<C, F, IO>(
     connect: C,
     authority: &str,
@@ -651,6 +669,11 @@ where
 /// two directions, `pipe_options` choosing its direction. Returns the pipe as
 /// [`Session::add_pipe`] does: once the peer attached it, or with
 /// [`PipeOptions::return_on_reply`] once its join is confirmed. A [`zmux::helpers::PipePool::join`] keeps such carriers up.
+///
+/// # Errors
+///
+/// The errors of [`dial_http1_split_with`], and `Other` when the session
+/// does not take the pipe.
 pub async fn join_http1_split_with<C, F, IO>(
     session: &Session,
     connect: C,
@@ -671,12 +694,21 @@ where
 }
 
 /// [`dial_http1_split_with`] over plain TCP connections to `addr`.
+///
+/// # Errors
+///
+/// The TCP connects' errors, and those of [`dial_http1_split_with`].
 pub async fn dial_http1_split(addr: &str, options: &Options) -> io::Result<PipeIo> {
     let a: Arc<str> = addr.into();
     dial_http1_split_with(move || tcp_owned(a.clone()), addr, options).await
 }
 
 /// Establishes a session over a new HTTP/1.1 connection ([`dial_http1`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial_http1`], and the errors of
+/// [`Session::connect`].
 pub async fn connect_http1(
     addr: &str,
     options: &Options,
@@ -690,6 +722,11 @@ pub async fn connect_http1(
 
 /// Establishes a session on a split bootstrap over plain TCP
 /// ([`dial_http1_split`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial_http1_split`], and the
+/// errors of [`Session::connect`].
 pub async fn connect_http1_split(
     addr: &str,
     options: &Options,
@@ -764,6 +801,10 @@ impl std::fmt::Debug for Http2Connection {
 impl Http2Connection {
     /// An HTTP/2 connection (prior knowledge, no TLS) to `addr`
     /// (`host:port`, also the `:authority`).
+    ///
+    /// # Errors
+    ///
+    /// The TCP connect's error, and those of [`Http2Connection::handshake`].
     pub async fn connect(addr: &str, options: Options) -> io::Result<Self> {
         Self::handshake(tcp(addr).await?, addr, options).await
     }
@@ -784,6 +825,11 @@ impl Http2Connection {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// `TimedOut` when the HTTP/2 handshake exceeds [`Options::timeout`],
+    /// `Other` when it fails.
     pub async fn handshake<IO>(io: IO, authority: &str, options: Options) -> io::Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -807,12 +853,17 @@ impl Http2Connection {
     }
 
     /// The connection's identity, as its pipes report it.
+    #[must_use]
     pub fn conn_id(&self) -> CarrierConnId {
         CarrierConnId::new(&self.inner)
     }
 
     /// A bidirectional carrier on a new request of the connection
     /// ([`Http2Connection::open_carrier`] with [`DialRequest::bidi`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Http2Connection::open_carrier`].
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
         self.open_carrier(&DialRequest::bidi()).await
     }
@@ -822,6 +873,12 @@ impl Http2Connection {
     /// request is under way; its reads wait for the response, which must
     /// arrive within [`Options::timeout`]. A bidirectional one opens lanes
     /// with [`Options::lanes`].
+    ///
+    /// # Errors
+    ///
+    /// `TimedOut` when the connection cannot take the request within
+    /// [`Options::timeout`], `Other` for an HTTP failure, and the carrier
+    /// credential's error when its prefix or header cannot be made.
     pub async fn open_carrier(&self, request: &DialRequest) -> io::Result<PipeIo> {
         let head = Head::of(request);
         let bidi = head.direction == PipeDirection::Bidi;
@@ -844,6 +901,11 @@ impl Http2Connection {
     /// A split bootstrap on two new requests of the connection, an uplink
     /// `POST` and a downlink `GET` with one fresh pairing token (see
     /// [`dial_http1_split_with`]).
+    ///
+    /// # Errors
+    ///
+    /// `Other` when the pairing token cannot be drawn, and those of
+    /// [`Http2Connection::open_carrier`] for either request.
     pub async fn open_split(&self) -> io::Result<PipeIo> {
         let (up, down) = split_heads()?;
         let up = self.open(up).await?;
@@ -894,6 +956,11 @@ impl Http2Connection {
 
     /// Establishes a session on a new bidirectional request of the
     /// connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::Io`] with an error of [`Http2Connection::open_pipe`],
+    /// and the errors of [`Session::connect`].
     pub async fn connect_session(
         &self,
         config: impl Into<Arc<zmux::Config>>,
@@ -907,6 +974,11 @@ impl Http2Connection {
 
     /// Establishes a session on a split bootstrap of the connection
     /// ([`Http2Connection::open_split`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::Io`] with an error of [`Http2Connection::open_split`],
+    /// and the errors of [`Session::connect`].
     pub async fn connect_split_session(
         &self,
         config: impl Into<Arc<zmux::Config>>,
@@ -920,6 +992,7 @@ impl Http2Connection {
 
     /// A [`Dial`] for the session's helpers: every carrier on a new
     /// request of this connection ([`Http2Connection::open_carrier`]).
+    #[must_use]
     pub fn dial(&self) -> Dial {
         let conn = self.clone();
         Dial::new(move |request: DialRequest| {
@@ -983,6 +1056,11 @@ impl H2Inner {
 /// ([`Http2Connection::connect`], then
 /// [`Http2Connection::connect_session`]); further pipes of the session
 /// need the connection handle.
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`Http2Connection::connect`] or
+/// [`Http2Connection::open_pipe`], and the errors of [`Session::connect`].
 pub async fn connect_http2(
     addr: &str,
     options: &Options,
@@ -1036,6 +1114,10 @@ where
 /// ([`join_http1_split_with`]). Its
 /// carriers must be confidential to the server or to a trusted
 /// TLS-terminating intermediary.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "one-letter clones are rebound to their full names inside the closure"
+)]
 pub fn candidate_split<C, F, IO>(connect: C, authority: &str, options: &Options) -> Candidate
 where
     C: Fn() -> F + Send + Sync + 'static,
@@ -1105,6 +1187,7 @@ where
 impl Http2Connection {
     /// A [`Candidate`] of [`CarrierKind::Streaming`] on new requests
     /// of this connection ([`Http2Connection::open_pipe`]).
+    #[must_use]
     pub fn candidate(&self) -> Candidate {
         let conn = self.clone();
         let target = Arc::new(self.target());
@@ -1133,6 +1216,7 @@ impl Http2Connection {
     /// A [`Candidate`] of [`CarrierKind::Split`] on new requests of
     /// this connection ([`Http2Connection::open_split`]; see
     /// [`candidate_split`]).
+    #[must_use]
     pub fn candidate_split(&self) -> Candidate {
         let conn = self.clone();
         let joining = self.clone();
@@ -1164,6 +1248,11 @@ impl Http2Connection {
 
     /// Joins a split carrier on two new requests of the connection to `session`: one Join
     /// across a paired `POST` and `GET` (see [`join_http1_split_with`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Http2Connection::open_split`], and `Other` when the
+    /// session does not take the pipe.
     pub async fn join_split(
         &self,
         session: &Session,

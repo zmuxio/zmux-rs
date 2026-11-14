@@ -99,7 +99,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
             c.try_open_bi().is_ok(),
             c.begin_add_pipe(
                 PipeIo::from_halves(io::empty(), io::sink()),
-                Default::default(),
+                zmux::PipeOptions::default(),
             )
             .is_err(),
             {

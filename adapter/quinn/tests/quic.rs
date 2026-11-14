@@ -90,11 +90,19 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
             for r in readers {
                 let data = r.await.unwrap();
                 assert_eq!(data.len(), len);
-                assert!(data.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+                assert!(
+                    data.iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
+                );
             }
         })
     };
-    let data = bytes::Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let data = bytes::Bytes::from(
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>(),
+    );
     let mut writers = Vec::new();
     for _ in 0..n {
         let mut send = from.open_uni().await.unwrap();
@@ -400,7 +408,9 @@ fn lingering(mut c: Config) -> Config {
 }
 
 async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..(1 << 20))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
     let reader = {
         let (server, data) = (server.clone(), data.clone());
         tokio::spawn(async move {

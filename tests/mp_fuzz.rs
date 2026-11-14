@@ -23,6 +23,15 @@
 //!
 //! `MP_FUZZ_STATS=1` prints one line of coverage counters per case.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -116,7 +125,7 @@ enum Sending {
         code: u64,
         reliable: u64,
     },
-    /// The writer saw the reader's STOP_SENDING.
+    /// The writer saw the reader's `STOP_SENDING`.
     Stopped,
 }
 
@@ -132,7 +141,7 @@ struct Half {
     read: u64,
     fin_read: bool,
     reset_read: bool,
-    /// The reader stopped with this code (STOP_SENDING or release).
+    /// The reader stopped with this code (`STOP_SENDING` or release).
     stopped: Option<u64>,
 }
 
@@ -369,7 +378,7 @@ fn net(setup: &Setup) -> Net {
         // An automatic cap grows within the memory budget.
         let window = match c.max_connection_receive_window {
             zmux::Cap::Fixed(w) => w,
-            _ => c.memory_budget.unwrap_or(u64::MAX),
+            zmux::Cap::Auto => c.memory_budget.unwrap_or(u64::MAX),
         };
         (c.send_buffer, window)
     });
@@ -528,7 +537,7 @@ impl Net {
         self.halves(|s, h| s.writer(h) != side && s.keys[side].is_some() && s.halves[h].readable())
     }
 
-    /// The writer of a half saw STOP_SENDING.
+    /// The writer of a half saw `STOP_SENDING`.
     fn saw_stop(&mut self, tag: usize, h: usize, code: VarInt) {
         let half = &mut self.s.streams[tag].halves[h];
         assert_eq!(
@@ -806,6 +815,10 @@ impl Net {
             })
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the stopped half is listed first as its own case"
+    )]
     fn half_complete(&self, tag: usize, h: usize) -> Result<(), String> {
         let s = &self.s.streams[tag];
         let half = &s.halves[h];
@@ -882,7 +895,7 @@ impl Net {
         }
     }
 
-    /// Lets acknowledgements, PIPE_ABANDON exchanges and retirement finish
+    /// Lets acknowledgements, `PIPE_ABANDON` exchanges and retirement finish
     /// on a healed network: afterwards no attachment may be left with no
     /// live direction. Unilateral retirement waits max(2 s, 3 x PTO) after
     /// the acknowledgement, and PTO follows the
@@ -1720,7 +1733,7 @@ fn preamble_lost_before_a_reset_is_sent_again() {
 
 /// BUG (`mpath.rs` `remove_pipe` and `fail_attachment`, `output.rs`
 /// `write_abandon`): a graceful removal of a writable pipe queues its
-/// PIPE_ABANDON(NO_ERROR) as the pipe's own last frame (`abandon_on_self`).
+/// `PIPE_ABANDON(NO_ERROR)` as the pipe's own last frame (`abandon_on_self`).
 /// When the pipe fails before its next batch (an abrupt removal, a carrier
 /// error), `fail_attachment` keeps that pending frame (the code is already
 /// set) and `abandon_on_self` stays set, so `write_abandon` never puts it on
@@ -1825,11 +1838,11 @@ fn custom_policy_fallbacks_are_counted() {
 /// BUG (`opp.rs` `session_blocking` and `stream_blocking`, `output.rs`
 /// `write_copy`): opportunistic reinjection picks the oldest unacknowledged
 /// STREAM frame from the pipe logs without checking whether the stream's
-/// sending part was reset; after RESET_STREAM (or above the Reliable Size
-/// of RESET_STREAM_AT) the send buffer no longer holds those bytes, and
+/// sending part was reset; after `RESET_STREAM` (or above the Reliable Size
+/// of `RESET_STREAM_AT`) the send buffer no longer holds those bytes, and
 /// `write_copy` fills the frame with zeros when `copy_kept` fails
 /// (`dst.fill(0)`). The peer receives zeros as stream data and, when the
-/// RESET_STREAM is still in flight on a slow pipe, delivers them to the
+/// `RESET_STREAM` is still in flight on a slow pipe, delivers them to the
 /// application: here end A reads 3294 zero bytes of a stream end B reset
 /// (B's statistics: `bytes_opportunistic` 28435, `bytes_reinjected` 0). The
 /// copy must skip reset data exactly as `reinject_frame` does (only ranges
@@ -1886,7 +1899,7 @@ fn opportunistic_copy_of_a_reset_stream() {
             cap: 16384,
             rst: true,
         },
-        Op::Step(18446744073709551615),
+        Op::Step(18_446_744_073_709_551_615),
         Op::Step(41644),
         Op::Advance(918),
         Op::Reset {
@@ -1896,13 +1909,13 @@ fn opportunistic_copy_of_a_reset_stream() {
         },
         Op::Add {
             opts: po! { fate_group: 0, send_priority: None, receive_priority: 0, send_standby: None, weight: 1, probation: Some( Duration::from_millis(300), ), suspect_floor: None, dead_timeout: None, },
-            cap: 1048576,
+            cap: 1_048_576,
             rst: true,
         },
         Op::Write {
             side: 1,
             sel: 229,
-            len: 268770,
+            len: 268_770,
             chunk: true,
         },
         Op::Step(638),
@@ -1934,7 +1947,7 @@ fn opportunistic_copy_of_a_reset_stream() {
     }
 }
 
-/// The reader's session ended before the data below a RESET_STREAM_AT's
+/// The reader's session ended before the data below a `RESET_STREAM_AT`'s
 /// Reliable Size arrived: `read` reports `Reset { reliable_size: 2 }`
 /// although none of those bytes was read.
 fn reset_then_session_loss() -> (Net, usize) {
@@ -2010,7 +2023,7 @@ fn reset_then_session_loss() -> (Net, usize) {
 }
 
 /// MINOR BUG (`api.rs` `readable`): after the session ended, a stream that
-/// received RESET_STREAM_AT reports `StreamError::Reset { reliable_size }`
+/// received `RESET_STREAM_AT` reports `StreamError::Reset { reliable_size }`
 /// even when the data below the Reliable Size never arrived (`read_offset <
 /// reliable`), because the reset branch also fires on `lost.is_some()`.
 /// `reliable_size` is documented as the application bytes delivered before
@@ -2151,7 +2164,7 @@ fn unilateral_retirement_after_stretched_rtt() {
 /// the opportunistic-reinjection penalty change which pipes are usable, but
 /// only the pick generation moved; the standby takeover
 /// was re-evaluated at the end of the next batch, so an empty
-/// batch left a PIPE_STATUS owed and write interest behind. Found by
+/// batch left a `PIPE_STATUS` owed and write interest behind. Found by
 /// `exactly_once_under_churn` (minimized).
 #[test]
 fn takeover_follows_the_reinjection_penalty() {
@@ -2215,8 +2228,8 @@ fn takeover_follows_the_reinjection_penalty() {
 }
 
 /// A graceful removal of the bootstrap pipe while the added pipe's link is
-/// delayed must not end the session for want of a viable path: STOP_SENDING
-/// afterwards found it lost with NO_VIABLE_PATH. Found by
+/// delayed must not end the session for want of a viable path: `STOP_SENDING`
+/// afterwards found it lost with `NO_VIABLE_PATH`. Found by
 /// `exactly_once_under_churn` (minimized).
 #[test]
 fn graceful_removal_during_a_delayed_join_keeps_the_session() {

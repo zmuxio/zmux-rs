@@ -4,6 +4,16 @@
 //! direction, forwards stream datagrams, charges its limiters exactly what
 //! it forwarded, and leaves nothing behind when it ends or is dropped.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::large_futures,
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 mod common;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{connect, duplex, eventually, multi_thread, settle, snapshot, watchdog};
 use tokio::task::JoinHandle;
-use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
+use zmux::helpers::{SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
 use zmux::proto::{ApplicationErrorCode, TransportParameters};
 use zmux::{Cap, Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
 
@@ -358,6 +368,37 @@ fn dropping_a_splice_resets_and_stops_both_streams() {
 }
 
 #[test]
+fn an_aborted_splice_ends_both_streams_with_the_code() {
+    multi_thread(async {
+        let base = snapshot();
+        {
+            let hop = Hop::default().await;
+            let abort = SpliceAbort::new();
+            let mut opts = SpliceOptions::default();
+            opts.abort = Some(abort.clone());
+            let relay = hop.relay(opts);
+            let ((s, mut r), (fs, mut fr)) = hop.stream(b"x").await;
+            let code = VarInt::from_u32(0x77);
+            abort.abort(code);
+            abort.abort(VarInt::from_u32(1));
+            let done = watchdog(10, "splice", relay).await.unwrap().unwrap();
+            assert_eq!(done.a_to_b.end, SpliceEnd::Cancelled(code));
+            assert_eq!(done.b_to_a.end, SpliceEnd::Cancelled(code));
+            for (send, recv) in [(&s, &mut r), (&fs, &mut fr)] {
+                let (_, e) = watchdog(10, "reset", read_until_end(recv)).await;
+                assert!(matches!(e, Some(StreamError::Reset { code: c, .. }) if c == code));
+                assert_eq!(
+                    watchdog(10, "stopped", send.stopped()).await.unwrap(),
+                    Some(code)
+                );
+            }
+            hop.close();
+        }
+        settle(base, 10, "abort").await;
+    });
+}
+
+#[test]
 fn a_direction_into_its_own_stream_is_refused() {
     multi_thread(async {
         let hop = Hop::default().await;
@@ -465,7 +506,7 @@ fn limiters_are_charged_exactly_what_was_forwarded_and_datagrams_follow() {
             let back = watchdog(10, "A reads", read_all(&mut r, 64 << 10))
                 .await
                 .unwrap();
-            assert!(back == down);
+            assert_eq!(back, down);
             s.write_all(&pattern(100_000, 6)).await.unwrap();
             s.finish().unwrap();
             let got = watchdog(10, "B reads", read_all(&mut fr, 1 << 20))
@@ -534,7 +575,7 @@ fn a_splice_cancelled_in_a_limiter_wait_leaves_nothing_behind() {
 
 /// A downstream window smaller than the relay's forwarding step: once what the relay wrote was sent, the capacity left
 /// below the step is forwarded, though no credit arrives (B reads nothing,
-/// so it sends no MAX_STREAM_DATA) and nothing else happens upstream: the
+/// so it sends no `MAX_STREAM_DATA`) and nothing else happens upstream: the
 /// drained send buffer wakes the capacity wait.
 #[test]
 fn a_window_remainder_below_the_step_is_forwarded_without_new_credit() {

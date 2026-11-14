@@ -1,5 +1,16 @@
 //! Runs the shaping vectors of the specification repository.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "vector fields are small non-negative numbers of the specification"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "vector runners bind short conventional names for the fields they read"
+)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -383,9 +394,10 @@ fn format() {
                 call["handshake"].as_str().unwrap(),
                 call["message"].as_str().unwrap(),
             );
-            match call["plan"].is_null() {
-                true => assert!(p.is_none(), "{name}: {call}"),
-                false => check_unit(&p.unwrap(), &call["plan"], name),
+            if call["plan"].is_null() {
+                assert!(p.is_none(), "{name}: {call}");
+            } else {
+                check_unit(&p.unwrap(), &call["plan"], name);
             }
             assert_eq!(
                 sh.consumed(),

@@ -39,11 +39,19 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
             for r in readers {
                 let data = r.await.unwrap();
                 assert_eq!(data.len(), len);
-                assert!(data.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+                assert!(
+                    data.iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
+                );
             }
         })
     };
-    let data = bytes::Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let data = bytes::Bytes::from(
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>(),
+    );
     let mut writers = Vec::new();
     for _ in 0..n {
         let mut send = from.open_uni().await.unwrap();
@@ -121,9 +129,15 @@ async fn one_exchange_carries_both_directions() {
                 requests.fetch_add(1, Ordering::SeqCst);
                 let listener = listener.clone();
                 async move {
-                    zmux_http::handle_request(&listener, req, Some(peer), None, &Default::default())
-                        .await
-                        .map_err(|_| std::io::Error::other("not handled"))
+                    zmux_http::handle_request(
+                        &listener,
+                        req,
+                        Some(peer),
+                        None,
+                        &zmux_http::PairField::default(),
+                    )
+                    .await
+                    .map_err(|_| std::io::Error::other("not handled"))
                 }
             });
             let _ = hyper::server::conn::http1::Builder::new()
@@ -279,7 +293,7 @@ async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
                 move |conn, _| acceptor.accept(conn),
                 Options::default(),
             )
-            .await
+            .await;
         });
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = connector
@@ -288,12 +302,16 @@ async fn sessions_over_tls_and_a_failed_handshake_is_counted() {
             .unwrap();
         assert_eq!(conn.get_ref().1.alpn_protocol(), Some(alpn));
         let client = if alpn == b"h2" {
-            Http2Connection::handshake(conn, "localhost", Options::default())
-                .await
-                .unwrap()
-                .connect_session(Config::default())
-                .await
-                .unwrap()
+            Box::pin(Http2Connection::handshake(
+                conn,
+                "localhost",
+                Options::default(),
+            ))
+            .await
+            .unwrap()
+            .connect_session(Config::default())
+            .await
+            .unwrap()
         } else {
             let io = zmux_http::dial_http1_over(conn, "localhost", &Options::default())
                 .await

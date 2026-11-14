@@ -24,7 +24,7 @@ use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 use crate::body::{self, BodyReader, PipeBody, ReplayBody};
 use crate::classify::{RequestClass, classify, forwarded_early_data};
 use crate::tls::binding_of;
-use crate::{ExchangeServer, Options, PairField};
+use crate::{Options, PairField};
 use zmux_rustls::TlsBinding;
 
 /// A request [`handle_request`] did not hand to the listener.
@@ -101,6 +101,7 @@ pub(crate) fn status(code: StatusCode) -> Response<PipeBody> {
 /// The answer to a carrier request that an intermediary forwarded from TLS
 /// early data (`Early-Data: 1`): `425 (Too Early)`, so that it repeats the
 /// request after its handshake.
+#[must_use]
 pub fn too_early() -> Response<PipeBody> {
     status(StatusCode::TOO_EARLY)
 }
@@ -108,6 +109,7 @@ pub fn too_early() -> Response<PipeBody> {
 /// The source of a request from `peer`: the client a trusted intermediary
 /// reports in its forwarding header field
 /// ([`zmux::TrustedProxies::source`]), else `peer`.
+#[must_use]
 pub fn request_source(
     listener: &Listener,
     headers: &http::HeaderMap,
@@ -177,7 +179,7 @@ fn carrier_response(
 /// ([`request_source`]); `conn` the
 /// identity of an HTTP/2 connection whose requests are carriers (one
 /// value per connection), `None` for HTTP/1.1. A bidirectional carrier
-/// declares the [`zmux_rustls::TlsBinding`] in the request's extensions,
+/// declares the [`TlsBinding`] in the request's extensions,
 /// that of the TLS connection it arrived on. Must be called inside a
 /// tokio runtime; the carrier runs in a task of its own.
 ///
@@ -204,6 +206,10 @@ fn carrier_response(
 ///   the carrier or has taken it ([`PipeIo::with_taken`]: a lane, an
 ///   uplink, a paired split bootstrap); a carrier the listener does not
 ///   take, with nothing written, is [`Unhandled::Fallback`] without a body.
+///
+/// # Errors
+///
+/// [`Unhandled`] for a request the listener did not take, as above.
 pub async fn handle_request<B>(
     listener: &Listener,
     req: Request<B>,
@@ -218,16 +224,13 @@ where
     let (parts, body) = req.into_parts();
     let version = parts.version;
     let binding = parts.extensions.get::<TlsBinding>().cloned();
-    let class = match classify(&parts, pair) {
-        Some(c @ (RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)) => {
-            c
-        }
-        _ => {
-            return Err(Unhandled::Fallback(Box::new(Request::from_parts(
-                parts,
-                ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
-            ))));
-        }
+    let Some(class @ (RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)) =
+        classify(&parts, pair)
+    else {
+        return Err(Unhandled::Fallback(Box::new(Request::from_parts(
+            parts,
+            ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
+        ))));
     };
     if forwarded_early_data(&parts.headers) {
         listener.adapter().count_setup_failure();
@@ -328,10 +331,10 @@ where
                     inner: writer,
                     started: None,
                 };
-                let (io, held) = carrier(reader, writer);
+                let (io, start) = carrier(reader, writer);
                 tokio::spawn(handled(
                     listener.clone(),
-                    (io.with_prefix(rest), held),
+                    (io.with_prefix(rest), start),
                     hint_of(entry),
                 ));
                 Ok(carrier_response(class, version, resp_body))
@@ -725,6 +728,12 @@ pub async fn serve_connection_with<IO, H, HF>(
 /// or the request back for the fallback. `peer` is the connection's
 /// remote address ([`handle_request`]); `conn` the connection's identity,
 /// which only HTTP/2 requests take as their carrier connection.
+///
+/// # Errors
+///
+/// [`Unhandled::Fallback`] with the request for a request that carries no
+/// pipe here, or that the listener refers to the fallback;
+/// [`Unhandled::Abort`] for one to end without a response.
 pub async fn route_request(
     listener: &Listener,
     req: Request<Incoming>,
@@ -736,14 +745,13 @@ pub async fn route_request(
     let (parts, body) = req.into_parts();
     let class = classify(&parts, &options.pair_field);
     let req = Request::from_parts(parts, body);
-    match class {
-        Some(RequestClass::Exchange) if exchange_on(options.exchange.as_ref(), &path) => {
-            let x = options.exchange.as_ref().expect("matched an exchange path");
-            x.handle(req, peer, &options.pair_field)
-                .await
-                .map_err(|req| Unhandled::Fallback(Box::new(req)))
-        }
-        Some(RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)
+    let exchange = options.exchange.as_ref().filter(|x| x.matches(&path));
+    match (class, exchange) {
+        (Some(RequestClass::Exchange), Some(x)) => x
+            .handle(req, peer, &options.pair_field)
+            .await
+            .map_err(|req| Unhandled::Fallback(Box::new(req))),
+        (Some(RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink), _)
             if path == options.path =>
         {
             let h2 = (req.version() == http::Version::HTTP_2)
@@ -757,16 +765,12 @@ pub async fn route_request(
     }
 }
 
-fn exchange_on(exchange: Option<&ExchangeServer>, path: &str) -> bool {
-    exchange.is_some_and(|x| x.matches(path))
-}
-
 /// The identity of a served connection.
 struct ConnTag;
 
 /// A time beyond every timer of a connection.
 fn far_future() -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(86_400 * 365)
+    tokio::time::Instant::now() + Duration::from_hours(8760)
 }
 
 /// The requests of a connection in progress, and when the last ended.

@@ -29,26 +29,31 @@ pub struct Cipher {
 
 impl Cipher {
     /// The key length.
+    #[must_use]
     pub fn key_len(&self) -> usize {
         self.key_len
     }
 
     /// The tag length.
+    #[must_use]
     pub fn tag_len(&self) -> usize {
         self.tag_len
     }
 
     /// Records per key.
+    #[must_use]
     pub fn rekey_interval(&self) -> u64 {
         self.rekey_interval
     }
 
     /// The largest record plaintext.
+    #[must_use]
     pub fn max_plaintext(&self) -> usize {
         u16::MAX as usize - self.tag_len
     }
 
     /// Encrypts with counter `n`.
+    #[must_use]
     pub fn seal(&self, key: &[u8], n: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
         (self.seal)(key, n, aad, plaintext)
     }
@@ -179,6 +184,7 @@ pub(super) static AES_256_GCM: Cipher = Cipher {
 };
 
 /// AES-256-GCM with a big-endian counter.
+#[must_use]
 pub fn aes_256_gcm() -> &'static Cipher {
     &AES_256_GCM
 }
@@ -213,6 +219,7 @@ pub(super) mod chacha {
 
 /// ChaCha20-Poly1305 with a little-endian counter.
 #[cfg(feature = "seal-chacha")]
+#[must_use]
 pub fn chacha20_poly1305() -> &'static Cipher {
     &chacha::CHACHA20_POLY1305
 }
@@ -221,7 +228,7 @@ pub fn chacha20_poly1305() -> &'static Cipher {
 #[derive(Debug)]
 pub struct Hash {
     out_len: usize,
-    hash: fn(&[&[u8]]) -> Vec<u8>,
+    digest: fn(&[&[u8]]) -> Vec<u8>,
     hmac: fn(&[u8], &[&[u8]]) -> Vec<u8>,
     extract: fn(&[u8], &[u8]) -> Vec<u8>,
     expand: ExpandFn,
@@ -229,21 +236,25 @@ pub struct Hash {
 
 impl Hash {
     /// The output length.
+    #[must_use]
     pub fn out_len(&self) -> usize {
         self.out_len
     }
 
     /// The hash of the concatenated parts.
+    #[must_use]
     pub fn hash(&self, parts: &[&[u8]]) -> Vec<u8> {
-        (self.hash)(parts)
+        (self.digest)(parts)
     }
 
     /// HMAC of the concatenated parts.
+    #[must_use]
     pub fn hmac(&self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
         (self.hmac)(key, parts)
     }
 
     /// HKDF-Extract.
+    #[must_use]
     pub fn extract(&self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
         (self.extract)(salt, ikm)
     }
@@ -267,7 +278,7 @@ fn sha256_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, Error> 
 /// SHA-256.
 pub static SHA256: Hash = Hash {
     out_len: 32,
-    hash: |parts| {
+    digest: |parts| {
         let mut hash = Sha256::new();
         for part in parts {
             hash.update(part);

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 //! The Establish handshake of the zmux secure carrier, sans-IO: Profiles, Noise
 //! and its payloads. Join, Sealed records, the payload codec, `Export`

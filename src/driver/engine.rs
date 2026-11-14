@@ -40,7 +40,7 @@ pub(crate) fn timer_deadline(deadline: Option<Instant>, now: Instant) -> Option<
 /// deadline (a deadline that stays due changed nothing).
 pub(crate) fn fire_timers(core: &mut Core, now: Instant) -> bool {
     let due = core.poll_timeout();
-    if !due.is_some_and(|t| t <= now) {
+    if due.is_none_or(|t| t > now) {
         return false;
     }
     core.handle_timeout(now);
@@ -374,12 +374,11 @@ impl Outbound {
         // taken, which saw this round's input, while that decision holds
         // (within the latency budget).
         let input = input && self.pos > 0;
-        self.call_limit = match self.cached.get(left, input, now) {
-            Some(limit) => limit,
-            None => {
-                let (limit, budget) = compute(left);
-                self.cached.set(left, limit, input, now, budget)
-            }
+        self.call_limit = if let Some(limit) = self.cached.get(left, input, now) {
+            limit
+        } else {
+            let (limit, budget) = compute(left);
+            self.cached.set(left, limit, input, now, budget)
         };
         self.call_limit
     }
@@ -494,7 +493,7 @@ impl Outbound {
     }
 
     /// Tells the core, under its lock, the bytes the carrier took since
-    /// it was last told: what is left of the batch counts in Q_p
+    /// it was last told: what is left of the batch counts in `Q_p`
     /// ([`Core::pipe_written`]). [`Outbound::take_batch`] does it first.
     /// The last byte of a batch that ends with a shutdown is told once the
     /// shutdown is done: a close counts as handed off only when the
@@ -621,7 +620,7 @@ mod tests {
             let m = o2.message();
             assert_eq!(m.len(), *len);
             if i > 0 {
-                assert_eq!(&m[..7], &[i as u8; 7]);
+                assert_eq!(&m[..7], &[u8::try_from(i).unwrap(); 7]);
             }
             o2.written(*len);
         }

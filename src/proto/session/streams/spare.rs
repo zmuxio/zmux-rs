@@ -53,6 +53,10 @@ impl Spare {
     }
 
     /// Auto-tuning state for a stream, cleared.
+    #[allow(
+        clippy::unnecessary_box_returns,
+        reason = "the spare pool recycles boxed tuners; the box is what streams hold"
+    )]
     pub(super) fn tuner(&mut self) -> Box<Tuner> {
         self.tuners.pop().unwrap_or_default()
     }

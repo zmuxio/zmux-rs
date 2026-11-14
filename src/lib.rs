@@ -14,8 +14,22 @@
 //! - the sans-IO core (the hidden `proto` module): the wire layer and the
 //!   session state machine, without I/O or clock, which the drivers, the
 //!   carrier crates and the bindings build on;
-//! - the crate root (feature `tokio`, on by default): [`Session`],
-//!   [`SendStream`] and [`RecvStream`] over a [`PipeIo`], one tokio task per
+#![cfg_attr(
+    feature = "tokio",
+    doc = " - the crate root (feature `tokio`, on by default): [`Session`],"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " - the crate root (feature `tokio`, on by default): `Session`,"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = "   [`SendStream`] and [`RecvStream`] over a [`PipeIo`], one tokio task per"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = "   `SendStream` and `RecvStream` over a `PipeIo`, one tokio task per"
+)]
 //!   session;
 //! - `blocking` (feature `blocking`): the same API for threads.
 //!
@@ -40,14 +54,36 @@
 //!
 //! # Choosing a carrier
 //!
-//! A session runs over any reliable, ordered byte pipe ([`PipeIo`]). The
+#![cfg_attr(
+    feature = "tokio",
+    doc = " A session runs over any reliable, ordered byte pipe ([`PipeIo`]). The"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " A session runs over any reliable, ordered byte pipe (`PipeIo`). The"
+)]
 //! carrier crates turn common transports into pipes, each with `dial`
-//! (a [`PipeIo`]), `connect` (a [`Session`]) and `serve` (into a
-//! [`Listener`]):
+#![cfg_attr(
+    feature = "tokio",
+    doc = " (a [`PipeIo`]), `connect` (a [`Session`]) and `serve` (into a"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " (a `PipeIo`), `connect` (a `Session`) and `serve` (into a"
+)]
+#![cfg_attr(feature = "tokio", doc = " [`Listener`]):")]
+#![cfg_attr(not(feature = "tokio"), doc = " `Listener`):")]
 //!
 //! | Carrier | Crate | Passes HTTP proxies and CDNs | Lanes | Exporter (`PipeAuth::exporter`) |
 //! |---|---|---|---|---|
-//! | TCP | this crate ([`PipeIo::from_tcp`], [`Listener::serve`]) | no | no | no |
+#![cfg_attr(
+    feature = "tokio",
+    doc = " | TCP | this crate ([`PipeIo::from_tcp`], [`Listener::serve`]) | no | no | no |"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " | TCP | this crate (`PipeIo::from_tcp`, `Listener::serve`) | no | no | no |"
+)]
 //! | TLS over TCP | `zmux-rustls` | no | no | yes |
 //! | QUIC | `zmux-quinn` | no | yes (QUIC streams) | yes |
 //! | WebSocket (`ws`, `wss`) | `zmux-websocket` | yes | no | no |
@@ -68,30 +104,95 @@
 //! # Multipath and resumption
 //!
 //! Both ends opt in with [`Config::multipath`] and a [`PipeAuth`]. The
-//! server takes every carrier through one [`Listener`], which starts new
-//! sessions ([`Listener::accept`]) and routes joins to existing ones; the
-//! client adds pipes with [`Session::add_pipe`](Session#method.add_pipe), or keeps a
-//! pool of them up with [`helpers::maintain_pipes`] and a
-//! [`helpers::PipePool`] whose dial function is a carrier crate's `dial`.
+#![cfg_attr(
+    feature = "tokio",
+    doc = " server takes every carrier through one [`Listener`], which starts new"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " server takes every carrier through one `Listener`, which starts new"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = " sessions ([`Listener::accept`]) and routes joins to existing ones; the"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " sessions (`Listener::accept`) and routes joins to existing ones; the"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = " client adds pipes with [`Session::add_pipe`](Session#method.add_pipe), or keeps a"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " client adds pipes with `Session::add_pipe`, or keeps a"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = " pool of them up with [`helpers::maintain_pipes`] and a"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " pool of them up with `helpers::maintain_pipes` and a"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = " [`helpers::PipePool`] whose dial function is a carrier crate's `dial`."
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " `helpers::PipePool` whose dial function is a carrier crate's `dial`."
+)]
 //! The session spreads frames over its pipes and fails over and reinjects
 //! when one is lost; with `resume_timeout` set ([`Config`]) it also
 //! survives losing all of them, resuming on the next pipe that joins in
 //! time. [`SessionEvent`]s
-//! ([`Session::next_event`](Session#method.next_event)) report pipes joining, failing
-//! ([`PipeFailure`]) and changing quality; [`Session::pipe_stats`](Session#method.pipe_stats) and
-//! [`Listener::stats`] give the counters.
+#![cfg_attr(
+    feature = "tokio",
+    doc = " ([`Session::next_event`](Session#method.next_event)) report pipes joining, failing"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " (`Session::next_event`) report pipes joining, failing"
+)]
+#![cfg_attr(
+    feature = "tokio",
+    doc = " ([`PipeFailure`]) and changing quality; [`Session::pipe_stats`](Session#method.pipe_stats) and"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " ([`PipeFailure`]) and changing quality; `Session::pipe_stats` and"
+)]
+#![cfg_attr(feature = "tokio", doc = " [`Listener::stats`] give the counters.")]
+#![cfg_attr(not(feature = "tokio"), doc = " `Listener::stats` give the counters.")]
 //!
 //! # Relays and nesting
 //!
 //! A relay accepts a stream, reads its [`Preamble`] (routing metadata in
 //! application TLVs), opens the next hop's stream with it and forwards the
-//! two into each other with [`helpers::splice`], which forwards data only
+#![cfg_attr(
+    feature = "tokio",
+    doc = " two into each other with [`helpers::splice`], which forwards data only"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " two into each other with `helpers::splice`, which forwards data only"
+)]
 //! as the next hop's flow control allows and forwards resets with their
 //! Reliable Size. A session can also run inside another one: a stream
-//! opened with [`Session::open_pipe_stream`](Session#method.open_pipe_stream) is a pipe of a
+#![cfg_attr(
+    feature = "tokio",
+    doc = " opened with [`Session::open_pipe_stream`](Session#method.open_pipe_stream) is a pipe of a"
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = " opened with `Session::open_pipe_stream` is a pipe of a"
+)]
 //! nested session (on the accepting side, a stream whose preamble
 //! [`is a pipe carrier`](Preamble::is_pipe_carrier) becomes one with
-//! [`PipeIo::from_stream`]), for
+#![cfg_attr(feature = "tokio", doc = " [`PipeIo::from_stream`]), for")]
+#![cfg_attr(not(feature = "tokio"), doc = " `PipeIo::from_stream`), for")]
 //! example an end-to-end session through relays that see only its
 //! records.
 
@@ -162,7 +263,11 @@ pub use proto::session::{
 };
 
 /// The QMux version this crate speaks, the only one: what
-/// [`Session::qmux_version`](Session#method.qmux_version) reports.
+#[cfg_attr(
+    feature = "tokio",
+    doc = " [`Session::qmux_version`](Session#method.qmux_version) reports."
+)]
+#[cfg_attr(not(feature = "tokio"), doc = " `Session::qmux_version` reports.")]
 pub const QMUX_VERSION: &str = proto::draft::CURRENT.name;
 pub use proto::trusted::{InvalidNet, IpNet, TrustedProxies};
 pub use proto::varint::VarIntBoundsExceeded;
@@ -260,6 +365,7 @@ pub mod test_hooks {
     pub use crate::driver::blocking::sealed_halves as blocking_sealed_halves;
 
     /// Read buffers in the process-wide pool of idle pipes' buffers.
+    #[must_use]
     pub fn read_pool_buffers() -> usize {
         crate::driver::read_pool::len()
     }
@@ -268,12 +374,14 @@ pub mod test_hooks {
     /// one included, whose public state stays DRAINING and so reports no
     /// `PipeSuspect` (tokio driver).
     #[cfg(feature = "tokio")]
+    #[must_use]
     pub fn suspects(session: &crate::Session) -> u64 {
         session.suspects()
     }
 
     /// The Lane Keys in the process's lane routing table (tokio driver).
     #[cfg(feature = "tokio")]
+    #[must_use]
     pub fn lane_keys() -> Vec<[u8; 16]> {
         crate::driver::lanes::registered()
     }

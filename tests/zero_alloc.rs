@@ -7,6 +7,20 @@
 // A global allocator can only be implemented with unsafe code: the trait and
 // the System calls it forwards to are unsafe. Nothing else here uses it.
 #![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -426,7 +440,7 @@ mod core_bulk {
         let mut buf = [0u8; 256];
         let mut total = 0;
         for _ in 0..rounds {
-            let (_, n) = super::allocations(|| {
+            let ((), n) = super::allocations(|| {
                 let s = p.a.open(Dir::Bidi).unwrap();
                 assert_eq!(p.a.write(s, &msg).unwrap(), 64);
                 p.a.finish(s).unwrap();
@@ -540,7 +554,7 @@ mod core_bulk {
         let shared = Bytes::from(vec![9u8; 256 * 1024]);
         let mut recv = None;
         ticking_transfer(&mut p, send, &mut recv, 64 << 20, &shared);
-        let (_, n) =
+        let ((), n) =
             super::allocations(|| ticking_transfer(&mut p, send, &mut recv, 256 << 20, &shared));
         let stats = p.a.stats();
         assert!(stats.min_rtt.is_some(), "no RTT sample from PIPE_ACK");
@@ -551,7 +565,7 @@ mod core_bulk {
 // ---- the multipath core ----------------------------------------------------------
 
 /// The per-chunk and per-acknowledgement paths of a multipath session: bulk
-/// data spread over two pipes, with PIPE_ACKs, credit and timers running,
+/// data spread over two pipes, with `PIPE_ACKs`, credit and timers running,
 /// allocates nothing once warmed up (at 10 Gbit/s and 16 KiB chunks these
 /// run about 76 000 times a second).
 mod core_multipath {
@@ -589,11 +603,11 @@ mod core_multipath {
     impl Pair {
         /// A multipath pair on pipe 0, then pipe 1 joined through
         /// B's listener.
-        fn new(policy: Scheduler) -> Self {
+        fn new(policy: &Scheduler) -> Self {
             let now = Instant::now();
-            let mut b_cfg = config(&policy);
+            let mut b_cfg = config(policy);
             b_cfg.test_hooks().locator = b"server".to_vec();
-            let mut a = SessionCore::new(config(&policy), Role::Client, None, now).unwrap();
+            let mut a = SessionCore::new(config(policy), Role::Client, None, now).unwrap();
             let mut b = SessionCore::new(b_cfg, Role::Server, None, now).unwrap();
             a.attach_pipe(PipeId::new(0), BS, now);
             b.attach_pipe(PipeId::new(0), BS, now);
@@ -712,8 +726,8 @@ mod core_multipath {
         read
     }
 
-    fn bulk_over_two_pipes(policy: Scheduler) {
-        let mut p = Pair::new(policy.clone());
+    fn bulk_over_two_pipes(policy: &Scheduler) {
+        let mut p = Pair::new(policy);
         let send = p.a.open(Dir::Uni).unwrap();
         let mut recv = None;
         // Warm up: windows, buffers and per-pipe state reach their size.
@@ -752,7 +766,7 @@ mod core_multipath {
     )]
     fn spread_eta_does_not_allocate_per_chunk_or_ack() {
         let _serial = crate::serial();
-        bulk_over_two_pipes(Scheduler::SpreadEta);
+        bulk_over_two_pipes(&Scheduler::SpreadEta);
     }
 
     #[test]
@@ -762,8 +776,8 @@ mod core_multipath {
     )]
     fn round_robin_does_not_allocate_per_chunk_or_ack() {
         let _serial = crate::serial();
-        bulk_over_two_pipes(Scheduler::SpreadRoundRobin);
-        bulk_over_two_pipes(Scheduler::SpreadRateWeighted);
+        bulk_over_two_pipes(&Scheduler::SpreadRoundRobin);
+        bulk_over_two_pipes(&Scheduler::SpreadRateWeighted);
     }
 }
 

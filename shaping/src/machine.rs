@@ -13,7 +13,9 @@ use zmux::shaping::{
 use crate::error::{Error, err};
 use crate::json::{Json, parse};
 use crate::random::{OsSeeded, Source};
-use crate::value::{ALL_SCOPES, Family, Reader, Sampler, Scope, Value, int, parse_value};
+use crate::value::{
+    ALL_SCOPES, Family, Reader, Sampler, Scope, Value, idx32, int, parse_value, to_u32, to_usize,
+};
 
 type NewSource = Arc<dyn Fn() -> Box<dyn Source> + Send + Sync>;
 
@@ -94,7 +96,7 @@ impl fmt::Debug for Options {
 }
 
 impl Options {
-    /// The random source of each compilation and each pipe; default: ChaCha8 seeded
+    /// The random source of each compilation and each pipe; default: `ChaCha8` seeded
     /// from the operating system.
     #[must_use]
     pub fn with_source(mut self, f: impl Fn() -> Box<dyn Source> + Send + Sync + 'static) -> Self {
@@ -272,7 +274,7 @@ fn slot(x: &Json, limit: u32, what: &str) -> Result<u32, Error> {
     if v < 0 || v >= i128::from(limit) {
         return Err(err("reference", format!("{what}.slot")));
     }
-    Ok(v as u32)
+    Ok(to_u32(v))
 }
 
 struct Ctx<'a, 'b> {
@@ -474,7 +476,7 @@ impl Ctx<'_, '_> {
         let prob = self.opt(x, "prob", Family::Ppm)?;
         Ok(Transition {
             on,
-            to: to as u32,
+            to: to_u32(to),
             cond,
             prob,
         })
@@ -563,7 +565,7 @@ fn parse_machine(x: &Json, reader: &Reader<'_>) -> Result<Machine, Error> {
     };
     let states = list.iter().map(|s| cx.state(s)).collect::<Result<_, _>>()?;
     let m = Machine {
-        start: start as u32,
+        start: to_u32(start),
         counters,
         timers,
         states,
@@ -804,6 +806,11 @@ impl fmt::Debug for MachineFactory {
 
 impl MachineFactory {
     /// Reads a definition: a JSON object with `machines` and optional `tables`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `b` exceeds the input limit, is not valid JSON, or a machine, table or
+    /// member is malformed, out of range or exceeds the size limits.
     pub fn from_json(b: &[u8], options: Options) -> Result<Self, Error> {
         options.limits.input(b.len())?;
         let doc = parse(b)?;
@@ -973,7 +980,7 @@ impl Run {
         match only {
             Some(m) => self.push(m, trigger),
             None => {
-                for m in 0..p.machines.len() as u32 {
+                for m in 0..idx32(p.machines.len()) {
                     self.push(m, trigger);
                 }
             }
@@ -1065,13 +1072,13 @@ impl Run {
         }
     }
 
-    fn act(&mut self, m: u32, a: &Action) {
+    fn act(&mut self, m: u32, action: &Action) {
         let i = m as usize;
-        match a {
+        match action {
             Action::Inject { after, len } => {
                 let after = self.val(after);
                 let len = self.val(len);
-                self.inj[i] = Some((self.now.saturating_add(after), len as usize));
+                self.inj[i] = Some((self.now.saturating_add(after), to_usize(len)));
             }
             Action::InjectCancel => self.inj[i] = None,
             Action::Pause { after } => {
@@ -1102,7 +1109,7 @@ impl Run {
                 self.counter(m, *slot, |c| c.saturating_sub(x), false);
             }
             Action::Weight { value } => {
-                let w = self.val(value) as u32;
+                let w = u32::try_from(self.val(value)).unwrap_or(u32::MAX);
                 if w != 0 {
                     self.weight[i] = w;
                 }
@@ -1162,11 +1169,11 @@ impl Run {
     fn plan_record(&mut self, r: &Record, plan: &mut RecordPlan) {
         let mut cut = None;
         if let Some(v) = &r.target {
-            let t = self.val(v) as usize;
+            let t = to_usize(self.val(v));
             cut = Some(t);
             plan.pad_to = plan.pad_to.max(t);
         } else if let Some(v) = &r.max_len {
-            cut = Some(self.val(v) as usize);
+            cut = Some(to_usize(self.val(v)));
         }
         if let Some(c) = cut.filter(|c| *c != 0)
             && (plan.max_len == 0 || c < plan.max_len)
@@ -1174,13 +1181,16 @@ impl Run {
             plan.max_len = c;
         }
         if let Some(v) = &r.pad_to {
-            plan.pad_to = plan.pad_to.max(self.val(v) as usize);
+            plan.pad_to = plan.pad_to.max(to_usize(self.val(v)));
         }
         if let Some(v) = &r.pad_multiple {
-            plan.pad_multiple = plan.pad_multiple.max(self.val(v) as usize);
+            plan.pad_multiple = plan.pad_multiple.max(to_usize(self.val(v)));
         }
         if let Some(v) = &r.pad {
-            plan.pad = (plan.pad + self.val(v) as usize).min((1 << 31) - 1);
+            plan.pad = plan
+                .pad
+                .saturating_add(to_usize(self.val(v)))
+                .min((1 << 31) - 1);
         }
         if let Some(v) = &r.delay {
             plan.delay = plan.delay.max(Duration::from_micros(self.val(v)));
@@ -1216,7 +1226,7 @@ impl Shaper for MachineShaper {
         match e.kind {
             EventKind::Start => {
                 for (m, def) in p.machines.iter().enumerate() {
-                    run.enter(p, m as u32, def.start);
+                    run.enter(p, idx32(m), def.start);
                 }
                 run.drain(p);
             }
@@ -1233,7 +1243,7 @@ impl Shaper for MachineShaper {
             EventKind::InjectDropped => {
                 if let Some(m) = run.surfaced {
                     run.inj[m] = None;
-                    run.fire(p, Trigger::InjectDropped, 0, Some(m as u32));
+                    run.fire(p, Trigger::InjectDropped, 0, Some(idx32(m)));
                 }
             }
             EventKind::Wake => {
@@ -1243,7 +1253,7 @@ impl Shaper for MachineShaper {
                     let at = run.tm_at[m] as usize;
                     for s in 0..def.timers {
                         if let Some(d) = run.tm[at + s as usize].filter(|d| *d <= run.now) {
-                            due.push((d, m as u32, s));
+                            due.push((d, idx32(m), s));
                         }
                     }
                 }
@@ -1370,10 +1380,11 @@ mod size_tests {
     /// A long chain of states is checked in linear time.
     #[test]
     fn the_structure_check_is_linear() {
+        use std::fmt::Write as _;
         const N: usize = 200_000;
         let mut b = String::from(r#"{"machines":[{"start":0,"states":["#);
         for i in 0..N - 1 {
-            b += &format!(r#"{{"next":[{{"on":"enter","to":{}}}]}},"#, i + 1);
+            write!(b, r#"{{"next":[{{"on":"enter","to":{}}}]}},"#, i + 1).unwrap();
         }
         b += "{}]}]}";
         let t0 = std::time::Instant::now();

@@ -29,6 +29,7 @@ use super::wait::{PipeDone, Ticket, WaitList};
 use super::wake::WakeList;
 use crate::proto::VarInt;
 use crate::proto::admission::{Admission, AdmissionVerdict, AdmittedValue, CarrierInfo};
+use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
     CarrierId, Classified, Entered, ListenerConfig, ListenerCore as Core, Paired, Slot,
 };
@@ -80,6 +81,7 @@ pub struct PipeHint {
 
 impl PipeHint {
     /// A hint with the directly connected peer, which is also the source.
+    #[must_use]
     pub fn from_peer(peer: SocketAddr) -> Self {
         Self {
             peer: Some(peer),
@@ -87,9 +89,10 @@ impl PipeHint {
         }
     }
 
-    /// The hint of a carrier that entered the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter))
+    /// The hint of a carrier that entered the listener ([`ListenerAdapter::enter`])
     /// and was admitted there ([`Entry::admit`]): its source and peer are
     /// the entry's, which [`Listener::handle_pipe`] goes on with.
+    #[must_use]
     pub fn from_entry(entry: Entry) -> Self {
         Self {
             source: Some(entry.source),
@@ -102,6 +105,7 @@ impl PipeHint {
     /// The hint of a further carrier (a stream) of a connection whose
     /// admission accepted it ([`Entry::admitted`]): it takes its own
     /// source slot in [`Listener::handle_pipe`], and is admitted already.
+    #[must_use]
     pub fn from_admitted(admitted: Admitted) -> Self {
         Self {
             source: Some(admitted.source),
@@ -116,6 +120,7 @@ impl PipeHint {
     /// ([`AdmissionVerdict::Accept`]): set by the listener before its inbound
     /// transform runs ([`InboundTransform`]); `None` without an
     /// admission or a value.
+    #[must_use]
     pub fn admitted(&self) -> Option<&AdmittedValue> {
         self.value.as_ref()
     }
@@ -309,7 +314,7 @@ impl ListenShared {
     }
 }
 
-/// A carrier that entered a listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)): it holds a
+/// A carrier that entered a listener ([`ListenerAdapter::enter`]): it holds a
 /// source slot ([`ListenerConfig::max_pending_per_source`]) and a slot of
 /// the listener ([`ListenerConfig::max_pending`]) from before its outer
 /// handshake, through its admission and, handed to
@@ -317,6 +322,10 @@ impl ListenShared {
 /// a session; or until it goes to a fallback target, is released
 /// ([`Entry::release`]) or dropped. Dropped before its admission
 /// ([`Entry::admit`]), its outer handshake counts as failed.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts of the carrier's admission"
+)]
 pub struct Entry {
     shared: Arc<ListenShared>,
     key: u64,
@@ -399,7 +408,7 @@ enum Round {
 }
 
 /// What a carrier's prefix is to the listener's sessions
-/// ([`ListenerAdapter::join_prefix`](crate::adapter::ListenerAdapter::join_prefix)).
+/// ([`ListenerAdapter::join_prefix`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinPrefix {
     /// A Join Hello whose Locator names a current session.
@@ -425,22 +434,26 @@ pub struct Admitted {
 
 impl Entry {
     /// The carrier's source.
+    #[must_use]
     pub fn source(&self) -> SocketAddr {
         self.source
     }
 
     /// The directly connected peer.
+    #[must_use]
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
 
     /// Whether the admission accepted it (or the listener has none).
+    #[must_use]
     pub fn is_admitted(&self) -> bool {
         self.admitted
     }
 
     /// The admitted source of this carrier's connection, once
     /// [`Entry::admit`] accepted it.
+    #[must_use]
     pub fn admitted(&self) -> Option<Admitted> {
         self.admitted.then(|| Admitted {
             source: self.source,
@@ -492,7 +505,7 @@ impl Entry {
         Some(*self.deadline.get_or_insert_with(|| {
             let now = Instant::now();
             now.checked_add(adm.peek_timeout())
-                .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+                .unwrap_or_else(|| now + Duration::from_hours(262_800))
         }))
     }
 
@@ -589,15 +602,10 @@ impl Entry {
     /// The outcome of a prefix that did not arrive within the peek
     /// timeout: counted in `peek_timed_out`, then closed, or taken to the
     /// fallback with `prefix` replayed when the admission says so
-    /// ([`crate::Admission::with_fallback_on_peek_timeout`]; counted in
+    /// ([`Admission::with_fallback_on_peek_timeout`]; counted in
     /// `fallback` as well), except an HTTP request carrier (`request`),
     /// which is always closed.
-    fn late_outcome(
-        &mut self,
-        adm: &crate::Admission,
-        prefix: &mut Vec<u8>,
-        request: bool,
-    ) -> Admit {
+    fn late_outcome(&mut self, adm: &Admission, prefix: &mut Vec<u8>, request: bool) -> Admit {
         let c = &self.shared.counts.admission;
         c.peek_timed_out.fetch_add(1, Relaxed);
         if adm.fallback_on_peek_timeout() && !request {
@@ -914,6 +922,7 @@ impl Listener {
     /// The listener's operations for carrier adapters and own accept
     /// loops: carrier slots, admission, join lookups, memory charges and
     /// setup-failure counts ([`ListenerAdapter`]).
+    #[must_use]
     pub fn adapter(&self) -> ListenerAdapter<'_> {
         ListenerAdapter { listener: self }
     }
@@ -939,6 +948,7 @@ impl<'a> ListenerAdapter<'a> {
     /// refused when the source has its share or the listener is closed,
     /// as rejected when every slot is taken and none is stalled. Then the
     /// outer handshake, [`Entry::admit`], and [`Listener::handle_pipe`].
+    #[must_use]
     pub fn enter(&self, peer: SocketAddr, source: Option<SocketAddr>) -> Option<Entry> {
         self.listener
             .enter_uncounted(peer, source)
@@ -947,6 +957,7 @@ impl<'a> ListenerAdapter<'a> {
     }
 
     /// The listener's admission ([`ListenerConfig::admission`]).
+    #[must_use]
     pub fn admission(&self) -> Option<&'a Admission> {
         self.listener.shared.admission.as_ref()
     }
@@ -956,11 +967,12 @@ impl<'a> ListenerAdapter<'a> {
     /// Locator names a session of the listener at this moment. While the
     /// prefix is shorter than the Hello's clear head (through the nonce,
     /// at most 291 bytes for the suites defined) the answer is
-    /// [`JoinPrefix::Need`], to ask for with [`crate::AdmissionVerdict::More`]
-    /// ([`crate::Admission::with_max_peek`] must allow it). On a
+    /// [`JoinPrefix::Need`], to ask for with [`AdmissionVerdict::More`]
+    /// ([`Admission::with_max_peek`] must allow it). On a
     /// message-framed carrier the prefix is the whole message, and `Need`
     /// means it is too short. Advisory: the join still authenticates, and
     /// one whose session ended meanwhile is an unknown Locator.
+    #[must_use]
     pub fn join_prefix(&self, prefix: &[u8]) -> JoinPrefix {
         use crate::proto::seal::{Error, join::JoinHello};
         match JoinHello::head_locator(prefix) {
@@ -974,12 +986,14 @@ impl<'a> ListenerAdapter<'a> {
     /// The intermediaries the listener trusts to report a carrier's client
     /// ([`ListenerConfig::trusted_proxies`]): its adapters take a carrier's
     /// source from them.
+    #[must_use]
     pub fn trusted_proxies(&self) -> &'a crate::proto::trusted::TrustedProxies {
         &self.listener.shared.trusted
     }
 
     /// Whether the listener is closed ([`Listener::close`]): an adapter
-    /// tells with it why [`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter) gave no place.
+    /// tells with it why [`ListenerAdapter::enter`] gave no place.
+    #[must_use]
     pub fn is_closed(&self) -> bool {
         self.listener.shared.lock().closed
     }
@@ -1000,6 +1014,7 @@ impl<'a> ListenerAdapter<'a> {
     /// handshake of an HTTP connection, whose requests enter the listener
     /// one by one): dropped before [`SetupGuard::done`], it counts a setup
     /// failure ([`ListenerStats::setup_failures`]).
+    #[must_use]
     pub fn setup_guard(&self) -> SetupGuard {
         SetupGuard(Some(self.listener.shared.clone()))
     }
@@ -1008,6 +1023,7 @@ impl<'a> ListenerAdapter<'a> {
     /// its memory budget for as long as the charge
     /// lives: for example the receive window of a QUIC connection whose
     /// streams carry their pipes and lanes.
+    #[must_use]
     pub fn charge_memory(&self, bytes: u64) -> MemoryCharge {
         self.listener.shared.account.charge(bytes, 0);
         MemoryCharge {
@@ -1075,7 +1091,7 @@ impl Listener {
             *c = random_u64().to_le_bytes();
         }
         let shared = Arc::new(ListenShared {
-            locators: Default::default(),
+            locators: handle::LocatorTable::default(),
             counts: Counts::default(),
             account,
             state: Mutex::new(State_ {
@@ -1227,6 +1243,14 @@ impl Listener {
     /// `tokio::time::timeout` at a deadline), it closes the listener and
     /// the sessions left at once.
     pub async fn shutdown(&self, code: VarInt, reason: &[u8]) {
+        // Closes the listener however the shutdown ends.
+        struct CloseOnDrop<'a>(&'a Listener);
+        impl Drop for CloseOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+
         let (sessions, unaccepted) = {
             let mut wakes = WakeList::default();
             let mut st = self.shared.lock();
@@ -1241,12 +1265,6 @@ impl Listener {
             (live, unaccepted)
         };
         drop(unaccepted);
-        struct CloseOnDrop<'a>(&'a Listener);
-        impl Drop for CloseOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.close();
-            }
-        }
         let _close = CloseOnDrop(self);
         // Dropped, the set aborts the shutdowns, which close their sessions
         // at once.
@@ -1261,11 +1279,13 @@ impl Listener {
     }
 
     /// The session configuration of the sessions it starts.
+    #[must_use]
     pub fn config(&self) -> &Arc<Config> {
         &self.shared.config
     }
 
     /// The listener's limits.
+    #[must_use]
     pub fn limits(&self) -> ListenerConfig {
         self.shared.lock().core.config().clone()
     }
@@ -1308,7 +1328,7 @@ impl Listener {
     /// connection, in a task of its own: a connection from an intermediary
     /// the listener trusts to send the PROXY protocol has its header read
     /// first ([`crate::adapter::proxied_source`]), and the client it reports is the
-    /// source; the connection enters the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter):
+    /// source; the connection enters the listener ([`ListenerAdapter::enter`]:
     /// refused at once when its source has its share); `setup` (a TLS
     /// handshake) runs within the listener's handshake timeout; the
     /// listener's admission reads the prefix and decides with the metadata
@@ -1318,7 +1338,7 @@ impl Listener {
     /// ([`PipeIo::with_prefix`]); one decided on with Fallback goes to
     /// [`ListenerConfig::fallback`], every byte read replayed, or is
     /// stalled without one. Each connection holds its slots of the
-    /// listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)) from before its setup. Nothing is written on a connection before it is accepted.
+    /// listener ([`ListenerAdapter::enter`]) from before its setup. Nothing is written on a connection before it is accepted.
     pub async fn serve_streams<T, A, AF, S, SF, C, I, P>(
         self,
         mut accept: A,
@@ -1393,7 +1413,7 @@ impl Listener {
     /// WebSocket upgrade), within the listener's `handshake_timeout`, and
     /// then served by `serve` for as long as it needs (handing its
     /// carriers to [`Listener::handle_pipe`], for example). A setup that
-    /// enters the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)) holds its slots from
+    /// enters the listener ([`ListenerAdapter::enter`]) holds its slots from
     /// then on; whatever a setup does before it enters, or when it never
     /// does (a connection whose carriers enter one by one), at most
     /// `max_pending` of the listener's limits are in setup at once: a new
@@ -1401,8 +1421,8 @@ impl Listener {
     /// handshakes can neither pile up nor lock new clients out. A setup counts its own
     /// failures: an [`Entry`] dropped before its admission counts its
     /// handshake as failed, and a setup without one calls
-    /// [`ListenerAdapter::count_setup_failure`](crate::adapter::ListenerAdapter::count_setup_failure) (or holds a
-    /// [`ListenerAdapter::setup_guard`](crate::adapter::ListenerAdapter::setup_guard)); one ended by its timeout or for a
+    /// [`ListenerAdapter::count_setup_failure`] (or holds a
+    /// [`ListenerAdapter::setup_guard`]); one ended by its timeout or for a
     /// newer one, or still running when the listener is closed, is dropped.
     /// Serving goes on after the close: it carries the sessions already
     /// accepted. Accept errors (a connection reset before it was accepted,
@@ -1473,7 +1493,11 @@ impl Listener {
     /// carrier is done, so that an HTTP handler stays alive with its pipe.
     /// A join over a stream of a session that runs over the session it
     /// joins ([`PipeIo::from_stream`]) is refused: the carrier is closed
-    /// and the session sends PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT).
+    /// and the session sends `PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT)`.
+    ///
+    /// # Errors
+    ///
+    /// The [`HandleError`] that says why the carrier was not used.
     pub fn handle_pipe(
         &self,
         pipe: PipeIo,
@@ -1514,6 +1538,7 @@ impl Listener {
     /// connections its `serve` loops set up: counts since it was made, for
     /// monitoring (a server whose certificate is wrong sees only setup
     /// failures).
+    #[must_use]
     pub fn stats(&self) -> ListenerStats {
         let c = &self.shared.counts;
         ListenerStats {
@@ -1541,16 +1566,15 @@ impl Listener {
     /// The carrier's entry: the adapter's, or one taken now, with the
     /// listener's admission applied to the carrier's own bytes.
     async fn entered(&self, pipe: &mut PipeIo, hint: &mut PipeHint) -> Result<Entry, HandleError> {
-        let mut entry = match hint.entry.take() {
-            Some(e) => e,
-            None => {
-                let peer = hint.peer.or(hint.source).unwrap_or(NO_ADDR);
-                let mut e = self.enter_uncounted(peer, hint.source)?;
-                // No outer handshake here.
-                e.handshaken = true;
-                e.admitted = hint.connection.is_some();
-                e
-            }
+        let mut entry = if let Some(e) = hint.entry.take() {
+            e
+        } else {
+            let peer = hint.peer.or(hint.source).unwrap_or(NO_ADDR);
+            let mut e = self.enter_uncounted(peer, hint.source)?;
+            // No outer handshake here.
+            e.handshaken = true;
+            e.admitted = hint.connection.is_some();
+            e
         };
         if entry.admitted {
             return Ok(entry);
@@ -1847,15 +1871,14 @@ impl Listener {
         }
         let arrived = now();
         // A half on a connection that carries a pipe has no slot yet: it takes one now.
-        let entry = match entry.take() {
-            Some(e) => e,
-            None => {
-                let peer = hint.peer.or(hint.source).unwrap_or(NO_ADDR);
-                let mut e = self.enter_uncounted(peer, hint.source)?;
-                e.handshaken = true;
-                e.admitted = true;
-                e
-            }
+        let entry = if let Some(e) = entry.take() {
+            e
+        } else {
+            let peer = hint.peer.or(hint.source).unwrap_or(NO_ADDR);
+            let mut e = self.enter_uncounted(peer, hint.source)?;
+            e.handshaken = true;
+            e.admitted = true;
+            e
         };
         let mut wakes = WakeList::default();
         let (limits, id) = {
@@ -2025,7 +2048,7 @@ impl Listener {
         }
         // A message arrives whole, so its room is the largest record's.
         let room = if pipe.framing == Framing::Records {
-            crate::proto::params::ZMUX_MAX_RECORD_SIZE as usize + 1
+            crate::util::usize_sat(crate::proto::params::ZMUX_MAX_RECORD_SIZE) + 1
         } else {
             16 * 1024
         };
@@ -2210,12 +2233,11 @@ impl Listener {
             if parsed.mode() == crate::proto::seal::RecordMode::Bound {
                 return self.rejected(pending, "early_data", mode, source).await;
             }
-            let completed = match deadline {
-                Some(d) => tokio::time::timeout_at(d.into(), done).await.is_ok(),
-                None => {
-                    done.await;
-                    true
-                }
+            let completed = if let Some(d) = deadline {
+                tokio::time::timeout_at(d.into(), done).await.is_ok()
+            } else {
+                done.await;
+                true
             };
             if !completed {
                 return Err(HandleError::SetupFailed);
@@ -2227,7 +2249,11 @@ impl Listener {
         // carriers open.
         let binding = if parsed.mode() == crate::proto::seal::RecordMode::Bound {
             let binding = (pipe.secure && !pipe.split)
-                .then(|| pipe.exporter.as_ref().and_then(|e| e.pipe_binding()))
+                .then(|| {
+                    pipe.exporter
+                        .as_ref()
+                        .and_then(CarrierExporter::pipe_binding)
+                })
                 .flatten();
             let Some(binding) = binding else {
                 session.hello_without_binding();
@@ -2514,7 +2540,7 @@ impl Listener {
 }
 
 /// Memory counted in a listener's budget on behalf of its sessions
-/// ([`ListenerAdapter::charge_memory`](crate::adapter::ListenerAdapter::charge_memory)) until dropped.
+/// ([`ListenerAdapter::charge_memory`]) until dropped.
 pub struct MemoryCharge {
     account: Arc<Account<Shared<Tokio>>>,
     bytes: u64,
@@ -2755,7 +2781,7 @@ impl Drop for FinishOnDrop {
     }
 }
 
-/// A connection's setup without an [`Entry`] ([`ListenerAdapter::setup_guard`](crate::adapter::ListenerAdapter::setup_guard)).
+/// A connection's setup without an [`Entry`] ([`ListenerAdapter::setup_guard`]).
 pub struct SetupGuard(Option<Arc<ListenShared>>);
 
 impl std::fmt::Debug for SetupGuard {
@@ -2905,7 +2931,7 @@ mod refusal_tests {
     use super::*;
     use crate::proto::TransportErrorCode;
 
-    /// A draining listener refuses a new session with CONNECTION_REFUSED
+    /// A draining listener refuses a new session with `CONNECTION_REFUSED`
     /// after its own parameters, so that the peer reads why, as the Go listener.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_draining_listener_refuses_with_connection_refused() {

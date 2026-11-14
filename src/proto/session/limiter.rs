@@ -6,7 +6,7 @@
 //! buffer becomes the queue in front of every urgent frame. On such a pipe
 //! the sender paces itself in the manner of BBR from what the peer
 //! acknowledges, and from nothing else: the inputs are the RTT and
-//! delivery-rate samples of PIPE_ACK, the bytes in
+//! delivery-rate samples of `PIPE_ACK`, the bytes in
 //! flight and the round trips of the delivery-rate estimator.
 //!
 //! The estimates reach the limiter through one call per acknowledgement
@@ -16,45 +16,46 @@
 //! and a single pipe with pipe acknowledgement
 //! feeds pipe 0 the same way. Everything is constant work per event
 //! (amortised): the standing queue is a three-sample windowed minimum,
-//! r_q the exact maximum of its window, the gain cycle a phase and its
+//! `r_q` the exact maximum of its window, the gain cycle a phase and its
 //! start, the pacing a token bucket refilled with the time that elapsed.
 
 use std::time::{Duration, Instant};
 
 use super::estimator::{AckSample, Estimator, RttSample};
 use super::filter::{MinFilter, SlidingMax};
+use crate::util::{f64_of, u64_sat};
 
 /// The timer granularity G the drivers honour: they never arm a timer
 /// earlier than 1 ms from now, so a paced pipe wakes at most 1000 times a
-/// second, and each wake-up releases a quantum of gain x R_p x G.
+/// second, and each wake-up releases a quantum of gain x `R_p` x G.
 pub(crate) const GRANULARITY: Duration = Duration::from_millis(1);
 /// The start-up gain 2 / ln 2, and the drain gain its inverse.
 const STARTUP_GAIN: f64 = 2.885;
-/// The gains of the cycle after the drain, each for max(RTT_base, 1 ms),
+/// The gains of the cycle after the drain, each for `max(RTT_base`, 1 ms),
 /// but the 0.75 phase ([`DOWN`]).
 const CYCLE: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-/// The 0.75 phase lasts until the bytes in flight are at most R_p x
-/// RTT_base_p + A, and at most this many phase durations (BBR v2's
-/// ProbeBW_DOWN).
+/// The 0.75 phase lasts until the bytes in flight are at most `R_p` x
+/// `RTT_base_p` + A, and at most this many phase durations (BBR v2's
+/// `ProbeBW_DOWN`).
 const DOWN: usize = 1;
 const DOWN_PHASES: u32 = 4;
 /// The pacing bucket holds up to this many quanta.
 const BUCKET_QUANTA: f64 = 2.0;
-/// Start-up ends once R_p has not grown by this factor over three round
+/// Start-up ends once `R_p` has not grown by this factor over three round
 /// trips.
 const FULL_GROWTH: f64 = 1.25;
 const FULL_ROUNDS: u8 = 3;
-/// A probe follows 10 s without a sample near the base: within B + A / R_p
-/// + RTT_base_p / 8 of it.
+/// A probe follows 10 s without a sample near the base: within B + A / `R_p`
+/// + `RTT_base_p` / 8 of it.
 const BASE_SPAN: Duration = Duration::from_secs(10);
 const BASE_TOLERANCE: u32 = 8;
-/// ... or max(1 s, 8 x RTT_base) without one the in-flight cap explains.
+/// ... or max(1 s, 8 x `RTT_base`) without one the in-flight cap explains.
 pub(super) const EXPLAINED_SPAN: Duration = Duration::from_secs(1);
 const EXPLAINED_BASES: u32 = 8;
-/// A probe lasts at least max(200 ms, smoothed_rtt).
+/// A probe lasts at least max(200 ms, `smoothed_rtt`).
 const PROBE_MIN: Duration = Duration::from_millis(200);
-/// r_q is the largest bottleneck sample of the last max(500 ms, 4 x
-/// RTT_base).
+/// `r_q` is the largest bottleneck sample of the last max(500 ms, 4 x
+/// `RTT_base`).
 const RQ_SPAN: Duration = Duration::from_millis(500);
 const RQ_BASES: u32 = 4;
 /// A rate bound that no later probe set again lapses after 10 s.
@@ -74,10 +75,10 @@ pub(crate) struct Params {
 }
 
 impl Params {
-    /// A = min(the peer's threshold, R_p x its max_ack_delay) +
-    /// spread_chunk: what the peer may leave unacknowledged.
+    /// A = min(the peer's threshold, `R_p` x its `max_ack_delay`) +
+    /// `spread_chunk`: what the peer may leave unacknowledged.
     fn slack(&self, rate: u64) -> u64 {
-        let delayed = (rate as f64 * self.max_ack_delay.as_secs_f64()) as u64;
+        let delayed = u64_sat(f64_of(rate) * self.max_ack_delay.as_secs_f64());
         self.threshold.min(delayed).saturating_add(self.chunk)
     }
 
@@ -105,7 +106,7 @@ pub(crate) struct AckEvent<'a> {
 
 /// The held bytes of a pipe with lanes: bytes
 /// acknowledged on their own lanes beyond the cumulative point, now and
-/// their smallest count over the last RTT_base_p.
+/// their smallest count over the last `RTT_base_p`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Held {
     pub(crate) now: u64,
@@ -115,7 +116,7 @@ pub(crate) struct Held {
 /// The limiter's phase.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
-    /// Gain 2.885 until R_p stops growing: its last growth step and the
+    /// Gain 2.885 until `R_p` stops growing: its last growth step and the
     /// round trips since without 25 % more.
     Startup { full: u64, flat: u8 },
     /// Gain 1 / 2.885 until the queue start-up built is gone.
@@ -141,6 +142,15 @@ impl Cycle {
         }
     }
 
+    /// Nanoseconds as an `f64`; a span below 2^53 ns (104 days) is exact.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a gain integral; rounding beyond 2^53 ns is immaterial"
+    )]
+    fn nanos(n: u128) -> f64 {
+        n as f64
+    }
+
     /// The cycle at `t` as it runs on from `self` with phases of `unit`,
     /// the 0.75 phase over at once when `down_done` (the bytes in flight
     /// are low enough) and lasting [`DOWN_PHASES`] units otherwise; and
@@ -164,7 +174,7 @@ impl Cycle {
             if *left < l {
                 return false;
             }
-            *gain += CYCLE[k] * l as f64;
+            *gain += CYCLE[k] * Self::nanos(l);
             *start += l;
             *left -= l;
             true
@@ -173,9 +183,9 @@ impl Cycle {
             k = (k + 1) % CYCLE.len();
             let period: u128 = (0..CYCLE.len()).map(len).sum();
             let n = left / period;
-            gain += n as f64
+            gain += Self::nanos(n)
                 * (0..CYCLE.len())
-                    .map(|i| CYCLE[i] * len(i) as f64)
+                    .map(|i| CYCLE[i] * Self::nanos(len(i)))
                     .sum::<f64>();
             start += n * period;
             left -= n * period;
@@ -184,7 +194,7 @@ impl Cycle {
                 k = (k + 1) % CYCLE.len();
             }
         }
-        gain += CYCLE[k] * left as f64;
+        gain += CYCLE[k] * Self::nanos(left);
         let since = u64::try_from(start)
             .ok()
             .and_then(|n| self.since.checked_add(Duration::from_nanos(n)))
@@ -197,7 +207,7 @@ impl Cycle {
 #[derive(Debug, Clone, Copy)]
 struct Probe {
     since: Instant,
-    /// max(200 ms, smoothed_rtt) at its start.
+    /// max(200 ms, `smoothed_rtt`) at its start.
     length: Duration,
     /// The send position at its start: the old queue is gone once the
     /// acknowledged position reaches it.
@@ -218,7 +228,7 @@ struct Probe {
 #[derive(Debug, Clone)]
 pub(crate) struct Limiter {
     mode: Mode,
-    /// RTT_base_p, kept as BBR keeps min_rtt: the smallest u so far, which
+    /// `RTT_base_p`, kept as BBR keeps `min_rtt`: the smallest u so far, which
     /// only a probe replaces (with what it measured); one value, no window
     /// of samples. A base that slid with a window would take in the
     /// pipe's own standing queue whenever no sample came near the base for
@@ -227,19 +237,19 @@ pub(crate) struct Limiter {
     /// by a probe instead. The smoothed RTT applies before the first
     /// sample.
     base: Option<Duration>,
-    /// The last sample within B + A / R_p + RTT_base_p / 8 of the base.
+    /// The last sample within B + A / `R_p` + `RTT_base_p` / 8 of the base.
     near_at: Instant,
-    /// The last sample within 2 x (RTT_base + B) + A / R_p of it.
+    /// The last sample within 2 x (`RTT_base` + B) + A / `R_p` of it.
     explained_at: Instant,
-    /// u over the last max(smoothed_rtt / 2, the interval since the
-    /// previous sample): S_p is its minimum minus the base.
+    /// u over the last `max(smoothed_rtt` / 2, the interval since the
+    /// previous sample): `S_p` is its minimum minus the base.
     recent: MinFilter,
     last_sample: Option<Instant>,
-    /// Bottleneck rate samples over max(500 ms, 4 x RTT_base) (r_q).
+    /// Bottleneck rate samples over max(500 ms, 4 x `RTT_base`) (`r_q`).
     bottleneck: SlidingMax,
     /// The largest bottleneck sample of the current round trip.
     round_max: u64,
-    /// When a probe last set the rate bound R_lo.
+    /// When a probe last set the rate bound `R_lo`.
     bound_set: Option<Instant>,
     /// The token bucket: bytes that may leave now, at the last refill
     /// (`None` at the start: a full quantum).
@@ -294,26 +304,26 @@ impl Limiter {
         self.held = true;
     }
 
-    /// RTT_base_p.
+    /// `RTT_base_p`.
     fn base(&self, est: &Estimator) -> Duration {
         self.base.unwrap_or(est.srtt)
     }
 
-    /// Past start-up, cruising with RTT_base_p `base` (tests).
+    /// Past start-up, cruising with `RTT_base_p` `base` (tests).
     #[cfg(test)]
     pub(crate) fn cruise(&mut self, base: Duration, now: Instant) {
         self.mode = Mode::Cruise(Cycle::start(now));
         self.base = Some(base);
     }
 
-    /// RTT_base_p, the window of the held bytes' minimum.
+    /// `RTT_base_p`, the window of the held bytes' minimum.
     pub(crate) fn base_rtt(&self, est: &Estimator) -> Duration {
         self.base(est)
     }
 
     /// The held bytes left out of the bytes in flight: all
     /// of them during start-up, their smallest count over the last
-    /// RTT_base_p afterwards.
+    /// `RTT_base_p` afterwards.
     pub(crate) fn left_out(&self, held: Held) -> u64 {
         match self.mode {
             Mode::Startup { .. } => held.now,
@@ -326,14 +336,14 @@ impl Limiter {
         self.bottleneck.memory()
     }
 
-    /// The unit of the gain cycle: max(RTT_base_p, 1 ms).
+    /// The unit of the gain cycle: `max(RTT_base_p`, 1 ms).
     fn unit(&self, est: &Estimator) -> Duration {
         self.base(est).max(GRANULARITY)
     }
 
-    /// The 0.75 phase is over: at most R_p x RTT_base_p + A in flight.
+    /// The 0.75 phase is over: at most `R_p` x `RTT_base_p` + A in flight.
     fn down_done(&self, est: &Estimator, p: &Params) -> bool {
-        let bdp = (est.rate as f64 * self.base(est).as_secs_f64()) as u64;
+        let bdp = u64_sat(f64_of(est.rate) * self.base(est).as_secs_f64());
         self.in_flight <= bdp.saturating_add(p.slack(est.rate))
     }
 
@@ -350,18 +360,18 @@ impl Limiter {
         }
     }
 
-    /// The pacing rate and quantum: gain x R_p, and max(2 x spread_chunk,
-    /// gain x R_p x G).
+    /// The pacing rate and quantum: gain x `R_p`, and max(2 x `spread_chunk`,
+    /// gain x `R_p` x G).
     fn pace(&self, now: Instant, est: &Estimator, p: &Params) -> (f64, f64) {
-        let rate = self.gain(now, est, p) * est.rate.max(1) as f64;
-        let quantum = (2 * p.chunk) as f64;
+        let rate = self.gain(now, est, p) * f64_of(est.rate.max(1));
+        let quantum = f64_of(2 * p.chunk);
         (rate, quantum.max(rate * GRANULARITY.as_secs_f64()))
     }
 
     /// The integral of the pacing gain over `[from, to]`, in seconds: each
     /// phase of the cycle counts with its own gain. Charging a whole
     /// refill interval at the gain of its end would favour the phase a
-    /// held pipe wakes up in, and overrun R_p (by about 0.2 % with
+    /// held pipe wakes up in, and overrun `R_p` (by about 0.2 % with
     /// chunk-sized sends, a queue that grows by milliseconds a second).
     fn gain_time(&self, from: Instant, to: Instant, est: &Estimator, p: &Params) -> f64 {
         let Mode::Cruise(c) = self.mode else {
@@ -378,14 +388,14 @@ impl Limiter {
         let Some(tokens) = self.tokens else {
             return quantum;
         };
-        let credit = est.rate.max(1) as f64 * self.gain_time(self.refilled, now, est, p);
+        let credit = f64_of(est.rate.max(1)) * self.gain_time(self.refilled, now, est, p);
         (tokens + credit).min(BUCKET_QUANTA * quantum)
     }
 
     /// Settles the bucket at `now`, at the gain that applied so far, and
     /// spends `bytes` from it.
     fn settle(&mut self, now: Instant, bytes: u64, est: &Estimator, p: &Params) {
-        self.tokens = Some(self.tokens(now, est, p) - bytes as f64);
+        self.tokens = Some(self.tokens(now, est, p) - f64_of(bytes));
         self.refilled = now;
     }
 
@@ -411,7 +421,7 @@ impl Limiter {
         }
     }
 
-    /// The in-flight cap: 2 x R_p x (RTT_base_p + B) + A, or A during a
+    /// The in-flight cap: 2 x `R_p` x (`RTT_base_p` + B) + A, or A during a
     /// probe.
     fn cap(&self, est: &Estimator, p: &Params) -> u64 {
         let a = p.slack(est.rate);
@@ -419,7 +429,7 @@ impl Limiter {
             return a;
         }
         let span = self.base(est) + p.budget;
-        (2.0 * est.rate as f64 * span.as_secs_f64()) as u64 + a
+        u64_sat(2.0 * f64_of(est.rate) * span.as_secs_f64()) + a
     }
 
     /// Bytes of stream data the pipe may take now: none while the bucket is
@@ -436,7 +446,7 @@ impl Limiter {
         if tokens < 1.0 || in_flight >= cap {
             return 0;
         }
-        let room = (tokens as u64).min(cap - in_flight).max(1);
+        let room = u64_sat(tokens).min(cap - in_flight).max(1);
         let chunk = p.chunk.max(1);
         room.div_ceil(chunk).saturating_mul(chunk)
     }
@@ -451,8 +461,8 @@ impl Limiter {
     /// G after its release time, later still on a busy host. The bucket
     /// holds what accrued meanwhile, up to two quanta: cut at one, the
     /// lateness of every wake-up would be lost to the pacing rate (a third
-    /// of it at quantum = R_p x G with wake-ups 1 to 2 ms apart), more than
-    /// the cycle's probing gain makes up, and R_p would fall round by round
+    /// of it at quantum = `R_p` x G with wake-ups 1 to 2 ms apart), more than
+    /// the cycle's probing gain makes up, and `R_p` would fall round by round
     /// while the RTT stays at the base.
     pub(crate) fn refresh(&mut self, now: Instant, in_flight: u64, est: &Estimator, p: &Params) {
         self.advance(now, in_flight, est, p);
@@ -478,13 +488,13 @@ impl Limiter {
     }
 
     /// A batch of `bytes` was handed to the carrier. The bucket pays for
-    /// all of it, as R_p counts it, though only stream data, reinjection
+    /// all of it, as `R_p` counts it, though only stream data, reinjection
     /// and copies wait for the bucket: control frames are never held back.
     pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64, est: &Estimator, p: &Params) {
         self.settle(now, bytes, est, p);
     }
 
-    /// S_p: the standing queue.
+    /// `S_p`: the standing queue.
     fn standing(&self, est: &Estimator) -> Duration {
         self.recent
             .get()
@@ -493,7 +503,7 @@ impl Limiter {
 
     /// An acknowledgement advanced the pipe's position: its samples, the
     /// round trip it ended, the phase changes it brings and the rate bound
-    /// R_lo, which it sets in `est`.
+    /// `R_lo`, which it sets in `est`.
     pub(crate) fn on_ack(
         &mut self,
         now: Instant,
@@ -541,7 +551,7 @@ impl Limiter {
             .saturating_sub(ev.acked)
             .saturating_sub(self.left_out(ev.held));
         match &mut self.mode {
-            Mode::Startup { .. } => {}
+            Mode::Startup { .. } | Mode::Cruise(_) => {}
             Mode::Drain => {
                 // The queue is gone, or at most max(R_p x RTT_base_p, A)
                 // is in flight: the A bytes the peer may leave
@@ -551,14 +561,13 @@ impl Limiter {
                 // more than B, S_p <= B may never hold either. Not the BDP
                 // plus A: that leaves up to A standing in the queue of
                 // every pipe, which then needs a probe.
-                let bdp = (est.rate as f64 * base.as_secs_f64()) as u64;
+                let bdp = u64_sat(f64_of(est.rate) * base.as_secs_f64());
                 let a = p.slack(est.rate);
                 let exit = bdp.max(a);
                 if self.standing(est) <= p.budget || in_flight <= exit {
                     self.mode = Mode::Cruise(Cycle::start(now));
                 }
             }
-            Mode::Cruise(_) => {}
             Mode::Probe(probe) => {
                 if probe.drained_at.is_none() && ev.acked >= probe.start_sent {
                     probe.drained_at = Some(now);
@@ -581,9 +590,9 @@ impl Limiter {
         self.refresh(now, in_flight, est, p);
     }
 
-    /// A round trip of the pipe measured outside PIPE_ACK: the response to
-    /// the QX_PING request of a single pipe's first record, which waited
-    /// behind nothing and was answered at once, unlike the first PIPE_ACK,
+    /// A round trip of the pipe measured outside `PIPE_ACK`: the response to
+    /// the `QX_PING` request of a single pipe's first record, which waited
+    /// behind nothing and was answered at once, unlike the first `PIPE_ACK`,
     /// which may wait the peer's `zmux_max_ack_delay`.
     pub(crate) fn ping_sample(&mut self, now: Instant, rtt: Duration, est: &Estimator, p: &Params) {
         let rate = est.rate.max(1);
@@ -639,7 +648,7 @@ impl Limiter {
         {
             // As in BBR, rounds without a bottleneck sample (limited by
             // the application) say nothing of the path.
-            if est.rate as f64 >= *full as f64 * FULL_GROWTH {
+            if f64_of(est.rate) >= f64_of(*full) * FULL_GROWTH {
                 *full = est.rate;
                 *flat = 0;
             } else {
@@ -658,7 +667,7 @@ impl Limiter {
     }
 
     /// Starts a probe when no sample was near the base for 10 s, or none
-    /// within what the cap can queue for max(1 s, 8 x RTT_base).
+    /// within what the cap can queue for max(1 s, 8 x `RTT_base`).
     fn maybe_probe(&mut self, now: Instant, ev: &AckEvent<'_>, est: &Estimator) {
         let base = self.base(est);
         let far = now.saturating_duration_since(self.near_at) >= BASE_SPAN;
@@ -682,7 +691,7 @@ impl Limiter {
     /// The probe is over: the base is measured again, unless a byte sent
     /// after the old queue was gone came back near the old base, which
     /// shows the queue was the sender's and the path slower: then the
-    /// old base stays and R_lo = r_q.
+    /// old base stays and `R_lo` = `r_q`.
     fn end_probe(&mut self, now: Instant, probe: &Probe, est: &mut Estimator, p: &Params) {
         let old = probe.old_base;
         let unchanged = match (probe.after_drain, probe.r_q) {
@@ -758,9 +767,9 @@ mod tests {
                 rtt,
                 sent: 0,
                 acked: 0,
-                flight: Default::default(),
+                flight: std::collections::VecDeque::default(),
                 busy_until: now,
-                arrivals: Default::default(),
+                arrivals: std::collections::VecDeque::default(),
                 round_end: 0,
                 last_ack: (now, 0),
             }
@@ -795,7 +804,7 @@ mod tests {
                     .last()
                     .unwrap();
                 let interval = now.saturating_duration_since(at).max(MS);
-                let rate = ((pos - delivered) as f64 / interval.as_secs_f64()) as u64;
+                let rate = u64_sat(f64_of(pos - delivered) / interval.as_secs_f64());
                 self.est.rate_sample(rate, false, now);
                 self.last_ack = (now, pos);
                 self.acked = pos;
@@ -872,7 +881,7 @@ mod tests {
             p.lim.mode
         );
         let delivered = p.run(Duration::from_secs(2));
-        let mbps = delivered as f64 * 8.0 / 2.0 / 1e6;
+        let mbps = f64_of(delivered) * 8.0 / 2.0 / 1e6;
         assert!(mbps > 90.0, "{mbps} Mbit/s");
         // The queue is what the in-flight cap allows beyond the path's
         // BDP (about one round trip plus A / R_p, 17 ms here), not the
@@ -902,7 +911,7 @@ mod tests {
         }
         assert!(worst < 300 * MS, "queue {worst:?}");
         let delivered = p.run(Duration::from_secs(5));
-        let mbps = delivered as f64 * 8.0 / 5.0 / 1e6;
+        let mbps = f64_of(delivered) * 8.0 / 5.0 / 1e6;
         assert!(mbps > 17.0, "{mbps} Mbit/s");
     }
 
@@ -921,7 +930,7 @@ mod tests {
         );
         assert_eq!(p.est.rate_lo, None);
         let delivered = p.run(Duration::from_secs(5));
-        let mbps = delivered as f64 * 8.0 / 5.0 / 1e6;
+        let mbps = f64_of(delivered) * 8.0 / 5.0 / 1e6;
         assert!(mbps > 8.5, "{mbps} Mbit/s");
     }
 
@@ -1076,7 +1085,7 @@ mod tests {
             phase: 2,
             since: t0,
         });
-        let quantum = (2 * p.chunk) as f64;
+        let quantum = f64_of(2 * p.chunk);
         lim.on_sent(t0, 2 * p.chunk, &est, &p);
         lim.refresh(t0, 0, &est, &p);
         assert!(lim.held());
@@ -1088,7 +1097,7 @@ mod tests {
         let accrued = lim.tokens(late, &est, &p);
         assert!(accrued > quantum, "{accrued}");
         let room = lim.room(late, 0, &est, &p);
-        assert!(room as f64 >= accrued && room % p.chunk == 0, "{room}");
+        assert!(f64_of(room) >= accrued && room % p.chunk == 0, "{room}");
         // Woken very late: two quanta at most.
         let later = release + Duration::from_secs(1);
         assert_eq!(lim.tokens(later, &est, &p), 2.0 * quantum);
@@ -1151,7 +1160,7 @@ mod tests {
         lim.on_ack(now, &ev, est, p);
     }
 
-    /// A limiter past start-up at `rate` with RTT_base_p `base`.
+    /// A limiter past start-up at `rate` with `RTT_base_p` `base`.
     fn cruising(rate: u64, base: Duration, now: Instant) -> (Limiter, Estimator) {
         let mut est = Estimator::new(base, now);
         est.rate_sample(rate, false, now);
@@ -1176,7 +1185,15 @@ mod tests {
             let u = base + p.budget + a_time + base / 16;
             for i in 1..=80 {
                 let now = t0 + 250 * MS * i;
-                feed(&mut lim, &mut est, p, now, &ack(Some((u, now - u))), 0, 0);
+                feed(
+                    &mut lim,
+                    &mut est,
+                    p,
+                    now,
+                    &ack(Some((u, now.checked_sub(u).unwrap()))),
+                    0,
+                    0,
+                );
                 if matches!(lim.mode, Mode::Probe(_)) {
                     return Some(now - t0);
                 }
@@ -1202,7 +1219,7 @@ mod tests {
                 &mut est,
                 p,
                 t0,
-                &ack(Some((u, t0 - u))),
+                &ack(Some((u, t0.checked_sub(u).unwrap()))),
                 0,
                 in_flight,
             );
@@ -1236,7 +1253,7 @@ mod tests {
             &mut est,
             &p,
             t,
-            &ack(Some((60 * MS, t - 60 * MS))),
+            &ack(Some((60 * MS, t.checked_sub(60 * MS).unwrap()))),
             100_000,
             120_000,
         );
@@ -1292,7 +1309,7 @@ mod tests {
             est.rate_sample(1_750_000, false, t0);
             let mut lim = Limiter::new(t0);
             for i in 1..=n {
-                let now = t0 + 10 * MS * i as u32;
+                let now = t0 + 10 * MS * u32::try_from(i).unwrap();
                 est.rate_sample(1_750_000, app_limited, now);
                 let s = AckSample {
                     rate: Some((1_750_000, app_limited)),

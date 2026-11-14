@@ -32,7 +32,7 @@ fn next_item(input: &[u8]) -> Result<(u64, &[u8], &[u8]), Error> {
     Ok((kind, value, rest))
 }
 
-/// The credential item: `CredType(varint) ‖ Credential`. An empty value and CredType 0
+/// The credential item: `CredType(varint) ‖ Credential`. An empty value and `CredType` 0
 /// ("no credential") are `tlv_credentials`; the credential itself may be empty.
 fn parse_credential(value: &[u8]) -> Result<CredentialEntry<'_>, Error> {
     if value.is_empty() {
@@ -94,6 +94,7 @@ impl JoinPipe {
     }
 
     /// Encodes the value of the item.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_varint(&mut out, self.id);
@@ -187,42 +188,50 @@ impl Payload {
     }
 
     /// The encoded payload.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.raw
     }
 
     /// The credential, if the item is present.
+    #[must_use]
     pub fn credential(&self) -> Option<CredentialEntry<'_>> {
         parse_credential(self.value(CREDENTIALS)?).ok()
     }
 
     /// The proof item, parsed. Whether the message knows the type is the caller's to
     /// judge: an unknown proof is skipped, never read.
+    #[must_use]
     pub fn proof(&self) -> Option<Proof<'_>> {
         Proof::parse(self.value(PROOF)?).ok()
     }
 
     /// The application's handshake data, where the message knows the type.
+    #[must_use]
     pub fn app_data(&self) -> Option<&[u8]> {
         self.value(APP_DATA)
     }
 
     /// The start of the sender's zmux byte stream.
+    #[must_use]
     pub fn first_bytes(&self) -> Option<&[u8]> {
         self.value(FIRST_BYTES)
     }
 
     /// The join pipe, if present and known in this message.
+    #[must_use]
     pub fn join_pipe(&self) -> Option<JoinPipe> {
         JoinPipe::decode(self.value(JOIN_PIPE)?).ok()
     }
 
     /// Encoded zmux frames, for the session layer.
+    #[must_use]
     pub fn frames(&self) -> Option<&[u8]> {
         self.value(FRAMES)
     }
 
     /// The key share: its Group and share, where the message knows the type.
+    #[must_use]
     pub fn key_share(&self) -> Option<(u64, &[u8])> {
         let value = self.value(KEY_SHARE)?;
         let (group, used) = get_item_varint(value).ok()?;
@@ -230,6 +239,7 @@ impl Payload {
     }
 
     /// The join decision: `true` accepts.
+    #[must_use]
     pub fn join_accepted(&self) -> Option<bool> {
         match self.value(JOIN_DECISION)? {
             [0] => Some(true),
@@ -247,7 +257,7 @@ impl Payload {
 /// its structure; the signature is judged against a verdict's proof key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof<'a> {
-    /// The KeyAlg of `key`.
+    /// The `KeyAlg` of `key`.
     pub key_alg: u64,
     /// The public key.
     pub key: &'a [u8],
@@ -272,6 +282,7 @@ impl<'a> Proof<'a> {
     }
 
     /// Encodes the value.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.key.len() + self.sig.len() + 8);
         put_varint(&mut out, self.key_alg);
@@ -283,6 +294,7 @@ impl<'a> Proof<'a> {
 }
 
 /// Encodes items for a payload, in the order given.
+#[must_use]
 pub fn encode_payload(items: &[(u64, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     for (kind, value) in items {
@@ -293,10 +305,10 @@ pub fn encode_payload(items: &[(u64, &[u8])]) -> Vec<u8> {
     out
 }
 
-/// A credential: its CredType and its bytes, opaque to the core.
+/// A credential: its `CredType` and its bytes, opaque to the core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CredentialEntry<'a> {
-    /// The CredType, never 0.
+    /// The `CredType`, never 0.
     pub kind: u64,
     /// The credential, possibly empty.
     pub credential: &'a [u8],

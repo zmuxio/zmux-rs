@@ -155,11 +155,13 @@ impl Candidate {
     }
 
     /// The candidate's target ([`Candidate::with_target`]).
+    #[must_use]
     pub fn target(&self) -> Option<&Arc<HttpTarget>> {
         self.target.as_ref()
     }
 
     /// The candidate's kind.
+    #[must_use]
     pub fn kind(&self) -> CarrierKind {
         self.kind
     }
@@ -175,12 +177,17 @@ impl Candidate {
     }
 
     /// The candidate's variant ([`Candidate::with_variant`]).
+    #[must_use]
     pub fn variant(&self) -> Option<&Arc<str>> {
         self.variant.as_ref()
     }
 
     /// Opens a carrier of the candidate.
     /// Its kind is the candidate's ([`PipeIo::with_carrier`]).
+    ///
+    /// # Errors
+    ///
+    /// The candidate's dial function's error.
     pub async fn dial(&self) -> io::Result<PipeIo> {
         (self.dial)().await.map(|io| {
             let io = io.with_carrier(self.kind);
@@ -204,6 +211,7 @@ pub struct CarrierChoice {
 impl CarrierChoice {
     /// `candidate` only: a failure is reported, never replaced by another
     /// kind.
+    #[must_use]
     pub fn explicit(candidate: Candidate) -> Self {
         Self {
             auto: false,
@@ -221,11 +229,13 @@ impl CarrierChoice {
     }
 
     /// Whether the choice chooses among candidates.
+    #[must_use]
     pub fn is_auto(&self) -> bool {
         self.auto
     }
 
     /// The candidates, in order of preference.
+    #[must_use]
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
     }
@@ -282,6 +292,7 @@ impl Default for CarrierChoicePolicy {
 
 impl CarrierChoicePolicy {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -302,6 +313,7 @@ impl CarrierChoicePolicy {
     }
 
     /// A candidate's timer for the round trip `rtt` of opening its carrier.
+    #[must_use]
     pub fn timer(&self, rtt: Duration) -> Duration {
         let min = self.timer_min;
         let max = self.timer_max.max(min);
@@ -364,7 +376,7 @@ impl std::error::Error for CarrierChoiceError {}
 /// application sends goes out before a carrier is chosen, and races no
 /// candidates. It skips the kinds the cache holds as failed (unless all
 /// are), and a candidate whose session is not established within its
-/// timer ([`CarrierChoicePolicy::timer`]) is abandoned without CONNECTION_CLOSE.
+/// timer ([`CarrierChoicePolicy::timer`]) is abandoned without `CONNECTION_CLOSE`.
 /// With `max_pipes` above 1 it establishes the session on the most robust
 /// candidate (a kind the cache holds as usable, else the exchange carrier,
 /// else the last) and, once multipath is in use, runs a pool of one member
@@ -385,6 +397,11 @@ impl std::error::Error for CarrierChoiceError {}
 /// of the session and ends with it. A choice without candidates or with two
 /// of one kind, or a policy with an invalid timer factor, is a
 /// [`CarrierChoiceError`] with [`CarrierChoiceError::invalid`](CarrierChoiceError#structfield.invalid) set.
+///
+/// # Errors
+///
+/// [`CarrierChoiceError`]: the choice or policy is invalid (as above), or
+/// no candidate established a session; it carries each try's result.
 pub async fn dial_choice(
     choice: &CarrierChoice,
     config: impl Into<Arc<Config>>,
@@ -524,7 +541,7 @@ fn pipe_outcome(e: &PipeError) -> CandidateOutcome {
 /// Opens a carrier of `cand` and starts a session on it, within the
 /// configuration's handshake timeout; with `p` (an auto choice) the session
 /// must be established within the candidate's timer, or it is abandoned
-/// without CONNECTION_CLOSE.
+/// without `CONNECTION_CLOSE`.
 async fn start(
     cand: &Candidate,
     config: &Arc<Config>,

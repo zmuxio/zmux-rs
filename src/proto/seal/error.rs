@@ -41,7 +41,7 @@ pub enum Error {
     TlvOrder,
     /// An unknown payload type with low bit 1.
     TlvUnknownCritical,
-    /// An empty credential value, or CredType 0.
+    /// An empty credential value, or `CredType` 0.
     TlvCredentials,
     /// A required Join item is absent.
     MissingField,
@@ -60,6 +60,7 @@ pub enum Error {
 
 impl Error {
     /// The class name of the error.
+    #[must_use]
     pub fn class(self) -> &'static str {
         match self {
             Error::Incomplete { .. } => "incomplete",

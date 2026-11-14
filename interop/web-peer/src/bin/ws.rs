@@ -6,10 +6,8 @@
 //! `FALLBACK <target>`. `client` prints `OK ping`; `bad` (no token) prints
 //! `REFUSED <error>`.
 
-#[path = "../common.rs"]
-mod common;
-
 use std::sync::Arc;
+use zmux_web_peer::common;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -53,7 +51,7 @@ async fn server(addr: &str) {
     tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     println!("READY");
     common::serve_sessions(listener).await;

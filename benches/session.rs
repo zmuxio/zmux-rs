@@ -10,6 +10,22 @@
 //! cross-thread wake-up round trip (`wake`).
 
 #![allow(missing_docs, unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
@@ -184,7 +200,7 @@ fn core_bulk(zero_copy: bool) {
     let d = t.elapsed();
     let allocs = ALLOCS.load(Relaxed) - allocs;
     let records = p.a.stats().records_sent - records;
-    let back = p.back - back;
+    let back = p.back.checked_sub(back).unwrap();
     let back_batches = p.back_batches - back_batches;
     let gb = total as f64 / 1e9;
     println!(
@@ -287,7 +303,7 @@ fn shape() -> (f64, Duration, usize) {
     let owd = Duration::from_secs_f64(f[1] / 1e3);
     let queue = f
         .get(2)
-        .map_or(2.0 * rate * 2.0 * owd.as_secs_f64(), |m| m * 1048576.0);
+        .map_or(2.0 * rate * 2.0 * owd.as_secs_f64(), |m| m * 1_048_576.0);
     (rate, owd, queue as usize)
 }
 
@@ -784,11 +800,11 @@ async fn latency(msg: usize, new_stream: bool) {
     println!(
         "RESULT scen=rr msg={msg} stream={} ops_per_s={:.0} p50_us={:.1} p99_us={:.1} p999_us={:.1} allocs_per_op={:.1}",
         if new_stream { "new" } else { "same" },
-        rounds as f64 / elapsed.as_secs_f64(),
+        f64::from(rounds) / elapsed.as_secs_f64(),
         p(0.5),
         p(0.99),
         p(0.999),
-        allocs as f64 / rounds as f64
+        allocs as f64 / f64::from(rounds)
     );
     drop(persistent);
     drop(client);
@@ -1055,14 +1071,13 @@ async fn wake_latency(q: Duration) -> (f64, f64) {
     (p50, p99)
 }
 
-/// The window span Q = max(B, K x RTT_min) of the bench's configuration on
+/// The window span Q = max(B, K x `RTT_min`) of the bench's configuration on
 /// loopback: B.
 fn bench_q() -> Duration {
     std::env::var("ZMUX_BENCH_B")
         .ok()
         .and_then(|v| v.parse().ok())
-        .map(Duration::from_micros)
-        .unwrap_or(Config::default().latency_budget)
+        .map_or(Config::default().latency_budget, Duration::from_micros)
 }
 
 async fn raw_latency(msg: usize) -> f64 {
@@ -1477,7 +1492,7 @@ async fn soak() {
         active: AtomicBool::new(true),
         stop: AtomicBool::new(false),
         counts: SoakCounts::default(),
-        open: Default::default(),
+        open: std::sync::Mutex::default(),
     });
     let t0 = Instant::now();
     let sample = |phase: &str, series: &mut Vec<(f64, i64, i64)>| {
@@ -1635,7 +1650,7 @@ fn cpu_secs() -> Option<f64> {
     }
     // SAFETY: initialized by the successful call.
     let ru = unsafe { ru.assume_init() };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
     Some(tv(ru.ru_utime) + tv(ru.ru_stime))
 }
 
@@ -1651,7 +1666,7 @@ fn policy_name(p: &Scheduler) -> &'static str {
         Scheduler::SpreadRoundRobin => "rr",
         Scheduler::SpreadRateWeighted => "rw",
         Scheduler::SessionAffinity => "session",
-        _ => "custom",
+        Scheduler::Custom(_) => "custom",
     }
 }
 
@@ -2014,7 +2029,7 @@ async fn multipath() {
                 r.cpu_per_gb.map_or("-".into(), |c| format!("{c:.3}")),
                 r.split
                     .iter()
-                    .map(|p| format!("{:.0}", p))
+                    .map(|p| format!("{p:.0}"))
                     .collect::<Vec<_>>()
                     .join("/"),
                 r.live_avg / 1024.0,

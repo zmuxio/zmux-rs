@@ -5,6 +5,16 @@
 //! under a watchdog: it fails, rather than hangs, when anything does not
 //! resolve in time.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 #[path = "common/basics.rs"]
 mod basics;
 
@@ -270,7 +280,7 @@ fn multipath_pipe_loss_during_traffic() {
             mp_config(),
         )
         .unwrap();
-        assert!(client.multipath() == zmux::Multipath::InUse);
+        assert_eq!(client.multipath(), zmux::Multipath::InUse);
         let (raddr, cut) = relay(addr);
         let pipe = client
             .begin_add_pipe(

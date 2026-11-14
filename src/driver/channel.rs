@@ -171,6 +171,7 @@ impl fmt::Debug for ChannelDemux {
 
 impl ChannelDemux {
     /// An empty router.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -204,6 +205,10 @@ impl ChannelDemux {
     /// closed) or whose ID is truncated is dropped and counted
     /// ([`ChannelDemux::dropped`]). Returns whether it was routed.
     /// The frame handed on is a slice of `datagram`, not a copy.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public API: the routed frame is a slice sharing the datagram's buffer"
+    )]
     pub fn deliver(&self, datagram: Bytes) -> bool {
         let route = channel::split(&datagram).and_then(|(id, frame)| {
             let at = datagram.len() - frame.len();
@@ -211,20 +216,18 @@ impl ChannelDemux {
             r.map(|r| (r, at))
         });
         let route = route.map(|(r, at)| (r, datagram.slice(at..)));
-        match route {
-            Some((r, frame)) => {
-                r.deliver(frame);
-                true
-            }
-            None => {
-                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                false
-            }
+        if let Some((r, frame)) = route {
+            r.deliver(frame);
+            true
+        } else {
+            self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 
     /// The datagrams [`ChannelDemux::deliver`] dropped because they named
     /// no registered pipe.
+    #[must_use]
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }

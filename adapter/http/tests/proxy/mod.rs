@@ -111,10 +111,8 @@ impl<R: AsyncRead + Unpin> Buffered<R> {
 
     /// Reads more; `false` at the end.
     async fn fill(&mut self) -> io::Result<bool> {
-        let mut chunk = [0u8; 16 << 10];
-        let n = self.r.read(&mut chunk).await?;
-        self.buf.extend_from_slice(&chunk[..n]);
-        Ok(n > 0)
+        self.buf.reserve(16 << 10);
+        Ok(self.r.read_buf(&mut self.buf).await? > 0)
     }
 
     /// The bytes up to and including the next `\r\n\r\n` (a head), or
@@ -204,13 +202,14 @@ impl Head {
 
     /// The head with the body length set to `len` (chunked coding removed).
     fn with_length(&self, len: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
         let mut out = format!("{}\r\n", self.first);
         for (n, v) in &self.fields {
             if n != "content-length" && n != "transfer-encoding" {
-                out.push_str(&format!("{n}: {v}\r\n"));
+                let _ = write!(out, "{n}: {v}\r\n");
             }
         }
-        out.push_str(&format!("content-length: {len}\r\n\r\n"));
+        let _ = write!(out, "content-length: {len}\r\n\r\n");
         out.into_bytes()
     }
 }
@@ -234,7 +233,6 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut collected = Vec::new();
     // Framing bytes go to the writer only; data to the writer or collected.
     async fn put<W: AsyncWrite + Unpin>(
         w: &mut Option<&mut W>,
@@ -251,6 +249,7 @@ where
             None => Ok(()),
         }
     }
+    let mut collected = Vec::new();
     match framing {
         Framing::Length(mut n) => {
             while n > 0 {

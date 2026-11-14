@@ -14,6 +14,7 @@ use super::recv_buf::{Backing, RecvBuf};
 use super::tuner::StreamTuner;
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::meter::{Count, Meter};
+use crate::util::usize_sat;
 
 /// A handle to a stream in a session. It stays valid until the stream's
 /// state is discarded; a stale handle is reported as a closed stream.
@@ -134,7 +135,7 @@ impl ChunkPool {
 ///
 /// A cursor separates the bytes already sent from the unsent ones. Outside
 /// multipath, sent bytes are dropped at once; in a multipath session they
-/// stay until a PIPE_ACK covers them and are
+/// stay until a `PIPE_ACK` covers them and are
 /// read again for reinjection.
 #[derive(Debug, Default)]
 pub(crate) struct SendBuf {
@@ -305,7 +306,7 @@ impl SendBuf {
 
     /// Drops `n` sent bytes from the front (acknowledged, or not needed).
     pub(crate) fn release(&mut self, n: u64, pool: &mut ChunkPool) {
-        let mut left = n.min(self.kept) as usize;
+        let mut left = usize_sat(n.min(self.kept));
         self.kept -= left as u64;
         while left > 0 {
             let Some(front) = self.segs.front_mut().map(|s| &mut s.bytes) else {
@@ -355,7 +356,7 @@ impl SendBuf {
         if off + dst.len() as u64 > self.len {
             return false;
         }
-        let mut skip = off as usize + self.seg_off;
+        let mut skip = usize_sat(off) + self.seg_off;
         let mut done = 0;
         for i in self.seg..=self.segs.len() {
             if done == dst.len() {
@@ -380,7 +381,7 @@ impl SendBuf {
         if off + dst.len() as u64 > self.kept {
             return false;
         }
-        let mut skip = off as usize;
+        let mut skip = usize_sat(off);
         let mut done = 0;
         for run in self.kept_runs() {
             if done == dst.len() {
@@ -404,7 +405,7 @@ impl SendBuf {
         if off + len as u64 > self.kept {
             return None;
         }
-        let mut skip = off as usize;
+        let mut skip = usize_sat(off);
         for seg in self.segs.iter().take(self.seg + 1).map(|s| &s.bytes) {
             let l = seg.len();
             if skip >= l {
@@ -447,7 +448,7 @@ impl SendBuf {
             return;
         }
         // Walk from the cursor, keeping `keep` bytes.
-        let mut left = keep as usize;
+        let mut left = usize_sat(keep);
         let mut i = self.seg;
         let mut off = self.seg_off;
         while left > 0 {
@@ -481,11 +482,11 @@ impl SendBuf {
 pub(crate) struct LocalReset {
     pub(crate) code: u64,
     /// Application bytes that must still be delivered (the reliable
-    /// boundary), for RESET_STREAM_AT.
+    /// boundary), for `RESET_STREAM_AT`.
     pub(crate) reliable_app: Option<u64>,
     /// The preamble stays reliable.
     pub(crate) keep_preamble: bool,
-    /// The reset answers the peer's STOP_SENDING.
+    /// The reset answers the peer's `STOP_SENDING`.
     pub(crate) answer: bool,
     /// The frame was written.
     pub(crate) written: bool,
@@ -498,7 +499,7 @@ pub(crate) enum SendOutcome {
     Finished,
     /// The application reset the stream.
     Reset,
-    /// The peer sent STOP_SENDING with this code.
+    /// The peer sent `STOP_SENDING` with this code.
     Stopped(u64),
 }
 
@@ -543,6 +544,10 @@ impl Waits {
 }
 
 /// The sending part of a stream.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-stream state flags, not one mode an enum would encode"
+)]
 #[derive(Debug)]
 pub(crate) struct SendPart {
     pub(crate) state: SendState,
@@ -551,11 +556,11 @@ pub(crate) struct SendPart {
     pub(crate) buf: SendBuf,
     /// Next stream offset to send.
     pub(crate) offset: u64,
-    /// The peer's MAX_STREAM_DATA.
+    /// The peer's `MAX_STREAM_DATA`.
     pub(crate) max_data: u64,
-    /// STREAM_DATA_BLOCKED to send at this limit.
+    /// `STREAM_DATA_BLOCKED` to send at this limit.
     pub(crate) blocked_at: Option<u64>,
-    /// The limit last reported in STREAM_DATA_BLOCKED.
+    /// The limit last reported in `STREAM_DATA_BLOCKED`.
     pub(crate) blocked_reported: Option<u64>,
     /// The application finished the stream.
     pub(crate) fin: bool,
@@ -590,20 +595,20 @@ pub(crate) struct SendPart {
     /// Multipath-only state, allocated when the stream first needs it in a
     /// multipath session (runtime zero cost on a single pipe).
     pub(crate) mp: Option<Box<SendMp>>,
-    /// The rarely used state of a sending part: resets, STOP_SENDING, limits and waits.
+    /// The rarely used state of a sending part: resets, `STOP_SENDING`, limits and waits.
     cold: Option<Box<SendCold>>,
 }
 
-/// The rarely used state of a sending part: resets, STOP_SENDING, limits
+/// The rarely used state of a sending part: resets, `STOP_SENDING`, limits
 /// and waits.
 #[derive(Debug, Clone)]
 pub(crate) struct SendCold {
     pub(crate) reset: Option<LocalReset>,
-    /// The peer's STOP_SENDING code.
+    /// The peer's `STOP_SENDING` code.
     pub(crate) stopped: Option<u64>,
     /// Reliable boundary set by the application, in application bytes.
     pub(crate) reliable_boundary: Option<u64>,
-    /// Last PRIORITY_UPDATE sequence applied from the peer.
+    /// Last `PRIORITY_UPDATE` sequence applied from the peer.
     pub(crate) peer_priority_seq: Option<u64>,
     /// Unsent bytes allowed for this stream (`set_send_buffer`).
     pub(crate) send_limit: Option<u64>,
@@ -625,6 +630,10 @@ impl SendCold {
 
 /// The multipath part of a sending part: retention and acknowledgement,
 /// reinjection, scheduling state.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-stream state flags, not one mode an enum would encode"
+)]
 #[derive(Debug, Default)]
 pub(crate) struct SendMp {
     /// Multipath retention: the
@@ -642,7 +651,7 @@ pub(crate) struct SendMp {
     /// The reset was acknowledged / must be sent again (multipath).
     pub(crate) reset_acked: bool,
     pub(crate) reset_lost: bool,
-    /// The smallest Reliable Size sent in a RESET_STREAM_AT (multipath).
+    /// The smallest Reliable Size sent in a `RESET_STREAM_AT` (multipath).
     pub(crate) reliable_sent: Option<u64>,
     /// Bytes sent opportunistically up to this offset.
     pub(crate) opportunistic_to: u64,
@@ -873,13 +882,13 @@ impl SendPart {
             return None;
         }
         let mut data = vec![0; len];
-        let (head, rest) = data.split_at_mut((base.saturating_sub(start) as usize).min(len));
+        let (head, rest) = data.split_at_mut(usize_sat(base.saturating_sub(start)).min(len));
         if !head.is_empty() {
             head.copy_from_slice(self.preamble.as_deref()?.get(..head.len())?);
         }
         let at = start.max(base);
         let kept_end = (m.buf_floor + self.buf.kept()).max(at);
-        let (kept, fresh) = rest.split_at_mut(((kept_end - at) as usize).min(rest.len()));
+        let (kept, fresh) = rest.split_at_mut(usize_sat(kept_end - at).min(rest.len()));
         if !self.buf.copy_kept(at - m.buf_floor, kept) {
             return None;
         }
@@ -895,8 +904,8 @@ impl SendPart {
     /// many of those the application wrote (the rest a preamble).
     pub(crate) fn batch_sent(&mut self, new: u64, chunks: &mut ChunkPool) -> (u64, u64) {
         let pre = new.min(self.preamble_left as u64);
-        self.preamble_left -= pre as usize;
-        let mut left = (new - pre) as usize;
+        self.preamble_left -= usize_sat(pre);
+        let mut left = usize_sat(new - pre);
         while left > 0 {
             let took = self.buf.take_shared(left, true, chunks).len();
             if took == 0 {
@@ -969,7 +978,7 @@ impl SendPart {
     }
 
     /// The Reliable Size of a reset, as a stream offset: `None` for a plain
-    /// RESET_STREAM.
+    /// `RESET_STREAM`.
     pub(crate) fn reset_reliable(&self) -> Option<u64> {
         let r = self.cold().reset?;
         if r.reliable_app.is_none() && !(r.keep_preamble && self.base > 0) {
@@ -1116,6 +1125,10 @@ impl SendPart {
 }
 
 /// The receiving part of a stream.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-stream state flags, not one mode an enum would encode"
+)]
 #[derive(Debug)]
 pub(crate) struct RecvPart {
     pub(crate) state: RecvState,
@@ -1137,11 +1150,11 @@ pub(crate) struct RecvPart {
     /// when it arrives.
     pub(crate) arrived_to: u64,
     pub(crate) final_size: Option<u64>,
-    /// STOP_SENDING still to write.
+    /// `STOP_SENDING` still to write.
     pub(crate) stop_pending: bool,
     /// The application read the end of the stream.
     pub(crate) end_read: bool,
-    /// The advertised MAX_STREAM_DATA.
+    /// The advertised `MAX_STREAM_DATA`.
     pub(crate) limit: u64,
     /// The current window (auto-tuned).
     pub(crate) window: u64,
@@ -1151,22 +1164,22 @@ pub(crate) struct RecvPart {
     pub(crate) max_window: u64,
     /// Receive-window auto-tuning.
     pub(crate) tuner: StreamTuner,
-    /// A MAX_STREAM_DATA update is owed.
+    /// A `MAX_STREAM_DATA` update is owed.
     pub(crate) update_pending: bool,
     /// Preamble size; application data starts here.
     pub(crate) preamble_size: Option<u64>,
-    /// MAX_STREAM_DATA was lost with a pipe: send the limit again.
+    /// `MAX_STREAM_DATA` was lost with a pipe: send the limit again.
     pub(crate) resend: bool,
     /// Application bytes returned to the application.
     pub(crate) app_read: u64,
     /// The part of a local bidirectional stream counts in the session's
     /// `local_recv_open` until it is terminal.
     pub(crate) counts_open: bool,
-    /// The rarely used state of a receiving part: resets, STOP_SENDING, blocked reports.
+    /// The rarely used state of a receiving part: resets, `STOP_SENDING`, blocked reports.
     cold: Option<Box<RecvCold>>,
 }
 
-/// The rarely used state of a receiving part: resets, STOP_SENDING,
+/// The rarely used state of a receiving part: resets, `STOP_SENDING`,
 /// blocked reports.
 #[derive(Debug, Clone)]
 pub(crate) struct RecvCold {
@@ -1175,11 +1188,11 @@ pub(crate) struct RecvCold {
     /// and are not tracked.
     pub(crate) released_from: Option<u64>,
     /// The peer's reset: code and Reliable Size (the final size for
-    /// RESET_STREAM).
+    /// `RESET_STREAM`).
     pub(crate) reset: Option<(u64, u64)>,
     /// The application stopped reading with this code.
     pub(crate) stopped: Option<u64>,
-    /// Largest limit reported in STREAM_DATA_BLOCKED (NE-4).
+    /// Largest limit reported in `STREAM_DATA_BLOCKED` (NE-4).
     pub(crate) blocked_seen: Option<u64>,
 }
 
@@ -1311,7 +1324,7 @@ impl RecvPart {
             return 0;
         }
         let (off, data) = if off < self.contig {
-            let skip = (self.contig - off) as usize;
+            let skip = usize_sat(self.contig - off);
             (self.contig, &data[skip..])
         } else {
             (off, data)
@@ -1337,7 +1350,7 @@ impl RecvPart {
                 .as_ref()
                 .and_then(|g| g.held.first())
                 .map_or(end, |o| o.min(end));
-            let k = (next - off) as usize;
+            let k = usize_sat(next - off);
             push(&mut self.buf, &data[..k]);
             self.contig = next;
             stored += k as u64;
@@ -1453,7 +1466,7 @@ impl RecvPart {
         let mut dropped = 0;
         let keep = limit.saturating_sub(self.read_offset);
         if (self.buf.len() as u64) > keep {
-            dropped += self.buf.truncate(keep as usize) as u64;
+            dropped += self.buf.truncate(usize_sat(keep)) as u64;
             self.contig = self.contig.min(limit.max(self.read_offset));
         }
         if let Some(g) = self.gaps.as_mut() {
@@ -1533,6 +1546,10 @@ impl GoAwayFail {
 }
 
 /// One stream.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-stream state flags, not one mode an enum would encode"
+)]
 #[derive(Debug)]
 pub(crate) struct Stream {
     pub(crate) id: Option<u64>,
@@ -1574,31 +1591,31 @@ pub(crate) struct Stream {
     /// The sending direction waits for a custom scheduling decision: in
     /// the multipath pick queue or in the call under way.
     pub(crate) pick_queued: Cell<bool>,
-    /// The preamble's contents and the PRIORITY_UPDATE state: most streams have none.
+    /// The preamble's contents and the `PRIORITY_UPDATE` state: most streams have none.
     extra: Option<Box<StreamExtra>>,
 }
 
-/// The preamble's contents and the PRIORITY_UPDATE state: most streams have
+/// The preamble's contents and the `PRIORITY_UPDATE` state: most streams have
 /// none.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamExtra {
-    /// OPEN_INFO of a peer stream, or the one to send on a local stream.
+    /// `OPEN_INFO` of a peer stream, or the one to send on a local stream.
     pub(crate) open_info: Option<Bytes>,
     /// PRIORITY requested by the peer's preamble (peer streams), or to
     /// request from the peer (local streams, before the first frame).
     pub(crate) peer_priority: Option<Priority>,
-    /// PIPE_CARRIER: sent by the peer (bidirectional peer streams), or to
+    /// `PIPE_CARRIER`: sent by the peer (bidirectional peer streams), or to
     /// send (local streams).
     pub(crate) pipe_carrier: bool,
     /// Encoded TLVs holding the application TLVs: the peer's preamble body
     /// (peer streams that carried any), or the ones to send (local
     /// streams). Iterated with `AppTlvs`.
     pub(crate) app_tlvs: Option<Bytes>,
-    /// Next PRIORITY_UPDATE sequence number to send.
+    /// Next `PRIORITY_UPDATE` sequence number to send.
     pub(crate) priority_seq: u64,
-    /// PRIORITY_UPDATE to send.
+    /// `PRIORITY_UPDATE` to send.
     pub(crate) priority_update: Option<Priority>,
-    /// The last PRIORITY_UPDATE sent (multipath: re-sent when lost).
+    /// The last `PRIORITY_UPDATE` sent (multipath: re-sent when lost).
     pub(crate) priority_sent: Option<(u64, Priority)>,
     pub(crate) priority_resend: bool,
 }
@@ -1698,7 +1715,7 @@ impl Stream {
         }
     }
 
-    /// The preamble's contents and the PRIORITY_UPDATE state (the
+    /// The preamble's contents and the `PRIORITY_UPDATE` state (the
     /// defaults while there are none).
     pub(crate) fn extra(&self) -> &StreamExtra {
         self.extra.as_deref().unwrap_or(&StreamExtra::NONE)
@@ -1712,7 +1729,7 @@ impl Stream {
         )
     }
 
-    /// The preamble's contents and the PRIORITY_UPDATE state, allocated on
+    /// The preamble's contents and the `PRIORITY_UPDATE` state, allocated on
     /// first use.
     pub(crate) fn extra_mut(&mut self) -> &mut StreamExtra {
         self.extra
@@ -1770,17 +1787,16 @@ impl Slab {
 
     pub(crate) fn insert(&mut self, stream: Stream) -> StreamKey {
         self.len += 1;
-        let slot = match self.free.pop() {
-            Some(slot) => slot,
-            None => {
-                let slot = self.next;
-                self.next += 1;
-                if slot as usize / PAGE == self.pages.len() {
-                    self.pages
-                        .push((0..PAGE).map(|_| Entry::default()).collect());
-                }
-                slot
+        let slot = if let Some(slot) = self.free.pop() {
+            slot
+        } else {
+            let slot = self.next;
+            self.next += 1;
+            if slot as usize / PAGE == self.pages.len() {
+                self.pages
+                    .push((0..PAGE).map(|_| Entry::default()).collect());
             }
+            slot
         };
         let entry = self.entry_mut(slot).expect("slot allocated");
         entry.generation = entry.generation.wrapping_add(1);
@@ -1836,6 +1852,10 @@ impl Slab {
         self.len
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "slot indices are bounded by the u32 slot space"
+    )]
     pub(crate) fn keys(&self) -> impl Iterator<Item = StreamKey> + '_ {
         self.pages
             .iter()

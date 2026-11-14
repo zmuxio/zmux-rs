@@ -6,7 +6,7 @@
 //! Mode checks that stay where they are: the protocol's rules that differ
 //! by mode (frames of the multipath layer are a violation outside it,
 //! duplicates and stale frames go uncharged in it, a single pipe's STREAM
-//! data arrives in order, a stale QX_PING is ignored there), and the
+//! data arrives in order, a stale `QX_PING` is ignored there), and the
 //! multipath module's own entry points.
 
 pub(super) mod ack;
@@ -30,6 +30,7 @@ use super::tier::Gate;
 use super::*;
 use crate::proto::payload::Flow;
 use crate::proto::varint;
+use crate::util::{f64_of, u64_sat};
 
 impl SessionCore {
     /// A session with acknowledgement: multipath or pipe acknowledgement
@@ -38,7 +39,7 @@ impl SessionCore {
         self.mp.is_some() || self.pipe_ack.is_some()
     }
 
-    /// The bytes sent and kept until a PIPE_ACK covers them (multipath
+    /// The bytes sent and kept until a `PIPE_ACK` covers them (multipath
     /// only: a single pipe drops what it sent).
     pub(super) fn retained(&self) -> u64 {
         self.mp.as_deref().map_or(0, mpath::Mp::retained)
@@ -136,7 +137,7 @@ impl SessionCore {
 }
 
 impl SessionCore {
-    /// Pipe-layer control frames are pending (PIPE_ABANDON, PIPE_STATUS).
+    /// Pipe-layer control frames are pending (`PIPE_ABANDON`, `PIPE_STATUS`).
     pub(super) fn mp_control_pending(&self) -> bool {
         self.mp.is_some()
             && self
@@ -145,7 +146,7 @@ impl SessionCore {
                 .any(|a| a.abandon_owed(false) || (a.tier().status_owed() && !a.status_held()))
     }
 
-    /// A PIPE_PING is owed on `id` and the limit of 8 per second lets it go
+    /// A `PIPE_PING` is owed on `id` and the limit of 8 per second lets it go
     /// now: pipes that have waited longest first.
     pub(super) fn ping_due(&self, id: u64, now: Instant) -> bool {
         let Some(mp) = self.mp.as_deref() else {
@@ -265,9 +266,9 @@ impl SessionCore {
 }
 
 impl SessionCore {
-    /// The TCP_NOTSENT_LOWAT a pipe's carrier should use now: on a single pipe max(128 KiB, send
-    /// rate x RTT_min / 8), in a multipath session max(32 KiB, R_p x
-    /// RTT_min_p / 8) per pipe. Without an RTT_min the floor. The driver
+    /// The `TCP_NOTSENT_LOWAT` a pipe's carrier should use now: on a single pipe max(128 KiB, send
+    /// rate x `RTT_min` / 8), in a multipath session max(32 KiB, `R_p` x
+    /// `RTT_min_p` / 8) per pipe. Without an `RTT_min` the floor. The driver
     /// applies it at most every 20 ms and only when it changes by more than
     /// 25 %, never above the carrier's send buffer.
     pub fn notsent_lowat(&self, pipe: PipeId) -> u64 {
@@ -280,17 +281,17 @@ impl SessionCore {
             let Some(rtt) = o.min_rtt() else {
                 return MULTI;
             };
-            let term = (o.est().rate as f64 * rtt.as_secs_f64() / 8.0) as u64;
+            let term = u64_sat(f64_of(o.est().rate) * rtt.as_secs_f64() / 8.0);
             return MULTI.max(term);
         }
         let Some(rtt) = self.session_rtt_min() else {
             return SINGLE;
         };
-        let term = (self.send_rate.get().unwrap_or(0) as f64 * rtt.as_secs_f64() / 8.0) as u64;
+        let term = u64_sat(f64_of(self.send_rate.get().unwrap_or(0)) * rtt.as_secs_f64() / 8.0);
         SINGLE.max(term)
     }
 
-    /// Asks for a QX_PING sample when auto-tuning would grow a window but
+    /// Asks for a `QX_PING` sample when auto-tuning would grow a window but
     /// has no RTT: one at a time, at most once per [`PROBE_INTERVAL`].
     pub(super) fn probe_rtt(&mut self, now: Instant) {
         if self.mp.is_some()
@@ -311,8 +312,8 @@ impl SessionCore {
 impl SessionCore {
     /// The RTT input of auto-tuning for a scope (`key` a stream, `None` the
     /// session): on a single pipe the
-    /// carrier's minimum RTT, else the credit-loop minimum (300 s, QX_PING
-    /// samples included); in a multipath session the largest pipe_min_rtt
+    /// carrier's minimum RTT, else the credit-loop minimum (300 s, `QX_PING`
+    /// samples included); in a multipath session the largest `pipe_min_rtt`
     /// of the pipes the scope's data arrived on in the last 4 intervals.
     pub(super) fn autotune_rtt(&self, key: Option<StreamKey>) -> Option<Duration> {
         if let Some(r) = self.config.hooks.rtt {
@@ -1000,7 +1001,7 @@ impl SessionCore {
     /// core yet), when the bound clamp(R x B / 2, 16 KiB, 64 KiB) lets a
     /// request, an acknowledgement or credit wait for at most one short
     /// call. A `blocking` write in a multipath session also holds at most
-    /// max(4 KiB, R_p x 50 ms), so that no call is
+    /// max(4 KiB, `R_p` x 50 ms), so that no call is
     /// expected to take much longer than 50 ms. Independent of the
     /// carrier: any carrier works with it, whatever signals it offers.
     pub fn write_call_limit(
@@ -1016,11 +1017,11 @@ impl SessionCore {
         if self.latency_work(pipe.0, input_pending, now) {
             let budget = self.config.latency_budget.as_secs_f64();
             let bound =
-                ((rate as f64 * budget / 2.0) as u64).clamp(WRITE_CALL_MIN as u64, WRITE_CALL_MAX);
+                u64_sat(f64_of(rate) * budget / 2.0).clamp(WRITE_CALL_MIN as u64, WRITE_CALL_MAX);
             limit = limit.min(bound);
         }
         if blocking && self.mp.is_some() {
-            let mp = ((rate as f64 * MP_WRITE_CALL_SPAN.as_secs_f64()) as u64)
+            let mp = u64_sat(f64_of(rate) * MP_WRITE_CALL_SPAN.as_secs_f64())
                 .clamp(MP_WRITE_CALL_MIN, (batch as u64).max(MP_WRITE_CALL_MIN));
             limit = limit.min(mp);
         }
@@ -1029,6 +1030,10 @@ impl SessionCore {
 }
 
 impl SessionCore {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "one of the record-event handlers the input loop matches on, which all return a Result"
+    )]
     pub(super) fn on_record_end(&mut self, len: u64, now: Instant) -> Result<(), Error> {
         self.stats.records_received += 1;
         let (id, li) = (self.rx, self.rx_lane);
@@ -1056,7 +1061,7 @@ impl SessionCore {
 
 // The path layer's properties and the hooks of what multipath alone does.
 impl SessionCore {
-    /// Whether sent stream data is kept until a PIPE_ACK covers it and
+    /// Whether sent stream data is kept until a `PIPE_ACK` covers it and
     /// resent when lost; a single pipe drops what it wrote.
     #[inline]
     pub(super) fn retains(&self) -> bool {
@@ -1070,7 +1075,7 @@ impl SessionCore {
         self.mp.is_some()
     }
 
-    /// The pipe-layer frames of a batch on pipe `id`: PIPE_ACK, PIPE_PING
+    /// The pipe-layer frames of a batch on pipe `id`: `PIPE_ACK`, `PIPE_PING`
     /// and the pipe control frames in a multipath session, the single
     /// pipe's acknowledgement when it is in use.
     pub(super) fn write_path_frames(&mut self, id: u64, w: &mut Records<'_>, now: Instant) {

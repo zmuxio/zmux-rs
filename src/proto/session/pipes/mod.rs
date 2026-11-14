@@ -5,7 +5,7 @@
 //! The state of each type is private to its module: the session reads it
 //! through accessors and changes it through the operations here, which keep
 //! a pipe's invariants (its state machine, its positions and logs, the
-//! PIPE_ABANDON exchange of its attachment, its probation and tier
+//! `PIPE_ABANDON` exchange of its attachment, its probation and tier
 //! settings) with the state they belong to.
 
 mod att;
@@ -21,7 +21,7 @@ use super::stream::StreamKey;
 
 pub(crate) use att::Attachment;
 pub(crate) use inp::{Classified, InPipe, LaneEnd};
-pub(crate) use lanes::{LaneState, OutLanes};
+pub(crate) use lanes::{LaneState, OutLane, OutLanes};
 pub(crate) use out::{BatchStart, Channel, Detection, OutPipe, QueuedCopy, splitmix};
 pub(crate) use probation::History;
 pub(crate) use rate::{RateLimiter, TokenBucket};
@@ -44,7 +44,7 @@ pub enum OutboundState {
     Joining,
     /// In use.
     Active,
-    /// No acknowledgement or write progress for T_suspect.
+    /// No acknowledgement or write progress for `T_suspect`.
     Suspect,
     /// Removed gracefully, draining.
     Draining,
@@ -210,11 +210,11 @@ pub(crate) enum SentFrame {
     PipeAbandon {
         pipe: u64,
     },
-    /// This end's SESSION_EPOCH answer: once acknowledged, this end switches epoch.
+    /// This end's `SESSION_EPOCH` answer: once acknowledged, this end switches epoch.
     EpochAnswer {
         epoch: u64,
     },
-    /// A QX_PING request: it stops being outstanding when its pipe
+    /// A `QX_PING` request: it stops being outstanding when its pipe
     /// fails.
     Ping {
         seq: u64,
@@ -224,9 +224,9 @@ pub(crate) enum SentFrame {
 /// The state of a revalidation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Revalidation {
-    /// Its PIPE_PING waits for the PIPE_PING limit.
+    /// Its `PIPE_PING` waits for the `PIPE_PING` limit.
     PingOwed,
-    /// Its PIPE_PING was sent: it ends when the acknowledged position
+    /// Its `PIPE_PING` was sent: it ends when the acknowledged position
     /// reaches this.
     Until(u64),
 }
@@ -237,7 +237,7 @@ pub(crate) enum Revalidation {
 pub enum PrioritySource {
     /// Set locally.
     Local,
-    /// The peer's PIPE_STATUS request.
+    /// The peer's `PIPE_STATUS` request.
     Peer,
     /// Neither: the default (priority 0, available).
     Default,

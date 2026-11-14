@@ -4,6 +4,20 @@
 //! back; no carrier capability; the loop check; an outer session without
 //! the preamble (a plain QMux peer).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "test-local consts and helper fns sit next to their only use"
+)]
+
 mod common;
 
 use std::future::Future;
@@ -245,7 +259,7 @@ impl Nested {
         }
         let x = Session::connect(a, multipath()).await.unwrap();
         let y = listener.accept().await.unwrap();
-        assert!(x.multipath() == zmux::Multipath::InUse);
+        assert_eq!(x.multipath(), zmux::Multipath::InUse);
         Self {
             oc,
             os,
@@ -385,7 +399,7 @@ fn stream_events_map_to_pipe_events() {
             // between zmux endpoints (a session with acknowledgement)
             // without CONNECTION_CLOSE, a carrier failure.
             let (x, _y, send, _recv) = single_raw(&oc, &os).await;
-            send.with(|s| s.finish()).unwrap();
+            send.with(zmux::SendStream::finish).unwrap();
             let e = watchdog(10, "closed", x.closing()).await;
             assert!(matches!(e, zmux::SessionError::PipesLost { .. }), "{e:?}");
 
@@ -545,7 +559,7 @@ fn a_pipe_never_runs_over_its_own_session() {
 /// cannot see the loop (its carrier hides that it is a stream of its own
 /// session) joins over a stream of that session; the listener sees that
 /// the carrier is a stream of the session it would join, refuses with
-/// PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT), and the joiner backs off.
+/// `PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT)`, and the joiner backs off.
 #[test]
 fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
     multi_thread(async {
@@ -612,10 +626,13 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
             // Whichever took the source's slots first hold them: the other
             // is refused at once (the tasks may start in any order).
             eventually(10, "one refused", || {
-                handled.iter().any(|h| h.is_finished())
+                handled.iter().any(tokio::task::JoinHandle::is_finished)
             })
             .await;
-            let i = handled.iter().position(|h| h.is_finished()).unwrap();
+            let i = handled
+                .iter()
+                .position(tokio::task::JoinHandle::is_finished)
+                .unwrap();
             let refused = watchdog(10, "the refused one", handled.remove(i))
                 .await
                 .unwrap();

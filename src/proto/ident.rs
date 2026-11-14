@@ -2,10 +2,10 @@
 //!
 //! Without TLS the first bytes identify the protocol: the first record of a bootstrap
 //! pipe must have a Size from 9 to the receiver's own `max_record_size` followed by the
-//! QX_TRANSPORT_PARAMETERS type (`ff 51 53 30 0d 0a 0d 0a` in QMux-02). A listener that
+//! `QX_TRANSPORT_PARAMETERS` type (`ff 51 53 30 0d 0a 0d 0a` in QMux-02). A listener that
 //! also accepts joins takes the first byte `02` of a Join Hello, which no first record
 //! begins with since a Size is at least 9, and on a new stream of a connection that
-//! already carries a pipe of the endpoint the PIPE_LANE type `ba 05 a1 c9` after a Size
+//! already carries a pipe of the endpoint the `PIPE_LANE` type `ba 05 a1 c9` after a Size
 //! from 22 (a lane). The check runs byte by byte and rejects as soon as no valid first
 //! record can begin with the bytes seen.
 
@@ -14,14 +14,14 @@ use super::error::Error;
 use super::params::ZMUX_MAX_RECORD_SIZE;
 use super::record::Framing;
 
-/// The encoded QX_TRANSPORT_PARAMETERS type that starts a session
+/// The encoded `QX_TRANSPORT_PARAMETERS` type that starts a session
 /// ([`crate::proto::draft`]).
 pub const SESSION_PREFIX: [u8; 8] = CURRENT.session_prefix();
 /// The first byte of a Join Hello.
 pub const JOIN_FIRST_BYTE: u8 = 0x02;
 /// The smallest Size of a first record that starts a session.
 pub const MIN_SESSION_RECORD: u64 = 9;
-/// The encoded PIPE_LANE type that starts a lane.
+/// The encoded `PIPE_LANE` type that starts a lane.
 pub const LANE_PREFIX: [u8; 4] = [0xba, 0x05, 0xa1, 0xc9];
 /// The smallest Size of a first record that starts a lane.
 pub const MIN_LANE_RECORD: u64 = 22;
@@ -29,11 +29,11 @@ pub const MIN_LANE_RECORD: u64 = 22;
 /// What a new carrier turned out to carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FirstRecord {
-    /// A new session (QX_TRANSPORT_PARAMETERS first).
+    /// A new session (`QX_TRANSPORT_PARAMETERS` first).
     Session,
     /// A pipe join (a Join Hello).
     Join,
-    /// A lane of a pipe (PIPE_LANE first).
+    /// A lane of a pipe (`PIPE_LANE` first).
     Lane,
 }
 
@@ -68,6 +68,7 @@ pub struct Classifier {
 impl Classifier {
     /// A check for the given alternatives; `max_record_size` is the
     /// receiver's own limit.
+    #[must_use]
     pub const fn new(max_record_size: u64, accept_sessions: bool, accept_joins: bool) -> Self {
         Self {
             max_record_size,
@@ -81,18 +82,21 @@ impl Classifier {
     }
 
     /// The check for a bootstrap pipe: only a new session is valid.
+    #[must_use]
     pub const fn bootstrap(max_record_size: u64) -> Self {
         Self::new(max_record_size, true, false)
     }
 
     /// The check also accepts a lane: for a new stream of a connection
     /// that already carries a pipe of the endpoint.
+    #[must_use]
     pub const fn with_lanes(mut self) -> Self {
         self.lanes = true;
         self
     }
 
     /// The current verdict.
+    #[must_use]
     pub const fn verdict(&self) -> Verdict {
         self.verdict
     }
@@ -198,7 +202,8 @@ impl Classifier {
     }
 
     /// The error a session closes with when the check fails: the endpoint
-    /// sends its own parameters and then CONNECTION_CLOSE with it.
+    /// sends its own parameters and then `CONNECTION_CLOSE` with it.
+    #[must_use]
     pub const fn rejection_error() -> Error {
         Error::protocol_violation(0, "not a zmux or QMux peer")
     }
@@ -232,6 +237,7 @@ fn alias_rule() -> Option<AliasRule> {
 /// shares ([`crate::proto::draft::Draft::alpn_alias`]): for QMux-02, `qmux-01` for `qmux-02`,
 /// `qmux-01.<application>` for `qmux-02.<application>`, `<name>-01` for any other `<name>-02`,
 /// and no alias otherwise. A client may offer the aliases after its configured identifiers.
+#[must_use]
 pub fn alpn_alias(configured: &[u8]) -> Option<Vec<u8>> {
     let AliasRule {
         own,
@@ -266,6 +272,7 @@ pub fn alpn_alias(configured: &[u8]) -> Option<Vec<u8>> {
 ///     [b"qmux-02.chat".to_vec(), b"qmux-01.chat".to_vec()]
 /// );
 /// ```
+#[must_use]
 pub fn alpn_protocols(applications: &[&str]) -> Vec<Vec<u8>> {
     let configured: Vec<Vec<u8>> = if applications.is_empty() {
         vec![DEFAULT_ALPN.to_vec()]
@@ -301,6 +308,7 @@ pub fn default_alpn(protocols: &mut Vec<Vec<u8>>, defaults: impl FnOnce() -> Vec
 /// Whether a protocol identifier offered by the peer matches a configured
 /// one: the same identifier or its draft-01 alias ([`alpn_alias`]),
 /// compared byte for byte.
+#[must_use]
 pub fn alpn_matches(configured: &[u8], offered: &[u8]) -> bool {
     if configured == offered {
         return true;
@@ -337,6 +345,10 @@ pub fn alpn_matches(configured: &[u8], offered: &[u8]) -> bool {
 
 /// Server-side ALPN selection: the first identifier in the client's offer
 /// that matches a configured one, in the client's order of preference.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "public signature: a cloneable iterable, walked once per offer"
+)]
 pub fn select_alpn<'a, C, O>(configured: C, offered: O) -> Option<&'a [u8]>
 where
     C: IntoIterator<Item = &'a [u8]> + Clone,
@@ -373,6 +385,7 @@ pub enum FirstBytes {
 /// which [`Classifier`] applies. `16 03`, as TLS begins, is always
 /// [`FirstBytes::Other`]. It is the one authority for hosts and transforms
 /// that tell zmux records from other content.
+#[must_use]
 pub fn classify_first_bytes(b: &[u8], framing: Framing) -> FirstBytes {
     let Some(&first) = b.first() else {
         return FirstBytes::NeedMore(1);

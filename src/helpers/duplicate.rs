@@ -29,7 +29,11 @@ pub enum DuplicateError {
     /// A session is not established, or already closing.
     NotEstablished,
     /// Which endpoint dialed a session is not known
-    /// ([`Session::set_dialer`](crate::Session#method.set_dialer)).
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " ([`Session::set_dialer`](crate::Session#method.set_dialer))."
+    )]
+    #[cfg_attr(not(feature = "tokio"), doc = " (`Session::set_dialer`).")]
     DialerUnknown,
     /// The same endpoint dialed both sessions: not a race; the dialer
     /// alone decides which to keep, and its peer leaves both to it.
@@ -161,7 +165,7 @@ macro_rules! duplicate_api {
             /// The session kept: open new streams here.
             pub survivor: $session,
             /// The session being drained: GOAWAY when it is in use, no new
-            /// streams, and an application close with NO_ERROR once its
+            /// streams, and an application close with `NO_ERROR` once its
             /// streams have ended (its `close_reason` tells when).
             pub loser: $session,
             /// The value that decided.
@@ -192,14 +196,20 @@ macro_rules! duplicate_api {
         /// The losing session stops opening streams at once and drains: two-phase
         /// GOAWAY when it is in use, so that streams the peer opened concurrently
         /// are processed or reported as retryable, then an application close with
-        /// NO_ERROR once its streams have ended; without GOAWAY it closes once its
+        /// `NO_ERROR` once its streams have ended; without GOAWAY it closes once its
         /// streams have ended. Never waits. With `opts.rejoin`, the losing route
         /// is dialed again in the background and joined to the survivor when that
         /// applies ([`Resolved::rejoin_started`]).
         ///
         /// Fails, and changes nothing, when a session is not established, a
-        /// dialer is unknown ([`Session::is_dialer`](crate::Session#method.is_dialer)), the same endpoint dialed
+        #[cfg_attr(feature = "tokio", doc = " dialer is unknown ([`Session::is_dialer`](crate::Session#method.is_dialer)), the same endpoint dialed")]
+        #[cfg_attr(not(feature = "tokio"), doc = " dialer is unknown (`Session::is_dialer`), the same endpoint dialed")]
         /// both sessions, or no value decides.
+        ///
+        /// # Errors
+        ///
+        /// The [`DuplicateError`](crate::helpers::DuplicateError) that says
+        /// why nothing was decided.
         pub fn resolve_duplicate(
             s1: &$session,
             s2: &$session,

@@ -2,7 +2,7 @@
 //! ready data within stream credit (X of tier saturation, the backlog of `spread-eta`), in total
 //! and per direction in order (the round robin's share of ECF's backlog), and the incremental
 //! directions with data ready (BLEST's n), the reinjected information pending, the oldest wait
-//! start, per pipe the expected bytes of the directions bound to it (A_p of `affinity`), the
+//! start, per pipe the expected bytes of the directions bound to it (`A_p` of `affinity`), the
 //! directions with new data by how a decision treats them, the blocking data of the directions held
 //! back by stream credit, the waiting writers, and the redundant copy bytes outstanding.
 //!
@@ -23,8 +23,8 @@ use crate::proto::session::stream::{SendPart, StreamKey};
 use crate::proto::session::{Redundancy, Scheduler};
 
 /// Tags kept in the ledger, empty ones included, before the empty ones are
-/// dropped: the fixed tags (Lost, eight Chunk levels, SessionAffinity,
-/// RoundRobin, Each) and the Bound tags of a few pipes.
+/// dropped: the fixed tags (Lost, eight Chunk levels, `SessionAffinity`,
+/// `RoundRobin`, Each) and the Bound tags of a few pipes.
 const TAGS_KEPT: usize = 32;
 
 /// The data that blocks the window, where and when it was last sent.
@@ -218,12 +218,13 @@ impl Waiter {
             && send.waits.holding
             && send.cold().send_limit.is_none()
             && !send.state.is_terminal();
-        Some(match plain {
-            true => Self::Holds {
+        Some(if plain {
+            Self::Holds {
                 held: send.held(true),
                 at,
-            },
-            false => Self::Other { at },
+            }
+        } else {
+            Self::Other { at }
         })
     }
 }
@@ -256,7 +257,7 @@ pub(crate) struct Ledger {
     ready: [u64; 8],
     /// Per level, the ready data of each incremental direction that has
     /// some, in order, and how many they are; and the ready data of the
-    /// non-incremental ones, which the round robin serves in full (N_u).
+    /// non-incremental ones, which the round robin serves in full (`N_u`).
     amounts: [Amounts; 8],
     sharers: [u64; 8],
     whole: [u64; 8],
@@ -530,15 +531,14 @@ impl Ledger {
     }
 
     fn count_load(&mut self, pipe: u64, expected: Expected, add_it: bool) {
-        let i = match self.loads.iter().position(|l| l.pipe == pipe) {
-            Some(i) => i,
-            None => {
-                self.loads.push(PipeLoad {
-                    pipe,
-                    ..PipeLoad::default()
-                });
-                self.loads.len() - 1
-            }
+        let i = if let Some(i) = self.loads.iter().position(|l| l.pipe == pipe) {
+            i
+        } else {
+            self.loads.push(PipeLoad {
+                pipe,
+                ..PipeLoad::default()
+            });
+            self.loads.len() - 1
         };
         let l = &mut self.loads[i];
         let sign = |a: u64| if add_it { a + 1 } else { a - 1 };
@@ -582,7 +582,7 @@ impl Ledger {
 
     /// The ready data within stream credit of level `level` that comes
     /// before `cap` bytes of an incremental direction: every
-    /// non-incremental direction's in full (N_u), each incremental one's up
+    /// non-incremental direction's in full (`N_u`), each incremental one's up
     /// to `cap`.
     pub(in crate::proto::session) fn ready_capped(&self, level: u8, cap: u64) -> u64 {
         let l = usize::from(level);
@@ -645,7 +645,7 @@ impl Ledger {
         (first(&self.marks), first(&self.waits))
     }
 
-    /// A_p: the expected bytes of the directions bound to `pipe`, but for
+    /// `A_p`: the expected bytes of the directions bound to `pipe`, but for
     /// `except`'s, with the session send buffer in force.
     pub(in crate::proto::session) fn load(
         &self,
@@ -772,7 +772,11 @@ impl crate::proto::session::SessionCore {
         for (u, q) in self.streams.queue().levels().iter().enumerate() {
             for &key in q {
                 if let Some(send) = self.streams.send(key) {
-                    debug_assert_eq!(send.queued, Some(u as u8), "queued at another level");
+                    debug_assert_eq!(
+                        send.queued.map(usize::from),
+                        Some(u),
+                        "queued at another level"
+                    );
                     keys.push(key);
                 }
             }

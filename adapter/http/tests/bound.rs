@@ -1,5 +1,5 @@
 //! The Bound contract of carriers on TLS this process terminates: a
-//! bidirectional carrier over HTTP/1.1 or HTTP/2 on a TlsConnection is
+//! bidirectional carrier over HTTP/1.1 or HTTP/2 on a `TlsConnection` is
 //! secure with the connection's exporter, shared by the streams of one
 //! HTTP/2 connection; split halves, h2c and an http origin are not.
 
@@ -47,7 +47,7 @@ fn config(pipe_auth: PipeAuth) -> Config {
     c
 }
 
-/// A TLS server whose connections are TlsConnections, routed by `endpoint`.
+/// A TLS server whose connections are `TlsConnections`, routed by `endpoint`.
 async fn tls_server(
     endpoint: zmux_http::Endpoint,
     acceptor: tokio_rustls::TlsAcceptor,

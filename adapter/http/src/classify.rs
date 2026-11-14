@@ -44,6 +44,11 @@ impl PairField {
     /// The field `name`: a header field name that no protocol field of
     /// HTTP, WebSocket or the adapters uses ([`io::ErrorKind::InvalidInput`]
     /// otherwise).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when `name` is not a header field name or is one a
+    /// protocol field uses.
     pub fn new(name: &str) -> io::Result<Self> {
         let invalid = |why| {
             io::Error::new(
@@ -106,6 +111,7 @@ impl RequestClass {
     /// Whether the request's carrier is decided on its head alone, without
     /// a prefix of its body: the upgrades and the downlink `GET` (a
     /// credential travels in a header field).
+    #[must_use]
     pub fn head_decided(self) -> bool {
         matches!(self, Self::WebSocket | Self::WebTransport | Self::Downlink)
     }
@@ -173,6 +179,7 @@ pub fn classify(parts: &http::request::Parts, pair: &PairField) -> Option<Reques
 /// (`Early-Data: 1`, RFC 8470): [`zmux::adapter::forwarded_early_data`] of its
 /// header fields. A carrier request with it is answered `425 (Too Early)`
 /// and given to no listener.
+#[must_use]
 pub fn forwarded_early_data(headers: &HeaderMap) -> bool {
     zmux::adapter::forwarded_early_data(headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())))
 }
@@ -191,6 +198,7 @@ fn tokens(headers: &HeaderMap, name: HeaderName) -> impl Iterator<Item = &str> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value, reason = "keeps the test table terse")]
     fn class(method: Method, version: Version, fields: &[(&str, &str)]) -> Option<RequestClass> {
         let mut h = HeaderMap::new();
         for (n, v) in fields {

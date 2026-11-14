@@ -1,7 +1,16 @@
 //! `helpers::PacketStream` and `helpers::splice_packets` (EXTENSIONS.md
 //! Section 12): packets as datagrams or DATAGRAM capsules, the send
-//! policies, malformed bytes ending the stream with ZMUX_PACKET_ERROR, and
+//! policies, malformed bytes ending the stream with `ZMUX_PACKET_ERROR`, and
 //! a relay that turns a datagram too large for the next hop into a capsule.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
 
 mod common;
 
@@ -165,7 +174,7 @@ fn without_datagrams_packets_fall_back_to_capsules() {
 
 /// Writes `bytes` raw on a stream whose far end is a packet stream with a
 /// bound of 100; what the far end's `recv` returns, and how the raw end
-/// saw the stream end: the STOP_SENDING code and the reset code.
+/// saw the stream end: the `STOP_SENDING` code and the reset code.
 async fn raw_to_packets(
     bytes: Vec<u8>,
     finish: bool,

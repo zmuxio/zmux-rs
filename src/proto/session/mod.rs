@@ -86,7 +86,6 @@ pub use api::{SendCapacity, SendOutcomeKind};
 pub use app_event::{
     CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, Support, Tracer,
 };
-pub(crate) use config::Period;
 #[cfg(feature = "test-hooks")]
 pub use config::TestHooks;
 pub use config::{AllowRecordMode, AuthorizeJoin, RecordPolicy, RecordPolicyInput};
@@ -98,6 +97,7 @@ pub use config::{
     Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT, PipeAuth, Redial, Redundancy,
     SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, UniCredit, WindowIncrease,
 };
+pub(crate) use config::{Period, STAGED_UNI_STREAMS};
 pub use early::EarlyDataState;
 pub use epoch::{
     DEFAULT_EPOCH_JOINS, DEFAULT_EPOCH_PERIOD, EPOCH_RETENTION, EpochPolicy, MAX_JOIN_DEADLINE,
@@ -142,18 +142,21 @@ impl std::fmt::Display for PipeId {
 impl PipeId {
     /// The pipe with ID `id` (pipe 0 is the bootstrap pair).
     #[inline]
+    #[must_use]
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
 
     /// The ID's value.
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     /// Lane `lane` of the pipe's directions.
     #[inline]
+    #[must_use]
     pub const fn lane(self, lane: u64) -> LaneId {
         LaneId {
             pipe: self,
@@ -174,12 +177,14 @@ impl Lane {
 
     /// Lane `n` of a pipe.
     #[inline]
+    #[must_use]
     pub const fn new(n: u64) -> Self {
         Self(n)
     }
 
     /// The lane's number.
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -224,7 +229,7 @@ fn select_protocol(ours: &[String], theirs: &[Vec<u8>], server: bool) -> Option<
 /// How an inbound pipe ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipeEnd {
-    /// End of stream (TCP FIN, TLS close_notify, end of a body).
+    /// End of stream (TCP FIN, TLS `close_notify`, end of a body).
     Eof,
     /// A carrier error or reset, of this kind.
     Error(std::io::ErrorKind),
@@ -263,8 +268,8 @@ pub enum State {
     Draining,
     /// Resume in use and no live pipe in a direction.
     Suspended,
-    /// Closing: writes shut down, reading until the peer ends or the linger
-    /// timeout.
+    /// Closing: writes shut down, reading each pipe until the peer ends it,
+    /// its `CONNECTION_CLOSE` was read on it, or the linger timeout.
     Closing,
     /// All done; close the carriers.
     Closed,
@@ -330,7 +335,7 @@ pub struct SessionStats {
     /// Current no-effect budget in tokens.
     pub no_effect_budget: u64,
     /// Smoothed RTT, when sampled: pipe 0's outside multipath (its
-    /// acknowledgements, the carrier's estimate, or QX_PING and credit-loop
+    /// acknowledgements, the carrier's estimate, or `QX_PING` and credit-loop
     /// samples), the primary pipe's in a multipath
     /// session.
     pub smoothed_rtt: Option<Duration>,
@@ -381,7 +386,7 @@ pub struct SessionStats {
     /// Joins closed as replays or too late.
     pub join_replays: u64,
     /// Our joins refused by a decision in the Reply, or abandoned with
-    /// ZMUX_PIPE_RESOURCE_LIMIT.
+    /// `ZMUX_PIPE_RESOURCE_LIMIT`.
     pub join_refusals: u64,
     /// Times the session entered SUSPENDED.
     pub suspensions: u64,
@@ -409,7 +414,7 @@ pub struct StreamStats {
     /// opportunistic) again.
     pub bytes_sent: u64,
     /// Distinct bytes acknowledged: passed to the carrier on a single
-    /// pipe, covered by PIPE_ACK in a multipath session.
+    /// pipe, covered by `PIPE_ACK` in a multipath session.
     pub bytes_acknowledged: u64,
     /// Distinct application bytes received, read or not; never
     /// decreases. None count before a peer stream's preamble, and once
@@ -440,7 +445,7 @@ pub struct StreamStats {
     pub pipe_id: Option<PipeId>,
 }
 
-/// QX_PING state.
+/// `QX_PING` state.
 #[derive(Debug, Default)]
 struct PingState {
     /// Next request sequence number.
@@ -473,7 +478,7 @@ struct PingState {
 struct GoAwayState {
     /// Shutdown requested with this application code.
     shutdown: Option<u64>,
-    /// The reason phrase of the final CONNECTION_CLOSE.
+    /// The reason phrase of the final `CONNECTION_CLOSE`.
     reason: Bytes,
     /// GOAWAY frame to send: watermarks and code.
     pending: Option<(u64, u64, u64)>,
@@ -573,7 +578,7 @@ struct WaitingDatagram {
 const WAITING_COST: usize = 64;
 
 /// How long an application close waits for the carriers to take
-/// CONNECTION_CLOSE before the session ends locally.
+/// `CONNECTION_CLOSE` before the session ends locally.
 pub(crate) const CLOSE_HANDOFF_LIMIT: Duration = Duration::from_secs(1);
 
 impl WaitingDatagram {
@@ -676,7 +681,7 @@ impl NoEffectBudget {
             let ms = i64::try_from(ms).unwrap_or(i64::MAX / BUDGET_REFILL_PER_MS);
             if ms > 0 {
                 self.milli = (self.milli + ms * BUDGET_REFILL_PER_MS).min(BUDGET_CAPACITY);
-                self.last = Some(last + Duration::from_millis(ms as u64));
+                self.last = Some(last + Duration::from_millis(ms.cast_unsigned()));
             }
         } else {
             self.last = Some(now);
@@ -690,7 +695,7 @@ impl NoEffectBudget {
     }
 
     fn tokens(&self) -> u64 {
-        (self.milli.max(0) / 1000) as u64
+        (self.milli.max(0) / 1000).cast_unsigned()
     }
 }
 
@@ -736,13 +741,13 @@ impl RecvRefs {
 /// What a close must still put on the wire.
 #[derive(Debug, Clone)]
 enum CloseFrame {
-    /// CONNECTION_CLOSE type 0x1c.
+    /// `CONNECTION_CLOSE` type 0x1c.
     Transport {
         code: u64,
         frame_type: u64,
         reason: Bytes,
     },
-    /// CONNECTION_CLOSE type 0x1d.
+    /// `CONNECTION_CLOSE` type 0x1d.
     Application { code: u64, reason: Bytes },
 }
 
@@ -804,6 +809,10 @@ enum CloseFrame {
 /// assert!(fin);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent session flags, not one mode an enum would encode"
+)]
 #[derive(Debug)]
 pub struct SessionCore {
     /// Shared by the sessions of a listener; `set_scheduler` copies it.
@@ -865,7 +874,7 @@ pub struct SessionCore {
     /// are processed, or at the close.
     exporter: Option<Box<Option<Vec<u8>>>>,
     /// The record mode of a first pipe on the secure carrier; `None` is Unmanaged.
-    first_pipe_mode: Option<crate::proto::seal::RecordMode>,
+    first_pipe_mode: Option<RecordMode>,
     /// The host declared pipe 0 end to end.
     declared: bool,
     /// The length of the instance identifier at the start of the local Locators.
@@ -889,7 +898,7 @@ pub struct SessionCore {
     srtt: Option<Duration>,
     /// The carrier's RTT estimate, from the driver.
     carrier_rtt: Option<Duration>,
-    /// The credit-loop minimum RTT over 300 s, QX_PING samples included.
+    /// The credit-loop minimum RTT over 300 s, `QX_PING` samples included.
     loop_min: filter::MinFilter,
     /// Memory the session's carriers hold for it, charged by their
     /// adapters without a listener (a QUIC connection's receive window).
@@ -904,9 +913,9 @@ pub struct SessionCore {
     /// The rate bytes are handed to the carrier (single pipe).
     send_rate: filter::IntervalRate,
     /// The limit of probe requests (at most
-    /// 16 QX_PING requests and PIPE_PING frames in any one second).
+    /// 16 `QX_PING` requests and `PIPE_PING` frames in any one second).
     requests: pipes::TokenBucket<16>,
-    /// When auto-tuning last asked for a QX_PING sample.
+    /// When auto-tuning last asked for a `QX_PING` sample.
     last_rtt_probe: Option<Instant>,
     /// The latest time an input carried; commands without a clock (stream
     /// operations) act at this time.
@@ -927,13 +936,13 @@ pub struct SessionCore {
     keep_alive_rng: u64,
     linger_deadline: Option<Instant>,
     /// When an application close stops waiting for the carriers to take
-    /// CONNECTION_CLOSE ([`SessionCore::close_handed_off`]).
+    /// `CONNECTION_CLOSE` ([`SessionCore::close_handed_off`]).
     handoff_deadline: Option<Instant>,
     /// The hand-off limit passed: a close no longer waits for the
     /// carriers ([`SessionCore::close_returned`]).
     handoff_expired: bool,
     /// A graceful close sends what the streams wrote before its
-    /// CONNECTION_CLOSE: its code and reason while it does.
+    /// `CONNECTION_CLOSE`: its code and reason while it does.
     close_flush: Option<Box<(VarInt, Bytes)>>,
     /// An abort was called: a close returns at once.
     close_aborted: bool,
@@ -941,14 +950,14 @@ pub struct SessionCore {
     /// The linger deadline was extended once because the close was not
     /// written yet.
     linger_extended: bool,
-    /// The peer's CONNECTION_CLOSE was processed: what arrived before it
+    /// The peer's `CONNECTION_CLOSE` was processed: what arrived before it
     /// stays readable while the session is closing.
     peer_close_processed: bool,
     /// After the peer's close: the streams the application holds (opened or
     /// accepted) whose received data is not read yet; CLOSED waits for 0 or
     /// the linger deadline.
     peer_close_unread: usize,
-    /// The linger was restarted when the carriers took CONNECTION_CLOSE.
+    /// The linger was restarted when the carriers took `CONNECTION_CLOSE`.
     pub(in crate::proto::session) linger_from_delivery: bool,
     /// The application byte counters.
     meter: Arc<Meter>,
@@ -987,7 +996,7 @@ const fn dir_of_index(i: usize) -> Dir {
     if i == BIDI { Dir::Bidi } else { Dir::Uni }
 }
 
-use crate::util::random_u64;
+use crate::util::{f64_of, random_u64};
 
 /// A Lane Key chosen uniformly at random.
 fn random_key() -> [u8; 16] {
@@ -1012,7 +1021,7 @@ impl SessionCore {
         role: Role,
         transport_role: Option<Role>,
         now: Instant,
-    ) -> Result<Self, crate::InvalidConfig> {
+    ) -> Result<Self, InvalidConfig> {
         let config: Arc<Config> = config.into();
         let keep_alive_rng = config
             .hooks
@@ -1030,7 +1039,7 @@ impl SessionCore {
         let lane_key = config.hooks.lane_key.unwrap_or_else(random_key);
         let local_tp = config.transport_parameters(role_nonce, session_nonce, lane_key);
         local_tp.validate().map_err(|_| {
-            crate::InvalidConfig::new("Config", "gives transport parameters that are not valid")
+            InvalidConfig::new("Config", "gives transport parameters that are not valid")
         })?;
         let local = tp::LocalTp::of(&local_tp);
         let grease = config.grease_parameter(random_u64());
@@ -1046,8 +1055,8 @@ impl SessionCore {
         ];
         // Unidirectional credit grows on the first accept unless the
         // application configured it (or the test parameters set more).
-        let staged_uni = config.max_incoming_uni_streams == config::UniCredit::Staged
-            && stream_limits[UNI] < config::STAGED_UNI_STREAMS.1;
+        let staged_uni = config.max_incoming_uni_streams == UniCredit::Staged
+            && stream_limits[UNI] < STAGED_UNI_STREAMS.1;
         let streams = Streams::new(config.send_buffer, stream_limits, staged_uni, window);
         let ping_start = config.hooks.ping_seq_start.unwrap_or(0);
         let srtt = config.hooks.rtt;
@@ -1056,7 +1065,7 @@ impl SessionCore {
             && (role != Role::Client
                 || !config.early_data.zmux_peer && !config.early_data.carrier_early_data)
         {
-            return Err(crate::InvalidConfig::new(
+            return Err(InvalidConfig::new(
                 "early_data",
                 "hold_first_flight without client early data",
             ));
@@ -1224,7 +1233,7 @@ impl SessionCore {
         (self.config.enable_datagrams, peer)
     }
 
-    /// RESET_STREAM_AT support: (local, the peer's once its parameters
+    /// `RESET_STREAM_AT` support: (local, the peer's once its parameters
     /// were processed).
     pub fn reset_stream_at_support(&self) -> (bool, bool) {
         (
@@ -1233,7 +1242,7 @@ impl SessionCore {
         )
     }
 
-    /// Whether the peer accepts RESET_STREAM_AT (its `reset_stream_at`
+    /// Whether the peer accepts `RESET_STREAM_AT` (its `reset_stream_at`
     /// transport parameter), once its parameters were processed.
     pub fn peer_accepts_reset_stream_at(&self) -> bool {
         self.peer_tp.as_ref().is_some_and(|t| t.reset_stream_at)
@@ -1258,17 +1267,17 @@ impl SessionCore {
         )
     }
 
-    /// The smoothed RTT, when sampled (QX_PING) or configured.
+    /// The smoothed RTT, when sampled (`QX_PING`) or configured.
     pub fn rtt(&self) -> Option<Duration> {
         self.srtt
     }
 
-    /// The variation of the QX_PING samples.
+    /// The variation of the `QX_PING` samples.
     pub(super) fn ping_rttvar(&self) -> Option<Duration> {
         self.ping.rttvar
     }
 
-    /// The latest QX_PING sample.
+    /// The latest `QX_PING` sample.
     pub(super) fn ping_latest(&self) -> Option<Duration> {
         self.ping.latest
     }
@@ -1286,8 +1295,8 @@ impl SessionCore {
 
     /// Sets or clears memory pressure, as a listener's memory budget
     /// decides. Under
-    /// pressure new peer streams are rejected with ZMUX_REJECTED without
-    /// receive buffers (MAX_STREAMS keeps flowing as they are discarded),
+    /// pressure new peer streams are rejected with `ZMUX_REJECTED` without
+    /// receive buffers (`MAX_STREAMS` keeps flowing as they are discarded),
     /// session credit is released only as data is consumed, and windows
     /// stop growing.
     pub fn set_memory_pressure(&mut self, on: bool) {
@@ -1399,7 +1408,7 @@ impl SessionCore {
     // ---- pipes ---------------------------------------------------------
 
     /// Attaches the bootstrap carrier (pipe 0, both directions). Its
-    /// outbound side starts with QX_TRANSPORT_PARAMETERS on the first
+    /// outbound side starts with `QX_TRANSPORT_PARAMETERS` on the first
     /// `poll_transmit`.
     pub fn attach_pipe(&mut self, pipe: PipeId, framing: Framing, now: Instant) {
         if pipe != PipeId(0) {
@@ -1845,7 +1854,7 @@ impl SessionCore {
     }
 
     /// Closes the session because of a violation the local endpoint found.
-    /// Closes the session with a transport INTERNAL_ERROR: after a panic
+    /// Closes the session with a transport `INTERNAL_ERROR`: after a panic
     /// under its lock in a driver, or when it cannot go on. It does nothing
     /// once the session is closing.
     pub fn fail_internal(&mut self, reason: &'static str, now: Instant) {
@@ -1861,7 +1870,7 @@ impl SessionCore {
         self.stats.stream_credit_waits += 1;
     }
 
-    /// Closes a session the listener does not take: CONNECTION_REFUSED,
+    /// Closes a session the listener does not take: `CONNECTION_REFUSED`,
     /// after the session's own parameters, so that the peer reads why. It does
     /// nothing once the session is closing.
     pub fn refuse(&mut self, reason: &'static str, now: Instant) {
@@ -1966,7 +1975,49 @@ impl SessionCore {
         self.closed_now();
     }
 
-    /// The peer's CONNECTION_CLOSE was processed: counts the streams the
+    /// The peer's `CONNECTION_CLOSE` was read on inbound pipe `pipe`: the
+    /// peer sends nothing after it there ([`Self::settle_pipe`]).
+    pub(super) fn peer_close_read(&mut self, pipe: u64, now: Instant) {
+        if let Some(p) = self.inp_mut(pipe) {
+            p.mark_peer_close();
+        }
+        self.settle_pipe(pipe, now);
+    }
+
+    /// Closing: the pipe's linger ends once the peer's `CONNECTION_CLOSE`
+    /// was read on it and ours was handed to its carrier (or it cannot
+    /// carry one): its input ends, and the driver closes the carrier,
+    /// without waiting for the peer's end of input, which a carrier
+    /// without a half-close never shows. The other pipes keep their own
+    /// linger, and the session ends when all are done
+    /// ([`Self::maybe_closed`]). Called again whenever either happens.
+    pub(super) fn settle_pipe(&mut self, pipe: u64, now: Instant) {
+        if self.state != State::Closing {
+            return;
+        }
+        let Some(a) = self.att(pipe) else {
+            return;
+        };
+        if !a
+            .inp()
+            .is_some_and(|p| p.peer_close_read() && p.state() != InState::Ended)
+            || !a.out().is_none_or(OutPipe::close_handed_off)
+        {
+            return;
+        }
+        let report = self.inp_mut(pipe).is_some_and(InPipe::end_gracefully);
+        if report {
+            self.push_event(CoreEvent::ClosePipe {
+                pipe: PipeId(pipe),
+                half: PipeHalf::Inbound,
+                abort: false,
+            });
+        }
+        self.recv_lane_gone(pipe);
+        self.maybe_closed(now);
+    }
+
+    /// The peer's `CONNECTION_CLOSE` was processed: counts the streams the
     /// application holds (opened or accepted) with received data unread,
     /// which stays readable until read, or until the linger deadline ends
     /// the session as for every close. Nothing arrives after it, so the
@@ -2000,7 +2051,7 @@ impl SessionCore {
         }
     }
 
-    /// Whether the session is closing for the peer's CONNECTION_CLOSE, while
+    /// Whether the session is closing for the peer's `CONNECTION_CLOSE`, while
     /// what arrived before it stays readable.
     pub(super) fn draining_peer_close(&self) -> bool {
         self.state == State::Closing && self.peer_close_processed
@@ -2047,7 +2098,7 @@ impl SessionCore {
 
     /// Abandons a session that is not established yet, as its handshake
     /// timeout does: it is closed without
-    /// CONNECTION_CLOSE, its carrier closed. Nothing happens to an
+    /// `CONNECTION_CLOSE`, its carrier closed. Nothing happens to an
     /// established session.
     pub fn abandon(&mut self, now: Instant) {
         self.tick(now);
@@ -2057,10 +2108,10 @@ impl SessionCore {
         }
     }
 
-    /// Closes the session gracefully with an application CONNECTION_CLOSE:
+    /// Closes the session gracefully with an application `CONNECTION_CLOSE`:
     /// the stream data written and not yet sent goes out first, as far as
     /// flow control and the carriers allow within the hand-off limit (data
-    /// waiting for the peer's credit waits for it), then CONNECTION_CLOSE. The
+    /// waiting for the peer's credit waits for it), then `CONNECTION_CLOSE`. The
     /// whole close, the flush included, is bounded by the hand-off limit
     /// (1 s) from this call: what has not left by then is discarded and the
     /// close goes on in the background as an abort's
@@ -2090,12 +2141,12 @@ impl SessionCore {
         self.check_close_flush(now);
     }
 
-    /// Ends the session at once with an application CONNECTION_CLOSE: data
-    /// not yet sent is discarded, and CONNECTION_CLOSE is handed to the
+    /// Ends the session at once with an application `CONNECTION_CLOSE`: data
+    /// not yet sent is discarded, and `CONNECTION_CLOSE` is handed to the
     /// carriers in the background, bounded by the hand-off limit (1 s), then
     /// their write sides are shut and their input drained until the peer
     /// ends it or the linger timeout passes. An abort during a graceful
-    /// close's flush ends the flush: the close's CONNECTION_CLOSE goes out
+    /// close's flush ends the flush: the close's `CONNECTION_CLOSE` goes out
     /// at once. A session already closing keeps its close.
     pub fn abort(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         self.tick(now);
@@ -2131,7 +2182,7 @@ impl SessionCore {
     /// empty or it was reset, or no outbound pipe can carry anything. Data
     /// that waits for the peer's credit (flow control, a stream ID) holds
     /// the flush, which the hand-off limit bounds: a peer that reads gets
-    /// it ahead of CONNECTION_CLOSE.
+    /// it ahead of `CONNECTION_CLOSE`.
     fn close_flushed(&self) -> bool {
         if !self.atts.outs().any(OutPipe::is_live) {
             return true;
@@ -2145,7 +2196,7 @@ impl SessionCore {
         })
     }
 
-    /// The application CONNECTION_CLOSE of a close or of a completed
+    /// The application `CONNECTION_CLOSE` of a close or of a completed
     /// shutdown (which has no hand-off limit).
     fn close_with(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         if self.state >= State::Closing {
@@ -2174,10 +2225,10 @@ impl SessionCore {
             .unwrap_or(CLOSE_HANDOFF_LIMIT)
     }
 
-    /// Whether a close no longer waits for the carriers: CONNECTION_CLOSE was taken whole by the
+    /// Whether a close no longer waits for the carriers: `CONNECTION_CLOSE` was taken whole by the
     /// carrier of every outbound pipe that wrote it and is not closed, and no live pipe
     /// that can still carry it lacks it; also once CLOSED, and for a close
-    /// without CONNECTION_CLOSE. False before the session is closing. The
+    /// without `CONNECTION_CLOSE`. False before the session is closing. The
     /// driver tells the bytes the carriers took
     /// ([`SessionCore::pipe_written`]).
     pub fn close_handed_off(&self) -> bool {
@@ -2190,7 +2241,7 @@ impl SessionCore {
         }
     }
 
-    /// Whether a close or abort no longer holds its caller: CONNECTION_CLOSE
+    /// Whether a close or abort no longer holds its caller: `CONNECTION_CLOSE`
     /// was handed to every carrier that can take it, the hand-off limit
     /// passed, an abort was called, or the session is CLOSED. The
     /// half-close and the drain then go on in the background until the
@@ -2219,7 +2270,7 @@ impl SessionCore {
     // ---- establishment -------------------------------------------------
 
     /// Processes the peer's transport parameters.
-    fn on_peer_parameters(&mut self, tp: TransportParameters, now: Instant) -> Result<(), Error> {
+    fn on_peer_parameters(&mut self, tp: &TransportParameters, now: Instant) -> Result<(), Error> {
         // The parameters this endpoint sends (or sent) offer E only with
         // the bootstrap exporter.
         self.offer_exporter_only_with_one();
@@ -2227,9 +2278,9 @@ impl SessionCore {
         let role =
             crate::proto::params::resolve_role(local.zmux_role, tp.zmux_role, self.transport_role)?;
         self.role = role;
-        self.features = Features::negotiate(&local, &tp);
-        self.keep_to_remember(&tp);
-        if !self.early_outcome(&tp, now)? {
+        self.features = Features::negotiate(&local, tp);
+        self.keep_to_remember(tp);
+        if !self.early_outcome(tp, now)? {
             return Ok(());
         }
         let protocol = match (&self.config.protocols, &tp.application_protocols) {
@@ -2244,12 +2295,12 @@ impl SessionCore {
                 tp.initial_max_streams_uni.unwrap_or(0),
             ],
         );
-        self.peer_tp = Some(tp::TpValues::of(&tp));
+        self.peer_tp = Some(tp::TpValues::of(tp));
         self.state = State::Active;
         self.handshake_deadline = None;
         self.pipe_ack_setup();
         if self.features.multipath {
-            self.mp_setup(&local, &tp, now);
+            self.mp_setup(&local, tp, now);
         }
         self.drop_unselected_secret();
         if let Some(idle) = self.idle_timeout() {
@@ -2325,14 +2376,14 @@ impl SessionCore {
         if j <= 0.0 {
             return Some(k);
         }
-        let u = (pipes::splitmix(&mut self.keep_alive_rng) >> 11) as f64 / (1u64 << 53) as f64;
+        let u = f64_of(pipes::splitmix(&mut self.keep_alive_rng) >> 11) / f64_of(1u64 << 53);
         Some(Duration::try_from_secs_f64(k.as_secs_f64() * (1.0 - j * u)).unwrap_or(k))
     }
 
     // ---- shutdown --------------------------------------------------------
 
     /// Graceful close: the two-phase GOAWAY when it is in use, then an
-    /// application CONNECTION_CLOSE once no stream remains.
+    /// application `CONNECTION_CLOSE` once no stream remains.
     pub fn shutdown(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         self.tick(now);
         if self.state >= State::Closing || self.goaway().shutdown.is_some() {
@@ -2426,7 +2477,7 @@ impl SessionCore {
         }
     }
 
-    /// Terminates a peer stream with ZMUX_REJECTED on both parts; it is
+    /// Terminates a peer stream with `ZMUX_REJECTED` on both parts; it is
     /// never offered and needs no release.
     fn stack_reject(&mut self, key: StreamKey, now: Instant) {
         let code = ApplicationErrorCode::ZMUX_REJECTED.0;

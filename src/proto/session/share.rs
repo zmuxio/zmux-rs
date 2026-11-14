@@ -30,7 +30,8 @@ impl SessionCore {
         #[cfg(debug_assertions)]
         for i in 0..self.streams.send_waiters().len() {
             debug_assert!(
-                !self.streams.has_room_at(i, buffer) || cands.binary_search(&(i as u32)).is_ok(),
+                !self.streams.has_room_at(i, buffer)
+                    || cands.binary_search(&u32::try_from(i).unwrap()).is_ok(),
                 "a waiting writer with room left out"
             );
         }

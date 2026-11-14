@@ -22,6 +22,7 @@ pub enum JoinDirection {
 
 impl JoinDirection {
     /// The value of Direction in a Hello's join pipe item.
+    #[must_use]
     pub const fn to_bits(self) -> u8 {
         match self {
             Self::Up => 0,
@@ -31,6 +32,7 @@ impl JoinDirection {
     }
 
     /// Parses Direction; 3 is invalid.
+    #[must_use]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         match bits {
             0 => Some(Self::Up),
@@ -41,7 +43,7 @@ impl JoinDirection {
     }
 }
 
-/// An entry of PIPE_ACK.
+/// An entry of `PIPE_ACK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipeAckEntry {
     /// A pipe inbound to the frame's sender.
@@ -86,7 +88,7 @@ impl PipeAckEntry {
 /// The length of a Lane Key.
 pub const LANE_KEY_LEN: usize = 16;
 
-/// PIPE_LANE (0x3a05a1c9): the first frame of a lane, whose first record holds nothing else but
+/// `PIPE_LANE` (0x3a05a1c9): the first frame of a lane, whose first record holds nothing else but
 /// PADDING.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipeLane {
@@ -101,6 +103,7 @@ pub struct PipeLane {
 
 impl PipeLane {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         vlen(FrameType::PIPE_LANE.0) + LANE_KEY_LEN + vlen(self.pipe_id) + vlen(self.lane)
     }
@@ -108,7 +111,7 @@ impl PipeLane {
     /// The smallest encoding: one-byte Pipe ID and Lane.
     pub const MIN_LEN: usize = vlen(FrameType::PIPE_LANE.0) + LANE_KEY_LEN + 2;
 
-    /// Decodes the PIPE_LANE frame that begins the first record of a new
+    /// Decodes the `PIPE_LANE` frame that begins the first record of a new
     /// stream, for routing it by its Lane Key. Returns the frame and its
     /// length; bytes after it are not examined.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), Error> {
@@ -143,15 +146,16 @@ impl PipeLane {
     }
 }
 
-/// PIPE_ACK (0x0b2b3eeb): a snapshot of the sender's receive positions.
+/// `PIPE_ACK` (0x0b2b3eeb): a snapshot of the sender's receive positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipeAck<'a> {
     entries: Entries<'a>,
 }
 
 impl<'a> PipeAck<'a> {
-    /// A PIPE_ACK listing `entries`, which must be non-empty and in strictly
+    /// A `PIPE_ACK` listing `entries`, which must be non-empty and in strictly
     /// increasing (Pipe ID, Lane) order.
+    #[must_use]
     pub const fn new(entries: &'a [PipeAckEntry]) -> Self {
         Self {
             entries: Entries::List(entries),
@@ -159,11 +163,13 @@ impl<'a> PipeAck<'a> {
     }
 
     /// Number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the frame has no entries (never true for a decoded frame).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.len() == 0
     }
@@ -174,6 +180,7 @@ impl<'a> PipeAck<'a> {
     }
 
     /// Length of the encoding.
+    #[must_use]
     pub fn encoded_len(&self) -> usize {
         vlen(FrameType::PIPE_ACK.0) + self.entries.encoded_len()
     }
@@ -201,17 +208,18 @@ impl<'a> PipeAck<'a> {
     }
 }
 
-/// PIPE_ABANDON (0x23b35b74).
+/// `PIPE_ABANDON` (0x23b35b74).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipeAbandon {
     /// Pipe ID of the attachment.
     pub pipe_id: u64,
-    /// Transport error code: NO_ERROR for a graceful removal.
+    /// Transport error code: `NO_ERROR` for a graceful removal.
     pub error_code: u64,
 }
 
 impl PipeAbandon {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         vlen(FrameType::PIPE_ABANDON.0) + vlen(self.pipe_id) + vlen(self.error_code)
     }
@@ -230,7 +238,7 @@ impl PipeAbandon {
     }
 }
 
-/// The Status field of PIPE_STATUS.
+/// The Status field of `PIPE_STATUS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PipeStatusValue {
     /// 0: use the pipe normally.
@@ -241,7 +249,7 @@ pub enum PipeStatusValue {
     Standby,
 }
 
-/// PIPE_STATUS (0x227b2811): the sender's request for how the receiver
+/// `PIPE_STATUS` (0x227b2811): the sender's request for how the receiver
 /// uses its outbound direction of an attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipeStatus {
@@ -257,6 +265,7 @@ pub struct PipeStatus {
 
 impl PipeStatus {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         vlen(FrameType::PIPE_STATUS.0)
             + vlen(self.pipe_id)
@@ -294,7 +303,7 @@ impl PipeStatus {
     }
 }
 
-/// The Phase of SESSION_EPOCH.
+/// The Phase of `SESSION_EPOCH`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EpochPhase {
     /// 0: the offering end's share.
@@ -305,12 +314,13 @@ pub enum EpochPhase {
 
 impl EpochPhase {
     /// The wire value.
+    #[must_use]
     pub const fn value(self) -> u8 {
         self as u8
     }
 }
 
-/// SESSION_EPOCH (0x024e93eb): one step of an epoch exchange.
+/// `SESSION_EPOCH` (0x024e93eb): one step of an epoch exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionEpoch<'a> {
     /// Phase.
@@ -328,11 +338,13 @@ pub struct SessionEpoch<'a> {
 
 impl<'a> SessionEpoch<'a> {
     /// Length of the encoding.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         vlen(FrameType::SESSION_EPOCH.0) + self.body_len()
     }
 
     /// Length of the body, Phase through Locator.
+    #[must_use]
     pub const fn body_len(&self) -> usize {
         1 + vlen(self.epoch)
             + vlen(self.share.len() as u64)
@@ -381,6 +393,7 @@ impl<'a> SessionEpoch<'a> {
 
     /// The body, Phase through Locator: what the epoch derivation takes. A received
     /// frame's are the bytes received.
+    #[must_use]
     pub fn body(&self) -> Vec<u8> {
         if !self.raw.is_empty() {
             return self.raw.to_vec();

@@ -21,6 +21,7 @@ use crate::proto::varint;
 
 /// The bytes before the DATAGRAM frame's data: the Pipe Stream ID `id`
 /// when present, and the frame type 0x30.
+#[must_use]
 pub const fn header_len(id: Option<u64>) -> usize {
     match id {
         Some(id) => varint::len(id) + 1,
@@ -31,9 +32,18 @@ pub const fn header_len(id: Option<u64>) -> usize {
 /// The length of a channel datagram carrying `data_len` bytes of DATAGRAM
 /// data (its flow prefix included), after the Pipe Stream ID `id` when
 /// present.
+#[must_use]
 pub const fn datagram_len(id: Option<u64>, data_len: usize) -> usize {
     header_len(id) + data_len
 }
+
+/// The type of a DATAGRAM frame without its Length field, a one-byte
+/// varint.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the type is 0x30, below 64"
+)]
+const DATAGRAM_TYPE: u8 = FrameType::DATAGRAM.0 as u8;
 
 /// Writes the header of a channel datagram ([`header_len`] bytes): the Pipe
 /// Stream ID `id` when present, then the type of a DATAGRAM frame without
@@ -44,11 +54,12 @@ pub fn encode_header(id: Option<u64>, buf: &mut [u8]) -> Result<usize, EncodeErr
         n = varint::encode(id, buf)?;
     }
     let b = buf.get_mut(n).ok_or(EncodeError::BufferTooShort)?;
-    *b = FrameType::DATAGRAM.0 as u8;
+    *b = DATAGRAM_TYPE;
     Ok(n + 1)
 }
 
 /// A whole channel datagram carrying `data`.
+#[must_use]
 pub fn encode(id: Option<u64>, data: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; datagram_len(id, data.len())];
     let n = encode_header(id, &mut out).unwrap_or(0);
@@ -58,6 +69,7 @@ pub fn encode(id: Option<u64>, data: &[u8]) -> Vec<u8> {
 
 /// Splits a channel datagram that starts with a Pipe Stream ID into that
 /// ID and the frame after it; `None` when the ID is truncated.
+#[must_use]
 pub fn split(datagram: &[u8]) -> Option<(u64, &[u8])> {
     let (id, n) = varint::decode(datagram)?;
     Some((id, &datagram[n..]))
@@ -66,11 +78,11 @@ pub fn split(datagram: &[u8]) -> Option<(u64, &[u8])> {
 /// Decodes the frame of a channel datagram, which must be exactly one
 /// DATAGRAM frame of type 0x30 that `gates` accepts; anything else
 /// (another or a truncated frame, a Length field, bytes after it) is a
-/// PROTOCOL_VIOLATION. The data borrows from `frame`.
+/// `PROTOCOL_VIOLATION`. The data borrows from `frame`.
 pub fn decode_frame<'a>(frame: &'a [u8], gates: &Gates) -> Result<Datagram<'a>, Error> {
     const NOT_ONE: &str = "channel datagram is not one DATAGRAM frame without Length";
     let ty = FrameType::DATAGRAM.0;
-    if frame.first() != Some(&(ty as u8)) {
+    if frame.first() != Some(&DATAGRAM_TYPE) {
         return Err(Error::protocol_violation(ty, NOT_ONE));
     }
     match Frame::decode(frame, gates) {

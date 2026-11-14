@@ -12,7 +12,7 @@
 //! ([`SessionCore::poll_channel`]), which sends them on a task of the pipe
 //! so that they never wait behind a batch. Received ones are processed by
 //! [`SessionCore::receive_channel_datagram`] with the rules of records,
-//! without the accounting of records: no PIPE_ACK position, no no-effect
+//! without the accounting of records: no `PIPE_ACK` position, no no-effect
 //! budget, no idle timer restart. The sizes, queues and limiters of
 //! datagrams are unchanged.
 
@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use super::pipes::{Channel, InState, OutPipe};
+use super::pipes::{Attachment, Channel, InState, OutPipe};
 use super::{CoreEvent, PipeId, SessionCore, State};
 use crate::proto::frame::{FrameType, channel};
 use crate::proto::payload::Flow;
@@ -68,11 +68,11 @@ impl SessionCore {
     /// not establish the session without the channel. Once it is false, the
     /// driver ends the channel's task.
     pub fn channel_live(&self, pipe: PipeId) -> bool {
-        self.state < State::Closing
-            && !(self.is_established() && !self.features.carrier_datagrams)
-            && self
-                .out_ref(pipe.0)
-                .is_some_and(|o| o.channel().is_some() && o.is_live())
+        self.state < State::Closing && !self.is_established()
+            || self.features.carrier_datagrams
+                && self
+                    .out_ref(pipe.0)
+                    .is_some_and(|o| o.channel().is_some() && o.is_live())
     }
 
     /// Moves the queued datagrams that go on the datagram channel of `pipe`
@@ -104,15 +104,15 @@ impl SessionCore {
             let Some((_, data)) = self.dgram_mut().send.remove(i) else {
                 return true;
             };
-            let mut b = BytesMut::with_capacity(channel::datagram_len(ch.id, n));
+            let mut buf = BytesMut::with_capacity(channel::datagram_len(ch.id, n));
             let mut header = [0u8; 9 + 16];
-            let mut h = channel::encode_header(ch.id, &mut header).unwrap_or(0);
+            let mut head_len = channel::encode_header(ch.id, &mut header).unwrap_or(0);
             if let Some(f) = f {
-                h += f.encode(&mut header[h..]).unwrap_or(0);
+                head_len += f.encode(&mut header[head_len..]).unwrap_or(0);
             }
-            b.put_slice(&header[..h]);
-            b.put_slice(&data);
-            out.push(b.freeze());
+            buf.put_slice(&header[..head_len]);
+            buf.put_slice(&data);
+            out.push(buf.freeze());
             self.datagram_sent(f, data.len() as u64);
             self.stats.datagrams_sent_channel += 1;
             if was_full {
@@ -143,9 +143,9 @@ impl SessionCore {
     /// A channel datagram received for `pipe`, its Pipe Stream ID removed. Dropped and counted when
     /// the pipe is not an open inbound pipe of the session or the session did not
     /// negotiate the channel; otherwise anything but one DATAGRAM frame of
-    /// type 0x30 closes the session with PROTOCOL_VIOLATION, and the frame
+    /// type 0x30 closes the session with `PROTOCOL_VIOLATION`, and the frame
     /// is processed as one in a record on that pipe, without the
-    /// accounting of a record (no PIPE_ACK position, no no-effect budget,
+    /// accounting of a record (no `PIPE_ACK` position, no no-effect budget,
     /// no idle timer restart).
     pub fn receive_channel_datagram(&mut self, pipe: PipeId, frame: &[u8], now: Instant) {
         self.tick(now);
@@ -187,7 +187,11 @@ impl SessionCore {
     /// not change while a carrier refuses bytes.
     fn channel_pipe(&self) -> Option<u64> {
         if self.mp.is_none() {
-            return self.atts.iter().find(|a| a.out().is_some()).map(|a| a.id());
+            return self
+                .atts
+                .iter()
+                .find(|a| a.out().is_some())
+                .map(Attachment::id);
         }
         let views = self.views();
         views
@@ -195,7 +199,7 @@ impl SessionCore {
             .iter()
             .map(|&i| self.atts.at(i))
             .find(|a| a.out().is_some_and(OutPipe::is_live))
-            .map(|a| a.id())
+            .map(Attachment::id)
     }
 
     /// The datagram channel that datagrams for `pipe` may take now: the

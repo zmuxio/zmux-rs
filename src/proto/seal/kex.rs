@@ -62,7 +62,7 @@ const MLKEM_Q: u16 = 3329;
 const MLKEM768_T_LEN: usize = 384 * 3;
 
 /// The encapsulation key check of FIPS 203 Section 7.2, done here rather than left to the
-/// library: the length, and every 12-bit coefficient (ByteDecode12) below q. The key is
+/// library: the length, and every 12-bit coefficient (`ByteDecode12`) below q. The key is
 /// public, so the check need not take constant time. This is the only check of a received
 /// encapsulation key.
 pub fn mlkem768_check_ek(ek: &[u8]) -> Result<(), Error> {

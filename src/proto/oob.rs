@@ -11,6 +11,7 @@ pub const PAIRING_TOKEN_LEN: usize = 16;
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Length of the unpadded base64url encoding of `n` bytes.
+#[must_use]
 pub const fn encoded_len(n: usize) -> usize {
     (n * 4).div_ceil(3)
 }
@@ -78,16 +79,16 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<usize, InvalidBase64> {
         let k = chunk.len();
         if k < 4 {
             // The bits of the last sextet that carry no data must be zero.
-            let unused = 8 - 2 * k as u32;
-            let mask = ((1u32 << unused) - 1) << (24 - 6 * k as u32);
+            let unused = 8 - 2 * k;
+            let mask = ((1u32 << unused) - 1) << (24 - 6 * k);
             if n & mask != 0 {
                 return Err(InvalidBase64);
             }
         }
-        let bytes = k - 1;
-        for i in 0..bytes {
+        // The 24 bits of the chunk are the low three bytes of `n`.
+        for &b in &n.to_be_bytes()[1..k] {
             if let Some(slot) = o.next() {
-                *slot = (n >> (16 - 8 * i)) as u8;
+                *slot = b;
             }
         }
     }
@@ -96,6 +97,7 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<usize, InvalidBase64> {
 
 /// Encodes `input` in base64url without padding into a new string (for a
 /// header value such as [`PAIR_HEADER`]).
+#[must_use]
 pub fn encode_string(input: &[u8]) -> String {
     let mut out = vec![0u8; encoded_len(input.len())];
     let n = encode(input, &mut out).unwrap_or(0);
@@ -118,7 +120,9 @@ mod tests {
     #[test]
     fn round_trip_and_strictness() {
         for n in 0..20usize {
-            let data: Vec<u8> = (0..n as u8).map(|b| b.wrapping_mul(37)).collect();
+            let data: Vec<u8> = (0..u8::try_from(n).unwrap())
+                .map(|b| b.wrapping_mul(37))
+                .collect();
             let mut enc = [0u8; 32];
             let e = encode(&data, &mut enc).unwrap();
             assert_eq!(e, encoded_len(n));

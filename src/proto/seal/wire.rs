@@ -74,12 +74,14 @@ impl RecordMode {
     /// accepts: its 3 is the reserved value [`Self::from_byte`] refuses;
     /// a configuration that chooses it for a join is refused before
     /// anything is sent.
+    #[must_use]
     pub fn byte(self) -> u8 {
         self as u8
     }
 
     /// Whether a pipe may be joined in this mode: every mode but
     /// `Unmanaged`.
+    #[must_use]
     pub fn joinable(self) -> bool {
         self != RecordMode::Unmanaged
     }
@@ -94,6 +96,7 @@ pub fn put_varint(out: &mut Vec<u8>, value: u64) {
 
 /// Reads a varint: value, length, whether it is shortest. `None` when the input
 /// ends inside it.
+#[must_use]
 pub fn read_shortest(input: &[u8]) -> Option<(u64, usize, bool)> {
     let (value, len) = varint::decode(input)?;
     let mut buf = [0; 8];
@@ -122,6 +125,7 @@ pub enum Dispatch {
 }
 
 /// Classifies the first bytes of a carrier.
+#[must_use]
 pub fn dispatch(framing: Framing, bytes: &[u8]) -> Dispatch {
     match bytes.first() {
         None if framing == Framing::ByteStream => Dispatch::Incomplete { need: 1 },
@@ -132,7 +136,7 @@ pub fn dispatch(framing: Framing, bytes: &[u8]) -> Dispatch {
         Some(_) => match classify_first_bytes(bytes, framing) {
             FirstBytes::Record => Dispatch::Record,
             FirstBytes::NeedMore(need) => Dispatch::Incomplete { need },
-            _ => Dispatch::Other,
+            FirstBytes::Other => Dispatch::Other,
         },
     }
 }

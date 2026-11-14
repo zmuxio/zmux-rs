@@ -7,6 +7,10 @@ use crate::Profile;
 const MIN_SECRET: usize = 16;
 
 /// `exporter_secret` from the final `ck` and `h` of a handshake of `profile`.
+///
+/// # Errors
+///
+/// `invalid_config` when `ck` is shorter than the hash output.
 pub fn exporter_secret(profile: Profile, ck: &[u8], h: &[u8]) -> Result<Vec<u8>, Error> {
     let hash = profile.0.hash;
     let info = [b"zmux-seal exporter", h].concat();
@@ -25,6 +29,11 @@ pub struct HandlePsk {
 /// Derives a Handle and pre-shared key from a high-entropy secret.
 /// `deployment_salt` is optional, empty by default, and keeps a batch of Handles
 /// to one deployment.
+///
+/// # Errors
+///
+/// `invalid_config` when `secret` is shorter than 16 bytes or `domain`
+/// is longer than 65535 bytes.
 pub fn derive_handle_psk(
     secret: &[u8],
     domain: &[u8],

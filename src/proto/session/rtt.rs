@@ -1,16 +1,17 @@
 //! The RTT that receive-window auto-tuning uses. On a single pipe the core
 //! takes no RTT samples of its own: it uses
-//! the carrier's estimate when the driver provides one (TCP_INFO), else the
-//! windowed minimum of QX_PING samples, never a smoothed mean (queueing
+//! the carrier's estimate when the driver provides one (`TCP_INFO`), else the
+//! windowed minimum of `QX_PING` samples, never a smoothed mean (queueing
 //! behind bulk data would inflate it and grow windows without end). A
 //! window never grows before a real sample exists; auto-tuning asks for a
-//! QX_PING instead.
+//! `QX_PING` instead.
 
 use std::time::Duration;
 
 use super::SessionCore;
+use crate::util::{f64_of, u64_sat};
 
-/// How often auto-tuning asks for a QX_PING sample, at most.
+/// How often auto-tuning asks for a `QX_PING` sample, at most.
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The smallest limit of one write call (and the limit before the first
@@ -27,15 +28,15 @@ pub(super) const MP_WRITE_CALL_SPAN: Duration = Duration::from_millis(50);
 
 impl SessionCore {
     /// Gives the core the carrier's own RTT estimate (for example the
-    /// kernel's from TCP_INFO), which receive-window auto-tuning prefers to
-    /// QX_PING samples; `None` when unknown.
+    /// kernel's from `TCP_INFO`), which receive-window auto-tuning prefers to
+    /// `QX_PING` samples; `None` when unknown.
     pub fn set_carrier_rtt(&mut self, rtt: Option<Duration>) {
         self.carrier_rtt = rtt.filter(|r| !r.is_zero());
         self.session_rtt_sampled(self.now);
     }
 
     /// Gives the core a pipe's carrier RTT estimate (for example the
-    /// kernel's from TCP_INFO); in a multipath session auto-tuning prefers
+    /// kernel's from `TCP_INFO`); in a multipath session auto-tuning prefers
     /// it to the pipe's own samples. `None` when unknown.
     pub fn set_pipe_carrier_rtt(&mut self, pipe: super::PipeId, rtt: Option<Duration>) {
         if let Some(o) = self.out_mut(pipe.0) {
@@ -44,9 +45,9 @@ impl SessionCore {
         }
     }
 
-    /// pipe_min_rtt of an attachment: its
+    /// `pipe_min_rtt` of an attachment: its
     /// carrier minimum when the carrier reports one, else the 300 s minimum
-    /// of its PIPE_ACK samples; an attachment without a local outbound
+    /// of its `PIPE_ACK` samples; an attachment without a local outbound
     /// direction takes the largest of the other attachments of its fate
     /// group, or without one the largest in the session. Never the
     /// credit-loop minimum.
@@ -88,7 +89,7 @@ impl SessionCore {
             return full;
         }
         let rate = self.pipe_send_rate(pipe);
-        let r_b = (rate as f64 * self.config.latency_budget.as_secs_f64()) as u64;
+        let r_b = u64_sat(f64_of(rate) * self.config.latency_budget.as_secs_f64());
         usize::try_from(r_b.max(BATCH_UNDER_INPUT_MIN))
             .unwrap_or(usize::MAX)
             .min(full)

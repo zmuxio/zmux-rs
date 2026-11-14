@@ -3,24 +3,26 @@
 //! moves whole (a batch is whole records) and allocates nothing once the
 //! buffers reached their size.
 
-#![allow(dead_code)]
+// The items are `pub` because the benches (separate crates) use them; the
+// lint cannot see that from the including crate.
+#![allow(dead_code, unreachable_pub)]
 
 use std::time::Instant;
 
 use zmux::proto::record::Framing;
 use zmux::proto::session::{Config, CoreEvent, PipeId, Role, SessionCore, TransmitBuf};
 
-pub(crate) const P0: PipeId = PipeId::new(0);
+pub const P0: PipeId = PipeId::new(0);
 
-pub(crate) struct CorePair {
-    pub(crate) a: SessionCore,
-    pub(crate) b: SessionCore,
-    pub(crate) out: TransmitBuf,
-    pub(crate) wire: Vec<u8>,
-    pub(crate) now: Instant,
+pub struct CorePair {
+    pub a: SessionCore,
+    pub b: SessionCore,
+    pub out: TransmitBuf,
+    pub wire: Vec<u8>,
+    pub now: Instant,
     /// The events each side emitted, when kept ([`CorePair::keep_events`]).
-    pub(crate) events_a: Vec<CoreEvent>,
-    pub(crate) events_b: Vec<CoreEvent>,
+    pub events_a: Vec<CoreEvent>,
+    pub events_b: Vec<CoreEvent>,
     keep_events: bool,
 }
 
@@ -28,7 +30,7 @@ impl CorePair {
     /// A pair established on pipe 0 (A dials). The pump moves bytes without
     /// time passing: a carrier that takes them all at once, as one with a
     /// low-water mark, which the carrier queue limiter does not pace.
-    pub(crate) fn new(a: Config, b: Config) -> Self {
+    pub fn new(a: Config, b: Config) -> Self {
         let mut p = Self::attached(a, b);
         p.pump();
         assert!(p.a.is_established() && p.b.is_established());
@@ -36,7 +38,7 @@ impl CorePair {
     }
 
     /// [`CorePair::new`] that keeps every event the sides emit.
-    pub(crate) fn with_events(a: Config, b: Config) -> Self {
+    pub fn with_events(a: Config, b: Config) -> Self {
         let mut p = Self::attached(a, b).keep_events();
         p.pump();
         assert!(p.a.is_established() && p.b.is_established());
@@ -44,7 +46,7 @@ impl CorePair {
     }
 
     /// The pair with pipe 0 attached, before anything moved.
-    pub(crate) fn attached(a: Config, b: Config) -> Self {
+    pub fn attached(a: Config, b: Config) -> Self {
         let now = Instant::now();
         let mut a = SessionCore::new(a, Role::Client, None, now).unwrap();
         let mut b = SessionCore::new(b, Role::Server, None, now).unwrap();
@@ -65,14 +67,14 @@ impl CorePair {
     }
 
     /// Keeps the events the sides emit from now on.
-    pub(crate) fn keep_events(mut self) -> Self {
+    pub fn keep_events(mut self) -> Self {
         self.keep_events = true;
         self
     }
 
     /// Moves every batch one side has for pipe 0 to the other (`a_to_b`:
     /// from A), showing each to `inspect`; returns the bytes moved.
-    pub(crate) fn send_with(&mut self, a_to_b: bool, mut inspect: impl FnMut(&[u8])) -> usize {
+    pub fn send_with(&mut self, a_to_b: bool, mut inspect: impl FnMut(&[u8])) -> usize {
         let (from, to) = if a_to_b {
             (&mut self.a, &mut self.b)
         } else {
@@ -96,12 +98,12 @@ impl CorePair {
     }
 
     /// [`CorePair::send_with`] without looking.
-    pub(crate) fn send(&mut self, a_to_b: bool) -> usize {
+    pub fn send(&mut self, a_to_b: bool) -> usize {
         self.send_with(a_to_b, |_| {})
     }
 
     /// Takes the events of both sides (kept or dropped).
-    pub(crate) fn drain_events(&mut self) {
+    pub fn drain_events(&mut self) {
         while let Some(e) = self.a.poll_event() {
             if self.keep_events {
                 self.events_a.push(e);
@@ -116,7 +118,7 @@ impl CorePair {
 
     /// Moves everything both sides have to send until nothing is left;
     /// returns the bytes moved.
-    pub(crate) fn pump(&mut self) -> usize {
+    pub fn pump(&mut self) -> usize {
         let mut moved = 0;
         for _ in 0..100_000 {
             let n = self.send(true) + self.send(false);

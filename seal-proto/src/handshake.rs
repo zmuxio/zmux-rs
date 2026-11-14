@@ -14,6 +14,7 @@ const BINDING_LEN: usize = 32;
 
 /// The Noise prologue. A sender's `binding` is present exactly when `mode` is Bound;
 /// a responder mixes what it has, and any disagreement is `auth`.
+#[must_use]
 pub fn prologue(profile: Profile, mode: RecordMode, handle: &[u8], binding: &[u8]) -> Vec<u8> {
     let mut out = b"zmux-seal".to_vec();
     put_varint(&mut out, profile.value());
@@ -47,7 +48,7 @@ struct Pending {
 
 impl Pending {
     /// Writes the tokens of the next message of `engine`. `payload` ends with a proof item
-    /// whose KeyAlg is a proof key's and whose signature has its length, any bytes: they
+    /// whose `KeyAlg` is a proof key's and whose signature has its length, any bytes: they
     /// give the message its length and are replaced by the signature.
     fn begin(engine: &mut Engine, payload: &[u8]) -> Result<Pending, Error> {
         Payload::check_outgoing(payload, engine.known_types())?;
@@ -170,12 +171,22 @@ pub struct Initiator {
 
 impl Initiator {
     /// Checks the configuration and prepares the handshake.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when the keys, Handle or Binding do not suit the
+    /// Profile and Mode.
     pub fn new(config: InitiatorConfig<'_>) -> Result<Initiator, Error> {
         Self::build(config, None, None)
     }
 
     /// As [`Initiator::new`] with a fixed ephemeral key and, in a hybrid
     /// Profile, a fixed KEM seed `(d, z)`, for the vectors.
+    ///
+    /// # Errors
+    ///
+    /// As [`Initiator::new`], and `invalid_config` when `e` or `kem_seed`
+    /// has the wrong length.
     #[cfg(feature = "test-vectors")]
     pub fn with_ephemeral(
         config: InitiatorConfig<'_>,
@@ -227,6 +238,12 @@ impl Initiator {
 
     /// Writes the Hello. `payload` is an encoded payload (see
     /// [`encode_payload`](crate::encode_payload)).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for a payload that is not well formed or holds items
+    /// the Hello may not carry, `too_large` when the Hello exceeds its
+    /// limit.
     pub fn write_hello(mut self, payload: &[u8]) -> Result<(Vec<u8>, AwaitReply), Error> {
         let noise = write_plain(&mut self.engine, payload)?;
         let wire = write_hello(self.framing, self.profile, self.mode, &self.handle, &noise)?;
@@ -248,6 +265,12 @@ pub struct AwaitReply {
 
 impl AwaitReply {
     /// Reads Noise message 2, already cut from its frame.
+    ///
+    /// # Errors
+    ///
+    /// The message's failure: `auth` when it does not decrypt, `kex` for an
+    /// invalid key share, `malformed` when it is too short, and the payload
+    /// errors (`tlv_*`, `too_large`).
     pub fn read_reply(mut self, message: &[u8]) -> Result<Verify, Error> {
         let known = self.engine.known_types();
         let raw = self.engine.read_message(message)?;
@@ -262,6 +285,7 @@ impl AwaitReply {
 
     #[cfg(feature = "test-vectors")]
     /// `h` and `ck` so far.
+    #[must_use]
     pub fn transcript(&self) -> (&[u8], &[u8]) {
         self.engine.transcript()
     }
@@ -279,6 +303,12 @@ pub struct Verify {
 
 impl Verify {
     /// The server's static public key.
+    ///
+    /// # Panics
+    ///
+    /// Never: a `Verify` exists only for a read message 2, which carries
+    /// the static key.
+    #[must_use]
     pub fn peer_static(&self) -> &[u8] {
         self.engine
             .peer_static()
@@ -286,14 +316,19 @@ impl Verify {
     }
 
     /// The payload of message 2, to read the credential from.
+    #[must_use]
     pub fn payload(&self) -> &Payload {
         &self.payload
     }
 
     /// The core's check of message 2's proof against the verdict: with
     /// `proof_key`, the proof must be under that key and verify. Returns PQ
-    /// authentication; with `require_pq_auth` its absence fails. Failures are
-    /// `credentials_failed`.
+    /// authentication; with `require_pq_auth` its absence fails.
+    ///
+    /// # Errors
+    ///
+    /// `credentials_failed` for a missing, mismatched or invalid proof, or
+    /// missing PQ authentication that is required.
     pub fn check_proof(
         &self,
         proof_key: Option<&KeyId>,
@@ -303,6 +338,7 @@ impl Verify {
     }
 
     /// The host has verified the server.
+    #[must_use]
     pub fn accept(self) -> Finish {
         Finish {
             engine: self.engine,
@@ -313,6 +349,7 @@ impl Verify {
 
     #[cfg(feature = "test-vectors")]
     /// `h` and `ck` so far.
+    #[must_use]
     pub fn transcript(&self) -> (&[u8], &[u8]) {
         self.engine.transcript()
     }
@@ -333,6 +370,12 @@ impl Finish {
     }
 
     /// Writes the Finish and completes the handshake.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for a payload that is not well formed or holds items
+    /// this message may not carry, `too_large` when the message exceeds its
+    /// limit.
     pub fn write_finish(mut self, payload: &[u8]) -> Result<(Vec<u8>, Complete), Error> {
         let noise = write_plain(&mut self.engine, payload)?;
         let mut wire = Vec::new();
@@ -341,7 +384,12 @@ impl Finish {
     }
 
     /// Starts a Finish with a proof: `payload` ends with a proof item whose signature is
-    /// a placeholder of the KeyAlg's length, replaced by [`SignFinish::finish`].
+    /// a placeholder of the `KeyAlg`'s length, replaced by [`SignFinish::finish`].
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for a payload that is not well formed or does not end
+    /// with a proof item, `too_large` when the message exceeds its limit.
     pub fn write_finish_signed(mut self, payload: &[u8]) -> Result<SignFinish, Error> {
         let pending = Pending::begin(&mut self.engine, payload)?;
         Ok(SignFinish {
@@ -363,11 +411,17 @@ pub struct SignFinish {
 
 impl SignFinish {
     /// What the proof signs: `"zmux-seal proof i" ‖ 0x00 ‖ h_p`.
+    #[must_use]
     pub fn message(&self) -> &[u8] {
         &self.pending.message
     }
 
     /// Writes the Finish with `sig` and completes the handshake.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when `sig` is not of the placeholder's length,
+    /// `too_large` when the message exceeds its limit.
     pub fn finish(mut self, sig: &[u8]) -> Result<(Vec<u8>, Complete), Error> {
         let noise = self.pending.finish(&mut self.engine, sig)?;
         let mut wire = Vec::new();
@@ -465,6 +519,13 @@ pub struct Responder;
 
 impl Responder {
     /// Reads Noise message 1 of a parsed Hello.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when `keys` do not suit the Hello's Profile, `auth`
+    /// for a Bound Hello without a Binding or one that does not decrypt, `kex`
+    /// for an invalid key share, and the payload errors (`tlv_*`,
+    /// `too_large`).
     pub fn read_hello(
         hello: &Hello<'_>,
         keys: ResponderKeys<'_>,
@@ -474,6 +535,11 @@ impl Responder {
 
     /// As [`Responder::read_hello`] with a fixed ephemeral key and, in a hybrid
     /// Profile, a fixed encapsulation randomness `m`, for the vectors.
+    ///
+    /// # Errors
+    ///
+    /// As [`Responder::read_hello`], and `invalid_config` when `e` or
+    /// `kem_random` has the wrong length.
     #[cfg(feature = "test-vectors")]
     pub fn read_hello_with_ephemeral(
         hello: &Hello<'_>,
@@ -538,7 +604,12 @@ pub struct ResponderReply {
 
 impl ResponderReply {
     /// Starts a Reply with a proof: `payload` ends with a proof item whose signature is
-    /// a placeholder of the KeyAlg's length, replaced by [`SignReply::finish`].
+    /// a placeholder of the `KeyAlg`'s length, replaced by [`SignReply::finish`].
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for a payload that is not well formed or does not end
+    /// with a proof item, `too_large` when the message exceeds its limit.
     pub fn write_reply_signed(mut self, payload: &[u8]) -> Result<SignReply, Error> {
         let pending = Pending::begin(&mut self.engine, payload)?;
         Ok(SignReply {
@@ -550,6 +621,12 @@ impl ResponderReply {
     }
 
     /// Writes the Reply.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` for a payload that is not well formed or holds items
+    /// this message may not carry, `too_large` when the message exceeds its
+    /// limit.
     pub fn write_reply(mut self, payload: &[u8]) -> Result<(Vec<u8>, AwaitFinish), Error> {
         let noise = write_plain(&mut self.engine, payload)?;
         let mut wire = Vec::new();
@@ -565,6 +642,7 @@ impl ResponderReply {
 
     #[cfg(feature = "test-vectors")]
     /// `h` and `ck` so far.
+    #[must_use]
     pub fn transcript(&self) -> (&[u8], &[u8]) {
         self.engine.transcript()
     }
@@ -580,11 +658,17 @@ pub struct SignReply {
 
 impl SignReply {
     /// What the proof signs: `"zmux-seal proof r" ‖ 0x00 ‖ h_p`.
+    #[must_use]
     pub fn message(&self) -> &[u8] {
         &self.pending.message
     }
 
     /// Writes the Reply with `sig`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when `sig` is not of the placeholder's length,
+    /// `too_large` when the message exceeds its limit.
     pub fn finish(mut self, sig: &[u8]) -> Result<(Vec<u8>, AwaitFinish), Error> {
         let noise = self.pending.finish(&mut self.engine, sig)?;
         let mut wire = Vec::new();
@@ -614,6 +698,12 @@ impl AwaitFinish {
 
     /// Reads Noise message 3, already cut from its frame. The client's identity
     /// and first bytes are delivered only through this success.
+    ///
+    /// # Errors
+    ///
+    /// The message's failure: `auth` when it does not decrypt, `kex` for an
+    /// invalid key share, `malformed` when it is too short, and the payload
+    /// errors (`tlv_*`, `too_large`).
     pub fn read_finish(mut self, message: &[u8]) -> Result<(Complete, Payload), Error> {
         let known = self.engine.known_types();
         let raw = self.engine.read_message(message)?;
@@ -623,6 +713,7 @@ impl AwaitFinish {
 
     #[cfg(feature = "test-vectors")]
     /// `h` and `ck` so far.
+    #[must_use]
     pub fn transcript(&self) -> (&[u8], &[u8]) {
         self.engine.transcript()
     }
@@ -653,17 +744,23 @@ impl Complete {
     }
 
     /// The record mode.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
     /// The peer's static public key, if the pattern sends one.
+    #[must_use]
     pub fn peer_static(&self) -> Option<&[u8]> {
         self.finished.peer_static.as_deref()
     }
 
     /// The core's check of the proof of the peer's last message against the verdict, as
     /// [`Verify::check_proof`]: at a server, message 3's.
+    ///
+    /// # Errors
+    ///
+    /// `credentials_failed`, as [`Verify::check_proof`].
     pub fn check_proof(
         &self,
         proof_key: Option<&KeyId>,
@@ -677,11 +774,17 @@ impl Complete {
     }
 
     /// The handshake hash.
+    #[must_use]
     pub fn handshake_hash(&self) -> &[u8] {
         &self.finished.h
     }
 
     /// `Export(label, context, n)` of this handshake.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when `label` is longer than 255 bytes, `context`
+    /// longer than 65535 bytes, or `len` beyond what the hash can expand.
     pub fn export(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, Error> {
         export(
             self.finished.params.hash,
@@ -693,6 +796,7 @@ impl Complete {
     }
 
     /// The exporter alone, kept after [`Complete::into_records`].
+    #[must_use]
     pub fn exporter_only(&self) -> HandshakeExporter {
         HandshakeExporter {
             hash: self.finished.params.hash,
@@ -701,6 +805,7 @@ impl Complete {
     }
 
     /// The record keys in Sealed mode; `None` otherwise, where records are raw.
+    #[must_use]
     pub fn into_records(self) -> Option<(Sealer, Opener)> {
         if self.mode != RecordMode::Sealed {
             return None;
@@ -716,18 +821,21 @@ impl Complete {
 
     #[cfg(feature = "test-vectors")]
     /// `h` and `ck` after the last message.
+    #[must_use]
     pub fn transcript(&self) -> (&[u8], &[u8]) {
         (&self.finished.h, &self.finished.ck)
     }
 
     #[cfg(feature = "test-vectors")]
     /// `(c1, c2)` of the split.
+    #[must_use]
     pub fn split(&self) -> (&[u8], &[u8]) {
         (&self.finished.c1, &self.finished.c2)
     }
 
     #[cfg(feature = "test-vectors")]
     /// The exporter secret.
+    #[must_use]
     pub fn exporter_secret(&self) -> &[u8] {
         &self.exporter_secret
     }
@@ -741,6 +849,11 @@ pub struct HandshakeExporter {
 
 impl HandshakeExporter {
     /// `Export(label, context, n)` of the handshake.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_config` when `label` is longer than 255 bytes, `context`
+    /// longer than 65535 bytes, or `len` beyond what the hash can expand.
     pub fn export(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, Error> {
         export(self.hash, &self.secret, label, context, len)
     }

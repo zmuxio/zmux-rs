@@ -1,5 +1,5 @@
 //! Tiers: the priority, standby flag and weight of each outbound direction,
-//! PIPE_STATUS requests for the peer's directions, standby takeover,
+//! `PIPE_STATUS` requests for the peer's directions, standby takeover,
 //! probation, tier saturation, and the tier gate that every scheduling
 //! policy runs behind.
 //!
@@ -134,7 +134,7 @@ impl Gate {
     }
 }
 
-/// Q_t and R_t of one usable tier, and when it last became eligible (the
+/// `Q_t` and `R_t` of one usable tier, and when it last became eligible (the
 /// age test of the tiers after the most-preferred one).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::proto::session) struct TierLoad {
@@ -183,9 +183,10 @@ impl Cascade {
         // counted for a tier other than the most-preferred one from when
         // it last became eligible.
         let aged = self.oldest.is_some_and(|w| {
-            let since = match self.first {
-                true => w,
-                false => w.max(t.since.unwrap_or(self.now)),
+            let since = if self.first {
+                w
+            } else {
+                w.max(t.since.unwrap_or(self.now))
             };
             self.now.saturating_duration_since(since) >= self.d
         });
@@ -197,7 +198,8 @@ impl Cascade {
             saturated: drained_late || aged,
         };
         // Only what this tier cannot absorb within D moves on.
-        let room = (t.rate as f64 * self.d.as_secs_f64()) as u64;
+        let room = crate::util::u64_sat(crate::util::f64_of(t.rate) * self.d.as_secs_f64());
+
         self.offered = self.offered.saturating_sub(room.saturating_sub(t.queued));
         self.first = false;
         tier
@@ -208,9 +210,9 @@ impl Cascade {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::proto::session) struct Tier {
     pub(in crate::proto::session) priority: u64,
-    /// Q_t: bytes committed to the tier's pipes and not yet transmitted.
+    /// `Q_t`: bytes committed to the tier's pipes and not yet transmitted.
     pub(in crate::proto::session) queued: u64,
-    /// R_t: the aggregate delivery rate.
+    /// `R_t`: the aggregate delivery rate.
     pub(in crate::proto::session) rate: u64,
     /// The data offered to the tier: ready data for the most-preferred
     /// tier, the excess of the tier before it otherwise.
@@ -272,7 +274,7 @@ pub(crate) struct TierReport {
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Views {
     generation: Option<u64>,
-    /// The smallest min_rtt of the live outbound pipes (OWD).
+    /// The smallest `min_rtt` of the live outbound pipes (OWD).
     owd_floor: Duration,
     /// The usable class, `None` when no pipe is usable.
     class: Option<Class>,
@@ -339,8 +341,8 @@ impl Views {
     }
 }
 
-/// The one-way delay of a pipe given the smallest min_rtt of the live
-/// pipes: its min_rtt less half that, or srtt / 2 before a sample.
+/// The one-way delay of a pipe given the smallest `min_rtt` of the live
+/// pipes: its `min_rtt` less half that, or srtt / 2 before a sample.
 pub(in crate::proto::session) fn owd(o: &OutPipe, floor: Duration) -> Duration {
     match o.est().min_rtt.get() {
         None => o.est().srtt / 2,
@@ -471,7 +473,7 @@ impl SessionCore {
         self.views().class
     }
 
-    /// Bytes committed to a pipe and not yet transmitted (Q_p,
+    /// Bytes committed to a pipe and not yet transmitted (`Q_p`,
     /// [`OutPipe::queued`]), and at least its low-water mark while it
     /// refuses bytes.
     pub(in crate::proto::session) fn queued(o: &OutPipe) -> u64 {
@@ -540,7 +542,7 @@ impl SessionCore {
         }
     }
 
-    /// Q_t and R_t of a usable tier, and when it last became eligible
+    /// `Q_t` and `R_t` of a usable tier, and when it last became eligible
     /// unless it is the most-preferred one (`first`).
     fn tier_load(&self, views: &Views, t: &TierView, first: bool) -> TierLoad {
         let (mut queued, mut rate) = (0u64, 0u64);
@@ -667,9 +669,12 @@ impl SessionCore {
             .tiers()
             .iter()
             .take_while(|t| t.priority < tier)
-            .any(|t| match sa {
-                true => open(self.atts.at(t.active)),
-                false => views.pipes(t).iter().any(|&i| open(self.atts.at(i))),
+            .any(|t| {
+                if sa {
+                    open(self.atts.at(t.active))
+                } else {
+                    views.pipes(t).iter().any(|&i| open(self.atts.at(i)))
+                }
             })
     }
 
@@ -841,7 +846,7 @@ impl SessionCore {
     }
 
     /// Sets the priority requested for the peer's outbound direction of a
-    /// pipe; the request goes out at once as PIPE_STATUS.
+    /// pipe; the request goes out at once as `PIPE_STATUS`.
     pub fn set_pipe_receive_priority(
         &mut self,
         pipe: PipeId,
@@ -855,7 +860,7 @@ impl SessionCore {
 
     /// Asks the peer to use its outbound direction of a pipe only on
     /// failover (`true`) or as an ordinary pipe; the request goes out at
-    /// once as PIPE_STATUS.
+    /// once as `PIPE_STATUS`.
     pub fn set_pipe_receive_standby(
         &mut self,
         pipe: PipeId,
@@ -868,7 +873,7 @@ impl SessionCore {
     }
 
     /// Sets the whole request for the peer's outbound direction of a pipe,
-    /// standby flag and priority, sent at once as one PIPE_STATUS.
+    /// standby flag and priority, sent at once as one `PIPE_STATUS`.
     pub fn set_pipe_receive_status(
         &mut self,
         pipe: PipeId,
@@ -883,7 +888,7 @@ impl SessionCore {
 
     /// Applies the changes of `update` to a pipe together: an invalid
     /// value is [`PipeError::InvalidOptions`] and changes nothing, and one
-    /// PIPE_STATUS carries both receive fields when the request in force
+    /// `PIPE_STATUS` carries both receive fields when the request in force
     /// changes.
     pub fn update_pipe(&mut self, pipe: PipeId, update: &PipeUpdate) -> Result<(), PipeError> {
         let i = self.tier_att(pipe)?;
@@ -973,8 +978,8 @@ impl SessionCore {
     }
 
     /// `RevalidatePipes` / `Revalidate`: the named
-    /// live outbound pipe, or every one, sends a PIPE_PING at once (within
-    /// the PIPE_PING limit, longest waiting first) and awaits revalidation
+    /// live outbound pipe, or every one, sends a `PIPE_PING` at once (within
+    /// the `PIPE_PING` limit, longest waiting first) and awaits revalidation
     /// until its acknowledged position reaches it. A pipe already awaiting
     /// revalidation, or one that is suspect,
     /// draining or gone, is left as it is.
@@ -1008,7 +1013,7 @@ impl SessionCore {
         Ok(())
     }
 
-    /// A revalidation of pipe `id` ends: its PIPE_PING was acknowledged,
+    /// A revalidation of pipe `id` ends: its `PIPE_PING` was acknowledged,
     /// or the pipe became suspect, failed, started draining or went away.
     pub(in crate::proto::session) fn end_revalidation(&mut self, id: u64) {
         if self.out_mut(id).is_some_and(OutPipe::end_revalidation) {
@@ -1046,7 +1051,7 @@ impl SessionCore {
         self.check_standby_takeover();
     }
 
-    /// A PIPE_STATUS request is owed for an attachment that has an inbound
+    /// A `PIPE_STATUS` request is owed for an attachment that has an inbound
     /// direction to ask about.
     fn request_status(&mut self, i: usize) {
         let a = self.atts.at_mut(i);
@@ -1091,7 +1096,7 @@ impl SessionCore {
 
     // ---- PIPE_STATUS -----------------------------------------------------------------
 
-    /// PIPE_STATUS: the peer's request for the local outbound direction
+    /// `PIPE_STATUS`: the peer's request for the local outbound direction
     /// of an attachment.
     pub(in crate::proto::session) fn on_pipe_status(
         &mut self,
@@ -1121,7 +1126,7 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Writes attachment `i`'s PIPE_STATUS when one is owed; `false` when
+    /// Writes attachment `i`'s `PIPE_STATUS` when one is owed; `false` when
     /// the batch is full.
     pub(in crate::proto::session) fn write_status(
         &mut self,
@@ -1174,8 +1179,8 @@ impl SessionCore {
     // ---- probation ------------------------------------------
 
     /// The probation base of attachment `a` now, from the current smoothed
-    /// RTT: 4 x smoothed_rtt for a path without history, max(1 s, 4 x
-    /// smoothed_rtt) otherwise; `None` when probation is disabled.
+    /// RTT: 4 x `smoothed_rtt` for a path without history, max(1 s, 4 x
+    /// `smoothed_rtt`) otherwise; `None` when probation is disabled.
     fn probation_base(&self, a: &Attachment) -> Option<Duration> {
         let srtt = a.out()?.est().srtt;
         match a.tier().probation().or(self.config.probation)? {
@@ -1196,7 +1201,7 @@ impl SessionCore {
     }
 
     /// When the probation of attachment `a` ends: its start plus
-    /// min(base x 2^k, max(base, 2 x U_max)), with the base of now, and
+    /// min(base x 2^k, max(base, 2 x `U_max`)), with the base of now, and
     /// without the uptime cap while no uptime was observed.
     pub(in crate::proto::session) fn probation_end(&self, a: &Attachment) -> Option<Instant> {
         let (started, k) = a.out()?.probation()?;
@@ -1231,10 +1236,10 @@ impl SessionCore {
 
     /// Changes the probation history of attachment `i`.
     fn update_history<R>(&mut self, i: usize, f: impl FnOnce(&mut History) -> R) -> R {
-        let a = self.atts.at_mut(i);
-        let (local, group) = a.fate();
+        let att = self.atts.at_mut(i);
+        let (local, group) = att.fate();
         if group == 0 || self.mp.is_none() {
-            return match a.out_mut() {
+            return match att.out_mut() {
                 Some(o) => f(o.history_mut()),
                 None => f(&mut History::default()),
             };
@@ -1244,14 +1249,13 @@ impl SessionCore {
             .as_deref_mut()
             .expect("multipath in use")
             .tiers_mut();
-        match mp.fate_history.iter_mut().find(|h| h.0 == (local, group)) {
-            Some(h) => f(&mut h.1),
-            None => {
-                let mut h = History::default();
-                let r = f(&mut h);
-                mp.fate_history.push(((local, group), h));
-                r
-            }
+        if let Some(h) = mp.fate_history.iter_mut().find(|h| h.0 == (local, group)) {
+            f(&mut h.1)
+        } else {
+            let mut history = History::default();
+            let out = f(&mut history);
+            mp.fate_history.push(((local, group), history));
+            out
         }
     }
 
@@ -1363,7 +1367,7 @@ impl SessionCore {
 
     /// Forgets the probation history of fate groups that no attachment
     /// uses any more once it no longer matters (a suspicion would start
-    /// over at k = 0), and keeps at most max_pipes + H such groups (the
+    /// over at k = 0), and keeps at most `max_pipes` + H such groups (the
     /// most recent), so that a peer cycling through fate groups cannot
     /// grow the state.
     fn prune_fate_history(&mut self, now: Instant) {
@@ -1484,7 +1488,7 @@ fn effective(a: &Attachment) -> (u64, bool, u64) {
 /// | `probation`, `liveness`, `quality_band` | follow the session's | this value (`probation` `None`: off) |
 ///
 /// A changed request for the peer's outbound direction is sent as one
-/// PIPE_STATUS, only when it differs from the request in force.
+/// `PIPE_STATUS`, only when it differs from the request in force.
 ///
 /// ```
 /// use zmux::{Change, PipeUpdate};

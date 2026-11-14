@@ -1,6 +1,6 @@
 //! Formats carried inside frame payloads: the stream preamble at the
 //! start of a stream's data, and the flow prefix of DATAGRAM data.
-//! Violations of either are PROTOCOL_VIOLATION.
+//! Violations of either are `PROTOCOL_VIOLATION`.
 
 use super::codec::{Cursor, Writer};
 use super::error::{EncodeError, Error};
@@ -9,13 +9,13 @@ use super::varint::{self, len as vlen};
 
 /// Preamble TLV types.
 pub mod tlv {
-    /// OPEN_INFO: the opener's metadata for the peer application.
+    /// `OPEN_INFO`: the opener's metadata for the peer application.
     pub const OPEN_INFO: u64 = 0x01;
     /// PRIORITY: the opener's initial priority request.
     pub const PRIORITY: u64 = 0x02;
     /// DEADLINE: reserved; never sent, ignored on receipt.
     pub const DEADLINE: u64 = 0x03;
-    /// PIPE_CARRIER: empty; the stream carries a pipe pair of a nested
+    /// `PIPE_CARRIER`: empty; the stream carries a pipe pair of a nested
     /// session.
     pub const PIPE_CARRIER: u64 = 0x05;
     /// The first type of the application range.
@@ -43,6 +43,7 @@ pub const PREAMBLE_TLVS: &[(&str, u64, TlvStatus)] = &[
 
 /// The GREASE TLV type 0x1f * `n` + 0x21, or `None` if it does not fit in a
 /// varint.
+#[must_use]
 pub const fn grease_tlv_type(n: u64) -> Option<u64> {
     match n.checked_mul(0x1f) {
         Some(v) if v <= varint::MAX - 0x21 => Some(v + 0x21),
@@ -51,6 +52,7 @@ pub const fn grease_tlv_type(n: u64) -> Option<u64> {
 }
 
 /// Whether `ty` is a GREASE TLV type.
+#[must_use]
 pub const fn is_grease_tlv_type(ty: u64) -> bool {
     ty >= 0x21 && (ty - 0x21).is_multiple_of(0x1f)
 }
@@ -58,6 +60,7 @@ pub const fn is_grease_tlv_type(ty: u64) -> bool {
 /// Whether `ty` is an application TLV type: 0x1000 to 0x3fff, GREASE values
 /// excluded. zmux never interprets these and delivers them to the
 /// application in the order received.
+#[must_use]
 pub const fn is_application_tlv_type(ty: u64) -> bool {
     ty >= tlv::APPLICATION_FIRST && ty <= tlv::APPLICATION_LAST && !is_grease_tlv_type(ty)
 }
@@ -73,22 +76,26 @@ pub struct AppTlvs<'a> {
 
 impl<'a> AppTlvs<'a> {
     /// A view over encoded TLVs (type, length, value, repeated).
+    #[must_use]
     pub const fn new(encoded: &'a [u8]) -> Self {
         Self { rest: encoded }
     }
 
     /// The encoded TLVs not yet iterated, other types included.
+    #[must_use]
     pub const fn encoded(&self) -> &'a [u8] {
         self.rest
     }
 
     /// Whether no application TLV is in the list.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         let mut it = *self;
         it.next().is_none()
     }
 
     /// The encoded length of the application TLVs alone.
+    #[must_use]
     pub fn encoded_len(&self) -> usize {
         (*self)
             .map(|(ty, v)| vlen(ty) + vlen(v.len() as u64) + v.len())
@@ -108,6 +115,10 @@ impl<'a> AppTlvs<'a> {
     }
 }
 
+#[allow(
+    clippy::copy_iterator,
+    reason = "a public cursor over borrowed bytes: a copy walks them again from its position"
+)]
 impl<'a> Iterator for AppTlvs<'a> {
     type Item = (u64, &'a [u8]);
 
@@ -147,13 +158,13 @@ pub struct GreaseTlv<'a> {
 /// parsing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WirePreamble<'a> {
-    /// OPEN_INFO.
+    /// `OPEN_INFO`.
     pub open_info: Option<&'a [u8]>,
     /// PRIORITY.
     pub priority: Option<Priority>,
-    /// PIPE_CARRIER: the stream carries a pipe pair of a nested session.
+    /// `PIPE_CARRIER`: the stream carries a pipe pair of a nested session.
     pub pipe_carrier: bool,
-    /// The application TLVs, in order (encoded after PIPE_CARRIER).
+    /// The application TLVs, in order (encoded after `PIPE_CARRIER`).
     pub app_tlvs: AppTlvs<'a>,
 }
 
@@ -231,12 +242,13 @@ impl<'a> WirePreamble<'a> {
     }
 
     /// Length of the encoding, Length field included.
+    #[must_use]
     pub fn encoded_len(&self, grease: Option<GreaseTlv<'_>>) -> usize {
         let body = self.body_len(grease);
         vlen(body as u64) + body
     }
 
-    /// Writes the preamble: OPEN_INFO, PRIORITY, PIPE_CARRIER, the
+    /// Writes the preamble: `OPEN_INFO`, PRIORITY, `PIPE_CARRIER`, the
     /// application TLVs in order, then `grease`.
     pub fn encode(
         &self,
@@ -294,6 +306,7 @@ pub enum Flow {
 
 impl Flow {
     /// Length of the prefix.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         match self {
             Self::Session => 1,
@@ -324,7 +337,7 @@ impl Flow {
     }
 
     /// Splits DATAGRAM data into its flow and payload. A truncated prefix,
-    /// or a flow naming a unidirectional stream, is a PROTOCOL_VIOLATION
+    /// or a flow naming a unidirectional stream, is a `PROTOCOL_VIOLATION`
     /// (the error's frame type is 0; [`crate::proto::frame::Datagram::flow`]
     /// sets it).
     pub fn parse(data: &[u8]) -> Result<(Self, &[u8]), Error> {
@@ -374,7 +387,7 @@ mod tests {
     }
 
     /// Application TLVs in order, repeats included; GREASE values in
-    /// the range and other types are not application TLVs; PIPE_CARRIER
+    /// the range and other types are not application TLVs; `PIPE_CARRIER`
     /// is empty and at most once.
     #[test]
     fn application_tlvs_and_pipe_carrier() {

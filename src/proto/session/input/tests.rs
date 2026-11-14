@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::stream::{RECV_KEEP, make_id};
+use super::super::stream::{RECV_KEEP, RecvPart, make_id};
 use bytes::Bytes;
 
 use super::super::{Backing, Config, PipeAuth, PipeId, Role, SessionCore, StreamKey, TransmitBuf};
@@ -217,6 +217,10 @@ fn drained_receive_buffers_release_their_capacity() {
 
 /// A local stream's receiving part leaves the buffer cap's `n_local`
 /// when it is terminal, before the stream is discarded.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "a and b the two sessions, s and k a stream"
+)]
 #[test]
 fn local_receiving_parts_leave_the_cap_when_terminal() {
     let (mut a, mut b, now) = pair();
@@ -245,6 +249,10 @@ fn local_receiving_parts_leave_the_cap_when_terminal() {
 /// retired buffers kept alive stay within twice the bytes referenced; a
 /// reader that leaves a rest of each buffer of a bulk transfer keeps every
 /// piece referenced.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "a and b the two sessions, s and k a stream"
+)]
 #[test]
 fn retired_read_buffers_stay_within_twice_the_referenced_bytes() {
     let (mut a, mut b, now) = pair();
@@ -297,9 +305,11 @@ fn retired_read_buffers_stay_within_twice_the_referenced_bytes() {
     let mut sink = vec![0u8; 1 << 20];
     while b.read(k, &mut sink).unwrap().is_some_and(|(n, _)| n > 0) {}
     // Bulk: 100 KiB per buffer, the reader leaves 10 KiB each time.
-    let held = |b: &SessionCore| b.streams.recv(k).map_or(0, |r| r.held()) as usize;
+    let held =
+        |b: &SessionCore| usize::try_from(b.streams.recv(k).map_or(0, RecvPart::held)).unwrap();
+    let bulk = vec![2; 100 * 1024];
     for _ in 0..20 {
-        deliver(&mut a, &mut b, &[2; 100 * 1024]);
+        deliver(&mut a, &mut b, &bulk);
         let n = held(&b).saturating_sub(10 * 1024);
         if n > 0 {
             b.read(k, &mut sink[..n]).unwrap().expect("data");
@@ -417,13 +427,14 @@ fn consumption_rechecks_the_read_buffer_bound() {
     let s1 = a.open(Dir::Uni).unwrap();
     let s2 = a.open(Dir::Uni).unwrap();
     let mut out = TransmitBuf::default();
+    let (ones, twos) = (vec![1; 50 * 1024], vec![2; 50 * 1024]);
     let mut now = now;
     // 50 KiB of each stream arrive in one fresh read buffer of 128 KiB.
     for next in 0..8 {
         now += Duration::from_millis(10);
         a.handle_timeout(now);
-        a.write(s1, &[1; 50 * 1024]).unwrap();
-        a.write(s2, &[2; 50 * 1024]).unwrap();
+        a.write(s1, &ones).unwrap();
+        a.write(s2, &twos).unwrap();
         let mut wire = Vec::new();
         while a.wants_write(PipeId(0)) {
             a.poll_transmit(PipeId(0), now, &mut out);

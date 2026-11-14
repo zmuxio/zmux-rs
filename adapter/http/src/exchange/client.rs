@@ -34,6 +34,11 @@ use crate::body::{PipeBody, collect};
 /// Returns at once, without a round trip; must be called inside a tokio
 /// runtime. Fails only on options without authentication that do not
 /// choose it ([`ExchangeOptions::unauthenticated`]).
+///
+/// # Errors
+///
+/// `InvalidInput` on options without a PSK that do not choose to run
+/// unauthenticated, or that set both.
 pub fn dial_exchange(addr: &str, options: &ExchangeOptions) -> io::Result<PipeIo> {
     let e = ExchangeEndpoint::tcp(addr);
     dial_exchange_split(e.clone(), e, options)
@@ -64,6 +69,11 @@ pub fn dial_exchange(addr: &str, options: &ExchangeOptions) -> io::Result<PipeIo
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// `InvalidInput` on options without a PSK that do not choose to run
+/// unauthenticated, or that set both.
 pub fn dial_exchange_with<C, F, IO>(
     connect: C,
     authority: &str,
@@ -114,6 +124,7 @@ impl ExchangeEndpoint {
 
     /// Plain TCP connections to `addr` (`host:port`, also the `Host`
     /// header).
+    #[must_use]
     pub fn tcp(addr: &str) -> Self {
         let target = addr.to_owned();
         Self::new(
@@ -146,6 +157,15 @@ impl ExchangeEndpoint {
 /// inside a tokio runtime. Fails ([`io::ErrorKind::InvalidInput`]) on
 /// options without a PSK that do not choose to run unauthenticated
 /// ([`ExchangeOptions::unauthenticated`]), or that set both.
+///
+/// # Errors
+///
+/// `InvalidInput` on options without a PSK that do not choose to run
+/// unauthenticated, or that set both.
+///
+/// # Panics
+///
+/// If the system's random source fails.
 pub fn dial_exchange_split(
     up: ExchangeEndpoint,
     down: ExchangeEndpoint,
@@ -211,6 +231,11 @@ pub fn dial_exchange_split(
 
 /// Establishes a session over an exchange carrier to `addr`
 /// ([`dial_exchange`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial_exchange`], and the errors
+/// of [`Session::connect`].
 pub async fn connect_exchange(
     addr: &str,
     options: &ExchangeOptions,
@@ -231,6 +256,10 @@ struct Halves {
 }
 
 #[derive(Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent end-of-stream and liveness flags of the two halves"
+)]
 struct HalfState {
     /// Uplink bytes zmux wrote that no piece holds yet.
     up: BytesMut,
@@ -552,7 +581,10 @@ async fn attempt(
         // Over the local limit: a configuration error, never retried.
         Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => return Outcome::Invalid,
         // A redirect the carrier must not follow fails it.
-        Ok(Err(e)) if e.get_ref().is_some_and(|r| r.is::<RedirectError>()) => {
+        Ok(Err(e))
+            if e.get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<RedirectError>) =>
+        {
             return Outcome::Invalid;
         }
         _ => return Outcome::NoResult,
@@ -702,6 +734,15 @@ impl Driver {
         self.ctx.options.backoff.delay(attempts)
     }
 
+    /// Both halves are closed by zmux: nothing reads the downlink and
+    /// nothing writes the uplink any more, so what is still outstanding
+    /// (the uplink's last piece, with its FIN) is not worth a retry
+    /// against a server that does not answer.
+    fn released(&self) -> bool {
+        let st = self.halves.lock();
+        st.reader_gone && st.writer_gone
+    }
+
     /// Starts the requests the state calls for; the end of the carrier
     /// when it has ended.
     fn pump(&mut self) -> Option<End> {
@@ -709,6 +750,14 @@ impl Driver {
         let (piece, fin, reader_gone, room) = {
             let mut st = self.halves.lock();
             if st.aborted || (st.writer_gone && !st.up_closed) {
+                return Some(End::Failed { close: true });
+            }
+            // A request that had no result and waits for its next attempt.
+            if st.reader_gone
+                && st.writer_gone
+                && (self.up.values().any(|p| p.req.attempts > 0)
+                    || self.down.values().any(|p| p.attempts > 0))
+            {
                 return Some(End::Failed { close: true });
             }
             let mut piece = None;
@@ -814,6 +863,14 @@ impl Driver {
     /// Repeats request `seq` of `kind` after a backoff, or fails the
     /// carrier when it has had no result for the deadline.
     fn repeat(&mut self, kind: Kind, seq: u64, busy: bool) -> Option<End> {
+        if kind == Kind::Close {
+            return None;
+        }
+        if !busy && self.released() {
+            // The first attempt without a result ends the carrier once zmux
+            // closed both halves.
+            return Some(End::Failed { close: true });
+        }
         let now = Instant::now();
         let deadline = self.ctx.options.deadline;
         let (flags, data, attempts) = match kind {

@@ -39,6 +39,7 @@ pub struct TlsState {
 
 impl TlsState {
     /// The state of a handshake with these results.
+    #[must_use]
     pub fn new(alpn: Option<Vec<u8>>, server_name: Option<String>) -> Self {
         Self { alpn, server_name }
     }
@@ -81,7 +82,7 @@ impl fmt::Debug for CarrierExporter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CarrierExporter")
             .field("split", &self.second.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -110,6 +111,7 @@ impl CarrierExporter {
     /// `length` bytes for `label` and `context`, twice that for a split
     /// exporter on two connections; `None` while the handshake is
     /// incomplete or once the connection is gone.
+    #[must_use]
     pub fn export(&self, label: &str, context: &[u8], length: usize) -> Option<Vec<u8>> {
         let mut out = vec![0; length];
         if !(self.first)(label, context, &mut out) {
@@ -147,12 +149,14 @@ impl CarrierExporter {
     /// The value of `EXPORTER-zmux-session`: the session secret's input,
     /// which a sans-IO host passes to
     /// [`SessionCore::set_bootstrap_exporter_value`](super::session::SessionCore::set_bootstrap_exporter_value).
+    #[must_use]
     pub fn session_value(&self) -> Option<Vec<u8>> {
         self.export(EXPORTER_SESSION_LABEL, b"", VALUE_LEN)
     }
 
     /// The Binding of an Establish. `split` is a carrier of two halves,
     /// which needs the exporter of each.
+    #[must_use]
     pub fn seal_binding(&self, split: bool) -> Option<Vec<u8>> {
         let read = |f: &Arc<ExportFn>| {
             let mut out = vec![0; VALUE_LEN];
@@ -168,6 +172,7 @@ impl CarrierExporter {
     }
 
     /// The value of `EXPORTER-zmux-join`: the Binding of a Bound Join, made on one connection.
+    #[must_use]
     pub fn pipe_binding(&self) -> Option<Vec<u8>> {
         let mut out = vec![0; VALUE_LEN];
         (self.first)(EXPORTER_JOIN_LABEL, b"", &mut out).then_some(out)

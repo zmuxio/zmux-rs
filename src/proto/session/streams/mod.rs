@@ -52,7 +52,7 @@ pub(crate) struct Streams {
     staged_target: u64,
     /// Released chunks of the send buffers, shared by the streams.
     chunks: ChunkPool,
-    /// Streams that owe a MAX_STREAM_DATA update.
+    /// Streams that owe a `MAX_STREAM_DATA` update.
     stream_updates: usize,
     slab: Slab,
     ids: IdMap,
@@ -77,10 +77,10 @@ pub(crate) struct Streams {
     /// in identifier order; later streams of the type wait for them.
     pinned: [VecDeque<StreamKey>; 2],
     /// Every queued stream waits for session credit: nothing to send until
-    /// MAX_DATA or a new stream.
+    /// `MAX_DATA` or a new stream.
     session_stalled: bool,
     /// Local bidirectional streams whose receiving part is open (the
-    /// n_local term of the buffer cap): those
+    /// `n_local` term of the buffer cap): those
     /// whose part `counts_open`.
     local_recv_open: u64,
     /// Streams waiting for send-buffer room, in the order they began to
@@ -316,7 +316,7 @@ impl Streams {
             || self.ctrl_pending()
     }
 
-    /// A credit update (MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA) waits.
+    /// A credit update (`MAX_DATA`, `MAX_STREAMS`, `MAX_STREAM_DATA`) waits.
     pub(super) fn credit_update_pending(&self) -> bool {
         #[cfg(debug_assertions)]
         if self.slab.len() <= 64 {
@@ -480,7 +480,7 @@ impl Streams {
         std::mem::replace(&mut self.local_dirs[d].waiting, false)
     }
 
-    /// The peer's initial limits: MAX_DATA and MAX_STREAMS per type.
+    /// The peer's initial limits: `MAX_DATA` and `MAX_STREAMS` per type.
     pub(super) fn peer_limits(&mut self, max_data: u64, max_streams: [u64; 2]) {
         self.send_flow.max = max_data;
         for (d, max) in self.local_dirs.iter_mut().zip(max_streams) {
@@ -488,13 +488,13 @@ impl Streams {
         }
     }
 
-    /// MAX_STREAMS raised the limit of type `d` to `max`; `false` when it
+    /// `MAX_STREAMS` raised the limit of type `d` to `max`; `false` when it
     /// did not.
     pub(super) fn raise_local(&mut self, d: usize, max: u64) -> bool {
         self.local_dirs[d].raise(max)
     }
 
-    /// A local stream of type `d` waits for stream credit: STREAMS_BLOCKED
+    /// A local stream of type `d` waits for stream credit: `STREAMS_BLOCKED`
     /// is owed unless reported.
     pub(super) fn report_streams_blocked(&mut self, d: usize) {
         self.local_dirs[d].report_blocked();
@@ -592,7 +592,7 @@ impl Streams {
             return;
         };
         let recv = s.recv.as_ref();
-        if preamble && !recv.is_some_and(|r| r.preamble_size.is_some()) {
+        if preamble && recv.is_none_or(|r| r.preamble_size.is_none()) {
             if recv.is_some_and(|r| r.cold().stopped.is_some()) {
                 s.offer = Offer::Rejected;
             }
@@ -610,7 +610,7 @@ impl Streams {
     }
 
     /// Raises the concurrency of the peer's streams of type `d` to `n`; owes
-    /// MAX_STREAMS when `grant`. It only grows; `false` when unchanged.
+    /// `MAX_STREAMS` when `grant`. It only grows; `false` when unchanged.
     pub(in super::super) fn raise_remote(&mut self, d: usize, n: u64, grant: bool) -> bool {
         let r = &mut self.remote_dirs[d];
         if r.staged {
@@ -629,8 +629,8 @@ impl Streams {
     }
 
     /// A peer stream of type `d` was discarded: its count returns to the
-    /// peer with MAX_STREAMS, owed when `raise` (an
-    /// endpoint that sent GOAWAY raises MAX_STREAMS no more).
+    /// peer with `MAX_STREAMS`, owed when `raise` (an
+    /// endpoint that sent GOAWAY raises `MAX_STREAMS` no more).
     pub(super) fn count_discarded(&mut self, d: usize, raise: bool) {
         let r = &mut self.remote_dirs[d];
         r.discarded += 1;
@@ -639,13 +639,13 @@ impl Streams {
         }
     }
 
-    /// STREAMS_BLOCKED from the peer at `limit` for type `d`, new.
+    /// `STREAMS_BLOCKED` from the peer at `limit` for type `d`, new.
     pub(super) fn remote_blocked(&mut self, d: usize, limit: u64) {
         self.remote_dirs[d].blocked_seen = Some(limit);
     }
 
     /// GOAWAY with watermark `watermark` for type `d` was written: the
-    /// lowest one sent, and MAX_STREAMS is owed no more.
+    /// lowest one sent, and `MAX_STREAMS` is owed no more.
     pub(super) fn goaway_written(&mut self, d: usize, watermark: u64) {
         let r = &mut self.remote_dirs[d];
         r.goaway_sent = Some(r.goaway_sent.map_or(watermark, |c| c.min(watermark)));

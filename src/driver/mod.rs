@@ -95,13 +95,13 @@ mod unsent;
 mod wait;
 mod wake;
 
-/// The initial TCP_NOTSENT_LOWAT of a TCP carrier on a single pipe, the
+/// The initial `TCP_NOTSENT_LOWAT` of a TCP carrier on a single pipe, the
 /// floor of the dynamic value, which
 /// [`tcp::Probe`] keeps up to date.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
 pub(crate) const NOTSENT_LOWAT_SINGLE: u64 = 128 * 1024;
 
-/// The initial TCP_NOTSENT_LOWAT of a TCP carrier added to a multipath
+/// The initial `TCP_NOTSENT_LOWAT` of a TCP carrier added to a multipath
 /// session, the per-pipe floor: unsent bytes in
 /// a carrier can no longer move to another pipe.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
@@ -257,21 +257,25 @@ pub struct StreamId(pub(crate) u64);
 
 impl StreamId {
     /// The identifier as an integer.
+    #[must_use]
     pub fn into_inner(self) -> u64 {
         self.0
     }
 
     /// The stream index within its type and initiator.
+    #[must_use]
     pub fn index(self) -> u64 {
         self.0 >> 2
     }
 
     /// The stream type.
+    #[must_use]
     pub fn dir(self) -> Dir {
         if self.0 & 2 == 0 { Dir::Bidi } else { Dir::Uni }
     }
 
     /// Which role opened the stream.
+    #[must_use]
     pub fn initiator(self) -> Role {
         if self.0 & 1 == 0 {
             Role::Client
@@ -302,7 +306,8 @@ impl fmt::Display for StreamId {
 pub use crate::proto::session::PipeDirection;
 
 /// What a dial is for: the halves the carrier provides. The argument of a
-/// [`Dial`](crate::Dial) function.
+#[cfg_attr(feature = "tokio", doc = " [`Dial`](crate::Dial) function.")]
+#[cfg_attr(not(feature = "tokio"), doc = " `Dial` function.")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DialRequest {
@@ -312,11 +317,13 @@ pub struct DialRequest {
 
 impl DialRequest {
     /// A request for a carrier with both halves (a rejoin, a pool's dial).
+    #[must_use]
     pub fn bidi() -> Self {
         Self::new(PipeDirection::Bidi)
     }
 
     /// A request for a carrier of `direction`.
+    #[must_use]
     pub fn new(direction: PipeDirection) -> Self {
         Self { direction }
     }
@@ -357,16 +364,28 @@ impl fmt::Display for EmptyMessage {
 
 impl std::error::Error for EmptyMessage {}
 
-/// For message-framed carriers ([`PipeIo::records`](crate::PipeIo::records)):
+#[cfg_attr(
+    feature = "tokio",
+    doc = " For message-framed carriers ([`PipeIo::records`](crate::PipeIo::records)):"
+)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    doc = " For message-framed carriers (`PipeIo::records`):"
+)]
 /// the read result that reports an empty message. A read that returns nothing
 /// is the end of the carrier, so a carrier's reader returns this error for a
 /// message without bytes instead; the session takes it as an empty record, a
 /// no-op that is not chargeable.
+#[must_use]
 pub fn empty_message() -> std::io::Error {
     std::io::Error::other(EmptyMessage)
 }
 
 /// Whether a read error is [`empty_message`].
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the path form is `<dyn Error + Send + Sync>::is`, harder to read"
+)]
 pub(crate) fn is_empty_message(e: &std::io::Error) -> bool {
     e.get_ref().is_some_and(|i| i.is::<EmptyMessage>())
 }

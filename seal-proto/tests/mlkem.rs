@@ -10,6 +10,7 @@
 //! both before they reach the KEM.
 
 use serde_json::Value;
+use std::fmt::Write as _;
 use zmux::proto::seal::Error;
 use zmux::proto::seal::kex;
 
@@ -148,7 +149,7 @@ fn cctv_modulus_keys_are_refused() {
     println!("modulus: {count} keys");
 }
 
-/// A key whose matrix needs more than the usual SHAKE-128 output in SampleNTT. Its
+/// A key whose matrix needs more than the usual SHAKE-128 output in `SampleNTT`. Its
 /// `ek` and `dk` came from `(d, z)` by the draft of FIPS 203, whose `G(d)` has no
 /// domain separator byte: the final standard derives another key from them, so key
 /// generation is not checked here. Encapsulation to `ek` with `m` and decapsulation
@@ -199,6 +200,9 @@ fn cctv_accumulated() {
     }
     let mut out = [0; 32];
     libcrux_sha3::portable::shake128(&mut out, &acc);
-    let got: String = out.iter().map(|b| format!("{b:02x}")).collect();
+    let got = out.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     assert_eq!(got, WANT);
 }

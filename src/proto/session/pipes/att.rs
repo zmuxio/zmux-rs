@@ -1,6 +1,6 @@
 //! An attachment: one pipe ID with up to one pipe in each direction, and
 //! its multipath part (fate group, join and failure state, the
-//! PIPE_ABANDON exchange, the tier settings).
+//! `PIPE_ABANDON` exchange, the tier settings).
 
 use std::time::{Duration, Instant};
 
@@ -31,12 +31,16 @@ pub(crate) struct Attachment {
 }
 
 /// The multipath part of an attachment: its fate group, join and failure
-/// state, the PIPE_ABANDON exchange and the tier settings.
+/// state, the `PIPE_ABANDON` exchange and the tier settings.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent state flags, not a mode that an enum would encode"
+)]
 struct AttMp {
     fate_group: u64,
     /// A peer ID used without attachment state (refused join, or abandoned
-    /// before it was seen): only its PIPE_ABANDON is kept, while the ID is
+    /// before it was seen): only its `PIPE_ABANDON` is kept, while the ID is
     /// in the replay window.
     unattached: bool,
     /// The join was confirmed: the acceptor attached it. Always true for
@@ -51,17 +55,17 @@ struct AttMp {
     /// Our joins refused in a row before this one was confirmed: they
     /// continue if the peer abandons it for a resource limit.
     refusals_at_join: u32,
-    /// The code of the local PIPE_ABANDON, once decided.
+    /// The code of the local `PIPE_ABANDON`, once decided.
     abandon_code: Option<u64>,
-    /// PIPE_ABANDON to (re)send.
+    /// `PIPE_ABANDON` to (re)send.
     abandon_pending: bool,
-    /// A graceful removal of our own outbound pipe puts PIPE_ABANDON on
+    /// A graceful removal of our own outbound pipe puts `PIPE_ABANDON` on
     /// that pipe.
     abandon_on_self: bool,
-    /// The local PIPE_ABANDON was written at least once.
+    /// The local `PIPE_ABANDON` was written at least once.
     abandon_sent: bool,
     abandon_acked: bool,
-    /// The peer's PIPE_ABANDON code.
+    /// The peer's `PIPE_ABANDON` code.
     abandon_received: Option<u64>,
     /// Unilateral retirement deadline.
     retire_at: Option<Instant>,
@@ -134,7 +138,7 @@ impl Attachment {
     }
 
     /// A peer-parity ID used without attachment state, with our
-    /// PIPE_ABANDON (`code`) for it pending and the peer's, when it sent
+    /// `PIPE_ABANDON` (`code`) for it pending and the peer's, when it sent
     /// one.
     pub(crate) fn unattached_id(id: u64, seq: u64, code: u64, received: Option<u64>) -> Self {
         let mut a = Self::new(id, false, 0, seq);
@@ -237,7 +241,7 @@ impl Attachment {
 
     /// The peer has attached the pipe: pipe 0 and a pipe the peer joined
     /// are attached from the start; one of our joins once the peer showed
-    /// it attached it, by a PIPE_ACK covering any byte on any lane of the
+    /// it attached it, by a `PIPE_ACK` covering any byte on any lane of the
     /// outbound pipe or, for an inbound-only pipe, by a record received
     /// on it.
     pub(crate) fn peer_attached(&self) -> bool {
@@ -356,7 +360,7 @@ impl Attachment {
     }
 
     /// Marks the attachment failed: `false` when it had failed already. A
-    /// PIPE_ABANDON meant as the pipe's own last frame goes on another pipe
+    /// `PIPE_ABANDON` meant as the pipe's own last frame goes on another pipe
     /// now: the failed pipe writes nothing more.
     pub(crate) fn fail(&mut self) -> bool {
         let m = self.mp_mut();
@@ -462,19 +466,19 @@ impl Attachment {
 
     // ---- the PIPE_ABANDON exchange --------------------------------------------------
 
-    /// The peer's PIPE_ABANDON code, once received.
+    /// The peer's `PIPE_ABANDON` code, once received.
     #[inline]
     pub(crate) fn abandon_received(&self) -> Option<u64> {
         self.mp().abandon_received
     }
 
-    /// Our PIPE_ABANDON was acknowledged.
+    /// Our `PIPE_ABANDON` was acknowledged.
     #[inline]
     pub(crate) fn abandon_acked(&self) -> bool {
         self.mp().abandon_acked
     }
 
-    /// Decides the local PIPE_ABANDON with `code` unless one was decided,
+    /// Decides the local `PIPE_ABANDON` with `code` unless one was decided,
     /// and owes it.
     pub(crate) fn abandon(&mut self, code: u64) {
         let m = self.mp_mut();
@@ -484,7 +488,7 @@ impl Attachment {
         }
     }
 
-    /// A graceful removal: PIPE_ABANDON(NO_ERROR) unless one was decided, as
+    /// A graceful removal: `PIPE_ABANDON(NO_ERROR)` unless one was decided, as
     /// the last frame of the drained pipe itself when it can still carry it.
     pub(crate) fn abandon_gracefully(&mut self) {
         let on_self = self
@@ -499,12 +503,12 @@ impl Attachment {
         }
     }
 
-    /// The attachment is retired at once without its PIPE_ABANDON.
+    /// The attachment is retired at once without its `PIPE_ABANDON`.
     pub(crate) fn drop_abandon(&mut self) {
         self.mp_mut().abandon_pending = false;
     }
 
-    /// The local PIPE_ABANDON waits to be written: on the attachment's own
+    /// The local `PIPE_ABANDON` waits to be written: on the attachment's own
     /// pipe (`on_self`) or on the control pipe.
     #[inline]
     pub(crate) fn abandon_owed(&self, on_self: bool) -> bool {
@@ -512,21 +516,21 @@ impl Attachment {
         m.abandon_pending && m.abandon_on_self == on_self
     }
 
-    /// The local PIPE_ABANDON to write: its code, when it is owed and goes
+    /// The local `PIPE_ABANDON` to write: its code, when it is owed and goes
     /// on the control pipe (or, with `own`, on whatever pipe writes it).
     pub(crate) fn abandon_to_write(&self, own: bool) -> Option<u64> {
         let m = self.mp();
         (m.abandon_pending && (own || !m.abandon_on_self)).then(|| m.abandon_code.unwrap_or(0))
     }
 
-    /// The local PIPE_ABANDON was written.
+    /// The local `PIPE_ABANDON` was written.
     pub(crate) fn abandon_written(&mut self) {
         let m = self.mp_mut();
         m.abandon_pending = false;
         m.abandon_sent = true;
     }
 
-    /// The local PIPE_ABANDON was acknowledged; without the peer's, the
+    /// The local `PIPE_ABANDON` was acknowledged; without the peer's, the
     /// attachment retires unilaterally after `delay`.
     pub(crate) fn abandon_acknowledged(&mut self, delay: Duration, now: Instant) {
         let m = self.mp_mut();
@@ -537,7 +541,7 @@ impl Attachment {
         }
     }
 
-    /// The frame that carried the local PIPE_ABANDON was lost: it is owed
+    /// The frame that carried the local `PIPE_ABANDON` was lost: it is owed
     /// again, on the control pipe, unless it was acknowledged.
     pub(crate) fn abandon_lost(&mut self) {
         let m = self.mp_mut();
@@ -547,7 +551,7 @@ impl Attachment {
         }
     }
 
-    /// The peer's PIPE_ABANDON with `code`: `false` for a copy of one
+    /// The peer's `PIPE_ABANDON` with `code`: `false` for a copy of one
     /// received already.
     pub(crate) fn abandon_arrived(&mut self, code: u64) -> bool {
         let m = self.mp_mut();
@@ -564,7 +568,7 @@ impl Attachment {
         self.mp().retire_at
     }
 
-    /// Its graceful removal has started: PIPE_ABANDON(NO_ERROR) sent (or
+    /// Its graceful removal has started: `PIPE_ABANDON(NO_ERROR)` sent (or
     /// decided) or received. Its failure or suspicion then affects no other
     /// attachment of its fate group and does not count in the group's
     /// probation history.
@@ -573,7 +577,7 @@ impl Attachment {
         self.mp().abandon_code == Some(0) || self.mp().abandon_received == Some(0)
     }
 
-    /// Abandoned with ZMUX_PIPE_RESOURCE_LIMIT, by either endpoint: it did
+    /// Abandoned with `ZMUX_PIPE_RESOURCE_LIMIT`, by either endpoint: it did
     /// not fail with its path.
     #[inline]
     pub(crate) fn limit_abandoned(&self) -> bool {
@@ -596,7 +600,7 @@ impl Attachment {
         self.draining() || self.limit_abandoned()
     }
 
-    /// The PIPE_ABANDON exchange is complete: ours sent, the peer's
+    /// The `PIPE_ABANDON` exchange is complete: ours sent, the peer's
     /// received.
     #[inline]
     pub(crate) fn exchange_complete(&self) -> bool {
@@ -609,7 +613,7 @@ impl Attachment {
         self.mp().abandon_received.is_some() || self.mp().abandon_code == Some(0)
     }
 
-    /// Our PIPE_ABANDON is acknowledged; `unattached` too when only a bit
+    /// Our `PIPE_ABANDON` is acknowledged; `unattached` too when only a bit
     /// in the replay window remains.
     pub(crate) fn own_abandon_done(&self) -> bool {
         self.mp().abandon_code.is_some() && self.mp().abandon_acked
@@ -654,7 +658,7 @@ impl Attachment {
             || (self.out().is_none() && self.inp().is_some_and(|p| p.records_received() == 0))
     }
 
-    /// One of our joins that is not confirmed yet: it sends no PIPE_STATUS.
+    /// One of our joins that is not confirmed yet: it sends no `PIPE_STATUS`.
     #[inline]
     pub(crate) fn joining_local(&self) -> bool {
         self.id != 0 && self.joiner_local && !self.mp().joined && !self.mp().failed

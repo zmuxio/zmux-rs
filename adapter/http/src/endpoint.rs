@@ -20,7 +20,14 @@ use crate::{Options, Unhandled, route_request};
 /// One HTTP endpoint for every carrier kind of a listener: bidirectional,
 /// uplink and downlink requests and the split bootstrap
 /// ([`crate::handle_request`]), exchange requests ([`Options::exchange`])
-/// and, with [`Endpoint::with_websocket`] (feature `websocket`), WebSocket
+#[cfg_attr(
+    feature = "websocket",
+    doc = " and, with [`Endpoint::with_websocket`] (feature `websocket`), WebSocket"
+)]
+#[cfg_attr(
+    not(feature = "websocket"),
+    doc = " and, with `Endpoint::with_websocket` (feature `websocket`), WebSocket"
+)]
 /// upgrades (`zmux_websocket::accept_request`), all on [`Options::path`].
 /// It composes the adapters' handlers and adds no behaviour of its own: a
 /// request it does not classify, that its carrier's admission does not
@@ -65,6 +72,7 @@ impl Endpoint {
     }
 
     /// The listener.
+    #[must_use]
     pub fn listener(&self) -> &Listener {
         &self.listener
     }
@@ -72,6 +80,12 @@ impl Endpoint {
     /// Routes one request: its carrier to its adapter, or the request back
     /// for the fallback. `peer` is the connection's remote address
     /// ([`crate::handle_request`]), `conn` the connection's identity.
+    ///
+    /// # Errors
+    ///
+    /// [`Unhandled::Fallback`] with the request for a request that carries no
+    /// pipe here, or that the listener refers to the fallback;
+    /// [`Unhandled::Abort`] for one to end without a response.
     pub async fn route(
         &self,
         req: Request<Incoming>,

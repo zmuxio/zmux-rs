@@ -115,10 +115,14 @@ impl TokenBucket {
             self.tokens = self.burst;
             self.rem = 0;
         } else {
-            self.tokens = level as i64;
+            self.tokens = i64::try_from(level).unwrap_or(i64::MIN);
         }
     }
 
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "rate x 1000 / 10^6 is below 2^54, MIN_MAX_LEN a small constant"
+    )]
     pub(super) fn quantum(&self) -> i64 {
         ((self.rate.saturating_mul(1000) / 1_000_000) as i64)
             .min(self.burst)
@@ -131,7 +135,7 @@ impl TokenBucket {
 
     /// The microsecond a held bucket reaches its quantum; `None` beyond any clock.
     pub(super) fn release(&self) -> Option<u64> {
-        let need = (self.quantum() - self.tokens) as u128;
+        let need = u128::from((self.quantum() - self.tokens).cast_unsigned());
         let wait = (need * 1_000_000 - u128::from(self.rem)).div_ceil(u128::from(self.rate));
         u64::try_from(wait).ok()?.checked_add(self.filled)
     }
@@ -209,7 +213,7 @@ mod tests {
         let d = match v["max_delay"].as_i64().unwrap_or(0) {
             0 => default,
             d if d < 0 => None,
-            d => Some(Duration::from_micros(d as u64)),
+            d => Some(Duration::from_micros(d.cast_unsigned())),
         };
         (acct(&v["wire"]), d)
     }
@@ -229,7 +233,9 @@ mod tests {
             assert_eq!(e.no_injection, set && e.wire.is_unset(), "{c}");
             assert_eq!(e.wire, acct(&c["want"]["wire"]), "{c}");
             let want = c["want"]["max_delay"].as_i64().unwrap();
-            let got = e.max_delay.map_or(-1, |d| d.as_micros() as i64);
+            let got = e
+                .max_delay
+                .map_or(-1, |d| i64::try_from(d.as_micros()).unwrap());
             assert_eq!(got, want, "{c}");
         }
     }

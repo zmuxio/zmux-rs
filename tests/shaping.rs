@@ -1,5 +1,14 @@
 //! Record shaping on two cores connected in memory.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::large_stack_arrays,
+    reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
+)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,7 +165,7 @@ fn injection_toward_a_zmux_peer() {
         st.injected > 16 && pad as u64 == st.injected && st.inject_dropped == 0,
         "{st:?}, {pad}"
     );
-    assert!(p.b.state() == zmux::proto::session::State::Active);
+    assert_eq!(p.b.state(), zmux::proto::session::State::Active);
 }
 
 #[test]
@@ -177,7 +186,7 @@ fn injection_toward_a_plain_qmux_peer() {
     // PADDING-only records and QX_PING requests share 16 per second.
     assert!(pad <= 16 && pad as u64 == st.injected, "{st:?}, {pad}");
     assert!(pad > 0 && st.inject_dropped > 0, "{st:?}");
-    assert!(p.b.state() == zmux::proto::session::State::Active);
+    assert_eq!(p.b.state(), zmux::proto::session::State::Active);
 }
 
 #[test]
@@ -590,7 +599,7 @@ impl Shaper for FirstDelay {
 
 /// A shaping delay of the first record of the bootstrap pipe, installed
 /// from the session's creation on both ends (`Config::shaper`), holds
-/// QX_TRANSPORT_PARAMETERS, which still lead the pipe once it ends (design
+/// `QX_TRANSPORT_PARAMETERS`, which still lead the pipe once it ends (design
 /// 18.9: the delay is the whole record's earliest send time, the first
 /// record included): both sessions establish and carry a stream, and
 /// nothing is written before the delay.

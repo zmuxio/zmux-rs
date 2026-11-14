@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::blocking::{Blocking, Closer, PipeIo, Session, Watchdog, run, spawn_pipe};
 use super::handle::{self, Shared, WeakSession};
 use crate::proto::VarInt;
+use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
     AdmissionStats, CarrierId, Classified, Entered, HandleError, ListenerConfig, ListenerCore,
     ListenerStats, RejectAction, RejectError, RejectInfo, Slot, random_locator,
@@ -173,7 +174,7 @@ impl Listener {
         let instance_id = limits.instance_id.clone();
         Ok(Self {
             inner: Arc::new(Inner {
-                locators: Default::default(),
+                locators: handle::LocatorTable::default(),
                 config,
                 transform,
                 instance_id,
@@ -195,6 +196,11 @@ impl Listener {
 
     /// Takes a carrier: returns once it started a session or joined one, or was not used.
     /// The session's threads then own it.
+    ///
+    /// # Errors
+    ///
+    /// The [`HandleError`] that says why the carrier was not used; the carrier
+    /// is closed.
     pub fn handle_pipe(&self, pipe: PipeIo, hint: PipeHint) -> Result<(), HandleError> {
         let r = self.handle(pipe, hint);
         if let Err(e) = r {
@@ -301,7 +307,7 @@ impl Listener {
         held: &mut Held<'_>,
     ) -> Result<PipeIo, HandleError> {
         let kind = (pipe.has_reader(), pipe.has_writer());
-        match (t.0)(pipe, hint) {
+        match t.0(pipe, hint) {
             Ok(io) if (io.has_reader(), io.has_writer()) == kind => Ok(io),
             Ok(_) => Err(HandleError::SetupFailed),
             Err(e) => {
@@ -504,7 +510,7 @@ impl Listener {
         // A Hello in Bound needs a Binding of this carrier (see the tokio listener).
         let binding = if parsed.mode() == crate::proto::seal::RecordMode::Bound {
             let binding = (pipe.is_secure() && !pipe.is_split())
-                .then(|| pipe.exporter_ref().and_then(|e| e.pipe_binding()))
+                .then(|| pipe.exporter_ref().and_then(CarrierExporter::pipe_binding))
                 .flatten();
             let Some(binding) = binding else {
                 session.hello_without_binding();
@@ -627,6 +633,7 @@ impl Listener {
     }
 
     /// The next session; `None` once the listener is closed.
+    #[must_use]
     pub fn accept(&self) -> Option<Session> {
         // Without a deadline it never times out.
         self.accept_until(None).unwrap_or(None)
@@ -634,6 +641,11 @@ impl Listener {
 
     /// [`accept`](Listener::accept), waiting at most `timeout`
     /// ([`WaitError::TimedOut`](super::blocking::WaitError::TimedOut)).
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::TimedOut`](super::blocking::WaitError::TimedOut) when no
+    /// session arrived and the listener did not close within `timeout`.
     pub fn accept_timeout(
         &self,
         timeout: Duration,
@@ -674,6 +686,11 @@ impl Listener {
     }
 
     /// Accepts on `tcp`, one thread per carrier, until the listener closes.
+    ///
+    /// # Errors
+    ///
+    /// Only the error of setting `tcp` non-blocking; accept errors are
+    /// waited out.
     pub fn serve(&self, tcp: &TcpListener) -> io::Result<()> {
         tcp.set_nonblocking(true)?;
         while !self.inner.lock().closed {
@@ -747,11 +764,13 @@ impl Listener {
 
     /// The listener's operations for own accept loops
     /// ([`ListenerAdapter`]).
+    #[must_use]
     pub fn adapter(&self) -> ListenerAdapter<'_> {
         ListenerAdapter { listener: self }
     }
 
     /// What happened to the carriers handed to the listener.
+    #[must_use]
     pub fn stats(&self) -> ListenerStats {
         let c = &self.inner.counts;
         ListenerStats {
@@ -868,7 +887,7 @@ mod tests {
             ..Default::default()
         };
         let l = refusing(2, limits, hour);
-        let key = crate::ListenerConfig::default().source_key([192, 0, 2, 1].into());
+        let key = ListenerConfig::default().source_key([192, 0, 2, 1].into());
         let (client, server) = pair();
         let lj = l.clone();
         let join = std::thread::spawn(move || lj.handle_pipe(PipeIo::from_tcp(server), from(1)));
@@ -901,9 +920,9 @@ mod tests {
         };
         let l = refusing(1, limits, hour);
         let stalled = |key| l.inner.lock().core.stalled(key).1;
-        let key = crate::ListenerConfig::default().source_key([192, 0, 2, 1].into());
+        let key = ListenerConfig::default().source_key([192, 0, 2, 1].into());
         let other_addr = SocketAddr::from(([198, 51, 100, 1], 3));
-        let other_key = crate::ListenerConfig::default().source_key(other_addr.ip());
+        let other_key = ListenerConfig::default().source_key(other_addr.ip());
         let (c1, s1) = pair();
         let l1 = l.clone();
         let first = std::thread::spawn(move || l1.handle_pipe(PipeIo::from_tcp(s1), from(1)));
@@ -957,7 +976,7 @@ mod tests {
             ..Default::default()
         };
         let l = Listener::new(Config::default(), limits, None).unwrap();
-        let key = crate::ListenerConfig::default().source_key([192, 0, 2, 1].into());
+        let key = ListenerConfig::default().source_key([192, 0, 2, 1].into());
         let mut held = Vec::new();
         for port in 1..=3 {
             let (c, s) = pair();
@@ -1135,7 +1154,7 @@ mod tests {
         assert_eq!(total(&l), 0);
     }
 
-    /// A draining listener refuses a new session with CONNECTION_REFUSED after its own
+    /// A draining listener refuses a new session with `CONNECTION_REFUSED` after its own
     /// parameters, so that the peer reads why, as the tokio and Go listeners.
     #[test]
     fn a_draining_listener_refuses_with_connection_refused() {

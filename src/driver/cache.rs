@@ -3,7 +3,7 @@
 //! imported as versioned JSON with wall-clock times.
 
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,9 +73,9 @@ pub enum CacheOutcome {
 impl Default for CarrierCache {
     fn default() -> Self {
         Self::new(
-            Duration::from_secs(6 * 3600),
+            Duration::from_hours(6),
             Duration::from_secs(60),
-            Duration::from_secs(6 * 3600),
+            Duration::from_hours(6),
         )
     }
 }
@@ -92,6 +92,7 @@ pub(crate) enum Known {
 impl CarrierCache {
     /// A cache that remembers a usable kind for `success_ttl` and backs a
     /// failed one off from `backoff_min` to `backoff_max`.
+    #[must_use]
     pub fn new(success_ttl: Duration, backoff_min: Duration, backoff_max: Duration) -> Self {
         Self(Arc::new(CacheInner {
             success_ttl,
@@ -242,6 +243,7 @@ impl CarrierCache {
     /// process ([`CacheSnapshot::to_json`]). Expired entries (both times
     /// past, and the failure time plus the longest backoff past too) are
     /// left out.
+    #[must_use]
     pub fn snapshot(&self) -> CacheSnapshot {
         let (now, wall) = (Instant::now(), WallTime::now());
         let hi = self.0.backoff.1;
@@ -321,11 +323,10 @@ fn merge(m: &mut HashMap<CacheKey, CacheEntry>, k: CacheKey, e: CacheEntry) {
 
 /// `t` on the wall clock, by its distance from `now` (`wall`).
 fn to_wall(t: Instant, now: Instant, wall: WallTime) -> WallTime {
-    let n = |d: Duration| d.as_nanos() as i128;
     if t >= now {
-        WallTime(wall.0.saturating_add(n(t - now)))
+        WallTime(wall.0.saturating_add(span_nanos(t - now)))
     } else {
-        WallTime(wall.0.saturating_sub(n(now - t)))
+        WallTime(wall.0.saturating_sub(span_nanos(now - t)))
     }
 }
 
@@ -336,14 +337,27 @@ fn to_mono(t: WallTime, now: Instant, wall: WallTime) -> Instant {
     let span = nanos(d.unsigned_abs());
     if d >= 0 {
         now.checked_add(span)
-            .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 86_400)))
+            .or_else(|| now.checked_add(Duration::from_hours(876_000)))
             .unwrap_or(now)
     } else {
         now.checked_sub(span).unwrap_or(now)
     }
 }
 
+/// `d` in nanoseconds, exact: a [`Duration`] holds fewer than 2^95.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "a Duration's nanoseconds are below 2^95, far inside i128"
+)]
+fn span_nanos(d: Duration) -> i128 {
+    d.as_nanos() as i128
+}
+
 /// `n` nanoseconds, saturated to the longest [`Duration`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the remainder is below 10^9, inside u32"
+)]
 fn nanos(n: u128) -> Duration {
     let secs = u64::try_from(n / NANOS as u128).unwrap_or(u64::MAX);
     Duration::new(secs, (n % NANOS as u128) as u32)
@@ -360,22 +374,26 @@ pub struct WallTime(i128);
 
 impl WallTime {
     /// The current time of the system clock.
+    #[must_use]
     pub fn now() -> Self {
         SystemTime::now().into()
     }
 
     /// The time `n` nanoseconds after the Unix epoch.
+    #[must_use]
     pub const fn from_unix_nanos(n: i128) -> Self {
         Self(n)
     }
 
     /// Nanoseconds since the Unix epoch.
+    #[must_use]
     pub const fn unix_nanos(self) -> i128 {
         self.0
     }
 
     /// The time as a [`SystemTime`], at that clock's resolution; `None`
     /// outside its range.
+    #[must_use]
     pub fn to_system_time(self) -> Option<SystemTime> {
         let span = nanos(self.0.unsigned_abs());
         if self.0 >= 0 {
@@ -388,21 +406,21 @@ impl WallTime {
     /// `d` later, saturated.
     #[must_use]
     pub fn saturating_add(self, d: Duration) -> Self {
-        Self(self.0.saturating_add(d.as_nanos() as i128))
+        Self(self.0.saturating_add(span_nanos(d)))
     }
 
     /// `d` earlier, saturated.
     #[must_use]
     pub fn saturating_sub(self, d: Duration) -> Self {
-        Self(self.0.saturating_sub(d.as_nanos() as i128))
+        Self(self.0.saturating_sub(span_nanos(d)))
     }
 }
 
 impl From<SystemTime> for WallTime {
     fn from(t: SystemTime) -> Self {
         match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => Self(d.as_nanos() as i128),
-            Err(e) => Self(-(e.duration().as_nanos() as i128)),
+            Ok(d) => Self(span_nanos(d)),
+            Err(e) => Self(-span_nanos(e.duration())),
         }
     }
 }
@@ -484,6 +502,7 @@ impl CacheSnapshot {
     /// The JSON interchange form: times in RFC 3339 UTC, the backoff in
     /// milliseconds, absent fields for no time, no backoff and the base
     /// URL.
+    #[must_use]
     pub fn to_json(&self) -> String {
         let mut out = format!("{{\"version\":{SNAPSHOT_VERSION},\"entries\":[");
         for (i, e) in self.entries.iter().enumerate() {
@@ -504,7 +523,7 @@ impl CacheSnapshot {
             }
             let ms = e.backoff.as_millis();
             if ms > 0 {
-                out.push_str(&format!(",\"backoff_ms\":{}", ms.min(i64::MAX as u128)));
+                let _ = write!(out, ",\"backoff_ms\":{}", ms.min(i64::MAX as u128));
             }
             if !e.url.is_empty() {
                 out.push_str(",\"url\":");
@@ -525,6 +544,10 @@ impl CacheSnapshot {
     /// absent times are none. Malformed JSON, a version other than 1, a
     /// field of the wrong type (times are RFC 3339 strings, `backoff_ms` a
     /// non-negative integer) is a [`SnapshotError`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`] for text that is not a valid snapshot, as above.
     pub fn from_json(text: &str) -> Result<Self, SnapshotError> {
         use json::Value;
         let Value::Object(top) = json::parse(text).map_err(invalid)? else {
@@ -618,11 +641,11 @@ mod rfc3339 {
         let n = t.unix_nanos();
         let secs =
             i64::try_from(n.div_euclid(NANOS)).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
-        let nanos = n.rem_euclid(NANOS) as u32;
+        let nanos = u32::try_from(n.rem_euclid(NANOS)).unwrap_or(0);
         let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-        let (y, m, d) = civil_from_days(days);
+        let (year, month, day) = civil_from_days(days);
         let mut s = format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
             rem / 3600,
             rem / 60 % 60,
             rem % 60
@@ -655,9 +678,9 @@ mod rfc3339 {
         {
             return None;
         }
-        let (y, mo, d) = (num(&b[0..4])?, num(&b[5..7])?, num(&b[8..10])?);
-        let (h, mi, se) = (num(&b[11..13])?, num(&b[14..16])?, num(&b[17..19])?);
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let (year, mo, day) = (num(&b[0..4])?, num(&b[5..7])?, num(&b[8..10])?);
+        let (hour, mi, se) = (num(&b[11..13])?, num(&b[14..16])?, num(&b[17..19])?);
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
         let dim = [
             31,
             if leap { 29 } else { 28 },
@@ -672,13 +695,11 @@ mod rfc3339 {
             30,
             31,
         ];
-        if !(1..=12).contains(&mo)
-            || d < 1
-            || d > dim[(mo - 1) as usize]
-            || h > 23
-            || mi > 59
-            || se > 59
-        {
+        if !(1..=12).contains(&mo) {
+            return None;
+        }
+        let days_in_month = dim[usize::try_from(mo - 1).ok()?];
+        if day < 1 || day > days_in_month || hour > 23 || mi > 59 || se > 59 {
             return None;
         }
         let mut rest = &b[19..];
@@ -688,7 +709,8 @@ mod rfc3339 {
             if n == 0 || n > 9 {
                 return None;
             }
-            nanos = (num(&rest[1..=n])? * 10i64.pow(9 - n as u32)) as u32;
+            let scale = 10i64.pow(9 - u32::try_from(n).ok()?);
+            nanos = u32::try_from(num(&rest[1..=n])? * scale).ok()?;
             rest = &rest[1 + n..];
         }
         let offset = match rest {
@@ -703,7 +725,7 @@ mod rfc3339 {
             }
             _ => return None,
         };
-        let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset;
+        let secs = days_from_civil(year, mo, day) * 86_400 + hour * 3600 + mi * 60 + se - offset;
         Some(WallTime::from_unix_nanos(
             i128::from(secs) * NANOS + i128::from(nanos),
         ))
@@ -749,6 +771,8 @@ mod rfc3339 {
 /// that unknown fields of any type are skipped; integers are kept apart
 /// from other numbers.
 mod json {
+    use std::fmt::Write as _;
+
     pub(super) enum Value {
         Null,
         Bool,
@@ -774,7 +798,9 @@ mod json {
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
                 c => out.push(c),
             }
         }
@@ -1025,7 +1051,7 @@ mod tests {
         c.record("k", CarrierKind::Streaming, None, None, false, now);
         c.record("k", CarrierKind::Streaming, None, None, false, now); // 2 min
         c.record("k2", CarrierKind::Streaming, None, None, true, now);
-        if let Some(old) = now.checked_sub(Duration::from_secs(7 * 3600)) {
+        if let Some(old) = now.checked_sub(Duration::from_hours(7)) {
             c.record("old", CarrierKind::Split, None, None, false, old);
         }
         let snap = c.snapshot();
@@ -1085,7 +1111,7 @@ mod tests {
     #[test]
     fn restore_bounds_times() {
         let wall = WallTime::now();
-        let far = wall.saturating_add(Duration::from_secs(10 * 365 * 86_400));
+        let far = wall.saturating_add(Duration::from_hours(87600));
         let mut s = CacheSnapshot::default();
         let mut good = CacheSnapshotEntry::new("g", CarrierKind::Split);
         good.good_until = Some(far);
@@ -1097,7 +1123,7 @@ mod tests {
         // Judged on the monotonic clock the cache keeps: a snapshot's wall
         // times come from a second pair of clock reads, whose skew is no
         // bound of `restore`.
-        let ahead = Duration::from_secs(6 * 3600);
+        let ahead = Duration::from_hours(6);
         let before = Instant::now();
         c.restore(&s);
         let after = Instant::now();

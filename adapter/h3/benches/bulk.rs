@@ -2,6 +2,7 @@
 //! `cargo bench -p zmux-h3 --bench bulk` (`BULK_MIB`, default 512).
 
 #![allow(missing_docs)]
+#![allow(clippy::cast_precision_loss, reason = "throughput arithmetic in f64")]
 
 use std::sync::Arc;
 use std::time::Instant;

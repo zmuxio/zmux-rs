@@ -22,6 +22,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use super::recv_buf::{Backing, REFERENCE_MIN, RecvBuf};
 
 use super::ranges::RangeSet;
+use crate::util::usize_sat;
 
 /// The page of the flat store.
 pub(crate) const PAGE: usize = 4096;
@@ -320,7 +321,7 @@ impl Arrived {
     /// Heap bytes of the bookkeeping.
     pub(crate) fn memory(&self) -> usize {
         match self {
-            Self::Ranges(r) => r.len() * ARRIVAL_RANGE_COST as usize,
+            Self::Ranges(r) => r.len() * usize_sat(ARRIVAL_RANGE_COST),
             Self::Bits(b) => b.memory(),
         }
     }
@@ -471,8 +472,8 @@ impl Range {
             }
             let k = (c.len() as u64).min(left);
             match c {
-                Chunk::Own(b) => b.truncate(k as usize),
-                Chunk::Ref(b, _) => b.truncate(k as usize),
+                Chunk::Own(b) => b.truncate(usize_sat(k)),
+                Chunk::Ref(b, _) => b.truncate(usize_sat(k)),
             }
             left -= k;
             n += 1;
@@ -522,7 +523,7 @@ impl Ranges {
                 let r_end = o + r.len;
                 if r_end > off {
                     // Overlaps the held range: skip what it covers.
-                    let covered = (r_end.min(end) - off) as usize;
+                    let covered = usize_sat(r_end.min(end) - off);
                     off += covered as u64;
                     data = &data[covered..];
                     continue;
@@ -530,7 +531,7 @@ impl Ranges {
             }
             let next = self.map.range(off..).next().map(|(&o, _)| o);
             let until = next.map_or(end, |n| n.min(end));
-            let k = (until - off) as usize;
+            let k = usize_sat(until - off);
             referenced += self.insert(off, &data[..k], next == Some(until), src);
             stored += k as u64;
             off = until;
@@ -557,34 +558,31 @@ impl Ranges {
         } else {
             None
         };
-        match prev {
-            Some(p) => {
-                let Some(r) = self.map.get_mut(&p) else {
-                    return 0;
-                };
-                let (added, referenced) = r.push(piece, src);
-                self.chunks += added;
-                let len = r.len;
-                if next_len.is_some_and(|n| n <= len)
-                    && let Some(n) = self.map.remove(&end)
-                    && let Some(r) = self.map.get_mut(&p)
-                {
-                    r.append(n);
-                }
-                referenced
+        if let Some(p) = prev {
+            let Some(r) = self.map.get_mut(&p) else {
+                return 0;
+            };
+            let (added, referenced) = r.push(piece, src);
+            self.chunks += added;
+            let len = r.len;
+            if next_len.is_some_and(|n| n <= len)
+                && let Some(n) = self.map.remove(&end)
+                && let Some(r) = self.map.get_mut(&p)
+            {
+                r.append(n);
             }
-            None => {
-                let mut r = Range::default();
-                let (added, referenced) = r.push(piece, src);
-                self.chunks += added;
-                if next_len.is_some_and(|n| n <= r.len)
-                    && let Some(n) = self.map.remove(&end)
-                {
-                    r.append(n);
-                }
-                self.map.insert(off, r);
-                referenced
+            referenced
+        } else {
+            let mut r = Range::default();
+            let (added, referenced) = r.push(piece, src);
+            self.chunks += added;
+            if next_len.is_some_and(|n| n <= r.len)
+                && let Some(n) = self.map.remove(&end)
+            {
+                r.append(n);
             }
+            self.map.insert(off, r);
+            referenced
         }
     }
 }
@@ -606,12 +604,12 @@ impl Flat {
         let mut at = off;
         let mut rest = data;
         while !rest.is_empty() {
-            let i = ((at - self.first) / page) as usize;
+            let i = usize_sat((at - self.first) / page);
             if self.pages.len() <= i {
                 self.pages.resize_with(i + 1, || None);
             }
             let p = self.pages[i].get_or_insert_with(|| Box::new([0; PAGE]));
-            let o = ((at - self.first) % page) as usize;
+            let o = usize_sat((at - self.first) % page);
             let k = (PAGE - o).min(rest.len());
             p[o..o + k].copy_from_slice(&rest[..k]);
             rest = &rest[k..];
@@ -625,9 +623,9 @@ impl Flat {
         let page = PAGE as u64;
         let mut at = start;
         while at < end {
-            let i = ((at - self.first) / page) as usize;
-            let o = ((at - self.first) % page) as usize;
-            let k = (page - o as u64).min(end - at) as usize;
+            let i = usize_sat((at - self.first) / page);
+            let o = usize_sat((at - self.first) % page);
+            let k = usize_sat((page - o as u64).min(end - at));
             if let Some(Some(p)) = self.pages.get(i) {
                 out.push_copy(&p[o..o + k]);
             }
@@ -757,16 +755,16 @@ impl Held {
                     for c in r.chunks {
                         let k = (c.len() as u64).min(skip);
                         skip -= k;
-                        if k as usize == c.len() {
+                        if usize_sat(k) == c.len() {
                             continue;
                         }
                         match c {
                             Chunk::Own(mut b) => {
-                                b.advance(k as usize);
+                                b.advance(usize_sat(k));
                                 buf.push_owned(b.freeze());
                             }
                             Chunk::Ref(mut b, backing) => {
-                                b.advance(k as usize);
+                                b.advance(usize_sat(k));
                                 buf.push_shared(b, backing);
                             }
                         }
@@ -848,6 +846,10 @@ impl Held {
 
     /// Calls `f` with each read buffer the chunks reference and the bytes
     /// they reference in it (a run of chunks of one buffer at a time).
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "m the ranges, r a range, c a chunk, b its buffer, k its bytes"
+    )]
     pub(crate) fn tally(&self, f: &mut impl FnMut(Backing, usize)) {
         let Mode::Ranges(m) = &self.mode else {
             return;
@@ -896,9 +898,9 @@ impl Held {
             Mode::Ranges(m) => {
                 m.map
                     .values()
-                    .map(|r| r.capacity() + RANGE_COST as usize)
+                    .map(|r| r.capacity() + usize_sat(RANGE_COST))
                     .sum::<usize>()
-                    + m.chunks * CHUNK_COST as usize
+                    + m.chunks * usize_sat(CHUNK_COST)
             }
             Mode::Flat(f) => size_of::<Flat>() + f.memory(),
         }
@@ -918,8 +920,8 @@ impl Flat {
                 continue;
             }
             let next = self.present.first_from(at).map_or(end, |n| n.min(end));
-            let s = (at - off) as usize;
-            let e = (next - off) as usize;
+            let s = usize_sat(at - off);
+            let e = usize_sat(next - off);
             stored += self.write(at, &data[s..e]);
             at = next;
         }
@@ -963,7 +965,7 @@ mod tests {
     /// truncates the last range.
     #[test]
     fn ranges_keep_their_chunks_in_order() {
-        let data: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+        let data: Vec<u8> = (0..40_000u32).map(|i| i.to_le_bytes()[0]).collect();
         let mut h = Held::default();
         assert_eq!(h.store_copy(20_000, &data[20_000..30_000], 0), 10_000);
         assert_eq!(h.store_copy(30_000, &data[30_000..40_000], 0), 10_000);
@@ -989,7 +991,7 @@ mod tests {
         let mut buf = RecvBuf::default();
         // One byte at every other offset beyond a hole at 0.
         for i in 0..10_000u64 {
-            assert_eq!(h.store_copy(1 + 2 * i, &[i as u8], 0), 1);
+            assert_eq!(h.store_copy(1 + 2 * i, &[i.to_le_bytes()[0]], 0), 1);
         }
         assert!(h.is_flat());
         assert_eq!(h.bytes(), 10_000);

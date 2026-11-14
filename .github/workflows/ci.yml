@@ -91,6 +91,17 @@ jobs:
       - run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Default features
+        run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: No default features (links to gated items must be cfg-aware)
+        run: |
+          cargo doc --locked -p zmux --no-default-features --no-deps
+          cargo doc --locked -p zmux --no-default-features --features blocking --no-deps
+          cargo doc --locked -p zmux-quinn -p zmux-h3 -p zmux-websocket -p zmux-http --no-default-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: Test (${{ matrix.os }})

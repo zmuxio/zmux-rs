@@ -3,6 +3,7 @@
 //! `BULK_MIB` sets the measured transfer (default 1024).
 
 #![allow(missing_docs, unsafe_code)]
+#![allow(clippy::cast_precision_loss, reason = "throughput arithmetic in f64")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;

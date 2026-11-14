@@ -211,6 +211,10 @@ pub struct FrameInfo {
 }
 
 /// A read-only view of an outbound pipe for a custom policy.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about the pipe a policy reads"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PipeSnapshot {
@@ -224,7 +228,7 @@ pub struct PipeSnapshot {
     pub rttvar: Duration,
     /// Delivery rate in bytes per second.
     pub rate: u64,
-    /// Q_p: bytes committed to the pipe and not yet transmitted, those of
+    /// `Q_p`: bytes committed to the pipe and not yet transmitted, those of
     /// the write calls in progress plus the carrier's unsent count where
     /// the adapter reports one.
     pub unsent: u64,
@@ -245,8 +249,12 @@ pub struct PipeSnapshot {
     pub eligible: bool,
     /// The weight.
     pub weight: u64,
-    /// The pipe's shaper, when one is active: the weight it set, as bits.
-    pub(crate) shaping: Option<Option<u64>>,
+    /// The pipe's shaper, when one is active: the weight it set, if any.
+    #[allow(
+        clippy::option_option,
+        reason = "no shaper and a shaper without a weight differ"
+    )]
+    pub(crate) shaping: Option<Option<u32>>,
 }
 
 impl PipeSnapshot {
@@ -259,7 +267,7 @@ impl PipeSnapshot {
     /// The weight the pipe's shaper set; `None`: none.
     #[must_use]
     pub fn shaping_weight(&self) -> Option<u32> {
-        self.shaping.flatten().map(|w| w as u32)
+        self.shaping.flatten()
     }
 }
 

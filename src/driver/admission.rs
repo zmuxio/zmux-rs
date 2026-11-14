@@ -107,6 +107,12 @@ impl<F: Future + Unpin> Future for CatchUnwind<F> {
 /// closes the connection. From any other address nothing is read and the
 /// source is `peer`. Bound the call (the listener's handshake timeout, an
 /// admission's peek timeout).
+///
+/// # Errors
+///
+/// From a trusted intermediary: [`io::ErrorKind::InvalidData`] for a header
+/// that is not a valid PROXY protocol header, or the read's error (an early
+/// end is [`io::ErrorKind::UnexpectedEof`]).
 pub async fn proxied_source<S>(
     io: &mut S,
     peer: SocketAddr,

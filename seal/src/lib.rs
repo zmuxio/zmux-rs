@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 //! The zmux secure carrier over zmux carriers (see the zmux specification): the client's
 //! [`establish`] and the server's [`ServerConfig::transform`], the trust of [`Verifier`] and

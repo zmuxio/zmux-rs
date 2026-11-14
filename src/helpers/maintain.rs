@@ -44,6 +44,7 @@
 
 use crate::Backoff;
 use crate::backoff::{random_fraction, reduce};
+use crate::util::{f64_of, u64_sat};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -78,7 +79,7 @@ pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
 /// a pipe on a carrier that [`PipePool::new`]'s dial opens (its
 /// [`DialRequest`] is `Bidi`), or the group of pipes that
 /// [`PipePool::join`]'s function joins, such as the downlink and uplink of
-/// a split carrier ([`crate::PipeIo::paired_join`]).
+/// a split carrier ([`PipeIo::paired_join`]).
 ///
 /// ```no_run
 /// # async fn example(session: zmux::Session) {
@@ -148,7 +149,7 @@ impl PipePool {
     }
 
     /// A pool of `count` members, each the pipes that `join` joins to the
-    /// session with the options given (for example over [`crate::PipeIo::paired_join`]
+    /// session with the options given (for example over [`PipeIo::paired_join`]
     /// or an adapter's split join): a member is usable while all of its
     /// pipes are, counts once against `count`, and is redialled, rotated
     /// (make before break) and retired as a whole. `join` returns the
@@ -186,6 +187,11 @@ impl PipePool {
     /// pools may share a cache. A choice without candidates or with two of
     /// one kind, or a policy with a negative or non-finite timer factor, is
     /// [`ConnectError::InvalidConfig`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::InvalidConfig`] for an invalid choice or policy, as
+    /// above.
     pub fn choice(
         choice: &CarrierChoice,
         policy: &CarrierChoicePolicy,
@@ -284,6 +290,7 @@ pub struct RotatePolicy {
 
 impl RotatePolicy {
     /// No limit and no jitter: set the limits with the builders.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -375,21 +382,25 @@ pub struct PoolMember {
 
 impl PoolMember {
     /// Bytes sent over its pipes.
+    #[must_use]
     pub fn bytes_sent(&self) -> u64 {
         self.pipes.iter().map(|p| p.bytes_sent).sum()
     }
 
     /// Bytes received over its pipes.
+    #[must_use]
     pub fn bytes_received(&self) -> u64 {
         self.pipes.iter().map(|p| p.bytes_received).sum()
     }
 
     /// The least time since a traffic frame on any of its pipes.
+    #[must_use]
     pub fn since_last_traffic(&self) -> Option<Duration> {
         self.pipes.iter().filter_map(|p| p.since_last_traffic).min()
     }
 
     /// How long its oldest pipe has been attached.
+    #[must_use]
     pub fn age(&self) -> Duration {
         self.pipes
             .iter()
@@ -437,6 +448,7 @@ impl PoolDecision {
     }
 
     /// The reason the decision was rejected, if it was.
+    #[must_use]
     pub fn rejected(&self) -> Option<&str> {
         self.rejected.as_deref()
     }
@@ -447,6 +459,10 @@ impl PoolDecision {
     /// already added keep theirs. Settings out of range are
     /// [`PipeError::InvalidOptions`], as for the pipe option, and change
     /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`PipeError::InvalidOptions`] for settings out of range.
     pub fn set_liveness(&mut self, liveness: PipeLiveness) -> Result<(), PipeError> {
         liveness.validate().map_err(PipeError::InvalidOptions)?;
         self.liveness = Some(liveness);
@@ -454,6 +470,7 @@ impl PoolDecision {
     }
 
     /// The liveness settings set, if any.
+    #[must_use]
     pub fn liveness(&self) -> Option<PipeLiveness> {
         self.liveness
     }
@@ -476,6 +493,7 @@ impl MaintainHandle {
     }
 
     /// Whether the maintainer has ended.
+    #[must_use]
     pub fn is_finished(&self) -> bool {
         self.stop.finished.load(Ordering::SeqCst)
     }
@@ -705,7 +723,7 @@ struct Maintainer {
     recheck_at: Option<Instant>,
     /// The session's pipe changes as of the last look.
     seen: u64,
-    /// The pool counted as a redial source while it runs (ResumeUnattended),
+    /// The pool counted as a redial source while it runs (`ResumeUnattended`),
     /// from its spawn.
     source: Option<handle::RedialSource<Tokio>>,
 }
@@ -809,7 +827,7 @@ impl Maintainer {
                 }
                 Wake::Dial(dialing, r) => {
                     if let Some(session) = self.link.get() {
-                        self.dialled(&session, *dialing, *r);
+                        self.dialled(&session, &dialing, *r);
                     }
                 }
                 Wake::Tick => {}
@@ -1109,7 +1127,7 @@ impl Maintainer {
             }
         }
         if due.is_empty()
-            || !self.session_whole(session)
+            || !Self::session_whole(session)
             || !session.adapter().join_ready()
             || !self.may_dial(self.rotate_delay, now)
         {
@@ -1130,7 +1148,7 @@ impl Maintainer {
 
     /// Whether the session has a usable outbound and a live inbound pipe
     /// and is not suspended: only then may members rotate.
-    fn session_whole(&self, session: &Session) -> bool {
+    fn session_whole(session: &Session) -> bool {
         if session.state() == State::Suspended {
             return false;
         }
@@ -1191,7 +1209,7 @@ impl Maintainer {
     /// The options of a pipe added now: the pool's, with the policy's
     /// idle-probe settings, and `return_on_reply` set: a replacement
     /// closes its old pipe only once the peer attached it (the member's own
-    /// judgement), and a redial must not wait for a PIPE_ACK that only the
+    /// judgement), and a redial must not wait for a `PIPE_ACK` that only the
     /// direction it restores could carry.
     fn options(&self) -> PipeOptions {
         let mut o = self.pool.options.clone();
@@ -1200,7 +1218,7 @@ impl Maintainer {
             fn own<T>(d: Inherit<T>, p: Inherit<T>) -> Inherit<T> {
                 match d {
                     Inherit::Session => p,
-                    d => d,
+                    d @ Inherit::Set(_) => d,
                 }
             }
             let p = match o.liveness {
@@ -1247,7 +1265,7 @@ impl Maintainer {
 
     /// A dial finished: the carrier joins the session, or the joined pipes
     /// are a member.
-    fn dialled(&mut self, session: &Session, dialing: Dialing, made: Made) {
+    fn dialled(&mut self, session: &Session, dialing: &Dialing, made: Made) {
         let now = Instant::now();
         let purpose = dialing.purpose;
         let pipes = match made {
@@ -1255,10 +1273,9 @@ impl Maintainer {
                 // The member waits for the Reply and the attachment itself.
                 session.begin_add_pipe(*io, self.options()).map(|p| vec![p])
             }
-            Made::Carrier(Err(e)) => Err(PipeError::Io(Arc::new(e))),
             Made::Joined(Ok(pipes)) if !pipes.is_empty() => Ok(pipes),
             Made::Joined(Ok(_)) => Err(PipeError::InvalidArgument),
-            Made::Joined(Err(e)) => Err(PipeError::Io(Arc::new(e))),
+            Made::Carrier(Err(e)) | Made::Joined(Err(e)) => Err(PipeError::Io(Arc::new(e))),
         };
         let pipes = match pipes {
             Ok(p) => p,
@@ -1288,7 +1305,7 @@ impl Maintainer {
 fn set_limits(m: &mut Member, rotate: Option<&RotatePolicy>, now: Instant) {
     let Some(r) = rotate else { return };
     let keep = |jitter: f64| 1.0 - jitter.clamp(0.0, 1.0) * random_fraction();
-    m.max_bytes = r.max_bytes.map(|b| (b as f64 * keep(r.jitter)) as u64);
+    m.max_bytes = r.max_bytes.map(|b| u64_sat(f64_of(b) * keep(r.jitter)));
     // An age beyond the clock's range never comes.
     m.max_age = r.max_age.and_then(|a| now.checked_add(reduce(a, r.jitter)));
 }
@@ -1312,6 +1329,10 @@ mod tests {
     /// waits of at least 30 ms, a draw at each look would add three or more
     /// per dial. Paused time on one thread: the count is exact.
     #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "test: the two ends, the listener's clone and a counter's"
+    )]
     async fn redial_jitter_is_drawn_once() {
         let listener = Listener::new(config(), ListenerConfig::default())
             .expect("valid listener configuration");

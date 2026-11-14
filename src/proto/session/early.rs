@@ -5,16 +5,17 @@
 //! The floor stands for the peer's parameters until they arrive: at most
 //! four bidirectional streams, 4096 bytes each (preamble included) and
 //! 16384 in all, preambles up to 1024 bytes, records up to 16382 bytes. A
-//! PIPE_ACK with one entry at Position 0 (the fence) precedes the first
-//! early STREAM frame, so that a peer without PIPE_ACK stops before it.
+//! `PIPE_ACK` with one entry at Position 0 (the fence) precedes the first
+//! early STREAM frame, so that a peer without `PIPE_ACK` stops before it.
 //! When the parameters arrive, the outcome rules decide: the peer could
 //! not take it (`EarlyDataRejected`), it advertised less than the floor
-//! (TRANSPORT_PARAMETER_ERROR), or the session goes on with the peer's
+//! (`TRANSPORT_PARAMETER_ERROR`), or the session goes on with the peer's
 //! limits, which cover everything sent.
 
 use bytes::Bytes;
 
 use super::output::Records;
+use super::pipes::OutPipe;
 use super::stream::SendState;
 use super::tp::TpValues;
 use super::{CloseFrame, SessionCore, SessionError, State};
@@ -57,7 +58,11 @@ pub(super) struct EarlyState {
 }
 
 /// What became of a session's early data
-/// ([`Session::early_data`](crate::Session#method.early_data)).
+#[cfg_attr(
+    feature = "tokio",
+    doc = " ([`Session::early_data`](crate::Session#method.early_data))."
+)]
+#[cfg_attr(not(feature = "tokio"), doc = " (`Session::early_data`).")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EarlyDataState {
@@ -129,11 +134,10 @@ impl SessionCore {
     pub(super) fn early_setup(&mut self, transport_role: Option<Role>) {
         let local = self.local_parameters();
         let independent = match (local.zmux_role, transport_role) {
-            (_, None) => false,
+            (_, None) | (Some(RoleParameter::Auto { .. }), Some(_)) => false,
             (None, Some(_)) => true,
             (Some(RoleParameter::Initiator), Some(t)) => t == Role::Client,
             (Some(RoleParameter::Responder), Some(t)) => t == Role::Server,
-            (Some(RoleParameter::Auto { .. }), Some(_)) => false,
         };
         if !self.config.early_data.zmux_peer || !independent {
             return;
@@ -174,11 +178,10 @@ impl SessionCore {
         }
         let local = self.local_parameters();
         let independent = match (local.zmux_role, self.transport_role) {
-            (_, None) => false,
+            (_, None) | (Some(RoleParameter::Auto { .. }), Some(_)) => false,
             (None, Some(_)) => true,
             (Some(RoleParameter::Initiator), Some(t)) => t == Role::Client,
             (Some(RoleParameter::Responder), Some(t)) => t == Role::Server,
-            (Some(RoleParameter::Auto { .. }), Some(_)) => false,
         };
         if !independent {
             return false;
@@ -334,7 +337,7 @@ impl SessionCore {
         self.early_state().starts += 1;
         let rtt = self.initial_rtt(0);
         if let Some(i) = self.att_index(0) {
-            let framing = self.atts.at(i).out().map(|o| o.framing());
+            let framing = self.atts.at(i).out().map(OutPipe::framing);
             if let Some(framing) = framing {
                 let o =
                     super::pipes::OutPipe::new(framing, super::pipes::OutState::Active, rtt, now)

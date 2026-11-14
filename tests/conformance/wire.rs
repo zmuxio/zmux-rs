@@ -214,7 +214,7 @@ pub fn encode_frame(spec: &FrameSpec, out: &mut Vec<u8>, sent: Sent<'_>) {
             }),
         ),
         FrameSpec::DataBlocked { limit } => {
-            push(out, &Frame::DataBlocked(DataBlocked { limit: *limit }))
+            push(out, &Frame::DataBlocked(DataBlocked { limit: *limit }));
         }
         FrameSpec::StreamDataBlocked { id, limit } => push(
             out,
@@ -366,7 +366,7 @@ pub fn encode_frame(spec: &FrameSpec, out: &mut Vec<u8>, sent: Sent<'_>) {
     }
 }
 
-/// The Phase of a SESSION_EPOCH by its trace name.
+/// The Phase of a `SESSION_EPOCH` by its trace name.
 pub fn epoch_phase(name: &str) -> zmux::proto::frame::EpochPhase {
     use zmux::proto::frame::EpochPhase as P;
     match name {

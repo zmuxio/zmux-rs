@@ -23,7 +23,6 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 tokio = { version = "1.54", features = ["full"] }
 zmux-seal = { path = ".", features = ["blocking"] }
 
-[lints.rust]
-missing_docs = "warn"
-unsafe_code = "forbid"
-unreachable_pub = "warn"
+[lints]
+workspace = true
+

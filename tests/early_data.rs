@@ -3,6 +3,11 @@
 //! first stream's bytes go out at once, and a peer that cannot take them
 //! processed none of them.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 use std::time::Duration;

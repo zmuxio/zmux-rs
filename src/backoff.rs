@@ -11,7 +11,11 @@ pub const DEFAULT_BACKOFF_JITTER: f64 = 0.2;
 /// by a random fraction of up to [`jitter`](Self::jitter). The
 /// [`redial`](crate::Config#structfield.redial) hook
 /// ([`Config::redial_backoff`](crate::Config#structfield.redial_backoff)),
-/// pipe pools ([`PipePool::backoff`](crate::helpers::PipePool::backoff)) and
+#[cfg_attr(
+    feature = "tokio",
+    doc = " pipe pools ([`PipePool::backoff`](crate::helpers::PipePool::backoff)) and"
+)]
+#[cfg_attr(not(feature = "tokio"), doc = " pipe pools (`PipePool::backoff`) and")]
 /// the repetitions of a carrier adapter's requests use it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -38,6 +42,7 @@ impl Default for Backoff {
 impl Backoff {
     /// From `min` to at most `max`, with [`DEFAULT_BACKOFF_JITTER`]; assign
     /// [`jitter`](Self::jitter) for another.
+    #[must_use]
     pub fn new(min: Duration, max: Duration) -> Self {
         Self {
             min,
@@ -48,6 +53,11 @@ impl Backoff {
 
     /// Whether the bounds are valid: `min` not zero and not above `max`,
     /// and the jitter in \[0, 1) (0: none; NaN is invalid).
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`](crate::InvalidConfig) naming the first field that
+    /// violates these bounds.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         if self.min.is_zero() {
             return Err(crate::InvalidConfig::new("Backoff::min", "zero"));
@@ -66,6 +76,7 @@ impl Backoff {
 
     /// The delay after `failures` consecutive failures (none before the
     /// first).
+    #[must_use]
     pub fn delay(&self, failures: u32) -> Duration {
         if failures == 0 {
             return Duration::ZERO;
@@ -90,7 +101,7 @@ pub(crate) fn random_fraction() -> f64 {
     #[cfg(test)]
     DRAWS.set(DRAWS.get() + 1);
     let r = crate::util::random_u64() >> 11;
-    r as f64 / (1u64 << 53) as f64
+    crate::util::f64_of(r) / crate::util::f64_of(1u64 << 53)
 }
 
 // The draws of `random_fraction` on this thread (unit tests count them on

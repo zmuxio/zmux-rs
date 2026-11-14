@@ -12,73 +12,73 @@ use super::varint::{self, len as vlen};
 
 /// Transport parameter identifiers.
 pub mod id {
-    /// original_destination_connection_id (prohibited).
+    /// `original_destination_connection_id` (prohibited).
     pub const ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
-    /// max_idle_timeout.
+    /// `max_idle_timeout`.
     pub const MAX_IDLE_TIMEOUT: u64 = 0x01;
-    /// stateless_reset_token (prohibited).
+    /// `stateless_reset_token` (prohibited).
     pub const STATELESS_RESET_TOKEN: u64 = 0x02;
-    /// max_udp_payload_size (prohibited).
+    /// `max_udp_payload_size` (prohibited).
     pub const MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
-    /// initial_max_data.
+    /// `initial_max_data`.
     pub const INITIAL_MAX_DATA: u64 = 0x04;
-    /// initial_max_stream_data_bidi_local.
+    /// `initial_max_stream_data_bidi_local`.
     pub const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
-    /// initial_max_stream_data_bidi_remote.
+    /// `initial_max_stream_data_bidi_remote`.
     pub const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
-    /// initial_max_stream_data_uni.
+    /// `initial_max_stream_data_uni`.
     pub const INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
-    /// initial_max_streams_bidi.
+    /// `initial_max_streams_bidi`.
     pub const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
-    /// initial_max_streams_uni.
+    /// `initial_max_streams_uni`.
     pub const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
-    /// ack_delay_exponent (prohibited).
+    /// `ack_delay_exponent` (prohibited).
     pub const ACK_DELAY_EXPONENT: u64 = 0x0a;
-    /// max_ack_delay (prohibited).
+    /// `max_ack_delay` (prohibited).
     pub const MAX_ACK_DELAY: u64 = 0x0b;
-    /// disable_active_migration (prohibited).
+    /// `disable_active_migration` (prohibited).
     pub const DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
-    /// preferred_address (prohibited).
+    /// `preferred_address` (prohibited).
     pub const PREFERRED_ADDRESS: u64 = 0x0d;
-    /// active_connection_id_limit (prohibited).
+    /// `active_connection_id_limit` (prohibited).
     pub const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
-    /// initial_source_connection_id (prohibited).
+    /// `initial_source_connection_id` (prohibited).
     pub const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
-    /// retry_source_connection_id (prohibited).
+    /// `retry_source_connection_id` (prohibited).
     pub const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
-    /// reset_stream_at.
+    /// `reset_stream_at`.
     pub const RESET_STREAM_AT: u64 = 0x1d;
-    /// max_datagram_frame_size.
+    /// `max_datagram_frame_size`.
     pub const MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
-    /// max_record_size (QMux-02 Section 5.2; [`crate::proto::draft`]).
+    /// `max_record_size` (QMux-02 Section 5.2; [`crate::proto::draft`]).
     pub const MAX_RECORD_SIZE: u64 = crate::proto::draft::CURRENT.max_record_size;
-    /// zmux_role.
+    /// `zmux_role`.
     pub const ZMUX_ROLE: u64 = 0x1724_0207;
-    /// zmux_goaway.
+    /// `zmux_goaway`.
     pub const ZMUX_GOAWAY: u64 = 0x0452_8a5f;
-    /// zmux_preamble.
+    /// `zmux_preamble`.
     pub const ZMUX_PREAMBLE: u64 = 0x0439_e07a;
-    /// zmux_priority.
+    /// `zmux_priority`.
     pub const ZMUX_PRIORITY: u64 = 0x31e7_139d;
-    /// zmux_datagram_flows.
+    /// `zmux_datagram_flows`.
     pub const ZMUX_DATAGRAM_FLOWS: u64 = 0x0af3_91ed;
-    /// zmux_carrier_datagrams.
+    /// `zmux_carrier_datagrams`.
     pub const ZMUX_CARRIER_DATAGRAMS: u64 = 0x3d27_4c5f;
-    /// zmux_multipath.
+    /// `zmux_multipath`.
     pub const ZMUX_MULTIPATH: u64 = 0x30dc_2978;
-    /// zmux_session_crypto.
+    /// `zmux_session_crypto`.
     pub const ZMUX_SESSION_CRYPTO: u64 = 0x026f_24b5;
-    /// zmux_ack_threshold.
+    /// `zmux_ack_threshold`.
     pub const ZMUX_ACK_THRESHOLD: u64 = 0x2762_c7e5;
-    /// zmux_pipe_ack.
+    /// `zmux_pipe_ack`.
     pub const ZMUX_PIPE_ACK: u64 = 0x34b4_7621;
-    /// zmux_max_ack_delay.
+    /// `zmux_max_ack_delay`.
     pub const ZMUX_MAX_ACK_DELAY: u64 = 0x17fa_1ed6;
-    /// zmux_max_lanes.
+    /// `zmux_max_lanes`.
     pub const ZMUX_MAX_LANES: u64 = 0x2785_6ef0;
-    /// zmux_resume.
+    /// `zmux_resume`.
     pub const ZMUX_RESUME: u64 = 0x0d57_78ce;
-    /// The `qmux` crate's application_protocols parameter; zmux does not
+    /// The `qmux` crate's `application_protocols` parameter; zmux does not
     /// define it and ignores it unless an application opts in.
     pub const APPLICATION_PROTOCOLS: u64 = 0x3d4f_9c2a_8b1e_6075;
 }
@@ -100,7 +100,8 @@ fn parse_names(mut value: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 /// Whether QMux-02 prohibits a QUIC version 1 parameter: receiving it is a
-/// TRANSPORT_PARAMETER_ERROR.
+/// `TRANSPORT_PARAMETER_ERROR`.
+#[must_use]
 pub const fn is_prohibited(pid: u64) -> bool {
     matches!(
         pid,
@@ -126,6 +127,7 @@ pub const MAX_PREAMBLE_TP_OVERHEAD: u64 = 32;
 
 /// The GREASE parameter ID 31 * `n` + 27 (RFC 9000 Section 18.1), or `None`
 /// if it does not fit in a varint.
+#[must_use]
 pub const fn grease_id(n: u64) -> Option<u64> {
     match n.checked_mul(31) {
         Some(v) if v <= varint::MAX - 27 => Some(v + 27),
@@ -134,11 +136,12 @@ pub const fn grease_id(n: u64) -> Option<u64> {
 }
 
 /// Whether `id` is a GREASE parameter ID.
+#[must_use]
 pub const fn is_grease_id(id: u64) -> bool {
     id % 31 == 27
 }
 
-/// The zmux_role value.
+/// The `zmux_role` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoleParameter {
     /// Role 0.
@@ -154,6 +157,7 @@ pub enum RoleParameter {
 
 impl RoleParameter {
     /// Length of the value.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         match self {
             Self::Initiator | Self::Responder => 1,
@@ -208,6 +212,7 @@ impl Locator {
     pub const MAX_LEN: usize = 255;
 
     /// Creates a locator; `None` if `bytes` is longer than 255.
+    #[must_use]
     pub fn new(bytes: &[u8]) -> Option<Self> {
         (bytes.len() <= Self::MAX_LEN).then(|| Self {
             bytes: bytes.into(),
@@ -215,13 +220,24 @@ impl Locator {
     }
 
     /// The locator bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     /// Whether the locator is empty.
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    /// The length, as the one byte that encodes it.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a locator is at most 255 bytes (`new`)"
+    )]
+    pub(crate) fn len_u8(&self) -> u8 {
+        self.bytes.len() as u8
     }
 }
 
@@ -235,7 +251,7 @@ impl fmt::Debug for Locator {
     }
 }
 
-/// The zmux_multipath value.
+/// The `zmux_multipath` value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultipathParameter {
     /// Secret Flags ([`keys::secret_flags`]); reserved bits are ignored.
@@ -248,6 +264,7 @@ pub struct MultipathParameter {
 
 impl MultipathParameter {
     /// Length of the value.
+    #[must_use]
     pub fn encoded_len(&self) -> usize {
         18 + self.locator.as_bytes().len()
     }
@@ -260,11 +277,10 @@ impl MultipathParameter {
     }
 
     fn write(&self, w: &mut Writer<'_>) -> Result<(), EncodeError> {
-        let locator = self.locator.as_bytes();
         w.u8(self.secret_flags)?;
         w.bytes(&self.session_nonce)?;
-        w.u8(locator.len() as u8)?;
-        w.bytes(locator)
+        w.u8(self.locator.len_u8())?;
+        w.bytes(self.locator.as_bytes())
     }
 
     fn parse(value: &[u8]) -> Result<Self, Error> {
@@ -307,13 +323,13 @@ pub mod floor {
 /// stream concurrency of 256, lane 0 and the copy lane.
 pub const DEFAULT_MAX_LANES: NonZeroU64 = NonZeroU64::new(258).expect("not 0");
 
-/// The zmux_max_lanes value.
+/// The `zmux_max_lanes` value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LanesParameter {
     /// Max Lanes L: the lanes, lane 0 included, the sender accepts on each
     /// of its inbound pipes (0 is invalid).
     pub max_lanes: NonZeroU64,
-    /// The sender's random Lane Key for the session, which every PIPE_LANE
+    /// The sender's random Lane Key for the session, which every `PIPE_LANE`
     /// toward it carries.
     pub lane_key: [u8; LANE_KEY_LEN],
 }
@@ -329,6 +345,7 @@ impl fmt::Debug for LanesParameter {
 
 impl LanesParameter {
     /// Length of the value.
+    #[must_use]
     pub const fn encoded_len(&self) -> usize {
         vlen(self.max_lanes.get()) + LANE_KEY_LEN
     }
@@ -378,54 +395,58 @@ pub struct Grease<'a> {
 /// `*_or_default` methods apply the meaning of an absent parameter. Unknown
 /// and GREASE parameters are not kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "flag parameters of the wire format, each a public field"
+)]
 pub struct TransportParameters {
-    /// max_idle_timeout in milliseconds.
+    /// `max_idle_timeout` in milliseconds.
     pub max_idle_timeout: Option<u64>,
-    /// initial_max_data.
+    /// `initial_max_data`.
     pub initial_max_data: Option<u64>,
-    /// initial_max_stream_data_bidi_local.
+    /// `initial_max_stream_data_bidi_local`.
     pub initial_max_stream_data_bidi_local: Option<u64>,
-    /// initial_max_stream_data_bidi_remote.
+    /// `initial_max_stream_data_bidi_remote`.
     pub initial_max_stream_data_bidi_remote: Option<u64>,
-    /// initial_max_stream_data_uni.
+    /// `initial_max_stream_data_uni`.
     pub initial_max_stream_data_uni: Option<u64>,
-    /// initial_max_streams_bidi (at most 2^60).
+    /// `initial_max_streams_bidi` (at most 2^60).
     pub initial_max_streams_bidi: Option<u64>,
-    /// initial_max_streams_uni (at most 2^60).
+    /// `initial_max_streams_uni` (at most 2^60).
     pub initial_max_streams_uni: Option<u64>,
-    /// reset_stream_at.
+    /// `reset_stream_at`.
     pub reset_stream_at: bool,
-    /// max_datagram_frame_size.
+    /// `max_datagram_frame_size`.
     pub max_datagram_frame_size: Option<u64>,
-    /// max_record_size (at least 16382).
+    /// `max_record_size` (at least 16382).
     pub max_record_size: Option<u64>,
-    /// zmux_role.
+    /// `zmux_role`.
     pub zmux_role: Option<RoleParameter>,
-    /// zmux_goaway.
+    /// `zmux_goaway`.
     pub zmux_goaway: bool,
-    /// zmux_preamble: the Maximum Preamble Size.
+    /// `zmux_preamble`: the Maximum Preamble Size.
     pub zmux_preamble: Option<u64>,
-    /// zmux_priority.
+    /// `zmux_priority`.
     pub zmux_priority: bool,
-    /// zmux_datagram_flows.
+    /// `zmux_datagram_flows`.
     pub zmux_datagram_flows: bool,
-    /// zmux_carrier_datagrams: the sender accepts DATAGRAM frames on the
+    /// `zmux_carrier_datagrams`: the sender accepts DATAGRAM frames on the
     /// datagram channels of its pipes' carriers.
     pub zmux_carrier_datagrams: bool,
-    /// zmux_multipath.
+    /// `zmux_multipath`.
     pub zmux_multipath: Option<MultipathParameter>,
-    /// zmux_session_crypto: the Join Suites and Groups the endpoint declares.
+    /// `zmux_session_crypto`: the Join Suites and Groups the endpoint declares.
     pub zmux_session_crypto: Option<SessionCrypto>,
-    /// zmux_ack_threshold in bytes (1024 to 2^30).
+    /// `zmux_ack_threshold` in bytes (1024 to 2^30).
     pub zmux_ack_threshold: Option<u64>,
-    /// zmux_pipe_ack: pipe acknowledgement without multipath.
+    /// `zmux_pipe_ack`: pipe acknowledgement without multipath.
     pub zmux_pipe_ack: bool,
-    /// zmux_max_ack_delay in milliseconds (below 2^14).
+    /// `zmux_max_ack_delay` in milliseconds (below 2^14).
     pub zmux_max_ack_delay: Option<u64>,
-    /// zmux_max_lanes: the lanes the sender accepts per inbound pipe and
+    /// `zmux_max_lanes`: the lanes the sender accepts per inbound pipe and
     /// its Lane Key.
     pub zmux_max_lanes: Option<LanesParameter>,
-    /// zmux_resume: Resume Grace in milliseconds (1 to 86400000).
+    /// `zmux_resume`: Resume Grace in milliseconds (1 to 86400000).
     pub zmux_resume: Option<u64>,
     /// The `qmux` crate's `application_protocols`: names in preference
     /// order; not a zmux parameter, sent only when the application
@@ -482,22 +503,26 @@ impl Value<'_> {
 
 impl TransportParameters {
     /// The effective `max_record_size`: 16382 when absent.
+    #[must_use]
     pub fn max_record_size_or_default(&self) -> u64 {
         self.max_record_size.unwrap_or(DEFAULT_MAX_RECORD_SIZE)
     }
 
     /// The effective `zmux_ack_threshold`: 65536 when absent.
+    #[must_use]
     pub fn ack_threshold_or_default(&self) -> u64 {
         self.zmux_ack_threshold.unwrap_or(DEFAULT_ACK_THRESHOLD)
     }
 
     /// The effective `zmux_max_ack_delay` in milliseconds: 25 when absent.
+    #[must_use]
     pub fn max_ack_delay_or_default(&self) -> u64 {
         self.zmux_max_ack_delay.unwrap_or(DEFAULT_MAX_ACK_DELAY_MS)
     }
 
     /// Whether these are the parameters of a plain QMux peer: none of the
     /// zmux transport parameters is present.
+    #[must_use]
     pub fn is_plain_qmux(&self) -> bool {
         self.zmux_role.is_none()
             && !self.zmux_goaway
@@ -515,6 +540,7 @@ impl TransportParameters {
     }
 
     /// The Max Lanes L the sender announced: 1 (no lanes) when absent.
+    #[must_use]
     pub fn max_lanes_or_default(&self) -> u64 {
         self.zmux_max_lanes.map_or(1, |l| l.max_lanes.get())
     }
@@ -604,6 +630,7 @@ impl TransportParameters {
     }
 
     /// Length of the encoded parameter block, including `grease`.
+    #[must_use]
     pub fn encoded_len(&self, grease: Option<Grease<'_>>) -> usize {
         let mut n = 0;
         let _ = self.for_each::<()>(grease, |pid, v| {
@@ -640,13 +667,14 @@ impl TransportParameters {
         })
     }
 
-    /// Length of a QX_TRANSPORT_PARAMETERS frame carrying these parameters.
+    /// Length of a `QX_TRANSPORT_PARAMETERS` frame carrying these parameters.
+    #[must_use]
     pub fn frame_len(&self, grease: Option<Grease<'_>>) -> usize {
         let block = self.encoded_len(grease);
         vlen(FrameType::QX_TRANSPORT_PARAMETERS.0) + vlen(block as u64) + block
     }
 
-    /// Writes a QX_TRANSPORT_PARAMETERS frame carrying these parameters.
+    /// Writes a `QX_TRANSPORT_PARAMETERS` frame carrying these parameters.
     pub fn encode_frame(
         &self,
         grease: Option<Grease<'_>>,
@@ -660,7 +688,7 @@ impl TransportParameters {
     }
 
     /// Parses and validates a parameter block: every violation is a
-    /// TRANSPORT_PARAMETER_ERROR.
+    /// `TRANSPORT_PARAMETER_ERROR`.
     pub fn decode(block: &[u8]) -> Result<Self, Error> {
         let mut tp = Self::default();
         for p in RawParameters::new(block) {
@@ -720,10 +748,10 @@ impl TransportParameters {
             id::ZMUX_CARRIER_DATAGRAMS => self.zmux_carrier_datagrams = empty()?,
             id::ZMUX_MULTIPATH => self.zmux_multipath = Some(MultipathParameter::parse(value)?),
             id::ZMUX_SESSION_CRYPTO => {
-                self.zmux_session_crypto = Some(
-                    SessionCrypto::parse(value)
-                        .map_err(|_| Error::transport_parameter("malformed zmux_session_crypto"))?,
-                )
+                self.zmux_session_crypto =
+                    Some(SessionCrypto::parse(value).map_err(|_| {
+                        Error::transport_parameter("malformed zmux_session_crypto")
+                    })?);
             }
             id::ZMUX_ACK_THRESHOLD => self.zmux_ack_threshold = Some(varint()?),
             id::ZMUX_PIPE_ACK => self.zmux_pipe_ack = empty()?,
@@ -805,7 +833,7 @@ impl TransportParameters {
 }
 
 /// Iterator over the (ID, value) pairs of a parameter block, including
-/// unknown and GREASE parameters. Yields `Err` (TRANSPORT_PARAMETER_ERROR)
+/// unknown and GREASE parameters. Yields `Err` (`TRANSPORT_PARAMETER_ERROR`)
 /// once for a truncated block and then stops.
 #[derive(Debug, Clone)]
 pub struct RawParameters<'a> {
@@ -814,6 +842,7 @@ pub struct RawParameters<'a> {
 
 impl<'a> RawParameters<'a> {
     /// Iterates over `block`.
+    #[must_use]
     pub const fn new(block: &'a [u8]) -> Self {
         Self { rest: block }
     }
@@ -827,22 +856,19 @@ impl<'a> Iterator for RawParameters<'a> {
             return None;
         }
         let mut c = Cursor::new(self.rest);
-        let parsed = (|| {
+        let parsed = (|| -> Result<_, crate::proto::codec::Short> {
             let pid = c.varint()?;
             let len = c.varint()?;
             Ok((pid, c.bytes(len)?))
         })();
-        match parsed {
-            Ok(p) => {
-                self.rest = c.rest();
-                Some(Ok(p))
-            }
-            Err(crate::proto::codec::Short) => {
-                self.rest = &[];
-                Some(Err(Error::transport_parameter(
-                    "truncated transport parameter",
-                )))
-            }
+        if let Ok(p) = parsed {
+            self.rest = c.rest();
+            Some(Ok(p))
+        } else {
+            self.rest = &[];
+            Some(Err(Error::transport_parameter(
+                "truncated transport parameter",
+            )))
         }
     }
 }
@@ -878,8 +904,8 @@ pub fn resolve_role(
     let conflict = Error::new(TransportErrorCode::ZMUX_ROLE_CONFLICT, 0, "role conflict");
     match (local, peer) {
         (Some(l), Some(p)) => match (l, p) {
-            (I, R) | (I, Auto { .. }) | (Auto { .. }, R) => Ok(Role::Client),
-            (R, I) | (R, Auto { .. }) | (Auto { .. }, I) => Ok(Role::Server),
+            (I | Auto { .. }, R) | (I, Auto { .. }) => Ok(Role::Client),
+            (R | Auto { .. }, I) | (R, Auto { .. }) => Ok(Role::Server),
             (Auto { nonce: a }, Auto { nonce: b }) if a > b => Ok(Role::Client),
             (Auto { nonce: a }, Auto { nonce: b }) if a < b => Ok(Role::Server),
             _ => Err(conflict),
@@ -894,6 +920,10 @@ pub fn resolve_role(
 
 /// The zmux features in use in a session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "features negotiated independently, each a public flag"
+)]
 pub struct Features {
     /// Role negotiation.
     pub role: bool,
@@ -901,7 +931,7 @@ pub struct Features {
     pub goaway: bool,
     /// Stream preamble.
     pub preamble: bool,
-    /// PRIORITY_UPDATE.
+    /// `PRIORITY_UPDATE`.
     pub priority: bool,
     /// Datagram flows.
     pub datagram_flows: bool,
@@ -925,6 +955,7 @@ pub struct Features {
 
 impl Features {
     /// Computes the features in use from both endpoints' parameters.
+    #[must_use]
     pub fn negotiate(local: &TransportParameters, peer: &TransportParameters) -> Self {
         let multipath = match (&local.zmux_multipath, &peer.zmux_multipath) {
             (Some(l), Some(p)) => !matches!(
@@ -963,8 +994,9 @@ impl Features {
     }
 
     /// The frames the local endpoint accepts: the zmux frames of features in
-    /// use, plus RESET_STREAM_AT and DATAGRAM as its parameters announced
+    /// use, plus `RESET_STREAM_AT` and DATAGRAM as its parameters announced
     /// them (`reset_stream_at`, `max_datagram_frame_size`, 0 when absent).
+    #[must_use]
     pub fn receive_gates(&self, reset_stream_at: bool, max_datagram_frame_size: u64) -> Gates {
         Gates {
             reset_stream_at,
@@ -1023,7 +1055,11 @@ mod tests {
                         8004000007048004000008024100090241001d0084528a5f008439e07a025000\
                         b1e7139d00b4b4762100a7856ef01241028d2f6a01c7e4b35a90f1d26e4b7c0a\
                         39c571c59429cd0845048000ffff4078029a7b";
-        let hex: String = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
+        let hex = buf[..n].iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         assert_eq!(hex, expected);
         let block = &buf[10..n];
         assert_eq!(TransportParameters::decode(block).unwrap(), tp);

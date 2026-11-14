@@ -272,7 +272,9 @@ pub(in crate::proto::session) struct LocalJoin {
 
 impl std::fmt::Debug for LocalJoin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalJoin").field("id", &self.id).finish()
+        f.debug_struct("LocalJoin")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -393,11 +395,13 @@ impl std::fmt::Debug for PeerJoin {
 
 impl PeerJoin {
     /// The Hello's join pipe item.
+    #[must_use]
     pub fn pipe(&self) -> &JoinPipe {
         &self.pipe
     }
 
     /// The Mode the joiner chose.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
@@ -428,6 +432,7 @@ impl PeerJoin {
     }
 
     /// The finished handshake of a Confirmed carrier, for its exporter.
+    #[must_use]
     pub fn finished(&self) -> Option<&Finished> {
         match &self.state {
             PeerJoinState::Confirmed(d) => Some(d),
@@ -483,7 +488,7 @@ pub enum ConfirmedJoin {
         /// The record directions in Sealed.
         records: JoinRecords,
     },
-    /// The cap no longer allows it: close the carrier. PIPE_ABANDON goes on another pipe.
+    /// The cap no longer allows it: close the carrier. `PIPE_ABANDON` goes on another pipe.
     Refused,
     /// Close the carrier: the session is ending.
     Close,
@@ -660,15 +665,15 @@ impl SessionCore {
         let hello_room = (u16::MAX as usize).saturating_sub(item_len + suite.tag_len());
         let limit = fit_item(hello_room).map_or(0, |v| v.min(limit));
         let batch = self.first_batch(id, limit);
-        let plain = item_len
+        let plain_len = item_len
             + if batch.is_empty() {
                 0
             } else {
                 item_size(batch.len())
             };
-        let w = unit(plain);
-        let gap = plan.pad_for(w) as isize - w as isize;
-        let room = (u16::MAX as usize).saturating_sub(plain + suite.tag_len());
+        let w = unit(plain_len);
+        let gap = plan.pad_for(w).cast_signed() - w.cast_signed();
+        let room = (u16::MAX as usize).saturating_sub(plain_len + suite.tag_len());
         let padding = pad_item(gap, room);
         let zeros = vec![0; padding.unwrap_or(0)];
         let mut items: Vec<(u64, &[u8])> = Vec::with_capacity(3);
@@ -814,7 +819,7 @@ impl SessionCore {
             RecordMode::Bound | RecordMode::Unmanaged => (0, 0),
         };
         let w = message_len(framing == Framing::ByteStream, body, overhead);
-        let zeros = pad_fill(plan.pad_for(w) as isize - w as isize, room);
+        let zeros = pad_fill(plan.pad_for(w).cast_signed() - w.cast_signed(), room);
         let Ok((confirm, finished)) = proven.write_confirm(zeros) else {
             self.join_failed(id, now);
             return Err(PipeError::Failed(PipeFailure::JoinFailed));
@@ -937,13 +942,10 @@ impl SessionCore {
         // No accepted epoch of this phase: a key no joiner has, so that the Hello fails
         // as any wrong key does.
         // Without randomness there is no such key, and the Hello fails as auth unopened.
-        let psk = match psk.or_else(|| unknown_phase_key(hello.suite().hash_len())) {
-            Some(k) => k,
-            None => {
-                self.stats.join_auth_failures += 1;
-                self.push_event(CoreEvent::JoinAuthFailed { reason: "auth" });
-                return OpenedHello::AuthFailed;
-            }
+        let Some(psk) = psk.or_else(|| unknown_phase_key(hello.suite().hash_len())) else {
+            self.stats.join_auth_failures += 1;
+            self.push_event(CoreEvent::JoinAuthFailed { reason: "auth" });
+            return OpenedHello::AuthFailed;
         };
         let opened = Acceptor::open(
             hello,
@@ -1012,9 +1014,9 @@ impl SessionCore {
     ) -> ClaimedHello {
         self.tick(now);
         let id = join.pipe.id;
-        let replay = self.att_index(id).is_some() || self.is_retired(id);
-        if self.state >= State::Closing || self.mp.is_none() || replay {
-            self.stats.join_replays += u64::from(replay);
+        let replayed = self.att_index(id).is_some() || self.is_retired(id);
+        if self.state >= State::Closing || self.mp.is_none() || replayed {
+            self.stats.join_replays += u64::from(replayed);
             return ClaimedHello::Close;
         }
         self.use_peer_id(id, true);
@@ -1032,18 +1034,18 @@ impl SessionCore {
             .outbound
             .or(carrier.inbound)
             .unwrap_or(Framing::ByteStream);
-        let plain = item_size(decision.len()) + key_share_item_len(opened.group(), false);
+        let plain_len = item_size(decision.len()) + key_share_item_len(opened.group(), false);
         let w = join_reply_len(
             join.suite.r_len(),
             framing == Framing::ByteStream,
-            plain + join.suite.tag_len(),
+            plain_len + join.suite.tag_len(),
             usize::from(carrier.overhead),
         );
-        let mut room = (u16::MAX as usize).saturating_sub(plain + join.suite.tag_len());
+        let mut room = (u16::MAX as usize).saturating_sub(plain_len + join.suite.tag_len());
         if join.mode != RecordMode::Trusted {
             room = room.min(reply_room(carrier.received, w, 0).1);
         }
-        let padding = pad_item(plan.pad_for(w) as isize - w as isize, room);
+        let padding = pad_item(plan.pad_for(w).cast_signed() - w.cast_signed(), room);
         let zeros = vec![0; padding.unwrap_or(0)];
         let mut items: Vec<(u64, &[u8])> = Vec::with_capacity(2);
         if padding.is_some() {
@@ -1177,15 +1179,14 @@ fn unknown_phase_key_in(
     len: usize,
     fill: impl FnOnce(&mut [u8; 64]) -> bool,
 ) -> Option<&'static [u8]> {
-    let key = match cell.get() {
-        Some(k) => k,
-        None => {
-            let mut k = [0; 64];
-            if !fill(&mut k) {
-                return None;
-            }
-            cell.get_or_init(|| k)
+    let key = if let Some(k) = cell.get() {
+        k
+    } else {
+        let mut k = [0; 64];
+        if !fill(&mut k) {
+            return None;
         }
+        cell.get_or_init(|| k)
     };
     Some(&key[..len.min(64)])
 }

@@ -1,6 +1,11 @@
 //! The configuration rules of the usability revision: secret sources, bounds, join
 //! timeout, and the warning of a resume nothing redials.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -30,7 +35,7 @@ async fn connect_alone(pipe: PipeIo, mut c: Config) -> Result<Session, ConnectEr
         .expect("in time")
 }
 
-/// Multipath or resume without a secret source fails before a byte; EndToEnd is no source.
+/// Multipath or resume without a secret source fails before a byte; `EndToEnd` is no source.
 #[tokio::test]
 async fn no_secret_source_is_a_configuration_error() {
     for auth in [PipeAuth::none(), PipeAuth::none().with_end_to_end()] {
@@ -45,7 +50,7 @@ async fn no_secret_source_is_a_configuration_error() {
 }
 
 /// On a secure first pipe the carrier is the source: any other is a configuration error,
-/// and EndToEnd is accepted.
+/// and `EndToEnd` is accepted.
 #[tokio::test]
 async fn a_secure_first_pipe_takes_no_other_source() {
     for auth in [
@@ -72,7 +77,7 @@ async fn bounds_are_errors() {
     type Case = (&'static str, fn(&mut Config));
     let cases: [Case; 5] = [
         ("send_buffer_max", |c| {
-            c.send_buffer_max = Cap::Fixed(c.send_buffer - 1)
+            c.send_buffer_max = Cap::Fixed(c.send_buffer - 1);
         }),
         ("join_timeout", |c| c.join_timeout = Duration::ZERO),
         ("redial_backoff", |c| {
@@ -160,14 +165,14 @@ async fn a_suspension_without_a_redial_source_is_reported() {
                 let l = l.clone();
                 async move {
                     let ((a, _), (b, _)) = duplex(1 << 16);
-                    tokio::spawn(async move { l.handle_pipe(b, Default::default()).await });
+                    tokio::spawn(async move { l.handle_pipe(b, zmux::PipeHint::default()).await });
                     Ok(a)
                 }
             }));
         }
         let ((a, ca), (b, _cb)) = duplex(1 << 16);
         let l = listener.clone();
-        tokio::spawn(async move { l.handle_pipe(b, Default::default()).await });
+        tokio::spawn(async move { l.handle_pipe(b, zmux::PipeHint::default()).await });
         let c = Session::connect(a, client).await.unwrap();
         let _s = listener.accept().await.unwrap();
         ca.fail();

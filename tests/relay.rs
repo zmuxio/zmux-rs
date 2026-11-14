@@ -13,6 +13,16 @@
 //! that wait: nothing survives, and the bytes charged are the bytes
 //! forwarded.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -273,7 +283,7 @@ fn bulk(x: &Session, y: &Session, stop: Arc<AtomicBool>) -> JoinHandle<usize> {
 #[derive(Debug, Clone, Copy)]
 enum Event {
     /// X aborts the relayed pipe: its stream is reset and stopped with
-    /// ZMUX_CARRIER_FAILED, which the relay forwards.
+    /// `ZMUX_CARRIER_FAILED`, which the relay forwards.
     PipeAborted,
     /// The relay's session with X ends.
     UpstreamLost,

@@ -1,6 +1,15 @@
 //! A slow bootstrap path next to a fast joined one, on a paused clock: the session
 //! runs at the fast path's rate, not the slow one's.
 
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -110,7 +119,7 @@ async fn echoed_with(config: Config, first: Link, joined: Link) -> (usize, u64, 
     let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
     let serve = |p: PipeIo| {
         let l = listener.clone();
-        tokio::spawn(async move { l.handle_pipe(p, Default::default()).await });
+        tokio::spawn(async move { l.handle_pipe(p, zmux::PipeHint::default()).await });
     };
     let (near, far) = carrier(first);
     serve(far);

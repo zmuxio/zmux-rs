@@ -138,16 +138,19 @@ impl TransmitBuf {
     }
 
     /// Total bytes in the batch.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the batch is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// The batch limit.
+    #[must_use]
     pub fn max_len(&self) -> usize {
         self.max_len
     }
@@ -193,6 +196,7 @@ impl TransmitBuf {
 
     /// The batch's length in byte-stream form (a message counts as its
     /// record with a shortest Size field).
+    #[must_use]
     pub fn stream_len(&self) -> u64 {
         self.stream_len
     }
@@ -205,6 +209,7 @@ impl TransmitBuf {
     /// On a message-framed pipe, the length of each
     /// message of the batch, in order: each is one record's Frames field,
     /// sent without its Size. Empty on a byte-stream pipe.
+    #[must_use]
     pub fn message_lens(&self) -> &[usize] {
         &self.messages
     }
@@ -229,6 +234,7 @@ impl TransmitBuf {
     }
 
     /// Heap bytes held by the batch's buffers.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.buf.capacity()
             + self.parts.capacity() * size_of::<Part>()
@@ -237,6 +243,7 @@ impl TransmitBuf {
 
     /// Whether the batch's storage is that of a small batch, which
     /// [`TransmitBuf::shrink`] keeps for reuse by the thread.
+    #[must_use]
     pub fn is_small(&self) -> bool {
         // A zero-copy batch copies little but has many parts.
         self.buf.capacity() <= FIRST_COPY && self.parts.capacity() <= SMALL_PARTS
@@ -558,6 +565,7 @@ impl TransmitBuf {
     }
 
     /// Number of separate slices (an estimate of the iovec count).
+    #[must_use]
     pub fn slice_count(&self) -> usize {
         self.parts.len()
     }

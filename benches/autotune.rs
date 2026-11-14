@@ -12,6 +12,11 @@
 //! | `AT-6` | 1 Gbit/s, 100 ms RTT, 100 streams | total >= 95 %, Jain >= 0.9 |
 
 #![allow(missing_docs)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
 
 use std::collections::VecDeque;
 use std::io;
@@ -219,10 +224,10 @@ async fn run(sc: &Scenario) {
     }
     // Writers: the first byte names the stream.
     for s in 0..sc.streams {
-        let (mut w, _r) = client.open_bi().await.unwrap();
+        let (mut w, r) = client.open_bi().await.unwrap();
         let chunk = bytes::Bytes::from(vec![s as u8; 64 * 1024]);
         tokio::spawn(async move {
-            let _keep = _r;
+            let _keep = r;
             while w.write_chunk(chunk.clone()).await.is_ok() {}
         });
     }

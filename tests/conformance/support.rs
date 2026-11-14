@@ -1,5 +1,6 @@
 //! Paths and small helpers shared by the conformance tests.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The vendored specification assets (`testdata/spec`), or
@@ -31,7 +32,11 @@ pub fn read_ndjson(rel: &str) -> Vec<serde_json::Value> {
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(out, "{b:02x}").unwrap();
+    }
+    out
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {

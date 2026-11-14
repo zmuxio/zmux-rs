@@ -135,7 +135,7 @@ impl ServerConfig {
             ));
         }
         check_pq_auth(options.require_pq_auth, options.client_verifier.as_ref())?;
-        let accepted = listed.to_vec();
+        let accepted = listed.clone();
         Ok(Self {
             gate,
             static_secret,
@@ -145,12 +145,14 @@ impl ServerConfig {
     }
 
     /// The accepted Profiles.
+    #[must_use]
     pub fn accepted_profiles(&self) -> &[u64] {
         &self.accepted
     }
 }
 
 /// The error class of a refusal, as the secure carrier names refusals.
+#[must_use]
 pub fn reject_reason(e: &Error) -> &'static str {
     e.class()
 }
@@ -163,6 +165,7 @@ impl ServerConfig {
     /// The transform of a `ListenerConfig`: a carrier whose first byte is 02 is a Join and a
     /// carrier that begins a record a lane; they pass on untouched. Establish runs on the
     /// others, a split carrier's once its halves are paired.
+    #[must_use]
     pub fn transform(self) -> InboundTransform {
         let this = Arc::new(self);
         InboundTransform::new(move |p, hint| {
@@ -212,7 +215,6 @@ impl ServerConfig {
                 Dispatch::Record if lane_first(&buf, framing) => {
                     return Ok(take(slot)?.replay(buf));
                 }
-                Dispatch::Incomplete { .. } => {}
                 Dispatch::Other | Dispatch::Reserved | Dispatch::Record if !buf.is_empty() => {
                     return Err(reject(None, None, "unknown_profile"));
                 }
@@ -428,7 +430,7 @@ fn take<C>(slot: &mut Option<C>) -> io::Result<C> {
         .ok_or_else(|| io::ErrorKind::NotConnected.into())
 }
 
-/// Whether a carrier's first bytes begin PIPE_LANE.
+/// Whether a carrier's first bytes begin `PIPE_LANE`.
 fn lane_first(buf: &[u8], framing: Framing) -> bool {
     let lane = zmux::proto::ident::LANE_PREFIX;
     match framing {
@@ -475,6 +477,10 @@ mod tests {
         (end(a_tx, b_rx), end(b_tx, a_rx))
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the trait is async; the channel completes writes in place"
+    )]
     impl Carrier for Chan {
         fn framing(&self) -> Framing {
             Framing::Records

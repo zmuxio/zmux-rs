@@ -167,26 +167,25 @@ async fn a_split_carrier_joins() {
             };
             let server = listener.accept().await.unwrap();
             let joined = tokio::time::timeout(Duration::from_secs(5), async {
-                match &h2 {
-                    Some(h2) => h2.join_split(&client, PipeOptions::default()).await,
-                    None => {
-                        let a = addr.clone();
-                        zmux_http::join_http1_split_with(
-                            &client,
-                            move || {
-                                let a = a.clone();
-                                async move {
-                                    let tcp = TcpStream::connect(a).await?;
-                                    tcp.set_nodelay(true)?;
-                                    Ok(tcp)
-                                }
-                            },
-                            &addr,
-                            &opts,
-                            PipeOptions::default(),
-                        )
-                        .await
-                    }
+                if let Some(h2) = &h2 {
+                    h2.join_split(&client, PipeOptions::default()).await
+                } else {
+                    let a = addr.clone();
+                    zmux_http::join_http1_split_with(
+                        &client,
+                        move || {
+                            let a = a.clone();
+                            async move {
+                                let tcp = TcpStream::connect(a).await?;
+                                tcp.set_nodelay(true)?;
+                                Ok(tcp)
+                            }
+                        },
+                        &addr,
+                        &opts,
+                        PipeOptions::default(),
+                    )
+                    .await
                 }
             })
             .await

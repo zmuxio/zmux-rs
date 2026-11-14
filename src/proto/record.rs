@@ -21,12 +21,14 @@ use super::varint;
 pub use super::params::{DEFAULT_MAX_RECORD_SIZE, ZMUX_MAX_RECORD_SIZE};
 
 /// Length of the shortest Size field for a record of `body_len` bytes.
+#[must_use]
 pub const fn size_len(body_len: u64) -> usize {
     varint::len(body_len)
 }
 
 /// The number of bytes a record with `body_len` bytes of frames counts for
 /// in pipe positions, with the shortest Size encoding.
+#[must_use]
 pub const fn wire_len(body_len: u64) -> u64 {
     body_len + varint::len(body_len) as u64
 }
@@ -106,6 +108,7 @@ pub struct RecordReader {
 impl RecordReader {
     /// A reader for byte-stream framing that accepts records of up to
     /// `max_record_size` bytes (the local endpoint's advertised limit).
+    #[must_use]
     pub fn new(max_record_size: u64) -> Self {
         Self::with_framing(max_record_size, Framing::ByteStream)
     }
@@ -123,12 +126,14 @@ impl RecordReader {
     }
 
     /// The framing this reader parses.
+    #[must_use]
     pub const fn framing(&self) -> Framing {
         self.framing
     }
 
     /// The pipe position: bytes of the records whose
     /// [`Event::RecordEnd`] has been yielded.
+    #[must_use]
     pub const fn position(&self) -> u64 {
         self.position
     }
@@ -138,6 +143,7 @@ impl RecordReader {
     /// `Ok(None)`. A pipe that ends while this is false ended inside a
     /// record: it has failed and the incomplete record is never
     /// processed. That is a pipe failure, not a protocol error.
+    #[must_use]
     pub const fn at_record_boundary(&self) -> bool {
         matches!(self.state, State::Size { have: 0, .. })
     }
@@ -272,7 +278,8 @@ impl RecordReader {
                                 *input = &data[take..];
                                 self.state = State::Size {
                                     buf,
-                                    have: (have + take) as u8,
+                                    // Below `need`, at most 8.
+                                    have: u8::try_from(have + take).unwrap_or(u8::MAX),
                                 };
                                 return Ok(None);
                             }
@@ -407,11 +414,13 @@ impl<'b> RecordBuilder<'b> {
     }
 
     /// Bytes of frames written so far.
+    #[must_use]
     pub fn body_len(&self) -> usize {
         self.end - self.reserved
     }
 
     /// Room left for frames.
+    #[must_use]
     pub fn remaining(&self) -> usize {
         self.limit - self.end
     }
@@ -490,7 +499,7 @@ mod tests {
 
     #[test]
     fn any_split_gives_the_same_events() {
-        let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let data: Vec<u8> = (0..3000u32).map(|i| i.to_le_bytes()[0]).collect();
         let mut bytes = record(&[
             Frame::MaxData(MaxData { maximum: 1 << 20 }),
             Frame::Stream(Stream::new(4, 100, &data, true)),

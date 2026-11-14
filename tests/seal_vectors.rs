@@ -2,6 +2,11 @@
 //! Join, Suites, records, `Export`, dispatch, and their shared derivations.
 //! `ZMUX_SEAL_VECTORS` overrides the sibling zmux-spec checkout.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zmux::proto::seal::join::*;
@@ -17,6 +22,15 @@ fn load(name: &str) -> Value {
     let path = format!("{dir}/{name}.json");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     serde_json::from_str(&text).unwrap()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(out, "{b:02x}").unwrap();
+    }
+    out
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -92,7 +106,7 @@ fn config<'a>(
 fn joiner_hello(
     v: &Value,
     framing: Framing,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> Result<(Vec<u8>, HelloSent), Error> {
     let (locator, psk, binding, random) = (
         hx(v, "locator"),
@@ -108,7 +122,7 @@ fn joiner_hello(
     )?
     .with_kex(&hx(v, "x_i"), &hx(v, "kem_seed"))
     // Some vectors carry an unassigned item a receiver skips.
-    .write_hello_with_unknown(&payload, Some(ShareOverride::InPayload))
+    .write_hello_with_unknown(payload, Some(ShareOverride::InPayload))
 }
 
 fn acceptor_open(
@@ -147,10 +161,7 @@ fn usable_groups(v: &Value) -> Vec<u64> {
 
 fn check_schedule(v: &Value, s: &Schedule) {
     let name = v["name"].as_str().unwrap();
-    let ss: Vec<String> =
-        s.ss.iter()
-            .map(|x| x.iter().map(|b| format!("{b:02x}")).collect())
-            .collect();
+    let ss: Vec<String> = s.ss.iter().map(|x| hex(x)).collect();
     let want: Vec<String> = v["ss"]
         .as_array()
         .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
@@ -201,7 +212,7 @@ fn run_join(v: &Value, framing: Framing) {
     );
 
     // Joiner: every AEAD output is byte-compared.
-    let (hello, sent) = joiner_hello(v, framing, hx(v, "hello_payload")).unwrap();
+    let (hello, sent) = joiner_hello(v, framing, &hx(v, "hello_payload")).unwrap();
     assert_eq!(hello, want_hello, "{name}: hello");
     let (proven, used) = sent.read_reply(&want_reply).unwrap();
     assert_eq!(used, want_reply.len(), "{name}");
@@ -282,10 +293,14 @@ enum End {
     Done,
 }
 
-fn padded(step: &Value, payload: Vec<u8>) -> Vec<u8> {
+fn padded(step: &Value, payload: &[u8]) -> Vec<u8> {
     match step.get("padding").and_then(Value::as_u64) {
-        Some(n) => [encode_payload(&[(0, &vec![0; n as usize])]), payload].concat(),
-        None => payload,
+        Some(n) => [
+            encode_payload(&[(0, &vec![0; n as usize])]),
+            payload.to_vec(),
+        ]
+        .concat(),
+        None => payload.to_vec(),
     }
 }
 
@@ -300,12 +315,12 @@ fn steps(v: &Value) -> Result<(), Error> {
         let wire = hx(step, "wire");
         end = match (step["op"].as_str().unwrap(), end) {
             ("write_hello", End::J0) => {
-                End::J1(joiner_hello(v, framing, padded(step, hx(v, "hello_payload")))?.1)
+                End::J1(joiner_hello(v, framing, &padded(step, &hx(v, "hello_payload")))?.1)
             }
             ("hello", End::A0) => End::A1(acceptor_open(v, framing, &wire)?.0),
             ("write_reply", End::A1(u)) => End::A2(
                 u.write_reply_with_random(
-                    &padded(step, hx(v, "reply_payload")),
+                    &padded(step, &hx(v, "reply_payload")),
                     v["attempt_r"].as_u64().unwrap(),
                     &hx(v, "random_r"),
                     Some(ShareOverride::InPayload),

@@ -50,13 +50,20 @@
 //!   served;
 //! - failure signalling: a sent body dropped without ending it is reset
 //!   with `ZMUX_CARRIER_FAILED`; a dropped received body is cancelled by
-//!   the transport with STOP_SENDING(0). Either signals a failure; a request, its
+//!   the transport with `STOP_SENDING(0)`. Either signals a failure; a request, its
 //!   response or the connection that fails under a pipe is a failure of
 //!   the pipe, and only the end of a body is its graceful end.
 //!
 //! The QUIC endpoints carry the HTTP/3 ALPN identifier `h3` ([`ALPN`]),
 //! which names the HTTP layer; zmux's own identifiers do not apply.
-//! [`client_config`] and [`server_config`] set it and the transport
+#![cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " [`client_config`] and [`server_config`] set it and the transport"
+)]
+#![cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " `client_config` and `server_config` set it and the transport"
+)]
 //! configuration ([`Options::transport_config`]).
 //!
 //! Each body write hands the HTTP/3 stream the session's buffers as they
@@ -79,6 +86,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![forbid(unsafe_code)]
 
 use std::future::{Future, poll_fn};
 use std::io;
@@ -135,6 +143,7 @@ pub struct Options {
 
 impl Options {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -163,6 +172,7 @@ impl Options {
     /// quinn's transport configuration for these options: the windows
     /// ([`LaneWindows::transport_config`]); the rest quinn's defaults.
     /// Build the endpoints' client and server configurations with it.
+    #[must_use]
     pub fn transport_config(&self) -> quinn::TransportConfig {
         self.windows.transport_config()
     }
@@ -171,6 +181,11 @@ impl Options {
 /// A quinn client configuration from a rustls one: the ALPN identifier
 /// `h3` when it has none, and the transport configuration of `options`
 /// ([`Options::transport_config`]).
+///
+/// # Errors
+///
+/// [`NoInitialCipherSuite`](quinn::crypto::rustls::NoInitialCipherSuite)
+/// when `tls` offers no cipher suite QUIC can use for its Initial packets.
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn client_config(
     mut tls: rustls::ClientConfig,
@@ -187,6 +202,11 @@ pub fn client_config(
 /// `h3` when it has none, and the transport configuration of `options`
 /// ([`Options::transport_config`]). Early data is refused
 /// (`max_early_data_size` 0): no request is taken from it.
+///
+/// # Errors
+///
+/// [`NoInitialCipherSuite`](quinn::crypto::rustls::NoInitialCipherSuite)
+/// when `tls` offers no cipher suite QUIC can use for its Initial packets.
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 pub fn server_config(
     mut tls: rustls::ServerConfig,
@@ -292,6 +312,10 @@ impl Carrier {
     /// set for the lanes and charged to the zmux session the pipes carry.
     /// With [`Options::carrier_credential`], each request body starts with its
     /// prefix.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionReset` when the HTTP/3 settings exchange fails.
     pub async fn new(conn: Connection, uri: http::Uri, options: &Options) -> io::Result<Self> {
         let carrier_credential = options
             .carrier_credential
@@ -324,6 +348,7 @@ impl Carrier {
 
     /// The QUIC connection, for its own features (statistics, path,
     /// close).
+    #[must_use]
     pub fn connection(&self) -> &Connection {
         &self.inner.conn
     }
@@ -331,6 +356,7 @@ impl Carrier {
     /// The connection's HTTP Datagrams as the datagram channels of its
     /// pipes: [`ConnectionDatagrams::dropped`] counts those that named no
     /// pipe.
+    #[must_use]
     pub fn datagrams(&self) -> &Arc<ConnectionDatagrams> {
         &self.inner.datagrams
     }
@@ -338,6 +364,12 @@ impl Carrier {
     /// A new pipe on a request of the connection: the bootstrap carrier of
     /// a session this endpoint starts, or a pipe it joins. Returns once the
     /// request was sent (its response is awaited by the pipe's reads).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when `uri` makes no valid request, the carrier
+    /// credential's error when its prefix cannot be made, and
+    /// `ConnectionReset` when the request cannot be sent.
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
         let inner = &self.inner;
         let (send, recv) = inner.request().await?;
@@ -400,10 +432,23 @@ impl ClientInner {
 }
 
 /// A carrier over a new HTTP/3 connection of `endpoint` (its default
-/// client configuration, with the ALPN identifier `h3`: [`client_config`])
+#[cfg_attr(
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"),
+    doc = " client configuration, with the ALPN identifier `h3`: [`client_config`])"
+)]
+#[cfg_attr(
+    not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    doc = " client configuration, with the ALPN identifier `h3`: `client_config`)"
+)]
 /// to `addr`, verified for the host of `uri`: a request to `uri`. For
 /// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to open more pipes
 /// on one connection, make a [`Carrier`] instead.
+///
+/// # Errors
+///
+/// `InvalidInput` when the endpoint refuses the connection's parameters,
+/// the QUIC handshake's failure, and the errors of [`Carrier::new`] and
+/// [`Carrier::open_pipe`].
 pub async fn dial(
     endpoint: &Endpoint,
     addr: SocketAddr,
@@ -421,6 +466,11 @@ pub async fn dial(
 
 /// Establishes a session over a new HTTP/3 connection ([`dial`], then
 /// [`Session::connect`]).
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with an error of [`dial`], and the errors of
+/// [`Session::connect`].
 pub async fn connect(
     endpoint: &Endpoint,
     addr: SocketAddr,
@@ -496,6 +546,11 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 ///
 /// The connection's handshake is complete before its requests are read:
 /// no request is taken from early data.
+///
+/// # Errors
+///
+/// `ConnectionReset` when the HTTP/3 connection fails or ends with an
+/// error; a request's failure ends only that request.
 pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
@@ -612,24 +667,21 @@ impl Served {
         mut send: ServerSend,
         recv: ServerRecv,
     ) {
-        match &self.fallback {
-            Some(f) => {
-                let peer = self.source(head.headers());
-                f.serve(FallbackRequest {
-                    head,
-                    prefix,
-                    send,
-                    recv,
-                    peer,
-                })
-                .await;
-            }
-            None => {
-                let mut resp = http::Response::new(());
-                *resp.status_mut() = http::StatusCode::NOT_FOUND;
-                if send.send_response(resp).await.is_ok() {
-                    let _ = send.finish().await;
-                }
+        if let Some(f) = &self.fallback {
+            let peer = self.source(head.headers());
+            f.serve(FallbackRequest {
+                head,
+                prefix,
+                send,
+                recv,
+                peer,
+            })
+            .await;
+        } else {
+            let mut resp = http::Response::new(());
+            *resp.status_mut() = http::StatusCode::NOT_FOUND;
+            if send.send_response(resp).await.is_ok() {
+                let _ = send.finish().await;
             }
         }
     }
@@ -676,9 +728,9 @@ impl Served {
             }
             Admit::Fallback(prefix) => {
                 drop(entry);
-                let (recv, held) = reader.into_server();
+                let (recv, unread) = reader.into_server();
                 let mut replay = prefix;
-                replay.extend_from_slice(&held);
+                replay.extend_from_slice(&unread);
                 self.fall_back(
                     http::Request::from_parts(parts, ()),
                     replay.into(),
@@ -1217,7 +1269,7 @@ impl Drop for BodyReader {
 /// Keeps a client's connection after its pipe's request body ended
 /// gracefully, until the response body ends (or fails): QUIC closes a
 /// connection whose last handle is dropped, and discards the data still in
-/// flight, so the request body's last records (a CONNECTION_CLOSE) would be
+/// flight, so the request body's last records (a `CONNECTION_CLOSE`) would be
 /// lost with it. The server ends the response once it read the request
 /// body to its end, or its session ended on its own; what it still sends
 /// is discarded.

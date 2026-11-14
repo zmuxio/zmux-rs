@@ -33,6 +33,7 @@ use super::wake::{Defer, Locked, WakeList};
 use super::{Event as AppEvent, GoAway, StreamId};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
 use crate::proto::VarInt;
+use crate::proto::exporter::CarrierExporter;
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::limit::{self, DatagramLimiter};
 use crate::proto::meter::Meter;
@@ -249,10 +250,7 @@ impl Drop for LogBatch {
 /// A listener's table from Session Locator to session, under its own lock: a session
 /// updates it with an epoch while it holds its own lock, so this lock is never held while
 /// a session's is taken.
-type LocatorMap<T> = (
-    std::collections::HashMap<Vec<u8>, std::sync::Weak<T>>,
-    usize,
-);
+type LocatorMap<T> = (std::collections::HashMap<Vec<u8>, Weak<T>>, usize);
 
 pub(crate) struct LocatorTable<T> {
     map: Mutex<LocatorMap<T>>,
@@ -275,20 +273,17 @@ impl<T> LocatorTable<T> {
 
     /// The session of a Locator, if it is still alive.
     pub(crate) fn get(&self, locator: &[u8]) -> Option<Arc<T>> {
-        self.lock()
-            .0
-            .get(locator)
-            .and_then(std::sync::Weak::upgrade)
+        self.lock().0.get(locator).and_then(Weak::upgrade)
     }
 
     /// Any live session, for tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn any(&self) -> Option<Arc<T>> {
-        self.lock().0.values().find_map(std::sync::Weak::upgrade)
+        self.lock().0.values().find_map(Weak::upgrade)
     }
 
     /// Adds a Locator; ended sessions leave once the table doubled since the last pruning.
-    pub(crate) fn insert(&self, locator: Vec<u8>, session: std::sync::Weak<T>) {
+    pub(crate) fn insert(&self, locator: Vec<u8>, session: Weak<T>) {
         let mut g = self.lock();
         let (map, pruned) = &mut *g;
         map.insert(locator, session);
@@ -299,7 +294,7 @@ impl<T> LocatorTable<T> {
     }
 
     /// Replaces the Locators `held` of a session by `now`; returns `now`.
-    pub(crate) fn replace(&self, held: &[Vec<u8>], now: &[Vec<u8>], session: &std::sync::Weak<T>) {
+    pub(crate) fn replace(&self, held: &[Vec<u8>], now: &[Vec<u8>], session: &Weak<T>) {
         let mut g = self.lock();
         for old in held.iter().filter(|o| !now.contains(o)) {
             g.0.remove(old);
@@ -395,7 +390,7 @@ impl<D: Driver> Defer for State<D> {
             })
     }
 
-    /// Closes the session with a transport INTERNAL_ERROR: what the core
+    /// Closes the session with a transport `INTERNAL_ERROR`: what the core
     /// still can do of it, with no second panic out of a drop.
     fn poison(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -611,7 +606,7 @@ impl<D: Driver> State<D> {
                     self.app_event(AppEvent::GoAwayReceived(g));
                 }
                 CoreEvent::ClosePipe { pipe, half, abort } => {
-                    D::close_pipe(self, pipe.0, half, abort)
+                    D::close_pipe(self, pipe.0, half, abort);
                 }
                 CoreEvent::OpenLane(lane) => D::open_lane(self, lane),
                 CoreEvent::ResetLane(lane) => D::reset_lane(self, lane),
@@ -654,14 +649,15 @@ impl<D: Driver> State<D> {
                 CoreEvent::JoinAuthFailed { reason } => {
                     self.app_event(AppEvent::JoinAuthFailed { reason, count: 1 });
                 }
-                // A maintainer asks `join_ready` again on its own schedule.
-                // The listener's joins held for the key.
-                CoreEvent::JoinKeysReady => w.wake_list(List::State, wakes),
+                // A maintainer asks `join_ready` again on its own schedule;
+                // the listener's joins held for the key, and `replace_pipes`
+                // for an epoch in use, wait on the state list.
+                CoreEvent::JoinKeysReady | CoreEvent::EpochInUse(_) => {
+                    w.wake_list(List::State, wakes);
+                }
                 CoreEvent::EpochCommitted(epoch) => {
                     self.app_event(AppEvent::EpochCommitted { epoch });
                 }
-                // `replace_pipes` waits for it.
-                CoreEvent::EpochInUse(_) => w.wake_list(List::State, wakes),
                 CoreEvent::EpochDeleted(epoch) => {
                     self.app_event(AppEvent::EpochDeleted { epoch });
                 }
@@ -964,7 +960,7 @@ impl<D: Driver> Shared<D> {
 
     #[cfg(feature = "tokio")]
     /// Abandons the session if it is not established yet: closed without
-    /// CONNECTION_CLOSE (the core's `abandon`).
+    /// `CONNECTION_CLOSE` (the core's `abandon`).
     pub(crate) fn abandon(&self) {
         self.command(|st| st.core.abandon(D::now()));
     }
@@ -1127,11 +1123,11 @@ pub(crate) fn dead(info: Option<&PipeStats>) -> bool {
 /// A reference to a session that does not keep it in use: a background
 /// job's (a rejoin's dial), which must not delay the close that dropping
 /// the application's last handle starts.
-pub struct WeakSession<D: Driver>(std::sync::Weak<Shared<D>>);
+pub struct WeakSession<D: Driver>(Weak<Shared<D>>);
 
 impl<D: Driver> WeakSession<D> {
     /// The weak handle of a session's shared state.
-    pub(crate) fn from_weak(shared: std::sync::Weak<Shared<D>>) -> Self {
+    pub(crate) fn from_weak(shared: Weak<Shared<D>>) -> Self {
         Self(shared)
     }
 
@@ -1227,7 +1223,7 @@ impl<D: Driver> Shared<D> {
     }
 
     /// Refuses the session (the core's `refuse`) and waits until its
-    /// carriers took CONNECTION_CLOSE or it ended.
+    /// carriers took `CONNECTION_CLOSE` or it ended.
     pub(crate) fn refuse(&self, reason: &'static str) -> impl Future<Output = ()> + '_ {
         self.command(|st| st.core.refuse(reason, D::now()));
         Wait::new(&self.inner, List::Close, |st: &mut State<D>| {
@@ -1322,7 +1318,7 @@ impl<D: Driver> Shared<D> {
                 Some(f) => f.allows(info, join.mode(), admitted),
                 None => join.mode() == crate::proto::seal::RecordMode::Sealed,
             };
-            mode_ok && authorize.is_none_or(|f| f.allows(core::PipeId(join.pipe().id)))
+            mode_ok && authorize.is_none_or(|f| f.allows(PipeId(join.pipe().id)))
         }))
         .unwrap_or(false)
     }
@@ -1680,7 +1676,7 @@ impl<D: Driver> Session<D> {
         self.command(|st| st.core.abort(code, reason, D::now()));
     }
 
-    /// Waits until a close no longer holds its caller: CONNECTION_CLOSE
+    /// Waits until a close no longer holds its caller: `CONNECTION_CLOSE`
     /// handed to the carriers, the hand-off limit passed, an abort, or the
     /// session's end (the core's `close_returned`).
     pub(crate) fn close_handoff_op(&self) -> impl Future<Output = ()> + '_ {
@@ -2024,7 +2020,7 @@ impl<D: Driver, F> Drop for StreamWait<'_, D, F> {
 }
 
 /// The sending part of a stream. Dropping it without
-/// `finish` resets the stream with ZMUX_CANCELLED.
+/// `finish` resets the stream with `ZMUX_CANCELLED`.
 pub struct SendStream<D: Driver> {
     conn: ConnRef<D>,
     key: StreamKey,
@@ -2278,7 +2274,7 @@ impl<D: Driver> SendStream<D> {
     }
 
     /// Registers `waker` as the part's writer, to be woken when it ends (a
-    /// STOP_SENDING, the session's end) or gets room; fails at once with
+    /// `STOP_SENDING`, the session's end) or gets room; fails at once with
     /// what ended it.
     pub(crate) fn watch(&self, waker: &Waker) -> Result<(), StreamError> {
         let mut st = self.conn.lock();
@@ -2328,14 +2324,14 @@ impl<D: Driver> SendStream<D> {
         }
     }
 
-    /// Whether the stream's peer accepts RESET_STREAM_AT.
+    /// Whether the stream's peer accepts `RESET_STREAM_AT`.
     pub(crate) fn peer_accepts_reset_stream_at(&self) -> bool {
         self.conn.lock().core.peer_accepts_reset_stream_at()
     }
 
     /// [`SendStream::finish`](crate::SendStream#method.finish) through a shared reference.
     pub(crate) fn finish_shared(&self) -> Result<(), StreamError> {
-        self.command(|c, k| c.finish(k))
+        self.command(core::SessionCore::finish)
     }
 
     /// [`SendStream::reset`](crate::SendStream#method.reset) through a shared reference.
@@ -2345,7 +2341,7 @@ impl<D: Driver> SendStream<D> {
 
     /// [`SendStream::set_reliable_boundary`](crate::SendStream#method.set_reliable_boundary) through a shared reference.
     pub(crate) fn set_reliable_boundary_shared(&self) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_reliable_boundary(k))
+        self.command(core::SessionCore::set_reliable_boundary)
     }
 
     /// One write of at most `limit` bytes of a batch from byte `from` on,
@@ -2493,7 +2489,8 @@ fn take_read(
     while t.count < READ_PIECES && t.len < max {
         match core.read_chunk(key, max - t.len) {
             Ok(None) if t.count == 0 => return None,
-            Ok(None) => break,
+            Err(e) if t.count == 0 => return Some(Err(e)),
+            Ok(None) | Err(_) => break,
             Ok(Some((b, fin))) => {
                 if !b.is_empty() {
                     t.len += b.len();
@@ -2505,8 +2502,6 @@ fn take_read(
                     break;
                 }
             }
-            Err(e) if t.count == 0 => return Some(Err(e)),
-            Err(_) => break,
         }
     }
     Some(Ok(t))
@@ -3215,7 +3210,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
             if !c.secure || c.split {
                 return Err(PipeError::InvalidArgument);
             }
-            let binding = c.exporter.as_ref().and_then(|e| e.pipe_binding());
+            let binding = c.exporter.as_ref().and_then(CarrierExporter::pipe_binding);
             Some(binding.ok_or(PipeError::InvalidArgument)?)
         } else {
             None
@@ -3399,7 +3394,7 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::datagram_support(self)
         }
 
-        /// RESET_STREAM_AT support of each side (the `reset_stream_at`
+        /// `RESET_STREAM_AT` support of each side (the `reset_stream_at`
         /// transport parameters).
         pub fn reset_stream_at_support(&self) -> crate::Support {
             <Self as crate::driver::handle::SessionApi<$d>>::reset_stream_at_support(self)
@@ -3708,7 +3703,7 @@ macro_rules! session_api {
         }
 
         /// Revalidates every live outbound pipe after a network change: each
-        /// gets a PIPE_PING at once and takes no new stream
+        /// gets a `PIPE_PING` at once and takes no new stream
         /// data, while another pipe can, until it is acknowledged. Never waits.
         pub fn revalidate_pipes(&self) -> Result<(), crate::PipeError> {
             <Self as crate::driver::handle::SessionApi<$d>>::revalidate_pipes(self)
@@ -3884,7 +3879,7 @@ macro_rules! pipe_api {
             <Self as crate::driver::handle::PipeApi<$d>>::admitted(self)
         }
 
-        /// Removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain.
+        /// Removes the pipe gracefully: `PIPE_ABANDON(NO_ERROR)` and drain.
         pub fn close(&self) -> Result<(), crate::PipeError> {
             <Self as crate::driver::handle::PipeApi<$d>>::close(self)
         }
@@ -3897,10 +3892,10 @@ macro_rules! pipe_api {
         /// Changes the pipe's runtime settings together
         /// ([`PipeUpdate`](crate::PipeUpdate)): each field keeps, clears or
         /// sets its setting. An invalid value changes nothing
-        /// ([`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions)).
+        /// ([`PipeError::InvalidOptions`]).
         /// Changes apply from the next scheduling decision; a changed
         /// request for the peer's outbound direction goes out as one
-        /// PIPE_STATUS, only when it differs from the request in force.
+        /// `PIPE_STATUS`, only when it differs from the request in force.
         pub fn update(&self, update: &crate::PipeUpdate) -> Result<(), crate::PipeError> {
             <Self as crate::driver::handle::PipeApi<$d>>::update(self, update)
         }
@@ -3908,7 +3903,7 @@ macro_rules! pipe_api {
         /// Installs `shaper` on the pipe's outbound direction until the
         /// session's next [`Session::set_shaper`](crate::Session#method.set_shaper);
         /// `None`: the pipe is not shaped.
-        /// [`PipeError::InvalidArgument`](crate::PipeError::InvalidArgument)
+        /// [`PipeError::InvalidArgument`]
         /// when the pipe has no outbound direction.
         pub fn set_shaper(
             &self,
@@ -3926,7 +3921,7 @@ macro_rules! pipe_api {
             <Self as crate::driver::handle::PipeApi<$d>>::options(self)
         }
 
-        /// Revalidates the outbound pipe after a network change: a PIPE_PING at
+        /// Revalidates the outbound pipe after a network change: a `PIPE_PING` at
         /// once, and no new stream data, while
         /// another pipe can take it, until it is acknowledged.
         pub fn revalidate(&self) -> Result<(), crate::PipeError> {
@@ -3936,7 +3931,7 @@ macro_rules! pipe_api {
 }
 pub(crate) use pipe_api;
 
-/// The SendStream operations both drivers share: the public methods of each
+/// The `SendStream` operations both drivers share: the public methods of each
 /// driver's type (`sendstream_api!`) call them.
 pub(crate) trait SendStreamApi<D: Driver> {
     fn id(&self) -> Option<StreamId>;
@@ -3966,7 +3961,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn pin_id(&self) -> Result<StreamId, StreamError> {
-        self.command(|c, k| c.stream_id(k)).map(StreamId)
+        self.command(core::SessionCore::stream_id).map(StreamId)
     }
 
     fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError> {
@@ -3994,7 +3989,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn finish(&mut self) -> Result<(), StreamError> {
-        self.command(|c, k| c.finish(k))
+        self.command(core::SessionCore::finish)
     }
 
     fn reset(&mut self, code: VarInt) -> Result<(), StreamError> {
@@ -4002,7 +3997,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn set_reliable_boundary(&mut self) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_reliable_boundary(k))
+        self.command(core::SessionCore::set_reliable_boundary)
     }
 
     fn set_priority(&self, priority: Priority) -> Result<(), StreamError> {
@@ -4056,7 +4051,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 }
 
-/// The public methods of a driver's SendStream type: `$d` the driver,
+/// The public methods of a driver's `SendStream` type: `$d` the driver,
 /// `$carrier` its carrier type.
 macro_rules! sendstream_api {
     ($d:ty, $carrier:ty) => {
@@ -4121,7 +4116,7 @@ macro_rules! sendstream_api {
         }
 
         /// Resets the stream with `code`. Data below the reliable boundary is
-        /// still delivered (RESET_STREAM_AT).
+        /// still delivered (`RESET_STREAM_AT`).
         pub fn reset(&mut self, code: crate::VarInt) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::reset(self, code)
         }
@@ -4198,7 +4193,7 @@ macro_rules! sendstream_api {
         /// part holds nothing unsent (so that a peer window smaller than `min`
         /// cannot stall the caller); `Ready` with the capacity, or at once
         /// with the error that ended the part: a reset or finish, the peer's
-        /// STOP_SENDING, the session's end. `Pending` registers `cx`'s waker
+        /// `STOP_SENDING`, the session's end. `Pending` registers `cx`'s waker
         /// as the part's writer, as a write that waits does.
         pub fn poll_send_capacity(
             &self,
@@ -4211,7 +4206,7 @@ macro_rules! sendstream_api {
 }
 pub(crate) use sendstream_api;
 
-/// The RecvStream operations both drivers share: the public methods of each
+/// The `RecvStream` operations both drivers share: the public methods of each
 /// driver's type (`recvstream_api!`) call them.
 pub(crate) trait RecvStreamApi<D: Driver> {
     fn id(&self) -> Option<StreamId>;
@@ -4235,7 +4230,7 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
     }
 
     fn pin_id(&self) -> Result<StreamId, StreamError> {
-        self.command(|c, k| c.stream_id(k)).map(StreamId)
+        self.command(core::SessionCore::stream_id).map(StreamId)
     }
 
     fn stop(&mut self, code: VarInt) -> Result<(), StreamError> {
@@ -4267,7 +4262,7 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
     }
 
     fn reject(self) -> Result<(), StreamError> {
-        self.command(|c, k| c.reject(k))
+        self.command(core::SessionCore::reject)
     }
 
     fn preamble(&self) -> Preamble {
@@ -4291,7 +4286,7 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
     }
 }
 
-/// The public methods of a driver's RecvStream type: `$d` the driver,
+/// The public methods of a driver's `RecvStream` type: `$d` the driver,
 /// `$carrier` its carrier type.
 macro_rules! recvstream_api {
     ($d:ty, $carrier:ty) => {
@@ -4308,7 +4303,7 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::pin_id(self)
         }
 
-        /// Stops reading: STOP_SENDING with `code`; unread data is discarded.
+        /// Stops reading: `STOP_SENDING` with `code`; unread data is discarded.
         pub fn stop(&mut self, code: crate::VarInt) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::stop(self, code)
         }
@@ -4343,9 +4338,9 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::peer_priority(self)
         }
 
-        /// Declines the stream before reading it: STOP_SENDING and, on a
-        /// sending part not written to, RESET_STREAM, both with
-        /// ZMUX_REJECTED.
+        /// Declines the stream before reading it: `STOP_SENDING` and, on a
+        /// sending part not written to, `RESET_STREAM`, both with
+        /// `ZMUX_REJECTED`.
         pub fn reject(self) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::reject(self)
         }
@@ -4371,7 +4366,7 @@ macro_rules! recvstream_api {
 
         /// The priority the peer requested for this stream in its opening
         /// preamble (its PRIORITY TLV), `None` when it sent none: the
-        /// opening value only, not a later PRIORITY_UPDATE.
+        /// opening value only, not a later `PRIORITY_UPDATE`.
         pub fn requested_priority(&self) -> Option<crate::Priority> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::requested_priority(self)
         }

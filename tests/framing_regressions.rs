@@ -2,6 +2,15 @@
 //! core hands to its carrier belongs to a record.
 //! Found by `tests/mp_fuzz.rs`.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+#![allow(
+    clippy::many_single_char_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::time::Instant;
 
 use zmux::proto::frame::{Dir, Frames, Gates};
@@ -43,7 +52,7 @@ fn check_records(wire: &[u8]) -> Result<(), String> {
 /// `stream_room` ends the record and returns 0 with no record open, the
 /// check `room < min` passes, and `stream_header` writes the frame after
 /// the last record, outside any record. The peer reads the frame type as a
-/// record size and the following bytes as frames: here FRAME_ENCODING_ERROR
+/// record size and the following bytes as frames: here `FRAME_ENCODING_ERROR`
 /// or a misparsed record, in general arbitrary frames. `write_copy` has the
 /// same gap for a re-sent FIN without data (`room == 0 && want > 0`). A
 /// zero `stream_room` must always mean "batch full".

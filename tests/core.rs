@@ -120,7 +120,7 @@ fn keep_alive_default_and_off() {
     }
 }
 
-/// Keep-alive sends at most one QX_PING after each activity: with its
+/// Keep-alive sends at most one `QX_PING` after each activity: with its
 /// answers lost, no further request follows each period; the answer that
 /// arrives (activity) arms the next one.
 #[test]
@@ -351,7 +351,7 @@ fn send_capacity_is_credit_left_minus_unsent_and_session_credit_wakes_it() {
 
 /// A capacity wait is ready with any capacity once
 /// the part holds nothing unsent. Sending changes no credit, and 3 KiB
-/// read of a 16 KiB window earns no MAX_STREAM_DATA (the W/4 rule), so
+/// read of a 16 KiB window earns no `MAX_STREAM_DATA` (the W/4 rule), so
 /// the drain of the send buffer itself must wake the wait.
 #[test]
 fn send_capacity_wait_wakes_when_the_unsent_bytes_drain() {
@@ -487,7 +487,7 @@ fn a_ping_whose_response_is_late_asks_again() {
 }
 
 /// Datagram statistics: a single-pipe
-/// session reports pipe 0 like any pipe; its RTT comes from QX_PING with a
+/// session reports pipe 0 like any pipe; its RTT comes from `QX_PING` with a
 /// plain QMux peer, which gives no acknowledgements and so no rates or
 /// acknowledged positions; `ping` measures a fresh RTT; the largest
 /// datagram is the peer's limit.
@@ -645,4 +645,31 @@ fn a_datagram_no_carrier_takes_any_more_is_dropped_without_holding_the_queue() {
     assert_eq!(p.b.recv_datagram().unwrap(), None);
     assert_eq!(p.a.stats().datagrams_dropped_send, 1);
     assert_eq!(datagram_through(&mut p, 20), Some(20));
+}
+
+/// A stop that arrives after the opening frame and every byte written left does not fail a
+/// flush: the next write reports it. A stop before the bytes left fails the flush.
+#[test]
+fn a_flush_fails_only_on_a_stop_before_its_bytes_left() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"request").unwrap();
+    p.a.flush(k).unwrap();
+    p.pump();
+    assert_eq!(p.a.flushed(k), Ok(true));
+    let r = p.b.accept(Dir::Bidi).unwrap().expect("stream");
+    p.b.stop(r, VarInt::from_u32(7)).unwrap();
+    p.pump();
+    assert_eq!(p.a.flush(k), Ok(()));
+    assert_eq!(p.a.flushed(k), Ok(true));
+    assert!(p.a.write(k, b"more").is_err());
+
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"first").unwrap();
+    p.pump();
+    let r = p.b.accept(Dir::Bidi).unwrap().expect("stream");
+    p.a.write(k, b"not yet sent").unwrap();
+    p.b.stop(r, VarInt::from_u32(7)).unwrap();
+    p.send(false);
+    assert!(p.a.flush(k).and_then(|()| p.a.flushed(k)).is_err());
 }

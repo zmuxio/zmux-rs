@@ -58,6 +58,10 @@ pub(crate) fn shaped_payload(
     let noise = profile.empty_message_len(seq) + zmux::proto::seal::encode_payload(items).len();
     let w = head(noise);
     let room = (u16::MAX as usize).saturating_sub(noise);
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "both sizes are bounded by a handshake unit, far below isize::MAX"
+    )]
     let value = pad_item(plan.pad_for(w) as isize - w as isize, room);
     *padded += value.map_or(0, |v| item_size(v) as u64);
     let random = seq == 0 && !psk;
@@ -82,7 +86,7 @@ pub struct Peer {
     /// The handshake's confidentiality resists a passive quantum adversary.
     pub pq_confidential: bool,
     /// The peer's authentication resists an active quantum adversary: the verdict named a
-    /// proof key, the proof verified, and its KeyAlg is post-quantum.
+    /// proof key, the proof verified, and its `KeyAlg` is post-quantum.
     pub pq_authenticated: bool,
 }
 
@@ -92,8 +96,8 @@ pub struct Peer {
 #[derive(Debug)]
 pub struct NoReply(pub io::Error);
 
-impl std::fmt::Display for NoReply {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NoReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "no reply from the server ({}): the Profile is not accepted, the Handle is unknown, \
@@ -201,8 +205,8 @@ impl Default for ClientConfig {
     }
 }
 
-impl std::fmt::Debug for ClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientConfig")
             .field("handle", &self.handle)
             .field("allow_psk_only", &self.allow_psk_only)
@@ -301,6 +305,14 @@ pub(crate) fn binding_of<C: Carrier>(p: &C, mode: RecordMode) -> Result<Vec<u8>,
 /// Runs the client's handshake on `p` and returns the carrier for `Session::connect`, with
 /// what it learned of the server. On a failure the carrier is dropped, and nothing is
 /// retried: a different choice is a new carrier. A caller bounds it with a timeout.
+///
+/// # Errors
+///
+/// `InvalidInput` for a configuration that does not suit the carrier or
+/// Profile; `PermissionDenied` when the server fails authentication or the
+/// verifier rejects it, `Other` when the verifier fails otherwise;
+/// `InvalidData` for a malformed reply; `UnexpectedEof` and the carrier's
+/// own errors (wrapped in [`NoReply`] while no reply was read).
 pub async fn establish(p: PipeIo, cfg: &ClientConfig) -> Result<(PipeIo, Peer), io::Error> {
     run_client(p, cfg).await
 }

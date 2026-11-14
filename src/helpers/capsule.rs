@@ -211,11 +211,11 @@ impl Decoder {
         loop {
             if let State::Payload { context, left, acc } = &mut self.state {
                 let context = *context;
-                match acc {
+                return match acc {
                     None if buf.len() >= *left => {
                         let payload = buf.split_to(*left);
                         self.state = State::Type;
-                        return Decoded::Packet { context, payload };
+                        Decoded::Packet { context, payload }
                     }
                     None => {
                         let mut a = BytesMut::with_capacity(*left);
@@ -223,7 +223,7 @@ impl Decoder {
                         *left -= buf.len();
                         buf.clear();
                         *acc = Some(a);
-                        return Decoded::More;
+                        Decoded::More
                     }
                     Some(a) => {
                         let n = (*left).min(buf.len());
@@ -231,13 +231,14 @@ impl Decoder {
                         buf.advance(n);
                         *left -= n;
                         if *left > 0 {
-                            return Decoded::More;
+                            Decoded::More
+                        } else {
+                            let payload = std::mem::take(a).freeze();
+                            self.state = State::Type;
+                            Decoded::Packet { context, payload }
                         }
-                        let payload = std::mem::take(a).freeze();
-                        self.state = State::Type;
-                        return Decoded::Packet { context, payload };
                     }
-                }
+                };
             }
             if let State::Skip(left) = self.state {
                 let n = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
@@ -296,7 +297,7 @@ impl Decoder {
                     }
                     self.state = State::Payload {
                         context: v,
-                        left: left as usize,
+                        left: crate::util::usize_sat(left),
                         acc: None,
                     };
                 }
@@ -443,7 +444,7 @@ mod tests {
         assert!(!cases.is_empty());
         for case in cases {
             let id = case["id"].as_str().unwrap();
-            let max = case["max_payload"].as_u64().unwrap() as usize;
+            let max = usize::try_from(case["max_payload"].as_u64().unwrap()).unwrap();
             let bytes = unhex(case["hex"].as_str().unwrap());
             let want: Vec<(u64, Vec<u8>)> = case["packets"]
                 .as_array()
@@ -456,7 +457,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let skipped = case["skipped"].as_u64().unwrap() as usize;
+            let skipped = usize::try_from(case["skipped"].as_u64().unwrap()).unwrap();
             let error = case["error"].as_str();
             for step in [bytes.len().max(1), 1] {
                 let (out, end) = decode_all(max, &bytes, step);
@@ -465,7 +466,7 @@ mod tests {
                 for d in out {
                     match d {
                         Decoded::Packet { context, payload } => {
-                            got.push((context, payload.to_vec()))
+                            got.push((context, payload.to_vec()));
                         }
                         Decoded::Skipped => skips += 1,
                         Decoded::Malformed(f) => fault = Some(f),

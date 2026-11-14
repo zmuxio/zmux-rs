@@ -1,7 +1,7 @@
-//! The entry list of PIPE_ACK, kept as the received bytes and
+//! The entry list of `PIPE_ACK`, kept as the received bytes and
 //! decoded lazily, so that decoding does not allocate. Entries are in
 //! strictly increasing (Pipe ID, Lane) order; anything else, an entry listed
-//! twice included, is a FRAME_ENCODING_ERROR, checked in one pass.
+//! twice included, is a `FRAME_ENCODING_ERROR`, checked in one pass.
 
 use std::fmt;
 
@@ -64,7 +64,7 @@ impl<'a> Entries<'a> {
 
     /// Reads the Entry Count and the entries, and rejects entries that are
     /// not in strictly increasing (Pipe ID, Lane) order with
-    /// FRAME_ENCODING_ERROR.
+    /// `FRAME_ENCODING_ERROR`.
     pub(super) fn read(c: &mut Cursor<'a>, ty: u64, order: &'static str) -> Result<Self, Fail> {
         let count = c.varint()?;
         let mut body = *c;

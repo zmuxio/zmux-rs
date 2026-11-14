@@ -3,6 +3,7 @@
 //! `BULK_MIB` sets the measured transfer (default 1024).
 
 #![allow(missing_docs, unsafe_code)]
+#![allow(clippy::cast_precision_loss, reason = "throughput arithmetic in f64")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -46,11 +47,11 @@ async fn pair() -> (Session, Session) {
     tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
-        Default::default(),
+        zmux_websocket::Options::default(),
     ));
     let c = zmux_websocket::connect(
         format!("ws://{addr}/zmux"),
-        &Default::default(),
+        &zmux_websocket::Options::default(),
         Config::default(),
     )
     .await

@@ -9,7 +9,7 @@ pub trait Source: Send {
     fn next_u64(&mut self) -> u64;
 }
 
-/// ChaCha8 seeded from the operating system.
+/// `ChaCha8` seeded from the operating system.
 pub(crate) struct OsSeeded(ChaCha8Rng);
 
 impl OsSeeded {

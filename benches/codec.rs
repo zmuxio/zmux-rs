@@ -2,6 +2,10 @@
 //! record parsing and variable-length integers.
 
 #![allow(missing_docs)]
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
 
 use std::hint::black_box;
 use std::time::Duration;
@@ -26,7 +30,7 @@ fn stream_frames(c: &mut Criterion) {
 
         // Header and payload copied into the batch buffer.
         g.bench_with_input(BenchmarkId::new("encode", size), &size, |b, _| {
-            b.iter(|| black_box(&frame).encode(black_box(&mut buf)).unwrap())
+            b.iter(|| black_box(&frame).encode(black_box(&mut buf)).unwrap());
         });
         // Header only, as a gather write sends the payload by reference.
         let header = StreamHeader {
@@ -38,11 +42,11 @@ fn stream_frames(c: &mut Criterion) {
             explicit_len: true,
         };
         g.bench_with_input(BenchmarkId::new("encode_header", size), &size, |b, _| {
-            b.iter(|| black_box(&header).encode(black_box(&mut buf)).unwrap())
+            b.iter(|| black_box(&header).encode(black_box(&mut buf)).unwrap());
         });
         // Zero-copy decode: the payload is a slice of the input.
         g.bench_with_input(BenchmarkId::new("decode", size), &size, |b, _| {
-            b.iter(|| Frame::decode(black_box(&encoded), &Gates::ALL).unwrap())
+            b.iter(|| Frame::decode(black_box(&encoded), &Gates::ALL).unwrap());
         });
         // Decode and copy the payload out, as a receive buffer does.
         g.bench_with_input(BenchmarkId::new("decode_copy", size), &size, |b, _| {
@@ -53,7 +57,7 @@ fn stream_frames(c: &mut Criterion) {
                     dst[..s.data.len()].copy_from_slice(s.data);
                 }
                 black_box(&dst);
-            })
+            });
         });
     }
     g.finish();
@@ -106,7 +110,7 @@ fn control_frames(c: &mut Criterion) {
         let n = frame.encode(&mut buf).unwrap();
         let encoded = buf[..n].to_vec();
         g.bench_function(BenchmarkId::new("encode", name), |b| {
-            b.iter(|| black_box(frame).encode(black_box(&mut buf)).unwrap())
+            b.iter(|| black_box(frame).encode(black_box(&mut buf)).unwrap());
         });
         g.bench_function(BenchmarkId::new("decode", name), |b| {
             b.iter(|| {
@@ -115,13 +119,13 @@ fn control_frames(c: &mut Criterion) {
                     black_box(ack.entries().map(|e| e.position).sum::<u64>());
                 }
                 n
-            })
+            });
         });
     }
     g.finish();
 }
 
-/// A batch of about 256 KiB of records, each with a MAX_STREAM_DATA and a
+/// A batch of about 256 KiB of records, each with a `MAX_STREAM_DATA` and a
 /// STREAM frame of `chunk` bytes.
 fn batch(chunk: usize) -> Vec<u8> {
     let payload = vec![0x42u8; chunk];
@@ -236,7 +240,7 @@ fn records(c: &mut Criterion) {
                         &mut buf,
                         Some(&mut dst),
                     )
-                })
+                });
             },
         );
     }
@@ -267,7 +271,7 @@ fn varints(c: &mut Criterion) {
                 at += varint::encode(v, &mut buf[at..]).unwrap();
             }
             at
-        })
+        });
     });
     g.bench_function("decode_1024_mixed", |b| {
         b.iter(|| {
@@ -278,7 +282,7 @@ fn varints(c: &mut Criterion) {
                 rest = &rest[n..];
             }
             sum
-        })
+        });
     });
     g.finish();
 }

@@ -100,7 +100,7 @@ impl SessionCore {
             else {
                 continue;
             };
-            if let Some(b) = self.blocking_at(o, c, key, send, x)
+            if let Some(b) = Self::blocking_at(o, c, key, send, x)
                 && best.is_none_or(|(d, pos)| {
                     b.sent > d.sent || (b.sent == d.sent && (b.pipe, c.pos) < (d.pipe, pos))
                 })
@@ -138,7 +138,7 @@ impl SessionCore {
                         pipe: a.id(),
                         pos,
                     };
-                    if let Some(b) = self.blocking_at(o, c, key, send, x)
+                    if let Some(b) = Self::blocking_at(o, c, key, send, x)
                         && best.is_none_or(|c| b.sent < c.sent)
                     {
                         best = Some(b);
@@ -154,7 +154,6 @@ impl SessionCore {
     /// Describes the part from `x` to the end of the frame `c` of pipe
     /// `o`.
     fn blocking_at(
-        &self,
         o: &OutPipe,
         c: Carry,
         key: StreamKey,
@@ -198,8 +197,8 @@ impl SessionCore {
         self.fastest_eligible(&gate?, len)
     }
 
-    /// When the copy of `b` becomes allowed: max(2 x srtt_f + peer max ACK
-    /// delay, min(PTO_p, 2E)) after its last send.
+    /// When the copy of `b` becomes allowed: max(2 x `srtt_f` + peer max ACK
+    /// delay, `min(PTO_p`, 2E)) after its last send.
     fn opp_due_at(&self, b: &Blocking, f: u64) -> Option<Instant> {
         let fo = self.out_ref(f)?;
         Some(
@@ -209,7 +208,7 @@ impl SessionCore {
     }
 
     /// The earliest a copy of `b` can become allowed on any pipe:
-    /// max(peer max ACK delay, min(PTO_p, 2E)) after its last send, which
+    /// max(peer max ACK delay, `min(PTO_p`, 2E)) after its last send, which
     /// the threshold of [`Self::opp_due_at`] never undercuts.
     fn opp_earliest(&self, b: &Blocking) -> Option<Instant> {
         let mad = self.mp().peer_mad();
@@ -219,6 +218,10 @@ impl SessionCore {
 
     /// The blocking data to copy on pipe `id` now, if the conditions hold;
     /// `gate` is the gate now, when the caller has it.
+    #[allow(
+        clippy::option_option,
+        reason = "outer None: the caller has no gate at hand; Some(None): the gate now is none"
+    )]
     pub(in crate::proto::session) fn opp_due(
         &self,
         id: u64,

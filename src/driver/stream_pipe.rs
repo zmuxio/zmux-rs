@@ -6,10 +6,10 @@
 //! |---|---|
 //! | write | write within the send capacity: not writable while the stream lacks credit or room |
 //! | graceful end of the sending half | finish (FIN) |
-//! | any other end of the sending half (an abort, the nested session's end) | reset with ZMUX_CARRIER_FAILED (RESET_STREAM_AT keeping the preamble on the opener's part) |
-//! | close of the receiving half before its end | stop with ZMUX_CARRIER_FAILED |
+//! | any other end of the sending half (an abort, the nested session's end) | reset with `ZMUX_CARRIER_FAILED` (`RESET_STREAM_AT` keeping the preamble on the opener's part) |
+//! | close of the receiving half before its end | stop with `ZMUX_CARRIER_FAILED` |
 //! | FIN received | graceful end of the inbound pipe |
-//! | reset received, STOP_SENDING received, the outer session's end | a read or write error: failure of the pipe |
+//! | reset received, `STOP_SENDING` received, the outer session's end | a read or write error: failure of the pipe |
 //!
 //! The halves pass the nested session's records as owned buffers: the
 //! session task reads the outer stream in chunks, which the nested core
@@ -38,7 +38,7 @@ use super::tokio::{RecvStream, SendStream, Tokio};
 use crate::proto::session::{PieceCursor, PipeError, StreamError, TransmitBuf};
 use crate::proto::{ApplicationErrorCode, VarInt};
 
-/// ZMUX_CARRIER_FAILED as a code.
+/// `ZMUX_CARRIER_FAILED` as a code.
 fn carrier_failed() -> VarInt {
     VarInt::from_u64(ApplicationErrorCode::ZMUX_CARRIER_FAILED.0).unwrap_or(VarInt::ZERO)
 }
@@ -97,7 +97,7 @@ impl AsyncRead for StreamReader {
 }
 
 impl Drop for StreamReader {
-    /// Closed before its end: stop with ZMUX_CARRIER_FAILED.
+    /// Closed before its end: stop with `ZMUX_CARRIER_FAILED`.
     fn drop(&mut self) {
         if !self.ended {
             let _ = self.recv.stop_shared(carrier_failed());
@@ -121,7 +121,7 @@ impl StreamWriter {
     }
 
     /// Registers the task as the stream's writer while the pipe has nothing
-    /// to write, so that a STOP_SENDING or the end of the stream's session
+    /// to write, so that a `STOP_SENDING` or the end of the stream's session
     /// wakes it; fails at once with what ended the stream.
     pub(crate) fn watch(&self, cx: &Context<'_>) -> io::Result<()> {
         self.send.watch(cx.waker()).map_err(io::Error::from)
@@ -172,7 +172,7 @@ impl AsyncWrite for StreamWriter {
 
 impl Drop for StreamWriter {
     /// Any end but the graceful one is an abort: reset with
-    /// ZMUX_CARRIER_FAILED (on the opener's part RESET_STREAM_AT keeping the
+    /// `ZMUX_CARRIER_FAILED` (on the opener's part `RESET_STREAM_AT` keeping the
     /// preamble).
     fn drop(&mut self) {
         if !self.finished {

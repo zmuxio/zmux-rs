@@ -57,16 +57,19 @@ static SUITES: &[Suite] = &[
 
 impl Suite {
     /// The AEAD's tag length.
+    #[must_use]
     pub fn tag_len(&self) -> usize {
         self.cipher.tag_len()
     }
 
     /// The hash output's length.
+    #[must_use]
     pub fn hash_len(&self) -> usize {
         self.hash.out_len()
     }
 
     /// The Suite with this value, if this build declares it.
+    #[must_use]
     pub fn from_value(value: u64) -> Option<&'static Suite> {
         SUITES.iter().find(|s| s.value == value)
     }
@@ -77,27 +80,32 @@ impl Suite {
     }
 
     /// The Suite value.
+    #[must_use]
     pub fn value(&self) -> u64 {
         self.value
     }
 
     /// The AEAD.
+    #[must_use]
     pub fn cipher(&self) -> &'static Cipher {
         self.cipher
     }
 
     /// The hash.
+    #[must_use]
     pub fn hash(&self) -> &'static Hash {
         self.hash
     }
 
     /// The length of R.
+    #[must_use]
     pub fn r_len(&self) -> usize {
         self.r_len
     }
 }
 
 /// Whether this machine has AES hardware, by which a joiner prefers a Suite.
+#[must_use]
 pub fn has_aes_hardware() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -161,6 +169,7 @@ pub fn expand_join_psk(
 
 /// `R`, bound to the message it goes in: `head` is the bytes before R and `payload`
 /// the plaintext. Every message takes a new one.
+#[must_use]
 pub fn join_r(
     suite: &Suite,
     psk: &[u8],
@@ -225,6 +234,10 @@ struct Keys {
 }
 
 impl Keys {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the secrets move in: wiped here, or kept for the test hooks"
+    )]
     fn new(
         suite: &Suite,
         psk: &[u8],
@@ -291,12 +304,13 @@ pub struct Schedule {
     pub confirm_tag: Vec<u8>,
 }
 
-/// The ModeByte of a Hello: the Mode in bits 0-1 and the key phase in bit 7.
+/// The `ModeByte` of a Hello: the Mode in bits 0-1 and the key phase in bit 7.
+#[must_use]
 pub fn mode_byte(mode: RecordMode, phase: u8) -> u8 {
     mode.byte() | (phase & 1) << 7
 }
 
-/// Parses a ModeByte: bits 2-6 set, or a reserved Mode, is `bad_flags`.
+/// Parses a `ModeByte`: bits 2-6 set, or a reserved Mode, is `bad_flags`.
 pub fn parse_mode_byte(byte: u8) -> Result<(RecordMode, u8), Error> {
     Ok((RecordMode::from_byte(byte & 0x7f)?, byte >> 7))
 }
@@ -481,6 +495,13 @@ impl Joiner {
         self.group.initiate()
     }
 
+    #[cfg_attr(
+        not(feature = "test-hooks"),
+        allow(
+            clippy::needless_pass_by_value,
+            reason = "`share` is used only with the test hooks"
+        )
+    )]
     fn write_hello_payload(
         self,
         payload: &[u8],
@@ -516,6 +537,10 @@ impl Joiner {
         let mut wire = vec![HELLO_TYPE];
         put_varint(&mut wire, suite.value);
         wire.push(mode_byte(self.mode, self.phase));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the locator is 1 to 255 bytes, checked at construction"
+        )]
         wire.push(self.locator.len() as u8);
         wire.extend_from_slice(&self.locator);
         let r = join_r(suite, &self.psk, attempt, &random, &wire, &payload);
@@ -553,6 +578,7 @@ fn item_len(share: &[u8], group: &Group) -> usize {
 
 /// The encoded length of the key share item of `group` for a role: what a message of that
 /// role adds for it.
+#[must_use]
 pub fn key_share_item_len(group: &Group, initiator: bool) -> usize {
     let mut value = Vec::new();
     put_varint(&mut value, group.value());
@@ -663,11 +689,13 @@ pub struct Proven {
 
 impl Proven {
     /// The record mode.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
     /// The Reply's payload, with the decision and return frames.
+    #[must_use]
     pub fn payload(&self) -> &Payload {
         &self.payload
     }
@@ -720,6 +748,7 @@ pub struct Finished {
 
 impl Finished {
     /// The record mode.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
@@ -741,12 +770,14 @@ impl Finished {
     }
 
     /// The record directions in Sealed, past Confirm; `None` otherwise.
+    #[must_use]
     pub fn into_records(self) -> Option<(Sealer, Opener)> {
         self.records
     }
 
     /// The inner values, for the vectors.
     #[cfg(feature = "test-hooks")]
+    #[must_use]
     pub fn schedule(&self) -> Schedule {
         let keys = self.keys.clone();
         Schedule {
@@ -876,26 +907,31 @@ impl<'a> JoinHello<'a> {
     }
 
     /// The Suite.
+    #[must_use]
     pub fn suite(&self) -> &'static Suite {
         self.suite
     }
 
     /// The Mode the joiner chose.
+    #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
     }
 
     /// The key phase: the parity of the epoch of the joiner's key.
+    #[must_use]
     pub fn phase(&self) -> u8 {
         self.phase
     }
 
     /// What the session table finds.
+    #[must_use]
     pub fn locator(&self) -> &'a [u8] {
         self.locator
     }
 
     /// The bytes of the Hello.
+    #[must_use]
     pub fn consumed(&self) -> usize {
         self.consumed
     }
@@ -980,6 +1016,7 @@ pub struct Unconfirmed {
 
 impl Unconfirmed {
     /// The Group of the joiner's key share.
+    #[must_use]
     pub fn group(&self) -> &'static Group {
         self.group
     }
@@ -1030,6 +1067,13 @@ impl Unconfirmed {
         self.group.respond(&self.share)
     }
 
+    #[cfg_attr(
+        not(feature = "test-hooks"),
+        allow(
+            clippy::needless_pass_by_value,
+            reason = "`share` is used only with the test hooks"
+        )
+    )]
     fn reply_with(
         self,
         payload: &[u8],

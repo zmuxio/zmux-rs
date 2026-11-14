@@ -2,6 +2,11 @@
 //! a custom scheduling policy on the driver's task or thread, and
 //! `allow_connection_window_increase` on the session's hook task or thread.
 
+#![allow(
+    clippy::similar_names,
+    reason = "short conventional names in scenario code"
+)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

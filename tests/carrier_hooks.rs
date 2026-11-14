@@ -2,6 +2,11 @@
 //! secret, runtime limits, flush, first-bytes and replay vectors, admission
 //! rounds and labels, and the cache's reports.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 mod common;
 
 #[path = "common/core_pair.rs"]
@@ -101,7 +106,7 @@ fn a_deferred_join_secret_holds_joins_until_it_is_given() {
         assert!(client.join_pending());
         let ((extra, _), _other) = duplex(1 << 16);
         assert!(matches!(
-            client.begin_add_pipe(extra, Default::default()),
+            client.begin_add_pipe(extra, zmux::PipeOptions::default()),
             Err(PipeError::JoinPending(zmux::JoinMissing::DeferredPsk))
         ));
         assert!(!client.adapter().join_ready());
@@ -134,7 +139,7 @@ fn a_held_join_counts_once_and_wakes_with_the_key() {
         let c = Config::multipath(PipeAuth::deferred_psk().with_end_to_end());
         let ((a, _), (b, _)) = duplex(1 << 20);
         let serving = listener.clone();
-        tokio::spawn(async move { serving.handle_pipe(b, Default::default()).await });
+        tokio::spawn(async move { serving.handle_pipe(b, zmux::PipeHint::default()).await });
         let client = watchdog(5, "connect", Session::connect(a, c))
             .await
             .unwrap();
@@ -145,8 +150,14 @@ fn a_held_join_counts_once_and_wakes_with_the_key() {
         client.set_join_secret(&key).unwrap();
         let ((extra_a, _), (extra_b, _)) = duplex(1 << 20);
         let serving = listener.clone();
-        tokio::spawn(async move { serving.handle_pipe(extra_b, Default::default()).await });
-        client.begin_add_pipe(extra_a, Default::default()).unwrap();
+        tokio::spawn(async move {
+            serving
+                .handle_pipe(extra_b, zmux::PipeHint::default())
+                .await
+        });
+        client
+            .begin_add_pipe(extra_a, zmux::PipeOptions::default())
+            .unwrap();
         // Longer than a good many rounds of any polling.
         watchdog(5, "held", async {
             while server.stats().join_pending == 0 {

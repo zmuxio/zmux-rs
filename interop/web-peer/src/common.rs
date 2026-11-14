@@ -6,11 +6,21 @@ use std::time::Duration;
 use zmux::{Listener, Session};
 
 /// The key of the prefix authentication tokens of the peer in `key`, 30 s slots.
+///
+/// # Panics
+///
+/// If `key` is not a valid prefix authentication key.
+#[must_use]
 pub fn auth(key: &[u8]) -> zmux::PrefixAuth {
     zmux::PrefixAuth::new(key, Duration::from_secs(30), false).expect("prefix auth")
 }
 
 /// A listener that admits only tokens of `auth`, one slot of skew.
+///
+/// # Panics
+///
+/// If `key` is not a valid prefix authentication key.
+#[must_use]
 pub fn listener(key: &[u8], fallback: Option<zmux::adapter::Fallback>) -> Listener {
     let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth(key), 1, 1 << 16));
     let mut limits = zmux::ListenerConfig::default();
@@ -43,6 +53,10 @@ pub async fn serve_sessions(listener: Listener) {
 }
 
 /// Sends `ping` on a stream of `session` and reads the echo.
+///
+/// # Errors
+///
+/// The failed step's error, as text.
 pub async fn ping(session: &Session) -> Result<String, String> {
     let (mut send, mut recv) = session.open_bi().await.map_err(|e| e.to_string())?;
     send.write_all(b"ping").await.map_err(|e| e.to_string())?;

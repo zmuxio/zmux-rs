@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 pub(super) struct Probation {
     /// When the current probation started (`None` when none runs).
     started: Option<Instant>,
-    /// Its backoff exponent k_p.
+    /// Its backoff exponent `k_p`.
     k: u32,
     /// The probation history of a pipe of fate group 0 (others keep it
     /// per fate group).
@@ -105,9 +105,9 @@ pub(crate) struct History {
     /// The path has history: a pipe of it has been suspect or has failed
     /// (the 1 s floor of the base applies).
     trouble: bool,
-    /// U_max: the longest ACTIVE period that began once the path had
+    /// `U_max`: the longest ACTIVE period that began once the path had
     /// history and ended in a suspicion or failure; it caps probation at
-    /// max(base, 2 x U_max), and is forgotten with k.
+    /// max(base, 2 x `U_max`), and is forgotten with k.
     u_max: Option<Duration>,
 }
 
@@ -123,7 +123,7 @@ impl History {
         self.trouble
     }
 
-    /// U_max, while it is remembered.
+    /// `U_max`, while it is remembered.
     pub(crate) fn u_max(&self) -> Option<Duration> {
         self.u_max
     }
@@ -176,7 +176,7 @@ impl History {
         self.k
     }
 
-    /// k returns to 0, and U_max is forgotten, once 10 bases passed since
+    /// k returns to 0, and `U_max` is forgotten, once 10 bases passed since
     /// the last probation ended without a new suspicion (`quiet`: none
     /// pending, none running).
     pub(crate) fn decay(&mut self, quiet: bool, now: Instant) {

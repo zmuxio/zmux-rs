@@ -9,7 +9,7 @@ use zmux::shaping::{
 
 use crate::error::{Error, err};
 use crate::json::{Json, parse};
-use crate::value::{BUDGET_SCOPES, Family, Reader, Sampler, Value, int, parse_value};
+use crate::value::{BUDGET_SCOPES, Family, Reader, Sampler, Value, int, parse_value, to_u64};
 
 const TIME: i128 = 1_000_000_000_000_000;
 
@@ -55,7 +55,7 @@ pub(crate) fn parse_budget(x: &Json, reader: &Reader<'_>) -> Result<BudgetDef, E
         if !(1..=TIME).contains(&n) {
             return Err(err("range", format!("max_delay: {n}")));
         }
-        b.max_delay = Some(Duration::from_micros(n as u64));
+        b.max_delay = Some(Duration::from_micros(to_u64(n)));
     }
     Ok(b)
 }
@@ -79,7 +79,7 @@ impl BudgetDef {
     pub(crate) fn source(self, s: Sampler) -> ShapingBudget {
         let s = Arc::new(Mutex::new(s));
         ShapingBudget::new(move || {
-            let mut s = s.lock().unwrap_or_else(|p| p.into_inner());
+            let mut s = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.draw(&mut s)
         })
     }
@@ -97,6 +97,11 @@ fn switch(x: &Json, key: &str) -> Result<bool, Error> {
 /// and `per_sec` in \[0, 2^43\]), `max_delay` (microseconds up to 10^15, 0 the default and a
 /// negative number no bound) and the switches `no_padding`, `no_pause` and `no_injection`.
 /// A wire of zeros means `no_injection`. An absent or `null` member is its default.
+///
+/// # Errors
+///
+/// Fails if `json` is not valid JSON, has an unknown member, or a member has the wrong
+/// type or is out of range.
 pub fn parse_limits(json: &[u8]) -> Result<Limits, Error> {
     let x = parse(json)?;
     known(
@@ -124,7 +129,7 @@ pub fn parse_limits(json: &[u8]) -> Result<Limits, Error> {
             if n < 0 || n > i128::from(max) {
                 return Err(err("range", format!("{k}: {n}")));
             }
-            Ok(n as u64)
+            Ok(to_u64(n))
         };
         l.wire = Account::new(
             read("initial", MAX_ACCOUNT_INITIAL)?,
@@ -141,7 +146,7 @@ pub fn parse_limits(json: &[u8]) -> Result<Limits, Error> {
         l.max_delay = match n {
             0 => Limits::default().max_delay,
             n if n < 0 => None,
-            n => Some(Duration::from_micros(n as u64)),
+            n => Some(Duration::from_micros(to_u64(n))),
         };
     }
     Ok(l)

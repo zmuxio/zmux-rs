@@ -4,6 +4,12 @@
 //! The pipe pool keeps the pipes up (redials on pipe events, rotates make
 //! before break); idle probes keep idle carriers alive and find dead ones.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test and bench values are small and bounded; checked conversions would only add noise"
+)]
+
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -325,7 +331,7 @@ fn check(data: &[u8], from: usize) -> usize {
 
 /// The idle rule of a middlebox (8 s): probes every 5 s with 30% jitter
 /// keep a quiet pipe alive for 10 minutes; at 12 s the relay drops it
-/// silently, the probe finds it within k + T_fail and the pool redials on
+/// silently, the probe finds it within k + `T_fail` and the pool redials on
 /// the failure at once.
 #[tokio::test(start_paused = true)]
 async fn probes_keep_an_idle_relay_open() {
@@ -418,7 +424,7 @@ async fn probes_keep_an_idle_relay_open() {
 }
 
 /// A relay that takes bytes and forwards none: the idle pipe fails within
-/// k + T_fail.
+/// k + `T_fail`.
 #[tokio::test(start_paused = true)]
 async fn a_black_hole_is_found_by_the_probe() {
     let listener = Listener::new(config(|_| {}), ListenerConfig::default())
@@ -555,7 +561,7 @@ async fn the_last_pipe_cut_resumes_without_loss() {
 }
 
 /// The relay refuses every redial during the grace period: the session
-/// ends with RESUME_TIMEOUT when it expires, and the pool with it.
+/// ends with `RESUME_TIMEOUT` when it expires, and the pool with it.
 #[tokio::test(start_paused = true)]
 async fn refused_redials_end_in_resume_timeout() {
     let cfg = || config(|c| c.resume_timeout = Some(Duration::from_secs(20)));

@@ -87,6 +87,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![forbid(unsafe_code)]
 
 mod body;
 mod classify;
@@ -207,6 +208,7 @@ impl Default for Options {
 
 impl Options {
     /// The defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
