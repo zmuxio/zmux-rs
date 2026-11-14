@@ -15,6 +15,7 @@ use crate::proto::record::Framing;
 use crate::proto::session::Period;
 use crate::proto::session::limiter::{Held, Limiter};
 use crate::proto::session::stream::StreamKey;
+use crate::util::drain_time;
 
 /// A redundant copy queued for a pipe: the stream range of the frame it
 /// copies, and whether that frame carried the FIN.
@@ -1327,11 +1328,10 @@ impl OutPipe {
         // of it excludes it.
         let queued = self.queued();
         let unsent_ahead = queued.saturating_sub(self.last_batch);
-        let queue =
-            Duration::from_secs_f64((unsent_ahead as f64 / self.est.rate.max(1) as f64).min(1.0));
-        let expect = Duration::from_secs_f64(queued as f64 / self.est.rate.max(1) as f64)
-            + self.est.min_or_srtt()
-            + peer_mad;
+        let queue = drain_time(unsent_ahead, self.est.rate).min(Duration::from_secs(1));
+        let expect = drain_time(queued, self.est.rate)
+            .saturating_add(self.est.min_or_srtt())
+            .saturating_add(peer_mad);
         self.batches.push_back(Batch {
             start: self.sent - self.last_batch.min(self.sent),
             end: self.sent,
@@ -2121,11 +2121,9 @@ impl OutPipe {
         &self,
         waits_since: impl FnOnce() -> Option<Instant>,
     ) -> Option<Instant> {
-        let rate = self.est.rate.max(1) as f64;
+        let rate = self.est.rate;
         match self.hold? {
-            Hold::Call { start, bytes } => {
-                start.checked_add(Duration::from_secs_f64(bytes as f64 / rate))
-            }
+            Hold::Call { start, bytes } => start.checked_add(drain_time(bytes, rate)),
             Hold::Refused { end, unsent } => {
                 let m = self.mp();
                 let since = m.waiting_since.or_else(waits_since)?;
@@ -2136,7 +2134,7 @@ impl OutPipe {
                 // Minus the time the carrier needs to drain what it held
                 // when the call ended: a slow carrier still taking bytes at
                 // its rate never looks stalled.
-                let drain = Duration::from_secs_f64(unsent as f64 / rate);
+                let drain = drain_time(unsent, rate);
                 since.max(end).checked_add(drain)
             }
         }
@@ -2161,9 +2159,7 @@ impl OutPipe {
     /// queued_bytes / R_p; `None` where the adapter reports no count.
     pub(crate) fn queue_delay(&self) -> Option<Duration> {
         let unsent = self.reported_unsent()?;
-        Some(Duration::from_secs_f64(
-            unsent as f64 / self.est.rate.max(1) as f64,
-        ))
+        Some(drain_time(unsent, self.est.rate))
     }
 
     // ---- probes ---------------------------------------------------------------------
@@ -2570,6 +2566,19 @@ mod tests {
             },
             now,
         )
+    }
+
+    /// Adapter-reported unsent bytes beyond the range of `Duration` saturate
+    /// rather than panic.
+    #[test]
+    fn a_huge_unsent_count_saturates_the_queue_delay() {
+        let t = Instant::now();
+        let mut o = pipe(t);
+        o.est_mut().rate = 1;
+        o.set_unsent(u64::MAX, t);
+        assert!(o.queue_delay().is_some());
+        o.est_mut().rate = 0;
+        assert!(o.queue_delay().is_some());
     }
 
     /// A failed pipe lost what it had sent and not had acknowledged; a

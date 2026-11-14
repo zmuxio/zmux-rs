@@ -17,7 +17,11 @@ Bidirectional commands are OPEN_INFO values. See the module comment in
 and replies `dgram-done` after FIN. `schedule:round-robin` changes the session's
 scheduler and replies `scheduled`. `drop-bootstrap` aborts pipe zero and replies
 `dropped` over the remaining path. Uni streams and session datagrams are echoed.
-These same commands are implemented by the Java test peer.
+`packets[:stream]` echoes the packets of a packet stream (EXTENSIONS.md Section 12)
+with their Context IDs until FIN, under a 1 MiB packet bound; `stream` sends the
+echoes as capsules only. `packets-bad` writes a truncated DATAGRAM capsule and FIN,
+then reports the code of the driver's reset as `packet-error=<code>` on a new uni
+stream. These same commands are implemented by the Java test peer.
 
 The `close` command waits for the request FIN and sends the requested session
 close without a stream reply. Drivers assert that session close's remote code

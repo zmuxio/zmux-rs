@@ -542,7 +542,8 @@ impl SessionCore {
     /// [`SessionCore::poll_channel`].
     pub(super) fn write_datagrams(&mut self, pipe: u64, control: bool, w: &mut Records<'_>) {
         let send_queue = self.config.datagram_send_queue;
-        let max_frame = self.max_datagram_frame().unwrap_or(0);
+        let bound = self.max_datagram_frame();
+        let max_frame = bound.unwrap_or(0);
         let ch = control
             .then(|| self.channel_for(pipe, w.shape.is_some()))
             .flatten();
@@ -574,6 +575,18 @@ impl SessionCore {
             {
                 // The channel's task sends it.
                 i += 1;
+                continue;
+            }
+            if bound.is_some_and(|m| 1 + total > m) {
+                // Larger than any frame the carriers take now (a pipe with
+                // smaller records joined since it was queued): dropped and
+                // counted, so that it does not hold the datagrams after it.
+                let was_full = self.dgram().send.len() >= send_queue;
+                self.dgram_mut().send.remove(i);
+                self.stats.datagrams_dropped_send += 1;
+                if was_full {
+                    self.events.push_back(CoreEvent::DatagramsUnblocked);
+                }
                 continue;
             }
             // With a Length field when it fits the peer's frame limit and

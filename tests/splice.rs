@@ -490,6 +490,7 @@ fn limiters_are_charged_exactly_what_was_forwarded_and_datagrams_follow() {
                 ba.bytes + ba.datagram_bytes
             );
             assert_eq!(ba.datagrams_dropped, 1, "the datagram over budget");
+            assert_eq!((ba.datagrams_limited, ba.datagrams_too_large), (1, 0));
             hop.close();
         }
         settle(base, 10, "limiters").await;

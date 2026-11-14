@@ -52,6 +52,12 @@
 //! a failure rather than a graceful end ([`PipeIo::with_tcp_socket`];
 //! one duplicate of the socket serves both).
 //!
+//! [`TlsConnection`] holds a TLS connection that another layer owns (an
+//! HTTP/1.1 or HTTP/2 connection, a WebSocket), and its [`TlsBinding`]
+//! declares the carriers on it: secure with the connection's exporter
+//! while [`is_bound`] holds, all carriers of the connection with the same
+//! exporter.
+//!
 //! The adapter takes the configuration as it is otherwise: no crypto
 //! provider, protocol version or buffer size is chosen here. Bytes rustls
 //! buffers above the socket (up to its buffer limit, 64 KiB by default) are
@@ -101,9 +107,13 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ProtocolVersion, ServerConfig};
+use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeIo, Session};
+
+mod connection;
+
+pub use connection::{TlsBinding, TlsConnection, is_bound};
 
 /// A pipe carrier from an established TLS stream over any transport: the
 /// exporter (TLS 1.3, handshake complete), partial reads and the ALPN
@@ -119,7 +129,7 @@ where
         .1
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
-    let tls13 = stream.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3);
+    let bound = is_bound(stream.get_ref().1);
     let done = !stream.get_ref().1.is_handshaking();
     let state = zmux::TlsState::new(alpn.clone().map(String::into_bytes), None);
     // Both halves share the connection, as a split would with a lock taken
@@ -131,9 +141,7 @@ where
     if done {
         io = io.with_terminated_tls(move || Some(state.clone()));
     }
-    // Secure only once the handshake completed: before it, the version and
-    // the peer's authentication are not settled (early data).
-    if done && tls13 {
+    if bound {
         io = io
             .with_carrier_secure()
             .with_exporter(move |label, context, out| {

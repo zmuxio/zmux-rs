@@ -12,6 +12,7 @@ fn vendored(spec_path: &str) -> &str {
     match spec_path {
         "assets/registry.json" => "registry.json",
         "fixtures/profiles.json" => "profiles.json",
+        "fixtures/capsules.json" => "capsules.json",
         "fixtures/wire/valid.ndjson" => "wire/valid.ndjson",
         "fixtures/wire/invalid.ndjson" => "wire/invalid.ndjson",
         "fixtures/traces/index.json" => "traces/index.json",

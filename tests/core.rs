@@ -598,3 +598,51 @@ fn no_timeout_and_off_settings() {
         assert_eq!(r.is_ok(), ok, "{ms} ms");
     }
 }
+
+fn datagram_pair() -> Pair {
+    let mut c = Config::default();
+    c.enable_datagrams = true;
+    Pair::new(c.clone(), c)
+}
+
+/// Sends `len` bytes from A and returns what B received.
+fn datagram_through(p: &mut Pair, len: usize) -> Option<usize> {
+    assert!(p.a.send_datagram(Bytes::from(vec![7; len]), true).unwrap());
+    p.pump();
+    p.b.recv_datagram().unwrap().map(|d| d.len())
+}
+
+#[test]
+fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
+    let mut p = datagram_pair();
+    let max = p.a.max_datagram_size().unwrap();
+    assert_eq!(datagram_through(&mut p, max), Some(max));
+    assert!(matches!(
+        p.a.send_datagram(Bytes::from(vec![0; max + 1]), true),
+        Err(zmux::proto::session::DatagramError::TooLarge { max: m }) if m == max
+    ));
+    // A carrier whose records are smaller than the peer's bound (a TLS
+    // record) bounds the datagrams with them.
+    p.a.set_pipe_max_record(P0, 1000);
+    let capped = p.a.max_datagram_size().unwrap();
+    assert!(capped < 1000, "{capped}");
+    assert_eq!(datagram_through(&mut p, capped), Some(capped));
+    assert!(
+        p.a.send_datagram(Bytes::from(vec![0; capped + 1]), true)
+            .is_err()
+    );
+    assert_eq!(p.a.stats().datagrams_dropped_send, 0);
+}
+
+#[test]
+fn a_datagram_no_carrier_takes_any_more_is_dropped_without_holding_the_queue() {
+    let mut p = datagram_pair();
+    let max = p.a.max_datagram_size().unwrap();
+    assert!(p.a.send_datagram(Bytes::from(vec![1; max]), true).unwrap());
+    // The carrier's records shrink before its turn.
+    p.a.set_pipe_max_record(P0, 1000);
+    assert_eq!(datagram_through(&mut p, 10), Some(10));
+    assert_eq!(p.b.recv_datagram().unwrap(), None);
+    assert_eq!(p.a.stats().datagrams_dropped_send, 1);
+    assert_eq!(datagram_through(&mut p, 20), Some(20));
+}

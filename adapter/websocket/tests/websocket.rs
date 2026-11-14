@@ -793,7 +793,7 @@ async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &
         .await
         .expect("the server ended its side after the close");
     assert!(
-        matches!(&end, zmux::SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
+        matches!(&end, SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
         "{end:?}"
     );
     let seen = tokio::time::timeout(Duration::from_secs(5), reader)
@@ -801,13 +801,13 @@ async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &
         .expect("the server read everything")
         .unwrap();
     assert!(
-        matches!(&seen, zmux::SessionError::ApplicationClosed { code: c, reason: r, remote: true }
+        matches!(&seen, SessionError::ApplicationClosed { code: c, reason: r, remote: true }
             if *c == code && r.as_ref() == reason),
         "{seen:?}"
     );
     let e = open.write_all(b"more").await.unwrap_err();
     assert!(
-        matches!(&e, zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
+        matches!(&e, zmux::StreamError::SessionLost(SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
         "{e:?}"
     );
 }

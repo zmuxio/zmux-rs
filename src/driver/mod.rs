@@ -68,6 +68,8 @@ pub(crate) mod listen;
 #[cfg(all(test, loom))]
 mod loom;
 #[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod packet;
+#[cfg(all(feature = "tokio", not(loom)))]
 mod precise;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod resources;

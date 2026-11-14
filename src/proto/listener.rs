@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::proto::frame::{LANE_KEY_LEN, PipeLane};
 use crate::proto::ident::{Classifier, FirstRecord, Verdict};
 use crate::proto::oob::PAIRING_TOKEN_LEN;
+use crate::proto::params::ZMUX_MAX_RECORD_SIZE;
 use crate::proto::record::Framing;
 use crate::proto::seal::Error as SealError;
 use crate::proto::seal::join::JoinHello;
@@ -602,6 +603,11 @@ pub struct ListenerCore {
 }
 
 impl ListenerConfig {
+    /// `max_record_size` as a length, saturating where `usize` is narrower.
+    fn max_record_size_usize(&self) -> usize {
+        usize::try_from(self.max_record_size).unwrap_or(usize::MAX)
+    }
+
     /// Checks the limits as creating a listener does: the error
     /// `Listener::new` would fail with, naming the field.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
@@ -610,6 +616,12 @@ impl ListenerConfig {
             return Err(e(
                 "ListenerConfig::instance_id",
                 "longer than MAX_INSTANCE_ID_LEN",
+            ));
+        }
+        if self.max_record_size > ZMUX_MAX_RECORD_SIZE {
+            return Err(e(
+                "ListenerConfig::max_record_size",
+                "above ZMUX_MAX_RECORD_SIZE",
             ));
         }
         if self.max_pending == Some(0) || self.max_pending_per_session == 0 {
@@ -885,7 +897,11 @@ impl ListenerCore {
     /// Bytes from a byte-stream carrier.
     pub fn data(&mut self, id: CarrierId, bytes: &[u8], now: Instant) -> Classified {
         let _ = now;
-        let max_hold = (self.config.max_record_size as usize + 8).max(MAX_HELLO);
+        let max_hold = self
+            .config
+            .max_record_size_usize()
+            .saturating_add(8)
+            .max(MAX_HELLO);
         let Some(i) = self.find(id) else {
             return Classified::Reject;
         };
@@ -949,7 +965,7 @@ impl ListenerCore {
         let p = &mut self.pending[i];
         if p.first {
             // Later messages before the join is decided.
-            if p.buf.len() + message.len() > self.config.max_record_size as usize * 2 {
+            if p.buf.len() + message.len() > self.config.max_record_size_usize().saturating_mul(2) {
                 self.done(id);
                 return Classified::Reject;
             }
@@ -1403,6 +1419,16 @@ mod tests {
             Entered::Taken { slot, evicted } => (slot, evicted),
             other => panic!("not taken: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_oversized_record_limit_is_rejected() {
+        let mut c = ListenerConfig::default();
+        assert!(c.validate().is_ok());
+        c.max_record_size = ZMUX_MAX_RECORD_SIZE + 1;
+        assert!(c.validate().is_err());
+        c.max_record_size = u64::MAX;
+        assert!(c.validate().is_err());
     }
 
     #[test]

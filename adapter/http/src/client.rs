@@ -22,6 +22,8 @@ use zmux::{
 
 use crate::Options;
 use crate::body::{self, BodyReader, PipeBody};
+use crate::tls::{BindingSlot, binding_of};
+use zmux_rustls::TlsBinding;
 
 pub(crate) fn hyper_err(e: hyper::Error) -> io::Error {
     io::Error::other(e)
@@ -162,8 +164,9 @@ type BoxIo = Box<dyn IoStream>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// Makes a new connection to the carriers' endpoint, for a request
-/// repeated at a redirect's URL.
-pub(crate) type Redial = Arc<dyn Fn() -> BoxFuture<io::Result<BoxIo>> + Send + Sync>;
+/// repeated at a redirect's URL: the connection and its TLS binding.
+pub(crate) type Redial =
+    Arc<dyn Fn() -> BoxFuture<io::Result<(BoxIo, Option<TlsBinding>)>> + Send + Sync>;
 
 fn redial<C, F, IO>(connect: Arc<C>) -> Redial
 where
@@ -173,7 +176,11 @@ where
 {
     Arc::new(move || {
         let f = connect();
-        Box::pin(async move { Ok(Box::new(f.await?) as BoxIo) })
+        Box::pin(async move {
+            let io = f.await?;
+            let binding = binding_of(&io);
+            Ok((Box::new(io) as BoxIo, binding))
+        })
     })
 }
 
@@ -459,8 +466,9 @@ async fn tcp(addr: &str) -> io::Result<TcpStream> {
 /// # async fn example(tls: tokio_rustls::TlsConnector,
 /// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> std::io::Result<()> {
 /// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
-/// let conn = tls.connect(name, tcp).await?;
-/// let pipe = zmux_http::dial_http1_over(conn, "example.com", &zmux_http::Options::default()).await?;
+/// let conn = zmux_rustls::TlsConnection::new(tls.connect(name, tcp).await?);
+/// let options = zmux_http::Options::default().with_https(true);
+/// let pipe = zmux_http::dial_http1_over(conn, "example.com", &options).await?;
 /// # drop(pipe);
 /// # Ok(())
 /// # }
@@ -505,27 +513,40 @@ async fn send_http1<IO>(
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    // A bidirectional request to an https origin declares the TLS
+    // connection it goes out on.
+    let slot = (options.https && head.direction == PipeDirection::Bidi)
+        .then(|| BindingSlot::new(binding_of(&io)));
     let (resp, body) = http1_request(io, authority, options, &options.path, &head, None).await?;
     let follow = redial.map(|redial| {
         let abort = body.as_ref().map(|(_, a)| a.clone());
         let (a, o, h) = (Arc::<str>::from(authority), options.clone(), head.clone());
+        let slot = slot.clone();
         let resend: Resend = Arc::new(move |path| {
-            let (redial, a, o, h, abort) = (
+            let (redial, a, o, h, abort, slot) = (
                 redial.clone(),
                 a.clone(),
                 o.clone(),
                 h.clone(),
                 abort.clone(),
+                slot.clone(),
             );
             Box::pin(async move {
-                let io = redial().await?;
+                let (io, binding) = redial().await?;
+                if let Some(slot) = &slot {
+                    slot.set(binding);
+                }
                 let (resp, _) = http1_request(io, &a, &o, &path, &h, abort.as_ref()).await?;
                 Ok(resp)
             })
         });
         Follow::new(options, authority, &head, body.as_ref(), target, resend)
     });
-    Ok(carrier(options.timeout, Sent { head, body, resp }, follow))
+    let io = carrier(options.timeout, Sent { head, body, resp }, follow);
+    Ok(match &slot {
+        Some(slot) => slot.apply(io),
+        None => io,
+    })
 }
 
 /// One carrier request on a new HTTP/1.1 connection over `io`, the
@@ -727,6 +748,9 @@ struct H2Inner {
     sender: http2::SendRequest<PipeBody>,
     authority: String,
     options: Options,
+    /// The TLS connection beneath, for bidirectional requests to an https
+    /// origin.
+    binding: Option<TlsBinding>,
 }
 
 impl std::fmt::Debug for Http2Connection {
@@ -752,8 +776,9 @@ impl Http2Connection {
     /// # async fn example(tls: tokio_rustls::TlsConnector,
     /// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> Result<(), Box<dyn std::error::Error>> {
     /// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
-    /// let conn = tls.connect(name, tcp).await?;
-    /// let h2 = zmux_http::Http2Connection::handshake(conn, "example.com", Default::default()).await?;
+    /// let conn = zmux_rustls::TlsConnection::new(tls.connect(name, tcp).await?);
+    /// let options = zmux_http::Options::default().with_https(true);
+    /// let h2 = zmux_http::Http2Connection::handshake(conn, "example.com", options).await?;
     /// let session = h2.connect_session(zmux::Config::default()).await?;
     /// # drop(session);
     /// # Ok(())
@@ -763,6 +788,7 @@ impl Http2Connection {
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        let binding = binding_of(&io).filter(|_| options.https);
         let (sender, conn) = within(options.timeout, async {
             http2::handshake::<_, _, PipeBody>(TokioExecutor::new(), TokioIo::new(io))
                 .await
@@ -775,6 +801,7 @@ impl Http2Connection {
                 sender,
                 authority: authority.to_owned(),
                 options,
+                binding,
             }),
         })
     }
@@ -856,10 +883,13 @@ impl Http2Connection {
             target,
             resend,
         );
-        Ok(
-            carrier(options.timeout, Sent { head, body, resp }, Some(follow))
-                .with_carrier_conn(self.conn_id()),
-        )
+        let bidi = head.direction == PipeDirection::Bidi;
+        let io = carrier(options.timeout, Sent { head, body, resp }, Some(follow))
+            .with_carrier_conn(self.conn_id());
+        Ok(match &self.inner.binding {
+            Some(b) if bidi => b.apply(io),
+            _ => io,
+        })
     }
 
     /// Establishes a session on a new bidirectional request of the

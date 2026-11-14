@@ -2249,6 +2249,20 @@ impl<D: Driver> SendStream<D> {
         &self.conn.0
     }
 
+    /// [`SendStream::send_datagram`](crate::SendStream#method.send_datagram) that tells whether the datagram was queued:
+    /// `Ok(false)` when the session's datagram limiter refused it.
+    pub(crate) fn try_send_datagram(
+        &self,
+        context: u64,
+        data: Bytes,
+    ) -> Result<bool, DatagramError> {
+        let len = data.len();
+        let allowed = self.conn.datagram_allowed(len);
+        let queued = self.command(|c, k| c.send_stream_datagram(k, context, data, allowed))?;
+        self.conn.datagram_queued(Ok(queued), len)?;
+        Ok(queued)
+    }
+
     /// Whether `recv` is the receiving part of this part's stream.
     pub(crate) fn same_stream(&self, recv: &RecvStream<D>) -> bool {
         Arc::ptr_eq(&self.conn.0, &recv.conn.0) && self.key == recv.key
@@ -2789,6 +2803,15 @@ impl<D: Driver> RecvStream<D> {
     /// [`RecvStream::stop`](crate::RecvStream#method.stop) through a shared reference.
     pub(crate) fn stop_shared(&self, code: VarInt) -> Result<(), StreamError> {
         self.command(|c, k| c.stop(k, code))
+    }
+
+    /// Ends both parts of the stream with `code`: stops the receiving part
+    /// and resets the sending part, whose handle may be elsewhere.
+    pub(crate) fn fail_shared(&self, code: VarInt) {
+        self.command(|c, k| {
+            let _ = c.stop(k, code);
+            let _ = c.reset(k, code);
+        });
     }
 }
 

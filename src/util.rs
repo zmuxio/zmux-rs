@@ -1,6 +1,8 @@
 //! Small primitives zmux uses: HMAC-SHA256 with a prepared key and a
 //! random `u64`.
 
+use std::time::Duration;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -41,6 +43,22 @@ impl HmacSha256 {
     }
 }
 
+/// `secs` seconds as a [`Duration`], saturating: a negative or NaN value is
+/// zero, one beyond the range of `Duration` is `Duration::MAX`. The
+/// panic-free form of `Duration::from_secs_f64` for computed inputs.
+pub(crate) fn saturating_secs(secs: f64) -> Duration {
+    if secs.is_nan() || secs <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
+}
+
+/// The time `bytes` take at `rate` bytes per second (a rate of 0 counts
+/// as 1), saturating at `Duration::MAX`.
+pub(crate) fn drain_time(bytes: u64, rate: u64) -> Duration {
+    saturating_secs(bytes as f64 / rate.max(1) as f64)
+}
+
 /// A random `u64` from the system's source; should that fail, from a
 /// process-local randomly seeded one.
 pub(crate) fn random_u64() -> u64 {
@@ -48,4 +66,20 @@ pub(crate) fn random_u64() -> u64 {
         use std::hash::BuildHasher;
         std::collections::hash_map::RandomState::new().hash_one(0x5a4d_u64)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_from_computed_seconds_saturate() {
+        assert_eq!(saturating_secs(f64::NAN), Duration::ZERO);
+        assert_eq!(saturating_secs(-1.0), Duration::ZERO);
+        assert_eq!(saturating_secs(f64::INFINITY), Duration::MAX);
+        assert_eq!(saturating_secs(1e300), Duration::MAX);
+        assert_eq!(saturating_secs(1.5), Duration::from_millis(1500));
+        assert_eq!(drain_time(100, 0), Duration::from_secs(100));
+        assert!(drain_time(u64::MAX, 1) > Duration::from_secs(1 << 40));
+    }
 }

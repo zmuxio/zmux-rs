@@ -305,7 +305,7 @@ impl CarrierChoicePolicy {
     pub fn timer(&self, rtt: Duration) -> Duration {
         let min = self.timer_min;
         let max = self.timer_max.max(min);
-        rtt.mul_f64(self.timer_factor.max(0.0)).clamp(min, max)
+        crate::util::saturating_secs(rtt.as_secs_f64() * self.timer_factor.max(0.0)).clamp(min, max)
     }
 }
 

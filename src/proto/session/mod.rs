@@ -314,7 +314,8 @@ pub struct SessionStats {
     pub datagrams_sent: u64,
     /// Datagrams received.
     pub datagrams_received: u64,
-    /// Datagrams dropped from the send queue.
+    /// Datagrams dropped from the send queue: the oldest when it was full,
+    /// or one that no carrier could take when its turn came.
     pub datagrams_dropped_send: u64,
     /// Received datagrams dropped from full queues or for closed streams.
     pub datagrams_dropped_recv: u64,

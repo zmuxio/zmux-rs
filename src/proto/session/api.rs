@@ -1278,11 +1278,20 @@ impl SessionCore {
     }
 
     /// The largest DATAGRAM frame this endpoint may send: the peer's
-    /// limits, whatever this endpoint's own record size.
+    /// limits and the largest record of every carrier that may carry it,
+    /// whatever this endpoint's own record size. The one bound of both the
+    /// sizes reported and the frames written: a frame is a record of its own
+    /// at most, written without a Length field when it is last in its record.
     pub(super) fn max_datagram_frame(&self) -> Option<usize> {
         let peer = self.peer_tp.as_ref()?;
         let frame = Some(peer.max_datagram_frame_size()).filter(|&m| m > 0)?;
-        Some(frame.min(peer.max_record_size()) as usize)
+        let frame = frame.min(peer.max_record_size());
+        let carriers = self
+            .atts
+            .outs()
+            .filter_map(super::pipes::OutPipe::max_record)
+            .min();
+        Some(carriers.map_or(frame, |c| frame.min(c as u64)) as usize)
     }
 
     /// Queues a session datagram (Flow 0 with datagram flows). Never waits:

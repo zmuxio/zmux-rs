@@ -47,7 +47,7 @@ use crate::backoff::{random_fraction, reduce};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Poll, Waker};
@@ -780,9 +780,9 @@ impl Maintainer {
             drop(session);
             let wake = {
                 let sleep = tokio::time::sleep_until(next);
-                let mut sleep = std::pin::pin!(sleep);
-                let mut closed = std::pin::pin!(handle::closed_wait(&sh));
-                let mut changed = std::pin::pin!(handle::pipes_changed_wait(&sh, self.seen));
+                let mut sleep = pin!(sleep);
+                let mut closed = pin!(handle::closed_wait(&sh));
+                let mut changed = pin!(handle::pipes_changed_wait(&sh, self.seen));
                 poll_fn(|cx| {
                     if self.stop.is_stopped(cx.waker()) || closed.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(Wake::Stop);
@@ -1255,10 +1255,10 @@ impl Maintainer {
                 // The member waits for the Reply and the attachment itself.
                 session.begin_add_pipe(*io, self.options()).map(|p| vec![p])
             }
-            Made::Carrier(Err(e)) => Err(PipeError::Io(std::sync::Arc::new(e))),
+            Made::Carrier(Err(e)) => Err(PipeError::Io(Arc::new(e))),
             Made::Joined(Ok(pipes)) if !pipes.is_empty() => Ok(pipes),
             Made::Joined(Ok(_)) => Err(PipeError::InvalidArgument),
-            Made::Joined(Err(e)) => Err(PipeError::Io(std::sync::Arc::new(e))),
+            Made::Joined(Err(e)) => Err(PipeError::Io(Arc::new(e))),
         };
         let pipes = match pipes {
             Ok(p) => p,

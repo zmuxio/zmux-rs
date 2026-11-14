@@ -19,6 +19,11 @@ TLS over TCP and adds the socket's capabilities. The carrier has:
   abort that shuts the socket down without TLS close_notify, so that the peer
   sees a failed pipe rather than a graceful end.
 
+`zmux_rustls::TlsConnection` holds a TLS connection that another layer owns
+(an HTTP/1.1 or HTTP/2 connection, a WebSocket); its `TlsBinding` declares the
+carriers on it the same way, every carrier of one connection with that
+connection's exporter.
+
 The adapter chooses no crypto provider, protocol version, buffer size or ALPN
 identifier: the application's rustls configuration does
 (`zmux::alpn_protocols(&[])` gives zmux's identifiers).

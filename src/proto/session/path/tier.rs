@@ -177,7 +177,7 @@ struct Cascade {
 
 impl Cascade {
     fn next(&mut self, t: &TierLoad) -> Tier {
-        let drain = Duration::from_secs_f64((t.queued + self.offered) as f64 / t.rate as f64);
+        let drain = crate::util::drain_time(t.queued.saturating_add(self.offered), t.rate);
         let drained_late = drain > self.d;
         // The age test: the oldest waiting data has waited D or longer,
         // counted for a tier other than the most-preferred one from when

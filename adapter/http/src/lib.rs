@@ -58,11 +58,17 @@
 //!
 //! TLS is the caller's: the `*_over`/[`Http2Connection::handshake`] entry
 //! points and [`serve_with`] speak HTTP over any established connection.
-//! The adapter sees only a byte stream, so its carriers have no exporter
-//! and are not declared secure ([`zmux::PipeIo::with_carrier_secure`]),
-//! even over TLS: no Bound join and no session exporter. A carrier whose
-//! TLS the adapter itself establishes and can read the exporter of (the
-//! WebSocket adapter's `wss://`, HTTP/3, WebTransport) declares both.
+//! Given as a [`zmux_rustls::TlsConnection`], a TLS connection this process
+//! terminates declares its bidirectional carriers
+//! ([`zmux_rustls::TlsBinding`]): over TLS 1.3 they are secure
+//! ([`zmux::PipeIo::with_carrier_secure`]) with the connection's exporter,
+//! which every carrier of the connection shares (the streams of an HTTP/2
+//! connection), on HTTP/1.1 and HTTP/2 alike. A server's connection puts
+//! the binding into each request's extensions ([`handle_request`] reads it
+//! there); a client declares it only for an https origin
+//! ([`Options::https`]). Split halves, exchange carriers and carriers on
+//! any other byte stream (TLS ended at an intermediary, h2c) have no
+//! exporter and are not declared secure.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +94,7 @@ mod client;
 mod endpoint;
 mod exchange;
 mod server;
+mod tls;
 mod util;
 
 use std::sync::Arc;
@@ -149,7 +156,8 @@ pub struct Options {
     pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
     /// Client: the connections carry TLS, so the carriers' URL is
     /// `https://` (default `false`, `http://`): the scheme redirects are
-    /// checked against and HTTP/2 requests name.
+    /// checked against and HTTP/2 requests name, and a bidirectional
+    /// carrier on a [`zmux_rustls::TlsConnection`] declares its binding.
     pub https: bool,
     /// Client: the redirects a carrier request follows (default
     /// [`zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none). One is

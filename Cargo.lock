@@ -3334,7 +3334,9 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "zmux",
+ "zmux-rustls",
  "zmux-websocket",
 ]
 
@@ -3411,6 +3413,7 @@ dependencies = [
  "webpki-roots",
  "x25519-dalek",
  "zmux",
+ "zmux-rustls",
  "zmux-seal",
 ]
 

@@ -15,7 +15,14 @@ bytes = "1"
 http = "1"
 tokio = { version = "1.54", features = ["full"] }
 zmux = { path = "../.." }
-zmux-http = { path = "../../adapter/http" }
+zmux-http = { path = "../../adapter/http", features = ["websocket"] }
+zmux-rustls = { path = "../../adapter/rustls" }
+hyper = { version = "1.12", features = ["client", "http2"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 zmux-websocket = { path = "../../adapter/websocket" }
 
 [[bin]]

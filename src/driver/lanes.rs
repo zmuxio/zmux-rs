@@ -454,8 +454,8 @@ fn finish_stream(mut w: StreamWriter) {
 }
 
 /// Shows no state: it may hold keys or locks.
-impl std::fmt::Debug for Lane {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Lane").finish_non_exhaustive()
     }
 }

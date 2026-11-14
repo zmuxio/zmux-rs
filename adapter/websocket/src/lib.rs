@@ -92,14 +92,13 @@ pub use zmux::adapter::redirect::{DEFAULT_MAX_REDIRECTS, RedirectError};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::ProtocolVersion;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -113,6 +112,7 @@ use tokio_tungstenite::tungstenite::{Bytes, Message};
 use zmux::adapter::ChunkWrite;
 use zmux::adapter::{Admit, Entry, Prefixed};
 use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
+use zmux_rustls::{TlsBinding, TlsConnection};
 
 pub(crate) const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
@@ -316,7 +316,7 @@ async fn dial_once(
     let _ = tcp.set_nodelay(true);
     let socket = tcp_dup(&tcp);
     let peer = tcp.peer_addr().ok();
-    let conn = SharedTls::new(tls.connect(name, tcp).await?);
+    let conn = TlsConnection::new(tls.connect(name, tcp).await?);
     let request = {
         let mut info = conn.info().with_server_name(Some(&host));
         if let Some(p) = peer {
@@ -324,13 +324,10 @@ async fn dial_once(
         }
         offer(request, options, &info)?
     };
-    let exporter = conn.exporter();
-    let io = with_socket(upgrade_over(conn, request).await?, socket);
+    let binding = conn.binding();
+    let io = binding.apply(with_socket(upgrade_over(conn, request).await?, socket));
     let state = zmux::TlsState::new(None, Some(host));
-    Ok(secured(
-        io.with_terminated_tls(move || Some(state.clone())),
-        exporter,
-    ))
+    Ok(io.with_terminated_tls(move || Some(state.clone())))
 }
 
 /// A carrier over a new WebSocket on `io`, an established byte stream such
@@ -417,144 +414,6 @@ pub async fn dial_tls(
     dial_following(request, Some(tls), options)
         .await
         .map(|(io, _)| io)
-}
-
-/// The exporter of a TLS connection, for a carrier.
-type Exporter = Arc<dyn Fn(&str, &[u8], &mut [u8]) -> bool + Send + Sync>;
-
-/// `io` with `exporter` and declared secure, when there is one.
-fn secured(io: PipeIo, exporter: Option<Exporter>) -> PipeIo {
-    match exporter {
-        Some(e) => io
-            .with_carrier_secure()
-            .with_exporter(move |label, context, out| e(label, context, out)),
-        None => io,
-    }
-}
-
-/// A TLS stream of either side, as the carrier needs it.
-trait TlsSide {
-    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool;
-    fn tls13(&self) -> bool;
-    fn alpn(&self) -> Option<Vec<u8>>;
-    fn server_name(&self) -> Option<String>;
-}
-
-impl<IO> TlsSide for tokio_rustls::client::TlsStream<IO> {
-    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
-        let c = self.get_ref().1;
-        !c.is_handshaking() && c.export_keying_material(out, label, Some(context)).is_ok()
-    }
-    fn tls13(&self) -> bool {
-        self.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3)
-    }
-    fn alpn(&self) -> Option<Vec<u8>> {
-        self.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
-    }
-    fn server_name(&self) -> Option<String> {
-        None
-    }
-}
-
-impl<IO> TlsSide for tokio_rustls::server::TlsStream<IO> {
-    fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
-        let c = self.get_ref().1;
-        !c.is_handshaking() && c.export_keying_material(out, label, Some(context)).is_ok()
-    }
-    fn tls13(&self) -> bool {
-        self.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3)
-    }
-    fn alpn(&self) -> Option<Vec<u8>> {
-        self.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
-    }
-    fn server_name(&self) -> Option<String> {
-        self.get_ref().1.server_name().map(str::to_owned)
-    }
-}
-
-/// A TLS stream that the WebSocket takes while the carrier keeps its
-/// exporter: both share the stream, which a lock taken per poll guards. The
-/// exporter does not keep it: once the WebSocket is gone it gives no value.
-struct SharedTls<S> {
-    stream: Arc<Mutex<S>>,
-    alpn: Option<Vec<u8>>,
-    server_name: Option<String>,
-}
-
-fn lock<S>(m: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl<S: TlsSide + Send + 'static> SharedTls<S> {
-    fn new(stream: S) -> Self {
-        Self {
-            alpn: stream.alpn(),
-            server_name: stream.server_name(),
-            stream: Arc::new(Mutex::new(stream)),
-        }
-    }
-
-    /// The metadata for an admission or a credential: the exporter, the
-    /// ALPN identifier and the server name.
-    fn info(&self) -> CarrierInfo<'_> {
-        let stream = &self.stream;
-        CarrierInfo::new()
-            .with_alpn(self.alpn.as_deref())
-            .with_server_name(self.server_name.as_deref())
-            .with_exporter(move |label, context, out| lock(stream).export(label, context, out))
-    }
-
-    /// The carrier's exporter, over TLS 1.3 only.
-    fn exporter(&self) -> Option<Exporter> {
-        if !lock(&self.stream).tls13() {
-            return None;
-        }
-        let weak = Arc::downgrade(&self.stream);
-        Some(Arc::new(move |label, context, out| {
-            weak.upgrade()
-                .is_some_and(|s| lock(&s).export(label.as_bytes(), context, out))
-        }))
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for SharedTls<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut *lock(&self.stream)).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for SharedTls<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *lock(&self.stream)).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *lock(&self.stream)).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *lock(&self.stream)).poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *lock(&self.stream)).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        lock(&self.stream).is_write_vectored()
-    }
 }
 
 /// A TLS connector for `wss://` that trusts `roots`, with rustls's ring provider, its
@@ -978,24 +837,24 @@ pub async fn serve_tls(
         options,
         move |conn| {
             let accepted = tls.accept(conn);
-            async move { accepted.await.map(SharedTls::new) }
+            async move { accepted.await.map(TlsConnection::new) }
         },
-        SharedTls::info,
-        SharedTls::exporter,
+        TlsConnection::info,
+        |c| Some(c.binding()),
     )
     .await;
 }
 
 /// [`serve`] with `setup` (a TLS handshake) between the PROXY protocol
 /// header and the upgrade, `info` the metadata of a set-up connection and
-/// `exporter` its exporter for the carrier.
+/// `binding` what its carriers declare.
 async fn serve_over<C, S, SF>(
     listener: Listener,
     tcp: TcpListener,
     options: Options,
     setup: S,
     info: fn(&C) -> CarrierInfo<'_>,
-    exporter: fn(&C) -> Option<Exporter>,
+    binding: fn(&C) -> Option<TlsBinding>,
 ) where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Fn(TcpStream) -> SF + Send + Sync + 'static,
@@ -1019,34 +878,39 @@ async fn serve_over<C, S, SF>(
                 let entry = listener.adapter().enter(peer, Some(source)).ok_or(())?;
                 // A failed handshake or upgrade counts with the entry.
                 let conn = setup(conn).await.map_err(drop)?;
-                let exporter = exporter(&conn);
+                let binding = binding(&conn);
                 let upgraded = accept(conn, entry, info, &listener, options)
                     .await
                     .map_err(drop)?;
-                Ok((upgraded, socket, source, exporter))
+                Ok((upgraded, socket, source, binding))
             }
         }
     };
-    let served = move |l: Listener, (upgraded, socket, source, exporter)| async move {
-        match upgraded {
-            Upgrade::Accepted(io, hint) => {
-                let io = secured(with_socket(io, socket), exporter);
-                let _ = l.handle_pipe(io, hint).await;
+    let served =
+        move |l: Listener, (upgraded, socket, source, binding): (_, _, _, Option<TlsBinding>)| async move {
+            match upgraded {
+                Upgrade::Accepted(io, hint) => {
+                    let io = with_socket(io, socket);
+                    let io = match &binding {
+                        Some(b) => b.apply(io),
+                        None => io,
+                    };
+                    let _ = l.handle_pipe(io, hint).await;
+                }
+                Upgrade::Refused(conn) => match l.limits().fallback {
+                    Some(f) => {
+                        let (conn, prefix) = conn.into_parts();
+                        let conn: Box<dyn zmux::adapter::FallbackStream> = Box::new(conn);
+                        f.serve(Prefixed::new(conn, prefix), source).await;
+                    }
+                    None => {
+                        let mut conn = conn;
+                        let _ = not_found(&mut conn).await;
+                    }
+                },
+                Upgrade::Ended => {}
             }
-            Upgrade::Refused(conn) => match l.limits().fallback {
-                Some(f) => {
-                    let (conn, prefix) = conn.into_parts();
-                    let conn: Box<dyn zmux::adapter::FallbackStream> = Box::new(conn);
-                    f.serve(Prefixed::new(conn, prefix), source).await;
-                }
-                None => {
-                    let mut conn = conn;
-                    let _ = not_found(&mut conn).await;
-                }
-            },
-            Upgrade::Ended => {}
-        }
-    };
+        };
     listener
         .serve_connections(|| async { Some(tcp.accept().await) }, upgrade, served)
         .await;

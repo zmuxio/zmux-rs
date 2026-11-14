@@ -856,7 +856,7 @@ impl Driver for Blocking {
             .name("zmux-join".into())
             .spawn(move || join_thread(s, PipeId(id), carrier, closer.is_some()))
             .map(drop)
-            .map_err(|e| PipeError::Io(std::sync::Arc::new(e)))
+            .map_err(|e| PipeError::Io(Arc::new(e)))
     }
 
     fn start_rejoin(session: handle::WeakSession<Self>, dial: Dial) -> bool {
@@ -1013,7 +1013,7 @@ impl Redialer {
                 // restores could carry.
                 session.begin_add_pipe(io, PipeOptions::new().with_return_on_reply(true))
             }
-            Err(e) => Err(PipeError::Io(std::sync::Arc::new(e))),
+            Err(e) => Err(PipeError::Io(Arc::new(e))),
         };
         match added {
             Ok(p) => {
@@ -2330,7 +2330,7 @@ impl Session {
             }
             let io = redial
                 .dial(super::DialRequest::new(direction))
-                .map_err(|e| PipeError::Io(std::sync::Arc::new(e)))?;
+                .map_err(|e| PipeError::Io(Arc::new(e)))?;
             let limit = Instant::now() + self.add_pipe_limit();
             let p = self.begin_add_pipe(io, opts)?;
             let guard = handle::AbortUnlessAdded(Some(&p));

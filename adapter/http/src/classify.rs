@@ -178,7 +178,7 @@ pub fn forwarded_early_data(headers: &HeaderMap) -> bool {
 }
 
 /// The comma-separated tokens of every `name` field.
-fn tokens(headers: &HeaderMap, name: http::header::HeaderName) -> impl Iterator<Item = &str> {
+fn tokens(headers: &HeaderMap, name: HeaderName) -> impl Iterator<Item = &str> {
     headers
         .get_all(name)
         .into_iter()
@@ -195,7 +195,7 @@ mod tests {
         let mut h = HeaderMap::new();
         for (n, v) in fields {
             h.append(
-                http::header::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                HeaderName::from_bytes(n.as_bytes()).unwrap(),
                 v.parse().unwrap(),
             );
         }

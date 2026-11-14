@@ -65,6 +65,15 @@ error at the other end, never a clean end.
   response lasts as long as the carrier. Once a connection has opened an
   extended CONNECT tunnel, the idle timeout no longer closes it: it ends
   when the tunnel or the peer closes it, or when the TCP connection goes.
+- On TLS this process terminates, given as a `zmux_rustls::TlsConnection`
+  (to `serve_with`'s setup, `Http2Connection::handshake` or
+  `dial_http1_over`), a bidirectional carrier over TLS 1.3 is declared
+  secure with the connection's exporter, shared by the streams of one
+  HTTP/2 connection; a client declares it for an https origin
+  (`Options::https`). A server puts the connection's `TlsBinding` into each
+  request's extensions, where `handle_request` and WebSocket upgrades find
+  it. Split halves, exchange carriers, h2c and TLS ended at an intermediary
+  are not declared.
 - Behind a reverse proxy or CDN: TLS ends at the intermediary, so prefix
   tokens are unbound. A carrier's source, for the listener's per-source
   limits and the admission, is the client that an intermediary the

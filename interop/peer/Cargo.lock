@@ -1826,4 +1826,5 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "zmux",
+ "zmux-rustls",
 ]

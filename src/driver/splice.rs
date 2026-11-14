@@ -22,16 +22,18 @@
 //! that keeps finding data yields after 1 MiB (or 256 steps) in one poll,
 //! so that it holds neither the other direction nor the executor.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 
 use super::handle::Upstream;
+use crate::helpers::capsule::{self, MAX_HEADER, Scanner};
 use crate::proto::limit::Limiter;
 use crate::proto::session::StreamError;
 use crate::proto::{ApplicationErrorCode, VarInt};
@@ -120,9 +122,25 @@ pub struct Forwarded {
     /// Payload bytes of the stream datagrams forwarded. With `bytes`,
     /// exactly what the direction's limiter was charged.
     pub datagram_bytes: u64,
-    /// Stream datagrams not forwarded: refused by the limiter or by the
-    /// downstream session.
+    /// Stream datagrams not forwarded, for any cause: at least
+    /// `datagrams_too_large + datagrams_limited`, and also those the
+    /// downstream stream or session could no longer carry.
     pub datagrams_dropped: u64,
+    /// Stream datagrams not forwarded because they did not fit a datagram
+    /// of the downstream stream (its largest payload, or no datagrams on
+    /// the downstream session). A packet relay ([`splice_packets`]) drops
+    /// one only when its capsule queue is full, or when the direction
+    /// ended (the upstream's FIN or reset included) before the capsule
+    /// was written whole.
+    pub datagrams_too_large: u64,
+    /// Stream datagrams not forwarded because the direction's limiter or
+    /// the downstream session's datagram limiter refused them.
+    pub datagrams_limited: u64,
+    /// Stream datagrams a packet relay forwarded as DATAGRAM capsules on
+    /// the downstream stream because they did not fit a datagram there,
+    /// counted once written whole; counted in `datagram_bytes` too.
+    /// Always 0 for [`splice`].
+    pub datagrams_as_capsules: u64,
     /// How the direction ended.
     pub end: SpliceEnd,
 }
@@ -196,14 +214,63 @@ pub async fn splice(
     b: (SendStream, RecvStream),
     opts: SpliceOptions,
 ) -> Result<Spliced, SpliceError> {
+    splice_with(a, b, opts, false).await
+}
+
+/// [`splice`] for two packet streams (EXTENSIONS.md Section 12): the
+/// relay of [`PacketStream`](crate::helpers::PacketStream)s. Ends,
+/// limiters and results are those of [`splice`]; what differs is how
+/// packets cross:
+///
+/// - the stream bytes are passed through in chunks, as [`splice`] passes
+///   them, while only the capsule headers are parsed, to know where each
+///   capsule ends; capsules of any type, unknown ones included, pass
+///   unchanged, and a capsule above a receiver's bound is the receiver's
+///   to refuse;
+/// - a stream datagram goes on as a datagram when it fits the downstream
+///   stream's datagrams, and otherwise (too large there, or no datagrams
+///   on the downstream session) as a DATAGRAM capsule with the same
+///   Context ID and payload, inserted at the next capsule boundary of the
+///   downstream bytes ([`Forwarded::datagrams_as_capsules`]). Those
+///   waiting for a boundary are bounded (the larger of the chunk and one
+///   largest datagram); beyond it they are dropped as too large. The
+///   direction's limiter must allow the payload when it is queued and is
+///   charged once the capsule was written whole; one the direction never
+///   wrote (it ended first) is dropped as too large and not charged.
+///
+/// A capsule is never turned into a datagram: what was sent reliably stays
+/// reliable.
+pub async fn splice_packets(
+    a: (SendStream, RecvStream),
+    b: (SendStream, RecvStream),
+    opts: SpliceOptions,
+) -> Result<Spliced, SpliceError> {
+    splice_with(a, b, opts, true).await
+}
+
+async fn splice_with(
+    a: (SendStream, RecvStream),
+    b: (SendStream, RecvStream),
+    opts: SpliceOptions,
+    packets: bool,
+) -> Result<Spliced, SpliceError> {
     let (a_send, a_recv) = a;
     let (b_send, b_recv) = b;
     if b_send.same_stream(&a_recv) || a_send.same_stream(&b_recv) {
         return Err(SpliceError::SameStream);
     }
     let chunk = opts.chunk.max(1);
-    let mut ab = Direction::new(&a_recv, &b_send, opts.a_to_b.as_deref(), chunk);
-    let mut ba = Direction::new(&b_recv, &a_send, opts.b_to_a.as_deref(), chunk);
+    // The DATAGRAM capsules waiting for a boundary of each direction (a
+    // packet relay's only).
+    let bound = chunk.max(MAX_HEADER + MAX_DATAGRAM);
+    let (ab_inserts, ba_inserts) = (Mutex::default(), Mutex::default());
+    let (ab_convert, ba_convert) = if packets {
+        (Some(&ab_inserts), Some(&ba_inserts))
+    } else {
+        (None, None)
+    };
+    let mut ab = Direction::new(&a_recv, &b_send, opts.a_to_b.as_deref(), chunk, ab_convert);
+    let mut ba = Direction::new(&b_recv, &a_send, opts.b_to_a.as_deref(), chunk, ba_convert);
     let mut ab_datagrams = Datagrams::default();
     let mut ba_datagrams = Datagrams::default();
     let (ab_end, ba_end) = {
@@ -211,17 +278,27 @@ pub async fn splice(
             &a_recv,
             &b_send,
             opts.a_to_b.as_deref(),
-            &mut ab_datagrams
+            &mut ab_datagrams,
+            ab_convert.map(|q| (q, bound)),
         ));
         let mut dg_ba = pin!(forward_datagrams(
             &b_recv,
             &a_send,
             opts.b_to_a.as_deref(),
-            &mut ba_datagrams
+            &mut ba_datagrams,
+            ba_convert.map(|q| (q, bound)),
         ));
         let (mut dg_ab_done, mut dg_ba_done) = (false, false);
         let (mut ab_end, mut ba_end) = (None, None);
         poll_fn(|cx| {
+            // Datagrams first: a capsule they queued is written by the
+            // direction in the same poll.
+            if !dg_ab_done {
+                dg_ab_done = dg_ab.as_mut().poll(cx).is_ready();
+            }
+            if !dg_ba_done {
+                dg_ba_done = dg_ba.as_mut().poll(cx).is_ready();
+            }
             if ab_end.is_none()
                 && let Poll::Ready(end) = ab.poll(cx)
             {
@@ -232,12 +309,6 @@ pub async fn splice(
             {
                 ba_end = Some(end);
             }
-            if !dg_ab_done {
-                dg_ab_done = dg_ab.as_mut().poll(cx).is_ready();
-            }
-            if !dg_ba_done {
-                dg_ba_done = dg_ba.as_mut().poll(cx).is_ready();
-            }
             match (ab_end, ba_end) {
                 (Some(x), Some(y)) => Poll::Ready((x, y)),
                 _ => Poll::Pending,
@@ -246,8 +317,8 @@ pub async fn splice(
         .await
     };
     Ok(Spliced {
-        a_to_b: ab_datagrams.result(ab.bytes, ab_end),
-        b_to_a: ba_datagrams.result(ba.bytes, ba_end),
+        a_to_b: ab_datagrams.result(ab.bytes, ab_end, &lock(&ab_inserts)),
+        b_to_a: ba_datagrams.result(ba.bytes, ba_end, &lock(&ba_inserts)),
     })
 }
 
@@ -273,31 +344,84 @@ fn charge(limiter: Option<&dyn Limiter>, n: usize) {
     }
 }
 
+/// The largest datagram payload a session carries.
+const MAX_DATAGRAM: usize = crate::proto::params::ZMUX_MAX_RECORD_SIZE as usize;
+
 /// The datagrams of one direction.
 #[derive(Default)]
 struct Datagrams {
     bytes: u64,
     dropped: u64,
+    too_large: u64,
+    limited: u64,
 }
 
 impl Datagrams {
-    fn result(&self, bytes: u64, end: SpliceEnd) -> Forwarded {
+    /// With what the direction wrote of the capsules queued in `inserts`.
+    fn result(&self, bytes: u64, end: SpliceEnd, inserts: &Inserts) -> Forwarded {
         Forwarded {
             bytes,
-            datagram_bytes: self.bytes,
-            datagrams_dropped: self.dropped,
+            datagram_bytes: self.bytes + inserts.sent_bytes,
+            datagrams_dropped: self.dropped + inserts.unsent,
+            datagrams_too_large: self.too_large + inserts.unsent,
+            datagrams_limited: self.limited,
+            datagrams_as_capsules: inserts.sent,
             end,
         }
     }
+
+    fn forwarded(&mut self, limiter: Option<&dyn Limiter>, len: usize) {
+        charge(limiter, len);
+        self.bytes += len as u64;
+    }
+}
+
+/// DATAGRAM capsules of a packet relay's direction waiting for a capsule
+/// boundary of the downstream bytes: each a header and a payload.
+#[derive(Default)]
+struct Inserts {
+    queue: VecDeque<(Bytes, Bytes)>,
+    bytes: usize,
+    /// The direction ended, or its upstream did (a FIN or a reset):
+    /// nothing more is queued.
+    closed: bool,
+    /// Capsules written whole, and their payload bytes (charged to the
+    /// direction's limiter as they were written).
+    sent: u64,
+    sent_bytes: u64,
+    /// Capsules queued and never written whole.
+    unsent: u64,
+}
+
+impl Inserts {
+    /// Queues a capsule unless the direction ended or `bound` bytes wait.
+    fn push(&mut self, context: u64, payload: Bytes, bound: usize) -> bool {
+        let mut h = [0; MAX_HEADER];
+        let n = capsule::datagram_header(context, payload.len(), &mut h);
+        let size = n + payload.len();
+        if self.closed || (!self.queue.is_empty() && self.bytes + size > bound) {
+            return false;
+        }
+        self.bytes += size;
+        self.queue
+            .push_back((Bytes::copy_from_slice(&h[..n]), payload));
+        true
+    }
+}
+
+fn lock(m: &Mutex<Inserts>) -> MutexGuard<'_, Inserts> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Forwards the stream datagrams of `r` to `w` until `r` can carry no more
-/// (or the splice ends and drops this).
+/// (or the splice ends and drops this); with `convert`, one that does not
+/// fit a datagram of `w` is queued as a DATAGRAM capsule.
 async fn forward_datagrams(
     r: &RecvStream,
     w: &SendStream,
     limiter: Option<&dyn Limiter>,
     count: &mut Datagrams,
+    convert: Option<(&Mutex<Inserts>, usize)>,
 ) {
     while let Ok(crate::StreamDatagram {
         context,
@@ -310,16 +434,40 @@ async fn forward_datagrams(
             && allowance(l, len) < len
         {
             count.dropped += 1;
+            count.limited += 1;
             continue;
         }
-        match w.send_datagram(context, data) {
-            Ok(()) => {
-                charge(limiter, len);
-                count.bytes += len as u64;
+        match w.try_send_datagram(context, data.clone()) {
+            Ok(true) => count.forwarded(limiter, len),
+            Ok(false) => {
+                count.dropped += 1;
+                count.limited += 1;
+            }
+            Err(crate::DatagramError::TooLarge { .. } | crate::DatagramError::NotNegotiated) => {
+                match convert {
+                    // Counted, and charged, once the direction wrote it.
+                    Some((q, bound)) if lock(q).push(context, data, bound) => {}
+                    _ => {
+                        count.dropped += 1;
+                        count.too_large += 1;
+                    }
+                }
             }
             Err(_) => count.dropped += 1,
         }
     }
+}
+
+/// A packet relay's view of a direction's downstream bytes.
+struct Framing<'a> {
+    scan: Scanner,
+    inserts: &'a Mutex<Inserts>,
+    /// Bytes read from `r` past the boundary where a capsule waits.
+    unscanned: Option<Bytes>,
+    /// The payload of the capsule being inserted, after its header.
+    tail: Option<Bytes>,
+    /// The payload length of the capsule being inserted.
+    insert_len: usize,
 }
 
 /// Where a direction is.
@@ -350,6 +498,9 @@ struct Direction<'a> {
     chunk: usize,
     /// A chunk read from `r` that `w` has not taken whole.
     held: Option<Bytes>,
+    /// `held` is part of an inserted capsule, not of `r`'s bytes.
+    held_insert: bool,
+    framing: Option<Framing<'a>>,
     /// Bytes `w` took.
     bytes: u64,
     phase: Phase,
@@ -361,6 +512,7 @@ impl<'a> Direction<'a> {
         w: &'a SendStream,
         limiter: Option<&'a dyn Limiter>,
         chunk: usize,
+        inserts: Option<&'a Mutex<Inserts>>,
     ) -> Self {
         Self {
             r,
@@ -368,6 +520,14 @@ impl<'a> Direction<'a> {
             limiter,
             chunk,
             held: None,
+            held_insert: false,
+            framing: inserts.map(|inserts| Framing {
+                scan: Scanner::default(),
+                inserts,
+                unscanned: None,
+                tail: None,
+                insert_len: 0,
+            }),
             bytes: 0,
             phase: Phase::Run,
         }
@@ -385,6 +545,15 @@ impl<'a> Direction<'a> {
                 Phase::Done(end) => {
                     // Whatever was read and not forwarded is released now.
                     self.held = None;
+                    if let Some(f) = self.framing.take() {
+                        let mut q = lock(f.inserts);
+                        q.closed = true;
+                        // A capsule cut short was not delivered either.
+                        let cut = u64::from(self.held_insert || f.tail.is_some());
+                        q.unsent += q.queue.len() as u64 + cut;
+                        q.queue.clear();
+                    }
+                    self.held_insert = false;
                     return Poll::Ready(end);
                 }
             };
@@ -410,6 +579,9 @@ impl<'a> Direction<'a> {
             if self.watch_upstream(waker) {
                 return Poll::Ready(());
             }
+            return self.write_held(waker);
+        }
+        if self.load_framed() {
             return self.write_held(waker);
         }
         // One critical section: a reset, acted on before the data below
@@ -456,7 +628,7 @@ impl<'a> Direction<'a> {
         };
         match self.r.poll_take_chunk(waker, allowed) {
             Poll::Ready(Ok(Some(chunk))) => {
-                self.held = Some(chunk);
+                self.hold(chunk);
                 // Handed to `w` at once: `r` stays registered for its
                 // next event while `w` takes the chunk.
                 self.write_held(waker)
@@ -471,6 +643,51 @@ impl<'a> Direction<'a> {
         }
     }
 
+    /// Takes a chunk read from `r` in hand: with framing, up to the first
+    /// capsule boundary while a capsule waits for one.
+    fn hold(&mut self, mut chunk: Bytes) {
+        self.held_insert = false;
+        if let Some(f) = &mut self.framing {
+            let waiting = !lock(f.inserts).queue.is_empty();
+            let n = f.scan.scan(&chunk, waiting);
+            if n < chunk.len() {
+                f.unscanned = Some(chunk.split_off(n));
+            }
+        }
+        self.held = Some(chunk);
+    }
+
+    /// With framing and nothing in hand: takes the next thing to write in
+    /// hand (the rest of an inserted capsule, a capsule waiting for the
+    /// boundary reached, the bytes read past it); whether there was one.
+    fn load_framed(&mut self) -> bool {
+        let Some(f) = &mut self.framing else {
+            return false;
+        };
+        if let Some(tail) = f.tail.take() {
+            self.held = Some(tail);
+            self.held_insert = true;
+            return true;
+        }
+        if f.scan.at_boundary() {
+            let mut q = lock(f.inserts);
+            if let Some((header, payload)) = q.queue.pop_front() {
+                q.bytes -= header.len() + payload.len();
+                drop(q);
+                f.insert_len = payload.len();
+                f.tail = (!payload.is_empty()).then_some(payload);
+                self.held = Some(header);
+                self.held_insert = true;
+                return true;
+            }
+        }
+        if let Some(rest) = f.unscanned.take() {
+            self.hold(rest);
+            return true;
+        }
+        false
+    }
+
     /// Hands the chunk in hand to `w`; `Pending` (the writer registered)
     /// while `w` takes nothing.
     fn write_held(&mut self, waker: &Waker) -> Poll<()> {
@@ -482,7 +699,20 @@ impl<'a> Direction<'a> {
                 if held.is_empty() {
                     self.held = None;
                 }
-                self.took(n);
+                if !self.held_insert {
+                    self.took(n);
+                } else if self.held.is_none() {
+                    self.held_insert = false;
+                    if let Some(f) = &self.framing
+                        && f.tail.is_none()
+                    {
+                        // The inserted capsule was written whole.
+                        charge(self.limiter, f.insert_len);
+                        let mut q = lock(f.inserts);
+                        q.sent += 1;
+                        q.sent_bytes += f.insert_len as u64;
+                    }
+                }
             }
             Poll::Ready(Err(e)) => self.downstream_failed(e),
             Poll::Pending => return Poll::Pending,
@@ -526,6 +756,7 @@ impl<'a> Direction<'a> {
 
     /// The FIN was read: consume it and finish `w`.
     fn forward_fin(&mut self, waker: &Waker) {
+        self.close_inserts();
         // Reads the end (nothing is left before it).
         let _ = self.r.poll_read_chunk(waker, 1);
         match self.w.finish_shared() {
@@ -539,7 +770,15 @@ impl<'a> Direction<'a> {
     /// `r` was reset with `code` and Reliable Size `reliable` (in
     /// application bytes).
     fn on_reset(&mut self, code: VarInt, reliable: u64) {
+        self.close_inserts();
         self.phase = Phase::Reliable { code, reliable };
+    }
+
+    /// No more capsules are queued: they would never be written.
+    fn close_inserts(&mut self) {
+        if let Some(f) = &self.framing {
+            lock(f.inserts).closed = true;
+        }
     }
 
     /// Forwards the bytes below the Reliable Size as `w`'s credit allows
@@ -548,6 +787,21 @@ impl<'a> Direction<'a> {
     /// left to forward, at once. The wait for credit ends early only when
     /// `w` ends.
     fn reliable(&mut self, waker: &Waker, code: VarInt, reliable: u64) -> Poll<()> {
+        // An inserted capsule is completed, so that the bytes delivered stay
+        // whole capsules; none is started.
+        if self.held.is_some() && self.held_insert {
+            return self.write_held(waker);
+        }
+        if let Some(f) = &mut self.framing {
+            if let Some(tail) = f.tail.take() {
+                self.held = Some(tail);
+                self.held_insert = true;
+                return self.write_held(waker);
+            }
+            if self.held.is_none() {
+                self.held = f.unscanned.take();
+            }
+        }
         if self.bytes < reliable {
             let need = usize::try_from(reliable - self.bytes).unwrap_or(usize::MAX);
             if let Some(held) = &mut self.held {

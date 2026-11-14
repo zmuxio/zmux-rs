@@ -1,0 +1,301 @@
+{
+ "spec": "EXTENSIONS.md Section 12",
+ "format": [
+  "Each case is the byte sequence of one direction of a packet stream (\"hex\"), a sequence of RFC 9297 capsules: Type (i), Length (i), Value.",
+  "A consumer decodes \"hex\" from the start with a receive bound of \"max_payload\" payload bytes, as if the bytes were followed by the end of the stream (FIN).",
+  "Type 0x00 is DATAGRAM: its Value is Context ID (i) followed by the payload; each yields one entry of \"packets\" ({context, payload hex}), in order.",
+  "A capsule of any other type is skipped; \"skipped\" counts them.",
+  "\"error\" is null when the bytes decode cleanly to the end. Otherwise it is \"oversized\" or \"truncated\" and the packets listed are those decoded before the error; a receiver answers either with ZMUX_PACKET_ERROR (RESET_STREAM and STOP_SENDING).",
+  "oversized: a Length above max_payload + 8 (any type), detected as soon as the Length is read, or a DATAGRAM whose payload (Value minus Context ID) exceeds max_payload.",
+  "truncated: the bytes end inside a capsule (in Type, Length or Value), or a DATAGRAM Value ends inside its Context ID.",
+  "\"encode\" true means \"hex\" is also the canonical encoding (minimal varints, no other capsules) of \"packets\": a sender that writes these packets as capsules produces exactly these bytes."
+ ],
+ "cases": [
+  {
+   "id": "datagram-context-0",
+   "note": "one packet, Context ID 0",
+   "max_payload": 65535,
+   "hex": "00060068656c6c6f",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "68656c6c6f"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "datagram-context-nonzero",
+   "note": "Context ID 37 (1-byte varint) and 0x1234 (2-byte)",
+   "max_payload": 65535,
+   "hex": "000325010200035234ff",
+   "packets": [
+    {
+     "context": 37,
+     "payload": "0102"
+    },
+    {
+     "context": 4660,
+     "payload": "ff"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "datagram-context-large",
+   "note": "Context ID 2^62-1 (8-byte varint)",
+   "max_payload": 65535,
+   "hex": "0009ffffffffffffffff78",
+   "packets": [
+    {
+     "context": 4611686018427387903,
+     "payload": "78"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "datagram-empty",
+   "note": "empty payload: Value is the Context ID alone",
+   "max_payload": 65535,
+   "hex": "000100",
+   "packets": [
+    {
+     "context": 0,
+     "payload": ""
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "datagram-length-2byte",
+   "note": "payload of 100 bytes: 2-byte Length",
+   "max_payload": 65535,
+   "hex": "00406500000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "sequence",
+   "note": "three packets in order",
+   "max_payload": 65535,
+   "hex": "000200610003016263000100",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    },
+    {
+     "context": 1,
+     "payload": "6263"
+    },
+    {
+     "context": 0,
+     "payload": ""
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "empty-stream",
+   "note": "no capsule at all",
+   "max_payload": 65535,
+   "hex": "",
+   "packets": [],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "unknown-type-skipped",
+   "note": "an unknown type (0x29) between two packets is skipped",
+   "max_payload": 65535,
+   "hex": "00020061290769676e6f72656400020062",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    },
+    {
+     "context": 0,
+     "payload": "62"
+    }
+   ],
+   "skipped": 1,
+   "error": null,
+   "encode": false
+  },
+  {
+   "id": "unknown-type-2byte",
+   "note": "unknown type with a 2-byte Type and empty Value",
+   "max_payload": 65535,
+   "hex": "80004321000002057a",
+   "packets": [
+    {
+     "context": 5,
+     "payload": "7a"
+    }
+   ],
+   "skipped": 1,
+   "error": null,
+   "encode": false
+  },
+  {
+   "id": "non-minimal-length",
+   "note": "Length in a non-minimal 2-byte varint is accepted",
+   "max_payload": 65535,
+   "hex": "004003006f6b",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "6f6b"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": false
+  },
+  {
+   "id": "at-bound",
+   "note": "payload exactly max_payload (16)",
+   "max_payload": 16,
+   "hex": "00110300000000000000000000000000000000",
+   "packets": [
+    {
+     "context": 3,
+     "payload": "00000000000000000000000000000000"
+    }
+   ],
+   "skipped": 0,
+   "error": null,
+   "encode": true
+  },
+  {
+   "id": "truncated-in-type",
+   "note": "stream ends inside a 2-byte Type",
+   "max_payload": 65535,
+   "hex": "0002006140",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    }
+   ],
+   "skipped": 0,
+   "error": "truncated",
+   "encode": false
+  },
+  {
+   "id": "truncated-in-length",
+   "note": "stream ends after the Type",
+   "max_payload": 65535,
+   "hex": "0002006100",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    }
+   ],
+   "skipped": 0,
+   "error": "truncated",
+   "encode": false
+  },
+  {
+   "id": "truncated-in-value",
+   "note": "Length 6, 3 bytes of Value",
+   "max_payload": 65535,
+   "hex": "000600616263",
+   "packets": [],
+   "skipped": 0,
+   "error": "truncated",
+   "encode": false
+  },
+  {
+   "id": "truncated-context",
+   "note": "DATAGRAM Value of 1 byte that starts a 2-byte Context ID",
+   "max_payload": 65535,
+   "hex": "000140",
+   "packets": [],
+   "skipped": 0,
+   "error": "truncated",
+   "encode": false
+  },
+  {
+   "id": "truncated-empty-value",
+   "note": "DATAGRAM with Length 0 has no Context ID",
+   "max_payload": 65535,
+   "hex": "0000",
+   "packets": [],
+   "skipped": 0,
+   "error": "truncated",
+   "encode": false
+  },
+  {
+   "id": "oversized-payload",
+   "note": "payload 17 bytes above max_payload 16",
+   "max_payload": 16,
+   "hex": "000200610012000000000000000000000000000000000000",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    }
+   ],
+   "skipped": 0,
+   "error": "oversized",
+   "encode": false
+  },
+  {
+   "id": "oversized-length",
+   "note": "Length 25 above max_payload 16 + 8, value never sent",
+   "max_payload": 16,
+   "hex": "000200610019",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    }
+   ],
+   "skipped": 0,
+   "error": "oversized",
+   "encode": false
+  },
+  {
+   "id": "oversized-unknown-type",
+   "note": "the bound applies to skipped types too",
+   "max_payload": 16,
+   "hex": "291900000000000000000000000000000000000000000000000000",
+   "packets": [],
+   "skipped": 0,
+   "error": "oversized",
+   "encode": false
+  },
+  {
+   "id": "oversized-default",
+   "note": "Length 65544 above the default bound 65535 + 8",
+   "max_payload": 65535,
+   "hex": "0080010008",
+   "packets": [],
+   "skipped": 0,
+   "error": "oversized",
+   "encode": false
+  }
+ ]
+}

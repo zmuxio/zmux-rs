@@ -83,7 +83,7 @@ impl Params {
 
     /// The time `bytes` take at `rate`.
     fn at(bytes: u64, rate: u64) -> Duration {
-        Duration::from_secs_f64(bytes as f64 / rate.max(1) as f64)
+        crate::util::drain_time(bytes, rate)
     }
 }
 
@@ -993,7 +993,7 @@ mod tests {
         lim.refresh(t, 0, &est, &p);
         assert!(lim.held());
         let release = lim.release().unwrap();
-        assert!(release == t + GRANULARITY, "{:?}", release - t);
+        assert_eq!(release, t + GRANULARITY, "{:?}", release - t);
         // A slow pipe with room under its cap: the quantum is two chunks.
         let mut est = Estimator::new(10 * MS, now);
         est.rate_sample(100_000, false, now);

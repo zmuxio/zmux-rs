@@ -117,6 +117,10 @@ codes! {
     /// relayed stream whose other side was lost. Data already delivered
     /// stands; the stream is not safe to retry blindly.
     ZMUX_CARRIER_FAILED = 0x5a4d_0003, None;
+    /// The bytes of a packet stream were malformed: a capsule above the
+    /// receiver's bound, or the stream ended inside a capsule
+    /// (EXTENSIONS.md Section 12).
+    ZMUX_PACKET_ERROR = 0x5a4d_0004, None;
     /// Proxy open failure: general failure.
     ZMUX_PROXY_GENERAL_FAILURE = 0x5a4d_0101, Some(0x01);
     /// Proxy open failure: not allowed by ruleset.

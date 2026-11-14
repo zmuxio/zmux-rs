@@ -23,7 +23,9 @@ use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::body::{self, BodyReader, PipeBody, ReplayBody};
 use crate::classify::{RequestClass, classify, forwarded_early_data};
+use crate::tls::binding_of;
 use crate::{ExchangeServer, Options, PairField};
+use zmux_rustls::TlsBinding;
 
 /// A request [`handle_request`] did not hand to the listener.
 #[derive(Debug)]
@@ -174,7 +176,9 @@ fn carrier_response(
 /// intermediary reports in a forwarding header field on top
 /// ([`request_source`]); `conn` the
 /// identity of an HTTP/2 connection whose requests are carriers (one
-/// value per connection), `None` for HTTP/1.1. Must be called inside a
+/// value per connection), `None` for HTTP/1.1. A bidirectional carrier
+/// declares the [`zmux_rustls::TlsBinding`] in the request's extensions,
+/// that of the TLS connection it arrived on. Must be called inside a
 /// tokio runtime; the carrier runs in a task of its own.
 ///
 /// The carrier takes its source slot first ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)):
@@ -213,6 +217,7 @@ where
 {
     let (parts, body) = req.into_parts();
     let version = parts.version;
+    let binding = parts.extensions.get::<TlsBinding>().cloned();
     let class = match classify(&parts, pair) {
         Some(c @ (RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)) => {
             c
@@ -269,11 +274,15 @@ where
                     PipeIo::chunk_writer(writer).with_carrier(zmux::CarrierKind::Split),
                     None,
                 ),
-                _ => (
-                    PipeIo::from_chunk_halves(reader, writer)
-                        .with_carrier(zmux::CarrierKind::Streaming),
-                    None,
-                ),
+                _ => {
+                    let io = PipeIo::from_chunk_halves(reader, writer)
+                        .with_carrier(zmux::CarrierKind::Streaming);
+                    let io = match &binding {
+                        Some(b) => b.apply(io),
+                        None => io,
+                    };
+                    (io, None)
+                }
             };
             let io = io.with_abort(move || abort.run());
             let io = match conn {
@@ -441,7 +450,10 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
 /// zmux_http::serve_with(
 ///     listener,
 ///     || tcp.accept(),
-///     move |conn, _| tls.accept(conn),
+///     move |conn, _| {
+///         let accepted = tls.accept(conn);
+///         async move { accepted.await.map(zmux_rustls::TlsConnection::new) }
+///     },
 ///     zmux_http::Options::default(),
 /// )
 /// .await;
@@ -560,7 +572,9 @@ pub async fn serve_proxied_with<T, IO, A, AF, F, SF, H, HF>(
 /// response in progress (a carrier's response lasts as long as the
 /// carrier), on both versions. `peer` is the client's address (or the
 /// client a PROXY protocol header reported); a trusted intermediary's
-/// forwarding header field is applied on top ([`request_source`]).
+/// forwarding header field is applied on top ([`request_source`]). A
+/// [`zmux_rustls::TlsConnection`] as `io` adds its binding to the
+/// extensions of each request.
 pub async fn serve_connection<IO>(
     listener: &Listener,
     io: IO,
@@ -600,10 +614,14 @@ pub async fn serve_connection_with<IO, H, HF>(
     // The connection's identity for the requests of HTTP/2.
     let tag = Arc::new(ConnTag);
     let conn = CarrierConnId::new(&tag);
+    let binding = binding_of(&io);
     let used = Arc::new(AtomicBool::new(false));
     let activity = Arc::new(Activity::new());
     let (seen, l, act) = (used.clone(), listener.clone(), activity.clone());
-    let service = service_fn(move |req: Request<Incoming>| {
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        if let Some(b) = &binding {
+            req.extensions_mut().insert(b.clone());
+        }
         let (seen, l, fallback, route, conn) = (
             seen.clone(),
             l.clone(),

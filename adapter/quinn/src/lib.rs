@@ -576,9 +576,7 @@ pub async fn connect_with_report(
                     // is a 1-RTT one and nothing goes as 0-RTT data. Rewriting after a
                     // rejection would start the session a second time on another stream.
                     let pipe = carrier.inner.pipe(Send::new(send), Recv::new(recv));
-                    let wait = config.handshake_wait();
-                    let session = Session::connect(pipe, config).await?;
-                    remember(&session, memory, server_name, wait);
+                    let session = establish(pipe, config, memory, server_name).await?;
                     return Ok((session, ZeroRtt::default()));
                 }
                 let retry = Arc::new(Retry::default());
@@ -610,9 +608,7 @@ pub async fn connect_with_report(
                         }
                         Ok(())
                     });
-                let wait = config.handshake_wait();
-                let session = Session::connect(pipe, config).await?;
-                remember(&session, memory, server_name, wait);
+                let session = establish(pipe, config, memory, server_name).await?;
                 return Ok((session, report));
             }
             Err(c) => connecting = c,
@@ -620,10 +616,22 @@ pub async fn connect_with_report(
     }
     let conn = connecting.await.map_err(|e| io_err(io::Error::other(e)))?;
     let pipe = first_pipe(conn, options).await.map_err(io_err)?;
+    let session = establish(pipe, config, memory, server_name).await?;
+    Ok((session, ZeroRtt::default()))
+}
+
+/// The session over `pipe`, its server's parameters kept in `memory` once
+/// it has them ([`remember`]).
+async fn establish(
+    pipe: PipeIo,
+    config: Arc<zmux::Config>,
+    memory: Option<ParameterMemory>,
+    server_name: &str,
+) -> Result<Session, ConnectError> {
     let wait = config.handshake_wait();
     let session = Session::connect(pipe, config).await?;
     remember(&session, memory, server_name, wait);
-    Ok((session, ZeroRtt::default()))
+    Ok(session)
 }
 
 /// Keeps the server's parameters once the session has them (at once when

@@ -37,6 +37,13 @@
 //!   write `<text>`, FIN, read the answer and reply `opened=<answer>`;
 //! - `open-uni:<text>`: open a unidirectional stream carrying `<text>`;
 //! - `dgram`: echo the stream's datagrams (context + 1) until FIN;
+//! - `packets[:stream]`: a packet stream (EXTENSIONS.md Section 12) that
+//!   echoes every packet with its Context ID until FIN, then FIN; `stream`
+//!   sends the echoes as capsules only, else datagrams are preferred; the
+//!   packet bound is 1 MiB;
+//! - `packets-bad`: write a truncated DATAGRAM capsule and FIN, read until
+//!   the peer's reset and report its code on a new unidirectional stream as
+//!   `packet-error=<code>`;
 //! - `goaway:<code>`: start a graceful shutdown with `code`; reply `draining`;
 //! - `early`: reply `early=<data>;replayable=<bool>`;
 //! - `close:<code>:<reason>`: consume FIN, then close without a stream reply
@@ -57,6 +64,7 @@ use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zmux::helpers::{PacketOptions, PacketStream, SendPolicy};
 use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Preamble, RecvStream, SendStream,
@@ -865,6 +873,48 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             }
             let _ = recv.read_to_end(1 << 20).await;
             reply(&mut send, "dgram-done").await;
+        }
+        "packets" => {
+            let policy = if arg == "stream" {
+                SendPolicy::StreamOnly
+            } else {
+                SendPolicy::PreferDatagram
+            };
+            let mut opts = PacketOptions::with_policy(policy);
+            opts.max_packet = 1 << 20;
+            let mut ps = PacketStream::with_options(send, recv, opts);
+            loop {
+                match ps.recv().await {
+                    Ok(Some(p)) => {
+                        if ps.send_with_context(p.context, p.payload).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    // Malformed bytes reset and stop the stream themselves.
+                    Err(_) => return,
+                }
+            }
+            let _ = ps.close().await;
+        }
+        "packets-bad" => {
+            // Type 0, Length 10, Context ID 0 and one byte of the payload.
+            let _ = send.write_all(&[0x00, 0x0a, 0x00, 0xab]).await;
+            let _ = send.finish();
+            let mut buf = vec![0u8; 4096];
+            let text = loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break "packet-error=fin".to_string(),
+                    Err(StreamError::Reset { code, .. }) => break format!("packet-error={code}"),
+                    Err(e) => break format!("packet-error={e}"),
+                }
+            };
+            if let Ok(mut s2) = session.open_uni().await {
+                let _ = s2.write_all(text.as_bytes()).await;
+                let _ = s2.finish();
+                let _ = s2.stopped().await;
+            }
         }
         "schedule" => {
             assert_eq!(arg, "round-robin", "unknown scheduler");

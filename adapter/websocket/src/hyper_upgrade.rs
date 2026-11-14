@@ -108,7 +108,11 @@ fn has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
 /// [`CarrierInfo::head`] are set here. Nothing is answered before the
 /// decision; a stall waits for its duration and ends the request. The
 /// hint carries the entry. No TCP
-/// socket is known: a pipe that zmux fails ends with a Close frame.
+/// socket is known: a pipe that zmux fails ends with a Close frame. A
+/// request whose extensions hold the [`zmux_rustls::TlsBinding`] of the
+/// TLS connection it arrived on (the HTTP adapter's servers add it for a
+/// [`zmux_rustls::TlsConnection`]), an HTTP/1.1 Upgrade or an extended
+/// `CONNECT` on an HTTP/2 stream, has a carrier that declares that binding.
 ///
 /// [`accept`]: crate::accept
 pub async fn accept_request<B, I>(
@@ -192,6 +196,7 @@ where
         h.insert(PROTOCOL_HEADER, p);
     }
     let hint = PipeHint::from_entry(entry);
+    let binding = parts.extensions.get::<zmux_rustls::TlsBinding>().cloned();
     let l = listener.clone();
     let carrier = Box::pin(async move {
         let upgraded = on_upgrade.await.map_err(|e| {
@@ -205,7 +210,12 @@ where
             Some(ws_config()),
         )
         .await;
-        Ok((pipe(ws, protocol), hint))
+        let io = pipe(ws, protocol);
+        let io = match &binding {
+            Some(b) => b.apply(io),
+            None => io,
+        };
+        Ok((io, hint))
     });
     RequestUpgrade::Accepted { response, carrier }
 }
