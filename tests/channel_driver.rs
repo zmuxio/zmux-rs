@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use zmux::carrier::{ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel};
+use zmux::adapter::{ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel};
 use zmux::{Config, PipeIo, Session};
 
 /// One end's channel: what it sends goes to the peer's demux.

@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use zmux::{Config, EarlyData, PipeIo, Session};

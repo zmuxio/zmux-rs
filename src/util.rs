@@ -1,5 +1,5 @@
-//! Small primitives zmux uses, shared with its adapters: HMAC-SHA256
-//! with a prepared key, hex encoding and a random `u64`.
+//! Small primitives zmux uses: HMAC-SHA256 with a prepared key and a
+//! random `u64`.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -7,7 +7,7 @@ use sha2::Sha256;
 /// HMAC-SHA256 under one key, prepared once: each MAC starts from the
 /// keyed state. Cheap to clone.
 #[derive(Clone)]
-pub struct HmacSha256(Hmac<Sha256>);
+pub(crate) struct HmacSha256(Hmac<Sha256>);
 
 impl std::fmt::Debug for HmacSha256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -17,7 +17,7 @@ impl std::fmt::Debug for HmacSha256 {
 
 impl HmacSha256 {
     /// The key `key` (any length).
-    pub fn new(key: &[u8]) -> Self {
+    pub(crate) fn new(key: &[u8]) -> Self {
         Self(Hmac::new_from_slice(key).expect("HMAC takes any key length"))
     }
 
@@ -30,35 +30,20 @@ impl HmacSha256 {
     }
 
     /// The MAC of the concatenation of `parts`.
-    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+    pub(crate) fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
         self.update(parts).finalize().into_bytes().into()
     }
 
     /// Whether `tag` is the MAC of the concatenation of `parts`, or its
     /// first `tag.len()` bytes (1 to 32), compared in constant time.
-    pub fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
+    pub(crate) fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
         self.update(parts).verify_truncated_left(tag).is_ok()
     }
 }
 
-/// `bytes` in lowercase hex.
-///
-/// ```
-/// assert_eq!(zmux::util::hex(&[0x0f, 0xa0]), "0fa0");
-/// ```
-pub fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from(DIGITS[usize::from(b >> 4)]));
-        s.push(char::from(DIGITS[usize::from(b & 0x0f)]));
-    }
-    s
-}
-
 /// A random `u64` from the system's source; should that fail, from a
 /// process-local randomly seeded one.
-pub fn random_u64() -> u64 {
+pub(crate) fn random_u64() -> u64 {
     getrandom::u64().unwrap_or_else(|_| {
         use std::hash::BuildHasher;
         std::collections::hash_map::RandomState::new().hash_one(0x5a4d_u64)

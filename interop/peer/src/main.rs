@@ -57,9 +57,10 @@ use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zmux::sched::Scheduler;
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Policy, Preamble, RecvStream,
-    SendStream, Session, StreamError, VarInt,
+    Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Preamble, RecvStream, SendStream,
+    Session, StreamError, VarInt,
 };
 
 fn config(multipath: bool) -> Config {
@@ -128,14 +129,14 @@ async fn run() {
             let listener = TcpListener::bind(addr).await.expect("bind");
             println!("LISTEN {}", listener.local_addr().expect("addr"));
             let (tcp, _) = listener.accept().await.expect("accept");
-            Session::accept(zmux::PipeIo::tcp(tcp), config(false))
+            Session::accept(zmux::PipeIo::from_tcp(tcp), config(false))
                 .await
                 .expect("establish")
         }
         "client" => {
             let addr = args.get(2).expect("address");
             let tcp = TcpStream::connect(addr).await.expect("connect");
-            Session::connect(zmux::PipeIo::tcp(tcp), config(false))
+            Session::connect(zmux::PipeIo::from_tcp(tcp), config(false))
                 .await
                 .expect("establish")
         }
@@ -154,13 +155,13 @@ async fn run() {
         "mp-client" => {
             let addr = args.get(2).expect("address");
             let tcp = TcpStream::connect(addr).await.expect("connect");
-            let session = Session::connect(zmux::PipeIo::tcp(tcp), config(true))
+            let session = Session::connect(zmux::PipeIo::from_tcp(tcp), config(true))
                 .await
                 .expect("establish");
             let joined = TcpStream::connect(addr).await.expect("connect joined pipe");
             let pipe = session
                 .begin_add_pipe(
-                    zmux::PipeIo::tcp(joined),
+                    zmux::PipeIo::from_tcp(joined),
                     PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Trusted),
                 )
                 .expect("add pipe");
@@ -456,7 +457,7 @@ async fn seal_client(addr: &str, profile: u64) -> Session {
         cfg.psk = k.psk;
     }
     let tcp = TcpStream::connect(addr).await.expect("connect");
-    let (p, peer) = zmux_seal::establish(zmux::PipeIo::tcp(tcp), &cfg)
+    let (p, peer) = zmux_seal::establish(zmux::PipeIo::from_tcp(tcp), &cfg)
         .await
         .expect("seal establish");
     println!("PROFILE {}", peer.profile);
@@ -758,7 +759,7 @@ async fn serve(session: Session) {
     // `wait` resolves once the session ended entirely (CONNECTION_CLOSE
     // written, the carriers half-closed and drained): exiting earlier could
     // reset a carrier before the peer read CONNECTION_CLOSE.
-    let reason = session.wait().await;
+    let reason = session.closed().await;
     println!("CLOSED {reason}");
 }
 
@@ -854,8 +855,8 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let n: u64 = arg.parse().unwrap_or(1);
             for _ in 0..n {
                 match recv.read_datagram().await {
-                    Ok((ctx, d)) => {
-                        if send.send_datagram(ctx + 1, d).is_err() {
+                    Ok(d) => {
+                        if send.send_datagram(d.context + 1, d.payload).is_err() {
                             break;
                         }
                     }
@@ -867,7 +868,7 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
         }
         "schedule" => {
             assert_eq!(arg, "round-robin", "unknown scheduler");
-            session.set_scheduler(Policy::SpreadRoundRobin);
+            session.set_scheduler(Scheduler::SpreadRoundRobin);
             reply(&mut send, "scheduled").await;
         }
         "drop-bootstrap" => {

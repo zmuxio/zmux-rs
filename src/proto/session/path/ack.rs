@@ -144,12 +144,15 @@ impl SessionCore {
     /// `self.rx`.
     pub(in crate::proto::session) fn mp_record_end(&mut self, len: u64, now: Instant) {
         let (id, li) = (self.rx, self.rx_lane);
-        let threshold = self.mp().acks().threshold;
+        let (threshold, delay) = {
+            let acks = self.mp().acks();
+            (acks.threshold, acks.local_mad)
+        };
         let attached = self.att(id).is_none_or(Attachment::peer_attached);
         let Some(p) = self.inp_mut(id) else {
             return;
         };
-        let rec = p.mp_record(li, len, threshold, now);
+        let rec = p.mp_record(li, len, threshold, delay, now);
         if !attached {
             self.note_attached(id);
         }
@@ -197,6 +200,30 @@ impl SessionCore {
             return Some(self.now);
         }
         let mad = acks.local_mad;
+        self.atts
+            .iter()
+            .filter_map(|a| a.inp()?.unacked_since())
+            .min()
+            .map(|t| t + mad)
+    }
+
+    /// When a shaping delay of `pipe`'s next record ends because the record
+    /// carries a pending PIPE_ACK: our `zmux_max_ack_delay` after the first
+    /// ack-eliciting byte it reports (MULTIPATH.md Section 6.3), on any
+    /// inbound pipe, not only those the primary PIPE_ACK owes. The peer's
+    /// T_suspect counts on that bound: held longer, its working pipe turns
+    /// suspect at every exchange. `None` when the record carries none.
+    pub(in crate::proto::session) fn ack_release(&self, pipe: u64) -> Option<Instant> {
+        let Some(mp) = self.mp.as_deref() else {
+            return self.single_ack_release();
+        };
+        let carries = self.snapshot_first(pipe)
+            || self.out_ref(pipe).is_some_and(OutPipe::answers_ping)
+            || !self.pairs_answer_all() && self.control_pipe(None) == Some(pipe);
+        if !carries {
+            return None;
+        }
+        let mad = mp.acks().local_mad;
         self.atts
             .iter()
             .filter_map(|a| a.inp()?.unacked_since())
@@ -375,7 +402,7 @@ impl SessionCore {
             }
             if pair_only {
                 for p in self.atts.inps_mut() {
-                    p.ack_sent();
+                    p.ack_sent(now);
                 }
                 let acks = self.mp_mut().acks_mut();
                 acks.ack_now = false;
@@ -395,7 +422,7 @@ impl SessionCore {
         let live_out = self.atts.iter().filter(|a| a.out_live()).count();
         if primary {
             for p in self.atts.inps_mut() {
-                p.ack_sent();
+                p.ack_sent(now);
             }
             let acks = self.mp_mut().acks_mut();
             let dirty = std::mem::take(&mut acks.snapshot_dirty);

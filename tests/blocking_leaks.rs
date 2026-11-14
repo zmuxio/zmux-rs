@@ -79,8 +79,8 @@ fn timeouts(mut c: Config) -> Config {
 }
 
 fn connect(a: TcpStream, b: TcpStream, client: Config, server: Config) -> (Session, Session) {
-    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), server).unwrap());
-    let client = Session::connect(PipeIo::tcp(a), client).unwrap();
+    let server = thread::spawn(move || Session::accept(PipeIo::from_tcp(b), server).unwrap());
+    let client = Session::connect(PipeIo::from_tcp(a), client).unwrap();
     (client, server.join().unwrap())
 }
 
@@ -286,11 +286,11 @@ fn session_life(end: End) {
     let scfg = cfg.clone();
     let server = thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        Session::accept(PipeIo::tcp(c), scfg).unwrap()
+        Session::accept(PipeIo::from_tcp(c), scfg).unwrap()
     });
     let carrier = TcpStream::connect(relay.addr).unwrap();
     let control = carrier.try_clone().unwrap();
-    let client = Session::connect(PipeIo::tcp(carrier), cfg).unwrap();
+    let client = Session::connect(PipeIo::from_tcp(carrier), cfg).unwrap();
     let server = server.join().unwrap();
     let served = serve(server.clone());
     let (mut send, mut recv) = open_cmd(&client, ECHO).unwrap();
@@ -359,11 +359,13 @@ fn session_life(end: End) {
 fn failed_handshakes() {
     // A silent peer.
     let (a, b) = tcp();
-    let r = Session::connect(PipeIo::tcp(a), timeouts(Config::default()));
+    let r = Session::connect(PipeIo::from_tcp(a), timeouts(Config::default()));
     assert!(
         matches!(
             r,
-            Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+            Err(zmux::blocking::WaitError::Failed(
+                ConnectError::SessionLost(SessionError::HandshakeTimeout)
+            ))
         ),
         "{r:?}"
     );
@@ -371,12 +373,12 @@ fn failed_handshakes() {
     // The peer's carrier ends.
     let (a, b) = tcp();
     drop(b);
-    let r = Session::accept(PipeIo::tcp(a), timeouts(Config::default()));
+    let r = Session::accept(PipeIo::from_tcp(a), timeouts(Config::default()));
     assert!(r.is_err(), "{r:?}");
     // Garbage.
     let (a, mut b) = tcp();
     b.write_all(&[0xff; 64]).unwrap();
-    let r = Session::accept(PipeIo::tcp(a), timeouts(Config::default()));
+    let r = Session::accept(PipeIo::from_tcp(a), timeouts(Config::default()));
     assert!(r.is_err(), "{r:?}");
     drop(b);
 }
@@ -433,11 +435,16 @@ fn stuck_carrier(how: Stuck) {
     if let Stuck::HandshakeTimeout = how {
         relay.stall.store(true, Ordering::SeqCst);
         let peer = thread::spawn(move || l.accept().map(|(c, _)| c));
-        let r = Session::connect(PipeIo::tcp(TcpStream::connect(relay.addr).unwrap()), cfg);
+        let r = Session::connect(
+            PipeIo::from_tcp(TcpStream::connect(relay.addr).unwrap()),
+            cfg,
+        );
         assert!(
             matches!(
                 r,
-                Err(ConnectError::SessionLost(SessionError::HandshakeTimeout))
+                Err(zmux::blocking::WaitError::Failed(
+                    ConnectError::SessionLost(SessionError::HandshakeTimeout)
+                ))
             ),
             "{r:?}"
         );
@@ -446,11 +453,11 @@ fn stuck_carrier(how: Stuck) {
     } else {
         let server = thread::spawn(move || {
             let (c, _) = l.accept().unwrap();
-            Session::accept(PipeIo::tcp(c), scfg).unwrap()
+            Session::accept(PipeIo::from_tcp(c), scfg).unwrap()
         });
         let carrier = TcpStream::connect(relay.addr).unwrap();
         let control = carrier.try_clone().unwrap();
-        let client = Session::connect(PipeIo::tcp(carrier), cfg).unwrap();
+        let client = Session::connect(PipeIo::from_tcp(carrier), cfg).unwrap();
         let server = server.join().unwrap();
         relay.stall.store(true, Ordering::SeqCst);
         // Writes the relay never takes: the writer thread blocks in
@@ -625,14 +632,11 @@ fn race_once(kind: Kind, race: Race, seed: u64) {
             for _ in 0..2000 {
                 let _ = s.send_datagram(Bytes::from_static(b"d"));
             }
-            format!(
-                "{:?}",
-                s.send_datagram_with_backpressure(Bytes::from_static(b"w"))
-            )
+            format!("{:?}", s.send_datagram_wait(Bytes::from_static(b"w")))
         }),
-        Kind::SessionEvent => thread::spawn(move || {
-            s.set_wait_timeout(deadline);
-            format!("{:?}", s.next_event())
+        Kind::SessionEvent => thread::spawn(move || match deadline {
+            Some(d) => format!("{:?}", s.next_event_timeout(d)),
+            None => format!("{:?}", s.next_event()),
         }),
         Kind::Closed => thread::spawn(move || format!("{:?}", s.closing())),
         Kind::Shutdown => {

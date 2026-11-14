@@ -1,8 +1,8 @@
 //! Regression baselines of the idle footprint rows: the live heap of idle
 //! sessions, streams and multipath
 //! sessions, counted by a global allocator by the requested layout sizes
-//! (independent of the allocator's size classes). Each row fails above the
-//! specification's bound and, on the platforms whose baseline is recorded
+//! (independent of the allocator's size classes). Each row fails above its
+//! bound (the specification's, except where its constant says otherwise) and, on the platforms whose baseline is recorded
 //! here (Apple platforms), above this implementation's own baseline by more
 //! than the run-to-run variation; an improvement moves the baseline down
 //! here. Elsewhere the rows are reported and checked against the bounds.
@@ -11,7 +11,8 @@
 //! `cargo test --release --test footprint`. Measurement: N sessions after a
 //! warm-up, both ends in this process, the carrier's user-space state
 //! included (in-memory pipes' buffers, or TCP sockets on loopback), no idle
-//! timeout or keep-alive, after the idle pipes gave their buffers back.
+//! timeout or keep-alive, after the idle pipes gave their buffers back, as
+//! the floor of the heap over a window ([`settled`]).
 
 // A global allocator can only be implemented with unsafe code.
 #![allow(unsafe_code)]
@@ -27,9 +28,10 @@ use std::time::{Duration, Instant};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, Role};
+use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    Policy, Session,
+    Session,
 };
 
 struct Counting;
@@ -141,26 +143,32 @@ const STREAM: Row = Row {
 /// counted), N = 200 after a warm-up. Variation within a version <= 30 B.
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
-    bound: 18_432.0,
-    baseline: base(18_336.0),
+    bound: 17_408.0,
+    baseline: base(16_920.0),
     noise: 0.005,
 };
 
 /// The same over loopback TCP (the sockets' user-space state counted).
+/// The first record of a pipe is acknowledged at once (MULTIPATH.md 6.3,
+/// rule 2), so the paced state of a carrier without a low-water mark exists
+/// from the first round trip rather than after the acknowledgement delay.
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
-    bound: 18_432.0,
-    baseline: base(17_746.0),
+    bound: 17_408.0,
+    baseline: base(17_010.0),
     noise: 0.01,
 };
 
 /// An idle multipath session, both ends, two pipe pairs (the second
 /// standby) after the join, over in-memory pipes, N = 200 after a warm-up,
-/// measured alone (the sessions of the rows before it released).
+/// measured alone (the sessions of the rows before it released). Its bound
+/// is above the specification's 44 KiB (45 056 B): what remains above it
+/// is state the session keeps for later joins, detection and scheduling;
+/// until either changes, the row guards against further growth.
 const MULTIPATH: Row = Row {
     name: "idle multipath session pair, two pipes",
-    bound: 57_344.0,
-    baseline: base(54_626.0),
+    bound: 49_152.0,
+    baseline: base(46_470.0),
     noise: 0.02,
 };
 
@@ -186,7 +194,7 @@ fn mp_config() -> Arc<Config> {
         c.probation = None;
         // As the measurement the bound was set from (`scale` in
         // benches/session.rs).
-        c.scheduler = Policy::Affinity;
+        c.scheduler = Scheduler::Affinity;
         Arc::new(c)
     });
     C.clone()
@@ -239,7 +247,7 @@ fn core_rows() {
 async fn tcp_pair(l: &tokio::net::TcpListener) -> (PipeIo, PipeIo) {
     let addr = l.local_addr().unwrap();
     let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
-    (PipeIo::tcp(a.unwrap()), PipeIo::tcp(b.unwrap().0))
+    (PipeIo::from_tcp(a.unwrap()), PipeIo::from_tcp(b.unwrap().0))
 }
 
 /// Idle single-pipe session pairs over in-memory pipes or loopback TCP.
@@ -274,29 +282,33 @@ where
     quiesce().await;
     let before = live();
     let v = make(n).await;
-    still(settle).await;
-    let heap = (live() - before) as f64 / n as f64;
+    let heap = (settled(settle).await - before) as f64 / n as f64;
     drop(v);
     quiesce().await;
     heap
 }
 
-/// Waits `at_least`, then until the heap is still: idle timers that free
-/// buffers fire at slightly different times run to run, and a measurement
-/// taken while some of them are still due varies by their buffers.
-async fn still(at_least: Duration) {
+/// Waits `at_least`, then returns the least live heap seen over
+/// [`WINDOW`]. What a session holds for good is the floor of its heap;
+/// above it come transient buffers whose timing varies run to run: the
+/// read buffer and queues of an exchange in progress (a multipath session's
+/// pipes are probed every 15 s, so 200 of them are never all still) and the
+/// idle releases still due within a second of a session's last activity.
+/// The floor over a window longer than that release time leaves them out.
+async fn settled(at_least: Duration) -> i64 {
     tokio::time::sleep(at_least).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = live();
-    loop {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let now = live();
-        if now == last || Instant::now() >= deadline {
-            return;
-        }
-        last = now;
+    let end = Instant::now() + WINDOW;
+    let mut least = live();
+    while Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        least = least.min(live());
     }
+    least
 }
+
+/// The window [`settled`] takes the floor over: twice the driver's idle
+/// release time.
+const WINDOW: Duration = Duration::from_secs(2);
 
 /// Waits until every session of the process is gone (closing sessions
 /// free their state over their linger time) and the heap is still.
@@ -342,8 +354,8 @@ async fn mp_pairs(
         let l = listener.clone();
         tokio::spawn(async move { l.handle_pipe(d, PipeHint::default()).await });
         let mut opts = PipeOptions::default();
-        opts.send_standby = Some(true);
-        opts.receive_standby = true;
+        opts.send_standby = zmux::Change::Set(true);
+        opts.receive_standby = zmux::Change::Set(true);
         client.begin_add_pipe(c, opts).unwrap();
         v.push((client, server));
     }
@@ -392,7 +404,7 @@ fn idle_footprint_stays_within_its_bounds_and_baselines() {
         let before = live();
         let v = mp_pairs(&listener, 200, None).await;
         // Quiet-session probing ends 15 s after the join.
-        still(Duration::from_secs(16)).await;
-        MULTIPATH.check((live() - before) as f64 / v.len() as f64);
+        let heap = settled(Duration::from_secs(16)).await;
+        MULTIPATH.check((heap - before) as f64 / v.len() as f64);
     });
 }

@@ -20,7 +20,7 @@ mod amounts;
 use amounts::Amounts;
 
 use crate::proto::session::stream::{SendPart, StreamKey};
-use crate::proto::session::{Policy, Redundancy};
+use crate::proto::session::{Redundancy, Scheduler};
 
 /// Tags kept in the ledger, empty ones included, before the empty ones are
 /// dropped: the fixed tags (Lost, eight Chunk levels, SessionAffinity,
@@ -98,7 +98,7 @@ impl Share {
     /// chunk, `redundancy` its redundancy setting.
     pub(in crate::proto::session) fn of(
         send: &SendPart,
-        policy: &Policy,
+        policy: &Scheduler,
         chunk: u64,
         redundancy: Redundancy,
     ) -> Option<Self> {
@@ -114,13 +114,15 @@ impl Share {
             _ if crate::proto::session::redundancy::redundant(send, redundancy, policy) => {
                 Tag::Each
             }
-            Policy::Affinity => match m.bound {
+            Scheduler::Affinity => match m.bound {
                 Some(b) if b.move_to.is_none() && send.unacked() > 0 => Tag::Bound(b.pipe),
                 _ => Tag::Each,
             },
-            Policy::SpreadEta if ready >= chunk => Tag::Chunk(send.priority.urgency()),
-            Policy::SessionAffinity => Tag::SessionAffinity,
-            Policy::SpreadRoundRobin | Policy::SpreadRateWeighted if m.scheduler.is_none() => {
+            Scheduler::SpreadEta if ready >= chunk => Tag::Chunk(send.priority.urgency()),
+            Scheduler::SessionAffinity => Tag::SessionAffinity,
+            Scheduler::SpreadRoundRobin | Scheduler::SpreadRateWeighted
+                if m.scheduler.is_none() =>
+            {
                 Tag::RoundRobin
             }
             _ => Tag::Each,

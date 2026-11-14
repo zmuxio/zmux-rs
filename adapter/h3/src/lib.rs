@@ -95,9 +95,10 @@ use h3::client::SendRequest;
 use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, ReadBuf};
-use zmux::carrier::{CarrierConnId, ChunkBuf, ChunkWrite};
+use zmux::adapter::{Admit, Entry};
+use zmux::adapter::{CarrierConnId, ChunkBuf, ChunkWrite};
 use zmux::proto::ApplicationErrorCode;
-use zmux::{Admit, CarrierCredential, ConnectError, Entry, Listener, PipeHint, PipeIo, Session};
+use zmux::{CarrierCredential, ConnectError, Listener, PipeHint, PipeIo, Session};
 pub use zmux_quinn::LaneWindows;
 use zmux_quinn::{ConnectionDatagrams, QuicChannel};
 
@@ -363,7 +364,7 @@ impl Carrier {
                     // the server drop the request before the lane is routed.
                     let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner));
                     lane.response = Some(recv);
-                    Ok(zmux::carrier::Lane::from_chunks(lane))
+                    Ok(zmux::adapter::Lane::from_chunks(lane))
                 }
             });
         Ok(with_connection(io, inner.id(), inner, |c| &c.conn))
@@ -446,7 +447,7 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         |incoming: quinn::Incoming| {
-            let guard = listener.setup_guard();
+            let guard = listener.adapter().setup_guard();
             async move {
                 let conn = incoming.await?;
                 guard.done();
@@ -469,7 +470,7 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 /// directions. The connection's receive window is set for the lanes and
 /// charged to the listener's budget meanwhile.
 ///
-/// Each request takes its source slot ([`Listener::enter`]; the source is
+/// Each request takes its source slot ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter); the source is
 /// the client a trusted intermediary reports in a forwarding header
 /// field, else the connection's peer); refused, it goes to
 /// [`Options::fallback`] untouched.
@@ -502,7 +503,7 @@ pub async fn serve_connection(
 ) -> io::Result<()> {
     let window = options.windows.receive_window();
     conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-    let _charge = listener.charge_memory(window);
+    let _charge = listener.adapter().charge_memory(window);
     let identity = Arc::new(conn.stable_id());
     let shared = Arc::new(Served {
         datagrams: ConnectionDatagrams::new(conn.clone()),
@@ -524,14 +525,14 @@ pub async fn serve_connection(
                 return;
             };
             let (mut send, mut recv) = stream.split();
-            if zmux::forwarded_early_data(
+            if zmux::adapter::forwarded_early_data(
                 head.headers()
                     .iter()
                     .map(|(n, v)| (n.as_str(), v.as_bytes())),
             ) {
                 // Forwarded from TLS early data: no carrier is taken from
                 // it.
-                shared.listener.count_setup_failure();
+                shared.listener.adapter().count_setup_failure();
                 let mut resp = http::Response::new(());
                 *resp.status_mut() = http::StatusCode::TOO_EARLY;
                 if send.send_response(resp).await.is_ok() {
@@ -544,12 +545,12 @@ pub async fn serve_connection(
             }
             let peer = shared.conn.remote_address();
             let source = shared.source(head.headers());
-            let Some(entry) = shared.listener.enter(peer, Some(source)) else {
+            let Some(entry) = shared.listener.adapter().enter(peer, Some(source)) else {
                 // Not taken, nothing answered: to the fallback.
                 shared.fall_back(head, Bytes::new(), send, recv).await;
                 return;
             };
-            if shared.listener.admission().is_some() {
+            if shared.listener.adapter().admission().is_some() {
                 shared.admit(entry, head, send, recv).await;
             } else {
                 shared.serve_unadmitted(entry, head, send, recv).await;
@@ -587,7 +588,7 @@ impl Served {
     /// intermediary reports in its forwarding header field
     /// ([`zmux::TrustedProxies::source`]), else the connection's peer.
     fn source(&self, headers: &http::HeaderMap) -> SocketAddr {
-        self.listener.trusted_proxies().source(
+        self.listener.adapter().trusted_proxies().source(
             self.conn.remote_address(),
             headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())),
         )

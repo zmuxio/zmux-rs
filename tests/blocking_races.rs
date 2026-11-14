@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use basics::{small_windows, tcp};
 use zmux::blocking::{PipeIo, Session};
-use zmux::{Config, PipeAuth, PipeOptions, Policy};
+use zmux::sched::Scheduler;
+use zmux::{Config, PipeAuth, PipeOptions};
 
 /// Runs `f` on a thread and fails when it does not finish within `secs`.
 fn watchdog<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -100,7 +101,7 @@ fn carrier_ends_mid_batch(eof: bool) {
     let (a, b) = tcp();
     let shut = a.try_clone().unwrap();
     let client_pipe = if eof {
-        PipeIo::tcp(a)
+        PipeIo::from_tcp(a)
     } else {
         let reader = a.try_clone().unwrap();
         PipeIo::from_halves(
@@ -111,7 +112,8 @@ fn carrier_ends_mid_batch(eof: bool) {
             },
         )
     };
-    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), Config::default()).unwrap());
+    let server =
+        thread::spawn(move || Session::accept(PipeIo::from_tcp(b), Config::default()).unwrap());
     let client = Session::connect(client_pipe, Config::default()).unwrap();
     let server = server.join().unwrap();
     let server_task = serve(server.clone());
@@ -164,7 +166,7 @@ fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"blocking-race-psk-0123456789abcd").with_end_to_end();
-    c.scheduler = Policy::SpreadEta;
+    c.scheduler = Scheduler::SpreadEta;
     c.liveness.suspect_floor = Duration::from_millis(100);
     c
 }
@@ -226,7 +228,7 @@ fn mp_server(rt: &tokio::runtime::Runtime) -> SocketAddr {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(zmux::PipeIo::tcp(c), zmux::PipeHint::from_peer(peer))
+                        .handle_pipe(zmux::PipeIo::from_tcp(c), zmux::PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -263,13 +265,16 @@ fn multipath_pipe_loss_during_traffic() {
             .build()
             .unwrap();
         let addr = mp_server(&rt);
-        let client =
-            Session::connect(PipeIo::tcp(TcpStream::connect(addr).unwrap()), mp_config()).unwrap();
+        let client = Session::connect(
+            PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+            mp_config(),
+        )
+        .unwrap();
         assert!(client.multipath() == zmux::Multipath::InUse);
         let (raddr, cut) = relay(addr);
         let pipe = client
             .begin_add_pipe(
-                PipeIo::tcp(TcpStream::connect(raddr).unwrap()),
+                PipeIo::from_tcp(TcpStream::connect(raddr).unwrap()),
                 PipeOptions::default(),
             )
             .unwrap();
@@ -311,8 +316,8 @@ fn idle_readers_resume_with_a_new_buffer() {
     watchdog(30, "idle readers", || {
         let (a, b) = tcp();
         let server =
-            thread::spawn(move || Session::accept(PipeIo::tcp(b), Config::default()).unwrap());
-        let client = Session::connect(PipeIo::tcp(a), Config::default()).unwrap();
+            thread::spawn(move || Session::accept(PipeIo::from_tcp(b), Config::default()).unwrap());
+        let client = Session::connect(PipeIo::from_tcp(a), Config::default()).unwrap();
         let server = server.join().unwrap();
         let task = serve(server.clone());
         assert!(echo_once(&client, 64 * 1024, 1));

@@ -977,13 +977,13 @@ async fn panicking_client_verifier_rejects() {
         let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut lc = ListenerConfig::default();
         lc.inbound_transform = Some(server.transform());
-        lc.on_reject = Some(zmux::proto::listener::OnReject(Arc::new({
+        lc.on_reject = Some(zmux::proto::listener::OnReject::new({
             let reasons = reasons.clone();
             move |i| {
                 reasons.lock().unwrap().push(i.reason);
                 zmux::proto::listener::RejectAction::Close
             }
-        })));
+        }));
         let l = Listener::new(config(), lc).expect("valid listener configuration");
         let (a, b) = duplex(1 << 20);
         let served = tokio::spawn({
@@ -1156,10 +1156,10 @@ fn mismatch_listener(action: Option<zmux::RejectAction>, seen: Seen) -> Listener
     let mut lc = ListenerConfig::default();
     lc.inbound_transform = Some(server.transform());
     lc.handshake_timeout = Duration::from_millis(1500);
-    lc.on_reject = Some(zmux::OnReject(Arc::new(move |i| {
+    lc.on_reject = Some(zmux::OnReject::new(move |i| {
         seen.lock().unwrap().push((i.reason, i.record_mode));
         action.unwrap_or_else(|| zmux::RejectAction::default_for(i))
-    })));
+    }));
     Listener::new(config(), lc).expect("valid listener configuration")
 }
 

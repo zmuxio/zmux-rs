@@ -88,6 +88,7 @@ mod client;
 mod endpoint;
 mod exchange;
 mod server;
+mod util;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,7 +104,7 @@ pub use client::{
 };
 pub use endpoint::Endpoint;
 pub use exchange::{
-    Backoff, BodyEncoding, ExchangeEndpoint, ExchangeOptions, ExchangeServer, connect_exchange,
+    BodyEncoding, ExchangeEndpoint, ExchangeOptions, ExchangeServer, connect_exchange,
     default_piece_size, dial_exchange, dial_exchange_split, dial_exchange_with,
 };
 pub use server::{
@@ -151,19 +152,19 @@ pub struct Options {
     /// checked against and HTTP/2 requests name.
     pub https: bool,
     /// Client: the redirects a carrier request follows (default
-    /// [`zmux::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none). One is
+    /// [`zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none). One is
     /// followed only within the origin, since the connection's endpoint is
     /// the caller's: the same scheme, host and port, as
-    /// [`zmux::redirect::check`] allows (a `POST` only for 307 and 308). The
+    /// [`zmux::adapter::redirect::check`] allows (a `POST` only for 307 and 308). The
     /// request is repeated on a new connection that the carrier's `connect`
     /// makes (an HTTP/2 connection's further request), with the credential
     /// presented anew and every uplink byte written before the response,
     /// up to 64 KiB; past that a later redirect is refused. A carrier over
     /// one connection the caller gave (`*_over`) follows none. A refused
-    /// redirect fails the carrier with a [`zmux::redirect::RedirectError`].
+    /// redirect fails the carrier with a [`zmux::adapter::redirect::RedirectError`].
     pub max_redirects: usize,
     /// The request field that pairs the two halves of a split bootstrap
-    /// (default [`zmux::PAIR_HEADER`]): the client sends its token in it,
+    /// (default [`zmux::adapter::PAIR_HEADER`]): the client sends its token in it,
     /// and the server classifies by it ([`classify`]). Both ends must
     /// agree.
     pub pair_field: PairField,
@@ -173,6 +174,9 @@ pub struct Options {
     /// A carrier's response lasts as long as the carrier, so a connection
     /// is idle only once its carriers ended. HTTP/2 has no idle timeout of
     /// its own, and on HTTP/1.1 it bounds the wait for the next request.
+    /// Once a connection has opened an HTTP/2 extended CONNECT tunnel, it
+    /// is no longer closed by this timeout: it ends when the tunnel or the
+    /// peer closes it, or when the TCP connection goes.
     pub idle_timeout: Option<Duration>,
 }
 
@@ -186,7 +190,7 @@ impl Default for Options {
             fallback: None,
             carrier_credential: None,
             https: false,
-            max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
+            max_redirects: zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS,
             pair_field: PairField::default(),
             idle_timeout: Some(Duration::from_secs(60)),
         }

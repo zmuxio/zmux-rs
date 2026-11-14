@@ -13,7 +13,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue, Method, StatusCode, Version};
 use tokio_tungstenite::tungstenite::protocol::Role;
-use zmux::{Admit, CarrierInfo, Listener, PipeHint, PipeIo};
+use zmux::adapter::Admit;
+use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::{Options, PROTOCOL_HEADER, pipe, ws_config};
 
@@ -98,7 +99,7 @@ fn has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
 /// upgraded when it is a WebSocket opening handshake (the HTTP/1.1
 /// Upgrade, or the extended `CONNECT` of HTTP/2, whose server must allow
 /// it: hyper's `enable_connect_protocol`), the client offers a subprotocol
-/// `options` accepts, it gets its source slot ([`Listener::enter`]; the
+/// `options` accepts, it gets its source slot ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter); the
 /// source is the client a trusted intermediary reports,
 /// [`zmux::TrustedProxies::source`] of `peer` and the request's header
 /// fields), and the listener's admission accepts it on the request head.
@@ -129,12 +130,12 @@ where
     let Some(protocol) = options.accept(&offered) else {
         return RequestUpgrade::Refused(req);
     };
-    if zmux::forwarded_early_data(
+    if zmux::adapter::forwarded_early_data(
         req.headers()
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_bytes())),
     ) {
-        listener.count_setup_failure();
+        listener.adapter().count_setup_failure();
         return RequestUpgrade::TooEarly;
     }
     let (mut parts, body) = req.into_parts();
@@ -144,8 +145,8 @@ where
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_bytes()))
     };
-    let source = listener.trusted_proxies().source(peer, fields());
-    let Some(mut entry) = listener.enter(peer, Some(source)) else {
+    let source = listener.adapter().trusted_proxies().source(peer, fields());
+    let Some(mut entry) = listener.adapter().enter(peer, Some(source)) else {
         // Not taken, nothing answered: the host's handler serves it.
         return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
     };
@@ -195,7 +196,7 @@ where
     let carrier = Box::pin(async move {
         let upgraded = on_upgrade.await.map_err(|e| {
             // A failed upgrade.
-            l.count_setup_failure();
+            l.adapter().count_setup_failure();
             io::Error::other(e)
         })?;
         let ws = WebSocketStream::from_raw_socket(

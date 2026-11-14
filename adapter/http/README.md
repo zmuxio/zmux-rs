@@ -62,7 +62,9 @@ error at the other end, never a clean end.
   (`Fallback`), or are answered with 404. A served connection that has
   had no request or response in progress for `Options::idle_timeout`
   (60 s) is closed gracefully, on HTTP/2 as on HTTP/1.1; a carrier's
-  response lasts as long as the carrier.
+  response lasts as long as the carrier. Once a connection has opened an
+  extended CONNECT tunnel, the idle timeout no longer closes it: it ends
+  when the tunnel or the peer closes it, or when the TCP connection goes.
 - Behind a reverse proxy or CDN: TLS ends at the intermediary, so prefix
   tokens are unbound. A carrier's source, for the listener's per-source
   limits and the admission, is the client that an intermediary the
@@ -89,7 +91,7 @@ error at the other end, never a clean end.
   presented anew and the uplink written so far, up to 64 KiB, on a new
   connection (HTTP/1.1) or a further request of the connection (HTTP/2);
   the candidate's next carriers start at the URL it led to. A refused
-  redirect fails the carrier with a `zmux::redirect::RedirectError`. A
+  redirect fails the carrier with a `zmux::adapter::redirect::RedirectError`. A
   carrier over one connection the caller gave follows none.
 
 TLS is the caller's concern: the adapter speaks HTTP over the connections

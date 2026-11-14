@@ -223,6 +223,17 @@ impl SessionCore {
         Ok(())
     }
 
+    /// The quality band of the session's outbound pipes that have none of
+    /// their own; `None`: none.
+    pub fn quality_band(&self) -> Option<QualityBand> {
+        self.quality.as_deref()?.default
+    }
+
+    /// The floor under the session's outbound capacity; `None`: none.
+    pub fn capacity_floor(&self) -> Option<CapacityFloor> {
+        self.quality.as_deref()?.floor.as_ref().map(|f| f.floor)
+    }
+
     /// Sets the quality band of one pipe; `None` returns it to the
     /// session's default (a band with both halves off turns its reports
     /// off). A band that is not [valid](QualityBand::validate) changes
@@ -550,7 +561,7 @@ mod tests {
 
     use super::super::sched::tests::{FAST, two_pipes};
     use super::*;
-    use crate::proto::session::Policy;
+    use crate::proto::session::Scheduler;
 
     const MS: Duration = Duration::from_millis(1);
 
@@ -590,7 +601,7 @@ mod tests {
     /// Nothing set, nothing held; clearing what was set frees it again.
     #[test]
     fn unset_quality_holds_no_state() {
-        let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
+        let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 0);
         assert!(a.quality.is_none());
         let now = a.now;
         a.quality_sample(0, now);
@@ -607,10 +618,10 @@ mod tests {
         assert!(a.quality.is_some(), "pipe 2 still has its own band");
         a.set_pipe_quality_band(PipeId(2), None).unwrap();
         assert!(a.quality.is_none());
-        assert_eq!(
+        assert!(matches!(
             a.set_pipe_quality_band(PipeId(4), None),
             Err(PipeError::UnknownPipe)
-        );
+        ));
     }
 
     /// The first estimates after the band is set are the first report; an
@@ -618,7 +629,7 @@ mod tests {
     /// k], and the band recentres on what was reported.
     #[test]
     fn a_band_reports_leaving_it_and_recentres() {
-        let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
+        let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 0);
         let now = a.now;
         a.set_quality_band(Some(QualityBand {
             min_interval: Duration::ZERO,
@@ -657,7 +668,7 @@ mod tests {
     /// then reports nothing.
     #[test]
     fn min_interval_holds_reports_back_with_the_latest_values() {
-        let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
+        let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 0);
         let t0 = a.now;
         a.set_quality_band(Some(QualityBand::new(Some(5 * MS), None)))
             .unwrap();
@@ -692,7 +703,7 @@ mod tests {
     #[test]
     fn the_capacity_floor_reports_crossings_once() {
         // Pipe 2 has not measured its rate: only pipe 0 counts.
-        let (mut a, _) = two_pipes(Policy::SpreadEta, None, 0);
+        let (mut a, _) = two_pipes(Scheduler::SpreadEta, None, 0);
         a.set_capacity_floor(Some(CapacityFloor::new(FAST + 1)))
             .unwrap();
         assert_eq!(events(&mut a), [CoreEvent::CapacityBelow { rate: FAST }]);
@@ -714,7 +725,7 @@ mod tests {
 
         // Above the floor when set: nothing; a pipe becoming standby
         // leaves the sum, reported at the next timer, which is due at once.
-        let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 0);
+        let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 0);
         a.set_capacity_floor(Some(CapacityFloor::new(FAST + FAST / 2)))
             .unwrap();
         assert!(events(&mut a).is_empty());

@@ -19,8 +19,8 @@ use zmux::proto::seal::{self, join as seal_join};
 use zmux::proto::session::{
     ClaimedHello, Config, ConfirmedJoin, CoreEvent, DEFAULT_OVERFLOW_DELAY, DatagramError,
     JoinStep, LaneAccept, LaneId, OpenError, OpenedHello, PeerCarrier, PipeAuth, PipeEnd,
-    PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Policy, Preamble, Redundancy, SessionCore,
-    SessionError, State, StreamError, StreamKey, Transmit, TransmitBuf,
+    PipeError, PipeHalf, PipeId, PipeOptions, PipeWrite, Preamble, Redundancy, Scheduler,
+    SessionCore, SessionError, State, StreamError, StreamKey, Transmit, TransmitBuf,
 };
 use zmux::proto::{Gates, VarInt, varint};
 
@@ -184,13 +184,13 @@ fn pipe_auth(a: &crate::model::PipeAuth) -> PipeAuth {
         .map_or_else(PipeAuth::none, |p| PipeAuth::psk(p.0.clone()))
 }
 
-fn policy(name: &str) -> Result<Policy, String> {
+fn policy(name: &str) -> Result<Scheduler, String> {
     Ok(match name {
-        "affinity" => Policy::Affinity,
-        "spread-eta" => Policy::SpreadEta,
-        "spread-rate-weighted" => Policy::SpreadRateWeighted,
-        "spread-round-robin" => Policy::SpreadRoundRobin,
-        "session-affinity" => Policy::SessionAffinity,
+        "affinity" => Scheduler::Affinity,
+        "spread-eta" => Scheduler::SpreadEta,
+        "spread-rate-weighted" => Scheduler::SpreadRateWeighted,
+        "spread-round-robin" => Scheduler::SpreadRoundRobin,
+        "session-affinity" => Scheduler::SessionAffinity,
         other => return Err(format!("unknown scheduler {other}")),
     })
 }
@@ -2044,7 +2044,7 @@ impl Runner {
                 let patterns = step.raw["frames"].as_array().cloned().unwrap_or_default();
                 let (frames, records, all) = self.take_frames(pipe, *lane);
                 let result = match mode {
-                    crate::model::MatchMode::First => match_exact(&patterns, &all),
+                    crate::model::MatchMode::First => match_first(&patterns, &all),
                     crate::model::MatchMode::Exact => match_exact(&patterns, &frames),
                     crate::model::MatchMode::Contains => match_contains(&patterns, &frames),
                     crate::model::MatchMode::Unordered => match_unordered(&patterns, &frames),
@@ -2486,18 +2486,20 @@ impl Runner {
                 let framing = Framing::ByteStream;
                 let mut opts = PipeOptions::default();
                 opts.fate_group = a.fate_group;
-                opts.send_priority = a.send_priority;
-                opts.receive_priority = a.receive_priority.unwrap_or(0);
-                opts.send_standby = a.send_standby.or(a.standby);
-                opts.receive_standby = a.receive_standby.or(a.standby).unwrap_or(false);
-                if let Some(w) = a.weight {
-                    opts.weight = w;
+                fn set<T>(v: Option<T>) -> zmux::Change<T> {
+                    v.map_or(zmux::Change::Keep, zmux::Change::Set)
                 }
+                opts.send_priority = set(a.send_priority);
+                opts.receive_priority = set(a.receive_priority);
+                opts.send_standby = set(a.send_standby.or(a.standby));
+                opts.receive_standby =
+                    zmux::Change::Set(a.receive_standby.or(a.standby).unwrap_or(false));
+                opts.weight = set(a.weight);
                 opts.probation = match a.probation {
-                    None => zmux::Inherit::Session,
-                    Some(0) => zmux::Inherit::Set(None),
+                    None => zmux::Change::Keep,
+                    Some(0) => zmux::Change::Set(None),
                     Some(ms) => {
-                        zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_millis(ms))))
+                        zmux::Change::Set(Some(zmux::Cap::Fixed(Duration::from_millis(ms))))
                     }
                 };
                 match s.add_pipe(
@@ -3113,7 +3115,18 @@ fn is_stream_data(p: &Value) -> bool {
     p["type"] == "STREAM_DATA"
 }
 
+/// The frames are the patterns, in order, and nothing else but PADDING.
 fn match_exact(patterns: &[Value], frames: &[Value]) -> Result<(), String> {
+    match_first(patterns, frames)?;
+    let n = frames.iter().filter(|f| f["type"] != "PADDING").count();
+    if !patterns.iter().any(is_stream_data) && n > patterns.len() {
+        return Err(format!("{n} frames, expected {}", patterns.len()));
+    }
+    Ok(())
+}
+
+/// The frames start with the patterns, in order (PADDING aside).
+fn match_first(patterns: &[Value], frames: &[Value]) -> Result<(), String> {
     let frames: Vec<Value> = frames
         .iter()
         .filter(|f| f["type"] != "PADDING")

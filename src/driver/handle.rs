@@ -39,9 +39,9 @@ use crate::proto::meter::Meter;
 use crate::proto::record::Framing;
 use crate::proto::session::{
     self as core, CapacityFloor, Config, CoreEvent, DatagramError, LaneId, Multipath, OpenError,
-    PipeError, PipeHalf, PipeId, PipeOptions, PipeStats, Policy, Preamble, QualityBand,
-    ReceivedDatagram, Role, SendOutcomeKind, SessionError, SessionStats, State as CoreState,
-    StreamError, StreamKey, StreamStats,
+    PipeError, PipeHalf, PipeId, PipeOptions, PipeStats, Preamble, QualityBand, ReceivedDatagram,
+    Role, Scheduler, SendOutcomeKind, SessionError, SessionStats, State as CoreState, StreamError,
+    StreamKey, StreamStats,
 };
 use crate::proto::session::{DirectionState, InboundState, LogLevel, Logger, OutboundState};
 #[cfg(feature = "tokio")]
@@ -103,7 +103,7 @@ pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
     fn session_closed(_state: &mut State<Self>) {}
 
     /// Whether the session's own tasks or threads have ended and released
-    /// its carriers, after it is CLOSED: the whole end `wait` waits for.
+    /// its carriers, after it is CLOSED: the whole end `closed` waits for.
     /// A driver that keeps nothing running after CLOSED answers at once;
     /// one that does wakes [`List::Close`] when it is done.
     #[doc(hidden)]
@@ -634,7 +634,7 @@ impl<D: Driver> State<D> {
                     if let Some(end) = self.pipe_ends.remove(&pipe.0).and_then(|w| w.upgrade())
                         && let Some(f) = join_failure
                     {
-                        let _ = end.set(PipeError::failed(f));
+                        let _ = end.set(PipeError::Failed(f));
                     }
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
@@ -745,7 +745,7 @@ impl<D: Driver> State<D> {
         if !self.closed_seen && self.core.state() == core::State::Closed {
             self.closed_seen = true;
             D::session_closed(self);
-            // `wait` resolves at the whole end.
+            // `closed` resolves at the whole end.
             self.waiters.wake_list(List::Close, &mut self.wakes);
         }
     }
@@ -878,34 +878,10 @@ pub struct Shared<D: Driver> {
     meter: Arc<Meter>,
     /// The datagram limiters, called without the lock.
     datagram_limiter: DatagramLimiter,
-    /// The std driver's bound of every wait of the session and its pipes,
-    /// in nanoseconds; `u64::MAX`: none.
-    #[cfg(feature = "blocking")]
-    pub(crate) wait_timeout: std::sync::atomic::AtomicU64,
     _live: Live,
 }
 
 impl<D: Driver> Shared<D> {
-    /// The std driver's wait bound ([`Shared::wait_timeout`]).
-    #[cfg(feature = "blocking")]
-    pub(crate) fn wait_timeout(&self) -> Option<Duration> {
-        match self.wait_timeout.load(std::sync::atomic::Ordering::Relaxed) {
-            u64::MAX => None,
-            n => Some(Duration::from_nanos(n)),
-        }
-    }
-
-    #[cfg(feature = "blocking")]
-    pub(crate) fn set_wait_timeout(&self, timeout: Option<Duration>) {
-        let n = timeout.map_or(u64::MAX, |t| {
-            u64::try_from(t.as_nanos())
-                .unwrap_or(u64::MAX - 1)
-                .min(u64::MAX - 1)
-        });
-        self.wait_timeout
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(crate) fn new(mut state: State<D>, paths: D::Paths) -> Self {
         // The std driver has no paths.
         #[cfg(not(feature = "tokio"))]
@@ -918,8 +894,6 @@ impl<D: Driver> Shared<D> {
             paths,
             meter,
             datagram_limiter,
-            #[cfg(feature = "blocking")]
-            wait_timeout: std::sync::atomic::AtomicU64::new(u64::MAX),
             _live: Live::new(Kind::Session),
         }
     }
@@ -1572,10 +1546,7 @@ impl<D: Driver> Session<D> {
         Ok(self.recv_stream(self.accept_key(Dir::Uni).await?))
     }
 
-    pub(crate) async fn send_datagram_with_backpressure_op(
-        &self,
-        data: Bytes,
-    ) -> Result<(), DatagramError> {
+    pub(crate) async fn send_datagram_wait_op(&self, data: Bytes) -> Result<(), DatagramError> {
         let len = data.len();
         let allowed = self.conn.datagram_allowed(len);
         let mut data = Some(data);
@@ -1857,14 +1828,6 @@ pub struct Pipe<D: Driver> {
     end: Arc<OnceLock<PipeError>>,
 }
 
-impl<D: Driver> Pipe<D> {
-    /// The shared part of the pipe's session.
-    #[cfg(feature = "blocking")]
-    pub(crate) fn shared(&self) -> &Shared<D> {
-        &self.conn.0
-    }
-}
-
 impl<D: Driver> Clone for Pipe<D> {
     fn clone(&self) -> Self {
         Self {
@@ -1945,7 +1908,7 @@ impl<D: Driver> Pipe<D> {
     /// What `add_pipe` waits for: the verified Reply with
     /// `return_on_reply`, else the peer's attachment. The core's join
     /// timeout is the call's own bound (both the handshake timeout from the
-    /// start): [`PipeError::TimedOut`].
+    /// start): [`core::PipeFailure::JoinTimedOut`].
     pub(crate) fn added_op(
         &self,
         return_on_reply: bool,
@@ -1957,12 +1920,7 @@ impl<D: Driver> Pipe<D> {
             } else {
                 st.core.pipe_attached(id)
             };
-            match ended(end, r)? {
-                Err(PipeError::Failed(core::PipeFailure::JoinTimedOut)) => {
-                    Some(Err(PipeError::TimedOut))
-                }
-                r => Some(r),
-            }
+            ended(end, r)
         })
     }
 
@@ -1989,6 +1947,24 @@ impl<D: Driver> Pipe<D> {
 }
 
 // ---- streams ------------------------------------------------------------------------------
+
+/// A datagram received on a stream (`RecvStream::read_datagram`): its flow
+/// context and payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamDatagram {
+    /// The datagram flow's context identifier.
+    pub context: u64,
+    /// The payload.
+    pub payload: Bytes,
+}
+
+fn stream_datagram(
+    r: Result<Option<(u64, Bytes)>, StreamError>,
+) -> Option<Result<StreamDatagram, StreamError>> {
+    r.transpose()
+        .map(|r| r.map(|(context, payload)| StreamDatagram { context, payload }))
+}
 
 /// What `write_chunks` wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2048,7 +2024,7 @@ impl<D: Driver, F> Drop for StreamWait<'_, D, F> {
 }
 
 /// The sending part of a stream. Dropping it without
-/// `finish` resets the stream with code 0.
+/// `finish` resets the stream with ZMUX_CANCELLED.
 pub struct SendStream<D: Driver> {
     conn: ConnRef<D>,
     key: StreamKey,
@@ -2697,12 +2673,12 @@ impl<D: Driver> RecvStream<D> {
 
     pub(crate) fn read_datagram_op(
         &self,
-    ) -> impl Future<Output = Result<(u64, Bytes), StreamError>> + '_ {
+    ) -> impl Future<Output = Result<StreamDatagram, StreamError>> + '_ {
         let key = self.key;
         Wait::new(
             &self.conn.inner,
             List::StreamDatagrams(key),
-            move |st: &mut State<D>| st.core.recv_stream_datagram(key).transpose(),
+            move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key)),
         )
     }
 
@@ -2710,13 +2686,13 @@ impl<D: Driver> RecvStream<D> {
     #[cfg(feature = "tokio")]
     pub(crate) fn read_datagram_owned_op(
         &self,
-    ) -> impl Future<Output = Result<(u64, Bytes), StreamError>> + Send + 'static {
+    ) -> impl Future<Output = Result<StreamDatagram, StreamError>> + Send + 'static {
         let (conn, key) = (self.conn.clone(), self.key);
         async move {
             Wait::new(
                 &conn.inner,
                 List::StreamDatagrams(key),
-                move |st: &mut State<D>| st.core.recv_stream_datagram(key).transpose(),
+                move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key)),
             )
             .await
         }
@@ -2884,7 +2860,8 @@ pub(crate) trait SessionApi<D: Driver> {
     fn set_dialer(&self, dialer: bool);
     fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])>;
     fn role_nonces(&self) -> Option<(u64, u64)>;
-    fn set_scheduler(&self, policy: Policy);
+    fn set_scheduler(&self, policy: Scheduler);
+    fn scheduler(&self) -> Scheduler;
     fn set_join_secret(&self, psk: &[u8]) -> Result<(), PipeError>;
     fn join_pending(&self) -> bool;
     fn set_shaping_limits(&self, limits: core::shaping::Limits)
@@ -2912,6 +2889,9 @@ pub(crate) trait SessionApi<D: Driver> {
     fn shaping_stats(&self) -> core::shaping::Stats;
     fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError>;
     fn set_capacity_floor(&self, floor: Option<CapacityFloor>) -> Result<(), PipeError>;
+    fn quality_band(&self) -> Option<QualityBand>;
+    fn capacity_floor(&self) -> Option<CapacityFloor>;
+    fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>>;
     fn begin_add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError>;
     fn join_ready(&self) -> bool;
     fn declare_end_to_end(&self);
@@ -3063,8 +3043,12 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.role_nonces()
     }
 
-    fn set_scheduler(&self, policy: Policy) {
+    fn set_scheduler(&self, policy: Scheduler) {
         self.command(|st| st.core.set_scheduler(policy));
+    }
+
+    fn scheduler(&self) -> Scheduler {
+        self.conn.lock().core.scheduler()
     }
 
     fn set_join_secret(&self, psk: &[u8]) -> Result<(), PipeError> {
@@ -3153,6 +3137,18 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn set_capacity_floor(&self, floor: Option<CapacityFloor>) -> Result<(), PipeError> {
         self.command(|st| st.core.set_capacity_floor(floor))
+    }
+
+    fn quality_band(&self) -> Option<QualityBand> {
+        self.conn.lock().core.quality_band()
+    }
+
+    fn capacity_floor(&self) -> Option<CapacityFloor> {
+        self.conn.lock().core.capacity_floor()
+    }
+
+    fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>> {
+        self.conn.lock().core.shaper()
     }
 
     fn begin_add_pipe(
@@ -3409,13 +3405,6 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::meter(self)
         }
 
-        /// How far the session's receive window grew above its initial size
-        /// (what a listener's memory budget charges for it;
-        /// growth goes through `allow_connection_window_increase` when set).
-        pub fn window_growth(&self) -> u64 {
-            <Self as crate::driver::handle::SessionApi<$d>>::window_growth(self)
-        }
-
         /// An identifier unique among live sessions of this process.
         pub fn stable_id(&self) -> usize {
             <Self as crate::driver::handle::SessionApi<$d>>::stable_id(self)
@@ -3426,15 +3415,6 @@ macro_rules! session_api {
         /// [`Config::protocols`].
         pub fn protocol(&self) -> Option<String> {
             <Self as crate::driver::handle::SessionApi<$d>>::protocol(self)
-        }
-
-        /// The peer's transport parameters that carrier early data may
-        /// assume on a later carrier that resumes this one's TLS session
-        /// (the ones stored for 0-RTT), once the session is established
-        /// with [`crate::EarlyData::carrier_early_data`] on. Carrier
-        /// adapters keep them with the ticket.
-        pub fn parameters_to_remember(&self) -> Option<crate::proto::params::TransportParameters> {
-            <Self as crate::driver::handle::SessionApi<$d>>::parameters_to_remember(self)
         }
 
         /// The session state: established, suspended or closing.
@@ -3480,21 +3460,15 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::set_dialer(self, dialer)
         }
 
-        /// The Session Nonces both endpoints sent in `zmux_multipath`,
-        /// this endpoint's first, while multipath is in use.
-        pub fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])> {
-            <Self as crate::driver::handle::SessionApi<$d>>::session_nonces(self)
-        }
-
-        /// The `zmux_role` nonces, this endpoint's first, when both
-        /// endpoints negotiated the roles with `auto`.
-        pub fn role_nonces(&self) -> Option<(u64, u64)> {
-            <Self as crate::driver::handle::SessionApi<$d>>::role_nonces(self)
-        }
-
         /// Sets the default scheduling policy of new stream data.
-        pub fn set_scheduler(&self, policy: crate::Policy) {
+        pub fn set_scheduler(&self, policy: crate::sched::Scheduler) {
             <Self as crate::driver::handle::SessionApi<$d>>::set_scheduler(self, policy)
+        }
+
+        /// The default scheduling policy of new stream data: the
+        /// configured one or the last [`set_scheduler`](Self::set_scheduler).
+        pub fn scheduler(&self) -> crate::sched::Scheduler {
+            <Self as crate::driver::handle::SessionApi<$d>>::scheduler(self)
         }
 
         /// Supplies the deferred pre-shared key
@@ -3644,6 +3618,24 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::set_capacity_floor(self, floor)
         }
 
+        /// The session's quality band, as [`set_quality_band`](Self::set_quality_band)
+        /// set it; `None`: none.
+        pub fn quality_band(&self) -> Option<crate::QualityBand> {
+            <Self as crate::driver::handle::SessionApi<$d>>::quality_band(self)
+        }
+
+        /// The floor under the session's outbound capacity, as
+        /// [`set_capacity_floor`](Self::set_capacity_floor) set it; `None`: none.
+        pub fn capacity_floor(&self) -> Option<crate::CapacityFloor> {
+            <Self as crate::driver::handle::SessionApi<$d>>::capacity_floor(self)
+        }
+
+        /// The factory shaping every outbound pipe, the configured one or the
+        /// last [`set_shaper`](Self::set_shaper); `None`: no shaping.
+        pub fn shaper(&self) -> Option<std::sync::Arc<dyn crate::shaping::Factory>> {
+            <Self as crate::driver::handle::SessionApi<$d>>::shaper(self)
+        }
+
         /// Starts adding a pipe as `add_pipe` does, without waiting: the
         /// local endpoint runs the Join handshake on the carrier, which needs
         /// both of its directions; the options choose the attachment's
@@ -3672,13 +3664,6 @@ macro_rules! session_api {
         /// The session's protection, that of its weakest pipe.
         pub fn weakest_record_mode(&self) -> crate::RecordMode {
             <Self as crate::driver::handle::SessionApi<$d>>::weakest_record_mode(self)
-        }
-
-        /// Whether a pipe added now would join at once rather than wait (the
-        /// cap of unretired attachments, or the backoff after a refused join).
-        /// Dial a carrier only then, so that none is held idle.
-        pub fn join_ready(&self) -> bool {
-            <Self as crate::driver::handle::SessionApi<$d>>::join_ready(self)
         }
 
         /// The session's pipes, every one alike: pipe 0,
@@ -3721,6 +3706,71 @@ macro_rules! session_api {
 }
 pub(crate) use session_api;
 
+/// The adapter view of each driver's session type (`zmux::adapter` and
+/// `zmux::blocking::adapter`): the session operations that only carrier
+/// adapters and helpers use.
+macro_rules! session_adapter {
+    ($d:ty) => {
+        impl Session {
+            /// The session's operations for carrier adapters and helpers:
+            /// nonces, window growth, join readiness and the parameters
+            /// kept for early data ([`SessionAdapter`]).
+            pub fn adapter(&self) -> SessionAdapter<'_> {
+                SessionAdapter { session: self }
+            }
+        }
+
+        /// The operations of a session that only carrier adapters and
+        /// helpers use ([`Session::adapter`](Session#method.adapter)).
+        #[derive(Debug, Clone, Copy)]
+        pub struct SessionAdapter<'a> {
+            session: &'a Session,
+        }
+
+        impl SessionAdapter<'_> {
+            /// How far the session's receive window grew above its initial size
+            /// (what a listener's memory budget charges for it;
+            /// growth goes through `allow_connection_window_increase` when set).
+            pub fn window_growth(&self) -> u64 {
+                <Session as crate::driver::handle::SessionApi<$d>>::window_growth(self.session)
+            }
+
+            /// The peer's transport parameters that carrier early data may
+            /// assume on a later carrier that resumes this one's TLS session
+            /// (the ones stored for 0-RTT), once the session is established
+            /// with [`crate::EarlyData::carrier_early_data`] on. Carrier
+            /// adapters keep them with the ticket.
+            pub fn parameters_to_remember(
+                &self,
+            ) -> Option<crate::proto::params::TransportParameters> {
+                <Session as crate::driver::handle::SessionApi<$d>>::parameters_to_remember(
+                    self.session,
+                )
+            }
+
+            /// The Session Nonces both endpoints sent in `zmux_multipath`,
+            /// this endpoint's first, while multipath is in use.
+            pub fn session_nonces(&self) -> Option<([u8; 16], [u8; 16])> {
+                <Session as crate::driver::handle::SessionApi<$d>>::session_nonces(self.session)
+            }
+
+            /// The `zmux_role` nonces, this endpoint's first, when both
+            /// endpoints negotiated the roles with `auto`.
+            pub fn role_nonces(&self) -> Option<(u64, u64)> {
+                <Session as crate::driver::handle::SessionApi<$d>>::role_nonces(self.session)
+            }
+
+            /// Whether a pipe added now would join at once rather than wait (the
+            /// cap of unretired attachments, or the backoff after a refused join).
+            /// Dial a carrier only then, so that none is held idle.
+            pub fn join_ready(&self) -> bool {
+                <Session as crate::driver::handle::SessionApi<$d>>::join_ready(self.session)
+            }
+        }
+    };
+}
+pub(crate) use session_adapter;
+
 /// The Pipe operations both drivers share: the public methods of each
 /// driver's type (`pipe_api!`) call them.
 pub(crate) trait PipeApi<D: Driver> {
@@ -3732,7 +3782,6 @@ pub(crate) trait PipeApi<D: Driver> {
     fn update(&self, update: &crate::proto::session::PipeUpdate) -> Result<(), PipeError>;
     fn set_shaper(&self, shaper: Option<Box<dyn core::shaping::Shaper>>) -> Result<(), PipeError>;
     fn options(&self) -> Option<PipeOptions>;
-    fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError>;
     fn revalidate(&self) -> Result<(), PipeError>;
 }
 
@@ -3775,10 +3824,6 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
 
     fn options(&self) -> Option<PipeOptions> {
         self.conn.lock().core.pipe_options(self.id)
-    }
-
-    fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError> {
-        self.command(|c, p| c.set_pipe_quality_band(p, band))
     }
 
     fn revalidate(&self) -> Result<(), PipeError> {
@@ -3849,47 +3894,6 @@ macro_rules! pipe_api {
             <Self as crate::driver::handle::PipeApi<$d>>::set_shaper(self, shaper)
         }
 
-        /// Sets the tier of the local outbound direction (lower preferred),
-        /// which wins over the peer's request; nothing is sent.
-        /// [`update`](Self::update) with `send_priority` set; clearing goes
-        /// through `update`.
-        pub fn set_send_priority(&self, priority: u64) -> Result<(), crate::PipeError> {
-            self.update(&crate::PipeUpdate {
-                send_priority: crate::Change::Set(priority),
-                ..Default::default()
-            })
-        }
-
-        /// Asks the peer to use this tier for its outbound direction (a
-        /// PIPE_STATUS when the request changes). [`update`](Self::update)
-        /// with `receive_priority` set.
-        pub fn set_receive_priority(&self, priority: u64) -> Result<(), crate::PipeError> {
-            self.update(&crate::PipeUpdate {
-                receive_priority: crate::Change::Set(priority),
-                ..Default::default()
-            })
-        }
-
-        /// Makes the local outbound direction standby (data only on
-        /// failover) or available, which wins over the peer's request.
-        /// [`update`](Self::update) with `send_standby` set.
-        pub fn set_send_standby(&self, standby: bool) -> Result<(), crate::PipeError> {
-            self.update(&crate::PipeUpdate {
-                send_standby: crate::Change::Set(standby),
-                ..Default::default()
-            })
-        }
-
-        /// Asks the peer to use its outbound direction only on failover, or
-        /// as an ordinary pipe (a PIPE_STATUS when the request changes).
-        /// [`update`](Self::update) with `receive_standby` set.
-        pub fn set_receive_standby(&self, standby: bool) -> Result<(), crate::PipeError> {
-            self.update(&crate::PipeUpdate {
-                receive_standby: crate::Change::Set(standby),
-                ..Default::default()
-            })
-        }
-
         /// The options the pipe is in use with: those it was added with
         /// (the defaults for a pipe the peer joined) and the settings
         /// changed since; the effective values, which may follow the peer's
@@ -3897,16 +3901,6 @@ macro_rules! pipe_api {
         /// released the pipe's state.
         pub fn options(&self) -> Option<crate::PipeOptions> {
             <Self as crate::driver::handle::PipeApi<$d>>::options(self)
-        }
-
-        /// Sets the quality band of this pipe's outbound direction (`None`:
-        /// the session's, [`Session::set_quality_band`](crate::Session#method.set_quality_band); a band with both
-        /// halves off turns its reports off).
-        pub fn set_quality_band(
-            &self,
-            band: Option<crate::QualityBand>,
-        ) -> Result<(), crate::PipeError> {
-            <Self as crate::driver::handle::PipeApi<$d>>::set_quality_band(self, band)
         }
 
         /// Revalidates the outbound pipe after a network change: a PIPE_PING at
@@ -3924,8 +3918,11 @@ pub(crate) use pipe_api;
 pub(crate) trait SendStreamApi<D: Driver> {
     fn id(&self) -> Option<StreamId>;
     fn pin_id(&self) -> Result<StreamId, StreamError>;
-    fn set_scheduler(&self, policy: Option<Policy>) -> Result<(), StreamError>;
+    fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError>;
     fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError>;
+    fn scheduler(&self) -> Result<Option<Scheduler>, StreamError>;
+    fn redundant(&self) -> Result<Option<bool>, StreamError>;
+    fn send_buffer(&self) -> Result<u64, StreamError>;
     fn finish(&mut self) -> Result<(), StreamError>;
     fn reset(&mut self, code: VarInt) -> Result<(), StreamError>;
     fn set_reliable_boundary(&mut self) -> Result<(), StreamError>;
@@ -3949,12 +3946,28 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
         self.command(|c, k| c.stream_id(k)).map(StreamId)
     }
 
-    fn set_scheduler(&self, policy: Option<Policy>) -> Result<(), StreamError> {
+    fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError> {
         self.command(|c, k| c.set_stream_scheduler(k, policy))
     }
 
     fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError> {
         self.command(|c, k| c.set_redundant(k, on))
+    }
+
+    fn scheduler(&self) -> Result<Option<Scheduler>, StreamError> {
+        self.conn.lock().core.stream_scheduler(self.key)
+    }
+
+    fn redundant(&self) -> Result<Option<bool>, StreamError> {
+        self.conn.lock().core.stream_redundant(self.key)
+    }
+
+    fn send_buffer(&self) -> Result<u64, StreamError> {
+        self.conn
+            .lock()
+            .core
+            .stream_send_buffer(self.key)
+            .ok_or(StreamError::ClosedLocally)
     }
 
     fn finish(&mut self) -> Result<(), StreamError> {
@@ -4046,7 +4059,7 @@ macro_rules! sendstream_api {
         /// session's.
         pub fn set_scheduler(
             &self,
-            policy: Option<crate::Policy>,
+            policy: Option<crate::sched::Scheduler>,
         ) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::set_scheduler(self, policy)
         }
@@ -4057,6 +4070,24 @@ macro_rules! sendstream_api {
         /// first call, has it follow the session's `redundancy` parameter.
         pub fn set_redundant(&self, on: Option<bool>) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::set_redundant(self, on)
+        }
+
+        /// The scheduling policy set on this stream direction; `None`: the
+        /// session's.
+        pub fn scheduler(&self) -> Result<Option<crate::sched::Scheduler>, crate::StreamError> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::scheduler(self)
+        }
+
+        /// The redundancy set on this stream direction; `None`: it follows
+        /// the session's `redundancy` parameter.
+        pub fn redundant(&self) -> Result<Option<bool>, crate::StreamError> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::redundant(self)
+        }
+
+        /// The bound of the stream's written-but-unsent bytes in force: its
+        /// own ([`set_send_buffer`](Self::set_send_buffer)) or the session's.
+        pub fn send_buffer(&self) -> Result<u64, crate::StreamError> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::send_buffer(self)
         }
 
         /// Ends the stream cleanly: a FIN follows the data written. Its
@@ -4165,6 +4196,8 @@ pub(crate) trait RecvStreamApi<D: Driver> {
     fn stop(&mut self, code: VarInt) -> Result<(), StreamError>;
     fn set_receive_window(&self, initial: u64, max: u64) -> Result<(), StreamError>;
     fn set_peer_priority(&self, priority: Priority) -> Result<(), StreamError>;
+    fn receive_window(&self) -> Result<(u64, u64), StreamError>;
+    fn peer_priority(&self) -> Result<Option<Priority>, StreamError>;
     fn reject(self) -> Result<(), StreamError>;
     fn preamble(&self) -> Preamble;
     fn is_replayable(&self) -> bool;
@@ -4192,6 +4225,22 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
 
     fn set_peer_priority(&self, priority: Priority) -> Result<(), StreamError> {
         self.command(|c, k| c.set_peer_priority(k, priority))
+    }
+
+    fn receive_window(&self) -> Result<(u64, u64), StreamError> {
+        self.conn
+            .lock()
+            .core
+            .receive_window(self.key)
+            .ok_or(StreamError::ClosedLocally)
+    }
+
+    fn peer_priority(&self) -> Result<Option<Priority>, StreamError> {
+        let c = self.conn.lock();
+        if c.core.receive_window(self.key).is_none() {
+            return Err(StreamError::ClosedLocally);
+        }
+        Ok(c.core.asked_peer_priority(self.key))
     }
 
     fn reject(self) -> Result<(), StreamError> {
@@ -4256,6 +4305,19 @@ macro_rules! recvstream_api {
             priority: crate::Priority,
         ) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::set_peer_priority(self, priority)
+        }
+
+        /// The stream's receive window: the window now advertised
+        /// (auto-tuning raises it) and the cap of auto-tuning.
+        pub fn receive_window(&self) -> Result<(u64, u64), crate::StreamError> {
+            <Self as crate::driver::handle::RecvStreamApi<$d>>::receive_window(self)
+        }
+
+        /// The priority last asked of the peer for its sending part of this
+        /// stream ([`set_peer_priority`](Self::set_peer_priority) or the
+        /// preamble's); `None`: none asked.
+        pub fn peer_priority(&self) -> Result<Option<crate::Priority>, crate::StreamError> {
+            <Self as crate::driver::handle::RecvStreamApi<$d>>::peer_priority(self)
         }
 
         /// Declines the stream before reading it: STOP_SENDING and, on a

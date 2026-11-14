@@ -21,19 +21,20 @@
 //! must not send early data). A session that ended for any other reason is
 //! not retryable: the peer may have processed some of its data.
 //!
-//! Through [`io::Error`], a rejection of early data has no kind of its own
-//! ([`io::ErrorKind::Other`]); [`SessionError::in_io`] finds the session
+//! Through [`io::Error`], every session end but a lost or failed
+//! resumption is [`io::ErrorKind::ConnectionAborted`], the timeouts that
+//! end a session and a rejection of early data included (never
+//! [`io::ErrorKind::TimedOut`]: that is a blocking call's own bound);
+//! [`SessionError::in_io`] finds the session
 //! error inside an [`io::Error`] made from any of these types, so
 //! `SessionError::in_io(&e).is_some_and(SessionError::is_early_data_rejected)`
 //! tells a caller that only sees [`io::Error`]s to retry without early
 //! data.
 //!
-//! A few variants belong to the drivers only, and the core never returns
-//! them: `OnDriverThread` of the operation errors (a blocking call of the
-//! std driver refused on a thread that drives sessions, mapped to
-//! [`io::ErrorKind::Deadlock`]; never a
-//! [`SessionError`], which only says why a session ended),
-//! [`StreamError::TimedOut`] (a blocking stream's timeout),
+//! A blocking call's timeout and its refusal on a thread that drives
+//! sessions are not variants of these types: the std driver's
+//! `blocking::WaitError` wraps the error of the call. A few variants are
+//! produced by the drivers only:
 //! [`PipeError::Io`] (the std driver could not start a pipe's threads),
 //! [`PipeError::CarrierLoop`] (a stream carrier that runs over the session
 //! it is for) and [`PipeError::Failed`] (a pipe's join failed).
@@ -171,7 +172,7 @@ pub enum PipeFailure {
     /// No acknowledgement, write progress or input in time, or a drain
     /// that did not complete.
     Stalled,
-    /// The join was not confirmed within `handshake_timeout`: the peer
+    /// The join was not confirmed within `join_timeout`: the peer
     /// refused it or never saw it.
     JoinTimedOut,
     /// The peer abandoned the pipe with this error code (PIPE_ABANDON).
@@ -268,17 +269,15 @@ impl SessionError {
             Self::ApplicationClosed { .. } | Self::TransportClosed { .. } => {
                 io::ErrorKind::ConnectionAborted
             }
-            Self::IdleTimeout { .. } | Self::HandshakeTimeout | Self::ResumeTimeout { .. } => {
-                io::ErrorKind::TimedOut
-            }
+            // A session's end is never an operation's timeout.
+            Self::IdleTimeout { .. }
+            | Self::HandshakeTimeout
+            | Self::ResumeTimeout { .. }
+            | Self::EarlyDataRejected => io::ErrorKind::ConnectionAborted,
             Self::PipesLost { .. } | Self::ResumeFailed { .. } => io::ErrorKind::ConnectionReset,
-            // Not "refused": the peer is there and closed cleanly.
-            Self::EarlyDataRejected => io::ErrorKind::Other,
         }
     }
 }
-
-pub(crate) const ON_DRIVER_THREAD: &str = "blocking call on a thread that drives sessions";
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -443,12 +442,6 @@ pub enum StreamError {
     Blocked,
     /// The session ended.
     SessionLost(SessionError),
-    /// The read or write timeout of a blocking stream expired (drivers
-    /// only).
-    TimedOut,
-    /// A blocking call was refused on a thread that drives sessions
-    /// (drivers only).
-    OnDriverThread,
 }
 
 impl StreamError {
@@ -473,8 +466,6 @@ impl StreamError {
             Self::PreambleTooLarge => io::ErrorKind::InvalidInput,
             Self::Blocked => io::ErrorKind::WouldBlock,
             Self::SessionLost(e) => e.kind(),
-            Self::TimedOut => io::ErrorKind::TimedOut,
-            Self::OnDriverThread => io::ErrorKind::Deadlock,
         }
     }
 }
@@ -492,8 +483,6 @@ impl fmt::Display for StreamError {
             Self::NotEstablished => f.write_str("session not established"),
             Self::Blocked => f.write_str("waiting for stream credit"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
-            Self::TimedOut => f.write_str("stream operation timed out"),
-            Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
         }
     }
 }
@@ -539,11 +528,6 @@ pub enum OpenError {
     InvalidArgument,
     /// The session ended.
     SessionLost(SessionError),
-    /// A blocking call was refused on a thread that drives sessions
-    /// (drivers only).
-    OnDriverThread,
-    /// A blocking wait's timeout expired (drivers only).
-    TimedOut,
 }
 
 impl OpenError {
@@ -569,8 +553,6 @@ impl fmt::Display for OpenError {
             Self::PreambleTooLarge => f.write_str("preamble too large for the peer"),
             Self::InvalidArgument => f.write_str("preamble not valid for this stream"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
-            Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
-            Self::TimedOut => f.write_str("open wait timed out"),
         }
     }
 }
@@ -593,8 +575,6 @@ impl From<OpenError> for io::Error {
             OpenError::NotNegotiated => io::ErrorKind::Unsupported,
             OpenError::PreambleTooLarge | OpenError::InvalidArgument => io::ErrorKind::InvalidInput,
             OpenError::SessionLost(s) => s.kind(),
-            OpenError::OnDriverThread => io::ErrorKind::Deadlock,
-            OpenError::TimedOut => io::ErrorKind::TimedOut,
         };
         io::Error::new(kind, e)
     }
@@ -617,18 +597,14 @@ pub enum DatagramError {
     ClosedStream,
     /// The session ended.
     SessionLost(SessionError),
-    /// A blocking call was refused on a thread that drives sessions
-    /// (drivers only).
-    OnDriverThread,
-    /// A blocking wait's timeout expired (drivers only).
-    TimedOut,
 }
 
 impl DatagramError {
-    /// Whether sending may succeed if retried: never (the queue drops the
-    /// oldest datagram instead of refusing a new one).
+    /// Whether sending may succeed if retried: only on a new session after
+    /// a session lost to [`SessionError::EarlyDataRejected`] (the queue
+    /// drops the oldest datagram instead of refusing a new one).
     pub fn is_retryable(&self) -> bool {
-        false
+        matches!(self, Self::SessionLost(e) if e.is_retryable())
     }
 }
 
@@ -639,8 +615,6 @@ impl fmt::Display for DatagramError {
             Self::TooLarge { max } => write!(f, "datagram larger than {max} bytes"),
             Self::ClosedStream => f.write_str("stream cannot carry datagrams"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
-            Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
-            Self::TimedOut => f.write_str("datagram wait timed out"),
         }
     }
 }
@@ -661,8 +635,6 @@ impl From<DatagramError> for io::Error {
             DatagramError::TooLarge { .. } => io::ErrorKind::InvalidInput,
             DatagramError::ClosedStream => io::ErrorKind::NotConnected,
             DatagramError::SessionLost(s) => s.kind(),
-            DatagramError::OnDriverThread => io::ErrorKind::Deadlock,
-            DatagramError::TimedOut => io::ErrorKind::TimedOut,
         };
         io::Error::new(kind, e)
     }
@@ -695,8 +667,8 @@ impl fmt::Display for JoinMissing {
     }
 }
 
-/// Why a pipe operation failed. Errors compare by variant and value, an
-/// [`PipeError::Io`] by identity.
+/// Why a pipe operation failed. It holds an [`io::Error`] and so does not
+/// compare: match it (`matches!`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PipeError {
@@ -719,19 +691,11 @@ pub enum PipeError {
     InvalidOptions(InvalidConfig),
     /// The pipe failed ([`Pipe::joined`](crate::Pipe#method.joined)).
     Failed(PipeFailure),
-    /// The peer refused the join in its Reply: the carrier was closed and
-    /// the join backoff started; the session goes on.
-    JoinRefused,
     /// The session is join pending: it has no join keys until what this
     /// names is in place.
     JoinPending(JoinMissing),
     /// The deferred pre-shared key was given already.
     JoinSecretSet,
-    /// A blocking call was refused on a thread that drives sessions
-    /// (drivers only).
-    OnDriverThread,
-    /// A blocking wait's timeout expired (drivers only).
-    TimedOut,
     /// The session ended.
     SessionLost(SessionError),
     /// Dialling or starting the pipe's I/O failed (drivers only): the
@@ -743,38 +707,17 @@ pub enum PipeError {
     CarrierLoop,
 }
 
-impl PartialEq for PipeError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::InvalidOptions(a), Self::InvalidOptions(b)) => a == b,
-            (Self::Failed(a), Self::Failed(b)) => a == b,
-            (Self::JoinPending(a), Self::JoinPending(b)) => a == b,
-            (Self::SessionLost(a), Self::SessionLost(b)) => a == b,
-            (Self::Io(a), Self::Io(b)) => std::sync::Arc::ptr_eq(a, b),
-            // The other variants carry nothing.
-            (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
-        }
-    }
-}
-
-impl Eq for PipeError {}
-
 impl PipeError {
     /// Whether the operation may succeed if retried: once the session is
-    /// established ([`PipeError::NotEstablished`]).
+    /// established ([`PipeError::NotEstablished`]), after the join backoff
+    /// ([`PipeError::Deferred`]), once the join keys are in place
+    /// ([`PipeError::JoinPending`]), or as the session error says
+    /// ([`PipeError::SessionLost`]).
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::NotEstablished | Self::Deferred | Self::JoinPending(_)
-        )
-    }
-
-    /// The error of a failed pipe: [`PipeError::JoinRefused`] for a refused
-    /// join, else [`PipeError::Failed`].
-    pub(crate) fn failed(f: PipeFailure) -> Self {
-        match f {
-            PipeFailure::JoinRefused => Self::JoinRefused,
-            f => Self::Failed(f),
+        match self {
+            Self::NotEstablished | Self::Deferred | Self::JoinPending(_) => true,
+            Self::SessionLost(e) => e.is_retryable(),
+            _ => false,
         }
     }
 }
@@ -791,9 +734,6 @@ impl fmt::Display for PipeError {
             Self::InvalidArgument => f.write_str("carrier not usable as this pipe"),
             Self::InvalidOptions(e) => write!(f, "pipe options not valid: {e}"),
             Self::Failed(e) => write!(f, "pipe failed: {e}"),
-            Self::JoinRefused => f.write_str("join refused by the peer"),
-            Self::OnDriverThread => f.write_str(ON_DRIVER_THREAD),
-            Self::TimedOut => f.write_str("pipe wait timed out"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
             Self::Io(e) => write!(f, "the pipe's I/O failed: {e}"),
             Self::CarrierLoop => f.write_str("the carrier runs over this session"),
@@ -823,10 +763,8 @@ impl From<PipeError> for io::Error {
             PipeError::InvalidArgument | PipeError::InvalidOptions(_) | PipeError::CarrierLoop => {
                 io::ErrorKind::InvalidInput
             }
+            PipeError::Failed(PipeFailure::JoinRefused) => io::ErrorKind::ConnectionRefused,
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
-            PipeError::JoinRefused => io::ErrorKind::ConnectionRefused,
-            PipeError::OnDriverThread => io::ErrorKind::Deadlock,
-            PipeError::TimedOut => io::ErrorKind::TimedOut,
             PipeError::SessionLost(s) => s.kind(),
             PipeError::Io(e) => e.kind(),
         };

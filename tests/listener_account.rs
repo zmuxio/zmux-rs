@@ -39,12 +39,12 @@ async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
     limits.memory_budget = Some(1024);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
-    limits.on_memory_pressure = Some(zmux::OnMemoryPressure(std::sync::Arc::new(
+    limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(
         move |p: zmux::MemoryPressure| {
             assert_eq!(p.budget, 1024);
             log.lock().unwrap().push(p.active);
         },
-    )));
+    ));
     let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let (io, _ctl, _) = dial(&listener);
     let client = watchdog(10, "connect", Session::connect(io, Config::default()))
@@ -174,10 +174,10 @@ async fn a_join_under_pressure_goes_to_the_reject_policy() {
     limits.memory_budget = Some(1024);
     let reasons = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
-    limits.on_reject = Some(zmux::OnReject(std::sync::Arc::new(move |i| {
+    limits.on_reject = Some(zmux::OnReject::new(move |i| {
         seen.lock().unwrap().push(i.reason);
         zmux::RejectAction::Close
-    })));
+    }));
     let listener = Listener::new(mp_config(), limits).expect("valid listener configuration");
     let (io, _ctl, _) = dial(&listener);
     let client = watchdog(10, "connect", Session::connect(io, mp_config()))

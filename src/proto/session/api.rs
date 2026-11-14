@@ -879,8 +879,8 @@ impl SessionCore {
     // ---- releasing -------------------------------------------------------------
 
     /// The application dropped every handle of the stream without finishing
-    /// it: an unfinished sending part is reset and an unread receiving part
-    /// stopped, both with code 0. The stream's
+    /// it: an unfinished sending part is reset with ZMUX_CANCELLED and an
+    /// unread receiving part stopped with code 0. The stream's
     /// state is discarded once both parts end.
     pub fn release(&mut self, key: StreamKey) {
         self.release_send(key);
@@ -901,7 +901,7 @@ impl SessionCore {
             .as_ref()
             .is_some_and(|x| x.outcome.is_none() && !x.state.is_terminal());
         if unfinished {
-            self.local_reset(key, 0);
+            self.local_reset(key, crate::proto::ApplicationErrorCode::ZMUX_CANCELLED.0);
         }
         self.mark_released(key);
     }
@@ -968,7 +968,7 @@ impl SessionCore {
     // ---- priorities and metadata -------------------------------------------------
 
     /// Sets the session's default scheduling policy.
-    pub fn set_scheduler(&mut self, policy: super::Policy) {
+    pub fn set_scheduler(&mut self, policy: super::Scheduler) {
         std::sync::Arc::make_mut(&mut self.config).scheduler = policy;
         // The previous policy's state is discarded; the new one starts
         // from its initial state at the next chunk.
@@ -984,12 +984,35 @@ impl SessionCore {
         }
     }
 
+    /// The session's default scheduling policy: the configured one or the
+    /// last [`Self::set_scheduler`].
+    pub fn scheduler(&self) -> super::Scheduler {
+        self.config.scheduler.clone()
+    }
+
+    /// The scheduling policy set on a stream's sending part; `None`: the
+    /// session's.
+    pub fn stream_scheduler(
+        &self,
+        key: StreamKey,
+    ) -> Result<Option<super::Scheduler>, StreamError> {
+        let send = self.streams.send(key).ok_or(StreamError::ClosedLocally)?;
+        Ok(send.mp().scheduler.clone())
+    }
+
+    /// The redundancy set on a stream's sending part; `None`: the part
+    /// follows the session's `redundancy` parameter.
+    pub fn stream_redundant(&self, key: StreamKey) -> Result<Option<bool>, StreamError> {
+        let send = self.streams.send(key).ok_or(StreamError::ClosedLocally)?;
+        Ok(send.mp().redundant)
+    }
+
     /// Sets the scheduling policy of a stream's sending part; `None` uses
     /// the session default.
     pub fn set_stream_scheduler(
         &mut self,
         key: StreamKey,
-        policy: Option<super::Policy>,
+        policy: Option<super::Scheduler>,
     ) -> Result<(), StreamError> {
         let send = self
             .streams
@@ -1183,6 +1206,32 @@ impl SessionCore {
             }
         }
         Ok(())
+    }
+
+    /// The stream's receive window: the window now advertised (auto-tuning
+    /// raises it) and the cap of auto-tuning.
+    pub fn receive_window(&self, key: StreamKey) -> Option<(u64, u64)> {
+        let r = self.streams.recv(key)?;
+        Some((r.window, r.max_window))
+    }
+
+    /// The bound of the sending part's written-but-unsent bytes in force:
+    /// its own ([`Self::set_send_buffer`]) or the session's.
+    pub fn stream_send_buffer(&self, key: StreamKey) -> Option<u64> {
+        let send = self.streams.send(key)?;
+        Some(send.cold().send_limit.unwrap_or(self.session_send_buffer()))
+    }
+
+    /// The priority asked of the peer for the stream's sending part, the
+    /// latest request: one still to be sent, the last one sent, or the
+    /// PRIORITY TLV of a local stream's preamble. `None`: none asked.
+    pub fn asked_peer_priority(&self, key: StreamKey) -> Option<Priority> {
+        let s = self.streams.get(key)?;
+        s.recv.as_ref()?;
+        let e = s.extra();
+        e.priority_update
+            .or(e.priority_sent.map(|(_, p)| p))
+            .or(if s.local { e.peer_priority } else { None })
     }
 
     /// Bounds the stream's written-but-unsent bytes.

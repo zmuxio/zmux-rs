@@ -97,7 +97,7 @@ impl Inner {
 
 /// A listener for blocking sessions: hand it carriers with [`Listener::handle_pipe`], or a
 /// socket with [`Listener::serve`], and take sessions with [`Listener::accept`]. Cheap to
-/// clone. A carrier needs a closer for the timeouts to end a blocked call: `PipeIo::tcp`
+/// clone. A carrier needs a closer for the timeouts to end a blocked call: `PipeIo::from_tcp`
 /// has one, others take [`PipeIo::with_closer`].
 #[derive(Clone)]
 pub struct Listener {
@@ -167,7 +167,7 @@ impl Listener {
                 "the std driver's listener runs no tokio transform or fallback",
             )));
         }
-        limits.check().map_err(InvalidConfig)?;
+        limits.validate().map_err(InvalidConfig)?;
         let config = config.into();
         config.validate().map_err(InvalidConfig)?;
         let instance_id = limits.instance_id.clone();
@@ -626,22 +626,37 @@ impl Listener {
         Ok(())
     }
 
-    /// The next session, waiting up to `timeout` (`None`: until the listener closes).
-    pub fn accept(&self, timeout: Option<Duration>) -> Option<Session> {
-        let until = timeout.and_then(|t| Instant::now().checked_add(t));
+    /// The next session; `None` once the listener is closed.
+    pub fn accept(&self) -> Option<Session> {
+        // Without a deadline it never times out.
+        self.accept_until(None).unwrap_or(None)
+    }
+
+    /// [`accept`](Listener::accept), waiting at most `timeout`
+    /// ([`WaitError::TimedOut`](super::blocking::WaitError::TimedOut)).
+    pub fn accept_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<Session>, super::blocking::WaitError<std::convert::Infallible>> {
+        self.accept_until(Instant::now().checked_add(timeout))
+            .map_err(|()| super::blocking::WaitError::TimedOut)
+    }
+
+    /// The next session; `Err` once `until` passed.
+    fn accept_until(&self, until: Option<Instant>) -> Result<Option<Session>, ()> {
         let mut st = self.inner.lock();
         loop {
             if let Some(s) = st.accept.pop_front() {
-                return Some(s);
+                return Ok(Some(s));
             }
             if st.closed || st.draining {
-                return None;
+                return Ok(None);
             }
             st = match until {
                 Some(u) => {
                     let left = u.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        return None;
+                        return Err(());
                     }
                     self.inner
                         .accepted
@@ -674,7 +689,7 @@ impl Listener {
                             .name("zmux-carrier".into())
                             .spawn(move || {
                                 let hint = PipeHint { source: Some(peer) };
-                                let _ = l.handle_pipe(PipeIo::tcp(stream), hint);
+                                let _ = l.handle_pipe(PipeIo::from_tcp(stream), hint);
                             });
                     if spawned.is_err() {
                         thread::sleep(super::ACCEPT_BACKOFF);
@@ -730,13 +745,10 @@ impl Listener {
         self.close();
     }
 
-    /// Counts a connection that an accept loop could not make a pipe input
-    /// of: a failed TLS handshake or its timeout, a failed upgrade, or the
-    /// setup limit. For the application's own accept loops
-    /// ([`ListenerStats::setup_failures`]); such a connection is counted
-    /// nowhere else.
-    pub fn count_setup_failure(&self) {
-        self.inner.counts.setup_failures.fetch_add(1, Relaxed);
+    /// The listener's operations for own accept loops
+    /// ([`ListenerAdapter`]).
+    pub fn adapter(&self) -> ListenerAdapter<'_> {
+        ListenerAdapter { listener: self }
     }
 
     /// What happened to the carriers handed to the listener.
@@ -754,6 +766,27 @@ impl Listener {
                 ..AdmissionStats::default()
             },
         }
+    }
+}
+
+/// The operations of a blocking [`Listener`] that only own accept loops
+/// use ([`Listener::adapter`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerAdapter<'a> {
+    listener: &'a Listener,
+}
+
+impl ListenerAdapter<'_> {
+    /// Counts a connection that an accept loop could not make a pipe input
+    /// of: a failed TLS handshake or its timeout, a failed upgrade, or the
+    /// setup limit ([`ListenerStats::setup_failures`]); such a connection
+    /// is counted nowhere else.
+    pub fn count_setup_failure(&self) {
+        self.listener
+            .inner
+            .counts
+            .setup_failures
+            .fetch_add(1, Relaxed);
     }
 }
 
@@ -819,7 +852,7 @@ mod tests {
             let l = refusing(1, limits, stall_max);
             let (client, server) = pair();
             let begun = Instant::now();
-            let r = l.handle_pipe(PipeIo::tcp(server), from(1));
+            let r = l.handle_pipe(PipeIo::from_tcp(server), from(1));
             let took = begun.elapsed();
             assert_eq!(r, Err(HandleError::Rejected));
             assert!(took >= Duration::from_millis(want - 10), "{took:?}");
@@ -838,7 +871,7 @@ mod tests {
         let key = crate::ListenerConfig::default().source_key([192, 0, 2, 1].into());
         let (client, server) = pair();
         let lj = l.clone();
-        let join = std::thread::spawn(move || lj.handle_pipe(PipeIo::tcp(server), from(1)));
+        let join = std::thread::spawn(move || lj.handle_pipe(PipeIo::from_tcp(server), from(1)));
         while !join.is_finished() {
             assert_eq!(
                 l.inner.lock().core.stalled(key).1,
@@ -873,14 +906,14 @@ mod tests {
         let other_key = crate::ListenerConfig::default().source_key(other_addr.ip());
         let (c1, s1) = pair();
         let l1 = l.clone();
-        let first = std::thread::spawn(move || l1.handle_pipe(PipeIo::tcp(s1), from(1)));
+        let first = std::thread::spawn(move || l1.handle_pipe(PipeIo::from_tcp(s1), from(1)));
         let (c3, s3) = pair();
         let l3 = l.clone();
         let other = std::thread::spawn(move || {
             let hint = PipeHint {
                 source: Some(other_addr),
             };
-            l3.handle_pipe(PipeIo::tcp(s3), hint)
+            l3.handle_pipe(PipeIo::from_tcp(s3), hint)
         });
         // Both are stalled once their sources hold a stall.
         while stalled(key) == 0 || stalled(other_key) == 0 {
@@ -888,7 +921,7 @@ mod tests {
         }
         let (c2, s2) = pair();
         let l2 = l.clone();
-        let second = std::thread::spawn(move || l2.handle_pipe(PipeIo::tcp(s2), from(2)));
+        let second = std::thread::spawn(move || l2.handle_pipe(PipeIo::from_tcp(s2), from(2)));
         // Stalled, it would count a second stall of its source while it waits.
         while !second.is_finished() {
             assert_eq!(stalled(key), 1, "the second carrier was stalled");
@@ -917,10 +950,10 @@ mod tests {
             handshake_timeout: Duration::from_secs(3600),
             first_record_timeout: Duration::from_secs(3600),
             max_pending_per_source: 3,
-            on_reject: Some(OnReject(std::sync::Arc::new(move |i| {
+            on_reject: Some(OnReject::new(move |i| {
                 seen.lock().unwrap().push((i.profile, i.reason));
                 RejectAction::Stall
-            }))),
+            })),
             ..Default::default()
         };
         let l = Listener::new(Config::default(), limits, None).unwrap();
@@ -931,7 +964,7 @@ mod tests {
             let lh = l.clone();
             held.push((
                 c,
-                std::thread::spawn(move || lh.handle_pipe(PipeIo::tcp(s), from(port))),
+                std::thread::spawn(move || lh.handle_pipe(PipeIo::from_tcp(s), from(port))),
             ));
         }
         let end = Instant::now() + Duration::from_secs(5);
@@ -941,7 +974,7 @@ mod tests {
         }
         let (c, s) = pair();
         assert_eq!(
-            l.handle_pipe(PipeIo::tcp(s), from(4)),
+            l.handle_pipe(PipeIo::from_tcp(s), from(4)),
             Err(HandleError::Refused)
         );
         closed_silently(c);
@@ -995,7 +1028,7 @@ mod tests {
                 let (lh, hint) = (l.clone(), at(ip));
                 held.push((
                     c,
-                    std::thread::spawn(move || lh.handle_pipe(PipeIo::tcp(s), hint)),
+                    std::thread::spawn(move || lh.handle_pipe(PipeIo::from_tcp(s), hint)),
                 ));
             }
             let end = Instant::now() + Duration::from_secs(5);
@@ -1006,7 +1039,7 @@ mod tests {
             // A third address of the prefix: its share is taken.
             let (c, s) = pair();
             assert_eq!(
-                l.handle_pipe(PipeIo::tcp(s), at(same)),
+                l.handle_pipe(PipeIo::from_tcp(s), at(same)),
                 Err(HandleError::Refused)
             );
             closed_silently(c);
@@ -1015,7 +1048,7 @@ mod tests {
             let (lh, hint) = (l.clone(), at(other));
             held.push((
                 c,
-                std::thread::spawn(move || lh.handle_pipe(PipeIo::tcp(s), hint)),
+                std::thread::spawn(move || lh.handle_pipe(PipeIo::from_tcp(s), hint)),
             ));
             let other_key = limits.source_key(other.parse().unwrap());
             while l.inner.lock().core.held(other_key).1 < 1 {
@@ -1043,7 +1076,7 @@ mod tests {
             handshake_timeout: hour,
             first_record_timeout: hour,
             max_pending: Some(2),
-            on_reject: Some(OnReject(std::sync::Arc::new(|_| RejectAction::Stall))),
+            on_reject: Some(OnReject::new(|_| RejectAction::Stall)),
             ..Default::default()
         };
         let mut l = Listener::new(Config::default(), limits, None).unwrap();
@@ -1061,13 +1094,13 @@ mod tests {
             let (mut c, s) = pair();
             c.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
             let lh = l.clone();
-            let t = std::thread::spawn(move || lh.handle_pipe(PipeIo::tcp(s), from(port)));
+            let t = std::thread::spawn(move || lh.handle_pipe(PipeIo::from_tcp(s), from(port)));
             (c, t)
         };
         let silent = |port: u16| {
             let (c, s) = pair();
             let lh = l.clone();
-            let t = std::thread::spawn(move || lh.handle_pipe(PipeIo::tcp(s), from(port)));
+            let t = std::thread::spawn(move || lh.handle_pipe(PipeIo::from_tcp(s), from(port)));
             (c, t)
         };
         let (c1, t1) = garbage(1);
@@ -1089,7 +1122,7 @@ mod tests {
         let rejected = l.stats().rejected;
         let (c5, s5) = pair();
         assert_eq!(
-            l.handle_pipe(PipeIo::tcp(s5), from(5)),
+            l.handle_pipe(PipeIo::from_tcp(s5), from(5)),
             Err(HandleError::Rejected)
         );
         closed_silently(c5);
@@ -1110,17 +1143,17 @@ mod tests {
         l.inner.lock().draining = true;
         let (c, s) = pair();
         let client = std::thread::spawn(move || {
-            match crate::driver::blocking::Session::connect(PipeIo::tcp(c), Config::default()) {
-                Ok(s) => {
-                    s.set_wait_timeout(Some(Duration::from_secs(5)));
-                    s.closing().unwrap()
-                }
-                Err(crate::ConnectError::SessionLost(e)) => e,
+            match crate::driver::blocking::Session::connect(PipeIo::from_tcp(c), Config::default())
+            {
+                Ok(s) => s.closing_timeout(Duration::from_secs(5)).unwrap(),
+                Err(super::super::blocking::WaitError::Failed(
+                    crate::ConnectError::SessionLost(e),
+                )) => e,
                 Err(e) => panic!("not refused: {e:?}"),
             }
         });
         assert_eq!(
-            l.handle_pipe(PipeIo::tcp(s), PipeHint::default()),
+            l.handle_pipe(PipeIo::from_tcp(s), PipeHint::default()),
             Err(HandleError::Refused)
         );
         match client.join().unwrap() {
@@ -1136,8 +1169,8 @@ mod tests {
     #[test]
     fn setup_failures_are_counted() {
         let l = Listener::new(Config::default(), ListenerConfig::default(), None).unwrap();
-        l.count_setup_failure();
-        l.count_setup_failure();
+        l.adapter().count_setup_failure();
+        l.adapter().count_setup_failure();
         assert_eq!(l.stats().setup_failures, 2);
     }
 }

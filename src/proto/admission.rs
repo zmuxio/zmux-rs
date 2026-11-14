@@ -286,8 +286,8 @@ pub enum AdmissionVerdict {
     /// ends, or the peek timeout passes, all rounds sharing it), then decide
     /// again with the longer prefix. `need` must exceed the prefix and not
     /// exceed [`Admission::max_peek`], and the carrier must be a byte
-    /// stream read by [`crate::Entry::admit`] or
-    /// [`crate::Entry::decide_reading`]; otherwise it counts as
+    /// stream read by [`crate::adapter::Entry::admit`] or
+    /// [`crate::adapter::Entry::decide_reading`]; otherwise it counts as
     /// [`AdmissionVerdict::Close`], as it does when the carrier ended short.
     More {
         /// The total prefix length wanted.

@@ -210,7 +210,7 @@ async fn zmux_establish(io: PipeIo, zmux_client: bool) -> zmux::Session {
 }
 
 /// A zmux carrier over `tcp` with taps, queried and tuned like
-/// [`PipeIo::tcp`].
+/// [`PipeIo::from_tcp`].
 fn tapped_tcp(tcp: TcpStream, out: &Tap, inn: &Tap) -> PipeIo {
     tcp.set_nodelay(true).unwrap();
     #[cfg(unix)]

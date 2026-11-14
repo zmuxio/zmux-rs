@@ -244,7 +244,7 @@ async fn bound_needs_an_exporter_at_both_ends() {
     // The joiner's carrier has no exporter (as behind a TLS-terminating intermediary):
     // Bound fails at once at the joiner, without a byte.
     let (c, _s) = tls.pair().await;
-    assert_eq!(
+    assert!(matches!(
         client
             .begin_add_pipe(
                 PipeIo::new(c),
@@ -252,7 +252,7 @@ async fn bound_needs_an_exporter_at_both_ends() {
             )
             .unwrap_err(),
         zmux::PipeError::InvalidArgument
-    );
+    ));
     // A joiner with an exporter binds its Hello: an acceptor whose carrier has none refuses
     // it as an authentication failure.
     assert!(
@@ -401,7 +401,7 @@ async fn admission_by_bound_prefix_auth() {
         .with_peek_timeout(Duration::from_millis(300))
         .with_stall_interval(STALL_MIN, Duration::from_millis(100));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = zmux::Fallback::new(move |mut conn, _| {
+    let fallback = zmux::adapter::Fallback::new(move |mut conn, _| {
         let tx = tx.clone();
         async move {
             let mut got = Vec::new();
@@ -718,7 +718,7 @@ async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &
     // The client lingers an hour (`lingering`): a wait that returns within
     // its guard returned at the server's end of its side, after it read the
     // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.wait())
+    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
         .await
         .expect("the server ended its side after the close");
     assert!(
@@ -757,11 +757,11 @@ async fn a_close_is_delivered_with_its_code_over_tcp_and_tls() {
         let l = listener.clone();
         let serving = tokio::spawn(async move {
             let (s, peer) = tcp.accept().await.unwrap();
-            l.handle_pipe(PipeIo::tcp(s), PipeHint::from_peer(peer))
+            l.handle_pipe(PipeIo::from_tcp(s), PipeHint::from_peer(peer))
                 .await
         });
         let client = Session::connect(
-            PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+            PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
             lingering(Config::default()),
         )
         .await

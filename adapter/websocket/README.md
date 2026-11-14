@@ -32,7 +32,7 @@ Only a request that is a valid upgrade, offers an accepted subprotocol and
 passes the listener's admission (`ListenerConfig::admission`, decided on
 the upgrade request head) is upgraded. Every other request is refused before
 anything is written: `serve` hands it to the listener's fallback
-(`ListenerConfig::fallback`, a `zmux::Fallback`) with the bytes read replayed, or answers
+(`ListenerConfig::fallback`, a `zmux::adapter::Fallback`) with the bytes read replayed, or answers
 `404 Not Found` without one.
 
 A Close frame is the graceful end of a pipe; a connection that ends

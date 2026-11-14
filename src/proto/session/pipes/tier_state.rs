@@ -39,6 +39,10 @@ pub(crate) struct TierState {
     probation: Probation,
 }
 
+/// A pipe's tier settings: own send tier and standby, requested receive
+/// tier and standby, weight and probation base.
+pub(crate) type TierSettings = (Option<u64>, Option<bool>, u64, bool, u64, Probation);
+
 impl Default for TierState {
     fn default() -> Self {
         Self::new()
@@ -125,7 +129,7 @@ impl TierState {
 
     /// The local settings: send priority and standby (`None`: follow the
     /// peer), the receive request, weight and probation base.
-    pub(crate) fn settings(&self) -> (Option<u64>, Option<bool>, u64, bool, u64, Probation) {
+    pub(crate) fn settings(&self) -> TierSettings {
         (
             self.send_priority,
             self.send_standby,

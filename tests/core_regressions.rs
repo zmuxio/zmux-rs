@@ -969,6 +969,22 @@ fn a_peer_s_idle_end_drains_nothing() {
     }
     let wire = without_pipe_ack(&first);
     assert_eq!(p.b.receive_in_place(P0, &wire, p.now), wire.len());
+    // The plain peer on both sides: its own first record reaches B without
+    // `zmux_pipe_ack`, and B's reaches it the same way, so that it never
+    // sends a PIPE_ACK either.
+    let mut reply = Vec::new();
+    while p.b.wants_write(P0) {
+        p.b.poll_transmit(P0, p.now, &mut p.out);
+        if p.out.is_empty() {
+            break;
+        }
+        let mut wire = Vec::new();
+        p.out.copy_to_vec(&mut wire);
+        p.b.pipe_written(P0, wire.len() as u64, p.now);
+        reply.extend_from_slice(&wire);
+    }
+    let reply = without_pipe_ack(&reply);
+    assert_eq!(p.a.receive_in_place(P0, &reply, p.now), reply.len());
     p.pump();
     assert!(p.b.is_established());
     let k = p.a.open(Dir::Bidi).unwrap();

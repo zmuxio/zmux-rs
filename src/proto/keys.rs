@@ -129,7 +129,9 @@ pub fn lane_key_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
 mod tests {
     use super::*;
 
-    use crate::util::hex;
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     #[test]
     fn rfc5869_case_1() {

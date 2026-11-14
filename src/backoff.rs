@@ -2,61 +2,63 @@
 
 use std::time::Duration;
 
-/// Exponential backoff: delays doubling from [`initial`](Self::initial) up
-/// to [`max`](Self::max), each reduced by a random fraction of up to
-/// [`jitter`](Self::jitter). Redials of a pipe pool
-/// ([`PipePool::backoff`](crate::helpers::PipePool::backoff)) and
-/// repetitions of a carrier adapter's requests use it.
+/// The default [`Backoff::jitter`]: each delay is reduced by a random
+/// fraction of up to 20 %.
+pub const DEFAULT_BACKOFF_JITTER: f64 = 0.2;
+
+/// Exponential backoff, the one retry backoff of every component: delays
+/// doubling from [`min`](Self::min) up to [`max`](Self::max), each reduced
+/// by a random fraction of up to [`jitter`](Self::jitter). The
+/// [`redial`](crate::Config#structfield.redial) hook
+/// ([`Config::redial_backoff`](crate::Config#structfield.redial_backoff)),
+/// pipe pools ([`PipePool::backoff`](crate::helpers::PipePool::backoff)) and
+/// the repetitions of a carrier adapter's requests use it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Backoff {
     /// The first delay.
-    pub initial: Duration,
+    pub min: Duration,
     /// The largest delay.
     pub max: Duration,
-    /// Each delay is reduced by a random fraction of up to this (0 to 1).
+    /// Each delay is reduced by a random fraction of up to this (\[0, 1); 0 is
+    /// none; default [`DEFAULT_BACKOFF_JITTER`]).
     pub jitter: f64,
 }
 
 impl Default for Backoff {
     /// From [`DEFAULT_MIN_BACKOFF`](crate::DEFAULT_MIN_BACKOFF) (1 s) to
     /// at most [`DEFAULT_MAX_BACKOFF`](crate::DEFAULT_MAX_BACKOFF) (60 s),
-    /// with 20 % jitter: the backoff of the redial hook and of pipe pools.
+    /// with [`DEFAULT_BACKOFF_JITTER`]: the backoff of the redial hook and
+    /// of pipe pools.
     fn default() -> Self {
-        Self::new(crate::DEFAULT_MIN_BACKOFF, crate::DEFAULT_MAX_BACKOFF).with_jitter(0.2)
+        Self::new(crate::DEFAULT_MIN_BACKOFF, crate::DEFAULT_MAX_BACKOFF)
     }
 }
 
 impl Backoff {
-    /// From `initial` to at most `max`, without jitter.
-    pub fn new(initial: Duration, max: Duration) -> Self {
+    /// From `min` to at most `max`, with [`DEFAULT_BACKOFF_JITTER`]; assign
+    /// [`jitter`](Self::jitter) for another.
+    pub fn new(min: Duration, max: Duration) -> Self {
         Self {
-            initial,
+            min,
             max,
-            jitter: 0.0,
+            jitter: DEFAULT_BACKOFF_JITTER,
         }
     }
 
-    /// With this jitter (0 to 1).
-    #[must_use]
-    pub fn with_jitter(mut self, jitter: f64) -> Self {
-        self.jitter = jitter;
-        self
-    }
-
-    /// Whether the bounds are valid: `initial` not zero and not above
-    /// `max`, and the jitter in \[0, 1\].
+    /// Whether the bounds are valid: `min` not zero and not above `max`,
+    /// and the jitter in \[0, 1) (0: none; NaN is invalid).
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
-        if self.initial.is_zero() {
-            return Err(crate::InvalidConfig::new("Backoff::initial", "zero"));
+        if self.min.is_zero() {
+            return Err(crate::InvalidConfig::new("Backoff::min", "zero"));
         }
-        if self.initial > self.max {
-            return Err(crate::InvalidConfig::new("Backoff::initial", "above max"));
+        if self.min > self.max {
+            return Err(crate::InvalidConfig::new("Backoff::min", "above max"));
         }
-        if !(0.0..=1.0).contains(&self.jitter) {
+        if !(0.0..1.0).contains(&self.jitter) {
             return Err(crate::InvalidConfig::new(
                 "Backoff::jitter",
-                "outside [0, 1]",
+                "outside [0, 1)",
             ));
         }
         Ok(())
@@ -69,7 +71,7 @@ impl Backoff {
             return Duration::ZERO;
         }
         let exp = self
-            .initial
+            .min
             .saturating_mul(1u32.checked_shl(failures - 1).unwrap_or(u32::MAX))
             .min(self.max);
         reduce(exp, self.jitter)
@@ -109,17 +111,20 @@ mod tests {
     fn the_largest_durations_saturate() {
         assert!(reduce(Duration::MAX, 0.0) <= Duration::MAX);
         assert!(reduce(Duration::MAX, 0.5) <= Duration::MAX);
-        let b = Backoff::new(Duration::MAX, Duration::MAX);
+        let mut b = Backoff::new(Duration::MAX, Duration::MAX);
+        b.jitter = 0.0;
         assert!(Instant::now().checked_add(b.delay(40)).is_none());
     }
 
     #[test]
     fn backoff_doubles_up_to_the_max() {
-        let b = Backoff::new(Duration::from_millis(100), Duration::from_secs(1));
+        let mut b = Backoff::new(Duration::from_millis(100), Duration::from_secs(1));
+        b.jitter = 0.0;
         let d: Vec<_> = (0..7).map(|n| b.delay(n).as_millis()).collect();
         assert_eq!(d, [0, 100, 200, 400, 800, 1000, 1000]);
         assert_eq!(b.delay(u32::MAX), Duration::from_secs(1));
-        let j = b.with_jitter(0.5);
+        let mut j = b;
+        j.jitter = 0.5;
         for _ in 0..100 {
             let d = j.delay(2);
             assert!(d <= Duration::from_millis(200) && d >= Duration::from_millis(100));

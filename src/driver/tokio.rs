@@ -10,6 +10,7 @@ use std::sync::{Arc, Weak};
 
 use super::account::AccountLink;
 use super::channel::DatagramChannel;
+use super::handle::StreamDatagram;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -308,7 +309,7 @@ pub(crate) fn now() -> Instant {
 pub type Session = handle::Session<Tokio>;
 /// The sending part of a stream of a tokio session;
 /// implements `AsyncWrite`, whose shutdown finishes the stream. Dropping it
-/// without `finish` resets the stream with code 0.
+/// without `finish` resets the stream with ZMUX_CANCELLED.
 pub type SendStream = handle::SendStream<Tokio>;
 /// The receiving part of a stream of a tokio session;
 /// implements `AsyncRead`. Dropping it before the end stops the stream
@@ -320,6 +321,8 @@ pub type Pipe = handle::Pipe<Tokio>;
 impl Session {
     handle::session_api!(Tokio, PipeIo);
 }
+
+handle::session_adapter!(Tokio);
 
 impl Pipe {
     handle::pipe_api!(Tokio, PipeIo);
@@ -340,7 +343,7 @@ pub struct PipeIo {
     pub(crate) writer: Option<Writer>,
     pub(crate) framing: Framing,
     pub(crate) abort: Option<Box<dyn FnOnce() + Send>>,
-    pub(crate) exporter: Option<crate::CarrierExporter>,
+    pub(crate) exporter: Option<crate::proto::exporter::CarrierExporter>,
     /// When the exporter can be read ([`PipeIo::with_early_data_in`]).
     exporter_ready: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     pub(crate) protocol: Option<String>,
@@ -472,20 +475,16 @@ pub(crate) struct LaneCaps {
 }
 
 impl PipeIo {
-    /// A carrier from a duplex byte stream, such as a TLS stream. A
-    /// [`TcpStream`] given here has Nagle's algorithm disabled, as every
-    /// carrier needs: it would hold a record back until the previous one
-    /// was acknowledged, merging records that shaping or pacing spaced
-    /// out (prefer [`PipeIo::tcp`] for one, which also queries the
-    /// socket). Under another layer, such as TLS, disable it on the
-    /// socket before (`set_nodelay(true)`).
+    /// A carrier from a duplex byte stream, such as a TLS stream. A TCP
+    /// connection is [`PipeIo::from_tcp`]. Under another layer, such as
+    /// TLS, disable Nagle's algorithm on the socket before
+    /// (`set_nodelay(true)`): it would hold a record back until the
+    /// previous one was acknowledged, merging records that shaping or
+    /// pacing spaced out.
     pub fn new<T>(io: T) -> Self
     where
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
-        if let Some(tcp) = (&io as &dyn std::any::Any).downcast_ref::<TcpStream>() {
-            let _ = tcp.set_nodelay(true);
-        }
         let (r, w) = tokio::io::split(io);
         Self::from_halves(r, w)
     }
@@ -497,7 +496,7 @@ impl PipeIo {
     /// platforms), which follows the send rate: max(128 KiB, rate x
     /// RTT_min / 8) on a single pipe, per pipe max(32 KiB, R_p x RTT_min_p
     /// / 8) in a multipath session, never above the socket's send buffer.
-    pub fn tcp(stream: TcpStream) -> Self {
+    pub fn from_tcp(stream: TcpStream) -> Self {
         let _ = stream.set_nodelay(true);
         #[cfg(any(unix, windows))]
         let socket = TcpSocket::new(&stream);
@@ -517,7 +516,7 @@ impl PipeIo {
     }
 
     /// The TCP socket under this carrier (for example under TLS): it is
-    /// then queried and tuned like that of a [`PipeIo::tcp`] carrier, which
+    /// then queried and tuned like that of a [`PipeIo::from_tcp`] carrier, which
     /// does this itself (its unsent bytes reported as by
     /// [`PipeIo::with_unsent`], unless the carrier has a query of its
     /// own), and, unless the carrier has an abort of its own
@@ -579,7 +578,7 @@ impl PipeIo {
     /// the pipe's `queued_bytes` (summed over its lanes) and, with the bytes of
     /// write calls in progress, its Q_p. A carrier that reports it is not paced
     /// by the carrier queue limiter.
-    /// [`PipeIo::tcp`] and [`PipeIo::with_tcp_socket`] install the socket's
+    /// [`PipeIo::from_tcp`] and [`PipeIo::with_tcp_socket`] install the socket's
     /// query where the platform has one (Linux, Android).
     #[must_use]
     pub fn with_unsent(mut self, unsent: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
@@ -595,7 +594,7 @@ impl PipeIo {
     /// lock, so it must be cheap and must not block. For pipes that share
     /// one carrier connection it is that connection's count. It feeds only
     /// [`crate::PipeStats::bytes_retransmitted`] and
-    /// [`crate::PipeStats::loss_rate`]. [`PipeIo::tcp`] and
+    /// [`crate::PipeStats::loss_rate`]. [`PipeIo::from_tcp`] and
     /// [`PipeIo::with_tcp_socket`] install the socket's query where the
     /// platform has one (Linux, Android, Apple platforms, Windows).
     #[must_use]
@@ -785,7 +784,7 @@ impl PipeIo {
 
     /// The carrier is a stream of a multi-stream connection whose identity
     /// is `conn`: the streams the peer opens on that
-    /// connection may be lanes of its pipe ([`crate::carrier::handle_lane`],
+    /// connection may be lanes of its pipe ([`crate::adapter::handle_lane`],
     /// [`crate::Listener::handle_pipe`]), checked against it. A stream
     /// carrier ([`PipeIo::from_stream`]) reports its session.
     #[must_use]
@@ -1020,7 +1019,7 @@ impl PipeIo {
             (a, b) => a.or(b),
         };
         up.exporter = match (up.exporter.take(), down.exporter.take()) {
-            (Some(u), Some(d)) => Some(crate::CarrierExporter::split(&u, &d)),
+            (Some(u), Some(d)) => Some(crate::proto::exporter::CarrierExporter::split(&u, &d)),
             (u, d) => u.or(d),
         };
         up.exporter_ready = match (up.exporter_ready.take(), down.exporter_ready.take()) {
@@ -1112,7 +1111,7 @@ impl PipeIo {
         export: impl Fn(&str, &[u8], &mut [u8]) -> bool + Send + Sync + 'static,
     ) -> Self {
         if self.outer.is_none() {
-            self.exporter = Some(crate::CarrierExporter::new(export));
+            self.exporter = Some(crate::proto::exporter::CarrierExporter::new(export));
         }
         self
     }
@@ -1125,7 +1124,7 @@ impl PipeIo {
         mut self,
         export: impl Fn(&str, &[u8], &mut [u8]) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.exporter = Some(crate::CarrierExporter::new(export));
+        self.exporter = Some(crate::proto::exporter::CarrierExporter::new(export));
         self
     }
 
@@ -1135,7 +1134,7 @@ impl PipeIo {
     /// connection ([`PipeIo::with_carrier_conn`]) in the session's own
     /// memory budget while a pipe of the session is on that connection.
     /// Behind a listener, charge
-    /// the listener instead ([`crate::Listener::charge_memory`]).
+    /// the listener instead ([`ListenerAdapter::charge_memory`](crate::adapter::ListenerAdapter::charge_memory)).
     #[must_use]
     pub fn with_connection_memory(mut self, bytes: u64) -> Self {
         self.conn_memory = bytes;
@@ -1240,7 +1239,9 @@ impl PipeIo {
     }
 
     /// Calls `close_code` once, whenever zmux is done with the carrier,
-    /// after the session's lock: with the application error code of the
+    /// once the session's task has dropped its halves and lanes (outside
+    /// the session's lock; a half an application still holds through a
+    /// fast path goes with it): with the application error code of the
     /// CONNECTION_CLOSE (0x1d) that ended its session, sent or received,
     /// once that session has ended (every pipe's inbound side ended or its
     /// linger timeout passed, and the session's task released its
@@ -1530,7 +1531,7 @@ type Dialing = Pin<Box<dyn Future<Output = io::Result<PipeIo>> + Send>>;
 ///
 /// ```no_run
 /// let dial = zmux::Dial::new(|_req| async {
-///     Ok(zmux::PipeIo::tcp(tokio::net::TcpStream::connect("127.0.0.1:4433").await?))
+///     Ok(zmux::PipeIo::from_tcp(tokio::net::TcpStream::connect("127.0.0.1:4433").await?))
 /// });
 /// # let _ = dial;
 /// ```
@@ -2509,13 +2510,13 @@ const READ_ROOM_BULK: usize = READ_BUFFER / 2;
 enum LateExporter {
     /// Not read yet; a value may have to wait for `ready`.
     Unread {
-        exporter: crate::CarrierExporter,
+        exporter: crate::proto::exporter::CarrierExporter,
         ready: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     },
     /// The first bytes arrived before the handshake that gives the value:
     /// they wait here with the read path, nothing else does.
     Waiting {
-        exporter: crate::CarrierExporter,
+        exporter: crate::proto::exporter::CarrierExporter,
         ready: Pin<Box<dyn Future<Output = ()> + Send>>,
         outcome: ReadOutcome,
     },
@@ -2950,9 +2951,6 @@ pub(crate) struct PipeTask {
     /// the session task closes).
     write_closed: bool,
     abort: Option<Box<dyn FnOnce() + Send>>,
-    /// The carrier's [`PipeIo::with_close_code`] hook: told 0 when the task
-    /// goes without [`PipeTask::tell_close_code`].
-    close_code: Option<TellCloseCode>,
     /// The last write.
     active: Instant,
     done: Arc<PipeDone>,
@@ -2970,6 +2968,11 @@ pub(crate) struct PipeTask {
     /// The pipe's lanes other than lane 0, allocated for a carrier that
     /// can open them or with the first one the peer opens.
     lanes: Option<Box<PipeLanes>>,
+    /// The carrier's [`PipeIo::with_close_code`] hook, with the code
+    /// [`PipeTask::tell_close_code`] set (0 without it). Declared after
+    /// the carrier's halves and lanes, so that it is called once they are
+    /// dropped: when the task drops the pipe, after the lock.
+    close_code: Option<TellCloseCode>,
     _live: Live,
 }
 
@@ -3191,13 +3194,12 @@ impl LaneTask {
 impl PipeTask {
     /// The session is done with this pipe's carrier: its close-code hook
     /// gets the session's code once the session is closing, and 0 for a
-    /// pipe that left a session that goes on, after the lock.
-    fn tell_close_code(&mut self, st: &mut State<Tokio>) {
-        if let Some(mut t) = self.close_code.take() {
-            if st.core.state() >= CoreState::Closing {
-                t.1 = close_code_of(st.core.error());
-            }
-            st.deferred.push(t);
+    /// pipe that left a session that goes on, when the pipe is dropped.
+    fn tell_close_code(&mut self, st: &State<Tokio>) {
+        if let Some(t) = &mut self.close_code
+            && st.core.state() >= CoreState::Closing
+        {
+            t.1 = close_code_of(st.core.error());
         }
     }
 
@@ -3780,6 +3782,9 @@ struct Task {
     /// after it, and requested lanes without an opener, refused in the
     /// next critical section; allocated with the first.
     lane_work: Option<Box<LaneWork>>,
+    /// The last pass that made progress, until the core's idle storage was
+    /// freed [`IDLE_RELEASE`] after it (then `None`).
+    active: Option<Instant>,
     _live: Live,
 }
 
@@ -3804,6 +3809,7 @@ impl Task {
             pick: PickRequest::default(),
             pick_made: false,
             lane_work: None,
+            active: Some(now()),
             _live: Live::new(Kind::Task),
         }
     }
@@ -3901,7 +3907,13 @@ fn housekeeping(
     st: &mut State<Tokio>,
 ) -> bool {
     let mut progress = !st.io.new_pipes.is_empty() || !st.io.close_halves.is_empty();
-    pipes.append(&mut st.io.new_pipes);
+    if !st.io.new_pipes.is_empty() {
+        pipes.append(&mut st.io.new_pipes);
+        // Pipes are added rarely: the handoff list's storage goes with the
+        // handoff, and the task's list holds only its pipes.
+        st.io.new_pipes = Vec::new();
+        pipes.shrink_to_fit();
+    }
     closes.append(&mut st.io.close_halves);
     let s = &mut *st;
     if let Some(l) = s.io.lanes.as_deref_mut() {
@@ -3947,7 +3959,7 @@ fn end(pipes: &mut Vec<PipeTask>, st: &mut State<Tokio>, shared: &Shared<Tokio>)
 }
 
 /// The session task has released its carriers, the last of the session's
-/// work: [`Session::wait`] resolves.
+/// work: [`Session::closed`] resolves.
 fn released(pipes: &mut Vec<PipeTask>, shared: &Shared<Tokio>) {
     pipes.clear();
     let mut st = shared.lock();
@@ -4148,12 +4160,25 @@ impl Future for Task {
             let pick = st.core.take_pick(&mut this.pick);
             let waiting = !(progress || more || pick);
             let mut deadline = None;
-            if waiting {
+            if !waiting {
+                this.active = Some(now);
+            } else {
                 match &mut st.io.task {
                     Some(w) => w.clone_from(cx.waker()),
                     none => *none = Some(cx.waker().clone()),
                 }
                 deadline = this.final_deadline.or(st.core.poll_timeout());
+                // The core's empty queues go once the session has been idle
+                // as long as a pipe's buffers: one timer per active period.
+                if let Some(active) = this.active {
+                    let due = active + IDLE_RELEASE;
+                    if now < due {
+                        deadline = Some(deadline.map_or(due, |d| d.min(due)));
+                    } else {
+                        st.core.release_idle();
+                        this.active = None;
+                    }
+                }
                 // A charge report the interval held back.
                 if let Some(t) = st.io.account.as_ref().and_then(|l| l.due()) {
                     deadline = Some(deadline.map_or(t, |d| d.min(t)));
@@ -4310,14 +4335,11 @@ impl Session {
         let session = Shared::create(pipe, config.clone(), role, transport, None, |_| {})?
             .established()
             .await?;
-        if let Some(dial) = &config.redial
+        if let Some(dial) = config.redial.as_ref().and_then(crate::Redial::as_tokio)
             && session.multipath() == crate::Multipath::InUse
             && let Some(pipe0) = session.pipe(PipeId(0))
         {
-            let backoff =
-                crate::helpers::Backoff::new(config.redial_min_backoff, config.redial_max_backoff)
-                    .with_jitter(0.2);
-            crate::helpers::maintain_redial(&session, dial.clone(), backoff, pipe0);
+            crate::helpers::maintain_redial(&session, dial.clone(), config.redial_backoff, pipe0);
         }
         Ok(session)
     }
@@ -4411,8 +4433,8 @@ impl Session {
 
     /// Queues a session datagram, waiting while the queue is full.
     /// Cancel-safe: a cancelled call queued nothing.
-    pub async fn send_datagram_with_backpressure(&self, data: Bytes) -> Result<(), DatagramError> {
-        self.send_datagram_with_backpressure_op(data).await
+    pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), DatagramError> {
+        self.send_datagram_wait_op(data).await
     }
 
     /// Receives the next session datagram. Cancel-safe.
@@ -4435,7 +4457,7 @@ impl Session {
     /// handed over by then is discarded. Each pipe's write side is then
     /// shut down and its input read until the peer ends it or the linger
     /// timeout passes, in the background while the runtime keeps running
-    /// ([`Session::wait`](Session#method.wait) waits for that end). A
+    /// ([`Session::closed`](Session#method.closed) waits for that end). A
     /// process may exit once it completed.
     ///
     /// The peer sees [`SessionError::ApplicationClosed`] with this code and
@@ -4490,7 +4512,8 @@ impl Session {
     /// call from its start; a shorter bound is the caller's, by dropping
     /// the future (for example with `tokio::time::timeout`). A pipe that
     /// is not attached when the bound ends is aborted (PIPE_ABANDON with
-    /// `ZMUX_PIPE_FAILED`) and the call fails with [`PipeError::TimedOut`];
+    /// `ZMUX_PIPE_FAILED`) and the call fails with
+    /// [`PipeFailure::JoinTimedOut`](crate::PipeFailure::JoinTimedOut);
     /// a dropped call aborts it the same way. A pipe that fails or is
     /// removed first fails the call with [`PipeError::Failed`] or
     /// [`PipeError::UnknownPipe`], the session's end with
@@ -4509,7 +4532,7 @@ impl Session {
         let guard = handle::AbortUnlessAdded(Some(&p));
         let r = tokio::time::timeout_at(deadline, p.added_op(no_wait))
             .await
-            .unwrap_or(Err(PipeError::TimedOut));
+            .unwrap_or(Err(PipeError::Failed(crate::PipeFailure::JoinTimedOut)));
         match r {
             Ok(()) => guard.added(),
             Err(e) => {
@@ -4540,7 +4563,7 @@ impl Session {
 
     /// Resolves once the session is closing, that is once it began to end,
     /// with the reason; its carriers may still be draining
-    /// ([`Session::wait`](Session#method.wait) waits for the whole end).
+    /// ([`Session::closed`](Session#method.closed) waits for the whole end).
     /// Cancel-safe.
     pub async fn closing(&self) -> SessionError {
         self.closing_op().await
@@ -4562,13 +4585,13 @@ impl Session {
     /// use std::time::Duration;
     ///
     /// session.close_with_error(zmux::VarInt::from_u32(0x2a), b"replaced").await;
-    /// match tokio::time::timeout(Duration::from_secs(5), session.wait()).await {
+    /// match tokio::time::timeout(Duration::from_secs(5), session.closed()).await {
     ///     Ok(end) => println!("ended: {end}"),
     ///     Err(_) => println!("not confirmed within 5 s; the linger goes on"),
     /// }
     /// # }
     /// ```
-    pub async fn wait(&self) -> SessionError {
+    pub async fn closed(&self) -> SessionError {
         self.wait_op().await
     }
 
@@ -4598,10 +4621,11 @@ impl Session {
     /// that long before its own exchange, by design. One called while an
     /// exchange is in progress takes that exchange's epoch as the new one.
     pub async fn replace_pipes(&self) -> Result<(), PipeError> {
-        let Some(redial) = self.shared().lock().core.config().redial.clone() else {
+        let redial = self.shared().lock().core.config().redial.clone();
+        let Some(redial) = redial.as_ref().and_then(crate::Redial::as_tokio) else {
             return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
                 "redial",
-                "replace_pipes needs the redial hook",
+                "replace_pipes needs a tokio redial hook",
             )));
         };
         let (old, before) = self.begin_replace_pipes()?;
@@ -4708,7 +4732,7 @@ impl Pipe {
     /// # async fn example(session: zmux::Session) -> Result<(), Box<dyn std::error::Error>> {
     /// let tcp = tokio::net::TcpStream::connect("10.0.0.2:4433").await?;
     /// let options = zmux::PipeOptions::new().with_send_priority(10).with_receive_priority(10);
-    /// let pipe = session.begin_add_pipe(zmux::PipeIo::tcp(tcp), options)?;
+    /// let pipe = session.begin_add_pipe(zmux::PipeIo::from_tcp(tcp), options)?;
     /// pipe.joined().await?;
     /// # Ok(())
     /// # }
@@ -4804,18 +4828,6 @@ impl SendStream {
     pub async fn wait_send_capacity(&self, min: u64) -> Result<u64, StreamError> {
         self.send_capacity_op(min).await
     }
-
-    /// Opens the stream now and waits until the opening frame and the data
-    /// written so far left for a carrier: the peer sees the stream even
-    /// with nothing written, for a protocol whose other side speaks first.
-    /// Data written before goes in the opening frame. Before establishment
-    /// the frame goes as soon as the stream may open, in early data if
-    /// that is in use; while the first flight is held it returns at once
-    /// and the frames leave with the flight. Cancel-safe; the frame stays
-    /// owed after a cancel.
-    pub async fn flush(&mut self) -> Result<(), StreamError> {
-        std::future::poll_fn(|cx| self.poll_flush_stream(cx.waker())).await
-    }
 }
 
 impl AsyncWrite for SendStream {
@@ -4828,8 +4840,17 @@ impl AsyncWrite for SendStream {
             .map_err(io::Error::from)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    /// Opens the stream now and waits until the opening frame and the data
+    /// written so far left for a carrier: the peer sees the stream even
+    /// with nothing written, for a protocol whose other side speaks first.
+    /// Data written before goes in the opening frame. Before establishment
+    /// the frame goes as soon as the stream may open, in early data if
+    /// that is in use; while the first flight is held it returns at once
+    /// and the frames leave with the flight. A flush that is cancelled leaves
+    /// the frame owed. It is the stream's one flush: the inherent API has no
+    /// other (`AsyncWriteExt::flush` calls it).
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_stream(cx.waker()).map_err(io::Error::from)
     }
 
     /// Finishes the stream.
@@ -4879,7 +4900,7 @@ impl RecvStream {
 
     /// Receives the next datagram of this stream: its context and payload.
     /// Cancel-safe.
-    pub async fn read_datagram(&self) -> Result<(u64, Bytes), StreamError> {
+    pub async fn read_datagram(&self) -> Result<StreamDatagram, StreamError> {
         self.read_datagram_op().await
     }
 
@@ -4887,7 +4908,7 @@ impl RecvStream {
     /// that reads the stream while it waits from another task.
     pub fn read_datagram_owned(
         &self,
-    ) -> impl Future<Output = Result<(u64, Bytes), StreamError>> + Send + 'static {
+    ) -> impl Future<Output = Result<StreamDatagram, StreamError>> + Send + 'static {
         self.read_datagram_owned_op()
     }
 }
@@ -4992,7 +5013,7 @@ mod tests {
         }
     }
 
-    /// A TCP stream given to `PipeIo::new` has Nagle's algorithm off:
+    /// A TCP stream given to `PipeIo::from_tcp` has Nagle's algorithm off:
     /// otherwise a record waits for the previous one's acknowledgement and
     /// records that shaping spaced out leave together (seen on Linux,
     /// whose delayed acknowledgements made bursts of a shaped session's
@@ -5007,7 +5028,7 @@ mod tests {
             .unwrap();
         assert!(!tcp.nodelay().unwrap());
         let same = std::net::TcpStream::from(tcp.as_fd().try_clone_to_owned().unwrap());
-        let _io = PipeIo::new(tcp);
+        let _io = PipeIo::from_tcp(tcp);
         assert!(same.nodelay().unwrap());
     }
 

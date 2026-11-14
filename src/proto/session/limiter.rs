@@ -251,6 +251,8 @@ pub(crate) struct Limiter {
     /// Held back now; when the bucket lets it go again (`None`: when an
     /// acknowledgement makes room under the cap).
     held: bool,
+    /// When the current hold began.
+    held_at: Instant,
     release: Option<Instant>,
 }
 
@@ -270,6 +272,7 @@ impl Limiter {
             refilled: now,
             in_flight: 0,
             held: false,
+            held_at: now,
             release: None,
         }
     }
@@ -283,6 +286,12 @@ impl Limiter {
     /// When a held pipe may send again without an acknowledgement.
     pub(crate) fn release(&self) -> Option<Instant> {
         self.release.filter(|_| self.held)
+    }
+
+    /// Holds the pipe back, with no release time (tests).
+    #[cfg(test)]
+    pub(crate) fn hold(&mut self) {
+        self.held = true;
     }
 
     /// RTT_base_p.
@@ -447,16 +456,24 @@ impl Limiter {
     /// while the RTT stays at the base.
     pub(crate) fn refresh(&mut self, now: Instant, in_flight: u64, est: &Estimator, p: &Params) {
         self.advance(now, in_flight, est, p);
+        let was = self.held;
         self.held = self.room(now, in_flight, est, p) == 0;
         self.release = None;
+        if self.held && !was {
+            self.held_at = now;
+        }
         let tokens = self.tokens(now, est, p);
         if self.held && tokens < 1.0 {
             let (rate, _) = self.pace(now, est, p);
             // Rounded up, so that the bucket holds a byte then.
             let wait = (1.0 - tokens) / rate + 1e-6;
+            // An absolute time, no earlier than G after the hold began and
+            // kept until the next decision: taken as G from the current
+            // time whenever it is read, it would move on with every event.
             self.release = Duration::try_from_secs_f64(wait)
                 .ok()
-                .and_then(|w| now.checked_add(w));
+                .and_then(|w| now.checked_add(w))
+                .map(|r| r.max(self.held_at + GRANULARITY));
         }
     }
 
@@ -976,11 +993,7 @@ mod tests {
         lim.refresh(t, 0, &est, &p);
         assert!(lim.held());
         let release = lim.release().unwrap();
-        assert!(
-            release > t && release - t < GRANULARITY,
-            "{:?}",
-            release - t
-        );
+        assert!(release == t + GRANULARITY, "{:?}", release - t);
         // A slow pipe with room under its cap: the quantum is two chunks.
         let mut est = Estimator::new(10 * MS, now);
         est.rate_sample(100_000, false, now);

@@ -11,7 +11,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use zmux::helpers::{Backoff, PipePool, PoolDecision, PoolView, RotatePolicy};
+use zmux::Backoff;
+use zmux::helpers::{PipePool, PoolDecision, PoolView, RotatePolicy};
 use zmux::{
     Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
     PipeHint, PipeIo, Session,
@@ -185,7 +186,7 @@ impl Dialer {
             }
         });
         pool.options.probation =
-            zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_millis(50))));
+            zmux::Change::Set(Some(zmux::Cap::Fixed(Duration::from_millis(50))));
         pool
     }
 
@@ -210,8 +211,8 @@ impl Dialer {
         });
         // Probation of 50 ms keeps the tests short.
         pool.options.probation =
-            zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_millis(50))));
-        pool.backoff = Backoff::new(Duration::from_millis(50), Duration::from_millis(200));
+            zmux::Change::Set(Some(zmux::Cap::Fixed(Duration::from_millis(50))));
+        pool.backoff = fixed_backoff(Duration::from_millis(50), Duration::from_millis(200));
         pool
     }
 }
@@ -381,7 +382,10 @@ async fn rotates_by_bytes_make_before_break() {
     client
         .pipe(zmux::PipeId::new(0))
         .unwrap()
-        .set_send_priority(10)
+        .update(&zmux::PipeUpdate {
+            send_priority: zmux::Change::Set(10),
+            ..Default::default()
+        })
         .unwrap();
     transfer(&client, &server, 8 << 20).await;
     // The maintainer looks every 100 ms: the last rotation may be seen
@@ -748,7 +752,7 @@ async fn policy_dial_time_replaces_the_backoff() {
     let seen = starts.clone();
     let pool = dialer
         .pool(1)
-        .with_backoff(Backoff::new(hour, hour))
+        .with_backoff(fixed_backoff(hour, hour))
         .with_policy(move |v: &PoolView<'_>, d: &mut PoolDecision| {
             seen.see(v);
             d.next_dial_at = v.last_dial_at.map(|t| t + Duration::from_millis(10));
@@ -891,7 +895,7 @@ async fn backoff_counts_from_the_start_of_the_attempt() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         Err::<PipeIo, _>(io::Error::other("refused"))
     })
-    .with_backoff(Backoff::new(
+    .with_backoff(fixed_backoff(
         Duration::from_millis(500),
         Duration::from_millis(500),
     ))
@@ -918,7 +922,7 @@ async fn backoff_follows_a_successful_dial() {
     let starts = Starts::default();
     let pool = dialer
         .pool(1)
-        .with_backoff(Backoff::new(
+        .with_backoff(fixed_backoff(
             Duration::from_millis(800),
             Duration::from_secs(2),
         ))
@@ -943,10 +947,10 @@ async fn a_split_bootstrap_carrier_cannot_join() {
     let (a, _b) = tokio::io::duplex(1024);
     let (c, _d) = tokio::io::duplex(1024);
     let io = PipeIo::split_bootstrap(PipeIo::writer(a), PipeIo::reader(c));
-    assert_eq!(
+    assert!(matches!(
         client.begin_add_pipe(io, zmux::PipeOptions::new()).err(),
         Some(zmux::PipeError::InvalidArgument)
-    );
+    ));
     client.close().await;
 }
 
@@ -1029,7 +1033,7 @@ async fn rotation_waits_for_the_acceptor_to_attach() {
         }
     });
     // No probation: a replacement is usable as soon as it is attached.
-    pool.options.probation = zmux::Inherit::Set(None);
+    pool.options.probation = zmux::Change::Set(None);
     pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(400)));
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one pool pipe", 10, || usable(&client) == 1).await;
@@ -1130,7 +1134,7 @@ async fn replace_pipes_replaces_every_pipe() {
     let dials = Arc::new(AtomicUsize::new(0));
     let mut cc = manual();
     let (l, d) = (listener.clone(), dials.clone());
-    cc.redial = Some(zmux::Dial::new(move |_req| {
+    cc.redial = Some(zmux::Redial::new(move |_req| {
         let l = l.clone();
         d.fetch_add(1, Ordering::SeqCst);
         async move {
@@ -1184,4 +1188,11 @@ async fn replace_pipes_needs_the_redial_hook() {
         Err(zmux::PipeError::InvalidOptions(e)) if e.field() == "redial"
     ));
     client.close().await;
+}
+
+/// A backoff without jitter, so that its delays are exact lower bounds.
+fn fixed_backoff(min: Duration, max: Duration) -> Backoff {
+    let mut b = Backoff::new(min, max);
+    b.jitter = 0.0;
+    b
 }

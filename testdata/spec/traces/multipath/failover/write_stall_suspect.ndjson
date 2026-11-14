@@ -5,15 +5,17 @@
 {"step": 4, "op": "expect_event", "event": "established", "fields": {"features": ["goaway", "preamble", "priority", "multipath"]}}
 {"step": 5, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
 {"step": 6, "op": "set_writable", "pipe": 0, "writable": false}
-{"step": 7, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
-{"step": 8, "op": "api", "call": "write", "args": {"stream": "a", "data": "737475636b", "fin": false}, "expect": {"accepted": 5}}
-{"step": 9, "op": "advance", "ms": 249}
-{"step": 10, "op": "expect_state", "pipe": 0, "dir": "out", "state": "ACTIVE"}
-{"step": 11, "op": "advance", "ms": 1}
-{"step": 12, "op": "expect_state", "pipe": 0, "dir": "out", "state": "SUSPECT"}
-{"step": 13, "op": "set_writable", "pipe": 0, "writable": true}
-{"step": 14, "op": "note", "text": "A SUSPECT pipe carries no new stream data, even as the only pipe (rule S1): it is probed, and the data waits until an acknowledgement makes it ACTIVE again."}
-{"step": 15, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "PIPE_PING"}, {"type": "STREAM", "count": 0}]}
-{"step": 16, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
-{"step": 17, "op": "expect_state", "pipe": 0, "dir": "out", "state": "ACTIVE"}
-{"step": 18, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "022100737475636b"}]}
+{"step": 7, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_PING"}]], "hex": "04a69b43e6"}
+{"step": 8, "op": "note", "text": "The PIPE_ACK that the PIPE_PING asks for waits for the carrier."}
+{"step": 9, "op": "api", "call": "open_bidi", "args": {}, "bind": "a", "expect": {"ok": true}}
+{"step": 10, "op": "api", "call": "write", "args": {"stream": "a", "data": "737475636b", "fin": false}, "expect": {"accepted": 5}}
+{"step": 11, "op": "advance", "ms": 249}
+{"step": 12, "op": "expect_state", "pipe": 0, "dir": "out", "state": "ACTIVE"}
+{"step": 13, "op": "advance", "ms": 1}
+{"step": 14, "op": "expect_state", "pipe": 0, "dir": "out", "state": "SUSPECT"}
+{"step": 15, "op": "set_writable", "pipe": 0, "writable": true}
+{"step": 16, "op": "note", "text": "A SUSPECT pipe carries no new stream data, even as the only pipe (rule S1): it is probed, and the data waits until an acknowledgement makes it ACTIVE again."}
+{"step": 17, "op": "expect_frames", "pipe": 0, "match": "unordered", "frames": [{"type": "PIPE_PING"}, {"type": "STREAM", "count": 0}]}
+{"step": 18, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 19, "op": "expect_state", "pipe": 0, "dir": "out", "state": "ACTIVE"}
+{"step": 20, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "STREAM_DATA", "id": 1, "data": "022100737475636b"}]}

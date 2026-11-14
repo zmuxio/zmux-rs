@@ -1,9 +1,10 @@
 //! QUIC connections as zmux carriers over quinn: zmux
 //! sessions whose pipes and lanes are streams of QUIC connections, and whose
 //! datagrams may go as QUIC datagrams of the connection, the pipes'
-//! datagram channel. The connection's own features (statistics, path, close)
-//! stay the application's, through the raw [`Connection`]
-//! ([`Carrier::connection`]).
+//! datagram channel. The carrier owns the connection: it is closed once no
+//! [`Carrier`] clone and no pipe made from it is left, so keep the carrier
+//! while the connection is to stay open. Its statistics and path stay
+//! readable through the raw [`Connection`] ([`Carrier::connection`]).
 //!
 //! One step from an endpoint to a session, and from an endpoint to the
 //! sessions it accepts: [`connect`] and [`serve`]. With the `rustls-ring`
@@ -28,7 +29,7 @@
 //! unidirectional streams, which zmux
 //! opens itself as it needs them. The carrier runs the connection's accept
 //! loop: every stream the peer opens is a carrier, handed to the
-//! [`Listener`] given, or else a lane to [`zmux::carrier::handle_lane`] and a
+//! [`Listener`] given, or else a lane to [`zmux::adapter::handle_lane`] and a
 //! pipe to [`Carrier::accept_pipe`]; zmux routes lanes by their Lane Key
 //! and checks that they are on the connection of their pipe, whose identity
 //! is the carrier. The connection's streams therefore belong to zmux.
@@ -101,15 +102,13 @@ use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
-use zmux::carrier::{
+use zmux::adapter::{Admit, Admitted, Entry, Prefixed};
+use zmux::adapter::{
     CarrierConnId, ChannelDemux, ChannelReceiver, ChannelRegistration, ChunkWrite, DatagramChannel,
     MemoryCharge,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::{
-    Admit, Admitted, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint,
-    PipeIo, Prefixed, Session,
-};
+use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
 
 /// How a QUIC connection's flow control is sized for lanes: the base of
 /// the options of every carrier over quinn (this crate's, and those of
@@ -639,7 +638,7 @@ fn remember(
     let Some(memory) = memory else {
         return;
     };
-    if let Some(tp) = session.parameters_to_remember() {
+    if let Some(tp) = session.adapter().parameters_to_remember() {
         memory.set(server_name, tp);
         return;
     }
@@ -647,7 +646,7 @@ fn remember(
     tokio::spawn(async move {
         // Bounded by the handshake timeout; ends with the session.
         if let Ok(Ok(())) = tokio::time::timeout(wait, session.established()).await
-            && let Some(tp) = session.parameters_to_remember()
+            && let Some(tp) = session.adapter().parameters_to_remember()
         {
             memory.set(&name, tp);
         }
@@ -655,7 +654,7 @@ fn remember(
 }
 
 /// Serves the connections `endpoint` accepts until `listener` is closed or
-/// the endpoint is: each takes its source slot ([`Listener::enter`], the
+/// the endpoint is: each takes its source slot ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter), the
 /// peer's address) before its handshake, which runs as a setup of
 /// [`Listener::serve_connections`]. Without an admission
 /// ([`zmux::ListenerConfig::admission`]), each connection is then a
@@ -696,7 +695,7 @@ pub async fn serve(
     options: Options,
     fallback: Option<Fallback>,
 ) {
-    let admitted = listener.admission().is_some();
+    let admitted = listener.adapter().admission().is_some();
     // 0-RTT data is taken before the handshake completes only when the
     // sessions allow carrier early data; otherwise it is processed once
     // the handshake completed.
@@ -708,7 +707,7 @@ pub async fn serve(
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         move |incoming: quinn::Incoming| {
-            let entry = listener.enter(incoming.remote_address(), None);
+            let entry = listener.adapter().enter(incoming.remote_address(), None);
             async move {
                 // Refused at its source's limit: dropped, the incoming
                 // connection is refused.
@@ -762,7 +761,7 @@ pub async fn serve_connection(
     options: &Options,
     fallback: Option<&Fallback>,
 ) -> io::Result<()> {
-    let Some(entry) = listener.enter(conn.remote_address(), None) else {
+    let Some(entry) = listener.adapter().enter(conn.remote_address(), None) else {
         conn.close(VarInt::from_u32(0), b"");
         return Err(io::ErrorKind::ConnectionRefused.into());
     };
@@ -781,7 +780,7 @@ async fn serve_entered(
     options: &Options,
     fallback: Option<&Fallback>,
 ) {
-    if listener.admission().is_some() {
+    if listener.adapter().admission().is_some() {
         admit(conn, entry, listener, options, fallback).await;
         return;
     }
@@ -804,6 +803,7 @@ async fn admit(
     fallback: Option<&Fallback>,
 ) {
     let wait = listener
+        .adapter()
         .admission()
         .map_or(std::time::Duration::ZERO, zmux::Admission::peek_timeout);
     let Ok(Ok((send, mut recv))) = tokio::time::timeout(wait, conn.accept_bi()).await else {
@@ -1021,7 +1021,7 @@ impl Carrier {
             accepted: Mutex::default(),
             notify: Notify::new(),
             accept_task: OnceLock::new(),
-            _charge: listener.map(|l| l.charge_memory(window)),
+            _charge: listener.map(|l| l.adapter().charge_memory(window)),
             handshake,
             datagrams: ConnectionDatagrams::new(conn.clone()),
             close_code: std::sync::atomic::AtomicU64::new(0),
@@ -1030,8 +1030,9 @@ impl Carrier {
         Self { inner }
     }
 
-    /// The QUIC connection, for its own features (statistics, path,
-    /// close). Its streams and datagrams belong to zmux.
+    /// The QUIC connection, for its statistics and path. The carrier owns
+    /// it: its streams and datagrams belong to zmux, and it is closed once
+    /// no carrier clone and no pipe made from it is left.
     pub fn connection(&self) -> &Connection {
         &self.inner.conn
     }
@@ -1047,8 +1048,7 @@ impl Carrier {
     /// bootstrap carrier of a session this endpoint starts, or a pipe it
     /// joins. Waits for the peer's stream credit.
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
-        let (send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
-        Ok(self.inner.pipe(Send::new(send), Recv::new(recv)))
+        self.open_pipe_with_prefix(&[]).await
     }
 
     /// [`Carrier::open_pipe`] with `prefix` written first on the
@@ -1058,7 +1058,9 @@ impl Carrier {
     /// an established connection.
     pub async fn open_pipe_with_prefix(&self, prefix: &[u8]) -> io::Result<PipeIo> {
         let (mut send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
-        send.write_all(prefix).await.map_err(io::Error::other)?;
+        if !prefix.is_empty() {
+            send.write_all(prefix).await.map_err(io::Error::other)?;
+        }
         Ok(self.inner.pipe(Send::new(send), Recv::new(recv)))
     }
 
@@ -1174,7 +1176,7 @@ impl Inner {
                 let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
                 let mut send = Send::new(send);
                 send.keep = Some(inner);
-                Ok(zmux::carrier::Lane::from_chunks(send))
+                Ok(zmux::adapter::Lane::from_chunks(send))
             }
         })
         .with_carrier_secure()
@@ -1253,6 +1255,10 @@ async fn accept_loop(
         Some(a) => PipeHint::from_admitted(a.clone()),
         None => PipeHint::from_peer(conn.remote_address()),
     };
+    let handle = |l: &Listener, io: PipeIo| {
+        let (l, hint) = (l.clone(), hint());
+        tokio::spawn(async move { l.handle_pipe(io, hint).await });
+    };
     loop {
         let accepted = {
             let mut bi = pin!(conn.accept_bi());
@@ -1278,10 +1284,7 @@ async fn accept_loop(
             break;
         };
         match (stream, &listener) {
-            (Incoming::Bi(send, recv), Some(l)) => {
-                let (l, io, hint) = (l.clone(), inner.pipe(send, recv), hint());
-                tokio::spawn(async move { l.handle_pipe(io, hint).await });
-            }
+            (Incoming::Bi(send, recv), Some(l)) => handle(l, inner.pipe(send, recv)),
             (Incoming::Bi(send, recv), None) => {
                 inner.accepted().pipes.push_back((send, recv));
                 inner.notify.notify_waiters();
@@ -1291,12 +1294,9 @@ async fn accept_loop(
                     .with_carrier(zmux::CarrierKind::Quic)
                     .with_carrier_conn(inner.id());
                 match l {
-                    Some(l) => {
-                        let (l, hint) = (l.clone(), hint());
-                        tokio::spawn(async move { l.handle_pipe(io, hint).await });
-                    }
+                    Some(l) => handle(l, io),
                     None => {
-                        tokio::spawn(zmux::carrier::handle_lane(io));
+                        tokio::spawn(zmux::adapter::handle_lane(io));
                     }
                 }
             }

@@ -17,7 +17,9 @@ async fn proxy_protocol_source() {
         a.write_all(b"PROXY TCP4 198.51.100.7 10.0.0.1 4000 443\r\nhello")
             .await
             .unwrap();
-        let source = zmux::proxied_source(&mut b, peer, &trusted).await.unwrap();
+        let source = zmux::adapter::proxied_source(&mut b, peer, &trusted)
+            .await
+            .unwrap();
         assert_eq!(source.to_string(), "198.51.100.7:4000");
         // Nothing after the header was read.
         let mut rest = [0u8; 5];
@@ -28,12 +30,18 @@ async fn proxy_protocol_source() {
         // An untrusted peer's header is not read: it is the peer's data.
         let other = "192.0.2.9:9".parse().unwrap();
         assert_eq!(
-            zmux::proxied_source(&mut b, other, &trusted).await.unwrap(),
+            zmux::adapter::proxied_source(&mut b, other, &trusted)
+                .await
+                .unwrap(),
             other
         );
         // A trusted peer without a header is an error.
         a.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
-        assert!(zmux::proxied_source(&mut b, peer, &trusted).await.is_err());
+        assert!(
+            zmux::adapter::proxied_source(&mut b, peer, &trusted)
+                .await
+                .is_err()
+        );
     })
     .await
     .unwrap();

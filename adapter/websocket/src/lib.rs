@@ -87,7 +87,7 @@
 mod hyper_upgrade;
 #[cfg(feature = "hyper")]
 pub use hyper_upgrade::{RequestUpgrade, UpgradedCarrier, accept_request};
-pub use zmux::redirect::{DEFAULT_MAX_REDIRECTS, RedirectError};
+pub use zmux::adapter::redirect::{DEFAULT_MAX_REDIRECTS, RedirectError};
 
 use std::io;
 use std::net::SocketAddr;
@@ -110,11 +110,9 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
-use zmux::carrier::ChunkWrite;
-use zmux::{
-    Admit, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint, PipeIo,
-    Prefixed, Session,
-};
+use zmux::adapter::ChunkWrite;
+use zmux::adapter::{Admit, Entry, Prefixed};
+use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
 
 pub(crate) const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
@@ -206,7 +204,7 @@ where
             Ok(io) => return Ok((io, request.uri().clone())),
             Err(Hop::Failed(e)) => return Err(e),
             Err(Hop::Redirect(status, location)) => {
-                let next = zmux::redirect::check(
+                let next = zmux::adapter::redirect::check(
                     &request.uri().to_string(),
                     "GET",
                     status,
@@ -380,7 +378,7 @@ where
                 // The server or an intermediary answered without upgrading.
                 tokio_tungstenite::tungstenite::Error::Http(r) => {
                     let status = r.status().as_u16();
-                    if zmux::redirect::is_redirect(status) {
+                    if zmux::adapter::redirect::is_redirect(status) {
                         let location = r
                             .headers()
                             .get(http::header::LOCATION)
@@ -678,7 +676,7 @@ pub enum Upgrade<S> {
 /// Upgrades one accepted connection, any byte stream such as a TLS
 /// stream, to a WebSocket carrier (messages of at most one record), or
 /// refuses it. `entry` is the connection's entry into the listener
-/// ([`Listener::enter`], taken before its TLS handshake). Nothing is
+/// ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter), taken before its TLS handshake). Nothing is
 /// written on the connection before the upgrade is decided.
 ///
 /// The request head is read first, up to [`Options::max_request_head`]
@@ -725,7 +723,7 @@ pub enum Upgrade<S> {
 ///
 /// // wss://: the source slot, TLS, then the upgrade.
 /// let (conn, peer) = tcp.accept().await?;
-/// let Some(entry) = listener.enter(peer, None) else {
+/// let Some(entry) = listener.adapter().enter(peer, None) else {
 ///     return Ok(());
 /// };
 /// let conn = tls.accept(conn).await?;
@@ -770,7 +768,7 @@ where
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_bytes()))
     };
-    if zmux::forwarded_early_data(fields()) {
+    if zmux::adapter::forwarded_early_data(fields()) {
         // Forwarded from TLS early data: no carrier is taken from it, and
         // the intermediary repeats it after its handshake.
         io.write_all(b"HTTP/1.1 425 Too Early\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -780,7 +778,10 @@ where
     }
     // Behind a PROXY protocol header, the client it reported is the hop
     // whose forwarding header field counts.
-    let source = listener.trusted_proxies().source(entry.source(), fields());
+    let source = listener
+        .adapter()
+        .trusted_proxies()
+        .source(entry.source(), fields());
     if !entry.set_source(source) {
         return Ok(Upgrade::Ended);
     }
@@ -934,9 +935,9 @@ fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
 /// [`Listener::serve_connections`] (within the listener's
 /// `handshake_timeout`), has the PROXY protocol header
 /// of an intermediary the listener trusts to send it read first
-/// ([`zmux::proxied_source`]: the client it reports is the source, a
+/// ([`zmux::adapter::proxied_source`]: the client it reports is the source, a
 /// forwarding header field then applies on top), takes its source slot
-/// ([`Listener::enter`]) and is upgraded by [`accept`], the listener's
+/// ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)) and is upgraded by [`accept`], the listener's
 /// admission deciding. An upgraded carrier goes to
 /// [`Listener::handle_pipe`] (new sessions to [`Listener::accept`]), and
 /// a refused request to the listener's byte-stream fallback
@@ -1000,7 +1001,7 @@ async fn serve_over<C, S, SF>(
     S: Fn(TcpStream) -> SF + Send + Sync + 'static,
     SF: Future<Output = io::Result<C>> + Send,
 {
-    let trusted = listener.trusted_proxies().clone();
+    let trusted = listener.adapter().trusted_proxies().clone();
     let shared = Arc::new((options, trusted, setup));
     let upgrade = {
         let listener = listener.clone();
@@ -1010,11 +1011,12 @@ async fn serve_over<C, S, SF>(
                 let (options, trusted, setup) = &*shared;
                 let _ = conn.set_nodelay(true);
                 let socket = tcp_dup(&conn);
-                let Ok(source) = zmux::proxied_source(&mut conn, peer, trusted).await else {
-                    listener.count_setup_failure();
+                let Ok(source) = zmux::adapter::proxied_source(&mut conn, peer, trusted).await
+                else {
+                    listener.adapter().count_setup_failure();
                     return Err(());
                 };
-                let entry = listener.enter(peer, Some(source)).ok_or(())?;
+                let entry = listener.adapter().enter(peer, Some(source)).ok_or(())?;
                 // A failed handshake or upgrade counts with the entry.
                 let conn = setup(conn).await.map_err(drop)?;
                 let exporter = exporter(&conn);
@@ -1034,7 +1036,7 @@ async fn serve_over<C, S, SF>(
             Upgrade::Refused(conn) => match l.limits().fallback {
                 Some(f) => {
                     let (conn, prefix) = conn.into_parts();
-                    let conn: Box<dyn zmux::FallbackStream> = Box::new(conn);
+                    let conn: Box<dyn zmux::adapter::FallbackStream> = Box::new(conn);
                     f.serve(Prefixed::new(conn, prefix), source).await;
                 }
                 None => {
@@ -1267,7 +1269,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
                 // An empty message is an empty record, a no-op for the
                 // session (a read of nothing would be the end).
                 Message::Binary(b) if b.is_empty() => {
-                    return Poll::Ready(Err(zmux::carrier::empty_message()));
+                    return Poll::Ready(Err(zmux::adapter::empty_message()));
                 }
                 Message::Binary(b) if b.len() <= buf.remaining() => {
                     buf.put_slice(&b);

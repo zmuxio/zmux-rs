@@ -242,7 +242,10 @@ impl Env {
             }
             "zmux-tcp" => {
                 let (a, b) = tcp_pair(&self.tcp).await;
-                Box::new(self.zmux_pair(PipeIo::tcp(a), PipeIo::tcp(b)).await)
+                Box::new(
+                    self.zmux_pair(PipeIo::from_tcp(a), PipeIo::from_tcp(b))
+                        .await,
+                )
             }
             "zmux-tls" => {
                 let (a, b) = self.tls_pair().await;

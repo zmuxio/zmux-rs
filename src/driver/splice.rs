@@ -173,7 +173,7 @@ impl std::error::Error for SpliceError {}
 /// | upstream reset (code c, Reliable Size s) | the bytes below s are forwarded without waiting for capacity, made reliable downstream, and the downstream part reset with c; towards a peer without RESET_STREAM_AT, once they were passed to its carrier |
 /// | downstream stopped with c | stop upstream with c |
 /// | either session ends | reset and stop the other side's stream with ZMUX_CARRIER_FAILED |
-/// | the future is dropped | reset and stop both streams with code 0 |
+/// | the future is dropped | reset both streams with ZMUX_CANCELLED and stop them with code 0 |
 ///
 /// Stream datagrams are forwarded to the other stream with their context,
 /// without waiting and without a queue of the helper's own: the
@@ -299,7 +299,11 @@ async fn forward_datagrams(
     limiter: Option<&dyn Limiter>,
     count: &mut Datagrams,
 ) {
-    while let Ok((context, data)) = r.read_datagram().await {
+    while let Ok(crate::StreamDatagram {
+        context,
+        payload: data,
+    }) = r.read_datagram().await
+    {
         let len = data.len();
         if let Some(l) = limiter
             && len > 0

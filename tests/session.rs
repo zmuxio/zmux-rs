@@ -245,8 +245,9 @@ async fn datagrams_both_ways() {
     assert_eq!(send.max_datagram_size(5), Some(65532));
     send.send_datagram(5, Bytes::from_static(b"on-stream"))
         .unwrap();
+    let d = srecv.read_datagram().await.unwrap();
     assert_eq!(
-        srecv.read_datagram().await.unwrap(),
+        (d.context, d.payload),
         (5, Bytes::from_static(b"on-stream"))
     );
 }
@@ -344,7 +345,7 @@ async fn echo_over_tcp() {
     let addr = listener.local_addr().unwrap();
     let srv = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        let session = Session::accept(PipeIo::tcp(tcp), Config::default())
+        let session = Session::accept(PipeIo::from_tcp(tcp), Config::default())
             .await
             .unwrap();
         let (mut s, mut r) = session.accept_bi().await.unwrap();
@@ -355,7 +356,7 @@ async fn echo_over_tcp() {
         session
     });
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let client = Session::connect(PipeIo::tcp(tcp), Config::default())
+    let client = Session::connect(PipeIo::from_tcp(tcp), Config::default())
         .await
         .unwrap();
     let (mut s, mut r) = client.open_bi().await.unwrap();
@@ -375,7 +376,7 @@ fn blocking_echo_over_tcp() {
     let srv = std::thread::spawn(move || {
         let (tcp, _) = listener.accept().unwrap();
         let session =
-            blocking::Session::accept(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
+            blocking::Session::accept(blocking::PipeIo::from_tcp(tcp), Config::default()).unwrap();
         let (mut s, mut r) = session.accept_bi().unwrap();
         let mut data = Vec::new();
         Read::read_to_end(&mut r, &mut data).unwrap();
@@ -385,7 +386,8 @@ fn blocking_echo_over_tcp() {
         session
     });
     let tcp = std::net::TcpStream::connect(addr).unwrap();
-    let client = blocking::Session::connect(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
+    let client =
+        blocking::Session::connect(blocking::PipeIo::from_tcp(tcp), Config::default()).unwrap();
     let (mut s, mut r) = client.open_bi().unwrap();
     let data: Vec<u8> = (0..2_000_000u32).map(|i| (i * 7) as u8).collect();
     Write::write_all(&mut s, &data).unwrap();
@@ -408,10 +410,11 @@ fn blocking_read_timeout() {
     let addr = listener.local_addr().unwrap();
     let srv = std::thread::spawn(move || {
         let (tcp, _) = listener.accept().unwrap();
-        blocking::Session::accept(blocking::PipeIo::tcp(tcp), Config::default()).unwrap()
+        blocking::Session::accept(blocking::PipeIo::from_tcp(tcp), Config::default()).unwrap()
     });
     let tcp = std::net::TcpStream::connect(addr).unwrap();
-    let client = blocking::Session::connect(blocking::PipeIo::tcp(tcp), Config::default()).unwrap();
+    let client =
+        blocking::Session::connect(blocking::PipeIo::from_tcp(tcp), Config::default()).unwrap();
     let server = srv.join().unwrap();
     let (mut s, _r) = client.open_bi().unwrap();
     s.write_all(b"x").unwrap();
@@ -419,7 +422,7 @@ fn blocking_read_timeout() {
     let mut b = [0u8; 4];
     assert_eq!(sr.read(&mut b).unwrap(), Some(1));
     sr.set_read_timeout(Some(Duration::from_millis(50)));
-    assert_eq!(sr.read(&mut b), Err(StreamError::TimedOut));
+    assert_eq!(sr.read(&mut b), Err(zmux::blocking::WaitError::TimedOut));
 }
 
 #[tokio::test]
@@ -688,7 +691,7 @@ fn blocking_a_delayed_first_record_keeps_the_parameters_first() {
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let session =
-                blocking::Session::accept(blocking::PipeIo::tcp(tcp), first_delay_config(all))
+                blocking::Session::accept(blocking::PipeIo::from_tcp(tcp), first_delay_config(all))
                     .unwrap();
             let (mut s, mut r) = session.accept_bi().unwrap();
             let mut data = Vec::new();
@@ -701,7 +704,7 @@ fn blocking_a_delayed_first_record_keeps_the_parameters_first() {
         let tcp = std::net::TcpStream::connect(addr).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let client =
-            blocking::Session::connect(blocking::PipeIo::tcp(tcp), first_delay_config(all))
+            blocking::Session::connect(blocking::PipeIo::from_tcp(tcp), first_delay_config(all))
                 .unwrap();
         let (mut s, mut r) = client.open_bi().unwrap();
         r.set_read_timeout(Some(Duration::from_secs(10)));

@@ -39,8 +39,8 @@ use proptest::test_runner::FileFailurePersistence;
 use zmux::proto::frame::{Dir, Frame, Frames, Gates};
 use zmux::proto::session::{
     Config, CoreEvent, FrameInfo, InboundState, OutboundState, Pick, PickAnswer, PipeAuth, PipeId,
-    PipeOptions, PipeSnapshot, Policy, SessionCore, SessionError, SessionStats, State, StreamError,
-    StreamKey,
+    PipeOptions, PipeSnapshot, Scheduler, SessionCore, SessionError, SessionStats, State,
+    StreamError, StreamKey,
 };
 use zmux::proto::{TransportErrorCode, VarInt, varint};
 
@@ -222,14 +222,14 @@ impl Pick for HashPick {
     }
 }
 
-fn policy() -> impl Strategy<Value = Policy> {
+fn policy() -> impl Strategy<Value = Scheduler> {
     prop_oneof![
-        Just(Policy::Affinity),
-        Just(Policy::SpreadEta),
-        Just(Policy::SpreadRateWeighted),
-        Just(Policy::SpreadRoundRobin),
-        Just(Policy::SessionAffinity),
-        Just(Policy::Custom(Arc::new(HashPick::default()))),
+        Just(Scheduler::Affinity),
+        Just(Scheduler::SpreadEta),
+        Just(Scheduler::SpreadRateWeighted),
+        Just(Scheduler::SpreadRoundRobin),
+        Just(Scheduler::SessionAffinity),
+        Just(Scheduler::Custom(Arc::new(HashPick::default()))),
     ]
 }
 
@@ -254,7 +254,7 @@ fn allowed(e: &SessionError) -> bool {
 #[derive(Debug, Clone)]
 struct Setup {
     resume: bool,
-    policies: [Policy; 2],
+    policies: [Scheduler; 2],
     /// Small stream and session windows: credit pressure, opportunistic
     /// copies.
     tight_windows: bool,
@@ -629,7 +629,7 @@ impl Net {
             if writer == side {
                 if half.sending == Sending::Open && !lost {
                     half.sending = Sending::Reset {
-                        code: 0,
+                        code: zmux::ApplicationErrorCode::ZMUX_CANCELLED.0,
                         reliable: half.boundary.unwrap_or(0),
                     };
                 }
@@ -1076,12 +1076,12 @@ enum Op {
     },
     SetPolicy {
         side: usize,
-        policy: Policy,
+        policy: Scheduler,
     },
     StreamPolicy {
         side: usize,
         sel: u8,
-        policy: Option<Policy>,
+        policy: Option<Scheduler>,
     },
     Tier {
         side: usize,
@@ -1121,14 +1121,14 @@ fn pipe_options() -> impl Strategy<Value = PipeOptions> {
             |(fate, send, recv, standby, weight, probation, floor, dead)| {
                 let mut o = PipeOptions::default();
                 o.fate_group = fate;
-                o.send_priority = send;
-                o.receive_priority = recv;
-                o.send_standby = standby;
-                o.receive_standby = standby.unwrap_or(false);
-                o.weight = weight;
+                o.send_priority = change(send);
+                o.receive_priority = zmux::Change::Set(recv);
+                o.send_standby = change(standby);
+                o.receive_standby = zmux::Change::Set(standby.unwrap_or(false));
+                o.weight = zmux::Change::Set(weight);
                 o.probation = self::probation(probation);
-                o.liveness.suspect_floor = inherit(floor);
-                o.liveness.dead_timeout = inherit(dead);
+                live(&mut o).suspect_floor = inherit(floor);
+                live(&mut o).dead_timeout = inherit(dead);
                 o
             },
         )
@@ -1407,8 +1407,8 @@ impl Net {
                             pipe,
                             &zmux::PipeUpdate {
                                 probation: match probation(p) {
-                                    zmux::Inherit::Session => zmux::Change::Clear,
-                                    zmux::Inherit::Set(v) => zmux::Change::Set(v),
+                                    zmux::Change::Set(v) => zmux::Change::Set(v),
+                                    _ => zmux::Change::Clear,
                                 },
                                 ..Default::default()
                             },
@@ -1441,22 +1441,47 @@ macro_rules! po_set {
         $o.probation = probation($v)
     };
     ($o:ident, suspect_floor, $v:expr) => {
-        $o.liveness.suspect_floor = inherit($v)
+        live(&mut $o).suspect_floor = inherit($v)
     };
     ($o:ident, dead_timeout, $v:expr) => {
-        $o.liveness.dead_timeout = inherit($v)
+        live(&mut $o).dead_timeout = inherit($v)
+    };
+    ($o:ident, send_priority, $v:expr) => {
+        $o.send_priority = change($v)
+    };
+    ($o:ident, send_standby, $v:expr) => {
+        $o.send_standby = change($v)
+    };
+    ($o:ident, fate_group, $v:expr) => {
+        $o.fate_group = $v
     };
     ($o:ident, $field:ident, $v:expr) => {
-        $o.$field = $v
+        $o.$field = zmux::Change::Set($v)
     };
 }
 
 /// A generated probation base: `None` the session's, zero off.
-fn probation(p: Option<Duration>) -> zmux::Inherit<Option<zmux::Cap<Duration>>> {
+fn probation(p: Option<Duration>) -> zmux::Change<Option<zmux::Cap<Duration>>> {
     match p {
-        None => zmux::Inherit::Session,
-        Some(d) if d.is_zero() => zmux::Inherit::Set(None),
-        Some(d) => zmux::Inherit::Set(Some(zmux::Cap::Fixed(d))),
+        None => zmux::Change::Keep,
+        Some(d) if d.is_zero() => zmux::Change::Set(None),
+        Some(d) => zmux::Change::Set(Some(zmux::Cap::Fixed(d))),
+    }
+}
+
+/// A generated own setting: `None` the default.
+fn change<T>(v: Option<T>) -> zmux::Change<T> {
+    v.map_or(zmux::Change::Keep, zmux::Change::Set)
+}
+
+/// The pipe's own liveness settings, to change one field.
+fn live(o: &mut PipeOptions) -> &mut zmux::PipeLiveness {
+    if !matches!(o.liveness, zmux::Change::Set(_)) {
+        o.liveness = zmux::Change::Set(zmux::PipeLiveness::default());
+    }
+    match &mut o.liveness {
+        zmux::Change::Set(l) => l,
+        _ => unreachable!(),
     }
 }
 
@@ -1543,7 +1568,7 @@ proptest! {
 fn lost_data_at_the_credit_limit_stays_scheduled() {
     let setup = Setup {
         resume: true,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: true,
         suspect_floor: Duration::from_millis(250),
         probation: None,
@@ -1593,7 +1618,7 @@ fn lost_data_at_the_credit_limit_stays_scheduled() {
 fn reset_after_reliable_data_with_data_lost_is_sent() {
     let setup = Setup {
         resume: true,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: false,
         suspect_floor: Duration::from_millis(250),
         probation: None,
@@ -1660,7 +1685,7 @@ fn reset_after_reliable_data_with_data_lost_is_sent() {
 fn preamble_lost_before_a_reset_is_sent_again() {
     let setup = Setup {
         resume: true,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: false,
         suspect_floor: Duration::from_millis(250),
         probation: None,
@@ -1711,7 +1736,7 @@ fn abandon_after_a_failed_drain_is_sent() {
     for carrier_error in [false, true] {
         let setup = Setup {
             resume: false,
-            policies: [Policy::Affinity, Policy::Affinity],
+            policies: [Scheduler::Affinity, Scheduler::Affinity],
             tight_windows: false,
             suspect_floor: Duration::from_millis(250),
             probation: None,
@@ -1767,7 +1792,7 @@ impl Pick for OutOfRange {
 /// answers that fell back"); `custom_ok` takes `&self` and cannot count.
 #[test]
 fn custom_policy_fallbacks_are_counted() {
-    let custom = Policy::Custom(Arc::new(OutOfRange));
+    let custom = Scheduler::Custom(Arc::new(OutOfRange));
     let setup = Setup {
         resume: false,
         policies: [custom.clone(), custom],
@@ -1815,7 +1840,7 @@ fn custom_policy_fallbacks_are_counted() {
 fn opportunistic_copy_of_a_reset_stream() {
     let setup = Setup {
         resume: false,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: true,
         suspect_floor: Duration::from_millis(250),
         probation: Some(Duration::from_nanos(0)),
@@ -1915,7 +1940,7 @@ fn opportunistic_copy_of_a_reset_stream() {
 fn reset_then_session_loss() -> (Net, usize) {
     let setup = Setup {
         resume: false,
-        policies: [Policy::Affinity, Policy::SpreadRoundRobin],
+        policies: [Scheduler::Affinity, Scheduler::SpreadRoundRobin],
         tight_windows: false,
         suspect_floor: Duration::from_millis(250),
         probation: Some(Duration::ZERO),
@@ -2019,7 +2044,7 @@ fn reset_after_session_loss_claims_unread_reliable_data() {
 fn session_credit_after_a_pipe_is_replaced() {
     let setup = Setup {
         resume: true,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: true,
         suspect_floor: Duration::from_millis(250),
         probation: None,
@@ -2076,7 +2101,7 @@ fn session_credit_after_a_pipe_is_replaced() {
 fn unilateral_retirement_after_stretched_rtt() {
     let setup = Setup {
         resume: false,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: true,
         suspect_floor: Duration::from_millis(250),
         probation: None,
@@ -2133,8 +2158,8 @@ fn takeover_follows_the_reinjection_penalty() {
     let setup = Setup {
         resume: true,
         policies: [
-            Policy::Custom(Arc::new(HashPick::default())),
-            Policy::Affinity,
+            Scheduler::Custom(Arc::new(HashPick::default())),
+            Scheduler::Affinity,
         ],
         tight_windows: true,
         suspect_floor: Duration::from_millis(250),
@@ -2197,7 +2222,7 @@ fn takeover_follows_the_reinjection_penalty() {
 fn graceful_removal_during_a_delayed_join_keeps_the_session() {
     let setup = Setup {
         resume: false,
-        policies: [Policy::Affinity, Policy::Affinity],
+        policies: [Scheduler::Affinity, Scheduler::Affinity],
         tight_windows: false,
         suspect_floor: Duration::from_millis(250),
         probation: None,

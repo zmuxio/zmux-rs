@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::Listener;
-use zmux::carrier::CarrierConnId;
+use zmux::adapter::CarrierConnId;
 
 use crate::body::PipeBody;
 use crate::{Options, Unhandled, route_request};
@@ -102,7 +102,7 @@ impl Endpoint {
     ) -> Result<Response<PipeBody>, Unhandled<Incoming>> {
         use zmux_websocket::RequestUpgrade;
         if crate::forwarded_early_data(req.headers()) {
-            self.listener.count_setup_failure();
+            self.listener.adapter().count_setup_failure();
             return Ok(crate::too_early());
         }
         let peer = peer.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -185,7 +185,7 @@ impl Endpoint {
     /// the listener is closed, reading the PROXY protocol header of a
     /// trusted intermediary first (see [`crate::serve`]).
     pub async fn serve(self, tcp: TcpListener) {
-        let trusted = Arc::new(self.listener.trusted_proxies().clone());
+        let trusted = Arc::new(self.listener.adapter().trusted_proxies().clone());
         self.serve_proxied(
             || tcp.accept(),
             move |stream: TcpStream, peer| {
@@ -193,7 +193,7 @@ impl Endpoint {
                 async move {
                     let _ = stream.set_nodelay(true);
                     let mut stream = stream;
-                    let source = zmux::proxied_source(&mut stream, peer, &trusted).await?;
+                    let source = zmux::adapter::proxied_source(&mut stream, peer, &trusted).await?;
                     Ok((stream, source))
                 }
             },

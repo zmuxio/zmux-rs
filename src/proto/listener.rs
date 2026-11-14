@@ -33,8 +33,17 @@ pub struct MemoryPressure {
 /// lock on the listener's own serial context, never on an I/O path, when
 /// pressure starts and when it ends; free to close sessions. A panic is
 /// ignored.
+// Called by the tokio listener only.
+#[cfg_attr(not(all(feature = "tokio", not(loom))), allow(dead_code))]
 #[derive(Clone)]
-pub struct OnMemoryPressure(pub std::sync::Arc<dyn Fn(MemoryPressure) + Send + Sync>);
+pub struct OnMemoryPressure(pub(crate) std::sync::Arc<dyn Fn(MemoryPressure) + Send + Sync>);
+
+impl OnMemoryPressure {
+    /// The hook calling `f`.
+    pub fn new(f: impl Fn(MemoryPressure) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+}
 
 impl std::fmt::Debug for OnMemoryPressure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,13 +65,16 @@ pub struct ListenerConfig {
     /// finds every slot taken closes the oldest stalled carrier to take
     /// its slot, or is closed at once (counted as rejected) when none is
     /// stalled. Stalled carriers hold at most half of the slots (rounded
-    /// down).
+    /// down, so that with one slot no carrier stalls: a Stall then closes
+    /// it at once, as `stall_overflow`).
     pub max_pending: Option<usize>,
     /// Carriers before a session per source (default 8; a source counted
     /// by its prefix, [`ListenerConfig::source_prefix_v4`] and
     /// [`ListenerConfig::source_prefix_v6`]), held as
     /// [`ListenerConfig::max_pending`] says. A source stalls at most one
-    /// fewer, so that it always keeps a slot for a new attempt.
+    /// fewer, so that it always keeps a slot for a new attempt. At least 2,
+    /// since a split bootstrap holds two slots and an exchange carrier's
+    /// further requests compete with the request that created it.
     pub max_pending_per_source: usize,
     /// The prefix an IPv4 source is counted by: its first this many bits
     /// (default 32, the address on its own; 1 to 32, another value being
@@ -301,10 +313,20 @@ impl RejectAction {
 }
 
 /// The function of [`ListenerConfig::on_reject`].
+// Called by the drivers' listeners only.
+#[cfg_attr(
+    any(loom, not(any(feature = "tokio", feature = "blocking"))),
+    allow(dead_code)
+)]
 #[derive(Clone)]
-pub struct OnReject(pub std::sync::Arc<dyn Fn(&RejectInfo) -> RejectAction + Send + Sync>);
+pub struct OnReject(pub(crate) std::sync::Arc<dyn Fn(&RejectInfo) -> RejectAction + Send + Sync>);
 
 impl OnReject {
+    /// The policy calling `f`.
+    pub fn new(f: impl Fn(&RejectInfo) -> RejectAction + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
     /// What the policy chooses for `info`; one that panics closes the carrier.
     #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
     pub(crate) fn ask(
@@ -580,9 +602,9 @@ pub struct ListenerCore {
 }
 
 impl ListenerConfig {
-    /// The checks every listener makes of its limits.
-    #[cfg(any(test, all(any(feature = "tokio", feature = "blocking"), not(loom))))]
-    pub(crate) fn check(&self) -> Result<(), crate::InvalidConfig> {
+    /// Checks the limits as creating a listener does: the error
+    /// `Listener::new` would fail with, naming the field.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         let e = crate::InvalidConfig::new;
         if self.instance_id.len() > MAX_INSTANCE_ID_LEN {
             return Err(e(
@@ -590,13 +612,16 @@ impl ListenerConfig {
                 "longer than MAX_INSTANCE_ID_LEN",
             ));
         }
-        if self.max_pending == Some(0)
-            || self.max_pending_per_source == 0
-            || self.max_pending_per_session == 0
-        {
+        if self.max_pending == Some(0) || self.max_pending_per_session == 0 {
             return Err(e(
                 "ListenerConfig::max_pending",
-                "max_pending, max_pending_per_source and max_pending_per_session must be at least 1",
+                "max_pending and max_pending_per_session must be at least 1",
+            ));
+        }
+        if self.max_pending_per_source < 2 {
+            return Err(e(
+                "ListenerConfig::max_pending_per_source",
+                "at least 2: a split bootstrap holds two slots",
             ));
         }
         if !(1..=32).contains(&self.source_prefix_v4) {
@@ -1291,7 +1316,7 @@ pub struct ListenerStats {
     /// Connections never made a pipe input: a failed TLS handshake or its
     /// timeout (also the handshake a join sent in early data waits for), a
     /// failed HTTP or WebSocket upgrade, or the setup limit
-    /// ([`crate::Listener::count_setup_failure`]). With an admission, a carrier's
+    /// ([`ListenerAdapter::count_setup_failure`](crate::adapter::ListenerAdapter::count_setup_failure)). With an admission, a carrier's
     /// failed outer handshake counts in [`AdmissionStats::handshake_failed`]
     /// instead.
     pub setup_failures: u64,
@@ -1473,6 +1498,23 @@ mod tests {
         assert_eq!(l.held(9), (4, 2));
     }
 
+    /// With one slot, half of it rounded down is none: no carrier stalls,
+    /// so a carrier holding the slot is never one to evict, and a new one
+    /// finds the listener full.
+    #[test]
+    fn one_slot_stalls_nothing() {
+        let mut l = ListenerCore::new(ListenerConfig {
+            max_pending: Some(1),
+            ..ListenerConfig::default()
+        });
+        let (slot, _) = taken(l.enter(0));
+        assert!(!l.stall(slot), "half of one slot, rounded down, is none");
+        assert_eq!(l.enter(1), Entered::Full);
+        l.release(slot);
+        let (_, evicted) = taken(l.enter(1));
+        assert_eq!(evicted, None);
+    }
+
     /// A source stalls at most `max_pending_per_source - 1` carriers; unlimited, the
     /// listener never refuses for its own bound.
     #[test]
@@ -1553,7 +1595,7 @@ mod tests {
                 source_prefix_v6: v6,
                 ..ListenerConfig::default()
             }
-            .check()
+            .validate()
         };
         assert!(with(32, 64).is_ok() && with(1, 1).is_ok() && with(32, 128).is_ok());
         for (v4, v6) in [(0, 64), (33, 64), (32, 0), (32, 129)] {

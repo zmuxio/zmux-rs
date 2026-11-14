@@ -15,8 +15,9 @@ use http::{Request, Response, header};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::Instant;
-use zmux::carrier::MemoryCharge;
-use zmux::{Entry, Listener, PipeHint, PipeIo};
+use zmux::adapter::Entry;
+use zmux::adapter::MemoryCharge;
+use zmux::{Listener, PipeHint, PipeIo};
 
 use super::ExchangeOptions;
 use super::record::Record;
@@ -43,7 +44,7 @@ const CHARGE_UNIT: u64 = 64 << 10;
 ///
 /// The bytes a carrier holds (uplink pieces for zmux, downlink bytes not
 /// yet acknowledged) are charged to the listener's memory budget
-/// ([`Listener::charge_memory`]).
+/// ([`ListenerAdapter::charge_memory`](zmux::adapter::ListenerAdapter::charge_memory)).
 #[derive(Clone)]
 pub struct ExchangeServer {
     inner: Arc<Shared>,
@@ -186,7 +187,7 @@ impl ExchangeServer {
     ///
     /// Every other request takes a place under the listener's limits of
     /// pending carriers, its source's and the global one
-    /// ([`Listener::enter`]); one that finds none is answered `503` without
+    /// ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)); one that finds none is answered `503` without
     /// a body, its body unread, and is not given back. A closed listener
     /// holds no place for a request but still authenticates it, to answer
     /// GONE for a carrier it does not know. The server then reads the
@@ -248,16 +249,16 @@ impl ExchangeServer {
         let s = &self.inner;
         if crate::forwarded_early_data(&parts.headers) {
             // Forwarded from TLS early data: no carrier is taken from it.
-            s.listener.count_setup_failure();
+            s.listener.adapter().count_setup_failure();
             return Ok(crate::too_early());
         }
         let peer = peer.unwrap_or(NO_ADDR);
         let source = crate::request_source(&s.listener, &parts.headers, Some(peer)).unwrap_or(peer);
         // The request's slots from its arrival; none for a closed listener,
         // which still authenticates the request to answer GONE.
-        let entry = match s.listener.enter(peer, Some(source)) {
+        let entry = match s.listener.adapter().enter(peer, Some(source)) {
             Some(e) => Some(e),
-            None if s.listener.is_closed() => None,
+            None if s.listener.adapter().is_closed() => None,
             None => {
                 return Ok(crate::server::status(http::StatusCode::SERVICE_UNAVAILABLE));
             }
@@ -917,7 +918,7 @@ impl Carrier {
             let want = st.held_bytes().div_ceil(CHARGE_UNIT) * CHARGE_UNIT;
             if want != st.charged {
                 st.charged = want;
-                st.charge = (want > 0).then(|| self.listener.charge_memory(want));
+                st.charge = (want > 0).then(|| self.listener.adapter().charge_memory(want));
             }
         }
         drop(st);
@@ -1298,9 +1299,10 @@ mod tests {
         let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let (_, req) = request(&[9; 16], Kind::Up, 0, 0, wire::unix_time(), nonce, b"x");
         let (mut parts, body) = req.into_parts();
-        parts
-            .headers
-            .insert(zmux::PAIR_HEADER, http::HeaderValue::from_static("x"));
+        parts.headers.insert(
+            zmux::adapter::PAIR_HEADER,
+            http::HeaderValue::from_static("x"),
+        );
         let back = server
             .handle(
                 Request::from_parts(parts, body),
@@ -1484,7 +1486,7 @@ mod tests {
     async fn a_closed_listener_answers_gone() {
         let (listener, server) = server(ExchangeOptions::default());
         listener.close();
-        assert!(listener.is_closed());
+        assert!(listener.adapter().is_closed());
         for kind in [Kind::Up, Kind::Down] {
             assert_eq!(send(&server, &[1; 16], kind, 0, 0, b"").await.flags, GONE);
         }
@@ -1634,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_data_mac_creates_nothing() {
         let mut limits = zmux::ListenerConfig::default();
-        limits.max_pending_per_source = 1;
+        limits.max_pending_per_source = 2;
         let listener =
             Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =

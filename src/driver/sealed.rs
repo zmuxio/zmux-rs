@@ -258,6 +258,12 @@ impl SealedWrite {
             match ready!(wrote) {
                 Ok(n) if n > 0 => {
                     let _ = self.pending.split_to(n);
+                    if self.pending.is_empty() {
+                        // An empty slice still holds the unit's allocation:
+                        // dropped, `unit` takes it back unshared, and an idle
+                        // release frees it.
+                        self.pending = Bytes::new();
+                    }
                 }
                 failed => {
                     self.sealer.fail();
@@ -297,12 +303,20 @@ impl AsyncWrite for SealedWrite {
             u.put_bytes(0, pre);
             u.extend_from_slice(buf);
             u.put_bytes(0, usize::from(TAG));
-            this.sealer
+            let sealed = this
+                .sealer
                 .seal_in_place(&mut u[pre..])
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            if pre > 0 {
-                let prefix = length_prefix(&u[pre..])?;
-                u[..pre].copy_from_slice(&prefix);
+                .map_err(io::Error::other)
+                .and_then(|()| match pre {
+                    0 => Ok(()),
+                    _ => length_prefix(&u[pre..]).map(|p| u[..pre].copy_from_slice(&p)),
+                });
+            if let Err(e) = sealed {
+                // No record went out for this write, and no record may
+                // follow: the direction fails, as after a failed write.
+                u.clear();
+                this.sealer.fail();
+                return Poll::Ready(Err(e));
             }
             this.pending = u.split().freeze();
             this.held = true;
@@ -445,6 +459,25 @@ mod tests {
         assert_eq!(n, 200);
         let got = reader.await.unwrap();
         assert_eq!(o.open(&got[2..]).unwrap(), data);
+    }
+
+    /// A record that cannot be sealed fails the direction, as a failed
+    /// write does: nothing is written and no later record follows.
+    #[tokio::test]
+    async fn a_seal_failure_fails_the_direction() {
+        let (near, mut far) = duplex(1 << 20);
+        let mut p = seal_carrier(PipeIo::new(near), keys().0, keys().1);
+        let Some(Writer::Sealed(w)) = p.writer.as_mut() else {
+            panic!("sealed")
+        };
+        let over = vec![1; aes_256_gcm().max_plaintext() + 1];
+        assert!(w.write(&over).await.is_err());
+        assert!(w.unit.is_empty() && w.pending.is_empty() && w.taken == 0);
+        assert!(w.write(&[1, 2, 3]).await.is_err(), "no record follows");
+        drop(p);
+        let mut rest = Vec::new();
+        far.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
     }
 
     /// The records written are the allocating AEAD's, with their length

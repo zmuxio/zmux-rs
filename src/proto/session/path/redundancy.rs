@@ -12,13 +12,13 @@ use crate::proto::session::output::Records;
 use crate::proto::session::pipes::{Attachment, OutPipe, QueuedCopy};
 use crate::proto::session::stream::SendPart;
 use crate::proto::session::tier::Gate;
-use crate::proto::session::{Policy, Redundancy, SessionCore, StreamKey};
+use crate::proto::session::{Redundancy, Scheduler, SessionCore, StreamKey};
 
 /// An idle period lasts at least max(this, T_suspect).
 const IDLE: Duration = Duration::from_secs(1);
 
 /// The policy that schedules a direction.
-fn policy_of<'a>(send: &'a SendPart, session: &'a Policy) -> &'a Policy {
+fn policy_of<'a>(send: &'a SendPart, session: &'a Scheduler) -> &'a Scheduler {
     send.mp().scheduler.as_ref().unwrap_or(session)
 }
 
@@ -28,9 +28,9 @@ fn policy_of<'a>(send: &'a SendPart, session: &'a Policy) -> &'a Policy {
 pub(in crate::proto::session) fn redundant(
     send: &SendPart,
     session: Redundancy,
-    policy: &Policy,
+    policy: &Scheduler,
 ) -> bool {
-    !matches!(policy_of(send, policy), Policy::SessionAffinity)
+    !matches!(policy_of(send, policy), Scheduler::SessionAffinity)
         && send
             .mp()
             .redundant
@@ -40,8 +40,8 @@ pub(in crate::proto::session) fn redundant(
 /// Whether the first chunk after an idle period is copied for a stream
 /// direction: unless `redundancy` is off or the direction's redundancy is
 /// turned off.
-fn idle_copied(send: &SendPart, session: Redundancy, policy: &Policy) -> bool {
-    !matches!(policy_of(send, policy), Policy::SessionAffinity)
+fn idle_copied(send: &SendPart, session: Redundancy, policy: &Scheduler) -> bool {
+    !matches!(policy_of(send, policy), Scheduler::SessionAffinity)
         && send.mp().redundant.unwrap_or(session != Redundancy::Off)
 }
 
@@ -350,7 +350,7 @@ mod tests {
     fn clearing_the_stream_setting_follows_the_session_again() {
         let mut send = SendPart::with_buf(0, SendBuf::default());
         send.priority = Priority::new(1, false).unwrap_or(Priority::DEFAULT);
-        let urgent = |s: &SendPart, r| redundant(s, r, &Policy::Affinity);
+        let urgent = |s: &SendPart, r| redundant(s, r, &Scheduler::Affinity);
         // Unset: urgency 1 under "urgent" is redundant, under "off" not.
         assert!(urgent(&send, Redundancy::Urgent));
         assert!(!urgent(&send, Redundancy::Off));

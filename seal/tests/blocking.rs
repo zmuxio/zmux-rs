@@ -112,7 +112,11 @@ fn establish_and_join_on_threads() {
         Some(zmux::shaping::UnitPlan::new(900, 0, 0).with_delay(Duration::from_millis(5)))
     }));
     let c = blocking::Session::connect(p, with_hook).unwrap();
-    let s = l.accept(Some(Duration::from_secs(5))).expect("a session");
+    let s = l
+        .accept_timeout(Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .expect("a session");
     assert_eq!(c.weakest_record_mode(), RecordMode::Sealed);
     assert_eq!(
         s.admitted().unwrap().downcast_ref::<&str>(),
@@ -121,7 +125,7 @@ fn establish_and_join_on_threads() {
     echo(&c, &s, b"on pipe 0");
     let pipe = c
         .begin_add_pipe(
-            PipeIo::tcp(TcpStream::connect(addr).unwrap()),
+            PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
             PipeOptions::new().with_record_mode(RecordMode::Sealed),
         )
         .unwrap();
@@ -151,10 +155,10 @@ fn timeouts_and_refusals() {
     let seen = asked.clone();
     let mut limits = ListenerConfig::default();
     limits.first_record_timeout = Duration::from_millis(100);
-    limits.on_reject = Some(OnReject(Arc::new(move |_| {
+    limits.on_reject = Some(OnReject::new(move |_| {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         RejectAction::Close
-    })));
+    }));
     let (l, addr, t) = serving(Some(server(vec![7; 32]).blocking_transform()), limits);
     // A wrong key: refused without an answer.
     let e = blocking_establish(addr).unwrap_err();
@@ -178,7 +182,7 @@ fn timeouts_and_refusals() {
     let (accepted, _) = tcp.accept().unwrap();
     let begun = Instant::now();
     assert_eq!(
-        l.handle_pipe(PipeIo::tcp(accepted), PipeHint::default()),
+        l.handle_pipe(PipeIo::from_tcp(accepted), PipeHint::default()),
         Err(HandleError::TimedOut)
     );
     assert!(begun.elapsed() < Duration::from_secs(2));
@@ -186,10 +190,10 @@ fn timeouts_and_refusals() {
     drop(silent);
     // Closed: refused, and accept ends.
     l.close();
-    assert!(l.accept(None).is_none());
+    assert!(l.accept().is_none());
     let tcp2 = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
     assert_eq!(
-        l.handle_pipe(PipeIo::tcp(tcp2), PipeHint::default()),
+        l.handle_pipe(PipeIo::from_tcp(tcp2), PipeHint::default()),
         Err(HandleError::Refused)
     );
 }
@@ -197,7 +201,7 @@ fn timeouts_and_refusals() {
 fn blocking_establish(addr: SocketAddr) -> std::io::Result<(PipeIo, Peer)> {
     let tcp = TcpStream::connect(addr)?;
     zmux_seal::blocking::establish(
-        PipeIo::tcp(tcp),
+        PipeIo::from_tcp(tcp),
         &client_config(),
         Some(Duration::from_secs(5)),
     )
@@ -211,7 +215,7 @@ fn a_client_timeout_ends_the_handshake() {
     let (_kept, _) = tcp.accept().unwrap();
     let begun = Instant::now();
     let e = zmux_seal::blocking::establish(
-        PipeIo::tcp(conn),
+        PipeIo::from_tcp(conn),
         &client_config(),
         Some(Duration::from_millis(100)),
     )
@@ -230,7 +234,7 @@ fn the_reply_timeout_ends_a_silent_handshake() {
     let mut cfg = client_config();
     cfg.reply_timeout = Some(Duration::from_millis(150));
     let begun = Instant::now();
-    let e = zmux_seal::blocking::establish(PipeIo::tcp(conn), &cfg, None).unwrap_err();
+    let e = zmux_seal::blocking::establish(PipeIo::from_tcp(conn), &cfg, None).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
     assert!(
         e.get_ref().is_some_and(|e| e.is::<zmux_seal::NoReply>()),
@@ -250,9 +254,12 @@ fn a_refused_establish_is_stalled_by_default() {
     let mut cfg = client_config();
     cfg.reply_timeout = Some(Duration::from_millis(400));
     let begun = Instant::now();
-    let e =
-        zmux_seal::blocking::establish(PipeIo::tcp(TcpStream::connect(addr).unwrap()), &cfg, None)
-            .unwrap_err();
+    let e = zmux_seal::blocking::establish(
+        PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+        &cfg,
+        None,
+    )
+    .unwrap_err();
     assert!(
         e.get_ref().is_some_and(|e| e.is::<zmux_seal::NoReply>()),
         "{e}"
@@ -283,12 +290,16 @@ fn drivers_interoperate() {
         .unwrap();
     let c = rt.block_on(async {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (p, _) = establish(zmux::PipeIo::tcp(tcp), &client_config())
+        let (p, _) = establish(zmux::PipeIo::from_tcp(tcp), &client_config())
             .await
             .unwrap();
         zmux::Session::connect(p, config()).await.unwrap()
     });
-    let s = l.accept(Some(Duration::from_secs(5))).expect("a session");
+    let s = l
+        .accept_timeout(Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .expect("a session");
     let (mut sw, mut sr) = {
         let (cw, cr) = rt.block_on(async {
             let (mut w, r) = c.open_bi().await.unwrap();
@@ -337,7 +348,7 @@ fn a_shaper_wait_ends_with_the_timeout() {
     let carrier = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
     let began = Instant::now();
     let r = zmux_seal::blocking::establish(
-        PipeIo::tcp(carrier),
+        PipeIo::from_tcp(carrier),
         &cfg,
         Some(Duration::from_millis(100)),
     );

@@ -95,14 +95,13 @@ pub use config::{
     DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MEMORY_BUDGET,
     DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
     DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, EarlyData, Inherit,
-    Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT, PipeAuth, Redundancy,
+    Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT, PipeAuth, Redial, Redundancy,
     SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, UniCredit, WindowIncrease,
 };
 pub use early::EarlyDataState;
 pub use epoch::{
     DEFAULT_EPOCH_JOINS, DEFAULT_EPOCH_PERIOD, EPOCH_RETENTION, EpochPolicy, MAX_JOIN_DEADLINE,
 };
-pub(crate) use error::ON_DRIVER_THREAD;
 pub use error::{
     DatagramError, InvalidConfig, JoinMissing, OpenError, PipeError, PipeFailure, SessionError,
     StreamError,
@@ -117,7 +116,7 @@ pub use mpath::{
     LaneStats, Multipath, PipeDirection, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource,
 };
 pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
-pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Policy};
+pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Scheduler};
 pub use preamble::Preamble;
 pub use quality::{CapacityFloor, QualityBand};
 pub use recv_buf::Backing;
@@ -1565,6 +1564,20 @@ impl SessionCore {
     }
 
     // ---- events and timers ---------------------------------------------
+
+    /// Frees the storage of the empty queues of a session that has been
+    /// idle for a while (a second in the tokio driver): the events and
+    /// every pipe's batches in flight. The next use takes it again, so a
+    /// busy session never does.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn release_idle(&mut self) {
+        if self.events.is_empty() {
+            self.events = VecDeque::new();
+        }
+        for o in self.atts.outs_mut() {
+            o.release_idle();
+        }
+    }
 
     /// The next event.
     pub fn poll_event(&mut self) -> Option<CoreEvent> {

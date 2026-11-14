@@ -650,7 +650,7 @@ pub(crate) struct SendMp {
     /// binding is provisional.
     pub(crate) bound: Option<super::policy::Binding>,
     /// Per-direction scheduler override.
-    pub(crate) scheduler: Option<super::policy::Policy>,
+    pub(crate) scheduler: Option<super::policy::Scheduler>,
     /// The current values of the direction's own `spread-round-robin`
     /// policy, by pipe; absent pipes are at 0.
     pub(crate) rr: Vec<(u64, f64)>,

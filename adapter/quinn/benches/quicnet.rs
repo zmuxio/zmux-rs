@@ -37,9 +37,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
+use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    Policy, Priority, Session,
+    Priority, Session,
 };
 use zmux_quinn::{Carrier, Options};
 
@@ -360,7 +361,7 @@ fn mp_config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"quicnet-bench-psk-0123456789abcd").with_end_to_end();
-    c.scheduler = Policy::SpreadEta;
+    c.scheduler = Scheduler::SpreadEta;
     c
 }
 
@@ -724,15 +725,16 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
         tokio::spawn(async move {
             while let Ok((c, _)) = tl.accept().await {
                 let l = l.clone();
-                tokio::spawn(
-                    async move { l.handle_pipe(PipeIo::tcp(c), PipeHint::default()).await },
-                );
+                tokio::spawn(async move {
+                    l.handle_pipe(PipeIo::from_tcp(c), PipeHint::default())
+                        .await
+                });
             }
         });
     }
     let tcp_addr = tcp_relay(tcp_server, tcp_link).await;
     let client = Session::connect(
-        PipeIo::tcp(TcpStream::connect(tcp_addr).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(tcp_addr).await.unwrap()),
         mp_config(),
     )
     .await

@@ -8,9 +8,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use zmux::InboundTransform;
 use zmux::{
-    Admission, AdmissionVerdict, AdmittedValue, Config, InboundTransform, Listener, ListenerConfig,
-    PipeAuth, PipeHint, PipeIo, PipeOptions, Session,
+    Admission, AdmissionVerdict, AdmittedValue, Config, Listener, ListenerConfig, PipeAuth,
+    PipeHint, PipeIo, PipeOptions, Session,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -64,14 +65,16 @@ async fn the_transform_sees_every_carrier_and_the_value_travels() {
             }));
         let (listener, addr) = serve(limits).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let client = Session::connect(PipeIo::tcp(tcp), config()).await.unwrap();
+        let client = Session::connect(PipeIo::from_tcp(tcp), config())
+            .await
+            .unwrap();
         let server = listener.accept().await.unwrap();
         assert_eq!(value_of(server.admitted()), Some(7));
         assert!(client.admitted().is_none());
         // A join: its own value, the session's unchanged.
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let pipe = client
-            .begin_add_pipe(PipeIo::tcp(tcp), PipeOptions::default())
+            .begin_add_pipe(PipeIo::from_tcp(tcp), PipeOptions::default())
             .unwrap();
         pipe.joined().await.unwrap();
         eventually(|| server.pipes().len() == 2).await;
@@ -118,7 +121,7 @@ async fn a_failed_or_kind_changing_transform_is_a_setup_failure() {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
             let r = tokio::time::timeout(
                 Duration::from_secs(3),
-                Session::connect(PipeIo::tcp(tcp), config()),
+                Session::connect(PipeIo::from_tcp(tcp), config()),
             )
             .await;
             assert!(!matches!(r, Ok(Ok(_))));
@@ -175,7 +178,9 @@ async fn an_unknown_join_gets_no_answer() {
         let lb = Listener::new(config(), ListenerConfig::default())
             .expect("valid listener configuration");
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let client = Session::connect(PipeIo::tcp(tcp), config()).await.unwrap();
+        let client = Session::connect(PipeIo::from_tcp(tcp), config())
+            .await
+            .unwrap();
         let _server = la.accept().await.unwrap();
         let (ours, theirs) = tokio::io::duplex(4096);
         let wrote = Arc::new(Mutex::new(Vec::new()));

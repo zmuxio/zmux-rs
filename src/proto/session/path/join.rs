@@ -775,7 +775,7 @@ impl SessionCore {
         let consumed = skip + used;
         self.stats.join_failures = 0;
         if proven.payload().join_accepted() == Some(false) {
-            self.mp_mut().local_joins.remove(i);
+            self.mp_mut().end_local_join(id);
             self.join_declined(id, now);
             return JoinStep::Declined;
         }
@@ -822,7 +822,7 @@ impl SessionCore {
         self.shaping_spend(zeros as u64);
         let mut finished = Box::new(finished);
         let records = finished.take_records();
-        self.mp_mut().local_joins.remove(i);
+        self.mp_mut().end_local_join(id);
         self.epoch_attached(id, epoch, now);
         self.join_proven(id, mode, now);
         if let Some(frames) = frames {

@@ -301,6 +301,19 @@ struct OutMp {
     bytes_redundant: u64,
     /// A PIPE_PING went into the current batch.
     ping_in_batch: bool,
+    /// The PIPE_PING owed is that of a suspicion.
+    suspect_ping: bool,
+    /// The current batch carries it.
+    probe_in_batch: bool,
+    /// The send positions after the unacknowledged batches that carried
+    /// a suspicion's PIPE_PING, in order: their RTT samples are taken
+    /// despite a later suspicion when the path delivered them at its own
+    /// pace. Suspicions alone add to it.
+    probe_ends: Vec<u64>,
+    /// The send time of the batch holding the last byte an advance
+    /// acknowledged, and when that advance arrived: the pace of the path
+    /// that a suspicion's PIPE_PING is checked against.
+    prev_ack: Option<(Instant, Instant)>,
     /// The records with a PIPE_PING not acknowledged yet: their lane and
     /// the lane's position at their end, in order per lane.
     pings_unanswered: Vec<(u64, u64)>,
@@ -387,6 +400,10 @@ impl OutMp {
             bytes_opportunistic: 0,
             bytes_redundant: 0,
             ping_in_batch: false,
+            suspect_ping: false,
+            probe_in_batch: false,
+            probe_ends: Vec::new(),
+            prev_ack: None,
             pings_unanswered: Vec::new(),
             answer_ping: false,
             revalidating: None,
@@ -856,6 +873,7 @@ impl OutPipe {
         let sent = self.sent;
         let m = self.mp_mut();
         m.ping_wanted.get_or_insert(now);
+        m.suspect_ping = true;
         m.suspect_held = (m.suspect_floor, m.dead_timeout);
         // Bytes held through the outage give no samples.
         m.suspect_pos = sent;
@@ -889,6 +907,8 @@ impl OutPipe {
         m.activity_ends = Default::default();
         m.waiting_since = None;
         m.ping_wanted = None;
+        m.suspect_ping = false;
+        m.probe_ends = Vec::new();
         self.shutdown = true;
         let report = !self.out_closed && !self.abort_reported && !self.shutdown_reported;
         self.abort_reported = true;
@@ -1101,6 +1121,7 @@ impl OutPipe {
         let lane_end = self.sent_on(lane);
         let m = self.mp_mut();
         let ping = std::mem::take(&mut m.ping_in_batch);
+        let probe = std::mem::take(&mut m.probe_in_batch);
         if ping {
             m.pings_unanswered.push((lane, lane_end));
             if m.revalidating == Some(Revalidation::PingOwed) {
@@ -1115,6 +1136,9 @@ impl OutPipe {
             // A PIPE_PING went: the next idle-probe wait starts.
             m.boot_wait = false;
             m.draw_probe_wait();
+        }
+        if probe {
+            self.mp_mut().probe_ends.push(sent);
         }
         self.record_batch(lane, eliciting, peer_mad, now);
     }
@@ -1264,6 +1288,15 @@ impl OutPipe {
         }
     }
 
+    /// Frees the storage of an empty batch list: an idle pipe holds none
+    /// until it sends again.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn release_idle(&mut self) {
+        if self.batches.is_empty() {
+            self.batches = VecDeque::new();
+        }
+    }
+
     /// The sample state of the batches sent so far is not needed (no pipe
     /// acknowledgement).
     pub(crate) fn forget_batches(&mut self) {
@@ -1393,6 +1426,9 @@ impl OutPipe {
             .find(|b| b.end >= pos)
             .filter(|b| b.start < pos)
             .copied();
+        if let (Some(b), Some(m)) = (carrier, self.mp.as_deref_mut()) {
+            m.prev_ack = Some((b.time, now));
+        }
         let mut eliciting = false;
         for b in &self.batches {
             eliciting |= b.end > old && b.eliciting;
@@ -1503,6 +1539,32 @@ impl OutPipe {
         s
     }
 
+    /// Whether the advance to `pos` acknowledges a suspicion's PIPE_PING
+    /// alone, apart from the bytes acknowledged before it by at least half
+    /// the time between their sending: the path delivered them at its own
+    /// pace, and the sample measures the path. Released together after an
+    /// outage (in one advance, or both at once), the sample would measure
+    /// the outage.
+    fn probe_paced(&self, pos: u64, now: Instant) -> bool {
+        let Some((prev_sent, prev_at)) = self.mp().prev_ack else {
+            return false;
+        };
+        let old = self.acked;
+        let mut covered = self
+            .batches
+            .iter()
+            .take_while(|b| b.start < pos)
+            .filter(|b| b.end > old && b.eliciting);
+        let Some(b) = covered.next() else {
+            return false;
+        };
+        if b.end < pos || covered.next().is_some() || !self.mp().probe_ends.contains(&b.end) {
+            // Acknowledged together with earlier bytes, or not alone.
+            return false;
+        }
+        now.saturating_duration_since(prev_at) >= b.time.saturating_duration_since(prev_sent) / 2
+    }
+
     /// A PIPE_ACK of a multipath session advanced the acknowledged position
     /// to `pos` (see [`OutPipe::sample_ack`]): bytes sent before the pipe
     /// last became SUSPECT, or while it is suspect, and those `heard`
@@ -1528,7 +1590,13 @@ impl OutPipe {
         } else {
             self.mp().suspect_pos
         };
-        let usable = |b: &Batch| b.end > outage && heard(b);
+        // Except the PIPE_PING of a suspicion that the path delivered at its
+        // own pace: on a path whose round trip exceeds T_suspect it is
+        // acknowledged after the next suspicion, and discarding it kept
+        // the estimate, and so the suspicions, from ever catching up.
+        let paced = self.probe_paced(pos, now);
+        // probe_paced checked that the batch is the probe's.
+        let usable = |b: &Batch| (b.end > outage || paced) && heard(b);
         let rtt_ok = self.state != OutState::Failed;
         // Bytes sent before SUSPECT (or acknowledged while suspect) still give a
         // queue-proven rate sample; a failed pipe and a suspension give none.
@@ -1537,6 +1605,9 @@ impl OutPipe {
             pos, ack_delay, peer_mad, rtt_ok, quiet, usable, proven_ok, now,
         );
         let m = self.mp_mut();
+        if !m.probe_ends.is_empty() {
+            m.probe_ends.retain(|&e| e > pos);
+        }
         let unpenalized = m.penalty_until.is_some_and(|p| pos >= p);
         if unpenalized {
             m.penalty_until = None;
@@ -2119,6 +2190,7 @@ impl OutPipe {
         m.ping_wanted = None;
         m.pings_sent += 1;
         m.ping_in_batch = true;
+        m.probe_in_batch |= std::mem::take(&mut m.suspect_ping);
     }
 
     /// The reference of the idle probe: the last ack-eliciting byte, or
@@ -2157,7 +2229,11 @@ impl OutPipe {
     /// nothing ack-eliciting for longer than `quiet`, unless the batch
     /// carries one.
     pub(crate) fn check_liveness(&mut self, quiet: Duration, now: Instant) {
-        let last = self.mp().last_eliciting_or_usable();
+        // An advance of the acknowledged position proves the pipe as a
+        // sent byte does (MULTIPATH.md Section 6.4): an answer that
+        // acknowledges the pipe's own PIPE_PING carries none, so PIPE_PING
+        // frames never answer each other however long an exchange takes.
+        let last = self.mp().last_eliciting_or_usable().max(self.last_advance);
         let m = self.mp_mut();
         // One PIPE_PING per batch is enough.
         if !m.ping_in_batch && now.saturating_duration_since(last) > quiet {
@@ -2876,5 +2952,24 @@ mod tests {
         assert_eq!(o.held_out(t7).now, 0);
         assert_eq!(o.held_out(t7).min, 0);
         assert_eq!(o.limiter_in_flight(t7), 0);
+    }
+
+    /// The answer to a PIPE_PING carries a PIPE_PING of its own only when
+    /// the pipe has gone unproven for R_p: an advance of its acknowledged
+    /// position proves it as a sent ack-eliciting byte does, so an answer
+    /// that acknowledges the pipe's own PIPE_PING carries none, however
+    /// long that exchange took.
+    #[test]
+    fn an_answer_after_an_advance_has_no_ping() {
+        let t0 = Instant::now();
+        let r = Duration::from_secs(1);
+        let mut o = pipe(t0);
+        let now = t0 + Duration::from_secs(10);
+        o.last_advance = now - MS * 950;
+        o.check_liveness(r, now);
+        assert_eq!(o.ping_wanted(), None);
+        o.last_advance = now - r * 2;
+        o.check_liveness(r, now);
+        assert_eq!(o.ping_wanted(), Some(now));
     }
 }

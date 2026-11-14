@@ -15,7 +15,6 @@
 #[cfg(any(feature = "tokio", feature = "blocking"))]
 pub(crate) const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-mod backoff;
 mod duplicate;
 #[cfg(feature = "tokio")]
 mod maintain;
@@ -26,7 +25,6 @@ mod maintain;
 pub use crate::driver::splice::{
     Forwarded, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice,
 };
-pub use backoff::Backoff;
 pub use duplicate::{DuplicateError, DuplicateRule};
 pub(crate) use duplicate::{duplicate_api, resolve};
 

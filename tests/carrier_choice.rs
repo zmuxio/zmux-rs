@@ -9,7 +9,8 @@
 use std::io;
 use std::time::Duration;
 
-use zmux::helpers::{Backoff, PipePool, maintain_pipes};
+use zmux::Backoff;
+use zmux::helpers::{PipePool, maintain_pipes};
 use zmux::{
     CacheSnapshot, CacheSnapshotEntry, Candidate, CandidateOutcome, CarrierCache, CarrierChoice,
     CarrierChoicePolicy, CarrierKind, Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo,

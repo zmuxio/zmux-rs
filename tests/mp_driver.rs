@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use common::relay;
 use tokio::net::{TcpListener, TcpStream};
-use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Policy, Session};
+use zmux::sched::Scheduler;
+use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Session};
 
-fn config(policy: Policy) -> Config {
+fn config(policy: Scheduler) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"driver-test-psk-0123456789abcdef").with_end_to_end();
@@ -19,7 +20,7 @@ fn config(policy: Policy) -> Config {
     c
 }
 
-async fn server(policy: Policy) -> (std::net::SocketAddr, Listener) {
+async fn server(policy: Scheduler) -> (std::net::SocketAddr, Listener) {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let listener = Listener::new(config(policy), ListenerConfig::default())
@@ -72,12 +73,12 @@ async fn echo(session: &Session, len: usize) {
 async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
-    let listener = Listener::new(config(Policy::Affinity), ListenerConfig::default())
+    let listener = Listener::new(config(Scheduler::Affinity), ListenerConfig::default())
         .expect("valid listener configuration");
     let l = listener.clone();
     let serving = tokio::spawn(async move { l.serve(tcp).await });
     let first = TcpStream::connect(addr).await.unwrap();
-    let client = Session::connect(PipeIo::tcp(first), config(Policy::Affinity))
+    let client = Session::connect(PipeIo::from_tcp(first), config(Scheduler::Affinity))
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
@@ -85,7 +86,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let second = TcpStream::connect(addr).await.unwrap();
     let pipe = client
         .begin_add_pipe(
-            PipeIo::tcp(second),
+            PipeIo::from_tcp(second),
             PipeOptions::new()
                 .with_send_priority(5)
                 .with_receive_priority(5)
@@ -108,7 +109,12 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     // joined, and can change them.
     common::eventually(10, "server sees the join", || ids(&server).len() == 2).await;
     let joined = server.pipe(pipe.id()).expect("the peer's pipe");
-    joined.set_send_priority(1).unwrap();
+    joined
+        .update(&zmux::PipeUpdate {
+            send_priority: zmux::Change::Set(1),
+            ..Default::default()
+        })
+        .unwrap();
     assert_eq!(joined.stats().unwrap().send_priority, 1);
     // The peer's join is attached from the start.
     assert!(joined.stats().unwrap().peer_attached);
@@ -162,15 +168,15 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_pipes_spread() {
-    let (addr, _l) = server(Policy::SpreadEta).await;
+    let (addr, _l) = server(Scheduler::SpreadEta).await;
     let c = TcpStream::connect(addr).await.unwrap();
-    let s = Session::connect(PipeIo::tcp(c), config(Policy::SpreadEta))
+    let s = Session::connect(PipeIo::from_tcp(c), config(Scheduler::SpreadEta))
         .await
         .unwrap();
     assert!(s.multipath() == zmux::Multipath::InUse);
     let c2 = TcpStream::connect(addr).await.unwrap();
     let pipe = s
-        .begin_add_pipe(PipeIo::tcp(c2), PipeOptions::default())
+        .begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
         .unwrap();
     echo(&s, 4 << 20).await;
     let info = s.pipes();
@@ -182,14 +188,14 @@ async fn two_pipes_spread() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn severed_pipe_fails_over() {
-    let (addr, _l) = server(Policy::SpreadEta).await;
+    let (addr, _l) = server(Scheduler::SpreadEta).await;
     let c = TcpStream::connect(addr).await.unwrap();
-    let mut cfg = config(Policy::SpreadEta);
+    let mut cfg = config(Scheduler::SpreadEta);
     cfg.liveness.suspect_floor = Duration::from_millis(100);
-    let s = Session::connect(PipeIo::tcp(c), cfg).await.unwrap();
+    let s = Session::connect(PipeIo::from_tcp(c), cfg).await.unwrap();
     let (raddr, cut) = relay(addr).await;
     let c2 = TcpStream::connect(raddr).await.unwrap();
-    s.begin_add_pipe(PipeIo::tcp(c2), PipeOptions::default())
+    s.begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
         .unwrap();
     let s2 = s.clone();
     let job = tokio::spawn(async move { echo(&s2, 8 << 20).await });
@@ -214,20 +220,20 @@ async fn severed_pipe_fails_over() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_client_two_pipes() {
-    let (addr, _l) = server(Policy::SpreadEta).await;
+    let (addr, _l) = server(Scheduler::SpreadEta).await;
     // A plain thread: blocking calls inside the runtime, `spawn_blocking`
     // included, fail at once.
     let (done, finished) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let c = std::net::TcpStream::connect(addr).unwrap();
         let s = zmux::blocking::Session::connect(
-            zmux::blocking::PipeIo::tcp(c),
-            config(Policy::SpreadEta),
+            zmux::blocking::PipeIo::from_tcp(c),
+            config(Scheduler::SpreadEta),
         )
         .unwrap();
         assert!(s.multipath() == zmux::Multipath::InUse);
         let c2 = std::net::TcpStream::connect(addr).unwrap();
-        s.begin_add_pipe(zmux::blocking::PipeIo::tcp(c2), PipeOptions::default())
+        s.begin_add_pipe(zmux::blocking::PipeIo::from_tcp(c2), PipeOptions::default())
             .unwrap();
         let (mut send, mut recv) = s.open_bi().unwrap();
         let len = 2 << 20;
@@ -252,13 +258,13 @@ async fn blocking_client_two_pipes() {
 /// driver and becomes the pipe's `queued_bytes`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
-    let (addr, _l) = server(Policy::SpreadEta).await;
+    let (addr, _l) = server(Scheduler::SpreadEta).await;
     let c = TcpStream::connect(addr).await.unwrap();
-    let s = Session::connect(PipeIo::tcp(c), config(Policy::SpreadEta))
+    let s = Session::connect(PipeIo::from_tcp(c), config(Scheduler::SpreadEta))
         .await
         .unwrap();
     let c2 = TcpStream::connect(addr).await.unwrap();
-    let io = PipeIo::tcp(c2).with_unsent(|| Some(4321));
+    let io = PipeIo::from_tcp(c2).with_unsent(|| Some(4321));
     let pipe = s.begin_add_pipe(io, PipeOptions::default()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await

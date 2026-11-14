@@ -145,8 +145,8 @@ impl TrustedProxies {
 ///
 /// ```
 /// let fields = [("early-data", &b"1"[..])];
-/// assert!(zmux::forwarded_early_data(fields));
-/// assert!(!zmux::forwarded_early_data([("early-data", &b"0"[..])]));
+/// assert!(zmux::adapter::forwarded_early_data(fields));
+/// assert!(!zmux::adapter::forwarded_early_data([("early-data", &b"0"[..])]));
 /// ```
 pub fn forwarded_early_data<'a>(fields: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> bool {
     fields

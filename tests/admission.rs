@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zmux::adapter::{Admit, Fallback, JoinPrefix};
 use zmux::{
-    Admission, AdmissionStats, AdmissionVerdict, Admit, CarrierInfo, Config, Decide, DecideFuture,
-    Fallback, HandleError, JoinPrefix, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth,
-    PrefixAuthVerifier, Session,
+    Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, DecideFuture,
+    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier,
+    Session,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -63,11 +64,13 @@ async fn prefix_auth_token_then_session() {
     let (listener, addr) = serve(Admission::prefix_auth(verifier), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(&auth.token(None).unwrap()).await.unwrap();
-    let session =
-        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
-            .await
-            .unwrap()
-            .unwrap();
+    let session = tokio::time::timeout(
+        LIMIT,
+        Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let accepted = tokio::time::timeout(LIMIT, listener.accept())
         .await
         .unwrap()
@@ -214,11 +217,13 @@ async fn an_async_decision_within_the_peek_timeout() {
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"z").await.unwrap();
-    let session =
-        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
-            .await
-            .unwrap()
-            .unwrap();
+    let session = tokio::time::timeout(
+        LIMIT,
+        Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         tokio::time::timeout(LIMIT, listener.accept())
             .await
@@ -311,10 +316,10 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     let (listener, addr) = serve_with(limits).await;
     let peer = "127.0.0.1:1".parse().unwrap();
     // One slot of the source held by the host.
-    let held = listener.enter(peer, None).unwrap();
+    let held = listener.adapter().enter(peer, None).unwrap();
     // One by a carrier under decision.
     let mut first = TcpStream::connect(&addr).await.unwrap();
-    eventually(|| listener.enter(peer, None).is_none()).await;
+    eventually(|| listener.adapter().enter(peer, None).is_none()).await;
     // Beyond the share: closed at once, refused, never decided.
     let mut second = TcpStream::connect(&addr).await.unwrap();
     assert!(ended(&mut second).await.is_empty());
@@ -322,15 +327,21 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     // Another source has its own share.
     assert!(
         listener
+            .adapter()
             .enter("192.0.2.1:1".parse().unwrap(), None)
             .is_some()
     );
     // An IPv6 source counts by its /64.
-    let v6 = listener.enter("[2001:db8::1]:1".parse().unwrap(), None);
-    let v6b = listener.enter("[2001:db8::2]:1".parse().unwrap(), None);
+    let v6 = listener
+        .adapter()
+        .enter("[2001:db8::1]:1".parse().unwrap(), None);
+    let v6b = listener
+        .adapter()
+        .enter("[2001:db8::2]:1".parse().unwrap(), None);
     assert!(v6.is_some() && v6b.is_some());
     assert!(
         listener
+            .adapter()
             .enter("[2001:db8::3]:1".parse().unwrap(), None)
             .is_none()
     );
@@ -346,7 +357,7 @@ async fn stall_duration_is_a_function_of_the_source() {
     let listener = Listener::new(Config::default(), limits(admission, None))
         .expect("valid listener configuration");
     let d = async |s: &str| {
-        let mut e = listener.enter(s.parse().unwrap(), None).unwrap();
+        let mut e = listener.adapter().enter(s.parse().unwrap(), None).unwrap();
         let start = tokio::time::Instant::now();
         e.stall(None::<&mut tokio::io::Empty>).await;
         start.elapsed()
@@ -369,8 +380,8 @@ async fn a_source_stalls_at_most_its_share_less_one() {
     config.max_pending_per_source = 3;
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let none = || None::<&mut tokio::io::Empty>;
-    let enter = |s: &str| listener.enter(s.parse().unwrap(), None).unwrap();
-    async fn admit(e: &mut zmux::Entry) -> Admit {
+    let enter = |s: &str| listener.adapter().enter(s.parse().unwrap(), None).unwrap();
+    async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
         e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
@@ -423,13 +434,13 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
     config.source_prefix_v4 = 24;
     config.source_prefix_v6 = 56;
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
-    let enter = |s: &str| listener.enter(s.parse().unwrap(), None);
-    async fn admit(e: &mut zmux::Entry) -> Admit {
+    let enter = |s: &str| listener.adapter().enter(s.parse().unwrap(), None);
+    async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
         e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
     let d = async |s: &str| {
-        let mut e = listener.enter(s.parse().unwrap(), None).unwrap();
+        let mut e = listener.adapter().enter(s.parse().unwrap(), None).unwrap();
         let start = tokio::time::Instant::now();
         e.stall(None::<&mut tokio::io::Empty>).await;
         start.elapsed()
@@ -475,21 +486,24 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
     let mut held = Vec::new();
     for s in ["192.0.2.1:1", "[2001:db8:0:a1::1]:1"] {
         for _ in 0..8 {
-            held.push(listener.enter(s.parse().unwrap(), None).unwrap());
+            held.push(listener.adapter().enter(s.parse().unwrap(), None).unwrap());
         }
     }
     assert!(
         listener
+            .adapter()
             .enter("192.0.2.2:1".parse().unwrap(), None)
             .is_some()
     );
     assert!(
         listener
+            .adapter()
             .enter("[2001:db8:0:a2::1]:1".parse().unwrap(), None)
             .is_some()
     );
     assert!(
         listener
+            .adapter()
             .enter("192.0.2.1:2".parse().unwrap(), None)
             .is_none()
     );
@@ -497,21 +511,18 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
     listener.close();
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_share_of_one_closes_every_stall() {
-    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall);
-    let mut config = limits(admission, None);
-    config.max_pending_per_source = 1;
-    let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
-    let mut e = listener
-        .enter("192.0.2.1:1".parse().unwrap(), None)
-        .unwrap();
-    let got = e
-        .admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
-        .await;
-    assert!(matches!(got, Admit::Close));
-    assert_eq!(listener.stats().admission.stall_overflow, 1);
-    listener.close();
+/// A share of one per source is a configuration error: a split bootstrap
+/// holds two slots.
+#[test]
+fn a_share_below_two_is_invalid() {
+    for share in [0, 1] {
+        let mut config = ListenerConfig::default();
+        config.max_pending_per_source = share;
+        assert!(Listener::new(Config::default(), config).is_err(), "{share}");
+    }
+    let mut config = ListenerConfig::default();
+    config.max_pending_per_source = 2;
+    assert!(Listener::new(Config::default(), config).is_ok());
 }
 
 /// The listener's bound holds every carrier from its entry: stalls take at most half of
@@ -525,8 +536,12 @@ async fn the_global_bound_evicts_the_oldest_stall() {
     let mut config = limits(admission, None);
     config.max_pending = Some(4);
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
-    let enter = |n: u8| listener.enter(SocketAddr::from(([192, 0, 2, n], 1)), None);
-    async fn admit(e: &mut zmux::Entry) -> Admit {
+    let enter = |n: u8| {
+        listener
+            .adapter()
+            .enter(SocketAddr::from(([192, 0, 2, n], 1)), None)
+    };
+    async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
         e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
@@ -578,11 +593,13 @@ async fn accept_keeps_the_bytes_after_the_skipped_ones() {
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"z").await.unwrap();
-    let session =
-        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
-            .await
-            .unwrap()
-            .unwrap();
+    let session = tokio::time::timeout(
+        LIMIT,
+        Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         tokio::time::timeout(LIMIT, listener.accept())
             .await
@@ -654,11 +671,13 @@ async fn no_admission_counts_nothing() {
     let addr = tcp.local_addr().unwrap();
     tokio::spawn(listener.clone().serve(tcp));
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let session =
-        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
-            .await
-            .unwrap()
-            .unwrap();
+    let session = tokio::time::timeout(
+        LIMIT,
+        Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(listener.accept().await.is_some());
     assert_eq!(listener.stats().admission, AdmissionStats::default());
     drop(session);
@@ -685,11 +704,13 @@ async fn more_reads_on_in_the_serve_loop() {
     tcp.flush().await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     tcp.write_all(b"ken").await.unwrap();
-    let session =
-        tokio::time::timeout(LIMIT, Session::connect(PipeIo::tcp(tcp), Config::default()))
-            .await
-            .unwrap()
-            .unwrap();
+    let session = tokio::time::timeout(
+        LIMIT,
+        Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let accepted = tokio::time::timeout(LIMIT, listener.accept())
         .await
         .unwrap()
@@ -734,13 +755,25 @@ fn join_prefix_reads_the_hello_head() {
     let mut hello = vec![0x02, 0x01, 0x00, 16];
     hello.extend_from_slice(&[7; 16]);
     hello.extend_from_slice(&[9; 32]);
-    assert_eq!(listener.join_prefix(&hello[..1]), JoinPrefix::Need(2));
-    assert_eq!(listener.join_prefix(&hello[..4]), JoinPrefix::Need(20));
-    assert_eq!(listener.join_prefix(&hello[..30]), JoinPrefix::Need(52));
-    assert_eq!(listener.join_prefix(&hello), JoinPrefix::Unknown);
-    assert_eq!(listener.join_prefix(b"GET / HTTP/1.1"), JoinPrefix::NotJoin);
     assert_eq!(
-        listener.join_prefix(&[0x02, 0x01, 0x7c]),
+        listener.adapter().join_prefix(&hello[..1]),
+        JoinPrefix::Need(2)
+    );
+    assert_eq!(
+        listener.adapter().join_prefix(&hello[..4]),
+        JoinPrefix::Need(20)
+    );
+    assert_eq!(
+        listener.adapter().join_prefix(&hello[..30]),
+        JoinPrefix::Need(52)
+    );
+    assert_eq!(listener.adapter().join_prefix(&hello), JoinPrefix::Unknown);
+    assert_eq!(
+        listener.adapter().join_prefix(b"GET / HTTP/1.1"),
+        JoinPrefix::NotJoin
+    );
+    assert_eq!(
+        listener.adapter().join_prefix(&[0x02, 0x01, 0x7c]),
         JoinPrefix::NotJoin
     );
 }

@@ -514,25 +514,25 @@ fn a_pipe_never_runs_over_its_own_session() {
             // The outer session cannot take a pipe over a stream of the
             // nested session that runs over it.
             let looped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
-            assert_eq!(
+            assert!(matches!(
                 n.oc.begin_add_pipe(looped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
-            );
+            ));
             // Nor a session a stream of its own.
             let own = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
-            assert_eq!(
+            assert!(matches!(
                 n.x.begin_add_pipe(own, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
-            );
+            ));
             // Once the pipe over the outer session is gone, nothing runs
             // over it any more: the refusal, if any, is not a loop.
             p.abort().unwrap();
             eventually(10, "the stream pipe retired", || p.stats().is_none()).await;
             let unlooped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
-            assert_ne!(
+            assert!(!matches!(
                 n.oc.begin_add_pipe(unlooped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
-            );
+            ));
             n.x.close().await;
             n.oc.close().await;
             n.listener.close();
@@ -592,12 +592,12 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending_per_source = 1;
+            limits.max_pending_per_source = 2;
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
             let mut held = Vec::new();
             let mut handled = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 // A stream that never completes its first record.
                 let (mut send, recv) = oc.open_bi().await.unwrap();
                 send.write_all(&[0x40]).await.unwrap();
@@ -609,8 +609,8 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
                         .await
                 }));
             }
-            // Whichever took the source's slot first holds it: the other
-            // is refused at once (the two tasks may start in either order).
+            // Whichever took the source's slots first hold them: the other
+            // is refused at once (the tasks may start in any order).
             eventually(10, "one refused", || {
                 handled.iter().any(|h| h.is_finished())
             })
@@ -621,7 +621,9 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
                 .unwrap();
             assert_eq!(refused.err(), Some(zmux::HandleError::Refused));
             listener.close();
-            let _ = watchdog(10, "the held one ended", handled.pop().unwrap()).await;
+            for h in handled {
+                let _ = watchdog(10, "the held ones ended", h).await;
+            }
             drop(held);
             oc.close().await;
             os.closing().await;
@@ -644,7 +646,7 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             // One pipe of a session of this process on the connection.
             let (nc, ns) = nested_over(&oc, &os, &[]).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending_per_source = 1;
+            limits.max_pending_per_source = 2;
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
             let handle = |send, recv| {
@@ -662,18 +664,20 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
                 ((send, recv), handle(s, r))
             };
             let settle_ms = || tokio::time::sleep(Duration::from_millis(50));
-            // The pipe's one exempt stream, then the source's one slot.
+            // The pipe's one exempt stream, then the source's two slots.
             let (b, b_handled) = waiting().await;
             settle_ms().await;
             let (c, c_handled) = waiting().await;
+            settle_ms().await;
+            let (c2, c2_handled) = waiting().await;
             settle_ms().await;
             // Neither left: refused.
             let (d, d_handled) = waiting().await;
             let r = watchdog(10, "the third refused", d_handled).await.unwrap();
             assert_eq!(r.err(), Some(zmux::HandleError::Refused));
             // The exempt stream goes: the next one is exempt until its
-            // first record makes it a new session, which needs the slot C
-            // holds.
+            // first record makes it a new session, which needs a slot C or
+            // C2 holds.
             drop(b);
             let _ = watchdog(10, "the exempt one ended", b_handled).await;
             let (send, recv) = oc.open_bi().await.unwrap();
@@ -687,7 +691,8 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             assert_eq!(r.err(), Some(zmux::HandleError::Refused));
             listener.close();
             let _ = watchdog(10, "the slot holder ended", c_handled).await;
-            drop((c, d));
+            let _ = watchdog(10, "the other slot holder ended", c2_handled).await;
+            drop((c, c2, d));
             let _ = watchdog(10, "client", client).await;
             nc.close().await;
             ns.closing().await;
@@ -810,7 +815,7 @@ fn a_nested_session_spreads_its_pipe_over_lanes_of_the_outer_session() {
                     let lanes = tokio::spawn(async move {
                         while let Ok((send, recv)) = os.accept_bi().await {
                             let _ =
-                                zmux::carrier::handle_lane(PipeIo::from_stream(send, recv)).await;
+                                zmux::adapter::handle_lane(PipeIo::from_stream(send, recv)).await;
                         }
                     });
                     (ns, lanes)
@@ -922,7 +927,7 @@ fn stream_carrier_lanes_keep_to_half_the_outer_streams() {
                     let lanes = tokio::spawn(async move {
                         while let Ok((send, recv)) = os.accept_bi().await {
                             let _ =
-                                zmux::carrier::handle_lane(PipeIo::from_stream(send, recv)).await;
+                                zmux::adapter::handle_lane(PipeIo::from_stream(send, recv)).await;
                         }
                     });
                     (ns, lanes)
@@ -1016,7 +1021,7 @@ fn lanes_ended_at_any_point_wake_nothing_under_a_core_lock() {
                 let ns = Session::accept(io, Config::default()).await.ok()?;
                 tokio::spawn(async move {
                     while let Ok((send, recv)) = os.accept_bi().await {
-                        let _ = zmux::carrier::handle_lane(PipeIo::from_stream(send, recv)).await;
+                        let _ = zmux::adapter::handle_lane(PipeIo::from_stream(send, recv)).await;
                     }
                 });
                 Some(ns)

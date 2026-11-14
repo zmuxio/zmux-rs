@@ -159,13 +159,15 @@ fn tasks_and_threads_end_with_their_sessions() {
         let addr = l.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (c, _) = l.accept().unwrap();
-            zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), Config::default())
+            zmux::blocking::Session::accept(zmux::blocking::PipeIo::from_tcp(c), Config::default())
                 .unwrap()
         });
         let c = std::net::TcpStream::connect(addr).unwrap();
-        let client =
-            zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(c), Config::default())
-                .unwrap();
+        let client = zmux::blocking::Session::connect(
+            zmux::blocking::PipeIo::from_tcp(c),
+            Config::default(),
+        )
+        .unwrap();
         let server = server.join().unwrap();
         // Reader, writer and timer threads of both sessions (they count
         // themselves once running).
@@ -191,11 +193,11 @@ fn tasks_and_threads_end_with_their_sessions() {
     let addr = l.local_addr().unwrap();
     let receiver = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), hooked()).unwrap()
+        zmux::blocking::Session::accept(zmux::blocking::PipeIo::from_tcp(c), hooked()).unwrap()
     });
     let c = std::net::TcpStream::connect(addr).unwrap();
     let sender =
-        zmux::blocking::Session::connect(zmux::blocking::PipeIo::tcp(c), Config::default())
+        zmux::blocking::Session::connect(zmux::blocking::PipeIo::from_tcp(c), Config::default())
             .unwrap();
     let receiver = receiver.join().unwrap();
     let (mut send, _r) = sender.open_bi().unwrap();

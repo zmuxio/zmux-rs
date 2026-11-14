@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt as _;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use zmux::{
@@ -207,7 +208,7 @@ fn close_hands_off_before_the_process_ends() {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(s), PipeHint::from_peer(peer))
+                        .handle_pipe(PipeIo::from_tcp(s), PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -226,7 +227,7 @@ fn close_hands_off_before_the_process_ends() {
         let cc = untimed_close(c.clone());
         let client = client_rt.block_on(async move {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let s = Session::connect(PipeIo::tcp(tcp), cc).await.unwrap();
+            let s = Session::connect(PipeIo::from_tcp(tcp), cc).await.unwrap();
             let (mut w, _r) = s.open_bi().await.unwrap();
             w.write_all(b"hello").await.unwrap();
             s
@@ -336,7 +337,7 @@ async fn close_hands_over_and_shuts_in_the_background() {
             .await
             .unwrap();
         assert!(closed_by_peer(&e, 0), "{e:?}");
-        tokio::time::timeout(Duration::from_secs(5), client.wait())
+        tokio::time::timeout(Duration::from_secs(5), client.closed())
             .await
             .expect("the session ended");
         assert!(
@@ -363,7 +364,7 @@ async fn the_drain_goes_on_after_close_returned() {
     tokio::time::timeout(GUARD, client.close())
         .await
         .expect("close waited for a timer");
-    tokio::time::timeout(Duration::from_secs(5), client.wait())
+    tokio::time::timeout(Duration::from_secs(5), client.closed())
         .await
         .expect("the session ended");
     let took = start.elapsed();
@@ -480,7 +481,10 @@ async fn add_pipe_times_out_and_leaves_no_pipe() {
             PipeOptions::new(),
         )
         .await;
-    assert_eq!(r.err(), Some(PipeError::TimedOut));
+    assert!(matches!(
+        r.err(),
+        Some(PipeError::Failed(zmux::PipeFailure::JoinTimedOut))
+    ));
     let took = start.elapsed();
     assert!(took >= Duration::from_millis(580), "{took:?}");
     // A guard against a hang only: three join timeouts and a second.
@@ -712,7 +716,7 @@ async fn data_before_a_peer_close_stays_readable_until_read() {
     };
     assert_eq!(got, 100_000);
     assert!(matches!(end, zmux::StreamError::SessionLost(_)), "{end:?}");
-    tokio::time::timeout(GUARD, server.wait()).await.unwrap();
+    tokio::time::timeout(GUARD, server.closed()).await.unwrap();
     listener.close();
 }
 
@@ -751,7 +755,7 @@ async fn dropping_unread_data_after_a_peer_close_ends_the_session() {
                 Err(zmux::StreamError::SessionLost(_))
             ));
         }
-        tokio::time::timeout(GUARD, server.wait())
+        tokio::time::timeout(GUARD, server.closed())
             .await
             .expect("the drain ended with the discard, not the hour's linger");
         listener.close();
@@ -809,10 +813,104 @@ async fn the_close_code_hook_hears_every_end() {
     client
         .close_with_error(VarInt::from_u32(0x2a), b"bye")
         .await;
-    tokio::time::timeout(GUARD, client.wait()).await.unwrap();
-    tokio::time::timeout(GUARD, server.wait()).await.unwrap();
+    tokio::time::timeout(GUARD, client.closed()).await.unwrap();
+    tokio::time::timeout(GUARD, server.closed()).await.unwrap();
     assert_eq!(*first.lock().unwrap(), [0x2a]);
     assert_eq!(*server_side.lock().unwrap(), [0x2a]);
+    listener.close();
+}
+
+/// A carrier that records its drop.
+struct Dropped(DuplexStream, Arc<AtomicBool>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.1.store(true, Ordering::SeqCst);
+    }
+}
+
+impl AsyncRead for Dropped {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Dropped {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// The close-code hook is called once the carrier is released: for a
+/// pipe removed while its session goes on and for the session's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_close_code_hook_follows_the_carriers_release() {
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let hooked = |gone: &Arc<AtomicBool>, seen: &Arc<Mutex<Vec<bool>>>| {
+        let (gone, seen) = (gone.clone(), seen.clone());
+        move |_: VarInt| seen.lock().unwrap().push(gone.load(Ordering::SeqCst))
+    };
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), hint()).await });
+    let (first_gone, first) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let client = Session::connect(
+        PipeIo::new(Dropped(a, first_gone.clone())).with_close_code(hooked(&first_gone, &first)),
+        config(),
+    )
+    .await
+    .unwrap();
+    let server = listener.accept().await.unwrap();
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), hint()).await });
+    let (gone, removed) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let pipe = client
+        .add_pipe(
+            PipeIo::new(Dropped(a, gone.clone())).with_close_code(hooked(&gone, &removed)),
+            PipeOptions::default(),
+        )
+        .await
+        .unwrap();
+    pipe.close().unwrap();
+    until("the removed pipe told", 10, || {
+        !removed.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        *removed.lock().unwrap(),
+        [true],
+        "told before its carrier went"
+    );
+    client.close_with_error(VarInt::from_u32(7), b"bye").await;
+    tokio::time::timeout(GUARD, client.closed()).await.unwrap();
+    tokio::time::timeout(GUARD, server.closed()).await.unwrap();
+    assert_eq!(
+        *first.lock().unwrap(),
+        [true],
+        "told before its carrier went"
+    );
     listener.close();
 }
 
@@ -849,4 +947,36 @@ async fn a_peer_close_during_a_flush_keeps_the_read_drain() {
     }
     assert_eq!(got, 50_000);
     listener.close();
+}
+
+/// A carrier whose writes never complete, a stream write queued ahead of
+/// the close: an abort and an idle timeout's close each end the session
+/// within the close bounds, though CONNECTION_CLOSE never leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_behind_a_stuck_write_still_ends() {
+    for idle in [false, true] {
+        let mut c = config();
+        if idle {
+            c.max_idle_timeout = Some(Duration::from_millis(300));
+            c.liveness.keep_alive_period = None;
+        }
+        let (client, _server, listener, stall) = setup(c).await;
+        stall.set(true);
+        let (mut w, _r) = client.open_bi().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(50), w.write_all(&[1; 1000])).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let start = Instant::now();
+        if !idle {
+            client.abort(VarInt::from_u32(3), b"gone");
+        }
+        tokio::time::timeout(Duration::from_secs(8), client.closed())
+            .await
+            .unwrap_or_else(|_| panic!("idle {idle}: the session never ended"));
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "idle {idle}: {:?}",
+            start.elapsed()
+        );
+        listener.close();
+    }
 }

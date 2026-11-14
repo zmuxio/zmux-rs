@@ -29,8 +29,8 @@ mod wire;
 use std::io;
 
 use std::time::Duration;
+use zmux::Backoff;
 use zmux::Cap;
-pub use zmux::helpers::Backoff;
 
 pub use client::{
     ExchangeEndpoint, connect_exchange, dial_exchange, dial_exchange_split, dial_exchange_with,
@@ -135,10 +135,10 @@ pub struct ExchangeOptions {
     /// checked against.
     pub https: bool,
     /// Client: the redirects one request follows (default
-    /// [`zmux::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none), each
+    /// [`zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS`]; 0 follows none), each
     /// only within the origin of its endpoint, since the connections are
     /// the caller's: another path or query of the same scheme, host and
-    /// port, as [`zmux::redirect::check`] allows (a `POST`, so 307 and 308
+    /// port, as [`zmux::adapter::redirect::check`] allows (a `POST`, so 307 and 308
     /// only). The request is repeated with its body unchanged, on a
     /// connection of the endpoint; the next request starts at its
     /// configured path again. A refused redirect fails the carrier.
@@ -219,12 +219,15 @@ impl Default for ExchangeOptions {
             up_requests: 2,
             up_piece: Cap::Auto,
             max_down_piece: Cap::Auto,
-            backoff: Backoff::new(Duration::from_millis(20), Duration::from_secs(2))
-                .with_jitter(0.5),
+            backoff: {
+                let mut b = Backoff::new(Duration::from_millis(20), Duration::from_secs(2));
+                b.jitter = 0.5;
+                b
+            },
             request_timeout: Duration::from_secs(25),
             deadline: Duration::from_secs(30),
             https: false,
-            max_redirects: zmux::redirect::DEFAULT_MAX_REDIRECTS,
+            max_redirects: zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS,
             hold: Duration::from_secs(20),
             coalesce: Duration::from_millis(2),
             down_piece: Cap::Auto,

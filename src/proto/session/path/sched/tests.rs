@@ -12,7 +12,7 @@ use crate::proto::seal::join::JoinHello;
 use crate::proto::session::pipes::{Estimator, INITIAL_RTT};
 use crate::proto::session::{
     ClaimedHello, Config, ConfirmedJoin, JoinStep, OpenedHello, PeerCarrier, PipeAuth, PipeId,
-    PipeOptions, Policy, Role, SessionCore, StreamKey, TransmitBuf,
+    PipeOptions, Role, Scheduler, SessionCore, StreamKey, TransmitBuf,
 };
 
 const BS: Framing = Framing::ByteStream;
@@ -20,7 +20,7 @@ const MS: Duration = Duration::from_millis(1);
 /// 100 Mbit/s.
 pub(in crate::proto::session) const FAST: u64 = 12_500_000;
 
-fn config(policy: Policy) -> Config {
+fn config(policy: Scheduler) -> Config {
     let mut c = Config {
         max_pipes: 4,
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end(),
@@ -109,7 +109,7 @@ fn pump(a: &mut SessionCore, b: &mut SessionCore, ids: &[u64], now: Instant) {
 /// 100 Mbit/s, pipe 2 (`second`) only what `second` says, both 10 ms
 /// round trips; and a stream of A with `ready` bytes written.
 pub(in crate::proto::session) fn two_pipes(
-    policy: Policy,
+    policy: Scheduler,
     second: Option<u64>,
     ready: usize,
 ) -> (SessionCore, StreamKey) {
@@ -170,7 +170,7 @@ fn a_joined_pipe_is_placed_as_fast_as_its_tier_for_four_round_trips() {
     // Pipe 2 has no bottleneck sample, its rate the initial 1 MB/s, and
     // the same one-way delay as pipe 0: without the placement rate BLEST
     // refuses it the bulk stream (the reorder budget is one chunk).
-    let (mut a, k) = two_pipes(Policy::SpreadEta, None, 1 << 20);
+    let (mut a, k) = two_pipes(Scheduler::SpreadEta, None, 1 << 20);
     assert!(takes(&a, 0, k));
     assert!(takes(&a, 2, k));
     let i = a.att_index(2).unwrap();
@@ -194,7 +194,7 @@ fn a_joined_pipe_is_placed_as_fast_as_its_tier_for_four_round_trips() {
     assert!(!takes(&a, 2, k));
 
     // Its first bottleneck sample ends it at once.
-    let (mut a, k) = two_pipes(Policy::SpreadEta, None, 1 << 20);
+    let (mut a, k) = two_pipes(Scheduler::SpreadEta, None, 1 << 20);
     let now = a.now;
     let i = a.att_index(2).unwrap();
     a.atts
@@ -206,13 +206,13 @@ fn a_joined_pipe_is_placed_as_fast_as_its_tier_for_four_round_trips() {
     assert!(!takes(&a, 2, k));
 
     // So does a penalty.
-    let (mut a, k) = two_pipes(Policy::SpreadEta, None, 1 << 20);
+    let (mut a, k) = two_pipes(Scheduler::SpreadEta, None, 1 << 20);
     a.atts.at_mut(i).out_mut().unwrap().est_mut().penalize();
     assert!(!takes(&a, 2, k));
 
     // In probation the pipe is not usable: its round trips do not count
     // yet.
-    let (mut a, _) = two_pipes(Policy::SpreadEta, None, 1 << 20);
+    let (mut a, _) = two_pipes(Scheduler::SpreadEta, None, 1 << 20);
     a.atts
         .at_mut(i)
         .out_mut()
@@ -226,7 +226,7 @@ fn a_joined_pipe_is_placed_as_fast_as_its_tier_for_four_round_trips() {
 
 #[test]
 fn rate_weights_use_the_placement_rate() {
-    let (a, k) = two_pipes(Policy::SpreadRateWeighted, None, 1 << 20);
+    let (a, k) = two_pipes(Scheduler::SpreadRateWeighted, None, 1 << 20);
     let gate = a.gate().unwrap();
     let w: Vec<(u64, f64)> = a.rr_weights(k, &gate, 0).collect();
     assert_eq!(w, [(0, FAST as f64), (2, FAST as f64)]);
@@ -237,7 +237,7 @@ fn an_eta_tie_goes_to_the_pipe_with_the_write_opportunity() {
     // Equal pipes and a small write: pipe 0, the first of the tie, is f,
     // and pipe 2 sends the bytes itself rather than leave them for pipe
     // 0's next opportunity.
-    let (a, k) = two_pipes(Policy::SpreadEta, Some(FAST), 512);
+    let (a, k) = two_pipes(Scheduler::SpreadEta, Some(FAST), 512);
     assert!(takes(&a, 2, k));
     assert!(takes(&a, 0, k));
 }
@@ -276,7 +276,7 @@ fn hooks(a: &mut SessionCore) -> &mut crate::proto::session::config::TestHooks {
 #[test]
 fn ecf_counts_the_round_robins_share_of_the_level() {
     let setup = || {
-        let (mut a, short) = two_pipes(Policy::SpreadEta, Some(FAST), 20_000);
+        let (mut a, short) = two_pipes(Scheduler::SpreadEta, Some(FAST), 20_000);
         slow_second(&mut a, FAST / 4, 40 * MS);
         let long = more_streams(&mut a, 4, 200_000);
         (a, short, long)
@@ -318,7 +318,7 @@ fn ecf_counts_the_round_robins_share_of_the_level() {
 fn blest_checks_the_streams_share_of_f_against_its_credit() {
     // F is about 440 KB: more than one stream's 256 KiB of credit, less
     // than a fifth of it times five.
-    let (mut a, k) = two_pipes(Policy::SpreadEta, Some(FAST), 200_000);
+    let (mut a, k) = two_pipes(Scheduler::SpreadEta, Some(FAST), 200_000);
     slow_second(&mut a, FAST / 4, 40 * MS);
     assert!(!takes(&a, 2, k));
     more_streams(&mut a, 4, 200_000);
@@ -337,7 +337,7 @@ fn bytes_wait_only_for_the_one_pipe_neither_suspect_nor_penalized() {
     // With two pipes that may carry the ready data neither is waited
     // for; a penalized pipe neither counts as a carrier nor is waited
     // for itself.
-    let (mut a, _) = two_pipes(Policy::SpreadEta, Some(FAST), 1 << 20);
+    let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 1 << 20);
     assert!(!a.bytes_wait_for(0) && !a.bytes_wait_for(2));
     let mut out = TransmitBuf::default();
     let now = a.now;
@@ -349,12 +349,30 @@ fn bytes_wait_only_for_the_one_pipe_neither_suspect_nor_penalized() {
     assert!(!a.bytes_wait_for(2), "a penalized pipe is not waited for");
 }
 
+#[test]
+fn bytes_the_limiter_holds_back_do_not_wait_for_the_carrier() {
+    // The same setup as above, with the only pipe that may carry the data
+    // held by its rate limiter: nothing waits for its carrier.
+    let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 1 << 20);
+    let mut out = TransmitBuf::default();
+    let now = a.now;
+    a.poll_transmit(PipeId(2), now, &mut out);
+    let i = a.att_index(2).unwrap();
+    assert!(a.atts.at_mut(i).out_mut().unwrap().penalize().is_some());
+    assert!(a.bytes_wait_for(0));
+    let o = a.out_mut(0).unwrap();
+    o.set_paced(true, now);
+    o.limiter_parts().unwrap().0.hold();
+    assert!(a.out_ref(0).unwrap().limiter_held());
+    assert!(!a.bytes_wait_for(0), "held by the limiter");
+}
+
 /// T_suspect includes queue_p on a carrier that reports no unsent count:
 /// the oldest ack-eliciting batch went out behind a batch whose write call
 /// on another lane had not returned.
 #[test]
 fn t_suspect_includes_the_write_calls_in_progress_ahead() {
-    let (mut a, _) = two_pipes(Policy::SpreadEta, Some(100_000), 0);
+    let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(100_000), 0);
     let now = Instant::now();
     let mad = a.mp().peer_mad();
     let o = a.out_mut(2).unwrap();

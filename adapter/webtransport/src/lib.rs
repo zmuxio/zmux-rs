@@ -26,7 +26,7 @@
 //! unidirectional streams, which zmux opens itself as it needs them. The
 //! carrier runs the session's accept loop: every stream the peer opens is a
 //! carrier, handed to the [`Listener`] given, or else a lane to
-//! [`zmux::carrier::handle_lane`] and a pipe to [`Carrier::accept_pipe`];
+//! [`zmux::adapter::handle_lane`] and a pipe to [`Carrier::accept_pipe`];
 //! zmux routes lanes by their Lane Key and checks that they are on the
 //! session of their pipe, whose identity is the carrier. One WebTransport
 //! session owns its QUIC connection, so the session's streams belong to
@@ -91,15 +91,13 @@ pub use web_transport_quinn;
 use web_transport_quinn::proto::ConnectRequest;
 use web_transport_quinn::quinn::{self, VarInt};
 use web_transport_quinn::{self as wt, Session};
-use zmux::carrier::{
+use zmux::adapter::{Admit, Admitted, Entry};
+use zmux::adapter::{
     CarrierConnId, ChannelDemux, ChannelReceiver, ChannelRegistration, ChunkWrite, DatagramChannel,
     MemoryCharge,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::{
-    Admit, Admitted, CarrierCredential, CarrierInfo, ConnectError, Entry, Listener, PipeHint,
-    PipeIo,
-};
+use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo};
 pub use zmux_quinn::LaneWindows;
 
 /// The unidirectional streams an HTTP/3 endpoint keeps open on its own
@@ -237,7 +235,7 @@ pub async fn connect(
 /// Serves the WebTransport sessions of the QUIC connections `endpoint`
 /// (with the ALPN `h3`, as a `web_transport_quinn::Server` would have it)
 /// accepts until `listener` is closed or the endpoint is: each connection
-/// takes its source slot ([`Listener::enter`]) before its QUIC handshake,
+/// takes its source slot ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)) before its QUIC handshake,
 /// and the handshake and the arrival of its session request run within
 /// the listener's limits ([`Listener::serve_connections`]; one that fails
 /// or misses them counts as a failed handshake); the request is then
@@ -253,7 +251,7 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         move |incoming: quinn::Incoming| {
-            let entry = listener.enter(incoming.remote_address(), None);
+            let entry = listener.adapter().enter(incoming.remote_address(), None);
             async move {
                 let entry = entry.ok_or(())?;
                 let conn = incoming.await.map_err(drop)?;
@@ -272,7 +270,7 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 /// Decides on a session request by the listener's admission
 /// ([`zmux::ListenerConfig::admission`]) and serves it until it ends;
 /// `entry` is the connection's entry into the listener
-/// ([`Listener::enter`], taken before its QUIC handshake). Nothing is
+/// ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter), taken before its QUIC handshake). Nothing is
 /// answered before the decision. The decision has no prefix; its metadata
 /// is the connection's ([`zmux_quinn::Handshake::carrier_info`]), with the
 /// request ([`ConnectRequest`] as the [`CarrierInfo::with_request`]
@@ -299,7 +297,7 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 /// taken from it.
 pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, options: &Options) {
     let connect: &ConnectRequest = &request;
-    if zmux::forwarded_early_data(
+    if zmux::adapter::forwarded_early_data(
         connect
             .headers
             .iter()
@@ -328,7 +326,7 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
     let conn = request.conn().clone();
     match decided {
         Admit::Accept(_) => {
-            let admitted = listener.admission().and(entry.admitted());
+            let admitted = listener.adapter().admission().and(entry.admitted());
             drop(entry);
             let Ok(session) = request.ok().await else {
                 return;
@@ -381,7 +379,7 @@ fn source_of(
     listener: &Listener,
 ) -> std::net::SocketAddr {
     match request {
-        Some(r) => listener.trusted_proxies().source(
+        Some(r) => listener.adapter().trusted_proxies().source(
             peer,
             r.headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())),
         ),
@@ -540,7 +538,7 @@ impl Carrier {
             accepted: Mutex::default(),
             notify: Notify::new(),
             accept_task: OnceLock::new(),
-            _charge: listener.as_ref().map(|l| l.charge_memory(window)),
+            _charge: listener.as_ref().map(|l| l.adapter().charge_memory(window)),
             datagrams: Arc::new(Datagrams {
                 session: conn.clone(),
                 demux: ChannelDemux::new(),
@@ -648,7 +646,7 @@ impl Inner {
                 let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
                 let mut send = Send::new(send);
                 send.keep = Some(inner);
-                Ok(zmux::carrier::Lane::from_chunks(send))
+                Ok(zmux::adapter::Lane::from_chunks(send))
             }
         })
         .with_terminated_tls(|| Some(zmux::TlsState::default()))
@@ -784,7 +782,7 @@ async fn accept_loop(
                         tokio::spawn(async move { l.handle_pipe(io, hint).await });
                     }
                     None => {
-                        tokio::spawn(zmux::carrier::handle_lane(io));
+                        tokio::spawn(zmux::adapter::handle_lane(io));
                     }
                 }
             }

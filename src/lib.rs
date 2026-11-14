@@ -28,7 +28,7 @@
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let tcp = tokio::net::TcpStream::connect("127.0.0.1:4433").await?;
-//! let session = zmux::Session::connect(zmux::PipeIo::tcp(tcp), zmux::Config::default()).await?;
+//! let session = zmux::Session::connect(zmux::PipeIo::from_tcp(tcp), zmux::Config::default()).await?;
 //! let (mut send, mut recv) = session.open_bi().await?;
 //! send.write_all(b"hello").await?;
 //! send.finish()?;
@@ -47,7 +47,7 @@
 //!
 //! | Carrier | Crate | Passes HTTP proxies and CDNs | Lanes | Exporter (`PipeAuth::exporter`) |
 //! |---|---|---|---|---|
-//! | TCP | this crate ([`PipeIo::tcp`], [`Listener::serve`]) | no | no | no |
+//! | TCP | this crate ([`PipeIo::from_tcp`], [`Listener::serve`]) | no | no | no |
 //! | TLS over TCP | `zmux-rustls` | no | no | yes |
 //! | QUIC | `zmux-quinn` | no | yes (QUIC streams) | yes |
 //! | WebSocket (`ws`, `wss`) | `zmux-websocket` | yes | no | no |
@@ -102,6 +102,7 @@
 // unused there.
 #![cfg_attr(loom, allow(dead_code, unused_imports))]
 #![warn(missing_debug_implementations)]
+mod backoff;
 mod driver;
 mod error;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -111,29 +112,30 @@ pub mod helpers;
 // No stable API: applications use the items the crate root re-exports.
 #[doc(hidden)]
 pub mod proto;
-pub mod redirect;
-pub mod util;
+#[cfg(all(feature = "tokio", not(loom)))]
+mod redirect;
+pub(crate) mod util;
 
+pub use backoff::{Backoff, DEFAULT_BACKOFF_JITTER};
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
 pub use proto::admission::{
     Admission, AdmissionVerdict, AdmittedValue, CarrierCredential, CarrierInfo, Decide,
     DecideFuture, Decision, PEEK_TIMEOUT_DRAWN, STALL_MAX_DRAWN,
 };
-pub use proto::exporter::{CarrierExporter, ExportError, RESERVED_EXPORTER_PREFIX, TlsState};
+pub use proto::error::{ApplicationErrorCode, TransportErrorCode};
+pub use proto::exporter::{ExportError, TlsState};
 pub use proto::frame::{Dir, Priority};
-pub use proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
 pub use proto::ident::{alpn_protocols, default_alpn};
 pub use proto::limit::{DatagramLimiter, Limiter};
 pub use proto::listener::{
-    ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure, OnReject, RejectAction,
-    RejectError, RejectInfo,
+    HandleError, ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure, OnReject,
+    RejectAction, RejectError, RejectInfo,
 };
 pub use proto::listener::{SessionCarrier, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};
-pub use proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
 pub use proto::params::DEFAULT_MAX_RECORD_SIZE;
-pub use proto::params::Role;
+pub use proto::params::{Role, TransportParameters};
 pub use proto::prefix_auth::{
     InvalidPrefixAuth, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL, PREFIX_AUTH_HEADER,
     PREFIX_TOKEN_LEN, PrefixAuth, PrefixAuthVerifier,
@@ -154,7 +156,7 @@ pub use proto::session::{
     DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, InboundState, Inherit,
     JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT, Multipath, OpenError,
     OutboundState, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeLiveness, PipeOptions,
-    PipeStats, PipeUpdate, Policy, Preamble, PrioritySource, QualityBand, Redundancy, RttSource,
+    PipeStats, PipeUpdate, Preamble, PrioritySource, QualityBand, Redial, Redundancy, RttSource,
     SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionStats,
     State as SessionState, StreamError, StreamStats, Support, Tracer, UniCredit, WindowIncrease,
 };
@@ -162,13 +164,12 @@ pub use proto::session::{
 /// The QMux version this crate speaks, the only one: what
 /// [`Session::qmux_version`](Session#method.qmux_version) reports.
 pub const QMUX_VERSION: &str = proto::draft::CURRENT.name;
-pub use proto::trusted::{InvalidNet, IpNet, TrustedProxies, forwarded_early_data};
+pub use proto::trusted::{InvalidNet, IpNet, TrustedProxies};
+pub use proto::varint::VarIntBoundsExceeded;
 pub use proto::{DetailKey, VarInt};
 
 // The drivers are left out of loom builds, which check their
 // synchronization units only (src/driver/loom.rs).
-#[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::cache::{
     CacheOutcome, CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime,
@@ -178,35 +179,63 @@ pub use driver::choice::{
     Candidate, CarrierChoice, CarrierChoiceError, CarrierChoicePolicy, HttpTarget, dial_choice,
 };
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-pub use driver::handle::Written;
+pub use driver::handle::{StreamDatagram, Written};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::listen::{
-    AdmissionStats, AdmissionVariants, Admit, Admitted, Entry, HandleError, JoinPrefix, Listener,
-    ListenerStats, MAX_ADMISSION_VARIANTS, PipeHint, SetupGuard, VariantStats,
+    AdmissionStats, AdmissionVariants, Listener, ListenerStats, MAX_ADMISSION_VARIANTS, PipeHint,
+    VariantStats,
 };
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::tokio::{Dial, Pipe, PipeIo, RecvStream, SendStream, Session};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::transform::{InboundTransform, PipeStream};
 
-/// What carrier adapters use beyond [`PipeIo`]'s builder methods: the identity
-/// of a multi-stream carrier connection, the
-/// router of its incoming lanes, and the memory charge of a connection
-/// held for a listener's sessions. Applications that only use carriers
-/// need none of it. The [`PipeIo`] methods for carrier authors are
-/// `from_chunk_halves`, `with_carrier_conn`, `with_lane_opener`, `with_lanes`,
-/// `with_connection_memory`, `with_tcp_socket`, `with_unsent`, `with_low_water`,
-/// `with_partial_reads`, `with_exporter`, `with_abort`,
+/// The scheduler of stream data over a session's pipes: the built-in
+/// policies and the interface of a custom one ([`sched::Pick`]), set with
+/// [`Config::scheduler`](Config#structfield.scheduler) or
+/// `Session::set_scheduler`.
+pub mod sched {
+    pub use crate::proto::session::{
+        FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Scheduler,
+    };
+}
+
+/// What only the authors of carrier adapters and of their own accept loops
+/// use: the adapter views of a listener and a session
+/// ([`Listener::adapter`], `Session::adapter`), carrier admission at an
+/// entrance, the identity, lanes and datagram channel of a multi-stream
+/// carrier connection, and the memory charge of a connection held for a
+/// listener's sessions. Applications that only use carriers need none of
+/// it. The [`PipeIo`] methods for carrier authors are `from_chunk_halves`,
+/// `with_carrier_conn`, `with_lane_opener`, `with_lanes`,
+/// `with_connection_memory`, `with_tcp_socket`, `with_unsent`,
+/// `with_low_water`, `with_partial_reads`, `with_exporter`, `with_abort`,
 /// `with_datagram_channel` and `with_protocol`.
 #[cfg(all(feature = "tokio", not(loom)))]
-pub mod carrier {
+pub mod adapter {
+    pub use crate::driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
     pub use crate::driver::channel::{
         ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
     };
     pub use crate::driver::empty_message;
     pub use crate::driver::lanes::{CarrierConnId, Lane, handle_lane};
-    pub use crate::driver::listen::MemoryCharge;
-    pub use crate::driver::tokio::{ChunkBuf, ChunkWrite};
+    pub use crate::driver::listen::{
+        Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, SetupGuard,
+    };
+    pub use crate::driver::tokio::{ChunkBuf, ChunkWrite, SessionAdapter};
+    pub use crate::proto::exporter::{CarrierExporter, RESERVED_EXPORTER_PREFIX};
+    pub use crate::proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
+    pub use crate::proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
+    pub use crate::proto::record::Framing;
+    pub use crate::proto::trusted::forwarded_early_data;
+
+    /// Following the redirects of an HTTP carrier's request: the rules the
+    /// HTTP and WebSocket adapters share.
+    pub mod redirect {
+        pub use crate::redirect::{
+            DEFAULT_MAX_REDIRECTS, RedirectError, check, is_redirect, same_origin,
+        };
+    }
 }
 
 /// Resource accounting for leak tests (feature `test-hooks`; never enable
@@ -256,24 +285,22 @@ pub mod test_hooks {
 /// The handles are the crate root's with the std driver: the same types,
 /// errors and non-waiting methods; the calls that wait block the calling
 /// thread instead of returning a future. Where a tokio future is bounded by
-/// its caller (`tokio::time::timeout`, or dropping it), a blocking call is
-/// bounded by a timeout: a stream's `set_read_timeout`/`set_write_timeout`
-/// bound each of its calls that waits ([`StreamError::TimedOut`]), and a
-/// session's [`set_wait_timeout`](blocking::Session#method.set_wait_timeout)
-/// bounds every other wait of the session and its pipes (the `TimedOut`
-/// variant of the call's error). Since a future of the tokio driver ends
-/// only by resolving, its session-wide waits return the [`SessionError`]
-/// itself; the blocking ones return a [`blocking::WaitError`], which adds
-/// the timeout and the refusal below.
+/// its caller (`tokio::time::timeout`, or dropping it), a blocking wait
+/// `x()` has a bounded form `x_timeout(d)` (`closed_timeout`,
+/// `accept_bi_timeout`, `joined_timeout`, ...), and a stream's
+/// `set_read_timeout`/`set_write_timeout` bound each of its calls that
+/// waits, as a `TcpStream`'s do.
 ///
-/// A call that may wait fails at once with the `OnDriverThread` variant of
-/// its error ([`WaitError::OnDriverThread`](blocking::WaitError) for the
-/// session-wide waits, [`StreamError::OnDriverThread`], ...) when it is
-/// made on a thread that
-/// drives sessions: inside a tokio runtime (`spawn_blocking` included), or
-/// on a session's own threads, for example inside a carrier's `Read` or
-/// `Write` or an abort closure. Calls that
-/// never wait, and waits with a zero timeout, work on any thread.
+/// A blocking call that may wait returns its operation's error inside a
+/// [`blocking::WaitError`]: [`WaitError::Failed`](blocking::WaitError::Failed)
+/// with the error the tokio driver's future returns,
+/// [`WaitError::TimedOut`](blocking::WaitError::TimedOut) when its bound
+/// expired, and [`WaitError::OnDriverThread`](blocking::WaitError::OnDriverThread)
+/// when it was made on a thread that drives sessions: inside a tokio
+/// runtime (`spawn_blocking` included), or on a session's own threads, for
+/// example inside a carrier's `Read` or `Write` or an abort closure. A
+/// refused call fails at once and changes nothing. Calls that never wait,
+/// and waits with a zero timeout, work on any thread.
 ///
 /// What only the tokio driver has, and why:
 ///
@@ -296,7 +323,7 @@ pub mod test_hooks {
 /// use zmux::blocking::{PipeIo, Session};
 ///
 /// let tcp = std::net::TcpStream::connect("127.0.0.1:4433")?;
-/// let session = Session::connect(PipeIo::tcp(tcp), zmux::Config::default())?;
+/// let session = Session::connect(PipeIo::from_tcp(tcp), zmux::Config::default())?;
 /// let (mut send, mut recv) = session.open_bi()?;
 /// send.write_all(b"hello")?;
 /// send.finish()?;
@@ -311,8 +338,15 @@ pub mod blocking {
         Dial, HandshakeWait, Pipe, PipeIo, RecvStream, SendStream, Session, WaitError, Watchdog,
     };
     pub use crate::driver::blocking_listen::{InboundTransform, Listener, PipeHint};
-    pub use crate::driver::empty_message;
     pub use crate::proto::listener::{HandleError, ListenerStats};
+
+    /// What only the authors of their own accept loops and carriers use,
+    /// as `zmux::adapter` has it for the tokio driver.
+    pub mod adapter {
+        pub use crate::driver::blocking::SessionAdapter;
+        pub use crate::driver::blocking_listen::ListenerAdapter;
+        pub use crate::driver::empty_message;
+    }
 
     /// The helpers of the std driver, as `zmux::helpers` has them for the
     /// tokio one.

@@ -1,6 +1,6 @@
 [package]
 name = "zmux-seal"
-version = "1.2.6"
+version = "1.2.7"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -11,8 +11,8 @@ categories = ["cryptography", "network-programming"]
 
 [dependencies]
 tokio = { version = "1.54", features = ["rt", "time"] }
-zmux = { version = "1.2.6", path = "..", features = ["seal-chacha"] }
-zmux-seal-proto = { version = "1.2.6", path = "../seal-proto" }
+zmux = { version = "1.2.7", path = "..", features = ["seal-chacha"] }
+zmux-seal-proto = { version = "1.2.7", path = "../seal-proto" }
 
 [features]
 # Establish and its transform for the std driver: `zmux_seal::blocking`.

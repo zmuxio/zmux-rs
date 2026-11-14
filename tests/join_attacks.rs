@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::timeout;
+use zmux::adapter::CarrierExporter;
 use zmux::proto::record::Framing;
 use zmux::proto::seal::RecordMode;
 use zmux::proto::seal::join::JoinHello;
@@ -19,8 +20,7 @@ use zmux::proto::session::{
     SessionCore, State,
 };
 use zmux::{
-    CarrierExporter, Listener, ListenerConfig, OnReject, PipeAuth, PipeIo, PipeOptions,
-    RejectAction, Session,
+    Listener, ListenerConfig, OnReject, PipeAuth, PipeIo, PipeOptions, RejectAction, Session,
 };
 
 fn config() -> Config {
@@ -346,7 +346,10 @@ async fn a_sealed_end_at_a_record_boundary_is_a_failure() {
     client
         .pipe(PipeId::new(0))
         .unwrap()
-        .set_send_standby(true)
+        .update(&zmux::PipeUpdate {
+            send_standby: zmux::Change::Set(true),
+            ..Default::default()
+        })
         .unwrap();
     let until = async |what: &str, f: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -411,10 +414,10 @@ async fn a_bound_hello_without_a_binding_is_refused_as_auth() {
     let reason = Arc::new(std::sync::Mutex::new(String::new()));
     let seen = reason.clone();
     let mut lc = ListenerConfig::default();
-    lc.on_reject = Some(OnReject(Arc::new(move |i| {
+    lc.on_reject = Some(OnReject::new(move |i| {
         *seen.lock().unwrap() = i.reason.to_string();
         RejectAction::Close
-    })));
+    }));
     let listener = Listener::new(config(), lc).expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });
@@ -719,10 +722,10 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     let mut lc = ListenerConfig::default();
-    lc.on_reject = Some(OnReject(Arc::new(move |i| {
+    lc.on_reject = Some(OnReject::new(move |i| {
         seen.lock().unwrap().push(i.reason.to_string());
         RejectAction::Stall
-    })));
+    }));
     lc.session_config = Some(zmux::SessionConfigFn::new(|_| {
         let mut c = config();
         c.join_timeout = Duration::from_secs(60);
@@ -780,10 +783,10 @@ async fn a_carrier_over_its_source_limit_is_closed_at_once() {
     lc.max_pending_per_source = 3;
     lc.handshake_timeout = Duration::from_millis(500);
     lc.first_record_timeout = Duration::from_secs(60);
-    lc.on_reject = Some(OnReject(Arc::new(move |i| {
+    lc.on_reject = Some(OnReject::new(move |i| {
         seen.lock().unwrap().push((i.profile, i.reason.to_string()));
         RejectAction::Stall
-    })));
+    }));
     let listener = Listener::new(config(), lc).expect("valid listener configuration");
     // Three silent carriers hold the source's slots; the fourth is over.
     let start = tokio::time::Instant::now();
@@ -814,10 +817,10 @@ async fn the_listener_refuses_a_suite_outside_the_session_as_unknown_suite() {
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     let mut lc = ListenerConfig::default();
-    lc.on_reject = Some(OnReject(Arc::new(move |i| {
+    lc.on_reject = Some(OnReject::new(move |i| {
         seen.lock().unwrap().push(i.reason.to_string());
         RejectAction::Close
-    })));
+    }));
     let mut base = config();
     base.session_crypto.suites = vec![1];
     let listener = Listener::new(base, lc).expect("valid listener configuration");

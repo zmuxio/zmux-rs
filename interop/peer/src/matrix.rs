@@ -376,7 +376,7 @@ async fn run_client(args: &[String]) -> Res {
     let tcp = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let (p, peer) = zmux_seal::establish(zmux::PipeIo::tcp(tcp), &cfg)
+    let (p, peer) = zmux_seal::establish(zmux::PipeIo::from_tcp(tcp), &cfg)
         .await
         .map_err(|e| format!("establish: {e}"))?;
     let s = Session::connect(p, session_config(sc))
@@ -427,7 +427,7 @@ async fn run_client(args: &[String]) -> Res {
                 .map_err(|e| format!("connect join: {e}"))?;
             let pipe = s
                 .begin_add_pipe(
-                    zmux::PipeIo::tcp(tcp),
+                    zmux::PipeIo::from_tcp(tcp),
                     PipeOptions::default().with_record_mode(RecordMode::Sealed),
                 )
                 .map_err(|e| format!("add pipe: {e}"))?;

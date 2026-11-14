@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{Carrier, eventually, multi_thread, settle, snapshot, watchdog};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use zmux::carrier::CarrierConnId;
+use zmux::adapter::CarrierConnId;
 use zmux::proto::session::State;
 use zmux::test_hooks::lane_keys;
 use zmux::{Config, PipeAuth, PipeIo, PipeOptions, Session};
@@ -36,10 +36,10 @@ fn lane_carrier(io: Carrier, conn: &CarrierConnId, peer: CarrierConnId) -> PipeI
             let peer = peer.clone();
             async move {
                 let (w, r) = tokio::io::duplex(1 << 20);
-                tokio::spawn(zmux::carrier::handle_lane(
+                tokio::spawn(zmux::adapter::handle_lane(
                     PipeIo::reader(r).with_carrier_conn(peer),
                 ));
-                Ok(zmux::carrier::Lane::new(w))
+                Ok(zmux::adapter::Lane::new(w))
             }
         })
 }
@@ -62,7 +62,7 @@ async fn lane_is_aborted(conn: &CarrierConnId, key: &[u8; 16]) {
     let (mut w, r) = tokio::io::duplex(4096);
     w.write_all(&pipe_lane_record(key)).await.unwrap();
     let routed =
-        zmux::carrier::handle_lane(PipeIo::reader(r).with_carrier_conn(conn.clone())).await;
+        zmux::adapter::handle_lane(PipeIo::reader(r).with_carrier_conn(conn.clone())).await;
     assert!(routed.is_err(), "a closing or closed session takes no lane");
     let mut b = [0u8; 1];
     assert!(
@@ -166,10 +166,10 @@ fn a_lane_openers_unsent_count_is_read() {
                 let (peer, was_read) = (peer.clone(), was_read.clone());
                 async move {
                     let (w, r) = tokio::io::duplex(1 << 20);
-                    tokio::spawn(zmux::carrier::handle_lane(
+                    tokio::spawn(zmux::adapter::handle_lane(
                         PipeIo::reader(r).with_carrier_conn(peer),
                     ));
-                    Ok(zmux::carrier::Lane::new(w).with_unsent(move || {
+                    Ok(zmux::adapter::Lane::new(w).with_unsent(move || {
                         was_read.store(true, Ordering::SeqCst);
                         Some(1234)
                     }))

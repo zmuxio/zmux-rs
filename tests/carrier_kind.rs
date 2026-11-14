@@ -82,7 +82,7 @@ async fn port(listener: &Listener, kind: Option<CarrierKind>) -> std::net::Socke
     let l = listener.clone();
     tokio::spawn(async move {
         while let Ok((c, _)) = tcp.accept().await {
-            let io = PipeIo::tcp(c);
+            let io = PipeIo::from_tcp(c);
             let io = match kind {
                 Some(k) => io.with_carrier(k),
                 None => io,
@@ -127,8 +127,8 @@ async fn kinds_reach_the_factories_of_both_ends() {
     let ws = port(&listener, Some(CarrierKind::WebSocket)).await;
     let quic = port(&listener, Some(CarrierKind::Quic)).await;
 
-    let first =
-        PipeIo::tcp(TcpStream::connect(ws).await.unwrap()).with_carrier(CarrierKind::WebSocket);
+    let first = PipeIo::from_tcp(TcpStream::connect(ws).await.unwrap())
+        .with_carrier(CarrierKind::WebSocket);
     assert_eq!(first.carrier(), Some(CarrierKind::WebSocket));
     let client = Session::connect(first, config(Some(client_shaper.clone())))
         .await
@@ -155,7 +155,8 @@ async fn kinds_reach_the_factories_of_both_ends() {
 
     let joined = client
         .begin_add_pipe(
-            PipeIo::tcp(TcpStream::connect(quic).await.unwrap()).with_carrier(CarrierKind::Quic),
+            PipeIo::from_tcp(TcpStream::connect(quic).await.unwrap())
+                .with_carrier(CarrierKind::Quic),
             PipeOptions::new(),
         )
         .unwrap();
@@ -216,7 +217,7 @@ async fn raw_tcp_has_no_kind() {
     .expect("valid listener configuration");
     let addr = port(&listener, None).await;
     let client = Session::connect(
-        PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
         config(Some(client_shaper.clone())),
     )
     .await

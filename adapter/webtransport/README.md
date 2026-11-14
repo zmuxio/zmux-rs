@@ -9,7 +9,7 @@ pipe's lanes are unidirectional streams that zmux opens as it needs them, in
 both directions, so that a loss on one lane does not hold back the others.
 The carrier runs the session's accept loop and hands every stream the peer
 opens to zmux: to a `zmux::Listener` when one is given, else lanes to
-`zmux::carrier::handle_lane` and pipes to `accept_pipe`. Because WebTransport runs
+`zmux::adapter::handle_lane` and pipes to `accept_pipe`. Because WebTransport runs
 over HTTP/3, the carrier reaches servers through HTTP/3 front ends that
 forward WebTransport.
 

@@ -1,10 +1,10 @@
 //! The exchange carrier's bodies: the request's authentication header and
 //! Data MAC, the response, their MACs and the body encoding.
 
+use crate::util::HmacSha256;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::{BufMut, Bytes, BytesMut};
-use zmux::util::HmacSha256;
 
 use super::BodyEncoding;
 
@@ -401,7 +401,7 @@ mod tests {
             .collect()
     }
 
-    use zmux::util::hex as to_hex;
+    use crate::util::hex as to_hex;
 
     const CID: CarrierId = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const NONCE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];

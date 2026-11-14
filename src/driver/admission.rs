@@ -3,7 +3,7 @@
 //! prefix back in front of a byte stream ([`Prefixed`]), the fallback
 //! target of byte-stream carriers ([`Fallback`]), and the PROXY protocol
 //! header of a trusted intermediary ([`proxied_source`]). The listener
-//! applies the admission itself ([`crate::Listener::enter`]).
+//! applies the admission itself ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)).
 
 use std::future::Future;
 use std::io;

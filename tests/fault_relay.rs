@@ -12,7 +12,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until};
-use zmux::helpers::{Backoff, PipePool, PoolDecision, PoolView, RotatePolicy, maintain_pipes};
+use zmux::Backoff;
+use zmux::helpers::{PipePool, PoolDecision, PoolView, RotatePolicy, maintain_pipes};
 use zmux::{
     Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
     PipeHint, PipeIo, PipeOptions, Session, SessionError, SessionState,
@@ -674,7 +675,10 @@ async fn age_rotation_beats_a_lifetime_limit() {
     client
         .pipe(zmux::PipeId::new(0))
         .unwrap()
-        .set_send_priority(10)
+        .update(&zmux::PipeUpdate {
+            send_priority: zmux::Change::Set(10),
+            ..Default::default()
+        })
         .unwrap();
     let pool = relay.pool(1, PipeOptions::new()).with_rotate(
         RotatePolicy::new()

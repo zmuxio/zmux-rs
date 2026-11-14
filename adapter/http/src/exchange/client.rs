@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::util::{hex, random_u64};
 use bytes::{Buf, Bytes, BytesMut};
 use http::{Method, Request, StatusCode, header};
 use hyper::client::conn::http1;
@@ -19,8 +20,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
-use zmux::redirect::{self, RedirectError};
-use zmux::util::{hex, random_u64};
+use zmux::adapter::redirect::{self, RedirectError};
 use zmux::{ConnectError, PipeIo, Session};
 
 use super::ExchangeOptions;

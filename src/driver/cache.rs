@@ -126,12 +126,12 @@ impl CarrierCache {
         }
     }
 
-    /// Records an outcome. A usable kind keeps the URL remembered for it;
-    /// a failed one starts at its base URL again.
     /// Records an outcome the host learnt after a dial: `key` the
     /// [`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key) in use, `variant` the
     /// candidate's ([`Candidate::with_variant`](crate::Candidate::with_variant)).
-    /// The same table as the automatic results and under the same rules.
+    /// The same table as the automatic results and under the same rules: a
+    /// usable kind keeps the URL remembered for it; a failed one starts at
+    /// its base URL again.
     pub fn report(
         &self,
         key: &str,

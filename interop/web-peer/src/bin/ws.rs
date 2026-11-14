@@ -28,7 +28,7 @@ async fn main() {
 }
 
 async fn server(addr: &str) {
-    let fallback = zmux::Fallback::new(|mut conn, _| async move {
+    let fallback = zmux::adapter::Fallback::new(|mut conn, _| async move {
         let mut head = Vec::new();
         let mut b = [0u8; 1024];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -65,13 +65,14 @@ async fn client(addr: &str, authed: bool) {
         options = options.with_carrier_credential(Arc::new(common::auth(KEY)));
     }
     let url = format!("ws://{addr}/zmux");
-    let session = match zmux_websocket::connect(url.as_str(), &options, zmux::Config::default()).await {
-        Ok(s) => s,
-        Err(e) => {
-            println!("REFUSED {e}");
-            return;
-        }
-    };
+    let session =
+        match zmux_websocket::connect(url.as_str(), &options, zmux::Config::default()).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("REFUSED {e}");
+                return;
+            }
+        };
     match common::ping(&session).await {
         Ok(got) => println!("OK {got}"),
         Err(e) => println!("REFUSED {e}"),

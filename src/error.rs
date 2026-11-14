@@ -22,9 +22,6 @@ pub enum ConnectError {
     Io(Arc<io::Error>),
     /// The configuration is invalid.
     InvalidConfig(InvalidConfig),
-    /// A blocking `connect` was refused on a thread that drives sessions
-    /// (std driver only); nothing was started.
-    OnDriverThread,
 }
 
 impl ConnectError {
@@ -41,7 +38,6 @@ impl fmt::Display for ConnectError {
             Self::SessionLost(e) => write!(f, "session lost during establishment: {e}"),
             Self::Io(e) => write!(f, "carrier error: {e}"),
             Self::InvalidConfig(e) => e.fmt(f),
-            Self::OnDriverThread => f.write_str(crate::proto::session::ON_DRIVER_THREAD),
         }
     }
 }
@@ -52,7 +48,6 @@ impl std::error::Error for ConnectError {
             Self::SessionLost(e) => Some(e),
             Self::Io(e) => Some(&**e),
             Self::InvalidConfig(e) => Some(e),
-            _ => None,
         }
     }
 }
@@ -63,7 +58,6 @@ impl From<ConnectError> for io::Error {
             ConnectError::SessionLost(s) => io::Error::from(s.clone()).kind(),
             ConnectError::Io(io) => io.kind(),
             ConnectError::InvalidConfig(_) => io::ErrorKind::InvalidInput,
-            ConnectError::OnDriverThread => io::ErrorKind::Deadlock,
         };
         io::Error::new(kind, e)
     }

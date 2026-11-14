@@ -562,7 +562,7 @@ mod core_multipath {
     use zmux::proto::listener::{ListenerConfig, ListenerCore};
     use zmux::proto::record::Framing;
     use zmux::proto::session::{
-        Config, PipeAuth, PipeId, PipeOptions, Policy, Role, SessionCore, StreamKey, TransmitBuf,
+        Config, PipeAuth, PipeId, PipeOptions, Role, Scheduler, SessionCore, StreamKey, TransmitBuf,
     };
 
     const BS: Framing = Framing::ByteStream;
@@ -576,7 +576,7 @@ mod core_multipath {
         now: Instant,
     }
 
-    fn config(policy: &Policy) -> Config {
+    fn config(policy: &Scheduler) -> Config {
         let mut c = Config::default();
         c.max_pipes = 4;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
@@ -589,7 +589,7 @@ mod core_multipath {
     impl Pair {
         /// A multipath pair on pipe 0, then pipe 1 joined through
         /// B's listener.
-        fn new(policy: Policy) -> Self {
+        fn new(policy: Scheduler) -> Self {
             let now = Instant::now();
             let mut b_cfg = config(&policy);
             b_cfg.test_hooks().locator = b"server".to_vec();
@@ -712,7 +712,7 @@ mod core_multipath {
         read
     }
 
-    fn bulk_over_two_pipes(policy: Policy) {
+    fn bulk_over_two_pipes(policy: Scheduler) {
         let mut p = Pair::new(policy.clone());
         let send = p.a.open(Dir::Uni).unwrap();
         let mut recv = None;
@@ -733,7 +733,7 @@ mod core_multipath {
             .collect();
         // The round robin alternates; `spread-eta` picks the pipe with the
         // earliest arrival, which here (no delay) may stay one.
-        if !matches!(policy, Policy::SpreadEta) {
+        if !matches!(policy, Scheduler::SpreadEta) {
             assert!(
                 sent.iter().all(|&s| s > 1 << 20),
                 "{policy:?}: not spread: {sent:?}"
@@ -752,7 +752,7 @@ mod core_multipath {
     )]
     fn spread_eta_does_not_allocate_per_chunk_or_ack() {
         let _serial = crate::serial();
-        bulk_over_two_pipes(Policy::SpreadEta);
+        bulk_over_two_pipes(Scheduler::SpreadEta);
     }
 
     #[test]
@@ -762,8 +762,8 @@ mod core_multipath {
     )]
     fn round_robin_does_not_allocate_per_chunk_or_ack() {
         let _serial = crate::serial();
-        bulk_over_two_pipes(Policy::SpreadRoundRobin);
-        bulk_over_two_pipes(Policy::SpreadRateWeighted);
+        bulk_over_two_pipes(Scheduler::SpreadRoundRobin);
+        bulk_over_two_pipes(Scheduler::SpreadRateWeighted);
     }
 }
 

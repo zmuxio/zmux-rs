@@ -87,7 +87,7 @@ impl PipeHint {
         }
     }
 
-    /// The hint of a carrier that entered the listener ([`Listener::enter`])
+    /// The hint of a carrier that entered the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter))
     /// and was admitted there ([`Entry::admit`]): its source and peer are
     /// the entry's, which [`Listener::handle_pipe`] goes on with.
     pub fn from_entry(entry: Entry) -> Self {
@@ -209,7 +209,8 @@ pub struct AdmissionVariants {
     pub overflow: VariantStats,
 }
 
-pub use crate::proto::listener::{AdmissionStats, HandleError, ListenerStats};
+pub(crate) use crate::proto::listener::HandleError;
+pub use crate::proto::listener::{AdmissionStats, ListenerStats};
 
 struct State_ {
     core: Core,
@@ -308,7 +309,7 @@ impl ListenShared {
     }
 }
 
-/// A carrier that entered a listener ([`Listener::enter`]): it holds a
+/// A carrier that entered a listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)): it holds a
 /// source slot ([`ListenerConfig::max_pending_per_source`]) and a slot of
 /// the listener ([`ListenerConfig::max_pending`]) from before its outer
 /// handshake, through its admission and, handed to
@@ -348,6 +349,30 @@ impl std::fmt::Debug for Entry {
     }
 }
 
+/// The setups [`Listener::serve_connections`] runs, oldest first.
+#[derive(Default)]
+struct SetupTasks(VecDeque<tokio::task::AbortHandle>);
+
+impl SetupTasks {
+    /// Makes room for one more setup within `most`: the finished ones are
+    /// forgotten and, at the bound, the oldest running one is ended.
+    fn make_room(&mut self, most: Option<usize>) {
+        let Some(most) = most else {
+            return;
+        };
+        self.0.retain(|h| !h.is_finished());
+        while self.0.len() >= most.max(1) {
+            if let Some(oldest) = self.0.pop_front() {
+                oldest.abort();
+            }
+        }
+    }
+
+    fn push(&mut self, task: tokio::task::AbortHandle) {
+        self.0.push_back(task);
+    }
+}
+
 /// What the listener's admission decided on an entered carrier
 /// ([`Entry::admit`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -374,7 +399,7 @@ enum Round {
 }
 
 /// What a carrier's prefix is to the listener's sessions
-/// ([`Listener::join_prefix`]).
+/// ([`ListenerAdapter::join_prefix`](crate::adapter::ListenerAdapter::join_prefix)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinPrefix {
     /// A Join Hello whose Locator names a current session.
@@ -619,7 +644,7 @@ impl Entry {
             let decide = CatchUnwind(decide);
             let timed = tokio::time::timeout_at(deadline, decide);
             let mut timed = std::pin::pin!(timed);
-            let mut closed = std::pin::pin!(listener.closed());
+            let mut closed = std::pin::pin!(listener.adapter().closed());
             std::future::poll_fn(|cx| {
                 if closed.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(None);
@@ -838,7 +863,7 @@ const NO_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPE
 ///     while let Ok((carrier, peer)) = tcp.accept().await {
 ///         let l = l.clone();
 ///         tokio::spawn(async move {
-///             let _ = l.handle_pipe(PipeIo::tcp(carrier), PipeHint::from_peer(peer)).await;
+///             let _ = l.handle_pipe(PipeIo::from_tcp(carrier), PipeHint::from_peer(peer)).await;
 ///         });
 ///     }
 /// });
@@ -855,14 +880,17 @@ const NO_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPE
 /// });
 ///
 /// let first = tokio::net::TcpStream::connect(addr).await?;
-/// let session = Session::connect(PipeIo::tcp(first), config).await?;
+/// let session = Session::connect(PipeIo::from_tcp(first), config).await?;
 /// let second = tokio::net::TcpStream::connect(addr).await?;
-/// let pipe = session.add_pipe(PipeIo::tcp(second), PipeOptions::default()).await?;
+/// let pipe = session.add_pipe(PipeIo::from_tcp(second), PipeOptions::default()).await?;
 /// // The second path is the fallback: it carries data only while the
 /// // first one is saturated or has failed, and the server is asked to do
 /// // the same on its side.
-/// pipe.set_send_priority(10)?;
-/// pipe.set_receive_priority(10)?;
+/// pipe.update(&zmux::PipeUpdate {
+///     send_priority: zmux::Change::Set(10),
+///     receive_priority: zmux::Change::Set(10),
+///     ..Default::default()
+/// })?;
 ///
 /// let (mut send, mut recv) = session.open_bi().await?;
 /// send.write_all(b"over two pipes").await?;
@@ -883,6 +911,127 @@ impl std::fmt::Debug for Listener {
 }
 
 impl Listener {
+    /// The listener's operations for carrier adapters and own accept
+    /// loops: carrier slots, admission, join lookups, memory charges and
+    /// setup-failure counts ([`ListenerAdapter`]).
+    pub fn adapter(&self) -> ListenerAdapter<'_> {
+        ListenerAdapter { listener: self }
+    }
+}
+
+/// The operations of a [`Listener`] that only carrier adapters and own
+/// accept loops use ([`Listener::adapter`]): an application that serves
+/// through the listener's `serve` entries or a carrier crate needs none of
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerAdapter<'a> {
+    listener: &'a Listener,
+}
+
+impl<'a> ListenerAdapter<'a> {
+    /// The first step of every carrier at every entry of the listener,
+    /// before its outer handshake: a source slot (`source`, or `peer` when
+    /// unset; counted by its prefix, [`ListenerConfig::source_prefix_v4`])
+    /// and a slot of the
+    /// listener, held by the returned [`Entry`]. With every slot of the
+    /// listener taken, the carrier stalled longest is closed to make room.
+    /// `None`: close the carrier at once, without a handshake; counted as
+    /// refused when the source has its share or the listener is closed,
+    /// as rejected when every slot is taken and none is stalled. Then the
+    /// outer handshake, [`Entry::admit`], and [`Listener::handle_pipe`].
+    pub fn enter(&self, peer: SocketAddr, source: Option<SocketAddr>) -> Option<Entry> {
+        self.listener
+            .enter_uncounted(peer, source)
+            .map_err(|e| self.listener.count(e))
+            .ok()
+    }
+
+    /// The listener's admission ([`ListenerConfig::admission`]).
+    pub fn admission(&self) -> Option<&'a Admission> {
+        self.listener.shared.admission.as_ref()
+    }
+
+    /// For use in an admission's decision: whether `prefix`, a byte-stream
+    /// carrier's first bytes, begins a Join Hello (first byte `02`) whose
+    /// Locator names a session of the listener at this moment. While the
+    /// prefix is shorter than the Hello's clear head (through the nonce,
+    /// at most 291 bytes for the suites defined) the answer is
+    /// [`JoinPrefix::Need`], to ask for with [`crate::AdmissionVerdict::More`]
+    /// ([`crate::Admission::with_max_peek`] must allow it). On a
+    /// message-framed carrier the prefix is the whole message, and `Need`
+    /// means it is too short. Advisory: the join still authenticates, and
+    /// one whose session ended meanwhile is an unknown Locator.
+    pub fn join_prefix(&self, prefix: &[u8]) -> JoinPrefix {
+        use crate::proto::seal::{Error, join::JoinHello};
+        match JoinHello::head_locator(prefix) {
+            Ok(l) if self.listener.shared.locators.get(l).is_some() => JoinPrefix::Known,
+            Ok(_) => JoinPrefix::Unknown,
+            Err(Error::Incomplete { need }) => JoinPrefix::Need(need),
+            Err(_) => JoinPrefix::NotJoin,
+        }
+    }
+
+    /// The intermediaries the listener trusts to report a carrier's client
+    /// ([`ListenerConfig::trusted_proxies`]): its adapters take a carrier's
+    /// source from them.
+    pub fn trusted_proxies(&self) -> &'a crate::proto::trusted::TrustedProxies {
+        &self.listener.shared.trusted
+    }
+
+    /// Whether the listener is closed ([`Listener::close`]): an adapter
+    /// tells with it why [`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter) gave no place.
+    pub fn is_closed(&self) -> bool {
+        self.listener.shared.lock().closed
+    }
+
+    /// Resolves once the listener is closed ([`Listener::close`]): for
+    /// accept loops of carriers, which end with it. Cancel-safe.
+    pub async fn closed(self) {
+        Closing {
+            shared: &self.listener.shared,
+            id: None,
+            slot: None,
+            ticket: None,
+        }
+        .await;
+    }
+
+    /// A guard for a connection's setup that holds no [`Entry`] (the TLS
+    /// handshake of an HTTP connection, whose requests enter the listener
+    /// one by one): dropped before [`SetupGuard::done`], it counts a setup
+    /// failure ([`ListenerStats::setup_failures`]).
+    pub fn setup_guard(&self) -> SetupGuard {
+        SetupGuard(Some(self.listener.shared.clone()))
+    }
+
+    /// Counts `bytes` that a carrier holds for the listener's sessions in
+    /// its memory budget for as long as the charge
+    /// lives: for example the receive window of a QUIC connection whose
+    /// streams carry their pipes and lanes.
+    pub fn charge_memory(&self, bytes: u64) -> MemoryCharge {
+        self.listener.shared.account.charge(bytes, 0);
+        MemoryCharge {
+            account: self.listener.shared.account.clone(),
+            bytes,
+        }
+    }
+
+    /// Counts a connection that an accept loop could not make a pipe input
+    /// of: a failed TLS handshake or its timeout (the handshake a join sent
+    /// in early data waits for included), a failed HTTP or WebSocket
+    /// upgrade, or the setup limit. For carrier adapters' own accept loops
+    /// ([`ListenerStats::setup_failures`]); such a connection is counted
+    /// nowhere else.
+    pub fn count_setup_failure(&self) {
+        self.listener
+            .shared
+            .counts
+            .setup_failures
+            .fetch_add(1, Relaxed);
+    }
+}
+
+impl Listener {
     /// A listener that starts sessions with `config` and applies `limits`.
     /// Must be created inside a tokio runtime.
     ///
@@ -896,7 +1045,9 @@ impl Listener {
         config: impl Into<Arc<Config>>,
         limits: ListenerConfig,
     ) -> Result<Self, crate::ConnectError> {
-        limits.check().map_err(crate::ConnectError::InvalidConfig)?;
+        limits
+            .validate()
+            .map_err(crate::ConnectError::InvalidConfig)?;
         let config = config.into();
         config
             .validate()
@@ -981,22 +1132,6 @@ impl Listener {
         entry.end_stall();
     }
 
-    /// The first step of every carrier at every entry of the listener,
-    /// before its outer handshake: a source slot (`source`, or `peer` when
-    /// unset; counted by its prefix, [`ListenerConfig::source_prefix_v4`])
-    /// and a slot of the
-    /// listener, held by the returned [`Entry`]. With every slot of the
-    /// listener taken, the carrier stalled longest is closed to make room.
-    /// `None`: close the carrier at once, without a handshake; counted as
-    /// refused when the source has its share or the listener is closed,
-    /// as rejected when every slot is taken and none is stalled. Then the
-    /// outer handshake, [`Entry::admit`], and [`Listener::handle_pipe`].
-    pub fn enter(&self, peer: SocketAddr, source: Option<SocketAddr>) -> Option<Entry> {
-        self.enter_uncounted(peer, source)
-            .map_err(|e| self.count(e))
-            .ok()
-    }
-
     /// Counts a carrier the listener did not use.
     fn count(&self, e: HandleError) {
         let c = &self.shared.counts;
@@ -1049,38 +1184,6 @@ impl Listener {
             late: false,
             value: None,
         })
-    }
-
-    /// The listener's admission ([`ListenerConfig::admission`]).
-    pub fn admission(&self) -> Option<&Admission> {
-        self.shared.admission.as_ref()
-    }
-
-    /// For use in an admission's decision: whether `prefix`, a byte-stream
-    /// carrier's first bytes, begins a Join Hello (first byte `02`) whose
-    /// Locator names a session of the listener at this moment. While the
-    /// prefix is shorter than the Hello's clear head (through the nonce,
-    /// at most 291 bytes for the suites defined) the answer is
-    /// [`JoinPrefix::Need`], to ask for with [`crate::AdmissionVerdict::More`]
-    /// ([`crate::Admission::with_max_peek`] must allow it). On a
-    /// message-framed carrier the prefix is the whole message, and `Need`
-    /// means it is too short. Advisory: the join still authenticates, and
-    /// one whose session ended meanwhile is an unknown Locator.
-    pub fn join_prefix(&self, prefix: &[u8]) -> JoinPrefix {
-        use crate::proto::seal::{Error, join::JoinHello};
-        match JoinHello::head_locator(prefix) {
-            Ok(l) if self.shared.locators.get(l).is_some() => JoinPrefix::Known,
-            Ok(_) => JoinPrefix::Unknown,
-            Err(Error::Incomplete { need }) => JoinPrefix::Need(need),
-            Err(_) => JoinPrefix::NotJoin,
-        }
-    }
-
-    /// The intermediaries the listener trusts to report a carrier's client
-    /// ([`ListenerConfig::trusted_proxies`]): its adapters take a carrier's
-    /// source from them.
-    pub fn trusted_proxies(&self) -> &crate::proto::trusted::TrustedProxies {
-        &self.shared.trusted
     }
 
     /// The next session a carrier started, once established. `None` after
@@ -1157,24 +1260,6 @@ impl Listener {
         while set.join_next().await.is_some() {}
     }
 
-    /// Whether the listener is closed ([`Listener::close`]): an adapter
-    /// tells with it why [`Listener::enter`] gave no place.
-    pub fn is_closed(&self) -> bool {
-        self.shared.lock().closed
-    }
-
-    /// Resolves once the listener is closed ([`Listener::close`]): for
-    /// accept loops of carriers, which end with it. Cancel-safe.
-    pub async fn closed(&self) {
-        Closing {
-            shared: &self.shared,
-            id: None,
-            slot: None,
-            ticket: None,
-        }
-        .await;
-    }
-
     /// The session configuration of the sessions it starts.
     pub fn config(&self) -> &Arc<Config> {
         &self.shared.config
@@ -1186,10 +1271,10 @@ impl Listener {
     }
 
     /// Serves a TCP listener until [`Listener::close`]: every connection
-    /// it accepts becomes a carrier ([`PipeIo::tcp`]), its source the
+    /// it accepts becomes a carrier ([`PipeIo::from_tcp`]), its source the
     /// peer or the client a trusted intermediary reports in a PROXY
     /// protocol header ([`ListenerConfig::trusted_proxies`],
-    /// [`crate::proxied_source`]), admitted by the listener's admission
+    /// [`crate::adapter::proxied_source`]), admitted by the listener's admission
     /// and handed to [`Listener::handle_pipe`], as
     /// [`Listener::serve_streams`] says. Run it in a task of its own:
     ///
@@ -1213,7 +1298,7 @@ impl Listener {
             || tcp.accept(),
             |stream| std::future::ready(Ok(stream)),
             |_: &tokio::net::TcpStream| CarrierInfo::new(),
-            PipeIo::tcp,
+            PipeIo::from_tcp,
         )
         .await;
     }
@@ -1222,8 +1307,8 @@ impl Listener {
     /// `accept` yields a connection and its peer's address. Each
     /// connection, in a task of its own: a connection from an intermediary
     /// the listener trusts to send the PROXY protocol has its header read
-    /// first ([`crate::proxied_source`]), and the client it reports is the
-    /// source; the connection enters the listener ([`Listener::enter`]:
+    /// first ([`crate::adapter::proxied_source`]), and the client it reports is the
+    /// source; the connection enters the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter):
     /// refused at once when its source has its share); `setup` (a TLS
     /// handshake) runs within the listener's handshake timeout; the
     /// listener's admission reads the prefix and decides with the metadata
@@ -1233,7 +1318,7 @@ impl Listener {
     /// ([`PipeIo::with_prefix`]); one decided on with Fallback goes to
     /// [`ListenerConfig::fallback`], every byte read replayed, or is
     /// stalled without one. Each connection holds its slots of the
-    /// listener ([`Listener::enter`]) from before its setup. Nothing is written on a connection before it is accepted.
+    /// listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)) from before its setup. Nothing is written on a connection before it is accepted.
     pub async fn serve_streams<T, A, AF, S, SF, C, I, P>(
         self,
         mut accept: A,
@@ -1265,10 +1350,10 @@ impl Listener {
                     let Ok(source) =
                         super::admission::proxied_source(&mut conn, peer, &trusted).await
                     else {
-                        l.count_setup_failure();
+                        l.adapter().count_setup_failure();
                         return Err(());
                     };
-                    let entry = l.enter(peer, Some(source)).ok_or(())?;
+                    let entry = l.adapter().enter(peer, Some(source)).ok_or(())?;
                     // A failed handshake counts with the entry dropped.
                     let conn = setup(conn).await.map_err(drop)?;
                     Ok((conn, entry))
@@ -1307,13 +1392,18 @@ impl Listener {
     /// task of its own (entering the listener, a TLS or QUIC handshake, a
     /// WebSocket upgrade), within the listener's `handshake_timeout`, and
     /// then served by `serve` for as long as it needs (handing its
-    /// carriers to [`Listener::handle_pipe`], for example); a setup that
-    /// enters the listener ([`Listener::enter`]) holds its slots, which
-    /// bound the carriers in setup. A setup counts its own
+    /// carriers to [`Listener::handle_pipe`], for example). A setup that
+    /// enters the listener ([`ListenerAdapter::enter`](crate::adapter::ListenerAdapter::enter)) holds its slots from
+    /// then on; whatever a setup does before it enters, or when it never
+    /// does (a connection whose carriers enter one by one), at most
+    /// `max_pending` of the listener's limits are in setup at once: a new
+    /// connection beyond them ends the oldest setup, so that slow
+    /// handshakes can neither pile up nor lock new clients out. A setup counts its own
     /// failures: an [`Entry`] dropped before its admission counts its
     /// handshake as failed, and a setup without one calls
-    /// [`Listener::count_setup_failure`] (or holds a
-    /// [`Listener::setup_guard`]); one ended by its timeout, or still running when the listener is closed, is dropped.
+    /// [`ListenerAdapter::count_setup_failure`](crate::adapter::ListenerAdapter::count_setup_failure) (or holds a
+    /// [`ListenerAdapter::setup_guard`](crate::adapter::ListenerAdapter::setup_guard)); one ended by its timeout or for a
+    /// newer one, or still running when the listener is closed, is dropped.
     /// Serving goes on after the close: it carries the sessions already
     /// accepted. Accept errors (a connection reset before it was accepted,
     /// no file descriptors left) are retried after a pause of up to
@@ -1334,8 +1424,12 @@ impl Listener {
         H: Fn(Listener, C) -> HF + Send + Sync + 'static,
         HF: Future<Output = ()> + Send + 'static,
     {
-        let limit = self.limits().handshake_timeout;
+        let limits = self.limits();
+        let (limit, most) = (limits.handshake_timeout, limits.max_pending);
         let serve = Arc::new(serve);
+        // The setup tasks, oldest first; each spawns its serving apart, so
+        // that aborting it ends only the setup.
+        let mut setups = SetupTasks::default();
         while let Some(Some(accepted)) = self.accept_or_close(accept()).await {
             let conn = match accepted {
                 Ok(conn) => conn,
@@ -1344,28 +1438,22 @@ impl Listener {
                     continue;
                 }
             };
+            setups.make_room(most);
             let (l, made, serve) = (self.clone(), setup(conn), serve.clone());
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let made = l.accept_or_close(tokio::time::timeout(limit, made)).await;
                 if let Some(Ok(Ok(c))) = made {
                     tokio::spawn(async move { serve(l, c).await });
                 }
             });
+            setups.push(task.abort_handle());
         }
-    }
-
-    /// A guard for a connection's setup that holds no [`Entry`] (the TLS
-    /// handshake of an HTTP connection, whose requests enter the listener
-    /// one by one): dropped before [`SetupGuard::done`], it counts a setup
-    /// failure ([`ListenerStats::setup_failures`]).
-    pub fn setup_guard(&self) -> SetupGuard {
-        SetupGuard(Some(self.shared.clone()))
     }
 
     /// `accept`'s result, or `None` once the listener is closed.
     async fn accept_or_close<T>(&self, accept: impl Future<Output = T>) -> Option<T> {
         let mut accept = std::pin::pin!(accept);
-        let mut closed = std::pin::pin!(self.closed());
+        let mut closed = std::pin::pin!(self.adapter().closed());
         std::future::poll_fn(|cx| {
             if closed.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(None);
@@ -1373,18 +1461,6 @@ impl Listener {
             accept.as_mut().poll(cx).map(Some)
         })
         .await
-    }
-
-    /// Counts `bytes` that a carrier holds for the listener's sessions in
-    /// its memory budget for as long as the charge
-    /// lives: for example the receive window of a QUIC connection whose
-    /// streams carry their pipes and lanes.
-    pub fn charge_memory(&self, bytes: u64) -> MemoryCharge {
-        self.shared.account.charge(bytes, 0);
-        MemoryCharge {
-            account: self.shared.account.clone(),
-            bytes,
-        }
     }
 
     /// Handles a new carrier: a new session (returned by
@@ -1398,21 +1474,29 @@ impl Listener {
     /// A join over a stream of a session that runs over the session it
     /// joins ([`PipeIo::from_stream`]) is refused: the carrier is closed
     /// and the session sends PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT).
-    pub async fn handle_pipe(&self, pipe: PipeIo, hint: PipeHint) -> Result<(), HandleError> {
-        // The setup's state (admission, transform, first record) is boxed
-        // and freed once it is done: what waits for the pipe's end is
-        // small, as it is kept for the pipe's lifetime.
-        let r = match Box::pin(self.handle(pipe, hint)).await {
-            Ok(end) => {
-                end.wait().await;
-                Ok(())
+    pub fn handle_pipe(
+        &self,
+        pipe: PipeIo,
+        hint: PipeHint,
+    ) -> impl Future<Output = Result<(), HandleError>> + Send + '_ {
+        // The setup's state (admission, transform, first record), the
+        // carrier and its hint included, is boxed now and freed once it is
+        // done: what waits for the pipe's end is small, as it is kept for
+        // the pipe's lifetime.
+        let setup = Box::pin(self.handle(pipe, hint));
+        async move {
+            let r = match setup.await {
+                Ok(end) => {
+                    end.wait().await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
+                self.count(e);
             }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = r {
-            self.count(e);
+            r
         }
-        r
     }
 
     /// The admission's verdicts on the carriers it labelled, per label.
@@ -1452,16 +1536,6 @@ impl Listener {
                 }
             },
         }
-    }
-
-    /// Counts a connection that an accept loop could not make a pipe input
-    /// of: a failed TLS handshake or its timeout (the handshake a join sent
-    /// in early data waits for included), a failed HTTP or WebSocket
-    /// upgrade, or the setup limit. For carrier adapters' own accept loops
-    /// ([`ListenerStats::setup_failures`]); such a connection is counted
-    /// nowhere else.
-    pub fn count_setup_failure(&self) {
-        self.shared.counts.setup_failures.fetch_add(1, Relaxed);
     }
 
     /// The carrier's entry: the adapter's, or one taken now, with the
@@ -1695,7 +1769,7 @@ impl Listener {
         let timeout = self.shared.lock().core.config().handshake_timeout;
         let timed = tokio::time::timeout(timeout, t.call(pipe, hint));
         let mut timed = std::pin::pin!(timed);
-        let mut closed = std::pin::pin!(self.closed());
+        let mut closed = std::pin::pin!(self.adapter().closed());
         let r = std::future::poll_fn(|cx| {
             if closed.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(None);
@@ -2440,7 +2514,7 @@ impl Listener {
 }
 
 /// Memory counted in a listener's budget on behalf of its sessions
-/// ([`Listener::charge_memory`]) until dropped.
+/// ([`ListenerAdapter::charge_memory`](crate::adapter::ListenerAdapter::charge_memory)) until dropped.
 pub struct MemoryCharge {
     account: Arc<Account<Shared<Tokio>>>,
     bytes: u64,
@@ -2681,7 +2755,7 @@ impl Drop for FinishOnDrop {
     }
 }
 
-/// A connection's setup without an [`Entry`] ([`Listener::setup_guard`]).
+/// A connection's setup without an [`Entry`] ([`ListenerAdapter::setup_guard`](crate::adapter::ListenerAdapter::setup_guard)).
 pub struct SetupGuard(Option<Arc<ListenShared>>);
 
 impl std::fmt::Debug for SetupGuard {
@@ -2860,5 +2934,76 @@ mod refusal_tests {
         })
         .await
         .expect("timed out");
+    }
+}
+
+#[cfg(test)]
+mod setup_bound_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Live(Arc<AtomicUsize>);
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Relaxed);
+        }
+    }
+
+    /// Setups that never enter the listener (a handshake before it, or
+    /// carriers entering one by one) stay within `max_pending`: a new
+    /// connection beyond it ends the oldest setup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setups_without_an_entry_stay_within_max_pending() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let limits = ListenerConfig {
+                max_pending: Some(3),
+                ..ListenerConfig::default()
+            };
+            let listener =
+                Listener::new(Config::default(), limits).expect("valid listener configuration");
+            let live = Arc::new(AtomicUsize::new(0));
+            let (most, accepted) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (l, live2, most2, acc2) = (
+                listener.clone(),
+                live.clone(),
+                most.clone(),
+                accepted.clone(),
+            );
+            let serving = tokio::spawn(l.serve_connections(
+                move || {
+                    let acc = acc2.clone();
+                    async move {
+                        if acc.fetch_add(1, Relaxed) == 20 {
+                            std::future::pending::<()>().await;
+                        }
+                        tokio::task::yield_now().await;
+                        Some(Ok(()))
+                    }
+                },
+                move |()| {
+                    let n = live2.fetch_add(1, Relaxed) + 1;
+                    most2.fetch_max(n, Relaxed);
+                    let guard = Live(live2.clone());
+                    async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<(), ()>>().await
+                    }
+                },
+                |_l, ()| async {},
+            ));
+            while accepted.load(Relaxed) <= 20 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                live.load(Relaxed) <= 3,
+                "{} setups running",
+                live.load(Relaxed)
+            );
+            listener.close();
+            serving.await.expect("serve loop");
+        })
+        .await
+        .expect("setup bound test deadline");
     }
 }

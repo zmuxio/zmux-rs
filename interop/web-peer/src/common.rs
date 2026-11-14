@@ -11,7 +11,7 @@ pub fn auth(key: &[u8]) -> zmux::PrefixAuth {
 }
 
 /// A listener that admits only tokens of `auth`, one slot of skew.
-pub fn listener(key: &[u8], fallback: Option<zmux::Fallback>) -> Listener {
+pub fn listener(key: &[u8], fallback: Option<zmux::adapter::Fallback>) -> Listener {
     let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth(key), 1, 1 << 16));
     let mut limits = zmux::ListenerConfig::default();
     limits.admission = Some(zmux::Admission::prefix_auth(verifier));
@@ -32,7 +32,7 @@ pub async fn echo_one(session: Session) {
         let _ = send.finish();
     }
     // The client closes after reading the echo.
-    let _ = tokio::time::timeout(Duration::from_secs(10), session.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), session.closed()).await;
 }
 
 /// Serves every session of `listener` until the process is killed.

@@ -18,7 +18,7 @@ use crate::proto::session::output::Records;
 use crate::proto::session::pipes::{Attachment, History, OutPipe, OutState, SentFrame, TierState};
 use crate::proto::session::sched::NOTSENT_LOWAT;
 use crate::proto::session::{
-    Cap, Change, CoreEvent, Inherit, PipeError, PipeId, PipeLiveness, Policy, SessionCore,
+    Cap, Change, CoreEvent, Inherit, PipeError, PipeId, PipeLiveness, Scheduler, SessionCore,
 };
 
 /// The floor of the probation base for a path with history.
@@ -549,7 +549,7 @@ impl SessionCore {
         // R_t.
         let only = [t.active];
         let pipes = match self.config.scheduler {
-            Policy::SessionAffinity => &only[..],
+            Scheduler::SessionAffinity => &only[..],
             _ => views.pipes(t),
         };
         for &i in pipes {
@@ -651,7 +651,7 @@ impl SessionCore {
         if tier <= gate.fed {
             return true;
         }
-        let sa = matches!(self.config.scheduler, Policy::SessionAffinity);
+        let sa = matches!(self.config.scheduler, Scheduler::SessionAffinity);
         let open = |b: &Attachment| b.out().is_some_and(|o| o.open() && !o.limiter_held());
         let views = self.views();
         if views.class() != Some(gate.class()) {
@@ -891,6 +891,9 @@ impl SessionCore {
         if let Change::Set(l) = &u.liveness {
             l.validate().map_err(PipeError::InvalidOptions)?;
         }
+        if let Change::Set(b) = &u.quality_band {
+            b.validate().map_err(PipeError::InvalidOptions)?;
+        }
         if matches!(u.probation, Change::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
             return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
                 "probation",
@@ -942,6 +945,11 @@ impl SessionCore {
             Change::Clear => self.set_pipe_liveness(pipe, &PipeLiveness::default())?,
             Change::Set(l) => self.set_pipe_liveness(pipe, &l)?,
         }
+        match u.quality_band {
+            Change::Keep => {}
+            Change::Clear => self.set_pipe_quality_band(pipe, None)?,
+            Change::Set(b) => self.set_pipe_quality_band(pipe, Some(b))?,
+        }
         Ok(())
     }
 
@@ -951,13 +959,7 @@ impl SessionCore {
     pub fn pipe_options(&self, pipe: PipeId) -> Option<crate::proto::session::PipeOptions> {
         let a = self.att(pipe.0).filter(|a| !a.unattached())?;
         let mut o = a.options().cloned().unwrap_or_default();
-        let (sp, ss, rp, rs, w, pr) = a.tier().settings();
-        o.send_priority = sp;
-        o.send_standby = ss;
-        o.receive_priority = rp;
-        o.receive_standby = rs;
-        o.weight = w;
-        o.probation = pr;
+        o.report_tier(a.tier().settings());
         o.fate_group = a.fate_group();
         Some(o)
     }
@@ -1078,12 +1080,12 @@ impl SessionCore {
     ) {
         // The initial request travels in the Hello.
         self.atts.at_mut(i).tier_mut().configure(
-            opts.send_priority,
-            opts.send_standby,
-            opts.receive_priority,
-            opts.receive_standby,
-            opts.weight,
-            opts.probation,
+            opts.own_send_priority(),
+            opts.own_send_standby(),
+            opts.receive_priority_value(),
+            opts.receive_standby_value(),
+            opts.weight_value(),
+            opts.own_probation(),
         );
     }
 
@@ -1479,7 +1481,7 @@ fn effective(a: &Attachment) -> (u64, bool, u64) {
 /// | `send_priority`, `send_standby` | follow the peer's latest request, else 0 and available | this value, which wins over the peer's request |
 /// | `receive_priority`, `receive_standby` | request 0 and available again | request this value |
 /// | `weight` | 1 | this value (0 excludes the pipe) |
-/// | `probation`, `liveness` | follow the session's | this value (`probation` `None`: off) |
+/// | `probation`, `liveness`, `quality_band` | follow the session's | this value (`probation` `None`: off) |
 ///
 /// A changed request for the peer's outbound direction is sent as one
 /// PIPE_STATUS, only when it differs from the request in force.
@@ -1512,4 +1514,6 @@ pub struct PipeUpdate {
     pub probation: Change<Option<Cap<Duration>>>,
     /// The pipe's own liveness settings, as a whole.
     pub liveness: Change<PipeLiveness>,
+    /// The pipe's own quality band ([`QualityBand`](crate::QualityBand)).
+    pub quality_band: Change<crate::QualityBand>,
 }

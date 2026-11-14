@@ -246,7 +246,7 @@ pub async fn connect(
 /// ([`Listener::serve_streams`]): a connection from an intermediary the
 /// listener trusts to send the PROXY protocol
 /// ([`zmux::TrustedProxies::proxy_protocol`]) has its header read first
-/// ([`zmux::proxied_source`]), and the client it reports is the carrier's
+/// ([`zmux::adapter::proxied_source`]), and the client it reports is the carrier's
 /// source; the connection takes its source slot, its handshake runs in a
 /// task of its own within the listener's `handshake_timeout`, the
 /// listener's admission ([`zmux::ListenerConfig::admission`]) decides
@@ -256,7 +256,7 @@ pub async fn connect(
 /// (`max_early_data_size` 0, no data sent before the handshake
 /// completes), so that the first bytes are never early data.
 pub async fn serve(listener: Listener, tcp: TcpListener, tls: Arc<ServerConfig>) {
-    let tls = if listener.admission().is_some() {
+    let tls = if listener.adapter().admission().is_some() {
         without_early_data(tls)
     } else {
         tls

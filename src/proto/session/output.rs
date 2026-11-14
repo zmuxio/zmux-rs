@@ -2145,7 +2145,7 @@ impl SessionCore {
             cap = cap.min(budget.saturating_sub(retained));
             // Redundant frames are chunks under every policy: each is
             // copied whole to the other pipe of the pair.
-            if !matches!(self.policy_for(key), super::Policy::Affinity)
+            if !matches!(self.policy_for(key), super::Scheduler::Affinity)
                 || self
                     .streams
                     .send(key)
@@ -2327,7 +2327,7 @@ impl SessionCore {
             self.mp_mut().batch_mut().new_data = true;
             if matches!(
                 self.policy_for(key),
-                super::Policy::SpreadRoundRobin | super::Policy::SpreadRateWeighted
+                super::Scheduler::SpreadRoundRobin | super::Scheduler::SpreadRateWeighted
             ) && let Some(g) = gate
             {
                 self.round_robin_commit(pipe, key, g);

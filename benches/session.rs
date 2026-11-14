@@ -22,9 +22,10 @@ use tokio::net::{TcpListener, TcpStream};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, Role};
+use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    Policy, Session, SessionStats,
+    Session, SessionStats,
 };
 
 static BASE: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
@@ -233,7 +234,7 @@ fn shared_config() -> Arc<Config> {
 async fn session_pair(tcp: bool) -> (Session, Session) {
     let (pa, pb) = if tcp {
         let (a, b) = tcp_pair().await;
-        (PipeIo::tcp(a), PipeIo::tcp(b))
+        (PipeIo::from_tcp(a), PipeIo::from_tcp(b))
     } else {
         let (a, b) = tokio::io::duplex(1 << 20);
         (PipeIo::new(a), PipeIo::new(b))
@@ -539,7 +540,7 @@ async fn wan_bulk() {
         last * 100.0 / link,
         to90.map_or("-".into(), |s| s.to_string()),
         cpu.map_or("-".into(), |c| format!("{c:.3}")),
-        receiver.window_growth() as f64 / 1e6,
+        receiver.adapter().window_growth() as f64 / 1e6,
     );
     client.close().await;
     let _ = writer.await;
@@ -569,7 +570,7 @@ async fn scale(multipath: bool) {
         .map(Duration::from_secs);
     let config = || {
         let mut c = if multipath {
-            mp_config(&Policy::Affinity)
+            mp_config(&Scheduler::Affinity)
         } else {
             Config::default()
         };
@@ -625,8 +626,8 @@ async fn scale(multipath: bool) {
                     async move { l2.handle_pipe(PipeIo::new(d), PipeHint::default()).await },
                 );
                 let mut opts = PipeOptions::default();
-                opts.send_standby = Some(true);
-                opts.receive_standby = true;
+                opts.send_standby = zmux::Change::Set(true);
+                opts.receive_standby = zmux::Change::Set(true);
                 client.begin_add_pipe(PipeIo::new(c), opts).unwrap();
                 (client, server)
             }
@@ -1469,7 +1470,7 @@ async fn soak() {
         .unwrap_or_else(|| "system".into());
     let mut single = Config::default();
     single.max_idle_timeout = None;
-    let mut mp = mp_config(&Policy::SpreadEta);
+    let mut mp = mp_config(&Scheduler::SpreadEta);
     mp.max_idle_timeout = None;
     let (single, mp) = (Arc::new(single), Arc::new(mp));
     let soak = Arc::new(Soak {
@@ -1643,18 +1644,18 @@ fn cpu_secs() -> Option<f64> {
     None
 }
 
-fn policy_name(p: &Policy) -> &'static str {
+fn policy_name(p: &Scheduler) -> &'static str {
     match p {
-        Policy::Affinity => "affinity",
-        Policy::SpreadEta => "eta",
-        Policy::SpreadRoundRobin => "rr",
-        Policy::SpreadRateWeighted => "rw",
-        Policy::SessionAffinity => "session",
+        Scheduler::Affinity => "affinity",
+        Scheduler::SpreadEta => "eta",
+        Scheduler::SpreadRoundRobin => "rr",
+        Scheduler::SpreadRateWeighted => "rw",
+        Scheduler::SessionAffinity => "session",
         _ => "custom",
     }
 }
 
-fn mp_config(policy: &Policy) -> Config {
+fn mp_config(policy: &Scheduler) -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
     c.pipe_auth = PipeAuth::psk(*b"bench-multipath-psk-0123456789ab").with_end_to_end();
@@ -1672,7 +1673,7 @@ struct Pair {
     client: Session,
     server: Session,
     pipes: usize,
-    policy: Option<Policy>,
+    policy: Option<Scheduler>,
     addr: Option<std::net::SocketAddr>,
     listener: Option<Listener>,
     acceptor: Option<tokio::task::JoinHandle<()>>,
@@ -1692,7 +1693,7 @@ impl Pair {
         }
     }
 
-    async fn multipath(pipes: usize, policy: &Policy) -> Self {
+    async fn multipath(pipes: usize, policy: &Scheduler) -> Self {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let listener = Listener::new(mp_config(policy), ListenerConfig::default())
@@ -1703,13 +1704,13 @@ impl Pair {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
+                        .handle_pipe(PipeIo::from_tcp(c), PipeHint::from_peer(peer))
                         .await;
                 });
             }
         });
         let c = TcpStream::connect(addr).await.unwrap();
-        let client = Session::connect(PipeIo::tcp(c), mp_config(policy))
+        let client = Session::connect(PipeIo::from_tcp(c), mp_config(policy))
             .await
             .unwrap();
         let server = listener.accept().await.unwrap();
@@ -1732,7 +1733,7 @@ impl Pair {
         for _ in 0..n {
             let c = TcpStream::connect(addr).await.unwrap();
             self.client
-                .begin_add_pipe(PipeIo::tcp(c), PipeOptions::default())
+                .begin_add_pipe(PipeIo::from_tcp(c), PipeOptions::default())
                 .unwrap();
         }
         self.pipes += n;
@@ -1866,7 +1867,7 @@ struct BulkRow {
 /// what it was before the pair existed, without the benchmark's own
 /// buffers: sampled every 20 ms during the window, its peak, and after the
 /// streams ended and idle buffers were returned.
-async fn mp_bulk(pipes: usize, policy: Option<&Policy>, streams: usize, secs: f64) -> BulkRow {
+async fn mp_bulk(pipes: usize, policy: Option<&Scheduler>, streams: usize, secs: f64) -> BulkRow {
     let base = live();
     let pair = match policy {
         None => Pair::plain().await,
@@ -1968,7 +1969,7 @@ async fn multipath() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10.0);
-        let policy = (f.get(2) != Some(&"plain")).then_some(Policy::SpreadEta);
+        let policy = (f.get(2) != Some(&"plain")).then_some(Scheduler::SpreadEta);
         mp_bulk(pipes, policy.as_ref(), streams, secs).await;
         return;
     }
@@ -1977,11 +1978,11 @@ async fn multipath() {
     // stream and with two per pipe.
     let mut bulk = vec![
         mp_bulk(1, None, 1, secs).await,
-        mp_bulk(1, Some(&Policy::SpreadEta), 1, secs).await,
+        mp_bulk(1, Some(&Scheduler::SpreadEta), 1, secs).await,
     ];
     for pipes in [2, 4] {
-        bulk.push(mp_bulk(pipes, Some(&Policy::SpreadEta), 1, secs).await);
-        bulk.push(mp_bulk(pipes, Some(&Policy::SpreadEta), 2 * pipes, secs).await);
+        bulk.push(mp_bulk(pipes, Some(&Scheduler::SpreadEta), 1, secs).await);
+        bulk.push(mp_bulk(pipes, Some(&Scheduler::SpreadEta), 2 * pipes, secs).await);
     }
     {
         let plain = bulk.iter().find(|r| r.label == "plain").map(|r| r.gbps);

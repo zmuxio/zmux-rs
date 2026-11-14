@@ -75,8 +75,8 @@ async fn bounds_are_errors() {
             c.send_buffer_max = Cap::Fixed(c.send_buffer - 1)
         }),
         ("join_timeout", |c| c.join_timeout = Duration::ZERO),
-        ("redial_min_backoff", |c| {
-            c.redial_min_backoff = c.redial_max_backoff + Duration::from_secs(1);
+        ("redial_backoff", |c| {
+            c.redial_backoff.min = c.redial_backoff.max + Duration::from_secs(1);
         }),
         ("resume_timeout", |c| {
             c.pipe_auth = PipeAuth::psk(PSK);
@@ -152,11 +152,11 @@ async fn a_suspension_without_a_redial_source_is_reported() {
         let mut client = Config::default();
         client.pipe_auth = PipeAuth::psk(PSK).with_end_to_end();
         client.resume_timeout = Some(Duration::from_secs(10));
-        client.redial_min_backoff = Duration::from_millis(50);
+        client.redial_backoff.min = Duration::from_millis(50);
         client.logger = Some(logger);
         if hooked {
             let l = listener.clone();
-            client.redial = Some(zmux::Dial::new(move |_| {
+            client.redial = Some(zmux::Redial::new(move |_| {
                 let l = l.clone();
                 async move {
                     let ((a, _), (b, _)) = duplex(1 << 16);

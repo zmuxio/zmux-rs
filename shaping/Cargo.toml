@@ -1,6 +1,6 @@
 [package]
 name = "zmux-shaping"
-version = "1.2.6"
+version = "1.2.7"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -17,9 +17,9 @@ tokio = ["zmux/tokio"]
 [dependencies]
 rand_chacha = "0.10"
 getrandom = "0.4"
-zmux = { version = "1.2.6", path = "..", default-features = false }
+zmux = { version = "1.2.7", path = "..", default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1.54", features = ["full"] }
-zmux = { version = "1.2.6", path = "..", features = ["tokio"] }
+zmux = { version = "1.2.7", path = "..", features = ["tokio"] }

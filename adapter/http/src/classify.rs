@@ -9,7 +9,7 @@ use http::header::{CONTENT_LENGTH, HeaderName, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, Method, Version};
 
 /// The request field that pairs the uplink `POST` and the downlink `GET`
-/// of a split bootstrap: [`zmux::PAIR_HEADER`] by default, another name
+/// of a split bootstrap: [`zmux::adapter::PAIR_HEADER`] by default, another name
 /// only where an intermediary strips unknown fields. Both ends must use
 /// the same ([`crate::Options::pair_field`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -170,11 +170,11 @@ pub fn classify(parts: &http::request::Parts, pair: &PairField) -> Option<Reques
 }
 
 /// Whether an intermediary forwarded the request from TLS early data
-/// (`Early-Data: 1`, RFC 8470): [`zmux::forwarded_early_data`] of its
+/// (`Early-Data: 1`, RFC 8470): [`zmux::adapter::forwarded_early_data`] of its
 /// header fields. A carrier request with it is answered `425 (Too Early)`
 /// and given to no listener.
 pub fn forwarded_early_data(headers: &HeaderMap) -> bool {
-    zmux::forwarded_early_data(headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())))
+    zmux::adapter::forwarded_early_data(headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())))
 }
 
 /// The comma-separated tokens of every `name` field.
@@ -296,7 +296,7 @@ mod tests {
     fn pair_field() {
         assert_eq!(
             PairField::default().name().as_str(),
-            zmux::PAIR_HEADER.to_ascii_lowercase()
+            zmux::adapter::PAIR_HEADER.to_ascii_lowercase()
         );
         let x = PairField::new("X-Pair").unwrap();
         let mut h = HeaderMap::new();

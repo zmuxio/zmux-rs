@@ -30,7 +30,7 @@ async fn connect(addr: std::net::SocketAddr) -> Option<Session> {
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
-        Session::connect(PipeIo::tcp(tcp), config()),
+        Session::connect(PipeIo::from_tcp(tcp), config()),
     )
     .await
     .ok()?
@@ -82,7 +82,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         let joins = listener.stats().joins;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _pipe = client
-            .begin_add_pipe(PipeIo::tcp(tcp), PipeOptions::default())
+            .begin_add_pipe(PipeIo::from_tcp(tcp), PipeOptions::default())
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while listener.stats().joins == joins && tokio::time::Instant::now() < deadline {
@@ -95,7 +95,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         drop(server);
         drop(client);
         shutdown.await.unwrap();
-        listener.closed().await;
+        listener.adapter().closed().await;
     })
     .await
     .unwrap();
@@ -132,7 +132,7 @@ async fn a_shutdown_past_its_deadline_closes() {
         )
         .await;
         drop(r);
-        listener.closed().await;
+        listener.adapter().closed().await;
         drop((client, server));
     })
     .await

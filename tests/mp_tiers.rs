@@ -12,7 +12,7 @@ use mp_net::{A, B, MpNet, Observe};
 use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::record::{Event as Rec, RecordReader};
 use zmux::proto::session::{
-    Config, CoreEvent, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, StreamKey,
+    Config, CoreEvent, PipeAuth, PipeId, PipeOptions, PipeWrite, Scheduler, StreamKey,
 };
 
 /// What a link's batches showed.
@@ -92,7 +92,7 @@ fn config(edit: impl Fn(&mut Config)) -> Config {
     let mut c = Config::default();
     c.max_pipes = 16;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
-    c.scheduler = Policy::SpreadEta;
+    c.scheduler = Scheduler::SpreadEta;
     c.max_idle_timeout = Some(Duration::from_secs(120));
     // Credit never limits the backlog here.
     c.initial_stream_receive_window = 16 << 20;
@@ -170,7 +170,7 @@ impl Net {
 fn two_tiers(edit: impl Fn(&mut Config)) -> Net {
     let mut n = net(edit);
     let mut opts = PipeOptions::default();
-    opts.send_priority = Some(5);
+    opts.send_priority = zmux::Change::Set(5);
     let id = n.add_pipe(&opts).unwrap();
     assert_eq!(id, 2);
     n.run_for(200);
@@ -239,8 +239,8 @@ fn sustained_overload_overflows_only_the_excess() {
 fn a_standby_takeover_is_announced_and_withdrawn() {
     let mut n = net(|c| c.resume_timeout = Some(Duration::from_secs(30)));
     let mut opts = PipeOptions::default();
-    opts.send_standby = Some(true);
-    opts.receive_standby = true;
+    opts.send_standby = zmux::Change::Set(true);
+    opts.receive_standby = zmux::Change::Set(true);
     let standby = n.add_pipe(&opts).unwrap();
     n.run_for(200);
     let req = |n: &Net| {
@@ -290,7 +290,7 @@ fn a_down_attachment_states_its_request_on_another_pipe_after_its_first_record()
     let mut n = net(|_| {});
     let mut opts = PipeOptions::default();
     opts.direction = zmux::PipeDirection::In;
-    opts.receive_priority = 6;
+    opts.receive_priority = zmux::Change::Set(6);
     let down = n.add_pipe_directed(true, false, &opts).unwrap();
     let pipe = PipeId::new(down);
     n.ends[A].set_pipe_receive_priority(pipe, 3).unwrap();
@@ -392,7 +392,7 @@ fn a_fate_group_keeps_the_probation_backoff_across_rejoins() {
 
 #[test]
 fn large_acknowledgement_snapshots_omit_unchanged_pipes() {
-    let mut n = net(|c| c.scheduler = Policy::Affinity);
+    let mut n = net(|c| c.scheduler = Scheduler::Affinity);
     let ids: Vec<u64> = (0..10)
         .map(|_| {
             // Within the per-source bound of carriers before Confirmed.
@@ -481,7 +481,7 @@ impl zmux::proto::session::Pick for Newest {
 fn a_custom_policy_never_puts_new_data_on_a_joining_pipe() {
     let mut n = net(|c| {
         c.resume_timeout = Some(Duration::from_secs(30));
-        c.scheduler = Policy::Custom(std::sync::Arc::new(Newest));
+        c.scheduler = Scheduler::Custom(std::sync::Arc::new(Newest));
     });
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     // The join never reaches B: the pipe stays JOINING.
@@ -518,7 +518,7 @@ fn wait_answers_are_not_counted() {
     let policy = waits.clone();
     let mut n = net(move |c| {
         c.resume_timeout = Some(Duration::from_secs(30));
-        c.scheduler = Policy::Custom(policy.clone());
+        c.scheduler = Scheduler::Custom(policy.clone());
     });
     n.add_pipe(&PipeOptions::default()).unwrap();
     n.write(64 * 1024);
@@ -538,7 +538,7 @@ fn wait_answers_are_not_counted() {
 fn probation_settings_take_effect_safely() {
     let mut n = net(|c| c.resume_timeout = Some(Duration::from_secs(30)));
     let mut opts = PipeOptions::default();
-    opts.probation = zmux::Inherit::Set(Some(zmux::Cap::Fixed(Duration::from_secs(10))));
+    opts.probation = zmux::Change::Set(Some(zmux::Cap::Fixed(Duration::from_secs(10))));
     let id = n.add_pipe(&opts).unwrap();
     n.run_for(200);
     assert!(n.ends[A].pipe_info(PipeId::new(id)).unwrap().in_probation);
@@ -640,7 +640,7 @@ fn quiet_sessions_probe_at_the_probe_interval() {
 #[test]
 fn intermittent_traffic_does_not_bring_probes_forward() {
     let mut n = two_tiers(|c| {
-        c.scheduler = Policy::Affinity;
+        c.scheduler = Scheduler::Affinity;
         c.redundancy = zmux::Redundancy::Off;
         c.liveness.standby_probe = None;
         c.liveness.probe_jitter = 0.25;

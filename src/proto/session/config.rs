@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Tracer;
-use super::policy::Policy;
+use super::policy::Scheduler;
 use crate::proto::keys::secret_flags;
 use crate::proto::limit::DatagramLimiter;
 use crate::proto::params::floor;
@@ -129,6 +129,7 @@ impl PipeAuth {
 
     /// The static pre-shared key, for a test's scripted peer.
     #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub fn psk_bytes(&self) -> &[u8] {
         self.psk.as_deref().unwrap_or_default()
     }
@@ -651,13 +652,13 @@ pub enum Redundancy {
 ///
 /// ```
 /// use std::time::Duration;
-/// use zmux::{Config, PipeAuth, Policy};
+/// use zmux::{Config, PipeAuth, sched::Scheduler};
 ///
 /// let mut config = Config::default();
 /// config.max_pipes = 8;
 /// config.resume_timeout = Some(Duration::from_secs(60));
 /// config.pipe_auth = PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec());
-/// config.scheduler = Policy::SpreadEta;
+/// config.scheduler = Scheduler::SpreadEta;
 /// // Let the preferred tier queue up to 200 ms before a fallback tier
 /// // takes the excess.
 /// config.overflow_delay = Duration::from_millis(200);
@@ -813,33 +814,26 @@ pub struct Config {
     /// session should have a redial source
     /// ([`redial`](Config#structfield.redial) or a pipe pool).
     pub resume_timeout: Option<Duration>,
-    /// The shortest wait between two dials of the
+    /// The backoff between two dials of the
     /// [`redial`](Config#structfield.redial) hook (default
-    /// [`DEFAULT_MIN_BACKOFF`], 1 s; not zero, and not above
-    /// `redial_max_backoff`).
-    pub redial_min_backoff: Duration,
-    /// The longest wait between two dials of the hook (default
-    /// [`DEFAULT_MAX_BACKOFF`], 60 s): the wait doubles from
-    /// `redial_min_backoff` after each failure up to this, with jitter,
+    /// [`Backoff::default`](crate::Backoff): from [`DEFAULT_MIN_BACKOFF`],
+    /// 1 s, doubling after each failure up to [`DEFAULT_MAX_BACKOFF`],
+    /// 60 s, with [`DEFAULT_BACKOFF_JITTER`](crate::DEFAULT_BACKOFF_JITTER)),
     /// measured from the start of the previous attempt.
-    pub redial_max_backoff: Duration,
-    /// The redial hook (tokio driver; the std driver's is
-    /// [`blocking_redial`](Config#structfield.blocking_redial)): dials a carrier that
-    /// replaces the session's pipe once the session suspends or lacks a direction, for
-    /// a session that runs on one pipe at a time. A dialling session runs it
-    /// (`Session::connect` and `Session::peer`); a session a listener accepted never
-    /// dials, and its peer redials. It runs with the backoff
-    /// of `redial_min_backoff` and `redial_max_backoff`; a refused join
-    /// adds its own backoff, and a dial waits for the longer of the two.
-    /// A multipath session that keeps several pipes uses pipe pools
-    /// instead ([`maintain_pipes`](crate::helpers::maintain_pipes)).
-    #[cfg(all(feature = "tokio", not(loom)))]
-    pub redial: Option<crate::Dial>,
-    /// The std driver's redial hook, as [`redial`](Config#structfield.redial) is the
-    /// tokio driver's: run on a thread of the session, with the same backoff, by
-    /// `zmux::blocking::Session::connect` and `peer`.
-    #[cfg(all(feature = "blocking", not(loom)))]
-    pub blocking_redial: Option<crate::blocking::Dial>,
+    pub redial_backoff: crate::Backoff,
+    /// The redial hook: dials a carrier that replaces the session's pipe
+    /// once the session suspends or lacks a direction, for a session that
+    /// runs on one pipe at a time. A dialling session runs it
+    /// (`Session::connect` and `Session::peer`); a session a listener
+    /// accepted never dials, and its peer redials. It runs with
+    /// [`redial_backoff`](Config#structfield.redial_backoff); a refused
+    /// join adds its own backoff, and a dial waits for the longer of the
+    /// two. A multipath session that keeps several pipes uses pipe pools
+    /// instead (`helpers::maintain_pipes`). The hook is built for the
+    /// driver that runs the session ([`Redial::new`] for the tokio driver,
+    /// [`Redial::blocking`] for the std driver); a driver ignores a hook
+    /// built for the other one.
+    pub redial: Option<Redial>,
     /// The logger: called with a level and a message, outside every lock;
     /// it must not block. Unset (the default), nothing is logged. zmux logs
     /// only what the application would otherwise not see: the removal of
@@ -848,7 +842,7 @@ pub struct Config {
     /// and failures of host callbacks that zmux contains.
     pub logger: Option<Logger>,
     /// The session's default scheduling policy (default `affinity`).
-    pub scheduler: Policy,
+    pub scheduler: Scheduler,
     /// The application's bounds on shaping (default: no account, one wait up to 1 s).
     pub shaping_limits: super::shaping::Limits,
     /// Gives the shaping configuration's budget, called once when the session is created
@@ -1032,6 +1026,72 @@ impl EarlyData {
     }
 }
 
+/// The [`redial`](Config#structfield.redial) hook of a session: a dial
+/// function built for the driver that runs the session. Clones share the
+/// function.
+#[derive(Clone)]
+pub struct Redial(RedialFn);
+
+#[derive(Clone)]
+enum RedialFn {
+    #[cfg(all(feature = "tokio", not(loom)))]
+    Tokio(crate::Dial),
+    #[cfg(all(feature = "blocking", not(loom)))]
+    Blocking(crate::blocking::Dial),
+}
+
+impl Redial {
+    /// The tokio driver's hook: an async dial function, run on a task of
+    /// the session.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: Fn(crate::DialRequest) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::io::Result<crate::PipeIo>> + Send + 'static,
+    {
+        Self(RedialFn::Tokio(crate::Dial::new(f)))
+    }
+
+    /// The std driver's hook: a blocking dial function, run on a thread of
+    /// the session.
+    #[cfg(all(feature = "blocking", not(loom)))]
+    pub fn blocking<F>(f: F) -> Self
+    where
+        F: Fn(crate::DialRequest) -> std::io::Result<crate::blocking::PipeIo>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self(RedialFn::Blocking(crate::blocking::Dial::new(f)))
+    }
+
+    /// The tokio driver's dial function, if built for it.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn as_tokio(&self) -> Option<&crate::Dial> {
+        #[allow(unreachable_patterns)]
+        match &self.0 {
+            RedialFn::Tokio(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The std driver's dial function, if built for it.
+    #[cfg(all(feature = "blocking", not(loom)))]
+    pub(crate) fn as_blocking(&self) -> Option<&crate::blocking::Dial> {
+        #[allow(unreachable_patterns)]
+        match &self.0 {
+            RedialFn::Blocking(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for Redial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Redial(..)")
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1068,14 +1128,10 @@ impl Default for Config {
             replay_window: Cap::Auto,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
-            redial_min_backoff: DEFAULT_MIN_BACKOFF,
-            redial_max_backoff: DEFAULT_MAX_BACKOFF,
-            #[cfg(all(feature = "tokio", not(loom)))]
+            redial_backoff: crate::Backoff::default(),
             redial: None,
-            #[cfg(all(feature = "blocking", not(loom)))]
-            blocking_redial: None,
             logger: None,
-            scheduler: Policy::Affinity,
+            scheduler: Scheduler::Affinity,
             shaping_limits: super::shaping::Limits::default(),
             shaping_budget: None,
             shaper: None,
@@ -1303,15 +1359,13 @@ impl Config {
         (id, value)
     }
 
-    /// The handshake timeout in effect: [`Config::handshake_timeout`], or
-    /// its default; `Duration::MAX`, a deadline that never comes, for no
-    /// timeout.
     /// The join deadline ([`Config::join_timeout`]).
     pub(crate) fn join_wait(&self) -> Duration {
         self.join_timeout
     }
 
-    /// The establishment deadline; no timeout is the longest wait.
+    /// The handshake timeout in effect: [`Config::handshake_timeout`];
+    /// `Duration::MAX`, a deadline that never comes, for no timeout.
     pub fn handshake_wait(&self) -> Duration {
         self.handshake_timeout.unwrap_or(Duration::MAX)
     }
@@ -1342,7 +1396,12 @@ impl Config {
     pub(crate) fn probe_interval(&self) -> Option<Duration> {
         self.liveness.probe_interval
     }
-    pub(crate) fn validate(&self) -> Result<(), crate::InvalidConfig> {
+    /// Checks the configuration as creating a session does: the error a
+    /// connect, accept or listener with it would fail with, naming the
+    /// field ([`InvalidConfig::field`](crate::InvalidConfig::field)).
+    /// Checks that need the first pipe (its secret source) are left to
+    /// the session.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         if self.own_locator().len() > Locator::MAX_LEN {
             return Err(crate::InvalidConfig::new("locator", "above 255 bytes"));
         }
@@ -1520,15 +1579,9 @@ impl Config {
                 "below send_buffer",
             ));
         }
-        if self.redial_min_backoff > self.redial_max_backoff {
-            return Err(crate::InvalidConfig::new(
-                "redial_min_backoff",
-                "above redial_max_backoff",
-            ));
-        }
-        if self.redial_min_backoff.is_zero() {
-            return Err(crate::InvalidConfig::new("redial_min_backoff", "zero"));
-        }
+        self.redial_backoff
+            .validate()
+            .map_err(|e| crate::InvalidConfig::new("redial_backoff", e.reason()))?;
         Ok(())
     }
 

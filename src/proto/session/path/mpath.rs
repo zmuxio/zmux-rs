@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::session::PipeError;
+use crate::proto::session::config::Change;
 
 use crate::proto::keys;
 use crate::proto::params::{Locator, Role, TransportParameters};
@@ -173,11 +174,13 @@ impl PipeLiveness {
 
 /// The options of a pipe, fixed when it is added (`direction`,
 /// `record_mode`, `key_group`, `label`, `fate_group`, `return_on_reply`)
-/// or its runtime settings at the start, which [`PipeUpdate`](crate::PipeUpdate) changes
-/// later.
+/// or its runtime settings at the start, which [`PipeUpdate`](crate::PipeUpdate)
+/// changes later. The runtime settings are the fields of `PipeUpdate`, of
+/// the same types: here [`Change::Keep`] and [`Change::Clear`] both mean
+/// the default.
 ///
 /// ```
-/// use zmux::PipeOptions;
+/// use zmux::{Change, PipeOptions};
 ///
 /// // A relay pipe as the fallback: used only while the preferred pipes are
 /// // saturated or have failed, and the peer is asked to do the same.
@@ -185,8 +188,8 @@ impl PipeLiveness {
 ///     .with_send_priority(10)
 ///     .with_receive_priority(10)
 ///     .with_label("relay");
-/// assert_eq!((relay.send_priority, relay.receive_priority), (Some(10), 10));
-/// assert_eq!(relay.weight, 1);
+/// assert_eq!(relay.send_priority, Change::Set(10));
+/// assert_eq!(relay.weight, Change::Keep);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -201,34 +204,37 @@ pub struct PipeOptions {
     /// [`Inherit::Session`] (the default) is the session's preference,
     /// Group 1 when usable. A Group the session cannot use fails the join.
     pub key_group: Inherit<u64>,
-    /// The tier of the local outbound direction, lower preferred; `None`
-    /// sets none of its own: the peer's latest request, else 0.
-    pub send_priority: Option<u64>,
+    /// The tier of the local outbound direction, lower preferred; by
+    /// default none of its own: the peer's latest request, else 0.
+    pub send_priority: Change<u64>,
     /// The tier requested for the peer's outbound direction (default 0),
     /// sent in the Hello.
-    pub receive_priority: u64,
-    /// The local outbound direction takes data only on failover; `None`
-    /// sets none of its own: the peer's latest request, else available.
-    pub send_standby: Option<bool>,
+    pub receive_priority: Change<u64>,
+    /// The local outbound direction takes data only on failover; by
+    /// default none of its own: the peer's latest request, else available.
+    pub send_standby: Change<bool>,
     /// Asks the peer to use its outbound direction only on failover
     /// (default false), sent in the Hello.
-    pub receive_standby: bool,
+    pub receive_standby: Change<bool>,
     /// The outbound direction's share for `spread-round-robin` and factor
     /// for `spread-rate-weighted` (default 1; 0 excludes the pipe).
-    pub weight: u64,
+    pub weight: Change<u64>,
     /// The base of the pipe's probation: the session's `probation` by
     /// default; `Set(None)` turns it off for this pipe; a fixed base is
     /// above zero.
-    pub probation: Inherit<Option<Cap<Duration>>>,
+    pub probation: Change<Option<Cap<Duration>>>,
+    /// The pipe's own liveness settings, as a whole; by default it follows
+    /// the session's.
+    pub liveness: Change<PipeLiveness>,
+    /// The pipe's own quality band; by default the session's
+    /// ([`QualityBand`](crate::QualityBand)).
+    pub quality_band: Change<crate::QualityBand>,
     /// The application's name for the pipe, reported by its statistics
     /// (local, never sent).
     pub label: Option<Arc<str>>,
     /// The fate group: pipes expected to fail together share one; 0 (the
     /// default) is independent.
     pub fate_group: u64,
-    /// The pipe's own liveness settings; by default it follows the
-    /// session's.
-    pub liveness: PipeLiveness,
     /// `add_pipe` returns once the Reply has been verified instead of once
     /// the peer attached the pipe (default false). The caller then keeps
     /// the session's other pipes until
@@ -267,42 +273,42 @@ impl PipeOptions {
     /// The tier of this endpoint's outbound direction.
     #[must_use]
     pub fn with_send_priority(mut self, priority: u64) -> Self {
-        self.send_priority = Some(priority);
+        self.send_priority = Change::Set(priority);
         self
     }
 
     /// The tier requested of the peer for its outbound direction.
     #[must_use]
     pub fn with_receive_priority(mut self, priority: u64) -> Self {
-        self.receive_priority = priority;
+        self.receive_priority = Change::Set(priority);
         self
     }
 
     /// Standby for this endpoint's outbound direction.
     #[must_use]
     pub fn with_send_standby(mut self, standby: bool) -> Self {
-        self.send_standby = Some(standby);
+        self.send_standby = Change::Set(standby);
         self
     }
 
     /// Standby requested of the peer for its outbound direction.
     #[must_use]
     pub fn with_receive_standby(mut self, standby: bool) -> Self {
-        self.receive_standby = standby;
+        self.receive_standby = Change::Set(standby);
         self
     }
 
     /// The outbound direction's weight.
     #[must_use]
     pub fn with_weight(mut self, weight: u64) -> Self {
-        self.weight = weight;
+        self.weight = Change::Set(weight);
         self
     }
 
     /// The pipe's own probation base; `None` turns probation off for it.
     #[must_use]
     pub fn with_probation(mut self, probation: Option<Cap<Duration>>) -> Self {
-        self.probation = Inherit::Set(probation);
+        self.probation = Change::Set(probation);
         self
     }
 
@@ -324,7 +330,14 @@ impl PipeOptions {
     /// The pipe's own liveness settings.
     #[must_use]
     pub fn with_liveness(mut self, liveness: PipeLiveness) -> Self {
-        self.liveness = liveness;
+        self.liveness = Change::Set(liveness);
+        self
+    }
+
+    /// The pipe's own quality band.
+    #[must_use]
+    pub fn with_quality_band(mut self, band: crate::QualityBand) -> Self {
+        self.quality_band = Change::Set(band);
         self
     }
 
@@ -341,11 +354,14 @@ impl PipeOptions {
     /// ([`PipeError::InvalidOptions`] otherwise, which adding a pipe with
     /// them also returns).
     pub fn validate(&self) -> Result<(), PipeError> {
-        self.liveness
+        self.own_liveness()
             .validate()
             .map_err(PipeError::InvalidOptions)?;
+        if let Some(b) = self.own_quality_band() {
+            b.validate().map_err(PipeError::InvalidOptions)?;
+        }
         let e = |f, r| Err(PipeError::InvalidOptions(InvalidConfig::new(f, r)));
-        if matches!(self.probation, Inherit::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
+        if matches!(self.probation, Change::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
             return e("probation", "a base of zero: turn probation off with None");
         }
         if self.record_mode == Inherit::Set(RecordMode::Unmanaged) {
@@ -364,17 +380,96 @@ impl Default for PipeOptions {
             direction: PipeDirection::Bidi,
             record_mode: Inherit::Session,
             key_group: Inherit::Session,
-            send_priority: None,
-            receive_priority: 0,
-            send_standby: None,
-            receive_standby: false,
-            weight: 1,
-            probation: Inherit::Session,
+            send_priority: Change::Keep,
+            receive_priority: Change::Keep,
+            send_standby: Change::Keep,
+            receive_standby: Change::Keep,
+            weight: Change::Keep,
+            probation: Change::Keep,
+            liveness: Change::Keep,
+            quality_band: Change::Keep,
             label: None,
             fate_group: 0,
-            liveness: PipeLiveness::default(),
             return_on_reply: false,
         }
+    }
+}
+
+/// The value of a [`Change`] in a [`PipeOptions`]: `Keep` and `Clear` are
+/// the default.
+fn own<T>(c: Change<T>) -> Option<T> {
+    match c {
+        Change::Set(v) => Some(v),
+        Change::Keep | Change::Clear => None,
+    }
+}
+
+/// A [`Change`] for [`PipeOptions`] reporting `v`: `Keep` for the default.
+fn reported<T: PartialEq>(v: T, default: T) -> Change<T> {
+    if v == default {
+        Change::Keep
+    } else {
+        Change::Set(v)
+    }
+}
+
+impl PipeOptions {
+    /// The own send tier; `None` follows the peer.
+    pub(crate) fn own_send_priority(&self) -> Option<u64> {
+        own(self.send_priority)
+    }
+
+    /// The own send standby; `None` follows the peer.
+    pub(crate) fn own_send_standby(&self) -> Option<bool> {
+        own(self.send_standby)
+    }
+
+    /// The tier requested of the peer.
+    pub(crate) fn receive_priority_value(&self) -> u64 {
+        own(self.receive_priority).unwrap_or(0)
+    }
+
+    /// The standby requested of the peer.
+    pub(crate) fn receive_standby_value(&self) -> bool {
+        own(self.receive_standby).unwrap_or(false)
+    }
+
+    /// The weight.
+    pub(crate) fn weight_value(&self) -> u64 {
+        own(self.weight).unwrap_or(1)
+    }
+
+    /// The probation base, or the session's.
+    pub(crate) fn own_probation(&self) -> Inherit<Option<Cap<Duration>>> {
+        own(self.probation).map_or(Inherit::Session, Inherit::Set)
+    }
+
+    /// The pipe's own liveness settings (the default follows the session).
+    pub(crate) fn own_liveness(&self) -> PipeLiveness {
+        own(self.liveness).unwrap_or_default()
+    }
+
+    /// The pipe's own quality band.
+    pub(crate) fn own_quality_band(&self) -> Option<crate::QualityBand> {
+        own(self.quality_band)
+    }
+
+    /// Records the tier settings in force, as [`PipeOptions`] reports them.
+    pub(crate) fn report_tier(
+        &mut self,
+        (sp, ss, rp, rs, w, pr): crate::proto::session::pipes::TierSettings,
+    ) {
+        self.send_priority = sp.map_or(Change::Keep, Change::Set);
+        self.send_standby = ss.map_or(Change::Keep, Change::Set);
+        self.receive_priority = reported(rp, 0);
+        self.receive_standby = reported(rs, false);
+        self.weight = reported(w, 1);
+        self.probation = pr.own().map_or(Change::Keep, Change::Set);
+    }
+
+    /// Records the pipe's own liveness settings.
+    pub(crate) fn report_liveness(&mut self, liveness: PipeLiveness) {
+        self.liveness = reported(liveness, PipeLiveness::default());
     }
 }
 
@@ -770,6 +865,25 @@ impl ReplayWindow {
 }
 
 impl Mp {
+    /// Ends the handshake of a local join (proven, declined, failed or
+    /// dropped): nothing of it is needed after, a rejoin being a new join
+    /// with its own. With none left the list's storage goes too.
+    pub(in crate::proto::session) fn end_local_join(&mut self, id: u64) {
+        self.local_joins.retain(|j| j.id != id);
+        if self.local_joins.is_empty() {
+            self.local_joins = Vec::new();
+        }
+    }
+
+    /// A deferred join went or was dropped; with none left the list's
+    /// storage goes too.
+    fn end_deferred(&mut self, id: u64) {
+        self.deferred.retain(|d| d.id != id);
+        if self.deferred.is_empty() {
+            self.deferred = Vec::new();
+        }
+    }
+
     /// Heap bytes the multipath state holds besides the attachments.
     pub(crate) fn heap_bytes(&self) -> usize {
         size_of::<Self>() + self.batch.heap_bytes() + self.acks.heap_bytes()
@@ -1441,6 +1555,10 @@ impl SessionCore {
         }
         let pos = self.insert_attachment(att);
         self.init_tier(pos, opts);
+        if let Some(band) = opts.own_quality_band() {
+            // Validated with the options.
+            let _ = self.set_pipe_quality_band(PipeId(id), Some(band));
+        }
         self.stats.pipes_added += 1;
         if let Some(a) = self.att_mut(id) {
             a.set_mode(mode);
@@ -1527,7 +1645,7 @@ impl SessionCore {
                 k += 1;
                 continue;
             }
-            self.mp_mut().deferred.remove(k);
+            self.mp_mut().end_deferred(id);
             if let Some(o) = self.out_mut(id) {
                 o.release_join();
             }
@@ -1554,8 +1672,8 @@ impl SessionCore {
         let id = a.id();
         self.recv_lane_gone(id);
         let mp = self.mp_mut();
-        mp.deferred.retain(|d| d.id != id);
-        mp.local_joins.retain(|j| j.id != id);
+        mp.end_deferred(id);
+        mp.end_local_join(id);
         for (half, present) in [
             (PipeHalf::Inbound, a.inp().is_some()),
             (PipeHalf::Outbound, a.out().is_some()),
@@ -1754,7 +1872,7 @@ impl SessionCore {
     ) -> Result<(), PipeError> {
         liveness.validate().map_err(PipeError::InvalidOptions)?;
         let mut opts = self.pipe_options(pipe).ok_or(PipeError::UnknownPipe)?;
-        opts.liveness = *liveness;
+        opts.report_liveness(*liveness);
         let c = self.config.liveness;
         let a = self.att_mut(pipe.0).ok_or(PipeError::UnknownPipe)?;
         a.set_options(&opts);
@@ -1917,7 +2035,7 @@ impl SessionCore {
             self.stats.join_failures += 1;
             // The handshake ends with the attachment: a Reply still in flight
             // can no longer confirm it, and so revive a failed attachment.
-            self.mp_mut().local_joins.retain(|j| j.id != id);
+            self.mp_mut().end_local_join(id);
         }
         if !self.atts.at_mut(i).fail() {
             return;
@@ -2386,7 +2504,7 @@ impl SessionCore {
             return Some(Err(PipeError::UnknownPipe));
         };
         if a.failed() {
-            return Some(Err(PipeError::failed(
+            return Some(Err(PipeError::Failed(
                 a.failure().unwrap_or(PipeFailure::Aborted),
             )));
         }
@@ -2426,7 +2544,7 @@ impl SessionCore {
             None => a.inp().is_some_and(|i| i.state() != InState::Ended),
         };
         (!live).then(|| {
-            Err(PipeError::failed(
+            Err(PipeError::Failed(
                 a.failure().unwrap_or(PipeFailure::Aborted),
             ))
         })
@@ -2443,7 +2561,7 @@ impl SessionCore {
             return Some(Ok(()));
         };
         if a.failed() {
-            return Some(Err(PipeError::failed(
+            return Some(Err(PipeError::Failed(
                 a.failure().unwrap_or(PipeFailure::Aborted),
             )));
         }
@@ -2773,8 +2891,12 @@ impl SessionCore {
     /// lower tiers included. Another such pipe counts whether or not its carrier takes bytes at the
     /// moment: two pipes that a bulk sender keeps full do not wait for each other, and a pipe whose
     /// path went dark is found by its ack stall; a suspect or penalized pipe is never waited for on
-    /// account of that data.
+    /// account of that data. Data the pipe's own rate limiter holds back does not wait for its
+    /// carrier.
     pub(in crate::proto::session) fn bytes_wait_for(&self, id: u64) -> bool {
+        if self.out_ref(id).is_some_and(OutPipe::limiter_held) {
+            return false;
+        }
         if self.data_bound_to(id) {
             return true;
         }
@@ -2925,7 +3047,7 @@ impl SessionCore {
         opts: Option<&PipeOptions>,
     ) -> crate::proto::session::pipes::Detection {
         let c = &self.config;
-        let own = opts.map(|o| o.liveness).unwrap_or_default();
+        let own = opts.map(PipeOptions::own_liveness).unwrap_or_default();
         crate::proto::session::pipes::Detection {
             suspect_floor: own.suspect_floor.or(c.liveness.suspect_floor),
             dead_timeout: own.dead_timeout.own().or(c.liveness.dead_timeout()),

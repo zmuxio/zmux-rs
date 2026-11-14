@@ -12,7 +12,7 @@ use super::{PipeId, StreamKey};
 
 /// A scheduling policy.
 #[derive(Clone, Default)]
-pub enum Policy {
+pub enum Scheduler {
     /// Each stream direction is bound to one pipe (the session default).
     #[default]
     Affinity,
@@ -30,7 +30,7 @@ pub enum Policy {
     Custom(Arc<dyn Pick>),
 }
 
-impl fmt::Debug for Policy {
+impl fmt::Debug for Scheduler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Affinity => "Affinity",
@@ -43,7 +43,7 @@ impl fmt::Debug for Policy {
     }
 }
 
-impl PartialEq for Policy {
+impl PartialEq for Scheduler {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
@@ -81,7 +81,7 @@ impl PartialEq for Policy {
 ///
 /// ```
 /// use std::sync::Arc;
-/// use zmux::proto::session::{Config, FrameInfo, Pick, PickAnswer, PipeSnapshot, Policy};
+/// use zmux::proto::session::{Config, FrameInfo, Pick, PickAnswer, PipeSnapshot, Scheduler};
 ///
 /// struct UrgentFirst;
 ///
@@ -102,7 +102,7 @@ impl PartialEq for Policy {
 /// }
 ///
 /// let mut config = Config::default();
-/// config.scheduler = Policy::Custom(Arc::new(UrgentFirst));
+/// config.scheduler = Scheduler::Custom(Arc::new(UrgentFirst));
 /// ```
 pub trait Pick: Send + Sync + 'static {
     /// One answer per request, in `out` (preset to [`PickAnswer::Wait`]).

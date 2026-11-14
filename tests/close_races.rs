@@ -159,11 +159,7 @@ async fn race_once(kind: Kind, race: Race, seed: u64, grace: Duration) {
                     let _ = s.send_datagram(Bytes::from_static(b"d"));
                 }
                 Box::pin(async move {
-                    format!(
-                        "{:?}",
-                        s.send_datagram_with_backpressure(Bytes::from_static(b"w"))
-                            .await
-                    )
+                    format!("{:?}", s.send_datagram_wait(Bytes::from_static(b"w")).await)
                 })
             }
             Kind::SessionEvent => Box::pin(async move { format!("{:?}", s.next_event().await) }),

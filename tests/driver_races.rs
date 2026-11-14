@@ -21,8 +21,9 @@ use bytes::Bytes;
 use common::{Rng, connect, relay, small_windows, tcp, watchdog};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use zmux::sched::Scheduler;
 use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, Policy, RecvStream,
+    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, RecvStream,
     SendStream, Session, VarInt,
 };
 
@@ -41,7 +42,7 @@ impl Rng {
 
 async fn tcp_pair(client: Config, server: Config) -> (Session, Session) {
     let (a, b) = tcp().await;
-    connect(PipeIo::tcp(a), PipeIo::tcp(b), client, server).await
+    connect(PipeIo::from_tcp(a), PipeIo::from_tcp(b), client, server).await
 }
 
 /// Echoes every bidirectional stream and drains every unidirectional one
@@ -230,13 +231,13 @@ async fn carrier_eof_mid_batch() {
     let target = l.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (c, _) = l.accept().await.unwrap();
-        Session::accept(PipeIo::tcp(c), Config::default())
+        Session::accept(PipeIo::from_tcp(c), Config::default())
             .await
             .unwrap()
     });
     let (addr, cut) = relay(target).await;
     let client = Session::connect(
-        PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
         Config::default(),
     )
     .await
@@ -333,7 +334,7 @@ async fn carrier_write_error_mid_batch() {
     );
     let (client, server) = connect(
         client_pipe,
-        PipeIo::tcp(b),
+        PipeIo::from_tcp(b),
         Config::default(),
         Config::default(),
     )
@@ -385,13 +386,13 @@ fn session_task_dropped_with_its_runtime() {
     let addr = l.local_addr().unwrap();
     let server = main.spawn(async move {
         let (c, _) = l.accept().await.unwrap();
-        Session::accept(PipeIo::tcp(c), Config::default())
+        Session::accept(PipeIo::from_tcp(c), Config::default())
             .await
             .unwrap()
     });
     let client = side.block_on(async {
         let c = TcpStream::connect(addr).await.unwrap();
-        Session::connect(PipeIo::tcp(c), Config::default())
+        Session::connect(PipeIo::from_tcp(c), Config::default())
             .await
             .unwrap()
     });
@@ -432,7 +433,7 @@ fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"driver-race-psk-0123456789abcdef").with_end_to_end();
-    c.scheduler = Policy::SpreadEta;
+    c.scheduler = Scheduler::SpreadEta;
     c.liveness.suspect_floor = Duration::from_millis(100);
     c
 }
@@ -453,7 +454,7 @@ async fn multipath_pipe_loss_under_concurrency() {
                 let l = l.clone();
                 tokio::spawn(async move {
                     let _ = l
-                        .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
+                        .handle_pipe(PipeIo::from_tcp(c), PipeHint::from_peer(peer))
                         .await;
                 });
             }
@@ -468,7 +469,7 @@ async fn multipath_pipe_loss_under_concurrency() {
         })
     };
     let client = Session::connect(
-        PipeIo::tcp(TcpStream::connect(target).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
         mp_config(),
     )
     .await
@@ -478,13 +479,13 @@ async fn multipath_pipe_loss_under_concurrency() {
     let (raddr, cut) = relay(target).await;
     client
         .begin_add_pipe(
-            PipeIo::tcp(TcpStream::connect(raddr).await.unwrap()),
+            PipeIo::from_tcp(TcpStream::connect(raddr).await.unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
     let third = client
         .begin_add_pipe(
-            PipeIo::tcp(TcpStream::connect(target).await.unwrap()),
+            PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
@@ -516,7 +517,7 @@ async fn multipath_pipe_loss_under_concurrency() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = third.abort();
     let _ = client.begin_add_pipe(
-        PipeIo::tcp(TcpStream::connect(target).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
         PipeOptions::default(),
     );
     tokio::time::sleep(Duration::from_millis(300)).await;

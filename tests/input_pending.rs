@@ -14,10 +14,9 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::TcpListener;
+use zmux::sched::Scheduler;
 use zmux::test_hooks::take_write_call_bytes;
-use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, Policy, Session,
-};
+use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, Session};
 
 const MIB: usize = 1 << 20;
 
@@ -25,7 +24,7 @@ fn config() -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"input-pending---0123456789abcdef").with_end_to_end();
-    c.scheduler = Policy::SpreadEta;
+    c.scheduler = Scheduler::SpreadEta;
     c
 }
 
@@ -83,7 +82,7 @@ async fn carriers(tcp: bool, l: Option<&TcpListener>) -> (PipeIo, PipeIo) {
         Some(l) => {
             let addr = l.local_addr().unwrap();
             let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
-            (PipeIo::tcp(a.unwrap()), PipeIo::tcp(b.unwrap().0))
+            (PipeIo::from_tcp(a.unwrap()), PipeIo::from_tcp(b.unwrap().0))
         }
         None => {
             let (a, b) = tokio::io::duplex(256 * 1024);

@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use bytes::{Buf, Bytes};
 use http_body::{Body, Frame};
 use tokio::io::{AsyncRead, ReadBuf};
-use zmux::carrier::{ChunkBuf, ChunkWrite};
+use zmux::adapter::{ChunkBuf, ChunkWrite};
 
 /// How a fed body ends.
 #[derive(Clone, Copy, PartialEq, Eq)]

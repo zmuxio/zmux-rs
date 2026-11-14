@@ -185,7 +185,7 @@ async fn redirects_to_another_host_or_past_the_bound_are_refused() {
     assert!(e.contains("ConnectionRefused"), "{e}");
     assert_eq!(
         count.swap(0, Ordering::SeqCst),
-        zmux::redirect::DEFAULT_MAX_REDIRECTS + 1
+        zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1
     );
     let e = refused(addr, "/loop", Options::default().with_max_redirects(0)).await;
     assert!(e.contains("ConnectionRefused"), "{e}");
@@ -337,7 +337,10 @@ async fn exchange_requests_follow_redirects_per_request() {
     for (path, hops) in [
         ("/moved/exchange", 1),
         ("/host/exchange", 1),
-        ("/loop/exchange", zmux::redirect::DEFAULT_MAX_REDIRECTS + 1),
+        (
+            "/loop/exchange",
+            zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1,
+        ),
     ] {
         count.store(0, Ordering::SeqCst);
         let options = exchange_options()

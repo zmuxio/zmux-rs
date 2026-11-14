@@ -8,9 +8,11 @@ are further unidirectional streams that zmux opens as it needs them, so that
 a loss on one lane does not hold back the streams on the others. The carrier
 runs the connection's accept loop and hands every stream the peer opens to
 zmux: to a `zmux::Listener` when one is given, else lanes to
-`zmux::carrier::handle_lane` and pipes to `accept_pipe`. The connection's streams
-and datagrams belong to zmux; its statistics, path and close stay the
-application's (`connection()`).
+`zmux::adapter::handle_lane` and pipes to `accept_pipe`. The carrier owns the
+connection: its streams and datagrams belong to zmux, and once no carrier
+clone and no pipe made from it is left the connection is closed. Keep the
+`Carrier` for as long as the connection is to stay open; its statistics and
+path stay readable through `connection()`.
 
 The carrier wires:
 

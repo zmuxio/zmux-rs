@@ -237,13 +237,25 @@ pub(crate) enum List<K> {
     StreamDatagrams(K),
 }
 
+impl<K> List<K> {
+    /// A list of rare events (the session's state, its pipes, a close, a
+    /// ping answer): it goes once nobody waits in it, so that a session
+    /// holds no storage for its handshake's or a past operation's waits.
+    /// The other session lists serve loops (accept, datagrams, events,
+    /// hooks, channels) and stay for their next wait.
+    fn transient(&self) -> bool {
+        matches!(self, Self::State | Self::Pipes | Self::Close | Self::Ping)
+    }
+}
+
 /// The blocked operations of a session, woken by the core's events. A
 /// stream has at most one read and one write waiting (they take the handle
 /// by `&mut`): its newest waker is kept, and dropping the handle removes it.
 /// Every other wait may be shared, waits in a list in arrival order and
 /// leaves it when it ends unresolved ([`Wait`]); openers wait their turn
 /// ([`OpenQueue`]). Lists exist from their first wait on: a session nobody
-/// waits on holds none.
+/// waits on holds none, and a list of rare events goes again once it is
+/// empty ([`List::transient`]).
 pub(crate) struct Waiters<K> {
     readers: HashMap<K, Waker>,
     writers: HashMap<K, Waker>,
@@ -321,6 +333,25 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
         if let Some(l) = self.existing(list) {
             l.remove(ticket);
         }
+        self.drop_if_empty(list);
+    }
+
+    /// Drops a transient session list nobody waits in, and the session's
+    /// list storage with the last list.
+    fn drop_if_empty(&mut self, list: List<K>) {
+        if !list.transient() {
+            return;
+        }
+        if let Some(i) = self
+            .session
+            .iter()
+            .position(|(l, w)| *l == list && w.is_empty())
+        {
+            self.session.swap_remove(i);
+            if self.session.is_empty() {
+                self.session = Vec::new();
+            }
+        }
     }
 
     /// A stream's read waits.
@@ -377,6 +408,7 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
         if let Some(l) = self.existing(list) {
             l.wake_all(wakes);
         }
+        self.drop_if_empty(list);
     }
 
     /// No stream opens from now on: waiting openers fail.

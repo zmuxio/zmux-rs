@@ -364,7 +364,7 @@ async fn graceful_ends_finish_their_streams() {
     assert!(clean(&server), "{:?}", server.pipe_stats());
     transfer(&client, &server, 4, 256 << 10).await;
     client.close().await;
-    let e = tokio::time::timeout(Duration::from_secs(10), server.wait())
+    let e = tokio::time::timeout(Duration::from_secs(10), server.closed())
         .await
         .expect("the session ended");
     assert!(
@@ -432,7 +432,7 @@ async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &
     // The client lingers an hour (`lingering`): a wait that returns within
     // its guard returned at the server's end of its side, after it read the
     // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.wait())
+    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
         .await
         .expect("the server ended its side after the close");
     assert!(

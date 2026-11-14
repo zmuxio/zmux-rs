@@ -20,7 +20,14 @@ async fn main() {
     let (mode, kind, addr) = (args[1].as_str(), args[2].as_str(), args[3].as_str());
     match mode {
         "server" => server(addr).await,
-        "client" | "bad" => client(kind, addr, if mode == "client" { b"right" } else { b"wrong" }).await,
+        "client" | "bad" => {
+            client(
+                kind,
+                addr,
+                if mode == "client" { b"right" } else { b"wrong" },
+            )
+            .await
+        }
         other => panic!("unknown mode {other}"),
     }
 }

@@ -50,7 +50,7 @@ fn quick() -> ExchangeOptions {
     o.gone_memory = Duration::from_secs(20);
     o.request_timeout = Duration::from_secs(2);
     o.deadline = Duration::from_secs(20);
-    o.backoff.initial = Duration::from_millis(5);
+    o.backoff.min = Duration::from_millis(5);
     o.backoff.max = Duration::from_millis(100);
     o.up_piece = Cap::Fixed(64 << 10);
     o.down_piece = Cap::Fixed(64 << 10);

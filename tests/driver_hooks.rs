@@ -9,10 +9,8 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use zmux::proto::session::{FrameInfo, Pick, PickAnswer, PipeSnapshot, WindowIncrease};
-use zmux::{
-    Config, ConnectError, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    Policy, Session,
-};
+use zmux::sched::Scheduler;
+use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, Session};
 
 /// What a test policy does besides answering.
 #[derive(Clone, Copy, PartialEq)]
@@ -41,11 +39,11 @@ impl Pick for LeastUnsent {
                 // A blocking zmux call on the driver's task fails at once.
                 let tcp = std::net::TcpStream::connect(self.spare).unwrap();
                 let r = zmux::blocking::Session::connect(
-                    zmux::blocking::PipeIo::tcp(tcp),
+                    zmux::blocking::PipeIo::from_tcp(tcp),
                     Config::default(),
                 );
                 self.refused.store(
-                    matches!(r, Err(ConnectError::OnDriverThread)),
+                    matches!(r, Err(zmux::blocking::WaitError::OnDriverThread)),
                     Ordering::SeqCst,
                 );
             }
@@ -110,7 +108,7 @@ async fn sink() -> (SocketAddr, Listener) {
             let l = l.clone();
             tokio::spawn(async move {
                 let _ = l
-                    .handle_pipe(PipeIo::tcp(c), PipeHint::from_peer(peer))
+                    .handle_pipe(PipeIo::from_tcp(c), PipeHint::from_peer(peer))
                     .await;
             });
         }
@@ -145,14 +143,17 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
     });
     let (addr, _listener) = sink().await;
     let mut config = still_sender(mp_config());
-    config.scheduler = Policy::Custom(policy.clone());
-    let client = Session::connect(PipeIo::tcp(TcpStream::connect(addr).await.unwrap()), config)
-        .await
-        .unwrap();
+    config.scheduler = Scheduler::Custom(policy.clone());
+    let client = Session::connect(
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
+        config,
+    )
+    .await
+    .unwrap();
     // The view the policy answers for is complete before the first chunk.
     client
         .add_pipe(
-            PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+            PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
             PipeOptions::default(),
         )
         .await
@@ -229,7 +230,7 @@ fn predicate(
         if let Some(s) = s {
             // Runs outside every lock: no deadlock.
             let _ = s.stats();
-            let _ = s.window_growth();
+            let _ = s.adapter().window_growth();
         }
         assert!(!panic, "predicate panics");
         approve
@@ -251,10 +252,10 @@ async fn window_transfer(approve: bool, panic: bool) -> (u64, u64) {
     config.test_hooks().rtt = Some(Duration::from_millis(5));
     let receiver = tokio::spawn(async move {
         let (c, _) = tcp.accept().await.unwrap();
-        Session::accept(PipeIo::tcp(c), config).await.unwrap()
+        Session::accept(PipeIo::from_tcp(c), config).await.unwrap()
     });
     let sender = Session::connect(
-        PipeIo::tcp(TcpStream::connect(addr).await.unwrap()),
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
         Config::default(),
     )
     .await
@@ -279,7 +280,7 @@ async fn window_transfer(approve: bool, panic: bool) -> (u64, u64) {
     }
     assert_eq!(got, 32 << 20);
     writer.await.unwrap();
-    let growth = receiver.window_growth();
+    let growth = receiver.adapter().window_growth();
     slot.lock().unwrap().take();
     sender.close().await;
     receiver.closing().await;
@@ -325,15 +326,15 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
         spare: spare.local_addr().unwrap(),
     });
     let mut config = mp_config();
-    config.scheduler = Policy::Custom(policy.clone());
+    config.scheduler = Scheduler::Custom(policy.clone());
     let client = zmux::blocking::Session::connect(
-        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
+        zmux::blocking::PipeIo::from_tcp(std::net::TcpStream::connect(addr).unwrap()),
         config,
     )
     .unwrap();
     client
         .begin_add_pipe(
-            zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
+            zmux::blocking::PipeIo::from_tcp(std::net::TcpStream::connect(addr).unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
@@ -376,10 +377,10 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     }
     let receiver = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        zmux::blocking::Session::accept(zmux::blocking::PipeIo::tcp(c), config).unwrap()
+        zmux::blocking::Session::accept(zmux::blocking::PipeIo::from_tcp(c), config).unwrap()
     });
     let sender = zmux::blocking::Session::connect(
-        zmux::blocking::PipeIo::tcp(std::net::TcpStream::connect(addr).unwrap()),
+        zmux::blocking::PipeIo::from_tcp(std::net::TcpStream::connect(addr).unwrap()),
         Config::default(),
     )
     .unwrap();
@@ -404,7 +405,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     let got = recv.read_to_end(usize::MAX).unwrap();
     assert_eq!(got.len(), w.join().unwrap());
     assert!(calls.load(Ordering::SeqCst) > 0);
-    assert!(receiver.window_growth() > 0);
+    assert!(receiver.adapter().window_growth() > 0);
     assert!(blocked.load(Ordering::SeqCst));
     slot.lock().unwrap().take();
     sender.close();

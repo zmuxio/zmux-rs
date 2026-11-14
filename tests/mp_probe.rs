@@ -665,3 +665,84 @@ fn keep_alive_is_capped_at_half_the_idle_timeout_and_jittered() {
         g.iter().max().unwrap().abs_diff(*g.iter().min().unwrap()) >= Duration::from_millis(300)
     );
 }
+
+/// Runs for `ms`; the PIPE_PING frames both ends wrote on link `id`
+/// meanwhile.
+fn pings_in(n: &mut Net, id: u64, ms: u64) -> u64 {
+    let count = |n: &Net| n.links[&id].a_pings + n.links[&id].b_pings;
+    let before = count(n);
+    ping_times(n, id, ms);
+    count(n) - before
+}
+
+/// An idle exchange of A probing every 15 s, each probe answered by B's
+/// PIPE_ACK with at most one PIPE_PING of its own: at most 8 PIPE_PING
+/// frames a minute, and the window's edges.
+const PING_STORM_LIMIT: u64 = 10;
+
+/// Both ends shape every record with a 2 s delay. A record that carries a
+/// PIPE_ACK goes no later than `zmux_max_ack_delay` after the first byte it
+/// reports, so the peer's RTT samples hold no shaping delay and its working
+/// pipe never turns suspect. Held for the whole delay, the first exchanges
+/// made the pipes suspect, and the samples (each a suspicion's PIPE_PING
+/// held as long) took the delay into the estimate.
+#[test]
+fn a_shaping_delay_keeps_acknowledgements_in_time() {
+    let mut n = net(
+        &|c| {
+            c.liveness.probe_interval = Some(Duration::from_secs(15));
+            c.shaping_limits.max_delay = Some(Duration::from_secs(3));
+        },
+        &|c| c.shaping_limits.max_delay = Some(Duration::from_secs(3)),
+    );
+    for end in [A, B] {
+        n.ends[end].set_shaper(Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
+            Some(Box::new(Delay {
+                plans: Arc::new(AtomicU64::new(0)),
+                by: Duration::from_secs(2),
+            }) as Box<dyn Shaper>)
+        })));
+    }
+    ping_times(&mut n, 0, 20_000);
+    let pings = pings_in(&mut n, 0, 60_000);
+    assert!(pings <= PING_STORM_LIMIT, "{pings} PIPE_PING in a minute");
+    for end in [A, B] {
+        let info = n.ends[end].pipe_info(PipeId::new(0)).unwrap();
+        assert_eq!(info.suspect_count, 0, "suspected under a 2 s shaping delay");
+        let srtt = info.smoothed_rtt.unwrap();
+        assert!(srtt < Duration::from_millis(500), "smoothed RTT {srtt:?}");
+    }
+    assert!(n.ends[A].error().is_none() && n.ends[B].error().is_none());
+}
+
+/// A path whose round trip grows to 4 s, far above the T_suspect of the
+/// estimate learned before: every probe turns the pipe suspect before its
+/// answer. The PIPE_PING of the suspicion gives a sample even though the
+/// pipe became suspect again before its acknowledgement, so the estimate
+/// learns the path and the suspicions stop. Discarded, every sample of the
+/// pipe was of bytes sent before its latest suspicion, the estimate stayed
+/// where it was and the pipe was suspect at every probe.
+#[test]
+fn a_long_round_trip_is_learned_despite_suspicion() {
+    let mut n = net(
+        &|c| c.liveness.probe_interval = Some(Duration::from_secs(15)),
+        &|_| {},
+    );
+    ping_times(&mut n, 0, 60_000);
+    for f in &mut n.links.get_mut(&0).unwrap().flows {
+        f.delay = Duration::from_secs(2);
+    }
+    ping_times(&mut n, 0, 30_000);
+    let suspected = |n: &Net| n.ends[A].pipe_info(PipeId::new(0)).unwrap().suspect_count;
+    let s0 = suspected(&n);
+    let pings = pings_in(&mut n, 0, 60_000);
+    assert!(pings <= PING_STORM_LIMIT, "{pings} PIPE_PING in a minute");
+    assert_eq!(suspected(&n), s0, "suspected at every probe");
+    let info = n.ends[A].pipe_info(PipeId::new(0)).unwrap();
+    let srtt = info.smoothed_rtt.unwrap();
+    assert!(
+        srtt >= Duration::from_secs(1),
+        "smoothed RTT {srtt:?} on a 4 s path"
+    );
+    assert!(n.ends[A].error().is_none() && n.ends[B].error().is_none());
+}

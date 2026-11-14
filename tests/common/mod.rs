@@ -325,7 +325,7 @@ pub(crate) async fn pair(
 ) -> (Session, Session, Vec<Arc<Ctl>>) {
     if tcp_carrier {
         let (a, b) = tcp().await;
-        let (c, s) = connect(PipeIo::tcp(a), PipeIo::tcp(b), client, server).await;
+        let (c, s) = connect(PipeIo::from_tcp(a), PipeIo::from_tcp(b), client, server).await;
         (c, s, Vec::new())
     } else {
         let ((a, ca), (b, cb)) = duplex(64 * 1024);

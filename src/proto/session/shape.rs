@@ -123,9 +123,14 @@ impl PipeShape {
         b
     }
 
-    /// Whether the planned record waits for its delay.
-    fn delayed(&self, now: Instant) -> bool {
-        self.shaper.is_some() && self.plan.is_some() && self.delay_until.is_some_and(|t| now < t)
+    /// Whether the planned record waits for its delay: it has not passed,
+    /// and `ack` (the deadline of a PIPE_ACK the record carries, see
+    /// [`SessionCore::ack_release`]) has not either.
+    fn delayed(&self, now: Instant, ack: Option<Instant>) -> bool {
+        self.shaper.is_some()
+            && self.plan.is_some()
+            && self.delay_until.is_some_and(|t| now < t)
+            && ack.is_none_or(|t| now < t)
     }
 
     fn held(&self, now: Instant, us: u64) -> bool {
@@ -442,8 +447,9 @@ impl Shaping {
             .is_some_and(|i| self.pipes[i].held(now, us))
     }
 
-    pub(super) fn delayed(&self, pipe: u64, now: Instant) -> bool {
-        self.index(pipe).is_some_and(|i| self.pipes[i].delayed(now))
+    pub(super) fn delayed(&self, pipe: u64, now: Instant, ack: Option<Instant>) -> bool {
+        self.index(pipe)
+            .is_some_and(|i| self.pipes[i].delayed(now, ack))
     }
 
     /// Whether `pipe` has an injection due.
@@ -495,8 +501,14 @@ impl Shaping {
         Some(p.bucket.tokens.max(0) as u64)
     }
 
-    /// The earliest shaping deadline; `data` whether stream data waits.
-    pub(super) fn deadline(&self, now: Instant, data: bool) -> Option<Instant> {
+    /// The earliest shaping deadline; `data` whether stream data waits,
+    /// `ack` the deadline of a PIPE_ACK a pipe's next record carries.
+    pub(super) fn deadline(
+        &self,
+        now: Instant,
+        data: bool,
+        ack: impl Fn(u64) -> Option<Instant>,
+    ) -> Option<Instant> {
         let mut t: Option<Instant> = None;
         let mut at = |x: Instant| t = Some(t.map_or(x, |t| t.min(x)));
         let us = self.micros(now);
@@ -512,9 +524,13 @@ impl Shaping {
             if let Some(x) = p.inject.filter(|_| !p.inject_due) {
                 at(self.instant(x.at));
             }
-            if p.delayed(now) {
-                // Exactly: the delayed record goes at its time.
-                at(p.delay_until.expect("delayed"));
+            if let Some(until) = p.delay_until.filter(|_| p.plan.is_some()) {
+                // Exactly: the delayed record goes at its time, or at the
+                // deadline of the PIPE_ACK it carries.
+                let ack = ack(p.pipe);
+                if p.delayed(now, ack) {
+                    at(ack.map_or(until, |a| a.min(until)));
+                }
             }
             if data && p.held(now, us) {
                 at(self.release(i, now));
@@ -584,6 +600,9 @@ pub(super) struct ShapeTx {
     now: Instant,
     /// The carrier's write overhead.
     overhead: usize,
+    /// The deadline of a PIPE_ACK the batch's records carry: a shaping
+    /// delay ends there.
+    ack: Option<Instant>,
     /// The largest frames length of the open plan; 0: none.
     cut: usize,
     /// Stream data room by the gate; `None`: unbounded.
@@ -675,7 +694,7 @@ impl ShapeTx {
             s.pipes[i].delay_until = s.pause(delay, now);
         }
         let s = &mut *self.s;
-        if s.pipes[i].delayed(now) {
+        if s.pipes[i].delayed(now, self.ack) {
             // The whole record, control frames included, waits.
             self.delayed = true;
             return limit;
@@ -781,6 +800,12 @@ impl ShapeTx {
 }
 
 impl SessionCore {
+    /// The factory installed on every outbound pipe (the configured one or
+    /// the last [`Self::set_shaper`]); `None`: no shaping.
+    pub fn shaper(&self) -> Option<Arc<dyn Factory>> {
+        self.shape.as_deref()?.factory.clone()
+    }
+
     /// Installs `factory` on every outbound pipe, with no configuration budget; `None`: no
     /// shaping. The account carries over.
     pub fn set_shaper(&mut self, factory: Option<Arc<dyn Factory>>) {
@@ -987,6 +1012,7 @@ impl SessionCore {
         };
         let room = s.room(i, now);
         let gates = s.pipes[i].gates;
+        let ack = self.ack_release(id);
         self.shape_pending = Some(Vec::new());
         Some(ShapeTx {
             s,
@@ -995,6 +1021,7 @@ impl SessionCore {
             lane,
             now,
             overhead,
+            ack,
             cut: 0,
             room,
             spent: 0,
@@ -1035,7 +1062,7 @@ impl SessionCore {
         };
         let (i, now) = (t.i, t.now);
         let p = &t.s.pipes[i];
-        if t.lane != 0 || !p.inject_due || p.delayed(now) {
+        if t.lane != 0 || !p.inject_due || p.delayed(now, t.ack) {
             return;
         }
         let Some(x) = p.inject else {
@@ -1148,7 +1175,7 @@ impl SessionCore {
     pub(super) fn shape_delayed(&self, id: u64) -> bool {
         self.shape
             .as_deref()
-            .is_some_and(|s| s.delayed(id, self.now))
+            .is_some_and(|s| s.delayed(id, self.now, self.ack_release(id)))
     }
 
     /// Whether the gate of pipe `id` holds stream data now.
@@ -1158,7 +1185,7 @@ impl SessionCore {
 
     pub(super) fn shape_deadline(&self) -> Option<Instant> {
         let s = self.shape.as_deref()?;
-        s.deadline(self.now, self.data_pending())
+        s.deadline(self.now, self.data_pending(), |id| self.ack_release(id))
     }
 
     pub(super) fn shape_timeout(&mut self, now: Instant) {
@@ -1289,7 +1316,7 @@ mod tests {
         s.timeout(now, 1200);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // The deadline is ahead of the clock, and a second look at this time sends nothing.
-        assert_eq!(s.deadline(now, false), Some(now + GRANULARITY));
+        assert_eq!(s.deadline(now, false, |_| None), Some(now + GRANULARITY));
         s.timeout(now, 1200);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         s.timeout(now + GRANULARITY, 1200);

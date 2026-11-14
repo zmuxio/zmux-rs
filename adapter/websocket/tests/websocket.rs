@@ -444,7 +444,7 @@ async fn an_unaccepted_subprotocol_is_refused_with_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_request_reaches_the_fallback_with_every_byte() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let fallback = zmux::Fallback::new(|mut conn, _source| async move {
+    let fallback = zmux::adapter::Fallback::new(|mut conn, _source| async move {
         // Echo the request as the body of a 200, then end.
         let mut got = vec![0u8; 4096];
         let mut n = 0;
@@ -789,7 +789,7 @@ async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &
     // The client lingers an hour (`lingering`): a wait that returns within
     // its guard returned at the server's end of its side, after it read the
     // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.wait())
+    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
         .await
         .expect("the server ended its side after the close");
     assert!(

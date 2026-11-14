@@ -13,8 +13,8 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use zmux::carrier::CarrierConnId;
-use zmux::redirect::{self, RedirectError};
+use zmux::adapter::CarrierConnId;
+use zmux::adapter::redirect::{self, RedirectError};
 use zmux::{
     Candidate, CarrierInfo, CarrierKind, ConnectError, Dial, DialRequest, HttpTarget, Pipe,
     PipeDirection, PipeIo, PipeOptions, Session,
@@ -403,7 +403,7 @@ impl AsyncRead for ResponseReader {
 /// A fresh pairing token as its header value: 16 random bytes in
 /// base64url without padding.
 fn pairing_token() -> io::Result<String> {
-    let mut token = [0u8; zmux::PAIRING_TOKEN_LEN];
+    let mut token = [0u8; zmux::adapter::PAIRING_TOKEN_LEN];
     getrandom::fill(&mut token).map_err(io::Error::other)?;
     let mut out = [0u8; 24];
     let n = zmux::proto::oob::encode(&token, &mut out)
@@ -807,7 +807,7 @@ impl Http2Connection {
                     inner
                         .open_lane()
                         .await
-                        .map(zmux::carrier::Lane::from_chunks)
+                        .map(zmux::adapter::Lane::from_chunks)
                 }
             });
         }

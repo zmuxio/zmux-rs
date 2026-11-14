@@ -1543,7 +1543,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zmux"
-version = "1.2.6"
+version = "1.2.7"
 dependencies = [
  "aes-gcm",
  "atomic-waker",
@@ -1559,15 +1559,17 @@ dependencies = [
 
 [[package]]
 name = "zmux-http"
-version = "1.2.6"
+version = "1.2.7"
 dependencies = [
  "base64",
  "bytes",
  "getrandom 0.4.3",
+ "hmac",
  "http",
  "http-body",
  "hyper",
  "hyper-util",
+ "sha2",
  "tokio",
  "zmux",
 ]
@@ -1586,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-websocket"
-version = "1.2.6"
+version = "1.2.7"
 dependencies = [
  "futures-util",
  "httparse",

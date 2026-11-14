@@ -30,7 +30,7 @@ roles, GOAWAY, stream preambles, priorities and datagram flows.
 ```rust,no_run
 async fn hello() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let tcp = tokio::net::TcpStream::connect("127.0.0.1:4433").await?;
-    let session = zmux::Session::connect(zmux::PipeIo::tcp(tcp), zmux::Config::default()).await?;
+    let session = zmux::Session::connect(zmux::PipeIo::from_tcp(tcp), zmux::Config::default()).await?;
     let (mut send, mut recv) = session.open_bi().await?;
     send.write_all(b"hello").await?;
     send.finish()?;
@@ -42,7 +42,7 @@ async fn hello() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 The accepting side calls `Session::accept`, then `accept_bi` / `accept_uni`.
 Streams implement `AsyncRead` / `AsyncWrite`; dropping a stream that was not
-finished resets it (and stops reading) with code 0. A bidirectional stream
+finished resets it with `ZMUX_CANCELLED` (and stops reading with code 0). A bidirectional stream
 can itself carry a pipe of another session (`Session::open_pipe_stream`,
 `PipeIo::from_stream`): a nested session whose pipes cross relays.
 
@@ -51,11 +51,14 @@ ended), `StreamError` (every stream operation), `OpenError`,
 `DatagramError`, `PipeError`, and `ConnectError`, `ReadExactError`,
 `ReadToEndError` for the compound calls; a setting that cannot work is an
 `InvalidConfig`, which names the setting. The std driver (`zmux::blocking`)
-returns the same types, with a `TimedOut` variant when its wait timeout
-expires, and its session-wide waits return a `WaitError` where the tokio
-driver's futures return the `SessionError` alone. Each tells whether the
-operation may be retried (`is_retryable`) and converts into
-`std::io::Error`. The session-ended variant is `SessionLost` everywhere.
+wraps the same types in a `WaitError` for the calls that wait: `Failed`
+with the error the tokio driver's future returns, `TimedOut` when the
+call's bound (`x_timeout(d)`, a stream's read or write timeout) expired,
+and `OnDriverThread` when it was refused on a thread that drives sessions.
+Each tells whether the operation may be retried (`is_retryable`) and
+converts into `std::io::Error`; a session's end is never
+`ErrorKind::TimedOut`, also when an idle, handshake or resume timeout
+ended it. The session-ended variant is `SessionLost` everywhere.
 
 ```rust,no_run
 use std::error::Error as _;
@@ -98,8 +101,8 @@ async fn two_pipes(first: TcpStream, second: TcpStream) -> Result<(), Box<dyn st
     // Server: a Listener routes joins to their session.
     let _listener = Listener::new(config.clone(), ListenerConfig::default())?;
     // Client: a second TCP connection becomes a second pipe.
-    let session = Session::connect(PipeIo::tcp(first), config).await?;
-    let pipe = session.add_pipe(PipeIo::tcp(second), PipeOptions::default()).await?;
+    let session = Session::connect(PipeIo::from_tcp(first), config).await?;
+    let pipe = session.add_pipe(PipeIo::from_tcp(second), PipeOptions::default()).await?;
     // Make it a fallback for both directions.
     pipe.update(&zmux::PipeUpdate {
         send_priority: zmux::Change::Set(10),
@@ -111,8 +114,8 @@ async fn two_pipes(first: TcpStream, second: TcpStream) -> Result<(), Box<dyn st
 ```
 
 `add_pipe` waits at most `Config::join_timeout` (10 s) for the peer to
-attach the pipe; it fails with `PipeError::JoinRefused` when the peer
-refused the join. `helpers::maintain_pipes` keeps a pool of pipes up per
+attach the pipe; it fails with `PipeError::Failed(PipeFailure::JoinRefused)`
+when the peer refused the join. `helpers::maintain_pipes` keeps a pool of pipes up per
 path, redialling with backoff.
 
 ## Resume
@@ -125,18 +128,19 @@ none of them is reported as `SessionEvent::ResumeUnattended` and logged.
 
 ```rust,no_run
 use std::time::Duration;
-use zmux::{Config, Dial, PipeAuth, PipeIo, Session};
+use zmux::{Config, PipeAuth, PipeIo, Redial, Session};
 
 async fn resumable(first: tokio::net::TcpStream) -> Result<Session, zmux::ConnectError> {
     let mut config = Config::default();
     config.pipe_auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
     config.resume_timeout = Some(Duration::from_secs(60));
-    // Replaces the lost pipe, with backoff from 1 s doubling up to 60 s.
-    config.redial = Some(Dial::new(|_req| async {
-        Ok(PipeIo::tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
+    // Replaces the lost pipe, with `config.redial_backoff` (from 1 s
+    // doubling up to 60 s).
+    config.redial = Some(Redial::new(|_req| async {
+        Ok(PipeIo::from_tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
     }));
     config.logger = Some(zmux::Logger::new(|level, msg| eprintln!("{level:?}: {msg}")));
-    Session::connect(PipeIo::tcp(first), config).await
+    Session::connect(PipeIo::from_tcp(first), config).await
 }
 ```
 
@@ -163,12 +167,12 @@ still read what arrived on its open streams until it has read it, within
 the linger timeout.
 
 `session.closing().await` returns why the session ended as soon as it is
-closing, and `session.wait().await` once it has ended entirely: every
+closing, and `session.closed().await` once it has ended entirely: every
 pipe's input ended (the peer read the close and ended its side) or the
 linger timeout passed, and the session's task released its carriers. A
 wait that returns before the linger timeout confirms the peer read the
 close; "delivered or given up after `d`" is
-`tokio::time::timeout(d, session.wait())`, which changes nothing in the
+`tokio::time::timeout(d, session.closed())`, which changes nothing in the
 session. Over QUIC, the adapter closes the QUIC connection only after
 that, with the same application error code.
 
@@ -185,7 +189,7 @@ that, with the same application error code.
   of the client address (PROXY protocol, a forwarding header field) is
   believed.
 - **Carriers before a session.** Every carrier holds a slot of its source
-  (`ListenerConfig::max_pending_per_source`, default 8) and one of the
+  (`ListenerConfig::max_pending_per_source`, default 8, at least 2) and one of the
   listener (`ListenerConfig::max_pending`, default 1024, `None` for
   unlimited) from the moment it is taken, through its handshake,
   admission, transform, pairing and classification, and through a stall,
@@ -249,7 +253,9 @@ the resident set, under any allocator given by `LD_PRELOAD`.
 | crate root | `Session`, `SendStream`, `RecvStream`, `PipeIo`, `Listener`: one tokio task per session | `tokio` (default) |
 | `zmux::blocking` | the same handles for threads: the calls that wait block instead of returning a future; streams implement `std::io::Read` / `Write` | `blocking` |
 | `zmux::helpers` | helpers above the public API: `maintain_pipes` (keeping pipes up), `splice` (relaying a stream into another), `resolve_duplicate` (two sessions between the same endpoints) | `tokio`; `resolve_duplicate` either driver |
-| `zmux::carrier` | items for carrier authors: connection identities, lane handling, memory charges | `tokio` |
+| `zmux::sched` | the scheduler: `Scheduler` and the custom policy's interface (`Pick`) | always |
+| `zmux::shaping` | traffic shaping: shapers, definitions and budgets | always |
+| `zmux::adapter` | what carrier adapters and own accept loops use: `Listener::adapter()` and `Session::adapter()` views, carrier admission at an entrance, connection identities, lanes, datagram channels, memory charges | `tokio` |
 
 The session core has no I/O and no clock: drivers feed it bytes, timer
 events and application commands, and pull records, events and deadlines

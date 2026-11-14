@@ -26,9 +26,10 @@ use common::{
 use tokio::task::JoinHandle;
 use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
 use zmux::proto::ApplicationErrorCode;
+use zmux::sched::Scheduler;
 use zmux::{
     Cap, Config, Limiter, Listener, ListenerConfig, OutboundState, Pipe, PipeAuth, PipeHint,
-    PipeIo, PipeOptions, Policy, Session, VarInt,
+    PipeIo, PipeOptions, Session, VarInt,
 };
 
 fn carrier_failed() -> VarInt {
@@ -40,7 +41,7 @@ fn nested_config() -> Config {
     c.max_pipes = 8;
     c.pipe_auth = PipeAuth::psk(*b"relay-psk-------0123456789abcdef").with_end_to_end();
     // Every pipe carries data: a relayed pipe fails with data in flight.
-    c.scheduler = Policy::SpreadRoundRobin;
+    c.scheduler = Scheduler::SpreadRoundRobin;
     c
 }
 

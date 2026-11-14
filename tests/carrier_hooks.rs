@@ -10,13 +10,15 @@ mod core_pair;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 
 use common::{duplex, multi_thread, watchdog};
+use zmux::adapter::{FirstBytes, classify_first_bytes};
 use zmux::proto::record::Framing;
 use zmux::{
     Admission, AdmissionVerdict, CacheOutcome, CarrierCache, CarrierKind, Config, ExportError,
-    FirstBytes, Listener, ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter,
-    ReplayVerdict, Session, SessionError, classify_first_bytes,
+    Listener, ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter, ReplayVerdict,
+    Session, SessionError,
 };
 
 fn exported(p: PipeIo, reads: Option<Arc<AtomicUsize>>) -> PipeIo {
@@ -102,17 +104,20 @@ fn a_deferred_join_secret_holds_joins_until_it_is_given() {
             client.begin_add_pipe(extra, Default::default()),
             Err(PipeError::JoinPending(zmux::JoinMissing::DeferredPsk))
         ));
-        assert!(!client.join_ready());
+        assert!(!client.adapter().join_ready());
         let key = [7u8; 32];
-        assert_eq!(
+        assert!(matches!(
             client.set_join_secret(&key[..8]),
             Err(PipeError::InvalidArgument)
-        );
+        ));
         client.set_join_secret(&key).unwrap();
         server.set_join_secret(&key).unwrap();
         assert!(!client.join_pending());
-        assert_eq!(client.set_join_secret(&key), Err(PipeError::JoinSecretSet));
-        assert!(client.join_ready());
+        assert!(matches!(
+            client.set_join_secret(&key),
+            Err(PipeError::JoinSecretSet)
+        ));
+        assert!(client.adapter().join_ready());
     });
 }
 
@@ -242,10 +247,10 @@ fn a_secret_the_negotiation_did_not_select_is_dropped() {
         client.set_join_secret(&[7; 32]).ok();
         watchdog(5, "est", client.established()).await.unwrap();
         assert!(!client.join_pending());
-        assert_eq!(
+        assert!(matches!(
             client.set_join_secret(&[7; 32]),
             Err(PipeError::NotNegotiated)
-        );
+        ));
     });
 }
 
@@ -451,12 +456,12 @@ fn admission_timeouts_beyond_the_clock_do_not_panic() {
         lc.admission = Some(adm);
         let listener = Listener::new(Config::default(), lc).expect("valid listener configuration");
         let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let mut entry = listener.enter(peer, None).unwrap();
+        let mut entry = listener.adapter().enter(peer, None).unwrap();
         let mut bytes: &[u8] = b"abcdefgh";
         let admit = entry
             .admit(zmux::CarrierInfo::new(), Some(&mut bytes))
             .await;
-        assert_eq!(admit, zmux::Admit::Accept(Vec::new()));
+        assert_eq!(admit, zmux::adapter::Admit::Accept(Vec::new()));
         assert_eq!(bytes, b"fgh");
         let stats = listener.stats().admission;
         assert_eq!(stats.accepted, 1);
@@ -512,11 +517,11 @@ fn a_join_has_a_deadline_without_a_handshake_timeout() {
     p.a.join_prepare(id, now).unwrap().unwrap();
     let later = now + Duration::from_secs(9);
     p.a.handle_timeout(later);
-    assert_eq!(p.a.pipe_joined(id).and_then(Result::err), None);
+    assert!(p.a.pipe_joined(id).and_then(Result::err).is_none());
     let later = now + Duration::from_secs(10);
     p.a.handle_timeout(later);
-    assert_eq!(
+    assert!(matches!(
         p.a.pipe_joined(id).and_then(Result::err),
         Some(PipeError::Failed(PipeFailure::JoinTimedOut))
-    );
+    ));
 }

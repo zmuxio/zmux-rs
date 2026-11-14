@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zmux::blocking::{PipeIo, Session};
-use zmux::{Config, ConnectError, OpenError, StreamError};
+use zmux::{Config, StreamError};
 
 type Hook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
@@ -38,7 +38,7 @@ fn pair(hook: Option<Hook>) -> (Session, Session) {
     let addr = l.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (c, _) = l.accept().unwrap();
-        Session::accept(PipeIo::tcp(c), Config::default()).unwrap()
+        Session::accept(PipeIo::from_tcp(c), Config::default()).unwrap()
     });
     let c = TcpStream::connect(addr).unwrap();
     let pipe = match hook {
@@ -49,7 +49,7 @@ fn pair(hook: Option<Hook>) -> (Session, Session) {
             },
             c,
         ),
-        None => PipeIo::tcp(c),
+        None => PipeIo::from_tcp(c),
     };
     let client = Session::connect(pipe, Config::default()).unwrap();
     (client, server.join().unwrap())
@@ -93,12 +93,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
         let nonblocking = (
             // An event, or none in time: not refused.
             matches!(
-                {
-                    c.set_wait_timeout(Some(Duration::ZERO));
-                    let r = c.next_event();
-                    c.set_wait_timeout(None);
-                    r
-                },
+                c.next_event_timeout(Duration::ZERO),
                 Ok(_) | Err(zmux::blocking::WaitError::TimedOut)
             ),
             c.try_open_bi().is_ok(),
@@ -109,7 +104,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
             .is_err(),
             {
                 recv.set_read_timeout(Some(Duration::ZERO));
-                recv.read(&mut buf) == Err(StreamError::TimedOut)
+                recv.read(&mut buf) == Err(zmux::blocking::WaitError::TimedOut)
             },
         );
         tx.send((r, nonblocking)).unwrap();
@@ -119,14 +114,14 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
     let (r, nonblocking) = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the hook ran");
-    assert_eq!(r.0, Some(OpenError::OnDriverThread));
+    assert_eq!(r.0, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.1, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.2, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.3, Some(zmux::blocking::WaitError::OnDriverThread));
-    assert_eq!(r.4, Some(StreamError::OnDriverThread));
-    assert_eq!(r.5, Some(StreamError::OnDriverThread));
-    assert_eq!(r.6, Some(StreamError::OnDriverThread));
-    assert_eq!(r.7, Some(StreamError::OnDriverThread));
+    assert_eq!(r.4, Some(zmux::blocking::WaitError::OnDriverThread));
+    assert_eq!(r.5, Some(zmux::blocking::WaitError::OnDriverThread));
+    assert_eq!(r.6, Some(zmux::blocking::WaitError::OnDriverThread));
+    assert_eq!(r.7, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.8, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.9, Some(zmux::blocking::WaitError::OnDriverThread));
     assert_eq!(r.10, Some(zmux::blocking::WaitError::OnDriverThread));
@@ -135,7 +130,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
     assert!(client.close_reason().is_none());
     still_works(&client, &server);
     assert_eq!(
-        io::Error::from(StreamError::OnDriverThread).kind(),
+        io::Error::from(zmux::blocking::WaitError::<StreamError>::OnDriverThread).kind(),
         io::ErrorKind::Deadlock
     );
     client.close();
@@ -158,13 +153,22 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
     let check = move || {
         let (mut send, mut recv) = c.try_open_bi().unwrap();
         let mut buf = [0u8; 4];
-        assert_eq!(c.open_uni().err(), Some(OpenError::OnDriverThread));
+        assert_eq!(
+            c.open_uni().err(),
+            Some(zmux::blocking::WaitError::OnDriverThread)
+        );
         assert_eq!(
             c.accept_bi().err(),
             Some(zmux::blocking::WaitError::OnDriverThread)
         );
-        assert_eq!(recv.read(&mut buf), Err(StreamError::OnDriverThread));
-        assert_eq!(send.write(b"x"), Err(StreamError::OnDriverThread));
+        assert_eq!(
+            recv.read(&mut buf),
+            Err(zmux::blocking::WaitError::OnDriverThread)
+        );
+        assert_eq!(
+            send.write(b"x"),
+            Err(zmux::blocking::WaitError::OnDriverThread)
+        );
         assert_eq!(c.closing(), Err(zmux::blocking::WaitError::OnDriverThread));
         assert_eq!(
             c.shutdown(0u32.into(), b""),
@@ -172,8 +176,8 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
         );
         let tcp = TcpStream::connect(spare_addr).unwrap();
         assert!(matches!(
-            Session::connect(PipeIo::tcp(tcp), Config::default()),
-            Err(ConnectError::OnDriverThread)
+            Session::connect(PipeIo::from_tcp(tcp), Config::default()),
+            Err(zmux::blocking::WaitError::OnDriverThread)
         ));
     };
     let c2 = check.clone();

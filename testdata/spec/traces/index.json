@@ -685,7 +685,7 @@
     {
       "id": "core.streams.release_without_finish_resets",
       "file": "fixtures/traces/core/streams/release_without_finish_resets.ndjson",
-      "title": "Dropping an unfinished send handle resets with code 0; dropping an unread receive handle stops with code 0",
+      "title": "Dropping an unfinished send handle resets with ZMUX_CANCELLED; dropping an unread receive handle stops with code 0",
       "refs": [
         "EXTENSIONS.md#7.4",
         "SPEC.md#7.5"
@@ -1392,6 +1392,18 @@
       "findings": [],
       "profile": "zmux-small",
       "steps": 11
+    },
+    {
+      "id": "core.pipe_ack.after_quiet",
+      "file": "fixtures/traces/core/pipe_ack/after_quiet.ndjson",
+      "title": "With pipe acknowledgement, an ack-eliciting record on a pipe without a PIPE_ACK during the preceding zmux_max_ack_delay is acknowledged at once, and one within it waits for the threshold or the delay",
+      "refs": [
+        "MULTIPATH.md#3.5",
+        "MULTIPATH.md#6.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 17
     },
     {
       "id": "core.pipe_ack.threshold",
@@ -3100,7 +3112,29 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
+      "steps": 20
+    },
+    {
+      "id": "multipath.failover.write_stall_stream_data",
+      "file": "fixtures/traces/multipath/failover/write_stall_stream_data.ndjson",
+      "title": "Stream data waiting for the only pipe, whose carrier accepts no bytes, is a write stall: the pipe becomes suspect after T_suspect with nothing else queued",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
       "steps": 18
+    },
+    {
+      "id": "multipath.failover.credit_blocked_no_write_stall",
+      "file": "fixtures/traces/multipath/failover/credit_blocked_no_write_stall.ndjson",
+      "title": "Stream data held back by the peer's credit does not wait for the carrier: a pipe whose carrier accepts no bytes has no write stall while nothing else waits",
+      "refs": [
+        "MULTIPATH.md#7.1"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
     },
     {
       "id": "multipath.failover.no_reinjection_while_acknowledged",
@@ -3286,6 +3320,17 @@
       "findings": [],
       "profile": "zmux-mp",
       "steps": 16
+    },
+    {
+      "id": "multipath.probe.answer_after_advance_has_no_ping",
+      "file": "fixtures/traces/multipath/probe/answer_after_advance_has_no_ping.ndjson",
+      "title": "The PIPE_ACK that answers a PIPE_PING carries a PIPE_PING of its own only when its pipe is unproven: no ack-eliciting byte sent and no advance of its acknowledged position for max(1 s, T_suspect)",
+      "refs": [
+        "MULTIPATH.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 22
     },
     {
       "id": "multipath.idle.peer_idle_close",
@@ -4280,11 +4325,12 @@
       "file": "fixtures/traces/resume/suspend/half_suspended_keeps_reading.ndjson",
       "title": "An endpoint that lost its outbound pipes but kept an inbound one suspends and keeps delivering what arrives",
       "refs": [
-        "RESUME.md#4.2"
+        "RESUME.md#4.2",
+        "MULTIPATH.md#6.3"
       ],
       "findings": [],
       "profile": "zmux-mp-resume",
-      "steps": 15
+      "steps": 17
     },
     {
       "id": "resume.suspend.half_suspended_keeps_sending",

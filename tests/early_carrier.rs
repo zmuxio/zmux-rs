@@ -74,7 +74,7 @@ async fn remembered() -> zmux::proto::params::TransportParameters {
         Session::accept(PipeIo::new(b), carrier_early()),
     );
     let (client, server) = (client.unwrap(), server.unwrap());
-    let tp = client.parameters_to_remember().unwrap();
+    let tp = client.adapter().parameters_to_remember().unwrap();
     client.close().await;
     server.close().await;
     tp

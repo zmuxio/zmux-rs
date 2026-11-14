@@ -30,10 +30,10 @@ fn config() -> Config {
 async fn sessions(rejects: Arc<AtomicUsize>) -> (Session, Session, Listener) {
     let (a, b) = duplex(1 << 20);
     let mut limits = ListenerConfig::default();
-    limits.on_reject = Some(OnReject(Arc::new(move |_| {
+    limits.on_reject = Some(OnReject::new(move |_| {
         rejects.fetch_add(1, SeqCst);
         RejectAction::Close
-    })));
+    }));
     let listener = Listener::new(config(), limits).expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), Default::default()).await });

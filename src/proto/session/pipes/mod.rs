@@ -25,7 +25,7 @@ pub(crate) use lanes::{LaneState, OutLanes};
 pub(crate) use out::{BatchStart, Channel, Detection, OutPipe, QueuedCopy, splitmix};
 pub(crate) use probation::History;
 pub(crate) use rate::{RateLimiter, TokenBucket};
-pub(crate) use tier_state::TierState;
+pub(crate) use tier_state::{TierSettings, TierState};
 
 /// One direction of an attachment, seen from the local endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

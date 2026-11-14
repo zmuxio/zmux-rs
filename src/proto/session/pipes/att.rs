@@ -447,7 +447,7 @@ impl Attachment {
         self.mp
             .as_deref()
             .and_then(|m| m.options.as_deref())
-            .map(|o| o.liveness)
+            .map(crate::proto::session::PipeOptions::own_liveness)
             .unwrap_or_default()
     }
 

@@ -70,7 +70,7 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
             // does (MULTIPATH.md Section 8.4); a join it releases then can
             // meet the acceptor's cap and be refused (Section 5.4 step 9),
             // and the refused attachment is retired at once.
-            Err(PipeError::JoinRefused) => {
+            Err(PipeError::Failed(zmux::PipeFailure::JoinRefused)) => {
                 assert!(server.pipes().iter().all(|p| p.id() != pipe.id()));
                 refused += 1;
                 continue;
@@ -146,10 +146,13 @@ async fn quality_events_reach_the_application() {
     let pipe = client
         .begin_add_pipe(carrier(&listener), PipeOptions::default())
         .unwrap();
-    pipe.set_quality_band(Some(QualityBand::new(
-        Some(Duration::from_millis(5)),
-        Some(1.5),
-    )))
+    pipe.update(&zmux::PipeUpdate {
+        quality_band: zmux::Change::Set(QualityBand::new(
+            Some(Duration::from_millis(5)),
+            Some(1.5),
+        )),
+        ..Default::default()
+    })
     .unwrap();
     client.set_quality_band(None).unwrap();
     // A rate ratio that is not a number, or a negative one, is rejected.
@@ -160,7 +163,10 @@ async fn quality_events_reach_the_application() {
             Err(zmux::PipeError::InvalidOptions(_))
         ));
         assert!(matches!(
-            pipe.set_quality_band(band),
+            pipe.update(&zmux::PipeUpdate {
+                quality_band: band.map_or(zmux::Change::Clear, zmux::Change::Set),
+                ..Default::default()
+            }),
             Err(zmux::PipeError::InvalidOptions(_))
         ));
     }
@@ -331,12 +337,24 @@ async fn a_refused_join_reports_the_refusal_after_its_retirement() {
             )
             .await;
     });
-    assert_eq!(refused.joined().await, Err(PipeError::JoinRefused));
+    assert!(matches!(
+        refused.joined().await,
+        Err(PipeError::Failed(zmux::PipeFailure::JoinRefused))
+    ));
     assert!(refused.stats().is_none(), "retired at once");
-    assert_eq!(other.joined().await, Err(PipeError::JoinRefused));
-    assert_eq!(refused.attached().await, Err(PipeError::JoinRefused));
+    assert!(matches!(
+        other.joined().await,
+        Err(PipeError::Failed(zmux::PipeFailure::JoinRefused))
+    ));
+    assert!(matches!(
+        refused.attached().await,
+        Err(PipeError::Failed(zmux::PipeFailure::JoinRefused))
+    ));
     let added = client
         .add_pipe(carrier(&listener), PipeOptions::default())
         .await;
-    assert_eq!(added.err(), Some(PipeError::JoinRefused));
+    assert!(matches!(
+        added.err(),
+        Some(PipeError::Failed(zmux::PipeFailure::JoinRefused))
+    ));
 }

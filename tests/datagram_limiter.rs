@@ -125,10 +125,8 @@ async fn datagram_limiters_run_outside_the_session_lock() {
     tx.write_all(b"open").await.unwrap();
     tx.send_datagram(1, Bytes::from_static(b"two")).unwrap();
     let (_stx, srx) = server.accept_bi().await.unwrap();
-    assert_eq!(
-        srx.read_datagram().await.unwrap(),
-        (1, Bytes::from_static(b"two"))
-    );
+    let d = srx.read_datagram().await.unwrap();
+    assert_eq!((d.context, d.payload), (1, Bytes::from_static(b"two")));
 
     send.detach();
     receive.detach();
@@ -148,8 +146,8 @@ fn blocking_datagram_limiters_run_outside_the_session_lock() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
     let (b, _) = l.accept().unwrap();
-    let server = thread::spawn(move || Session::accept(PipeIo::tcp(b), s).unwrap());
-    let client = Session::connect(PipeIo::tcp(a), c).unwrap();
+    let server = thread::spawn(move || Session::accept(PipeIo::from_tcp(b), s).unwrap());
+    let client = Session::connect(PipeIo::from_tcp(a), c).unwrap();
     let server = server.join().unwrap();
     let helpers = [
         send.attach({
@@ -172,10 +170,8 @@ fn blocking_datagram_limiters_run_outside_the_session_lock() {
     tx.write_all(b"open").unwrap();
     tx.send_datagram(1, Bytes::from_static(b"two")).unwrap();
     let (_stx, srx) = server.accept_bi().unwrap();
-    assert_eq!(
-        srx.read_datagram().unwrap(),
-        (1, Bytes::from_static(b"two"))
-    );
+    let d = srx.read_datagram().unwrap();
+    assert_eq!((d.context, d.payload), (1, Bytes::from_static(b"two")));
 
     send.detach();
     receive.detach();

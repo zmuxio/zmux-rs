@@ -136,7 +136,7 @@ pub(crate) struct InPipe {
     /// First-record check of a bootstrap pipe, until decided.
     classifier: Option<Classifier>,
     /// Bytes the classifier has seen (in-place receiving).
-    classified: usize,
+    classified: u32,
     /// Lane 0: the pipe's own carrier.
     zero: RecvLane,
     /// Lane 0 ended at a record boundary while other lanes were open.
@@ -148,6 +148,16 @@ pub(crate) struct InPipe {
     elicit: u64,
     elicit_since: Option<Instant>,
     elicit_other: bool,
+    /// When a PIPE_ACK last listed the pipe (`None`: none did yet), and
+    /// whether an ack-eliciting record arrived after a quiet
+    /// `zmux_max_ack_delay` since then: acknowledged at once.
+    /// (milliseconds after `opened_at` modulo 2^32, `u32::MAX` before the
+    /// first: four bytes instead of an `Option<Instant>`, as the idle
+    /// footprint counts. Compared by wrapping difference, it never
+    /// saturates; only a PIPE_ACK more than 49.7 days ago can read as
+    /// recent, which delays one acknowledgement by at most the delay.)
+    acked_ms: u32,
+    prompt: bool,
     last_record: Instant,
     /// G_p: the longest interval between two complete records.
     gap: Duration,
@@ -223,6 +233,8 @@ impl InPipe {
             elicit: 0,
             elicit_since: None,
             elicit_other: false,
+            acked_ms: u32::MAX,
+            prompt: false,
             last_record: now,
             gap: Duration::ZERO,
             records: 0,
@@ -444,8 +456,8 @@ impl InPipe {
         // Nothing is consumed before it decides, since it decides within
         // the first record.
         let fresh = if retain {
-            let seen = self.classified.min(data.len());
-            self.classified = data.len();
+            let seen = usize::try_from(self.classified).map_or(data.len(), |c| c.min(data.len()));
+            self.classified = u32::try_from(data.len()).unwrap_or(u32::MAX);
             &data[seen..]
         } else {
             data
@@ -556,14 +568,17 @@ impl InPipe {
     }
 
     /// Lane `li`'s position was processed now; ack-eliciting bytes of the
-    /// record wait for a PIPE_ACK. Whether the bytes waiting, summed over
-    /// the lanes, reach `threshold`.
+    /// record wait for a PIPE_ACK. Whether a PIPE_ACK is due at once: the
+    /// bytes waiting, summed over the lanes, reach `threshold`, or the
+    /// record came more than `delay` after the last PIPE_ACK that listed
+    /// the pipe (or before its first).
     pub(crate) fn await_ack(
         &mut self,
         li: usize,
         len: u64,
         eliciting: bool,
         threshold: u64,
+        delay: Duration,
         now: Instant,
     ) -> bool {
         self.recv_mut(li).position_at = now;
@@ -572,18 +587,22 @@ impl InPipe {
         }
         self.elicit += len;
         self.elicit_since.get_or_insert(now);
-        self.elicit >= threshold
+        if self.quiet_since_ack(delay, now) {
+            self.prompt = true;
+        }
+        self.elicit >= threshold || self.prompt
     }
 
     /// A record of `len` bytes ended on lane `li` of a pipe of a multipath
     /// session: the position and the record statistics count it, a joining
     /// pipe opens, and its ack-eliciting bytes wait for a PIPE_ACK, due at
-    /// once from `threshold` bytes.
+    /// once from `threshold` bytes or after a quiet `delay`.
     pub(crate) fn mp_record(
         &mut self,
         li: usize,
         len: u64,
         threshold: u64,
+        delay: Duration,
         now: Instant,
     ) -> RecordEnd {
         self.lane_record(li);
@@ -597,7 +616,7 @@ impl InPipe {
         r.position += len;
         let (eliciting, activity, ping, other) = r.take_marks();
         self.elicit_other |= eliciting && other;
-        let threshold_reached = self.await_ack(li, len, eliciting, threshold, now);
+        let threshold_reached = self.await_ack(li, len, eliciting, threshold, delay, now);
         RecordEnd {
             activity,
             ping,
@@ -661,8 +680,24 @@ impl InPipe {
         self.zero.entry(pipe_id, 0, now)
     }
 
+    /// Whether no PIPE_ACK listed the pipe during the last `delay` (or ever).
+    fn quiet_since_ack(&self, delay: Duration, now: Instant) -> bool {
+        self.acked_ms == u32::MAX
+            || Duration::from_millis(u64::from(
+                self.ms_since_open(now).wrapping_sub(self.acked_ms),
+            )) >= delay
+    }
+
+    /// Milliseconds from `opened_at` to `now`, modulo 2^32.
+    fn ms_since_open(&self, now: Instant) -> u32 {
+        // Truncation is the modulo.
+        now.saturating_duration_since(self.opened_at).as_millis() as u32
+    }
+
     /// A PIPE_ACK listing the positions went out: nothing waits for one.
-    pub(crate) fn ack_sent(&mut self) {
+    pub(crate) fn ack_sent(&mut self, now: Instant) {
+        self.acked_ms = self.ms_since_open(now).min(u32::MAX - 1);
+        self.prompt = false;
         self.elicit = 0;
         self.elicit_since = None;
         self.elicit_other = false;
@@ -806,5 +841,70 @@ impl InPipe {
     /// The driver was not told to close the carrier half yet.
     pub(crate) fn close_unreported(&self) -> bool {
         !self.close_reported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+    const DELAY: Duration = Duration::from_millis(25);
+    const THRESHOLD: u64 = 65536;
+
+    fn pipe(now: Instant) -> InPipe {
+        InPipe::new(Framing::ByteStream, 1 << 20, InState::Open, now)
+    }
+
+    #[test]
+    fn a_lone_record_is_acknowledged_at_once() {
+        let t0 = Instant::now();
+        let mut p = pipe(t0);
+        // Before the first PIPE_ACK, and after a quiet delay.
+        assert!(p.await_ack(0, 100, true, THRESHOLD, DELAY, t0));
+        p.ack_sent(t0);
+        assert!(!p.await_ack(0, 100, true, THRESHOLD, DELAY, t0 + 24 * MS));
+        p.ack_sent(t0 + 24 * MS);
+        assert!(p.await_ack(0, 100, true, THRESHOLD, DELAY, t0 + 49 * MS));
+        // Non-eliciting records never ask.
+        p.ack_sent(t0 + 49 * MS);
+        assert!(!p.await_ack(0, 100, false, THRESHOLD, DELAY, t0 + 100 * MS));
+    }
+
+    /// Past 49.7 days (the end of a u32 of milliseconds) a record within
+    /// the delay of the last PIPE_ACK still waits.
+    #[test]
+    fn a_long_lived_pipe_keeps_delaying_acknowledgements() {
+        let t0 = Instant::now();
+        let mut p = pipe(t0);
+        for days in [50, 60, 100, 400] {
+            let late = t0 + Duration::from_secs(days * 24 * 3600);
+            p.ack_sent(late);
+            assert!(
+                !p.await_ack(0, 100, true, THRESHOLD, DELAY, late + MS),
+                "{days}"
+            );
+            p.ack_sent(late + MS);
+            assert!(
+                p.await_ack(0, 100, true, THRESHOLD, DELAY, late + 2 * DELAY),
+                "{days}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_burst_adds_no_acknowledgement() {
+        let t0 = Instant::now();
+        let mut p = pipe(t0);
+        assert!(p.await_ack(0, 1000, true, THRESHOLD, DELAY, t0));
+        p.ack_sent(t0);
+        // Records within the delay of the last PIPE_ACK wait for the
+        // threshold or the delay, however many.
+        for i in 1..=20u32 {
+            let now = t0 + i * MS;
+            assert!(!p.await_ack(0, 1000, true, THRESHOLD, DELAY, now), "{i}");
+        }
+        assert_eq!(p.unacked(), 20_000);
+        assert!(p.await_ack(0, THRESHOLD, true, THRESHOLD, DELAY, t0 + 21 * MS));
     }
 }

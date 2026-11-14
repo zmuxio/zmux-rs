@@ -334,7 +334,7 @@ fn a_lost_session_resets_and_stops_the_other_side_with_carrier_failed() {
 }
 
 #[test]
-fn dropping_a_splice_resets_and_stops_both_streams_with_code_zero() {
+fn dropping_a_splice_resets_and_stops_both_streams() {
     multi_thread(async {
         let base = snapshot();
         {
@@ -345,7 +345,7 @@ fn dropping_a_splice_resets_and_stops_both_streams_with_code_zero() {
             let _ = relay.await;
             for (send, recv) in [(&s, &mut r), (&fs, &mut fr)] {
                 let (_, e) = watchdog(10, "reset", read_until_end(recv)).await;
-                assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == VarInt::ZERO));
+                assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == CANCELLED));
                 assert_eq!(
                     watchdog(10, "stopped", send.stopped()).await.unwrap(),
                     Some(VarInt::ZERO)
@@ -442,8 +442,8 @@ fn limiters_are_charged_exactly_what_was_forwarded_and_datagrams_follow() {
             let ((mut s, mut r), (mut fs, mut fr)) = hop.stream(b"x").await;
             // Stream datagrams go to the other stream with their context.
             s.send_datagram(3, Bytes::from_static(b"datagram")).unwrap();
-            let (ctx, d) = watchdog(10, "datagram", fr.read_datagram()).await.unwrap();
-            assert_eq!((ctx, &d[..]), (3, &b"datagram"[..]));
+            let d = watchdog(10, "datagram", fr.read_datagram()).await.unwrap();
+            assert_eq!((d.context, &d.payload[..]), (3, &b"datagram"[..]));
             // From B: the budget allows 16 KiB; a datagram larger than
             // what is left is dropped, the stream data waits for more.
             let down = pattern(64 << 10, 5);
@@ -515,7 +515,7 @@ fn a_splice_cancelled_in_a_limiter_wait_leaves_nothing_behind() {
             let _ = relay.await;
             assert_eq!(budget.charged.load(Ordering::Relaxed), 0);
             let (_, e) = watchdog(10, "reset", read_until_end(&mut r)).await;
-            assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == VarInt::ZERO));
+            assert!(matches!(e, Some(StreamError::Reset { code, .. }) if code == CANCELLED));
             assert_eq!(
                 watchdog(10, "stopped", s.stopped()).await.unwrap(),
                 Some(VarInt::ZERO)
@@ -608,8 +608,7 @@ fn a_stalled_downstream_bounds_what_the_relay_holds() {
             let done = watchdog(10, "splice", relay).await.unwrap().unwrap();
             for end in [done.a_to_b.end, done.b_to_a.end] {
                 assert!(
-                    end == SpliceEnd::Reset(VarInt::ZERO)
-                        || end == SpliceEnd::Stopped(VarInt::ZERO),
+                    end == SpliceEnd::Reset(CANCELLED) || end == SpliceEnd::Stopped(VarInt::ZERO),
                     "{end:?}"
                 );
             }
@@ -618,3 +617,6 @@ fn a_stalled_downstream_bounds_what_the_relay_holds() {
         settle(base, 10, "stall").await;
     });
 }
+
+/// The code a dropped, unfinished sending part resets with.
+const CANCELLED: VarInt = VarInt::from_u32(0x5a4d_0001);

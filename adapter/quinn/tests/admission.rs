@@ -57,7 +57,7 @@ impl Server {
         let serving = if one_by_one {
             let (l, opts) = (listener.clone(), opts.clone());
             tokio::spawn(async move {
-                let closed = l.closed();
+                let closed = l.adapter().closed();
                 let mut closed = std::pin::pin!(closed);
                 loop {
                     let incoming = tokio::select! {

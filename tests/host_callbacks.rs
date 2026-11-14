@@ -12,6 +12,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
+use zmux::adapter::PAIRING_TOKEN_LEN;
 #[cfg(unix)]
 use zmux::blocking as b;
 use zmux::proto::listener::{OnReject, RejectAction};
@@ -19,8 +20,8 @@ use zmux::proto::seal::RecordMode;
 use zmux::proto::session::{AllowRecordMode, AuthorizeJoin, RecordPolicy};
 use zmux::shaping::{HandshakeShaper, UnitPlan};
 use zmux::{
-    Config, HandleError, Listener, ListenerConfig, PAIRING_TOKEN_LEN, PipeAuth, PipeHint, PipeIo,
-    PipeOptions, Session, VarInt,
+    Config, HandleError, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions,
+    Session, VarInt,
 };
 
 fn config() -> Config {
@@ -108,7 +109,7 @@ async fn panicking_join_policies_refuse() {
                 server.authorize_join = Some(AuthorizeJoin::new(|_| panic!("b")));
             }
             let (s, _srv, l) = sessions(config(), server).await;
-            while !s.join_ready() {
+            while !s.adapter().join_ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             assert_eq!(join_through(&s, &l).await, Err(HandleError::Rejected));
@@ -124,10 +125,10 @@ async fn a_panicking_reject_policy_closes() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let mut limits = ListenerConfig::default();
-        limits.on_reject = Some(OnReject(Arc::new(move |_| {
+        limits.on_reject = Some(OnReject::new(move |_| {
             seen.fetch_add(1, Ordering::SeqCst);
             panic!("the policy");
-        })));
+        }));
         let (s, _srv, l) = sessions_with(limits).await;
         // A Hello in Bound on a carrier with nothing to check it with.
         let (near, far) = duplex(1 << 16);
@@ -148,10 +149,10 @@ fn a_panicking_reject_policy_closes_on_the_std_driver() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let mut limits = ListenerConfig::default();
-    limits.on_reject = Some(OnReject(Arc::new(move |_| {
+    limits.on_reject = Some(OnReject::new(move |_| {
         seen.fetch_add(1, Ordering::SeqCst);
         panic!("the policy");
-    })));
+    }));
     limits.handshake_timeout = Duration::from_secs(5);
     let l = b::Listener::new(config(), limits, None).expect("valid listener configuration");
     // An unknown Locator: whichever join of no session.
@@ -175,7 +176,7 @@ fn stray_join_hello() -> Vec<u8> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (s, _srv, _l) = sessions(config(), config()).await;
-        while !s.join_ready() {
+        while !s.adapter().join_ready() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let (x, mut y) = duplex(1 << 16);
@@ -198,7 +199,7 @@ async fn sessions_with(limits: ListenerConfig) -> (Session, Session, Listener) {
     });
     let s = Session::connect(PipeIo::new(a), config()).await.unwrap();
     let srv = l.accept().await.unwrap();
-    while !s.join_ready() {
+    while !s.adapter().join_ready() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     (s, srv, l)
@@ -222,10 +223,10 @@ fn bound_listener() -> (ListenerConfig, Config, Arc<Mutex<Vec<String>>>) {
     let reasons: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = reasons.clone();
     let mut limits = ListenerConfig::default();
-    limits.on_reject = Some(OnReject(Arc::new(move |i| {
+    limits.on_reject = Some(OnReject::new(move |i| {
         seen.lock().unwrap().push(i.reason.to_string());
         RejectAction::Close
-    })));
+    }));
     let mut server = config();
     server.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
     (limits, server, reasons)
@@ -243,7 +244,7 @@ async fn bound_without_a_binding_is_auth() {
         });
         let s = Session::connect(PipeIo::new(a), config()).await.unwrap();
         let _srv = l.accept().await.unwrap();
-        while !s.join_ready() {
+        while !s.adapter().join_ready() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // An exporter without the declaration, a declaration without an exporter, neither.
@@ -283,7 +284,7 @@ async fn bound_on_a_split_acceptor_is_auth() {
         });
         let s = Session::connect(PipeIo::new(a), config()).await.unwrap();
         let _srv = l.accept().await.unwrap();
-        while !s.join_ready() {
+        while !s.adapter().join_ready() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let (x, y) = duplex(1 << 16);
@@ -449,8 +450,12 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
     });
     let x2 = x.try_clone().unwrap();
     let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c).unwrap();
-    let srv = l.accept(Some(Duration::from_secs(5))).unwrap();
-    while !s.join_ready() {
+    let srv = l
+        .accept_timeout(Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .unwrap();
+    while !s.adapter().join_ready() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let holder: Arc<OnceLock<b::Session>> = Arc::default();
@@ -502,8 +507,12 @@ fn paired_join_on_the_std_driver() {
     });
     let x2 = x.try_clone().unwrap();
     let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c).unwrap();
-    let srv = l.accept(Some(Duration::from_secs(5))).unwrap();
-    while !s.join_ready() {
+    let srv = l
+        .accept_timeout(Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .unwrap();
+    while !s.adapter().join_ready() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let (up_near, up_far) = UnixStream::pair().unwrap();
@@ -533,9 +542,7 @@ fn paired_join_on_the_std_driver() {
         let _keep = f2;
         l3.handle_pipe(b::PipeIo::from_halves(up_far, df), b::PipeHint::default())
     });
-    pipe.session()
-        .set_wait_timeout(Some(Duration::from_secs(10)));
-    pipe.joined().unwrap();
+    pipe.joined_timeout(Duration::from_secs(10)).unwrap();
     let echo = std::thread::spawn(move || {
         let (mut send, mut recv) = srv.accept_bi().unwrap();
         let mut got = [0; 5];
@@ -613,7 +620,7 @@ fn hook_lengths_saturate() {
                 Some(UnitPlan::new(usize::MAX, 0, usize::MAX))
             }));
             let (s, _srv, l) = sessions(c, config()).await;
-            while !s.join_ready() {
+            while !s.adapter().join_ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let (x, y) = duplex(1 << 18);

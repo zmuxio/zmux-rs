@@ -9,7 +9,7 @@ use crate::proto::session::ledger::{Expected, Tag};
 use crate::proto::session::mpath::Mp;
 use crate::proto::session::pipes::{Attachment, Attachments, OutPipe};
 use crate::proto::session::policy::{
-    Binding, FrameInfo, PickAnswer, PickRequest, Picked, PipeSnapshot, Policy,
+    Binding, FrameInfo, PickAnswer, PickRequest, Picked, PipeSnapshot, Scheduler,
 };
 use crate::proto::session::stream::SendPart;
 use crate::proto::session::tier::{Class, Gate};
@@ -369,7 +369,7 @@ impl SessionCore {
     }
 
     /// The scheduling policy of a stream direction.
-    pub(in crate::proto::session) fn policy_for(&self, key: StreamKey) -> &Policy {
+    pub(in crate::proto::session) fn policy_for(&self, key: StreamKey) -> &Scheduler {
         self.streams
             .send(key)
             .and_then(|s| s.mp().scheduler.as_ref())
@@ -437,19 +437,21 @@ impl SessionCore {
         }
         match self.policy_for(key) {
             // A binding and a custom policy apply the gate themselves.
-            Policy::Affinity => d.usable && self.affinity_target(key, d) == Some(id),
-            Policy::Custom(_) => self.custom_ok(d, key),
+            Scheduler::Affinity => d.usable && self.affinity_target(key, d) == Some(id),
+            Scheduler::Custom(_) => self.custom_ok(d, key),
             _ if !d.takes => false,
-            Policy::SpreadEta => self.spread_eta_ok(d, send),
-            Policy::SpreadRoundRobin | Policy::SpreadRateWeighted if self.own_round_robin(key) => {
+            Scheduler::SpreadEta => self.spread_eta_ok(d, send),
+            Scheduler::SpreadRoundRobin | Scheduler::SpreadRateWeighted
+                if self.own_round_robin(key) =>
+            {
                 self.round_robin_pick(key, &gate, d.tier) == Some(id)
             }
-            Policy::SpreadRoundRobin | Policy::SpreadRateWeighted => {
+            Scheduler::SpreadRoundRobin | Scheduler::SpreadRateWeighted => {
                 *d.round_robin
                     .get_or_init(|| self.round_robin_pick(key, &gate, d.tier))
                     == Some(id)
             }
-            Policy::SessionAffinity => {
+            Scheduler::SessionAffinity => {
                 *d.session_pipe
                     .get_or_init(|| self.tier_active(gate.class(), d.tier))
                     == Some(id)
@@ -584,7 +586,10 @@ impl SessionCore {
     /// Records the pipe an `affinity` direction sent `n` bytes of new data
     /// on; a custom answer uses up its bytes (a miss serves one chunk).
     pub(in crate::proto::session) fn bind_on_send(&mut self, id: u64, key: StreamKey, n: u64) {
-        if !matches!(self.policy_for(key), Policy::Affinity | Policy::Custom(_)) {
+        if !matches!(
+            self.policy_for(key),
+            Scheduler::Affinity | Scheduler::Custom(_)
+        ) {
             return;
         }
         if let Some(send) = self.streams.send_mut(key) {
@@ -693,7 +698,7 @@ impl SessionCore {
         for u in 0..self.streams.queue().levels().len() {
             for i in 0..self.streams.queue().level(u).len() {
                 let key = self.streams.queue().level(u)[i];
-                if !matches!(self.policy_for(key), Policy::Affinity) {
+                if !matches!(self.policy_for(key), Scheduler::Affinity) {
                     continue;
                 }
                 let Some(b) = self
@@ -795,7 +800,7 @@ impl SessionCore {
                 }),
         );
         for k in self.streams.queue().keys() {
-            if !matches!(self.policy_for(k), Policy::Affinity) {
+            if !matches!(self.policy_for(k), Scheduler::Affinity) {
                 continue;
             }
             let Some(send) = self.streams.send(k) else {
@@ -834,7 +839,7 @@ impl SessionCore {
             }
             let (donor, receiver) = (pipes[d].0, pipes[r].0);
             let mover = self.streams.queue().keys().find(|&k| {
-                matches!(self.policy_for(k), Policy::Affinity)
+                matches!(self.policy_for(k), Scheduler::Affinity)
                     && self.streams.send(k).is_some_and(|s| {
                         self.is_bulk(s)
                             && s.mp()
@@ -1128,7 +1133,7 @@ impl SessionCore {
         self.streams.send(key).is_some_and(|s| {
             matches!(
                 s.mp().scheduler,
-                Some(Policy::SpreadRoundRobin | Policy::SpreadRateWeighted)
+                Some(Scheduler::SpreadRoundRobin | Scheduler::SpreadRateWeighted)
             )
         })
     }
@@ -1142,7 +1147,7 @@ impl SessionCore {
         gate: &Gate,
         tier: u64,
     ) -> impl Iterator<Item = (u64, f64)> + 'a {
-        let by_rate = matches!(self.policy_for(key), Policy::SpreadRateWeighted);
+        let by_rate = matches!(self.policy_for(key), Scheduler::SpreadRateWeighted);
         let off = self.config.hooks.no_placement_rate;
         self.weighted_candidates(gate, tier)
             .map(move |(a, o, w)| (a.id(), Self::rr_weight(&self.atts, a, o, w, by_rate, off)))
@@ -1207,7 +1212,7 @@ impl SessionCore {
             return;
         };
         let own = self.own_round_robin(key);
-        let by_rate = matches!(self.policy_for(key), Policy::SpreadRateWeighted);
+        let by_rate = matches!(self.policy_for(key), Scheduler::SpreadRateWeighted);
         let all_zero = self.weights_all_zero(gate, tier);
         let off = self.config.hooks.no_placement_rate;
         let weight = |atts: &Attachments, a: &Attachment| {
@@ -1386,7 +1391,8 @@ impl SessionCore {
         req.panicked = false;
         req.policy = None;
         for key in pending {
-            let Some(Policy::Custom(policy)) = self.streams.get(key).map(|_| self.policy_for(key))
+            let Some(Scheduler::Custom(policy)) =
+                self.streams.get(key).map(|_| self.policy_for(key))
             else {
                 self.unqueue_pick(key);
                 continue;

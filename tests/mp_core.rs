@@ -16,7 +16,7 @@ use zmux::proto::frame::{Dir, Frame, Padding, Priority, Stream};
 use zmux::proto::record::RecordBuilder;
 use zmux::proto::session::{
     Config, CoreEvent, DirectionState, OutboundState, PipeAuth, PipeEnd, PipeHalf, PipeId,
-    PipeOptions, Policy, QualityBand, State, StreamKey,
+    PipeOptions, QualityBand, Scheduler, State, StreamKey,
 };
 
 /// The streams A wrote, with their data, and what B read of them.
@@ -32,7 +32,7 @@ struct Book {
 
 type Net = MpNet<(), Book>;
 
-fn config(policy: Policy, resume: bool) -> Config {
+fn config(policy: Scheduler, resume: bool) -> Config {
     let mut c = Config::default();
     c.max_pipes = 4;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
@@ -45,12 +45,12 @@ fn config(policy: Policy, resume: bool) -> Config {
 }
 
 /// A multipath pair on pipe 0, established.
-fn net(policy: Policy, resume: bool) -> Net {
+fn net(policy: Scheduler, resume: bool) -> Net {
     net_with_b(policy, resume, |_| {})
 }
 
 /// [`net`] with B's configuration changed by `f`.
-fn net_with_b(policy: Policy, resume: bool, f: impl FnOnce(&mut Config)) -> Net {
+fn net_with_b(policy: Scheduler, resume: bool, f: impl FnOnce(&mut Config)) -> Net {
     let mut b_cfg = config(policy.clone(), resume);
     b_cfg.test_hooks().locator = b"server".to_vec();
     f(&mut b_cfg);
@@ -196,7 +196,7 @@ impl Net {
 
 #[test]
 fn spread_over_two_pipes_and_survive_a_failure() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     for _ in 0..4 {
@@ -231,7 +231,7 @@ fn spread_over_two_pipes_and_survive_a_failure() {
 /// pipes left, so it is answered.
 #[test]
 fn a_ping_lost_with_its_pipe_asks_again() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     n.advance(5);
@@ -275,7 +275,7 @@ fn a_ping_lost_with_its_pipe_asks_again() {
 /// activity, not from the call.
 #[test]
 fn a_new_keep_alive_counts_from_the_last_activity() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let mut l = n.ends[A].config().liveness;
     l.keep_alive_period = None;
     l.probe_interval = None;
@@ -292,7 +292,7 @@ fn a_new_keep_alive_counts_from_the_last_activity() {
 /// A pipe already suspect keeps the dead timeout it turned suspect under.
 #[test]
 fn a_suspect_pipe_keeps_its_dead_timeout() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let mut l = n.ends[A].config().liveness;
     l.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(50));
     n.ends[A].set_liveness(&l).unwrap();
@@ -323,7 +323,7 @@ fn a_suspect_pipe_keeps_its_dead_timeout() {
 
 #[test]
 fn silently_stalled_pipe_fails_over() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     n.advance(5);
@@ -373,7 +373,7 @@ fn silently_stalled_pipe_fails_over() {
 /// report.
 #[test]
 fn acknowledgements_drive_quality_events() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     n.advance(5);
@@ -439,7 +439,7 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
         |n, id| n.ends[A].write_failed(PipeId::new(id), std::io::ErrorKind::BrokenPipe, n.now),
     ];
     for (i, report) in reports.into_iter().enumerate() {
-        let mut n = net(Policy::SpreadEta, false);
+        let mut n = net(Scheduler::SpreadEta, false);
         let id = n.add_pipe(&PipeOptions::default()).unwrap();
         n.pump(10);
         n.advance(5);
@@ -466,7 +466,7 @@ fn a_carrier_verdict_fails_the_pipe_at_once() {
 #[test]
 fn the_exporter_flag_needs_an_exporter() {
     for exporter in [false, true] {
-        let mut a = config(Policy::SpreadEta, false);
+        let mut a = config(Scheduler::SpreadEta, false);
         a.pipe_auth = PipeAuth::exporter();
         let mut b = a.clone();
         b.test_hooks().locator = b"server".to_vec();
@@ -493,7 +493,7 @@ fn the_exporter_flag_needs_an_exporter() {
 
 #[test]
 fn affinity_and_graceful_removal() {
-    let mut n = net(Policy::Affinity, false);
+    let mut n = net(Scheduler::Affinity, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     n.open_and_write(50_000, false);
@@ -512,7 +512,7 @@ fn affinity_and_graceful_removal() {
 /// at the peer).
 #[test]
 fn an_aborted_pipe_is_never_shut_down_gracefully() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(10);
     n.open_and_write(50_000, false);
@@ -537,7 +537,7 @@ fn an_aborted_pipe_is_never_shut_down_gracefully() {
 
 #[test]
 fn resume_after_losing_every_pipe() {
-    let mut n = net(Policy::SpreadEta, true);
+    let mut n = net(Scheduler::SpreadEta, true);
     n.open_and_write(20_000, false);
     n.step(5000);
     n.fail(0);
@@ -583,12 +583,12 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn policy() -> impl Strategy<Value = Policy> {
+fn policy() -> impl Strategy<Value = Scheduler> {
     prop_oneof![
-        Just(Policy::Affinity),
-        Just(Policy::SpreadEta),
-        Just(Policy::SpreadRateWeighted),
-        Just(Policy::SessionAffinity),
+        Just(Scheduler::Affinity),
+        Just(Scheduler::SpreadEta),
+        Just(Scheduler::SpreadRateWeighted),
+        Just(Scheduler::SessionAffinity),
     ]
 }
 
@@ -617,7 +617,7 @@ proptest! {
 
 /// Applies `ops` to a fresh pair, heals it with a new pipe and checks that
 /// every stream completed exactly once, in order.
-fn run_churn(policy: Policy, resume: bool, ops: Vec<Op>) {
+fn run_churn(policy: Scheduler, resume: bool, ops: Vec<Op>) {
     let mut n = net(policy, resume);
     for op in ops {
         n.apply(op);
@@ -731,14 +731,14 @@ fn session_affinity_churn_with_removals_completes() {
         Fail(221),
         Write(91, 1385),
     ];
-    run_churn(Policy::SessionAffinity, true, ops);
+    run_churn(Scheduler::SessionAffinity, true, ops);
 }
 
 /// A stream that never completed after a churn of joins and failures
 /// (found by `exactly_once_under_pipe_churn`).
 #[test]
 fn churn_with_failures_completes() {
-    let mut n = net(Policy::Affinity, false);
+    let mut n = net(Scheduler::Affinity, false);
     let ops = [
         Op::Add,
         Op::Add,
@@ -888,7 +888,7 @@ fn paced_writes(
 /// the blocking driver's writer threads would wake each other in a loop.
 #[test]
 fn held_pipes_are_not_asked_to_write() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(20);
     n.open_and_write(64 << 20, false);
@@ -902,7 +902,7 @@ fn held_pipes_are_not_asked_to_write() {
 /// the fragments that would then wait for the stream's next turn.
 #[test]
 fn paced_pipes_send_whole_chunks() {
-    let mut n = net(Policy::SpreadEta, false);
+    let mut n = net(Scheduler::SpreadEta, false);
     n.add_pipe(&PipeOptions::default()).unwrap();
     n.pump(20);
     n.open_and_write(8 << 20, false);
@@ -932,7 +932,7 @@ fn deliberate_fragmentation_is_bounded_by_the_span() {
     for padded in [false, true] {
         const WINDOW: u64 = 4096;
         const STREAMS: u64 = 4;
-        let mut n = net_with_b(Policy::SpreadEta, false, |c| {
+        let mut n = net_with_b(Scheduler::SpreadEta, false, |c| {
             c.initial_stream_receive_window = WINDOW;
             c.initial_connection_receive_window = WINDOW * STREAMS;
         });
@@ -1033,7 +1033,7 @@ fn deliberate_fragmentation_is_bounded_by_the_span() {
 /// The bootstrap pair is no join: its end counts no failed join.
 #[test]
 fn the_end_of_the_bootstrap_pair_is_no_failed_join() {
-    let mut n = net(Policy::default(), false);
+    let mut n = net(Scheduler::default(), false);
     assert_eq!(n.ends[A].stats().join_failures, 0);
     n.ends[A].pipe_ended(
         PipeId::new(0),
@@ -1049,10 +1049,10 @@ fn the_end_of_the_bootstrap_pair_is_no_failed_join() {
 /// `join_ready` asks for a displaceable attachment only once the cap is reached.
 #[test]
 fn held_joins_are_judged_one_by_one_at_the_cap() {
-    let mut a_cfg = config(Policy::SpreadEta, true);
+    let mut a_cfg = config(Scheduler::SpreadEta, true);
     a_cfg.max_pipes = 1;
     a_cfg.pipe_headroom = 1;
-    let mut b_cfg = config(Policy::SpreadEta, true);
+    let mut b_cfg = config(Scheduler::SpreadEta, true);
     b_cfg.test_hooks().locator = b"server".to_vec();
     let mut n = Net::new(a_cfg, b_cfg, Book::default());
     n.pump(10);
@@ -1122,10 +1122,10 @@ impl mp_net::Observe for Abandons {
 /// false, finds room under a cap of 3. Returns the PIPE_ABANDON(0) frames A
 /// wrote in all.
 fn abandons_written(hold: bool, displace: bool) -> usize {
-    let mut a_cfg = config(Policy::SpreadEta, true);
+    let mut a_cfg = config(Scheduler::SpreadEta, true);
     a_cfg.max_pipes = 1;
     a_cfg.pipe_headroom = if displace { 1 } else { 2 };
-    let mut b_cfg = config(Policy::SpreadEta, true);
+    let mut b_cfg = config(Scheduler::SpreadEta, true);
     b_cfg.test_hooks().locator = b"server".to_vec();
     let mut n = MpNet::<Abandons, Book>::new(a_cfg, b_cfg, Book::default());
     for _ in 0..10 {
@@ -1199,7 +1199,7 @@ fn displacement_drops_a_retained_abandon() {
 /// healing join deferred).
 #[test]
 fn a_reply_after_an_abrupt_removal_revives_nothing() {
-    let mut n = net(Policy::Affinity, false);
+    let mut n = net(Scheduler::Affinity, false);
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     // The Hello goes out; nothing arrives yet.
     n.links.get_mut(&id).unwrap().stall(true);

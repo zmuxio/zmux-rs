@@ -114,7 +114,14 @@ impl SessionCore {
         let Some(p) = self.atts.first_mut().and_then(Attachment::inp_mut) else {
             return;
         };
-        pa.due |= p.await_ack(self.rx_lane, len, eliciting, pa.threshold, now);
+        pa.due |= p.await_ack(
+            self.rx_lane,
+            len,
+            eliciting,
+            pa.threshold,
+            pa.local_mad,
+            now,
+        );
     }
 
     /// When the received ack-eliciting bytes must be acknowledged at the
@@ -122,6 +129,13 @@ impl SessionCore {
     fn single_ack_deadline(&self, pa: &PipeAckState) -> Option<Instant> {
         let p = self.atts.first()?.inp()?;
         Some(p.unacked_since()? + pa.local_mad)
+    }
+
+    /// The acknowledgement deadline of pipe 0, which a shaping delay of the
+    /// record carrying the PIPE_ACK never passes (see
+    /// [`SessionCore::ack_release`]).
+    pub(super) fn single_ack_release(&self) -> Option<Instant> {
+        self.single_ack_deadline(self.pipe_ack.as_ref()?)
     }
 
     /// Whether a PIPE_ACK is due on pipe 0.
@@ -166,7 +180,7 @@ impl SessionCore {
                 return;
             }
             if let Some(p) = self.atts.first_mut().and_then(Attachment::inp_mut) {
-                p.ack_sent();
+                p.ack_sent(now);
                 if complete {
                     p.complete_sent_at(now);
                 }
@@ -181,7 +195,7 @@ impl SessionCore {
             return;
         }
         if let Some(p) = self.atts.first_mut().and_then(Attachment::inp_mut) {
-            p.ack_sent();
+            p.ack_sent(now);
         }
         if let Some(pa) = &mut self.pipe_ack {
             pa.due = false;

@@ -123,7 +123,7 @@ struct BatchWriter {
     calls: Arc<Mutex<Vec<usize>>>,
 }
 
-impl zmux::carrier::ChunkWrite for BatchWriter {
+impl zmux::adapter::ChunkWrite for BatchWriter {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,

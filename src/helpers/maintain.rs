@@ -42,7 +42,8 @@
 //! make before break, close) and bounds it; without a policy nothing
 //! changes.
 
-use super::backoff::{Backoff, random_fraction, reduce};
+use crate::Backoff;
+use crate::backoff::{random_fraction, reduce};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -86,7 +87,7 @@ pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
 /// use zmux::helpers::{PipePool, RotatePolicy, maintain_pipes};
 ///
 /// let pool = PipePool::new(2, |_req| async {
-///     Ok(zmux::PipeIo::tcp(tokio::net::TcpStream::connect("10.0.0.2:4433").await?))
+///     Ok(zmux::PipeIo::from_tcp(tokio::net::TcpStream::connect("10.0.0.2:4433").await?))
 /// })
 /// .with_options(PipeOptions::new().with_send_priority(10).with_receive_priority(10).with_label("relay"))
 /// .with_rotate(RotatePolicy::new().with_max_age(Duration::from_secs(600)));
@@ -1109,7 +1110,7 @@ impl Maintainer {
         }
         if due.is_empty()
             || !self.session_whole(session)
-            || !session.join_ready()
+            || !session.adapter().join_ready()
             || !self.may_dial(self.rotate_delay, now)
         {
             return;
@@ -1146,7 +1147,9 @@ impl Maintainer {
             self.stop.stop();
             return;
         }
-        if !self.wants_redial() || !session.join_ready() || !self.may_dial(self.redial_delay(), now)
+        if !self.wants_redial()
+            || !session.adapter().join_ready()
+            || !self.may_dial(self.redial_delay(), now)
         {
             // A carrier dialled now would wait idle for its join: look again
             // at the next poll.
@@ -1200,13 +1203,16 @@ impl Maintainer {
                     d => d,
                 }
             }
-            let p = o.liveness;
-            o.liveness = PipeLiveness {
+            let p = match o.liveness {
+                crate::Change::Set(p) => p,
+                crate::Change::Keep | crate::Change::Clear => PipeLiveness::default(),
+            };
+            o.liveness = crate::Change::Set(PipeLiveness {
                 suspect_floor: own(l.suspect_floor, p.suspect_floor),
                 dead_timeout: own(l.dead_timeout, p.dead_timeout),
                 probe_interval: own(l.probe_interval, p.probe_interval),
                 probe_jitter: own(l.probe_jitter, p.probe_jitter),
-            };
+            });
         }
         o
     }
@@ -1323,19 +1329,21 @@ mod tests {
             d.fetch_add(1, Ordering::SeqCst);
             async { Err(io::Error::other("refused")) }
         })
-        .with_backoff(
-            Backoff::new(Duration::from_millis(300), Duration::from_millis(300)).with_jitter(0.9),
-        )
+        .with_backoff({
+            let mut b = Backoff::new(Duration::from_millis(300), Duration::from_millis(300));
+            b.jitter = 0.9;
+            b
+        })
         .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
             d.recheck = Some(Duration::from_millis(10));
         });
-        let before = super::super::backoff::DRAWS.with(std::cell::Cell::get);
+        let before = crate::backoff::DRAWS.with(std::cell::Cell::get);
         let handle = maintain_pipes(&client, pool).expect("valid pool");
         while dials.load(Ordering::SeqCst) < 16 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         handle.stop();
-        let draws = super::super::backoff::DRAWS.with(std::cell::Cell::get) - before;
+        let draws = crate::backoff::DRAWS.with(std::cell::Cell::get) - before;
         let n = dials.load(Ordering::SeqCst) as u64;
         // One at each dial's start, one at its failure.
         assert!(draws <= 2 * n, "{draws} draws for {n} dials");

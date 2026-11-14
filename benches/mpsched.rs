@@ -29,7 +29,7 @@ use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::{Event as R, Framing, RecordReader};
 use zmux::proto::session::{
-    Backing, Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Policy, Role, SessionCore,
+    Backing, Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Role, Scheduler, SessionCore,
     StreamKey, TransmitBuf,
 };
 
@@ -127,7 +127,7 @@ struct Net {
     next_buffer: u64,
 }
 
-fn config(policy: &Policy) -> Config {
+fn config(policy: &Scheduler) -> Config {
     let mut c = Config::default();
     c.max_pipes = 8;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
@@ -138,7 +138,7 @@ fn config(policy: &Policy) -> Config {
 }
 
 impl Net {
-    fn new(policy: &Policy, specs: &[(usize, u32)], streams: usize) -> Self {
+    fn new(policy: &Scheduler, specs: &[(usize, u32)], streams: usize) -> Self {
         let start = Instant::now();
         let mut b_cfg = config(policy);
         b_cfg.test_hooks().locator = b"server".to_vec();
@@ -359,9 +359,9 @@ fn main() {
     let streams = env("MPSCHED_STREAMS").unwrap_or(1000) as usize;
     let steps = env("MPSCHED_STEPS").unwrap_or(3000);
     let policies = [
-        ("eta", Policy::SpreadEta),
-        ("affinity", Policy::Affinity),
-        ("session-affinity", Policy::SessionAffinity),
+        ("eta", Scheduler::SpreadEta),
+        ("affinity", Scheduler::Affinity),
+        ("session-affinity", Scheduler::SessionAffinity),
     ];
     let specs: BTreeMap<usize, Vec<(usize, u32)>> = BTreeMap::from([
         (2, vec![(400, 5), (200, 20)]),

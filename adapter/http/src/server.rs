@@ -17,8 +17,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use zmux::carrier::CarrierConnId;
-use zmux::{Admit, CarrierInfo, Listener, PipeHint, PipeIo};
+use zmux::adapter::Admit;
+use zmux::adapter::CarrierConnId;
+use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::body::{self, BodyReader, PipeBody, ReplayBody};
 use crate::classify::{RequestClass, classify, forwarded_early_data};
@@ -111,7 +112,7 @@ pub fn request_source(
     peer: Option<SocketAddr>,
 ) -> Option<SocketAddr> {
     let peer = peer?;
-    Some(listener.trusted_proxies().source(
+    Some(listener.adapter().trusted_proxies().source(
         peer,
         headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())),
     ))
@@ -176,7 +177,7 @@ fn carrier_response(
 /// value per connection), `None` for HTTP/1.1. Must be called inside a
 /// tokio runtime; the carrier runs in a task of its own.
 ///
-/// The carrier takes its source slot first ([`Listener::enter`]):
+/// The carrier takes its source slot first ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)):
 /// refused (the source has its share, or the listener is closed), the
 /// request, untouched, is [`Unhandled::Fallback`]. Nothing is answered
 /// before the carrier is accepted:
@@ -224,12 +225,12 @@ where
         }
     };
     if forwarded_early_data(&parts.headers) {
-        listener.count_setup_failure();
+        listener.adapter().count_setup_failure();
         return Ok(too_early());
     }
     let peer = peer.unwrap_or(NO_ADDR);
     let source = request_source(listener, &parts.headers, Some(peer)).unwrap_or(peer);
-    let Some(mut entry) = listener.enter(peer, Some(source)) else {
+    let Some(mut entry) = listener.adapter().enter(peer, Some(source)) else {
         // Not taken, nothing written: the host's fallback serves it.
         return Err(Unhandled::Fallback(Box::new(Request::from_parts(
             parts,
@@ -293,7 +294,7 @@ where
         }
         r
     };
-    if listener.admission().is_some() {
+    if listener.adapter().admission().is_some() {
         let prefix = if bodiless {
             Vec::new()
         } else {
@@ -378,7 +379,7 @@ struct StartWriter {
     started: Option<Arc<tokio::sync::watch::Sender<bool>>>,
 }
 
-impl zmux::carrier::ChunkWrite for StartWriter {
+impl zmux::adapter::ChunkWrite for StartWriter {
     fn poll_write_chunks(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -405,7 +406,7 @@ impl zmux::carrier::ChunkWrite for StartWriter {
 /// protocol ([`zmux::TrustedProxies::proxy_protocol`]) has its header read
 /// first, its client the source of its carriers.
 pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
-    let trusted = Arc::new(listener.trusted_proxies().clone());
+    let trusted = Arc::new(listener.adapter().trusted_proxies().clone());
     serve_proxied(
         listener,
         || tcp.accept(),
@@ -414,7 +415,7 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
             async move {
                 let _ = stream.set_nodelay(true);
                 let mut stream = stream;
-                let source = zmux::proxied_source(&mut stream, peer, &trusted).await?;
+                let source = zmux::adapter::proxied_source(&mut stream, peer, &trusted).await?;
                 Ok((stream, source))
             }
         },
@@ -428,7 +429,7 @@ pub async fn serve(listener: Listener, tcp: TcpListener, options: Options) {
 /// `h2` and `http/1.1`) within the listener's `handshake_timeout`, then
 /// served in a task of its own ([`serve_connection`]). A connection's
 /// setup holds no listener slot (each request that carries a pipe takes
-/// its own, [`Listener::enter`]); it is bounded by the handshake timeout.
+/// its own, [`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)); it is bounded by the handshake timeout.
 /// A connection whose setup fails, is ended or carries no pipe counts in
 /// [`Listener::stats`]. Run it in a task of its own; it ends with
 /// [`Listener::close`].
@@ -472,7 +473,7 @@ pub async fn serve_with<T, IO, A, AF, F, SF>(
 
 /// [`serve_with`] whose `setup` also gives the connection's source: the
 /// peer, or the client an intermediary reports for it (the PROXY protocol,
-/// [`zmux::proxied_source`]).
+/// [`zmux::adapter::proxied_source`]).
 pub async fn serve_proxied<T, IO, A, AF, F, SF>(
     listener: Listener,
     accept: A,
@@ -520,7 +521,7 @@ pub async fn serve_proxied_with<T, IO, A, AF, F, SF, H, HF>(
             async move { Some(next.await) }
         },
         |(conn, peer)| {
-            let (made, guard) = (setup(conn, peer), listener.setup_guard());
+            let (made, guard) = (setup(conn, peer), listener.adapter().setup_guard());
             async move {
                 let made = made.await?;
                 guard.done();
@@ -695,7 +696,7 @@ pub async fn serve_connection_with<IO, H, HF>(
     if !used.load(Ordering::Relaxed) {
         // Closed without carrying a pipe or answering a request (a 425
         // answer is counted where it is made).
-        listener.count_setup_failure();
+        listener.adapter().count_setup_failure();
     }
     drop(tag);
 }
