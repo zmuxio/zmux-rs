@@ -489,6 +489,18 @@ impl PipeIo {
         }
     }
 
+    /// The closer of [`PipeIo::from_tcp`] for a carrier built over a TCP socket by hand
+    /// (separate halves, a wrapper that frames or counts), for [`PipeIo::with_closer`]:
+    /// [`Shutdown::Read`] and [`Shutdown::Write`] shut that side, [`Shutdown::Both`] shuts
+    /// both sides one by one and, on Windows, cancels the I/O blocked in other threads, which
+    /// a shutdown alone does not end. `socket` is the stream or a shared handle to it.
+    pub fn tcp_closer<S>(socket: S) -> impl Fn(Shutdown) + Send + Sync + 'static
+    where
+        S: std::borrow::Borrow<TcpStream> + Send + Sync + 'static,
+    {
+        move |how| shut_down(socket.borrow(), how)
+    }
+
     /// A carrier from separate halves. The write side ends by dropping the
     /// writer; the reader thread ends when its reader does. A read or write
     /// blocked in such halves is interrupted only by a closer
@@ -551,6 +563,11 @@ impl PipeIo {
     /// ended gracefully, and [`Shutdown::Both`] once the session ended, so
     /// that a read or write blocked in the carrier returns. It must not block. TCP carriers
     /// ([`PipeIo::from_tcp`]) have one.
+    ///
+    /// The closer must really end a blocked read, not only mark the socket: a bare
+    /// `TcpStream::shutdown` does not wake a `recv` blocked in another thread on Windows,
+    /// and the reader thread would then outlive the session. A closer over a TCP socket
+    /// should be built with [`PipeIo::tcp_closer`].
     #[must_use]
     pub fn with_closer(mut self, closer: impl Fn(Shutdown) + Send + Sync + 'static) -> Self {
         self.closer = Some(Box::new(closer));

@@ -778,12 +778,8 @@ impl Write for GatedWrite {
 
 /// A carrier on `s` whose writes pass `gate`.
 fn gated(s: TcpStream, gate: &Arc<Gate>) -> PipeIo {
-    let closer = s.try_clone().unwrap();
-    PipeIo::from_halves(s.try_clone().unwrap(), GatedWrite(s, gate.clone())).with_closer(
-        move |how| {
-            let _ = closer.shutdown(how);
-        },
-    )
+    let closer = PipeIo::tcp_closer(s.try_clone().unwrap());
+    PipeIo::from_halves(s.try_clone().unwrap(), GatedWrite(s, gate.clone())).with_closer(closer)
 }
 
 /// Dropped stream handles are released by the session, promptly and without blocking the

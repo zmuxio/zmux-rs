@@ -405,7 +405,7 @@ fn blocking_carrier(
     alive: &Arc<AtomicUsize>,
     silence: &Arc<Silence>,
 ) -> zmux::blocking::PipeIo {
-    let c = s.try_clone().unwrap();
+    let close = zmux::blocking::PipeIo::tcp_closer(s.try_clone().unwrap());
     let silence_c = silence.clone();
     zmux::blocking::PipeIo::from_halves(
         Half::new(s.try_clone().unwrap(), alive, silence),
@@ -414,7 +414,7 @@ fn blocking_carrier(
     .with_closer(move |how| {
         if how != Shutdown::Write {
             silence_c.ended.store(true, Ordering::SeqCst);
-            let _ = c.shutdown(how);
+            close(how);
         }
     })
 }
