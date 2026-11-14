@@ -11,6 +11,7 @@
 
 #![allow(missing_docs, unsafe_code)]
 #![allow(
+    clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
@@ -1650,7 +1651,7 @@ fn cpu_secs() -> Option<f64> {
     }
     // SAFETY: initialized by the successful call.
     let ru = unsafe { ru.assume_init() };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     Some(tv(ru.ru_utime) + tv(ru.ru_stime))
 }
 

@@ -340,7 +340,7 @@ fn getsockopt(
     (r == 0).then_some(len as usize)
 }
 
-/// TCP_NOTSENT_LOWAT (`<netinet/tcp.h>`; 0x201 on Apple platforms).
+/// `TCP_NOTSENT_LOWAT` (`<netinet/tcp.h>`; 0x201 on Apple platforms).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
 #[cfg(target_vendor = "apple")]
