@@ -191,7 +191,7 @@ async fn preamble_and_priority_reach_the_peer() {
             .open_bi_with(&zmux::Preamble::new().with_info(vec![b'x'; 5000]))
             .await
             .err(),
-        Some(OpenError::PreambleTooLarge)
+        Some(OpenError::PreambleTooLarge { max: 4096 })
     );
     let (mut send, _recv) = client.open_bi_with(&pre).await.unwrap();
     // Reading the identifier pins the stream; the preamble was given at

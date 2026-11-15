@@ -1247,6 +1247,10 @@ impl SessionCore {
             self.shape_return(&mut w);
         }
         self.batch_not_earned = w.not_earned;
+        if w.oversized {
+            // Unreachable under the carrier record floor: the session cannot go on.
+            self.fail_internal("a frame exceeds the record limit", self.now);
+        }
         w.finish()
     }
 }

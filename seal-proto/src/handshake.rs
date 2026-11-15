@@ -7,7 +7,7 @@ use zmux::proto::seal::{
 use crate::derive::exporter_secret;
 use crate::keyalg::{KeyAlg, KeyId, KeyUse};
 use crate::noise::{Engine, Finished, ReceivedProof};
-use crate::wire::{handle_fits, write_hello};
+use crate::wire::{handle_fits, hello_header_len, noise_room, write_hello};
 use crate::{Hello, Profile};
 
 const BINDING_LEN: usize = 32;
@@ -26,7 +26,7 @@ pub fn prologue(profile: Profile, mode: RecordMode, handle: &[u8], binding: &[u8
 
 /// Writes the next message of `engine` with `payload`, which holds no proof: a proof is
 /// written by the signing steps.
-fn write_plain(engine: &mut Engine, payload: &[u8]) -> Result<Vec<u8>, Error> {
+fn write_plain(engine: &mut Engine, payload: &[u8], room: usize) -> Result<Vec<u8>, Error> {
     Payload::check_outgoing(payload, engine.known_types())?;
     if Payload::validate(payload.to_vec(), engine.known_types())?
         .proof()
@@ -34,7 +34,7 @@ fn write_plain(engine: &mut Engine, payload: &[u8]) -> Result<Vec<u8>, Error> {
     {
         return Err(Error::InvalidConfig);
     }
-    engine.write_message(payload)
+    engine.write_message(payload, room)
 }
 
 /// A message whose tokens are written and whose payload waits for the signature of its
@@ -44,13 +44,15 @@ struct Pending {
     payload: Vec<u8>,
     sig_len: usize,
     message: Vec<u8>,
+    /// What the Noise message may take of the handshake message floor.
+    room: usize,
 }
 
 impl Pending {
     /// Writes the tokens of the next message of `engine`. `payload` ends with a proof item
     /// whose `KeyAlg` is a proof key's and whose signature has its length, any bytes: they
     /// give the message its length and are replaced by the signature.
-    fn begin(engine: &mut Engine, payload: &[u8]) -> Result<Pending, Error> {
+    fn begin(engine: &mut Engine, payload: &[u8], room: usize) -> Result<Pending, Error> {
         Payload::check_outgoing(payload, engine.known_types())?;
         let parsed = Payload::validate(payload.to_vec(), engine.known_types())?;
         let proof = parsed.proof().ok_or(Error::InvalidConfig)?;
@@ -63,7 +65,7 @@ impl Pending {
         // A message's highest known type is the proof: its signature ends the payload.
         let index = engine.message_index();
         let tokens = engine.write_tokens()?;
-        if engine.message_len(tokens.len(), payload.len()) > u16::MAX as usize {
+        if engine.message_len(tokens.len(), payload.len()) > room {
             return Err(Error::TooLarge);
         }
         Ok(Pending {
@@ -71,6 +73,7 @@ impl Pending {
             payload: payload.to_vec(),
             sig_len: alg.sig_len(),
             message: crate::proof::proof_message(index, engine.h_p()),
+            room,
         })
     }
 
@@ -82,7 +85,7 @@ impl Pending {
         let mut payload = self.payload;
         let at = payload.len() - sig.len();
         payload[at..].copy_from_slice(sig);
-        engine.write_payload(self.tokens, &payload)
+        engine.write_payload(self.tokens, &payload, self.room)
     }
 }
 
@@ -245,7 +248,8 @@ impl Initiator {
     /// the Hello may not carry, `too_large` when the Hello exceeds its
     /// limit.
     pub fn write_hello(mut self, payload: &[u8]) -> Result<(Vec<u8>, AwaitReply), Error> {
-        let noise = write_plain(&mut self.engine, payload)?;
+        let room = noise_room(self.framing, hello_header_len(self.profile));
+        let noise = write_plain(&mut self.engine, payload, room)?;
         let wire = write_hello(self.framing, self.profile, self.mode, &self.handle, &noise)?;
         let next = AwaitReply {
             engine: self.engine,
@@ -377,7 +381,7 @@ impl Finish {
     /// this message may not carry, `too_large` when the message exceeds its
     /// limit.
     pub fn write_finish(mut self, payload: &[u8]) -> Result<(Vec<u8>, Complete), Error> {
-        let noise = write_plain(&mut self.engine, payload)?;
+        let noise = write_plain(&mut self.engine, payload, noise_room(self.framing, 0))?;
         let mut wire = Vec::new();
         frame(self.framing, &mut wire, &noise)?;
         Ok((wire, Complete::new(self.engine, self.mode, true)?))
@@ -391,7 +395,7 @@ impl Finish {
     /// `invalid_config` for a payload that is not well formed or does not end
     /// with a proof item, `too_large` when the message exceeds its limit.
     pub fn write_finish_signed(mut self, payload: &[u8]) -> Result<SignFinish, Error> {
-        let pending = Pending::begin(&mut self.engine, payload)?;
+        let pending = Pending::begin(&mut self.engine, payload, noise_room(self.framing, 0))?;
         Ok(SignFinish {
             engine: self.engine,
             mode: self.mode,
@@ -611,7 +615,7 @@ impl ResponderReply {
     /// `invalid_config` for a payload that is not well formed or does not end
     /// with a proof item, `too_large` when the message exceeds its limit.
     pub fn write_reply_signed(mut self, payload: &[u8]) -> Result<SignReply, Error> {
-        let pending = Pending::begin(&mut self.engine, payload)?;
+        let pending = Pending::begin(&mut self.engine, payload, noise_room(self.framing, 0))?;
         Ok(SignReply {
             engine: self.engine,
             mode: self.mode,
@@ -628,7 +632,7 @@ impl ResponderReply {
     /// this message may not carry, `too_large` when the message exceeds its
     /// limit.
     pub fn write_reply(mut self, payload: &[u8]) -> Result<(Vec<u8>, AwaitFinish), Error> {
-        let noise = write_plain(&mut self.engine, payload)?;
+        let noise = write_plain(&mut self.engine, payload, noise_room(self.framing, 0))?;
         let mut wire = Vec::new();
         frame(self.framing, &mut wire, &noise)?;
         Ok((

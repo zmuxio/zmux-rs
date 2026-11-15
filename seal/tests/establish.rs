@@ -1344,3 +1344,62 @@ async fn a_sealed_close_without_half_close_keeps_its_code() {
         .unwrap_or_else(|_| panic!("iteration {i} in time"));
     }
 }
+
+/// Whether a handshake with an ML-DSA-44 proof and a server credential of `len` bytes
+/// completes: message 2 as written is at most 8192 bytes, and a server whose message would
+/// exceed it fails before writing anything (the client then hears nothing).
+async fn message_2_with_a_credential_of(len: usize) -> bool {
+    let server_id = SigningKey::from_seed(KEYALG_MLDSA44, &[5; 32])
+        .unwrap()
+        .key_id();
+    let server = ServerConfig::new(
+        Arc::new(TestGate {
+            psk: keys().psk,
+            cred: Some((77, vec![0x5a; len])),
+        }),
+        NODE,
+        ServerOptions {
+            signer: Some(Arc::new(KeySigner(
+                SigningKey::from_seed(KEYALG_MLDSA44, &[5; 32]).unwrap(),
+            ))),
+            ..Default::default()
+        },
+    )
+    .expect("valid server configuration");
+    let mut lc = ListenerConfig::default();
+    lc.inbound_transform = Some(server.transform());
+    let l = Listener::new(config(), lc).expect("valid listener configuration");
+    let c = client(Arc::new(PinVerifier::with_proof_key(
+        key_id(KEYALG_X25519, &node_public()),
+        server_id,
+    )));
+    let (a, b) = duplex(1 << 20);
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
+    matches!(
+        tokio::time::timeout(Duration::from_millis(1500), establish(PipeIo::new(a), &c)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// A credential in message 2 beside an ML-DSA-44 proof has 3252 bytes of room, entry and item
+/// headers included: one byte more is `too_large` at the server.
+#[tokio::test]
+async fn message_2_with_a_proof_holds_a_credential_up_to_the_floor() {
+    let (mut ok, mut bad) = (1000, 4000);
+    assert!(message_2_with_a_credential_of(ok).await);
+    assert!(!message_2_with_a_credential_of(bad).await);
+    while bad - ok > 1 {
+        let mid = usize::midpoint(ok, bad);
+        if message_2_with_a_credential_of(mid).await {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    // 3252 bytes of room: the credential, its entry's type (77: two bytes) and length, and the
+    // item's own header take five of them.
+    assert_eq!(ok, 3247);
+}

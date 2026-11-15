@@ -26,6 +26,11 @@ const MIN_PREAMBLE_FLOOR: u64 = 1024;
 /// This endpoint's own limit on the preambles it sends.
 const MAX_LOCAL_PREAMBLE: u64 = 4096;
 
+/// What a preamble leaves of the carrier record floor for the STREAM frame header and the
+/// record's own: the one margin of every language (EXTENSIONS.md Section 4.1), so the
+/// bound is 8160.
+const PREAMBLE_MARGIN: usize = 32;
+
 /// Smallest per-stream window or send buffer.
 const MIN_STREAM_WINDOW: u64 = 16 * 1024;
 
@@ -215,8 +220,9 @@ impl SessionCore {
             // The peer's parameters arrived below the limit the open
             // assumed: only this stream fails, nothing is sent.
             self.unschedule(key);
-            self.reject_unopened(key, GoAwayFail::PreambleTooLarge);
-            return Err(StreamError::PreambleTooLarge);
+            let max = self.preamble_limit();
+            self.reject_unopened(key, GoAwayFail::too_large(max));
+            return Err(StreamError::PreambleTooLarge { max });
         }
         self.unschedule(key);
         self.assign_id(key);
@@ -252,6 +258,18 @@ impl SessionCore {
     pub fn write_room(&self, key: StreamKey) -> Result<u64, StreamError> {
         self.writable_part(key)?;
         Ok(self.send_room(key))
+    }
+
+    /// Room for new data on the stream's sending part, as
+    /// [`SessionCore::write`] takes it, or the outcome that ended it; with
+    /// no room, registers for [`super::CoreEvent::StreamWritable`] once
+    /// there is some or the part ends, as a write that took nothing does.
+    pub fn poll_write_room(&mut self, key: StreamKey) -> Result<u64, StreamError> {
+        let room = self.write_room(key)?;
+        if room == 0 {
+            self.wait_writable(key);
+        }
+        Ok(room)
     }
 
     /// The sending part, while the application may still write to it.
@@ -1172,7 +1190,7 @@ impl SessionCore {
                 .map(|(ty, v)| GreaseTlv { ty: *ty, value: v }),
         );
         if len as u64 > limit {
-            return Err(OpenError::PreambleTooLarge);
+            return Err(OpenError::PreambleTooLarge { max: limit });
         }
         let key = self.open(dir)?;
         let s = self.streams.get_mut(key).expect("just opened");
@@ -1184,12 +1202,14 @@ impl SessionCore {
     /// The largest preamble a local stream may send now: the peer's
     /// Maximum Preamble Size, or before its parameters the assumed set's
     /// (remembered, or the 1024-byte floor every zmux endpoint advertises); at
-    /// most [`MAX_LOCAL_PREAMBLE`] and whole in one of our records.
+    /// most [`MAX_LOCAL_PREAMBLE`] and whole in one record of the carrier record floor, which
+    /// every pipe's records hold (SPEC.md Section 3.2): a preamble that passes fits any pipe,
+    /// now or later.
     pub(super) fn preamble_limit(&self) -> u64 {
         self.send_tp()
             .map_or(MIN_PREAMBLE_FLOOR, TpValues::preamble)
             .min(MAX_LOCAL_PREAMBLE)
-            .min((self.max_record() - 25) as u64)
+            .min((super::RECORD_FLOOR - PREAMBLE_MARGIN) as u64)
     }
 
     /// The stream's preamble: the peer's for a peer stream, the one it was
@@ -1319,12 +1339,17 @@ impl SessionCore {
         let peer = self.peer_tp.as_ref()?;
         let frame = Some(peer.max_datagram_frame_size()).filter(|&m| m > 0)?;
         let frame = frame.min(peer.max_record_size());
-        let carriers = self
-            .atts
+        Some(usize_sat(frame.min(self.carrier_record_limit() as u64)))
+    }
+
+    /// The smallest record limit of the carriers of the outbound pipes: a frame that cannot
+    /// be split has to fit it to go on any of them; `usize::MAX` when none has a limit.
+    pub(super) fn carrier_record_limit(&self) -> usize {
+        self.atts
             .outs()
             .filter_map(super::pipes::OutPipe::max_record)
-            .min();
-        Some(usize_sat(carriers.map_or(frame, |c| frame.min(c as u64))))
+            .min()
+            .unwrap_or(usize::MAX)
     }
 
     /// Queues a session datagram (Flow 0 with datagram flows). Never waits:

@@ -2492,6 +2492,42 @@ impl SessionCore {
     }
 }
 
+/// The carrier record floor (zmux-spec SPEC.md Section 3.2): every carrier of a pipe, each
+/// lane included, takes records (messages) of 8192 bytes, so every frame that cannot be
+/// split fits one, and a record limit is never below it.
+pub(crate) const RECORD_FLOOR: usize = 8192;
+
+/// The one check of a pipe's record limit (the plaintext of a record, a transform's
+/// overhead already taken off): at least [`RECORD_FLOOR`].
+pub(crate) fn check_record_limit(limit: usize) -> Result<(), InvalidConfig> {
+    if limit < RECORD_FLOOR {
+        return Err(InvalidConfig::new(
+            "PipeIo::with_max_record",
+            "the record limit, its transform overhead taken off, is below 8192",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a value for `PipeIo::with_max_record` without a carrier at hand: 0 (the
+/// carrier's default) or at least 8192, the carrier record floor. There is no upper bound;
+/// the peer's `max_record_size` and the implementation's own limit reduce it. Call it
+/// first where a failed `with_max_record` must not cost the caller its carrier, which the
+/// method consumes.
+///
+/// # Errors
+///
+/// [`InvalidConfig`] for a value from 1 to 8191.
+pub const fn check_max_record(max: usize) -> Result<(), InvalidConfig> {
+    if max != 0 && max < RECORD_FLOOR {
+        return Err(InvalidConfig::new(
+            "PipeIo::with_max_record",
+            "below 8192 (0 is the carrier's default)",
+        ));
+    }
+    Ok(())
+}
+
 /// Converts an application code into a [`VarInt`], saturating (codes from
 /// the wire are always in range).
 fn varint(v: u64) -> VarInt {
@@ -2522,4 +2558,19 @@ fn clip_reason(reason: &[u8]) -> &[u8] {
 pub(crate) struct JoinShaping {
     unplanned: u64,
     faults: u64,
+}
+
+#[cfg(test)]
+mod record_limit_tests {
+    use super::{RECORD_FLOOR, check_max_record, check_record_limit};
+
+    #[test]
+    fn the_floor_is_checked_in_one_place() {
+        assert!(check_record_limit(RECORD_FLOOR - 1).is_err());
+        assert!(check_record_limit(RECORD_FLOOR).is_ok());
+        assert!(check_max_record(0).is_ok());
+        assert!(check_max_record(1).is_err());
+        assert!(check_max_record(RECORD_FLOOR - 1).is_err());
+        assert!(check_max_record(RECORD_FLOOR).is_ok());
+    }
 }

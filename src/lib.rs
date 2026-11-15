@@ -243,7 +243,6 @@ pub use proto::prefix_auth::{
 };
 pub use proto::replay::{InvalidReplayConfig, ReplayFilter, ReplayVerdict};
 pub use proto::seal::SessionCrypto;
-pub use proto::session::InvalidConfig;
 pub use proto::session::shaping;
 pub use proto::session::{
     AllowRecordMode, AuthorizeJoin, RecordMode, RecordPolicy, RecordPolicyInput,
@@ -261,6 +260,7 @@ pub use proto::session::{
     SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionStats,
     State as SessionState, StreamError, StreamStats, Support, Tracer, UniCredit, WindowIncrease,
 };
+pub use proto::session::{InvalidConfig, check_max_record};
 
 /// The QMux version this crate speaks, the only one: what
 #[cfg_attr(

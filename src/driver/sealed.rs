@@ -15,11 +15,8 @@ use super::tokio::{PipeIo, Reader, Writer};
 use crate::proto::record::Framing;
 use crate::proto::seal::{Opener, Sealer};
 
-/// The AEAD tag and, on a byte stream, the length prefix of a Sealed record.
-const TAG: u16 = 16;
-const LEN: u16 = 2;
-/// The largest plaintext of a Sealed record: its ciphertext fits in 16 bits.
-pub(crate) const SEALED_MAX_RECORD: usize = u16::MAX as usize - TAG as usize;
+// The AEAD tag and, on a byte stream, the length prefix of a Sealed record.
+use super::handle::{SEALED_LEN as LEN, SEALED_TAG as TAG};
 
 /// The read buffer of a Sealed carrier: a byte-stream record whole, its length prefix
 /// included, which also holds the largest message of a message carrier.
@@ -57,11 +54,10 @@ pub(crate) fn seal_carrier(mut p: PipeIo, sealer: Sealer, opener: Opener) -> Pip
             held: false,
         }))
     });
-    p.write_overhead = p
-        .write_overhead
-        .saturating_add(TAG + if lower == Framing::ByteStream { LEN } else { 0 });
+    let overhead = super::handle::sealed_overhead(lower);
+    p.write_overhead = p.write_overhead.saturating_add(overhead);
     p.framing = Framing::Records;
-    p.max_record = Some(SEALED_MAX_RECORD);
+    p.max_record = Some(super::handle::sealed_max_record(p.max_record, overhead));
     p.hide_capabilities();
     p
 }
@@ -410,6 +406,7 @@ pub(crate) async fn until<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::handle::SEALED_MAX_RECORD;
     use crate::proto::seal::aes_256_gcm;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -508,6 +505,26 @@ mod tests {
             r.as_mut().get_mut().release_idle();
             assert!(!w.idle_held() && !r.idle_buffer());
         }
+    }
+
+    /// A Sealed transform keeps the carrier's record limit less its overhead, and the
+    /// Sealed maximum without one.
+    #[test]
+    fn sealing_keeps_the_carrier_record_limit() {
+        let (near, _far) = duplex(64);
+        let p = seal_carrier(PipeIo::new(near), keys().0, keys().1);
+        assert_eq!(p.max_record, Some(SEALED_MAX_RECORD));
+        let (near, _far) = duplex(64);
+        let p = seal_carrier(
+            PipeIo::new(near).with_max_record(9000).unwrap(),
+            keys().0,
+            keys().1,
+        );
+        assert_eq!(p.max_record, Some(9000 - 18));
+        let (near, _far) = duplex(64);
+        let msg = PipeIo::new(near).records().with_max_record(9000).unwrap();
+        let p = seal_carrier(msg, keys().0, keys().1);
+        assert_eq!(p.max_record, Some(9000 - 16));
     }
 
     #[tokio::test]

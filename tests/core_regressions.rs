@@ -126,7 +126,7 @@ fn session_credit_stall_does_not_spin() {
 #[test]
 fn small_send_records_still_carry_stream_data() {
     let mut a_cfg = Config::default();
-    a_cfg.max_send_record = 1024; // accepted by Config::validate
+    a_cfg.max_send_record = 8192; // accepted by Config::validate
     let mut b_cfg = Config::default();
     b_cfg.max_incoming_uni_streams = zmux::UniCredit::Limit(4);
     let mut p = Pair::new(a_cfg, b_cfg);
@@ -380,6 +380,45 @@ fn pinned_openings_go_out_in_identifier_order() {
     assert!(!p.a.wants_write(P0), "no spinning while blocked");
 }
 
+/// An application close reason is cut to 1024 bytes at a character boundary (SPEC.md
+/// Section 4.3), whichever way the session closes: the peer reads valid UTF-8 of at most
+/// 1024 bytes, a prefix of what was given.
+#[test]
+fn application_close_reasons_are_cut_at_a_character_boundary() {
+    // 3-byte characters: 1024 is not a multiple of 3, so the cut backs up to 1023.
+    let long = "\u{20ac}".repeat(5000 / 3);
+    // 4-byte characters after one ASCII byte: the cut backs up to 1021.
+    let skewed = format!("a{}", "\u{1f600}".repeat(1250));
+    for reason in [long, skewed] {
+        for how in 0..3 {
+            let mut p = Pair::attached(Config::default(), Config::default());
+            let code = VarInt::from_u32(9);
+            match how {
+                0 => p.a.close(code, reason.as_bytes(), p.now),
+                1 => p.a.abort(code, reason.as_bytes(), p.now),
+                _ => p.a.shutdown(code, reason.as_bytes(), p.now),
+            }
+            for _ in 0..50 {
+                p.pump();
+                p.now += Duration::from_millis(10);
+                p.a.handle_timeout(p.now);
+                p.b.handle_timeout(p.now);
+            }
+            let Some(zmux::SessionError::ApplicationClosed {
+                reason: got,
+                remote: true,
+                ..
+            }) = p.b.error()
+            else {
+                panic!("how {how}: {:?}", p.b.error());
+            };
+            let got = std::str::from_utf8(got).expect("valid UTF-8");
+            assert!(got.len() <= 1024 && got.len() > 1024 - 4, "{}", got.len());
+            assert!(reason.starts_with(got));
+        }
+    }
+}
+
 #[test]
 fn shutdown_before_establishment_drains_after_it() {
     let mut p = Pair::attached(Config::default(), Config::default());
@@ -399,6 +438,37 @@ fn shutdown_before_establishment_drains_after_it() {
         p.b.error(),
         Some(zmux::SessionError::ApplicationClosed { remote: true, .. })
     ));
+}
+
+/// A preamble is bounded by the carrier record floor, not by the pipes there are: at the
+/// floor a preamble of the largest size opens and arrives, whatever Maximum Preamble Size
+/// the peer announces, and one beyond the bound fails at the open, nothing sent.
+#[test]
+fn a_preamble_fits_the_record_floor() {
+    let probe = Pair::attached(Config::default(), Config::default());
+    let mut big = probe.b.local_parameters();
+    big.zmux_preamble = Some(8160);
+    let mut b_cfg = Config::default();
+    b_cfg.test_hooks().transport_parameters = Some(big);
+    let mut p = Pair::attached(Config::default(), b_cfg);
+    p.a.set_pipe_max_record(P0, 8192).unwrap();
+    p.b.set_pipe_max_record(P0, 8192).unwrap();
+    p.pump();
+    // Beyond the local limit of 4096 whatever the peer allows.
+    assert_eq!(
+        p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 5000]))
+            .err(),
+        Some(OpenError::PreambleTooLarge { max: 4096 })
+    );
+    let len = 4000;
+    let k =
+        p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; len]))
+            .unwrap();
+    p.a.write(k, b"data").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("arrived");
+    assert_eq!(p.b.preamble(s).info().map(Bytes::len), Some(len));
+    assert!(p.a.state() < State::Closing, "{:?}", p.a.error());
 }
 
 /// With pipe acknowledgement on a single pipe, the sender's sample state is
@@ -820,25 +890,28 @@ fn a_preamble_beyond_the_peer_limit_fails_only_its_stream() {
     assert_eq!(
         p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 5000]))
             .err(),
-        Some(OpenError::PreambleTooLarge)
+        Some(OpenError::PreambleTooLarge { max: 4096 })
     );
     let k = p.a.open_with(Dir::Bidi, &big).unwrap();
     // The peer's parameters arrive before the stream's first frame.
     p.send(false);
     assert!(p.a.is_established());
     if let Err(e) = p.a.write(k, b"data") {
-        assert_eq!(e, zmux::proto::session::StreamError::PreambleTooLarge);
+        assert_eq!(
+            e,
+            zmux::proto::session::StreamError::PreambleTooLarge { max: 1500 }
+        );
     }
     p.pump();
     assert_eq!(
         p.a.write(k, b"more").err(),
-        Some(zmux::proto::session::StreamError::PreambleTooLarge)
+        Some(zmux::proto::session::StreamError::PreambleTooLarge { max: 1500 })
     );
     assert!(p.b.accept(Dir::Bidi).unwrap().is_none(), "nothing was sent");
     // Now the peer's limit applies at once.
     assert_eq!(
         p.a.open_with(Dir::Bidi, &big).err(),
-        Some(OpenError::PreambleTooLarge)
+        Some(OpenError::PreambleTooLarge { max: 1500 })
     );
     let ok =
         p.a.open_with(Dir::Bidi, &Preamble::new().with_info("small"))
@@ -864,7 +937,7 @@ fn early_preambles_are_bounded_by_the_floor() {
     assert_eq!(
         a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 1100]))
             .err(),
-        Some(OpenError::PreambleTooLarge)
+        Some(OpenError::PreambleTooLarge { max: 1024 })
     );
 }
 

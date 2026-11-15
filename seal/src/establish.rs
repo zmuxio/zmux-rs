@@ -44,20 +44,23 @@ pub(crate) async fn plan_of<C: Carrier>(
 }
 
 /// The payload of message `seq` under `plan`. `head` gives the wire length of a unit of so
-/// many Noise bytes. A message sent without a key has random padding. `padded` counts the
+/// many Noise bytes, `over` of them the carrier's own framing. A message sent without a key has random padding. `padded` counts the
 /// bytes the padding took.
 pub(crate) fn shaped_payload(
     plan: &UnitPlan,
     (seq, profile): (usize, Profile),
     items: &[(u64, &[u8])],
-    head: impl Fn(usize) -> usize,
+    (head, over): (impl Fn(usize) -> usize, usize),
     padded: &mut u64,
 ) -> Result<Vec<u8>, Error> {
     let psk = has_psk(profile);
     // The plaintext of the items, whatever their types.
     let noise = profile.empty_message_len(seq) + zmux::proto::seal::encode_payload(items).len();
     let w = head(noise);
-    let room = (u16::MAX as usize).saturating_sub(noise);
+    let room = (u16::MAX as usize)
+        .saturating_sub(noise)
+        // The floor counts the message as written, without the carrier's own framing.
+        .min(zmux::proto::seal::HANDSHAKE_MESSAGE_FLOOR.saturating_sub(w.saturating_sub(over)));
     #[allow(
         clippy::cast_possible_wrap,
         reason = "both sizes are bounded by a handshake unit, far below isize::MAX"
@@ -389,7 +392,10 @@ pub(crate) async fn run_client<C: Carrier>(
         &plan,
         (0, profile),
         &message_items(&[], &early, &[]),
-        |noise| establish_hello_len(profile.value(), handle, stream, noise, over),
+        (
+            |noise| establish_hello_len(profile.value(), handle, stream, noise, over),
+            over,
+        ),
         &mut padded,
     )
     .map_err(invalid)?;
@@ -457,7 +463,7 @@ pub(crate) async fn run_client<C: Carrier>(
         &plan,
         (2, profile),
         &message_items(&value, &late, &proof),
-        |noise| message_len(stream, noise, over),
+        (|noise| message_len(stream, noise, over), over),
         &mut padded,
     )
     .map_err(invalid)?;

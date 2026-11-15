@@ -14,8 +14,8 @@ use crate::proto::seal::join::{
     Proven, Unconfirmed, key_share_item_len,
 };
 use crate::proto::seal::{
-    self, Group, JoinPipe, JoinRole, Opener, Payload, RecordMode, Sealer, Secret, Suite,
-    derive_join_psk, encode_payload,
+    self, Group, HANDSHAKE_MESSAGE_FLOOR, JoinPipe, JoinRole, Opener, Payload, RecordMode, Sealer,
+    Secret, Suite, derive_join_psk, encode_payload,
 };
 use crate::proto::session::pipes::{
     Attachment, InPipe, InState, OutPipe, OutState, PipeHalf, SentFrame,
@@ -24,7 +24,10 @@ use crate::proto::session::shaping::{
     PlanAnswer, UnitPlan, first_batch_limit, fit_item, join_hello_len, join_reply_len, message_len,
     pad_fill, pad_item, reply_room, varint_len,
 };
-use crate::proto::session::{CoreEvent, PipeError, PipeFailure, PipeId, SessionCore, State};
+use crate::proto::session::{
+    CoreEvent, InvalidConfig, PipeError, PipeFailure, PipeId, SessionCore, State,
+    check_record_limit,
+};
 use crate::proto::{Error, TransportErrorCode as T, keys};
 
 /// What a joiner reads before a verified Reply: one transport parameters record and a
@@ -543,6 +546,13 @@ fn leading_record(b: &[u8], framing: Framing) -> Result<Option<usize>, ()> {
     }
 }
 
+/// The room a handshake message of wire length `w` leaves under the handshake message
+/// floor. The floor counts the message as written, without the carrier's own framing
+/// (`overhead` bytes); `w` includes it, for the shaping lengths.
+fn floor_room(w: usize, overhead: usize) -> usize {
+    HANDSHAKE_MESSAGE_FLOOR.saturating_sub(w.saturating_sub(overhead))
+}
+
 impl SessionCore {
     // ---- joiner ---------------------------------------------------------------------
 
@@ -661,6 +671,9 @@ impl SessionCore {
         };
         let early = self.config.join_early_hello.unwrap_or(0);
         let limit = first_batch_limit(early, plan.pad_to, unit(item_len));
+        // The Hello stays within the handshake message floor.
+        let limit =
+            fit_item(floor_room(unit(item_len), usize::from(overhead))).map_or(0, |v| v.min(limit));
         // The frames item stays within what the Hello's ciphertext holds.
         let hello_room = (u16::MAX as usize).saturating_sub(item_len + suite.tag_len());
         let limit = fit_item(hello_room).map_or(0, |v| v.min(limit));
@@ -673,7 +686,10 @@ impl SessionCore {
             };
         let w = unit(plain_len);
         let gap = plan.pad_for(w).cast_signed() - w.cast_signed();
-        let room = (u16::MAX as usize).saturating_sub(plain_len + suite.tag_len());
+        // The padding stays within the Hello's ciphertext and its message floor.
+        let room = (u16::MAX as usize)
+            .saturating_sub(plain_len + suite.tag_len())
+            .min(floor_room(w, usize::from(overhead)));
         let padding = pad_item(gap, room);
         let zeros = vec![0; padding.unwrap_or(0)];
         let mut items: Vec<(u64, &[u8])> = Vec::with_capacity(3);
@@ -819,6 +835,7 @@ impl SessionCore {
             RecordMode::Bound | RecordMode::Unmanaged => (0, 0),
         };
         let w = message_len(framing == Framing::ByteStream, body, overhead);
+        let room = room.min(floor_room(w, overhead));
         let zeros = pad_fill(plan.pad_for(w).cast_signed() - w.cast_signed(), room);
         let Ok((confirm, finished)) = proven.write_confirm(zeros) else {
             self.join_failed(id, now);
@@ -1042,6 +1059,7 @@ impl SessionCore {
             usize::from(carrier.overhead),
         );
         let mut room = (u16::MAX as usize).saturating_sub(plain_len + join.suite.tag_len());
+        room = room.min(floor_room(w, usize::from(carrier.overhead)));
         if join.mode != RecordMode::Trusted {
             room = room.min(reply_room(carrier.received, w, 0).1);
         }
@@ -1305,11 +1323,18 @@ impl SessionCore {
     }
 
     /// The largest record plaintext of a pipe, local and applied beside the peer's
-    /// `max_record_size`.
-    pub fn set_pipe_max_record(&mut self, pipe: PipeId, max: usize) {
+    /// `max_record_size`. Below the carrier record floor (8192) it is refused and nothing
+    /// changes: every frame that cannot be split must fit a record.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`] when `max` is below the record floor.
+    pub fn set_pipe_max_record(&mut self, pipe: PipeId, max: usize) -> Result<(), InvalidConfig> {
+        check_record_limit(max)?;
         if let Some(o) = self.out_mut(pipe.0) {
             o.set_max_record(max);
         }
+        Ok(())
     }
 
     /// Whether the attachment reads and writes.

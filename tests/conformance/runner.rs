@@ -2668,7 +2668,7 @@ fn open_error(e: &OpenError) -> Value {
         OpenError::Blocked => json!({"pending": true}),
         OpenError::GoingAway => json!({"error": {"kind": "going_away"}}),
         OpenError::NotNegotiated => json!({"error": {"kind": "unsupported"}}),
-        OpenError::PreambleTooLarge => json!({"error": {"kind": "too_large"}}),
+        OpenError::PreambleTooLarge { .. } => json!({"error": {"kind": "too_large"}}),
         OpenError::SessionLost(s) => session_error(s),
         other => json!({"error": {"kind": format!("{other:?}")}}),
     }

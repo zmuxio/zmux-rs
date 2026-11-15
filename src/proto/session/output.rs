@@ -41,7 +41,7 @@ const MIN_FRAGMENT_DEFICIT: i64 = MIN_FRAGMENT as i64;
 
 /// The smallest message of a message-framed pipe the write-call bound
 /// leaves (the smallest `max_send_record`).
-const MIN_MESSAGE: usize = 1024;
+const MIN_MESSAGE: usize = super::RECORD_FLOOR;
 
 /// The result of writing one STREAM frame.
 enum Step {
@@ -786,6 +786,8 @@ impl SessionCore {
             Framing::ByteStream => self.max_record(),
             Framing::Records => self.max_record().min(out.max_message().max(MIN_MESSAGE)),
         };
+        // The pipe's carrier limit holds on every lane, as on lane 0.
+        let max_record = o.max_record().map_or(max_record, |m| max_record.min(m));
         if first && !shutdown {
             let Some(lane_key) = self.peer_lane_key() else {
                 return Transmit::Idle;
@@ -2115,7 +2117,7 @@ impl SessionCore {
             if need as u64 > self.preamble_limit() {
                 // The peer's parameters arrived below the limit the open
                 // assumed: only this stream fails, nothing is sent.
-                self.reject_unopened(key, stream::GoAwayFail::PreambleTooLarge);
+                self.reject_unopened(key, stream::GoAwayFail::too_large(self.preamble_limit()));
                 return Step::Done;
             }
             if w.stream_room(|_| need, need).is_none_or(|(r, _)| r < need) {
@@ -2601,6 +2603,8 @@ pub(super) struct Records<'a> {
     pub(super) shape: Option<super::shape::ShapeTx>,
     /// Padding, injections and copies written, which the batch does not earn.
     pub(super) not_earned: u64,
+    /// A frame that cannot be split was longer than the record limit.
+    pub(super) oversized: bool,
 }
 
 impl<'a> Records<'a> {
@@ -2616,6 +2620,7 @@ impl<'a> Records<'a> {
             ping: false,
             shape: None,
             not_earned: 0,
+            oversized: false,
         }
     }
 
@@ -2726,7 +2731,19 @@ impl<'a> Records<'a> {
     /// Makes room for `n` frame bytes in one record, closing the open one
     /// if they do not fit. `false` when the batch is full.
     pub(super) fn ensure(&mut self, n: usize) -> bool {
-        if n > self.max_record || self.closed() {
+        if n > self.max_record {
+            // Every frame that cannot be split is at most 8192 bytes and the record
+            // limit never falls below it (SPEC.md Section 3.2): a frame refused here
+            // would wait for room forever.
+            debug_assert!(
+                false,
+                "a {n}-byte frame cannot fit records of {}",
+                self.max_record
+            );
+            self.oversized = true;
+            return false;
+        }
+        if self.closed() {
             return false;
         }
         if self.out.in_record() {
@@ -2796,12 +2813,15 @@ impl<'a> Records<'a> {
     }
 
     /// Like [`Records::ensure`], but always opens room: the first frame and
-    /// `CONNECTION_CLOSE` go out even beyond the batch limit.
+    /// `CONNECTION_CLOSE` go out even beyond the batch limit. Their frames are at most the
+    /// record floor, which no record limit falls below, so a record of `max_record` holds
+    /// them; `ensure` never sees an oversized frame here.
     pub(super) fn force(&mut self, n: usize) {
         self.activity = true;
         if !self.ensure(n) {
+            debug_assert!(n <= self.max_record, "forced frame beyond the record limit");
             self.end_record();
-            self.out.begin_record(self.max_record.max(n));
+            self.out.begin_record(self.max_record);
         }
         self.elicit();
     }

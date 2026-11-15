@@ -193,6 +193,8 @@ pub struct CarrierInfo {
     pub(crate) kind: Option<crate::CarrierKind>,
     pub(crate) variant: Option<Arc<str>>,
     pub(crate) write_overhead: u16,
+    /// The largest record the carrier takes ([`crate::PipeIo::with_max_record`]).
+    pub(crate) max_record: Option<usize>,
     /// The padding of a handshake run on the carrier before the session.
     pub(crate) handshake_padding: u64,
     pub(crate) admitted: Option<crate::AdmittedValue>,
@@ -204,12 +206,80 @@ pub struct CarrierInfo {
     pub(crate) first_mode: Option<crate::proto::seal::RecordMode>,
 }
 
+/// The largest plaintext of a Sealed record: its ciphertext, tag included, fits in 16 bits.
+pub(crate) const SEALED_MAX_RECORD: usize = u16::MAX as usize - 16;
+
+/// A pipe input's record limit after `with_max_record(max)` on one that had `current`
+/// (the specification's `MaxRecord` setting): 0 keeps the carrier's default, a value
+/// below 8192 is an invalid configuration (there is no upper bound: the limit is a cap that
+/// the peer's `max_record_size` and the implementation's own limit reduce), and the smaller
+/// of the two limits holds.
+pub(crate) fn checked_max_record(
+    current: Option<usize>,
+    max: usize,
+) -> Result<Option<usize>, crate::proto::session::InvalidConfig> {
+    crate::proto::session::check_max_record(max)?;
+    Ok(match max {
+        0 => current,
+        _ => Some(current.map_or(max, |c| c.min(max))),
+    })
+}
+
+/// The record limit a pipe's carrier reports, after its transforms' overhead, is at least
+/// the carrier record floor; otherwise the pipe cannot be attached.
+pub(crate) fn check_pipe_record_limit(
+    limit: Option<usize>,
+) -> Result<(), crate::proto::session::InvalidConfig> {
+    limit.map_or(Ok(()), crate::proto::session::check_record_limit)
+}
+
+/// The authentication tag of a Sealed record, and its length prefix on a byte stream.
+pub(crate) const SEALED_TAG: u16 = 16;
+pub(crate) const SEALED_LEN: u16 = 2;
+
+/// What a Sealed record adds over a carrier with `lower` framing: the tag, and a length
+/// prefix on a byte stream.
+pub(crate) fn sealed_overhead(lower: Framing) -> u16 {
+    SEALED_TAG
+        + if lower == Framing::ByteStream {
+            SEALED_LEN
+        } else {
+            0
+        }
+}
+
+/// The record limit of a Sealed transform over a carrier limited to `lower`: the Sealed
+/// maximum, or the carrier's limit less the `overhead` each Sealed record adds.
+pub(crate) fn sealed_max_record(lower: Option<usize>, overhead: u16) -> usize {
+    lower.map_or(SEALED_MAX_RECORD, |m| {
+        SEALED_MAX_RECORD.min(m.saturating_sub(overhead.into()))
+    })
+}
+
+/// The record limit a pipe ends with, from its carrier's `lower` limit and framing: a
+/// Sealed transform takes its overhead off. Checked with [`check_pipe_record_limit`].
+pub(crate) fn pipe_record_limit(
+    mode: crate::proto::seal::RecordMode,
+    lower: Option<usize>,
+    framing: Framing,
+) -> Option<usize> {
+    if mode == crate::proto::seal::RecordMode::Sealed {
+        lower.map(|_| sealed_max_record(lower, sealed_overhead(framing)))
+    } else {
+        lower
+    }
+}
+
 impl CarrierInfo {
     /// Records what the core keeps of the carrier on pipe `id`.
     pub(crate) fn describe(&self, core: &mut core::SessionCore, id: PipeId) {
         core.set_pipe_carrier(id, self.kind);
         core.set_pipe_variant(id, self.variant.clone());
         core.set_pipe_write_overhead(id, self.write_overhead);
+        if let Some(max) = self.max_record {
+            // Checked before: `connect` (`check_pipe_record_limit`).
+            let _ = core.set_pipe_max_record(id, max);
+        }
         core.shaping_spend_handshake(self.handshake_padding);
         core.set_pipe_admitted(id, self.admitted.clone());
     }
@@ -477,6 +547,7 @@ impl<D: Driver> State<D> {
                 "the exporter on a carrier without an exporter",
             )));
         }
+        check_pipe_record_limit(carrier.max_record).map_err(ConnectError::InvalidConfig)?;
         let events = EventQueue::new(&config);
         let mut window_hook = WindowHook::new(&config);
         // A tracer starts the hook context with the session.
@@ -2227,6 +2298,27 @@ impl<D: Driver> SendStream<D> {
         }
     }
 
+    /// `Ready` with the bytes a write takes now (more than 0), or with the
+    /// error that ended the part; `Pending` registers `waker` as the part's
+    /// writer, woken once it has room or ended.
+    fn poll_room(&self, waker: &Waker) -> Poll<Result<u64, StreamError>> {
+        let mut st = self.conn.lock();
+        match st.core.poll_write_room(self.key) {
+            Ok(0) => {
+                st.waiters.register_writer(self.key, waker);
+                st.after_command();
+                Poll::Pending
+            }
+            r => Poll::Ready(r),
+        }
+    }
+
+    pub(crate) fn writable_op(&self) -> impl Future<Output = Result<u64, StreamError>> + '_ {
+        StreamWait::new(&self.conn, self.key, true, move |w: &Waker| {
+            self.poll_room(w)
+        })
+    }
+
     pub(crate) fn send_capacity_op(
         &self,
         min: u64,
@@ -3200,6 +3292,9 @@ impl<D: Driver> SessionApi<D> for Session<D> {
                 "chose Unmanaged, which no pipe is joined in",
             )));
         }
+        // The limit the pipe ends with: a Sealed transform takes its overhead off.
+        let limit = pipe_record_limit(mode, c.max_record, input);
+        check_pipe_record_limit(limit).map_err(PipeError::InvalidOptions)?;
         // Read here, without the lock: the carrier's handshake completed.
         let binding = if mode == crate::proto::seal::RecordMode::Bound {
             if !c.secure || c.split {
@@ -3948,6 +4043,9 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn stats(&self) -> StreamStats;
     fn send_capacity(&self) -> u64;
     fn poll_send_capacity(&self, cx: &mut Context<'_>, min: u64) -> Poll<Result<u64, StreamError>>;
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>>;
+    fn try_write(&mut self, buf: &[u8]) -> Result<usize, StreamError>;
+    fn try_write_chunk(&mut self, chunk: &mut Bytes) -> Result<usize, StreamError>;
 }
 
 impl<D: Driver> SendStreamApi<D> for SendStream<D> {
@@ -4043,6 +4141,28 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
 
     fn poll_send_capacity(&self, cx: &mut Context<'_>, min: u64) -> Poll<Result<u64, StreamError>> {
         self.poll_capacity(cx.waker(), min)
+    }
+
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>> {
+        self.poll_room(cx.waker())
+    }
+
+    fn try_write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
+        let mut st = self.conn.lock();
+        let r = st.core.write(self.key, buf);
+        D::finish_write(&self.conn, st);
+        r
+    }
+
+    fn try_write_chunk(&mut self, chunk: &mut Bytes) -> Result<usize, StreamError> {
+        let mut st = self.conn.lock();
+        // Like `try_write`: whatever the outcome, the call ends with `finish_write`.
+        let r = st.core.write_chunk(self.key, chunk.clone());
+        if let Ok(n) = r {
+            chunk.advance(n);
+        }
+        D::finish_write(&self.conn, st);
+        r
     }
 }
 
@@ -4184,7 +4304,9 @@ macro_rules! sendstream_api {
             <Self as crate::driver::handle::SendStreamApi<$d>>::send_capacity(self)
         }
 
-        /// Polls for send capacity of at least `min` bytes, or of any while the
+        /// Polls for send capacity (credit, not room: see
+        /// [`poll_writable`](Self::poll_writable) for what a write takes) of
+        /// at least `min` bytes, or of any while the
         /// part holds nothing unsent (so that a peer window smaller than `min`
         /// cannot stall the caller); `Ready` with the capacity, or at once
         /// with the error that ended the part: a reset or finish, the peer's
@@ -4196,6 +4318,48 @@ macro_rules! sendstream_api {
             min: u64,
         ) -> ::std::task::Poll<Result<u64, crate::StreamError>> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::poll_send_capacity(self, cx, min)
+        }
+
+        /// Polls for room for a write: `Ready` with the bytes
+        /// [`try_write`](Self::try_write) takes now (more than 0), or at once
+        /// with the error that ended the part (a reset or finish, the
+        /// peer's `STOP_SENDING`, the session's end). `Pending` registers
+        /// `cx`'s waker as the part's writer, woken once the send buffers
+        /// have room for it or the part ended, as a write that waits is.
+        ///
+        /// Room is what a write is admitted by; credit only paces what
+        /// leaves the buffers, so room may be there while the
+        /// [`send_capacity`](Self::send_capacity) is 0, and the other way
+        /// round. With `try_write` it gives a fully cancel-safe write for
+        /// bindings: poll for room (the poll consumes nothing and may be
+        /// dropped at any point), then call `try_write` synchronously; on
+        /// `Ok(0)` other streams took the shared room first, and the next
+        /// poll waits for more.
+        pub fn poll_writable(
+            &self,
+            cx: &mut ::std::task::Context<'_>,
+        ) -> ::std::task::Poll<Result<u64, crate::StreamError>> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::poll_writable(self, cx)
+        }
+
+        /// Writes as much of `buf` as the send buffers take now, without
+        /// waiting: the bytes taken, `Ok(0)` when they have no room (or
+        /// `buf` is empty), or the error that ended the part. Never blocks
+        /// and takes no waker: a write that finds no room only has the session
+        /// record that the stream waits for room, and
+        /// [`poll_writable`](Self::poll_writable) waits for it with a waker.
+        pub fn try_write(&mut self, buf: &[u8]) -> Result<usize, crate::StreamError> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::try_write(self, buf)
+        }
+
+        /// The zero-copy form of [`try_write`](Self::try_write): takes as
+        /// much of `chunk` as fits now without copying and advances it past
+        /// the bytes taken; `Ok(0)` leaves it unchanged.
+        pub fn try_write_chunk(
+            &mut self,
+            chunk: &mut ::bytes::Bytes,
+        ) -> Result<usize, crate::StreamError> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::try_write_chunk(self, chunk)
         }
     };
 }
@@ -4416,5 +4580,37 @@ impl<D: Driver> std::fmt::Debug for Shared<D> {
 impl<D: Driver> std::fmt::Debug for WeakSession<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeakSession").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod record_limit_tests {
+    use super::{
+        SEALED_MAX_RECORD, check_pipe_record_limit, checked_max_record, sealed_max_record,
+    };
+
+    #[test]
+    fn the_record_limit_rule() {
+        assert_eq!(checked_max_record(None, 0), Ok(None));
+        assert_eq!(checked_max_record(Some(9000), 0), Ok(Some(9000)));
+        assert_eq!(checked_max_record(None, 8192), Ok(Some(8192)));
+        assert_eq!(checked_max_record(None, 65535), Ok(Some(65535)));
+        assert_eq!(checked_max_record(None, 1 << 20), Ok(Some(1 << 20)));
+        assert_eq!(checked_max_record(None, usize::MAX), Ok(Some(usize::MAX)));
+        assert_eq!(checked_max_record(Some(9000), 12000), Ok(Some(9000)));
+        assert_eq!(checked_max_record(Some(12000), 9000), Ok(Some(9000)));
+        for bad in [1, 512, 4096, 8191] {
+            assert!(checked_max_record(None, bad).is_err(), "{bad}");
+        }
+        assert_eq!(sealed_max_record(None, 18), SEALED_MAX_RECORD);
+        assert_eq!(sealed_max_record(Some(65535), 16), SEALED_MAX_RECORD);
+        assert_eq!(sealed_max_record(Some(usize::MAX), 16), SEALED_MAX_RECORD);
+        assert_eq!(sealed_max_record(Some(9000), 18), 8982);
+        // The limit after a transform's overhead is what the floor holds.
+        assert!(check_pipe_record_limit(None).is_ok());
+        assert!(check_pipe_record_limit(Some(8192)).is_ok());
+        assert!(check_pipe_record_limit(Some(8191)).is_err());
+        assert!(check_pipe_record_limit(Some(sealed_max_record(Some(8192), 18))).is_err());
+        assert!(check_pipe_record_limit(Some(sealed_max_record(Some(8210), 18))).is_ok());
     }
 }

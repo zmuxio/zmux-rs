@@ -124,6 +124,9 @@ pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 /// How much a `zmux_preamble` limit must stay below the sender's own
 /// `max_record_size`.
 pub const MAX_PREAMBLE_TP_OVERHEAD: u64 = 32;
+/// The most a `zmux_preamble` may say (EXTENSIONS Section 4.1): the carrier record floor
+/// (8192) less [`MAX_PREAMBLE_TP_OVERHEAD`].
+pub const MAX_PREAMBLE_FIELD: u64 = 8192 - MAX_PREAMBLE_TP_OVERHEAD;
 
 /// The GREASE parameter ID 31 * `n` + 27 (RFC 9000 Section 18.1), or `None`
 /// if it does not fit in a varint.
@@ -792,6 +795,9 @@ impl TransportParameters {
             if preamble < 1 {
                 return Err(err("zmux_preamble below 1"));
             }
+            if preamble > MAX_PREAMBLE_FIELD {
+                return Err(err("zmux_preamble above 8160"));
+            }
             if preamble > self.max_record_size_or_default() - MAX_PREAMBLE_TP_OVERHEAD {
                 return Err(err("zmux_preamble above max_record_size - 32"));
             }
@@ -1038,6 +1044,18 @@ mod tests {
             max_record_size: Some(ZMUX_MAX_RECORD_SIZE),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn preamble_field_is_capped_at_the_record_floor_less_32() {
+        let tp = |v| TransportParameters {
+            zmux_preamble: Some(v),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            ..zmux_default()
+        };
+        assert!(tp(MAX_PREAMBLE_FIELD).validate().is_ok());
+        assert!(tp(MAX_PREAMBLE_FIELD + 1).validate().is_err());
     }
 
     #[test]

@@ -5,10 +5,20 @@ use crate::proto::ident::{FirstBytes, classify_first_bytes};
 use crate::proto::record::Framing;
 use crate::proto::varint;
 
-/// Frames one unit: a 16-bit length on a byte stream, nothing on a message
-/// carrier.
+/// The handshake message floor (secure-carrier/SPEC.md Section 4.1): every handshake message
+/// is written in at most 8192 bytes, from its first byte through the end of its last unit,
+/// the carrier record floor. Receivers accept up to 65535.
+pub const HANDSHAKE_MESSAGE_FLOOR: usize = 8192;
+
+/// Frames one unit: a 16-bit length on a byte stream, nothing on a message carrier. `out`
+/// holds the header of the message so far: a message that comes to more than
+/// [`HANDSHAKE_MESSAGE_FLOOR`] bytes is `too_large`, and nothing is written.
 pub fn frame(framing: Framing, out: &mut Vec<u8>, unit: &[u8]) -> Result<(), Error> {
     let len = u16::try_from(unit.len()).map_err(|_| Error::TooLarge)?;
+    let prefix = if framing == Framing::ByteStream { 2 } else { 0 };
+    if out.len() + prefix + unit.len() > HANDSHAKE_MESSAGE_FLOOR {
+        return Err(Error::TooLarge);
+    }
     if framing == Framing::ByteStream {
         out.extend_from_slice(&len.to_be_bytes());
     }

@@ -438,7 +438,11 @@ pub enum StreamError {
     /// known when its identifier was due (the peer's parameters arrived
     /// after the open, below the limit assumed then): nothing was sent and
     /// the stream never opened; the session is unaffected.
-    PreambleTooLarge,
+    PreambleTooLarge {
+        /// The largest preamble the stream may carry: the peer's Maximum Preamble Size, at
+        /// most 4096 bytes and the carrier record floor less 32 (8160).
+        max: u64,
+    },
     /// This direction was already closed locally (finished, reset or
     /// stopped).
     ClosedLocally,
@@ -474,7 +478,7 @@ impl StreamError {
             Self::Rejected | Self::GoingAway => io::ErrorKind::ConnectionRefused,
             Self::ClosedLocally | Self::NotEstablished => io::ErrorKind::NotConnected,
             Self::NotNegotiated => io::ErrorKind::Unsupported,
-            Self::PreambleTooLarge => io::ErrorKind::InvalidInput,
+            Self::PreambleTooLarge { .. } => io::ErrorKind::InvalidInput,
             Self::Blocked => io::ErrorKind::WouldBlock,
             Self::SessionLost(e) => e.kind(),
         }
@@ -488,7 +492,7 @@ impl fmt::Display for StreamError {
             Self::Stopped(code) => write!(f, "stream stopped by peer with code {code}"),
             Self::Rejected => f.write_str("stream rejected; retryable"),
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
-            Self::PreambleTooLarge => f.write_str("preamble too large for the peer"),
+            Self::PreambleTooLarge { max } => write!(f, "preamble above the {max}-byte limit"),
             Self::ClosedLocally => f.write_str("stream direction closed locally"),
             Self::NotNegotiated => f.write_str("not negotiated with the peer"),
             Self::NotEstablished => f.write_str("session not established"),
@@ -531,8 +535,11 @@ pub enum OpenError {
     /// The preamble, with room for a PRIORITY and a GREASE TLV, is larger
     /// than the limit known now: the peer's Maximum Preamble Size (before
     /// its parameters, the remembered one or the 1024-byte floor), at most
-    /// 4096 bytes and one record.
-    PreambleTooLarge,
+    /// 4096 bytes and the record floor less 32.
+    PreambleTooLarge {
+        /// The largest preamble the session takes now.
+        max: u64,
+    },
     /// The preamble is not valid for the stream: a TLV type outside the
     /// application range (0x1000 to 0x3fff) or a GREASE value, or
     /// `PIPE_CARRIER` on a unidirectional stream.
@@ -561,7 +568,7 @@ impl fmt::Display for OpenError {
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::NotNegotiated => f.write_str("preambles not negotiated with the peer"),
-            Self::PreambleTooLarge => f.write_str("preamble too large for the peer"),
+            Self::PreambleTooLarge { max } => write!(f, "preamble above the {max}-byte limit"),
             Self::InvalidArgument => f.write_str("preamble not valid for this stream"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
         }
@@ -584,7 +591,9 @@ impl From<OpenError> for io::Error {
             OpenError::GoingAway => io::ErrorKind::ConnectionRefused,
             OpenError::NotEstablished => io::ErrorKind::NotConnected,
             OpenError::NotNegotiated => io::ErrorKind::Unsupported,
-            OpenError::PreambleTooLarge | OpenError::InvalidArgument => io::ErrorKind::InvalidInput,
+            OpenError::PreambleTooLarge { .. } | OpenError::InvalidArgument => {
+                io::ErrorKind::InvalidInput
+            }
             OpenError::SessionLost(s) => s.kind(),
         };
         io::Error::new(kind, e)

@@ -1528,19 +1528,25 @@ pub(crate) enum GoAwayFail {
     /// Neither emitted nor pinned when the GOAWAY arrived: it never opens
     /// ("going away").
     GoingAway,
-    /// Its preamble no longer fits the peer's limit when its identifier
-    /// was due (the peer's parameters arrived after the open): it never
-    /// opens.
-    PreambleTooLarge,
+    /// Its preamble no longer fits the peer's limit (the field, at most 8160) when its
+    /// identifier was due (the peer's parameters arrived after the open): it never opens.
+    PreambleTooLarge(u16),
 }
 
 impl GoAwayFail {
+    /// A preamble over the limit `max` (at most 8160).
+    pub(crate) fn too_large(max: u64) -> Self {
+        Self::PreambleTooLarge(u16::try_from(max).unwrap_or(u16::MAX))
+    }
+
     /// The error the stream's operations report.
     pub(crate) fn error(self) -> super::StreamError {
         match self {
             Self::Rejected => super::StreamError::Rejected,
             Self::GoingAway => super::StreamError::GoingAway,
-            Self::PreambleTooLarge => super::StreamError::PreambleTooLarge,
+            Self::PreambleTooLarge(max) => super::StreamError::PreambleTooLarge {
+                max: u64::from(max),
+            },
         }
     }
 }

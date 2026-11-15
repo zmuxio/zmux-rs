@@ -778,7 +778,9 @@ pub struct Config {
     /// value below `send_buffer` is a configuration error.
     pub send_buffer_max: Cap,
     /// The largest Frames field of the records this endpoint sends, before
-    /// the peer's `max_record_size` caps it (default 16382, one TLS record).
+    /// the peer's `max_record_size` caps it (default 16382, one TLS record; at least
+    /// 8192, the carrier record floor, and no upper bound: a cap that the peer's limit
+    /// reduces).
     pub max_send_record: usize,
     /// The attachments this endpoint aims for with its own joins. 1 (the
     /// default) keeps multipath off; 8 is the recommended value when
@@ -801,8 +803,9 @@ pub struct Config {
     pub epoch_policy: crate::proto::session::EpochPolicy,
     /// The first batch of a Hello, in bytes (default 8 KiB; `None` turns it
     /// off; a set value is at least 1): larger ones outgrow the first
-    /// congestion window and delay both the Hello and the Reply. A first
-    /// batch has no forward secrecy: a host whose data needs it turns it off.
+    /// congestion window and delay both the Hello and the Reply. The batch is cut to what
+    /// the Hello's handshake message floor of 8192 bytes leaves after its Locator and key
+    /// share. A first batch has no forward secrecy: a host whose data needs it turns it off.
     pub join_early_hello: Option<usize>,
     /// Chooses the record mode of each carrier this endpoint joins; unset is always
     /// Sealed. [`PipeOptions::record_mode`](crate::PipeOptions::record_mode) wins over it.
@@ -1506,11 +1509,8 @@ impl Config {
                 "a window or timeout is too large to encode",
             ));
         }
-        if !(1024..=65535).contains(&self.max_send_record) {
-            return Err(crate::InvalidConfig::new(
-                "max_send_record",
-                "outside 1024..=65535",
-            ));
+        if self.max_send_record < super::RECORD_FLOOR {
+            return Err(crate::InvalidConfig::new("max_send_record", "below 8192"));
         }
         if self.send_buffer == 0 {
             return Err(crate::InvalidConfig::new("send_buffer", "zero"));

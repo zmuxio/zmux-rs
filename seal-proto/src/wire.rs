@@ -1,6 +1,9 @@
 //! The Establish Hello.
 
-use zmux::proto::seal::{Error, Framing, RecordMode, cut_frame, frame, put_varint, read_shortest};
+use zmux::proto::seal::{
+    Error, Framing, HANDSHAKE_MESSAGE_FLOOR, RecordMode, cut_frame, frame, put_varint,
+    read_shortest,
+};
 
 use crate::Profile;
 
@@ -124,14 +127,31 @@ pub(crate) fn handle_fits(profile: Profile, handle: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn write_hello(
-    framing: Framing,
-    profile: Profile,
-    mode: RecordMode,
-    handle: &[u8],
-    noise: &[u8],
-) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(noise.len() + handle.len() + 8);
+/// The room the Noise message of a handshake message has under the handshake message
+/// floor, once `header` (a Hello's Profile, Mode and Handle; 0 for any other message) and
+/// the unit's length prefix are counted. [`frame`] is the authority on the whole message;
+/// this reserves the same bytes, so that a message too large fails before it is signed.
+pub(crate) fn noise_room(framing: Framing, header: usize) -> usize {
+    let prefix = if framing == Framing::ByteStream { 2 } else { 0 };
+    HANDSHAKE_MESSAGE_FLOOR.saturating_sub(header + prefix)
+}
+
+/// The length of a Hello's header: its Profile, Mode and Handle.
+pub(crate) fn hello_header_len(profile: Profile) -> usize {
+    hello_header(
+        profile,
+        RecordMode::Sealed,
+        &[0; HANDLE_LEN][..handle_len(profile)],
+    )
+    .len()
+}
+
+fn handle_len(profile: Profile) -> usize {
+    if profile.has_handle() { HANDLE_LEN } else { 0 }
+}
+
+fn hello_header(profile: Profile, mode: RecordMode, handle: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(handle.len() + 8);
     let value = profile.value();
     if let Ok(b) = u8::try_from(value)
         && b < ESCAPE
@@ -145,6 +165,17 @@ pub(crate) fn write_hello(
     if profile.has_handle() {
         out.extend_from_slice(handle);
     }
+    out
+}
+
+pub(crate) fn write_hello(
+    framing: Framing,
+    profile: Profile,
+    mode: RecordMode,
+    handle: &[u8],
+    noise: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut out = hello_header(profile, mode, handle);
     frame(framing, &mut out, noise)?;
     Ok(out)
 }

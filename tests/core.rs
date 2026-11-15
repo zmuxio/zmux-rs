@@ -349,6 +349,53 @@ fn send_capacity_is_credit_left_minus_unsent_and_session_credit_wakes_it() {
     assert!(p.a.send_capacity(s).is_err(), "a part that ended has none");
 }
 
+/// Write readiness is the room a write takes, not credit: a full send
+/// buffer with credit left is not ready (and registers for the drain),
+/// the drain makes it ready with what a write then takes, and room with no
+/// credit is ready, as the write takes it too.
+#[test]
+fn write_room_is_what_a_write_takes_not_credit() {
+    let mut b_cfg = Config::default();
+    b_cfg.initial_stream_receive_window = 64 * 1024;
+    b_cfg.max_stream_receive_window = zmux::Cap::Fixed(64 * 1024);
+    let mut p = Pair::with_events(Config::default(), b_cfg);
+    let s = p.a.open(Dir::Bidi).unwrap();
+    p.a.set_send_buffer(s, 16 * 1024).unwrap();
+    let big = vec![7u8; 128 * 1024];
+    let room = p.a.poll_write_room(s).unwrap();
+    assert!(room > 0 && room < 64 * 1024, "{room}");
+    assert_eq!(
+        p.a.write(s, &big).unwrap() as u64,
+        room,
+        "takes what it said"
+    );
+    // Full buffer, credit left: not ready, and the write agrees.
+    assert!(p.a.send_capacity(s).unwrap().capacity > 0);
+    p.events_a.clear();
+    assert_eq!(p.a.poll_write_room(s).unwrap(), 0);
+    assert_eq!(p.a.write(s, b"x").unwrap(), 0);
+    p.pump();
+    assert!(
+        p.events_a
+            .iter()
+            .any(|e| matches!(e, CoreEvent::StreamWritable(k) if *k == s)),
+        "the drain wakes the room wait"
+    );
+    // Use up the credit (nothing is read, so none comes back).
+    while p.a.send_capacity(s).unwrap().capacity > 0 {
+        let room = p.a.poll_write_room(s).unwrap();
+        assert!(room > 0, "drained");
+        assert_eq!(p.a.write(s, &big).unwrap() as u64, room);
+        p.pump();
+    }
+    // No credit, but room: ready, and the write takes it.
+    let room = p.a.poll_write_room(s).unwrap();
+    assert!(room > 0, "room without credit");
+    assert_eq!(p.a.write(s, &big).unwrap() as u64, room);
+    p.a.reset(s, VarInt::from_u32(1)).unwrap();
+    assert!(p.a.poll_write_room(s).is_err(), "an ended part reports why");
+}
+
 /// A capacity wait is ready with any capacity once
 /// the part holds nothing unsent. Sending changes no credit, and 3 KiB
 /// read of a 16 KiB window earns no `MAX_STREAM_DATA` (the W/4 rule), so
@@ -623,9 +670,9 @@ fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
     ));
     // A carrier whose records are smaller than the peer's bound (a TLS
     // record) bounds the datagrams with them.
-    p.a.set_pipe_max_record(P0, 1000);
+    p.a.set_pipe_max_record(P0, 8192).unwrap();
     let capped = p.a.max_datagram_size().unwrap();
-    assert!(capped < 1000, "{capped}");
+    assert!(capped < max && capped < 8192, "{capped}");
     assert_eq!(datagram_through(&mut p, capped), Some(capped));
     assert!(
         p.a.send_datagram(Bytes::from(vec![0; capped + 1]), true)
@@ -640,7 +687,7 @@ fn a_datagram_no_carrier_takes_any_more_is_dropped_without_holding_the_queue() {
     let max = p.a.max_datagram_size().unwrap();
     assert!(p.a.send_datagram(Bytes::from(vec![1; max]), true).unwrap());
     // The carrier's records shrink before its turn.
-    p.a.set_pipe_max_record(P0, 1000);
+    p.a.set_pipe_max_record(P0, 8192).unwrap();
     assert_eq!(datagram_through(&mut p, 10), Some(10));
     assert_eq!(p.b.recv_datagram().unwrap(), None);
     assert_eq!(p.a.stats().datagrams_dropped_send, 1);

@@ -546,6 +546,12 @@ impl Listener {
         if !session.join_allowed(&info, &join, admitted.as_ref()) {
             return Err(HandleError::Rejected);
         }
+        // A carrier limit the Sealed overhead takes below the record floor refuses the
+        // join, as it does an added pipe.
+        let limit = super::handle::pipe_record_limit(join.mode(), pipe.record_limit(), framing);
+        if super::handle::check_pipe_record_limit(limit).is_err() {
+            return Err(HandleError::Refused);
+        }
         let carrier = PeerCarrier {
             inbound: pipe.has_reader().then_some(framing),
             outbound: pipe.has_writer().then_some(framing),
@@ -619,7 +625,12 @@ impl Listener {
         io.keep_directions(want_in, want_out);
         if let Some(m) = io.record_limit() {
             let mut st = session.lock();
-            st.core.set_pipe_max_record(attached, m);
+            // Fits: checked against the join's mode before it was confirmed.
+            if st.core.set_pipe_max_record(attached, m).is_err() {
+                st.core.abandon_pipe_for_limit(attached, Instant::now());
+                st.after_command();
+                return Err(HandleError::Refused);
+            }
             st.core.set_pipe_write_overhead(attached, io.overhead());
         }
         if spawn_pipe(&session, attached.0, io).is_err() {

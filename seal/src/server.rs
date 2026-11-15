@@ -327,7 +327,7 @@ impl ServerConfig {
             &plan,
             (1, profile),
             &message_items(&value, &own, &proof),
-            |noise| message_len(stream, noise, over),
+            (|noise| message_len(stream, noise, over), over),
             &mut padded,
         )
         .map_err(|e| refuse(e.class()))?;

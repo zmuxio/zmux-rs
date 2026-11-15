@@ -51,6 +51,8 @@ struct LanePair {
     /// Holds A's lane 0 batches instead of delivering them (a carrier that
     /// delays one stream of the connection), in order.
     hold_a0: Option<Vec<Vec<u8>>>,
+    /// The largest record (its Size) either side wrote on any lane.
+    widest: usize,
 }
 
 impl LanePair {
@@ -75,6 +77,7 @@ impl LanePair {
             first_a: std::collections::HashMap::new(),
             refuse: false,
             hold_a0: None,
+            widest: 0,
         };
         p.run(Duration::from_millis(100));
         assert!(p.a.is_established() && p.b.is_established());
@@ -128,6 +131,11 @@ impl LanePair {
                 }
                 self.wire.clear();
                 self.out.copy_to_vec(&mut self.wire);
+                let mut at_byte = 0;
+                while let Some((size, n)) = zmux::proto::varint::decode(&self.wire[at_byte..]) {
+                    self.widest = self.widest.max(size as usize);
+                    at_byte += n + size as usize;
+                }
                 if a_to_b && lane != 0 {
                     first_a.entry(lane).or_insert(self.wire.len());
                 }
@@ -243,6 +251,60 @@ fn bulk_streams_spread_over_lanes_and_keep_their_order_without_multipath() {
     assert!(info.lanes_out > 1, "lanes opened: {info:?}");
     assert_eq!(info.lanes_refused, 0);
     assert_eq!(p.b.pipe_info(P0).unwrap().lanes_in, info.lanes_out);
+}
+
+/// The pipe's carrier record limit holds on every lane, as on lane 0: records of at most
+/// 8192 bytes everywhere, and the data still arrives.
+#[test]
+fn every_lane_keeps_the_pipe_s_record_limit() {
+    const CAP: usize = 8192;
+    let mut p = LanePair::new(Config::default(), Config::default());
+    p.a.set_pipe_max_record(P0, CAP).unwrap();
+    p.b.set_pipe_max_record(P0, CAP).unwrap();
+    const STREAMS: usize = 4;
+    const LEN: usize = 192 * 1024;
+    let keys: Vec<StreamKey> = (0..STREAMS).map(|_| p.a.open(Dir::Uni).unwrap()).collect();
+    let data: Vec<Vec<u8>> = (0..STREAMS).map(|i| pattern(i, LEN)).collect();
+    let mut written = [0usize; STREAMS];
+    let mut got: Vec<Vec<u8>> = vec![Vec::new(); STREAMS];
+    let mut peers: [Option<StreamKey>; STREAMS] = [None; STREAMS];
+    let mut done = 0;
+    for _ in 0..20_000 {
+        for i in 0..STREAMS {
+            if written[i] < LEN {
+                let end = (written[i] + 8192).min(LEN);
+                if let Ok(n) = p.a.write(keys[i], &data[i][written[i]..end]) {
+                    written[i] += n;
+                    if written[i] == LEN {
+                        p.a.finish(keys[i]).unwrap();
+                    }
+                }
+            }
+        }
+        p.run(Duration::from_millis(1));
+        while let Ok(Some(k)) = p.b.accept(Dir::Uni) {
+            let id = p.b.peek_stream_id(k).unwrap();
+            peers[(id >> 2) as usize] = Some(k);
+        }
+        for i in 0..STREAMS {
+            if let Some(k) = peers[i]
+                && got[i].len() < LEN
+                && LanePair::read_all(&mut p.b, k, &mut got[i])
+            {
+                done += 1;
+            }
+        }
+        if done == STREAMS {
+            break;
+        }
+    }
+    for i in 0..STREAMS {
+        assert!(got[i] == data[i], "stream {i} arrived whole and in order");
+    }
+    assert!(p.a.pipe_info(P0).unwrap().lanes_out > 1, "lanes opened");
+    assert!(p.widest <= CAP, "a record of {} bytes", p.widest);
+    assert!(p.widest > CAP / 2, "records were filled: {}", p.widest);
+    assert!(p.a.state() < State::Closing, "{:?}", p.a.error());
 }
 
 /// A stream's data written on lane 0 in the very batch whose scheduling

@@ -707,7 +707,8 @@ fn a_closing_session_ends_a_prepared_join() {
     assert!(r.is_err());
 }
 
-/// A first batch above what a Hello's ciphertext holds does not fail the join.
+/// A first batch above what a Hello's ciphertext holds does not fail the join, and the Hello
+/// stays within the handshake message floor of 8192 bytes.
 #[test]
 fn an_early_limit_beyond_the_ciphertext_keeps_the_join() {
     let mut a = config();
@@ -726,11 +727,50 @@ fn an_early_limit_beyond_the_ciphertext_keeps_the_join() {
     let hello =
         p.a.join_hello(id, (Framing::ByteStream, 0), &plan, now)
             .unwrap();
-    assert!(hello.len() > 60_000, "{}", hello.len());
+    assert!((7_000..=8192).contains(&hello.len()), "{}", hello.len());
     assert!(matches!(
         open(&mut p.b, &hello, &[], now),
         OpenedHello::Verified(_)
     ));
+}
+
+/// With Group 2, the largest Locator and the default 8 KiB first batch, the Hello is at most
+/// 8192 bytes as written, the batch cut to the room the key share leaves, and the join
+/// verifies; a Reply stays within the floor too.
+#[test]
+fn a_hello_with_the_largest_locator_and_a_full_batch_fits_the_floor() {
+    let mut client = config();
+    client.resume_timeout = Some(Duration::from_secs(60));
+    let mut server = config();
+    server.resume_timeout = client.resume_timeout;
+    server.test_hooks().locator = vec![b'L'; 255];
+    let mut p = core_pair::CorePair::new(client, server);
+    let now = p.now;
+    let k = p.a.open(zmux::proto::frame::Dir::Bidi).unwrap();
+    assert!(p.a.write(k, &vec![7; 128 << 10]).unwrap() >= 66_000);
+    p.a.write_failed(PipeId::new(0), std::io::ErrorKind::BrokenPipe, now);
+    let (id, name) = prepared(&mut p.a, RecordMode::Sealed, now);
+    assert_eq!(name, "hello_early");
+    let hello =
+        p.a.join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now)
+            .unwrap();
+    assert!(
+        (6_000..=8192).contains(&hello.len()),
+        "{} bytes",
+        hello.len()
+    );
+    let OpenedHello::Verified(mut join) = open(&mut p.b, &hello, &[], now) else {
+        panic!("not verified");
+    };
+    let mut c = carrier();
+    c.received = hello.len();
+    let ClaimedHello::Accept(reply) =
+        p.b.claim_hello(&mut join, c, &UnitPlan::new(60_000, 0, 0), now)
+    else {
+        panic!("not accepted");
+    };
+    // A plan of 60000 bytes is cut to the floor (and to three times the Hello received).
+    assert!(reply.len() <= 8192, "{}", reply.len());
 }
 
 /// Every refused join stalls for the listener's join timeout from its refusal: a Hello that

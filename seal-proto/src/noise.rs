@@ -255,9 +255,11 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    /// `room` is what the Noise message may take of the handshake message floor
+    /// ([`crate::wire::noise_room`]); one read may be up to `MAX_UNIT`.
+    pub(crate) fn write_message(&mut self, payload: &[u8], room: usize) -> Result<Vec<u8>, Error> {
         let tokens = self.write_tokens()?;
-        self.write_payload(tokens, payload)
+        self.write_payload(tokens, payload, room)
     }
 
     /// The index of the next message.
@@ -331,12 +333,13 @@ impl Engine {
         &mut self,
         mut out: Vec<u8>,
         payload: &[u8],
+        room: usize,
     ) -> Result<Vec<u8>, Error> {
-        if self.message_len(out.len(), payload.len()) > MAX_UNIT {
+        if self.message_len(out.len(), payload.len()) > room {
             return Err(Error::TooLarge);
         }
         out.extend(self.sym.encrypt_and_hash(payload)?);
-        if out.len() > MAX_UNIT {
+        if out.len() > room {
             return Err(Error::TooLarge);
         }
         self.next_message += 1;

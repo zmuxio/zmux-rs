@@ -78,7 +78,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
 #     cargo test --lib --release loom
 [target.'cfg(loom)'.dev-dependencies]
-loom = { version = "0.7.2", features = ["futures"] }
+loom = { version = "0.7.3", features = ["futures"] }
 
 # Randomized schedules of the std driver's thread protocol
 # (src/driver/shuttle.rs, the driver's thread-protocol schedule exploration):

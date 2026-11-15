@@ -230,6 +230,53 @@ fn spread_over_two_pipes_and_survive_a_failure() {
     );
 }
 
+/// Every pipe at the carrier record floor (8192 bytes), with a 255-byte Locator: the
+/// session establishes, a pipe joins, acknowledgements and data move, and no frame is left
+/// unwritable for its size. (The epoch exchange needs Sealed or Bound pipes; the driver
+/// test `a_sealed_join_keeps_the_carrier_record_limit` runs over them.)
+#[test]
+fn every_pipe_at_the_record_floor_moves_data() {
+    const FLOOR: usize = 8192;
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = vec![b'L'; 255];
+    let mut n = Net::new(config(Scheduler::SpreadEta, false), b_cfg, Book::default());
+    for e in &mut n.ends {
+        e.set_pipe_max_record(PipeId::new(0), FLOOR).unwrap();
+    }
+    n.pump(10);
+    assert!(n.ends[A].is_multipath() && n.ends[B].is_multipath());
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.ends[A]
+        .set_pipe_max_record(PipeId::new(id), FLOOR)
+        .unwrap();
+    n.pump(10);
+    n.ends[B]
+        .set_pipe_max_record(PipeId::new(id), FLOOR)
+        .unwrap();
+    for _ in 0..4 {
+        n.open_and_write(100_000, true);
+    }
+    n.settle();
+    n.check_prefix();
+    n.check_application_bytes();
+    for (tag, sent) in &n.s.sent {
+        assert_eq!(
+            n.s.recv.get(tag).map_or(0, Vec::len),
+            sent.len(),
+            "stream {tag}"
+        );
+    }
+    for e in &n.ends {
+        let st = e.stats();
+        assert!(st.records_sent > 0);
+    }
+    assert!(
+        n.ends[A].state() < State::Closing,
+        "{:?}",
+        n.ends[A].error()
+    );
+}
+
 /// A request lost with its
 /// pipe stops being outstanding; a ping still waiting asks again on the
 /// pipes left, so it is answered.

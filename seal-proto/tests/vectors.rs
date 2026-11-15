@@ -239,16 +239,27 @@ fn run_handshake(v: &Value, framing: Framing) {
         |k, r| verify.check_proof(k, r),
     );
     let finish = verify.accept();
-    let (finish, init_done) = match signer(&msgs[2]) {
-        Some(k) => {
-            let s = finish.write_finish_signed(&p(2)).unwrap();
-            let sig = sign(name, &msgs[2], &k, s.message());
-            s.finish(&sig).unwrap()
-        }
-        None => finish.write_finish(&p(2)).unwrap(),
+    // A message over the handshake message floor of 8192 bytes is read, never written.
+    let too_large = hx(&msgs[2], key).len() > 8192;
+    let init_done = if too_large {
+        assert!(
+            matches!(finish.write_finish(&p(2)), Err(Error::TooLarge)),
+            "{name}: a Finish over the floor is too_large"
+        );
+        None
+    } else {
+        let (f, d) = match signer(&msgs[2]) {
+            Some(k) => {
+                let s = finish.write_finish_signed(&p(2)).unwrap();
+                let sig = sign(name, &msgs[2], &k, s.message());
+                s.finish(&sig).unwrap()
+            }
+            None => finish.write_finish(&p(2)).unwrap(),
+        };
+        check_step(name, &msgs[2], &f, framing, d.transcript());
+        check_complete(v, &d);
+        Some(d)
     };
-    check_step(name, &msgs[2], &finish, framing, init_done.transcript());
-    check_complete(v, &init_done);
 
     let (reply, payload) = responder(v, framing, &hx(&msgs[0], key)).unwrap();
     assert_eq!(payload.as_bytes(), p(0), "{name}: r reads payload 1");
@@ -286,6 +297,9 @@ fn run_handshake(v: &Value, framing: Framing) {
     check_step(name, &msgs[2], &finish, framing, resp_done.transcript());
     check_complete(v, &resp_done);
 
+    let Some(init_done) = init_done else {
+        return;
+    };
     match (init_done.into_records(), resp_done.into_records()) {
         (Some((mut is, mut io)), Some((mut rs, mut ro))) => {
             assert_eq!(ro.open(&is.seal(b"up").unwrap()).unwrap(), b"up", "{name}");

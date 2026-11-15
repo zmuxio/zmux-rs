@@ -916,11 +916,21 @@ impl PipeIo {
     }
 
     /// The largest record plaintext the carrier takes, applied beside the peer's
-    /// `max_record_size`.
-    #[must_use]
-    pub fn with_max_record(mut self, max: usize) -> Self {
-        self.max_record = Some(max);
-        self
+    /// `max_record_size` on every pipe this input becomes, a session's first included.
+    /// 0 keeps the carrier's default; the smaller of `max` and a limit the carrier already
+    /// has holds, and a Sealed transform above keeps it less its overhead.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`](crate::InvalidConfig) for a value below 8192 (the carrier record
+    /// floor; there is no upper bound, the peer's `max_record_size` and the record limit of
+    /// the implementation reduce it); it is never clamped. A pipe whose limit, less a Sealed
+    /// transform's overhead, is below 8192 is refused when it is added or joined
+    /// ([`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions); a listener's join
+    /// is refused).
+    pub fn with_max_record(mut self, max: usize) -> Result<Self, crate::InvalidConfig> {
+        self.max_record = super::handle::checked_max_record(self.max_record, max)?;
+        Ok(self)
     }
 
     /// The framing of the carrier's handshake units.
@@ -1745,6 +1755,7 @@ impl Driver for Tokio {
             kind: carrier.carrier,
             variant: carrier.variant.take(),
             write_overhead: carrier.write_overhead,
+            max_record: carrier.max_record,
             handshake_padding: carrier.handshake_padding,
             admitted: carrier.admitted.take().map(|v| *v),
             secure: carrier.secure,
@@ -1993,13 +2004,18 @@ async fn join_carrier(shared: Arc<Shared<Tokio>>, id: PipeId, mut pipe: PipeIo) 
                     if let Some((s, o)) = records {
                         io = seal_carrier(io, s, o);
                     }
-                    let (inbound, outbound) = {
+                    let limits = {
                         let mut st = shared_ref.lock();
-                        if let Some(m) = io.max_record {
-                            st.core.set_pipe_max_record(id, m);
-                        }
+                        // Checked when the pipe was added (`check_pipe_record_limit`).
+                        let fit = io
+                            .max_record
+                            .is_none_or(|m| st.core.set_pipe_max_record(id, m).is_ok());
                         st.core.set_pipe_write_overhead(id, io.write_overhead);
-                        st.core.pipe_directions(id)
+                        fit.then(|| st.core.pipe_directions(id))
+                    };
+                    let Some((inbound, outbound)) = limits else {
+                        failed(io::ErrorKind::InvalidInput);
+                        return;
                     };
                     io.end_unused(inbound, outbound).await;
                     if claim_carrier(shared_ref, id.0, io.outer.take()).is_err()
@@ -2031,10 +2047,16 @@ impl PipeIo {
 
 impl Shared<Tokio> {
     /// A Sealed carrier's limit and overhead, before the pipe's first record.
-    pub(crate) fn set_pipe_limits(&self, p: PipeId, max: usize, overhead: u16) {
+    pub(crate) fn set_pipe_limits(
+        &self,
+        p: PipeId,
+        max: usize,
+        overhead: u16,
+    ) -> Result<(), crate::InvalidConfig> {
         let mut st = self.lock();
-        st.core.set_pipe_max_record(p, max);
+        st.core.set_pipe_max_record(p, max)?;
         st.core.set_pipe_write_overhead(p, overhead);
+        Ok(())
     }
 
     /// Gives up a pipe whose carrier could not be attached (the session
@@ -4885,6 +4907,14 @@ impl SendStream {
     pub async fn wait_send_capacity(&self, min: u64) -> Result<u64, StreamError> {
         self.send_capacity_op(min).await
     }
+
+    /// Waits until the send buffers have room for a write and returns the
+    /// bytes [`try_write`](Self::try_write) takes now (see
+    /// [`poll_writable`](Self::poll_writable)); resolves at once with the
+    /// error that ended the part. Cancel-safe: it consumes nothing.
+    pub async fn writable(&self) -> Result<u64, StreamError> {
+        self.writable_op().await
+    }
 }
 
 impl AsyncWrite for SendStream {
@@ -5028,12 +5058,14 @@ mod tests {
         let half = |overhead: u16, max: usize, read: bool| {
             let p = PipeIo::chunk_writer(ChunkTestWriter)
                 .with_write_overhead(overhead)
-                .with_max_record(max);
+                .with_max_record(max)
+                .unwrap();
             if read {
                 let (r, _w) = tokio::io::duplex(8);
                 let mut p = PipeIo::from_halves(r, tokio::io::sink())
                     .with_write_overhead(overhead)
-                    .with_max_record(max);
+                    .with_max_record(max)
+                    .unwrap();
                 p.writer = None;
                 p
             } else {
@@ -5041,12 +5073,18 @@ mod tests {
             }
         };
         // A listener's uplink is the half it reads.
-        let p = PipeIo::paired(half(9, 900, true).with_variant("up"), half(5, 500, false));
-        assert_eq!((p.write_overhead, p.max_record), (5, Some(500)));
+        let p = PipeIo::paired(
+            half(9, 12000, true).with_variant("up"),
+            half(5, 9000, false),
+        );
+        assert_eq!((p.write_overhead, p.max_record), (5, Some(9000)));
         assert_eq!(p.variant().map(|v| &**v), Some("up"));
         // A joiner's uplink is the half it writes.
-        let p = PipeIo::paired(half(5, 500, false).with_variant("up"), half(9, 900, true));
-        assert_eq!((p.write_overhead, p.max_record), (5, Some(500)));
+        let p = PipeIo::paired(
+            half(5, 9000, false).with_variant("up"),
+            half(9, 12000, true),
+        );
+        assert_eq!((p.write_overhead, p.max_record), (5, Some(9000)));
         assert_eq!(p.variant().map(|v| &**v), Some("up"));
     }
 

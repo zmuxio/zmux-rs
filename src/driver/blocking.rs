@@ -352,10 +352,10 @@ impl PipeIo {
                 unit: Vec::new(),
             }) as Box<dyn Write + Send>
         });
-        let overhead = 16 + if framing == Framing::ByteStream { 2 } else { 0 };
+        let overhead = super::handle::sealed_overhead(framing);
         self.write_overhead = self.write_overhead.saturating_add(overhead);
         self.framing = Framing::Records;
-        self.max_record = Some(u16::MAX as usize - 16);
+        self.max_record = Some(super::handle::sealed_max_record(self.max_record, overhead));
         self.exporter = None;
         self
     }
@@ -617,6 +617,24 @@ impl PipeIo {
     pub fn with_write_overhead(mut self, bytes: u16) -> Self {
         self.write_overhead = bytes;
         self
+    }
+
+    /// The largest record plaintext the carrier takes, applied beside the peer's
+    /// `max_record_size` on every pipe this input becomes, a session's first included.
+    /// 0 keeps the carrier's default; the smaller of `max` and a limit the carrier already
+    /// has holds, and a Sealed transform above keeps it less its overhead.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`](crate::InvalidConfig) for a value below 8192 (the carrier record
+    /// floor; there is no upper bound, the peer's `max_record_size` and the record limit of
+    /// the implementation reduce it); it is never clamped. A pipe whose limit, less a Sealed
+    /// transform's overhead, is below 8192 is refused when it is added or joined
+    /// ([`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions); a listener's join
+    /// is refused).
+    pub fn with_max_record(mut self, max: usize) -> Result<Self, crate::InvalidConfig> {
+        self.max_record = super::handle::checked_max_record(self.max_record, max)?;
+        Ok(self)
     }
 
     /// Declares that the carrier bounds what it holds unsent itself, as a
@@ -895,6 +913,7 @@ impl Driver for Blocking {
             kind: carrier.carrier,
             variant: carrier.variant.take(),
             write_overhead: carrier.write_overhead,
+            max_record: carrier.max_record,
             handshake_padding: carrier.handshake_padding,
             secure: carrier.secure,
             split: carrier.split,
@@ -1306,8 +1325,9 @@ fn join_thread(shared: &Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clo
                 }
                 let gone = {
                     let mut st = shared.lock();
+                    // Checked when the pipe was added (`check_pipe_record_limit`).
                     if let Some(m) = pipe.max_record {
-                        st.core.set_pipe_max_record(id, m);
+                        let _ = st.core.set_pipe_max_record(id, m);
                     }
                     st.core.set_pipe_write_overhead(id, pipe.write_overhead);
                     // The session or the attachment may have ended while the Confirm was
@@ -2166,9 +2186,6 @@ impl Session {
             State::new(config.into(), role, transport, locator, carrier, io)?,
             (),
         ));
-        if let Some(m) = pipe.max_record {
-            shared.lock().core.set_pipe_max_record(PipeId(0), m);
-        }
         register(&shared);
         // The handle counted first: if a thread cannot be started, dropping
         // it closes the session, and the threads started end.
@@ -2591,6 +2608,14 @@ impl SendStream {
     /// timeout bounds the wait.
     pub fn wait_send_capacity(&self, min: u64) -> Result<u64, WaitError<StreamError>> {
         call_timeout(self.timeout, self.send_capacity_op(min))
+    }
+
+    /// Waits until the send buffers have room for a write and returns the
+    /// bytes [`try_write`](Self::try_write) takes now (see
+    /// [`poll_writable`](Self::poll_writable)); returns at once with the
+    /// error that ended the part. The write timeout bounds the wait.
+    pub fn wait_writable(&self) -> Result<u64, WaitError<StreamError>> {
+        call_timeout(self.timeout, self.writable_op())
     }
 }
 
