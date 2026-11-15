@@ -2680,6 +2680,10 @@ impl Read for RecvStream {
     }
 }
 
+// The doc link of the generated `resolve_duplicate`.
+#[cfg(doc)]
+use crate::helpers::DuplicateError;
+
 crate::helpers::duplicate_api!(Blocking, Session, Dial);
 
 /// Shows no state: it may hold keys or locks.

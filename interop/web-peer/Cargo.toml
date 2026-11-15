@@ -10,7 +10,6 @@ description = "Scripted zmux WebSocket and HTTP streaming peers for cross-implem
 #   cargo build --release --locked -p zmux-web-peer
 
 [dependencies]
-bytes = "1"
 http = "1"
 tokio = { version = "1.54", features = ["full"] }
 zmux = { path = "../.." }

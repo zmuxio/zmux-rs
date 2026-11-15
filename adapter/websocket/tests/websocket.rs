@@ -188,8 +188,8 @@ async fn application_subprotocols() {
         ),
         // Neither offered nor selected: no application protocol.
         (
-            zmux_websocket::Options::default().with_no_subprotocol(true),
-            zmux_websocket::Options::default().with_no_subprotocol(true),
+            Options::default().with_no_subprotocol(true),
+            Options::default().with_no_subprotocol(true),
             None,
         ),
     ] {

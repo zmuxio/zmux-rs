@@ -208,7 +208,7 @@ macro_rules! duplicate_api {
         ///
         /// # Errors
         ///
-        /// The [`DuplicateError`](crate::helpers::DuplicateError) that says
+        /// The [`DuplicateError`] that says
         /// why nothing was decided.
         pub fn resolve_duplicate(
             s1: &$session,

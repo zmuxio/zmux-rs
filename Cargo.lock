@@ -3400,7 +3400,6 @@ dependencies = [
 name = "zmux-web-peer"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "http",
  "hyper",
  "hyper-util",

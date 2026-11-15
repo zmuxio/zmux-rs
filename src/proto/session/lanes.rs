@@ -74,7 +74,7 @@ impl SessionCore {
             State::Active | State::Draining | State::Suspended
         ) && self
             .att(pipe.0)
-            .and_then(super::Attachment::inp)
+            .and_then(Attachment::inp)
             .is_some_and(|p| p.state() == super::InState::Open)
     }
 

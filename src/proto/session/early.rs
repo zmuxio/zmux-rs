@@ -339,9 +339,8 @@ impl SessionCore {
         if let Some(i) = self.att_index(0) {
             let framing = self.atts.at(i).out().map(OutPipe::framing);
             if let Some(framing) = framing {
-                let o =
-                    super::pipes::OutPipe::new(framing, super::pipes::OutState::Active, rtt, now)
-                        .with_parameters_first();
+                let o = OutPipe::new(framing, super::pipes::OutState::Active, rtt, now)
+                    .with_parameters_first();
                 self.atts.at_mut(i).replace_out(o);
             }
         }

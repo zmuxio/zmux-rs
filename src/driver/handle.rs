@@ -185,7 +185,7 @@ mod sealed {
 pub struct CarrierInfo {
     pub(crate) inbound: Option<Framing>,
     pub(crate) outbound: Option<Framing>,
-    pub(crate) exporter: Option<crate::proto::exporter::CarrierExporter>,
+    pub(crate) exporter: Option<CarrierExporter>,
     pub(crate) protocol: Option<String>,
     /// The TLS or QUIC handshake this process ran for the carrier
     /// ([`crate::PipeIo::terminated_tls`]).
@@ -314,7 +314,7 @@ pub struct State<D: Driver> {
     /// The listener's table of this session's Locators.
     pub(crate) locator_hook: Option<LocatorHook>,
     /// The bootstrap carrier's exporter: never called under the lock.
-    boot_exporter: Option<Box<crate::proto::exporter::CarrierExporter>>,
+    boot_exporter: Option<Box<CarrierExporter>>,
     pub(super) waiters: Waiters<StreamKey>,
     /// Wake-ups decided under the lock, delivered after it.
     pub(super) wakes: WakeList,
@@ -3096,12 +3096,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     ) -> Result<Vec<u8>, crate::proto::exporter::ExportError> {
         // Outside the lock: the carrier's exporter is the host's code.
         let exporter = self.conn.lock().boot_exporter.clone();
-        crate::proto::exporter::CarrierExporter::export_for_host(
-            exporter.as_deref(),
-            label,
-            context,
-            length,
-        )
+        CarrierExporter::export_for_host(exporter.as_deref(), label, context, length)
     }
 
     fn session_binding(&self) -> Option<[u8; 32]> {
