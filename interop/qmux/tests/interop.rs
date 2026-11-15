@@ -16,17 +16,17 @@
 //! - establishment: zmux's transport parameters, zmux parameters and GREASE
 //!   included, are accepted by the peer; zmux detects a plain QMux peer;
 //! - bidirectional and unidirectional streams opened by either side, with
-//!   more data than the initial windows of both sides (MAX_STREAM_DATA and
-//!   MAX_DATA updates both ways);
-//! - RESET_STREAM and STOP_SENDING in both directions, with their codes;
-//! - QX_PING both ways and a DATAGRAM each way;
+//!   more data than the initial windows of both sides (`MAX_STREAM_DATA` and
+//!   `MAX_DATA` updates both ways);
+//! - `RESET_STREAM` and `STOP_SENDING` in both directions, with their codes;
+//! - `QX_PING` both ways and a DATAGRAM each way;
 //! - a graceful close by either side, with code and reason.
 //!
 //! The bytes on the carrier are tapped in both directions and decoded
 //! afterwards. Towards the plain peer zmux may send only QMux-02 frames
-//! (the plain-peer sending rules): no GOAWAY, PRIORITY_UPDATE or PIPE_* frame, no
+//! (the plain-peer sending rules): no GOAWAY, `PRIORITY_UPDATE` or PIPE_* frame, no
 //! out-of-order or repeated STREAM data, no record above the peer's
-//! `max_record_size`, and QX_TRANSPORT_PARAMETERS exactly once, first.
+//! `max_record_size`, and `QX_TRANSPORT_PARAMETERS` exactly once, first.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::IoSlice;
@@ -287,7 +287,13 @@ async fn establish(carrier: Carrier, zmux_client: bool) -> Pair {
 
 fn pattern(len: usize, seed: u8) -> Bytes {
     (0..len)
-        .map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[1] ^ seed)
+        .map(|i| {
+            u32::try_from(i)
+                .expect("below 2^32")
+                .wrapping_mul(2_654_435_761)
+                .to_le_bytes()[1]
+                ^ seed
+        })
         .collect::<Vec<u8>>()
         .into()
 }
@@ -331,7 +337,7 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
             send.write_chunk(data.clone()).await.unwrap();
             send.finish().unwrap();
         };
-        let (_, back) = tokio::join!(writer, recv.read_to_end(2 * BULK));
+        let ((), back) = tokio::join!(writer, recv.read_to_end(2 * BULK));
         assert_eq!(back.unwrap(), data, "bidirectional echo differs");
     };
     let qmux_side = async {
@@ -370,7 +376,7 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
         send.write_chunk(pattern(100_000, 3)).await.unwrap();
         seen_rx.await.unwrap();
         send.reset(VarInt::from_u32(RESET_BY_ZMUX)).unwrap();
-        assert!(recv.read_to_end(16).await.unwrap().is_empty());
+        assert_eq!(recv.read_to_end(16).await.unwrap(), b"");
     };
     let qmux_side = async {
         let (mut send, mut recv) = q.accept_bi().await.unwrap();
@@ -420,7 +426,7 @@ async fn qmux_drives(z: &zmux::Session, q: &qmux::Session) {
             send.write_chunk(data.clone()).await.unwrap();
             send.finish().unwrap();
         };
-        let (_, back) = tokio::join!(writer, recv.read_all());
+        let ((), back) = tokio::join!(writer, recv.read_all());
         assert_eq!(back.unwrap(), data, "bidirectional echo differs");
     };
     let zmux_side = async {
@@ -504,7 +510,7 @@ async fn qmux_drives(z: &zmux::Session, q: &qmux::Session) {
     tokio::join!(zmux_side, qmux_side);
 }
 
-/// QX_PING and DATAGRAM, both ways.
+/// `QX_PING` and DATAGRAM, both ways.
 async fn pings_and_datagrams(z: &zmux::Session, q: &qmux::Session) {
     // zmux's QX_PING request, answered by the peer.
     let rtt = z.ping().await.unwrap();
@@ -569,11 +575,11 @@ struct StreamTrack {
 #[derive(Default)]
 struct Wire {
     records: u64,
-    wire_len: u64,
+    total_bytes: u64,
     max_record: u64,
     frames: BTreeMap<&'static str, u64>,
     params: Option<Vec<u8>>,
-    /// The CONNECTION_CLOSE frames, decoded.
+    /// The `CONNECTION_CLOSE` frames, decoded.
     closes: Vec<String>,
     violations: Vec<String>,
 }
@@ -629,7 +635,7 @@ fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
         let f = match ev {
             Event::RecordEnd { len } => {
                 w.records += 1;
-                w.wire_len += len;
+                w.total_bytes += len;
                 w.max_record = w.max_record.max(len);
                 continue;
             }
@@ -723,10 +729,10 @@ fn decode(bytes: &[u8], max_record: u64, strict: bool) -> Wire {
                 .push(format!("{name}: not a QMux-02 frame (plain-peer rules)")),
         }
     }
-    if w.wire_len != bytes.len() as u64 {
+    if w.total_bytes != bytes.len() as u64 {
         w.violations.push(format!(
             "{} bytes after the last complete record",
-            bytes.len() as u64 - w.wire_len
+            bytes.len() as u64 - w.total_bytes
         ));
     }
     w
@@ -897,29 +903,29 @@ async fn duplex_zmux_server() {
 
 /// Interop case: zmux as client with `early_data`
 /// wrongly declaring the target a zmux endpoint. The target stops at the
-/// PIPE_ACK fence with FRAME_ENCODING_ERROR, its application sees no
+/// `PIPE_ACK` fence with `FRAME_ENCODING_ERROR`, its application sees no
 /// stream, and zmux reports `EarlyDataRejected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_data_wrongly_declared() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (dialed, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
-    let (z, q) = (dialed.unwrap(), accepted.unwrap().0);
+    let (dial_tcp, accept_tcp) = (dialed.unwrap(), accepted.unwrap().0);
     let (out, inn) = (Tap::default(), Tap::default());
     let mut cfg = zmux_config();
     cfg.early_data = zmux::EarlyData::for_zmux_peer();
-    let client = zmux::Session::connect(tapped_tcp(z, &out, &inn), cfg)
+    let client = zmux::Session::connect(tapped_tcp(dial_tcp, &out, &inn), cfg)
         .await
         .expect("returns before the peer's parameters");
     let (mut send, _recv) = client.open_bi().await.unwrap();
     send.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-    let c = qmux_config();
-    let t = QmuxTransport::new(q, c.version, c.max_record_size);
-    let target = qmux::Session::accept(t, c).await;
-    let e = tokio::time::timeout(Duration::from_secs(10), client.closing())
+    let qcfg = qmux_config();
+    let transport = QmuxTransport::new(accept_tcp, qcfg.version, qcfg.max_record_size);
+    let target = qmux::Session::accept(transport, qcfg).await;
+    let closed = tokio::time::timeout(Duration::from_secs(10), client.closing())
         .await
         .expect("closed in time");
-    assert_eq!(e, SessionError::EarlyDataRejected, "{e:?}");
+    assert_eq!(closed, SessionError::EarlyDataRejected, "{closed:?}");
     if let Ok(target) = target {
         let accepted = tokio::time::timeout(Duration::from_millis(500), target.accept_bi()).await;
         assert!(

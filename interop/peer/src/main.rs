@@ -5,7 +5,7 @@
 //! one session) or `zmux-interop-peer client <addr>`; `mp-server`/`mp-client`
 //! for multipath over TCP; `quic-server [n]` (serves `n` sessions over QUIC,
 //! 0-RTT for resumed ones) and `quic-client <addr>` (a session, then a
-//! resumed one whose first stream, OPEN_INFO `early`, goes in 0-RTT); both
+//! resumed one whose first stream, `OPEN_INFO` `early`, goes in 0-RTT); both
 //! take a last argument `exporter` for the join secret from the exporter
 //! alone, and then print `KEYS <hex>` for each session.
 //!
@@ -26,14 +26,14 @@
 //! `zmux-spec/interop/seal-matrix/matrix.py` defines them (`src/matrix.rs`).
 //!
 //! The peer under test drives; this side answers. A bidirectional stream
-//! carries its command in the stream preamble (OPEN_INFO):
+//! carries its command in the stream preamble (`OPEN_INFO`):
 //!
 //! - `echo`: echo the data, then FIN;
 //! - `info`: reply with `info=<open info>;prio=<u>,<i>` (the PRIORITY TLV);
 //! - `reset`: read until the peer's reset and reply `reset=<code>`;
 //! - `stop:<code>`: stop reading with `code`, then reply `stopped`;
 //! - `sendreset:<code>`: write 1000 bytes, then reset with `code`;
-//! - `open-bidi:<text>`: open a bidirectional stream with OPEN_INFO `back`,
+//! - `open-bidi:<text>`: open a bidirectional stream with `OPEN_INFO` `back`,
 //!   write `<text>`, FIN, read the answer and reply `opened=<answer>`;
 //! - `open-uni:<text>`: open a unidirectional stream carrying `<text>`;
 //! - `dgram`: echo the stream's datagrams (context + 1) until FIN;
@@ -117,7 +117,7 @@ async fn main() {
 
 async fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("server");
+    let mode = args.get(1).map_or("server", String::as_str);
     let mut endpoint = None;
     let mut serving = None;
     let session = match mode {
@@ -133,7 +133,7 @@ async fn run() {
             return quic_client(addr, args.get(3).is_some_and(|a| a == "exporter")).await;
         }
         "server" => {
-            let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:0");
+            let addr = args.get(2).map_or("127.0.0.1:0", String::as_str);
             let listener = TcpListener::bind(addr).await.expect("bind");
             println!("LISTEN {}", listener.local_addr().expect("addr"));
             let (tcp, _) = listener.accept().await.expect("accept");
@@ -149,7 +149,7 @@ async fn run() {
                 .expect("establish")
         }
         "mp-server" => {
-            let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:0");
+            let addr = args.get(2).map_or("127.0.0.1:0", String::as_str);
             let tcp = TcpListener::bind(addr).await.expect("bind");
             println!("LISTEN {}", tcp.local_addr().expect("addr"));
             let listener = Listener::new(config(true), ListenerConfig::default())
@@ -194,7 +194,7 @@ async fn run() {
         }
         "seal-server" => {
             let profiles = args.get(2).expect("profiles");
-            let addr = args.get(3).map(String::as_str).unwrap_or("127.0.0.1:0");
+            let addr = args.get(3).map_or("127.0.0.1:0", String::as_str);
             let (session, listener, task) = seal_server(profiles, addr).await;
             endpoint = Some(listener);
             serving = Some(task);
@@ -342,7 +342,7 @@ fn half_exporter<C>(
     let session = value("EXPORTER-zmux-session", 32);
     let app = value(APP_LABEL, 16);
     move |label, context, out| {
-        assert!(context.is_empty());
+        assert_eq!(context, b"");
         let v = match label {
             "EXPORTER-zmux-session" => &session,
             APP_LABEL => &app,
@@ -357,8 +357,7 @@ fn print_keys(session: &Session) {
     let v = session
         .export_keying_material(APP_LABEL, b"", 16)
         .expect("export");
-    let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
-    println!("KEYS {hex}");
+    println!("KEYS {}", matrix::hex(&v));
 }
 
 /// Prints the keys once the carrier's handshake gives them (a session on
@@ -802,10 +801,10 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let _ = send.stopped().await;
         }
         "info" => {
-            let prio = recv
-                .requested_priority()
-                .map(|p| format!("{},{}", p.urgency(), p.incremental()))
-                .unwrap_or_else(|| "none".into());
+            let prio = recv.requested_priority().map_or_else(
+                || "none".into(),
+                |p| format!("{},{}", p.urgency(), p.incremental()),
+            );
             let _ = recv.read_to_end(1 << 20).await;
             reply(&mut send, &format!("info={cmd};prio={prio}")).await;
         }
@@ -813,7 +812,7 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let mut buf = vec![0u8; 4096];
             let text = loop {
                 match recv.read(&mut buf).await {
-                    Ok(Some(_)) => continue,
+                    Ok(Some(_)) => {}
                     Ok(None) => break "fin".to_string(),
                     Err(StreamError::Reset { code, .. }) => break format!("reset={code}"),
                     Err(e) => break format!("error={e}"),
@@ -904,7 +903,7 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let mut buf = vec![0u8; 4096];
             let text = loop {
                 match recv.read(&mut buf).await {
-                    Ok(Some(_)) => continue,
+                    Ok(Some(_)) => {}
                     Ok(None) => break "packet-error=fin".to_string(),
                     Err(StreamError::Reset { code, .. }) => break format!("packet-error={code}"),
                     Err(e) => break format!("packet-error={e}"),

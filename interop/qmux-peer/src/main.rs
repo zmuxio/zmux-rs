@@ -291,7 +291,7 @@ async fn bidi(session: Session, mut send: Send, mut recv: Recv) {
                         &mut send,
                         &format!("opened={}", String::from_utf8_lossy(&a)),
                     )
-                    .await
+                    .await;
                 }
                 None => reply(&mut send, "opened-failed").await,
             }

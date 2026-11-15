@@ -20,11 +20,18 @@ const CLOSE_REASON: &[u8] = b"matrix-close";
 type Res<T = ()> = Result<T, String>;
 
 fn pattern(n: usize) -> Vec<u8> {
-    (0..n).map(|i| ((i * 31 + 7) % 256) as u8).collect()
+    (0..n)
+        .map(|i| u8::try_from((i * 31 + 7) % 256).expect("below 256"))
+        .collect()
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+pub(crate) fn hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut out, x| {
+            let _ = write!(out, "{x:02x}");
+            out
+        })
 }
 
 fn unhex(s: &str) -> Res<[u8; 32]> {
@@ -161,7 +168,7 @@ fn epoch_of(s: &Session, committed: u64) -> u64 {
         .max(committed)
 }
 
-/// Waits for the event EpochCommitted and returns its epoch.
+/// Waits for the event `EpochCommitted` and returns its epoch.
 async fn wait_commit(s: &Session) -> Res<u64> {
     while let Some(e) = s.next_event().await {
         if let zmux::SessionEvent::EpochCommitted { epoch } = e {

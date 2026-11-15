@@ -16,7 +16,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -26,24 +26,35 @@ use zmux::{Config, PipeIo, Session};
 
 struct Counting;
 
-static LIVE: AtomicI64 = AtomicI64::new(0);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+/// A byte count as a signed delta; layout sizes never exceed `isize::MAX`.
+fn signed(n: usize) -> isize {
+    isize::try_from(n).unwrap_or(isize::MAX)
+}
+
+/// Mean bytes per pair; the counts are far below 2^52, so `f64` is exact.
+#[allow(clippy::cast_precision_loss)]
+fn per_pair(delta: isize, pairs: usize) -> f64 {
+    delta as f64 / pairs as f64
+}
 
 // SAFETY: forwards to the system allocator unchanged.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        LIVE.fetch_add(l.size() as i64, Relaxed);
+        LIVE.fetch_add(signed(l.size()), Relaxed);
         // SAFETY: forwarded unchanged.
         unsafe { System.alloc(l) }
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size() as i64, Relaxed);
+        LIVE.fetch_sub(signed(l.size()), Relaxed);
         // SAFETY: forwarded unchanged.
         unsafe { System.dealloc(p, l) }
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        LIVE.fetch_add(n as i64 - l.size() as i64, Relaxed);
+        LIVE.fetch_add(signed(n) - signed(l.size()), Relaxed);
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(p, l, n) }
     }
@@ -52,7 +63,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-fn live() -> i64 {
+fn live() -> isize {
     LIVE.load(Relaxed)
 }
 
@@ -210,14 +221,14 @@ impl Env {
             return (client, server);
         }
         // A request-response, as the carrier rows' exchange.
-        let (mut send, mut recv) = client.open_bi().await.unwrap();
-        send.write_all(&[1; 300]).await.unwrap();
-        send.finish().unwrap();
-        let (mut ssend, mut srecv) = server.accept_bi().await.unwrap();
-        srecv.read_to_end(1024).await.unwrap();
-        ssend.write_all(&[2; 300]).await.unwrap();
-        ssend.finish().unwrap();
-        recv.read_to_end(1024).await.unwrap();
+        let (mut cli_tx, mut cli_rx) = client.open_bi().await.unwrap();
+        cli_tx.write_all(&[1; 300]).await.unwrap();
+        cli_tx.finish().unwrap();
+        let (mut srv_tx, mut srv_rx) = server.accept_bi().await.unwrap();
+        srv_rx.read_to_end(1024).await.unwrap();
+        srv_tx.write_all(&[2; 300]).await.unwrap();
+        srv_tx.finish().unwrap();
+        cli_rx.read_to_end(1024).await.unwrap();
         (client, server)
     }
 
@@ -304,9 +315,9 @@ async fn main() {
             v.push(env.pair(row).await);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let active = (live() - before) as f64 / n as f64;
+        let active = per_pair(live() - before, n);
         tokio::time::sleep(Duration::from_millis(idle_ms)).await;
-        let idle = (live() - before) as f64 / n as f64;
+        let idle = per_pair(live() - before, n);
         println!(
             "RESULT scen=carrier-mem row={row} pairs={n} heap_B_per_pair_active={active:.0} heap_B_per_pair_idle={idle:.0}"
         );
