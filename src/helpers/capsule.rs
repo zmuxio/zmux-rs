@@ -441,7 +441,7 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert!(!cases.is_empty());
+        assert_ne!(cases.as_slice(), [] as [serde_json::Value; 0]);
         for case in cases {
             let id = case["id"].as_str().unwrap();
             let max = usize::try_from(case["max_payload"].as_u64().unwrap()).unwrap();

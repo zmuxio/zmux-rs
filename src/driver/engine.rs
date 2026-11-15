@@ -600,7 +600,7 @@ mod tests {
         }
         assert_eq!(got, whole);
         assert!(shared >= payloads.len());
-        assert!(o.owned.is_empty());
+        assert_eq!(o.owned, [] as [Bytes; 0]);
     }
 
     /// A message-framed carrier gets one message per call: a message of

@@ -652,7 +652,7 @@ mod tests {
         set_srtt(&mut a, 0, 15 * MS);
         set_rate(&mut a, 0, FAST * 2);
         a.quality_sample(0, now);
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         set_srtt(&mut a, 0, 16 * MS);
         a.quality_sample(0, now);
         assert_eq!(events(&mut a), [quality(0, 16 * MS, FAST * 2)]);
@@ -660,7 +660,7 @@ mod tests {
         // below.
         set_srtt(&mut a, 0, 20 * MS);
         a.quality_sample(0, now);
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         set_rate(&mut a, 0, FAST / 2);
         a.quality_sample(0, now);
         assert_eq!(events(&mut a), [quality(0, 20 * MS, FAST / 2)]);
@@ -669,7 +669,7 @@ mod tests {
             .unwrap();
         set_srtt(&mut a, 2, 500 * MS);
         a.quality_sample(2, now);
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
     }
 
     /// At most one event per pipe per `MinInterval`, with the latest values
@@ -689,7 +689,7 @@ mod tests {
         let t1 = t0 + 100 * MS;
         set_srtt(&mut a, 0, 50 * MS);
         a.quality_sample(0, t1);
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         let due = t0 + Duration::from_secs(1);
         assert!(a.poll_timeout().is_some_and(|t| t <= due));
         set_srtt(&mut a, 0, 60 * MS);
@@ -702,7 +702,7 @@ mod tests {
         set_srtt(&mut a, 0, 62 * MS);
         a.quality_sample(0, due + 2 * MS);
         a.handle_timeout(due + Duration::from_secs(1));
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         assert!(a.quality.as_deref().unwrap().due.is_none());
     }
 
@@ -722,7 +722,7 @@ mod tests {
         set_rate(&mut a, 2, FAST / 8);
         a.quality_sample(2, now);
         a.quality_sample(0, now);
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         set_rate(&mut a, 2, FAST / 2);
         a.quality_sample(2, now);
         assert_eq!(
@@ -737,7 +737,7 @@ mod tests {
         let (mut a, _) = two_pipes(Scheduler::SpreadEta, Some(FAST), 0);
         a.set_capacity_floor(Some(CapacityFloor::new(FAST + FAST / 2)))
             .unwrap();
-        assert!(events(&mut a).is_empty());
+        assert_eq!(events(&mut a), [] as [CoreEvent; 0]);
         a.set_pipe_send_standby(PipeId(2), Some(true)).unwrap();
         let now = a.now;
         assert_eq!(a.poll_timeout(), Some(now));

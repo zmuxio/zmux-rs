@@ -519,7 +519,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
 async fn an_admission_decides_on_the_request_head() {
     use zmux::{Admission, AdmissionVerdict};
     let admission = Admission::new(0, |info, prefix| {
-        assert!(prefix.is_empty());
+        assert_eq!(prefix, []);
         assert!(info.source.is_some());
         assert!(info.head);
         let mut upgrade = false;

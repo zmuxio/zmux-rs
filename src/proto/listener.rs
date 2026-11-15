@@ -1492,7 +1492,10 @@ mod tests {
         assert_eq!(l.enter(a), Entered::SourceFull);
         let (slot, _) = taken(l.enter(source_name("b")));
         l.open(Some(slot), Framing::ByteStream, now);
-        assert!(l.expired(now + Duration::from_millis(1999)).is_empty());
+        assert_eq!(
+            l.expired(now + Duration::from_millis(1999)),
+            [] as [CarrierId; 0]
+        );
         assert_eq!(l.expired(now + Duration::from_secs(2)).len(), 9);
         // The carriers' slots went with them.
         assert_eq!(l.held(a), (0, 0));

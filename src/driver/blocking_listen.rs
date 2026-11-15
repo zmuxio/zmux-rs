@@ -548,8 +548,8 @@ impl Listener {
         }
         // A carrier limit the Sealed overhead takes below the record floor refuses the
         // join, as it does an added pipe.
-        let limit = super::handle::pipe_record_limit(join.mode(), pipe.record_limit(), framing);
-        if super::handle::check_pipe_record_limit(limit).is_err() {
+        let limit = handle::pipe_record_limit(join.mode(), pipe.record_limit(), framing);
+        if handle::check_pipe_record_limit(limit).is_err() {
             return Err(HandleError::Refused);
         }
         let carrier = PeerCarrier {

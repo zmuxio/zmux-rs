@@ -896,7 +896,7 @@ async fn application_data_in_messages_1_2_and_3() {
         assert_eq!(r.message, 2);
         let peer = r.peer.expect("what is known of the client");
         assert_eq!(peer.peer_app_data[0].data, b"m1");
-        assert!(peer.peer_static.is_empty());
+        assert_eq!(peer.peer_static, []);
         Box::pin(async { Ok(b"m2".to_vec()) })
     });
     let gate = Arc::new(SeesAdmission(std::sync::Mutex::new(Vec::new())));

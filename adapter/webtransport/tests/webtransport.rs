@@ -322,7 +322,7 @@ async fn a_lost_session_is_a_failure_not_a_clean_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admission_decides_on_the_session_request() {
     let admission = zmux::Admission::new(0, |info, prefix| {
-        assert!(prefix.is_empty());
+        assert_eq!(prefix, []);
         let req = info
             .request
             .and_then(|r| r.downcast_ref::<web_transport_quinn::proto::ConnectRequest>())

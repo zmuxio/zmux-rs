@@ -191,7 +191,7 @@ async fn a_large_first_message_is_read_whole() {
         let (mut s, mut r) = server.accept_bi().await.unwrap();
         assert_eq!(r.read_to_end(1 << 20).await.unwrap().len(), 24 << 10);
         s.finish().unwrap();
-        assert!(b.read_to_end(16).await.unwrap().is_empty());
+        assert_eq!(b.read_to_end(16).await.unwrap(), [] as [u8; 0]);
         client.close().await;
     })
     .await

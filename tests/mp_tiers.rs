@@ -362,7 +362,7 @@ fn a_bidi_attachment_states_its_request_on_itself() {
         .unwrap();
     n.run_for(100);
     assert_eq!(n.links[&id].statuses, [(id, 1, false, 3)]);
-    assert!(n.links[&0].statuses.is_empty());
+    assert_eq!(n.links[&0].statuses, [] as [(u64, u64, bool, u64); 0]);
 }
 
 #[test]

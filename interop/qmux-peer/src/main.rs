@@ -105,7 +105,7 @@ async fn main() {
     // `closed()` resolves once the close is recorded, before the backend has
     // written the CONNECTION_CLOSE; keep the runtime up so the frame reaches the
     // socket before the process exits (qmux has no way to wait for it).
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
 fn rtt(session: &Session) -> String {

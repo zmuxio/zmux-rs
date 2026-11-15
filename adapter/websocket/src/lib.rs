@@ -1446,6 +1446,6 @@ mod tests {
         assert_eq!(o.accept(&offer(&[""])), Some(None));
         assert_eq!(o.accept(&offer(&["qmux-02"])), Some(Some("qmux-02".into())));
         assert_eq!(o.accept(&offer(&["other"])), None);
-        assert!(o.offer().is_empty());
+        assert_eq!(o.offer(), [] as [std::string::String; 0]);
     }
 }

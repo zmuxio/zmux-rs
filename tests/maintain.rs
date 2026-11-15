@@ -1175,7 +1175,7 @@ async fn replace_pipes_replaces_every_pipe() {
         .into_iter()
         .filter(|p| p.outbound == Some(OutboundState::Active))
         .collect();
-    assert!(!live.is_empty());
+    assert_ne!(live, [] as [zmux::PipeStats; 0]);
     for p in &live {
         assert!(!before.contains(&p.pipe), "{p:?}");
         assert_eq!(p.epoch, Some(1), "{p:?}");

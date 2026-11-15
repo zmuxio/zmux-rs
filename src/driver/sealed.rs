@@ -478,7 +478,7 @@ mod tests {
         drop(p);
         let mut rest = Vec::new();
         far.read_to_end(&mut rest).await.unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 
     /// The records written are the allocating AEAD's, with their length

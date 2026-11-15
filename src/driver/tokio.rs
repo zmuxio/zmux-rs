@@ -926,10 +926,10 @@ impl PipeIo {
     /// floor; there is no upper bound, the peer's `max_record_size` and the record limit of
     /// the implementation reduce it); it is never clamped. A pipe whose limit, less a Sealed
     /// transform's overhead, is below 8192 is refused when it is added or joined
-    /// ([`PipeError::InvalidOptions`](crate::PipeError::InvalidOptions); a listener's join
+    /// ([`PipeError::InvalidOptions`](PipeError::InvalidOptions); a listener's join
     /// is refused).
     pub fn with_max_record(mut self, max: usize) -> Result<Self, crate::InvalidConfig> {
-        self.max_record = super::handle::checked_max_record(self.max_record, max)?;
+        self.max_record = handle::checked_max_record(self.max_record, max)?;
         Ok(self)
     }
 
