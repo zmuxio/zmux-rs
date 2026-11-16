@@ -1916,7 +1916,7 @@ fn opportunistic_copy_of_a_reset_stream() {
             cap: 16384,
             rst: true,
         },
-        Op::Step(18_446_744_073_709_551_615),
+        Op::Step(usize::MAX),
         Op::Step(41644),
         Op::Advance(918),
         Op::Reset {

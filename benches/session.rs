@@ -384,6 +384,7 @@ async fn carrier_pair(carrier: &str) -> (Session, Session) {
         }
         "tcp" => return session_pair(true).await,
         "mem" => return session_pair(false).await,
+        #[cfg(unix)]
         "unix" => {
             let (a, b) = tokio::net::UnixStream::pair().unwrap();
             (PipeIo::new(a), PipeIo::new(b))
@@ -1206,12 +1207,19 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 /// The process's resident set (Linux: `/proc/self/statm`), in bytes.
+#[cfg(unix)]
 fn rss() -> Option<i64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: i64 = statm.split_whitespace().nth(1)?.parse().ok()?;
     // SAFETY: sysconf has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     Some(pages * page as i64)
+}
+
+/// Not measured off Unix.
+#[cfg(not(unix))]
+fn rss() -> Option<i64> {
+    None
 }
 
 /// A seeded xorshift64* generator for the soak's choices.

@@ -170,7 +170,7 @@ jobs:
             packages: gcc-multilib
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            packages: gcc-arm-linux-gnueabihf
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
           - target: i686-pc-windows-msvc
             os: windows-latest
     steps:
