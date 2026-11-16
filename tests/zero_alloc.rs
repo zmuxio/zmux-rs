@@ -755,9 +755,18 @@ mod core_multipath {
                 "{policy:?}: not spread: {sent:?}"
             );
         }
+        // The first window after the warm-up may still grow a queue to the
+        // depth that whole-chunk turns keep in flight; the allocations are a
+        // few capacity doublings, no more at four times the length. The
+        // next window shows the steady state.
         assert!(
-            n <= 4,
+            n <= 6,
             "{policy:?}: {n} allocations for 128 MiB over two pipes"
+        );
+        let (_, steady) = super::allocations(|| transfer(&mut p, send, &mut recv, 128 << 20));
+        assert!(
+            steady <= 4,
+            "{policy:?}: {steady} allocations for the next 128 MiB over two pipes"
         );
     }
 
