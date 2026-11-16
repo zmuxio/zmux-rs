@@ -2,7 +2,7 @@
 //! KIND `stream`, `split` (HTTP/1.1), `stream2`, `split2` (h2c).
 //!
 //! Prefix authentication key `right` (`bad` presents `wrong`), 30 s slots, skew 1.
-//! `server` serves HTTP/1.1 and h2c on ADDR whatever KIND, prints `READY`, echoes one
+//! `server` serves HTTP/1.1 and h2c on ADDR whatever KIND, prints `READY <address>` (the bound one; port 0 picks a free port), echoes one
 //! stream per session (`SESSION <content>`) and answers other requests 418, printing
 //! `FALLBACK <target>`. `client` prints `OK ping`; `bad` prints `REFUSED <error>`.
 //!
@@ -57,12 +57,13 @@ async fn server(addr: &str) {
     });
     let listener = common::listener(b"right", None);
     let tcp = TcpListener::bind(addr).await.expect("bind");
+    let local = tcp.local_addr().expect("local address");
     tokio::spawn(zmux_http::serve(
         listener.clone(),
         tcp,
         Options::default().with_fallback(fallback),
     ));
-    println!("READY");
+    println!("READY {local}");
     common::serve_sessions(listener).await;
 }
 
@@ -101,6 +102,7 @@ async fn mp_server(addr: &str, tls: bool) {
     let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default())
         .with_websocket(zmux_websocket::Options::default());
     let tcp = TcpListener::bind(addr).await.expect("bind");
+    let local = tcp.local_addr().expect("local address");
     if tls {
         let acceptor = tls_acceptor();
         tokio::spawn(async move {
@@ -117,7 +119,7 @@ async fn mp_server(addr: &str, tls: bool) {
     } else {
         tokio::spawn(endpoint.serve(tcp));
     }
-    println!("READY");
+    println!("READY {local}");
     while let Some(session) = listener.accept().await {
         tokio::spawn(echo_all(session));
     }

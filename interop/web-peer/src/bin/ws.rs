@@ -1,7 +1,7 @@
 //! WebSocket peer for the Java HTTP interop test: `server|client|bad ADDR`.
 //!
 //! Prefix authentication key `ws-interop`, 30 s slots, skew 1, token in the
-//! upgrade request's header field. `server` prints `READY`, echoes one stream
+//! upgrade request's header field. `server` prints `READY <address>` (the bound one; port 0 picks a free port), echoes one stream
 //! per session (`SESSION <content>`) and answers refused requests 418, printing
 //! `FALLBACK <target>`. `client` prints `OK ping`; `bad` (no token) prints
 //! `REFUSED <error>`.
@@ -49,12 +49,13 @@ async fn server(addr: &str) {
     });
     let listener = common::listener(KEY, Some(fallback));
     let tcp = TcpListener::bind(addr).await.expect("bind");
+    let local = tcp.local_addr().expect("local address");
     tokio::spawn(zmux_websocket::serve(
         listener.clone(),
         tcp,
         zmux_websocket::Options::default(),
     ));
-    println!("READY");
+    println!("READY {local}");
     common::serve_sessions(listener).await;
 }
 

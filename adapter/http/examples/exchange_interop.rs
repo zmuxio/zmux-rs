@@ -5,7 +5,8 @@
 //! - `ZMUX_EXCHANGE_PSK`: the pre-shared key in hex (empty by default).
 //! - `ZMUX_EXCHANGE_BASE64=1`: base64 bodies.
 //! - server: `ZMUX_EXCHANGE_ADDR` (default `127.0.0.1:8080`), the address
-//!   to serve on, every POST path but `/zmux` (the streaming pipes) being
+//!   to serve on (port 0 picks a free port; the bound address is printed
+//!   as `READY <address>`), every POST path but `/zmux` (the streaming pipes) being
 //!   an exchange request;
 //!   `ZMUX_EXCHANGE_FOR` (seconds, default 60), how long to serve. Every
 //!   stream of every session is echoed.
@@ -80,7 +81,9 @@ async fn server(o: ExchangeOptions) -> Result<(), Error> {
     // Every path is an exchange path.
     let exchange = ExchangeServer::new(&listener, o.with_path("/"))?;
     let tcp = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("serving exchanges on {addr} for {secs} s");
+    let local = tcp.local_addr()?;
+    eprintln!("serving exchanges on {local} for {secs} s");
+    println!("READY {local}");
     let serving = tokio::spawn(zmux_http::serve(
         listener.clone(),
         tcp,
