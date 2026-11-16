@@ -156,6 +156,49 @@ jobs:
       - name: Build benchmarks
         run: cargo bench --locked --workspace --no-run
 
+  cross:
+    name: 32-bit check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            # ring and aws-lc build C and assembly for the target.
+            packages: gcc-multilib
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            packages: gcc-arm-linux-gnueabihf
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the C toolchain for the target
+        if: matrix.packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cross-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cross-${{ matrix.target }}-
+      # Nothing is run: a 32-bit usize, 4-byte alignment of 64-bit atomics
+      # and narrowed casts fail to compile (tests, benches and examples
+      # included), not at run time.
+      - name: Check every crate and target
+        run: cargo check --locked --workspace --all-features --all-targets --target ${{ matrix.target }}
+
   msrv:
     name: Minimum Rust version (1.95)
     runs-on: ubuntu-latest

@@ -223,8 +223,9 @@ impl TcpSocket {
 }
 
 /// Cancels the I/O blocked on a socket in other threads (Windows: a
-/// shutdown alone does not end a blocked `recv`).
-#[cfg(windows)]
+/// shutdown alone does not end a blocked `recv`). Only the std driver
+/// blocks in sockets.
+#[cfg(all(windows, feature = "blocking"))]
 pub(crate) fn cancel_blocked(socket: &std::net::TcpStream) {
     use std::os::windows::io::AsRawSocket;
     windows::cancel_blocked(socket.as_raw_socket());
@@ -452,6 +453,7 @@ mod windows {
         syn_retrans: u8,
     }
 
+    #[cfg(feature = "blocking")]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CancelIoEx(handle: *mut c_void, overlapped: *mut c_void) -> i32;
@@ -460,6 +462,7 @@ mod windows {
     /// Cancels the I/O any thread has pending on `socket`, blocking calls
     /// included (their Winsock implementation waits for overlapped
     /// requests, which this cancels): they return with an error.
+    #[cfg(feature = "blocking")]
     pub(crate) fn cancel_blocked(socket: std::os::windows::io::RawSocket) {
         // SAFETY: `socket` is an open socket handle (the caller holds the
         // socket); a null OVERLAPPED cancels every request on the handle,
