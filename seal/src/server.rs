@@ -39,7 +39,7 @@ impl ModeCheck {
     /// own copy of the peer.
     pub fn new_async<F>(f: impl Fn(RecordMode, Peer) -> F + Send + Sync + 'static) -> Self
     where
-        F: std::future::Future<Output = bool> + Send + 'static,
+        F: Future<Output = bool> + Send + 'static,
     {
         Self(Arc::new(move |m, p| Decision::later(f(m, p.clone()))))
     }

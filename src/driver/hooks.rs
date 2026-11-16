@@ -192,7 +192,7 @@ pub(crate) async fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&
 pub(crate) async fn settle_by<T>(
     decision: crate::proto::Decision<T>,
     deadline: Option<std::time::Instant>,
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl Future<Output = ()>,
 ) -> Option<T> {
     match decision {
         crate::proto::Decision::Now(v) => Some(v),
@@ -216,7 +216,7 @@ pub(crate) async fn settle_by<T>(
 pub(crate) fn settle_blocking<T>(
     decision: crate::proto::Decision<T>,
     deadline: Option<std::time::Instant>,
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl Future<Output = ()>,
 ) -> Option<T> {
     match decision {
         crate::proto::Decision::Now(v) => Some(v),
@@ -230,8 +230,8 @@ pub(crate) fn settle_blocking<T>(
 
 /// `f`'s output, or `None` once `stop` is ready first.
 pub(crate) async fn first<T>(
-    stop: impl std::future::Future<Output = ()>,
-    f: impl std::future::Future<Output = T>,
+    stop: impl Future<Output = ()>,
+    f: impl Future<Output = T>,
 ) -> Option<T> {
     let (mut stop, mut f) = (std::pin::pin!(stop), std::pin::pin!(f));
     std::future::poll_fn(|cx| {

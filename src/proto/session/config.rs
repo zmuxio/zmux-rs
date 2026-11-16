@@ -292,7 +292,7 @@ impl AllowRecordMode {
         + 'static,
     ) -> Self
     where
-        F: std::future::Future<Output = bool> + Send + 'static,
+        F: Future<Output = bool> + Send + 'static,
     {
         Self(Arc::new(move |i, m, a| {
             Decision::later(f(i.clone(), m, a.cloned()))
@@ -325,7 +325,7 @@ impl AuthorizeJoin {
     /// The check `f`, answering when its future completes.
     pub fn new_async<F>(f: impl Fn(super::PipeId) -> F + Send + Sync + 'static) -> Self
     where
-        F: std::future::Future<Output = bool> + Send + 'static,
+        F: Future<Output = bool> + Send + 'static,
     {
         Self(Arc::new(move |p| Decision::later(f(p))))
     }
@@ -669,7 +669,7 @@ impl WindowIncrease {
     /// The predicate `f`, answering when its future completes.
     pub fn new_async<F>(f: impl Fn(u64) -> F + Send + Sync + 'static) -> Self
     where
-        F: std::future::Future<Output = bool> + Send + 'static,
+        F: Future<Output = bool> + Send + 'static,
     {
         Self(Arc::new(move |d| Decision::later(f(d))))
     }
@@ -1319,7 +1319,7 @@ impl Config {
         let before = self.logger.take();
         self.logger = Some(Logger::new(move |level, message| {
             if let Some(b) = &before {
-                (b.0)(level, message);
+                b.0(level, message);
             }
             log.push(HostEvent::Log {
                 level,

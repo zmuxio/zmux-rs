@@ -324,7 +324,7 @@ fn bound_listener() -> Listener {
         }),
         NODE,
         ServerOptions {
-            allow_record_mode: Some(zmux_seal::ModeCheck::new(|_, _| true)),
+            allow_record_mode: Some(ModeCheck::new(|_, _| true)),
             shaper: None,
             shaping_limits: None,
             ..Default::default()
@@ -1175,7 +1175,7 @@ fn mismatch_listener(action: Option<zmux::RejectAction>, seen: Seen) -> Listener
         }),
         NODE,
         ServerOptions {
-            allow_record_mode: Some(zmux_seal::ModeCheck::new(|_, _| true)),
+            allow_record_mode: Some(ModeCheck::new(|_, _| true)),
             ..Default::default()
         },
     )

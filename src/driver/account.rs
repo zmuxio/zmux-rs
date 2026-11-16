@@ -427,6 +427,6 @@ mod tests {
         assert!(link.due().is_none());
         drop(link);
         assert_eq!(account.used.load(Ordering::Acquire), 0, "the charge left");
-        assert_eq!(close, [] as [std::sync::Arc<()>; 0]);
+        assert_eq!(close, Vec::<Arc<()>>::new());
     }
 }

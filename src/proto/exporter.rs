@@ -359,7 +359,7 @@ impl CarrierExporter {
     #[must_use]
     pub fn seal_binding(&self, split: bool) -> Option<Vec<u8>> {
         let read = |f: &Source| {
-            let mut out = super::seal::Secret::from(vec![0; VALUE_LEN]);
+            let mut out = Secret::from(vec![0; VALUE_LEN]);
             f.fill(EXPORTER_SEAL_BOUND_LABEL, b"", out.as_mut_slice())
                 .then_some(out)
         };

@@ -317,7 +317,7 @@ where
                 .get::<TlsBinding>()
                 .map_or_else(CarrierInfo::new, TlsBinding::info);
             let mut info = base.with_request_head(
-                std::sync::Arc::new(parts.clone()),
+                Arc::new(parts.clone()),
                 |p: &http::request::Parts, each| {
                     zmux::adapter::visit_fields(&p.headers, each);
                 },

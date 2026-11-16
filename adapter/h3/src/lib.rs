@@ -117,11 +117,11 @@ pub use bounded::RecvStream;
 pub const ALPN: &[u8] = b"h3";
 
 type ClientSend = h3::client::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
-type ClientRecv = h3::client::RequestStream<bounded::RecvStream, ChunkBuf>;
+type ClientRecv = h3::client::RequestStream<RecvStream, ChunkBuf>;
 /// The sending half of a server's request stream: the response.
 pub type ServerSend = h3::server::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
 /// The receiving half of a server's request stream: the request body.
-pub type ServerRecv = h3::server::RequestStream<bounded::RecvStream, ChunkBuf>;
+pub type ServerRecv = h3::server::RequestStream<RecvStream, ChunkBuf>;
 
 /// The adapter's options: how the carriers size the connection's flow
 /// control for lanes, and the fallback of requests.
@@ -614,7 +614,7 @@ pub async fn serve_connection(
         conn: conn.clone(),
         fallback: options.fallback.clone(),
         _charge: charge,
-        connection: std::sync::Mutex::new(None),
+        connection: Mutex::new(None),
     });
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
@@ -627,7 +627,7 @@ pub async fn serve_connection(
     // HEADERS holds neither tasks nor the connection beyond it.
     let head_limit = listener.limits().handshake_timeout;
     let first_by = tokio::time::Instant::now() + head_limit;
-    let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resolved = Arc::new(AtomicBool::new(false));
     {
         let (conn, resolved) = (conn.clone(), resolved.clone());
         tokio::spawn(async move {
@@ -638,7 +638,7 @@ pub async fn serve_connection(
             {
                 return;
             }
-            if !resolved.load(std::sync::atomic::Ordering::Relaxed) {
+            if !resolved.load(Ordering::Relaxed) {
                 conn.close(VarInt::from_u32(0x0100), b"no request in time");
             }
         });
@@ -652,7 +652,7 @@ pub async fn serve_connection(
             else {
                 return;
             };
-            resolved.store(true, std::sync::atomic::Ordering::Relaxed);
+            resolved.store(true, Ordering::Relaxed);
             let (mut send, mut recv) = stream.split();
             if zmux::adapter::forwarded_early_data(head.headers()) {
                 // Forwarded from TLS early data: no carrier is taken from
@@ -687,7 +687,7 @@ pub async fn serve_connection(
     *shared
         .connection
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(h3));
+        .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(h3));
     Ok(())
 }
 
@@ -704,7 +704,7 @@ struct Served {
     /// last of its requests ends (not only its accept loop).
     _charge: zmux::adapter::MemoryCharge,
     /// The HTTP/3 connection once it accepts no more requests.
-    connection: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    connection: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl Served {

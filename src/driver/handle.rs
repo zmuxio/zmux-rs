@@ -1098,7 +1098,7 @@ enum HookWork {
 
 /// A proposal's answer in progress: its generation and the predicate's
 /// future (one per proposal, which the core keeps at most one of).
-type Answering = (u64, std::pin::Pin<Box<dyn Future<Output = bool> + Send>>);
+type Answering = (u64, Pin<Box<dyn Future<Output = bool> + Send>>);
 
 /// The session's hook context (a task or a thread): runs
 /// `allow_connection_window_increase` for each proposal and tells the
@@ -3603,6 +3603,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.session_binding()
     }
 
+    fn id(&self) -> crate::SessionId {
+        self.conn.id
+    }
+
     #[cfg(feature = "test-hooks")]
     fn panic_under_lock(&self) {
         let _st = self.conn.lock();
@@ -3658,10 +3662,6 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn capacity_floor(&self) -> Option<CapacityFloor> {
         self.conn.lock().core.capacity_floor()
-    }
-
-    fn id(&self) -> crate::SessionId {
-        self.conn.id
     }
 
     fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>> {

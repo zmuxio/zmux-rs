@@ -600,7 +600,7 @@ mod tests {
         }
         assert_eq!(got, whole);
         assert!(shared >= payloads.len());
-        assert_eq!(o.owned, [] as [Bytes; 0]);
+        assert_eq!(o.owned, Vec::<Bytes>::new());
     }
 
     /// A message-framed carrier gets one message per call: a message of

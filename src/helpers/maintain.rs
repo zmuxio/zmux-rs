@@ -563,8 +563,8 @@ pub fn maintain_pipes(session: &Session, pool: PipePool) -> Result<MaintainHandl
         Vec::new(),
         stop.clone(),
     ) {
-        return Err(ConnectError::Io(Arc::new(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
+        return Err(ConnectError::Io(Arc::new(io::Error::new(
+            io::ErrorKind::Unsupported,
             "maintain_pipes outside a tokio runtime",
         ))));
     }

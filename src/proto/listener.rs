@@ -359,7 +359,7 @@ impl OnReject {
     /// given its own copy of the input.
     pub fn new_async<F>(f: impl Fn(RejectInfo) -> F + Send + Sync + 'static) -> Self
     where
-        F: std::future::Future<Output = RejectAction> + Send + 'static,
+        F: Future<Output = RejectAction> + Send + 'static,
     {
         Self(std::sync::Arc::new(move |i| Decision::later(f(i.clone()))))
     }
@@ -424,7 +424,7 @@ impl SessionConfigFn {
     /// copy of the carrier's description.
     pub fn new_async<F>(f: impl Fn(SessionCarrier) -> F + Send + Sync + 'static) -> Self
     where
-        F: std::future::Future<Output = SessionConfigAnswer> + Send + 'static,
+        F: Future<Output = SessionConfigAnswer> + Send + 'static,
     {
         Self(std::sync::Arc::new(move |c| Decision::later(f(c.clone()))))
     }
@@ -661,7 +661,7 @@ impl ListenerConfig {
         let before = self.logger.take();
         self.logger = Some(crate::proto::session::Logger::new(move |level, message| {
             if let Some(b) = &before {
-                (b.0)(level, message);
+                b.0(level, message);
             }
             log.push(HostEvent::Log {
                 level,
@@ -671,7 +671,7 @@ impl ListenerConfig {
         let before = self.on_memory_pressure.take();
         self.on_memory_pressure = Some(OnMemoryPressure::new(move |p| {
             if let Some(b) = &before {
-                (b.0)(p);
+                b.0(p);
             }
             tx.push(HostEvent::MemoryPressure(p));
         }));
@@ -1598,7 +1598,7 @@ mod tests {
         l.open(Some(slot), Framing::ByteStream, now);
         assert_eq!(
             l.expired(now + Duration::from_millis(1999)),
-            [] as [CarrierId; 0]
+            Vec::<CarrierId>::new()
         );
         assert_eq!(l.expired(now + Duration::from_secs(2)).len(), 9);
         // The carriers' slots went with them.

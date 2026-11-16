@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsStream;
-use tokio_rustls::rustls::{CommonState, ProtocolVersion};
+use tokio_rustls::rustls::{CommonState, ConnectionCommon, ProtocolVersion};
 use zmux::{CarrierInfo, PipeIo, TlsState};
 
 /// Whether the carriers on a rustls connection meet the Bound contract
@@ -268,9 +268,7 @@ pub(crate) fn tls_info(
 /// The exporter values zmux reads from `conn` now
 /// ([`zmux::CarrierExporter::snapshot`]), for a stream borrowed only for the
 /// call.
-pub(crate) fn snapshot_exporter<D>(
-    conn: &tokio_rustls::rustls::ConnectionCommon<D>,
-) -> zmux::CarrierExporter {
+pub(crate) fn snapshot_exporter<D>(conn: &ConnectionCommon<D>) -> zmux::CarrierExporter {
     zmux::CarrierExporter::snapshot(|label, context, out| {
         conn.export_keying_material(out, label.as_bytes(), Some(context))
             .is_ok()

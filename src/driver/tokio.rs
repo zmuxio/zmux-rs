@@ -457,11 +457,11 @@ pub fn spawn_drain(drain: impl Future<Output = ()> + Send + 'static, limit: Dura
 /// `dial`'s error, or `TimedOut` when it is not done within `limit`.
 pub async fn within<T>(
     limit: Duration,
-    dial: impl Future<Output = std::io::Result<T>>,
-) -> std::io::Result<T> {
+    dial: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
     tokio::time::timeout(limit, dial).await.unwrap_or_else(|_| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
             "the carrier was not ready in time",
         ))
     })

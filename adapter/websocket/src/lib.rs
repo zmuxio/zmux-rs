@@ -182,10 +182,7 @@ pub async fn dial(
 }
 
 /// A client dial within [`Options::timeout`].
-async fn bounded<T>(
-    options: &Options,
-    dial: impl std::future::Future<Output = io::Result<T>>,
-) -> io::Result<T> {
+async fn bounded<T>(options: &Options, dial: impl Future<Output = io::Result<T>>) -> io::Result<T> {
     zmux::adapter::within(options.timeout, dial).await
 }
 
@@ -1468,6 +1465,6 @@ mod tests {
         assert_eq!(o.accept(&offer(&[""])), Some(None));
         assert_eq!(o.accept(&offer(&["qmux-02"])), Some(Some("qmux-02".into())));
         assert_eq!(o.accept(&offer(&["other"])), None);
-        assert_eq!(o.offer(), [] as [std::string::String; 0]);
+        assert_eq!(o.offer(), Vec::<String>::new());
     }
 }

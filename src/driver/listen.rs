@@ -650,7 +650,7 @@ impl Entry {
         // synchronously ([`CarrierInfo::export`]).
         if let Some(e) = info.exporter().filter(|e| !e.is_resolved()) {
             let resolve = tokio::time::timeout_at(deadline, e.resolve());
-            let resolved = super::sealed::until(listener.adapter().closed(), resolve).await;
+            let resolved = until(listener.adapter().closed(), resolve).await;
             match resolved {
                 Some(Ok(())) => {}
                 Some(Err(_)) => {
@@ -1828,12 +1828,7 @@ impl Listener {
                 bytes,
             } => {
                 pending.done();
-                super::lanes::route(
-                    pipe,
-                    &lane_key,
-                    crate::proto::session::PipeId(id).lane(lane),
-                    bytes,
-                )?;
+                super::lanes::route(pipe, &lane_key, PipeId(id).lane(lane), bytes)?;
                 shared.counts.joins.fetch_add(1, Relaxed);
                 Ok(PipeEnd::default())
             }
@@ -2374,7 +2369,7 @@ impl Listener {
         };
         let mut acc = JoinAccept::new(session, self.shared.config.join_timeout, hello, carrier);
         let deadline = acc.deadline();
-        let bounded = |d: Option<std::time::Instant>| d.map(tokio::time::Instant::from_std);
+        let bounded = |d: Option<std::time::Instant>| d.map(Instant::from_std);
         // A Hello that arrived as carrier early data could be a replay: it is
         // offered only once the carrier's handshake completed, within the join's
         // deadline; one that does not complete is a setup failure. Bound never takes it.

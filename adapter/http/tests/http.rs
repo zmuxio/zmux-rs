@@ -581,7 +581,7 @@ async fn a_request_the_listener_does_not_take_falls_back() {
     let (addr, _l) = server_with(Options::default().with_fallback(echo())).await;
     let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(read_all(resp).await, [] as [u8; 0]);
+    assert_eq!(read_all(resp).await, Vec::<u8>::new());
 
     let (addr, l) = server_with(Options::default()).await;
     let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();

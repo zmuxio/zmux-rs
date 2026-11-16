@@ -140,7 +140,7 @@ struct Stopped<'a> {
     key: Option<u64>,
 }
 
-impl std::future::Future for Stopped<'_> {
+impl Future for Stopped<'_> {
     type Output = ();
 
     fn poll(
