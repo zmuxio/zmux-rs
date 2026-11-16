@@ -326,9 +326,11 @@ async fn mode_pool_upgrade_failures_back_off() {
         ]);
         let pool = PipePool::choice(&mode, &quick().with_cache(cache.clone(), "k"))
             .unwrap()
+            // The pool's redial delay outlasts the check below: a redial that
+            // succeeds clears the failure the aborted member left in the cache.
             .with_backoff(Backoff::new(
-                Duration::from_millis(50),
-                Duration::from_millis(50),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
             ));
         let pipe0 = client.pipes()[0].id();
         let _keep = maintain_pipes(&client, pool).expect("valid pool");
