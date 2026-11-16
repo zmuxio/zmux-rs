@@ -42,6 +42,7 @@ use zmux::proto::session::{
 const BS: Framing = Framing::ByteStream;
 
 /// The CPU time of the calling thread.
+#[cfg(unix)]
 fn cpu() -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -50,6 +51,13 @@ fn cpu() -> Duration {
     // SAFETY: `ts` is a valid timespec for the call to write.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Off Unix: the wall time since the first call (std has no thread CPU time).
+#[cfg(not(unix))]
+fn cpu() -> Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
 }
 const STEP: Duration = Duration::from_millis(1);
 /// The carrier's low-water mark: the sender writes while less is unsent.
