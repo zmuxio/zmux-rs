@@ -79,18 +79,34 @@ impl std::fmt::Debug for TlsConnection {
 }
 
 impl TlsConnection {
-    /// The connection of an established tokio-rustls stream, client or server.
+    /// The connection of an established tokio-rustls stream, client or
+    /// server; a client's [`TlsConnection::client`] also reports the server
+    /// name it dialled.
     pub fn new<IO>(stream: impl Into<TlsStream<IO>>) -> Self
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let stream = stream.into();
-        let common = stream.get_ref().1;
-        let alpn = common.alpn_protocol().map(<[u8]>::to_vec);
         let server_name = match &stream {
             TlsStream::Server(s) => s.get_ref().1.server_name().map(str::to_owned),
             TlsStream::Client(_) => None,
         };
+        Self::of(stream, server_name)
+    }
+
+    /// The connection of an established client stream to `server_name`.
+    pub fn client<IO>(stream: tokio_rustls::client::TlsStream<IO>, server_name: &str) -> Self
+    where
+        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::of(stream.into(), Some(server_name.to_owned()))
+    }
+
+    fn of<IO>(stream: TlsStream<IO>, server_name: Option<String>) -> Self
+    where
+        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         Self {
             stream: Arc::new(Mutex::new(Box::new(stream))),
             alpn,
@@ -98,15 +114,11 @@ impl TlsConnection {
         }
     }
 
-    /// The metadata for an admission or a credential: the exporter, the
-    /// negotiated ALPN identifier and a server's client-given name.
+    /// The metadata for an admission or a credential: its binding's
+    /// ([`TlsBinding::info`]).
     #[must_use]
-    pub fn info(&self) -> CarrierInfo<'_> {
-        let stream = &self.stream;
-        CarrierInfo::new()
-            .with_alpn(self.alpn.as_deref())
-            .with_server_name(self.server_name.as_deref())
-            .with_exporter(move |label, context, out| lock(stream).export(label, context, out))
+    pub fn info(&self) -> CarrierInfo {
+        self.binding().info()
     }
 
     /// The binding the connection's carriers declare.
@@ -206,6 +218,21 @@ impl TlsBinding {
         done.then(|| self.state.clone())
     }
 
+    /// The connection's metadata for an admission or a credential, the one
+    /// source of it: the negotiated ALPN identifier, the server name, and
+    /// the exporter while the connection is bound ([`Self::export`]).
+    #[must_use]
+    pub fn info(&self) -> CarrierInfo {
+        let binding = self.clone();
+        tls_info(
+            self.state.alpn.as_deref(),
+            self.state.server_name.as_deref(),
+            zmux::CarrierExporter::new(move |label, context, out| {
+                binding.export(label, context, out)
+            }),
+        )
+    }
+
     /// `io` as a carrier on the connection: with the TLS terminated here
     /// once the handshake is complete, and, when the connection is bound
     /// now, declared secure with its exporter ([`TlsBinding::export`]).
@@ -222,4 +249,30 @@ impl TlsBinding {
         io.with_carrier_secure()
             .with_exporter(move |label, context, out| binding.export(label, context, out))
     }
+}
+
+/// A TLS connection's metadata: its ALPN identifier, its server name and
+/// `exporter`; what [`TlsBinding::info`] and the metadata of a borrowed
+/// stream ([`crate::carrier_info`]) are made of.
+pub(crate) fn tls_info(
+    alpn: Option<&[u8]>,
+    server_name: Option<&str>,
+    exporter: zmux::CarrierExporter,
+) -> CarrierInfo {
+    CarrierInfo::new()
+        .with_alpn(alpn)
+        .with_server_name(server_name)
+        .with_exporter(exporter)
+}
+
+/// The exporter values zmux reads from `conn` now
+/// ([`zmux::CarrierExporter::snapshot`]), for a stream borrowed only for the
+/// call.
+pub(crate) fn snapshot_exporter<D>(
+    conn: &tokio_rustls::rustls::ConnectionCommon<D>,
+) -> zmux::CarrierExporter {
+    zmux::CarrierExporter::snapshot(|label, context, out| {
+        conn.export_keying_material(out, label.as_bytes(), Some(context))
+            .is_ok()
+    })
 }

@@ -8,7 +8,6 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -80,22 +79,6 @@ where
         }
     };
     let _ = tokio::time::timeout(duration, discard).await;
-}
-
-/// A future whose panic is its output `None`.
-pub(crate) struct CatchUnwind<F>(pub(crate) F);
-
-impl<F: Future + Unpin> Future for CatchUnwind<F> {
-    type Output = Option<F::Output>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = &mut self.0;
-        match std::panic::catch_unwind(AssertUnwindSafe(|| Pin::new(inner).poll(cx))) {
-            Ok(Poll::Ready(v)) => Poll::Ready(Some(v)),
-            Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(None),
-        }
-    }
 }
 
 /// The source of a TCP connection that arrived from `peer`, which `trusted`

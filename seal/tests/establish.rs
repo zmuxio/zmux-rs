@@ -103,7 +103,7 @@ async fn run(l: &Listener, cfg: &ClientConfig) -> std::io::Result<(PipeIo, Peer)
 
 #[tokio::test]
 async fn a_pinned_key_needs_no_credential_and_a_wrong_one_fails() {
-    let l = listener(None, keys().psk);
+    let l = listener(None, keys().psk.to_vec());
     let pin = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
     let (_, peer) = run(&l, &pin).await.expect("message 2 without credentials");
     assert_eq!(peer.static_key, node_public());
@@ -138,7 +138,7 @@ async fn a_wrong_key_is_refused_without_an_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_joins_a_sealed_pipe() {
     for profile in [1, 3] {
-        let l = listener(None, keys().psk);
+        let l = listener(None, keys().psk.to_vec());
         let mut cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
         cfg.allowed_profiles = vec![profile];
         let (p, _) = run(&l, &cfg).await.unwrap();
@@ -231,15 +231,18 @@ async fn echo_once(c: &Session, s: &Session) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_split_carrier_is_established_after_pairing() {
     for downlink_first in [false, true] {
-        let l = listener(None, keys().psk);
+        let l = listener(None, keys().psk.to_vec());
         let (client_pipe, up, down) = split(None, false);
         let (a, b) = if downlink_first {
             (down, up)
         } else {
             (up, down)
         };
+        // Handed over in this order; when each half registers depends on when
+        // the client's bytes reach it, which no sleep here would decide: the
+        // pairing must hold for any interleaving, and the two orders of
+        // hand-over cover both the uplink and the downlink arriving first.
         let first = hand_over(&l, a);
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let second = hand_over(&l, b);
         let cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
         let (p, peer) = tokio::time::timeout(Duration::from_secs(5), establish(client_pipe, &cfg))
@@ -272,7 +275,7 @@ async fn a_split_carrier_without_establish_starts_no_session() {
     // in the way.
     let server = ServerConfig::new(
         Arc::new(TestGate {
-            psk: keys().psk,
+            psk: keys().psk.to_vec(),
             cred: None,
         }),
         NODE,
@@ -316,12 +319,12 @@ async fn a_split_carrier_without_establish_starts_no_session() {
 fn bound_listener() -> Listener {
     let server = ServerConfig::new(
         Arc::new(TestGate {
-            psk: keys().psk,
+            psk: keys().psk.to_vec(),
             cred: None,
         }),
         NODE,
         ServerOptions {
-            allow_record_mode: Some(Arc::new(|_, _| true)),
+            allow_record_mode: Some(zmux_seal::ModeCheck::new(|_, _| true)),
             shaper: None,
             shaping_limits: None,
             ..Default::default()
@@ -429,7 +432,7 @@ async fn the_handshake_shaper_plans_each_message() {
         let client_log: Log = Arc::default();
         let server = ServerConfig::new(
             Arc::new(TestGate {
-                psk: keys().psk,
+                psk: keys().psk.to_vec(),
                 cred: list.clone(),
             }),
             NODE,
@@ -571,7 +574,7 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
         server_config.handshake_shaper = Some(hook(server_log.clone(), plan, fail));
         let server = ServerConfig::new(
             Arc::new(TestGate {
-                psk: keys().psk,
+                psk: keys().psk.to_vec(),
                 cred: None,
             }),
             NODE,
@@ -633,7 +636,7 @@ async fn an_establish_on_a_stream_carrier_keeps_its_exporter() {
             .await
             .unwrap();
         let outer_server = outer_server.await.unwrap().unwrap();
-        let l = listener(None, keys().psk);
+        let l = listener(None, keys().psk.to_vec());
         let ll = l.clone();
         tokio::spawn(async move {
             let (send, recv) = outer_server.accept_bi().await.unwrap();
@@ -694,9 +697,9 @@ fn a_server_configuration_is_checked_when_it_is_made() {
 /// its list is refused, not only the first one tried.
 #[tokio::test]
 async fn a_client_configuration_names_its_mistake() {
-    let l = listener(None, keys().psk);
+    let l = listener(None, keys().psk.to_vec());
     let mut cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
-    cfg.psk = Vec::new();
+    cfg.psk = zmux::proto::seal::Secret::default();
     let e = run(&l, &cfg).await.unwrap_err();
     assert!(
         e.to_string()
@@ -723,7 +726,7 @@ async fn a_profile_without_a_key_is_accepted_only_when_listed() {
         ..Default::default()
     };
     cfg.allowed_profiles = vec![4];
-    let l = listener(None, keys().psk);
+    let l = listener(None, keys().psk.to_vec());
     let e = run(&l, &cfg).await.unwrap_err();
     let no_reply = e.get_ref().and_then(|e| e.downcast_ref::<NoReply>());
     assert!(no_reply.is_some(), "{e}");
@@ -751,7 +754,7 @@ async fn a_profile_without_a_key_is_accepted_only_when_listed() {
 #[tokio::test]
 async fn profiles_pq_facts_and_no_fallback() {
     let pin = || Arc::new(PinVerifier::new(key_id(1, &node_public())));
-    let l = listener(None, keys().psk);
+    let l = listener(None, keys().psk.to_vec());
     let (_, peer) = run(&l, &client(pin())).await.unwrap();
     assert!(peer.profile == 1 || peer.profile == 3, "{}", peer.profile);
     assert!(peer.pq_confidential && !peer.pq_authenticated);
@@ -781,7 +784,7 @@ async fn profiles_pq_facts_and_no_fallback() {
 }
 
 /// A credential travels to the verifier with the PSK identity and the local context; a
-/// rejection and a temporary failure are told apart, and a panic is temporary.
+/// rejection and a temporary failure are told apart, and a panic rejects.
 #[tokio::test]
 async fn the_verifier_sees_one_credential_and_tells_its_errors_apart() {
     struct Check(bool);
@@ -814,7 +817,7 @@ async fn the_verifier_sees_one_credential_and_tells_its_errors_apart() {
             panic!("a host's bug")
         }
     }
-    let l = listener(Some((7, vec![1, 2])), keys().psk);
+    let l = listener(Some((7, vec![1, 2])), keys().psk.to_vec());
     let mut c = client(Arc::new(Check(true)));
     c.local_context = b"ctx".to_vec();
     let (_, peer) = run(&l, &c).await.unwrap();
@@ -872,7 +875,7 @@ async fn application_data_in_messages_1_2_and_3() {
             _: &'a [u8],
             _: Option<SocketAddr>,
         ) -> BoxFuture<'a, Result<Vec<u8>, VerifyError>> {
-            Box::pin(async { Ok(keys().psk) })
+            Box::pin(async { Ok(keys().psk.to_vec()) })
         }
         fn credential<'a>(
             &'a self,
@@ -985,7 +988,7 @@ async fn panicking_client_verifier_rejects() {
     for v in [Arc::new(Panics) as Arc<dyn Verifier>, Arc::new(PanicsLater)] {
         let server = ServerConfig::new(
             Arc::new(TestGate {
-                psk: keys().psk,
+                psk: keys().psk.to_vec(),
                 cred: None,
             }),
             NODE,
@@ -1039,7 +1042,7 @@ fn proving_listener(
 ) -> Listener {
     let server = ServerConfig::new(
         Arc::new(TestGate {
-            psk: keys().psk,
+            psk: keys().psk.to_vec(),
             cred: Some((77, b"node".to_vec())),
         }),
         NODE,
@@ -1167,12 +1170,12 @@ type Seen = Arc<std::sync::Mutex<Vec<(&'static str, Option<RecordMode>)>>>;
 fn mismatch_listener(action: Option<zmux::RejectAction>, seen: Seen) -> Listener {
     let server = ServerConfig::new(
         Arc::new(TestGate {
-            psk: keys().psk,
+            psk: keys().psk.to_vec(),
             cred: None,
         }),
         NODE,
         ServerOptions {
-            allow_record_mode: Some(Arc::new(|_, _| true)),
+            allow_record_mode: Some(zmux_seal::ModeCheck::new(|_, _| true)),
             ..Default::default()
         },
     )
@@ -1300,7 +1303,7 @@ impl tokio::io::AsyncWrite for NoHalfClose {
 /// the close code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sealed_close_without_half_close_keeps_its_code() {
-    let l = listener(None, keys().psk);
+    let l = listener(None, keys().psk.to_vec());
     let cfg = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
     for i in 0..200 {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1354,7 +1357,7 @@ async fn message_2_with_a_credential_of(len: usize) -> bool {
         .key_id();
     let server = ServerConfig::new(
         Arc::new(TestGate {
-            psk: keys().psk,
+            psk: keys().psk.to_vec(),
             cred: Some((77, vec![0x5a; len])),
         }),
         NODE,

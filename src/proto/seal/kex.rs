@@ -21,8 +21,7 @@ pub const MLKEM768_RANDOM_LEN: usize = libcrux_ml_kem::ENCAPS_SEED_SIZE;
 
 /// Overwrites a stack copy of key material.
 fn wipe<const N: usize>(mut bytes: [u8; N]) {
-    bytes.fill(0);
-    std::hint::black_box(&mut bytes);
+    crate::util::wipe(&mut bytes);
 }
 
 fn x25519_private(private: &[u8]) -> Result<StaticSecret, Error> {

@@ -92,6 +92,8 @@
 mod body;
 mod classify;
 mod client;
+#[cfg(test)]
+mod conformance_tests;
 mod endpoint;
 mod exchange;
 mod server;
@@ -133,7 +135,10 @@ pub struct Options {
     pub lanes: bool,
     /// Client: the limit on establishing a carrier, from the connection's
     /// HTTP handshake to the response head (default 10 s); a carrier not
-    /// answered within it fails with `TimedOut`.
+    /// answered within it fails with `TimedOut`. Also how long the
+    /// response of an uplink or a lane, which carries no pipe bytes, is
+    /// read on after the request body ended gracefully, before it is
+    /// dropped with what it holds.
     pub timeout: Duration,
     /// Server: the exchange carrier's server, which answers the exchange
     /// requests whose path starts with the fixed part of its
@@ -150,10 +155,10 @@ pub struct Options {
     /// ([`zmux::ListenerConfig::admission`], none by default): its prefix
     /// ([`CarrierCredential::prefix`]) is written first on each request body that
     /// carries a pipe or a lane, and a downlink `GET`, which has no body,
-    /// carries its header form ([`CarrierCredential::header`]). The adapter does
-    /// not see the TLS layer of its connections (they are the caller's
-    /// byte streams): the credential is given no exporter, so a bound one
-    /// fails each request.
+    /// carries its header form ([`CarrierCredential::header`]). On a
+    /// [`zmux_rustls::TlsConnection`] the credential is given the
+    /// connection's metadata and exporter (`TlsBinding::info`); on another
+    /// byte stream it is given none, so a bound one fails each request.
     pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
     /// Client: the connections carry TLS, so the carriers' URL is
     /// `https://` (default `false`, `http://`): the scheme redirects are
@@ -194,7 +199,7 @@ impl Default for Options {
         Self {
             path: "/zmux".into(),
             lanes: false,
-            timeout: Duration::from_secs(10),
+            timeout: zmux::adapter::DIAL_TIMEOUT,
             exchange: None,
             fallback: None,
             carrier_credential: None,

@@ -76,7 +76,11 @@ impl PairField {
 
 impl Default for PairField {
     fn default() -> Self {
-        Self(HeaderName::from_static("zmux-pipe-pair"))
+        // The one name of the field, normalised to lower case.
+        Self(
+            HeaderName::from_bytes(zmux::adapter::PAIR_HEADER.as_bytes())
+                .expect("PAIR_HEADER is a valid field name"),
+        )
     }
 }
 
@@ -181,7 +185,7 @@ pub fn classify(parts: &http::request::Parts, pair: &PairField) -> Option<Reques
 /// and given to no listener.
 #[must_use]
 pub fn forwarded_early_data(headers: &HeaderMap) -> bool {
-    zmux::adapter::forwarded_early_data(headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())))
+    zmux::adapter::forwarded_early_data(headers)
 }
 
 /// The comma-separated tokens of every `name` field.

@@ -186,13 +186,11 @@ impl PoolSpec {
             }
         }
         if let Some(p) = x.get("probe_interval") {
-            s.probe_interval = Some(parse_value(
-                p,
-                Family::Time,
-                tables,
-                FREE_SCOPES,
-                "probe_interval",
-            )?);
+            // A drawn value outside 0 or [10^6, 10^15] is the decision's to
+            // refuse ([`MemberDecision::validate`], reported to the pool's
+            // `decision_rejected`): the shared vectors accept it here.
+            let v = parse_value(p, Family::Time, tables, FREE_SCOPES, "probe_interval")?;
+            s.probe_interval = Some(v);
         }
         if let Some(j) = x.get("probe_jitter") {
             s.probe_jitter = Some(jitter(j, "probe_jitter")?);

@@ -346,12 +346,16 @@ impl std::error::Error for Error {}
 
 /// An encoder could not write a frame or value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// The output buffer is shorter than the encoding.
     BufferTooShort,
     /// A field holds a value that cannot be encoded: above 2^62 - 1, or
     /// outside the range the field's definition allows.
     ValueOutOfRange,
+    /// A frame after one without a Length field, which runs to the end of
+    /// its record.
+    AfterLastFrame,
 }
 
 impl fmt::Display for EncodeError {
@@ -359,6 +363,7 @@ impl fmt::Display for EncodeError {
         f.write_str(match self {
             Self::BufferTooShort => "output buffer too short",
             Self::ValueOutOfRange => "value out of range for its field",
+            Self::AfterLastFrame => "a frame after one that runs to the end of the record",
         })
     }
 }

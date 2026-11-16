@@ -1,0 +1,72 @@
+//! A carrier whose first bytes start a session and then stall: the
+//! listener's handshake timeout ends it, and so does its close, whatever the
+//! session configuration's own handshake timeout (none here).
+
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use zmux::{Config, HandleError, Listener, ListenerConfig, PipeHint, PipeIo, Session};
+
+const LIMIT: Duration = Duration::from_secs(10);
+
+/// The first bytes a client sends: the start of its first record.
+async fn first_bytes() -> Vec<u8> {
+    let (a, mut b) = duplex(1 << 16);
+    let client = tokio::spawn(Session::connect(PipeIo::new(a), Config::default()));
+    let mut buf = vec![0; 1 << 16];
+    let n = tokio::time::timeout(LIMIT, b.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    client.abort();
+    buf.truncate(n);
+    // Half of it: the classifier accepts the record's start.
+    buf.truncate((n / 2).max(4));
+    buf
+}
+
+fn listener(handshake: Duration) -> Listener {
+    let mut server = Config::default();
+    server.handshake_timeout = None;
+    let mut limits = ListenerConfig::default();
+    limits.handshake_timeout = handshake;
+    Listener::new(server, limits).expect("valid listener configuration")
+}
+
+#[tokio::test]
+async fn a_valid_first_record_that_stalls_times_out() {
+    let first = first_bytes().await;
+    let l = listener(Duration::from_millis(200));
+    let (mut near, far) = duplex(1 << 16);
+    near.write_all(&first).await.unwrap();
+    let begun = Instant::now();
+    let r = tokio::time::timeout(LIMIT, l.handle_pipe(PipeIo::new(far), PipeHint::default()))
+        .await
+        .unwrap();
+    assert_eq!(r, Err(HandleError::TimedOut));
+    assert!(begun.elapsed() < Duration::from_secs(3));
+    assert_eq!(l.stats().timed_out, 1);
+    drop(near);
+    l.close();
+}
+
+#[tokio::test]
+async fn the_listeners_close_ends_a_stalled_establishment() {
+    let first = first_bytes().await;
+    let l = listener(Duration::from_secs(3600));
+    let (mut near, far) = duplex(1 << 16);
+    near.write_all(&first).await.unwrap();
+    let ll = l.clone();
+    let handled =
+        tokio::spawn(async move { ll.handle_pipe(PipeIo::new(far), PipeHint::default()).await });
+    // The listener's own first record shows the establishment began.
+    let mut answer = [0u8; 1];
+    tokio::time::timeout(LIMIT, near.read(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    l.close();
+    let r = tokio::time::timeout(LIMIT, handled).await.unwrap().unwrap();
+    assert!(r.is_err(), "{r:?}");
+    drop(near);
+}

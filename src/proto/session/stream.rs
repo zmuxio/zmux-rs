@@ -1805,7 +1805,8 @@ impl Slab {
             slot
         };
         let entry = self.entry_mut(slot).expect("slot allocated");
-        entry.generation = entry.generation.wrapping_add(1);
+        // A slot whose generations are used up is never freed (`remove`).
+        entry.generation += 1;
         entry.stream = Some(stream);
         StreamKey {
             slot,
@@ -1849,7 +1850,11 @@ impl Slab {
         if track {
             self.touched.get_mut().push(key);
         }
-        self.free.push(key.slot);
+        // Retired after its last generation: an old key never names a new
+        // stream.
+        if key.generation < u32::MAX {
+            self.free.push(key.slot);
+        }
         self.len -= 1;
         Some(s)
     }

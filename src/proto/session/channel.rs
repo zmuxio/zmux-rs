@@ -68,11 +68,12 @@ impl SessionCore {
     /// not establish the session without the channel. Once it is false, the
     /// driver ends the channel's task.
     pub fn channel_live(&self, pipe: PipeId) -> bool {
-        self.state < State::Closing && !self.is_established()
-            || self.features.carrier_datagrams
-                && self
-                    .out_ref(pipe.0)
-                    .is_some_and(|o| o.channel().is_some() && o.is_live())
+        self.state < State::Closing
+            && (!self.is_established()
+                || self.features.carrier_datagrams
+                    && self
+                        .out_ref(pipe.0)
+                        .is_some_and(|o| o.channel().is_some() && o.is_live()))
     }
 
     /// Moves the queued datagrams that go on the datagram channel of `pipe`

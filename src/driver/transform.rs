@@ -138,8 +138,13 @@ impl AsyncRead for PipeStream {
             // A message arrives whole: read it into room for the largest.
             this.pending.resize(MESSAGE_ROOM, 0);
             let mut rb = ReadBuf::new(&mut this.pending);
-            let r = ready!(Pin::new(r).poll_read(cx, &mut rb));
+            let polled = Pin::new(r).poll_read(cx, &mut rb);
             let n = rb.filled().len();
+            let Poll::Ready(r) = polled else {
+                // Nothing arrived: the room is no data.
+                this.pending.clear();
+                return Poll::Pending;
+            };
             this.pending.truncate(n);
             r?;
             if n == 0 {
@@ -235,9 +240,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FlushEach<T> {
         ready!(this.poll_flushed(cx))?;
         let n = ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
         this.flushing = true;
-        // The bytes are taken; a flush that cannot finish now does before
-        // the next write.
-        let _ = this.poll_flushed(cx)?;
+        // The bytes are taken: a flush that cannot finish now does before
+        // the next write, and one that fails fails that call (`flushing`
+        // stays set), never this one, which would say the bytes were not
+        // taken.
+        let _ = this.poll_flushed(cx);
         Poll::Ready(Ok(n))
     }
 
@@ -334,6 +341,40 @@ mod tests {
         let io = io.wrap(|s| async move { Ok(s) }).await.unwrap();
         assert!(io.reader.is_some() && io.writer.is_none());
         assert_eq!(io.framing, Framing::Records);
+    }
+
+    /// A message reader whose first poll is `Pending`.
+    struct LateMessage(u8);
+
+    impl AsyncRead for LateMessage {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0 += 1;
+            match self.0 {
+                1 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                2 => {
+                    buf.put_slice(b"hello");
+                    Poll::Ready(Ok(()))
+                }
+                _ => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    /// A message carrier whose lower layer is `Pending` first hands out only
+    /// the message, not the room read into.
+    #[tokio::test]
+    async fn a_pending_message_read_hands_out_nothing() {
+        let mut s = PipeIo::reader(LateMessage(0)).records().into_stream();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
     }
 
     /// A writer that records each write call it gets.

@@ -824,6 +824,12 @@ impl SessionCore {
             }
         }
         self.streams.count_received(increase);
+        // Keys of streams gone since they were listed go, amortised: the
+        // list follows the live streams, not the history.
+        if self.recv_refs.holders.len() >= 2 * self.streams.len() + 64 {
+            let streams = &self.streams;
+            self.recv_refs.holders.retain(|&k| streams.get(k).is_some());
+        }
         let (s, spare) = self.streams.stream_and_spare(key).expect("present");
         let r = s.recv.as_mut().expect("present");
         r.received = r.received.max(end);
@@ -1471,6 +1477,24 @@ impl SessionCore {
         Ok(())
     }
 
+    /// A received datagram's payload: a reference into the shared read
+    /// buffer of [`SessionCore::receive_shared`] from
+    /// [`super::recv_buf::REFERENCE_MIN`] bytes on, as STREAM data is kept,
+    /// otherwise a copy.
+    fn datagram_bytes(&self, payload: &[u8]) -> Bytes {
+        match &self.rx_src {
+            Some((src, _))
+                if payload.len() >= super::recv_buf::REFERENCE_MIN && {
+                    let (r, p) = (src.as_ptr_range(), payload.as_ptr_range());
+                    r.start <= p.start && p.end <= r.end
+                } =>
+            {
+                src.slice_ref(payload)
+            }
+            _ => Bytes::copy_from_slice(payload),
+        }
+    }
+
     pub(super) fn on_datagram(
         &mut self,
         d: crate::proto::frame::Datagram<'_>,
@@ -1478,14 +1502,16 @@ impl SessionCore {
     ) -> Result<(), Error> {
         self.stats.datagrams_received += 1;
         if !self.features.datagram_flows {
-            self.datagram_arrived(None, Bytes::copy_from_slice(d.data));
+            let data = self.datagram_bytes(d.data);
+            self.datagram_arrived(None, data);
             return Ok(());
         }
         let (flow, payload) =
             Flow::parse(d.data).map_err(|e| Error::new(e.code(), ty, e.reason()))?;
         match flow {
             Flow::Session => {
-                self.datagram_arrived(None, Bytes::copy_from_slice(payload));
+                let data = self.datagram_bytes(payload);
+                self.datagram_arrived(None, data);
                 Ok(())
             }
             Flow::Stream { stream_id, context } => {
@@ -1511,10 +1537,12 @@ impl SessionCore {
                     // RTT.
                     // Counted as received once delivered.
                     self.stats.datagrams_received -= 1;
-                    self.hold_datagram(stream_id, context, Bytes::copy_from_slice(payload));
+                    let data = self.datagram_bytes(payload);
+                    self.hold_datagram(stream_id, context, data);
                     return Ok(());
                 }
-                self.stream_datagram_arrived(stream_id, context, Bytes::copy_from_slice(payload));
+                let data = self.datagram_bytes(payload);
+                self.stream_datagram_arrived(stream_id, context, data);
                 Ok(())
             }
         }
@@ -1578,7 +1606,7 @@ impl SessionCore {
         while d.recv_bytes + d.held_bytes + len > recv_bytes_cap
             && let Some(old) = d.waiting.pop_front()
         {
-            d.recv_bytes -= old.cost();
+            super::debit(&mut d.recv_bytes, old.cost());
             dropped += 1;
         }
         if dropped > 0 {
@@ -1604,7 +1632,7 @@ impl SessionCore {
         let mut ready = Vec::new();
         for w in all {
             if stream::index(w.stream_id) < opened {
-                d.recv_bytes -= w.cost();
+                super::debit(&mut d.recv_bytes, w.cost());
                 ready.push(w);
             } else {
                 d.waiting.push_back(w);
@@ -1632,7 +1660,7 @@ impl SessionCore {
             while let Some(w) = d.waiting.front()
                 && w.until <= now
             {
-                d.recv_bytes -= w.cost();
+                super::debit(&mut d.recv_bytes, w.cost());
                 d.waiting.pop_front();
                 dropped += 1;
             }
@@ -1655,7 +1683,7 @@ impl SessionCore {
             if stream.is_none() {
                 self.trim_waiting(data.len());
             }
-            self.queue_received_datagram(stream, data);
+            let _ = self.queue_received_datagram(stream, data);
             return;
         }
         self.trim_waiting(data.len());
@@ -1666,7 +1694,7 @@ impl SessionCore {
             while d.held_bytes + d.recv_bytes + len > recv_bytes_cap
                 && let Some(old) = d.held.pop_front()
             {
-                d.held_bytes -= old.data.len();
+                super::debit(&mut d.held_bytes, old.data.len());
                 dropped.push(old.stream);
             }
         }
@@ -1682,16 +1710,17 @@ impl SessionCore {
         self.dgram_mut().held.push_back(super::ReceivedDatagram {
             stream,
             data,
-            allowed: false,
+            granted: None,
         });
     }
 
-    /// Queues a received datagram for the application.
+    /// Queues a received datagram for the application; `false` when the
+    /// queue refused it (dropped and counted).
     pub(super) fn queue_received_datagram(
         &mut self,
         stream: Option<(StreamKey, u64)>,
         data: Bytes,
-    ) {
+    ) -> bool {
         match stream {
             None => self.queue_session_datagram(data),
             Some((key, context)) => self.queue_stream_datagram(key, context, data),
@@ -1708,8 +1737,8 @@ impl SessionCore {
 
     /// Queues a session datagram: the oldest session datagrams make room
     /// (128 at most); one that still does not fit within the session's
-    /// datagram bytes is dropped.
-    fn queue_session_datagram(&mut self, data: Bytes) {
+    /// datagram bytes is dropped (`false`).
+    fn queue_session_datagram(&mut self, data: Bytes) -> bool {
         let recv_queue = self.config.datagram_receive_queue;
         let recv_bytes_cap = self.config.datagram_receive_bytes;
         let mut dropped = 0;
@@ -1718,13 +1747,13 @@ impl SessionCore {
             || self.dgram_mut().recv_bytes + held + data.len() > recv_bytes_cap)
             && let Some(old) = self.dgram_mut().recv.pop_front()
         {
-            self.dgram_mut().recv_bytes -= old.len();
+            super::debit(&mut self.dgram_mut().recv_bytes, old.len());
             dropped += 1;
         }
         if self.dgram_mut().recv_bytes + held + data.len() > recv_bytes_cap {
             // Stream queues hold the bytes: drop the new one.
             self.count_dropped(dropped + 1);
-            return;
+            return false;
         }
         if dropped > 0 {
             self.count_dropped(dropped);
@@ -1735,6 +1764,7 @@ impl SessionCore {
         if was_empty {
             self.events.push_back(CoreEvent::DatagramReceived);
         }
+        true
     }
 
     /// Queues a stream datagram within the stream's own two bounds, the
@@ -1742,22 +1772,22 @@ impl SessionCore {
     /// ([`Config::datagram_stream_bytes`]): the stream's oldest datagrams
     /// make room until both hold, each counted as dropped; one larger than
     /// the bytes alone is kept alone. Stream queues do not count in the
-    /// session's datagram bytes.
-    fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) {
+    /// session's datagram bytes. `false` when the stream is gone.
+    fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) -> bool {
         let stream_queue = self.config.datagram_stream_queue;
         let stream_bytes = self.config.datagram_stream_bytes;
         let mut dropped = 0;
         let len = data.len();
         let Some(s) = self.streams.get_mut(key) else {
-            return;
+            return false;
         };
         let s = s.datagrams_mut();
         let dgram = self.dgram.get_or_insert_with(Box::default);
         while (s.queue.len() >= stream_queue || stream_bytes.is_some_and(|cap| s.bytes + len > cap))
             && let Some((_, old)) = s.queue.pop_front()
         {
-            s.bytes -= old.len();
-            dgram.stream_bytes -= old.len();
+            super::debit(&mut s.bytes, old.len());
+            super::debit(&mut dgram.stream_bytes, old.len());
             dropped += 1;
         }
         s.counts.dropped_recv += dropped;
@@ -1771,6 +1801,7 @@ impl SessionCore {
         if was_empty {
             self.events.push_back(CoreEvent::StreamDatagram(key));
         }
+        true
     }
 
     pub(super) fn count_dropped(&mut self, n: u64) {

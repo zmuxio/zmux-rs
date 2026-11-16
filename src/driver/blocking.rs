@@ -118,6 +118,9 @@ impl Write for SharedTcp {
 #[derive(Clone, Default)]
 pub struct HandshakeWait(Arc<HandshakeWaitState>);
 
+/// How often [`HandshakeWait::block_on`] looks for the carrier's shutdown.
+const SHUT_POLL: Duration = Duration::from_millis(50);
+
 #[derive(Default)]
 struct HandshakeWaitState {
     /// The carrier was shut down, and the deadline.
@@ -170,6 +173,38 @@ impl HandshakeWait {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .0 = true;
         self.0.changed.notify_all();
+    }
+
+    /// Runs `fut` on this thread until it completes, bounded as the
+    /// handshake's waits are: past the deadline, or once the carrier was
+    /// shut down, the future is dropped and the call fails with
+    /// `TimedOut`. For the host's futures of a handshake (a Gate, a
+    /// verifier), which do not read the carrier.
+    ///
+    /// # Errors
+    ///
+    /// `TimedOut` past the deadline or after the shutdown.
+    pub fn block_on<F: Future>(&self, fut: F) -> io::Result<F::Output> {
+        let mut fut = pin!(fut);
+        let waker = thread_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                return Ok(r);
+            }
+            let (shut, deadline) = *self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if shut || deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            // Woken by the future, or checked again at the deadline; a
+            // shutdown is seen within the poll interval.
+            let end = Instant::now() + SHUT_POLL;
+            park(Some(deadline.map_or(end, |d| d.min(end))));
+        }
     }
 
     fn limit(&self, timeout: Duration) {
@@ -282,7 +317,7 @@ impl PipeIo {
             .as_mut()
             .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?;
         let at = into.len();
-        into.resize(at + core_join_chunk(), 0);
+        into.resize(at + super::HANDSHAKE_READ, 0);
         let got = r.read(&mut into[at..]);
         into.truncate(at + *got.as_ref().unwrap_or(&0));
         got
@@ -338,18 +373,13 @@ impl PipeIo {
         self.reader = self.reader.take().map(|lower| {
             Box::new(SealedRead {
                 lower,
-                framing,
-                opener,
-                buf: vec![0; u16::MAX as usize + 1].into_boxed_slice(),
-                failed: false,
+                records: crate::proto::seal::SealedReader::new(framing, opener, Vec::new()),
             }) as Box<dyn Read + Send>
         });
         self.writer = self.writer.take().map(|lower| {
             Box::new(SealedWrite {
                 lower,
-                framing,
-                sealer,
-                unit: Vec::new(),
+                records: crate::proto::seal::SealedWriter::new(framing, sealer),
             }) as Box<dyn Write + Send>
         });
         let overhead = handle::sealed_overhead(framing);
@@ -371,8 +401,14 @@ impl PipeIo {
     /// Bounds this carrier's reads and writes: past `timeout` the carrier is shut down.
     /// `None` for a carrier without a closer ([`PipeIo::with_closer`]), which nothing can
     /// interrupt. Dropping the result disarms it.
-    pub fn watchdog(&mut self, timeout: Duration) -> Option<Watchdog> {
-        Some(Watchdog::new(self.shared_closer()?, timeout))
+    ///
+    /// # Errors
+    ///
+    /// The error of starting the watchdog's thread: the bound would not hold.
+    pub fn watchdog(&mut self, timeout: Duration) -> io::Result<Option<Watchdog>> {
+        self.shared_closer()
+            .map(|c| Watchdog::new(c, timeout))
+            .transpose()
     }
 
     /// What a handshake's waits on this carrier end with.
@@ -432,6 +468,18 @@ impl PipeIo {
         }
         if !outbound {
             self.writer = None;
+        }
+    }
+
+    /// Ends the writing half gracefully: what is written is flushed, then
+    /// the half is shut down (a carrier without a closer drops it).
+    pub(crate) fn shutdown_write(&mut self) {
+        if let Some(w) = self.writer.as_mut() {
+            let _ = w.flush();
+        }
+        match &self.closer {
+            Some(c) => c(Shutdown::Write),
+            None => self.writer = None,
         }
     }
 
@@ -678,6 +726,31 @@ impl PipeIo {
         self
     }
 
+    /// [`Self::with_exporter`] whose values come later (from another
+    /// thread, a language binding): as the tokio driver's
+    /// `PipeIo::with_exporter_async`; the thread that takes the carrier
+    /// waits for the values zmux reads, bounded by its handshake (or join)
+    /// deadline.
+    #[must_use]
+    pub fn with_exporter_async<F>(
+        mut self,
+        export: impl Fn(crate::ExportRequest) -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: Future<Output = io::Result<Vec<u8>>> + Send + 'static,
+    {
+        self.exporter = Some(crate::proto::exporter::CarrierExporter::new_async(export));
+        self
+    }
+
+    /// Fetches the values of an exporter whose values come later until
+    /// `deadline`, parking the thread; nothing to do for others.
+    pub(crate) fn resolve_exporter(&self, deadline: Option<Instant>) {
+        if let Some(e) = self.exporter.as_ref().filter(|e| !e.is_resolved()) {
+            let _ = run(e.resolve(), deadline);
+        }
+    }
+
     /// The application protocol the carrier negotiated (for example the
     /// ALPN identifier), reported by `Session::protocol`.
     #[must_use]
@@ -773,6 +846,27 @@ pub struct Io {
     writers_alive: usize,
     /// The timer thread while it waits, and its deadline.
     timer: Option<(std::task::Waker, Option<Instant>)>,
+    /// The listener's account the session reports its charge to.
+    pub(crate) account: Option<Box<super::account::AccountLink<Shared<Blocking>>>>,
+}
+
+impl Io {
+    /// `threads` more threads of pipe `id` use `closer`: one entry per pipe,
+    /// its count the threads alive (a join thread's carrier is the closer of
+    /// the pipe threads it starts).
+    fn add_threads(&mut self, id: u64, closer: &Arc<Closer>, threads: usize) {
+        match self.closers.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.threads += threads;
+                p.closer = closer.clone();
+            }
+            None => self.closers.push(PipeThreads {
+                id,
+                closer: closer.clone(),
+                threads,
+            }),
+        }
+    }
 }
 
 /// The threads of a pipe and its closer.
@@ -930,11 +1024,7 @@ impl Driver for Blocking {
         // from now on.
         let closer: Option<Arc<Closer>> = carrier.closer.take().map(Arc::new);
         if let Some(c) = &closer {
-            shared.lock().io.closers.push(PipeThreads {
-                id,
-                closer: c.clone(),
-                threads: 1,
-            });
+            shared.lock().io.add_threads(id, c, 1);
             let c = c.clone();
             carrier.closer = Some(Box::new(move |how| c(how)));
         }
@@ -1198,174 +1288,115 @@ impl Queries {
     }
 }
 
-/// Starts the threads of a pipe's halves. Added pipes (`id` > 0) belong to
-/// a multipath session.
-/// How often a deferred join asks again.
-const JOIN_HOLD_POLL: Duration = Duration::from_millis(50);
-
 /// Runs the joiner's handshake, then the pipe's threads.
 fn join_thread(shared: &Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, closer: bool) {
+    use super::accept::{DialStep, JoinDial};
     let _driver = DriverThread::enter();
-    let done = |shared: &Arc<Shared<Blocking>>, failed: bool| {
-        let mut st = shared.lock();
-        if failed {
-            st.core
-                .join_carrier_failed(id, io::ErrorKind::UnexpectedEof, Instant::now());
-        }
+    let done = |shared: &Arc<Shared<Blocking>>| {
         if closer {
+            let mut st = shared.lock();
             st.thread_done(id);
+            st.after_command();
         }
-        st.after_command();
     };
     let framing = pipe.framing;
-    let (kind, overhead) = (pipe.carrier, pipe.write_overhead);
-    let message = loop {
-        let r = {
-            let mut st = shared.lock();
-            let r = st.core.join_prepare(id, Instant::now());
-            st.after_command();
-            r
-        };
-        match r {
-            Ok(Some(message)) => break message,
-            Ok(None) => thread::sleep(JOIN_HOLD_POLL),
-            Err(_) => return done(shared, false),
-        }
-    };
-    let plan = shared.join_plan(kind, message);
-    if join_wait(shared, id, plan.delay) {
-        return done(shared, false);
-    }
-    let hello = {
-        let mut st = shared.lock();
-        let r = st
-            .core
-            .join_hello(id, (framing, overhead), &plan, Instant::now());
-        st.after_command();
-        r
-    };
-    let Ok(hello) = hello else {
-        return done(shared, false);
-    };
+    let mut dial = JoinDial::new(
+        shared.clone(),
+        id,
+        framing,
+        pipe.carrier,
+        pipe.write_overhead,
+    );
     let (Some(mut r), Some(mut w)) = (pipe.reader.take(), pipe.writer.take()) else {
-        return done(shared, true);
+        dial.failed(io::ErrorKind::UnexpectedEof);
+        return done(shared);
     };
-    if w.write_all(&hello).and_then(|()| w.flush()).is_err() {
-        return done(shared, true);
-    }
     let mut input = Vec::new();
-    let mut want = 1;
-    let mut chunk = vec![0; core_join_chunk()];
-    loop {
-        while input.len() < want {
-            match r.read(&mut chunk) {
-                Ok(n @ 1..) if input.len() + n <= crate::proto::session::JOIN_READ_BOUND => {
+    let mut chunk = vec![0; super::HANDSHAKE_READ];
+    let mut step = dial.start();
+    let (consumed, records) = loop {
+        step = match step {
+            DialStep::Hold => {
+                run(handle::join_released_wait(shared, id), None);
+                dial.released()
+            }
+            DialStep::Delay(d) => dial.delayed(!join_wait(shared, id, d)),
+            DialStep::Write(unit) => {
+                let wrote = if unit.is_empty() {
+                    Ok(())
+                } else {
+                    w.write_all(&unit).and_then(|()| w.flush())
+                };
+                dial.written(wrote)
+            }
+            DialStep::Read(want) => {
+                while input.len() < want {
+                    // Checked before it is appended.
+                    let (got, n) = match r.read(&mut chunk) {
+                        Ok(n) => (Ok(n), n),
+                        Err(e) => (Err(e), 0),
+                    };
+                    if !dial.read(got, input.len() + n) {
+                        return done(shared);
+                    }
                     input.extend_from_slice(&chunk[..n]);
                 }
-                _ => return done(shared, true),
+                dial.input(&mut input)
             }
-        }
-        let step = {
-            let mut st = shared.lock();
-            let step = st.core.verify_reply(id, &input, Instant::now());
-            st.after_command();
-            step
+            DialStep::End => return done(shared),
+            DialStep::Attach { consumed, records } => break (consumed, records),
         };
-        match step {
-            crate::proto::session::JoinStep::More { consumed, need } => {
-                input.drain(..consumed);
-                want = if framing == Framing::Records {
-                    input.clear();
-                    1
-                } else {
-                    need.max(input.len() + 1)
-                };
-            }
-            crate::proto::session::JoinStep::Verified { consumed, mode } => {
-                let plan = if mode == crate::proto::seal::RecordMode::Bound {
-                    crate::shaping::UnitPlan::default()
-                } else {
-                    let plan = shared.join_plan(kind, "confirm");
-                    if join_wait(shared, id, plan.delay) {
-                        return done(shared, false);
-                    }
-                    plan
-                };
-                let finished = {
-                    let mut st = shared.lock();
-                    let r = st.core.join_finish(id, &plan, Instant::now());
-                    st.after_command();
-                    r
-                };
-                let Ok(crate::proto::session::JoinFinished {
-                    confirm, records, ..
-                }) = finished
-                else {
-                    return done(shared, false);
-                };
-                if !confirm.is_empty() && w.write_all(&confirm).and_then(|()| w.flush()).is_err() {
-                    return done(shared, true);
-                }
-                input.drain(..consumed);
-                let (inbound, outbound) = {
-                    let st = shared.lock();
-                    st.core.pipe_directions(id)
-                };
-                let rest = io::Cursor::new(input);
-                pipe.reader = Some(Box::new(Read::chain(rest, r)));
-                pipe.writer = Some(w);
-                if let Some((sealer, opener)) = records {
-                    pipe = pipe.seal_records(sealer, opener);
-                }
-                if !inbound {
-                    pipe.reader = None;
-                }
-                if !outbound {
-                    pipe.writer = None;
-                }
-                let gone = {
-                    let mut st = shared.lock();
-                    // Checked when the pipe was added (`check_pipe_record_limit`).
-                    if let Some(m) = pipe.max_record {
-                        let _ = st.core.set_pipe_max_record(id, m);
-                    }
-                    st.core.set_pipe_write_overhead(id, pipe.write_overhead);
-                    // The session or the attachment may have ended while the Confirm was
-                    // written.
-                    let gone = st.core.state() >= CoreState::Closing
-                        || matches!(st.core.pipe_joined(id), Some(Err(_)));
-                    if gone && closer {
-                        st.thread_done(id);
-                    }
-                    gone
-                };
-                if gone {
-                    // No thread takes the carrier: it ends here, as the session's end
-                    // would have ended it.
-                    if let Some(c) = pipe.closer.take() {
-                        c(Shutdown::Both);
-                    }
-                    return;
-                }
-                let spawned = spawn_pipe(shared, id.0, pipe);
-                // The join's hold on the closer ends only once the pipe's threads hold
-                // it: the session's end, whenever it comes, finds the closer.
-                let mut st = shared.lock();
-                if spawned.is_err() {
-                    st.core
-                        .join_carrier_failed(id, io::ErrorKind::BrokenPipe, Instant::now());
-                }
-                if closer {
-                    st.thread_done(id);
-                }
-                st.after_command();
-                return;
-            }
-            crate::proto::session::JoinStep::Declined | crate::proto::session::JoinStep::Failed => {
-                return done(shared, false);
-            }
-        }
+    };
+    input.drain(..consumed);
+    let Some((inbound, outbound)) = dial.limits(pipe.max_record, pipe.write_overhead) else {
+        return done(shared);
+    };
+    let rest = io::Cursor::new(input);
+    pipe.reader = Some(Box::new(Read::chain(rest, r)));
+    pipe.writer = Some(w);
+    if let Some((sealer, opener)) = records {
+        pipe = pipe.seal_records(sealer, opener);
     }
+    if !inbound {
+        pipe.reader = None;
+    }
+    if !outbound {
+        pipe.writer = None;
+    }
+    let gone = {
+        let mut st = shared.lock();
+        // The session or the attachment may have ended while the Confirm was
+        // written.
+        let gone = st.core.state() >= CoreState::Closing
+            || matches!(st.core.pipe_joined(id), Some(Err(_)));
+        if gone && closer {
+            st.thread_done(id);
+        }
+        gone
+    };
+    if gone {
+        // Nothing to fail: the join is over with its session or attachment.
+        dial.attached();
+        // No thread takes the carrier: it ends here, as the session's end
+        // would have ended it.
+        if let Some(c) = pipe.closer.take() {
+            c(Shutdown::Both);
+        }
+        return;
+    }
+    let spawned = spawn_pipe(shared, id.0, pipe);
+    if spawned.is_err() {
+        dial.failed(io::ErrorKind::BrokenPipe);
+    } else {
+        dial.attached();
+    }
+    // The join's hold on the closer ends only once the pipe's threads hold
+    // it: the session's end, whenever it comes, finds the closer.
+    let mut st = shared.lock();
+    if closer {
+        st.thread_done(id);
+    }
+    st.after_command();
 }
 
 /// Waits out a plan's delay, holding no lock; `true` when the join failed meanwhile.
@@ -1377,27 +1408,23 @@ fn join_wait(shared: &Arc<Shared<Blocking>>, id: PipeId, delay: Duration) -> boo
     run(handle::join_failed_wait(shared, id), deadline).is_some()
 }
 
-/// The size of the handshake's reads: a message carrier needs a whole unit to fit.
-const fn core_join_chunk() -> usize {
-    u16::MAX as usize + 64
-}
-
 /// Shuts a carrier down at a deadline, ending calls blocked on it. One thread until dropped.
 #[derive(Debug)]
 pub struct Watchdog {
     deadline: std::sync::mpsc::Sender<Instant>,
-    fired: Arc<std::sync::atomic::AtomicBool>,
+    /// 0 armed, 1 disarmed, 2 fired: decided under the lock, so that a
+    /// watchdog disarmed never fires after.
+    state: Arc<std::sync::Mutex<u8>>,
 }
 
 impl Watchdog {
-    pub(crate) fn new(closer: Arc<Closer>, timeout: Duration) -> Self {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    pub(crate) fn new(closer: Arc<Closer>, timeout: Duration) -> io::Result<Self> {
         use std::sync::mpsc::{RecvTimeoutError, channel};
         let (deadline, moves) = channel::<Instant>();
-        let fired = Arc::new(AtomicBool::new(false));
-        let flag = fired.clone();
+        let state = Arc::new(std::sync::Mutex::new(0u8));
+        let flag = state.clone();
         let mut at = Instant::now().checked_add(timeout);
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("zmux-watchdog".into())
             .spawn(move || {
                 loop {
@@ -1409,14 +1436,20 @@ impl Watchdog {
                         Ok(t) => at = Some(t),
                         Err(RecvTimeoutError::Disconnected) => return,
                         Err(RecvTimeoutError::Timeout) => {
-                            flag.store(true, Ordering::SeqCst);
-                            closer(Shutdown::Both);
+                            let mut st = flag
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if *st == 0 {
+                                *st = 2;
+                                drop(st);
+                                closer(Shutdown::Both);
+                            }
                             return;
                         }
                     }
                 }
-            });
-        Self { deadline, fired }
+            })?;
+        Ok(Self { deadline, state })
     }
 
     /// Moves the deadline to `timeout` from now.
@@ -1426,10 +1459,26 @@ impl Watchdog {
         }
     }
 
+    /// Ends the watch: once this returns, the carrier is never shut down by
+    /// it (it fired before, or never will).
+    pub fn disarm(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *st == 0 {
+            *st = 1;
+        }
+    }
+
     /// Whether the deadline passed and the carrier was shut down.
     #[must_use]
     pub fn fired(&self) -> bool {
-        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == 2
     }
 }
 
@@ -1456,62 +1505,43 @@ where
     )
 }
 
-/// The reading half of a Sealed carrier: one record per read.
+/// The reading half of a Sealed carrier: an I/O shell of
+/// [`SealedReader`](crate::proto::seal::SealedReader).
 struct SealedRead {
     lower: Box<dyn Read + Send>,
-    framing: Framing,
-    opener: crate::proto::seal::Opener,
-    /// The ciphertext of the record being read: allocated once, at the size of the
-    /// largest message, and reused for every record.
-    buf: Box<[u8]>,
-    failed: bool,
+    records: crate::proto::seal::SealedReader,
+}
+
+fn sealed_failure(f: crate::proto::seal::SealedFailure) -> io::Error {
+    match f {
+        crate::proto::seal::SealedFailure::Invalid => io::ErrorKind::InvalidData.into(),
+        crate::proto::seal::SealedFailure::Cut => io::ErrorKind::UnexpectedEof.into(),
+    }
 }
 
 impl Read for SealedRead {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.failed {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
+        use crate::proto::seal::SealedRead as R;
         loop {
-            // The end at a record's boundary reads as the carrier's end (see the tokio
-            // reader); inside a record `read_exact` fails.
-            let n = if self.framing == Framing::Records {
-                match self.lower.read(&mut self.buf)? {
-                    0 => return Ok(0),
-                    n => n,
+            match self.records.read(out).map_err(sealed_failure)? {
+                // The end at a record's boundary reads as the carrier's end (see the
+                // tokio reader).
+                R::End => return Ok(0),
+                R::Data(n) => return Ok(n),
+                R::More => {
+                    let n = self.lower.read(self.records.space())?;
+                    self.records.filled(n);
                 }
-            } else {
-                let mut head = [0; 2];
-                match self.lower.read(&mut head[..1])? {
-                    0 => return Ok(0),
-                    _ => self.lower.read_exact(&mut head[1..])?,
-                }
-                let n = usize::from(u16::from_be_bytes(head));
-                self.lower.read_exact(&mut self.buf[..n])?;
-                n
-            };
-            let plain = self.opener.open_in_place(&mut self.buf[..n]);
-            let Some(plain) = plain.ok().filter(|p| p.len() <= out.len()) else {
-                self.failed = true;
-                return Err(io::ErrorKind::InvalidData.into());
-            };
-            // No bytes of a record are not the end of the carrier.
-            if !plain.is_empty() {
-                out[..plain.len()].copy_from_slice(plain);
-                return Ok(plain.len());
             }
         }
     }
 }
 
-/// The writing half of a Sealed carrier: each write is one record in one write below.
+/// The writing half of a Sealed carrier: each write is one record, written
+/// whole before the call returns (one write below on a message carrier).
 struct SealedWrite {
     lower: Box<dyn Write + Send>,
-    framing: Framing,
-    sealer: crate::proto::seal::Sealer,
-    /// A record, with its length prefix on a byte stream, reused for every
-    /// record.
-    unit: Vec<u8>,
+    records: crate::proto::seal::SealedWriter,
 }
 
 impl Write for SealedWrite {
@@ -1520,38 +1550,20 @@ impl Write for SealedWrite {
             // Nothing to write is no record.
             return Ok(0);
         }
-        self.unit.clear();
-        if self.framing == Framing::ByteStream {
-            self.unit.extend_from_slice(&[0, 0]);
-        }
-        let pre = self.unit.len();
-        let sealed = self
-            .sealer
-            .seal_into(buf, &mut self.unit)
-            .map_err(io::Error::other)
-            .and_then(|()| match pre {
-                0 => Ok(()),
-                _ => u16::try_from(self.unit.len() - pre)
-                    .map(|n| self.unit[..pre].copy_from_slice(&n.to_be_bytes()))
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "sealed record over 65535 bytes",
-                        )
-                    }),
-            });
-        if let Err(e) = sealed {
-            // No record went out, and no record may follow: the direction
-            // fails, as after a failed write.
-            self.unit.clear();
-            self.sealer.fail();
-            return Err(e);
-        }
-        let written = self.lower.write_all(&self.unit);
-        // A record cut or lost, no record may follow it.
-        if let Err(e) = written {
-            self.sealer.fail();
-            return Err(e);
+        self.records.seal(buf).map_err(io::Error::other)?;
+        while !self.records.pending().is_empty() {
+            match self.lower.write(self.records.pending()) {
+                Ok(n) => self
+                    .records
+                    .wrote(n)
+                    .map_err(|_| io::Error::from(io::ErrorKind::WriteZero))?,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    // A record cut or lost, no record may follow it.
+                    self.records.failed();
+                    return Err(e);
+                }
+            }
         }
         Ok(buf.len())
     }
@@ -1561,6 +1573,8 @@ impl Write for SealedWrite {
     }
 }
 
+/// Starts the threads of a pipe's halves. Added pipes (`id` > 0) belong to
+/// a multipath session.
 pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Result<()> {
     let PipeIo {
         exporter,
@@ -1595,11 +1609,7 @@ pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) 
     let closer: Option<Arc<Closer>> = closer.map(Arc::new);
     if let Some(c) = &closer {
         let threads = usize::from(reader.is_some()) + usize::from(writer.is_some());
-        shared.lock().io.closers.push(PipeThreads {
-            id,
-            closer: c.clone(),
-            threads,
-        });
+        shared.lock().io.add_threads(id, c, threads);
     }
     if let Some(r) = reader {
         let s = shared.clone();
@@ -2047,6 +2057,23 @@ fn timer_thread(shared: &Arc<Shared<Blocking>>) {
         if engine::fire_timers(&mut st.core, now) {
             st.after_command();
         }
+        // The listener's account: the charge, allowance, pressure and
+        // suspended limit (`super::account`); suspended sessions it asks to
+        // close are closed after the lock.
+        let mut closing = Vec::new();
+        {
+            let s = &mut *st;
+            if let Some(link) = s.io.account.as_mut() {
+                link.report(&mut s.core, shared, now, &mut closing);
+            }
+        }
+        if !closing.is_empty() {
+            drop(st);
+            for s in closing {
+                s.close_suspended();
+            }
+            continue;
+        }
         if let Some(hooks) = st.take_hook_start() {
             drop(st);
             let s = shared.clone();
@@ -2070,9 +2097,15 @@ fn timer_thread(shared: &Arc<Shared<Blocking>>) {
         // After the hook start: a tracer is told even of a session that
         // ended before this thread's first round.
         if st.core.state() == CoreState::Closed {
+            // Its charge leaves the listener's account.
+            st.io.account = None;
             break;
         }
-        let until = engine::timer_deadline(st.core.poll_timeout(), now);
+        let mut until = engine::timer_deadline(st.core.poll_timeout(), now);
+        // A charge report the interval held back.
+        if let Some(t) = st.io.account.as_ref().and_then(|l| l.due()) {
+            until = Some(until.map_or(t, |d| d.min(t)));
+        }
         st.io.timer = Some((me.clone(), until));
         drop(st);
         park(until);
@@ -2173,6 +2206,8 @@ impl Session {
         if on_driver_thread() {
             return Err(WaitError::OnDriverThread);
         }
+        let config = config.into();
+        pipe.resolve_exporter(Instant::now().checked_add(config.handshake_wait()));
         let carrier = Blocking::carrier_info(&mut pipe);
         let io = Io {
             closing: Vec::new(),
@@ -2181,9 +2216,10 @@ impl Session {
             writers: WaitList::default(),
             writers_alive: 0,
             timer: None,
+            account: None,
         };
         let shared = Arc::new(Shared::new(
-            State::new(config.into(), role, transport, locator, carrier, io)?,
+            State::new(config, role, transport, locator, carrier, io)?,
             (),
         ));
         register(&shared);
@@ -2356,6 +2392,7 @@ impl Session {
         }
         let deadline = Instant::now() + self.add_pipe_limit();
         let no_wait = opts.return_on_reply;
+        pipe.resolve_exporter(Some(deadline));
         let p = self.begin_add_pipe(pipe, opts)?;
         let guard = handle::AbortUnlessAdded(Some(&p));
         run(p.added_op(no_wait), Some(deadline)).unwrap_or(Err(JOIN_TIMED_OUT))?;
@@ -2637,12 +2674,7 @@ impl Write for SendStream {
     /// before all that left; once it left, the flush succeeds and the next
     /// write or finish reports the stop. A lost session fails it.
     fn flush(&mut self) -> io::Result<()> {
-        let this = &*self;
-        call_timeout(
-            self.timeout,
-            std::future::poll_fn(move |cx| this.poll_flush_stream(cx.waker())),
-        )
-        .map_err(io::Error::from)
+        call_timeout(self.timeout, self.flush_op()).map_err(io::Error::from)
     }
 }
 

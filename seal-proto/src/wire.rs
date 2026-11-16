@@ -1,8 +1,8 @@
 //! The Establish Hello.
 
 use zmux::proto::seal::{
-    Error, Framing, HANDSHAKE_MESSAGE_FLOOR, RecordMode, cut_frame, frame, put_varint,
-    read_shortest,
+    Error, Framing, HANDSHAKE_MESSAGE_FLOOR, RecordMode, frame, message_tail, put_varint, short,
+    shortest_varint,
 };
 
 use crate::Profile;
@@ -10,7 +10,6 @@ use crate::Profile;
 const ESCAPE: u8 = 8;
 /// The length of a Handle.
 pub const HANDLE_LEN: usize = 16;
-const MAX_UNIT: usize = u16::MAX as usize;
 
 /// A parsed Hello: Noise message 1 has not been read yet.
 #[derive(Clone, Copy, Debug)]
@@ -33,26 +32,12 @@ impl<'a> Hello<'a> {
     /// stream (`malformed` in records), `unknown_profile`, `bad_flags`,
     /// `bad_handle`, `malformed` for a bad encoding, `trailing_bytes`.
     pub fn parse(framing: Framing, input: &'a [u8]) -> Result<Hello<'a>, Error> {
-        let stream = framing == Framing::ByteStream;
-        let cut = |need| {
-            if stream {
-                Error::Incomplete { need }
-            } else {
-                Error::Malformed
-            }
-        };
+        let cut = |need| short(framing, need);
         let first = *input.first().ok_or(cut(1))?;
         let mut at = 1;
         let value = match first {
             ESCAPE => {
-                let rest = &input[1..];
-                let Some((value, used, shortest)) = read_shortest(rest) else {
-                    let width = rest.first().map_or(1, |b| 1usize << (b >> 6));
-                    return Err(cut(1 + width));
-                };
-                if !shortest {
-                    return Err(Error::Malformed);
-                }
+                let (value, used) = shortest_varint(framing, input, 1)?;
                 if value <= u64::from(ESCAPE) {
                     return Err(Error::UnknownProfile);
                 }
@@ -72,18 +57,7 @@ impl<'a> Hello<'a> {
             handle = input.get(at..at + HANDLE_LEN).ok_or(cut(at + HANDLE_LEN))?;
             at += HANDLE_LEN;
         }
-        let (noise, consumed) = if stream {
-            let (unit, total) = cut_frame(input, at)?;
-            if total != input.len() {
-                return Err(Error::TrailingBytes);
-            }
-            (unit, total)
-        } else {
-            if input.len() - at > MAX_UNIT {
-                return Err(Error::TooLarge);
-            }
-            (&input[at..], input.len())
-        };
+        let (noise, consumed) = message_tail(framing, input, at, true)?;
         Ok(Hello {
             profile,
             mode,
@@ -138,14 +112,10 @@ pub(crate) fn noise_room(framing: Framing, header: usize) -> usize {
 
 /// The length of a Hello's header: its Profile, Mode and Handle.
 pub(crate) fn hello_header_len(profile: Profile) -> usize {
-    hello_header(
-        profile,
-        RecordMode::Sealed,
-        &[0; HANDLE_LEN][..handle_len(profile)],
-    )
-    .len()
+    zmux::shaping::establish_hello_header_len(profile.value(), profile.has_handle())
 }
 
+#[cfg(test)]
 fn handle_len(profile: Profile) -> usize {
     if profile.has_handle() { HANDLE_LEN } else { 0 }
 }
@@ -178,4 +148,18 @@ pub(crate) fn write_hello(
     let mut out = hello_header(profile, mode, handle);
     frame(framing, &mut out, noise)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one length formula matches the bytes the codec builds.
+    #[test]
+    fn hello_header_len_matches_the_codec() {
+        for p in Profile::all() {
+            let built = hello_header(p, RecordMode::Sealed, &[0; HANDLE_LEN][..handle_len(p)]);
+            assert_eq!(hello_header_len(p), built.len(), "{p:?}");
+        }
+    }
 }

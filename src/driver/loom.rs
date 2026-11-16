@@ -164,17 +164,13 @@ impl Carrier for WireReader {
     type Outcome = usize;
 
     fn poll_read(&mut self, cx: &mut Context<'_>, _max: usize) -> Poll<usize> {
-        if PANICS.with(|p| p.replace(false)) {
-            panic!("the carrier panics");
-        }
+        assert!(!PANICS.with(|p| p.replace(false)), "the carrier panics");
         let mut s = lock(&self.0.state);
-        match s.queue.pop_front() {
-            Some(m) => Poll::Ready(m),
-            None => {
-                s.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+        if let Some(m) = s.queue.pop_front() {
+            return Poll::Ready(m);
         }
+        s.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 
     fn outcome_bytes(_: &usize) -> usize {
@@ -421,7 +417,7 @@ fn loom_read_through_reader_panics() {
                 // Either the carrier panics in this read, or the task read
                 // the message first and this read takes it.
                 let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    block_on(read_message(&path, &core, 0))
+                    block_on(read_message(&path, &core, 0));
                 }));
                 PANICS.with(|p| p.set(false));
                 drop(read);
@@ -703,6 +699,8 @@ struct FakeCore {
     credit: usize,
     /// An open was blocked since the last credit.
     waiting: bool,
+    /// Room in stream 1's send buffers (`StreamWritable`).
+    room: bool,
 }
 
 impl FakeCore {
@@ -762,14 +760,13 @@ impl Sess {
 /// A stream read (`poll_read_cmd` without reading through): resolves at the
 /// end of the session.
 fn read_until_closed(m: &Mutex<Sess>, key: u32) -> impl Future<Output = ()> + Unpin + '_ {
-    poll_fn(move |cx| {
-        let mut s = Locked::lock(m);
-        s.waiters.remove_reader(key);
-        if s.core.closed {
-            return Poll::Ready(());
-        }
-        s.waiters.register_reader(key, &checked(cx));
-        Poll::Pending
+    Wait::new(m, List::Readable(key), until_closed)
+}
+
+/// `SendStream::writable` on stream 1 through a shared handle.
+fn writable(m: &Mutex<Sess>) -> impl Future<Output = ()> + Unpin + '_ {
+    Wait::new(m, List::Writable(1), |s: &mut Sess| {
+        s.core.room.then_some(())
     })
 }
 
@@ -830,6 +827,41 @@ fn loom_close_resolves_open_and_stopped_with_a_cancelled_wait() {
         closer.join().unwrap();
         opener.join().unwrap();
         stopped.join().unwrap();
+        assert_idle(&m);
+    });
+}
+
+/// Two tasks wait for room on one stream through a shared handle while a
+/// third wait on it is cancelled and room arrives: both live waits resolve
+/// (one waiter never takes the other's wake-up) and nothing stays
+/// registered.
+#[test]
+fn loom_shared_write_waits_survive_a_cancelled_one() {
+    loom::model(|| {
+        let m = Arc::new(Mutex::new(Sess::default()));
+        let a = {
+            let m = m.clone();
+            thread::spawn(move || block_on(writable(&m)))
+        };
+        let b = {
+            let m = m.clone();
+            thread::spawn(move || block_on(writable(&m)))
+        };
+        let room = {
+            let m = m.clone();
+            thread::spawn(move || {
+                let mut s = Locked::lock(&m);
+                s.core.room = true;
+                let Sess { waiters, wakes, .. } = &mut *s;
+                waiters.writable(1, wakes);
+            })
+        };
+        let mut cancelled = writable(&m);
+        let _ = poll_once(&mut cancelled);
+        drop(cancelled);
+        room.join().unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
         assert_idle(&m);
     });
 }

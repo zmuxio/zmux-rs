@@ -21,7 +21,7 @@ const PIPE: u64 = 0;
 
 /// The most sample entries kept for batches in flight: at 10 Gbit/s and
 /// 100 ms, 256 KiB batches fill about 480, so an entry spans two at most.
-const SAMPLE_ENTRIES: usize = 256;
+pub(in crate::proto::session) const SAMPLE_ENTRIES: usize = 256;
 
 /// The fixed record of pipe acknowledgement.
 #[derive(Debug, Clone)]

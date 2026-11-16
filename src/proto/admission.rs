@@ -8,37 +8,44 @@ use std::any::Any;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::exporter::CarrierExporter;
 use super::prefix_auth::{PREFIX_TOKEN_LEN, PrefixAuthVerifier};
-
-/// The future of a decision ([`Decide::decide`]).
-pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
 /// The decision on a carrier from its metadata and its prefix: called
 /// once per carrier, outside the listener's locks, concurrently for
-/// different carriers. The decision may take time (a lookup): it is bound
-/// by what remains of the peek timeout, and is cancelled (its future
-/// dropped) when that ends or when the listener stops taking carriers; the
-/// carrier is then closed. `prefix` is valid only during the call.
+/// different carriers. A decision that takes time (a lookup) answers
+/// [`Decision::Later`](crate::Decision::Later): it is bound by what remains
+/// of the peek timeout, and is cancelled (its future dropped) when that ends
+/// or when the listener stops taking carriers; the carrier is then closed.
+/// A later answer clones what it keeps of `info` (cheap: shared fields) and
+/// of `prefix`.
 ///
 /// A synchronous function `Fn(&CarrierInfo, &[u8]) -> AdmissionVerdict` is a
 /// `Decide`; implement the trait for one that waits.
 pub trait Decide: Send + Sync + 'static {
     /// The decision on the carrier `info` describes, whose first bytes are
     /// `prefix`.
-    fn decide<'a>(&'a self, info: &'a CarrierInfo<'a>, prefix: &'a [u8]) -> DecideFuture<'a>;
+    fn decide(
+        &self,
+        info: &CarrierInfo,
+        prefix: &[u8],
+    ) -> crate::proto::Decision<AdmissionDecision>;
 }
 
 impl<F, D> Decide for F
 where
-    F: Fn(&CarrierInfo<'_>, &[u8]) -> D + Send + Sync + 'static,
-    D: Into<Decision>,
+    F: Fn(&CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
+    D: Into<AdmissionDecision>,
 {
-    fn decide<'a>(&'a self, info: &'a CarrierInfo<'a>, prefix: &'a [u8]) -> DecideFuture<'a> {
-        Box::pin(std::future::ready(self(info, prefix).into()))
+    fn decide(
+        &self,
+        info: &CarrierInfo,
+        prefix: &[u8],
+    ) -> crate::proto::Decision<AdmissionDecision> {
+        crate::proto::Decision::Now(self(info, prefix).into())
     }
 }
 
@@ -93,9 +100,9 @@ impl Admission {
     /// timeout is closed, or see
     /// [`Admission::with_fallback_on_peek_timeout`]): a synchronous
     /// decision ([`Admission::with_decider`] takes one that waits).
-    pub fn new<D: Into<Decision>>(
+    pub fn new<D: Into<AdmissionDecision>>(
         peek: usize,
-        decide: impl Fn(&CarrierInfo<'_>, &[u8]) -> D + Send + Sync + 'static,
+        decide: impl Fn(&CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
     ) -> Self {
         Self::with_decider(peek, decide)
     }
@@ -138,7 +145,8 @@ impl Admission {
     }
 
     /// With this peek timeout: the limit on reading the prefix and
-    /// deciding, from the end of the carrier's outer handshake.
+    /// deciding, from the end of the carrier's outer handshake. Zero keeps
+    /// the drawn one.
     #[must_use]
     pub fn with_peek_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
@@ -158,7 +166,7 @@ impl Admission {
 
     /// With this stall interval: a stall lasts a duration in `[min, max]`
     /// (`max` when `min` is above it) that the listener derives from the
-    /// carrier's source.
+    /// carrier's source. A `max` of zero keeps the drawn interval.
     #[must_use]
     pub fn with_stall_interval(mut self, min: Duration, max: Duration) -> Self {
         if !max.is_zero() {
@@ -272,6 +280,7 @@ pub type AdmittedValue = Arc<dyn Any + Send + Sync>;
 
 /// The decision on a carrier under admission.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AdmissionVerdict {
     /// The first `skip` bytes of the prefix are removed; the rest of the
     /// prefix, then the rest of the carrier, go to the listener. A `skip`
@@ -335,14 +344,14 @@ pub enum AdmissionVerdict {
 )]
 /// the carrier's variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Decision {
+pub struct AdmissionDecision {
     /// What to do.
     pub verdict: AdmissionVerdict,
     /// The carrier's label; `None` for none.
     pub variant: Option<Arc<str>>,
 }
 
-impl From<AdmissionVerdict> for Decision {
+impl From<AdmissionVerdict> for AdmissionDecision {
     fn from(verdict: AdmissionVerdict) -> Self {
         Self {
             verdict,
@@ -394,10 +403,10 @@ impl AdmissionVerdict {
         }
     }
 
-    /// A [`Decision`] of this verdict labelled `variant`.
+    /// An [`AdmissionDecision`] of this verdict labelled `variant`.
     #[must_use]
-    pub fn labelled(self, variant: impl Into<Arc<str>>) -> Decision {
-        Decision {
+    pub fn labelled(self, variant: impl Into<Arc<str>>) -> AdmissionDecision {
+        AdmissionDecision {
             verdict: self,
             variant: Some(variant.into()),
         }
@@ -414,21 +423,20 @@ impl AdmissionVerdict {
     }
 }
 
-/// A TLS exporter (RFC 8446 Section 7.5): fills `out` with the value for
-/// `label` and `context`, or returns `false`.
-type ExportFn<'a> = dyn Fn(&[u8], &[u8], &mut [u8]) -> bool + Send + Sync + 'a;
-
 /// The request header fields of an HTTP carrier: calls `each(name, value)`
 /// for every field, in order.
-type HeadersFn<'a> = dyn Fn(&mut dyn FnMut(&str, &[u8])) + Send + Sync + 'a;
+/// Visits the header fields of a request head `R`: `(request, each)`.
+pub type VisitFields<R> = fn(&R, &mut dyn FnMut(&str, &[u8]));
 
-/// The metadata of a carrier, read-only, as far as its adapter has it: a
-/// server's admission decides with it, and a
-/// client's [`CarrierCredential`] is given it. Fields that do not apply are
-/// `None`.
-#[derive(Default)]
+type HeadersFn = dyn Fn(&mut dyn FnMut(&str, &[u8])) + Send + Sync;
+
+/// The metadata of a carrier, as far as its adapter has it: a server's
+/// admission decides with it, and a client's [`CarrierCredential`] is given
+/// it. Fields that do not apply are `None`. Owned and cheap to clone (its
+/// fields are shared), so that a decision that answers later keeps it.
+#[derive(Clone, Default)]
 #[non_exhaustive]
-pub struct CarrierInfo<'a> {
+pub struct CarrierInfo {
     /// The carrier's source: the client a trusted intermediary reports
     /// ([`crate::TrustedProxies::source`], a reported port of 0 when it
     /// reported none), the source a host gave the listener
@@ -447,24 +455,24 @@ pub struct CarrierInfo<'a> {
     /// address of an HTTP request's connection.
     pub peer: Option<SocketAddr>,
     /// The application protocol the TLS or QUIC handshake negotiated.
-    pub alpn: Option<&'a [u8]>,
+    pub alpn: Option<Arc<[u8]>>,
     /// The server name the client sent in its TLS or QUIC handshake.
-    pub server_name: Option<&'a str>,
+    pub server_name: Option<Arc<str>>,
     /// The request head of an HTTP carrier, as the adapter's own type (the
     /// HTTP adapters give `http::request::Parts`): downcast it. Its
     /// header fields are also given independently of the type
     /// ([`CarrierInfo::for_each_header`]).
-    pub request: Option<&'a (dyn Any + Send + Sync)>,
+    pub request: Option<Arc<dyn Any + Send + Sync>>,
     /// Whether the carrier is decided on its HTTP request head, without a
     /// prefix: an HTTP upgrade (WebSocket,
     /// WebTransport), or an HTTP request carrier whose request has no
     /// body. A token travels in a request header field.
     pub head: bool,
-    headers: Option<Box<HeadersFn<'a>>>,
-    exporter: Option<Box<ExportFn<'a>>>,
+    headers: Option<Arc<HeadersFn>>,
+    exporter: Option<CarrierExporter>,
 }
 
-impl std::fmt::Debug for CarrierInfo<'_> {
+impl std::fmt::Debug for CarrierInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CarrierInfo")
             .field("source", &self.source)
@@ -479,7 +487,7 @@ impl std::fmt::Debug for CarrierInfo<'_> {
     }
 }
 
-impl<'a> CarrierInfo<'a> {
+impl CarrierInfo {
     /// No metadata.
     #[must_use]
     pub fn new() -> Self {
@@ -502,23 +510,37 @@ impl<'a> CarrierInfo<'a> {
 
     /// With the negotiated application protocol.
     #[must_use]
-    pub fn with_alpn(mut self, alpn: Option<&'a [u8]>) -> Self {
-        self.alpn = alpn;
+    pub fn with_alpn(mut self, alpn: Option<&[u8]>) -> Self {
+        self.alpn = alpn.map(Arc::from);
         self
     }
 
     /// With the client's server name.
     #[must_use]
-    pub fn with_server_name(mut self, name: Option<&'a str>) -> Self {
-        self.server_name = name;
+    pub fn with_server_name(mut self, name: Option<&str>) -> Self {
+        self.server_name = name.map(Arc::from);
         self
     }
 
     /// With an HTTP carrier's request head.
     #[must_use]
-    pub fn with_request(mut self, request: &'a (dyn Any + Send + Sync)) -> Self {
+    pub fn with_request(mut self, request: Arc<dyn Any + Send + Sync>) -> Self {
         self.request = Some(request);
         self
+    }
+
+    /// With an HTTP carrier's request head `request` ([`Self::request`])
+    /// and its header fields, which `fields(request, each)` visits
+    /// ([`Self::with_headers`]); one shared value for both.
+    #[must_use]
+    pub fn with_request_head<R: Any + Send + Sync>(
+        self,
+        request: Arc<R>,
+        fields: VisitFields<R>,
+    ) -> Self {
+        let r = request.clone();
+        self.with_request(request)
+            .with_headers(move |each| fields(&r, each))
     }
 
     /// As a carrier decided on its HTTP request head
@@ -529,18 +551,15 @@ impl<'a> CarrierInfo<'a> {
         self
     }
 
-    /// With an HTTP carrier's request header fields: `fields()` gives
-    /// every field as `(name, value)`, in order, the name in lower case.
+    /// With an HTTP carrier's request header fields: `fields(each)` calls
+    /// `each(name, value)` for every field, in order, the name in lower
+    /// case.
     #[must_use]
-    pub fn with_headers<I>(mut self, fields: impl Fn() -> I + Send + Sync + 'a) -> Self
-    where
-        I: IntoIterator<Item = (&'a str, &'a [u8])>,
-    {
-        self.headers = Some(Box::new(move |each| {
-            for (name, value) in fields() {
-                each(name, value);
-            }
-        }));
+    pub fn with_headers(
+        mut self,
+        fields: impl Fn(&mut dyn FnMut(&str, &[u8])) + Send + Sync + 'static,
+    ) -> Self {
+        self.headers = Some(Arc::new(fields));
         self
     }
 
@@ -553,15 +572,17 @@ impl<'a> CarrierInfo<'a> {
         }
     }
 
-    /// With the exporter of the carrier's completed TLS or QUIC handshake:
-    /// `export(label, context, out)` fills `out` or returns `false`.
+    /// With the exporter of the carrier's completed TLS or QUIC handshake.
     #[must_use]
-    pub fn with_exporter(
-        mut self,
-        export: impl Fn(&[u8], &[u8], &mut [u8]) -> bool + Send + Sync + 'a,
-    ) -> Self {
-        self.exporter = Some(Box::new(export));
+    pub fn with_exporter(mut self, exporter: CarrierExporter) -> Self {
+        self.exporter = Some(exporter);
         self
+    }
+
+    /// The carrier's exporter.
+    #[must_use]
+    pub fn exporter(&self) -> Option<&CarrierExporter> {
+        self.exporter.as_ref()
     }
 
     /// Whether the carrier has an exporter.
@@ -571,12 +592,25 @@ impl<'a> CarrierInfo<'a> {
     }
 
     /// `len` bytes of the exporter for `label` and `context`; `None` without
-    /// an exporter or when it fails.
+    /// an exporter, when it fails, or for an exporter whose values come
+    /// later that has not given this one yet ([`Self::export_async`]).
     #[must_use]
-    pub fn export(&self, label: &[u8], context: &[u8], len: usize) -> Option<Vec<u8>> {
-        let export = self.exporter.as_ref()?;
-        let mut out = vec![0u8; len];
-        export(label, context, &mut out).then_some(out)
+    pub fn export(&self, label: &str, context: &[u8], len: usize) -> Option<Vec<u8>> {
+        self.exporter.as_ref()?.export(label, context, len)
+    }
+
+    /// [`Self::export`], waiting for an exporter whose values come later.
+    pub fn export_async(
+        &self,
+        label: &str,
+        context: &[u8],
+        len: usize,
+    ) -> impl Future<Output = Option<Vec<u8>>> + Send + 'static {
+        let fut = self
+            .exporter
+            .as_ref()
+            .map(|e| e.export_async(label, context, len));
+        async move { fut?.await }
     }
 }
 
@@ -590,12 +624,12 @@ impl<'a> CarrierInfo<'a> {
 pub trait CarrierCredential: Send + Sync + std::fmt::Debug {
     /// The bytes a byte-stream carrier, an HTTP request body carrier or a
     /// QUIC carrier's first stream starts with.
-    fn prefix(&self, info: &CarrierInfo<'_>) -> io::Result<Vec<u8>>;
+    fn prefix(&self, info: &CarrierInfo) -> io::Result<Vec<u8>>;
 
     /// The request header field, `(name, value)`, of a carrier decided on
     /// its HTTP request head: an HTTP upgrade (WebSocket, WebTransport), or
     /// an HTTP request without a body.
-    fn header(&self, info: &CarrierInfo<'_>) -> io::Result<(String, String)>;
+    fn header(&self, info: &CarrierInfo) -> io::Result<(String, String)>;
 }
 
 #[cfg(test)]
@@ -635,18 +669,22 @@ mod tests {
     #[test]
     fn exporter_is_optional() {
         let info = CarrierInfo::new();
-        assert!(info.export(b"l", b"", 32).is_none());
-        let info = CarrierInfo::new().with_exporter(|l, _, out| {
+        assert!(info.export("l", b"", 32).is_none());
+        let info = CarrierInfo::new().with_exporter(CarrierExporter::new(|l, _, out| {
             out.fill(u8::try_from(l.len()).unwrap());
             true
-        });
-        assert_eq!(info.export(b"abc", b"", 2), Some(vec![3, 3]));
+        }));
+        assert_eq!(info.export("abc", b"", 2), Some(vec![3, 3]));
     }
 
     #[test]
     fn headers_are_visited_in_order() {
         let fields = [("a", &b"1"[..]), ("b", b"2"), ("a", b"3")];
-        let info = CarrierInfo::new().with_headers(|| fields);
+        let info = CarrierInfo::new().with_headers(move |each| {
+            for (n, v) in fields {
+                each(n, v);
+            }
+        });
         let mut seen = Vec::new();
         info.for_each_header(|n, v| seen.push((n.to_owned(), v.to_vec())));
         assert_eq!(seen.len(), 3);

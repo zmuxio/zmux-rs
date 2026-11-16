@@ -237,6 +237,10 @@ pub(crate) enum List<K> {
     /// The tasks of the pipes' datagram channels (datagrams for a channel
     /// were queued, or a pipe changed).
     Channel,
+    /// A stream's reads (data, its end, a reset, the session's end).
+    Readable(K),
+    /// A stream's writes and its waits for room or capacity.
+    Writable(K),
     Stopped(K),
     StreamDatagrams(K),
 }
@@ -250,21 +254,28 @@ impl<K> List<K> {
     fn transient(&self) -> bool {
         matches!(self, Self::State | Self::Pipes | Self::Close | Self::Ping)
     }
+
+    /// A list of one stream, kept until its handle is gone.
+    fn of_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::Readable(_) | Self::Writable(_) | Self::Stopped(_) | Self::StreamDatagrams(_)
+        )
+    }
 }
 
-/// The blocked operations of a session, woken by the core's events. A
-/// stream has at most one read and one write waiting (they take the handle
-/// by `&mut`): its newest waker is kept, and dropping the handle removes it.
-/// Every other wait may be shared, waits in a list in arrival order and
-/// leaves it when it ends unresolved ([`Wait`]); openers wait their turn
+/// The blocked operations of a session, woken by the core's events. Every
+/// wait, a stream's reads and writes included, may be shared: it waits in
+/// a list in arrival order under its own [`Ticket`] and leaves it when it
+/// ends unresolved ([`Wait`]), so that one handle may have any number of
+/// waits (`&self` calls from several tasks, a cancelled call next to a
+/// live one) without one taking another's wake-up. Openers wait their turn
 /// ([`OpenQueue`]). Lists exist from their first wait on: a session nobody
-/// waits on holds none, and a list of rare events goes again once it is
-/// empty ([`List::transient`]).
+/// waits on holds none, a stream's lists go with its handle, and a list of
+/// rare events goes again once it is empty ([`List::transient`]).
 pub(crate) struct Waiters<K> {
-    readers: HashMap<K, Waker>,
-    writers: HashMap<K, Waker>,
-    /// The lists of a stream ([`List::Stopped`], [`List::StreamDatagrams`]),
-    /// kept until its handle is gone.
+    /// The lists of a stream ([`List::of_stream`]), kept until its handle
+    /// is gone, so that its waits do not allocate again.
     streams: HashMap<List<K>, WaitList>,
     /// The session's other lists.
     session: Vec<(List<K>, WaitList)>,
@@ -274,8 +285,6 @@ pub(crate) struct Waiters<K> {
 impl<K> Default for Waiters<K> {
     fn default() -> Self {
         Self {
-            readers: HashMap::new(),
-            writers: HashMap::new(),
             streams: HashMap::new(),
             session: Vec::new(),
             open: Default::default(),
@@ -283,20 +292,10 @@ impl<K> Default for Waiters<K> {
     }
 }
 
-/// Keeps the newest waker of a stream's read or write.
-fn register_one<K: Eq + Hash>(map: &mut HashMap<K, Waker>, key: K, waker: &Waker) {
-    match map.get_mut(&key) {
-        Some(w) => w.clone_from(waker),
-        None => {
-            map.insert(key, waker.clone());
-        }
-    }
-}
-
 impl<K: Copy + Eq + Hash> Waiters<K> {
     /// `list`, created if it does not exist yet.
     fn list(&mut self, list: List<K>) -> &mut WaitList {
-        if matches!(list, List::Stopped(_) | List::StreamDatagrams(_)) {
+        if list.of_stream() {
             return self.streams.entry(list).or_default();
         }
         let i = if let Some(i) = self.session.iter().position(|(l, _)| *l == list) {
@@ -310,7 +309,7 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
 
     /// `list`, if it exists.
     fn existing(&mut self, list: List<K>) -> Option<&mut WaitList> {
-        if matches!(list, List::Stopped(_) | List::StreamDatagrams(_)) {
+        if list.of_stream() {
             return self.streams.get_mut(&list);
         }
         self.session
@@ -357,49 +356,32 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
         }
     }
 
-    /// A stream's read waits.
-    pub(crate) fn register_reader(&mut self, key: K, waker: &Waker) {
-        register_one(&mut self.readers, key, waker);
-    }
-
-    /// A stream's read polls again (or ended).
-    pub(crate) fn remove_reader(&mut self, key: K) {
-        self.readers.remove(&key);
-    }
-
-    /// A stream's write waits.
-    pub(crate) fn register_writer(&mut self, key: K, waker: &Waker) {
-        register_one(&mut self.writers, key, waker);
-    }
-
-    /// A stream's write no longer waits (it was cancelled).
-    pub(crate) fn remove_writer(&mut self, key: K) {
-        self.writers.remove(&key);
-    }
-
     /// The receiving handle of a stream is gone.
-    pub(crate) fn forget_recv(&mut self, key: K) {
-        self.readers.remove(&key);
-        self.streams.remove(&List::StreamDatagrams(key));
+    /// Its remaining waits (a `StreamHandle`'s) are woken: they find the
+    /// part gone.
+    pub(crate) fn forget_recv(&mut self, key: K, wakes: &mut WakeList) {
+        for l in [List::Readable(key), List::StreamDatagrams(key)] {
+            if let Some(mut w) = self.streams.remove(&l) {
+                w.wake_all(wakes);
+            }
+        }
     }
 
-    /// The sending handle of a stream is gone.
-    pub(crate) fn forget_send(&mut self, key: K) {
-        self.writers.remove(&key);
-        self.streams.remove(&List::Stopped(key));
+    /// The sending handle of a stream is gone; its remaining waits are woken.
+    pub(crate) fn forget_send(&mut self, key: K, wakes: &mut WakeList) {
+        for l in [List::Writable(key), List::Stopped(key)] {
+            if let Some(mut w) = self.streams.remove(&l) {
+                w.wake_all(wakes);
+            }
+        }
     }
 
     pub(crate) fn readable(&mut self, key: K, wakes: &mut WakeList) {
-        if let Some(w) = self.readers.remove(&key) {
-            wakes.push(w);
-        }
+        self.wake_list(List::Readable(key), wakes);
     }
 
     pub(crate) fn writable(&mut self, key: K, wakes: &mut WakeList) {
-        if let Some(w) = self.writers.remove(&key) {
-            wakes.push(w);
-        }
-        // The list stays for the next wait until the handle is dropped.
+        self.wake_list(List::Writable(key), wakes);
         self.wake_list(List::Stopped(key), wakes);
     }
 
@@ -423,25 +405,24 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
 
     /// The session ended: every wait resolves.
     pub(crate) fn close(&mut self, wakes: &mut WakeList) {
-        wakes.extend(self.readers.drain().map(|(_, w)| w));
-        wakes.extend(self.writers.drain().map(|(_, w)| w));
         for l in self.lists() {
             l.wake_all(wakes);
         }
         self.fail_opens(wakes);
     }
 
-    /// Entries held (registered waits, and per-stream lists even when
-    /// empty), for the leak tests ([`super::resources::Tables`]).
+    /// Entries held (registered waits, and the `stopped` and datagram lists
+    /// of a stream even when empty), for the leak tests ([`super::resources::Tables`]).
     #[cfg(feature = "test-hooks")]
     pub(crate) fn entries(&self) -> usize {
-        self.readers.len()
-            + self.writers.len()
-            + self
-                .streams
-                .values()
-                .map(|l| l.waiters.len().max(1))
-                .sum::<usize>()
+        self.streams
+            .iter()
+            .map(|(k, l)| match k {
+                // Kept for the stream's next read or write.
+                List::Readable(_) | List::Writable(_) => l.waiters.len(),
+                _ => l.waiters.len().max(1),
+            })
+            .sum::<usize>()
             + self
                 .session
                 .iter()
@@ -458,9 +439,7 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
     /// Nothing is registered (openers aside, which leave by themselves).
     #[cfg(any(test, loom))]
     pub(crate) fn is_idle(&self) -> bool {
-        self.readers.is_empty()
-            && self.writers.is_empty()
-            && self.streams.values().all(WaitList::is_empty)
+        self.streams.values().all(WaitList::is_empty)
             && self.session.iter().all(|(_, w)| w.is_empty())
             && self.open.iter().all(|q| q.list.is_empty())
     }
@@ -807,8 +786,9 @@ mod tests {
     fn closing_wakes_every_wait() {
         let mut w = Waiters::<u32>::default();
         let (c, waker) = counter();
-        w.register_reader(1, &waker);
-        w.register_writer(1, &waker);
+        let (mut r, mut wr) = (None, None);
+        w.register(List::Readable(1), &mut r, &waker);
+        w.register(List::Writable(1), &mut wr, &waker);
         let (mut t1, mut t2, mut t3) = (None, None, None);
         w.register(List::Accept(0), &mut t1, &waker);
         w.register(List::Stopped(1), &mut t2, &waker);
@@ -826,6 +806,40 @@ mod tests {
         // The opener leaves when it fails; the rest left already.
         assert!(!w.is_idle());
         w.open[0].leave(opener.unwrap(), &mut WakeList::default());
+        assert!(w.is_idle());
+    }
+
+    /// Two waits on one stream's writes (two tasks sharing the handle):
+    /// both are woken, and one that is cancelled takes only itself out.
+    #[test]
+    fn a_stream_keeps_every_write_wait_and_a_cancelled_one_leaves_alone() {
+        let mut w = Waiters::<u32>::default();
+        let (a, wa) = counter();
+        let (b, wb) = counter();
+        let (mut ta, mut tb) = (None, None);
+        w.register(List::Writable(7), &mut ta, &wa);
+        w.register(List::Writable(7), &mut tb, &wb);
+        let mut wakes = WakeList::default();
+        w.writable(7, &mut wakes);
+        drop(wakes);
+        assert_eq!(
+            (woken(&a), woken(&b)),
+            (1, 1),
+            "the first wait was not lost"
+        );
+        // Both wait again; the first is cancelled (a timed-out select).
+        w.register(List::Writable(7), &mut ta, &wa);
+        w.register(List::Writable(7), &mut tb, &wb);
+        w.remove(List::Writable(7), ta.take().unwrap());
+        let mut wakes = WakeList::default();
+        w.writable(7, &mut wakes);
+        drop(wakes);
+        assert_eq!(
+            (woken(&a), woken(&b)),
+            (1, 2),
+            "the live wait is still woken"
+        );
+        w.forget_send(7, &mut WakeList::default());
         assert!(w.is_idle());
     }
 

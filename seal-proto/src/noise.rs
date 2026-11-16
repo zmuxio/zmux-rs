@@ -7,7 +7,7 @@ use zmux::proto::seal::fill_random;
 use crate::Profile;
 use crate::profile::{KemFn, Params, Token};
 
-const MAX_UNIT: usize = u16::MAX as usize;
+use zmux::proto::seal::MAX_UNIT;
 /// The payload type of application data.
 const APP_DATA: u64 = 2;
 
@@ -81,7 +81,7 @@ impl Symmetric {
         let out = match &self.key {
             Some(_) if self.n == u64::MAX => return Err(Error::Exhausted),
             Some(key) => {
-                let out = (self.params.cipher)().seal(key, self.n, &self.h, plain);
+                let out = (self.params.cipher)().seal(key, self.n, &self.h, plain)?;
                 self.n += 1;
                 out
             }

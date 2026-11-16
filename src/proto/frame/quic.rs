@@ -188,15 +188,21 @@ impl StreamHeader {
 }
 
 /// Parses a STREAM frame header from `buf`, a prefix of the rest of a record
-/// that is `record_rest` bytes long; the first byte is a STREAM type.
+/// that is `record_rest` bytes long; it starts with a STREAM type `ty`
+/// encoded in `width` bytes.
 ///
 /// Returns `Ok(None)` when `buf` ends inside the header.
 pub(super) fn parse_stream_header(
     buf: &[u8],
+    (ty, width): (u64, usize),
     record_rest: u64,
 ) -> Result<Option<(StreamHeader, usize)>, Error> {
+    // The type as the frame decoder read it, in whatever encoding.
     let mut c = Cursor::new(buf);
-    let (Ok(ty), Ok(stream_id)) = (c.u8().map(u64::from), c.varint()) else {
+    if c.advance(width).is_err() {
+        return Ok(None);
+    }
+    let Ok(stream_id) = c.varint() else {
         return Ok(None);
     };
     let explicit_offset = ty & STREAM_OFF != 0;

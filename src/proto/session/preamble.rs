@@ -138,7 +138,7 @@ impl Preamble {
     /// The application TLVs in order; the values share the preamble's
     /// buffer.
     pub fn tlvs(&self) -> impl Iterator<Item = (u64, Bytes)> + '_ {
-        AppTlvs::new(&self.tlvs).map(|(ty, v)| (ty, self.tlvs.slice_ref(v)))
+        AppTlvs::whole(&self.tlvs).map(|(ty, v)| (ty, self.tlvs.slice_ref(v)))
     }
 
     /// The value of the first TLV of type `ty`.
@@ -154,7 +154,10 @@ impl Preamble {
         }
         let mut out = Vec::with_capacity(self.tlvs.len() + value.len() + 16);
         out.extend_from_slice(&self.tlvs);
-        AppTlvs::encode_one(ty, value, &mut out);
+        if AppTlvs::encode_one(ty, value, &mut out).is_err() {
+            self.unencodable = true;
+            return;
+        }
         self.tlvs = Bytes::from(out);
     }
 
@@ -168,16 +171,19 @@ impl Preamble {
         }
         let mut out = Vec::with_capacity(self.tlvs.len() + value.len() + 16);
         let mut done = false;
-        for (t, v) in AppTlvs::new(&self.tlvs) {
+        for (t, v) in AppTlvs::whole(&self.tlvs) {
             if t != ty {
-                AppTlvs::encode_one(t, v, &mut out);
+                // A type checked above, or read back from an encoded TLV: fits.
+                let _ = AppTlvs::encode_one(t, v, &mut out);
             } else if !done {
-                AppTlvs::encode_one(ty, value, &mut out);
+                // A type checked above, or read back from an encoded TLV: fits.
+                let _ = AppTlvs::encode_one(ty, value, &mut out);
                 done = true;
             }
         }
         if !done {
-            AppTlvs::encode_one(ty, value, &mut out);
+            // A type checked above, or read back from an encoded TLV: fits.
+            let _ = AppTlvs::encode_one(ty, value, &mut out);
         }
         self.tlvs = Bytes::from(out);
     }
@@ -185,8 +191,9 @@ impl Preamble {
     /// Removes the TLVs of type `ty`.
     pub fn remove_tlv(&mut self, ty: u64) {
         let mut out = Vec::with_capacity(self.tlvs.len());
-        for (t, v) in AppTlvs::new(&self.tlvs).filter(|(t, _)| *t != ty) {
-            AppTlvs::encode_one(t, v, &mut out);
+        for (t, v) in AppTlvs::whole(&self.tlvs).filter(|(t, _)| *t != ty) {
+            // A type checked above, or read back from an encoded TLV: fits.
+            let _ = AppTlvs::encode_one(t, v, &mut out);
         }
         self.tlvs = Bytes::from(out);
     }
@@ -212,12 +219,13 @@ impl Preamble {
         let tlvs = match raw {
             None => Bytes::new(),
             // Only application TLVs: shared as they are.
-            Some(raw) if AppTlvs::new(raw).encoded_len() == raw.len() => raw.clone(),
+            Some(raw) if AppTlvs::whole(raw).encoded_len() == raw.len() => raw.clone(),
             Some(raw) => {
                 let mut out = BytesMut::new();
-                for (t, v) in AppTlvs::new(raw) {
+                for (t, v) in AppTlvs::whole(raw) {
                     let mut one = Vec::new();
-                    AppTlvs::encode_one(t, v, &mut one);
+                    // A type checked above, or read back from an encoded TLV: fits.
+                    let _ = AppTlvs::encode_one(t, v, &mut one);
                     out.extend_from_slice(&one);
                 }
                 out.freeze()

@@ -469,3 +469,24 @@ fn consumption_rechecks_the_read_buffer_bound() {
         "{retired} bytes of retired buffers for {referenced} referenced"
     );
 }
+
+/// A granted datagram the session queue refuses (the session's datagram
+/// bytes are held by datagrams waiting for their streams) is dropped,
+/// counted, and its grant handed back for a refund.
+#[test]
+fn a_granted_datagram_the_queue_refuses_is_refunded() {
+    let now = Instant::now();
+    let mut c = SessionCore::new(config(), Role::Server, None, now).unwrap();
+    let cap = c.config.datagram_receive_bytes;
+    // The bytes of datagrams held for streams not opened yet.
+    c.dgram_mut().recv_bytes = cap;
+    c.dgram_mut().held_bytes += 10;
+    let mut staged = vec![super::super::ReceivedDatagram {
+        stream: None,
+        data: Bytes::from_static(&[1; 10]),
+        granted: Some(10),
+    }];
+    assert_eq!(c.admit_datagrams(&mut staged), 10, "the grant is refunded");
+    assert_eq!(c.stats.datagrams_dropped_recv, 1);
+    assert_eq!(c.recv_datagram().unwrap(), None);
+}

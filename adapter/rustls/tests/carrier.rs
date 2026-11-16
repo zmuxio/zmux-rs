@@ -398,7 +398,7 @@ async fn admission_by_bound_prefix_auth() {
     const STALL_MIN: Duration = Duration::from_millis(50);
     let (client_tls, server_tls) = configs(&[b"zmux"]);
     let auth = zmux::PrefixAuth::new(b"k", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let admission = zmux::Admission::prefix_auth(verifier)
         .with_peek_timeout(Duration::from_millis(300))
         .with_stall_interval(STALL_MIN, Duration::from_millis(100));
@@ -627,7 +627,7 @@ async fn more_reads_on_through_tls() {
     use zmux::{Admission, AdmissionVerdict};
     let (client_tls, server_tls) = configs(&[b"x"]);
     let admission = Admission::new(2, |info, p| {
-        assert_eq!(info.alpn, Some(&b"x"[..]));
+        assert_eq!(info.alpn.as_deref(), Some(&b"x"[..]));
         if p.len() < 5 {
             AdmissionVerdict::More { need: 5 }
         } else if p == b"token" {

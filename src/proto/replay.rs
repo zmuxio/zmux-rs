@@ -122,8 +122,12 @@ impl ReplayFilter {
         let slot = usize::try_from(index.rem_euclid(n)).unwrap_or(0);
         let (idx, set) = &mut buckets[slot];
         if *idx != index {
-            *held -= set.len();
-            set.clear();
+            // Expired buckets were emptied above: one that still holds keys
+            // is within the window (the clock went back, or far ahead), and
+            // is never dropped to make room.
+            if !set.is_empty() {
+                return ReplayVerdict::Full;
+            }
             *idx = index;
         }
         set.insert(hashed);

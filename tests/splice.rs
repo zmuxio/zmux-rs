@@ -417,26 +417,32 @@ fn a_direction_into_its_own_stream_is_refused() {
 struct Count(AtomicU64);
 
 impl Limiter for Count {
-    fn poll_ready(&self, _: &mut Context<'_>, _: usize, max: usize) -> Poll<usize> {
-        Poll::Ready(max)
+    fn poll_acquire(
+        &self,
+        _: &mut Context<'_>,
+        min: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        Poll::Ready(Ok(self.try_acquire(min, max)))
     }
-    fn try_ready(&self, max: usize) -> usize {
+    fn try_acquire(&self, _: u64, max: u64) -> u64 {
+        self.0.fetch_add(max, Ordering::Relaxed);
         max
     }
-    fn charge(&self, n: usize) {
-        self.0.fetch_add(n as u64, Ordering::Relaxed);
+    fn refund(&self, n: u64) {
+        self.0.fetch_sub(n, Ordering::Relaxed);
     }
 }
 
 /// A budget of bytes, refilled by the test; waits while it is empty.
 #[derive(Default)]
 struct Budget {
-    left: Mutex<(usize, Option<Waker>)>,
+    left: Mutex<(u64, Option<Waker>)>,
     charged: AtomicU64,
 }
 
 impl Budget {
-    fn add(&self, n: usize) {
+    fn add(&self, n: u64) {
         let w = {
             let mut g = self.left.lock().unwrap();
             g.0 += n;
@@ -449,21 +455,39 @@ impl Budget {
 }
 
 impl Limiter for Budget {
-    fn poll_ready(&self, cx: &mut Context<'_>, min: usize, max: usize) -> Poll<usize> {
-        let mut g = self.left.lock().unwrap();
-        if g.0 >= min {
-            return Poll::Ready(g.0.min(max));
+    fn poll_acquire(
+        &self,
+        cx: &mut Context<'_>,
+        min: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        match self.try_acquire(min, max) {
+            0 => {
+                let mut g = self.left.lock().unwrap();
+                // Checked again under the lock that `add` takes.
+                if g.0 < min {
+                    g.1 = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                drop(g);
+                self.poll_acquire(cx, min, max)
+            }
+            n => Poll::Ready(Ok(n)),
         }
-        g.1 = Some(cx.waker().clone());
-        Poll::Pending
     }
-    fn try_ready(&self, max: usize) -> usize {
-        self.left.lock().unwrap().0.min(max)
-    }
-    fn charge(&self, n: usize) {
+    fn try_acquire(&self, min: u64, max: u64) -> u64 {
         let mut g = self.left.lock().unwrap();
-        g.0 = g.0.saturating_sub(n);
-        self.charged.fetch_add(n as u64, Ordering::Relaxed);
+        if g.0 < min {
+            return 0;
+        }
+        let n = g.0.min(max);
+        g.0 -= n;
+        self.charged.fetch_add(n, Ordering::Relaxed);
+        n
+    }
+    fn refund(&self, n: u64) {
+        self.left.lock().unwrap().0 += n;
+        self.charged.fetch_sub(n, Ordering::Relaxed);
     }
 }
 
@@ -662,3 +686,128 @@ fn a_stalled_downstream_bounds_what_the_relay_holds() {
 
 /// The code a dropped, unfinished sending part resets with.
 const CANCELLED: VarInt = VarInt::from_u32(0x5a4d_0001);
+
+/// Records every call: the arguments, what it granted and what came back.
+#[derive(Default)]
+struct Recorder {
+    calls: Mutex<Vec<(u64, u64)>>,
+    granted: AtomicU64,
+    refunded: AtomicU64,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl Limiter for Recorder {
+    fn poll_acquire(
+        &self,
+        _: &mut Context<'_>,
+        min: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        self.calls.lock().unwrap().push((min, max));
+        if self.fail.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(zmux::LimitError::new("quota gone")));
+        }
+        self.granted.fetch_add(max, Ordering::SeqCst);
+        Poll::Ready(Ok(max))
+    }
+    fn try_acquire(&self, _: u64, _: u64) -> u64 {
+        0
+    }
+    fn refund(&self, n: u64) {
+        self.refunded.fetch_add(n, Ordering::SeqCst);
+    }
+}
+
+/// The limiter is asked only once the source is readable, for at most
+/// what is readable, with `min` 1: an idle source holds no grant.
+#[test]
+fn a_splice_holds_no_grant_while_its_source_is_idle() {
+    multi_thread(async {
+        let hop = Hop::default().await;
+        let rec = Arc::new(Recorder::default());
+        let mut opts = SpliceOptions::default();
+        opts.a_to_b = Some(rec.clone());
+        let relay = hop.relay(opts);
+        let ((mut s, _r), (_fs, mut fr)) = hop.stream(b"x").await;
+        let got = watchdog(10, "x", read_n(&mut fr, 1)).await;
+        assert_eq!(got, b"x");
+        let used = || rec.granted.load(Ordering::SeqCst) - rec.refunded.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let calls = rec.calls.lock().unwrap().clone();
+        assert_eq!(calls, [(1, 1)], "asked once, for the readable byte");
+        assert_eq!(used(), 1);
+        s.write_all(&[7; 10]).await.unwrap();
+        let got = watchdog(10, "ten", read_n(&mut fr, 10)).await;
+        assert_eq!(got, [7; 10]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for &(min, max) in rec.calls.lock().unwrap().iter() {
+            assert!(min == 1 && (1..=10).contains(&max), "({min}, {max})");
+        }
+        assert_eq!(used(), 11, "exactly what was forwarded stays taken");
+        relay.abort();
+        hop.close();
+    });
+}
+
+/// A limiter error ends the direction as cancelled: the upstream part is
+/// stopped with `ZMUX_CANCELLED` (and the downstream part reset with it).
+#[test]
+fn a_limiter_error_ends_the_direction() {
+    multi_thread(async {
+        let hop = Hop::default().await;
+        let rec = Arc::new(Recorder::default());
+        rec.fail.store(true, Ordering::SeqCst);
+        let mut opts = SpliceOptions::default();
+        opts.a_to_b = Some(rec.clone());
+        let relay = hop.relay(opts);
+        let (mut s, _r) = hop.a.open_bi().await.unwrap();
+        s.write_all(b"x").await.unwrap();
+        let stopped = watchdog(10, "stopped", async {
+            loop {
+                match s.write_all(&[0; 1024]).await {
+                    Ok(()) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    Err(e) => return e,
+                }
+            }
+        })
+        .await;
+        let cancelled = VarInt::from_u32(0x5a4d_0001);
+        assert!(
+            matches!(stopped, StreamError::Stopped(c) if c == cancelled),
+            "{stopped:?}"
+        );
+        assert!(rec.calls.lock().unwrap().iter().all(|c| c.0 == 1));
+        relay.abort();
+        hop.close();
+    });
+}
+
+/// A limiter that fails before the downstream stream sent anything: the
+/// downstream stream never reaches B, so the reverse direction can read
+/// nothing from it and ends with its FIN; the splice ends both ways.
+#[test]
+fn a_limiter_error_on_a_never_flushed_downstream_ends_the_splice() {
+    multi_thread(async {
+        let hop = Hop::default().await;
+        let rec = Arc::new(Recorder::default());
+        rec.fail.store(true, Ordering::SeqCst);
+        let mut opts = SpliceOptions::default();
+        opts.a_to_b = Some(rec.clone());
+        let relay = hop.relay(opts);
+        let (mut s, mut r) = hop.a.open_bi().await.unwrap();
+        s.write_all(b"x").await.unwrap();
+        let done = watchdog(10, "splice", relay).await.unwrap().unwrap();
+        assert_eq!(done.a_to_b.end, SpliceEnd::LimiterFailed);
+        assert_eq!(done.b_to_a.end, SpliceEnd::Finished);
+        let (got, e) = watchdog(10, "A reads", read_until_end(&mut r)).await;
+        assert!(got.is_empty() && e.is_none(), "{got:?} {e:?}");
+        assert_eq!(hop.b.stats().streams_opened_remote, 0, "never seen by B");
+        hop.close();
+    });
+}
+
+async fn read_n(r: &mut RecvStream, n: usize) -> Vec<u8> {
+    let mut b = vec![0; n];
+    r.read_exact(&mut b).await.unwrap();
+    b
+}

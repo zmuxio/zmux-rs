@@ -182,12 +182,25 @@ pub fn over_tcp(stream: impl Into<TlsStream<TcpStream>>) -> PipeIo {
 
 /// What a client sends first on a connection: the per-connection options of
 /// [`dial`] and [`connect`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Options {
     /// The credential presented to a server's admission (none by default;
     /// [`Options::with_carrier_credential`]).
     pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
+    /// The bound on a dial, from the TCP connect to the credential's prefix
+    /// written (default [`zmux::adapter::DIAL_TIMEOUT`], 10 s); one not done
+    /// within it fails with `TimedOut`.
+    pub timeout: std::time::Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            carrier_credential: None,
+            timeout: zmux::adapter::DIAL_TIMEOUT,
+        }
+    }
 }
 
 impl Options {
@@ -224,12 +237,15 @@ pub async fn dial(
     tls: Arc<ClientConfig>,
     options: &Options,
 ) -> io::Result<PipeIo> {
-    let mut stream = handshake(addr, server_name, tls).await?;
-    if let Some(credential) = &options.carrier_credential {
-        let prefix = credential.prefix(&client_carrier_info(&stream, server_name))?;
-        stream.write_all(&prefix).await?;
-    }
-    Ok(over_tcp(stream))
+    let dial = async {
+        let mut stream = handshake(addr, server_name, tls).await?;
+        if let Some(credential) = &options.carrier_credential {
+            let prefix = credential.prefix(&client_carrier_info(&stream, server_name))?;
+            stream.write_all(&prefix).await?;
+        }
+        Ok(over_tcp(stream))
+    };
+    zmux::adapter::within(options.timeout, dial).await
 }
 
 async fn handshake(
@@ -297,34 +313,31 @@ pub async fn serve(listener: Listener, tcp: TcpListener, tls: Arc<ServerConfig>)
 pub type ServerStream = tokio_rustls::server::TlsStream<TcpStream>;
 
 /// The admission metadata of a server's TLS connection: the negotiated
-/// ALPN identifier, the client's server name and the TLS exporter (the
-/// peer's address is the caller's).
-pub fn carrier_info<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> CarrierInfo<'_> {
+/// ALPN identifier, the client's server name and the values of the TLS
+/// exporter zmux reads ([`zmux::CarrierExporter::snapshot`]; the peer's
+/// address is the caller's).
+pub fn carrier_info<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> CarrierInfo {
     let conn = stream.get_ref().1;
-    CarrierInfo::new()
-        .with_alpn(conn.alpn_protocol())
-        .with_server_name(conn.server_name())
-        .with_exporter(move |label, context, out| {
-            conn.export_keying_material(out, label, Some(context))
-                .is_ok()
-        })
+    connection::tls_info(
+        conn.alpn_protocol(),
+        conn.server_name(),
+        connection::snapshot_exporter(conn),
+    )
 }
 
 /// The metadata of a client's TLS connection over TCP to `server_name`,
 /// for its [`CarrierCredential`]: the server's address, the negotiated ALPN
 /// identifier, the server name and the TLS exporter.
-fn client_carrier_info<'a>(
-    stream: &'a tokio_rustls::client::TlsStream<TcpStream>,
-    server_name: &'a str,
-) -> CarrierInfo<'a> {
+fn client_carrier_info(
+    stream: &tokio_rustls::client::TlsStream<TcpStream>,
+    server_name: &str,
+) -> CarrierInfo {
     let (tcp, conn) = stream.get_ref();
-    let info = CarrierInfo::new()
-        .with_alpn(conn.alpn_protocol())
-        .with_server_name(Some(server_name))
-        .with_exporter(move |label, context, out| {
-            conn.export_keying_material(out, label, Some(context))
-                .is_ok()
-        });
+    let info = connection::tls_info(
+        conn.alpn_protocol(),
+        Some(server_name),
+        connection::snapshot_exporter(conn),
+    );
     match tcp.peer_addr() {
         Ok(peer) => info.with_source(peer).with_peer(peer),
         Err(_) => info,

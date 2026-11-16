@@ -437,10 +437,11 @@ impl PacketSender {
     /// Writes what remains of a capsule.
     async fn flush(&mut self) -> Result<(), PacketError> {
         let (send, pending, started) = (&self.send, &mut self.pending, &mut self.started);
+        let mut wait = send.wait_slot();
         poll_fn(|cx: &mut Context<'_>| {
             for slot in pending.iter_mut() {
                 while let Some(part) = slot {
-                    match send.poll_write_part(cx.waker(), part) {
+                    match send.poll_write_part(cx.waker(), &mut wait.ticket, part) {
                         Poll::Ready(Ok(n)) => {
                             *started |= n > 0;
                             if part.is_empty() {
@@ -533,6 +534,7 @@ impl PacketReceiver {
             stats,
         } = self;
         let recv: &RecvStream = recv;
+        let mut wait = recv.wait_slot();
         let mut datagram = pin!(recv.read_datagram());
         poll_fn(|cx| {
             if *state == RecvState::Draining {
@@ -575,7 +577,7 @@ impl PacketReceiver {
                     }
                     Decoded::More => {}
                 }
-                match recv.poll_read_chunk(cx.waker(), decoder.want()) {
+                match recv.poll_read_chunk(cx.waker(), &mut wait.ticket, decoder.want()) {
                     Poll::Ready(Ok(Some(chunk))) => {
                         *buf = chunk;
                         continue;

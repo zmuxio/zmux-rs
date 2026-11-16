@@ -329,14 +329,16 @@ fn the_counter_sees_allocations() {
 #[test]
 fn key_schedule_does_not_allocate() {
     let _serial = serial();
+    // The session secret is held in a Secret (one allocation per session,
+    // cleared when dropped); the rest of the schedule allocates nothing.
+    let secret = keys::session_secret(&[1; 16], &[2; 16], &[3; 32], &[]);
     let (ok, n) = allocations(|| {
-        let secret = keys::session_secret(&[1; 16], &[2; 16], &[3; 32], &[]);
         let binding = keys::session_binding(&[1; 16], &[2; 16]);
         let mut expanded = [0u8; 32];
         keys::hkdf_expand(&secret, b"label", &mut expanded);
-        secret != [0; 32]
+        secret[..] != [0; 32]
             && binding != [0; 32]
-            && expanded != secret
+            && expanded[..] != secret[..]
             && keys::lane_key_eq(&[7; 16], &[7; 16])
             && !keys::lane_key_eq(&[7; 16], &[8; 16])
     });
@@ -1084,6 +1086,127 @@ mod sealed_records {
             for _ in 0..64 {
                 w.write_all(&data).unwrap();
                 assert_eq!(r.read(&mut out).unwrap(), RECORD);
+            }
+        });
+        assert_eq!(n, 0);
+    }
+}
+
+// ---- non-blocking writes, readiness and channel routing -----------------------
+
+mod steady_state {
+    use std::task::{Context, Poll, Waker};
+
+    use bytes::Bytes;
+    use zmux::proto::record::Framing;
+    use zmux::proto::seal::{Opener, SealedRead, SealedReader, SealedWriter, Sealer, aes_256_gcm};
+    use zmux::{Config, PipeIo, Session};
+
+    use super::{allocations, serial};
+
+    /// `try_write` and a ready `poll_writable` (its wait slot) allocate
+    /// nothing per call once the stream's buffers reached their size.
+    #[test]
+    fn try_write_and_readiness_do_not_allocate_per_call() {
+        let _serial = serial();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let server = tokio::spawn(Session::accept(PipeIo::new(b), Config::default()));
+            let client = Session::connect(PipeIo::new(a), Config::default())
+                .await
+                .unwrap();
+            let server = server.await.unwrap().unwrap();
+            let (mut send, _r) = client.open_bi().await.unwrap();
+            send.write_all(b"x").await.unwrap();
+            let (_s, mut recv) = server.accept_bi().await.unwrap();
+            let mut one = [0u8; 1];
+            recv.read_exact(&mut one).await.unwrap();
+            let data = [5u8; 1024];
+            let mut sink = vec![0u8; 64 * 1024];
+            let mut total = 0;
+            for round in 0..48 {
+                let (written, n) = allocations(|| {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    let mut written = 0;
+                    for _ in 0..16 {
+                        if !matches!(send.poll_writable(&mut cx), Poll::Ready(Ok(_))) {
+                            break;
+                        }
+                        written += send.try_write(&data).unwrap();
+                    }
+                    written
+                });
+                // Warm-up rounds first: the stream's chunks reach their size.
+                if round >= 16 {
+                    total += n;
+                }
+                recv.read_exact(&mut sink[..written]).await.unwrap();
+            }
+            assert!(total <= 2, "{total} allocations for 512 writes");
+            drop((send, recv, client, server));
+        });
+    }
+
+    /// A channel datagram routed to its pipe is a slice of the datagram:
+    /// nothing is allocated per datagram.
+    #[test]
+    fn channel_routing_does_not_allocate() {
+        let _serial = serial();
+        let demux = zmux::adapter::ChannelDemux::new();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let s = seen.clone();
+        let _reg = demux.register(
+            5,
+            zmux::adapter::ChannelReceiver::new(move |f: Bytes| {
+                s.fetch_add(f.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+        let mut d = vec![5u8];
+        d.extend_from_slice(&[1u8; 1200]);
+        let datagram = Bytes::from(d);
+        // The first clone of a vector's Bytes makes it shared (one
+        // allocation, the buffer's, not the routing's).
+        assert!(demux.deliver(datagram.clone()));
+        let (routed, n) = allocations(|| (0..1000).all(|_| demux.deliver(datagram.clone())));
+        assert!(routed);
+        assert_eq!(n, 0);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1001 * 1200);
+    }
+
+    /// The Sealed record codec on a message carrier, sealed and opened
+    /// through its own buffers, allocates nothing in the steady state.
+    #[test]
+    fn sealed_reader_and_writer_on_messages_do_not_allocate() {
+        let _serial = serial();
+        let key = [0x44u8; 32];
+        let mut w = SealedWriter::new(Framing::Records, Sealer::new(aes_256_gcm(), key.to_vec()));
+        let mut r = SealedReader::new(
+            Framing::Records,
+            Opener::new(aes_256_gcm(), key.to_vec()),
+            Vec::new(),
+        );
+        let plain = vec![3u8; 8 * 1024];
+        let mut out = vec![0u8; 16 * 1024];
+        let mut round = |w: &mut SealedWriter, r: &mut SealedReader| {
+            w.seal(&plain).unwrap();
+            let unit = w.pending().clone();
+            let space = r.space();
+            space[..unit.len()].copy_from_slice(&unit);
+            r.filled(unit.len());
+            w.wrote(unit.len()).unwrap();
+            drop(unit);
+            assert!(matches!(r.read(&mut out), Ok(SealedRead::Data(n)) if n == plain.len()));
+        };
+        for _ in 0..4 {
+            round(&mut w, &mut r);
+        }
+        let ((), n) = allocations(|| {
+            for _ in 0..64 {
+                round(&mut w, &mut r);
             }
         });
         assert_eq!(n, 0);

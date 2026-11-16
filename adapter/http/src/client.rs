@@ -13,8 +13,8 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use zmux::adapter::CarrierConnId;
 use zmux::adapter::redirect::{self, RedirectError};
+use zmux::adapter::{CarrierConnId, within};
 use zmux::{
     Candidate, CarrierInfo, CarrierKind, ConnectError, Dial, DialRequest, HttpTarget, Pipe,
     PipeDirection, PipeIo, PipeOptions, Session,
@@ -27,19 +27,6 @@ use zmux_rustls::TlsBinding;
 
 pub(crate) fn hyper_err(e: hyper::Error) -> io::Error {
     io::Error::other(e)
-}
-
-/// `f` within `limit`, or a `TimedOut` error.
-pub(crate) async fn within<T>(
-    limit: Duration,
-    f: impl Future<Output = io::Result<T>>,
-) -> io::Result<T> {
-    tokio::time::timeout(limit, f).await.unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the exchange was not established in time",
-        ))
-    })
 }
 
 /// What one carrier request is: its direction and its pairing token.
@@ -86,6 +73,7 @@ impl Options {
         version: Version,
         head: &Head,
         repeat: Option<&body::Abort>,
+        info: &CarrierInfo,
     ) -> io::Result<(Request<PipeBody>, Option<BodyFeed>)> {
         let get = head.direction == PipeDirection::In;
         let mut req = Request::builder()
@@ -102,13 +90,13 @@ impl Options {
         }
         let (body, writer) = if get {
             if let Some(c) = &self.carrier_credential {
-                let (name, value) = c.header(&CarrierInfo::new().with_head())?;
+                let (name, value) = c.header(&info.clone().with_head())?;
                 req = req.header(name, value);
             }
             (PipeBody::empty(), None)
         } else {
             let prefix = match &self.carrier_credential {
-                Some(c) => Some(bytes::Bytes::from(c.prefix(&CarrierInfo::new())?)),
+                Some(c) => Some(bytes::Bytes::from(c.prefix(info)?)),
                 None => None,
             };
             if let Some(a) = repeat {
@@ -287,15 +275,18 @@ where
         (PipeDirection::Out, Some((writer, abort))) => {
             // The response carries no pipe bytes: it is read to its end,
             // which ends the carrier, as does a failure or another status.
+            // After the request body's graceful end it is read on, within
+            // the exchange timeout, as the carrier's drain.
             let mut reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()), follow);
             let ended = abort.clone();
-            tokio::spawn(async move {
+            let response = Reading::spawn(async move {
                 match tokio::io::copy(&mut reader, &mut tokio::io::sink()).await {
                     Ok(_) => ended.run(),
                     Err(e) => ended.fail(e.kind()),
                 }
             });
             PipeIo::chunk_writer(writer)
+                .with_drain(response.finish(), timeout)
                 .with_abort(move || abort.run())
                 .with_carrier(CarrierKind::Split)
         }
@@ -408,7 +399,7 @@ impl AsyncRead for ResponseReader {
 /// base64url without padding.
 fn pairing_token() -> io::Result<String> {
     let mut token = [0u8; zmux::adapter::PAIRING_TOKEN_LEN];
-    getrandom::fill(&mut token).map_err(io::Error::other)?;
+    zmux::proto::seal::fill_random(&mut token).map_err(io::Error::other)?;
     let mut out = [0u8; 24];
     let n = zmux::proto::oob::encode(&token, &mut out)
         .map_err(|_| io::Error::other("pairing token encoding"))?;
@@ -464,10 +455,12 @@ async fn tcp(addr: &str) -> io::Result<TcpStream> {
 /// with [`DialRequest::bidi`]).
 ///
 /// ```no_run
-/// # async fn example(tls: tokio_rustls::TlsConnector,
-/// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> std::io::Result<()> {
+/// # async fn example(tls: tokio_rustls::TlsConnector) -> std::io::Result<()> {
 /// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
-/// let conn = zmux_rustls::TlsConnection::new(tls.connect(name, tcp).await?);
+/// let name = tokio_rustls::rustls::pki_types::ServerName::try_from("example.com")
+///     .map_err(std::io::Error::other)?;
+/// // `client` keeps the server name in the carrier's metadata.
+/// let conn = zmux_rustls::TlsConnection::client(tls.connect(name, tcp).await?, "example.com");
 /// let options = zmux_http::Options::default().with_https(true);
 /// let pipe = zmux_http::dial_http1_over(conn, "example.com", &options).await?;
 /// # drop(pipe);
@@ -574,6 +567,8 @@ async fn http1_request<IO>(
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    // The TLS connection's metadata, when the request goes out on one.
+    let info = binding_of(&io).map_or_else(CarrierInfo::new, |b| b.info());
     let (mut sender, conn) = within(options.timeout, async {
         http1::handshake::<_, PipeBody>(TokioIo::new(io))
             .await
@@ -581,7 +576,8 @@ where
     })
     .await?;
     tokio::spawn(conn);
-    let (req, body) = options.carrier_request(authority, path, Version::HTTP_11, head, repeat)?;
+    let (req, body) =
+        options.carrier_request(authority, path, Version::HTTP_11, head, repeat, &info)?;
     let resp = sender.send_request(req);
     // One request per connection: it closes once this one is done.
     drop(sender);
@@ -814,10 +810,11 @@ impl Http2Connection {
     /// `:authority` of its requests.
     ///
     /// ```no_run
-    /// # async fn example(tls: tokio_rustls::TlsConnector,
-    /// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn example(tls: tokio_rustls::TlsConnector) -> Result<(), Box<dyn std::error::Error>> {
     /// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
-    /// let conn = zmux_rustls::TlsConnection::new(tls.connect(name, tcp).await?);
+    /// let name = tokio_rustls::rustls::pki_types::ServerName::try_from("example.com")?;
+    /// // `client` keeps the server name in the carrier's metadata.
+    /// let conn = zmux_rustls::TlsConnection::client(tls.connect(name, tcp).await?, "example.com");
     /// let options = zmux_http::Options::default().with_https(true);
     /// let h2 = zmux_http::Http2Connection::handshake(conn, "example.com", options).await?;
     /// let session = h2.connect_session(zmux::Config::default()).await?;
@@ -1016,9 +1013,18 @@ impl H2Inner {
     ) -> io::Result<(ResponseFuture, Option<BodyFeed>)> {
         let mut sender = self.sender.clone();
         sender.ready().await.map_err(hyper_err)?;
-        let (req, body) =
-            self.options
-                .carrier_request(&self.authority, path, Version::HTTP_2, head, repeat)?;
+        let info = self
+            .binding
+            .as_ref()
+            .map_or_else(CarrierInfo::new, TlsBinding::info);
+        let (req, body) = self.options.carrier_request(
+            &self.authority,
+            path,
+            Version::HTTP_2,
+            head,
+            repeat,
+            &info,
+        )?;
         Ok((Box::pin(sender.send_request(req)), body))
     }
 
@@ -1026,7 +1032,7 @@ impl H2Inner {
     /// request is under way. Its response, the unused reverse half, is read
     /// to its end meanwhile; one that fails, is not 200 or does not arrive
     /// within [`Options::timeout`] fails the lane's writes.
-    async fn open_lane(self: Arc<Self>) -> io::Result<body::BodyWriter> {
+    async fn open_lane(self: Arc<Self>) -> io::Result<LaneBody> {
         let head = Head {
             direction: PipeDirection::Bidi,
             pair: None,
@@ -1040,7 +1046,7 @@ impl H2Inner {
             return Err(io::Error::other("a lane request without a body"));
         };
         let mut reader = ResponseReader::spawn(self.options.timeout, resp, None, None);
-        tokio::spawn(async move {
+        let response = Reading::spawn(async move {
             if tokio::io::copy(&mut reader, &mut tokio::io::sink())
                 .await
                 .is_err()
@@ -1048,7 +1054,76 @@ impl H2Inner {
                 abort.run();
             }
         });
-        Ok(writer)
+        Ok(LaneBody {
+            body: writer,
+            response: Some(response),
+            finished: false,
+            limit: self.options.timeout,
+        })
+    }
+}
+
+/// The reading of a response whose body carries no pipe bytes, read to its
+/// end in a task of its own: stopped when this is dropped.
+struct Reading(tokio::task::JoinHandle<()>);
+
+impl Reading {
+    fn spawn(f: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(tokio::spawn(f))
+    }
+
+    /// Waits for the end of the reading (still stopped if dropped first).
+    async fn finish(mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A lane's request body: its response is read on after the body's
+/// graceful end, within the exchange timeout, as the drain of a pipe's
+/// carrier is ([`PipeIo::with_drain`]), and stopped at once after any
+/// other end.
+struct LaneBody {
+    body: body::BodyWriter,
+    response: Option<Reading>,
+    finished: bool,
+    limit: Duration,
+}
+
+impl zmux::adapter::ChunkWrite for LaneBody {
+    fn poll_write_chunks(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        chunks: &mut [bytes::Bytes],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.body).poll_write_chunks(cx, chunks)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.body).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = Pin::new(&mut self.body).poll_shutdown(cx);
+        if matches!(r, Poll::Ready(Ok(()))) {
+            self.finished = true;
+        }
+        r
+    }
+}
+
+impl Drop for LaneBody {
+    fn drop(&mut self) {
+        if self.finished
+            && let Some(r) = self.response.take()
+        {
+            zmux::adapter::spawn_drain(r.finish(), self.limit);
+        }
     }
 }
 

@@ -579,7 +579,7 @@ fn derive_establish() {
         } else {
             let got = got.unwrap();
             assert_eq!(got.handle, hx(h, "handle"), "{}", h["name"]);
-            assert_eq!(got.psk, hx(h, "psk"), "{}", h["name"]);
+            assert_eq!(got.psk[..], hx(h, "psk")[..], "{}", h["name"]);
         }
         count += 1;
     }

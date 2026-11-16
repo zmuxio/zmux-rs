@@ -181,7 +181,7 @@ impl JoinKeys {
         if !declared {
             return;
         }
-        let secret = Secret::from(&keys::session_secret(i_nonce, r_nonce, exporter, key)[..]);
+        let secret = keys::session_secret(i_nonce, r_nonce, exporter, key);
         exporter.fill(0);
         let epoch0 = EpochKeys::derive(0, secret, usable, session_crypto);
         *self = Self::Ready(ReadyKeys {
@@ -890,6 +890,14 @@ impl SessionCore {
         if out.is_some() {
             self.start_probation(id, now);
         }
+        self.pipe_attached_now(id, now);
+    }
+
+    /// The one ending of a pipe attaching, our join's or the peer's: its
+    /// events, the views, deferred joins, standby, resumption and the pipe
+    /// set's consequences (`after_pipe_change`, which keeps the inbound
+    /// state).
+    fn pipe_attached_now(&mut self, id: u64, now: Instant) {
         for half in [PipeHalf::Inbound, PipeHalf::Outbound] {
             self.pipe_event(id, half);
         }
@@ -913,8 +921,10 @@ impl SessionCore {
 
     /// Steps 3 to 6 for a Hello that named this session's locator: a Suite outside the
     /// session's is refused before the AEAD, and the key is that of the joiner's role in
-    /// the session, never inferred from the Pipe ID. `binding` is the carrier's when it
-    /// has one.
+    /// the session, never inferred from the Pipe ID. `binding` is the carrier's Binding
+    /// when the Hello's Mode is Bound and empty otherwise: the secure
+    /// carrier mixes what it is given, as the vectors define (the drivers
+    /// decide this in one place, the join step machine).
     pub fn open_hello(
         &mut self,
         hello: &JoinHello<'_>,
@@ -1148,13 +1158,7 @@ impl SessionCore {
         if want_out {
             self.start_probation(id, now);
         }
-        for half in [PipeHalf::Inbound, PipeHalf::Outbound] {
-            self.pipe_event(id, half);
-        }
-        self.check_standby_takeover();
-        if self.state == State::Suspended {
-            self.check_resume(now);
-        }
+        self.pipe_attached_now(id, now);
         self.epoch_progress(now);
         ConfirmedJoin::Attached {
             pipe: PipeId(id),

@@ -7,7 +7,6 @@
 //!             -> AwaitConfirm::read_confirm -> Confirmed
 //! ```
 
-use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::cipher::AES_256_GCM;
@@ -18,7 +17,7 @@ use super::group::{Group, GroupInitiator, SharedSecrets, combine};
 use super::payload::{
     JOIN_HELLO_KNOWN, JOIN_HELLO_REQUIRED, JOIN_REPLY_KNOWN, JOIN_REPLY_REQUIRED, KEY_SHARE_ITEM,
 };
-use super::wire::{cut_frame, cut_unit, frame, put_varint, read_shortest};
+use super::wire::{cut_unit, frame, message_tail, put_varint, short, shortest_varint};
 use super::{
     Cipher, Error, Framing, Hash, Opener, Payload, RecordMode, SHA256, Sealer, Secret, export,
     fill_random,
@@ -27,7 +26,6 @@ use super::{
 const HELLO_TYPE: u8 = 0x02;
 /// The first byte of a Reply.
 pub const REPLY_TYPE: u8 = 0x03;
-const MAX_UNIT: usize = u16::MAX as usize;
 const BINDING_LEN: usize = 32;
 
 /// One row of the Suite table.
@@ -547,7 +545,7 @@ impl Joiner {
         wire.extend_from_slice(&r);
         let th = transcript_start(suite, &wire, &self.binding);
         let k0 = expand_labeled(suite, &self.psk, b"hello", &th, suite.cipher.key_len());
-        let ciphertext = suite.cipher.seal(&k0, 0, b"", &payload);
+        let ciphertext = suite.cipher.seal(&k0, 0, b"", &payload)?;
         frame(self.framing, &mut wire, &ciphertext)?;
         let next = HelloSent {
             suite,
@@ -595,27 +593,13 @@ pub fn parse_reply<'a>(
     framing: Framing,
     input: &'a [u8],
 ) -> Result<(&'a [u8], &'a [u8], usize), Error> {
-    let stream = framing == Framing::ByteStream;
-    let cut = |need| {
-        if stream {
-            Error::Incomplete { need }
-        } else {
-            Error::Malformed
-        }
-    };
-    if *input.first().ok_or(cut(1))? != REPLY_TYPE {
+    if *input.first().ok_or(short(framing, 1))? != REPLY_TYPE {
         return Err(Error::Malformed);
     }
     let header = 1 + suite.r_len;
-    let r = input.get(1..header).ok_or(cut(header))?;
-    let (ciphertext, consumed) = if stream {
-        cut_frame(input, header)?
-    } else {
-        if input.len() - header > MAX_UNIT {
-            return Err(Error::TooLarge);
-        }
-        (&input[header..], input.len())
-    };
+    let r = input.get(1..header).ok_or(short(framing, header))?;
+    // The pipe's records may follow a Reply.
+    let (ciphertext, consumed) = message_tail(framing, input, header, false)?;
     Ok((r, ciphertext, consumed))
 }
 
@@ -810,26 +794,13 @@ struct HelloHead<'a> {
 impl<'a> HelloHead<'a> {
     /// The head `input` starts with; a cut one is `Incomplete` on a byte
     /// stream (`stream`), `Malformed` otherwise.
-    fn parse(stream: bool, input: &'a [u8]) -> Result<Self, Error> {
-        let cut = |need| {
-            if stream {
-                Error::Incomplete { need }
-            } else {
-                Error::Malformed
-            }
-        };
+    fn parse(framing: Framing, input: &'a [u8]) -> Result<Self, Error> {
+        let cut = |need| short(framing, need);
         let first = *input.first().ok_or(cut(1))?;
         if first != HELLO_TYPE {
             return Err(Error::UnknownProfile);
         }
-        let rest = &input[1..];
-        let Some((value, used, shortest)) = read_shortest(rest) else {
-            let width = rest.first().map_or(1, |b| 1usize << (b >> 6));
-            return Err(cut(1 + width));
-        };
-        if !shortest {
-            return Err(Error::Malformed);
-        }
+        let (value, used) = shortest_varint(framing, input, 1)?;
         let suite = Suite::from_value(value).ok_or(Error::UnknownSuite)?;
         let mut at = 1 + used;
         let (mode, phase) = parse_mode_byte(*input.get(at).ok_or(cut(at + 1))?)?;
@@ -872,21 +843,9 @@ impl<'a> JoinHello<'a> {
     /// Parses a Hello in wire order. On a byte stream a byte past the Hello is
     /// `trailing_bytes`.
     pub fn parse(framing: Framing, input: &'a [u8]) -> Result<JoinHello<'a>, Error> {
-        let stream = framing == Framing::ByteStream;
-        let head = HelloHead::parse(stream, input)?;
+        let head = HelloHead::parse(framing, input)?;
         let prefix_end = head.len;
-        let (ciphertext, consumed) = if stream {
-            let (unit, total) = cut_frame(input, prefix_end)?;
-            if total != input.len() {
-                return Err(Error::TrailingBytes);
-            }
-            (unit, total)
-        } else {
-            if input.len() - prefix_end > MAX_UNIT {
-                return Err(Error::TooLarge);
-            }
-            (&input[prefix_end..], input.len())
-        };
+        let (ciphertext, consumed) = message_tail(framing, input, prefix_end, true)?;
         Ok(JoinHello {
             suite: head.suite,
             mode: head.mode,
@@ -903,7 +862,7 @@ impl<'a> JoinHello<'a> {
     /// head (through the nonce R) alone: [`Error::Incomplete`] with the
     /// head's whole length while `input` is shorter.
     pub fn head_locator(input: &'a [u8]) -> Result<&'a [u8], Error> {
-        HelloHead::parse(true, input).map(|h| h.locator)
+        HelloHead::parse(Framing::ByteStream, input).map(|h| h.locator)
     }
 
     /// The Suite.
@@ -1107,7 +1066,7 @@ impl Unconfirmed {
         let r = join_r(suite, &self.psk, attempt, random, &[REPLY_TYPE], &payload);
         let th2 = suite.hash.hash(&[&self.th, &self.hello_ct, &r]);
         let k1 = expand_labeled(suite, &self.psk, b"reply", &th2, suite.cipher.key_len());
-        let ciphertext = suite.cipher.seal(&k1, 0, b"", &payload);
+        let ciphertext = suite.cipher.seal(&k1, 0, b"", &payload)?;
         let mut wire = vec![REPLY_TYPE];
         wire.extend_from_slice(&r);
         frame(self.framing, &mut wire, &ciphertext)?;
@@ -1137,10 +1096,6 @@ pub struct AwaitConfirm {
     #[cfg(feature = "test-hooks")]
     k0: Secret,
     keys: Keys,
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && black_box(a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y))) == 0
 }
 
 impl AwaitConfirm {
@@ -1184,7 +1139,7 @@ impl AwaitConfirm {
                 let (unit, consumed) = cut_unit(self.framing, input)?;
                 let tag = self.keys.confirm_tag(suite);
                 let (received, rest) = unit.split_at_checked(tag.len()).ok_or(Error::Malformed)?;
-                if !constant_time_eq(received, &tag) {
+                if !super::ct_eq(received, &tag) {
                     return Err(Error::Auth);
                 }
                 if rest.iter().any(|&b| b != 0) {

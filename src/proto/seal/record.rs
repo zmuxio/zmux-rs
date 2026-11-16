@@ -17,13 +17,16 @@ struct Direction {
 }
 
 impl Direction {
+    /// A key not of the cipher's length fails the direction at its first
+    /// record, never with a panic.
     fn new(cipher: &'static Cipher, key: Secret, n: u64) -> Direction {
+        let failed = (key.len() != cipher.key_len()).then_some(Error::InvalidConfig);
         Direction {
             cipher,
             keyed: None,
             key,
             n,
-            failed: None,
+            failed,
         }
     }
 
@@ -37,7 +40,7 @@ impl Direction {
         }
         if self.n != 0 && self.n.is_multiple_of(self.cipher.rekey_interval()) {
             let zeros = vec![0; self.cipher.key_len()];
-            let mut key = Secret::from(self.cipher.seal(&self.key, RESERVED_NONCE, b"", &zeros));
+            let mut key = Secret::from(self.cipher.seal(&self.key, RESERVED_NONCE, b"", &zeros)?);
             key.truncate(self.cipher.key_len());
             self.keyed = None;
             self.key = key;
@@ -107,7 +110,6 @@ impl Sealer {
 
     /// Drops the expanded key of an idle carrier; the next record expands it
     /// again.
-    #[cfg(all(feature = "tokio", not(loom)))]
     pub(crate) fn release_idle(&mut self) {
         self.0.keyed = None;
     }
@@ -176,7 +178,6 @@ impl Opener {
 
     /// Drops the expanded key of an idle carrier; the next record expands it
     /// again.
-    #[cfg(all(feature = "tokio", not(loom)))]
     pub(crate) fn release_idle(&mut self) {
         self.0.keyed = None;
     }

@@ -147,7 +147,7 @@ impl Carrier for zmux::blocking::PipeIo {
         limit: Duration,
     ) -> io::Result<Vec<u8>> {
         // Disarmed when dropped, at the end of this read.
-        let watchdog = self.watchdog(limit);
+        let watchdog = self.watchdog(limit)?;
         let r = read_frame(self, framing, buf).await;
         if watchdog.is_some_and(|w| w.fired()) {
             return Err(timed_out());

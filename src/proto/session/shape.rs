@@ -586,10 +586,12 @@ impl Shaping {
         }
     }
 
-    /// Ends shaping of a pipe whose outbound direction failed.
-    pub(super) fn pipe_failed(&mut self, pipe: u64, now: Instant) {
+    /// Ends shaping of a pipe: its outbound direction failed
+    /// ([`EventKind::PipeFailed`]) or it was retired ([`EventKind::Stopped`]).
+    /// The one place a pipe's shaping state goes.
+    pub(super) fn pipe_ended(&mut self, pipe: u64, kind: EventKind, now: Instant) {
         if let Some(i) = self.index(pipe) {
-            let e = Event::new(EventKind::PipeFailed, PipeId(pipe), self.micros(now));
+            let e = Event::new(kind, PipeId(pipe), self.micros(now));
             self.event(i, e, 0);
             self.pipes.swap_remove(i);
         }
@@ -1223,7 +1225,15 @@ impl SessionCore {
     pub(super) fn shape_pipe_failed(&mut self, id: u64) {
         let now = self.now;
         if let Some(s) = self.shape.as_deref_mut() {
-            s.pipe_failed(id, now);
+            s.pipe_ended(id, EventKind::PipeFailed, now);
+        }
+    }
+
+    /// A retired pipe's shaping state goes (a failed one's went already).
+    pub(super) fn shape_retired(&mut self, id: u64) {
+        let now = self.now;
+        if let Some(s) = self.shape.as_deref_mut() {
+            s.pipe_ended(id, EventKind::Stopped, now);
         }
     }
 
@@ -1306,6 +1316,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A pipe that ends, failed or retired, leaves the shaping state with
+    /// its shaper, which is told once; a retired pipe's wake no longer
+    /// drives the session's timer.
+    #[test]
+    fn an_ended_pipe_leaves_the_shaping_state() {
+        for kind in [EventKind::Stopped, EventKind::PipeFailed] {
+            let mut s = shaping(Limits::default());
+            let woken = Arc::new(AtomicUsize::new(0));
+            pipe(&mut s, Waked(woken, Some(1)));
+            assert!(s.index(1).is_some());
+            s.pipe_ended(1, kind, Instant::now());
+            assert!(s.index(1).is_none(), "{kind:?}");
+            assert_eq!(s.pipes.len(), 0);
+        }
+    }
+
+    /// The core's release point: a `PipeRetired` event, pushed as the
+    /// retirement paths push it, takes the pipe's shaping state with it.
+    #[test]
+    fn a_retired_pipe_event_releases_its_shaping_state() {
+        let now = Instant::now();
+        let mut core =
+            SessionCore::new(crate::Config::default(), crate::Role::Client, None, now).unwrap();
+        let woken = Arc::new(AtomicUsize::new(0));
+        pipe(core.shaping(), Waked(woken, Some(1)));
+        assert!(core.shaping().index(1).is_some());
+        core.push_event(crate::proto::session::CoreEvent::PipeRetired {
+            pipe: PipeId(1),
+            join_failure: None,
+        });
+        assert!(core.shaping().index(1).is_none());
     }
 
     #[test]

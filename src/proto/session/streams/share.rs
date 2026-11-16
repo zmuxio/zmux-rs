@@ -443,13 +443,21 @@ impl Streams {
 
     // ---- capacity waits ------------------------------------------------------
 
-    /// A sending part waits for `min` bytes of send capacity (the latest
-    /// registration counts); `false` when the part is gone.
+    /// A sending part waits for `min` bytes of send capacity (with several
+    /// waiters, the smallest threshold counts); `false` when the part is
+    /// gone.
     pub(in super::super) fn add_capacity_wait(&mut self, key: StreamKey, min: u64) -> bool {
         let Some(send) = self.slab.get_mut(key).and_then(|s| s.send.as_mut()) else {
             return false;
         };
-        if send.cold_mut().capacity_wait.replace(min).is_none() {
+        // Several waiters may wait with different thresholds: the part is
+        // notified at the smallest, and a waiter with a larger one checks
+        // again and registers again.
+        let wait = &mut send.cold_mut().capacity_wait;
+        if let Some(m) = wait {
+            *m = (*m).min(min);
+        } else {
+            *wait = Some(min);
             self.capacity_waiters.push(key);
         }
         true

@@ -241,7 +241,7 @@ async fn run_server(args: &[String]) -> Res {
         ..Default::default()
     };
     if sc == "join" || sc == "epoch" {
-        opts.allow_record_mode = Some(Arc::new(|_, _| true));
+        opts.allow_record_mode = Some(zmux_seal::ModeCheck::new(|_, _| true));
     }
     if sc == "appdata" {
         opts.app_data = Some(app_data(2, b"srv-msg2"));
@@ -377,7 +377,7 @@ async fn run_client(args: &[String]) -> Res {
         cfg.record_mode = RecordMode::Sealed;
     }
     if sc == "appdata" {
-        cfg.static_secret = zmux_seal::StaticSecret::Given(CLIENT_KEY);
+        cfg.static_secret = zmux_seal::StaticSecret::Given(CLIENT_KEY.into());
         cfg.app_data = Some(app_data(3, b"cli-msg3"));
     }
     let tcp = TcpStream::connect(&addr)

@@ -20,18 +20,28 @@
 //! - [`seal`]: the shared part of the secure carrier: Join, Suites, Sealed
 //!   records, the handshake payload codec and `Export`. It allocates.
 //! - [`error`]: error codes and the error types of this layer.
+//! - [`exporter`]: the keying material exporter of a carrier.
+//! - [`replay`]: the replay filter of stamped keys.
+//! - [`host_events`]: the observing hooks as a bounded subscription.
+//! - [`session`]: the sans-IO session core.
 //!
-//! Nothing in this module performs I/O or panics on peer input, and outside
-//! [`seal`] decoding and encoding allocate nothing.
+//! Nothing in this module performs I/O or panics on peer input. Frame and
+//! record decoding and encoding allocate nothing per frame (see [`frame`]
+//! for its one exception); [`seal`], [`session`], the exporter, the replay
+//! filter, prefix authentication and the out-of-band codecs allocate where
+//! they keep or return values.
 
 #![forbid(unsafe_code)]
 
 pub mod admission;
+mod decision;
+pub use decision::{Decision, LaterFuture};
 mod codec;
 pub mod draft;
 pub mod error;
 pub mod exporter;
 pub mod frame;
+pub mod host_events;
 pub mod ident;
 pub mod keys;
 pub mod limit;

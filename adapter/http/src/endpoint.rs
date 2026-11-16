@@ -220,7 +220,7 @@ impl Endpoint {
 #[cfg(feature = "websocket")]
 fn remote_info<F>(f: F) -> F
 where
-    F: for<'a> FnOnce(zmux::CarrierInfo<'a>) -> zmux::CarrierInfo<'a>,
+    F: FnOnce(zmux::CarrierInfo) -> zmux::CarrierInfo,
 {
     f
 }

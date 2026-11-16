@@ -134,7 +134,7 @@ pub enum SessionError {
     /// accepted): the peer processed none of it. The streams may be opened
     /// again on a new session without early data; this is the one
     /// termination that [`SessionError::is_retryable`] reports. Through
-    /// [`io::Error`] it is [`io::ErrorKind::Other`]: see
+    /// [`io::Error`] it is [`io::ErrorKind::ConnectionAborted`]: see
     /// [`SessionError::in_io`].
     EarlyDataRejected,
     /// The resume grace period expired while the session was suspended, or a listener limit ended
@@ -193,8 +193,8 @@ pub enum PipeFailure {
     /// The carrier broke the protocol for its state.
     Protocol,
     /// The acceptor closed the carrier of this endpoint's join before
-    /// confirming it, with a `CONNECTION_CLOSE` of this error code; `ZMUX_RESUME_FAILED`: it has no
-    /// session for the locator.
+    /// confirming it (with `CONNECTION_CLOSE` `ZMUX_RESUME_FAILED` when it
+    /// has no session for the locator).
     JoinFailed,
     /// The peer refused the join in its Reply.
     JoinRefused,
@@ -615,6 +615,9 @@ pub enum DatagramError {
     },
     /// The stream cannot carry datagrams (unidirectional or closed).
     ClosedStream,
+    /// The stream has no identifier yet and the peer's stream limit allows
+    /// none now: its datagram is refused, the stream stays unopened.
+    Blocked,
     /// The session ended.
     SessionLost(SessionError),
 }
@@ -634,6 +637,7 @@ impl fmt::Display for DatagramError {
             Self::NotNegotiated => f.write_str("datagrams not negotiated with the peer"),
             Self::TooLarge { max } => write!(f, "datagram larger than {max} bytes"),
             Self::ClosedStream => f.write_str("stream cannot carry datagrams"),
+            Self::Blocked => f.write_str("stream not opened yet: the peer's stream limit"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
         }
     }
@@ -654,6 +658,7 @@ impl From<DatagramError> for io::Error {
             DatagramError::NotNegotiated => io::ErrorKind::Unsupported,
             DatagramError::TooLarge { .. } => io::ErrorKind::InvalidInput,
             DatagramError::ClosedStream => io::ErrorKind::NotConnected,
+            DatagramError::Blocked => io::ErrorKind::WouldBlock,
             DatagramError::SessionLost(s) => s.kind(),
         };
         io::Error::new(kind, e)

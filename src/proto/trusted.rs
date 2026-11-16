@@ -97,10 +97,10 @@ impl TrustedProxies {
     /// a node name that is not an IP address) ends the walk at the trusted hop that
     /// reported it; when every hop is trusted, the first is the client. A
     /// reported port is kept; without one the port is 0.
-    pub fn source<'a>(
+    pub fn source<K: AsRef<str>, V: AsRef<[u8]>>(
         &self,
         peer: SocketAddr,
-        fields: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+        fields: impl IntoIterator<Item = (K, V)>,
     ) -> SocketAddr {
         let Some(name) = self.header.as_deref() else {
             return peer;
@@ -111,10 +111,10 @@ impl TrustedProxies {
         let rfc7239 = name.eq_ignore_ascii_case("forwarded");
         let mut hops: Vec<Option<SocketAddr>> = Vec::new();
         for (n, v) in fields {
-            if !n.eq_ignore_ascii_case(name) {
+            if !n.as_ref().eq_ignore_ascii_case(name) {
                 continue;
             }
-            let Ok(v) = std::str::from_utf8(v) else {
+            let Ok(v) = std::str::from_utf8(v.as_ref()) else {
                 // A value that is not text reports nothing usable.
                 hops.push(None);
                 continue;
@@ -153,10 +153,26 @@ impl TrustedProxies {
 /// assert!(zmux::adapter::forwarded_early_data(fields));
 /// assert!(!zmux::adapter::forwarded_early_data([("early-data", &b"0"[..])]));
 /// ```
-pub fn forwarded_early_data<'a>(fields: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> bool {
-    fields
-        .into_iter()
-        .any(|(n, v)| n.eq_ignore_ascii_case("early-data") && v.trim_ascii() == b"1")
+pub fn forwarded_early_data<K: AsRef<str>, V: AsRef<[u8]>>(
+    fields: impl IntoIterator<Item = (K, V)>,
+) -> bool {
+    fields.into_iter().any(|(n, v)| {
+        n.as_ref().eq_ignore_ascii_case("early-data") && v.as_ref().trim_ascii() == b"1"
+    })
+}
+
+/// Calls `each(name, value)` for every field of `fields`, in order: the
+/// visitor of an HTTP request head's fields
+/// ([`CarrierInfo::with_request_head`](crate::CarrierInfo::with_request_head))
+/// for any field type that gives its name as text and its value as bytes
+/// (`&http::HeaderMap` among them).
+pub fn visit_fields<K: AsRef<str>, V: AsRef<[u8]>>(
+    fields: impl IntoIterator<Item = (K, V)>,
+    each: &mut dyn FnMut(&str, &[u8]),
+) {
+    for (n, v) in fields {
+        each(n.as_ref(), v.as_ref());
+    }
 }
 
 /// The `for` parameter of one element of a `Forwarded` field (RFC 7239

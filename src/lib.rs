@@ -197,8 +197,9 @@
 //! records.
 
 // Unsafe code is denied (Cargo.toml) and forbidden in the sans-IO core
-// (`proto`); the one exception is the TCP carriers' socket queries and
-// low-water mark (`driver/tcp.rs`).
+// (`proto`). The exceptions: the TCP carriers' socket queries and low-water
+// mark (`driver/tcp.rs`), and `util::wipe`'s volatile writes, which the core
+// calls to clear key material.
 // Loom builds leave the drivers out (src/driver/loom.rs): their helpers go
 // unused there.
 #![cfg_attr(loom, allow(dead_code, unused_imports))]
@@ -221,19 +222,20 @@ pub use backoff::{Backoff, DEFAULT_BACKOFF_JITTER};
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
 pub use proto::admission::{
-    Admission, AdmissionVerdict, AdmittedValue, CarrierCredential, CarrierInfo, Decide,
-    DecideFuture, Decision, PEEK_TIMEOUT_DRAWN, STALL_MAX_DRAWN,
+    Admission, AdmissionDecision, AdmissionVerdict, AdmittedValue, CarrierCredential, CarrierInfo,
+    Decide, PEEK_TIMEOUT_DRAWN, STALL_MAX_DRAWN,
 };
 pub use proto::error::{ApplicationErrorCode, TransportErrorCode};
-pub use proto::exporter::{ExportError, TlsState};
+pub use proto::exporter::{CarrierExporter, ExportError, ExportFuture, ExportRequest, TlsState};
 pub use proto::frame::{Dir, Priority};
+pub use proto::host_events::{HostEvent, HostEvents};
 pub use proto::ident::{alpn_protocols, default_alpn};
-pub use proto::limit::{DatagramLimiter, Limiter};
+pub use proto::limit::{DatagramLimiter, LimitError, Limiter, Permit};
 pub use proto::listener::{
-    HandleError, ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure, OnMemoryPressure, OnReject,
-    RejectAction, RejectError, RejectInfo,
+    DEFAULT_FIRST_RECORD_TIMEOUT, HandleError, ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure,
+    OnMemoryPressure, OnReject, RejectAction, RejectError, RejectInfo,
 };
-pub use proto::listener::{SessionCarrier, SessionConfigFn};
+pub use proto::listener::{SessionCarrier, SessionConfigAnswer, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};
 pub use proto::params::DEFAULT_MAX_RECORD_SIZE;
 pub use proto::params::{Role, TransportParameters};
@@ -257,10 +259,12 @@ pub use proto::session::{
     JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT, Multipath, OpenError,
     OutboundState, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeLiveness, PipeOptions,
     PipeStats, PipeUpdate, Preamble, PrioritySource, QualityBand, Redial, Redundancy, RttSource,
-    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionStats,
-    State as SessionState, StreamError, StreamStats, Support, Tracer, UniCredit, WindowIncrease,
+    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionId, SessionStats,
+    State as SessionState, StreamError, StreamStats, Support, TraceRecord, Tracer, UniCredit,
+    WindowIncrease,
 };
 pub use proto::session::{InvalidConfig, check_max_record};
+pub use proto::{Decision, LaterFuture};
 
 /// The QMux version this crate speaks, the only one: what
 #[cfg_attr(
@@ -291,7 +295,9 @@ pub use driver::listen::{
     VariantStats,
 };
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::tokio::{Dial, Pipe, PipeIo, RecvStream, SendStream, Session};
+pub use driver::tokio::{
+    Dial, Pipe, PipeIo, RecvStream, SendStream, Session, StreamHandle, TryRead,
+};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::transform::{InboundTransform, PipeStream};
 
@@ -327,12 +333,23 @@ pub mod adapter {
     pub use crate::driver::listen::{
         Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, SetupGuard,
     };
-    pub use crate::driver::tokio::{ChunkBuf, ChunkWrite, SessionAdapter};
+    pub use crate::driver::tokio::{
+        ChunkBuf, ChunkWrite, DRAIN_LIMIT, SessionAdapter, spawn_drain, within,
+    };
     pub use crate::proto::exporter::{CarrierExporter, RESERVED_EXPORTER_PREFIX};
     pub use crate::proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
     pub use crate::proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
     pub use crate::proto::record::Framing;
-    pub use crate::proto::trusted::forwarded_early_data;
+    pub use crate::proto::trusted::{forwarded_early_data, visit_fields};
+    // Primitives zmux's own adapters share; hidden and outside the stable
+    // API: they may change or go in any release.
+    #[doc(hidden)]
+    pub use crate::util::{HmacSha256, random_u64};
+
+    /// The default bound of an adapter's dial, from its connect to the
+    /// carrier being ready (the HTTP response head, the WebSocket upgrade,
+    /// the TLS handshake): the one default the adapters share.
+    pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Following the redirects of an HTTP carrier's request: the rules the
     /// HTTP and WebSocket adapters share.
@@ -353,6 +370,13 @@ pub mod adapter {
 #[doc(hidden)]
 pub mod test_hooks {
     pub use crate::driver::resources::{Resources, Tables, resources, take_write_call_bytes};
+
+    /// The carrier contract every adapter's carriers keep, as a suite an
+    /// adapter runs on pairs of its carriers (tokio driver).
+    #[cfg(feature = "tokio")]
+    pub use crate::driver::conformance::{
+        pattern_byte as carrier_conformance_byte, run as carrier_conformance,
+    };
 
     /// A byte-stream carrier's halves as Sealed records (tokio driver).
     #[cfg(feature = "tokio")]

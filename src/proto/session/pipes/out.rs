@@ -135,6 +135,9 @@ pub(crate) struct OutPipe {
     shutdown: bool,
     /// The driver was told to shut down.
     shutdown_reported: bool,
+    /// The state last reported in a `PipeState` event (`None` before the
+    /// first): the event carries it, so that the transition is the core's.
+    pub(crate) reported: Option<OutboundState>,
     /// The driver will not write any more (carrier closed).
     out_closed: bool,
     /// The driver was told to abort the carrier.
@@ -457,6 +460,7 @@ impl OutPipe {
             close_sent: false,
             shutdown: false,
             shutdown_reported: false,
+            reported: None,
             out_closed: false,
             abort_reported: false,
             sent: 0,
@@ -706,7 +710,8 @@ impl OutPipe {
         self.out_closed || self.shutdown_reported || self.abort_reported
     }
 
-    /// The first frames of the pipe are owed: `QX_TRANSPORT_PARAMETERS`, or
+    /// The first frames of the pipe are owed: `QX_TRANSPORT_PARAMETERS`
+    /// has not been sent on it yet.
     #[inline]
     pub(crate) fn leading_frames_owed(&self) -> bool {
         !self.tp_sent
@@ -1152,6 +1157,18 @@ impl OutPipe {
         }
         if probe {
             self.mp_mut().probe_ends.push(sent);
+        }
+        // Past the bound of the single pipe's samples, a batch the peer is
+        // not made to acknowledge (PIPE_ACK alone) joins the latest such
+        // entry: a peer that never acknowledges them cannot make the state
+        // grow with them.
+        if !eliciting
+            && self.batches.len() >= crate::proto::session::pipe_ack::SAMPLE_ENTRIES
+            && let Some(last) = self.batches.back_mut()
+            && !last.eliciting
+        {
+            last.end = self.sent;
+            return;
         }
         self.record_batch(lane, eliciting, peer_mad, now);
     }
@@ -2221,7 +2238,12 @@ impl OutPipe {
     /// asked for after the wait started, the same value after.
     pub(crate) fn probe_hold(&self, hold: impl FnOnce() -> Duration) -> Duration {
         use std::sync::atomic::Ordering::Relaxed;
-        let c = &self.mp().probe_hold;
+        // Without multipath state nothing is kept: the shared default is
+        // never written.
+        let Some(mp) = self.mp.as_deref() else {
+            return hold();
+        };
+        let c = &mp.probe_hold;
         match c.load(Relaxed) {
             u64::MAX => {
                 let h = hold();

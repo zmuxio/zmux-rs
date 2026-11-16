@@ -4,16 +4,20 @@
 //! complete later (early data).
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use super::keys::{EXPORTER_JOIN_LABEL, EXPORTER_SESSION_LABEL};
+use super::seal::{Secret, ct_eq};
+
+use super::keys::{
+    EXPORTER_JOIN_LABEL, EXPORTER_SEAL_BOUND_LABEL, EXPORTER_SESSION_LABEL,
+    PREFIX_AUTH_EXPORTER_LABEL,
+};
 
 /// Labels starting with this key zmux's own joins:
 /// [`CarrierExporter::export_for_host`] refuses them.
 pub const RESERVED_EXPORTER_PREFIX: &str = "EXPORTER-zmux-";
-
-/// The carrier exporter's label of an Establish's Binding.
-const EXPORTER_SEAL_BOUND_LABEL: &str = "EXPORTER-zmux-seal-bound";
 
 /// The length of the exporter values zmux reads.
 const VALUE_LEN: usize = 32;
@@ -70,28 +74,223 @@ impl fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
+/// What an asynchronous exporter ([`CarrierExporter::new_async`]) is asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExportRequest {
+    /// The label.
+    pub label: String,
+    /// The context.
+    pub context: Vec<u8>,
+    /// The length of the value.
+    pub length: usize,
+}
+
+/// The future of an asynchronous exporter.
+pub type ExportFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
+
+/// The callable behind an asynchronous exporter.
+pub type AsyncExportFn = dyn Fn(ExportRequest) -> ExportFuture + Send + Sync;
+
+/// The labels zmux reads, each with an empty context and [`VALUE_LEN`] bytes.
+const ZMUX_LABELS: [&str; 4] = [
+    EXPORTER_SESSION_LABEL,
+    EXPORTER_JOIN_LABEL,
+    EXPORTER_SEAL_BOUND_LABEL,
+    PREFIX_AUTH_EXPORTER_LABEL,
+];
+
+/// One connection's exporter.
+#[derive(Clone)]
+enum Source {
+    /// Answers in the call, from any thread.
+    Now(Arc<ExportFn>),
+    /// Answers later; the values zmux reads are fetched once
+    /// ([`CarrierExporter::resolve`]) and answered from then on.
+    Later {
+        export: Arc<AsyncExportFn>,
+        values: Arc<std::sync::Mutex<[Option<Secret>; ZMUX_LABELS.len()]>>,
+    },
+}
+
+impl Source {
+    fn fill(&self, label: &str, context: &[u8], out: &mut [u8]) -> bool {
+        match self {
+            Self::Now(f) => f(label, context, out),
+            Self::Later { values, .. } => {
+                if !context.is_empty() || out.len() != VALUE_LEN {
+                    return false;
+                }
+                let Some(i) = ZMUX_LABELS.iter().position(|l| *l == label) else {
+                    return false;
+                };
+                let values = values
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                values[i].as_deref().is_some_and(|v| {
+                    out.copy_from_slice(v);
+                    true
+                })
+            }
+        }
+    }
+
+    async fn ask(&self, label: &str, context: &[u8], length: usize) -> Option<Vec<u8>> {
+        match self {
+            Self::Now(f) => {
+                let mut out = vec![0; length];
+                f(label, context, &mut out).then_some(out)
+            }
+            Self::Later { export, .. } => {
+                let request = ExportRequest {
+                    label: label.to_owned(),
+                    context: context.to_vec(),
+                    length,
+                };
+                let later = crate::proto::Decision::catch(|| {
+                    crate::proto::Decision::Later(export(request))
+                })?;
+                let v = later.settle().await?.ok()?;
+                (v.len() == length).then_some(v)
+            }
+        }
+    }
+
+    async fn resolve(&self) {
+        let Self::Later { values, .. } = self else {
+            return;
+        };
+        for (i, label) in ZMUX_LABELS.iter().enumerate() {
+            let known = values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[i]
+                .is_some();
+            if !known && let Some(v) = self.ask(label, b"", VALUE_LEN).await {
+                values
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(Secret::from(v));
+            }
+        }
+    }
+}
+
 /// A carrier's exporter; for a split bootstrap, those of its two halves
-/// ([`Self::split`]).
+/// ([`Self::split`]). Cheap to clone and callable from any thread.
 #[derive(Clone)]
 pub struct CarrierExporter {
-    first: Arc<ExportFn>,
-    second: Option<Arc<ExportFn>>,
+    first: Source,
+    second: Option<Source>,
 }
 
 impl fmt::Debug for CarrierExporter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CarrierExporter")
             .field("split", &self.second.is_some())
+            .field("later", &matches!(self.first, Source::Later { .. }))
             .finish_non_exhaustive()
     }
 }
 
 impl CarrierExporter {
-    /// The exporter of one connection.
+    /// The exporter of one connection, answering in the call.
     pub fn new(export: impl Fn(&str, &[u8], &mut [u8]) -> bool + Send + Sync + 'static) -> Self {
         Self {
-            first: Arc::new(export),
+            first: Source::Now(Arc::new(export)),
             second: None,
+        }
+    }
+
+    /// The exporter of one connection whose values come later (from
+    /// another thread, a language binding): `export` returns the value's
+    /// future, an error while the handshake is incomplete or once the
+    /// connection is gone. The values zmux itself reads are fetched once,
+    /// outside every lock, by [`Self::resolve`], which the drivers await
+    /// before a carrier's session, join or Establish needs them; until then
+    /// the synchronous reads give nothing. Other labels are read with
+    /// [`Self::export_async`].
+    pub fn new_async<F>(export: impl Fn(ExportRequest) -> F + Send + Sync + 'static) -> Self
+    where
+        F: Future<Output = std::io::Result<Vec<u8>>> + Send + 'static,
+    {
+        Self {
+            first: Source::Later {
+                export: Arc::new(move |r| Box::pin(export(r))),
+                values: Arc::default(),
+            },
+            second: None,
+        }
+    }
+
+    /// An exporter holding the values zmux reads (its joins, an
+    /// Establish's Binding, prefix authentication), read now from `export`,
+    /// and no other: for metadata of a connection borrowed only for the
+    /// call (an admission's [`CarrierInfo`](crate::CarrierInfo) of a TLS
+    /// stream it does not own). Other labels give nothing.
+    pub fn snapshot(export: impl Fn(&str, &[u8], &mut [u8]) -> bool) -> Self {
+        let mut values: [Option<Secret>; ZMUX_LABELS.len()] = Default::default();
+        for (v, label) in values.iter_mut().zip(ZMUX_LABELS) {
+            let mut out = Secret::from(vec![0; VALUE_LEN]);
+            *v = export(label, b"", out.as_mut_slice()).then_some(out);
+        }
+        Self {
+            first: Source::Later {
+                export: Arc::new(|_| {
+                    Box::pin(std::future::ready(Err(
+                        std::io::ErrorKind::Unsupported.into()
+                    )))
+                }),
+                values: Arc::new(std::sync::Mutex::new(values)),
+            },
+            second: None,
+        }
+    }
+
+    /// Fetches the values zmux reads from an exporter whose values come
+    /// later; nothing for one that answers in the call. Cancel-safe: the
+    /// values fetched stay.
+    pub fn resolve(&self) -> impl Future<Output = ()> + Send + 'static {
+        let this = self.clone();
+        async move {
+            this.first.resolve().await;
+            if let Some(s) = &this.second {
+                s.resolve().await;
+            }
+        }
+    }
+
+    /// Whether the values zmux reads are answered without waiting.
+    #[must_use]
+    pub fn is_resolved(&self) -> bool {
+        let done = |s: &Source| match s {
+            Source::Now(_) => true,
+            Source::Later { values, .. } => values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(Option::is_some),
+        };
+        done(&self.first) && self.second.as_ref().is_none_or(done)
+    }
+
+    /// [`Self::export`] for any label, waiting for an exporter whose
+    /// values come later.
+    pub fn export_async(
+        &self,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> impl Future<Output = Option<Vec<u8>>> + Send + 'static {
+        let this = self.clone();
+        let (label, context) = (label.to_owned(), context.to_vec());
+        async move {
+            let mut out = this.first.ask(&label, &context, length).await?;
+            if let Some(second) = &this.second {
+                let other = Secret::from(second.ask(&label, &context, length).await?);
+                if !ct_eq(&other, &out) {
+                    out.extend_from_slice(&other);
+                }
+            }
+            Some(out)
         }
     }
 
@@ -114,15 +313,16 @@ impl CarrierExporter {
     #[must_use]
     pub fn export(&self, label: &str, context: &[u8], length: usize) -> Option<Vec<u8>> {
         let mut out = vec![0; length];
-        if !(self.first)(label, context, &mut out) {
+        if !self.first.fill(label, context, &mut out) {
             return None;
         }
         if let Some(second) = &self.second {
-            let mut other = vec![0; length];
-            if !second(label, context, &mut other) {
+            // Keying material dropped here is cleared.
+            let mut other = Secret::from(vec![0; length]);
+            if !second.fill(label, context, other.as_mut_slice()) {
                 return None;
             }
-            if other != out {
+            if !ct_eq(&other, &out) {
                 out.extend_from_slice(&other);
             }
         }
@@ -158,9 +358,10 @@ impl CarrierExporter {
     /// which needs the exporter of each.
     #[must_use]
     pub fn seal_binding(&self, split: bool) -> Option<Vec<u8>> {
-        let read = |f: &Arc<ExportFn>| {
-            let mut out = vec![0; VALUE_LEN];
-            f(EXPORTER_SEAL_BOUND_LABEL, b"", &mut out).then_some(out)
+        let read = |f: &Source| {
+            let mut out = super::seal::Secret::from(vec![0; VALUE_LEN]);
+            f.fill(EXPORTER_SEAL_BOUND_LABEL, b"", out.as_mut_slice())
+                .then_some(out)
         };
         let up = read(&self.first)?;
         let down = match (&self.second, split) {
@@ -175,7 +376,9 @@ impl CarrierExporter {
     #[must_use]
     pub fn pipe_binding(&self) -> Option<Vec<u8>> {
         let mut out = vec![0; VALUE_LEN];
-        (self.first)(EXPORTER_JOIN_LABEL, b"", &mut out).then_some(out)
+        self.first
+            .fill(EXPORTER_JOIN_LABEL, b"", &mut out)
+            .then_some(out)
     }
 }
 

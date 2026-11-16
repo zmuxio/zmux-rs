@@ -116,10 +116,7 @@ pub fn request_source(
     peer: Option<SocketAddr>,
 ) -> Option<SocketAddr> {
     let peer = peer?;
-    Some(listener.adapter().trusted_proxies().source(
-        peer,
-        headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())),
-    ))
+    Some(listener.adapter().trusted_proxies().source(peer, headers))
 }
 
 /// The response of an accepted carrier: status 200 with `body`, sent
@@ -314,12 +311,17 @@ where
         };
         let head = bodiless || (prefix.is_empty() && reader.ended());
         let admit = {
-            let mut info = CarrierInfo::new().with_request(&parts).with_headers(|| {
-                parts
-                    .headers
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_bytes()))
-            });
+            // The TLS connection's metadata, when the request came over one.
+            let base = parts
+                .extensions
+                .get::<TlsBinding>()
+                .map_or_else(CarrierInfo::new, TlsBinding::info);
+            let mut info = base.with_request_head(
+                std::sync::Arc::new(parts.clone()),
+                |p: &http::request::Parts, each| {
+                    zmux::adapter::visit_fields(&p.headers, each);
+                },
+            );
             if head {
                 info = info.with_head();
             }
@@ -633,13 +635,16 @@ pub async fn serve_connection_with<IO, H, HF>(
             conn.clone(),
         );
         // Active from now until the response body is dropped.
-        let active = Active::new(act.clone());
+        let mut active = Active::new(act.clone());
         async move {
             let source = request_source(&l, req.headers(), peer);
             // An HTTP/2 extended CONNECT whose tunnel outlives its response
             // body.
             let tunnel = req.method() == http::Method::CONNECT
                 && req.extensions().get::<hyper::ext::Protocol>().is_some();
+            // Routed to zmux while `route` has it: only such requests hold
+            // a connection that carries no pipe past its setup end.
+            active.route(true);
             let req = match route(req, peer, conn).await {
                 Ok(resp) => {
                     seen.store(true, Ordering::Relaxed);
@@ -649,7 +654,10 @@ pub async fn serve_connection_with<IO, H, HF>(
                         _active: active,
                     }));
                 }
-                Err(Unhandled::Fallback(req)) => *req,
+                Err(Unhandled::Fallback(req)) => {
+                    active.route(false);
+                    *req
+                }
                 Err(Unhandled::Abort) => {
                     seen.store(true, Ordering::Relaxed);
                     return Err(io::Error::new(
@@ -681,7 +689,11 @@ pub async fn serve_connection_with<IO, H, HF>(
     let served = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     let mut served = std::pin::pin!(served);
     // A connection that carries no pipe within the limit is closed; one
-    // that did, once it has been idle for the idle timeout.
+    // that did, once it has been idle for the idle timeout. Only a request
+    // routed to zmux in progress holds it past the setup end, bounded by its
+    // own deadlines (an exchange request's hold may outlast the setup limit
+    // on a connection of its own, so no fixed cap applies); other requests
+    // (a fallback 404 whose body the peer does not take) never do.
     let setup_end = tokio::time::Instant::now() + limit;
     loop {
         // Before its first request is served, both ends are looked at:
@@ -689,8 +701,14 @@ pub async fn serve_connection_with<IO, H, HF>(
         let idle_end = options
             .idle_timeout
             .map_or_else(far_future, |idle| activity.idle_end(idle));
+        // A routed request in progress is bounded by its own deadlines (an
+        // exchange's hold among them), not by the setup's: past the setup
+        // end the connection is looked at again once the request ended.
+        let busy = activity.routed.load(Ordering::Acquire) > 0;
         let wake = if used.load(Ordering::Relaxed) {
             idle_end
+        } else if busy {
+            (tokio::time::Instant::now() + limit).max(setup_end)
         } else if idle_end > tokio::time::Instant::now() {
             setup_end.min(idle_end)
         } else {
@@ -706,7 +724,7 @@ pub async fn serve_connection_with<IO, H, HF>(
                 .idle_timeout
                 .is_some_and(|idle| activity.idle_end(idle) <= now)
         } else {
-            now >= setup_end
+            now >= setup_end && activity.routed.load(Ordering::Acquire) == 0
         };
         if close {
             served.as_mut().graceful_shutdown();
@@ -777,6 +795,8 @@ fn far_future() -> tokio::time::Instant {
 struct Activity {
     start: tokio::time::Instant,
     active: AtomicUsize,
+    /// The requests in progress routed to zmux (see `Active::route`).
+    routed: AtomicUsize,
     /// An extended CONNECT tunnel was opened: the connection is in use
     /// until it ends, as an upgraded HTTP/1.1 connection is, since hyper
     /// does not tell when a tunnel ends.
@@ -790,6 +810,7 @@ impl Activity {
         Self {
             start: tokio::time::Instant::now(),
             active: AtomicUsize::new(0),
+            routed: AtomicUsize::new(0),
             tunnel: AtomicBool::new(false),
             last: AtomicU64::new(0),
         }
@@ -818,13 +839,25 @@ impl Activity {
 }
 
 /// A request in progress, from its arrival until its response body is
-/// dropped.
-struct Active(Arc<Activity>);
+/// dropped; whether it is routed to zmux.
+struct Active(Arc<Activity>, bool);
 
 impl Active {
     fn new(a: Arc<Activity>) -> Self {
         a.active.fetch_add(1, Ordering::AcqRel);
-        Self(a)
+        Self(a, false)
+    }
+
+    /// Routed to zmux (`true`) or handed back to the fallback.
+    fn route(&mut self, routed: bool) {
+        if routed != self.1 {
+            self.1 = routed;
+            if routed {
+                self.0.routed.fetch_add(1, Ordering::AcqRel);
+            } else {
+                self.0.routed.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 
     /// Marks the connection as carrying a tunnel when `opened`.
@@ -837,6 +870,7 @@ impl Active {
 
 impl Drop for Active {
     fn drop(&mut self) {
+        self.route(false);
         self.0.ended();
     }
 }

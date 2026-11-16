@@ -65,10 +65,23 @@ pub const fn is_application_tlv_type(ty: u64) -> bool {
     ty >= tlv::APPLICATION_FIRST && ty <= tlv::APPLICATION_LAST && !is_grease_tlv_type(ty)
 }
 
+/// A TLV list that ends inside a TLV: the error of [`AppTlvs::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncatedTlvs;
+
+impl core::fmt::Display for TruncatedTlvs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("encoded TLVs that end inside a TLV")
+    }
+}
+
+impl std::error::Error for TruncatedTlvs {}
+
 /// The application TLVs of a TLV list, in order: an iterator of
 /// `(type, value)` over encoded TLVs that skips every other type. Built from
 /// a parsed preamble ([`WirePreamble::app_tlvs`]) or from TLVs a sender encoded
-/// with [`AppTlvs::encode_one`]; iteration stops at a truncated TLV.
+/// with [`AppTlvs::encode_one`]; [`AppTlvs::new`] refuses a list that ends
+/// inside a TLV, so that none is dropped unseen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppTlvs<'a> {
     rest: &'a [u8],
@@ -76,8 +89,28 @@ pub struct AppTlvs<'a> {
 
 impl<'a> AppTlvs<'a> {
     /// A view over encoded TLVs (type, length, value, repeated).
-    #[must_use]
-    pub const fn new(encoded: &'a [u8]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TruncatedTlvs`] when `encoded` ends inside a TLV.
+    pub fn new(encoded: &'a [u8]) -> Result<Self, TruncatedTlvs> {
+        let mut c = Cursor::new(encoded);
+        while !c.is_empty() {
+            let ok = (|| {
+                c.varint().ok()?;
+                let len = c.varint().ok()?;
+                c.bytes(len).ok()
+            })();
+            if ok.is_none() {
+                return Err(TruncatedTlvs);
+            }
+        }
+        Ok(Self { rest: encoded })
+    }
+
+    /// A view over TLVs known to be whole: a parsed preamble's, or ones
+    /// encoded here.
+    pub(crate) const fn whole(encoded: &'a [u8]) -> Self {
         Self { rest: encoded }
     }
 
@@ -103,15 +136,23 @@ impl<'a> AppTlvs<'a> {
     }
 
     /// Encodes one TLV, appending it to `out`.
-    pub fn encode_one(ty: u64, value: &[u8], out: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::ValueOutOfRange`] for a type or length above 2^62 - 1;
+    /// nothing is appended.
+    pub fn encode_one(ty: u64, value: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut head = [0u8; 16];
         let mut w = Writer::new(&mut head);
-        // Two varints of at most 8 bytes each always fit.
-        let _ = w.varint(ty);
-        let _ = w.varint(value.len() as u64);
+        // Two varints of at most 8 bytes each fit: only a value out of
+        // range fails.
+        w.varint(ty).map_err(|_| EncodeError::ValueOutOfRange)?;
+        w.varint(value.len() as u64)
+            .map_err(|_| EncodeError::ValueOutOfRange)?;
         let n = w.pos();
         out.extend_from_slice(&head[..n]);
         out.extend_from_slice(value);
+        Ok(())
     }
 }
 
@@ -131,6 +172,7 @@ impl<'a> Iterator for AppTlvs<'a> {
                 let value = c.bytes(len).ok()?;
                 Some((ty, value))
             })();
+            // Whole by construction (`new`, `whole`): not reached.
             let Some((ty, value)) = parsed else {
                 self.rest = &[];
                 return None;
@@ -219,7 +261,7 @@ impl<'a> WirePreamble<'a> {
                 _ => {}
             }
         }
-        out.app_tlvs = AppTlvs::new(body);
+        out.app_tlvs = AppTlvs::whole(body);
         Ok((out, body.len() + width))
     }
 
@@ -364,6 +406,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_tlvs_refuse_a_truncated_list() {
+        let mut ok = Vec::new();
+        AppTlvs::encode_one(0x1000, b"abc", &mut ok).unwrap();
+        assert_eq!(AppTlvs::new(&ok).unwrap().count(), 1);
+        assert_eq!(AppTlvs::new(&ok[..ok.len() - 1]), Err(TruncatedTlvs));
+        assert!(AppTlvs::new(&[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn preamble_round_trip() {
         // The specification's preamble wire example: OPEN_INFO,
         // PRIORITY urgency 1 and an empty GREASE TLV of type 0x21, then
@@ -392,12 +443,13 @@ mod tests {
     #[test]
     fn application_tlvs_and_pipe_carrier() {
         let mut tlvs = Vec::new();
-        AppTlvs::encode_one(0x1000, b"a", &mut tlvs);
-        AppTlvs::encode_one(0x3fff, b"", &mut tlvs);
-        AppTlvs::encode_one(0x1000, b"b", &mut tlvs);
+        AppTlvs::encode_one(0x1000, b"a", &mut tlvs).unwrap();
+        AppTlvs::encode_one(0x3fff, b"", &mut tlvs).unwrap();
+        assert!(AppTlvs::encode_one(1 << 62, b"", &mut Vec::new()).is_err());
+        AppTlvs::encode_one(0x1000, b"b", &mut tlvs).unwrap();
         let p = WirePreamble {
             pipe_carrier: true,
-            app_tlvs: AppTlvs::new(&tlvs),
+            app_tlvs: AppTlvs::whole(&tlvs),
             ..WirePreamble::default()
         };
         let mut buf = [0u8; 64];

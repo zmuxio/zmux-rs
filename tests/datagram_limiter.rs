@@ -23,7 +23,7 @@ use zmux::{Config, Limiter, PipeIo, Session};
 type Calls = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
 /// A limiter that, holding a lock of its own, calls into the session it
-/// limits from `try_ready` and `charge`. The call runs on a helper thread
+/// limits from `try_acquire` and `release`. The call runs on a helper thread
 /// the limiter waits for: called under the session's lock, the helper
 /// cannot finish, and the limiter records that instead of deadlocking.
 #[derive(Default)]
@@ -66,7 +66,8 @@ impl CallsSession {
     }
 
     fn check(&self, what: &str) {
-        assert!(self.used.load(Ordering::Relaxed) >= 4, "{what}: not called");
+        // One `try_acquire` for each of the two datagrams, which are queued.
+        assert!(self.used.load(Ordering::Relaxed) >= 2, "{what}: not called");
         assert!(
             !self.under_lock.load(Ordering::Relaxed),
             "{what}: called under the session's lock"
@@ -75,16 +76,21 @@ impl CallsSession {
 }
 
 impl Limiter for CallsSession {
-    fn poll_ready(&self, _: &mut Context<'_>, _: usize, max: usize) -> Poll<usize> {
-        Poll::Ready(max)
+    fn poll_acquire(
+        &self,
+        _: &mut Context<'_>,
+        _: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        Poll::Ready(Ok(max))
     }
 
-    fn try_ready(&self, max: usize) -> usize {
+    fn try_acquire(&self, _: u64, max: u64) -> u64 {
         self.touch();
         max
     }
 
-    fn charge(&self, _: usize) {
+    fn refund(&self, _: u64) {
         self.touch();
     }
 }

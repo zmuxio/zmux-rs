@@ -84,7 +84,8 @@ use crate::proto::{ApplicationErrorCode, Error, TransportErrorCode, VarInt};
 pub use crate::proto::seal::RecordMode;
 pub use api::{SendCapacity, SendOutcomeKind};
 pub use app_event::{
-    CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, Support, Tracer,
+    CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, SessionId, Support,
+    TraceRecord, Tracer,
 };
 #[cfg(feature = "test-hooks")]
 pub use config::TestHooks;
@@ -633,14 +634,15 @@ impl SessionCore {
 /// application code. The driver takes the held
 /// datagrams with [`SessionCore::take_received_datagrams`] after the input
 /// that carried them, asks the limiter for each outside the lock, records
-/// its verdict with [`ReceivedDatagram::set_allowed`], and gives them back
+/// its grant with [`ReceivedDatagram::set_granted`], and gives them back
 /// with [`SessionCore::admit_datagrams`].
 #[derive(Debug)]
 pub struct ReceivedDatagram {
     /// The stream and context, `None` for the session.
     stream: Option<(StreamKey, u64)>,
     data: Bytes,
-    allowed: bool,
+    /// The receive limiter's grant; `None`: refused (the default).
+    granted: Option<u64>,
 }
 
 impl ReceivedDatagram {
@@ -649,10 +651,12 @@ impl ReceivedDatagram {
         self.data.len()
     }
 
-    /// Records the limiter's verdict; a datagram not allowed (the
-    /// default) is dropped and counted (`datagrams_dropped_limit`).
-    pub fn set_allowed(&mut self, allowed: bool) {
-        self.allowed = allowed;
+    /// Records the limiter's grant (`try_acquire(n, n)`); a datagram
+    /// without one (`None`, the default) is dropped and counted
+    /// (`datagrams_dropped_limit`). A grant whose datagram the queue then
+    /// refuses is returned by `admit_datagrams`, to be refunded.
+    pub fn set_granted(&mut self, granted: Option<u64>) {
+        self.granted = granted;
     }
 }
 
@@ -953,6 +957,8 @@ pub struct SessionCore {
     /// The peer's `CONNECTION_CLOSE` was processed: what arrived before it
     /// stays readable while the session is closing.
     peer_close_processed: bool,
+    /// `Established` was emitted (it stays true through the close).
+    established: bool,
     /// After the peer's close: the streams the application holds (opened or
     /// accepted) whose received data is not read yet; CLOSED waits for 0 or
     /// the linger deadline.
@@ -1138,6 +1144,7 @@ impl SessionCore {
             stats: SessionStats::default(),
             linger_extended: false,
             peer_close_processed: false,
+            established: false,
             peer_close_unread: 0,
             linger_from_delivery: false,
             meter: Arc::new(Meter::new()),
@@ -1256,6 +1263,12 @@ impl SessionCore {
     /// The error that ended the session, once it is closing.
     pub fn error(&self) -> Option<&SessionError> {
         self.error.as_deref()
+    }
+
+    /// Whether the session was established at some point (its
+    /// [`CoreEvent::Established`] was emitted), closed since or not.
+    pub fn was_established(&self) -> bool {
+        self.established
     }
 
     /// Whether the session is established and not closing (SUSPENDED
@@ -1589,7 +1602,11 @@ impl SessionCore {
         }
     }
 
-    /// The next event.
+    /// The next event. A driver takes every event after each command and
+    /// timeout, until this returns `None`: stream readiness is coalesced
+    /// (one `StreamReadable` or `StreamWritable` per stream until it is
+    /// taken here), so an event left queued holds back the next one of its
+    /// stream.
     pub fn poll_event(&mut self) -> Option<CoreEvent> {
         let e = self.events.pop_front()?;
         match &e {
@@ -1812,8 +1829,10 @@ impl SessionCore {
     }
 
     fn push_event(&mut self, e: CoreEvent) {
+        // The one release point of per-pipe state of the subsystems.
         if let CoreEvent::PipeRetired { pipe, .. } = e {
             self.quality_retired(pipe.0);
+            self.shape_retired(pipe.0);
         }
         if matches!(
             e,
@@ -2066,6 +2085,7 @@ impl SessionCore {
             self.set_error(SessionError::PipesLost { last: None });
         }
         self.state = State::Closed;
+        self.events.push_back(CoreEvent::Released);
         self.wipe_exporter();
         self.handshake_deadline = None;
         self.idle_deadline = None;
@@ -2308,6 +2328,7 @@ impl SessionCore {
         }
         self.last_activity = now;
         self.keep_alive_deadline = self.keep_alive_wait().and_then(|p| now.checked_add(p));
+        self.established = true;
         self.push_event(CoreEvent::Established {
             role,
             features: self.features,
@@ -2558,6 +2579,13 @@ fn clip_reason(reason: &[u8]) -> &[u8] {
 pub(crate) struct JoinShaping {
     unplanned: u64,
     faults: u64,
+}
+
+/// Takes `n` off a byte counter that holds at least `n` (checked in debug
+/// builds; saturating in release): the one way the datagram counters drop.
+pub(super) fn debit(counter: &mut usize, n: usize) {
+    debug_assert!(*counter >= n, "byte counter below what it releases");
+    *counter = counter.saturating_sub(n);
 }
 
 #[cfg(test)]

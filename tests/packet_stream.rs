@@ -14,6 +14,11 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
 use bytes::Bytes;
 use common::{connect, duplex, multi_thread, watchdog};
 use zmux::helpers::{
@@ -21,7 +26,7 @@ use zmux::helpers::{
     splice_packets,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::{Config, RecvStream, SendStream, Session, StreamError, VarInt};
+use zmux::{Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
 
 fn packet_error() -> VarInt {
     VarInt::from_u64(ApplicationErrorCode::ZMUX_PACKET_ERROR.0).unwrap()
@@ -282,10 +287,21 @@ struct Hop {
     a: Session,
     b: Session,
     relay: tokio::task::JoinHandle<(Forwarded, Forwarded)>,
+    /// The relay's inbound session.
+    inbound: Session,
 }
 
 impl Hop {
     async fn new(next_hop_datagrams: bool, burn: usize, packets: bool) -> Self {
+        Self::with(next_hop_datagrams, burn, packets, SpliceOptions::default()).await
+    }
+
+    async fn with(
+        next_hop_datagrams: bool,
+        burn: usize,
+        packets: bool,
+        opts: SpliceOptions,
+    ) -> Self {
         let ((x, _), (y, _)) = duplex(1 << 20);
         let (a, ra) = connect(x, y, config(true), config(true)).await;
         let ((x, _), (y, _)) = duplex(1 << 20);
@@ -300,19 +316,25 @@ impl Hop {
         for _ in 0..burn {
             far.push(watchdog(10, "burnt", b.accept_bi()).await.unwrap());
         }
+        let inbound = ra.clone();
         let relay = tokio::spawn(async move {
             let (s_in, r_in) = ra.accept_bi().await.unwrap();
             let out = rb.open_bi_with(&r_in.preamble()).await.unwrap();
             let r = if packets {
-                splice_packets((s_in, r_in), out, SpliceOptions::default()).await
+                splice_packets((s_in, r_in), out, opts).await
             } else {
-                splice((s_in, r_in), out, SpliceOptions::default()).await
+                splice((s_in, r_in), out, opts).await
             }
             .unwrap();
             drop((keep, far));
             (r.a_to_b, r.b_to_a)
         });
-        Self { a, b, relay }
+        Self {
+            a,
+            b,
+            relay,
+            inbound,
+        }
     }
 }
 
@@ -634,4 +656,283 @@ fn a_packet_relay_counts_capsules_a_fin_left_unwritten_as_dropped() {
 #[test]
 fn a_packet_relay_counts_capsules_a_reset_left_unwritten_as_dropped() {
     multi_thread(queued_capsules_dropped_by_the_end(true));
+}
+
+/// A limiter that records every call. `acquire` grants at most `burst`
+/// (all of `max` when 0) and waits while `open` is false; `try_acquire`
+/// grants `try_grant`.
+#[derive(Default)]
+struct Rec {
+    acquires: Mutex<Vec<(u64, u64)>>,
+    tries: Mutex<Vec<(u64, u64)>>,
+    burst: u64,
+    try_grant: AtomicU64,
+    closed: AtomicBool,
+    waiter: Mutex<Option<Waker>>,
+    out: AtomicU64,
+}
+
+impl Rec {
+    fn open(&self) {
+        self.closed.store(false, Ordering::SeqCst);
+        if let Some(w) = self.waiter.lock().unwrap().take() {
+            w.wake();
+        }
+    }
+
+    /// Granted and not refunded.
+    fn outstanding(&self) -> u64 {
+        self.out.load(Ordering::SeqCst)
+    }
+}
+
+impl Limiter for Rec {
+    fn poll_acquire(
+        &self,
+        cx: &mut Context<'_>,
+        min: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        if self.closed.load(Ordering::SeqCst) {
+            *self.waiter.lock().unwrap() = Some(cx.waker().clone());
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+        self.acquires.lock().unwrap().push((min, max));
+        let n = if self.burst == 0 {
+            max
+        } else {
+            max.min(self.burst)
+        };
+        self.out.fetch_add(n, Ordering::SeqCst);
+        Poll::Ready(Ok(n))
+    }
+    fn try_acquire(&self, min: u64, max: u64) -> u64 {
+        self.tries.lock().unwrap().push((min, max));
+        let n = self.try_grant.load(Ordering::SeqCst).min(max);
+        self.out.fetch_add(n, Ordering::SeqCst);
+        n
+    }
+    fn refund(&self, n: u64) {
+        self.out.fetch_sub(n, Ordering::SeqCst);
+    }
+}
+
+fn limited(rec: &Arc<Rec>) -> SpliceOptions {
+    let mut opts = SpliceOptions::default();
+    opts.a_to_b = Some(rec.clone());
+    opts
+}
+
+/// Reads `p` to its end: the packets in order.
+async fn drain(p: &mut PacketStream) -> Vec<(u64, Bytes)> {
+    let mut got = Vec::new();
+    while let Some(x) = watchdog(10, "packet", p.recv()).await.unwrap() {
+        got.push((x.context, x.payload));
+    }
+    got
+}
+
+#[test]
+fn a_packet_relay_takes_one_whole_grant_per_capsule() {
+    multi_thread(async {
+        let rec = Arc::new(Rec::default());
+        let mut opts = limited(&rec);
+        opts.chunk = 4096;
+        let hop = Hop::with(true, 0, true, opts).await;
+        let (mut s, r) = hop.a.open_bi().await.unwrap();
+        // Larger than the chunk, small, empty, and of an unknown type.
+        let sizes = [60_000usize, 5, 0];
+        let mut raw = Vec::new();
+        let mut want = Vec::new();
+        for (i, &n) in sizes.iter().enumerate() {
+            let c = capsule(i as u64, &vec![i as u8; n]);
+            want.push((c.len() as u64, c.len() as u64));
+            raw.extend(c);
+        }
+        raw.extend([0x17, 0x02, 1, 2]);
+        want.push((4, 4));
+        s.write_all(&raw).await.unwrap();
+        s.finish().unwrap();
+        let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
+        let mut q = PacketStream::new(fs, fr);
+        let got = drain(&mut q).await;
+        assert_eq!(got.len(), sizes.len());
+        for (i, (c, p)) in got.iter().enumerate() {
+            assert_eq!((*c, p.len()), (i as u64, sizes[i]));
+        }
+        drop(r);
+        q.close().await.unwrap();
+        let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
+        assert_eq!(ab.bytes, raw.len() as u64);
+        assert_eq!(
+            *rec.acquires.lock().unwrap(),
+            want,
+            "one acquire(n, n) per capsule"
+        );
+        assert_eq!(
+            rec.outstanding(),
+            raw.len() as u64,
+            "every capsule went out"
+        );
+    });
+}
+
+#[test]
+fn a_burst_below_the_capsule_still_forwards_it_whole() {
+    multi_thread(async {
+        let rec = Arc::new(Rec {
+            burst: 10,
+            ..Rec::default()
+        });
+        let hop = Hop::with(true, 0, true, limited(&rec)).await;
+        let (mut s, r) = hop.a.open_bi().await.unwrap();
+        let c = capsule(4, &[9; 1000]);
+        s.write_all(&c).await.unwrap();
+        s.finish().unwrap();
+        let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
+        let mut q = PacketStream::new(fs, fr);
+        assert_eq!(drain(&mut q).await, [(4, Bytes::from(vec![9; 1000]))]);
+        drop(r);
+        q.close().await.unwrap();
+        watchdog(10, "relay", hop.relay).await.unwrap();
+        let n = c.len() as u64;
+        assert_eq!(*rec.acquires.lock().unwrap(), [(n, n)]);
+    });
+}
+
+#[test]
+fn a_packet_relay_holds_only_the_header_while_the_limiter_waits() {
+    multi_thread(async {
+        let rec = Arc::new(Rec::default());
+        rec.closed.store(true, Ordering::SeqCst);
+        let hop = Hop::with(true, 0, true, limited(&rec)).await;
+        let (mut s, r) = hop.a.open_bi().await.unwrap();
+        // Type 0x00, a two-byte Length (1 + 1000), Context ID 4.
+        let c = capsule(4, &[9; 1000]);
+        s.write_all(&c).await.unwrap();
+        // The relay read the header and waits: nothing more is read,
+        // nothing granted, nothing forwarded.
+        let read = || hop.inbound.stats().bytes_read;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while read() < 3 {
+            assert!(std::time::Instant::now() < deadline, "header not read");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(read(), 3, "only Type and Length are held");
+        assert_eq!(rec.outstanding(), 0);
+        assert!(rec.acquires.lock().unwrap().is_empty());
+        rec.open();
+        s.finish().unwrap();
+        let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
+        let mut q = PacketStream::new(fs, fr);
+        assert_eq!(drain(&mut q).await, [(4, Bytes::from(vec![9; 1000]))]);
+        drop(r);
+        q.close().await.unwrap();
+        watchdog(10, "relay", hop.relay).await.unwrap();
+        let n = c.len() as u64;
+        assert_eq!(*rec.acquires.lock().unwrap(), [(n, n)]);
+    });
+}
+
+/// While the grant of a capsule whose header was read is awaited, the
+/// upstream reset still ends the direction: a limiter that never grants
+/// does not hold it.
+#[test]
+fn a_reset_ends_a_packet_relay_waiting_for_a_capsule_grant() {
+    multi_thread(async {
+        let rec = Arc::new(Rec::default());
+        rec.closed.store(true, Ordering::SeqCst);
+        let hop = Hop::with(true, 0, true, limited(&rec)).await;
+        let (mut s, r) = hop.a.open_bi().await.unwrap();
+        s.write_all(&capsule(4, &[9; 1000])).await.unwrap();
+        let read = || hop.inbound.stats().bytes_read;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while read() < 3 {
+            assert!(std::time::Instant::now() < deadline, "header not read");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        s.reset(VarInt::from_u32(9)).unwrap();
+        drop(r);
+        let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
+        assert_eq!(ab.end, zmux::helpers::SpliceEnd::Reset(VarInt::from_u32(9)));
+        assert_eq!(rec.outstanding(), 0, "nothing granted");
+    });
+}
+
+/// A packet relay dropped inside a capsule refunds the part of its grant
+/// that was not forwarded.
+#[test]
+fn a_packet_relay_dropped_inside_a_capsule_refunds_the_rest_of_its_grant() {
+    multi_thread(async {
+        let rec = Arc::new(Rec::default());
+        let hop = Hop::with(true, 0, true, limited(&rec)).await;
+        let (mut s, _r) = hop.a.open_bi().await.unwrap();
+        let c = capsule(4, &[9; 1000]);
+        s.write_all(&c[..13]).await.unwrap();
+        let (_fs, mut fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
+        let mut got = [0; 13];
+        watchdog(10, "B reads", fr.read_exact(&mut got))
+            .await
+            .unwrap();
+        assert_eq!(got[..], c[..13]);
+        assert_eq!(
+            rec.outstanding(),
+            c.len() as u64,
+            "the whole capsule granted"
+        );
+        hop.relay.abort();
+        let _ = hop.relay.await;
+        assert_eq!(rec.outstanding(), 13, "only what was forwarded stays taken");
+    });
+}
+
+#[test]
+fn a_packet_relay_polices_datagrams_and_drops_them_without_a_grant() {
+    multi_thread(async {
+        for capsules in [false, true] {
+            let rec = Arc::new(Rec::default());
+            let hop = Hop::with(!capsules, 0, true, limited(&rec)).await;
+            let (mut s, mut r) = hop.a.open_bi().await.unwrap();
+            s.write_all(&capsule(1, b"x")).await.unwrap();
+            let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
+            let mut q = PacketStream::new(fs, fr);
+            assert_eq!(next(&mut q).await, (1, Bytes::from_static(b"x")));
+            // Refused: dropped and counted. Then granted, and an empty
+            // one that passes without a call.
+            s.send_datagram(2, Bytes::from(vec![5; 100])).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while rec.tries.lock().unwrap().is_empty() {
+                assert!(std::time::Instant::now() < deadline, "not policed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            rec.try_grant.store(u64::MAX, Ordering::SeqCst);
+            s.send_datagram(3, Bytes::from(vec![6; 50])).unwrap();
+            s.send_datagram(4, Bytes::new()).unwrap();
+            let mut got = vec![next(&mut q).await, next(&mut q).await];
+            got.sort();
+            assert_eq!(
+                got,
+                [(3, Bytes::from(vec![6; 50])), (4, Bytes::new())],
+                "capsules: {capsules}"
+            );
+            s.finish().unwrap();
+            assert_eq!(drain(&mut q).await.len(), 0, "nothing more");
+            q.close().await.unwrap();
+            let mut buf = [0; 8];
+            while watchdog(10, "A reads", r.read(&mut buf))
+                .await
+                .unwrap()
+                .is_some()
+            {}
+            let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
+            assert_eq!((ab.datagrams_dropped, ab.datagrams_limited), (1, 1));
+            assert_eq!(*rec.tries.lock().unwrap(), [(100, 100), (50, 50)]);
+            // Only the capsule written by the sender was acquired.
+            assert_eq!(*rec.acquires.lock().unwrap(), [(4, 4)]);
+            assert_eq!(ab.datagrams_as_capsules, u64::from(capsules) * 2);
+        }
+    });
 }

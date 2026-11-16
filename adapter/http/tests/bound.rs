@@ -252,3 +252,48 @@ async fn bound_websocket_over_h2() {
     listener.close();
     serving.await.unwrap();
 }
+
+/// A credential bound to the TLS connection (prefix authentication with a
+/// TLS binding) passes the HTTP server's admission over HTTP/2 and
+/// HTTP/1.1: both ends read the connection's metadata from its one source,
+/// `TlsBinding::info`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_prefix_token_passes_over_tls() {
+    let (connector, acceptor) = tls();
+    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 64).unwrap());
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+    let listener = Listener::new(Config::default(), limits).unwrap();
+    let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
+    let (addr, serving) = tls_server(endpoint, acceptor).await;
+    let https = Options::default()
+        .with_https(true)
+        .with_carrier_credential(Arc::new(auth));
+    let h2 = Http2Connection::handshake(
+        tls_conn(&connector, addr, b"h2").await,
+        "localhost",
+        https.clone(),
+    )
+    .await
+    .unwrap();
+    let cs = Session::connect(h2.open_pipe().await.unwrap(), Config::default())
+        .await
+        .unwrap();
+    let ss = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let io = zmux_http::dial_http1_over(
+        tls_conn(&connector, addr, b"http/1.1").await,
+        "localhost",
+        &https,
+    )
+    .await
+    .unwrap();
+    let cs1 = Session::connect(io, Config::default()).await.unwrap();
+    assert_eq!(listener.stats().admission.accepted, 2);
+    drop((cs, cs1, ss));
+    listener.close();
+    serving.await.unwrap();
+}

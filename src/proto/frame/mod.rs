@@ -4,7 +4,10 @@
 //!
 //! Decoding borrows from the input: payloads (STREAM data, DATAGRAM data,
 //! reasons, locators, parameter blocks) are slices of it and nothing is
-//! copied or allocated. Every frame type has an exact `encoded_len` and an
+//! copied or allocated, with one exception: a `QX_TRANSPORT_PARAMETERS`
+//! block is validated by decoding it (the wire vectors make a malformed
+//! block a frame error), once per pipe, and its receiver decodes it again
+//! to read the values. Every frame type has an exact `encoded_len` and an
 //! `encode` that writes into a caller-provided buffer.
 
 pub mod channel;
@@ -494,7 +497,8 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         0x04 => Frame::ResetStream(ResetStream::read(&mut c)?),
         0x05 => Frame::StopSending(StopSending::read(&mut c)?),
         0x08..=0x0f => {
-            let (h, header_len) = parse_stream_header(buf, buf.len() as u64)?.ok_or(Fail::Short)?;
+            let (h, header_len) =
+                parse_stream_header(buf, (ty, width), buf.len() as u64)?.ok_or(Fail::Short)?;
             c = Cursor::new(buf);
             c.advance(header_len)?;
             Frame::Stream(Stream {
@@ -671,5 +675,17 @@ mod tests {
         assert_eq!(code(&[0x31, 0x01, 0xaa], small), T::PROTOCOL_VIOLATION);
         // A frame of a feature not in use, malformed or not.
         assert_eq!(code(&[0x24, 0x00], none), T::FRAME_ENCODING_ERROR);
+        // A non-minimal STREAM type (0x0a: LEN) is read past its two bytes:
+        // truncated, a decode error with the frame's own type; whole, a
+        // protocol violation.
+        let short = Frames::new(&[0x40, 0x0a, 0x04, 0x05, b'x'], none)
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(short.code(), T::FRAME_ENCODING_ERROR);
+        assert_eq!(
+            code(&[0x40, 0x0a, 0x04, 0x01, b'x'], none),
+            T::PROTOCOL_VIOLATION
+        );
     }
 }

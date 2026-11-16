@@ -29,7 +29,8 @@ async fn server(addr: &str) {
     let fallback = zmux::adapter::Fallback::new(|mut conn, _| async move {
         let mut head = Vec::new();
         let mut b = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        // A test peer's fallback, bounded all the same.
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 << 10 {
             match conn.read(&mut b).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => head.extend_from_slice(&b[..n]),

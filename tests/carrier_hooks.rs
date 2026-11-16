@@ -453,7 +453,7 @@ fn the_cache_takes_reports_per_variant() {
 fn admission_timeouts_beyond_the_clock_do_not_panic() {
     multi_thread(async {
         use zmux::{Listener, ListenerConfig};
-        let adm = Admission::new(2, |_: &zmux::CarrierInfo<'_>, prefix: &[u8]| {
+        let adm = Admission::new(2, |_: &zmux::CarrierInfo, prefix: &[u8]| {
             if prefix.len() < 5 {
                 AdmissionVerdict::More { need: 5 }.labelled("x")
             } else {

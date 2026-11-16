@@ -559,18 +559,14 @@ async fn the_tracer_sees_events_in_order_and_the_end_last() {
     #[derive(Default)]
     struct Log(std::sync::Mutex<Vec<String>>);
     impl zmux::Tracer for Log {
-        fn established(&self) {
-            self.0.lock().unwrap().push("established".into());
-        }
-        fn event(&self, event: &zmux::SessionEvent) {
-            let name = match event {
-                zmux::SessionEvent::GoAwayReceived(_) => "goaway",
+        fn trace(&self, _: zmux::SessionId, record: &zmux::TraceRecord) {
+            let name = match record {
+                zmux::TraceRecord::Established => "established",
+                zmux::TraceRecord::Event(zmux::SessionEvent::GoAwayReceived(_)) => "goaway",
+                zmux::TraceRecord::Closed(_) => "closed",
                 _ => "other",
             };
             self.0.lock().unwrap().push(name.into());
-        }
-        fn closed(&self, _: &SessionError) {
-            self.0.lock().unwrap().push("closed".into());
         }
     }
     let log = std::sync::Arc::new(Log::default());

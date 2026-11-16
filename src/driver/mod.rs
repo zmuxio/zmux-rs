@@ -37,7 +37,9 @@
     allow(dead_code, unused_imports, unreachable_pub)
 )]
 
-#[cfg(all(feature = "tokio", not(loom)))]
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod accept;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 mod account;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod admission;
@@ -51,6 +53,8 @@ pub(crate) mod cache;
 pub(crate) mod channel;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod choice;
+#[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+pub(crate) mod conformance;
 #[cfg(all(feature = "blocking", not(loom)))]
 mod context;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -204,6 +208,11 @@ pub(crate) mod read_pool {
 /// buffer again.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
 pub(crate) const IDLE_READ: usize = 4096;
+
+/// The room of one read of a handshake (a join's, a transform's) on either
+/// driver: a whole unit of a message carrier fits, and on a byte stream a
+/// length-prefixed unit with room to spare.
+pub(crate) const HANDSHAKE_READ: usize = crate::proto::seal::MAX_UNIT + 64;
 
 /// I/O slices per vectored write.
 pub(crate) const MAX_SLICES: usize = 64;

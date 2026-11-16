@@ -353,7 +353,7 @@ fn lookup(key: &[u8; 16]) -> Option<Arc<Shared<Tokio>>> {
 }
 
 /// How long a stream may take to bring its first record (the first-record timeout).
-const FIRST_RECORD: Duration = Duration::from_secs(2);
+const FIRST_RECORD: Duration = crate::proto::listener::DEFAULT_FIRST_RECORD_TIMEOUT;
 
 /// Hands a stream the peer opened on a lane-capable connection to the
 /// session and pipe it is a lane of: by the Lane Key
@@ -443,13 +443,13 @@ impl PipeIo {
 pub(crate) fn finish_reverse(writer: Option<Writer>) {
     match writer {
         Some(Writer::Stream(w)) => finish_stream(w),
-        Some(mut w) => {
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    let _ = std::future::poll_fn(|cx| w.poll_shutdown(cx)).await;
-                });
-            }
-        }
+        // Bounded as every graceful end the peer may never answer.
+        Some(mut w) => super::tokio::spawn_drain(
+            async move {
+                let _ = std::future::poll_fn(|cx| w.poll_shutdown(cx)).await;
+            },
+            super::tokio::DRAIN_LIMIT,
+        ),
         None => {}
     }
 }

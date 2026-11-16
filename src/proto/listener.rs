@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use crate::proto::decision::Decision;
 use crate::proto::frame::{LANE_KEY_LEN, PipeLane};
 use crate::proto::ident::{Classifier, FirstRecord, Verdict};
 use crate::proto::oob::PAIRING_TOKEN_LEN;
@@ -17,8 +18,8 @@ use crate::proto::seal::join::JoinHello;
 use crate::proto::varint;
 
 /// A change of a listener's memory pressure: it
-/// started (the sessions' charges reached the budget) or ended (they fell
-/// below three quarters of it).
+/// started (the sessions' charges went above the budget) or ended (they
+/// fell below three quarters of it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemoryPressure {
@@ -51,6 +52,11 @@ impl std::fmt::Debug for OnMemoryPressure {
         f.write_str("OnMemoryPressure(..)")
     }
 }
+
+/// The default bound on a carrier's first record
+/// ([`ListenerConfig::first_record_timeout`]); also the bound of a lane's
+/// first record on an endpoint without a listener.
+pub const DEFAULT_FIRST_RECORD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Listener limits.
 #[derive(Debug, Clone)]
@@ -104,6 +110,12 @@ pub struct ListenerConfig {
     pub max_record_size: u64,
     /// Whether carriers may start new sessions.
     pub accept_sessions: bool,
+    /// New sessions the application has not accepted yet, those still
+    /// being established included (default [`DEFAULT_MAX_UNACCEPTED`];
+    /// `None` is unlimited). A new session beyond it is refused after its
+    /// transport parameters (`CONNECTION_REFUSED`), so that an application
+    /// that does not keep up with `accept` holds a bounded backlog.
+    pub max_unaccepted: Option<usize>,
     /// Suspended sessions held at once (default 1024).
     pub max_suspended: usize,
     /// Bytes the sessions may hold together (default 1 GiB; `None` is
@@ -323,39 +335,40 @@ impl RejectAction {
     }
 }
 
-/// The function of [`ListenerConfig::on_reject`].
+/// The function of [`ListenerConfig::on_reject`]: asked outside every lock;
+/// a later answer is bounded by the carrier's handshake deadline, and one
+/// that misses it, or panics, closes the carrier.
 // Called by the drivers' listeners only.
 #[cfg_attr(
     any(loom, not(any(feature = "tokio", feature = "blocking"))),
     allow(dead_code)
 )]
 #[derive(Clone)]
-pub struct OnReject(pub(crate) std::sync::Arc<dyn Fn(&RejectInfo) -> RejectAction + Send + Sync>);
+pub struct OnReject(pub(crate) std::sync::Arc<OnRejectFn>);
+
+/// The callable behind an [`OnReject`].
+pub type OnRejectFn = dyn Fn(&RejectInfo) -> Decision<RejectAction> + Send + Sync;
 
 impl OnReject {
     /// The policy calling `f`.
     pub fn new(f: impl Fn(&RejectInfo) -> RejectAction + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(f))
+        Self(std::sync::Arc::new(move |i| Decision::Now(f(i))))
     }
 
-    /// What the policy chooses for `info`; one that panics closes the carrier.
+    /// The policy calling `f`, answering when its future completes; it is
+    /// given its own copy of the input.
+    pub fn new_async<F>(f: impl Fn(RejectInfo) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = RejectAction> + Send + 'static,
+    {
+        Self(std::sync::Arc::new(move |i| Decision::later(f(i.clone()))))
+    }
+
+    /// What the policy chooses for `info`; `None` when it panicked (the
+    /// carrier is then closed), logged to `logger`.
     #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
-    pub(crate) fn ask(
-        &self,
-        info: &RejectInfo,
-        logger: Option<&crate::proto::session::Logger>,
-    ) -> RejectAction {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0(info))).unwrap_or_else(
-            |_| {
-                if let Some(l) = logger {
-                    l.log(
-                        crate::proto::session::LogLevel::Error,
-                        "zmux: on_reject panicked; the carrier is closed",
-                    );
-                }
-                RejectAction::Close
-            },
-        )
+    pub(crate) fn ask(&self, info: &RejectInfo) -> Decision<Option<RejectAction>> {
+        crate::proto::decision::call(|| self.0(info))
     }
 }
 
@@ -367,17 +380,17 @@ impl std::fmt::Debug for OnReject {
 
 /// What [`ListenerConfig::session_config`] knows of a carrier that starts a
 /// session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct SessionCarrier<'a> {
+pub struct SessionCarrier {
     /// The carrier's source, as the admission saw it.
     pub source: Option<std::net::SocketAddr>,
     /// The directly connected peer.
     pub peer: Option<std::net::SocketAddr>,
     /// The TLS or QUIC handshake this process terminated for the carrier.
-    pub tls: Option<&'a crate::proto::exporter::TlsState>,
+    pub tls: Option<crate::proto::exporter::TlsState>,
     /// The value of the admission that accepted the carrier.
-    pub admitted: Option<&'a crate::proto::admission::AdmittedValue>,
+    pub admitted: Option<crate::proto::admission::AdmittedValue>,
 }
 
 /// The function of [`ListenerConfig::session_config`].
@@ -389,40 +402,56 @@ pub struct SessionCarrier<'a> {
 /// the session verify with its own configuration. Settings of the listener
 /// as a whole stay the listener's: its memory budget and the bounds at the
 /// carrier level use the listener's configuration. A configuration invalid
-/// for a server session, an error and a panic close the carrier without a
-/// byte, counted as rejected.
+/// for a server session, an error, a panic and a later answer that misses
+/// the carrier's handshake deadline close the carrier without a byte,
+/// counted as rejected.
 #[derive(Clone)]
 pub struct SessionConfigFn(pub std::sync::Arc<SessionConfigDyn>);
 
+/// What a [`SessionConfigFn`] answers.
+pub type SessionConfigAnswer = Result<Option<crate::Config>, String>;
+
 /// The callable behind a [`SessionConfigFn`].
-pub type SessionConfigDyn =
-    dyn Fn(&SessionCarrier<'_>) -> Result<Option<crate::Config>, String> + Send + Sync;
+pub type SessionConfigDyn = dyn Fn(&SessionCarrier) -> Decision<SessionConfigAnswer> + Send + Sync;
 
 impl SessionConfigFn {
-    /// Wraps `f`.
-    pub fn new(
-        f: impl Fn(&SessionCarrier<'_>) -> Result<Option<crate::Config>, String> + Send + Sync + 'static,
-    ) -> Self {
-        Self(std::sync::Arc::new(f))
+    /// Wraps `f`, answering at once.
+    pub fn new(f: impl Fn(&SessionCarrier) -> SessionConfigAnswer + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(move |c| Decision::Now(f(c))))
     }
 
-    /// Runs the function for `carrier`: `Ok(None)` selects the listener's
-    /// configuration; an error, a panic or a configuration invalid for a
-    /// session is logged to the listener's `logger` and returns `Err`.
+    /// Wraps `f`, answering when its future completes; it is given its own
+    /// copy of the carrier's description.
+    pub fn new_async<F>(f: impl Fn(SessionCarrier) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = SessionConfigAnswer> + Send + 'static,
+    {
+        Self(std::sync::Arc::new(move |c| Decision::later(f(c.clone()))))
+    }
+
+    /// Asks the function for `carrier`.
     #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
-    pub(crate) fn choose(
-        &self,
-        carrier: &SessionCarrier<'_>,
+    pub(crate) fn ask(&self, carrier: &SessionCarrier) -> Decision<Option<SessionConfigAnswer>> {
+        crate::proto::decision::call(|| self.0(carrier))
+    }
+
+    /// The configuration an answer selects: `Ok(None)` the listener's; an
+    /// error, a panic (`None`), a missed deadline (`None`) or a
+    /// configuration invalid for a session is logged to the listener's
+    /// `logger` and returns `Err`.
+    #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
+    pub(crate) fn chosen(
+        answer: Option<SessionConfigAnswer>,
         logger: Option<&crate::proto::session::Logger>,
     ) -> Result<Option<crate::Config>, ()> {
-        let why = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0(carrier))) {
-            Ok(Ok(None)) => return Ok(None),
-            Ok(Ok(Some(c))) => match c.validate() {
+        let why = match answer {
+            Some(Ok(None)) => return Ok(None),
+            Some(Ok(Some(c))) => match c.validate() {
                 Ok(()) => return Ok(Some(c)),
                 Err(e) => format!("returned an invalid configuration ({e})"),
             },
-            Ok(Err(e)) => format!("failed: {e}"),
-            Err(_) => "panicked; the panic was contained".to_string(),
+            Some(Err(e)) => format!("failed: {e}"),
+            None => "panicked or missed the handshake deadline".to_string(),
         };
         if let Some(l) = logger {
             l.log(
@@ -447,6 +476,9 @@ pub const MAX_HELLO: usize = 2 + 8 + 1 + 1 + 255 + 64 + 2 + 65_535;
 /// The default of [`ListenerConfig::max_pending`].
 pub const DEFAULT_MAX_PENDING: usize = 1024;
 
+/// The default of [`ListenerConfig::max_unaccepted`].
+pub const DEFAULT_MAX_UNACCEPTED: usize = 1024;
+
 /// The longest [`ListenerConfig::instance_id`], so that at least 8 random
 /// bytes remain in the 16-byte session locator.
 pub const MAX_INSTANCE_ID_LEN: usize = 8;
@@ -459,10 +491,11 @@ impl Default for ListenerConfig {
             source_prefix_v4: 32,
             source_prefix_v6: 64,
             max_pending_per_session: 4,
-            first_record_timeout: Duration::from_secs(2),
+            first_record_timeout: DEFAULT_FIRST_RECORD_TIMEOUT,
             handshake_timeout: Duration::from_secs(10),
             max_record_size: 65535,
             accept_sessions: true,
+            max_unaccepted: Some(DEFAULT_MAX_UNACCEPTED),
             max_suspended: 1024,
             memory_budget: Some(super::session::DEFAULT_MEMORY_BUDGET),
             on_memory_pressure: None,
@@ -609,9 +642,42 @@ pub struct ListenerCore {
     next_slot: u64,
     /// The order of the next carrier to become Unconfirmed.
     unconfirmed_seq: u64,
+    /// New sessions not accepted yet ([`ListenerCore::reserve_unaccepted`]).
+    unaccepted: usize,
 }
 
 impl ListenerConfig {
+    /// Subscribes to what the listener's logger and `on_memory_pressure`
+    /// are told: [`ListenerConfig::logger`] and
+    /// [`ListenerConfig::on_memory_pressure`] become hooks that queue it, at
+    /// most `capacity` events, and call the ones set before, with the
+    /// subscription semantics of [`crate::Config::events`]. The listener's
+    /// sessions log and trace through their own configuration's
+    /// subscription.
+    pub fn events(&mut self, capacity: usize) -> crate::proto::host_events::HostEvents {
+        use crate::proto::host_events::{HostEvent, HostEvents};
+        let (events, tx) = HostEvents::channel(capacity);
+        let log = tx.clone();
+        let before = self.logger.take();
+        self.logger = Some(crate::proto::session::Logger::new(move |level, message| {
+            if let Some(b) = &before {
+                (b.0)(level, message);
+            }
+            log.push(HostEvent::Log {
+                level,
+                message: message.to_owned(),
+            });
+        }));
+        let before = self.on_memory_pressure.take();
+        self.on_memory_pressure = Some(OnMemoryPressure::new(move |p| {
+            if let Some(b) = &before {
+                (b.0)(p);
+            }
+            tx.push(HostEvent::MemoryPressure(p));
+        }));
+        events
+    }
+
     /// `max_record_size` as a length, saturating where `usize` is narrower.
     fn max_record_size_usize(&self) -> usize {
         usize::try_from(self.max_record_size).unwrap_or(usize::MAX)
@@ -699,7 +765,53 @@ impl ListenerCore {
             stall_seq: 0,
             next_slot: 1,
             unconfirmed_seq: 0,
+            unaccepted: 0,
         }
+    }
+
+    /// Whether a new session established on a carrier is queued for the
+    /// application, in the one order both listeners apply: refused while the
+    /// listener closes or drains (`"draining"`), over its memory budget
+    /// (`pressure`, `"memory budget"`) or with its accept queue full
+    /// (`"accept queue full"`); otherwise its place is taken
+    /// ([`ListenerCore::reserve_unaccepted`]). The reason goes to the peer
+    /// in the session's refusal.
+    pub fn admit_session(&mut self, closing: bool, pressure: bool) -> Result<(), &'static str> {
+        if closing {
+            Err("draining")
+        } else if pressure {
+            Err("memory budget")
+        } else if self.reserve_unaccepted() {
+            Ok(())
+        } else {
+            Err("accept queue full")
+        }
+    }
+
+    /// Takes a place for a new session until the application accepts it or
+    /// it ends unaccepted ([`ListenerCore::release_unaccepted`]); `false`
+    /// when [`ListenerConfig::max_unaccepted`] places are taken.
+    pub fn reserve_unaccepted(&mut self) -> bool {
+        if self
+            .config
+            .max_unaccepted
+            .is_some_and(|m| self.unaccepted >= m)
+        {
+            return false;
+        }
+        self.unaccepted += 1;
+        true
+    }
+
+    /// A new session was accepted, or ended unaccepted: its place is free.
+    pub fn release_unaccepted(&mut self) {
+        self.unaccepted = self.unaccepted.saturating_sub(1);
+    }
+
+    /// New sessions holding a place.
+    #[must_use]
+    pub fn unaccepted(&self) -> usize {
+        self.unaccepted
     }
 
     /// The limits.
@@ -1447,15 +1559,7 @@ impl std::error::Error for HandleError {}
 pub(crate) fn random_locator(prefix: &[u8]) -> Vec<u8> {
     let mut l = vec![0u8; 16];
     l[..prefix.len()].copy_from_slice(prefix);
-    let rest = &mut l[prefix.len()..];
-    if getrandom::fill(rest).is_err() {
-        use std::hash::BuildHasher;
-        let s = std::collections::hash_map::RandomState::new();
-        for (i, c) in rest.chunks_mut(8).enumerate() {
-            let t = s.hash_one((0x006c_6f63_6174_6f72_u64, i));
-            c.copy_from_slice(&t.to_le_bytes()[..c.len()]);
-        }
-    }
+    crate::util::fill_random_or_fallback(&mut l[prefix.len()..]);
     l
 }
 

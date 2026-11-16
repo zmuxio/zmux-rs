@@ -12,7 +12,7 @@ use super::SessionCore;
 use crate::util::{f64_of, u64_sat};
 
 /// How often auto-tuning asks for a `QX_PING` sample, at most.
-pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const RTT_PROBE_GAP: Duration = Duration::from_secs(1);
 
 /// The smallest limit of one write call (and the limit before the first
 /// rate measurement).

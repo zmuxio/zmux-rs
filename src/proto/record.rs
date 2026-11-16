@@ -226,7 +226,9 @@ impl RecordReader {
     /// more appended. Nothing is copied, so every payload is a slice of the
     /// caller's buffer, which must be able to hold a whole record (the
     /// Size field plus `max_record_size`). A Size above the limit is still
-    /// rejected as soon as it is complete.
+    /// rejected as soon as it is complete. A reader uses this or
+    /// [`Self::read`], not both: after `read` buffered part of a record,
+    /// this copies that record as `read` would.
     pub fn read_complete<'s, 'i: 's>(
         &'s mut self,
         input: &mut &'i [u8],
@@ -394,6 +396,8 @@ pub struct RecordBuilder<'b> {
     reserved: usize,
     end: usize,
     limit: usize,
+    /// A frame without a Length field was pushed: it is the last.
+    closed: bool,
 }
 
 impl<'b> RecordBuilder<'b> {
@@ -410,6 +414,7 @@ impl<'b> RecordBuilder<'b> {
             reserved,
             end: reserved,
             limit,
+            closed: false,
         })
     }
 
@@ -425,8 +430,17 @@ impl<'b> RecordBuilder<'b> {
         self.limit - self.end
     }
 
-    /// Appends a frame. A frame without a length field must be the last.
+    /// Appends a frame. A frame without a length field must be the last:
+    /// one pushed after it is [`EncodeError::AfterLastFrame`].
     pub fn push(&mut self, frame: &Frame<'_>) -> Result<(), EncodeError> {
+        if self.closed {
+            return Err(EncodeError::AfterLastFrame);
+        }
+        let open_ended = match frame {
+            Frame::Stream(s) => !s.explicit_len,
+            Frame::Datagram(d) => !d.explicit_len,
+            _ => false,
+        };
         let len = frame.encoded_len();
         if len > self.remaining() {
             return Err(EncodeError::BufferTooShort);
@@ -435,6 +449,7 @@ impl<'b> RecordBuilder<'b> {
         let mut w = Writer::new(dst);
         frame.write(&mut w)?;
         self.end += w.pos();
+        self.closed = open_ended;
         Ok(())
     }
 

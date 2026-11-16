@@ -167,6 +167,10 @@ impl CarrierCache {
         now: Instant,
     ) {
         let mut entries = self.entries();
+        // Entries past every time they keep go here, with the outcomes that
+        // arrive (once per dial), not only from snapshots.
+        let hi = self.0.backoff.1;
+        entries.retain(|_, e| !e.expired(now, hi));
         let e = entries
             .entry((key.to_owned(), kind, variant.cloned()))
             .or_default();
@@ -191,7 +195,7 @@ impl CarrierCache {
             t.reset();
         }
         let (lo, hi) = self.0.backoff;
-        e.backoff = (e.backoff * 2).clamp(lo, hi);
+        e.backoff = e.backoff.saturating_mul(2).clamp(lo, hi);
         e.good_until = None;
         e.fail_until = now.checked_add(e.backoff);
         e.url.clear();
@@ -1042,6 +1046,25 @@ mod tests {
 
     fn at(t: Instant, now: Instant) -> Duration {
         t.saturating_duration_since(now)
+    }
+
+    #[test]
+    fn a_huge_backoff_bound_saturates_and_expired_entries_go() {
+        let c = CarrierCache::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::MAX,
+        );
+        let now = Instant::now();
+        for _ in 0..80 {
+            c.record("k", CarrierKind::Streaming, None, None, false, now);
+        }
+        let c = CarrierCache::default();
+        if let Some(old) = now.checked_sub(Duration::from_hours(7)) {
+            c.record("old", CarrierKind::Split, None, None, false, old);
+        }
+        c.record("new", CarrierKind::Split, None, None, true, now);
+        assert_eq!(c.entries().len(), 1, "the expired entry went on record");
     }
 
     #[test]

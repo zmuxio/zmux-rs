@@ -39,16 +39,66 @@ pub fn cut_frame(input: &[u8], at: usize) -> Result<(&[u8], usize), Error> {
     Ok((unit, total))
 }
 
+/// The largest handshake unit, a message of a message carrier or a
+/// length-prefixed unit of a byte stream: the one definition the Join and
+/// the Establish codecs share.
+pub const MAX_UNIT: usize = u16::MAX as usize;
+
 /// Cuts one unit from the start of `input`: a framed unit on a byte stream, the
 /// whole message on a message carrier. Returns the unit and the bytes consumed.
 pub fn cut_unit(framing: Framing, input: &[u8]) -> Result<(&[u8], usize), Error> {
+    message_tail(framing, input, 0, false)
+}
+
+/// The failure of a handshake message that ends before `need` bytes:
+/// `incomplete` on a byte stream, where more may come, `malformed` on a
+/// message carrier, whose message is whole.
+#[must_use]
+pub fn short(framing: Framing, need: usize) -> Error {
     if framing == Framing::ByteStream {
-        return cut_frame(input, 0);
+        Error::Incomplete { need }
+    } else {
+        Error::Malformed
     }
-    if input.len() > u16::MAX as usize {
+}
+
+/// The shortest-encoded varint at `at` of a handshake message: its value
+/// and width. A cut one is [`short`]; one not in its shortest encoding is
+/// `malformed`.
+pub fn shortest_varint(framing: Framing, input: &[u8], at: usize) -> Result<(u64, usize), Error> {
+    let rest = input.get(at..).unwrap_or(&[]);
+    let Some((value, used, shortest)) = read_shortest(rest) else {
+        let width = rest.first().map_or(1, |b| 1usize << (b >> 6));
+        return Err(short(framing, at + width));
+    };
+    if !shortest {
+        return Err(Error::Malformed);
+    }
+    Ok((value, used))
+}
+
+/// The last unit of a handshake message, from `at`: on a byte stream the
+/// framed unit there, which must end `input` when `whole` (a byte past it is
+/// `trailing_bytes`); on a message carrier the rest of the message, at most
+/// [`MAX_UNIT`]. Returns the unit and the bytes consumed.
+pub fn message_tail(
+    framing: Framing,
+    input: &[u8],
+    at: usize,
+    whole: bool,
+) -> Result<(&[u8], usize), Error> {
+    if framing == Framing::ByteStream {
+        let (unit, total) = cut_frame(input, at)?;
+        if whole && total != input.len() {
+            return Err(Error::TrailingBytes);
+        }
+        return Ok((unit, total));
+    }
+    let rest = input.get(at..).ok_or(Error::Malformed)?;
+    if rest.len() > MAX_UNIT {
         return Err(Error::TooLarge);
     }
-    Ok((input, input.len()))
+    Ok((rest, input.len()))
 }
 
 /// How a pipe's records are protected, ordered from the strongest to the

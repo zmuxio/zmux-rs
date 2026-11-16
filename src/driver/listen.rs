@@ -16,9 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::time::Instant;
 
 use super::account::{Account, AccountLink};
-use super::admission::{
-    CatchUnwind, Fallback, FallbackStream, Prefixed, discard, read_more, read_prefix,
-};
+use super::admission::{Fallback, FallbackStream, Prefixed, discard, read_more, read_prefix};
 use super::handle::{self, Shared, WeakSession};
 use super::resources::{Kind, Live};
 use super::sealed::{read_unit, seal_carrier, until, write_unit};
@@ -33,13 +31,10 @@ use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
     CarrierId, Classified, Entered, ListenerConfig, ListenerCore as Core, Paired, Slot,
 };
-use crate::proto::listener::{RejectAction, RejectInfo};
+use crate::proto::listener::{RejectAction, RejectInfo, SessionConfigFn};
 use crate::proto::oob::PAIRING_TOKEN_LEN;
 use crate::proto::record::Framing;
-use crate::proto::seal::join::JoinHello;
-use crate::proto::session::{
-    ClaimedHello, Config, ConfirmedJoin, OpenedHello, PeerCarrier, RecordPolicyInput, Role,
-};
+use crate::proto::session::{Config, PipeId, Role};
 use crate::util::{HmacSha256, random_u64};
 
 /// What a carrier came with besides its bytes.
@@ -183,7 +178,7 @@ impl AdmissionCounts {
 }
 
 /// The admission's verdicts on the carriers it labelled
-/// ([`crate::Decision::variant`]), per label; they count in the totals of
+/// ([`crate::AdmissionDecision::variant`]), per label; they count in the totals of
 /// [`AdmissionStats`] as well.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -198,7 +193,7 @@ pub struct VariantStats {
     pub closed: u64,
 }
 
-/// How many distinct [`crate::Decision::variant`] labels a listener counts
+/// How many distinct [`crate::AdmissionDecision::variant`] labels a listener counts
 /// apart; further ones share [`AdmissionVariants::overflow`]. Labels are
 /// meant to be a few constants of the host, never derived from the peer's
 /// bytes.
@@ -410,6 +405,7 @@ enum Round {
 /// What a carrier's prefix is to the listener's sessions
 /// ([`ListenerAdapter::join_prefix`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinPrefix {
     /// A Join Hello whose Locator names a current session.
     Known,
@@ -466,7 +462,7 @@ impl Entry {
     /// completed: [`Entry::read_prefix`] from `reader` (none without one,
     /// for a carrier decided on its request head), then
     /// [`Entry::decide_reading`] with `info`.
-    pub async fn admit<R>(&mut self, info: CarrierInfo<'_>, reader: Option<&mut R>) -> Admit
+    pub async fn admit<R>(&mut self, info: CarrierInfo, reader: Option<&mut R>) -> Admit
     where
         R: AsyncRead + Unpin + Send + ?Sized,
     {
@@ -497,6 +493,15 @@ impl Entry {
         }
     }
 
+    /// The admission's peek deadline, started now if it was not (the end
+    /// of the carrier's outer handshake): what an adapter waits for the
+    /// carrier's first stream within, so that the stream's arrival and the
+    /// reading of its prefix together take at most the peek timeout. `None`
+    /// without an admission.
+    pub fn peek_deadline(&mut self) -> Option<Instant> {
+        self.start()
+    }
+
     /// The deadline of the admission, started at the first call: the end
     /// of the outer handshake. A timeout beyond the clock's range never ends.
     fn start(&mut self) -> Option<Instant> {
@@ -515,7 +520,7 @@ impl Entry {
     /// cancelled when the listener closes. Without an admission it accepts
     /// at once. Counted in [`ListenerStats::admission`]. With no reader to
     /// read more from, [`AdmissionVerdict::More`] closes the carrier.
-    pub async fn decide(&mut self, info: CarrierInfo<'_>, prefix: Vec<u8>) -> Admit {
+    pub async fn decide(&mut self, info: CarrierInfo, prefix: Vec<u8>) -> Admit {
         self.decide_rounds(info, prefix, None::<&mut tokio::io::Empty>)
             .await
     }
@@ -524,7 +529,7 @@ impl Entry {
     /// on from `reader` and decides again.
     pub async fn decide_reading<R>(
         &mut self,
-        info: CarrierInfo<'_>,
+        info: CarrierInfo,
         prefix: Vec<u8>,
         reader: &mut R,
     ) -> Admit
@@ -537,7 +542,7 @@ impl Entry {
     /// One decision or more, reading on from `reader` for [`AdmissionVerdict::More`].
     async fn decide_rounds<R>(
         &mut self,
-        info: CarrierInfo<'_>,
+        info: CarrierInfo,
         mut prefix: Vec<u8>,
         mut reader: Option<&mut R>,
     ) -> Admit
@@ -566,7 +571,7 @@ impl Entry {
     async fn decide_carrier<C, I>(&mut self, conn: &mut C, info: &I, mut prefix: Vec<u8>) -> Admit
     where
         C: AsyncRead + Unpin + Send,
-        I: for<'a> Fn(&'a C) -> CarrierInfo<'a>,
+        I: Fn(&C) -> CarrierInfo,
     {
         let mut short = false;
         loop {
@@ -620,7 +625,7 @@ impl Entry {
     /// carrier did not end `short`.
     async fn decide_round(
         &mut self,
-        info: &CarrierInfo<'_>,
+        info: &CarrierInfo,
         prefix: &mut Vec<u8>,
         can_read: bool,
         short: bool,
@@ -640,26 +645,42 @@ impl Entry {
         let listener = Listener {
             shared: self.shared.clone(),
         };
+        // An exporter whose values come later is resolved first, within the
+        // peek deadline and the listener's life: a decision reads its values
+        // synchronously ([`CarrierInfo::export`]).
+        if let Some(e) = info.exporter().filter(|e| !e.is_resolved()) {
+            let resolve = tokio::time::timeout_at(deadline, e.resolve());
+            let resolved = super::sealed::until(listener.adapter().closed(), resolve).await;
+            match resolved {
+                Some(Ok(())) => {}
+                Some(Err(_)) => {
+                    self.late = true;
+                    return Round::Done(self.late_outcome(&adm, prefix, info.request.is_some()));
+                }
+                None => return Round::Done(Admit::Close),
+            }
+        }
         let decided = {
             // A synchronous decision panics in the call itself.
-            let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                adm.decider().decide(info, prefix)
-            }));
-            let Ok(decide) = call else {
+            let Some(decide) = crate::Decision::catch(|| adm.decider().decide(info, prefix)) else {
                 c.closed.fetch_add(1, Relaxed);
                 return Round::Done(Admit::Close);
             };
-            let decide = CatchUnwind(decide);
-            let timed = tokio::time::timeout_at(deadline, decide);
-            let mut timed = std::pin::pin!(timed);
-            let mut closed = std::pin::pin!(listener.adapter().closed());
-            std::future::poll_fn(|cx| {
-                if closed.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(None);
+            match decide {
+                crate::Decision::Now(d) => Some(Ok(Some(d))),
+                later @ crate::Decision::Later(_) => {
+                    let timed = tokio::time::timeout_at(deadline, later.settle());
+                    let mut timed = std::pin::pin!(timed);
+                    let mut closed = std::pin::pin!(listener.adapter().closed());
+                    std::future::poll_fn(|cx| {
+                        if closed.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(None);
+                        }
+                        timed.as_mut().poll(cx).map(Some)
+                    })
+                    .await
                 }
-                timed.as_mut().poll(cx).map(Some)
-            })
-            .await
+            }
         };
         let decision = match decided {
             Some(Ok(Some(d))) => d,
@@ -670,7 +691,7 @@ impl Entry {
             // Panicked, or cancelled with the listener.
             Some(Ok(None)) | None => AdmissionVerdict::Close.into(),
         };
-        let crate::Decision { verdict, variant } = decision;
+        let crate::AdmissionDecision { verdict, variant } = decision;
         let verdict = match verdict.bounded(prefix.len()) {
             AdmissionVerdict::More { need } => {
                 if can_read && !short && need > prefix.len() && need <= adm.max_peek() {
@@ -918,6 +939,31 @@ impl std::fmt::Debug for Listener {
     }
 }
 
+/// A pipe a join attached whose carrier task does not run yet: forgotten
+/// (it fails) when dropped armed, so that a handler that ends early, also
+/// by its future being dropped, leaves no pipe without a carrier.
+struct AttachedPipe<'a> {
+    session: &'a Arc<Shared<Tokio>>,
+    pipe: Option<PipeId>,
+}
+
+impl AttachedPipe<'_> {
+    /// Abandons the pipe for a limit (`ZMUX_PIPE_RESOURCE_LIMIT`).
+    fn abandon(&mut self) {
+        if let Some(p) = self.pipe.take() {
+            self.session.drop_pipe(p);
+        }
+    }
+}
+
+impl Drop for AttachedPipe<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.pipe.take() {
+            self.session.forget_pipe(p);
+        }
+    }
+}
+
 impl Listener {
     /// The listener's operations for carrier adapters and own accept
     /// loops: carrier slots, admission, join lookups, memory charges and
@@ -1085,7 +1131,14 @@ impl Listener {
             limits.memory_budget,
             limits.max_suspended,
             limits.on_memory_pressure.clone(),
-        );
+            super::account::HookContext::Task,
+        )
+        .ok_or_else(|| {
+            crate::ConnectError::InvalidConfig(crate::InvalidConfig::new(
+                "ListenerConfig::on_memory_pressure",
+                "its hook runs on a tokio runtime: create the listener inside one",
+            ))
+        })?;
         let mut stall_key = [0u8; 32];
         for c in stall_key.as_chunks_mut::<8>().0 {
             *c = random_u64().to_le_bytes();
@@ -1122,12 +1175,36 @@ impl Listener {
         Ok(Self { shared })
     }
 
-    /// The response to a refused carrier: the policy's, or the default.
-    fn reject_response(&self, info: &RejectInfo) -> RejectAction {
-        self.shared.on_reject.as_ref().map_or_else(
-            || RejectAction::default_for(info),
-            |f| f.ask(info, self.shared.logger.as_ref()),
-        )
+    /// The response to a refused carrier `id` (none: one not yet
+    /// registered): the policy's, or the default. A later answer is bounded
+    /// by the handshake timeout from now, the listener's close and the
+    /// carrier's eviction; one that panics, misses them or is stopped closes
+    /// the carrier.
+    async fn reject_response(&self, info: &RejectInfo, id: Option<CarrierId>) -> RejectAction {
+        let Some(f) = &self.shared.on_reject else {
+            return RejectAction::default_for(info);
+        };
+        let deadline = self.handshake_deadline();
+        if let Some(a) = super::hooks::settle_by(f.ask(info), deadline, self.closed_or_evicted(id))
+            .await
+            .flatten()
+        {
+            a
+        } else {
+            if let Some(l) = &self.shared.logger {
+                l.log(
+                    crate::LogLevel::Error,
+                    "zmux: on_reject panicked or missed the handshake deadline; the carrier is closed",
+                );
+            }
+            RejectAction::Close
+        }
+    }
+
+    /// The handshake timeout from now; `None` when it does not end.
+    fn handshake_deadline(&self) -> Option<std::time::Instant> {
+        let timeout = self.shared.lock().core.config().handshake_timeout;
+        now().checked_add(timeout)
     }
 
     /// Stalls a refused carrier, which keeps its slots meanwhile, until
@@ -1228,6 +1305,9 @@ impl Listener {
         // its carrier task and this listener alive for as long as its
         // peer.
         let unaccepted = std::mem::take(&mut st.accept);
+        for _ in 0..unaccepted.len() {
+            st.core.release_unaccepted();
+        }
         // Woken and dropped (each takes its session's lock) after the
         // listener's lock.
         drop(st);
@@ -1257,6 +1337,9 @@ impl Listener {
             st.draining = true;
             st.accept_waiters.wake_all(&mut wakes);
             let unaccepted = std::mem::take(&mut st.accept);
+            for _ in 0..unaccepted.len() {
+                st.core.release_unaccepted();
+            }
             let live: Vec<_> = st
                 .live
                 .iter()
@@ -1352,7 +1435,7 @@ impl Listener {
         S: Fn(T) -> SF + Send + Sync + 'static,
         SF: Future<Output = std::io::Result<C>> + Send + 'static,
         C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        I: for<'a> Fn(&'a C) -> CarrierInfo<'a> + Send + Sync + 'static,
+        I: Fn(&C) -> CarrierInfo + Send + Sync + 'static,
         P: Fn(C) -> PipeIo + Send + Sync + 'static,
     {
         let trusted = Arc::new(self.shared.trusted.clone());
@@ -1495,6 +1578,13 @@ impl Listener {
     /// joins ([`PipeIo::from_stream`]) is refused: the carrier is closed
     /// and the session sends `PIPE_ABANDON(ZMUX_PIPE_RESOURCE_LIMIT)`.
     ///
+    /// The first poll decides whether the listener takes the carrier at
+    /// all, before any I/O or wait: a closed listener's carrier resolves
+    /// `Err(HandleError::Refused)` on it, and so does one that came with its
+    /// entry ([`PipeHint::from_entry`]) when the listener has no place for
+    /// it. A caller that must answer at once (an HTTP exchange) may poll
+    /// once with a no-op waker to learn that.
+    ///
     /// # Errors
     ///
     /// The [`HandleError`] that says why the carrier was not used.
@@ -1606,6 +1696,10 @@ impl Listener {
     /// became a pipe.
     async fn handle(&self, mut pipe: PipeIo, mut hint: PipeHint) -> Result<PipeEnd, HandleError> {
         let shared = &self.shared;
+        // Decided on the first poll (see `handle_pipe`).
+        if shared.lock().closed {
+            return Err(HandleError::Refused);
+        }
         // A stream that may be a lane of a pipe on its connection waits
         // for its first record outside the limits: its connection was
         // admitted, and it takes a slot once it turns out a join or a
@@ -1639,6 +1733,7 @@ impl Listener {
         if let Some(t) = shared.transform.clone() {
             pipe = self.transform(&t, pipe, &hint, entry.as_mut()).await?;
         }
+        pipe.resolve_exporter(self.handshake_deadline()).await;
         let now = now();
         let (limits, id) = {
             let mut st = shared.lock();
@@ -1944,20 +2039,22 @@ impl Listener {
             id,
             armed: true,
         };
-        let deadline = arrived.checked_add(limits.handshake_timeout);
+        // Always bounded: a timeout past the clock's range waits as long as
+        // the clock goes, never without a deadline (the wait also ends with
+        // the listener's close and the half's eviction).
+        let deadline = arrived
+            .checked_add(limits.handshake_timeout)
+            .unwrap_or_else(|| arrived + Duration::from_hours(262_800));
         let partner = PairWait {
             shared,
             token,
             id,
             ticket: None,
         };
-        let partner = match deadline {
-            Some(d) => tokio::time::timeout_at(d.into(), partner)
-                .await
-                .ok()
-                .flatten(),
-            None => partner.await,
-        };
+        let partner = tokio::time::timeout_at(deadline.into(), partner)
+            .await
+            .ok()
+            .flatten();
         let Some((other, finish)) = partner else {
             return Err(HandleError::TimedOut);
         };
@@ -2072,24 +2169,34 @@ impl Listener {
         }
     }
 
-    /// The configuration of a new session on `pipe`.
-    fn session_config(
-        &self,
+    /// What the listener's `session_config` is told of a new session's carrier.
+    fn session_carrier(
         pipe: &PipeIo,
         (source, peer): (Option<SocketAddr>, Option<SocketAddr>),
+    ) -> crate::SessionCarrier {
+        crate::SessionCarrier {
+            source: source.or(peer),
+            peer,
+            tls: pipe.terminated_tls(),
+            admitted: pipe.admitted.as_deref().cloned(),
+        }
+    }
+
+    /// The configuration of a new session on the carrier `carrier` describes.
+    async fn session_config(
+        &self,
+        carrier: crate::SessionCarrier,
     ) -> Result<Arc<Config>, HandleError> {
         let chosen = self.shared.lock().core.config().session_config.clone();
         let Some(f) = chosen else {
             return Ok(self.shared.config.clone());
         };
-        let tls = pipe.terminated_tls();
-        let carrier = crate::SessionCarrier {
-            source: source.or(peer),
-            peer,
-            tls: tls.as_ref(),
-            admitted: pipe.admitted.as_deref(),
-        };
-        match f.choose(&carrier, self.shared.logger.as_ref()) {
+        let deadline = self.handshake_deadline();
+        let answer =
+            super::hooks::settle_by(f.ask(&carrier), deadline, self.closed_or_evicted(None))
+                .await
+                .flatten();
+        match SessionConfigFn::chosen(answer, self.shared.logger.as_ref()) {
             Ok(None) => Ok(self.shared.config.clone()),
             Ok(Some(c)) => Ok(Arc::new(c)),
             Err(()) => Err(HandleError::Rejected),
@@ -2104,7 +2211,9 @@ impl Listener {
         addrs: (Option<SocketAddr>, Option<SocketAddr>),
         _slot: Option<Entry>,
     ) -> Result<PipeEnd, HandleError> {
-        let config = self.session_config(&pipe, addrs)?;
+        let config = self
+            .session_config(Self::session_carrier(&pipe, addrs))
+            .await?;
         // Each session of the listener has its own locator unless one is
         // configured.
         let own = (config.offers_multipath() && config.own_locator().is_empty())
@@ -2118,19 +2227,45 @@ impl Listener {
             |shared| self.register_session(shared),
         )
         .map_err(|_| HandleError::Rejected)?;
-        let refusal = if self.shared.account.pressure() {
-            Some("memory budget")
-        } else {
-            let st = self.shared.lock();
-            (st.closed || st.draining).then_some("draining")
+        let mut place = Unaccepted(&self.shared, false);
+        let refusal = {
+            let pressure = self.shared.account.pressure();
+            let mut st = self.shared.lock();
+            let closing = st.closed || st.draining;
+            let r = st.core.admit_session(closing, pressure).err();
+            place.1 = r.is_none();
+            r
         };
         if let Some(reason) = refusal {
-            // Refused after its own parameters, so that the peer reads why.
-            shared.refuse(reason).await;
+            // Refused after its own parameters, so that the peer reads why,
+            // within the handshake timeout.
+            let limit = self.shared.lock().core.config().handshake_timeout;
+            let _ = tokio::time::timeout(limit, shared.refuse(reason)).await;
             return Err(HandleError::Refused);
         }
         let done = shared.lock_pipe_done(0);
-        match shared.established().await {
+        // Bounded by the handshake timeout and the listener's close: a peer
+        // that never completes the parameters holds no place for good.
+        let limit = self.shared.lock().core.config().handshake_timeout;
+        let closing = Closing {
+            shared: &self.shared,
+            id: None,
+            slot: None,
+            ticket: None,
+        };
+        let mut closing = std::pin::pin!(closing);
+        let mut establishing = std::pin::pin!(tokio::time::timeout(limit, shared.established()));
+        let established = std::future::poll_fn(|cx| {
+            if closing.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(HandleError::Refused));
+            }
+            establishing
+                .as_mut()
+                .poll(cx)
+                .map(|r| r.map_err(|_| HandleError::TimedOut))
+        })
+        .await?;
+        match established {
             Ok(s) => {
                 let mut wakes = WakeList::default();
                 let mut st = self.shared.lock();
@@ -2142,6 +2277,8 @@ impl Listener {
                     return Err(HandleError::Refused);
                 }
                 st.accept.push_back(s);
+                // The queued session holds the place until it is taken.
+                place.1 = false;
                 self.shared.counts.sessions.fetch_add(1, Relaxed);
                 st.accept_waiters.wake_all(&mut wakes);
                 // Woken after the listener's lock.
@@ -2201,200 +2338,120 @@ impl Listener {
         _limits: &ListenerConfig,
         source: Option<SocketAddr>,
     ) -> Result<PipeEnd, HandleError> {
+        use super::accept::{AcceptStep, JoinAccept, JoinCarrier};
         let session = self.shared.locators.get(locator);
-        // The joined session's join timeout bounds the handshake, or the listener's session
-        // configuration's for an unknown Locator. A refusal's stall does not use it.
-        let join_timeout = session
-            .as_ref()
-            .map_or(self.shared.config.join_timeout, |s| {
-                s.lock().core.config().join_timeout
-            });
-        let deadline = now().checked_add(join_timeout);
-        let Ok(parsed) = JoinHello::parse(pipe.framing, hello) else {
-            return self.rejected(pending, "malformed", None, source).await;
-        };
-        let mode = Some(parsed.mode());
-        let Some(session) = session else {
-            return self
-                .rejected(pending, "unknown_locator", mode, source)
-                .await;
-        };
         // A stream carrier of a session that runs over this one is refused once the join is
         // authenticated, so that a joiner that cannot see the loop backs off.
-        let looped = pipe
-            .outer
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .is_some_and(|outer| runs_over(&outer, &session));
+        let looped = session.as_ref().is_some_and(|session| {
+            pipe.outer
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|outer| runs_over(&outer, session))
+        });
+        // A Bound Hello needs a Binding of this carrier: it declares the contract, is not
+        // split and has an exporter. A stream of a multiplexed session has none here: the
+        // connection below it would vouch for streams the multiplexer's other carriers
+        // open.
+        let binding = (pipe.secure && !pipe.split)
+            .then(|| {
+                pipe.exporter
+                    .as_ref()
+                    .and_then(CarrierExporter::pipe_binding)
+            })
+            .flatten();
+        let carrier = JoinCarrier {
+            framing: pipe.framing,
+            binding,
+            has_exporter: pipe.exporter.is_some(),
+            secure: pipe.secure,
+            admitted: pipe.admitted.as_deref().cloned(),
+            inbound: pipe.reader.is_some(),
+            outbound: pipe.writer.is_some(),
+            looped,
+            overhead: pipe.write_overhead,
+            max_record: pipe.max_record,
+            kind: pipe.carrier,
+        };
+        let mut acc = JoinAccept::new(session, self.shared.config.join_timeout, hello, carrier);
+        let deadline = acc.deadline();
+        let bounded = |d: Option<std::time::Instant>| d.map(tokio::time::Instant::from_std);
         // A Hello that arrived as carrier early data could be a replay: it is
-        // offered only once the carrier's handshake completed, within the handshake
-        // timeout; one that does not complete is a setup failure. Bound never takes it.
-        if let Some(done) = pipe.take_early_in() {
-            if parsed.mode() == crate::proto::seal::RecordMode::Bound {
+        // offered only once the carrier's handshake completed, within the join's
+        // deadline; one that does not complete is a setup failure. Bound never takes it.
+        if acc.session().is_some()
+            && let Some(done) = pipe.take_early_in()
+        {
+            let mode = JoinAccept::<Tokio>::parse_mode(pipe.framing, hello);
+            if mode == Some(crate::proto::seal::RecordMode::Bound) {
                 return self.rejected(pending, "early_data", mode, source).await;
             }
-            let completed = if let Some(d) = deadline {
-                tokio::time::timeout_at(d.into(), done).await.is_ok()
-            } else {
-                done.await;
-                true
-            };
-            if !completed {
+            if !within(bounded(deadline), done).await {
                 return Err(HandleError::SetupFailed);
             }
         }
-        // A Hello in Bound needs a Binding of this carrier: it declares the contract, is
-        // not split and has an exporter. A stream of a multiplexed session has none
-        // here: the connection below it would vouch for streams the multiplexer's other
-        // carriers open.
-        let binding = if parsed.mode() == crate::proto::seal::RecordMode::Bound {
-            let binding = (pipe.secure && !pipe.split)
-                .then(|| {
-                    pipe.exporter
-                        .as_ref()
-                        .and_then(CarrierExporter::pipe_binding)
-                })
-                .flatten();
-            let Some(binding) = binding else {
-                session.hello_without_binding();
-                return self.rejected(pending, "auth", mode, source).await;
-            };
-            binding
-        } else {
-            Vec::new()
-        };
-        let mut join = loop {
-            // The listener's lock is never taken under a session's.
-            let closed = {
-                let st = self.shared.lock();
-                // Evicted for a newer carrier while it waits: closed
-                // like one waiting for its first record.
-                st.closed || st.evicted.contains(&pending.id)
-            };
-            let pressure = self.shared.account.pressure();
-            if closed {
-                return Err(HandleError::Refused);
-            }
-            // Only joins that let a session resume pass the budget; the others are declined
-            // by the reject policy, like an unknown Locator.
-            let Some(opened) =
-                session.open_hello(&parsed, &binding, |suspended| suspended || !pressure)
-            else {
-                return self
-                    .rejected(pending, "memory_pressure", mode, source)
-                    .await;
-            };
-            match opened {
-                OpenedHello::Verified(j) => break j,
-                OpenedHello::AuthFailed => {
-                    return self.rejected(pending, "auth", mode, source).await;
+        let mut step = self.join_open(pending, &mut acc, None);
+        let reply = loop {
+            step = match step {
+                AcceptStep::Reject(reason, mode) => {
+                    return self.rejected(pending, reason, mode, source).await;
                 }
-                OpenedHello::UnknownSuite => {
-                    return self.rejected(pending, "unknown_suite", mode, source).await;
-                }
-                OpenedHello::UnknownLocator => {
-                    return self
-                        .rejected(pending, "unknown_locator", mode, source)
-                        .await;
-                }
-                OpenedHello::Close | OpenedHello::Fatal => return Err(HandleError::Rejected),
-                // Offered again only when the session is ready, so that each carrier
-                // counts once in `join_pending`.
-                OpenedHello::Hold | OpenedHello::KeyWait => {
+                AcceptStep::End(e) => return Err(e),
+                AcceptStep::WaitKeys => {
+                    let session = acc.session().expect("named").clone();
                     let keys = handle::join_keys_wait(&session);
-                    let mut keys = std::pin::pin!(keys);
-                    let mut closing = Closing {
-                        slot: None,
-                        shared: &self.shared,
-                        id: Some(pending.id),
-                        ticket: None,
-                    };
-                    let waited = std::pin::pin!(async {
-                        std::future::poll_fn(|cx| {
-                            if let Poll::Ready(ready) = keys.as_mut().poll(cx) {
-                                return Poll::Ready(Ok(ready));
-                            }
-                            Pin::new(&mut closing).poll(cx).map(|()| Err(()))
-                        })
-                        .await
-                    });
-                    let waited = match deadline {
-                        Some(d) => tokio::time::timeout_at(d.into(), waited).await.ok(),
+                    let waited = until(self.closed_or_evicted(Some(pending.id)), keys);
+                    let waited = match bounded(deadline) {
+                        Some(d) => tokio::time::timeout_at(d, waited).await.ok(),
                         None => Some(waited.await),
                     };
                     match waited {
-                        Some(Ok(true)) => {}
-                        Some(Err(()) | Ok(false)) => return Err(HandleError::Refused),
-                        None => return Err(HandleError::TimedOut),
+                        Some(Some(ready)) => self.join_open(pending, &mut acc, Some(ready)),
+                        Some(None) => AcceptStep::End(HandleError::Refused),
+                        None => AcceptStep::End(HandleError::TimedOut),
                     }
                 }
-            }
-        };
-        // Step 7: a Mode or authorization that local policy refuses leaves the Pipe ID's
-        // bit clear and is counted.
-        let info = RecordPolicyInput {
-            has_exporter: pipe.exporter.is_some(),
-            secure: pipe.secure,
-            ..RecordPolicyInput::default()
-        };
-        let admitted = pipe.admitted.as_deref().cloned();
-        if !session.join_allowed(&info, &join, admitted.as_ref()) {
-            return Err(HandleError::Rejected);
-        }
-        // A carrier limit the Sealed overhead takes below the record floor refuses the
-        // join, as it does an added pipe.
-        let limit = handle::pipe_record_limit(join.mode(), pipe.max_record, pipe.framing);
-        if handle::check_pipe_record_limit(limit).is_err() {
-            return Err(HandleError::Refused);
-        }
-        let carrier = PeerCarrier {
-            inbound: pipe.reader.is_some().then_some(pipe.framing),
-            outbound: pipe.writer.is_some().then_some(pipe.framing),
-            looped,
-            overhead: pipe.write_overhead,
-            received: hello.len(),
-        };
-        let plan = session.join_plan(pipe.carrier, "reply");
-        if !plan.delay.is_zero() {
-            let wait = until(
-                self.join_stopped(pending.id, &session),
-                tokio::time::sleep(plan.delay),
-            );
-            let waited = match deadline {
-                Some(d) => match tokio::time::timeout_at(d.into(), wait).await {
-                    Ok(w) => w,
-                    Err(_) => return Err(HandleError::TimedOut),
-                },
-                None => wait.await,
+                AcceptStep::Ask(d) => {
+                    let session = acc.session().expect("named").clone();
+                    let ended = self.join_stopped(pending.id, &session);
+                    let ok = super::hooks::settle_by(d, deadline, ended).await == Some(true);
+                    acc.allowed(ok)
+                }
+                AcceptStep::Delay(delay) => {
+                    let session = acc.session().expect("named").clone();
+                    let wait = until(
+                        self.join_stopped(pending.id, &session),
+                        tokio::time::sleep(delay),
+                    );
+                    match bounded(deadline) {
+                        Some(d) => match tokio::time::timeout_at(d, wait).await {
+                            Ok(w) => acc.delayed(w.is_some()),
+                            Err(_) => AcceptStep::End(HandleError::TimedOut),
+                        },
+                        None => acc.delayed(wait.await.is_some()),
+                    }
+                }
+                AcceptStep::Refuse(reply) => {
+                    let session = acc.session().expect("named").clone();
+                    let refuse = async {
+                        if write_unit(&mut pipe, &reply).await.is_ok() {
+                            pipe.end_unused(true, false).await;
+                        }
+                    };
+                    let refuse = until(self.join_stopped(pending.id, &session), refuse);
+                    match bounded(deadline) {
+                        Some(d) => {
+                            let _ = tokio::time::timeout_at(d, refuse).await;
+                        }
+                        None => {
+                            let _ = refuse.await;
+                        }
+                    }
+                    return Err(HandleError::Refused);
+                }
+                AcceptStep::Reply(reply) => break reply,
             };
-            if waited.is_none() {
-                return Err(HandleError::Refused);
-            }
-        }
-        let reply = match session.claim_hello(&mut join, carrier, &plan) {
-            ClaimedHello::Accept(reply) => reply,
-            ClaimedHello::Refuse(reply) => {
-                // The Reply ends with a graceful end of the writing half: closing the half
-                // abruptly could discard it on the way, and the joiner would not see the
-                // refusal.
-                let refuse = async {
-                    if write_unit(&mut pipe, &reply).await.is_ok() {
-                        pipe.end_unused(true, false).await;
-                    }
-                };
-                let refuse = until(self.join_stopped(pending.id, &session), refuse);
-                match deadline {
-                    Some(d) => {
-                        let _ = tokio::time::timeout_at(d.into(), refuse).await;
-                    }
-                    None => {
-                        let _ = refuse.await;
-                    }
-                }
-                return Err(HandleError::Refused);
-            }
-            ClaimedHello::Close => return Err(HandleError::Rejected),
         };
+        let session = acc.session().expect("named").clone();
         {
             // A new authenticated Hello may evict the session's oldest Unconfirmed one
             // and is not refused for lack of room.
@@ -2408,16 +2465,10 @@ impl Listener {
             // The acceptor's records wait for Confirmed.
             let mut input = Vec::new();
             loop {
-                match join.read_confirm(&input) {
-                    Ok(Some(n)) => {
-                        input.drain(..n);
-                        return Ok::<_, std::io::Error>(input);
-                    }
-                    Ok(None) => {}
-                    Err(_) => return Err(std::io::ErrorKind::InvalidData.into()),
-                }
-                if pipe.framing == Framing::Records {
-                    input.clear();
+                match acc.confirm(&mut input) {
+                    Ok(true) => return Ok::<_, std::io::Error>(input),
+                    Ok(false) => {}
+                    Err(()) => return Err(std::io::ErrorKind::InvalidData.into()),
                 }
                 if read_unit(&mut pipe, &mut input).await? == 0 {
                     return Err(std::io::ErrorKind::UnexpectedEof.into());
@@ -2426,8 +2477,8 @@ impl Listener {
         };
         // An Unconfirmed carrier ends with its session and with the listener.
         let confirm = until(self.join_stopped(pending.id, &session), confirm);
-        let confirmed = match deadline {
-            Some(d) => match tokio::time::timeout_at(d.into(), confirm).await {
+        let confirmed = match bounded(deadline) {
+            Some(d) => match tokio::time::timeout_at(d, confirm).await {
                 Ok(c) => c,
                 Err(_) => return Err(HandleError::TimedOut),
             },
@@ -2439,15 +2490,18 @@ impl Listener {
             // Nothing the peer did: no authentication failure.
             None => return Err(HandleError::Refused),
         };
-        let meta = (
-            pipe.carrier,
-            pipe.write_overhead,
-            pipe.admitted.as_deref().cloned(),
-        );
-        let (want_in, want_out) = (join.pipe().direction != 1, join.pipe().direction != 0);
-        let (attached, records) = match session.confirm_join(*join, carrier, meta) {
-            ConfirmedJoin::Attached { pipe, records } => (pipe, records),
-            ConfirmedJoin::Refused | ConfirmedJoin::Close => return Err(HandleError::Refused),
+        let super::accept::Attached {
+            pipe: attached,
+            records,
+            want_in,
+            want_out,
+        } = acc.attach()?;
+        // Until its carrier task runs, the attached pipe is given up with
+        // this handler however it ends: by an error below, or by the
+        // handler's future being dropped at an await.
+        let mut guard = AttachedPipe {
+            session: &session,
+            pipe: Some(attached),
         };
         // A pipe of its session now, no longer pending.
         pending.done();
@@ -2462,40 +2516,72 @@ impl Listener {
                 .set_pipe_limits(attached, m, pipe.write_overhead)
                 .is_err()
             {
-                session.drop_pipe(attached);
+                guard.abandon();
                 return Err(HandleError::Refused);
             }
         }
-        pipe.end_unused(want_in, want_out).await;
+        // The unused halves end within the join's deadline: a buffering layer
+        // whose peer does not read holds no handler past it.
+        if !within(bounded(deadline), pipe.end_unused(want_in, want_out)).await {
+            guard.abandon();
+            return Err(HandleError::TimedOut);
+        }
         if claim_carrier(&session, attached.0, pipe.outer.take()).is_err() {
             // A loop formed since the check above, through another session:
             // ZMUX_PIPE_RESOURCE_LIMIT.
-            session.drop_pipe(attached);
+            guard.abandon();
             return Err(HandleError::Refused);
         }
-        // A session closing meanwhile takes no new pipe.
+        // A session closing meanwhile takes no new pipe (the guard forgets it).
         let Ok(done) = session.attach_task(attached.0, pipe) else {
-            session.forget_pipe(attached);
             return Err(HandleError::Refused);
         };
+        guard.pipe = None;
+        drop(guard);
         // Counted once attached.
         self.shared.counts.joins.fetch_add(1, Relaxed);
         drop(session);
         Ok(PipeEnd::of(done))
     }
 
+    /// Opens the Hello unless the listener closed or evicted the carrier
+    /// meanwhile; `ready` is the answer of a key wait, if one came first.
+    fn join_open(
+        &self,
+        pending: &Pending<'_>,
+        acc: &mut super::accept::JoinAccept<Tokio>,
+        ready: Option<bool>,
+    ) -> super::accept::AcceptStep {
+        // The listener's lock is never taken under a session's.
+        let closed = {
+            let st = self.shared.lock();
+            // Evicted for a newer carrier while it waits: closed like one
+            // waiting for its first record.
+            st.closed || st.evicted.contains(&pending.id)
+        };
+        if closed {
+            return super::accept::AcceptStep::End(HandleError::Refused);
+        }
+        let pressure = self.shared.account.pressure();
+        match ready {
+            None => acc.start(pressure),
+            Some(r) => acc.keys_ready(r, pressure),
+        }
+    }
+
     /// Ready once a Hello's handshake has nothing left to wait for: its session ended, the
     /// listener closed or the carrier was evicted.
     async fn join_stopped(&self, id: CarrierId, session: &Shared<Tokio>) {
         let ended = handle::session_ended_wait(session);
-        let _ = until(self.closed_or_evicted(id), ended).await;
+        let _ = until(self.closed_or_evicted(Some(id)), ended).await;
     }
 
-    /// Ready once the listener closes or the carrier was evicted.
-    fn closed_or_evicted(&self, id: CarrierId) -> impl Future<Output = ()> + '_ {
+    /// Ready once the listener closes or the carrier `id` (if any) was
+    /// evicted.
+    fn closed_or_evicted(&self, id: Option<CarrierId>) -> impl Future<Output = ()> + '_ {
         let mut closing = Closing {
             shared: &self.shared,
-            id: Some(id),
+            id,
             slot: None,
             ticket: None,
         };
@@ -2524,7 +2610,7 @@ impl Listener {
     /// closed as `stall_overflow`). A pending carrier `id` also ends its stall when evicted
     /// as Unconfirmed.
     async fn refuse(&self, info: &RejectInfo, id: Option<CarrierId>, entry: Option<&mut Entry>) {
-        if self.reject_response(info) != RejectAction::Stall {
+        if self.reject_response(info, id).await != RejectAction::Stall {
             return;
         }
         let limit = if info.profile == Some(2) {
@@ -2543,12 +2629,23 @@ impl Listener {
         let wait = async {
             match id {
                 Some(id) => {
-                    let _ = until(self.closed_or_evicted(id), stall).await;
+                    let _ = until(self.closed_or_evicted(Some(id)), stall).await;
                 }
                 None => stall.await,
             }
         };
         self.stall_refused(entry, wait).await;
+    }
+}
+
+/// Whether `fut` completed before `deadline` (none: it is awaited without
+/// one).
+async fn within(deadline: Option<Instant>, fut: impl Future<Output = ()>) -> bool {
+    if let Some(d) = deadline {
+        tokio::time::timeout_at(d, fut).await.is_ok()
+    } else {
+        fut.await;
+        true
     }
 }
 
@@ -2602,6 +2699,18 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// A new session's place among the unaccepted
+/// ([`ListenerCore::reserve_unaccepted`]), released when dropped while held.
+struct Unaccepted<'a>(&'a ListenShared, bool);
+
+impl Drop for Unaccepted<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.lock().core.release_unaccepted();
+        }
+    }
+}
+
 /// [`Listener::accept`]; dropped while waiting, it leaves the waiters.
 struct Accept<'a> {
     shared: &'a ListenShared,
@@ -2615,7 +2724,10 @@ impl Future for Accept<'_> {
         let this = self.get_mut();
         let mut st = this.shared.lock();
         let ready = match st.accept.pop_front() {
-            Some(s) => Some(Some(s)),
+            Some(s) => {
+                st.core.release_unaccepted();
+                Some(Some(s))
+            }
             None => (st.closed || st.draining).then_some(None),
         };
         if let Some(r) = ready {

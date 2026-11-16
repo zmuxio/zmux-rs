@@ -97,7 +97,7 @@ impl Net {
                             self.s.in_closed[side].insert(id);
                         }
                     }
-                    CoreEvent::PipeState { pipe, state } => {
+                    CoreEvent::PipeState { pipe, state, .. } => {
                         self.s.log.push(format!("{end} {} {state:?}", pipe.get()));
                         let outbound = state.half() == PipeHalf::Outbound;
                         self.s.reported[side].insert((pipe.get(), outbound));

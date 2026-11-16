@@ -73,7 +73,7 @@ use super::POLL;
 
 /// The shortest [`PoolDecision::recheck`] a pool honours: a shorter one
 /// is lengthened to this, so that a policy cannot make it spin.
-pub const RECHECK_FLOOR: Duration = Duration::from_millis(10);
+pub const MIN_RECHECK: Duration = Duration::from_millis(10);
 
 /// Members to keep up over one path; see [`maintain_pipes`]. A member is
 /// a pipe on a carrier that [`PipePool::new`]'s dial opens (its
@@ -431,7 +431,7 @@ pub struct PoolDecision {
     pub rotate: Vec<(PipeId, std::time::Instant)>,
     /// Ask the policy again within this, even if nothing happens in the
     /// pool (`None`: no such need; the pool's own looks go on). It is
-    /// lengthened to [`RECHECK_FLOOR`] at least and is not capped.
+    /// lengthened to [`MIN_RECHECK`] at least and is not capped.
     pub recheck: Option<Duration>,
     liveness: Option<PipeLiveness>,
     rejected: Option<String>,
@@ -545,23 +545,29 @@ impl Stop {
 /// make before break. Dropping the handle or [`MaintainHandle::stop`] ends
 /// it (a replacement still being rotated in is closed; the members' pipes
 /// stay), as does the end of the session. Needs a multipath session and a
-/// tokio runtime (it panics outside one).
+/// tokio runtime.
 ///
 /// # Errors
 ///
 /// [`ConnectError::InvalidConfig`] for a backoff whose initial delay is
-/// zero or above its max, or whose jitter is outside \[0, 1\].
+/// zero or above its max, or whose jitter is outside \[0, 1); a
+/// [`ConnectError::Io`] of kind `Unsupported` outside a tokio runtime.
 pub fn maintain_pipes(session: &Session, pool: PipePool) -> Result<MaintainHandle, ConnectError> {
     pool.backoff
         .validate()
         .map_err(ConnectError::InvalidConfig)?;
     let stop = Arc::new(Stop::default());
-    Maintainer::spawn(
+    if !Maintainer::spawn(
         Link::Strong(session.clone()),
         pool,
         Vec::new(),
         stop.clone(),
-    );
+    ) {
+        return Err(ConnectError::Io(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "maintain_pipes outside a tokio runtime",
+        ))));
+    }
     Ok(MaintainHandle { stop })
 }
 
@@ -573,7 +579,8 @@ pub(crate) fn maintain_redial(session: &Session, dial: Dial, backoff: Backoff, p
     let mut first = Member::new(vec![pipe0], None);
     first.was_usable = true;
     let pool = PipePool::with_dial(1, dial).with_backoff(backoff);
-    Maintainer::spawn(
+    // Called on the runtime the session runs on.
+    let _ = Maintainer::spawn(
         Link::Weak(session.downgrade()),
         pool,
         vec![first],
@@ -595,7 +602,8 @@ pub(crate) fn maintain_choice(
     first.joined = chosen;
     first.was_usable = true;
     let pool = PipePool::of(1, Source::Choice(src));
-    Maintainer::spawn(
+    // Called on the runtime the session runs on.
+    let _ = Maintainer::spawn(
         Link::Weak(session.downgrade()),
         pool,
         vec![first],
@@ -736,7 +744,11 @@ enum Wake {
 }
 
 impl Maintainer {
-    fn spawn(link: Link, pool: PipePool, members: Vec<Member>, stop: Arc<Stop>) {
+    /// Starts the maintainer on the current runtime; `false` outside one.
+    fn spawn(link: Link, pool: PipePool, members: Vec<Member>, stop: Arc<Stop>) -> bool {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
         let now = Instant::now();
         let task = Self {
             link,
@@ -762,7 +774,8 @@ impl Maintainer {
             .link
             .get()
             .map(|s| handle::RedialSource::new(s.shared()));
-        tokio::spawn(task.run());
+        rt.spawn(task.run());
+        true
     }
 
     /// The pool's carrier choice, if it dials by one.
@@ -913,13 +926,21 @@ impl Maintainer {
             session_state: session.state(),
         };
         let mut d = PoolDecision::default();
-        policy
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .decide(&view, &mut d);
+        // A policy that panics is a rejected decision: the maintainer goes
+        // on, and ends (and cleans up) as it would otherwise.
+        let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            policy
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .decide(&view, &mut d);
+        }));
+        if decided.is_err() {
+            d = PoolDecision::default();
+            d.rejected = Some("the pool policy panicked".into());
+        }
         if let Some(reason) = d.rejected.take() {
             if let Some(f) = &self.pool.decision_rejected {
-                f(&reason);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&reason)));
             }
             d = PoolDecision::default();
         }
@@ -928,9 +949,7 @@ impl Maintainer {
         }
         self.dial_gate = d.next_dial_at.map(Instant::from_std);
         self.liveness = d.liveness;
-        self.recheck_at = d
-            .recheck
-            .and_then(|r| now.checked_add(r.max(RECHECK_FLOOR)));
+        self.recheck_at = d.recheck.and_then(|r| now.checked_add(r.max(MIN_RECHECK)));
         for (id, at) in d.rotate {
             let at = Instant::from_std(at);
             if let Some(m) = self
@@ -985,14 +1004,23 @@ impl Maintainer {
         self.dial_time(delay).is_some_and(|t| now >= t)
     }
 
-    /// Members and redials that fill the pool's slots (a replacement
-    /// shares its old member's slot).
+    /// The members and dials that fill the pool's count: a replacement, or
+    /// a rotation dial, whose old member is gone takes its place (it joins
+    /// as an ordinary member), so that the failure of the old one does not
+    /// also start a redial that would leave one member too many.
     fn slots(&self) -> usize {
-        self.members.iter().filter(|m| m.replaces.is_none()).count()
+        let present = |old: PipeId| self.members.iter().any(|o| o.id() == old);
+        self.members
+            .iter()
+            .filter(|m| m.replaces.is_none_or(|old| !present(old)))
+            .count()
             + self
                 .dials
                 .iter()
-                .filter(|d| d.purpose == Purpose::Redial)
+                .filter(|d| match d.purpose {
+                    Purpose::Redial => true,
+                    Purpose::Rotate(old) => !present(old),
+                })
                 .count()
     }
 
@@ -1165,15 +1193,16 @@ impl Maintainer {
             self.stop.stop();
             return;
         }
-        if !self.wants_redial()
-            || !session.adapter().join_ready()
-            || !self.may_dial(self.redial_delay(), now)
-        {
+        let room = session.adapter().join_room();
+        if !self.wants_redial() || room == 0 || !self.may_dial(self.redial_delay(), now) {
             // A carrier dialled now would wait idle for its join: look again
             // at the next poll.
             return;
         }
-        for _ in self.slots()..self.count {
+        // No more at once than the session can take: a count above
+        // `max_pipes` does not open carriers that would only be refused.
+        let want = self.count.saturating_sub(self.slots()).min(room);
+        for _ in 0..want {
             let kind = self.choice().map(|m| m.pick());
             self.dial(session, Purpose::Redial, kind, false);
         }

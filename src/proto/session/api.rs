@@ -311,8 +311,9 @@ impl SessionCore {
     /// `min` bytes of send capacity is over ([`SendCapacity::reaches`]), or
     /// the part ended. The part is woken only then, not on every change of
     /// credit, so that a caller that wants a chunk's worth costs one
-    /// wake-up per chunk. A later registration
-    /// replaces `min`; one that is over already notifies at once.
+    /// wake-up per chunk. Registrations until the notification keep the
+    /// smallest `min` (a waiter for more checks again when it is woken);
+    /// one that is over already notifies at once.
     pub fn wait_send_capacity(&mut self, key: StreamKey, min: u64) {
         if self.streams.add_capacity_wait(key, min) {
             self.check_capacity_wait(key);
@@ -648,8 +649,11 @@ impl SessionCore {
             });
             let dir = s.dir;
             if let Some(r) = s.recv.as_mut() {
-                // The peer never heard of the stream: nothing will arrive.
-                r.state = RecvState::ResetRead;
+                // The peer never heard of the stream: nothing will arrive,
+                // so the receiving part ends cleanly where it is (a reader
+                // sees the end, as on a stream the peer finished empty).
+                r.final_size = Some(r.read_offset);
+                r.state = RecvState::DataRead;
             }
             self.streams.drop_unsent(unsent);
             let d = di(dir);
@@ -1182,7 +1186,7 @@ impl SessionCore {
             // A PRIORITY set before the first frame always fits.
             priority: Some(Priority::DEFAULT),
             pipe_carrier: carrier,
-            app_tlvs: AppTlvs::new(tlvs.as_deref().unwrap_or_default()),
+            app_tlvs: AppTlvs::whole(tlvs.as_deref().unwrap_or_default()),
         }
         .encoded_len(
             grease
@@ -1441,14 +1445,20 @@ impl SessionCore {
         if s.dir != Dir::Bidi || s.parts_terminal() || s.goaway.is_some() || context >= 1 << 62 {
             return Err(DatagramError::ClosedStream);
         }
-        let id = self
-            .stream_id(key)
-            .map_err(|_| DatagramError::ClosedStream)?;
-        let prefix = varint::len(id + 1) + varint::len(context);
-        let max = frame.saturating_sub(1 + prefix);
+        // Checked against the identifier the stream has or would get, so
+        // that a datagram too large never pins it.
+        let would = s.id.unwrap_or_else(|| {
+            let client = matches!(self.role, super::Role::Client);
+            super::stream::make_id(self.streams.local_dir(di(s.dir)).next_index, s.dir, client)
+        });
+        let max = frame.saturating_sub(1 + varint::len(would + 1) + varint::len(context));
         if len > max {
             return Err(DatagramError::TooLarge { max });
         }
+        let id = self.stream_id(key).map_err(|e| match e {
+            StreamError::Blocked => DatagramError::Blocked,
+            _ => DatagramError::ClosedStream,
+        })?;
         Ok((id, context))
     }
 
@@ -1523,33 +1533,38 @@ impl SessionCore {
     /// with the limiter's verdicts, emptying `datagrams`: those it allowed
     /// go to the application's queues (a stream that ended or was released
     /// meanwhile drops its own), the others are dropped and counted
-    /// (`datagrams_dropped_limit`).
-    pub fn admit_datagrams(&mut self, datagrams: &mut Vec<super::ReceivedDatagram>) {
+    /// (`datagrams_dropped_limit`). Returns the grants of the allowed ones
+    /// the queues refused, for the driver to refund outside the lock.
+    #[must_use = "the grants of refused datagrams are refunded"]
+    pub fn admit_datagrams(&mut self, datagrams: &mut Vec<super::ReceivedDatagram>) -> u64 {
+        let mut refused = 0;
         for d in datagrams.drain(..) {
-            let held = &mut self.dgram_mut().held_bytes;
-            *held = held.saturating_sub(d.data.len());
-            if !d.allowed {
+            super::debit(&mut self.dgram_mut().held_bytes, d.data.len());
+            let Some(granted) = d.granted else {
                 self.stats.datagrams_dropped_limit += 1;
                 continue;
-            }
+            };
             let usable = d.stream.is_none_or(|(k, _)| {
                 self.streams.get(k).is_some_and(|s| {
                     !s.released && !s.parts_terminal() && s.offer != Offer::Rejected
                 })
             });
-            if usable {
-                self.queue_received_datagram(d.stream, d.data);
-            } else {
+            if !usable {
+                refused += granted;
                 self.drop_received_datagram(d.stream);
+            } else if !self.queue_received_datagram(d.stream, d.data) {
+                // The queue refused it: its grant goes back too.
+                refused += granted;
             }
         }
+        refused
     }
 
     /// The next session datagram.
     pub fn recv_datagram(&mut self) -> Result<Option<Bytes>, SessionError> {
         match self.dgram.as_deref_mut().and_then(|d| d.recv.pop_front()) {
             Some(d) => {
-                self.dgram_mut().recv_bytes -= d.len();
+                super::debit(&mut self.dgram_mut().recv_bytes, d.len());
                 self.meter.add(Count::DatagramReceived, d.len() as u64);
                 Ok(Some(d))
             }
@@ -1571,9 +1586,9 @@ impl SessionCore {
                 let n = d.len() as u64;
                 let q = s.datagrams_mut();
                 q.counts.bytes_received += n;
-                q.bytes -= d.len();
+                super::debit(&mut q.bytes, d.len());
                 s.count(Count::DatagramReceived, n);
-                self.dgram_mut().stream_bytes -= d.len();
+                super::debit(&mut self.dgram_mut().stream_bytes, d.len());
                 self.meter.add(Count::DatagramReceived, n);
                 Ok(Some((context, d)))
             }

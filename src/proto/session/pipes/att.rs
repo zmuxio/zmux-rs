@@ -445,7 +445,6 @@ impl Attachment {
         self.mp().options.as_ref()?.label.as_ref()
     }
 
-    /// The options the application added the pipe with.
     /// The pipe's own liveness settings.
     pub(crate) fn own_liveness(&self) -> crate::proto::session::PipeLiveness {
         self.mp
@@ -455,6 +454,7 @@ impl Attachment {
             .unwrap_or_default()
     }
 
+    /// The options the application added the pipe with.
     pub(crate) fn options(&self) -> Option<&crate::proto::session::PipeOptions> {
         self.mp().options.as_deref()
     }

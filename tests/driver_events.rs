@@ -155,8 +155,8 @@ async fn quality_events_reach_the_application() {
     })
     .unwrap();
     client.set_quality_band(None).unwrap();
-    // A rate ratio that is not a number, or a negative one, is rejected.
-    for bad in [f64::NAN, -1.0] {
+    // A rate ratio other than 0 (off) or finite and at least 1 is rejected.
+    for bad in [f64::NAN, -1.0, 0.5, f64::INFINITY] {
         let band = Some(QualityBand::new(Some(Duration::from_millis(5)), Some(bad)));
         assert!(matches!(
             client.set_quality_band(band),
@@ -170,12 +170,20 @@ async fn quality_events_reach_the_application() {
             Err(zmux::PipeError::InvalidOptions(_))
         ));
     }
-    let mut nan = CapacityFloor::new(1);
-    nan.rate_ratio = f64::NAN;
-    assert!(matches!(
-        client.set_capacity_floor(Some(nan)),
-        Err(zmux::PipeError::InvalidOptions(_))
-    ));
+    for bad in [f64::NAN, -1.0, 0.5, 0.999, f64::INFINITY] {
+        let mut floor = CapacityFloor::new(1);
+        floor.recovery_ratio = bad;
+        assert!(matches!(
+            client.set_capacity_floor(Some(floor)),
+            Err(zmux::PipeError::InvalidOptions(_))
+        ));
+    }
+    let mut floor = CapacityFloor::new(1);
+    floor.recovery_ratio = 0.0;
+    assert_eq!(floor.effective_recovery_ratio(), 1.25);
+    client.set_capacity_floor(Some(floor)).unwrap();
+    floor.recovery_ratio = 1.0;
+    client.set_capacity_floor(Some(floor)).unwrap();
     client
         .set_capacity_floor(Some(CapacityFloor::new(u64::MAX)))
         .unwrap();

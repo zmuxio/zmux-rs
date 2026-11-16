@@ -1,14 +1,14 @@
 //! The session secret of Join: the secret sources and the derivations before `join_psk`.
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
-
 /// TLS exporter label of the session secret input.
 pub const EXPORTER_SESSION_LABEL: &str = "EXPORTER-zmux-session";
 /// Exporter label of the Binding of a Bound Join.
 pub const EXPORTER_JOIN_LABEL: &str = "EXPORTER-zmux-join";
+/// Exporter label of an Establish's Binding.
+pub const EXPORTER_SEAL_BOUND_LABEL: &str = "EXPORTER-zmux-seal-bound";
+/// Exporter label of a prefix authentication token's binding (32 bytes,
+/// empty context).
+pub const PREFIX_AUTH_EXPORTER_LABEL: &str = "EXPORTER-zmux-prefix-auth";
 /// Prefix of the HKDF salt.
 pub const SALT_PREFIX: &[u8] = b"zmux session";
 
@@ -71,16 +71,7 @@ pub fn session_binding(initiator: &[u8; 16], responder: &[u8; 16]) -> [u8; 32] {
 }
 
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    // HMAC accepts keys of any length; the error branch is unreachable.
-    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-        return [0; 32];
-    };
-    for p in parts {
-        mac.update(p);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&mac.finalize().into_bytes());
-    out
+    crate::util::HmacSha256::new(key).mac(parts)
 }
 
 /// HKDF-Extract with SHA-256 (RFC 5869 Section 2.2).
@@ -89,10 +80,15 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     hmac(salt, &[ikm])
 }
 
-/// HKDF-Expand with SHA-256 (RFC 5869 Section 2.3) into `out`. RFC 5869
-/// allows at most 255 * 32 bytes; bytes of `out` beyond that are left
-/// unwritten. zmux only derives 32-byte keys.
+/// HKDF-Expand with SHA-256 (RFC 5869 Section 2.3) into `out`, at most
+/// 255 * 32 bytes as RFC 5869 allows. zmux only derives 32-byte keys.
+///
+/// # Panics
+///
+/// For `out` above 255 * 32 bytes, beyond what HKDF-SHA256 defines (RFC
+/// 5869): a caller's error, never peer input.
 pub fn hkdf_expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
+    assert!(out.len() <= 255 * 32, "HKDF-SHA256 output above 255 blocks");
     let mut prev: [u8; 32] = [0; 32];
     for (chunk, counter) in out.chunks_mut(32).zip(1..=u8::MAX) {
         let counter = [counter];
@@ -100,6 +96,7 @@ pub fn hkdf_expand(prk: &[u8], info: &[u8], out: &mut [u8]) {
         prev = hmac(prk, &[t, info, &counter]);
         chunk.copy_from_slice(&prev[..chunk.len()]);
     }
+    crate::util::wipe(&mut prev);
 }
 
 /// The session secret: HKDF-Extract("zmux session" || initiator nonce ||
@@ -112,22 +109,24 @@ pub fn session_secret(
     responder_nonce: &[u8; 16],
     exporter: &[u8],
     psk: &[u8],
-) -> [u8; 32] {
+) -> super::seal::Secret {
     let mut salt = [0u8; 44];
     let (prefix, nonces) = salt.split_at_mut(SALT_PREFIX.len());
     prefix.copy_from_slice(SALT_PREFIX);
     let (i, r) = nonces.split_at_mut(16);
     i.copy_from_slice(initiator_nonce);
     r.copy_from_slice(responder_nonce);
-    hmac(&salt, &[exporter, psk])
+    let mut v = hmac(&salt, &[exporter, psk]);
+    let secret = super::seal::Secret::from(&v[..]);
+    crate::util::wipe(&mut v);
+    secret
 }
 
 /// Whether two Lane Keys are equal, compared in constant time: a reader
 /// looks a lane's key up among its sessions this way.
 #[must_use]
 pub fn lane_key_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
-    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
-    std::hint::black_box(diff) == 0
+    super::seal::ct_eq(a, b)
 }
 
 #[cfg(test)]

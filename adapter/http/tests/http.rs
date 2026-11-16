@@ -480,7 +480,7 @@ async fn read_all(resp: http::Response<hyper::body::Incoming>) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admitted_request_carries_a_session() {
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let admission = zmux::Admission::prefix_auth(verifier);
     let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
     let (mut ours, theirs) = tokio::io::duplex(64 << 10);
@@ -595,7 +595,7 @@ async fn a_request_the_listener_does_not_take_falls_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_writes_its_token_first_on_the_request_body() {
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let admission = zmux::Admission::prefix_auth(verifier);
     let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
     let client_opts = Options::default().with_carrier_credential(Arc::new(auth));

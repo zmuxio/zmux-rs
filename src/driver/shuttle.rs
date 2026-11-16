@@ -21,7 +21,7 @@
 //! thread that marks the wait expired and unparks it).
 
 use std::collections::VecDeque;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -137,17 +137,11 @@ fn run<F: Future>(fut: F, expiry: &Expiry) -> Option<F::Output> {
 /// A blocking read of `stream` (`RecvStream::poll_read_cmd`): its bytes, or
 /// `None` at the end.
 fn read(s: &Session, stream: usize) -> Option<u8> {
-    let read = poll_fn(|cx| {
-        let mut inner = lock(s);
-        inner.waiters.remove_reader(stream);
+    let read = Wait::new(&**s, List::Readable(stream), |inner: &mut Inner| {
         if let Some(b) = inner.data[stream].pop_front() {
-            return Poll::Ready(Some(b));
+            return Some(Some(b));
         }
-        if inner.closed {
-            return Poll::Ready(None);
-        }
-        inner.waiters.register_reader(stream, cx.waker());
-        Poll::Pending
+        inner.closed.then_some(None)
     });
     run(read, &Expiry::default()).flatten()
 }
@@ -294,7 +288,7 @@ fn readers_writer_and_close() {
     for r in readers {
         let got = r.join().unwrap();
         assert!(
-            got.iter().enumerate().all(|(i, &b)| b == i as u8),
+            got.iter().enumerate().all(|(i, &b)| usize::from(b) == i),
             "{got:?}"
         );
     }

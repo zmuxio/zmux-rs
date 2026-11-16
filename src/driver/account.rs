@@ -9,11 +9,10 @@
 //! after the session's own lock is released).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+#[cfg(feature = "tokio")]
 use std::task::Poll;
 use std::time::{Duration, Instant};
-
-use atomic_waker::AtomicWaker;
 
 use crate::proto::listener::{MemoryBudget, MemoryPressure, OnMemoryPressure};
 use crate::proto::session::SessionCore as Core;
@@ -38,54 +37,114 @@ pub(crate) struct Account<S> {
     state: Mutex<State<S>>,
 }
 
-/// The latest pressure change for the hook's task, and its waker. The
-/// task reads the latest only: changes it has not seen coalesce, the last
-/// state winning.
+/// The latest pressure change for the hook's context, and how it is woken.
+/// The context reads the latest only: changes it has not seen coalesce,
+/// the last state winning.
 struct PressureSignal {
-    latest: Mutex<Option<MemoryPressure>>,
-    waker: AtomicWaker,
-    closed: AtomicBool,
+    /// The latest change, and the account is gone.
+    latest: Mutex<(Option<MemoryPressure>, bool)>,
+    /// Wakes a hook thread.
+    changed: Condvar,
+    /// Wakes a hook task.
+    waker: Mutex<Option<std::task::Waker>>,
 }
 
-/// The listener's hook context: calls `on_memory_pressure` for each change,
+impl PressureSignal {
+    fn wake(&self) {
+        self.changed.notify_all();
+        if let Some(w) = self
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            w.wake();
+        }
+    }
+
+    /// The next change, if any; `Err` once the account is gone.
+    #[cfg(feature = "tokio")]
+    fn take(&self) -> Result<Option<MemoryPressure>, ()> {
+        let mut l = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        match l.0.take() {
+            Some(p) => Ok(Some(p)),
+            None if l.1 => Err(()),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Where the hook runs: a task of the tokio runtime current at the
+/// listener's creation, or a thread of its own (the std driver).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookContext {
+    #[cfg(feature = "tokio")]
+    Task,
+    #[cfg(feature = "blocking")]
+    Thread,
+}
+
+/// Tells `hook` a change, in order, unless it cancels the last one.
+fn tell(hook: &OnMemoryPressure, last: &mut bool, p: MemoryPressure) {
+    // Changes that cancelled out before the context ran are not reported.
+    if *last == p.active {
+        return;
+    }
+    *last = p.active;
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook.0.as_ref()(p)));
+}
+
+/// The listener's hook task: calls `on_memory_pressure` for each change,
 /// in order, until the account is gone.
-async fn run_pressure_hook(signal: Arc<PressureSignal>, hook: OnMemoryPressure) {
-    // No pressure to begin with.
+#[cfg(feature = "tokio")]
+async fn run_pressure_task(signal: Arc<PressureSignal>, hook: OnMemoryPressure) {
     let mut last = false;
     loop {
         let next = std::future::poll_fn(|cx| {
-            signal.waker.register(cx.waker());
-            let latest = signal
-                .latest
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(p) = latest {
-                return Poll::Ready(Some(p));
+            *signal.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx.waker().clone());
+            match signal.take() {
+                Ok(Some(p)) => Poll::Ready(Some(p)),
+                Ok(None) => Poll::Pending,
+                Err(()) => Poll::Ready(None),
             }
-            if signal.closed.load(Ordering::Acquire) {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
         })
         .await;
         let Some(p) = next else {
             return;
         };
-        // Changes that cancelled out before the task ran are not reported.
-        if last == p.active {
-            continue;
-        }
-        last = p.active;
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook.0.as_ref()(p)));
+        tell(&hook, &mut last, p);
+    }
+}
+
+/// The listener's hook thread (the std driver), as the task.
+#[cfg(feature = "blocking")]
+fn run_pressure_thread(signal: &PressureSignal, hook: &OnMemoryPressure) {
+    let mut last = false;
+    loop {
+        let p = {
+            let mut l = signal.latest.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(p) = l.0.take() {
+                    break p;
+                }
+                if l.1 {
+                    return;
+                }
+                l = signal
+                    .changed
+                    .wait(l)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        tell(hook, &mut last, p);
     }
 }
 
 impl<S> Drop for Account<S> {
     fn drop(&mut self) {
         if let Some(s) = &self.signal {
-            s.closed.store(true, Ordering::Release);
-            s.waker.wake();
+            s.latest.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+            s.wake();
         }
     }
 }
@@ -98,23 +157,42 @@ struct State<S> {
 }
 
 impl<S> Account<S> {
-    /// An account; with a hook, its task is started (inside a tokio
-    /// runtime).
+    /// An account; with a hook, its context is started: a task on the
+    /// current tokio runtime (`None` outside one) or a thread (`None` when
+    /// it cannot be started).
     pub(crate) fn new(
         budget_bytes: Option<u64>,
         max_suspended: usize,
         hook: Option<OnMemoryPressure>,
-    ) -> Arc<Self> {
-        let signal = hook.map(|hook| {
-            let signal = Arc::new(PressureSignal {
-                latest: Mutex::new(None),
-                waker: AtomicWaker::new(),
-                closed: AtomicBool::new(false),
-            });
-            tokio::spawn(run_pressure_hook(signal.clone(), hook));
-            signal
-        });
-        Arc::new(Self {
+        context: HookContext,
+    ) -> Option<Arc<Self>> {
+        let signal = match hook {
+            None => None,
+            Some(hook) => {
+                let signal = Arc::new(PressureSignal {
+                    latest: Mutex::new((None, false)),
+                    changed: Condvar::new(),
+                    waker: Mutex::new(None),
+                });
+                match context {
+                    #[cfg(feature = "tokio")]
+                    HookContext::Task => {
+                        let rt = tokio::runtime::Handle::try_current().ok()?;
+                        rt.spawn(run_pressure_task(signal.clone(), hook));
+                    }
+                    #[cfg(feature = "blocking")]
+                    HookContext::Thread => {
+                        let s = signal.clone();
+                        std::thread::Builder::new()
+                            .name("zmux-pressure".into())
+                            .spawn(move || run_pressure_thread(&s, &hook))
+                            .ok()?;
+                    }
+                }
+                Some(signal)
+            }
+        };
+        Some(Arc::new(Self {
             budget_bytes,
             max_suspended,
             used: AtomicU64::new(0),
@@ -125,7 +203,7 @@ impl<S> Account<S> {
                 budget: MemoryBudget::new(budget_bytes),
                 suspended: Vec::new(),
             }),
-        })
+        }))
     }
 
     /// The sessions are above the budget: new sessions are refused, and
@@ -164,13 +242,13 @@ impl<S> Account<S> {
         let Some(s) = &self.signal else {
             return;
         };
-        *s.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(MemoryPressure {
+        s.latest.lock().unwrap_or_else(PoisonError::into_inner).0 = Some(MemoryPressure {
             used,
             budget,
             active: on,
         });
         drop(st);
-        s.waker.wake();
+        s.wake();
     }
 }
 
@@ -329,11 +407,13 @@ mod tests {
 
     /// A report the interval holds back is due at the end of the interval,
     /// so that a session that goes quiet still reports its last charge.
+    #[cfg(feature = "tokio")]
     #[test]
     fn a_report_held_back_by_the_interval_is_due_after_it() {
         let t0 = Instant::now();
         let mut core = Core::new(Config::default(), Role::Client, None, t0).unwrap();
-        let account = Account::<()>::new(Some(1 << 20), 4, None);
+        let account =
+            Account::<()>::new(Some(1 << 20), 4, None, HookContext::Task).expect("no hook");
         let me = Arc::new(());
         let mut link = AccountLink::new(account.clone());
         let mut close = Vec::new();

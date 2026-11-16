@@ -21,7 +21,7 @@ const KEY: [u8; 32] = [0x5a; 32];
 
 /// The record the allocating path makes at `(key, n)`.
 fn reference(c: &Cipher, key: &[u8], n: u64, plain: &[u8]) -> Vec<u8> {
-    c.seal(key, n, b"", plain)
+    c.seal(key, n, b"", plain).unwrap()
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn in_place_records_match_the_aead_calls() {
             for (i, &len) in lens.iter().enumerate() {
                 let n = start + i as u64;
                 if n != 0 && n.is_multiple_of(c.rekey_interval()) {
-                    key = c.seal(&key, u64::MAX, b"", &[0; 32])[..32].to_vec();
+                    key = c.seal(&key, u64::MAX, b"", &[0; 32]).unwrap()[..32].to_vec();
                 }
                 let plain: Vec<u8> = (0..len).map(|b| (b * 7 + i) as u8).collect();
                 let want = reference(c, &key, n, &plain);
@@ -95,4 +95,16 @@ fn in_place_failures_match() {
             assert_eq!(o.state(), old.state());
         }
     }
+}
+
+/// A key of the wrong length fails, it does not panic.
+#[test]
+fn a_wrong_key_length_is_an_error() {
+    use zmux::proto::seal::{Error, Sealer, aes_256_gcm};
+    assert_eq!(
+        aes_256_gcm().seal(&[1; 7], 0, b"", b"x"),
+        Err(Error::InvalidConfig)
+    );
+    let mut s = Sealer::new(aes_256_gcm(), vec![1; 7]);
+    assert_eq!(s.seal(b"x"), Err(Error::InvalidConfig));
 }

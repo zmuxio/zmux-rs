@@ -17,7 +17,7 @@ use crate::trust::{
     AppData, AppDataRequest, AppDataSource, ConfigError, Credential, Signer, Verifier, VerifyError,
     VerifyInput, VerifyVerdict, ask_app_data, check_pq_auth, judge,
 };
-use crate::{MAX_UNIT, credential_value, handshake_payload, message_items, proof_placeholder};
+use crate::{MAX_FRAME, credential_value, handshake_payload, message_items, proof_placeholder};
 
 /// Asks the hook about a message and waits as it says.
 /// Each handshake family has its own name: a plan made for the lengths of one is never
@@ -57,7 +57,7 @@ pub(crate) fn shaped_payload(
     // The plaintext of the items, whatever their types.
     let noise = profile.empty_message_len(seq) + zmux::proto::seal::encode_payload(items).len();
     let w = head(noise);
-    let room = (u16::MAX as usize)
+    let room = zmux::proto::seal::MAX_UNIT
         .saturating_sub(noise)
         // The floor counts the message as written, without the carrier's own framing.
         .min(zmux::proto::seal::HANDSHAKE_MESSAGE_FLOOR.saturating_sub(w.saturating_sub(over)));
@@ -117,13 +117,36 @@ impl std::error::Error for NoReply {
 }
 
 /// Where a client's static key comes from.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub enum StaticSecret {
     /// A key generated once per process and shared by its clients.
     #[default]
     Process,
-    /// This X25519 private scalar.
-    Given([u8; 32]),
+    /// This X25519 private scalar, cleared when the last copy is dropped.
+    Given(StaticKey),
+}
+
+/// An X25519 private scalar held by a [`StaticSecret::Given`]: its bytes
+/// are overwritten when it is dropped, and its `Debug` shows none of them.
+#[derive(Clone)]
+pub struct StaticKey([u8; 32]);
+
+impl From<[u8; 32]> for StaticKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+impl Drop for StaticKey {
+    fn drop(&mut self) {
+        zmux::proto::seal::wipe(&mut self.0);
+    }
+}
+
+impl fmt::Debug for StaticKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StaticKey(..)")
+    }
 }
 
 impl fmt::Debug for StaticSecret {
@@ -149,8 +172,8 @@ pub struct ClientConfig {
     /// The Handle, with `psk`, selects a Profile with a pre-shared key; both empty select
     /// one without.
     pub handle: Vec<u8>,
-    /// The pre-shared key.
-    pub psk: Vec<u8>,
+    /// The pre-shared key (cleared when dropped).
+    pub psk: zmux::proto::seal::Secret,
     /// The client's static key (default [`StaticSecret::Process`]).
     pub static_secret: StaticSecret,
     /// The Profiles this client may use, the first that fits the pre-shared key being
@@ -191,7 +214,7 @@ impl Default for ClientConfig {
             verifier: None,
             allow_psk_only: false,
             handle: Vec::new(),
-            psk: Vec::new(),
+            psk: zmux::proto::seal::Secret::default(),
             static_secret: StaticSecret::Process,
             allowed_profiles: client_default().to_vec(),
             record_mode: RecordMode::Sealed,
@@ -289,7 +312,7 @@ pub(crate) async fn read_frame<C: Carrier>(
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             }
         }
-        if buf.len() > MAX_UNIT {
+        if buf.len() > MAX_FRAME {
             return Err(io::ErrorKind::InvalidData.into());
         }
         if p.read(buf).await? == 0 {
@@ -339,9 +362,10 @@ pub(crate) async fn run_client<C: Carrier>(
             "allow_psk_only without a pre-shared key",
         )));
     }
-    let secret = match cfg.static_secret {
-        StaticSecret::Given(s) => s,
-        StaticSecret::Process => process_secret().map_err(invalid)?,
+    // A copy cleared when this call ends.
+    let secret = match &cfg.static_secret {
+        StaticSecret::Given(s) => s.clone(),
+        StaticSecret::Process => StaticKey(process_secret().map_err(invalid)?),
     };
     let mode = cfg.record_mode;
     let binding = binding_of(&p, mode).map_err(invalid)?;
@@ -352,7 +376,7 @@ pub(crate) async fn run_client<C: Carrier>(
         framing,
         handle: &cfg.handle,
         psk: &cfg.psk,
-        static_secret: &secret,
+        static_secret: &secret.0,
         binding: &binding,
         max_app_data: cfg.max_app_data,
     })
@@ -472,7 +496,11 @@ pub(crate) async fn run_client<C: Carrier>(
         None => finish.write_finish(&payload).map_err(invalid)?,
         Some(signer) => {
             let pending = finish.write_finish_signed(&payload).map_err(invalid)?;
-            let sig = signer.sign(pending.message()).await?;
+            let sig = crate::trust::guarded(
+                || signer.sign(pending.message()),
+                crate::trust::signer_panicked,
+            )
+            .await?;
             pending.finish(&sig).map_err(invalid)?
         }
     };

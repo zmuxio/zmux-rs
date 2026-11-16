@@ -1074,10 +1074,13 @@ impl Runner {
             .allow_record_mode
             .clone()
             .is_none_or(|f| {
-                f.allows(
-                    &zmux::proto::session::RecordPolicyInput::default(),
-                    join.mode(),
-                    None,
+                matches!(
+                    f.allows(
+                        &zmux::proto::session::RecordPolicyInput::default(),
+                        join.mode(),
+                        None,
+                    ),
+                    zmux::Decision::Now(Some(true))
                 )
             });
         if !allowed {
@@ -2898,7 +2901,7 @@ fn match_event(
             }
             Ok(())
         }
-        CoreEvent::PipeState { pipe, state } => {
+        CoreEvent::PipeState { pipe, state, .. } => {
             let half = &state.half();
             if fields.pipe.is_some_and(|p| p != pipe.get()) {
                 return Err(format!("pipe_state pipe {}", pipe.get()));

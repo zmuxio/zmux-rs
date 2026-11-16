@@ -110,19 +110,22 @@ use zmux::{CarrierCredential, ConnectError, Listener, PipeHint, PipeIo, Session}
 pub use zmux_quinn::LaneWindows;
 use zmux_quinn::{ConnectionDatagrams, QuicChannel};
 
+mod bounded;
+pub use bounded::RecvStream;
+
 /// The HTTP/3 ALPN identifier, which the QUIC endpoints must carry.
 pub const ALPN: &[u8] = b"h3";
 
 type ClientSend = h3::client::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
-type ClientRecv = h3::client::RequestStream<h3_quinn::RecvStream, ChunkBuf>;
+type ClientRecv = h3::client::RequestStream<bounded::RecvStream, ChunkBuf>;
 /// The sending half of a server's request stream: the response.
 pub type ServerSend = h3::server::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
 /// The receiving half of a server's request stream: the request body.
-pub type ServerRecv = h3::server::RequestStream<h3_quinn::RecvStream, ChunkBuf>;
+pub type ServerRecv = h3::server::RequestStream<bounded::RecvStream, ChunkBuf>;
 
 /// The adapter's options: how the carriers size the connection's flow
 /// control for lanes, and the fallback of requests.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Options {
     /// The windows; [`LaneWindows::lanes`] is the lanes that may be
@@ -139,6 +142,22 @@ pub struct Options {
     /// server with an admission ([`zmux::ListenerConfig::admission`]; none
     /// by default).
     pub carrier_credential: Option<Arc<dyn CarrierCredential>>,
+    /// Client: the bound on a dial, from the QUIC connect to the request
+    /// sent ([`dial`], the settings exchange of [`Carrier::new`]), and on a
+    /// request's response head (default [`zmux::adapter::DIAL_TIMEOUT`],
+    /// 10 s); one not done within it fails with `TimedOut`.
+    pub timeout: std::time::Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            windows: LaneWindows::default(),
+            fallback: None,
+            carrier_credential: None,
+            timeout: zmux::adapter::DIAL_TIMEOUT,
+        }
+    }
 }
 
 impl Options {
@@ -159,6 +178,13 @@ impl Options {
     #[must_use]
     pub fn with_fallback(mut self, fallback: Fallback) -> Self {
         self.fallback = Some(fallback);
+        self
+    }
+
+    /// With this bound on a dial ([`Options::timeout`]).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -248,7 +274,8 @@ fn with_connection<T: Send + Sync + 'static>(
 ) -> PipeIo {
     let exporter = Arc::downgrade(owner);
     io.with_carrier_conn(id)
-        .with_terminated_tls(|| Some(zmux::TlsState::default()))
+        // HTTP/3 runs over ALPN `h3`, as the other QUIC carriers report theirs.
+        .with_terminated_tls(|| Some(zmux::TlsState::new(Some(b"h3".to_vec()), None)))
         .with_carrier_secure()
         .with_exporter(move |label, context, out| {
             exporter.upgrade().is_some_and(|owner| {
@@ -285,11 +312,13 @@ impl std::fmt::Debug for Carrier {
 
 struct ClientInner {
     conn: Connection,
-    send: SendRequest<h3_quinn::OpenStreams, ChunkBuf>,
+    send: SendRequest<bounded::OpenStreams, ChunkBuf>,
     uri: http::Uri,
     /// The connection's identity for zmux: this state's allocation.
     id: OnceLock<CarrierConnId>,
     window: u64,
+    /// The limit on a response head ([`Options::timeout`]).
+    timeout: std::time::Duration,
     /// The credential of each request, and the connection's handshake it
     /// is given.
     carrier_credential: Option<(Arc<dyn CarrierCredential>, zmux_quinn::Handshake)>,
@@ -315,7 +344,8 @@ impl Carrier {
     ///
     /// # Errors
     ///
-    /// `ConnectionReset` when the HTTP/3 settings exchange fails.
+    /// `ConnectionReset` when the HTTP/3 settings exchange fails, `TimedOut`
+    /// when it is not done within [`Options::timeout`].
     pub async fn new(conn: Connection, uri: http::Uri, options: &Options) -> io::Result<Self> {
         let carrier_credential = options
             .carrier_credential
@@ -323,11 +353,15 @@ impl Carrier {
             .map(|c| (c, zmux_quinn::Handshake::of(&conn)));
         let window = options.windows.receive_window();
         conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-        let (mut driver, send) = h3::client::builder()
-            .enable_datagram(true)
-            .build::<_, _, ChunkBuf>(h3_quinn::Connection::new(conn.clone()))
-            .await
-            .map_err(h3_error)?;
+        let (mut driver, send) = zmux::adapter::within(options.timeout, async {
+            h3::client::builder()
+                .enable_datagram(true)
+                .max_field_section_size(bounded::MAX_FIELD_SECTION)
+                .build::<_, _, ChunkBuf>(bounded::Connection::new(conn.clone()))
+                .await
+                .map_err(h3_error)
+        })
+        .await?;
         let driver = tokio::spawn(async move {
             let _ = poll_fn(|cx| driver.poll_close(cx)).await;
         })
@@ -339,6 +373,7 @@ impl Carrier {
             uri,
             id: OnceLock::new(),
             window,
+            timeout: options.timeout,
             carrier_credential,
             driver,
         });
@@ -380,11 +415,15 @@ impl Carrier {
             Box::new(move || settings.settings().enable_datagram()),
         );
         let opener = inner.clone();
+        let (left, response) = tokio::sync::oneshot::channel();
+        let mut reader = BodyReader::client(recv, inner.clone());
+        reader.left = Some(left);
         let (r, w) = paired(
-            BodyReader::client(recv, inner.clone()),
+            reader,
             BodyWriter::new(SendHalf::Client(send), Some(inner.clone())),
         );
         let io = PipeIo::from_chunk_halves(r, w)
+            .with_drain(drain(response, inner.clone()), zmux::adapter::DRAIN_LIMIT)
             .with_carrier(zmux::CarrierKind::Http3)
             .with_connection_memory(inner.window)
             .with_datagram_channel(channel)
@@ -456,12 +495,19 @@ pub async fn dial(
     options: &Options,
 ) -> io::Result<PipeIo> {
     let host = uri.host().unwrap_or("localhost").to_owned();
-    let conn = endpoint
+    let connecting = endpoint
         .connect(addr, &host)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-        .await
-        .map_err(io::Error::other)?;
-    Carrier::new(conn, uri, options).await?.open_pipe().await
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // Boxed: the handshake, settings exchange and request together are a
+    // large future, made once per dial.
+    zmux::adapter::within(
+        options.timeout,
+        Box::pin(async {
+            let conn = connecting.await.map_err(io::Error::other)?;
+            Carrier::new(conn, uri, options).await?.open_pipe().await
+        }),
+    )
+    .await
 }
 
 /// Establishes a session over a new HTTP/3 connection ([`dial`], then
@@ -558,7 +604,7 @@ pub async fn serve_connection(
 ) -> io::Result<()> {
     let window = options.windows.receive_window();
     conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-    let _charge = listener.adapter().charge_memory(window);
+    let charge = listener.adapter().charge_memory(window);
     let identity = Arc::new(conn.stable_id());
     let shared = Arc::new(Served {
         datagrams: ConnectionDatagrams::new(conn.clone()),
@@ -567,24 +613,48 @@ pub async fn serve_connection(
         handshake: zmux_quinn::Handshake::of(&conn),
         conn: conn.clone(),
         fallback: options.fallback.clone(),
+        _charge: charge,
+        connection: std::sync::Mutex::new(None),
     });
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
-        .build::<_, ChunkBuf>(h3_quinn::Connection::new(conn.clone()))
+        .max_field_section_size(bounded::MAX_FIELD_SECTION)
+        .build::<_, ChunkBuf>(bounded::Connection::new(conn.clone()))
         .await
         .map_err(h3_error)?;
+    // A request's head arrives within the handshake timeout, and so does
+    // the connection's first one: a peer that opens streams and sends no
+    // HEADERS holds neither tasks nor the connection beyond it.
+    let head_limit = listener.limits().handshake_timeout;
+    let first_by = tokio::time::Instant::now() + head_limit;
+    let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (conn, resolved) = (conn.clone(), resolved.clone());
+        tokio::spawn(async move {
+            // Gone with the connection: no wait for a closed one.
+            if tokio::time::timeout_at(first_by, conn.closed())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            if !resolved.load(std::sync::atomic::Ordering::Relaxed) {
+                conn.close(VarInt::from_u32(0x0100), b"no request in time");
+            }
+        });
+    }
     while let Some(resolver) = h3.accept().await.map_err(h3_error)? {
         let shared = shared.clone();
+        let resolved = resolved.clone();
         tokio::spawn(async move {
-            let Ok((head, stream)) = resolver.resolve_request().await else {
+            let Ok(Ok((head, stream))) =
+                tokio::time::timeout(head_limit, resolver.resolve_request()).await
+            else {
                 return;
             };
+            resolved.store(true, std::sync::atomic::Ordering::Relaxed);
             let (mut send, mut recv) = stream.split();
-            if zmux::adapter::forwarded_early_data(
-                head.headers()
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_bytes())),
-            ) {
+            if zmux::adapter::forwarded_early_data(head.headers()) {
                 // Forwarded from TLS early data: no carrier is taken from
                 // it.
                 shared.listener.adapter().count_setup_failure();
@@ -612,6 +682,12 @@ pub async fn serve_connection(
             }
         });
     }
+    // The HTTP/3 connection (its control stream) lives on with the requests
+    // still served: it goes with the last of them.
+    *shared
+        .connection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(h3));
     Ok(())
 }
 
@@ -624,6 +700,11 @@ struct Served {
     fallback: Option<Fallback>,
     /// The connection's HTTP Datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
+    /// The connection's receive window in the listener's budget, until the
+    /// last of its requests ends (not only its accept loop).
+    _charge: zmux::adapter::MemoryCharge,
+    /// The HTTP/3 connection once it accepts no more requests.
+    connection: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl Served {
@@ -643,10 +724,10 @@ impl Served {
     /// intermediary reports in its forwarding header field
     /// ([`zmux::TrustedProxies::source`]), else the connection's peer.
     fn source(&self, headers: &http::HeaderMap) -> SocketAddr {
-        self.listener.adapter().trusted_proxies().source(
-            self.conn.remote_address(),
-            headers.iter().map(|(n, v)| (n.as_str(), v.as_bytes())),
-        )
+        self.listener
+            .adapter()
+            .trusted_proxies()
+            .source(self.conn.remote_address(), headers)
     }
 
     async fn handle(self: &Arc<Self>, io: PipeIo, entry: Entry) {
@@ -698,16 +779,12 @@ impl Served {
         let prefix = entry.read_prefix(&mut reader).await;
         let (parts, ()) = head.into_parts();
         let admit = {
-            let info = self
-                .handshake
-                .carrier_info(&self.conn)
-                .with_request(&parts)
-                .with_headers(|| {
-                    parts
-                        .headers
-                        .iter()
-                        .map(|(n, v)| (n.as_str(), v.as_bytes()))
-                });
+            let info = self.handshake.carrier_info(&self.conn).with_request_head(
+                Arc::new(parts.clone()),
+                |p, each| {
+                    zmux::adapter::visit_fields(&p.headers, each);
+                },
+            );
             entry.decide_reading(info, prefix, &mut reader).await
         };
         match admit {
@@ -1189,7 +1266,10 @@ struct BodyReader {
     /// gracefully: the carrier closes cleanly, and the peer's body is not
     /// stopped, or its sender could fail before it reads what was sent.
     peer_may_finish: Arc<AtomicBool>,
-    keep: Option<Arc<ClientInner>>,
+    /// The client a pipe's response keeps alive.
+    _keep: Option<Arc<ClientInner>>,
+    /// A client's response not read to its end, for the pipe's drain.
+    left: Option<tokio::sync::oneshot::Sender<Left>>,
     /// A server's request served without admission: the half returns to
     /// it on drop while nothing committed to the carrier.
     answer: Option<Arc<Answer>>,
@@ -1197,14 +1277,19 @@ struct BodyReader {
 
 impl BodyReader {
     fn client(mut recv: ClientRecv, keep: Arc<ClientInner>) -> Self {
+        let limit = keep.timeout;
         let response: Response = Box::pin(async move {
-            let r = match recv.recv_response().await {
-                Ok(resp) if resp.status().is_success() => Ok(()),
-                Ok(resp) => Err(io::Error::new(
+            let r = match tokio::time::timeout(limit, recv.recv_response()).await {
+                Ok(Ok(resp)) if resp.status().is_success() => Ok(()),
+                Ok(Ok(resp)) => Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("HTTP/3 status {}", resp.status()),
                 )),
-                Err(e) => Err(h3_error(e)),
+                Ok(Err(e)) => Err(h3_error(e)),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no HTTP/3 response head in time",
+                )),
             };
             (recv, r)
         });
@@ -1214,7 +1299,8 @@ impl BodyReader {
             held: Bytes::new(),
             ended: false,
             peer_may_finish: Arc::default(),
-            keep: Some(keep),
+            _keep: Some(keep),
+            left: None,
             answer: None,
         }
     }
@@ -1226,7 +1312,8 @@ impl BodyReader {
             held: Bytes::new(),
             ended: false,
             peer_may_finish: Arc::default(),
-            keep: None,
+            _keep: None,
+            left: None,
             answer: None,
         }
     }
@@ -1255,9 +1342,9 @@ impl Drop for BodyReader {
             return;
         }
         if self.peer_may_finish.load(Ordering::Acquire)
-            && let Some(keep) = self.keep.take()
+            && let Some(left) = self.left.take()
         {
-            linger(self.response.take(), self.half.take(), keep);
+            let _ = left.send((self.response.take(), self.half.take()));
         }
         // The HTTP decoder may return buffered data while its transport
         // read is still pending. Its outer Poll cannot tell us whether an
@@ -1266,29 +1353,29 @@ impl Drop for BodyReader {
     }
 }
 
-/// Keeps a client's connection after its pipe's request body ended
-/// gracefully, until the response body ends (or fails): QUIC closes a
+/// What a client's reader leaves of its response once its pipe's request
+/// body ended gracefully: the wait for its head, or its body.
+type Left = (Option<Response>, Option<RecvHalf>);
+
+/// The drain of a client's pipe ([`PipeIo::with_drain`]): keeps the
+/// connection after the pipe's request body ended gracefully, until the
+/// response body ends (or fails), within the drain's limit: QUIC closes a
 /// connection whose last handle is dropped, and discards the data still in
-/// flight, so the request body's last records (a `CONNECTION_CLOSE`) would be
-/// lost with it. The server ends the response once it read the request
+/// flight, so the request body's last records (a `CONNECTION_CLOSE`) would
+/// be lost with it. The server ends the response once it read the request
 /// body to its end, or its session ended on its own; what it still sends
 /// is discarded.
-fn linger(response: Option<Response>, half: Option<RecvHalf>, keep: Arc<ClientInner>) {
-    let Ok(rt) = tokio::runtime::Handle::try_current() else {
-        return;
+async fn drain(left: tokio::sync::oneshot::Receiver<Left>, keep: Arc<ClientInner>) {
+    let mut recv = match left.await {
+        Ok((Some(response), _)) => match response.await {
+            (recv, Ok(())) => recv,
+            (_, Err(_)) => return,
+        },
+        Ok((None, Some(RecvHalf::Client(recv)))) => recv,
+        _ => return,
     };
-    rt.spawn(async move {
-        let mut recv = match (response, half) {
-            (Some(response), _) => match response.await {
-                (recv, Ok(())) => recv,
-                (_, Err(_)) => return,
-            },
-            (None, Some(RecvHalf::Client(recv))) => recv,
-            _ => return,
-        };
-        while let Ok(Some(_)) = poll_fn(|cx| recv.poll_recv_data(cx)).await {}
-        drop(keep);
-    });
+    while let Ok(Some(_)) = poll_fn(|cx| recv.poll_recv_data(cx)).await {}
+    drop(keep);
 }
 
 impl AsyncRead for BodyReader {
@@ -1393,7 +1480,7 @@ mod tests {
             .await
             .unwrap();
             let mut server =
-                h3::server::Connection::<_, ChunkBuf>::new(h3_quinn::Connection::new(s.clone()))
+                h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(s.clone()))
                     .await
                     .unwrap();
             // Put an entire request header and DATA frame in one QUIC write.
@@ -1430,5 +1517,79 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The carrier contract (`zmux::test_hooks::carrier_conformance`) on a
+    /// client's pipes and the server's halves of their requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_pipes_keep_the_carrier_contract() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key.into())
+            .unwrap();
+        let server = Endpoint::server(
+            server_config(tls, &Options::default()).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config(tls, &Options::default()).unwrap());
+        let (c, s) = tokio::join!(
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+            async { server.accept().await.unwrap().await },
+        );
+        let (c, s) = (c.unwrap(), s.unwrap());
+        let client = Carrier::new(
+            c,
+            "https://localhost/".parse().unwrap(),
+            &Options::default(),
+        )
+        .await
+        .unwrap();
+        let (requests, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let incoming = Arc::new(tokio::sync::Mutex::new(incoming));
+        let serving = tokio::spawn(async move {
+            let mut server =
+                h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(s))
+                    .await
+                    .unwrap();
+            while let Ok(Some(resolver)) = server.accept().await {
+                if requests.send(resolver).is_err() {
+                    break;
+                }
+            }
+        });
+        zmux::test_hooks::carrier_conformance("h3", || {
+            let (client, incoming) = (client.clone(), incoming.clone());
+            async move {
+                let opened = client.open_pipe().await.unwrap();
+                let resolver = incoming.lock().await.recv().await.unwrap();
+                let (_, request) = resolver.resolve_request().await.unwrap();
+                let (mut send, recv) = request.split();
+                send.send_response(http::Response::new(())).await.unwrap();
+                let (reader, writer) = paired(
+                    BodyReader::server(recv),
+                    BodyWriter::new(SendHalf::Server(send), None),
+                );
+                (opened, PipeIo::from_chunk_halves(reader, writer), 0)
+            }
+        })
+        .await;
+        serving.abort();
     }
 }

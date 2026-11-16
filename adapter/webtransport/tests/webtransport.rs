@@ -325,6 +325,7 @@ async fn an_admission_decides_on_the_session_request() {
         assert_eq!(prefix, []);
         let req = info
             .request
+            .as_deref()
             .and_then(|r| r.downcast_ref::<web_transport_quinn::proto::ConnectRequest>())
             .expect("the request");
         assert!(info.has_exporter());
@@ -374,7 +375,7 @@ async fn an_admission_decides_on_the_session_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bound_token_in_the_session_request() {
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let opts = Options::default();
     let mut wt = Wt::new(&opts);
     let listener = Listener::new(

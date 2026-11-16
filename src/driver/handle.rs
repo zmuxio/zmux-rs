@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 use bytes::{Buf, Bytes};
 
 use super::events::EventQueue;
-use super::hooks::{HookStart, Trace, TraceQueue, WindowHook, ask, trace};
+use super::hooks::{HookStart, TraceQueue, WindowHook, ask, trace};
 use super::resources::{Kind, Live};
 use super::sync::Mutex;
-use super::wait::{Attempt, List, Open, Wait, Waiters, Waiting, open_now};
+use super::wait::{Attempt, List, Open, Ticket, Wait, Waiters, Waiting, open_now};
 use super::wake::{Defer, Locked, WakeList};
 use super::{Event as AppEvent, GoAway, StreamId};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
@@ -38,6 +38,7 @@ use crate::proto::frame::{Dir, Priority};
 use crate::proto::limit::{self, DatagramLimiter};
 use crate::proto::meter::Meter;
 use crate::proto::record::Framing;
+use crate::proto::session::TraceRecord;
 use crate::proto::session::{
     self as core, CapacityFloor, Config, CoreEvent, DatagramError, LaneId, Multipath, OpenError,
     PipeError, PipeHalf, PipeId, PipeOptions, PipeStats, Preamble, QualityBand, ReceivedDatagram,
@@ -206,8 +207,9 @@ pub struct CarrierInfo {
     pub(crate) first_mode: Option<crate::proto::seal::RecordMode>,
 }
 
-/// The largest plaintext of a Sealed record: its ciphertext, tag included, fits in 16 bits.
-pub(crate) const SEALED_MAX_RECORD: usize = u16::MAX as usize - 16;
+#[cfg(test)]
+pub(crate) use crate::proto::seal::SEALED_MAX_RECORD;
+pub(crate) use crate::proto::seal::{sealed_max_record, sealed_overhead};
 
 /// A pipe input's record limit after `with_max_record(max)` on one that had `current`
 /// (the specification's `MaxRecord` setting): 0 keeps the carrier's default, a value
@@ -233,29 +235,6 @@ pub(crate) fn check_pipe_record_limit(
     limit.map_or(Ok(()), crate::proto::session::check_record_limit)
 }
 
-/// The authentication tag of a Sealed record, and its length prefix on a byte stream.
-pub(crate) const SEALED_TAG: u16 = 16;
-pub(crate) const SEALED_LEN: u16 = 2;
-
-/// What a Sealed record adds over a carrier with `lower` framing: the tag, and a length
-/// prefix on a byte stream.
-pub(crate) fn sealed_overhead(lower: Framing) -> u16 {
-    SEALED_TAG
-        + if lower == Framing::ByteStream {
-            SEALED_LEN
-        } else {
-            0
-        }
-}
-
-/// The record limit of a Sealed transform over a carrier limited to `lower`: the Sealed
-/// maximum, or the carrier's limit less the `overhead` each Sealed record adds.
-pub(crate) fn sealed_max_record(lower: Option<usize>, overhead: u16) -> usize {
-    lower.map_or(SEALED_MAX_RECORD, |m| {
-        SEALED_MAX_RECORD.min(m.saturating_sub(overhead.into()))
-    })
-}
-
 /// The record limit a pipe ends with, from its carrier's `lower` limit and framing: a
 /// Sealed transform takes its overhead off. Checked with [`check_pipe_record_limit`].
 pub(crate) fn pipe_record_limit(
@@ -264,7 +243,7 @@ pub(crate) fn pipe_record_limit(
     framing: Framing,
 ) -> Option<usize> {
     if mode == crate::proto::seal::RecordMode::Sealed {
-        lower.map(|_| sealed_max_record(lower, sealed_overhead(framing)))
+        Some(sealed_max_record(lower, sealed_overhead(framing)))
     } else {
         lower
     }
@@ -291,6 +270,40 @@ pub struct AfterUnlock<X> {
     _deferred: X,
     _wakes: WakeList,
     _logs: LogBatch,
+}
+
+/// A datagram's grant of the send limiter: refunded when dropped unless
+/// [`DatagramAllowance::queued`] says the datagram was queued.
+pub(crate) struct DatagramAllowance<'a> {
+    limiter: Option<&'a dyn crate::Limiter>,
+    /// The grant, `None` when the limiter refused.
+    granted: Option<u64>,
+}
+
+impl DatagramAllowance<'_> {
+    /// Whether the limiter allowed the datagram.
+    pub(crate) const fn allowed(&self) -> bool {
+        self.granted.is_some()
+    }
+
+    /// The datagram's outcome: its allowance stays taken if it was queued.
+    pub(crate) fn queued(
+        mut self,
+        queued: Result<bool, DatagramError>,
+    ) -> Result<(), DatagramError> {
+        if matches!(queued, Ok(true)) {
+            self.granted = Some(0);
+        }
+        queued.map(|_| ())
+    }
+}
+
+impl Drop for DatagramAllowance<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.granted {
+            limit::refund(self.limiter, n);
+        }
+    }
 }
 
 /// Messages for the logger, logged after the unlock.
@@ -335,10 +348,8 @@ impl<T> Default for LocatorTable<T> {
 }
 
 impl<T> LocatorTable<T> {
-    fn lock(&self) -> std::sync::MutexGuard<'_, LocatorMap<T>> {
-        self.map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> super::sync::MutexGuard<'_, LocatorMap<T>> {
+        super::sync::lock(&self.map)
     }
 
     /// The session of a Locator, if it is still alive.
@@ -392,9 +403,6 @@ pub struct State<D: Driver> {
     pub(super) deferred: D::Deferred,
     /// Application handles (sessions and streams) alive.
     handles: usize,
-    established: bool,
-    /// The core was seen CLOSED ([`Driver::session_closed`] ran).
-    closed_seen: bool,
     /// This endpoint established the bootstrap carrier, when known.
     dialer: Option<bool>,
     goaway: Option<GoAway>,
@@ -406,9 +414,6 @@ pub struct State<D: Driver> {
     events: EventQueue,
     /// Pipe state changes and suspensions seen so far ([`Session::pipes_changed_op`]).
     pipe_changes: u64,
-    /// The last state of each unretired pipe's outbound direction, which tells
-    /// `PipeAdded` (first seen) and `PipeRecovered` (active after suspect).
-    out_seen: std::collections::HashMap<u64, OutboundState>,
     /// The outcome slots of the unretired pipes that have handles
     /// ([`Pipe::end`]).
     pipe_ends: std::collections::HashMap<u64, Weak<OnceLock<PipeError>>>,
@@ -417,6 +422,8 @@ pub struct State<D: Driver> {
     tls: Option<crate::TlsState>,
     /// `allow_connection_window_increase`'s mailbox.
     window_hook: WindowHook,
+    /// The session's identity in this process.
+    id: crate::SessionId,
     /// The tracer's queue, with a tracer.
     traces: Option<Box<TraceQueue>>,
     /// The hook context is to be started (by the driver, after the lock;
@@ -487,11 +494,29 @@ const fn di(dir: Dir) -> usize {
 }
 
 impl<D: Driver> State<D> {
+    /// Registers (or refreshes) the stream wait holding `slot` in `list`.
+    fn wait_stream(&mut self, list: List<StreamKey>, slot: &mut Option<Ticket>, waker: &Waker) {
+        self.waiters.register(list, slot, waker);
+    }
+
+    /// The stream wait holding `slot` ends: it leaves `list` if it is still
+    /// there (it was not woken).
+    fn leave_stream(&mut self, list: List<StreamKey>, slot: &mut Option<Ticket>) {
+        if let Some(t) = slot.take() {
+            self.waiters.remove(list, t);
+        }
+    }
+
     /// The application event of a pipe direction's new state: `PipeAdded` when an outbound direction is first seen,
     /// then `PipeJoined`, `PipeSuspect`, `PipeRecovered`, `PipeFailed` or
     /// `PipeClosed`; a joining or draining direction, and an inbound one
     /// before it ended, have none.
-    fn pipe_state_event(&mut self, pipe: PipeId, state: DirectionState) -> Option<AppEvent> {
+    fn pipe_state_event(
+        &mut self,
+        pipe: PipeId,
+        state: DirectionState,
+        prev: Option<OutboundState>,
+    ) -> Option<AppEvent> {
         let carrier = self.core.pipe_carrier(pipe);
         let out = match state {
             DirectionState::Inbound(InboundState::Ended) => {
@@ -504,7 +529,6 @@ impl<D: Driver> State<D> {
             DirectionState::Inbound(_) => return None,
             DirectionState::Outbound(out) => out,
         };
-        let prev = self.out_seen.insert(pipe.0, out);
         if prev.is_none() {
             self.app_event(AppEvent::PipeAdded { pipe, carrier });
         }
@@ -551,10 +575,11 @@ impl<D: Driver> State<D> {
         let events = EventQueue::new(&config);
         let mut window_hook = WindowHook::new(&config);
         // A tracer starts the hook context with the session.
+        let id = crate::SessionId::next();
         let traces = config
             .tracer
             .clone()
-            .map(|tracer| Box::new(TraceQueue::new(tracer)));
+            .map(|tracer| Box::new(TraceQueue::new(tracer, id)));
         let start_hook = traces.is_some();
         if start_hook {
             window_hook.mark_started();
@@ -589,8 +614,6 @@ impl<D: Driver> State<D> {
             wakes: WakeList::default(),
             deferred: D::Deferred::default(),
             handles: 0,
-            established: false,
-            closed_seen: false,
             dialer: transport.map(|r| r == Role::Client),
             goaway: None,
             carrier: None,
@@ -598,11 +621,11 @@ impl<D: Driver> State<D> {
             events,
             pipe_changes: 0,
             locator_hook: None,
-            out_seen: std::collections::HashMap::new(),
             pipe_ends: std::collections::HashMap::new(),
             protocol: carrier.protocol,
             tls: carrier.tls,
             window_hook,
+            id,
             traces,
             start_hook,
             datagram_limiter,
@@ -643,7 +666,6 @@ impl<D: Driver> State<D> {
             let wakes = &mut self.wakes;
             match e {
                 CoreEvent::Established { protocol, .. } => {
-                    self.established = true;
                     // The carrier's own protocol (ALPN) wins.
                     if self.protocol.is_none() {
                         self.protocol = protocol.map(String::from);
@@ -652,7 +674,7 @@ impl<D: Driver> State<D> {
                     // The channels' tasks end when the peer did not
                     // negotiate them.
                     w.wake_list(List::Channel, wakes);
-                    self.trace(Trace::Established);
+                    self.trace(TraceRecord::Established);
                 }
                 CoreEvent::StreamOpened(d) => w.wake_list(List::Accept(di(d)), wakes),
                 CoreEvent::StreamReadable(k) => w.readable(k, wakes),
@@ -681,13 +703,20 @@ impl<D: Driver> State<D> {
                 }
                 CoreEvent::OpenLane(lane) => D::open_lane(self, lane),
                 CoreEvent::ResetLane(lane) => D::reset_lane(self, lane),
-                CoreEvent::PipeState { pipe, state } => {
+                CoreEvent::PipeState {
+                    pipe,
+                    state,
+                    previous,
+                } => {
                     self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
-                    if let Some(event) = self.pipe_state_event(pipe, state) {
+                    if let Some(event) = self.pipe_state_event(pipe, state, previous) {
                         self.app_event(event);
                     }
+                }
+                CoreEvent::PipeReceiving { .. } => {
+                    self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
                 CoreEvent::PipeAttached { .. } => {
                     self.pipe_changes += 1;
@@ -705,7 +734,7 @@ impl<D: Driver> State<D> {
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
                     if self.traces.is_some() {
-                        self.trace(Trace::Event(AppEvent::PipesRetired {
+                        self.trace(TraceRecord::Event(AppEvent::PipesRetired {
                             retired: 1,
                             failed: 0,
                             closed: 0,
@@ -714,7 +743,6 @@ impl<D: Driver> State<D> {
                         }));
                     }
                     self.events.retire(pipe.0);
-                    self.out_seen.remove(&pipe.0);
                     self.waiters.wake_list(List::Events, &mut self.wakes);
                 }
                 CoreEvent::JoinAuthFailed { reason } => {
@@ -804,16 +832,15 @@ impl<D: Driver> State<D> {
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
                     w.close(wakes);
-                    self.trace(Trace::Closed(e));
+                    self.trace(TraceRecord::Closed(e));
+                }
+                CoreEvent::Released => {
+                    D::session_closed(self);
+                    // `closed` resolves at the whole end.
+                    self.waiters.wake_list(List::Close, &mut self.wakes);
                 }
                 _ => {}
             }
-        }
-        if !self.closed_seen && self.core.state() == core::State::Closed {
-            self.closed_seen = true;
-            D::session_closed(self);
-            // `closed` resolves at the whole end.
-            self.waiters.wake_list(List::Close, &mut self.wakes);
         }
     }
 
@@ -846,7 +873,7 @@ impl<D: Driver> State<D> {
 
     fn app_event(&mut self, e: AppEvent) {
         if self.traces.is_some() {
-            self.trace(Trace::Event(e.clone()));
+            self.trace(TraceRecord::Event(e.clone()));
         }
         self.events.push(e);
         self.waiters.wake_list(List::Events, &mut self.wakes);
@@ -874,7 +901,7 @@ impl<D: Driver> State<D> {
         }
     }
 
-    fn trace(&mut self, item: Trace) {
+    fn trace(&mut self, item: TraceRecord) {
         if let Some(t) = self.traces.as_deref_mut() {
             t.push(item);
             self.waiters.wake_list(List::Hook, &mut self.wakes);
@@ -909,7 +936,7 @@ fn with_meter<D: Driver>(core: &mut core::SessionCore, key: StreamKey) -> Opened
 
 /// A stream's statistics: the core's while it holds the stream, else the
 /// final ones it kept (read under the lock it sets them under).
-fn stream_stats<D: Driver>(conn: &ConnRef<D>, key: StreamKey, last: &FinalStats) -> StreamStats {
+fn stream_stats<D: Driver>(conn: &Shared<D>, key: StreamKey, last: &FinalStats) -> StreamStats {
     let st = conn.lock();
     st.core
         .stream_stats(key)
@@ -945,6 +972,8 @@ pub struct Shared<D: Driver> {
     meter: Arc<Meter>,
     /// The datagram limiters, called without the lock.
     datagram_limiter: DatagramLimiter,
+    /// The session's identity in this process.
+    pub(crate) id: crate::SessionId,
     _live: Live,
 }
 
@@ -955,7 +984,9 @@ impl<D: Driver> Shared<D> {
         let () = drop(paths);
         let meter = state.core.meter().clone();
         let datagram_limiter = std::mem::take(&mut state.datagram_limiter);
+        let id = state.id;
         Self {
+            id,
             inner: Mutex::new(state),
             #[cfg(feature = "tokio")]
             paths,
@@ -987,33 +1018,31 @@ impl<D: Driver> Shared<D> {
             batch,
         };
         for d in &mut guard.batch {
-            d.set_allowed(limit::police(limiter, d.payload_len()));
+            d.set_granted(limit::police(limiter, d.payload_len() as u64));
         }
         let mut batch = std::mem::take(&mut guard.batch);
         drop(guard);
         let mut locked = self.lock();
-        locked.core.admit_datagrams(&mut batch);
+        let refused = locked.core.admit_datagrams(&mut batch);
         locked.datagram_batch = batch;
         locked.dispatch();
+        if refused > 0 {
+            // Granted, then refused by the queue: refunded outside the lock.
+            drop(locked);
+            limit::refund(Some(limiter), refused);
+            locked = self.lock();
+        }
         (locked, true)
     }
 
-    /// Whether the send limiter allows a datagram of `len` payload bytes,
-    /// asked before the lock.
-    fn datagram_allowed(&self, len: usize) -> bool {
-        limit::allows(self.datagram_limiter.send.as_deref(), len)
-    }
-
-    /// Charges the send limiter for a datagram queued, after the lock.
-    fn datagram_queued(
-        &self,
-        queued: Result<bool, DatagramError>,
-        len: usize,
-    ) -> Result<(), DatagramError> {
-        if queued? {
-            limit::charge(self.datagram_limiter.send.as_deref(), len);
+    /// The send limiter's allowance of a datagram of `len` payload bytes,
+    /// taken before the lock: given back unless the datagram is queued.
+    fn datagram_allowed(&self, len: usize) -> DatagramAllowance<'_> {
+        let limiter = self.datagram_limiter.send.as_deref();
+        DatagramAllowance {
+            granted: limiter.map_or(Some(0), |l| limit::police(l, len as u64)),
+            limiter,
         }
-        Ok(())
     }
 
     /// Locks the core.
@@ -1046,7 +1075,7 @@ impl<D: Driver> Shared<D> {
             Wait::new(&conn.inner, List::State, |st: &mut State<D>| {
                 // With early data the session is usable as soon as its
                 // parameters are written.
-                if st.established || st.core.early_data_open() {
+                if st.core.was_established() || st.core.early_data_open() {
                     return Some(Ok(()));
                 }
                 st.core
@@ -1062,45 +1091,79 @@ impl<D: Driver> Shared<D> {
 /// Work for the hook context.
 enum HookWork {
     Window(u64, u64),
-    Trace(VecDeque<Trace>),
+    Trace(crate::SessionId, VecDeque<TraceRecord>),
+    /// The answer to the proposal of this generation.
+    Answered(u64, bool),
 }
+
+/// A proposal's answer in progress: its generation and the predicate's
+/// future (one per proposal, which the core keeps at most one of).
+type Answering = (u64, std::pin::Pin<Box<dyn Future<Output = bool> + Send>>);
 
 /// The session's hook context (a task or a thread): runs
 /// `allow_connection_window_increase` for each proposal and tells the
 /// tracer the session's events, outside every lock and off the session's
-/// I/O, until the session ended and the tracer was told.
+/// I/O, until the session ended and the tracer was told. A later answer
+/// and the tracer advance together: one waiting for the other would fill
+/// the trace backlog. A later answer still pending when the session ended
+/// is dropped.
 pub(crate) async fn run_hook<D: Driver>(shared: Arc<Shared<D>>, hooks: HookStart) {
     let _live = Live::new(Kind::Hook);
+    let mut answering: Option<Answering> = None;
     loop {
-        let next = Wait::new(&shared.inner, List::Hook, |st: &mut State<D>| {
-            if let Some((generation, delta)) = st.window_hook.take() {
-                return Some(Some(HookWork::Window(generation, delta)));
-            }
-            if let Some(items) = st.traces.as_deref_mut().and_then(TraceQueue::take) {
-                return Some(Some(HookWork::Trace(items)));
-            }
-            let traced = st.traces.as_deref().is_none_or(TraceQueue::finished);
-            (st.core.error().is_some() && traced).then_some(None)
-        })
-        .await;
+        let next = {
+            let mut wait =
+                std::pin::pin!(Wait::new(&shared.inner, List::Hook, |st: &mut State<D>| {
+                    if let Some((generation, delta)) = st.window_hook.take() {
+                        return Some(Some(HookWork::Window(generation, delta)));
+                    }
+                    if let Some(q) = st.traces.as_deref_mut()
+                        && let Some(items) = q.take()
+                    {
+                        return Some(Some(HookWork::Trace(q.session, items)));
+                    }
+                    let traced = st.traces.as_deref().is_none_or(TraceQueue::finished);
+                    (st.core.error().is_some() && traced).then_some(None)
+                }));
+            std::future::poll_fn(|cx| {
+                if let Some((generation, answer)) = &mut answering
+                    && let Poll::Ready(v) = answer.as_mut().poll(cx)
+                {
+                    return Poll::Ready(Some(HookWork::Answered(*generation, v)));
+                }
+                wait.as_mut().poll(cx)
+            })
+            .await
+        };
         match next {
             None => return,
-            Some(HookWork::Trace(items)) => {
+            Some(HookWork::Trace(session, items)) => {
                 if let Some(t) = &hooks.tracer {
-                    trace(t, items, hooks.logger.as_ref());
+                    trace(t, session, items, hooks.logger.as_ref());
                 }
             }
-            Some(HookWork::Window(generation, delta)) => {
-                let approved = hooks
-                    .predicate
-                    .as_ref()
-                    .is_some_and(|p| ask(p, delta, hooks.logger.as_ref()));
-                let mut st = shared.lock();
-                st.core.answer_window_increase(generation, approved);
-                st.after_command();
+            Some(HookWork::Window(generation, delta)) => match &hooks.predicate {
+                Some(p) => {
+                    let (p, logger) = (p.clone(), hooks.logger.clone());
+                    answering = Some((
+                        generation,
+                        Box::pin(async move { ask(&p, delta, logger.as_ref()).await }),
+                    ));
+                }
+                None => answer_window(&shared, generation, false),
+            },
+            Some(HookWork::Answered(generation, approved)) => {
+                answering = None;
+                answer_window(&shared, generation, approved);
             }
         }
     }
+}
+
+fn answer_window<D: Driver>(shared: &Shared<D>, generation: u64, approved: bool) {
+    let mut st = shared.lock();
+    st.core.answer_window_increase(generation, approved);
+    st.after_command();
 }
 
 #[cfg(feature = "blocking")]
@@ -1252,7 +1315,6 @@ pub(crate) fn session_ended_wait<D: Driver>(shared: &Shared<D>) -> impl Future<O
 }
 
 /// Ready once a deferred local join may go, or will never go.
-#[cfg(feature = "tokio")]
 pub(crate) fn join_released_wait<D: Driver>(
     shared: &Shared<D>,
     id: PipeId,
@@ -1300,6 +1362,14 @@ impl<D: Driver> Shared<D> {
         Wait::new(&self.inner, List::Close, |st: &mut State<D>| {
             st.core.close_handed_off().then_some(())
         })
+    }
+
+    /// Ends the session while it is suspended (the suspended-session
+    /// limit of the listener's account).
+    pub(crate) fn close_suspended(&self) {
+        let mut st = self.lock();
+        st.core.close_suspended(D::now());
+        st.after_command();
     }
 
     /// A Hello in Bound on a carrier without a Binding was refused.
@@ -1371,27 +1441,35 @@ impl<D: Driver> Shared<D> {
         v
     }
 
-    /// The session's checks of a Hello's mode and of the join at the acceptor.
+    /// The session's checks of a Hello's mode and of the join at the acceptor,
+    /// asked now: a later answer is the caller's to await, bounded by the
+    /// join's deadline. A check that panics refuses.
     pub(crate) fn join_allowed(
         &self,
         info: &crate::proto::session::RecordPolicyInput,
         join: &crate::proto::session::PeerJoin,
         admitted: Option<&crate::AdmittedValue>,
-    ) -> bool {
+    ) -> crate::Decision<bool> {
         let (allow, authorize) = {
             let st = self.lock();
             let c = st.core.config();
             (c.allow_record_mode.clone(), c.authorize_join.clone())
         };
-        // A policy that panics refuses.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mode_ok = match allow {
-                Some(f) => f.allows(info, join.mode(), admitted),
-                None => join.mode() == crate::proto::seal::RecordMode::Sealed,
-            };
-            mode_ok && authorize.is_none_or(|f| f.allows(PipeId(join.pipe().id)))
-        }))
-        .unwrap_or(false)
+        let mode = join.mode();
+        let pipe = PipeId(join.pipe().id);
+        let authorized = move |authorize: Option<crate::AuthorizeJoin>| match authorize {
+            None => crate::Decision::Now(true),
+            Some(f) => f.allows(pipe).map(|v| v == Some(true)),
+        };
+        match allow.map(|f| f.allows(info, mode, admitted)) {
+            None if mode == crate::proto::seal::RecordMode::Sealed => authorized(authorize),
+            Some(crate::Decision::Now(Some(true))) => authorized(authorize),
+            None | Some(crate::Decision::Now(_)) => crate::Decision::Now(false),
+            Some(later) => crate::Decision::later(async move {
+                later.settle().await.flatten() == Some(true)
+                    && authorized(authorize).settle().await == Some(true)
+            }),
+        }
     }
 }
 
@@ -1481,7 +1559,7 @@ pub struct Session<D: Driver> {
 impl<D: Driver> Session<D> {
     /// How often an outbound pipe became suspect, a DRAINING one included
     /// (`test_hooks::suspects`).
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
     pub(crate) fn suspects(&self) -> u64 {
         self.conn.lock().core.suspects()
     }
@@ -1519,6 +1597,7 @@ impl<D: Driver> Session<D> {
             key,
             meter,
             last,
+            slot: None,
             #[cfg(feature = "blocking")]
             timeout: D::Timeout::default(),
         }
@@ -1530,6 +1609,8 @@ impl<D: Driver> Session<D> {
             key,
             meter,
             last,
+            #[cfg(feature = "tokio")]
+            slot: None,
             #[cfg(feature = "blocking")]
             timeout: D::Timeout::default(),
         }
@@ -1614,8 +1695,8 @@ impl<D: Driver> Session<D> {
     }
 
     pub(crate) async fn send_datagram_wait_op(&self, data: Bytes) -> Result<(), DatagramError> {
-        let len = data.len();
-        let allowed = self.conn.datagram_allowed(len);
+        let allowance = self.conn.datagram_allowed(data.len());
+        let allowed = allowance.allowed();
         let mut data = Some(data);
         // A datagram the limiter refused does not wait for room.
         let queued = Wait::new(
@@ -1633,7 +1714,7 @@ impl<D: Driver> Session<D> {
             },
         )
         .await;
-        self.conn.datagram_queued(queued, len)
+        allowance.queued(queued)
     }
 
     pub(crate) fn read_datagram_op(
@@ -1668,7 +1749,7 @@ impl<D: Driver> Session<D> {
 
     pub(crate) fn established_op(&self) -> impl Future<Output = Result<(), SessionError>> + '_ {
         Wait::new(&self.conn.inner, List::State, |st: &mut State<D>| {
-            if st.established {
+            if st.core.was_established() {
                 return Some(Ok(()));
             }
             st.core.error().cloned().map(Err)
@@ -1895,6 +1976,24 @@ pub struct Pipe<D: Driver> {
     end: Arc<OnceLock<PipeError>>,
 }
 
+impl<D: Driver> Pipe<D> {
+    /// Resolves once the pipe's inbound direction received a record, or
+    /// it has none, or the pipe or session is gone: woken by the core's
+    /// `PipeReceiving` and the pipe changes.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn inbound_received(&self) {
+        let id = self.id;
+        Wait::new(&self.conn.0.inner, List::Pipes, |st: &mut State<D>| {
+            let waiting = st
+                .core
+                .pipe_info(id)
+                .is_some_and(|s| s.inbound.is_some() && s.records_received == 0);
+            (!waiting || st.core.error().is_some()).then_some(())
+        })
+        .await;
+    }
+}
+
 impl<D: Driver> Clone for Pipe<D> {
     fn clone(&self) -> Self {
         Self {
@@ -2042,50 +2141,187 @@ pub struct Written {
     pub bytes: usize,
 }
 
-/// A stream call that registers the stream's read or write waker while it
-/// waits. Dropped while it waits (an `async` call cancelled, or a blocking
-/// call timed out), it leaves that registration at once instead of keeping
-/// the waker until the stream's next event.
+/// A stream call that waits in the stream's read or write list under its
+/// own ticket, so that any number of calls may wait on one handle. Dropped
+/// while it waits (an `async` call cancelled, or a blocking call timed
+/// out), it leaves the list at once, taking out only its own wait.
 struct StreamWait<'a, D: Driver, F> {
     conn: &'a ConnRef<D>,
-    key: StreamKey,
-    write: bool,
-    waiting: bool,
+    list: List<StreamKey>,
+    ticket: Option<Ticket>,
     poll: F,
 }
 
 impl<'a, D: Driver, F> StreamWait<'a, D, F> {
-    fn new(conn: &'a ConnRef<D>, key: StreamKey, write: bool, poll: F) -> Self {
+    fn new(conn: &'a ConnRef<D>, list: List<StreamKey>, poll: F) -> Self {
         Self {
             conn,
-            key,
-            write,
-            waiting: false,
+            list,
+            ticket: None,
             poll,
         }
     }
 }
 
-impl<D: Driver, R, F: FnMut(&Waker) -> Poll<R> + Unpin> Future for StreamWait<'_, D, F> {
+impl<D: Driver, R, F: FnMut(&Waker, &mut Option<Ticket>) -> Poll<R> + Unpin> Future
+    for StreamWait<'_, D, F>
+{
     type Output = R;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         let this = self.get_mut();
-        let r = (this.poll)(cx.waker());
-        this.waiting = r.is_pending();
-        r
+        (this.poll)(cx.waker(), &mut this.ticket)
     }
 }
 
 impl<D: Driver, F> Drop for StreamWait<'_, D, F> {
     fn drop(&mut self) {
-        if self.waiting {
-            let mut st = self.conn.lock();
-            if self.write {
-                st.waiters.remove_writer(self.key);
-            } else {
-                st.waiters.remove_reader(self.key);
-            }
+        // A call that completed left its list already.
+        if self.ticket.is_some() {
+            self.conn.lock().leave_stream(self.list, &mut self.ticket);
+        }
+    }
+}
+
+/// What a read that never waits found ([`RecvStream::try_read`](crate::RecvStream#method.try_read)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryRead<T> {
+    /// Data was taken.
+    Data(T),
+    /// The stream ended with a FIN and everything was read.
+    Finished,
+    /// Nothing to read now; wait with
+    /// [`StreamHandle::readable`](crate::StreamHandle#method.readable).
+    WouldBlock,
+}
+
+/// A cheap, cloneable reference to one stream, for reading its metadata and
+/// waiting for its readiness while its `SendStream` or `RecvStream` is busy
+/// elsewhere (in a read or write in flight, or owned by another task). It
+/// owns no part of the stream: dropping it stops or resets nothing, and it
+/// does not keep the session open. Once the stream's handles are gone, its
+/// waits fail with the stream's error.
+pub struct StreamHandle<D: Driver> {
+    shared: Arc<Shared<D>>,
+    key: StreamKey,
+    meter: Arc<Meter>,
+    last: FinalStats,
+}
+
+impl<D: Driver> Clone for StreamHandle<D> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            key: self.key,
+            meter: self.meter.clone(),
+            last: self.last.clone(),
+        }
+    }
+}
+
+impl<D: Driver> std::fmt::Debug for StreamHandle<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamHandle")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D: Driver> StreamHandle<D> {
+    fn of(conn: &ConnRef<D>, key: StreamKey, meter: &Arc<Meter>, last: &FinalStats) -> Self {
+        Self {
+            shared: conn.0.clone(),
+            key,
+            meter: meter.clone(),
+            last: last.clone(),
+        }
+    }
+
+    /// The stream's ID, once it has one.
+    pub fn id(&self) -> Option<StreamId> {
+        self.shared
+            .lock()
+            .core
+            .peek_stream_id(self.key)
+            .map(StreamId)
+    }
+
+    /// A snapshot of the stream's statistics (final once it was released).
+    pub fn stats(&self) -> StreamStats {
+        stream_stats(&self.shared, self.key, &self.last)
+    }
+
+    /// The stream's application byte counters, read without a lock.
+    pub fn meter(&self) -> &Arc<Meter> {
+        &self.meter
+    }
+
+    /// Resolves once a read would not wait: data or the FIN is there, or the
+    /// peer reset the stream (`Ok`; the read reports what it is), or with
+    /// the error that ended the receiving part. Consumes nothing, so it is
+    /// cancel-safe at every point; any number may wait at once. With
+    /// [`RecvStream::try_read`](crate::RecvStream#method.try_read) it is a read that a binding can cancel
+    /// without losing data: wait here, then take synchronously.
+    pub fn readable(&self) -> impl Future<Output = Result<(), StreamError>> + Send + 'static
+    where
+        D: 'static,
+        Shared<D>: Send + Sync,
+    {
+        let (shared, key) = (self.shared.clone(), self.key);
+        async move {
+            Wait::new(
+                &shared.inner,
+                List::Readable(key),
+                move |st: &mut State<D>| {
+                    match st.core.received_reset(key) {
+                        Ok(Some(_)) => return Some(Ok(())),
+                        Err(e) => return Some(Err(e)),
+                        Ok(None) => {}
+                    }
+                    st.core.readable_len(key).transpose().map(|r| r.map(drop))
+                },
+            )
+            .await
+        }
+    }
+
+    /// Resolves with the bytes [`SendStream::try_write`](crate::SendStream#method.try_write) takes now (more
+    /// than 0), or with the error that ended the sending part. Consumes
+    /// nothing; cancel-safe; any number may wait at once.
+    pub fn writable(&self) -> impl Future<Output = Result<u64, StreamError>> + Send + 'static
+    where
+        D: 'static,
+        Shared<D>: Send + Sync,
+    {
+        let (shared, key) = (self.shared.clone(), self.key);
+        async move {
+            Wait::new(
+                &shared.inner,
+                List::Writable(key),
+                move |st: &mut State<D>| match st.core.poll_write_room(key) {
+                    Ok(0) => None,
+                    r => Some(r),
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// A stream wait held by a caller that polls the handle through a shared
+/// reference (a relay, a packet stream): it leaves its list when dropped.
+#[cfg(feature = "tokio")]
+pub(crate) struct WaitSlot<'a, D: Driver> {
+    conn: &'a ConnRef<D>,
+    list: List<StreamKey>,
+    pub(crate) ticket: Option<Ticket>,
+}
+
+#[cfg(feature = "tokio")]
+impl<D: Driver> Drop for WaitSlot<'_, D> {
+    fn drop(&mut self) {
+        if self.ticket.is_some() {
+            self.conn.lock().leave_stream(self.list, &mut self.ticket);
         }
     }
 }
@@ -2097,6 +2333,9 @@ pub struct SendStream<D: Driver> {
     key: StreamKey,
     meter: Arc<Meter>,
     last: FinalStats,
+    /// The wait of the handle's own `poll_*` calls (the calls that return
+    /// futures wait under their own tickets).
+    pub(crate) slot: Option<Ticket>,
     /// The tokio driver keeps none.
     #[cfg(feature = "blocking")]
     pub(crate) timeout: D::Timeout,
@@ -2111,10 +2350,38 @@ impl<D: Driver> std::fmt::Debug for SendStream<D> {
 }
 
 impl<D: Driver> SendStream<D> {
+    /// Runs one of the handle's own polls with its wait slot.
+    pub(crate) fn with_slot<R>(&mut self, f: impl FnOnce(&Self, &mut Option<Ticket>) -> R) -> R {
+        let mut slot = self.slot.take();
+        let r = f(self, &mut slot);
+        self.slot = slot;
+        r
+    }
+
+    /// A [`StreamHandle`] of this stream.
+    pub fn handle(&self) -> StreamHandle<D> {
+        StreamHandle::of(&self.conn, self.key, &self.meter, &self.last)
+    }
+
+    /// A write wait for a caller that polls through `&self`.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_slot(&self) -> WaitSlot<'_, D> {
+        WaitSlot {
+            conn: &self.conn,
+            list: List::Writable(self.key),
+            ticket: None,
+        }
+    }
+
     /// Makes the opening frame owed; `Ready` once it and every byte written
     /// were passed to a carrier, or with the error that ended the part.
-    pub(crate) fn poll_flush_stream(&self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub(crate) fn poll_flush_stream(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Poll<Result<(), StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         let r = st
             .core
             .flush(self.key)
@@ -2122,13 +2389,23 @@ impl<D: Driver> SendStream<D> {
         let out = match r {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
         };
         st.after_command();
         out
+    }
+
+    /// [`Self::poll_flush_stream`] as a call that waits.
+    #[cfg(feature = "blocking")]
+    pub(crate) fn flush_op(&self) -> impl Future<Output = Result<(), StreamError>> + '_ {
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |w: &Waker, t: &mut Option<Ticket>| self.poll_flush_stream(w, t),
+        )
     }
 
     /// Runs a command that may produce output.
@@ -2143,12 +2420,14 @@ impl<D: Driver> SendStream<D> {
     pub(crate) fn poll_write_buf(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         buf: &[u8],
     ) -> Poll<Result<usize, StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         match st.core.write(self.key, buf) {
             Ok(0) if !buf.is_empty() => {
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 Poll::Pending
             }
             r => {
@@ -2162,9 +2441,11 @@ impl<D: Driver> SendStream<D> {
         &'a self,
         buf: &'a [u8],
     ) -> impl Future<Output = Result<usize, StreamError>> + 'a {
-        StreamWait::new(&self.conn, self.key, true, move |w: &Waker| {
-            self.poll_write_buf(w, buf)
-        })
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |w: &Waker, t: &mut Option<Ticket>| self.poll_write_buf(w, t, buf),
+        )
     }
 
     pub(crate) async fn write_all_op(&self, mut buf: &[u8]) -> Result<(), StreamError> {
@@ -2179,73 +2460,83 @@ impl<D: Driver> SendStream<D> {
         &self,
         mut data: Bytes,
     ) -> impl Future<Output = Result<(), StreamError>> + '_ {
-        StreamWait::new(&self.conn, self.key, true, move |w: &Waker| {
-            let mut st = self.conn.lock();
-            let mut wrote = false;
-            while !data.is_empty() {
-                match st.core.write_chunk(self.key, data.clone()) {
-                    Ok(0) => {
-                        st.waiters.register_writer(self.key, w);
-                        if wrote {
-                            // What went in is written through meanwhile.
-                            D::finish_write(&self.conn, st);
-                        } else {
-                            st.after_command();
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |w: &Waker, slot: &mut Option<Ticket>| {
+                let mut st = self.conn.lock();
+                st.leave_stream(List::Writable(self.key), slot);
+                let mut wrote = false;
+                while !data.is_empty() {
+                    match st.core.write_chunk(self.key, data.clone()) {
+                        Ok(0) => {
+                            st.wait_stream(List::Writable(self.key), slot, w);
+                            if wrote {
+                                // What went in is written through meanwhile.
+                                D::finish_write(&self.conn, st);
+                            } else {
+                                st.after_command();
+                            }
+                            return Poll::Pending;
                         }
-                        return Poll::Pending;
-                    }
-                    Ok(n) => {
-                        data.advance(n);
-                        wrote = true;
-                    }
-                    Err(e) => {
-                        st.after_command();
-                        return Poll::Ready(Err(e));
+                        Ok(n) => {
+                            data.advance(n);
+                            wrote = true;
+                        }
+                        Err(e) => {
+                            st.after_command();
+                            return Poll::Ready(Err(e));
+                        }
                     }
                 }
-            }
-            D::finish_write(&self.conn, st);
-            Poll::Ready(Ok(()))
-        })
+                D::finish_write(&self.conn, st);
+                Poll::Ready(Ok(()))
+            },
+        )
     }
 
     pub(crate) fn write_chunks_op<'a>(
         &'a self,
         bufs: &'a mut [Bytes],
     ) -> impl Future<Output = Result<Written, StreamError>> + 'a {
-        StreamWait::new(&self.conn, self.key, true, move |waker: &Waker| {
-            let mut st = self.conn.lock();
-            let mut w = Written::default();
-            for b in bufs.iter_mut() {
-                if b.is_empty() {
-                    w.chunks += 1;
-                    continue;
-                }
-                match st.core.write_chunk(self.key, b.clone()) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        w.bytes += n;
-                        b.advance(n);
-                        if !b.is_empty() {
-                            break;
-                        }
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |waker: &Waker, slot: &mut Option<Ticket>| {
+                let mut st = self.conn.lock();
+                st.leave_stream(List::Writable(self.key), slot);
+                let mut w = Written::default();
+                for b in bufs.iter_mut() {
+                    if b.is_empty() {
                         w.chunks += 1;
+                        continue;
                     }
-                    Err(e) if w.bytes == 0 => {
-                        st.after_command();
-                        return Poll::Ready(Err(e));
+                    match st.core.write_chunk(self.key, b.clone()) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            w.bytes += n;
+                            b.advance(n);
+                            if !b.is_empty() {
+                                break;
+                            }
+                            w.chunks += 1;
+                        }
+                        Err(e) if w.bytes == 0 => {
+                            st.after_command();
+                            return Poll::Ready(Err(e));
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            if w.bytes == 0 && w.chunks < bufs.len() {
-                st.waiters.register_writer(self.key, waker);
-                st.after_command();
-                return Poll::Pending;
-            }
-            D::finish_write(&self.conn, st);
-            Poll::Ready(Ok(w))
-        })
+                if w.bytes == 0 && w.chunks < bufs.len() {
+                    st.wait_stream(List::Writable(self.key), slot, waker);
+                    st.after_command();
+                    return Poll::Pending;
+                }
+                D::finish_write(&self.conn, st);
+                Poll::Ready(Ok(w))
+            },
+        )
     }
 
     pub(crate) fn stopped_op(
@@ -2285,14 +2576,20 @@ impl<D: Driver> SendStream<D> {
         }
     }
 
-    fn poll_capacity(&self, waker: &Waker, min: u64) -> Poll<Result<u64, StreamError>> {
+    fn poll_capacity(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+        min: u64,
+    ) -> Poll<Result<u64, StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         match st.core.send_capacity(self.key) {
             Err(e) => Poll::Ready(Err(e)),
             Ok(c) if c.reaches(min) => Poll::Ready(Ok(c.capacity)),
             Ok(_) => {
                 st.core.wait_send_capacity(self.key, min);
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 Poll::Pending
             }
         }
@@ -2301,11 +2598,16 @@ impl<D: Driver> SendStream<D> {
     /// `Ready` with the bytes a write takes now (more than 0), or with the
     /// error that ended the part; `Pending` registers `waker` as the part's
     /// writer, woken once it has room or ended.
-    fn poll_room(&self, waker: &Waker) -> Poll<Result<u64, StreamError>> {
+    fn poll_room(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Poll<Result<u64, StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         match st.core.poll_write_room(self.key) {
             Ok(0) => {
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 st.after_command();
                 Poll::Pending
             }
@@ -2314,18 +2616,22 @@ impl<D: Driver> SendStream<D> {
     }
 
     pub(crate) fn writable_op(&self) -> impl Future<Output = Result<u64, StreamError>> + '_ {
-        StreamWait::new(&self.conn, self.key, true, move |w: &Waker| {
-            self.poll_room(w)
-        })
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |w: &Waker, t: &mut Option<Ticket>| self.poll_room(w, t),
+        )
     }
 
     pub(crate) fn send_capacity_op(
         &self,
         min: u64,
     ) -> impl Future<Output = Result<u64, StreamError>> + '_ {
-        StreamWait::new(&self.conn, self.key, true, move |w: &Waker| {
-            self.poll_capacity(w, min)
-        })
+        StreamWait::new(
+            &self.conn,
+            List::Writable(self.key),
+            move |w: &Waker, t: &mut Option<Ticket>| self.poll_capacity(w, t, min),
+        )
     }
 }
 
@@ -2344,10 +2650,10 @@ impl<D: Driver> SendStream<D> {
         context: u64,
         data: Bytes,
     ) -> Result<bool, DatagramError> {
-        let len = data.len();
-        let allowed = self.conn.datagram_allowed(len);
+        let allowance = self.conn.datagram_allowed(data.len());
+        let allowed = allowance.allowed();
         let queued = self.command(|c, k| c.send_stream_datagram(k, context, data, allowed))?;
-        self.conn.datagram_queued(Ok(queued), len)?;
+        allowance.queued(Ok(queued))?;
         Ok(queued)
     }
 
@@ -2360,18 +2666,24 @@ impl<D: Driver> SendStream<D> {
     pub(crate) fn poll_capacity_with(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         min: u64,
     ) -> Poll<Result<u64, StreamError>> {
-        self.poll_capacity(waker, min)
+        self.poll_capacity(waker, slot, min)
     }
 
     /// Registers `waker` as the part's writer, to be woken when it ends (a
     /// `STOP_SENDING`, the session's end) or gets room; fails at once with
     /// what ended it.
-    pub(crate) fn watch(&self, waker: &Waker) -> Result<(), StreamError> {
+    pub(crate) fn watch(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Result<(), StreamError> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         st.core.write_room(self.key)?;
-        st.waiters.register_writer(self.key, waker);
+        st.wait_stream(List::Writable(self.key), slot, waker);
         Ok(())
     }
 
@@ -2381,12 +2693,14 @@ impl<D: Driver> SendStream<D> {
     pub(crate) fn poll_write_part(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         data: &mut Bytes,
     ) -> Poll<Result<usize, StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         match st.core.write_chunk(self.key, data.clone()) {
             Ok(0) if !data.is_empty() => {
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 st.after_command();
                 Poll::Pending
             }
@@ -2404,12 +2718,17 @@ impl<D: Driver> SendStream<D> {
 
     /// `Ready` once every byte written was passed to a carrier, or with the
     /// error that ended the part.
-    pub(crate) fn poll_sent(&self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub(crate) fn poll_sent(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Poll<Result<(), StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         match st.core.data_sent(self.key) {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
-                st.waiters.register_writer(self.key, waker);
+                st.wait_stream(List::Writable(self.key), slot, waker);
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -2444,19 +2763,21 @@ impl<D: Driver> SendStream<D> {
     pub(crate) fn poll_write_batch(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         out: &TransmitBuf,
         cursor: &mut PieceCursor,
         from: usize,
         limit: usize,
     ) -> Poll<Result<usize, StreamError>> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Writable(self.key), slot);
         let capacity = match st.core.send_capacity(self.key) {
             Ok(c) => c.capacity,
             Err(e) => return Poll::Ready(Err(e)),
         };
         if capacity == 0 {
             st.core.wait_send_capacity(self.key, 1);
-            st.waiters.register_writer(self.key, waker);
+            st.wait_stream(List::Writable(self.key), slot, waker);
             return Poll::Pending;
         }
         let limit = limit.min(usize::try_from(capacity).unwrap_or(usize::MAX));
@@ -2481,7 +2802,7 @@ impl<D: Driver> SendStream<D> {
             st.after_command();
             return Poll::Ready(Err(e));
         }
-        st.waiters.register_writer(self.key, waker);
+        st.wait_stream(List::Writable(self.key), slot, waker);
         st.after_command();
         Poll::Pending
     }
@@ -2491,6 +2812,7 @@ impl<D: Driver> SendStream<D> {
     pub(crate) fn poll_write_capped(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         buf: &[u8],
     ) -> Poll<Result<usize, StreamError>> {
         if buf.is_empty() {
@@ -2498,11 +2820,12 @@ impl<D: Driver> SendStream<D> {
         }
         let capacity = {
             let mut st = self.conn.lock();
+            st.leave_stream(List::Writable(self.key), slot);
             match st.core.send_capacity(self.key) {
                 Ok(c) if c.capacity > 0 => c.capacity,
                 Ok(_) => {
                     st.core.wait_send_capacity(self.key, 1);
-                    st.waiters.register_writer(self.key, waker);
+                    st.wait_stream(List::Writable(self.key), slot, waker);
                     return Poll::Pending;
                 }
                 Err(e) => return Poll::Ready(Err(e)),
@@ -2511,14 +2834,15 @@ impl<D: Driver> SendStream<D> {
         let n = buf
             .len()
             .min(usize::try_from(capacity).unwrap_or(usize::MAX));
-        self.poll_write_buf(waker, &buf[..n])
+        self.poll_write_buf(waker, slot, &buf[..n])
     }
 }
 
 impl<D: Driver> Drop for SendStream<D> {
     fn drop(&mut self) {
         let mut st = self.conn.lock();
-        st.waiters.forget_send(self.key);
+        let State { waiters, wakes, .. } = &mut *st;
+        waiters.forget_send(self.key, wakes);
         st.core.release_send(self.key);
         D::finish_write(&self.conn, st);
     }
@@ -2531,6 +2855,10 @@ pub struct RecvStream<D: Driver> {
     key: StreamKey,
     meter: Arc<Meter>,
     last: FinalStats,
+    /// The wait of the handle's own `poll_*` calls (the calls that return
+    /// futures wait under their own tickets).
+    #[cfg(feature = "tokio")]
+    pub(crate) slot: Option<Ticket>,
     /// The tokio driver keeps none.
     #[cfg(feature = "blocking")]
     pub(crate) timeout: D::Timeout,
@@ -2600,6 +2928,65 @@ fn take_read(
 }
 
 impl<D: Driver> RecvStream<D> {
+    /// Runs one of the handle's own polls with its wait slot.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn with_slot<R>(&mut self, f: impl FnOnce(&Self, &mut Option<Ticket>) -> R) -> R {
+        let mut slot = self.slot.take();
+        let r = f(self, &mut slot);
+        self.slot = slot;
+        r
+    }
+
+    /// A [`StreamHandle`] of this stream.
+    pub fn handle(&self) -> StreamHandle<D> {
+        StreamHandle::of(&self.conn, self.key, &self.meter, &self.last)
+    }
+
+    /// Reads into `buf` what is there now, never waiting.
+    ///
+    /// # Errors
+    ///
+    /// The error that ended the receiving part (a reset among them).
+    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<TryRead<usize>, StreamError> {
+        let max = buf.len();
+        let taken = self
+            .conn
+            .command(|st| take_read(&mut st.core, self.key, max));
+        Ok(match taken {
+            None => TryRead::WouldBlock,
+            Some(t) => match t?.copy_into(buf) {
+                Some(n) => TryRead::Data(n),
+                None => TryRead::Finished,
+            },
+        })
+    }
+
+    /// Takes one chunk of at most `max` bytes that is there now, without
+    /// copying where possible, never waiting.
+    ///
+    /// # Errors
+    ///
+    /// The error that ended the receiving part (a reset among them).
+    pub fn try_read_chunk(&mut self, max: usize) -> Result<TryRead<Bytes>, StreamError> {
+        self.conn
+            .command(|st| match st.core.read_chunk(self.key, max) {
+                Ok(None) => Ok(TryRead::WouldBlock),
+                Ok(Some((b, true))) if b.is_empty() => Ok(TryRead::Finished),
+                Ok(Some((b, _))) => Ok(TryRead::Data(b)),
+                Err(e) => Err(e),
+            })
+    }
+
+    /// A read wait for a caller that polls through `&self`.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_slot(&self) -> WaitSlot<'_, D> {
+        WaitSlot {
+            conn: &self.conn,
+            list: List::Readable(self.key),
+            ticket: None,
+        }
+    }
+
     fn command<R>(&self, f: impl FnOnce(&mut core::SessionCore, StreamKey) -> R) -> R {
         self.conn.command(|st| f(&mut st.core, self.key))
     }
@@ -2611,9 +2998,10 @@ impl<D: Driver> RecvStream<D> {
     fn poll_read_cmd<R>(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         f: impl FnMut(&mut core::SessionCore, StreamKey) -> Option<R>,
     ) -> Poll<R> {
-        self.poll_read_keep(waker, f, |_| false)
+        self.poll_read_keep(waker, slot, f, |_| false)
     }
 
     /// [`RecvStream::poll_read_cmd`](crate::RecvStream#method.poll_read_cmd) that also leaves `waker` registered
@@ -2623,18 +3011,19 @@ impl<D: Driver> RecvStream<D> {
     fn poll_read_keep<R>(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         mut f: impl FnMut(&mut core::SessionCore, StreamKey) -> Option<R>,
         keep: impl Fn(&R) -> bool,
     ) -> Poll<R> {
         let mut st = self.conn.lock();
-        // This poll replaces an earlier registration, which data read
+        // This poll replaces its earlier registration, which data read
         // through below would otherwise wake again for nothing.
-        st.waiters.remove_reader(self.key);
+        st.leave_stream(List::Readable(self.key), slot);
         let mut through = true;
         loop {
             if let Some(r) = f(&mut st.core, self.key) {
                 if keep(&r) {
-                    st.waiters.register_reader(self.key, waker);
+                    st.wait_stream(List::Readable(self.key), slot, waker);
                 }
                 st.after_command();
                 return Poll::Ready(r);
@@ -2653,7 +3042,7 @@ impl<D: Driver> RecvStream<D> {
             }
             // Registered under the lock before `Pending`: whatever the
             // driver reads for this stream wakes this read.
-            st.waiters.register_reader(self.key, waker);
+            st.wait_stream(List::Readable(self.key), slot, waker);
             st.after_command();
             return Poll::Pending;
         }
@@ -2664,10 +3053,11 @@ impl<D: Driver> RecvStream<D> {
     pub(crate) fn poll_read_buf(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         buf: &mut [u8],
     ) -> Poll<Result<Option<usize>, StreamError>> {
         let max = buf.len();
-        self.poll_read_cmd(waker, |core, key| take_read(core, key, max))
+        self.poll_read_cmd(waker, slot, |core, key| take_read(core, key, max))
             .map(|r| r.map(|t| t.copy_into(buf)))
     }
 
@@ -2675,9 +3065,11 @@ impl<D: Driver> RecvStream<D> {
         &'a self,
         mut f: impl FnMut(&mut core::SessionCore, StreamKey) -> Option<R> + Unpin + 'a,
     ) -> impl Future<Output = R> + 'a {
-        StreamWait::new(&self.conn, self.key, false, move |w: &Waker| {
-            self.poll_read_cmd(w, &mut f)
-        })
+        StreamWait::new(
+            &self.conn,
+            List::Readable(self.key),
+            move |w: &Waker, t: &mut Option<Ticket>| self.poll_read_cmd(w, t, &mut f),
+        )
     }
 
     pub(crate) fn read_op<'a>(
@@ -2821,9 +3213,14 @@ impl<D: Driver> RecvStream<D> {
     /// report. `Pending` registers the reader, and so does `Readable(n)`
     /// with `n > 0`, so that the part's next event (a reset, the session's
     /// end) wakes a task that goes on to wait for capacity.
-    pub(crate) fn poll_upstream(&self, waker: &Waker) -> Poll<Result<Upstream, StreamError>> {
+    pub(crate) fn poll_upstream(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Poll<Result<Upstream, StreamError>> {
         self.poll_read_keep(
             waker,
+            slot,
             |core, key| match core.received_reset(key) {
                 Ok(Some((code, reliable))) => Some(Ok(Upstream::Reset(code, reliable))),
                 Err(e) => Some(Err(e)),
@@ -2840,11 +3237,16 @@ impl<D: Driver> RecvStream<D> {
     /// or the error that ended the part's session; otherwise registers
     /// `waker` as the part's reader, in the same critical section, to be
     /// woken by its next event (data, a FIN, a reset, the session's end).
-    pub(crate) fn watch(&self, waker: &Waker) -> Result<Option<(VarInt, u64)>, StreamError> {
+    pub(crate) fn watch(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+    ) -> Result<Option<(VarInt, u64)>, StreamError> {
         let mut st = self.conn.lock();
+        st.leave_stream(List::Readable(self.key), slot);
         let reset = st.core.received_reset(self.key)?;
         if reset.is_none() {
-            st.waiters.register_reader(self.key, waker);
+            st.wait_stream(List::Readable(self.key), slot, waker);
         }
         Ok(reset)
     }
@@ -2854,9 +3256,10 @@ impl<D: Driver> RecvStream<D> {
     pub(crate) fn poll_read_chunk(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         max: usize,
     ) -> Poll<Result<Option<Bytes>, StreamError>> {
-        self.poll_read_cmd(waker, |core, key| Self::chunk_step(core, key, max))
+        self.poll_read_cmd(waker, slot, |core, key| Self::chunk_step(core, key, max))
     }
 
     /// [`RecvStream::poll_read_chunk`](crate::RecvStream#method.poll_read_chunk) that leaves the reader registered
@@ -2865,10 +3268,12 @@ impl<D: Driver> RecvStream<D> {
     pub(crate) fn poll_take_chunk(
         &self,
         waker: &Waker,
+        slot: &mut Option<Ticket>,
         max: usize,
     ) -> Poll<Result<Option<Bytes>, StreamError>> {
         self.poll_read_keep(
             waker,
+            slot,
             |core, key| Self::chunk_step(core, key, max),
             |r| matches!(r, Ok(Some(_))),
         )
@@ -2905,7 +3310,8 @@ impl<D: Driver> RecvStream<D> {
 impl<D: Driver> Drop for RecvStream<D> {
     fn drop(&mut self) {
         let mut st = self.conn.lock();
-        st.waiters.forget_recv(self.key);
+        let State { waiters, wakes, .. } = &mut *st;
+        waiters.forget_recv(self.key, wakes);
         st.core.release_recv(self.key);
         st.after_command();
     }
@@ -2925,10 +3331,10 @@ impl<D: Driver> Drop for Policed<'_, D> {
             return;
         }
         for d in &mut self.batch {
-            d.set_allowed(false);
+            d.set_granted(None);
         }
         let mut locked = self.shared.lock();
-        locked.core.admit_datagrams(&mut self.batch);
+        let _ = locked.core.admit_datagrams(&mut self.batch);
         locked.dispatch();
     }
 }
@@ -2984,6 +3390,7 @@ pub(crate) trait SessionApi<D: Driver> {
         length: usize,
     ) -> Result<Vec<u8>, crate::proto::exporter::ExportError>;
     fn session_binding(&self) -> Option<[u8; 32]>;
+    fn id(&self) -> crate::SessionId;
     #[cfg(feature = "test-hooks")]
     fn panic_under_lock(&self);
     fn liveness(&self) -> core::Liveness;
@@ -3004,6 +3411,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>>;
     fn begin_add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError>;
     fn join_ready(&self) -> bool;
+    fn join_room(&self) -> usize;
     fn declare_end_to_end(&self);
     fn weakest_record_mode(&self) -> core::RecordMode;
     fn pipes(&self) -> Vec<Pipe<D>>;
@@ -3035,10 +3443,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn send_datagram(&self, data: Bytes) -> Result<(), DatagramError> {
-        let len = data.len();
-        let allowed = self.conn.datagram_allowed(len);
+        let allowance = self.conn.datagram_allowed(data.len());
+        let allowed = allowance.allowed();
         let queued = self.command(|st| st.core.send_datagram(data, allowed));
-        self.conn.datagram_queued(queued, len)
+        allowance.queued(queued)
     }
 
     fn max_datagram_size(&self) -> Option<usize> {
@@ -3070,7 +3478,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn is_established(&self) -> bool {
-        self.conn.lock().established
+        self.conn.lock().core.was_established()
     }
 
     fn tls(&self) -> Option<crate::TlsState> {
@@ -3252,6 +3660,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.capacity_floor()
     }
 
+    fn id(&self) -> crate::SessionId {
+        self.conn.id
+    }
+
     fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>> {
         self.conn.lock().core.shaper()
     }
@@ -3317,6 +3729,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn join_ready(&self) -> bool {
         self.conn.lock().core.join_ready(D::now())
+    }
+
+    fn join_room(&self) -> usize {
+        self.conn.lock().core.join_room(D::now())
     }
 
     fn declare_end_to_end(&self) {
@@ -3689,6 +4105,14 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::shaping_meters(self)
         }
 
+        /// The session's identity in this process: the one its trace
+        /// records carry ([`Tracer`](crate::Tracer),
+        /// [`HostEvent::Trace`](crate::HostEvent::Trace)).
+        #[must_use]
+        pub fn id(&self) -> crate::SessionId {
+            <Self as crate::driver::handle::SessionApi<$d>>::id(self)
+        }
+
         /// The shaping counters.
         pub fn shaping_stats(&self) -> crate::shaping::Stats {
             <Self as crate::driver::handle::SessionApi<$d>>::shaping_stats(self)
@@ -3874,6 +4298,13 @@ macro_rules! session_adapter {
             pub fn join_ready(&self) -> bool {
                 <Session as crate::driver::handle::SessionApi<$d>>::join_ready(self.session)
             }
+
+            /// How many pipes may be added now: 0 unless
+            /// [`join_ready`](Self::join_ready), else the room under
+            /// `max_pipes`. Dial at most this many carriers at once.
+            pub fn join_room(&self) -> usize {
+                <Session as crate::driver::handle::SessionApi<$d>>::join_room(self.session)
+            }
         }
     };
 }
@@ -4042,8 +4473,12 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn meter(&self) -> &Arc<Meter>;
     fn stats(&self) -> StreamStats;
     fn send_capacity(&self) -> u64;
-    fn poll_send_capacity(&self, cx: &mut Context<'_>, min: u64) -> Poll<Result<u64, StreamError>>;
-    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>>;
+    fn poll_send_capacity(
+        &mut self,
+        cx: &mut Context<'_>,
+        min: u64,
+    ) -> Poll<Result<u64, StreamError>>;
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>>;
     fn try_write(&mut self, buf: &[u8]) -> Result<usize, StreamError>;
     fn try_write_chunk(&mut self, chunk: &mut Bytes) -> Result<usize, StreamError>;
 }
@@ -4117,10 +4552,10 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
-        let len = data.len();
-        let allowed = self.conn.datagram_allowed(len);
+        let allowance = self.conn.datagram_allowed(data.len());
+        let allowed = allowance.allowed();
         let queued = self.command(|c, k| c.send_stream_datagram(k, context, data, allowed));
-        self.conn.datagram_queued(queued, len)
+        allowance.queued(queued)
     }
 
     fn meter(&self) -> &Arc<Meter> {
@@ -4128,7 +4563,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn stats(&self) -> StreamStats {
-        stream_stats(&self.conn, self.key, &self.last)
+        stream_stats(&self.conn.0, self.key, &self.last)
     }
 
     fn send_capacity(&self) -> u64 {
@@ -4139,12 +4574,16 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
             .map_or(0, |c| c.capacity)
     }
 
-    fn poll_send_capacity(&self, cx: &mut Context<'_>, min: u64) -> Poll<Result<u64, StreamError>> {
-        self.poll_capacity(cx.waker(), min)
+    fn poll_send_capacity(
+        &mut self,
+        cx: &mut Context<'_>,
+        min: u64,
+    ) -> Poll<Result<u64, StreamError>> {
+        self.with_slot(|s, slot| s.poll_capacity(cx.waker(), slot, min))
     }
 
-    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>> {
-        self.poll_room(cx.waker())
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>> {
+        self.with_slot(|s, slot| s.poll_room(cx.waker(), slot))
     }
 
     fn try_write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
@@ -4313,7 +4752,7 @@ macro_rules! sendstream_api {
         /// `STOP_SENDING`, the session's end. `Pending` registers `cx`'s waker
         /// as the part's writer, as a write that waits does.
         pub fn poll_send_capacity(
-            &self,
+            &mut self,
             cx: &mut ::std::task::Context<'_>,
             min: u64,
         ) -> ::std::task::Poll<Result<u64, crate::StreamError>> {
@@ -4336,7 +4775,7 @@ macro_rules! sendstream_api {
         /// `Ok(0)` other streams took the shared room first, and the next
         /// poll waits for more.
         pub fn poll_writable(
-            &self,
+            &mut self,
             cx: &mut ::std::task::Context<'_>,
         ) -> ::std::task::Poll<Result<u64, crate::StreamError>> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::poll_writable(self, cx)
@@ -4441,7 +4880,7 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
     }
 
     fn stats(&self) -> StreamStats {
-        stream_stats(&self.conn, self.key, &self.last)
+        stream_stats(&self.conn.0, self.key, &self.last)
     }
 }
 

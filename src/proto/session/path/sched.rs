@@ -65,12 +65,14 @@ impl Picks {
         (self.fallbacks.get(), self.applied)
     }
 
-    /// A stream is gone: it waits for no decision and holds no answer.
+    /// A stream is gone: it holds no answer. Its place among the
+    /// directions waiting for a decision goes when they are next taken
+    /// (`take_pick` skips a stream that is gone), not with a scan of every
+    /// waiting one per stream discarded.
     pub(in crate::proto::session) fn forget(&mut self, key: StreamKey) {
         if let Some(i) = self.picked.iter().position(|&k| k == key) {
             self.picked.swap_remove(i);
         }
-        self.pending.get_mut().retain(|&k| k != key);
     }
 }
 
@@ -1391,7 +1393,11 @@ impl SessionCore {
     /// Hands the driver every stream direction waiting for a custom
     /// decision, with a value-only view of the pipes, copied into `req`
     /// (no handle, nothing that leads back to the session). Returns `false`
-    /// when none waits.
+    /// when none waits. A `true` must be followed by one
+    /// [`SessionCore::answer_pick`] with `req`, even when the driver did not
+    /// run the policy (its answers are then counted as misses): until then
+    /// no other decision is handed out, and the directions waiting for one
+    /// are not scheduled.
     pub fn take_pick(&mut self, req: &mut PickRequest) -> bool {
         if !self.wants_pick() {
             return false;

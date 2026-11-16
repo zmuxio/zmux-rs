@@ -162,10 +162,6 @@ impl ExchangeEndpoint {
 ///
 /// `InvalidInput` on options without a PSK that do not choose to run
 /// unauthenticated, or that set both.
-///
-/// # Panics
-///
-/// If the system's random source fails.
 pub fn dial_exchange_split(
     up: ExchangeEndpoint,
     down: ExchangeEndpoint,
@@ -173,7 +169,7 @@ pub fn dial_exchange_split(
 ) -> io::Result<PipeIo> {
     let psk = options.mac_psk()?;
     let mut cid: CarrierId = [0; 16];
-    getrandom::fill(&mut cid).expect("the system's random source");
+    zmux::proto::seal::fill_random(&mut cid).map_err(io::Error::other)?;
     let o = options;
     let (alive, _) = watch::channel(());
     let alive = Arc::new(alive);
@@ -189,7 +185,7 @@ pub fn dial_exchange_split(
     let up_http = http(up, o.up_requests + 1);
     let down_http = http(down, o.down_requests);
     let mut token = [0u8; 8];
-    getrandom::fill(&mut token).expect("the system's random source");
+    zmux::proto::seal::fill_random(&mut token).map_err(io::Error::other)?;
     let ctx = Arc::new(Ctx {
         key: Key::new(psk, &cid),
         cid,

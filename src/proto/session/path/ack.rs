@@ -157,6 +157,11 @@ impl SessionCore {
             return;
         };
         let rec = p.mp_record(li, len, threshold, delay, now);
+        if p.records_received() == 1 {
+            self.push_event(crate::proto::session::CoreEvent::PipeReceiving {
+                pipe: crate::proto::session::PipeId(id),
+            });
+        }
         if !attached {
             self.note_attached(id);
         }

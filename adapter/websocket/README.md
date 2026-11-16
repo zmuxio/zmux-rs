@@ -13,7 +13,7 @@ accepted).
   listener, handed to a `zmux::Listener`; `serve_tls` the same over TLS
   (`wss://`). Behind intermediaries the listener trusts, the source is the
   client a PROXY protocol header or a forwarding header field reports;
-  `accept(io, info, listener,
+  `accept(io, entry, info, listener,
   options)` upgrades one connection, plain or TLS, or refuses it, `info`
   giving the connection's metadata (address, TLS exporter);
 - `Options` (`Options::new()` for the defaults): the subprotocols, `qmux-02[.<application>]` or an

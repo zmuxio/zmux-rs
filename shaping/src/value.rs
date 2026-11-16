@@ -145,13 +145,14 @@ impl Sampler {
         mulhi64(self.0.next_u64(), 1_000_000) < p
     }
 
-    /// `v` reduced by a random amount of up to `j` parts per million.
+    /// `v` reduced by a random amount of up to `j` parts per million (at
+    /// most 999 999: a larger `j` counts as that).
     #[inline]
     pub fn jitter(&mut self, v: u64, j: u32) -> u64 {
         if j == 0 {
             return v;
         }
-        jitter_with(self.0.next_u64(), v, j)
+        jitter_with(self.0.next_u64(), v, j.min(999_999))
     }
 }
 

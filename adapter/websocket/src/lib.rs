@@ -176,9 +176,17 @@ pub async fn dial(
     options: &Options,
 ) -> io::Result<PipeIo> {
     let request = request.into_client_request().map_err(io::Error::other)?;
-    dial_following(request, None, options)
+    bounded(options, dial_following(request, None, options))
         .await
         .map(|(io, _)| io)
+}
+
+/// A client dial within [`Options::timeout`].
+async fn bounded<T>(
+    options: &Options,
+    dial: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    zmux::adapter::within(options.timeout, dial).await
 }
 
 /// What became of one upgrade request that did not upgrade.
@@ -338,18 +346,16 @@ async fn dial_once(
     let _ = tcp.set_nodelay(true);
     let socket = tcp_dup(&tcp);
     let peer = tcp.peer_addr().ok();
-    let conn = TlsConnection::new(tls.connect(name, tcp).await?);
+    let conn = TlsConnection::client(tls.connect(name, tcp).await?, &host);
     let request = {
-        let mut info = conn.info().with_server_name(Some(&host));
+        let mut info = conn.info();
         if let Some(p) = peer {
             info = info.with_source(p).with_peer(p);
         }
         offer(request, options, &info)?
     };
     let binding = conn.binding();
-    let io = binding.apply(with_socket(upgrade_over(conn, request).await?, socket));
-    let state = zmux::TlsState::new(None, Some(host));
-    Ok(io.with_terminated_tls(move || Some(state.clone())))
+    Ok(binding.apply(with_socket(upgrade_over(conn, request).await?, socket)))
 }
 
 /// A carrier over a new WebSocket on `io`, an established byte stream such
@@ -388,7 +394,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = offer(request, options, &CarrierInfo::new())?;
-    Ok(upgrade_over(io, request).await?)
+    bounded(options, async { Ok(upgrade_over(io, request).await?) }).await
 }
 
 /// The client handshake of `request` on `io`.
@@ -447,7 +453,7 @@ pub async fn dial_tls(
     options: &Options,
 ) -> io::Result<PipeIo> {
     let request = request.into_client_request().map_err(io::Error::other)?;
-    dial_following(request, Some(tls), options)
+    bounded(options, dial_following(request, Some(tls), options))
         .await
         .map(|(io, _)| io)
 }
@@ -511,7 +517,7 @@ pub async fn connect_tls(
 fn offer(
     request: impl IntoClientRequest + Unpin,
     options: &Options,
-    info: &CarrierInfo<'_>,
+    info: &CarrierInfo,
 ) -> io::Result<ClientRequest> {
     let mut request = request.into_client_request().map_err(io::Error::other)?;
     let offer = options.offer();
@@ -666,7 +672,7 @@ pub async fn accept<S, I>(
 ) -> io::Result<Upgrade<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    I: for<'a> FnOnce(&'a S) -> CarrierInfo<'a>,
+    I: FnOnce(&S) -> CarrierInfo,
 {
     let (buf, head_len) = read_head(&mut io, options.max_request_head).await?;
     // Not an upgrade this server takes: a failed upgrade (the entry
@@ -677,13 +683,7 @@ where
     let Some(upgrade) = parse_upgrade(&buf[..head_len], options) else {
         return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
     };
-    let fields = || {
-        upgrade
-            .parts
-            .headers
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.as_bytes()))
-    };
+    let fields = || &upgrade.parts.headers;
     if zmux::adapter::forwarded_early_data(fields()) {
         // Forwarded from TLS early data: no carrier is taken from it, and
         // the intermediary repeats it after its handshake.
@@ -704,8 +704,7 @@ where
     let admit = {
         let info = info(&io)
             .with_head()
-            .with_request(&upgrade.parts)
-            .with_headers(fields);
+            .with_request_head(Arc::new(upgrade.parts.clone()), header_fields);
         entry.decide(info, Vec::new()).await
     };
     match admit {
@@ -918,7 +917,7 @@ async fn serve_over<C, S, SF>(
     tcp: TcpListener,
     options: Options,
     setup: S,
-    info: fn(&C) -> CarrierInfo<'_>,
+    info: fn(&C) -> CarrierInfo,
     binding: fn(&C) -> Option<TlsBinding>,
 ) where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1000,6 +999,7 @@ pub struct Options {
     carrier_credential: Option<Arc<dyn CarrierCredential>>,
     max_request_head: usize,
     max_redirects: usize,
+    timeout: std::time::Duration,
 }
 
 /// The default of [`Options::max_request_head`].
@@ -1037,7 +1037,24 @@ impl Options {
             carrier_credential: None,
             max_request_head: DEFAULT_MAX_REQUEST_HEAD,
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            timeout: zmux::adapter::DIAL_TIMEOUT,
         }
+    }
+
+    /// With this bound on a client's dial, from the TCP connect to the
+    /// upgrade's response, redirects included (default
+    /// [`zmux::adapter::DIAL_TIMEOUT`], 10 s); a dial not done within it
+    /// fails with `TimedOut`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The bound on a client's dial.
+    #[must_use]
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
     }
 
     /// With the credential a client presents in a request header field
@@ -1391,6 +1408,11 @@ pub fn candidate_tls(
         }
     })
     .with_target(named)
+}
+
+/// Visits the header fields of a request head, for its admission.
+pub(crate) fn header_fields(parts: &http::request::Parts, each: &mut dyn FnMut(&str, &[u8])) {
+    zmux::adapter::visit_fields(&parts.headers, each);
 }
 
 #[cfg(test)]

@@ -16,63 +16,54 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use crate::proto::session::{
-    Config, LogLevel, Logger, SessionCore as Core, SessionError, SessionEvent, Tracer,
-    WindowIncrease,
+    Config, LogLevel, Logger, SessionCore as Core, SessionId, TraceRecord, Tracer, WindowIncrease,
 };
 
 /// Events a tracer may have unread before more are dropped.
 pub(crate) const TRACE_BACKLOG: usize = 256;
 
-/// What the tracer is told, in order.
-#[derive(Debug)]
-pub(crate) enum Trace {
-    Established,
-    Event(SessionEvent),
-    /// Events dropped since the last item.
-    Dropped(u64),
-    Closed(SessionError),
-}
-
 /// The bounded queue of a session's tracer, and the tracer.
 pub(crate) struct TraceQueue {
     pub(crate) tracer: Arc<dyn Tracer>,
-    items: VecDeque<Trace>,
+    pub(crate) session: SessionId,
+    items: VecDeque<TraceRecord>,
     dropped: u64,
     /// The end was queued: the last item.
     closed: bool,
 }
 
 impl TraceQueue {
-    pub(crate) fn new(tracer: Arc<dyn Tracer>) -> Self {
+    pub(crate) fn new(tracer: Arc<dyn Tracer>, session: SessionId) -> Self {
         Self {
             tracer,
+            session,
             items: VecDeque::new(),
             dropped: 0,
             closed: false,
         }
     }
 
-    /// Queues an item; past the backlog an event is dropped and counted,
+    /// Queues a record; past the backlog an event is dropped and counted,
     /// and the end is always queued.
-    pub(crate) fn push(&mut self, item: Trace) {
+    pub(crate) fn push(&mut self, item: TraceRecord) {
         if self.closed {
             return;
         }
-        let end = matches!(item, Trace::Closed(_));
+        let end = matches!(item, TraceRecord::Closed(_));
         if self.items.len() >= TRACE_BACKLOG && !end {
             self.dropped += 1;
             return;
         }
         if self.dropped > 0 {
             self.items
-                .push_back(Trace::Dropped(std::mem::take(&mut self.dropped)));
+                .push_back(TraceRecord::Dropped(std::mem::take(&mut self.dropped)));
         }
         self.closed = end;
         self.items.push_back(item);
     }
 
-    /// The items queued, all of them.
-    pub(crate) fn take(&mut self) -> Option<VecDeque<Trace>> {
+    /// The records queued, all of them.
+    pub(crate) fn take(&mut self) -> Option<VecDeque<TraceRecord>> {
         (!self.items.is_empty()).then(|| std::mem::take(&mut self.items))
     }
 
@@ -82,15 +73,16 @@ impl TraceQueue {
     }
 }
 
-/// Tells the tracer `items`, outside every lock; a panic is ignored.
-pub(crate) fn trace(tracer: &Arc<dyn Tracer>, items: VecDeque<Trace>, logger: Option<&Logger>) {
+/// Tells the tracer `items` of `session`, outside every lock; a panic is
+/// ignored.
+pub(crate) fn trace(
+    tracer: &Arc<dyn Tracer>,
+    session: SessionId,
+    items: VecDeque<TraceRecord>,
+    logger: Option<&Logger>,
+) {
     for item in items {
-        let r = catch_unwind(AssertUnwindSafe(|| match &item {
-            Trace::Established => tracer.established(),
-            Trace::Event(e) => tracer.event(e),
-            Trace::Dropped(n) => tracer.dropped(*n),
-            Trace::Closed(e) => tracer.closed(e),
-        }));
+        let r = catch_unwind(AssertUnwindSafe(|| tracer.trace(session, &item)));
         if let (Err(_), Some(l)) = (r, logger) {
             l.log(
                 LogLevel::Error,
@@ -174,14 +166,79 @@ impl WindowHook {
 }
 
 /// Asks the predicate (with no zmux lock held); a panic is a refusal.
-pub(crate) fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&Logger>) -> bool {
-    catch_unwind(AssertUnwindSafe(|| predicate.allows(delta))).unwrap_or_else(|_| {
-        if let Some(l) = logger {
-            l.log(
-                LogLevel::Error,
-                "zmux: allow_connection_window_increase panicked; counted as a refusal",
-            );
+pub(crate) async fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&Logger>) -> bool {
+    predicate
+        .allows(delta)
+        .settle()
+        .await
+        .flatten()
+        .unwrap_or_else(|| {
+            if let Some(l) = logger {
+                l.log(
+                    LogLevel::Error,
+                    "zmux: allow_connection_window_increase panicked; counted as a refusal",
+                );
+            }
+            false
+        })
+}
+
+/// A host decision, awaited until `deadline` (`None`: unbounded) or until
+/// `stop` (its caller ended: the listener closed, the carrier was evicted,
+/// the session ended), whichever comes first; `None` when it panicked,
+/// missed the deadline or was stopped, the future dropped unfinished. An
+/// answer given now never touches the timer or `stop`.
+#[cfg(feature = "tokio")]
+pub(crate) async fn settle_by<T>(
+    decision: crate::proto::Decision<T>,
+    deadline: Option<std::time::Instant>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Option<T> {
+    match decision {
+        crate::proto::Decision::Now(v) => Some(v),
+        later @ crate::proto::Decision::Later(_) => {
+            let settled = first(stop, later.settle());
+            match deadline {
+                Some(at) => tokio::time::timeout_at(at.into(), settled)
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten(),
+                None => settled.await.flatten(),
+            }
         }
-        false
+    }
+}
+
+/// [`settle_by`] on a thread of the std driver: the thread parks while it
+/// waits.
+#[cfg(feature = "blocking")]
+pub(crate) fn settle_blocking<T>(
+    decision: crate::proto::Decision<T>,
+    deadline: Option<std::time::Instant>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Option<T> {
+    match decision {
+        crate::proto::Decision::Now(v) => Some(v),
+        later @ crate::proto::Decision::Later(_) => {
+            super::blocking::run(first(stop, later.settle()), deadline)
+                .flatten()
+                .flatten()
+        }
+    }
+}
+
+/// `f`'s output, or `None` once `stop` is ready first.
+pub(crate) async fn first<T>(
+    stop: impl std::future::Future<Output = ()>,
+    f: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let (mut stop, mut f) = (std::pin::pin!(stop), std::pin::pin!(f));
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(v) = f.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(v));
+        }
+        stop.as_mut().poll(cx).map(|()| None)
     })
+    .await
 }

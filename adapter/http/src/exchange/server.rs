@@ -136,9 +136,15 @@ impl ExchangeServer {
     /// # Errors
     ///
     /// `InvalidInput` on options without a PSK that do not choose to run
-    /// unauthenticated, or that set both.
+    /// unauthenticated, or that set both, and on an `idle_timeout` of zero.
     pub fn new(listener: &Listener, options: ExchangeOptions) -> io::Result<Self> {
         options.mac_psk()?;
+        if options.idle_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exchange idle_timeout of zero: a carrier needs a bound above the hold time",
+            ));
+        }
         // A difference of Times is a signed 32-bit value: a wider window
         // takes every Time.
         let window = i64::try_from(options.time_window.as_secs())

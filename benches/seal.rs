@@ -40,6 +40,34 @@ fn records(c: &mut Criterion) {
             });
         });
     }
+    // The drivers' framing: a record sealed, written and read back through
+    // the sans-IO Sealed halves, 16 KiB at a time.
+    for size in [1024usize, 16 * 1024] {
+        use zmux::proto::seal::{Framing, SealedRead, SealedReader, SealedWriter};
+        let plain = vec![0x42u8; size];
+        g.throughput(Throughput::Bytes(size as u64));
+        g.bench_with_input(BenchmarkId::new("framed", size), &size, |b, _| {
+            let mut w =
+                SealedWriter::new(Framing::ByteStream, Sealer::new(aes_256_gcm(), key.clone()));
+            let mut r = SealedReader::new(
+                Framing::ByteStream,
+                Opener::new(aes_256_gcm(), key.clone()),
+                Vec::new(),
+            );
+            let mut out = vec![0; 16 * 1024];
+            b.iter(|| {
+                w.seal(black_box(&plain)).unwrap();
+                let unit = w.pending().clone();
+                w.wrote(unit.len()).unwrap();
+                r.space()[..unit.len()].copy_from_slice(&unit);
+                drop(unit);
+                r.filled(size + 18);
+                while let SealedRead::Data(n) = r.read(&mut out).unwrap() {
+                    black_box(n);
+                }
+            });
+        });
+    }
     // ChaCha20-Poly1305 in place.
     for size in [1024usize, 16 * 1024] {
         let plain = vec![0x42u8; size];

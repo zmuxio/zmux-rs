@@ -31,7 +31,7 @@ use crate::proto::session::join::EpochKeys;
 use crate::proto::session::output::Records;
 use crate::proto::session::pipes::{Attachment, SentFrame};
 
-use crate::proto::session::rtt::PROBE_INTERVAL;
+use crate::proto::session::DEFAULT_PROBE_INTERVAL;
 use crate::proto::session::{CoreEvent, SessionCore, State};
 
 const TYPE: u64 = 0x024e_93eb;
@@ -123,7 +123,12 @@ impl Own {
 
 enum St {
     Stable,
-    /// O sent its offer and holds the private values.
+    /// O sent its offer and holds the private values. There is no way out
+    /// but the answer (or a crossed offer, rule 4): the offer is repeated
+    /// until a record carrying it is acknowledged (MULTIPATH.md Section 10),
+    /// and a peer that never answers is the peer's failure, not a reason to
+    /// give up an exchange the peer may already have committed. The cost is
+    /// bounded: one exchange, one set of private values per session.
     Offering {
         kex: GroupInitiator,
     },
@@ -191,7 +196,7 @@ impl Epochs {
             sent: Vec::new(),
             local: vec![(0, local.to_vec())],
             peer: vec![(0, peer)],
-            instance: instance.min(local.len()),
+            instance,
             wanted: false,
             stable_at: now,
             joins: 0,
@@ -285,9 +290,11 @@ impl SessionCore {
     /// The length of the instance identifier at the start of this session's Locators, which
     /// every new Locator keeps; the rest is random. A listener sets it with the Locator.
     pub fn set_locator_instance(&mut self, len: usize) {
+        // Kept here until multipath starts, then by the epochs alone; it
+        // is cut to the Locator where a new one is made.
         self.locator_instance = len;
         if let Some(mp) = self.mp.as_deref_mut() {
-            mp.epochs.instance = len.min(self.locator_instance);
+            mp.epochs.instance = len;
         }
     }
 
@@ -462,16 +469,15 @@ impl SessionCore {
         let head = &current[..ep.instance.min(current.len())];
         let len = current.len().max(head.len() + 8).max(16);
         let mut l = head.to_vec();
-        let mut rest = vec![0; len - head.len()];
-        if crate::proto::seal::fill_random(&mut rest).is_err() {
-            return Vec::new();
-        }
-        l.extend_from_slice(&rest);
+        l.resize(len, 0);
+        crate::util::fill_random_or_fallback(&mut l[head.len()..]);
         l
     }
 
     fn session_probe_interval(&self) -> Duration {
-        self.config.probe_interval().unwrap_or(PROBE_INTERVAL)
+        self.config
+            .probe_interval()
+            .unwrap_or(DEFAULT_PROBE_INTERVAL)
     }
 
     /// The probe interval of pipe `id`, by which a frame repeats.
@@ -481,7 +487,8 @@ impl SessionCore {
             .and_then(|o| o.probe_settings().0)
             .map(Period::duration);
         match own {
-            Some(d) => d.unwrap_or(PROBE_INTERVAL),
+            // Idle probes off: a frame still repeats at the default interval.
+            Some(d) => d.unwrap_or(DEFAULT_PROBE_INTERVAL),
             None => self.session_probe_interval(),
         }
     }

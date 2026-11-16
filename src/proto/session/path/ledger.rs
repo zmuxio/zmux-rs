@@ -719,8 +719,11 @@ impl crate::proto::session::SessionCore {
         let mp = self.mp.as_deref()?;
         let generation = Some(mp.tiers().view_generation());
         let ledger = mp.ledger();
-        if self.streams.has_touched() || ledger.borrow().held_generation != generation {
-            let mut l = ledger.borrow_mut();
+        // A read nested in another (a `Ref` held up the call chain) sees the
+        // outer read's snapshot: the refresh is the outermost read's.
+        if (self.streams.has_touched() || ledger.borrow().held_generation != generation)
+            && let Ok(mut l) = ledger.try_borrow_mut()
+        {
             if l.held_generation != generation {
                 // Pipes went live or stopped being so.
                 l.held_generation = generation;

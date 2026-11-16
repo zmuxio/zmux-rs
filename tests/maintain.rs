@@ -619,6 +619,23 @@ async fn policy_count_replaces_the_pool_count() {
     client.close().await;
 }
 
+/// A policy count far above `max_pipes` (6) dials no more carriers at once
+/// than the session can take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_count_above_max_pipes_dials_only_the_room() {
+    let (client, _server, dialer) = setup().await;
+    let pool = dialer
+        .pool(1)
+        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(usize::MAX));
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("several usable pipes", 10, || usable(&client) >= 3).await;
+    let dials = dialer.dials.load(Ordering::SeqCst);
+    assert!(dials <= 6, "dialled {dials}, beyond the room");
+    handle.stop();
+    until("stopped", 5, || handle.is_finished()).await;
+    client.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_count_of_zero_keeps_one_pipe() {
     let (client, _server, dialer) = setup().await;
@@ -740,7 +757,7 @@ async fn policy_recheck_shortens_the_interval() {
 /// A recheck below the floor is lengthened to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_recheck_is_floored() {
-    assert_eq!(zmux::helpers::RECHECK_FLOOR, Duration::from_millis(10));
+    assert_eq!(zmux::helpers::MIN_RECHECK, Duration::from_millis(10));
     let got = decisions_with_recheck(Duration::from_nanos(1), Duration::from_secs(1)).await;
     assert!((20..=130).contains(&got), "{got}");
 }

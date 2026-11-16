@@ -542,7 +542,7 @@ fn machine() {
             let st: Vec<u64> = m.states().iter().map(|x| u64::from(*x)).collect();
             assert_eq!(st, ints(&s["state"]), "{name} step {i}");
             for (j, want) in s["counters"].as_array().unwrap().iter().enumerate() {
-                assert_eq!(m.counters(j), ints(want), "{name} step {i}");
+                assert_eq!(m.counters(j).unwrap(), ints(want), "{name} step {i}");
             }
         }
     }

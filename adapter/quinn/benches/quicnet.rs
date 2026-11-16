@@ -347,7 +347,8 @@ impl Quic {
 }
 
 fn transport() -> Arc<quinn::TransportConfig> {
-    let mut t = quinn::TransportConfig::default();
+    // The adapter's windows: one source of the stream window.
+    let mut t = options().transport_config();
     t.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
     if std::env::var("QN_CC").as_deref() == Ok("bbr") {
         t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
@@ -765,7 +766,7 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
     let pipe = client
         .begin_add_pipe(
             client_quic.open_pipe().await.unwrap(),
-            PipeOptions::default(),
+            PipeOptions::default().with_record_mode(zmux::RecordMode::Bound),
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

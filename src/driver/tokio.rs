@@ -96,6 +96,15 @@ pub trait ChunkWrite: Send {
     /// buffer taken whole is left empty, and one taken in part is advanced
     /// past what was taken (as quinn's `SendStream::write_chunks` does).
     /// `chunks` is unchanged when the call returns `Pending` or an error.
+    ///
+    /// After `Pending` the caller either calls again with the same
+    /// `chunks` (the same buffers, in the same order, none advanced) or
+    /// drops the writer: an implementation may have started sending them
+    /// (a frame header written, a write in flight) and continue where it
+    /// stopped, so it may rely on that and need not cope with other
+    /// buffers in between. zmux keeps to this; a carrier written by
+    /// anything else must too.
+    ///
     /// On a message-framed carrier ([`PipeIo::records`]) `chunks` is one
     /// message, taken whole or not at all. `Ok(0)` for non-empty `chunks`
     /// means the carrier is closed.
@@ -317,6 +326,10 @@ pub type SendStream = handle::SendStream<Tokio>;
 pub type RecvStream = handle::RecvStream<Tokio>;
 /// A pipe of a tokio session.
 pub type Pipe = handle::Pipe<Tokio>;
+/// A cheap reference to a stream of a tokio session: its metadata and its
+/// readiness, while its `SendStream` or `RecvStream` is busy elsewhere.
+pub type StreamHandle = handle::StreamHandle<Tokio>;
+pub use handle::TryRead;
 
 impl Session {
     handle::session_api!(Tokio, PipeIo);
@@ -410,6 +423,105 @@ pub struct PipeIo {
     /// Told the session's close code once the session is done with the
     /// carrier ([`PipeIo::with_close_code`]).
     pub(crate) close_code: Option<TellCloseCode>,
+    /// Run after the carrier's graceful end ([`PipeIo::with_drain`]).
+    pub(crate) drain: Option<Box<Drain>>,
+}
+
+/// How long a [`PipeIo::with_drain`] future may run at most when the
+/// adapter has no timeout of its own that fits: the upper bound of a
+/// session's linger timeout, which waits for the peer's close the same way.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(2);
+
+/// The rounds a session task makes in one poll before it yields to the
+/// other tasks of its worker.
+const TASK_ROUNDS: u32 = 64;
+
+/// Runs `drain` on the current tokio runtime for at most `limit`: dropped
+/// at the limit, or with the runtime when it shuts down earlier; dropped
+/// at once outside a runtime. What [`PipeIo::with_drain`] does with its
+/// future, for an adapter's own carrier that has no such hook (a lane).
+pub fn spawn_drain(drain: impl Future<Output = ()> + Send + 'static, limit: Duration) {
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            let _ = tokio::time::timeout(limit, drain).await;
+        });
+    }
+}
+
+/// `dial` within `limit` ([`DIAL_TIMEOUT`](crate::adapter::DIAL_TIMEOUT) by
+/// default in the adapters), or a `TimedOut` error: the one bound of an
+/// adapter's dial, from its connect to the carrier being ready.
+///
+/// # Errors
+///
+/// `dial`'s error, or `TimedOut` when it is not done within `limit`.
+pub async fn within<T>(
+    limit: Duration,
+    dial: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(limit, dial).await.unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the carrier was not ready in time",
+        ))
+    })
+}
+
+type DrainFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A [`PipeIo::with_drain`] future: spawned when dropped once the
+/// carrier's sending half ended gracefully (armed), and dropped unrun
+/// otherwise. Declared after the carrier's halves, so that it starts once
+/// they are gone.
+pub(crate) struct Drain {
+    future: Option<DrainFuture>,
+    limit: Duration,
+    armed: bool,
+}
+
+impl Drain {
+    /// `a` and `b` together, each within its own limit.
+    fn join(a: Drain, b: Drain) -> Drain {
+        let limit = a.limit.max(b.limit);
+        let armed = a.armed || b.armed;
+        let mut a = a.take();
+        let mut b = b.take();
+        Drain {
+            future: Some(Box::pin(std::future::poll_fn(move |cx| {
+                for f in [&mut a, &mut b] {
+                    if f.as_mut().is_some_and(|f| f.as_mut().poll(cx).is_ready()) {
+                        *f = None;
+                    }
+                }
+                if a.is_none() && b.is_none() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }))),
+            limit,
+            armed,
+        }
+    }
+
+    /// The future bounded by its own limit.
+    fn take(mut self) -> Option<DrainFuture> {
+        let f = self.future.take()?;
+        let limit = self.limit;
+        Some(Box::pin(async move {
+            let _ = tokio::time::timeout(limit, f).await;
+        }))
+    }
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(f) = self.future.take()
+        {
+            spawn_drain(f, self.limit);
+        }
+    }
 }
 
 /// The hook of [`PipeIo::with_close_code`].
@@ -692,6 +804,7 @@ impl PipeIo {
             taken: None,
             split_bootstrap: false,
             close_code: None,
+            drain: None,
             max_record: None,
             secure: false,
             split: false,
@@ -780,6 +893,7 @@ impl PipeIo {
             taken: None,
             split_bootstrap: false,
             close_code: None,
+            drain: None,
             max_record: None,
             secure: false,
             split: false,
@@ -1041,6 +1155,10 @@ impl PipeIo {
             })),
             (a, b) => a.or(b).map(|f| TellCloseCode(Some(f), VarInt::ZERO)),
         };
+        up.drain = match (up.drain.take(), down.drain.take()) {
+            (Some(a), Some(b)) => Some(Box::new(Drain::join(*a, *b))),
+            (a, b) => a.or(b),
+        };
         up.taken = match (up.taken.take(), down.taken.take()) {
             (Some(a), Some(b)) => Some(Box::new(Box::new(move || {
                 a();
@@ -1144,6 +1262,54 @@ impl PipeIo {
             self.exporter = Some(crate::proto::exporter::CarrierExporter::new(export));
         }
         self
+    }
+
+    /// [`Self::with_exporter`] whose values come later (from another
+    /// thread, a language binding): `export` returns the value's future,
+    /// an error while the handshake is incomplete or once the connection is
+    /// gone. The values zmux reads are fetched outside every lock before the
+    /// carrier's session, join or Establish needs them, bounded by its
+    /// handshake (or join) deadline; other labels of
+    /// `Session::export_keying_material` give nothing (a host reads them
+    /// from its own TLS layer). Not for carrier early data: such a carrier
+    /// gives the exporter that answers in the call.
+    #[must_use]
+    pub fn with_exporter_async<F>(
+        mut self,
+        export: impl Fn(crate::ExportRequest) -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: Future<Output = io::Result<Vec<u8>>> + Send + 'static,
+    {
+        if self.outer.is_none() {
+            self.exporter = Some(crate::proto::exporter::CarrierExporter::new_async(export));
+        }
+        self
+    }
+
+    /// Fetches the values of an exporter whose values come later
+    /// ([`Self::with_exporter_async`]) until `deadline`; nothing to do for
+    /// others.
+    pub(crate) fn resolve_exporter(
+        &self,
+        deadline: Option<Instant>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let fut = self
+            .exporter
+            .as_ref()
+            .filter(|e| !e.is_resolved())
+            .map(crate::proto::exporter::CarrierExporter::resolve);
+        async move {
+            let Some(fut) = fut else {
+                return;
+            };
+            match deadline {
+                Some(d) => {
+                    let _ = tokio::time::timeout_at(d.into(), fut).await;
+                }
+                None => fut.await,
+            }
+        }
     }
 
     /// The exporter of a handshake run over this carrier itself, such as an
@@ -1292,6 +1458,48 @@ impl PipeIo {
     pub fn with_close_code(mut self, close_code: impl FnOnce(VarInt) + Send + 'static) -> Self {
         self.close_code = Some(TellCloseCode::new(close_code));
         self
+    }
+
+    /// Runs `drain` once the session is done with the carrier after its
+    /// sending half ended gracefully (its `poll_shutdown` returned
+    /// `Ok`), and the halves are dropped: on the tokio runtime, for at
+    /// most `limit` ([`DRAIN_LIMIT`] when the adapter has no timeout of its
+    /// own that fits), and no longer than the runtime runs. A carrier that
+    /// failed, was aborted, has no sending half or never became a pipe
+    /// drops `drain` unrun.
+    ///
+    /// For what the carrier's connection must still do after the pipe's
+    /// own end: wait until the peer acknowledged the last bytes, or read a
+    /// response to its end, holding the connection until then, so that its
+    /// close does not discard them. `drain` holds what it needs (a clone of
+    /// the connection handle) from the start, and none of the halves; what
+    /// exists only inside a half (a response being received) reaches it
+    /// through a channel the half sends on when it is dropped, such as a
+    /// `tokio::sync::oneshot`. A second call adds its future beside the
+    /// first, each within its limit.
+    #[must_use]
+    pub fn with_drain(
+        mut self,
+        drain: impl Future<Output = ()> + Send + 'static,
+        limit: Duration,
+    ) -> Self {
+        let next = Drain {
+            future: Some(Box::pin(drain)),
+            limit,
+            armed: false,
+        };
+        self.drain = Some(Box::new(match self.drain.take() {
+            Some(first) => Drain::join(*first, next),
+            None => next,
+        }));
+        self
+    }
+
+    /// The carrier's sending half ended gracefully: its drain runs.
+    fn arm_drain(drain: &mut Option<Box<Drain>>) {
+        if let Some(d) = drain {
+            d.armed = true;
+        }
     }
 
     /// Calls `taken` once a listener takes the carrier
@@ -1893,141 +2101,80 @@ impl Shared<Tokio> {
 /// pipe. Nothing read from the carrier reaches the session before the Reply verifies; a
 /// failure fails only the attachment.
 async fn join_carrier(shared: Arc<Shared<Tokio>>, id: PipeId, mut pipe: PipeIo) {
+    use super::accept::{DialStep, JoinDial};
     use super::sealed::{read_unit, seal_carrier, until, write_unit};
-    use crate::proto::session::{JOIN_READ_BOUND, JoinStep};
-    let framing = pipe.framing;
     pipe.resolve_lanes();
     let mut pipe = Some(pipe);
     let shared_ref = &shared;
     let stop = handle::join_failed_wait(shared_ref, id);
     let work = async move {
         let mut io = pipe.take().expect("present");
-        let kind = io.carrier;
-        let overhead = io.write_overhead;
-        // The cap or the refusal backoff holds the join.
-        let message = loop {
-            let r = {
-                let mut st = shared_ref.lock();
-                let r = st.core.join_prepare(id, now());
-                st.after_command();
-                r
-            };
-            match r {
-                Ok(Some(message)) => break message,
-                Ok(None) => handle::join_released_wait(shared_ref, id).await,
-                Err(_) => return,
-            }
-        };
-        let plan = shared_ref.join_plan(kind, message);
-        if !plan.delay.is_zero() {
-            tokio::time::sleep(plan.delay).await;
-        }
-        let hello = {
-            let mut st = shared_ref.lock();
-            let r = st.core.join_hello(id, (framing, overhead), &plan, now());
-            st.after_command();
-            r
-        };
-        let Ok(hello) = hello else {
-            return;
-        };
-        let failed = |kind: io::ErrorKind| {
-            let mut st = shared_ref.lock();
-            st.core.join_carrier_failed(id, kind, now());
-            st.after_command();
-        };
-        if let Err(e) = write_unit(&mut io, &hello).await {
-            failed(e.kind());
-            return;
-        }
-        drop(hello);
+        let mut dial = JoinDial::new(
+            shared_ref.clone(),
+            id,
+            io.framing,
+            io.carrier,
+            io.write_overhead,
+        );
         let mut input = Vec::new();
-        let mut want = 1;
-        loop {
-            while input.len() < want {
-                match read_unit(&mut io, &mut input).await {
-                    Ok(n) if n > 0 && input.len() <= JOIN_READ_BOUND => {}
-                    Ok(_) => {
-                        failed(io::ErrorKind::UnexpectedEof);
-                        return;
-                    }
-                    Err(e) => {
-                        failed(e.kind());
-                        return;
-                    }
+        let mut next = dial.start();
+        let (consumed, records) = loop {
+            next = match next {
+                DialStep::Hold => {
+                    handle::join_released_wait(shared_ref, id).await;
+                    dial.released()
                 }
-            }
-            let verdict = {
-                let mut st = shared_ref.lock();
-                let verdict = st.core.verify_reply(id, &input, now());
-                st.after_command();
-                verdict
-            };
-            match verdict {
-                JoinStep::More { consumed, need } => {
-                    input.drain(..consumed);
-                    want = if framing == Framing::Records {
-                        input.clear();
-                        1
-                    } else {
-                        need.max(input.len() + 1)
-                    };
+                DialStep::Delay(d) => {
+                    tokio::time::sleep(d).await;
+                    dial.delayed(true)
                 }
-                JoinStep::Verified { consumed, mode } => {
-                    let plan = if mode == crate::proto::seal::RecordMode::Bound {
-                        crate::shaping::UnitPlan::default()
-                    } else {
-                        let plan = shared_ref.join_plan(kind, "confirm");
-                        if !plan.delay.is_zero() {
-                            tokio::time::sleep(plan.delay).await;
+                DialStep::Write(unit) => {
+                    let wrote = write_unit(&mut io, &unit).await;
+                    dial.written(wrote)
+                }
+                DialStep::Read(want) => {
+                    while input.len() < want {
+                        let r = read_unit(&mut io, &mut input).await;
+                        if !dial.read(r, input.len()) {
+                            return;
                         }
-                        plan
-                    };
-                    let finished = {
-                        let mut st = shared_ref.lock();
-                        let r = st.core.join_finish(id, &plan, now());
-                        st.after_command();
-                        r
-                    };
-                    let Ok(crate::proto::session::JoinFinished {
-                        confirm, records, ..
-                    }) = finished
-                    else {
-                        return;
-                    };
-                    if let Err(e) = write_unit(&mut io, &confirm).await {
-                        failed(e.kind());
-                        return;
                     }
-                    input.drain(..consumed);
-                    io.prefix = input;
-                    if let Some((s, o)) = records {
-                        io = seal_carrier(io, s, o);
-                    }
-                    let limits = {
-                        let mut st = shared_ref.lock();
-                        // Checked when the pipe was added (`check_pipe_record_limit`).
-                        let fit = io
-                            .max_record
-                            .is_none_or(|m| st.core.set_pipe_max_record(id, m).is_ok());
-                        st.core.set_pipe_write_overhead(id, io.write_overhead);
-                        fit.then(|| st.core.pipe_directions(id))
-                    };
-                    let Some((inbound, outbound)) = limits else {
-                        failed(io::ErrorKind::InvalidInput);
-                        return;
-                    };
-                    io.end_unused(inbound, outbound).await;
-                    if claim_carrier(shared_ref, id.0, io.outer.take()).is_err()
-                        || shared_ref.attach_task(id.0, io).is_err()
-                    {
-                        failed(io::ErrorKind::BrokenPipe);
-                    }
-                    return;
+                    dial.input(&mut input)
                 }
-                JoinStep::Declined | JoinStep::Failed => return,
-            }
+                DialStep::End => return,
+                DialStep::Attach { consumed, records } => break (consumed, records),
+            };
+        };
+        input.drain(..consumed);
+        io.prefix = input;
+        if let Some((s, o)) = records {
+            io = seal_carrier(io, s, o);
         }
+        let Some((inbound, outbound)) = dial.limits(io.max_record, io.write_overhead) else {
+            return;
+        };
+        // Bounded on its own: the core's handshake timer ended with the
+        // Confirm.
+        let deadline = dial.deadline().map(tokio::time::Instant::from_std);
+        let ended = if let Some(d) = deadline {
+            tokio::time::timeout_at(d, io.end_unused(inbound, outbound))
+                .await
+                .is_ok()
+        } else {
+            io.end_unused(inbound, outbound).await;
+            true
+        };
+        if !ended {
+            dial.failed(io::ErrorKind::TimedOut);
+            return;
+        }
+        if claim_carrier(shared_ref, id.0, io.outer.take()).is_err()
+            || shared_ref.attach_task(id.0, io).is_err()
+        {
+            dial.failed(io::ErrorKind::BrokenPipe);
+            return;
+        }
+        dial.attached();
     };
     let _ = until(stop, work).await;
 }
@@ -2039,8 +2186,11 @@ impl PipeIo {
             self.reader = None;
             self.prefix.clear();
         }
-        if !outbound && let Some(mut w) = self.writer.take() {
-            let _ = std::future::poll_fn(|cx| w.poll_shutdown(cx)).await;
+        if !outbound
+            && let Some(mut w) = self.writer.take()
+            && std::future::poll_fn(|cx| w.poll_shutdown(cx)).await.is_ok()
+        {
+            Self::arm_drain(&mut self.drain);
         }
     }
 }
@@ -2073,14 +2223,6 @@ impl Shared<Tokio> {
     pub(crate) fn drop_pipe(&self, p: PipeId) {
         let mut st = self.lock();
         st.core.abandon_pipe_for_limit(p, now());
-        st.after_command();
-    }
-
-    /// Ends the session while it is suspended (the suspended-session
-    /// limit).
-    pub(crate) fn close_suspended(&self) {
-        let mut st = self.lock();
-        st.core.close_suspended(now());
         st.after_command();
     }
 }
@@ -2195,17 +2337,30 @@ impl Shared<Tokio> {
         tokio::spawn(Task::new(shared.clone(), first));
         if let Some((settled, done, applied)) = early {
             let weak = Arc::downgrade(&shared);
+            let ended = shared.clone();
             tokio::spawn(async move {
                 // Dropped last, whichever way this ends: the first bytes go on.
                 let _applied = applied;
-                let accepted = match (settled, done) {
-                    (Some(s), _) => Some(s.await),
-                    (None, Some(d)) => {
-                        d.await;
-                        None
+                let verdict = async move {
+                    match (settled, done) {
+                        (Some(s), _) => Some(Some(s.await)),
+                        (None, Some(d)) => {
+                            d.await;
+                            Some(None)
+                        }
+                        (None, None) => None,
                     }
-                    (None, None) => return,
                 };
+                // The adapter's verdict is dropped with the session's end.
+                let session_end = super::wait::Wait::new(
+                    &ended.inner,
+                    super::wait::List::State,
+                    |st: &mut State<Tokio>| st.core.error().map(|_| ()),
+                );
+                let Some(Some(accepted)) = super::sealed::until(session_end, verdict).await else {
+                    return;
+                };
+                drop(ended);
                 let Some(shared) = weak.upgrade() else {
                     return;
                 };
@@ -3027,6 +3182,9 @@ pub(crate) struct PipeTask {
     /// the carrier's halves and lanes, so that it is called once they are
     /// dropped: when the task drops the pipe, after the lock.
     close_code: Option<TellCloseCode>,
+    /// The carrier's [`PipeIo::with_drain`] future, armed by a graceful
+    /// end of the sending half; dropped after the halves too.
+    drain: Option<Box<Drain>>,
     _live: Live,
 }
 
@@ -3175,7 +3333,7 @@ impl LaneTask {
                     Poll::Pending => false,
                 };
             }
-            if let Some(Writer::Stream(w)) = &ws.writer
+            if let Some(Writer::Stream(w)) = &mut ws.writer
                 && let Err(e) = w.watch(cx)
             {
                 return self.fail(e.kind());
@@ -3319,6 +3477,7 @@ impl PipeTask {
             })),
             abort: io.abort,
             close_code: io.close_code,
+            drain: io.drain,
             active: now(),
             done: Arc::new(PipeDone::default()),
             read_skipped: false,
@@ -3648,10 +3807,13 @@ impl PipeTask {
                     return false;
                 };
                 return match w.poll_shutdown(cx) {
-                    Poll::Ready(_) => {
+                    Poll::Ready(r) => {
                         ws.writer = None;
                         ws.out.shutdown_done();
                         self.write_closed = true;
+                        if r.is_ok() {
+                            PipeIo::arm_drain(&mut self.drain);
+                        }
                         true
                     }
                     Poll::Pending => false,
@@ -3660,7 +3822,7 @@ impl PipeTask {
             // An idle stream carrier is watched for its end: a STOP_SENDING
             // or the end of its session fails the pipe at once, not at its
             // next write.
-            if let Some(Writer::Stream(w)) = &ws.writer
+            if let Some(Writer::Stream(w)) = &mut ws.writer
                 && let Err(e) = w.watch(cx)
             {
                 return Self::fail_write(ws, &mut self.write_closed, &mut self.failed, e.kind());
@@ -3758,6 +3920,10 @@ impl PipeTask {
                 // must not have ended the carrier before the abort took it.
                 if abort && let Some(f) = self.abort.take() {
                     f();
+                    // An aborted carrier has no graceful end to drain.
+                    if let Some(d) = &mut self.drain {
+                        d.armed = false;
+                    }
                 }
                 ws.writer = None;
                 ws.out.clear();
@@ -4087,6 +4253,7 @@ impl Future for Task {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
         let shared = &*this.shared;
+        let mut rounds = 0u32;
         loop {
             let mut progress = false;
             let mut input = false;
@@ -4311,6 +4478,14 @@ impl Future for Task {
                 this.pick_made = true;
             }
             if !waiting {
+                // Carriers that are always ready (nested sessions, custom
+                // writers outside tokio's budget) never make the task
+                // yield: it does, after a bounded number of rounds.
+                rounds += 1;
+                if rounds >= TASK_ROUNDS {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 continue;
             }
             for p in &mut this.pipes {
@@ -4411,6 +4586,8 @@ impl Session {
         transport: Option<Role>,
     ) -> Result<Session, ConnectError> {
         let config = config.into();
+        pipe.resolve_exporter(Instant::now().checked_add(config.handshake_wait()))
+            .await;
         let session = Shared::create(pipe, config.clone(), role, transport, None, |_| {})?
             .established()
             .await?;
@@ -4607,6 +4784,7 @@ impl Session {
     pub async fn add_pipe(&self, pipe: PipeIo, opts: PipeOptions) -> Result<Pipe, PipeError> {
         let deadline = tokio::time::Instant::now() + self.add_pipe_limit();
         let no_wait = opts.return_on_reply;
+        pipe.resolve_exporter(Some(deadline.into_std())).await;
         let p = self.begin_add_pipe(pipe, opts)?;
         let guard = handle::AbortUnlessAdded(Some(&p));
         let r = tokio::time::timeout_at(deadline, p.added_op(no_wait))
@@ -4923,7 +5101,8 @@ impl AsyncWrite for SendStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_write_buf(cx.waker(), buf)
+        self.get_mut()
+            .with_slot(|s, slot| s.poll_write_buf(cx.waker(), slot, buf))
             .map_err(io::Error::from)
     }
 
@@ -4941,7 +5120,9 @@ impl AsyncWrite for SendStream {
     /// before all that left; once it left, the flush succeeds and the next
     /// write or finish reports the stop. A lost session fails it.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush_stream(cx.waker()).map_err(io::Error::from)
+        self.get_mut()
+            .with_slot(|s, slot| s.poll_flush_stream(cx.waker(), slot))
+            .map_err(io::Error::from)
     }
 
     /// Finishes the stream.
@@ -5011,7 +5192,10 @@ impl AsyncRead for RecvStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let dst = buf.initialize_unfilled();
-        match self.poll_read_buf(cx.waker(), dst) {
+        match self
+            .get_mut()
+            .with_slot(|s, slot| s.poll_read_buf(cx.waker(), slot, dst))
+        {
             Poll::Ready(Ok(Some(n))) => {
                 buf.advance(n);
                 Poll::Ready(Ok(()))

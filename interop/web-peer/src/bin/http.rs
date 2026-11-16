@@ -225,7 +225,10 @@ async fn ws_h2(addr: &str) -> std::io::Result<zmux::PipeIo> {
         .method(http::Method::CONNECT)
         .uri(format!("https://{addr}/zmux"))
         .header("sec-websocket-version", "13")
-        .header("sec-websocket-protocol", "qmux-02")
+        .header(
+            "sec-websocket-protocol",
+            String::from_utf8_lossy(zmux::proto::ident::DEFAULT_ALPN).as_ref(),
+        )
         .body(zmux_http::PipeBody::empty())
         .map_err(std::io::Error::other)?;
     req.extensions_mut()

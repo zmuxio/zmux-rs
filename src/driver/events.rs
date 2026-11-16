@@ -52,8 +52,9 @@ enum Key {
     Capacity,
     /// Failed join authentications, counted.
     JoinAuth,
-    /// The latest try of a carrier kind, as the session or as a pipe.
-    Candidate(crate::CarrierKind, bool),
+    /// The latest try of a carrier kind and variant (by a hash of its
+    /// label), as the session or as a pipe.
+    Candidate(crate::CarrierKind, u64, bool),
     /// The latest choice of carrier kind.
     Chosen,
     /// The latest committed epoch.
@@ -135,7 +136,17 @@ impl EventQueue {
                 Key::Capacity
             }
             SessionEvent::JoinAuthFailed { .. } => Key::JoinAuth,
-            SessionEvent::CarrierCandidate { kind, joined, .. } => Key::Candidate(*kind, *joined),
+            SessionEvent::CarrierCandidate {
+                kind,
+                variant,
+                joined,
+                ..
+            } => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                variant.hash(&mut h);
+                Key::Candidate(*kind, h.finish(), *joined)
+            }
             SessionEvent::CarrierChosen(..) => Key::Chosen,
             SessionEvent::EpochCommitted { .. } => Key::EpochCommitted,
             SessionEvent::EpochDeleted { .. } => Key::EpochDeleted,

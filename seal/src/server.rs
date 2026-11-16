@@ -4,10 +4,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use zmux::InboundTransform;
 use zmux::proto::listener::RejectError;
-use zmux::proto::seal::{Dispatch, Framing, RecordMode, dispatch};
+use zmux::proto::seal::{Dispatch, Framing, RecordMode, Secret, dispatch};
 use zmux::shaping::{HandshakeShaper, Limits, message_len};
+use zmux::{Decision, InboundTransform};
 use zmux_seal_proto::{Error, Hello, Profile, Responder, ResponderKeys};
 
 use crate::carrier::Carrier;
@@ -15,12 +15,50 @@ use crate::establish::{Peer, binding_of, plan_of, read_frame, shaped_payload};
 use crate::profiles::{SERVER_DEFAULT, has_psk};
 use crate::trust::{
     Admission, AppData, AppDataRequest, AppDataSource, ConfigError, Gate, Signer, Verifier,
-    VerifyError, VerifyInput, ask_app_data, check_pq_auth, judge,
+    VerifyError, VerifyInput, ask_app_data, check_pq_auth, guarded, host_panicked, judge,
+    signer_panicked,
 };
 use crate::{credential_value, message_items, proof_placeholder};
 
-/// The callable of [`ServerOptions::allow_record_mode`].
-pub type ModeCheck = dyn Fn(RecordMode, &Peer) -> bool + Send + Sync;
+/// The check of [`ServerOptions::allow_record_mode`]: asked outside every
+/// lock while the Hello is answered; a later answer is bounded as the
+/// handshake is, and one that panics refuses.
+#[derive(Clone)]
+pub struct ModeCheck(Arc<ModeCheckFn>);
+
+/// The callable behind a [`ModeCheck`].
+pub type ModeCheckFn = dyn Fn(RecordMode, &Peer) -> Decision<bool> + Send + Sync;
+
+impl ModeCheck {
+    /// The check `f`.
+    pub fn new(f: impl Fn(RecordMode, &Peer) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(move |m, p| Decision::Now(f(m, p))))
+    }
+
+    /// The check `f`, answering when its future completes; it is given its
+    /// own copy of the peer.
+    pub fn new_async<F>(f: impl Fn(RecordMode, Peer) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move |m, p| Decision::later(f(m, p.clone()))))
+    }
+
+    /// Whether `mode` is allowed for `peer`; a panic refuses.
+    async fn allows(&self, mode: RecordMode, peer: &Peer) -> bool {
+        let f = &self.0;
+        match Decision::catch(|| f(mode, peer)) {
+            Some(d) => d.settle().await == Some(true),
+            None => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for ModeCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ModeCheck(..)")
+    }
+}
 
 /// The options of a [`ServerConfig`]; the default accepts Profiles 1 and 3.
 #[derive(Clone)]
@@ -32,7 +70,7 @@ pub struct ServerOptions {
     pub accepted_profiles: Vec<u64>,
     /// The check of a Hello's mode; unset passes only Sealed. Joins have their own,
     /// `Config::allow_record_mode`.
-    pub allow_record_mode: Option<Arc<ModeCheck>>,
+    pub allow_record_mode: Option<ModeCheck>,
     /// Plans the handshake's messages; unset: none.
     pub shaper: Option<HandshakeShaper>,
     /// Applied to the plans, and not counted: there is no session yet.
@@ -96,7 +134,8 @@ impl std::fmt::Debug for ServerOptions {
 #[derive(Clone)]
 pub struct ServerConfig {
     gate: Arc<dyn Gate>,
-    static_secret: [u8; 32],
+    /// Cleared when the last clone is dropped.
+    static_secret: Secret,
     accepted: Vec<u64>,
     options: ServerOptions,
 }
@@ -136,6 +175,7 @@ impl ServerConfig {
         }
         check_pq_auth(options.require_pq_auth, options.client_verifier.as_ref())?;
         let accepted = listed.clone();
+        let static_secret = Secret::from(&static_secret[..]);
         Ok(Self {
             gate,
             static_secret,
@@ -262,12 +302,14 @@ impl ServerConfig {
         }
         let handle = parsed.handle().to_vec();
         let psk = if with_psk {
-            self.gate
-                .resolve(&handle, source)
-                .await
-                .map_err(|e| gate_error("unknown_handle", e))?
+            // Held as a Secret from here: cleared when the handshake ends.
+            Secret::from(
+                guarded(|| self.gate.resolve(&handle, source), host_panicked)
+                    .await
+                    .map_err(|e| gate_error("unknown_handle", e))?,
+            )
         } else {
-            Vec::new()
+            Secret::default()
         };
         // A Hello in Bound is never carrier early data. A carrier without the Bound contract
         // has no Binding to check it with.
@@ -279,7 +321,8 @@ impl ServerConfig {
             &parsed,
             ResponderKeys {
                 psk: &psk,
-                static_secret: &self.static_secret,
+                static_secret: <&[u8; 32]>::try_from(&self.static_secret[..])
+                    .expect("32 bytes, from the constructor's array"),
                 binding: &binding,
                 max_app_data: self.options.max_app_data,
             },
@@ -305,11 +348,15 @@ impl ServerConfig {
         )
         .await
         .map_err(|e| gate_error("app_data", e))?;
-        let credential = self
-            .gate
-            .credential(&handle, profile, &self.options.local_context, source)
-            .await
-            .map_err(|e| gate_error("gate_error", e))?;
+        let credential = guarded(
+            || {
+                self.gate
+                    .credential(&handle, profile, &self.options.local_context, source)
+            },
+            host_panicked,
+        )
+        .await
+        .map_err(|e| gate_error("gate_error", e))?;
         let value = credential_value(credential.as_ref());
         let proof = proof_placeholder(self.options.signer.as_ref());
         let plan = plan_of::<C>(
@@ -337,7 +384,7 @@ impl ServerConfig {
                 let pending = reply
                     .write_reply_signed(&payload)
                     .map_err(|e| refuse(e.class()))?;
-                let sig = signer.sign(pending.message()).await?;
+                let sig = guarded(|| signer.sign(pending.message()), signer_panicked).await?;
                 pending.finish(&sig).map_err(|e| refuse(e.class()))?
             }
         };
@@ -392,21 +439,24 @@ impl ServerConfig {
             pq_authenticated,
         };
         if let Some(allow) = &self.options.allow_record_mode
-            && !allow(mode, &peer)
+            && !allow.allows(mode, &peer).await
         {
             return Err(refuse("record_mode"));
         }
-        let value = self
-            .gate
-            .commit(
-                Admission {
-                    handle: &handle,
-                    peer: &peer,
-                },
-                source,
-            )
-            .await
-            .map_err(|e| gate_error("gate_error", e))?;
+        let value = guarded(
+            || {
+                self.gate.commit(
+                    Admission {
+                        handle: &handle,
+                        peer: &peer,
+                    },
+                    source,
+                )
+            },
+            host_panicked,
+        )
+        .await
+        .map_err(|e| gate_error("gate_error", e))?;
         Ok(take(slot)?
             .finish(rest, complete, mode)
             .padded(padded)
@@ -580,7 +630,7 @@ mod tests {
         let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(node));
         let k = derive_handle_psk(&[9; 32], b"tests", b"").unwrap();
         let server = ServerConfig::new(
-            Arc::new(OneKey(k.psk.clone())),
+            Arc::new(OneKey(k.psk.to_vec())),
             node,
             ServerOptions::default(),
         )

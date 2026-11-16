@@ -20,7 +20,7 @@
     "fixtures/wire/valid.ndjson": "7cafc4488518721b044644fcf7979000f6fa4cb0d375d9853ed6367157352a69",
     "fixtures/wire/invalid.ndjson": "027805f0ff24796d9d847473a4cab8cc08d1f1447ef818d22b0d44ccb6a2a106",
     "fixtures/traces/index.json": "8fd3f254ad2bea9fc1e8f9f59a238bfbb3493edf9b29d9a6b1a9270cf43515ce",
-    "fixtures/capsules.json": "75f922aead84fd51477dc443e234b3a720cb05ec26666dded8938da52abe35c5",
+    "fixtures/capsules.json": "eb1e8eae3c52ce610344cb440c4eaf6c6cda74671c72f1edcc682ea92d3a5fa6",
     "WIRE_EXAMPLES.md": "0df557fa54d0abae95381e0fa303efc1e5d9684cd92d3cf17b4afd82301ca312"
   },
   "traces_sha256": "1c50c94816d2a9715a3affc18cc560ec7fe7db17f8a8d7904553cb9f07dcc2cf"

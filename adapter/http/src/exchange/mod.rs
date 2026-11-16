@@ -171,7 +171,9 @@ pub struct ExchangeOptions {
     /// held.
     pub up_store: usize,
     /// Server: a carrier without a request for this long has failed
-    /// (default 60 s); above the hold time.
+    /// (default 60 s); above the hold time. Unlike the connection's
+    /// optional [`crate::Options::idle_timeout`], it is required: a
+    /// carrier's end is decided by it, and zero is refused.
     pub idle_timeout: Duration,
     /// Server: a carrier that ended is remembered this long, to answer
     /// GONE to late requests (default 60 s).

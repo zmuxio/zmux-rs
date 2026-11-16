@@ -396,6 +396,29 @@ fn a_listener_releases_a_failed_carrier_once() {
     });
 }
 
+/// A later `on_reject` is dropped when the listener closes, as on the tokio
+/// listener: the handler ends with the close, not at the handshake timeout.
+#[test]
+fn a_later_reject_policy_ends_with_the_listener() {
+    watchdog(30, "later reject", || {
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = Duration::from_secs(30);
+        limits.on_reject = Some(zmux::OnReject::new_async(|_| std::future::pending()));
+        let l = Listener::new(Config::default(), limits, None).unwrap();
+        let (a, mut b) = tcp_pair();
+        b.write_all(&[0xff; 64]).unwrap();
+        let handler = {
+            let l = l.clone();
+            thread::spawn(move || l.handle_pipe(PipeIo::from_tcp(a), PipeHint::default()))
+        };
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        l.close();
+        assert!(handler.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    });
+}
+
 // ---- the close's linger ---------------------------------------------------------------
 
 /// A session on a counted carrier to a blocking peer.

@@ -105,23 +105,30 @@ impl Gate {
 }
 
 impl Limiter for Gate {
-    fn poll_ready(&self, cx: &mut Context<'_>, _: usize, max: usize) -> Poll<usize> {
+    fn poll_acquire(
+        &self,
+        cx: &mut Context<'_>,
+        _: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
         let mut w = self.waker.lock().unwrap();
         if self.shut.load(Ordering::SeqCst) {
             *w = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        Poll::Ready(max)
+        self.charged.fetch_add(max, Ordering::Relaxed);
+        Poll::Ready(Ok(max))
     }
-    fn try_ready(&self, max: usize) -> usize {
+    fn try_acquire(&self, _: u64, max: u64) -> u64 {
         if self.shut.load(Ordering::SeqCst) {
             0
         } else {
+            self.charged.fetch_add(max, Ordering::Relaxed);
             max
         }
     }
-    fn charge(&self, n: usize) {
-        self.charged.fetch_add(n as u64, Ordering::Relaxed);
+    fn refund(&self, n: u64) {
+        self.charged.fetch_sub(n, Ordering::Relaxed);
     }
 }
 

@@ -52,7 +52,7 @@ fn admitted(mut limits: ListenerConfig, admission: zmux::Admission) -> ListenerC
 
 fn prefix_auth() -> (zmux::PrefixAuth, zmux::Admission) {
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     (auth, zmux::Admission::prefix_auth(verifier))
 }
 

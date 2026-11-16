@@ -28,8 +28,7 @@ use crate::util::HmacSha256;
 
 /// The length of a token: the admission's prefix length.
 pub const PREFIX_TOKEN_LEN: usize = NONCE_LEN + TAG_LEN;
-/// The TLS exporter label of a token's binding (32 bytes, empty context).
-pub const PREFIX_AUTH_EXPORTER_LABEL: &str = "EXPORTER-zmux-prefix-auth";
+pub use super::keys::PREFIX_AUTH_EXPORTER_LABEL;
 /// The length of a binding.
 pub const PREFIX_AUTH_BINDING_LEN: usize = 32;
 /// The request header field of the header form, unless both ends agree on
@@ -50,7 +49,9 @@ pub struct InvalidPrefixAuth;
 
 impl std::fmt::Display for InvalidPrefixAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("prefix auth needs a non-empty key and a slot of whole seconds")
+        f.write_str(
+            "prefix auth needs a non-empty key, a slot of whole seconds and room for a Nonce",
+        )
     }
 }
 
@@ -88,7 +89,7 @@ impl PrefixAuth {
         if psk.is_empty() || slot.subsec_nanos() != 0 || slot.as_secs() == 0 {
             return Err(InvalidPrefixAuth);
         }
-        let kp = HmacSha256::new(psk).mac(&[KEY_LABEL]);
+        let kp = crate::proto::seal::Secret::from(&HmacSha256::new(psk).mac(&[KEY_LABEL])[..]);
         Ok(Self {
             kp: HmacSha256::new(&kp),
             slot: slot.as_secs(),
@@ -120,25 +121,25 @@ impl PrefixAuth {
 
     /// The binding of a carrier with metadata `info`: its exporter's value
     /// when tokens are bound, else `None`; an error when they are bound
-    /// and `info` has no exporter.
-    pub fn binding(
-        &self,
-        info: &CarrierInfo<'_>,
-    ) -> io::Result<Option<[u8; PREFIX_AUTH_BINDING_LEN]>> {
+    /// and `info` has no exporter, or one that gives its values later and
+    /// was not resolved yet ([`CarrierExporter::resolve`](crate::CarrierExporter::resolve);
+    /// a listener resolves it before its admission decides).
+    pub fn binding(&self, info: &CarrierInfo) -> io::Result<Option<[u8; PREFIX_AUTH_BINDING_LEN]>> {
         if !self.bind_tls {
             return Ok(None);
         }
         let b = info
-            .export(
-                PREFIX_AUTH_EXPORTER_LABEL.as_bytes(),
-                &[],
-                PREFIX_AUTH_BINDING_LEN,
-            )
+            .export(PREFIX_AUTH_EXPORTER_LABEL, &[], PREFIX_AUTH_BINDING_LEN)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "bound prefix authentication needs the carrier's TLS exporter",
-                )
+                let why = match info.exporter() {
+                    Some(e) if !e.is_resolved() => {
+                        "the carrier's exporter gives its values later and was not resolved \
+                         (CarrierExporter::resolve)"
+                    }
+                    Some(_) => "the carrier's TLS exporter failed",
+                    None => "bound prefix authentication needs the carrier's TLS exporter",
+                };
+                io::Error::new(io::ErrorKind::InvalidInput, why)
             })?;
         let mut a = [0u8; PREFIX_AUTH_BINDING_LEN];
         a.copy_from_slice(&b);
@@ -189,7 +190,9 @@ impl PrefixAuth {
 pub struct PrefixAuthVerifier {
     auth: PrefixAuth,
     skew: u64,
-    record: Option<ReplayFilter>,
+    record: ReplayFilter,
+    /// The first slot whose tokens are taken: the one it started in.
+    first_slot: u64,
 }
 
 impl std::fmt::Debug for PrefixAuthVerifier {
@@ -204,20 +207,41 @@ impl std::fmt::Debug for PrefixAuthVerifier {
 impl PrefixAuthVerifier {
     /// A verifier of `auth`'s tokens that accepts the slots within `skew`
     /// of its current one and records at most `max_nonces` Nonces; a token
-    /// that finds the record full is not accepted.
-    #[must_use]
-    pub fn new(auth: PrefixAuth, skew: u32, max_nonces: usize) -> Self {
+    /// that finds the record full is not accepted. Each token costs up to
+    /// `2 * skew + 1` HMACs to verify: keep `skew` small.
+    ///
+    /// The Nonces of an earlier run are gone: tokens stamped before the
+    /// slot this verifier starts in are refused, so that one captured
+    /// before a restart replays at most within that slot (a client whose
+    /// clock is a slot behind fails until the next).
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidPrefixAuth`] for `max_nonces` of zero, which could record
+    /// no Nonce and so accept no token.
+    pub fn new(auth: PrefixAuth, skew: u32, max_nonces: usize) -> Result<Self, InvalidPrefixAuth> {
         let skew = u64::from(skew);
         let slot = auth.slot;
-        Self {
+        let record = ReplayFilter::new(
+            Duration::from_secs((skew + 1).saturating_mul(slot)),
+            max_nonces,
+        )
+        .map_err(|_| InvalidPrefixAuth)?;
+        Ok(Self {
             auth,
             skew,
-            record: ReplayFilter::new(
-                Duration::from_secs((skew + 1).saturating_mul(slot)),
-                max_nonces,
-            )
-            .ok(),
-        }
+            record,
+            first_slot: unix_now() / slot,
+        })
+    }
+
+    /// As if it started at `unix` (seconds since the epoch): the slot whose
+    /// tokens it takes first, for verifying at given times
+    /// ([`Self::verify_at`]).
+    #[must_use]
+    pub fn started_at(mut self, unix: u64) -> Self {
+        self.first_slot = unix / self.auth.slot;
+        self
     }
 
     /// The parameters it verifies.
@@ -246,6 +270,7 @@ impl PrefixAuthVerifier {
         let binding = binding.map_or(&[][..], |b| &b[..]);
         let cur = unix / self.auth.slot;
         let low = cur.saturating_sub(self.skew);
+        let low = low.max(self.first_slot);
         let Some(slot) = (low..=cur.saturating_add(self.skew)).find(|&s| {
             let hdr = slot_header(s, binding.len());
             self.auth.kp.verify(&[&hdr, binding, nonce], tag)
@@ -254,10 +279,9 @@ impl PrefixAuthVerifier {
         };
         let ms = |secs: u64| i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX);
         // A slot stands for its start: within (skew + 1) slots of the clock.
-        self.record.as_ref().is_some_and(|r| {
-            r.check_at(nonce, ms(slot.saturating_mul(self.auth.slot)), ms(unix))
-                == ReplayVerdict::Fresh
-        })
+        self.record
+            .check_at(nonce, ms(slot.saturating_mul(self.auth.slot)), ms(unix))
+            == ReplayVerdict::Fresh
     }
 
     /// An admission decision: [`AdmissionVerdict::Accept`] of the token when it
@@ -269,7 +293,7 @@ impl PrefixAuthVerifier {
     /// ([`PrefixAuth::header_name`]), 43 base64url characters (accepted with
     /// no prefix): a missing, repeated or malformed field fails like a
     /// wrong token.
-    pub fn decide(&self, info: &CarrierInfo<'_>, prefix: &[u8]) -> AdmissionVerdict {
+    pub fn decide(&self, info: &CarrierInfo, prefix: &[u8]) -> AdmissionVerdict {
         let header;
         let (token, accept) = if info.head {
             let Some(t) = self.header_token(info) else {
@@ -291,33 +315,31 @@ impl PrefixAuthVerifier {
     }
 
     /// The token of the header form: the field's one value, decoded.
-    fn header_token(&self, info: &CarrierInfo<'_>) -> Option<[u8; PREFIX_TOKEN_LEN]> {
-        let mut value = None;
+    fn header_token(&self, info: &CarrierInfo) -> Option<[u8; PREFIX_TOKEN_LEN]> {
+        // Decoded in place, without a copy of the value.
+        let mut token = [0u8; PREFIX_TOKEN_LEN];
+        let mut decoded = false;
         let mut fields = 0usize;
         info.for_each_header(|name, v| {
             if name.eq_ignore_ascii_case(&self.auth.header) {
                 fields += 1;
-                value = Some(v.to_vec());
+                decoded = v.len() == HEADER_VALUE_LEN
+                    && oob::decode(v, &mut token) == Ok(PREFIX_TOKEN_LEN);
             }
         });
-        let value = value.filter(|v| fields == 1 && v.len() == HEADER_VALUE_LEN)?;
-        let mut token = [0u8; PREFIX_TOKEN_LEN];
-        match oob::decode(&value, &mut token) {
-            Ok(PREFIX_TOKEN_LEN) => Some(token),
-            _ => None,
-        }
+        (fields == 1 && decoded).then_some(token)
     }
 }
 
 impl CarrierCredential for PrefixAuth {
     /// A fresh token, bound to the carrier when tokens are bound.
-    fn prefix(&self, info: &CarrierInfo<'_>) -> io::Result<Vec<u8>> {
+    fn prefix(&self, info: &CarrierInfo) -> io::Result<Vec<u8>> {
         Ok(self.token(self.binding(info)?.as_ref())?.to_vec())
     }
 
     /// A fresh token in the header form: [`PrefixAuth::header_name`] and the
     /// token in base64url without padding.
-    fn header(&self, info: &CarrierInfo<'_>) -> io::Result<(String, String)> {
+    fn header(&self, info: &CarrierInfo) -> io::Result<(String, String)> {
         let token = self.token(self.binding(info)?.as_ref())?;
         Ok((self.header.to_string(), Self::header_value(&token)))
     }
@@ -385,7 +407,9 @@ mod tests {
     #[test]
     fn verifies_within_skew_once() {
         let a = PrefixAuth::new(b"k", Duration::from_secs(30), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 1, 16);
+        let v = PrefixAuthVerifier::new(a.clone(), 1, 16)
+            .unwrap()
+            .started_at(0);
         let tok = a.token_at(None, T, NONCE);
         assert!(!v.verify_at(&tok, None, T + 60), "two slots later");
         assert!(v.verify_at(&tok, None, T + 30));
@@ -402,7 +426,9 @@ mod tests {
     #[test]
     fn full_record_refuses_until_its_slots_expire() {
         let a = PrefixAuth::new(b"k", Duration::from_secs(1), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 0, 2);
+        let v = PrefixAuthVerifier::new(a.clone(), 0, 2)
+            .unwrap()
+            .started_at(0);
         assert!(v.verify_at(&a.token_at(None, 10, [1; 16]), None, 10));
         assert!(v.verify_at(&a.token_at(None, 10, [2; 16]), None, 10));
         assert!(
@@ -428,10 +454,16 @@ mod tests {
         );
     }
 
-    fn upgrade<'a>(fields: &'a [(&'a str, &'a str)]) -> CarrierInfo<'a> {
-        CarrierInfo::new()
-            .with_head()
-            .with_headers(|| fields.iter().map(|(n, v)| (*n, v.as_bytes())))
+    fn upgrade(fields: &[(&str, &str)]) -> CarrierInfo {
+        let fields: Vec<(String, String)> = fields
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+            .collect();
+        CarrierInfo::new().with_head().with_headers(move |each| {
+            for (n, v) in &fields {
+                each(n, v.as_bytes());
+            }
+        })
     }
 
     /// The header form of the test vectors verifies at their time,
@@ -440,7 +472,9 @@ mod tests {
     #[test]
     fn header_form_decides() {
         let a = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 1, 16);
+        let v = PrefixAuthVerifier::new(a.clone(), 1, 16)
+            .unwrap()
+            .started_at(0);
         let tok = a.token_at(None, unix_now(), NONCE);
         let val = PrefixAuth::header_value(&tok);
         let ok = [("zmux-prefix-auth", val.as_str())];
@@ -468,7 +502,9 @@ mod tests {
                 "{bad}"
             );
         }
-        let other = PrefixAuthVerifier::new(a.clone().with_header("X-Auth"), 1, 16);
+        let other = PrefixAuthVerifier::new(a.clone().with_header("X-Auth"), 1, 16)
+            .unwrap()
+            .started_at(0);
         assert_eq!(
             v.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
             AdmissionVerdict::Fallback
@@ -479,12 +515,15 @@ mod tests {
         );
 
         let bound = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), true).unwrap();
-        let v = PrefixAuthVerifier::new(bound.clone(), 1, 16);
-        let exported = |_: &[u8], _: &[u8], out: &mut [u8]| {
+        let v = PrefixAuthVerifier::new(bound.clone(), 1, 16)
+            .unwrap()
+            .started_at(0);
+        let exported = |_: &str, _: &[u8], out: &mut [u8]| {
             out.copy_from_slice(&binding());
             true
         };
-        let info = CarrierInfo::new().with_exporter(exported);
+        let exported = crate::proto::exporter::CarrierExporter::new(exported);
+        let info = CarrierInfo::new().with_exporter(exported.clone());
         let (name, value) = bound.header(&info).unwrap();
         assert_eq!(name, PREFIX_AUTH_HEADER);
         let f = [(PREFIX_AUTH_HEADER, value.as_str())];

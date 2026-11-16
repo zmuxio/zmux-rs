@@ -634,7 +634,10 @@ async fn join_candidate(
     p.cache.prime(&p.key, cand);
     let r: Result<Vec<Pipe>, (CandidateOutcome, String)> = async {
         if let Some(join) = &cand.join {
-            return match tokio::time::timeout(p.policy.timer_min, join(s.clone(), options)).await {
+            // The carrier's own round trip is unknown before it opens: the
+            // session's stands in for it, as a dial's would.
+            let rtt = s.stats().smoothed_rtt.unwrap_or_default();
+            return match tokio::time::timeout(p.timer(rtt), join(s.clone(), options)).await {
                 Ok(Ok(pipes)) if !pipes.is_empty() => Ok(pipes),
                 Ok(Ok(_)) => Err((CandidateOutcome::Failed, "joined no pipe".into())),
                 Ok(Err(e)) => Err((io_outcome(&e), e.to_string())),
@@ -694,13 +697,7 @@ async fn join_candidate(
 /// an intermediary holds back (a response forwarded only after the
 /// request) joins, yet carries nothing to this endpoint.
 async fn inbound_open(pipe: &Pipe) {
-    loop {
-        match pipe.stats() {
-            Some(s) if s.inbound.is_none() || s.records_received > 0 => return,
-            None => return,
-            _ => tokio::time::sleep(Duration::from_millis(10)).await,
-        }
-    }
+    pipe.inbound_received().await;
 }
 
 /// Whether the session closed with an error other than an application
@@ -735,10 +732,13 @@ impl ChoiceSource {
             return Err(crate::InvalidConfig::new("CarrierChoice", "no candidate"));
         }
         for (i, c) in choice.candidates.iter().enumerate() {
-            if choice.candidates[..i].iter().any(|o| o.kind == c.kind) {
+            if choice.candidates[..i]
+                .iter()
+                .any(|o| o.kind == c.kind && o.variant() == c.variant())
+            {
                 return Err(crate::InvalidConfig::new(
                     "CarrierChoice",
-                    "two candidates of one kind",
+                    "two candidates of one kind and variant",
                 ));
             }
         }

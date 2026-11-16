@@ -32,14 +32,11 @@ pub(crate) struct CreditBlocked {
 }
 
 impl CreditBlocked {
-    /// The directions listed.
+    /// The directions listed; a stream gone since stays until the next
+    /// prune (`prune_credit_blocked`, every batch of new data), and readers
+    /// skip it.
     pub(in crate::proto::session) fn keys(&self) -> &[StreamKey] {
         &self.list
-    }
-
-    /// A stream is gone.
-    pub(in crate::proto::session) fn forget(&mut self, key: StreamKey) {
-        self.list.retain(|&k| k != key);
     }
 }
 
@@ -317,7 +314,7 @@ impl SessionCore {
     /// Re-sends the unacknowledged stream data on pipe `id` of the directions
     /// bound to it, which its penalty moves off.
     fn resend_on_penalty(&mut self, id: u64) {
-        let bound: Vec<StreamKey> = self
+        let mut bound: Vec<StreamKey> = self
             .streams
             .keys()
             .filter(|&k| {
@@ -330,9 +327,10 @@ impl SessionCore {
         if bound.is_empty() {
             return;
         }
+        bound.sort_unstable();
         let mut frames = Vec::new();
         if let Some(o) = self.out_mut(id) {
-            o.take_penalty_resend(|k| bound.contains(&k), &mut frames);
+            o.take_penalty_resend(|k| bound.binary_search(&k).is_ok(), &mut frames);
         }
         let now = self.now;
         for f in frames {

@@ -117,7 +117,7 @@ fn auth() -> PrefixAuth {
 }
 
 fn admission() -> Admission {
-    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024)))
+    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024).unwrap()))
         .with_peek_timeout(Duration::from_secs(5))
         .with_stall_interval(Duration::from_millis(10), Duration::from_millis(20))
 }

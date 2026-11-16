@@ -2,7 +2,7 @@
 //! connected in memory.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -180,19 +180,33 @@ fn idle_sessions_time_out_without_keep_alive() {
 }
 
 /// A budget of bytes that never refills (a limiter).
-struct Budget(AtomicUsize);
+struct Budget(AtomicU64);
 
 impl Limiter for Budget {
-    fn poll_ready(&self, _: &mut Context<'_>, _: usize, max: usize) -> Poll<usize> {
-        Poll::Ready(self.try_ready(max))
+    fn poll_acquire(
+        &self,
+        _: &mut Context<'_>,
+        min: u64,
+        max: u64,
+    ) -> Poll<Result<u64, zmux::LimitError>> {
+        match self.try_acquire(min, max) {
+            0 => Poll::Ready(Err(zmux::LimitError::new("budget exhausted"))),
+            n => Poll::Ready(Ok(n)),
+        }
     }
 
-    fn try_ready(&self, max: usize) -> usize {
-        self.0.load(Ordering::Relaxed).min(max)
-    }
-
-    fn charge(&self, n: usize) {
+    fn try_acquire(&self, min: u64, max: u64) -> u64 {
+        let left = self.0.load(Ordering::Relaxed);
+        if left < min {
+            return 0;
+        }
+        let n = left.min(max);
         self.0.fetch_sub(n, Ordering::Relaxed);
+        n
+    }
+
+    fn refund(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -207,7 +221,7 @@ fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
     a_cfg.enable_datagrams = true;
     let mut b_cfg = Config::default();
     b_cfg.enable_datagrams = true;
-    b_cfg.datagram_limiter.receive = Some(Arc::new(Budget(AtomicUsize::new(usize::MAX))));
+    b_cfg.datagram_limiter.receive = Some(Arc::new(Budget(AtomicU64::new(u64::MAX))));
     let mut p = Pair::with_events(a_cfg, b_cfg);
     let send = |p: &mut Pair, n: usize| {
         for _ in 0..n {
@@ -229,15 +243,15 @@ fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
     assert!(p.b.held_bytes() <= LIMIT);
     assert!(p.b.held_bytes() > LIMIT - 2000);
     for d in &mut staged {
-        d.set_allowed(true);
+        d.set_granted(Some(d.payload_len() as u64));
     }
-    p.b.admit_datagrams(&mut staged);
+    let _ = p.b.admit_datagrams(&mut staged);
     let mut rest = Vec::new();
     p.b.take_received_datagrams(&mut rest);
     for d in &mut rest {
-        d.set_allowed(true);
+        d.set_granted(Some(d.payload_len() as u64));
     }
-    p.b.admit_datagrams(&mut rest);
+    let _ = p.b.admit_datagrams(&mut rest);
     assert!(p.b.held_bytes() <= LIMIT);
     let mut n = 0;
     while p.b.recv_datagram().unwrap().is_some() {
@@ -250,8 +264,8 @@ fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
 
 #[test]
 fn application_bytes_count_payload_once_and_never_what_was_discarded() {
-    let send_budget = Arc::new(Budget(AtomicUsize::new(1000)));
-    let receive_budget = Arc::new(Budget(AtomicUsize::new(600)));
+    let send_budget = Arc::new(Budget(AtomicU64::new(1000)));
+    let receive_budget = Arc::new(Budget(AtomicU64::new(600)));
     let mut a_cfg = Config::default();
     a_cfg.enable_datagrams = true;
     a_cfg.datagram_limiter.send = Some(send_budget.clone());
@@ -273,31 +287,38 @@ fn application_bytes_count_payload_once_and_never_what_was_discarded() {
     p.a.reset(s2, VarInt::from_u32(7)).unwrap();
     // Datagrams: the third exceeds the send budget, the second the receive
     // budget.
-    // The core never calls a limiter: the caller asks
-    // the send limiter before and charges after, and polices received
-    // datagrams the core holds.
+    // The core never calls a limiter: the caller takes the send
+    // allowance before and gives back what is not queued, and polices
+    // received datagrams the core holds.
+    // The host's pattern with a Permit: a datagram is sent only with its
+    // whole allowance, which stays taken once it is queued and goes back
+    // with the permit otherwise.
     for _ in 0..3 {
-        let allowed = send_budget.try_ready(400) >= 400;
-        if p.a
-            .send_datagram(Bytes::from_static(&[3; 400]), allowed)
-            .unwrap()
-        {
-            send_budget.charge(400);
+        let permit = zmux::Permit::try_acquire(&*send_budget, 400, 400);
+        let queued =
+            p.a.send_datagram(Bytes::from_static(&[3; 400]), permit.is_some())
+                .unwrap();
+        if let (Some(mut permit), true) = (permit, queued) {
+            permit.consume(400);
         }
     }
+    // Two taken; the third refused, nothing taken.
+    assert_eq!(send_budget.0.load(Ordering::Relaxed), 200);
     p.pump();
     let mut held = Vec::new();
     p.b.take_received_datagrams(&mut held);
     assert_eq!(held.len(), 2, "held for the limiter");
     assert_eq!(p.b.recv_datagram().unwrap(), None, "not queued before it");
     for d in &mut held {
-        d.set_allowed(zmux::proto::limit::police(
+        d.set_granted(zmux::proto::limit::police(
             &*receive_budget,
-            d.payload_len(),
+            d.payload_len() as u64,
         ));
     }
-    p.b.admit_datagrams(&mut held);
+    assert_eq!(p.b.admit_datagrams(&mut held), 0);
     assert!(held.is_empty() && !p.b.has_received_datagrams());
+    // One admitted; the other refused, nothing taken.
+    assert_eq!(receive_budget.0.load(Ordering::Relaxed), 200);
 
     let r1 = p.b.accept(Dir::Bidi).unwrap().expect("stream");
     let meter = p.b.stream_meter(r1).unwrap();
@@ -719,4 +740,59 @@ fn a_flush_fails_only_on_a_stop_before_its_bytes_left() {
     p.b.stop(r, VarInt::from_u32(7)).unwrap();
     p.send(false);
     assert!(p.a.flush(k).and_then(|()| p.a.flushed(k)).is_err());
+}
+
+/// Two waiters on one stream with different thresholds: the later, larger
+/// registration does not raise the smaller one's threshold, so the smaller
+/// wait is still notified when its minimum is reached.
+#[test]
+fn a_larger_capacity_wait_does_not_hide_a_smaller_one() {
+    let mut b_cfg = Config::default();
+    b_cfg.initial_stream_receive_window = 16 * 1024;
+    b_cfg.max_stream_receive_window = zmux::Cap::Fixed(16 * 1024);
+    let mut p = Pair::with_events(Config::default(), b_cfg);
+    let s = p.a.open(Dir::Bidi).unwrap();
+    assert_eq!(p.a.write(s, &[7; 16 * 1024]).unwrap(), 16 * 1024);
+    p.pump();
+    assert_eq!(p.a.send_capacity(s).unwrap().capacity, 0);
+    p.a.wait_send_capacity(s, 4 * 1024);
+    p.a.wait_send_capacity(s, 64 * 1024);
+    let mut buf = [0u8; 8 * 1024];
+    let r = p.b.accept(Dir::Bidi).unwrap().expect("stream");
+    assert_eq!(p.b.read(r, &mut buf).unwrap(), Some((8 * 1024, false)));
+    let mut wire = Vec::new();
+    while p.b.wants_write(P0) {
+        p.b.poll_transmit(P0, p.now, &mut p.out);
+        if p.out.is_empty() {
+            break;
+        }
+        wire.clear();
+        p.out.copy_to_vec(&mut wire);
+        p.a.receive(P0, &wire, p.now);
+    }
+    assert!(p.a.send_capacity(s).unwrap().capacity >= 4 * 1024);
+    let mut woken = false;
+    while let Some(e) = p.a.poll_event() {
+        woken |= matches!(e, CoreEvent::StreamWritable(w) if w == s);
+    }
+    assert!(woken, "the smaller wait was hidden by the larger one");
+}
+
+/// A stream reset before anything was sent never reaches the peer, so
+/// nothing will ever arrive on its receiving part: that part ends cleanly
+/// at once instead of waiting forever.
+#[test]
+fn an_unopened_stream_reset_ends_its_receiving_part() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let s = p.a.open(Dir::Bidi).unwrap();
+    assert_eq!(p.a.readable_len(s).unwrap(), None, "waits before the reset");
+    p.a.reset(s, VarInt::from_u32(1)).unwrap();
+    assert_eq!(p.a.readable_len(s).unwrap(), Some(0));
+    assert_eq!(p.a.read(s, &mut [0; 8]).unwrap(), Some((0, true)));
+    p.pump();
+    assert_eq!(
+        p.b.accept(Dir::Bidi).unwrap(),
+        None,
+        "the peer never sees it"
+    );
 }

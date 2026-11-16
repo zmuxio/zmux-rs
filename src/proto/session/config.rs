@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::Tracer;
 use super::policy::Scheduler;
+use crate::proto::decision::{self, Decision};
 use crate::proto::keys::secret_flags;
 use crate::proto::limit::DatagramLimiter;
 use crate::proto::params::floor;
@@ -45,8 +46,7 @@ impl std::ops::Deref for JoinSecret {
 
 impl Drop for JoinSecret {
     fn drop(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
+        crate::util::wipe(&mut self.0);
     }
 }
 
@@ -179,6 +179,9 @@ pub enum LogLevel {
 
 /// The logger of a session or listener ([`Config::logger`]): a callback
 /// taking a level and a message, so that zmux depends on no logging crate.
+/// It is called on the thread that logs, a runtime worker included, after
+/// every lock is released, and must not block: a host whose logging waits
+/// (a language binding) subscribes with [`Config::events`] instead.
 #[derive(Clone)]
 pub struct Logger(pub Arc<LogFn>);
 
@@ -221,7 +224,10 @@ pub struct RecordPolicyInput {
 
 /// Chooses each carrier's record mode at the joiner: [`Config::record_policy`].
 /// A choice of [`RecordMode::Unmanaged`](crate::RecordMode::Unmanaged), which
-/// no pipe is joined in, fails the join with the configuration error.
+/// no pipe is joined in, fails the join with the configuration error. It is
+/// asked in the call that adds the pipe and must not block: a host whose
+/// choice needs I/O makes it before and sets
+/// [`PipeOptions::record_mode`](crate::PipeOptions) instead.
 #[derive(Clone)]
 pub struct RecordPolicy(Arc<RecordPolicyFn>);
 
@@ -243,7 +249,9 @@ impl RecordPolicy {
 }
 
 /// The acceptor's check of a Hello's mode, with the session's host value:
-/// [`Config::allow_record_mode`].
+/// [`Config::allow_record_mode`]. Asked outside every lock while the join
+/// is read; a later answer is bounded by the join's deadline, and one that
+/// misses it, or panics, refuses the join.
 #[derive(Clone)]
 pub struct AllowRecordMode(Arc<AllowRecordModeFn>);
 
@@ -251,7 +259,7 @@ type AllowRecordModeFn = dyn Fn(
         &RecordPolicyInput,
         crate::proto::seal::RecordMode,
         Option<&crate::proto::admission::AdmittedValue>,
-    ) -> bool
+    ) -> Decision<bool>
     + Send
     + Sync;
 
@@ -268,35 +276,64 @@ impl AllowRecordMode {
         + Sync
         + 'static,
     ) -> Self {
-        Self(Arc::new(f))
+        Self(Arc::new(move |i, m, a| Decision::Now(f(i, m, a))))
     }
 
-    /// Asks the check.
+    /// The check `f`, answering when its future completes; it is given its
+    /// own copies of the inputs.
+    pub fn new_async<F>(
+        f: impl Fn(
+            RecordPolicyInput,
+            crate::proto::seal::RecordMode,
+            Option<crate::proto::admission::AdmittedValue>,
+        ) -> F
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self
+    where
+        F: std::future::Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move |i, m, a| {
+            Decision::later(f(i.clone(), m, a.cloned()))
+        }))
+    }
+
+    /// Asks the check; a panic of the call is `None`.
     #[must_use]
     pub fn allows(
         &self,
         input: &RecordPolicyInput,
         mode: crate::proto::seal::RecordMode,
         admitted: Option<&crate::proto::admission::AdmittedValue>,
-    ) -> bool {
-        self.0(input, mode, admitted)
+    ) -> Decision<Option<bool>> {
+        decision::call(|| self.0(input, mode, admitted))
     }
 }
 
-/// An acceptor's further check of a join: [`Config::authorize_join`].
+/// An acceptor's further check of a join: [`Config::authorize_join`]. Asked
+/// as [`AllowRecordMode`] is.
 #[derive(Clone)]
-pub struct AuthorizeJoin(Arc<dyn Fn(super::PipeId) -> bool + Send + Sync>);
+pub struct AuthorizeJoin(Arc<dyn Fn(super::PipeId) -> Decision<bool> + Send + Sync>);
 
 impl AuthorizeJoin {
     /// The check `f`, given the pipe ID of the join.
     pub fn new(f: impl Fn(super::PipeId) -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
+        Self(Arc::new(move |p| Decision::Now(f(p))))
     }
 
-    /// Asks the check.
+    /// The check `f`, answering when its future completes.
+    pub fn new_async<F>(f: impl Fn(super::PipeId) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move |p| Decision::later(f(p))))
+    }
+
+    /// Asks the check; a panic of the call is `None`.
     #[must_use]
-    pub fn allows(&self, pipe: super::PipeId) -> bool {
-        self.0(pipe)
+    pub fn allows(&self, pipe: super::PipeId) -> Decision<Option<bool>> {
+        decision::call(|| self.0(pipe))
     }
 }
 
@@ -617,20 +654,30 @@ pub(crate) const STAGED_UNI_STREAMS: (u64, u64) = (16, 256);
 /// it is shown the proposed increase of the session receive window and
 /// answers whether to allow it. It runs outside every zmux lock on the
 /// session's hook context, never on a
-/// driver thread; a panic counts as a refusal.
+/// driver thread; a panic counts as a refusal. A later answer holds the
+/// proposal (no other is made meanwhile) and the session's tracer behind it
+/// until it completes or the session ends.
 #[derive(Clone)]
-pub struct WindowIncrease(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+pub struct WindowIncrease(Arc<dyn Fn(u64) -> Decision<bool> + Send + Sync>);
 
 impl WindowIncrease {
     /// The predicate `f`.
     pub fn new(f: impl Fn(u64) -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
+        Self(Arc::new(move |d| Decision::Now(f(d))))
     }
 
-    /// Asks the predicate.
+    /// The predicate `f`, answering when its future completes.
+    pub fn new_async<F>(f: impl Fn(u64) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move |d| Decision::later(f(d))))
+    }
+
+    /// Asks the predicate; a panic of the call is `None`.
     #[must_use]
-    pub fn allows(&self, increase: u64) -> bool {
-        self.0(increase)
+    pub fn allows(&self, increase: u64) -> Decision<Option<bool>> {
+        decision::call(|| self.0(increase))
     }
 }
 
@@ -1254,6 +1301,38 @@ pub struct TestHooks {
 }
 
 impl Config {
+    /// Subscribes to what this configuration's logger and tracer are told:
+    /// at most `capacity` events queued for the host to read from the
+    /// returned [`HostEvents`](crate::HostEvents) when it wants, on its own
+    /// thread, each trace record with its session's
+    /// [`SessionId`](crate::SessionId). Every session of the configuration
+    /// (and of its clones made after) writes to it. [`Config::logger`] and
+    /// [`Config::tracer`] become hooks that queue and then call the ones set
+    /// before, so that a second call makes a second subscription that also
+    /// reads every event; a hook set after replaces that part. The
+    /// subscription ends when it is closed ([`HostEvents::close`](crate::HostEvents::close))
+    /// or when the configuration, its clones and their sessions are gone.
+    pub fn events(&mut self, capacity: usize) -> crate::proto::host_events::HostEvents {
+        use crate::proto::host_events::{HostEvent, HostEvents, TraceSink};
+        let (events, tx) = HostEvents::channel(capacity);
+        let log = tx.clone();
+        let before = self.logger.take();
+        self.logger = Some(Logger::new(move |level, message| {
+            if let Some(b) = &before {
+                (b.0)(level, message);
+            }
+            log.push(HostEvent::Log {
+                level,
+                message: message.to_owned(),
+            });
+        }));
+        self.tracer = Some(Arc::new(TraceSink {
+            tx,
+            before: self.tracer.take(),
+        }));
+        events
+    }
+
     /// A configuration for multipath: the
     /// recommended `max_pipes` of 8 and the join
     /// credentials, which multipath needs; the rest default.
@@ -1483,31 +1562,46 @@ impl Config {
                 "neither 0 nor at least the early-data floor of 4",
             ));
         }
-        if self.max_incoming_streams > MAX_STREAM_CREDIT
-            || matches!(self.max_incoming_uni_streams, UniCredit::Limit(n) if n > MAX_STREAM_CREDIT)
-        {
+        if self.max_incoming_streams > MAX_STREAM_CREDIT {
             return Err(crate::InvalidConfig::new(
                 "max_incoming_streams",
-                "a stream limit above MAX_STREAM_CREDIT (2^60)",
+                "above MAX_STREAM_CREDIT (2^60)",
+            ));
+        }
+        if matches!(self.max_incoming_uni_streams, UniCredit::Limit(n) if n > MAX_STREAM_CREDIT) {
+            return Err(crate::InvalidConfig::new(
+                "max_incoming_uni_streams",
+                "above MAX_STREAM_CREDIT (2^60)",
             ));
         }
         // Values sent as variable-length integers.
         let varint_max = (1u64 << 62) - 1;
-        let windows = [
-            self.max_stream_receive_window,
-            self.max_connection_receive_window,
-        ];
-        if windows
-            .into_iter()
-            .any(|c| matches!(c, Cap::Fixed(v) if v > varint_max))
-            || self.initial_stream_receive_window > varint_max
-            || self.initial_connection_receive_window > varint_max
-            || self.idle_millis() > varint_max
-        {
-            return Err(crate::InvalidConfig::new(
-                "max_idle_timeout",
-                "a window or timeout is too large to encode",
-            ));
+        let too_large = "too large to encode (above 2^62 - 1)";
+        for (field, cap) in [
+            ("max_stream_receive_window", self.max_stream_receive_window),
+            (
+                "max_connection_receive_window",
+                self.max_connection_receive_window,
+            ),
+        ] {
+            if matches!(cap, Cap::Fixed(v) if v > varint_max) {
+                return Err(crate::InvalidConfig::new(field, too_large));
+            }
+        }
+        for (field, v) in [
+            (
+                "initial_stream_receive_window",
+                self.initial_stream_receive_window,
+            ),
+            (
+                "initial_connection_receive_window",
+                self.initial_connection_receive_window,
+            ),
+            ("max_idle_timeout", self.idle_millis()),
+        ] {
+            if v > varint_max {
+                return Err(crate::InvalidConfig::new(field, too_large));
+            }
         }
         if self.max_send_record < super::RECORD_FLOOR {
             return Err(crate::InvalidConfig::new("max_send_record", "below 8192"));
@@ -1515,25 +1609,25 @@ impl Config {
         if self.send_buffer == 0 {
             return Err(crate::InvalidConfig::new("send_buffer", "zero"));
         }
-        if self.datagram_send_queue == 0
-            || self.datagram_receive_queue == 0
-            || self.datagram_stream_queue == 0
-            || self.datagram_receive_bytes == 0
-            || self.datagram_stream_bytes == Some(0)
-        {
-            return Err(crate::InvalidConfig::new(
-                "datagram_send_queue",
-                "a datagram queue or the datagram receive bytes is zero",
-            ));
+        for (field, zero) in [
+            ("datagram_send_queue", self.datagram_send_queue == 0),
+            ("datagram_receive_queue", self.datagram_receive_queue == 0),
+            ("datagram_stream_queue", self.datagram_stream_queue == 0),
+            ("datagram_receive_bytes", self.datagram_receive_bytes == 0),
+            (
+                "datagram_stream_bytes",
+                self.datagram_stream_bytes == Some(0),
+            ),
+        ] {
+            if zero {
+                return Err(crate::InvalidConfig::new(field, "zero"));
+            }
         }
         if self.max_pipes == 0 {
             return Err(crate::InvalidConfig::new("max_pipes", "zero"));
         }
         if self.max_lanes.get() > varint_max {
             return Err(crate::InvalidConfig::new("max_lanes", "above 2^62 - 1"));
-        }
-        if self.own_locator().len() > Locator::MAX_LEN {
-            return Err(crate::InvalidConfig::new("locator", "above 255 bytes"));
         }
         if self
             .max_idle_timeout

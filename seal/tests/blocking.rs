@@ -108,7 +108,7 @@ fn echo(c: &blocking::Session, s: &blocking::Session, data: &[u8]) {
 #[test]
 fn establish_and_join_on_threads() {
     let (l, addr, t) = serving(
-        Some(server(keys().psk).blocking_transform()),
+        Some(server(keys().psk.to_vec()).blocking_transform()),
         ListenerConfig::default(),
     );
     let (p, peer) = blocking_establish(addr).unwrap();
@@ -291,7 +291,7 @@ fn a_refused_establish_is_stalled_by_default() {
 fn drivers_interoperate() {
     // Tokio client, blocking server.
     let (l, addr, t) = serving(
-        Some(server(keys().psk).blocking_transform()),
+        Some(server(keys().psk.to_vec()).blocking_transform()),
         ListenerConfig::default(),
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -328,7 +328,7 @@ fn drivers_interoperate() {
     t.join().unwrap();
     // Blocking client, tokio server.
     let mut lc = ListenerConfig::default();
-    lc.inbound_transform = Some(server(keys().psk).transform());
+    lc.inbound_transform = Some(server(keys().psk.to_vec()).transform());
     let tl = zmux::Listener::new(config(), lc).expect("valid listener configuration");
     let addr = rt.block_on(async {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -405,7 +405,7 @@ fn a_sealed_close_without_half_close_keeps_its_code() {
     let l = blocking::Listener::new(
         config(),
         ListenerConfig::default(),
-        Some(server(keys().psk).blocking_transform()),
+        Some(server(keys().psk.to_vec()).blocking_transform()),
     )
     .expect("valid listener configuration");
     let mut closing = Vec::new();
@@ -460,4 +460,64 @@ fn a_sealed_close_without_half_close_keeps_its_code() {
         t.join().unwrap();
     }
     l.close();
+}
+
+/// A Gate that never answers: the listener's handshake timeout drops its
+/// future on the std driver too, and the carrier's handler ends.
+struct StuckGate(Vec<u8>);
+
+impl Gate for StuckGate {
+    fn resolve<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: Option<SocketAddr>,
+    ) -> BoxFuture<'a, Result<Vec<u8>, VerifyError>> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+    fn credential<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: zmux_seal::Profile,
+        _: &'a [u8],
+        _: Option<SocketAddr>,
+    ) -> BoxFuture<'a, Result<Option<Credential>, VerifyError>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn commit<'a>(
+        &'a self,
+        _: Admission<'a>,
+        _: Option<SocketAddr>,
+    ) -> BoxFuture<'a, Result<AdmittedValue, VerifyError>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[test]
+fn a_host_future_past_the_handshake_timeout_is_dropped() {
+    let server = ServerConfig::new(
+        Arc::new(StuckGate(keys().psk.to_vec())),
+        NODE,
+        zmux_seal::ServerOptions::default(),
+    )
+    .unwrap();
+    let mut limits = ListenerConfig::default();
+    limits.handshake_timeout = Duration::from_millis(200);
+    let l = blocking::Listener::new(config(), limits, Some(server.blocking_transform()))
+        .expect("valid listener configuration");
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let client = std::thread::spawn(move || blocking_establish(addr));
+    let (accepted, _) = tcp.accept().unwrap();
+    let begun = Instant::now();
+    // The Gate's future reads nothing: only the deadline of the
+    // handshake's waits drops it.
+    let r = l.handle_pipe(PipeIo::from_tcp(accepted), PipeHint::default());
+    assert!(r.is_err());
+    assert!(
+        begun.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        begun.elapsed()
+    );
+    l.close();
+    let _ = client.join();
 }

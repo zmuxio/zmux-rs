@@ -394,7 +394,7 @@ impl zmux_seal::Gate for SealGate {
         Box::pin(async move {
             let k = seal_keys();
             if handle == k.handle {
-                Ok(k.psk)
+                Ok(k.psk.to_vec())
             } else {
                 Err(zmux_seal::VerifyError::rejected("unknown handle"))
             }

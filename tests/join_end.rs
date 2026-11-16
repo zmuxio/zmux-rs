@@ -12,12 +12,12 @@ use std::time::Duration;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
 use zmux::proto::session::AllowRecordMode;
 use zmux::{
-    Config, HandleError, Listener, ListenerConfig, OnReject, PipeAuth, PipeIo, PipeOptions,
-    RejectAction, Session,
+    Config, HandleError, Listener, ListenerConfig, OnReject, PipeAuth, PipeDirection, PipeIo,
+    PipeOptions, RejectAction, Session,
 };
 
 fn config() -> Config {
@@ -217,4 +217,124 @@ async fn no_pipe_starts_after_its_end_during_the_confirm() {
         }
         listener.close();
     }
+}
+
+/// A carrier whose shutdown never completes; it says when it is first asked to.
+struct StalledShutdown {
+    inner: DuplexStream,
+    asked: Option<oneshot::Sender<()>>,
+}
+
+impl AsyncRead for StalledShutdown {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StalledShutdown {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(asked) = self.asked.take() {
+            let _ = asked.send(());
+        }
+        Poll::Pending
+    }
+}
+
+/// The handler's future dropped after the join attached its pipe, while it ends the
+/// unused sending half, takes the pipe with it: the session keeps no pipe without a
+/// carrier task.
+#[tokio::test]
+async fn a_dropped_handler_leaves_no_attached_pipe_behind() {
+    let (client, server, listener) = sessions(Arc::default()).await;
+    let (near, far) = duplex(1 << 16);
+    let (asked, at_shutdown) = oneshot::channel();
+    let l = listener.clone();
+    let handler = tokio::spawn(async move {
+        let carrier = StalledShutdown {
+            inner: far,
+            asked: Some(asked),
+        };
+        l.handle_pipe(PipeIo::new(carrier), zmux::PipeHint::default())
+            .await
+    });
+    // The client only sends: the acceptor's sending half is unused.
+    let mut only_out = PipeOptions::new();
+    only_out.direction = PipeDirection::Out;
+    let _pipe = client.begin_add_pipe(PipeIo::new(near), only_out).unwrap();
+    timeout(Duration::from_secs(5), at_shutdown)
+        .await
+        .expect("the handler reached the end of the unused half")
+        .unwrap();
+    let stats = server.pipe_stats();
+    assert_eq!(stats.len(), 2, "the join attached its pipe");
+    assert!(stats.iter().all(|p| p.failure.is_none()));
+    handler.abort();
+    assert!(handler.await.unwrap_err().is_cancelled());
+    let failed = server
+        .pipe_stats()
+        .iter()
+        .filter(|p| p.failure.is_some())
+        .count();
+    assert_eq!(failed, 1, "the pipe of the dropped handler failed");
+    listener.close();
+}
+
+/// A joiner whose carrier task is dropped in its handshake (here by the end of the runtime
+/// it runs on, while the session lives on another) fails the join at once, rather than
+/// leaving the pipe to the handshake timeout.
+#[test]
+fn a_dropped_joiner_fails_its_join_at_once() {
+    let session_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let joiner_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pipe, _alive) = session_rt.block_on(async {
+        let (client, server, listener) = sessions(Arc::default()).await;
+        let (near, mut far) = duplex(1 << 16);
+        // The carrier task of the join runs on the joiner's runtime.
+        let pipe = {
+            let _on_joiner_rt = joiner_rt.enter();
+            client
+                .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+                .unwrap()
+        };
+        // The joiner's Hello is out, and nobody answers it.
+        timeout(Duration::from_secs(5), far.read_u8())
+            .await
+            .expect("the joiner started")
+            .unwrap();
+        (pipe, (client, server, listener, far))
+    });
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(
+        std::pin::pin!(pipe.joined()).poll(&mut cx).is_pending(),
+        "the join waits for its handshake"
+    );
+    drop(joiner_rt);
+    let joined = std::pin::pin!(pipe.joined()).poll(&mut cx);
+    assert!(
+        matches!(joined, Poll::Ready(Err(zmux::PipeError::Failed(_)))),
+        "{joined:?}"
+    );
 }

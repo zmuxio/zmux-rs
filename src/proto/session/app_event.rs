@@ -337,32 +337,67 @@ pub enum SessionEvent {
     },
 }
 
-/// Observes a session (the `tracer` hook): its events,
-/// whether or not the application reads them with `next_event`, and its
-/// end. Called outside every lock, serially and in order on the session's
-/// hook context, `closed` last; a slow
-/// tracer never holds the session back: past a bounded backlog, events
-/// other than the end are dropped and counted ([`Tracer::dropped`]). A
-/// panic in a call is caught and ignored. Every method does nothing by
-/// default.
-pub trait Tracer: Send + Sync + 'static {
+/// A session's identity within this process: distinct for every session
+/// the process makes (a counter, never reused), so that the hooks shared by
+/// the sessions of one configuration ([`Tracer`], [`HostEvents`]) tell them
+/// apart. `Session::id` gives a session's. Not sent to the peer.
+///
+/// [`HostEvents`]: crate::HostEvents
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// A new identity, distinct from every other of the process.
+    #[cfg(any(all(any(feature = "tokio", feature = "blocking"), not(loom)), test))]
+    pub(crate) fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The number (at least 1).
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session #{}", self.0)
+    }
+}
+
+/// What a [`Tracer`] is told of a session, in order: `Established` once
+/// it is, its events, `Dropped` where its backlog overflowed, and `Closed`
+/// last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TraceRecord {
     /// The session was established.
-    fn established(&self) {}
-
+    Established,
     /// A session event.
-    fn event(&self, event: &SessionEvent) {
-        let _ = event;
-    }
+    Event(SessionEvent),
+    /// This many of the session's events were dropped here: the tracer's
+    /// backlog was full.
+    Dropped(u64),
+    /// The session ended; nothing of it follows.
+    Closed(SessionError),
+}
 
-    /// Events dropped since the previous call, before the next delivered.
-    fn dropped(&self, count: u64) {
-        let _ = count;
-    }
-
-    /// The session ended, with the reason; nothing follows.
-    fn closed(&self, reason: &SessionError) {
-        let _ = reason;
-    }
+/// Observes sessions (the `tracer` hook): each session's events, whether or
+/// not the application reads them with `next_event`, and its end, as
+/// [`TraceRecord`]s with the session's [`SessionId`] (the sessions of one
+/// configuration share its tracer). Called outside every lock, serially and
+/// in order on each session's hook context, [`TraceRecord::Closed`] last; a
+/// slow tracer never holds a session back: past a bounded backlog, records
+/// other than the end are dropped and counted ([`TraceRecord::Dropped`]). A
+/// panic in a call is caught and ignored. The hook context is a task of the
+/// runtime (a thread of the std driver): a tracer must not block it; one
+/// that would subscribes with [`Config::events`](crate::Config::events)
+/// instead.
+pub trait Tracer: Send + Sync + 'static {
+    /// A record of session `session`.
+    fn trace(&self, session: SessionId, record: &TraceRecord);
 }
 
 impl fmt::Debug for dyn Tracer {

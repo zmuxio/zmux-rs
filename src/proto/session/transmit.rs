@@ -308,7 +308,9 @@ impl TransmitBuf {
         let want = if total <= FIRST_COPY {
             FIRST_COPY
         } else {
-            self.max_len.max(total)
+            // Grown as the batch needs, never reserved up to a large limit
+            // at once.
+            self.max_len.min(DEFAULT_BATCH).max(total)
         };
         self.buf.reserve_exact(want - self.buf.len());
     }

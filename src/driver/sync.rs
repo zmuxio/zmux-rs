@@ -10,15 +10,22 @@
 use std::sync::PoisonError;
 
 #[cfg(all(test, loom))]
-pub(crate) use loom::sync::{Mutex, MutexGuard};
+pub(crate) use model::{TryMutex as Mutex, TryMutexGuard as MutexGuard};
 #[cfg(all(test, shuttle, not(loom)))]
 pub(crate) use shuttle::sync::{Mutex, MutexGuard};
 #[cfg(not(any(all(test, loom), all(test, shuttle))))]
 pub(crate) use std::sync::{Mutex, MutexGuard};
 
 /// Locks `m`.
+#[cfg(not(all(test, loom)))]
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Locks `m`.
+#[cfg(all(test, loom))]
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock()
 }
 
 #[cfg(any(feature = "tokio", all(test, loom)))]
@@ -60,7 +67,7 @@ mod side {
     /// operations over a model mutex (at least its guarantees).
     #[cfg(all(test, loom))]
     #[derive(Default)]
-    pub(crate) struct AtomicWaker(loom::sync::Mutex<Option<std::task::Waker>>);
+    pub(crate) struct AtomicWaker(super::Mutex<Option<std::task::Waker>>);
 
     #[cfg(all(test, loom))]
     impl AtomicWaker {
@@ -140,14 +147,24 @@ mod park {
     }
 }
 
-/// The side mutex of the loom models. Loom's own mutex treats a `try_lock`
-/// that waits to be scheduled while another thread holds the lock as blocked
-/// until the lock is released, so a thread that holds the core lock and
-/// tries a pipe's side would wait for the side's holder, which waits for the
-/// core lock: a deadlock the real `try_lock` cannot have. This one is a
-/// model-checked atomic lock bit whose `try_lock` fails at once (sides are
-/// never waited for). The data sits in a std mutex that is never contended:
-/// the bit is taken before it and released after it.
+/// The mutex of the loom models, for the core locks and the sides. Loom's
+/// own mutex does not fit them twice:
+///
+/// - It treats a `try_lock` that waits to be scheduled while another thread
+///   holds the lock as blocked until the lock is released, so a thread that
+///   holds the core lock and tries a pipe's side would wait for the side's
+///   holder, which waits for the core lock: a deadlock the real `try_lock`
+///   cannot have.
+/// - It unwraps the poison of the std mutex it keeps the data in, and its
+///   threads share one OS thread, so one model thread's unwinding makes
+///   another's guard poison the lock: the next lock panics, in a destructor
+///   during the unwinding (the hand-over guard of a read that unwinds out of
+///   the carrier) an abort. The drivers ignore poisoning ([`super::lock`]).
+///
+/// This one is a model-checked atomic lock bit: `try_lock` fails at once
+/// (sides are never waited for), `lock` parks until a holder releases the
+/// bit. The data sits in a std mutex that is never contended
+/// (the bit is taken before it and released after it), its poison ignored.
 #[cfg(all(test, loom))]
 mod model {
     use std::sync::PoisonError;
@@ -158,6 +175,8 @@ mod model {
     pub(crate) struct TryMutex<T> {
         locked: AtomicBool,
         data: std::sync::Mutex<T>,
+        /// Threads parked in `lock`, unparked at each release.
+        waiters: std::sync::Mutex<Vec<loom::thread::Thread>>,
     }
 
     /// Fields drop in order: the data's guard, then the bit.
@@ -166,11 +185,19 @@ mod model {
         _bit: Unlock<'a>,
     }
 
-    struct Unlock<'a>(&'a AtomicBool);
+    struct Unlock<'a>(
+        &'a AtomicBool,
+        &'a std::sync::Mutex<Vec<loom::thread::Thread>>,
+    );
 
     impl Drop for Unlock<'_> {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
+            let waiters =
+                std::mem::take(&mut *self.1.lock().unwrap_or_else(PoisonError::into_inner));
+            for t in waiters {
+                t.unpark();
+            }
         }
     }
 
@@ -179,6 +206,26 @@ mod model {
             Self {
                 locked: AtomicBool::new(false),
                 data: std::sync::Mutex::new(data),
+                waiters: std::sync::Mutex::default(),
+            }
+        }
+
+        /// Waits for the lock bit: parked until a holder releases it.
+        pub(crate) fn lock(&self) -> TryMutexGuard<'_, T> {
+            loop {
+                if let Some(g) = self.try_lock() {
+                    return g;
+                }
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(loom::thread::current());
+                // Released since: the unpark may have gone before this
+                // thread was listed.
+                if let Some(g) = self.try_lock() {
+                    return g;
+                }
+                loom::thread::park();
             }
         }
 
@@ -188,7 +235,7 @@ mod model {
                 .ok()?;
             Some(TryMutexGuard {
                 data: self.data.lock().unwrap_or_else(PoisonError::into_inner),
-                _bit: Unlock(&self.locked),
+                _bit: Unlock(&self.locked, &self.waiters),
             })
         }
     }

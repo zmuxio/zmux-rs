@@ -33,7 +33,7 @@ fn exchange_options() -> ExchangeOptions {
 /// The unified endpoint, prefix authentication on every streaming kind;
 /// its address and listener.
 async fn origin(config: Config) -> (std::net::SocketAddr, Listener) {
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth(), 1, 4096));
+    let verifier = Arc::new(PrefixAuthVerifier::new(auth(), 1, 4096).unwrap());
     let mut limits = ListenerConfig::default();
     limits.admission = Some(Admission::prefix_auth(verifier));
     let listener = Listener::new(config, limits).expect("valid listener configuration");

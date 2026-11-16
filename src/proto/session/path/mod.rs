@@ -21,7 +21,7 @@ pub(super) mod sched;
 pub(super) mod tier;
 
 use super::output::{BatchLog, LanePick, Records, SinglePick};
-use super::rtt::{MP_WRITE_CALL_MIN, MP_WRITE_CALL_SPAN, PROBE_INTERVAL, WRITE_CALL_MAX};
+use super::rtt::{MP_WRITE_CALL_MIN, MP_WRITE_CALL_SPAN, RTT_PROBE_GAP, WRITE_CALL_MAX};
 use super::sched::Picks;
 use super::stream::Offer;
 use super::streams::SendBuffer;
@@ -292,7 +292,7 @@ impl SessionCore {
     }
 
     /// Asks for a `QX_PING` sample when auto-tuning would grow a window but
-    /// has no RTT: one at a time, at most once per [`PROBE_INTERVAL`].
+    /// has no RTT: one at a time, at most once per [`RTT_PROBE_GAP`].
     pub(super) fn probe_rtt(&mut self, now: Instant) {
         if self.mp.is_some()
             || self.state != State::Active
@@ -300,7 +300,7 @@ impl SessionCore {
             || self.ping.request_pending
             || self
                 .last_rtt_probe
-                .is_some_and(|t| now.saturating_duration_since(t) < PROBE_INTERVAL)
+                .is_some_and(|t| now.saturating_duration_since(t) < RTT_PROBE_GAP)
         {
             return;
         }
@@ -753,7 +753,6 @@ impl SessionCore {
         }
         if let Some(mp) = self.mp.as_deref_mut() {
             mp.picks_mut().forget(key);
-            mp.blocked_mut().forget(key);
         }
         if let Some(r) = &s.recv
             && r.held() > 0
@@ -968,8 +967,6 @@ impl SessionCore {
         self.streams.stop_waking();
     }
 }
-
-impl SessionCore {}
 
 impl SessionCore {
     /// Stream data arrived: the arrival rates and credit-loop samples of

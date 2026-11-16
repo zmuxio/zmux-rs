@@ -117,6 +117,8 @@ pub const fn is_prohibited(pid: u64) -> bool {
 pub const DEFAULT_MAX_RECORD_SIZE: u64 = 16382;
 /// The `max_record_size` zmux endpoints advertise.
 pub const ZMUX_MAX_RECORD_SIZE: u64 = 65535;
+/// The largest `zmux_ack_threshold` taken from a peer.
+pub const MAX_ACK_THRESHOLD: u64 = 1 << 30;
 /// The `zmux_ack_threshold` an absent parameter stands for.
 pub const DEFAULT_ACK_THRESHOLD: u64 = 65536;
 /// The `zmux_max_ack_delay` (milliseconds) an absent parameter stands for.
@@ -440,7 +442,9 @@ pub struct TransportParameters {
     pub zmux_multipath: Option<MultipathParameter>,
     /// `zmux_session_crypto`: the Join Suites and Groups the endpoint declares.
     pub zmux_session_crypto: Option<SessionCrypto>,
-    /// `zmux_ack_threshold` in bytes (1024 to 2^30).
+    /// `zmux_ack_threshold` in bytes (at least 1024; a value above 2^30 is
+    /// taken as 2^30, the local bound on what a peer may leave
+    /// unacknowledged).
     pub zmux_ack_threshold: Option<u64>,
     /// `zmux_pipe_ack`: pipe acknowledgement without multipath.
     pub zmux_pipe_ack: bool,
@@ -449,7 +453,9 @@ pub struct TransportParameters {
     /// `zmux_max_lanes`: the lanes the sender accepts per inbound pipe and
     /// its Lane Key.
     pub zmux_max_lanes: Option<LanesParameter>,
-    /// `zmux_resume`: Resume Grace in milliseconds (1 to 86400000).
+    /// `zmux_resume`: Resume Grace in milliseconds (at least 1; the grace
+    /// in use is the smaller of the two ends', so the local configuration
+    /// bounds it).
     pub zmux_resume: Option<u64>,
     /// The `qmux` crate's `application_protocols`: names in preference
     /// order; not a zmux parameter, sent only when the application
@@ -511,10 +517,13 @@ impl TransportParameters {
         self.max_record_size.unwrap_or(DEFAULT_MAX_RECORD_SIZE)
     }
 
-    /// The effective `zmux_ack_threshold`: 65536 when absent.
+    /// The effective `zmux_ack_threshold`: 65536 when absent, at most
+    /// 2^30.
     #[must_use]
     pub fn ack_threshold_or_default(&self) -> u64 {
-        self.zmux_ack_threshold.unwrap_or(DEFAULT_ACK_THRESHOLD)
+        self.zmux_ack_threshold
+            .unwrap_or(DEFAULT_ACK_THRESHOLD)
+            .min(MAX_ACK_THRESHOLD)
     }
 
     /// The effective `zmux_max_ack_delay` in milliseconds: 25 when absent.

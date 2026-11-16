@@ -29,9 +29,9 @@ pub struct QualityBand {
     /// The half-width of the RTT band (zero reports every change of the
     /// RTT); `None`: the RTT half off.
     pub rtt: Option<Duration>,
-    /// The ratio of the rate band (1 or less reports every change of the
-    /// rate); `None`: the rate half off. A negative one, or one that is
-    /// not a number, is not valid.
+    /// The ratio of the rate band (1 reports every change of the rate);
+    /// `None` or `Some(0.0)`: the rate half off. Any other value must be
+    /// finite and at least 1.
     pub rate_ratio: Option<f64>,
     /// At most one event per pipe in this interval, the latest values
     /// winning (default 1 s); zero sets no minimum.
@@ -53,20 +53,33 @@ impl QualityBand {
         }
     }
 
-    /// Whether the band is valid: a set `rate_ratio` a number of at least 0.
+    /// Whether the band is valid: a set `rate_ratio` 0 (off) or finite and
+    /// at least 1.
+    ///
+    /// # Errors
+    ///
+    /// `QualityBand::rate_ratio` for any other value.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
-        if self.rate_ratio.is_some_and(|r| r.is_nan() || r < 0.0) {
+        if self
+            .rate_ratio
+            .is_some_and(|r| r != 0.0 && !(r.is_finite() && r >= 1.0))
+        {
             return Err(crate::InvalidConfig::new(
                 "QualityBand::rate_ratio",
-                "negative or not a number",
+                "neither 0 (off) nor finite and at least 1",
             ));
         }
         Ok(())
     }
 
+    /// The rate ratio in effect: `None` when the rate half is off.
+    fn rate_ratio_on(&self) -> Option<f64> {
+        self.rate_ratio.filter(|&r| r != 0.0)
+    }
+
     /// Whether the band reports anything.
     fn reports(&self) -> bool {
-        self.rtt.is_some() || self.rate_ratio.is_some()
+        self.rtt.is_some() || self.rate_ratio_on().is_some()
     }
 }
 
@@ -81,32 +94,49 @@ impl Default for QualityBand {
 /// `CapacityBelow` is reported once when the sum of the
 /// delivery rates of the usable, non-standby outbound pipes falls below
 /// `rate`, and `CapacityRestored` once when it rises to `rate` ×
-/// `rate_ratio` or more again. A pipe counts 0 until its rate has been
+/// `recovery_ratio` or more again. A pipe counts 0 until its rate has been
 /// measured (the initial value is not a measurement). zmux only reports:
 /// the application decides.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CapacityFloor {
     /// The floor in bytes per second.
     pub rate: u64,
-    /// The ratio above the floor that restores it (default 1.25); a ratio
-    /// below 1 counts as 1, and a negative one, or one that is not a
-    /// number, is not valid.
-    pub rate_ratio: f64,
+    /// The ratio above the floor that restores it: 0 is the default
+    /// ([`CapacityFloor::DEFAULT_RECOVERY_RATIO`], 1.25), and any other
+    /// value must be finite and at least 1.
+    pub recovery_ratio: f64,
 }
 
 impl CapacityFloor {
     /// The default ratio that restores the floor.
-    pub const DEFAULT_RATE_RATIO: f64 = 1.25;
+    pub const DEFAULT_RECOVERY_RATIO: f64 = 1.25;
 
-    /// Whether the floor is valid: `rate_ratio` a number of at least 0.
+    /// Whether the floor is valid: `recovery_ratio` 0 (the default) or
+    /// finite and at least 1 (an infinite one would never restore).
+    ///
+    /// # Errors
+    ///
+    /// `CapacityFloor::recovery_ratio` for any other value.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
-        if self.rate_ratio.is_nan() || self.rate_ratio < 0.0 {
+        let r = self.recovery_ratio;
+        // NaN is not finite.
+        if r != 0.0 && !(r.is_finite() && r >= 1.0) {
             return Err(crate::InvalidConfig::new(
-                "CapacityFloor::rate_ratio",
-                "negative or not a number",
+                "CapacityFloor::recovery_ratio",
+                "neither 0 (the default) nor finite and at least 1",
             ));
         }
         Ok(())
+    }
+
+    /// The ratio in effect: `recovery_ratio`, 0 standing for the default.
+    #[must_use]
+    pub fn effective_recovery_ratio(&self) -> f64 {
+        if self.recovery_ratio == 0.0 {
+            Self::DEFAULT_RECOVERY_RATIO
+        } else {
+            self.recovery_ratio
+        }
     }
 
     /// A floor of `rate` bytes per second with the default ratio.
@@ -114,7 +144,7 @@ impl CapacityFloor {
     pub fn new(rate: u64) -> Self {
         Self {
             rate,
-            rate_ratio: Self::DEFAULT_RATE_RATIO,
+            recovery_ratio: Self::DEFAULT_RECOVERY_RATIO,
         }
     }
 }
@@ -201,10 +231,6 @@ fn check_band(band: Option<QualityBand>) -> Result<(), PipeError> {
         Some(b) => b.validate().map_err(PipeError::InvalidOptions),
         None => Ok(()),
     }
-}
-
-fn at_least_one(k: f64) -> f64 {
-    if k >= 1.0 { k } else { 1.0 }
 }
 
 impl SessionCore {
@@ -358,8 +384,8 @@ impl SessionCore {
         }
         match (p.rate, rate) {
             (None, Some(r)) => p.rate = Some(r),
-            (Some(last), Some(r)) if band.rate_ratio.is_some() => {
-                let k = at_least_one(band.rate_ratio.unwrap_or(1.0));
+            (Some(last), Some(r)) if band.rate_ratio_on().is_some() => {
+                let k = band.rate_ratio_on().unwrap_or(1.0);
                 let (r, last) = (f64_of(r), f64_of(last));
                 out |= r < last / k || r > last * k;
             }
@@ -461,7 +487,8 @@ impl SessionCore {
         let rate = f.sum;
         let event = if !f.below && rate < f.asked.rate {
             CoreEvent::CapacityBelow { rate }
-        } else if f.below && f64_of(rate) >= f64_of(f.asked.rate) * at_least_one(f.asked.rate_ratio)
+        } else if f.below
+            && f64_of(rate) >= f64_of(f.asked.rate) * f.asked.effective_recovery_ratio()
         {
             CoreEvent::CapacityRestored { rate }
         } else {
@@ -604,6 +631,33 @@ mod tests {
             pipe: PipeId(pipe),
             smoothed_rtt: Some(rtt),
             delivery_rate: Some(rate),
+        }
+    }
+
+    #[test]
+    fn rate_ratio_must_be_zero_or_finite_and_at_least_one() {
+        let band = |r| QualityBand::new(None, Some(r));
+        for ok in [0.0, 1.0, 1.5, 1e300] {
+            assert!(band(ok).validate().is_ok(), "{ok}");
+        }
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -1.0, 0.5, 0.999] {
+            assert!(band(bad).validate().is_err(), "{bad}");
+        }
+        assert!(!band(0.0).reports());
+        assert!(band(1.0).reports());
+    }
+
+    #[test]
+    fn recovery_ratio_must_be_zero_or_finite_and_at_least_one() {
+        let floor = |r| CapacityFloor {
+            rate: 1,
+            recovery_ratio: r,
+        };
+        for ok in [0.0, 1.0, 1.25, 1e300] {
+            assert!(floor(ok).validate().is_ok(), "{ok}");
+        }
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -1.0, 0.5] {
+            assert!(floor(bad).validate().is_err(), "{bad}");
         }
     }
 

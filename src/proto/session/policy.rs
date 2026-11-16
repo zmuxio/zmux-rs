@@ -12,6 +12,7 @@ use super::{PipeId, StreamKey};
 
 /// A scheduling policy.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub enum Scheduler {
     /// Each stream direction is bound to one pipe (the session default).
     #[default]

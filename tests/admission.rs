@@ -20,9 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::adapter::{Admit, Fallback, JoinPrefix};
 use zmux::{
-    Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, DecideFuture,
-    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier,
-    Session,
+    Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, HandleError,
+    Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier, Session,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -69,7 +68,7 @@ async fn ended(tcp: &mut TcpStream) -> Vec<u8> {
 #[tokio::test]
 async fn prefix_auth_token_then_session() {
     let auth = PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let (listener, addr) = serve(Admission::prefix_auth(verifier), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(&auth.token(None).unwrap()).await.unwrap();
@@ -98,7 +97,7 @@ async fn prefix_auth_token_then_session() {
 async fn fallback_receives_every_byte_read() {
     let auth = PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
     let wrong = PrefixAuth::new(b"other", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024));
+    let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024).unwrap());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let fallback = Fallback::new(move |mut conn, source: SocketAddr| {
         let tx = tx.clone();
@@ -167,8 +166,8 @@ async fn every_outcome_is_counted_once() {
     // Close, an Accept beyond the prefix, and a decision that panics are
     // all closed.
     for decide in [
-        (|_: &CarrierInfo<'_>, _: &[u8]| AdmissionVerdict::Close)
-            as fn(&CarrierInfo<'_>, &[u8]) -> AdmissionVerdict,
+        (|_: &CarrierInfo, _: &[u8]| AdmissionVerdict::Close)
+            as fn(&CarrierInfo, &[u8]) -> AdmissionVerdict,
         |_, _| AdmissionVerdict::accept(5),
         |_, _| panic!("a failing decision"),
     ] {
@@ -208,10 +207,11 @@ async fn every_outcome_is_counted_once() {
 struct Slow(Duration, AdmissionVerdict);
 
 impl Decide for Slow {
-    fn decide<'a>(&'a self, _: &'a CarrierInfo<'a>, _: &'a [u8]) -> DecideFuture<'a> {
-        Box::pin(async move {
-            tokio::time::sleep(self.0).await;
-            self.1.clone().into()
+    fn decide(&self, _: &CarrierInfo, _: &[u8]) -> zmux::Decision<zmux::AdmissionDecision> {
+        let (wait, verdict) = (self.0, self.1.clone());
+        zmux::Decision::later(async move {
+            tokio::time::sleep(wait).await;
+            verdict.into()
         })
     }
 }
@@ -263,8 +263,7 @@ async fn a_late_decision_is_a_peek_timeout() {
 #[tokio::test]
 async fn a_late_prefix_is_closed_or_falls_back() {
     // Two of four bytes, then silence: the decision is never asked.
-    let never =
-        |_: &CarrierInfo<'_>, _: &[u8]| -> AdmissionVerdict { panic!("decided a late prefix") };
+    let never = |_: &CarrierInfo, _: &[u8]| -> AdmissionVerdict { panic!("decided a late prefix") };
     let late = || Admission::new(4, never).with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(late(), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
@@ -785,4 +784,43 @@ fn join_prefix_reads_the_hello_head() {
         listener.adapter().join_prefix(&[0x02, 0x01, 0x7c]),
         JoinPrefix::NotJoin
     );
+}
+
+/// A carrier whose exporter gives its values later is admitted with a bound
+/// prefix token: the listener resolves the exporter before the decision.
+#[tokio::test]
+async fn a_bound_token_with_a_later_exporter_is_admitted() {
+    use zmux::{CarrierCredential, CarrierExporter};
+    let secret = |label: &str, out: &mut [u8]| {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).unwrap() ^ label.as_bytes()[0];
+        }
+    };
+    let auth = PrefixAuth::new(b"key", Duration::from_secs(30), true).unwrap();
+    let client = CarrierInfo::new().with_exporter(CarrierExporter::new(move |label, _, out| {
+        secret(label, out);
+        true
+    }));
+    let token = auth.prefix(&client).unwrap();
+    let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024).unwrap());
+    let listener = Listener::new(
+        Config::default(),
+        limits(Admission::prefix_auth(verifier), None),
+    )
+    .expect("valid listener configuration");
+    let server =
+        CarrierInfo::new().with_exporter(CarrierExporter::new_async(move |req| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut out = vec![0; req.length];
+            secret(&req.label, &mut out);
+            Ok(out)
+        }));
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let mut entry = listener.adapter().enter(peer, None).unwrap();
+    let _ = entry.peek_deadline();
+    let admit = tokio::time::timeout(LIMIT, entry.decide(server, token))
+        .await
+        .unwrap();
+    assert!(matches!(admit, Admit::Accept(_)), "{admit:?}");
+    listener.close();
 }

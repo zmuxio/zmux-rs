@@ -1,5 +1,11 @@
-//! Small primitives zmux uses: HMAC-SHA256 with a prepared key and a
-//! random `u64`.
+//! Small primitives zmux uses: HMAC-SHA256 with a prepared key, a
+//! random `u64` and the wipe of key material.
+// The public items are re-exported to the adapters with the tokio driver
+// only (not under loom).
+#![cfg_attr(
+    not(all(feature = "tokio", not(loom))),
+    expect(unreachable_pub, reason = "re-exported only with the tokio driver")
+)]
 
 use std::time::Duration;
 
@@ -9,7 +15,7 @@ use sha2::Sha256;
 /// HMAC-SHA256 under one key, prepared once: each MAC starts from the
 /// keyed state. Cheap to clone.
 #[derive(Clone)]
-pub(crate) struct HmacSha256(Hmac<Sha256>);
+pub struct HmacSha256(Hmac<Sha256>);
 
 impl std::fmt::Debug for HmacSha256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,7 +25,12 @@ impl std::fmt::Debug for HmacSha256 {
 
 impl HmacSha256 {
     /// The key `key` (any length).
-    pub(crate) fn new(key: &[u8]) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Never: HMAC takes a key of any length.
+    #[must_use]
+    pub fn new(key: &[u8]) -> Self {
         Self(Hmac::new_from_slice(key).expect("HMAC takes any key length"))
     }
 
@@ -32,13 +43,15 @@ impl HmacSha256 {
     }
 
     /// The MAC of the concatenation of `parts`.
-    pub(crate) fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+    #[must_use]
+    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
         self.update(parts).finalize().into_bytes().into()
     }
 
     /// Whether `tag` is the MAC of the concatenation of `parts`, or its
     /// first `tag.len()` bytes (1 to 32), compared in constant time.
-    pub(crate) fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
+    #[must_use]
+    pub fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
         self.update(parts).verify_truncated_left(tag).is_ok()
     }
 }
@@ -59,13 +72,29 @@ pub(crate) fn drain_time(bytes: u64, rate: u64) -> Duration {
     saturating_secs(f64_of(bytes) / f64_of(rate.max(1)))
 }
 
-/// A random `u64` from the system's source; should that fail, from a
-/// process-local randomly seeded one.
-pub(crate) fn random_u64() -> u64 {
-    getrandom::u64().unwrap_or_else(|_| {
+/// Fills `out` from the system's random source; should that fail, from a
+/// process-local randomly seeded one. The one fallback, for values that
+/// need to differ but guard nothing (jitter, Locators; joins are
+/// authenticated): key material never uses it.
+pub(crate) fn fill_random_or_fallback(out: &mut [u8]) {
+    if getrandom::fill(out).is_err() {
         use std::hash::BuildHasher;
-        std::collections::hash_map::RandomState::new().hash_one(0x5a4d_u64)
-    })
+        let s = std::collections::hash_map::RandomState::new();
+        for (i, c) in out.chunks_mut(8).enumerate() {
+            let t = s.hash_one((0x5a4d_u64, i));
+            c.copy_from_slice(&t.to_le_bytes()[..c.len()]);
+        }
+    }
+}
+
+/// A random `u64` from the system's source; should that fail, from a
+/// process-local randomly seeded one: for values that need to differ but
+/// guard nothing (key material uses `zmux::proto::seal::fill_random`).
+#[must_use]
+pub fn random_u64() -> u64 {
+    let mut b = [0u8; 8];
+    fill_random_or_fallback(&mut b);
+    u64::from_le_bytes(b)
 }
 
 /// `v` as a `usize`, saturating at `usize::MAX` on targets where `usize` is
@@ -102,9 +131,29 @@ pub(crate) fn u64_sat(v: f64) -> u64 {
     v as u64
 }
 
+/// Overwrites `bytes` with zeros through volatile writes the compiler may
+/// not remove, then fences, so the zeros are written even when `bytes` is
+/// about to be freed. Copies made elsewhere are out of its reach.
+#[allow(unsafe_code, reason = "the one volatile write; std has no safe form")]
+pub fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference to a `u8`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wipe_zeroes_every_byte() {
+        let mut key = [0xa5u8; 33];
+        wipe(&mut key);
+        assert_eq!(key, [0; 33]);
+        wipe(&mut []);
+    }
 
     #[test]
     fn durations_from_computed_seconds_saturate() {

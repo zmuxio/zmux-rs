@@ -313,6 +313,108 @@ async fn a_panicking_predicate_refuses() {
     assert_eq!(growth, 0);
 }
 
+/// The tracer's records, sent to the test.
+struct Traces(tokio::sync::mpsc::UnboundedSender<zmux::TraceRecord>);
+
+impl zmux::Tracer for Traces {
+    fn trace(&self, _: zmux::SessionId, record: &zmux::TraceRecord) {
+        let _ = self.0.send(record.clone());
+    }
+}
+
+/// A window answer that has not come does not hold the session's trace delivery back, and
+/// the answer, when it comes, is still applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_window_answer_does_not_hold_the_tracer_back() {
+    use tokio::sync::{mpsc, oneshot};
+    let (asked_tx, mut asked) = mpsc::unbounded_channel();
+    let (answer_tx, answer_rx) = oneshot::channel::<bool>();
+    let answer_rx = Arc::new(Mutex::new(Some(answer_rx)));
+    let (trace_tx, mut traces) = mpsc::unbounded_channel();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let mut config = mp_config();
+    config.tracer = Some(Arc::new(Traces(trace_tx)));
+    config.allow_connection_window_increase = Some(WindowIncrease::new_async(move |_| {
+        let _ = asked_tx.send(());
+        let held = answer_rx.lock().unwrap().take();
+        async move {
+            match held {
+                Some(held) => held.await.unwrap_or(false),
+                None => false,
+            }
+        }
+    }));
+    config.test_hooks().rtt = Some(Duration::from_millis(5));
+    let listener = Listener::new(mp_config(), ListenerConfig::default()).unwrap();
+    let l = listener.clone();
+    tokio::spawn(async move {
+        let (c, peer) = tcp.accept().await.unwrap();
+        let _ = l
+            .handle_pipe(PipeIo::from_tcp(c), PipeHint::from_peer(peer))
+            .await;
+    });
+    // The receiver dials (an endpoint that dials can add pipes).
+    let receiver = Session::connect(
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
+        config,
+    )
+    .await
+    .unwrap();
+    let sender = listener.accept().await.unwrap();
+    let (mut send, _r) = sender.open_bi().await.unwrap();
+    // Data until the receiver's window wants to grow (a host that is fast or slow reaches that
+    // after a different amount); the answer is held.
+    let writer = tokio::spawn(async move {
+        let chunk = vec![1u8; 256 * 1024];
+        while send.write_all(&chunk).await.is_ok() {}
+    });
+    let (_s, mut recv) = receiver.accept_bi().await.unwrap();
+    let drain = tokio::spawn(async move {
+        let mut buf = vec![0u8; 1 << 20];
+        while matches!(recv.read(&mut buf).await, Ok(Some(_))) {}
+    });
+    tokio::time::timeout(Duration::from_secs(60), asked.recv())
+        .await
+        .expect("the window grew")
+        .unwrap();
+    while traces.try_recv().is_ok() {}
+    // A session event now, while the answer is pending: it reaches the tracer.
+    let (carrier, _far) = tokio::io::duplex(1 << 16);
+    let pipe = receiver
+        .begin_add_pipe(PipeIo::new(carrier), PipeOptions::default())
+        .unwrap();
+    let id = pipe.id();
+    loop {
+        let record = tokio::time::timeout(Duration::from_secs(10), traces.recv())
+            .await
+            .expect("traced while the answer is pending")
+            .unwrap();
+        assert!(
+            !matches!(record, zmux::TraceRecord::Dropped(_)),
+            "{record:?}"
+        );
+        if matches!(record, zmux::TraceRecord::Event(zmux::SessionEvent::PipeAdded { pipe, .. }) if pipe == id)
+        {
+            break;
+        }
+    }
+    // The answer comes: the window grows.
+    answer_tx.send(true).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while receiver.adapter().window_growth() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the answer was not applied"
+        );
+        tokio::task::yield_now().await;
+    }
+    writer.abort();
+    drain.abort();
+    sender.close().await;
+    receiver.closing().await;
+}
+
 #[test]
 fn blocking_driver_runs_hooks_outside_the_lock() {
     // A custom policy on a writer thread, and the predicate on the hook

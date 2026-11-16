@@ -44,7 +44,7 @@ pub(crate) use duplicate::{duplicate_api, resolve};
 duplicate_api!(crate::driver::tokio::Tokio, crate::Session, crate::Dial);
 #[cfg(feature = "tokio")]
 pub use maintain::{
-    MaintainHandle, PipePool, PoolDecision, PoolMember, PoolPolicy, PoolView, RECHECK_FLOOR,
+    MIN_RECHECK, MaintainHandle, PipePool, PoolDecision, PoolMember, PoolPolicy, PoolView,
     RotatePolicy, maintain_pipes,
 };
 #[cfg(feature = "tokio")]

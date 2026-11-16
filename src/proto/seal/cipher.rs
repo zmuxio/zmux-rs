@@ -2,7 +2,6 @@
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Nonce, Payload, Tag};
-use hmac::Mac;
 use sha2::{Digest, Sha256};
 
 use super::Error;
@@ -53,9 +52,15 @@ impl Cipher {
     }
 
     /// Encrypts with counter `n`.
-    #[must_use]
-    pub fn seal(&self, key: &[u8], n: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        (self.seal)(key, n, aad, plaintext)
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfig`] for a key not of [`Self::key_len`] bytes.
+    pub fn seal(&self, key: &[u8], n: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        if key.len() != self.key_len {
+            return Err(Error::InvalidConfig);
+        }
+        Ok((self.seal)(key, n, aad, plaintext))
     }
 
     /// Decrypts with counter `n`.
@@ -285,14 +290,7 @@ pub static SHA256: Hash = Hash {
         }
         hash.finalize().to_vec()
     },
-    hmac: |key, parts| {
-        let mut mac = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(key)
-            .expect("HMAC takes keys of any length");
-        for part in parts {
-            mac.update(part);
-        }
-        mac.finalize().into_bytes().to_vec()
-    },
+    hmac: |key, parts| crate::util::HmacSha256::new(key).mac(parts).to_vec(),
     extract: |salt, ikm| hkdf_extract(salt, ikm).to_vec(),
     expand: sha256_expand,
 };

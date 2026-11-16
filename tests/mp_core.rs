@@ -611,6 +611,29 @@ fn resume_after_losing_every_pipe() {
     );
 }
 
+/// After the session lost every pipe and resumed on a join, the interval
+/// without an inbound pipe is closed: acknowledgements of what the new pipe
+/// carries give it delivery samples again (they were all dropped as
+/// "not heard" before).
+#[test]
+fn a_resumed_session_samples_its_new_pipe() {
+    let mut n = net(Scheduler::SpreadEta, true);
+    n.open_and_write(20_000, false);
+    n.step(5000);
+    n.fail(0);
+    assert_eq!(n.ends[A].state(), State::Suspended);
+    assert!(n.ends[A].debug_deaf());
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.settle();
+    n.write_more(0, 200_000);
+    n.settle();
+    assert!(n.ends[A].pipe_info(PipeId::new(id)).is_some());
+    assert!(
+        !n.ends[A].debug_deaf(),
+        "the interval without an inbound pipe stayed open after the resume"
+    );
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Open(u16),

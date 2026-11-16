@@ -168,7 +168,7 @@ fn a_panicking_reject_policy_closes_on_the_std_driver() {
         let _ = x.write_all(&stray_join_hello());
         x
     });
-    let r = l.handle_pipe(b::PipeIo::from_halves(y, y2), b::PipeHint::default());
+    let r = l.handle_pipe(served(y, y2), b::PipeHint::default());
     assert_eq!(r, Err(HandleError::Rejected));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop((x2, t.join().unwrap()));
@@ -449,9 +449,7 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
         .expect("valid listener configuration");
     let (x, y) = UnixStream::pair().unwrap();
     let (l2, y2) = (l.clone(), y.try_clone().unwrap());
-    std::thread::spawn(move || {
-        l2.handle_pipe(b::PipeIo::from_halves(y, y2), b::PipeHint::default())
-    });
+    std::thread::spawn(move || l2.handle_pipe(served(y, y2), b::PipeHint::default()));
     let x2 = x.try_clone().unwrap();
     let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c).unwrap();
     let srv = l
@@ -466,9 +464,7 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
     holder.set(s.clone()).ok();
     let (p, q) = UnixStream::pair().unwrap();
     let (l3, q2) = (l.clone(), q.try_clone().unwrap());
-    std::thread::spawn(move || {
-        l3.handle_pipe(b::PipeIo::from_halves(q, q2), b::PipeHint::default())
-    });
+    std::thread::spawn(move || l3.handle_pipe(served(q, q2), b::PipeHint::default()));
     let seen = Arc::new(Seen::default());
     let ended = Arc::new(AtomicUsize::new(0));
     let e = ended.clone();
@@ -506,9 +502,7 @@ fn paired_join_on_the_std_driver() {
         .expect("valid listener configuration");
     let (x, y) = UnixStream::pair().unwrap();
     let (l2, y2) = (l.clone(), y.try_clone().unwrap());
-    std::thread::spawn(move || {
-        l2.handle_pipe(b::PipeIo::from_halves(y, y2), b::PipeHint::default())
-    });
+    std::thread::spawn(move || l2.handle_pipe(served(y, y2), b::PipeHint::default()));
     let x2 = x.try_clone().unwrap();
     let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c).unwrap();
     let srv = l
@@ -544,7 +538,11 @@ fn paired_join_on_the_std_driver() {
     let df = down_far.try_clone().unwrap();
     std::thread::spawn(move || {
         let _keep = f2;
-        l3.handle_pipe(b::PipeIo::from_halves(up_far, df), b::PipeHint::default())
+        let c = df.try_clone().unwrap();
+        let io = b::PipeIo::from_halves(up_far, df).with_closer(move |h| {
+            let _ = c.shutdown(h);
+        });
+        l3.handle_pipe(io, b::PipeHint::default())
     });
     pipe.joined_timeout(Duration::from_secs(10)).unwrap();
     let echo = std::thread::spawn(move || {
@@ -738,4 +736,76 @@ async fn a_failing_session_config_is_logged() {
         );
         client.abort();
     }
+}
+
+/// A listener's carrier on a Unix socket, with the closer the std driver's
+/// listener requires.
+#[cfg(unix)]
+fn served(r: std::os::unix::net::UnixStream, w: std::os::unix::net::UnixStream) -> b::PipeIo {
+    let c = w.try_clone().unwrap();
+    b::PipeIo::from_halves(r, w).with_closer(move |h| {
+        let _ = c.shutdown(h);
+    })
+}
+
+/// The std driver's listener takes no carrier without a closer, and none on
+/// a thread that drives sessions: setup failures, before a byte is read.
+#[cfg(unix)]
+#[test]
+fn the_std_listener_refuses_carriers_it_could_not_bound() {
+    use std::os::unix::net::UnixStream;
+    let l = b::Listener::new(config(), ListenerConfig::default(), None)
+        .expect("valid listener configuration");
+    let (_x, y) = UnixStream::pair().unwrap();
+    let y2 = y.try_clone().unwrap();
+    assert_eq!(
+        l.handle_pipe(b::PipeIo::from_halves(y, y2), b::PipeHint::default()),
+        Err(HandleError::SetupFailed)
+    );
+    let (_x, y) = UnixStream::pair().unwrap();
+    let y2 = y.try_clone().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let r = rt.block_on(async { l.handle_pipe(served(y, y2), b::PipeHint::default()) });
+    assert_eq!(r, Err(HandleError::SetupFailed));
+    assert_eq!(l.stats().setup_failures, 2);
+}
+
+/// The std driver's listener keeps the memory budget: its pressure hook is
+/// told, and a new session under pressure is refused.
+#[cfg(unix)]
+#[test]
+fn the_std_listener_keeps_the_memory_budget() {
+    use std::os::unix::net::UnixStream;
+    let told = Arc::new(AtomicUsize::new(0));
+    let t = told.clone();
+    let mut limits = ListenerConfig::default();
+    limits.memory_budget = Some(1);
+    limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(move |p| {
+        if p.active {
+            t.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let c = Arc::new(config());
+    let l = b::Listener::new(c.clone(), limits, None).expect("valid listener configuration");
+    let connect = |l: &b::Listener| {
+        let (x, y) = UnixStream::pair().unwrap();
+        let (l2, y2) = (l.clone(), y.try_clone().unwrap());
+        let h = std::thread::spawn(move || l2.handle_pipe(served(y, y2), b::PipeHint::default()));
+        let x2 = x.try_clone().unwrap();
+        let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c.clone());
+        (s, h.join().unwrap())
+    };
+    // The first session's own charge exceeds the budget of one byte: it
+    // may be refused as well, once its report comes before its queueing.
+    let _first = connect(&l);
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while told.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(told.load(Ordering::SeqCst), 1, "pressure reported");
+    let (_second, r) = connect(&l);
+    assert_eq!(r, Err(HandleError::Refused), "refused under pressure");
+    l.close();
 }

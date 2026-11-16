@@ -3,7 +3,7 @@
 use crate::proto::frame::Dir;
 use crate::proto::params::{Features, Role};
 
-use super::pipes::{DirectionState, PipeHalf, PrioritySource};
+use super::pipes::{DirectionState, OutboundState, PipeHalf, PrioritySource};
 use super::stream::StreamKey;
 use super::{LaneId, PipeFailure, PipeId, SessionError};
 
@@ -79,6 +79,17 @@ pub enum CoreEvent {
         pipe: PipeId,
         /// The direction and its new state.
         state: DirectionState,
+        /// An outbound direction's state in its previous `PipeState`
+        /// event, `None` in its first (the pipe was added) and for an
+        /// inbound direction. Equal to the new state when only something
+        /// else of the pipe changed. Events are queued in order, so every
+        /// transition is seen even when several happen between two drains.
+        previous: Option<OutboundState>,
+    },
+    /// The first record arrived on a pipe's inbound direction.
+    PipeReceiving {
+        /// The attachment.
+        pipe: PipeId,
     },
     /// The peer attached one of our joins
     /// ([`super::SessionCore::pipe_attached`]).
@@ -182,4 +193,7 @@ pub enum CoreEvent {
     /// The session ended. Carriers are closed once `poll_transmit` reports
     /// it and the session is [`super::State::Closed`].
     Closed(SessionError),
+    /// The session reached [`super::State::Closed`] and released its state:
+    /// the last event, emitted once.
+    Released,
 }

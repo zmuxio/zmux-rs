@@ -14,8 +14,10 @@ mod profiles;
 mod server;
 mod trust;
 
-pub use establish::{ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticSecret, establish};
-pub use server::{ModeCheck, ServerConfig, ServerOptions, reject_reason};
+pub use establish::{
+    ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticKey, StaticSecret, establish,
+};
+pub use server::{ModeCheck, ModeCheckFn, ServerConfig, ServerOptions, reject_reason};
 pub use trust::{
     Admission, AppData, AppDataRequest, AppDataSource, BoxFuture, ConfigError, Credential, Gate,
     KeySigner, PinVerifier, Principal, Signer, Verifier, VerifyError, VerifyInput, VerifyVerdict,
@@ -26,8 +28,9 @@ pub use zmux_seal_proto::{
     Profile, SigningKey, derive_handle_psk, key_id,
 };
 
-/// The largest handshake unit plus its header.
-pub(crate) const MAX_UNIT: usize = u16::MAX as usize + 512;
+/// The largest handshake unit ([`zmux::proto::seal::MAX_UNIT`]) plus the
+/// header before it, the bound of one read of a handshake frame.
+pub(crate) const MAX_FRAME: usize = zmux::proto::seal::MAX_UNIT + 512;
 
 /// Type 0 of a handshake payload: padding.
 pub(crate) const PADDING_ITEM: u64 = 0;

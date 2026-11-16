@@ -301,7 +301,7 @@ fn auth() -> PrefixAuth {
 }
 
 fn admission() -> Admission {
-    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024)))
+    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024).unwrap()))
         .with_peek_timeout(Duration::from_secs(5))
         .with_stall_interval(Duration::from_millis(300), Duration::from_millis(300))
 }
@@ -428,6 +428,66 @@ async fn a_request_the_listener_does_not_take_is_answered_with_404() {
     let h3 = H3::new(Config::default(), &Options::default());
     let (status, _) = raw_request(&h3, b"GET / HTTP/1.1\r\n\r\n", true).await;
     assert_eq!(status, Some(http::StatusCode::NOT_FOUND));
+    h3.stop().await;
+}
+
+/// A request stream whose HEADERS frame claims more than the field section
+/// bound is stopped (`H3_EXCESSIVE_LOAD`) as soon as its frame header
+/// arrives: the server does not buffer the frame while the peer keeps
+/// sending it within the head timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_request_head_is_refused_before_it_is_buffered() {
+    let h3 = H3::new(Config::default(), &Options::default());
+    let conn = h3
+        .client
+        .connect(h3.addr, "127.0.0.1")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    // HEADERS (0x01) claiming 1 MiB and none of its payload: the frame
+    // header alone is refused (unbounded, the server would wait for the
+    // payload until the head timeout).
+    send.write_all(&[0x01, 0x80, 0x10, 0x00, 0x00])
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), send.stopped())
+        .await
+        .expect("stopped in time");
+    assert_eq!(stopped.unwrap(), Some(0x0107u32.into()));
+    // The connection itself stays usable.
+    let (status, _) = raw_request(&h3, b"x", true).await;
+    assert_eq!(status, Some(http::StatusCode::NOT_FOUND));
+    conn.close(0u32.into(), b"");
+    h3.stop().await;
+}
+
+/// A request whose head does not arrive within the listener's handshake
+/// timeout is dropped, and a connection without a resolved request is
+/// closed by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_head_and_the_first_request_are_bounded_in_time() {
+    let mut lc = ListenerConfig::default();
+    lc.handshake_timeout = Duration::from_millis(300);
+    let h3 = H3::with_listener(Config::default(), lc, &Options::default());
+    let conn = h3
+        .client
+        .connect(h3.addr, "127.0.0.1")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    // The start of a HEADERS frame, never completed.
+    send.write_all(&[0x01, 0x10]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("closed in time");
+    assert!(
+        matches!(closed, quinn::ConnectionError::ApplicationClosed(ref c) if c.error_code == 0x0100u32.into()),
+        "{closed:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
     h3.stop().await;
 }
 

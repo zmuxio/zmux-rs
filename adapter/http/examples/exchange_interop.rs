@@ -127,7 +127,7 @@ async fn client(o: ExchangeOptions) -> Result<(), Error> {
     )?;
     let session = Session::connect(pipe, Config::default()).await?;
     let mut msg = vec![0u8; n];
-    getrandom::fill(&mut msg)?;
+    zmux::proto::seal::fill_random(&mut msg)?;
     let digest = Sha256::digest(&msg);
     let (mut send, mut recv) = session.open_bi().await?;
     let writer = tokio::spawn(async move {

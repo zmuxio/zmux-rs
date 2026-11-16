@@ -104,7 +104,7 @@ pub(crate) async fn ask_app_data(
     request: AppDataRequest<'_>,
 ) -> Result<Vec<u8>, VerifyError> {
     match source {
-        Some(f) => f(&request).await,
+        Some(f) => guarded(|| f(&request), host_panicked).await,
         None => Ok(Vec::new()),
     }
 }
@@ -212,17 +212,36 @@ pub trait Verifier: Send + Sync {
     }
 }
 
-/// Runs `verifier` on `input`; a panic, when the future is made or while it runs, is a
-/// rejection.
+/// Runs a host callback: a panic, when its future is made or while it
+/// runs, is `panicked()`. The one policy of every host callback of
+/// Establish (Gate, Verifier, Signer, the application data): a panic fails
+/// closed, as a rejection, the same for every callback.
+pub(crate) async fn guarded<'a, T, E>(
+    call: impl FnOnce() -> BoxFuture<'a, Result<T, E>>,
+    panicked: impl FnOnce() -> E,
+) -> Result<T, E> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(f) => CatchUnwind(f).await.unwrap_or_else(|| Err(panicked())),
+        Err(_) => Err(panicked()),
+    }
+}
+
+/// The error of a Gate, verifier or application-data source that panicked.
+pub(crate) fn host_panicked() -> VerifyError {
+    VerifyError::rejected("a host callback panicked")
+}
+
+/// The error of a signer that panicked.
+pub(crate) fn signer_panicked() -> std::io::Error {
+    std::io::Error::other("the signer panicked")
+}
+
+/// Runs `verifier` on `input` ([`guarded`]).
 pub(crate) async fn judge(
     verifier: &dyn Verifier,
     input: VerifyInput<'_>,
 ) -> Result<VerifyVerdict, VerifyError> {
-    let panicked = || VerifyError::rejected("the verifier panicked");
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verifier.verify(input))) {
-        Ok(f) => CatchUnwind(f).await.unwrap_or_else(|| Err(panicked())),
-        Err(_) => Err(panicked()),
-    }
+    guarded(|| verifier.verify(input), host_panicked).await
 }
 
 /// A future whose panic is caught: `None`.

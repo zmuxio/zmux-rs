@@ -123,7 +123,7 @@ pub async fn accept_request<B, I>(
     options: &Options,
 ) -> RequestUpgrade<B>
 where
-    I: for<'a> FnOnce(CarrierInfo<'a>) -> CarrierInfo<'a>,
+    I: FnOnce(CarrierInfo) -> CarrierInfo,
 {
     if !is_upgrade(&req) {
         return RequestUpgrade::Refused(req);
@@ -134,31 +134,28 @@ where
     let Some(protocol) = options.accept(&offered) else {
         return RequestUpgrade::Refused(req);
     };
-    if zmux::adapter::forwarded_early_data(
-        req.headers()
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.as_bytes())),
-    ) {
+    if zmux::adapter::forwarded_early_data(req.headers()) {
         listener.adapter().count_setup_failure();
         return RequestUpgrade::TooEarly;
     }
     let (mut parts, body) = req.into_parts();
-    let fields = || {
-        parts
-            .headers
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.as_bytes()))
-    };
-    let source = listener.adapter().trusted_proxies().source(peer, fields());
+    let source = listener
+        .adapter()
+        .trusted_proxies()
+        .source(peer, &parts.headers);
     let Some(mut entry) = listener.adapter().enter(peer, Some(source)) else {
         // Not taken, nothing answered: the host's handler serves it.
         return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
     };
     let admit = {
-        let info = info(CarrierInfo::new())
+        // The TLS connection's metadata, when the request came over one.
+        let base = parts
+            .extensions
+            .get::<zmux_rustls::TlsBinding>()
+            .map_or_else(CarrierInfo::new, zmux_rustls::TlsBinding::info);
+        let info = info(base)
             .with_head()
-            .with_request(&parts)
-            .with_headers(fields);
+            .with_request_head(std::sync::Arc::new(parts.clone()), crate::header_fields);
         entry.decide(info, Vec::new()).await
     };
     match admit {

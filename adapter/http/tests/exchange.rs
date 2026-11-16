@@ -68,8 +68,11 @@ struct Server {
 /// A listener served with the exchange server; every session it accepts
 /// echoes its bidirectional streams.
 async fn server(options: ExchangeOptions) -> Server {
-    let listener = Listener::new(Config::default(), ListenerConfig::default())
-        .expect("valid listener configuration");
+    server_with(options, ListenerConfig::default()).await
+}
+
+async fn server_with(options: ExchangeOptions, limits: ListenerConfig) -> Server {
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let exchange = ExchangeServer::new(&listener, options).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
@@ -298,6 +301,35 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
     let stats = proxy.stats.clone();
     finish(client, srv, vec![proxy], base, ready).await;
     stats
+}
+
+/// A held DOWN request on a connection of its own (a proxy that opens one
+/// per request) outlives the listener's handshake timeout: the setup
+/// deadline bounds connections without a request in progress only, so an
+/// idle session's held requests are answered, not cut.
+#[test]
+fn held_requests_outlive_the_setup_deadline() {
+    run(60, async {
+        let mut o = quick();
+        o.hold = Duration::from_millis(900);
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = Duration::from_millis(200);
+        let srv = server_with(o.clone(), limits).await;
+        let proxy = Proxy::start(&srv.addr, Faults::default(), 7).await;
+        let client = zmux_http::connect_exchange(&proxy.addr, &o, Config::default())
+            .await
+            .unwrap();
+        echo(&client, 10_000, 7).await;
+        // Idle for several holds: each held DOWN is answered at its end.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        echo(&client, 10_000, 8).await;
+        assert_eq!(
+            srv.listener.stats().setup_failures,
+            0,
+            "held requests were cut"
+        );
+        client.close().await;
+    });
 }
 
 /// The count of a fault in the proxy's counts.

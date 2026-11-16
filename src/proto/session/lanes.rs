@@ -22,6 +22,7 @@ use crate::proto::record::Framing;
 
 /// What became of a lane the peer opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LaneAccept {
     /// The lane belongs to the pipe: feed its bytes, from its first, to
     /// [`SessionCore::receive`] and the other receive calls.

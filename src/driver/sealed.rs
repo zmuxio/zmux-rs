@@ -8,22 +8,17 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tokio::{PipeIo, Reader, Writer};
 use crate::proto::record::Framing;
-use crate::proto::seal::{Opener, Sealer};
-
-// The AEAD tag and, on a byte stream, the length prefix of a Sealed record.
-use super::handle::{SEALED_LEN as LEN, SEALED_TAG as TAG};
-
-/// The read buffer of a Sealed carrier: a byte-stream record whole, its length prefix
-/// included, which also holds the largest message of a message carrier.
-const READ_BUF: usize = LEN as usize + u16::MAX as usize;
+use crate::proto::seal::{
+    Opener, SealedFailure, SealedRead as SealedRecordRead, SealedReader, SealedWriter, Sealer,
+};
 
 /// The length prefix of a byte-stream Sealed record carrying `sealed`.
-pub(crate) fn length_prefix(sealed: &[u8]) -> io::Result<[u8; 2]> {
+#[cfg(test)]
+fn length_prefix(sealed: &[u8]) -> io::Result<[u8; 2]> {
     u16::try_from(sealed.len())
         .map(u16::to_be_bytes)
         .map_err(|_| {
@@ -39,19 +34,17 @@ pub(crate) fn length_prefix(sealed: &[u8]) -> io::Result<[u8; 2]> {
 pub(crate) fn seal_carrier(mut p: PipeIo, sealer: Sealer, opener: Opener) -> PipeIo {
     let lower = p.framing;
     let prefix = std::mem::take(&mut p.prefix);
-    p.reader = p
-        .reader
-        .take()
-        .map(|r| Reader::Sealed(Box::pin(SealedRead::new(r, lower, opener, prefix))));
+    p.reader = p.reader.take().map(|r| {
+        Reader::Sealed(Box::pin(SealedRead {
+            lower: r,
+            records: SealedReader::new(lower, opener, prefix),
+        }))
+    });
     p.writer = p.writer.take().map(|w| {
         Writer::Sealed(Box::pin(SealedWrite {
             lower: w,
-            framing: lower,
-            sealer,
-            pending: Bytes::new(),
-            taken: 0,
-            unit: BytesMut::new(),
-            held: false,
+            records: SealedWriter::new(lower, sealer),
+            error: None,
         }))
     });
     let overhead = super::handle::sealed_overhead(lower);
@@ -82,73 +75,28 @@ where
     (r, w)
 }
 
+/// The reading half: an I/O shell of [`SealedReader`].
 pub(crate) struct SealedRead {
     lower: Reader,
-    framing: Framing,
-    opener: Opener,
-    /// The bytes read from the carrier and not opened yet are `buf[start..end]`; on a
-    /// message carrier they are one message. Allocated at its full size when a read
-    /// starts and reused for every record, until the driver finds the pipe idle with
-    /// nothing in it ([`SealedRead::release_idle`]).
-    buf: Vec<u8>,
-    start: usize,
-    end: usize,
-    failed: bool,
+    records: SealedReader,
 }
 
 impl SealedRead {
-    fn new(lower: Reader, framing: Framing, opener: Opener, prefix: Vec<u8>) -> Self {
-        let end = prefix.len();
-        let mut buf = prefix;
-        if end > 0 {
-            buf.resize(end.max(READ_BUF), 0);
-        }
-        Self {
-            lower,
-            framing,
-            opener,
-            buf,
-            start: 0,
-            end,
-            failed: false,
-        }
-    }
-
     /// Whether the buffer is held with no record bytes in it.
     pub(crate) fn idle_buffer(&self) -> bool {
-        self.start == self.end && self.buf.capacity() > 0
+        self.records.idle_buffer()
     }
 
-    /// Frees the buffer of an idle pipe when it holds no record bytes: the next read
-    /// allocates it again.
+    /// Frees the buffer of an idle pipe: the next read allocates it again.
     pub(crate) fn release_idle(&mut self) {
-        if self.start == self.end {
-            self.buf = Vec::new();
-            (self.start, self.end) = (0, 0);
-            self.opener.release_idle();
-        }
+        self.records.release_idle();
     }
+}
 
-    /// The bounds in `buf` of the next whole unit, taken.
-    fn cut(&mut self) -> Option<(usize, usize)> {
-        let (start, end) = (self.start, self.end);
-        if start == end {
-            return None;
-        }
-        if self.framing == Framing::Records {
-            (self.start, self.end) = (0, 0);
-            return Some((start, end));
-        }
-        let head = self.buf.get(start..end)?.get(..2)?;
-        let n = usize::from(u16::from_be_bytes([head[0], head[1]]));
-        if end - start < 2 + n {
-            return None;
-        }
-        self.start = start + 2 + n;
-        if self.start == end {
-            (self.start, self.end) = (0, 0);
-        }
-        Some((start + 2, start + 2 + n))
+fn failure(f: SealedFailure) -> io::Error {
+    match f {
+        SealedFailure::Invalid => io::ErrorKind::InvalidData.into(),
+        SealedFailure::Cut => io::ErrorKind::UnexpectedEof.into(),
     }
 }
 
@@ -159,116 +107,84 @@ impl AsyncRead for SealedRead {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.failed {
-            return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-        }
         loop {
-            if let Some((a, b)) = this.cut() {
-                let Ok(plain) = this.opener.open_in_place(&mut this.buf[a..b]) else {
-                    this.failed = true;
-                    return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-                };
-                if plain.len() > out.remaining() {
-                    this.failed = true;
-                    return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-                }
-                // No bytes of a record are not the end of the carrier.
-                if plain.is_empty() {
-                    continue;
-                }
-                out.put_slice(plain);
-                return Poll::Ready(Ok(()));
-            }
-            // A cut record moves to the front, so that the whole of it fits.
-            if this.start > 0 {
-                this.buf.copy_within(this.start..this.end, 0);
-                (this.start, this.end) = (0, this.end - this.start);
-            }
-            if this.buf.is_empty() {
-                this.buf.resize(READ_BUF, 0);
-            }
-            let mut rb = ReadBuf::new(&mut this.buf[this.end..]);
-            ready!(Pin::new(&mut this.lower).poll_read(cx, &mut rb))?;
-            let n = rb.filled().len();
-            // The end at a record's boundary reads as the carrier's end, which closes no
-            // stream and which the session judges by its frames: a pipe's graceful removal
-            // ends so, its PIPE_ABANDON possibly on another pipe.
-            if n == 0 {
-                if this.end == 0 {
+            match this
+                .records
+                .read(out.initialize_unfilled())
+                .map_err(failure)?
+            {
+                // The end at a record's boundary reads as the carrier's end, which
+                // closes no stream and which the session judges by its frames.
+                SealedRecordRead::End => return Poll::Ready(Ok(())),
+                SealedRecordRead::Data(n) => {
+                    out.advance(n);
                     return Poll::Ready(Ok(()));
                 }
-                // A cut record is a carrier failure.
-                this.failed = true;
-                return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                SealedRecordRead::More => {
+                    let mut rb = ReadBuf::new(this.records.space());
+                    ready!(Pin::new(&mut this.lower).poll_read(cx, &mut rb))?;
+                    let n = rb.filled().len();
+                    this.records.filled(n);
+                }
             }
-            this.end += n;
         }
     }
 }
 
+/// The writing half: an I/O shell of [`SealedWriter`]. A write is taken
+/// (`Ready`) once its record is sealed; the record is written by this write
+/// as far as the carrier takes it, then by the next write, flush or
+/// shutdown, which wait for it first.
 pub(crate) struct SealedWrite {
     lower: Writer,
-    framing: Framing,
-    sealer: Sealer,
-    /// The unit being written.
-    pending: Bytes,
-    /// Plaintext bytes of it to report once written.
-    taken: usize,
-    /// Where units are built: once a unit is written and dropped below, its
-    /// allocation is taken back for the next one.
-    unit: BytesMut,
-    /// `unit`'s allocation or the sealer's expanded key may be held.
-    held: bool,
+    records: SealedWriter,
+    /// The error that failed the direction after its write was reported.
+    error: Option<io::ErrorKind>,
 }
 
 impl SealedWrite {
     /// Whether an idle pipe would free something.
     pub(crate) fn idle_held(&self) -> bool {
-        self.held && self.pending.is_empty()
+        self.records.idle_held()
     }
 
     /// Frees the unit's allocation and the expanded key with nothing
     /// pending: the next write takes them again.
     pub(crate) fn release_idle(&mut self) {
-        if self.pending.is_empty() {
-            self.unit = BytesMut::new();
-            self.sealer.release_idle();
-            self.held = false;
-        }
+        self.records.release_idle();
     }
 
-    /// Writes what is pending; it is one write of the carrier below. A failed write
-    /// leaves a record cut or lost, after which no record may follow: it fails the
-    /// direction.
+    /// Writes the committed record; a failure fails the direction.
     fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.pending.is_empty() {
+        if let Some(e) = self.error {
+            return Poll::Ready(Err(e.into()));
+        }
+        while !self.records.pending().is_empty() {
+            let unit = self.records.pending();
             let wrote = match &mut self.lower {
-                Writer::Io(w) => w.as_mut().poll_write(cx, &self.pending),
-                Writer::Sealed(w) => w.as_mut().poll_write(cx, &self.pending),
+                Writer::Io(w) => w.as_mut().poll_write(cx, unit),
+                Writer::Sealed(w) => w.as_mut().poll_write(cx, unit),
                 Writer::Chunks(w) => {
-                    let mut c = [self.pending.clone()];
+                    let mut c = [unit.clone()];
                     w.as_mut().poll_write_chunks(cx, &mut c)
                 }
-                Writer::Stream(w) => Pin::new(w).poll_write(cx, &self.pending),
+                Writer::Stream(w) => Pin::new(w).poll_write(cx, unit),
             };
-            match ready!(wrote) {
-                Ok(n) if n > 0 => {
-                    let _ = self.pending.split_to(n);
-                    if self.pending.is_empty() {
-                        // An empty slice still holds the unit's allocation:
-                        // dropped, `unit` takes it back unshared, and an idle
-                        // release frees it.
-                        self.pending = Bytes::new();
-                    }
+            let r = match ready!(wrote) {
+                Ok(n) => self.records.wrote(n).map_err(failure),
+                Err(e) => {
+                    self.records.failed();
+                    Err(e)
                 }
-                failed => {
-                    self.sealer.fail();
-                    self.pending = Bytes::new();
-                    self.taken = 0;
-                    return Poll::Ready(Err(failed
-                        .err()
-                        .unwrap_or_else(|| io::ErrorKind::WriteZero.into())));
-                }
+            };
+            if let Err(e) = r {
+                let e = if e.kind() == io::ErrorKind::InvalidData {
+                    io::Error::from(io::ErrorKind::WriteZero)
+                } else {
+                    e
+                };
+                self.error = Some(e.kind());
+                return Poll::Ready(Err(e));
             }
         }
         Poll::Ready(Ok(()))
@@ -282,44 +198,20 @@ impl AsyncWrite for SealedWrite {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.pending.is_empty() && this.taken == 0 {
-            if buf.is_empty() {
-                // Nothing to write is no record: an empty write is done at
-                // once, and leaves nothing pending to a later write.
-                return Poll::Ready(Ok(0));
-            }
-            let pre = if this.framing == Framing::ByteStream {
-                usize::from(LEN)
-            } else {
-                0
-            };
-            let u = &mut this.unit;
-            u.clear();
-            u.reserve(pre + buf.len() + usize::from(TAG));
-            u.put_bytes(0, pre);
-            u.extend_from_slice(buf);
-            u.put_bytes(0, usize::from(TAG));
-            let sealed = this
-                .sealer
-                .seal_in_place(&mut u[pre..])
-                .map_err(io::Error::other)
-                .and_then(|()| match pre {
-                    0 => Ok(()),
-                    _ => length_prefix(&u[pre..]).map(|p| u[..pre].copy_from_slice(&p)),
-                });
-            if let Err(e) = sealed {
-                // No record went out for this write, and no record may
-                // follow: the direction fails, as after a failed write.
-                u.clear();
-                this.sealer.fail();
-                return Poll::Ready(Err(e));
-            }
-            this.pending = u.split().freeze();
-            this.held = true;
-            this.taken = buf.len();
-        }
+        // A record committed before goes first: nothing of `buf` is taken
+        // until it is out.
         ready!(this.poll_pending(cx))?;
-        Poll::Ready(Ok(std::mem::take(&mut this.taken)))
+        if buf.is_empty() {
+            // Nothing to write is no record.
+            return Poll::Ready(Ok(0));
+        }
+        this.records.seal(buf).map_err(io::Error::other)?;
+        // Taken: the record is committed (its nonce spent) and goes out
+        // here as far as the carrier takes it, the rest at the next call.
+        match this.poll_pending(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -344,7 +236,7 @@ pub(crate) async fn write_unit(p: &mut PipeIo, unit: &[u8]) -> io::Result<()> {
         .writer
         .as_mut()
         .ok_or(io::Error::from(io::ErrorKind::BrokenPipe))?;
-    let mut rest = Bytes::copy_from_slice(unit);
+    let mut rest = bytes::Bytes::copy_from_slice(unit);
     std::future::poll_fn(|cx| {
         while !rest.is_empty() {
             let n = match &mut *w {
@@ -379,7 +271,7 @@ pub(crate) async fn read_unit(p: &mut PipeIo, into: &mut Vec<u8>) -> io::Result<
         .as_mut()
         .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?;
     let at = into.len();
-    into.resize(at + 16 * 1024 + (u16::MAX as usize + 64), 0);
+    into.resize(at + super::HANDSHAKE_READ, 0);
     let mut rb = ReadBuf::new(&mut into[at..]);
     let got = std::future::poll_fn(|cx| Pin::new(&mut *r).poll_read(cx, &mut rb)).await;
     let n = rb.filled().len();
@@ -445,19 +337,24 @@ mod tests {
             w.as_mut().poll_write(&mut cx, &[]),
             Poll::Ready(Ok(0))
         ));
-        // A record larger than the pipe's room is pending until read.
+        // A write is taken once its record is sealed (S1: `Pending` takes
+        // nothing): the record larger than the pipe's room goes out as the
+        // reader makes room, and the next write waits for it first.
         let data = vec![5; 200];
-        assert!(w.as_mut().poll_write(&mut cx, &data).is_pending());
-        assert!(matches!(w.as_mut().poll_write(&mut cx, &[]), Poll::Pending));
+        assert!(matches!(
+            w.as_mut().poll_write(&mut cx, &data),
+            Poll::Ready(Ok(200))
+        ));
+        assert!(w.as_mut().poll_write(&mut cx, &[1]).is_pending());
+        assert!(w.as_mut().poll_flush(&mut cx).is_pending());
         let reader = tokio::spawn(async move {
             let mut got = vec![0; 2 + 200 + 16];
             far.read_exact(&mut got).await.unwrap();
             got
         });
-        let n = std::future::poll_fn(|cx| w.as_mut().poll_write(cx, &data))
+        std::future::poll_fn(|cx| w.as_mut().poll_flush(cx))
             .await
             .unwrap();
-        assert_eq!(n, 200);
         let got = reader.await.unwrap();
         assert_eq!(o.open(&got[2..]).unwrap(), data);
     }
@@ -473,7 +370,7 @@ mod tests {
         };
         let over = vec![1; aes_256_gcm().max_plaintext() + 1];
         assert!(w.write(&over).await.is_err());
-        assert!(w.unit.is_empty() && w.pending.is_empty() && w.taken == 0);
+        assert!(w.records.pending().is_empty());
         assert!(w.write(&[1, 2, 3]).await.is_err(), "no record follows");
         drop(p);
         let mut rest = Vec::new();
@@ -540,7 +437,7 @@ mod tests {
         for (n, &len) in lens.iter().enumerate() {
             let plain = vec![u8::try_from(n).unwrap(); len];
             w.write_all(&plain).await.unwrap();
-            let c = aes_256_gcm().seal(&key, n as u64, b"", &plain);
+            let c = aes_256_gcm().seal(&key, n as u64, b"", &plain).unwrap();
             want.extend_from_slice(&length_prefix(&c).unwrap());
             want.extend_from_slice(&c);
         }
@@ -559,6 +456,34 @@ mod tests {
             assert_eq!(r.read(&mut buf).await.unwrap(), len);
             assert!(buf[..len].iter().all(|&b| usize::from(b) == n));
         }
+    }
+
+    /// A record larger than the caller's buffer is given over several reads
+    /// (S2): the surplus plaintext stays.
+    #[tokio::test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "test: carriers and halves of the usual short names"
+    )]
+    async fn a_small_read_takes_a_record_in_parts() {
+        let (near, far) = duplex(1 << 20);
+        let mut p = seal_carrier(PipeIo::new(near), keys().0, keys().1);
+        let mut q = seal_carrier(PipeIo::new(far), keys().0, keys().1);
+        let (Some(Writer::Sealed(w)), Some(Reader::Sealed(r))) =
+            (p.writer.as_mut(), q.reader.as_mut())
+        else {
+            panic!("sealed")
+        };
+        w.write_all(&[3; 9000]).await.unwrap();
+        w.flush().await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0; 1000];
+        while got.len() < 9000 {
+            let n = r.read(&mut buf).await.unwrap();
+            assert!(n > 0 && n <= 1000);
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(got.iter().all(|&b| b == 3));
     }
 
     /// The carrier's end reads as an end at a record's boundary and as a failure inside one.

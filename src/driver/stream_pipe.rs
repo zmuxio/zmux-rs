@@ -62,7 +62,11 @@ impl StreamReader {
         cx: &mut Context<'_>,
         max: usize,
     ) -> Poll<io::Result<Option<Bytes>>> {
-        let r = std::task::ready!(self.recv.poll_read_chunk(cx.waker(), max.max(1)));
+        let r = std::task::ready!(self.recv.with_slot(|r, t| r.poll_read_chunk(
+            cx.waker(),
+            t,
+            max.max(1)
+        )));
         self.ended |= !matches!(r, Ok(Some(_)));
         Poll::Ready(r.map_err(io::Error::from))
     }
@@ -79,7 +83,10 @@ impl AsyncRead for StreamReader {
         if dst.is_empty() {
             return Poll::Ready(Ok(()));
         }
-        match std::task::ready!(this.recv.poll_read_buf(cx.waker(), dst)) {
+        match std::task::ready!(
+            this.recv
+                .with_slot(|r, t| r.poll_read_buf(cx.waker(), t, dst))
+        ) {
             Ok(Some(n)) => {
                 buf.advance(n);
                 Poll::Ready(Ok(()))
@@ -123,8 +130,10 @@ impl StreamWriter {
     /// Registers the task as the stream's writer while the pipe has nothing
     /// to write, so that a `STOP_SENDING` or the end of the stream's session
     /// wakes it; fails at once with what ended the stream.
-    pub(crate) fn watch(&self, cx: &Context<'_>) -> io::Result<()> {
-        self.send.watch(cx.waker()).map_err(io::Error::from)
+    pub(crate) fn watch(&mut self, cx: &Context<'_>) -> io::Result<()> {
+        self.send
+            .with_slot(|s, t| s.watch(cx.waker(), t))
+            .map_err(io::Error::from)
     }
 
     /// One write call of a batch (see [`SendStream::poll_write_batch`](SendStream#method.poll_write_batch)).
@@ -137,7 +146,7 @@ impl StreamWriter {
         limit: usize,
     ) -> Poll<io::Result<usize>> {
         self.send
-            .poll_write_batch(cx.waker(), out, cursor, from, limit)
+            .with_slot(|s, t| s.poll_write_batch(cx.waker(), t, out, cursor, from, limit))
             .map_err(io::Error::from)
     }
 }
@@ -148,8 +157,9 @@ impl AsyncWrite for StreamWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.send
-            .poll_write_capped(cx.waker(), buf)
+        self.get_mut()
+            .send
+            .with_slot(|s, t| s.poll_write_capped(cx.waker(), t, buf))
             .map_err(io::Error::from)
     }
 

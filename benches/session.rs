@@ -1668,6 +1668,7 @@ fn policy_name(p: &Scheduler) -> &'static str {
         Scheduler::SpreadRateWeighted => "rw",
         Scheduler::SessionAffinity => "session",
         Scheduler::Custom(_) => "custom",
+        _ => "other",
     }
 }
 

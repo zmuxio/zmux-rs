@@ -61,6 +61,21 @@
    "encode": true
   },
   {
+   "id": "datagram-context-not-minimal",
+   "note": "Context ID 0 in two bytes (40 00): the payload is the Value after the bytes read, and the next capsule stays in step",
+   "max_payload": 65535,
+   "hex": "000340006121020a0b",
+   "packets": [
+    {
+     "context": 0,
+     "payload": "61"
+    }
+   ],
+   "skipped": 1,
+   "error": null,
+   "encode": false
+  },
+  {
    "id": "datagram-empty",
    "note": "empty payload: Value is the Context ID alone",
    "max_payload": 65535,

@@ -61,9 +61,19 @@ async fn try_write_takes_what_fits_and_never_waits() {
         assert_eq!(send.try_write(b"x").unwrap(), 0, "no room");
         // The driver drains the buffers as far as credit lets: every room
         // it makes is taken, until credit is out and the buffers are full.
-        while let Ok(room) = tokio::time::timeout(Duration::from_millis(50), send.writable()).await
-        {
-            let room = room.unwrap() as usize;
+        // Done once the driver sent all the credit (`window`, the capacity
+        // of the empty stream) and nothing fits: then the buffers can no
+        // longer drain, which no wall-clock wait has to tell.
+        loop {
+            let n = send.try_write(&big).unwrap();
+            total += n;
+            if n == 0 && send.stats().bytes_sent >= window as u64 {
+                break;
+            }
+            let room = tokio::time::timeout(Duration::from_secs(5), send.writable())
+                .await
+                .expect("room while credit is left")
+                .unwrap() as usize;
             let n = send.try_write(&big).unwrap();
             assert!(n >= room.min(big.len()), "ready means the write takes it");
             total += n;
@@ -223,4 +233,104 @@ fn blocking_try_write_never_waits() {
     assert!(got.iter().all(|&b| b == 9));
     send.reset(VarInt::from_u32(1)).unwrap();
     assert!(send.try_write_chunk(&mut chunk).is_err());
+}
+
+/// Fills `send` (buffers and credit) so that a room wait waits; the bytes.
+async fn fill_until_waiting(send: &mut SendStream) -> usize {
+    send.set_send_buffer(1).unwrap();
+    let mut total = fill(send);
+    loop {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if poll_fn(|_| std::task::Poll::Ready(send.poll_writable(&mut cx)))
+            .await
+            .is_pending()
+        {
+            break;
+        }
+        total += fill(send);
+        tokio::task::yield_now().await;
+    }
+    total
+}
+
+/// Room waits of two tasks on one shared handle, one of them cancelled
+/// (a timed-out `select!`): the live waits are still woken. A single
+/// waker slot per stream lost the first wait's wake-up, and the cancelled
+/// wait took the live one's registration with it.
+#[tokio::test]
+async fn shared_room_waits_are_all_woken_and_cancel_alone() {
+    use std::future::Future;
+    watchdog(20, "shared writable", async {
+        let (client, server) = pair().await;
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        let total = fill_until_waiting(&mut send).await;
+        let send = &send;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut a = std::pin::pin!(send.writable());
+        let mut b = std::pin::pin!(send.wait_send_capacity(1));
+        let mut c = Box::pin(send.writable());
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        assert!(c.as_mut().poll(&mut cx).is_pending());
+        // The newest wait is cancelled; the older ones stay registered.
+        drop(c);
+        let (_ss, mut sr) = server.accept_bi().await.unwrap();
+        let read = async {
+            let mut buf = vec![0u8; total];
+            sr.read_exact(&mut buf).await.unwrap();
+        };
+        let (ra, rb, ()) = tokio::join!(a, b, read);
+        assert!(ra.unwrap() > 0);
+        assert!(rb.unwrap() > 0);
+    })
+    .await;
+}
+
+/// `StreamHandle::readable` takes nothing: cancelled at any point it loses
+/// no data, and `try_read_chunk` then takes it synchronously; a wait on a
+/// handle whose stream part is dropped ends with an error.
+#[tokio::test]
+async fn readable_then_try_read_loses_nothing() {
+    use std::future::Future;
+    use zmux::TryRead;
+    watchdog(20, "readable", async {
+        let (client, server) = pair().await;
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        let h = recv.handle();
+        assert_eq!(h.id(), recv.id());
+        // A wait cancelled after it completed took nothing.
+        let mut w = Box::pin(h.readable());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = w.as_mut().poll(&mut cx);
+        drop(w);
+        h.readable().await.unwrap();
+        assert_eq!(
+            recv.try_read_chunk(100).unwrap(),
+            TryRead::Data(Bytes::from_static(b"hello"))
+        );
+        assert_eq!(recv.try_read_chunk(100).unwrap(), TryRead::WouldBlock);
+        send.finish().unwrap();
+        h.readable().await.unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(recv.try_read(&mut buf).unwrap(), TryRead::Finished);
+        // The other direction: a pending wait ends when its part goes.
+        let (mut s2, _r2) = client.open_bi().await.unwrap();
+        s2.write_all(b"x").await.unwrap();
+        let (_a2, mut recv2) = server.accept_bi().await.unwrap();
+        let h2 = recv2.handle();
+        let mut one = [0u8; 1];
+        recv2.read_exact(&mut one).await.unwrap();
+        // Nothing more arrives while the sender holds its half open.
+        let mut wait = Box::pin(h2.readable());
+        assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing to read");
+        drop(recv2);
+        let r = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the wait ended with its part");
+        assert!(r.is_err(), "{r:?}");
+        drop(s2);
+    })
+    .await;
 }

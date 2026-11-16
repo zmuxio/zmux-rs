@@ -333,7 +333,7 @@ async fn connect_over_tls() {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
 
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let mut limits = ListenerConfig::default();
     limits.admission = Some(zmux::Admission::prefix_auth(verifier));
     let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
@@ -527,6 +527,7 @@ async fn an_admission_decides_on_the_request_head() {
         assert!(upgrade);
         let parts = info
             .request
+            .as_deref()
             .and_then(|r| r.downcast_ref::<http::request::Parts>())
             .expect("the request head");
         if parts.headers.contains_key("x-pass") {
@@ -573,7 +574,7 @@ async fn an_admission_decides_on_the_request_head() {
 async fn prefix_auth_in_the_request_header() {
     use std::sync::Arc;
     let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024));
+    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
     let mut limits = ListenerConfig::default();
     limits.admission = Some(zmux::Admission::prefix_auth(verifier));
     let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");

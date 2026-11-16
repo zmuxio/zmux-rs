@@ -26,6 +26,7 @@ zmux = { version = "1.2.8", path = "../.." }
 zmux-quinn = { version = "1.2.8", path = "../quinn", default-features = false }
 
 [dev-dependencies]
+zmux = { path = "../..", features = ["test-hooks"] }
 bytes = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -301,10 +301,21 @@ async fn run(
         };
         if !out.is_empty() {
             let mut failed = 0;
-            for b in out.drain(..) {
-                if ch.send(b).await.is_err() {
-                    failed += 1;
+            // A send that waits for room ends with the channel's use (the
+            // session closing): what is left is dropped with the task.
+            let shut = Wait::new(&shared.inner, List::Channel, |st: &mut State<Tokio>| {
+                (!st.core.channel_live(pipe)).then_some(())
+            });
+            let sent = super::sealed::until(shut, async {
+                for b in out.drain(..) {
+                    if ch.send(b).await.is_err() {
+                        failed += 1;
+                    }
                 }
+            })
+            .await;
+            if sent.is_none() {
+                return;
             }
             if failed > 0 {
                 let mut st = shared.lock();

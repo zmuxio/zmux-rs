@@ -19,6 +19,11 @@ struct Quic {
 
 impl Quic {
     fn new() -> Self {
+        Self::with_transport(quinn::TransportConfig::default())
+    }
+
+    /// With the server's transport configuration `transport`.
+    fn with_transport(transport: quinn::TransportConfig) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = CertificateDer::from(cert.cert.der().to_vec());
@@ -30,8 +35,9 @@ impl Quic {
             .with_single_cert(vec![der.clone()], key)
             .unwrap();
         tls.alpn_protocols = vec![b"zmux".to_vec()];
-        let server_config =
+        let mut server_config =
             quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
+        server_config.transport_config(Arc::new(transport));
         let server =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -551,4 +557,27 @@ async fn an_abort_ends_the_connection_with_its_code_after_the_close() {
         other => panic!("{other:?}"),
     }
     drop((server, ss));
+}
+
+/// A dial to a server that grants no stream fails within its timeout
+/// instead of waiting for stream credit for ever.
+#[tokio::test]
+async fn a_dial_without_stream_credit_times_out() {
+    let mut t = quinn::TransportConfig::default();
+    t.max_concurrent_bidi_streams(0u32.into());
+    let q = Quic::with_transport(t);
+    let addr = q.server.local_addr().unwrap();
+    let server = q.server.clone();
+    let held = tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() });
+    let started = tokio::time::Instant::now();
+    let r = zmux_quinn::dial(
+        &q.client,
+        addr,
+        "localhost",
+        &Options::default().with_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(held.await.unwrap());
 }

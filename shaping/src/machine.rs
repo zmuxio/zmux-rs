@@ -953,11 +953,13 @@ impl MachineShaper {
         &self.run.cur
     }
 
-    /// The counters of machine `m`.
+    /// The counters of machine `m`; `None` for no such machine.
     #[must_use]
-    pub fn counters(&self, m: usize) -> &[u64] {
-        let at = self.run.ctr_at[m] as usize;
-        &self.run.ctr[at..at + self.p.machines[m].counters as usize]
+    pub fn counters(&self, m: usize) -> Option<&[u64]> {
+        let at = *self.run.ctr_at.get(m)? as usize;
+        self.run
+            .ctr
+            .get(at..at + self.p.machines.get(m)?.counters as usize)
     }
 }
 

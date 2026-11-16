@@ -497,14 +497,22 @@ pub const fn establish_hello_len(
     noise: usize,
     overhead: usize,
 ) -> usize {
+    establish_hello_header_len(profile, handle) + message_len(stream, noise, overhead)
+}
+
+/// The header of an Establish Hello before its Noise message: `profile`
+/// (one byte up to 7, else an escape and its varint), the mode byte, and a
+/// 16-byte Handle when the Profile has one. The one definition of that
+/// length; the secure carrier's codec builds the bytes.
+#[must_use]
+pub const fn establish_hello_header_len(profile: u64, handle: bool) -> usize {
     let wire_profile = if profile <= 7 {
         1
     } else {
         1 + varint_len(profile)
     };
-    // The Handle is 16 bytes, present exactly when the Profile has one.
     let handle = if handle { 16 } else { 0 };
-    wire_profile + 1 + handle + message_len(stream, noise, overhead)
+    wire_profile + 1 + handle
 }
 
 /// The wire length without padding of a message that is its body: an Establish Reply or

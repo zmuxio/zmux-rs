@@ -25,8 +25,8 @@ use crate::proto::session::{
 use crate::proto::{Error, TransportErrorCode as T, VarInt};
 
 /// The idle-pipe probe interval of attachments without an outbound
-/// direction at the peer, and the default of `probe_interval`.
-pub(in crate::proto::session) const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// direction at the peer: the default of `probe_interval`.
+use crate::proto::session::DEFAULT_PROBE_INTERVAL as PROBE_INTERVAL;
 /// The busy window: a session that sent or received a traffic frame within
 /// it, or was established within it, probes its backup pipes every
 /// `standby_probe`.
@@ -804,12 +804,13 @@ impl ReplayWindow {
     /// bootstrap pair) sets h = 0 and its bit.
     pub(crate) fn new(width: u64, bootstrap: bool) -> Self {
         let width = width.max(1);
-        let words = usize::try_from(width.saturating_mul(2) / 64 + 2).unwrap_or(usize::MAX);
         let mut w = Self {
             high: None,
             width,
             base: 0,
-            bits: Vec::with_capacity(words),
+            // Grown as the window fills (`set`): the configured width is
+            // no allocation up front.
+            bits: Vec::new(),
         };
         if bootstrap {
             w.raise(0);
@@ -985,9 +986,11 @@ impl Mp {
         self.inbound_live = live;
     }
 
-    /// The session resumed: detection by acknowledgement starts over.
+    /// The session resumed: an inbound pipe is live again (the interval
+    /// without one ends, through the one writer of the inbound state), and
+    /// detection by acknowledgement starts over.
     pub(crate) fn resumed(&mut self, now: Instant) {
-        self.inbound_live = true;
+        self.inbound(true, now);
         self.detect_from = now;
     }
 
@@ -1612,6 +1615,20 @@ impl SessionCore {
     /// added would join at once ([`SessionCore::join_ready`]), and its live
     /// attachments stay within `max_pipes`, the attachments it aims for.
     /// A rejoin of a duplicate session's route is skipped otherwise.
+    /// Pipes that may be added now: none unless [`Self::join_ready`], else
+    /// the room under `max_pipes` beside the live attachments.
+    pub fn join_room(&self, now: Instant) -> usize {
+        if !self.join_ready(now) {
+            return 0;
+        }
+        let live = self
+            .atts
+            .iter()
+            .filter(|a| !a.unattached() && !a.failed())
+            .count();
+        (self.config.max_pipes as usize).saturating_sub(live)
+    }
+
     pub fn join_wanted(&self, now: Instant) -> bool {
         let live = self
             .atts
@@ -2436,12 +2453,18 @@ impl SessionCore {
         let Some(a) = self.att(id) else {
             return;
         };
-        if let Some(state) = Self::direction_state(a, half) {
-            self.push_event(CoreEvent::PipeState {
-                pipe: PipeId(id),
-                state,
-            });
-        }
+        let Some(state) = Self::direction_state(a, half) else {
+            return;
+        };
+        let previous = match state {
+            DirectionState::Outbound(now) => self.out_mut(id).and_then(|o| o.reported.replace(now)),
+            DirectionState::Inbound(_) => None,
+        };
+        self.push_event(CoreEvent::PipeState {
+            pipe: PipeId(id),
+            state,
+            previous,
+        });
     }
 
     fn direction_state(a: &Attachment, half: PipeHalf) -> Option<DirectionState> {
@@ -2461,7 +2484,7 @@ impl SessionCore {
     }
 
     /// How often an outbound pipe became suspect, a DRAINING one included.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
     pub(crate) fn suspects(&self) -> u64 {
         self.mp.as_deref().map_or(0, |m| m.suspects)
     }
@@ -2602,6 +2625,17 @@ impl SessionCore {
             inb |= p.inbound == Some(InboundState::Open);
         }
         !out || !inb
+    }
+
+    /// Whether an interval without a live inbound pipe is open (its
+    /// acknowledgements give no samples), for tests.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn debug_deaf(&self) -> bool {
+        self.mp
+            .as_deref()
+            .and_then(Mp::no_inbound)
+            .is_some_and(|(_, end)| end.is_none())
     }
 
     /// One attachment's quality, `None` when unknown.

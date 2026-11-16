@@ -1,19 +1,25 @@
 use std::fmt;
 use std::hint::black_box;
+
+pub use crate::util::wipe;
 use std::ops::Deref;
 
-/// Key material, overwritten with zeros when dropped. Best effort: the sans-IO
-/// core has no unsafe code for a volatile write, and copies a cipher or hash
-/// keeps of its own for the duration of a call are out of reach.
+/// Key material, overwritten with zeros ([`wipe`]) when dropped. Copies a
+/// cipher or hash keeps of its own for the duration of a call are out of
+/// reach.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct Secret(Vec<u8>);
 
 impl Secret {
+    /// The bytes, to fill in place.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
     /// Keeps the first `len` bytes; the others are overwritten.
     pub fn truncate(&mut self, len: usize) {
         if let Some(tail) = self.0.get_mut(len..) {
-            tail.fill(0);
-            black_box(&mut *tail);
+            wipe(tail);
         }
         self.0.truncate(len);
     }
@@ -51,10 +57,16 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// Whether `a` and `b` are equal, compared in constant time for their
+/// length: the one comparison of secret values (tags, keys, exporter
+/// values).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && black_box(a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y))) == 0
+}
+
 impl Drop for Secret {
     fn drop(&mut self) {
-        self.0.fill(0);
-        black_box(&mut self.0);
+        wipe(&mut self.0);
     }
 }
 

@@ -317,6 +317,8 @@ impl InPipe {
     pub(crate) fn restart(&mut self, now: Instant) {
         self.opened_at = now;
         self.last_record = now;
+        // Relative to the old time base: no acknowledgement yet on the new.
+        self.acked_ms = u32::MAX;
     }
 
     /// Records received.

@@ -592,15 +592,32 @@ impl Net {
             half.boundary = Some(half.sent);
         }
         let code = reset_code(tag);
+        // A stream its opener resets before it took an identifier, with no
+        // reliable data, never reaches the peer: the opener's receiving
+        // part ends cleanly, empty.
+        let unopened = w == self.s.streams[tag].opener
+            && self.ends[w].peek_stream_id(key).is_none()
+            && self.s.streams[tag].halves[h]
+                .boundary
+                .is_none_or(|b| b == 0);
         if self.ends[w]
             .reset(key, VarInt::from_u32(code as u32))
             .is_ok()
         {
-            let half = &mut self.s.streams[tag].halves[h];
+            let s = &mut self.s.streams[tag];
+            let half = &mut s.halves[h];
             half.sending = Sending::Reset {
                 code,
                 reliable: half.boundary.unwrap_or(0),
             };
+            if unopened && s.has(1 - h) {
+                let back = &mut s.halves[1 - h];
+                assert_eq!(
+                    back.sent, 0,
+                    "stream {tag}: the peer wrote to an unseen stream"
+                );
+                back.sending = Sending::Finished;
+            }
         }
     }
 

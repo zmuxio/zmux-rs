@@ -642,7 +642,9 @@ impl SessionCore {
             if let Some(p) = self.out_mut(id) {
                 p.close_written();
             }
-            // Linger from the time the close is written.
+            // Linger from the time the close is written, on each pipe: a
+            // slow pipe's close, written last, gets the whole linger too
+            // (each pipe writes it once, so the total stays bounded).
             self.linger_deadline = Some(now + self.linger_timeout());
             self.maybe_closed(now);
             return Transmit::Shutdown;
@@ -2456,7 +2458,7 @@ impl SessionCore {
             open_info: s.extra().open_info.as_deref(),
             priority: s.extra().peer_priority,
             pipe_carrier: s.extra().pipe_carrier,
-            app_tlvs: AppTlvs::new(s.extra().app_tlvs.as_deref().unwrap_or_default()),
+            app_tlvs: AppTlvs::whole(s.extra().app_tlvs.as_deref().unwrap_or_default()),
         }
         .encoded_len(g)
     }
@@ -2483,7 +2485,7 @@ impl SessionCore {
                 open_info: extra.open_info.as_deref(),
                 priority: extra.peer_priority,
                 pipe_carrier: extra.pipe_carrier,
-                app_tlvs: AppTlvs::new(extra.app_tlvs.as_deref().unwrap_or_default()),
+                app_tlvs: AppTlvs::whole(extra.app_tlvs.as_deref().unwrap_or_default()),
             };
             let mut buf = [0u8; 64];
             let bytes = match p.encoded_len(g) {

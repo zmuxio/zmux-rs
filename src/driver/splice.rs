@@ -6,10 +6,13 @@
 //! for `w`'s send capacity with `min` = m = min(chunk, the bytes readable
 //! on `r`, 16 KiB) ([`SendStream::poll_send_capacity`]: woken once
 //! per chunk, not on every credit change, and never stalled by a peer
-//! window smaller than m); asks the
-//! direction's limiter, if any, for `ready(min(m, capacity), min(capacity,
-//! chunk))`; takes at most that from `r` as a chunk and hands it to `w`
-//! without copying; and charges the limiter with what `w` took. Every wait
+//! window smaller than m); with a limiter for the direction, waits until
+//! `r` is readable without consuming anything and then asks it for
+//! `acquire(1, k)`, k = min(the bytes readable, capacity, chunk); takes at
+//! most the grant from `r` as a chunk and hands it to `w` without copying;
+//! and refunds the limiter what it granted and was not forwarded. A
+//! limiter that fails ends the direction ([`SpliceEnd::LimiterFailed`]).
+//! Every wait
 //! also watches both parts, so that an end or an error never waits behind
 //! capacity: the waits register the task with `r` (data, FIN, reset, the
 //! session's end) and with `w` (`STOP_SENDING`, the session's end) at once.
@@ -25,15 +28,15 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
+use crate::proto::limit::Permit;
 use bytes::Bytes;
 
-use super::handle::Upstream;
-use crate::helpers::capsule::{self, MAX_HEADER, Scanner};
+use super::handle::{Upstream, WaitSlot};
+use crate::helpers::capsule::{self, MAX_HEADER, MAX_TYPE_LENGTH, Scanner};
 use crate::proto::limit::Limiter;
 use crate::proto::session::StreamError;
 use crate::proto::{ApplicationErrorCode, VarInt};
@@ -117,6 +120,10 @@ pub enum SpliceEnd {
     /// The splice was aborted with this code ([`SpliceAbort::abort`]): the
     /// downstream part was reset and the upstream part stopped with it.
     Cancelled(VarInt),
+    /// The direction's limiter failed (its error, a panic or a grant
+    /// outside its contract): the downstream part was reset and the
+    /// upstream part stopped with `ZMUX_CANCELLED`.
+    LimiterFailed,
 }
 
 /// Aborts splices with a chosen application error code: what dropping the
@@ -226,7 +233,9 @@ pub struct Forwarded {
     /// downstream part.
     pub bytes: u64,
     /// Payload bytes of the stream datagrams forwarded. With `bytes`,
-    /// exactly what the direction's limiter was charged.
+    /// exactly what the direction's limiter granted and kept (a datagram
+    /// granted less than its payload, at the limiter's burst, keeps its
+    /// grant).
     pub datagram_bytes: u64,
     /// Stream datagrams not forwarded, for any cause: at least
     /// `datagrams_too_large + datagrams_limited`, and also those the
@@ -299,11 +308,12 @@ impl std::error::Error for SpliceError {}
 /// | either session ends | reset and stop the other side's stream with `ZMUX_CARRIER_FAILED` |
 /// | the future is dropped | reset both streams with `ZMUX_CANCELLED` and stop them with code 0 |
 /// | [`SpliceOptions::abort`] aborted with c | reset both streams and stop them with c; the result reports [`SpliceEnd::Cancelled`] |
+/// | the direction's limiter fails | reset downstream and stop upstream with `ZMUX_CANCELLED`; the result reports [`SpliceEnd::LimiterFailed`] |
 ///
 /// Stream datagrams are forwarded to the other stream with their context,
 /// without waiting and without a queue of the helper's own: the
-/// direction's limiter allows the whole payload or the datagram is
-/// dropped, then the other session's datagram limiter and send queue take
+/// direction's limiter grants the whole payload (`try_acquire(n, n)`) or
+/// the datagram is dropped, then the other session's datagram limiter and send queue take
 /// it.
 ///
 /// Each direction holds at most one chunk ([`SpliceOptions::chunk`], and
@@ -345,10 +355,19 @@ pub async fn splice(
 ///   Context ID and payload, inserted at the next capsule boundary of the
 ///   downstream bytes ([`Forwarded::datagrams_as_capsules`]). Those
 ///   waiting for a boundary are bounded (the larger of the chunk and one
-///   largest datagram); beyond it they are dropped as too large. The
-///   direction's limiter must allow the payload when it is queued and is
-///   charged once the capsule was written whole; one the direction never
-///   wrote (it ended first) is dropped as too large and not charged.
+///   largest datagram); beyond it they are dropped as too large. One the
+///   direction never wrote (it ended first) is dropped as too large and
+///   its grant refunded.
+///
+/// With a limiter for the direction, a packet relay charges whole units:
+///
+/// - each capsule takes one grant of its whole size (`acquire(n, n)`)
+///   once its Type and Length are read, those few bytes being all that is
+///   held while it waits, and then goes on without another call;
+/// - each stream datagram, including one turned into a capsule, is policed
+///   as a datagram send (`try_acquire(n, n)`): without a grant it is
+///   dropped and counted ([`Forwarded::datagrams_limited`]), never waited
+///   for while it is held. An empty datagram passes without a call.
 ///
 /// A capsule is never turned into a datagram: what was sent reliably stays
 /// reliable.
@@ -420,11 +439,13 @@ async fn splice_with(
             }
             // Datagrams first: a capsule they queued is written by the
             // direction in the same poll.
-            if !dg_ab_done {
-                dg_ab_done = dg_ab.as_mut().poll(cx).is_ready();
-            }
-            if !dg_ba_done {
-                dg_ba_done = dg_ba.as_mut().poll(cx).is_ready();
+            for (done, dg) in [
+                (&mut dg_ab_done, dg_ab.as_mut()),
+                (&mut dg_ba_done, dg_ba.as_mut()),
+            ] {
+                if !*done && dg.poll(cx).is_ready() {
+                    *done = true;
+                }
             }
             if ab_end.is_none()
                 && let Poll::Ready(end) = ab.poll(cx)
@@ -447,28 +468,6 @@ async fn splice_with(
         a_to_b: ab_datagrams.result(ab.bytes, ab_end, &lock(&ab_inserts)),
         b_to_a: ba_datagrams.result(ba.bytes, ba_end, &lock(&ba_inserts)),
     })
-}
-
-/// A limiter's allowance now for `len` bytes (a panic allows nothing).
-fn allowance(limiter: &dyn Limiter, len: usize) -> usize {
-    catch_unwind(AssertUnwindSafe(|| limiter.try_ready(len))).unwrap_or(0)
-}
-
-/// Polls a limiter for `min..=max` bytes (a panic allows nothing).
-fn poll_allowance(limiter: &dyn Limiter, waker: &Waker, min: usize, max: usize) -> Poll<usize> {
-    catch_unwind(AssertUnwindSafe(|| {
-        limiter.poll_ready(&mut Context::from_waker(waker), min, max)
-    }))
-    .unwrap_or(Poll::Ready(0))
-}
-
-/// Charges a limiter (a panic is ignored).
-fn charge(limiter: Option<&dyn Limiter>, n: usize) {
-    if let Some(l) = limiter
-        && n > 0
-    {
-        let _ = catch_unwind(AssertUnwindSafe(|| l.charge(n)));
-    }
 }
 
 /// The largest datagram payload a session carries.
@@ -500,23 +499,19 @@ impl Datagrams {
             end,
         }
     }
-
-    fn forwarded(&mut self, limiter: Option<&dyn Limiter>, len: usize) {
-        charge(limiter, len);
-        self.bytes += len as u64;
-    }
 }
 
 /// DATAGRAM capsules of a packet relay's direction waiting for a capsule
 /// boundary of the downstream bytes: each a header and a payload.
 #[derive(Default)]
 struct Inserts {
-    queue: VecDeque<(Bytes, Bytes)>,
+    /// Header, payload, and the limiter's grant for it.
+    queue: VecDeque<(Bytes, Bytes, u64)>,
     bytes: usize,
     /// The direction ended, or its upstream did (a FIN or a reset):
     /// nothing more is queued.
     closed: bool,
-    /// Capsules written whole, and their payload bytes (charged to the
+    /// Capsules written whole, and their payload bytes (granted by the
     /// direction's limiter as they were written).
     sent: u64,
     sent_bytes: u64,
@@ -526,7 +521,7 @@ struct Inserts {
 
 impl Inserts {
     /// Queues a capsule unless the direction ended or `bound` bytes wait.
-    fn push(&mut self, context: u64, payload: Bytes, bound: usize) -> bool {
+    fn push(&mut self, context: u64, payload: Bytes, granted: u64, bound: usize) -> bool {
         let mut h = [0; MAX_HEADER];
         let n = capsule::datagram_header(context, payload.len(), &mut h);
         let size = n + payload.len();
@@ -535,7 +530,7 @@ impl Inserts {
         }
         self.bytes += size;
         self.queue
-            .push_back((Bytes::copy_from_slice(&h[..n]), payload));
+            .push_back((Bytes::copy_from_slice(&h[..n]), payload, granted));
         true
     }
 }
@@ -545,8 +540,10 @@ fn lock(m: &Mutex<Inserts>) -> MutexGuard<'_, Inserts> {
 }
 
 /// Forwards the stream datagrams of `r` to `w` until `r` can carry no more
-/// (or the splice ends and drops this); with `convert`, one that does not
-/// fit a datagram of `w` is queued as a DATAGRAM capsule.
+/// (or the splice ends and drops this); with `convert` (a packet relay),
+/// one that does not fit a datagram of `w` is queued as a DATAGRAM
+/// capsule. Each datagram is policed (`try_acquire(n, n)`, never waited
+/// for while it is held): one without a grant is dropped and counted.
 async fn forward_datagrams(
     r: &RecvStream,
     w: &SendStream,
@@ -560,31 +557,42 @@ async fn forward_datagrams(
     }) = r.read_datagram().await
     {
         let len = data.len();
-        if let Some(l) = limiter
-            && len > 0
-            && allowance(l, len) < len
-        {
-            count.dropped += 1;
-            count.limited += 1;
-            continue;
-        }
+        let unit = len as u64;
+        let granted = match limiter {
+            None => 0,
+            Some(l) => {
+                let Some(g) = crate::proto::limit::police(l, unit) else {
+                    count.dropped += 1;
+                    count.limited += 1;
+                    continue;
+                };
+                g
+            }
+        };
+        // Taken: refunded unless it goes on.
+        let unsent = || crate::proto::limit::refund(limiter, granted);
         match w.try_send_datagram(context, data.clone()) {
-            Ok(true) => count.forwarded(limiter, len),
+            Ok(true) => count.bytes += len as u64,
             Ok(false) => {
+                unsent();
                 count.dropped += 1;
                 count.limited += 1;
             }
             Err(crate::DatagramError::TooLarge { .. } | crate::DatagramError::NotNegotiated) => {
                 match convert {
-                    // Counted, and charged, once the direction wrote it.
-                    Some((q, bound)) if lock(q).push(context, data, bound) => {}
+                    // Counted once the direction wrote it.
+                    Some((q, bound)) if lock(q).push(context, data, granted, bound) => {}
                     _ => {
+                        unsent();
                         count.dropped += 1;
                         count.too_large += 1;
                     }
                 }
             }
-            Err(_) => count.dropped += 1,
+            Err(_) => {
+                unsent();
+                count.dropped += 1;
+            }
         }
     }
 }
@@ -599,6 +607,15 @@ struct Framing<'a> {
     tail: Option<Bytes>,
     /// The payload length of the capsule being inserted.
     insert_len: usize,
+    /// With a limiter: the Type and Length read of the next capsule, the
+    /// only bytes held while its grant is awaited.
+    header: [u8; MAX_TYPE_LENGTH],
+    header_len: usize,
+    /// The header in `header` was cut short by the FIN: it goes alone.
+    truncated: bool,
+    /// What is left of the grant of the capsule being forwarded: refunded
+    /// when the direction ends before the capsule went out.
+    grant: u64,
 }
 
 /// Where a direction is.
@@ -625,6 +642,9 @@ enum Phase {
 struct Direction<'a> {
     r: &'a RecvStream,
     w: &'a SendStream,
+    /// This direction's waits on `r` and `w`.
+    r_wait: WaitSlot<'a, super::tokio::Tokio>,
+    w_wait: WaitSlot<'a, super::tokio::Tokio>,
     limiter: Option<&'a dyn Limiter>,
     chunk: usize,
     /// A chunk read from `r` that `w` has not taken whole.
@@ -635,6 +655,13 @@ struct Direction<'a> {
     /// Bytes `w` took.
     bytes: u64,
     phase: Phase,
+}
+
+impl Drop for Direction<'_> {
+    /// A splice dropped before its end refunds the grants it did not use.
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl<'a> Direction<'a> {
@@ -648,6 +675,8 @@ impl<'a> Direction<'a> {
         Self {
             r,
             w,
+            r_wait: r.wait_slot(),
+            w_wait: w.wait_slot(),
             limiter,
             chunk,
             held: None,
@@ -658,6 +687,10 @@ impl<'a> Direction<'a> {
                 unscanned: None,
                 tail: None,
                 insert_len: 0,
+                header: [0; MAX_TYPE_LENGTH],
+                header_len: 0,
+                truncated: false,
+                grant: 0,
             }),
             bytes: 0,
             phase: Phase::Run,
@@ -674,17 +707,7 @@ impl<'a> Direction<'a> {
                 Phase::Reliable { code, reliable } => self.reliable(waker, code, reliable),
                 Phase::Flush { code } => self.flush(waker, code),
                 Phase::Done(end) => {
-                    // Whatever was read and not forwarded is released now.
-                    self.held = None;
-                    if let Some(f) = self.framing.take() {
-                        let mut q = lock(f.inserts);
-                        q.closed = true;
-                        // A capsule cut short was not delivered either.
-                        let cut = u64::from(self.held_insert || f.tail.is_some());
-                        q.unsent += q.queue.len() as u64 + cut;
-                        q.queue.clear();
-                    }
-                    self.held_insert = false;
+                    self.release();
                     return Poll::Ready(end);
                 }
             };
@@ -701,6 +724,25 @@ impl<'a> Direction<'a> {
         }
     }
 
+    /// Releases whatever was read and not forwarded: at the end, or when
+    /// the splice is dropped before it. Once only (the framing is taken).
+    fn release(&mut self) {
+        self.held = None;
+        if let Some(f) = self.framing.take() {
+            let mut q = lock(f.inserts);
+            q.closed = true;
+            // A capsule cut short was not delivered either.
+            let cut = u64::from(self.held_insert || f.tail.is_some());
+            q.unsent += q.queue.len() as u64 + cut;
+            // The grant of a capsule never written is refunded (one cut
+            // short stays taken: part of it went out).
+            let unwritten: u64 = q.queue.drain(..).map(|(_, _, g)| g).sum();
+            drop(q);
+            crate::proto::limit::refund(self.limiter, unwritten + f.grant);
+        }
+        self.held_insert = false;
+    }
+
     /// Forwarding: one step; `Ready` when the phase changed or progress
     /// was made.
     fn run(&mut self, waker: &Waker) -> Poll<()> {
@@ -715,10 +757,16 @@ impl<'a> Direction<'a> {
         if self.load_framed() {
             return self.write_held(waker);
         }
+        if let Some(l) = self.limiter
+            && let Some(f) = &self.framing
+            && f.scan.value_left().is_none()
+        {
+            return self.capsule_header(l, waker);
+        }
         // One critical section: a reset, acted on before the data below
         // its Reliable Size was read, or what is readable; `r` stays
         // registered while the step waits on `w`.
-        let readable = match self.r.poll_upstream(waker) {
+        let readable = match self.r.poll_upstream(waker, &mut self.r_wait.ticket) {
             Poll::Ready(Ok(Upstream::Reset(code, reliable))) => {
                 self.on_reset(code, reliable);
                 return Poll::Ready(());
@@ -738,7 +786,10 @@ impl<'a> Direction<'a> {
             }
         };
         let m = self.chunk.min(readable).min(STEP);
-        let capacity = match self.w.poll_capacity_with(waker, m as u64) {
+        let capacity = match self
+            .w
+            .poll_capacity_with(waker, &mut self.w_wait.ticket, m as u64)
+        {
             Poll::Ready(Ok(c)) => usize::try_from(c).unwrap_or(usize::MAX),
             Poll::Ready(Err(e)) => {
                 self.downstream_failed(&e);
@@ -746,18 +797,45 @@ impl<'a> Direction<'a> {
             }
             Poll::Pending => return Poll::Pending,
         };
-        let max = capacity.min(self.chunk);
-        let allowed = match self.limiter {
-            None => max,
-            Some(l) => match poll_allowance(l, waker, m.min(capacity), max) {
-                Poll::Ready(a) if a > 0 => a.min(max),
-                // An allowance of 0 breaks the contract (a limiter waits
-                // instead), as does a panic: taken as a wait that only the
-                // streams' events end, never as a reason to spin.
-                _ => return self.watch_downstream(waker),
-            },
+        let mut max = capacity.min(self.chunk);
+        // `r` is readable: only now is the limiter asked, for at most
+        // what can be read and sent, so an idle source holds no grant. A
+        // packet relay's capsule was granted whole with its header: the
+        // read stays inside it.
+        let value_left = self.framing.as_ref().and_then(|f| f.scan.value_left());
+        let mut permit = match (self.limiter, value_left) {
+            (None, _) => None,
+            (Some(_), Some(left)) => {
+                max = max.min(usize::try_from(left).unwrap_or(usize::MAX));
+                None
+            }
+            (Some(l), None) => {
+                let k = max.min(readable) as u64;
+                match Permit::poll_acquire(l, &mut Context::from_waker(waker), 1, k) {
+                    Poll::Ready(Ok(p)) => Some(p),
+                    Poll::Ready(Err(_)) => {
+                        self.limiter_failed();
+                        return Poll::Ready(());
+                    }
+                    // The limiter woke the task when it can grant; `w` is
+                    // watched for its end meanwhile.
+                    Poll::Pending => return self.watch_downstream(waker),
+                }
+            }
         };
-        match self.r.poll_take_chunk(waker, allowed) {
+        let allowed = permit
+            .as_ref()
+            .map_or(max, |p| usize::try_from(p.len()).unwrap_or(usize::MAX));
+        let taken = self
+            .r
+            .poll_take_chunk(waker, &mut self.r_wait.ticket, allowed);
+        // What the chunk does not use of the grant is refunded with the
+        // permit.
+        if let (Some(p), Poll::Ready(Ok(Some(chunk)))) = (permit.as_mut(), &taken) {
+            p.consume(chunk.len() as u64);
+        }
+        drop(permit);
+        match taken {
             Poll::Ready(Ok(Some(chunk))) => {
                 self.hold(chunk);
                 // Handed to `w` at once: `r` stays registered for its
@@ -800,9 +878,9 @@ impl<'a> Direction<'a> {
             self.held_insert = true;
             return true;
         }
-        if f.scan.at_boundary() {
+        if f.scan.at_boundary() && f.header_len == 0 {
             let mut q = lock(f.inserts);
-            if let Some((header, payload)) = q.queue.pop_front() {
+            if let Some((header, payload, _)) = q.queue.pop_front() {
                 q.bytes -= header.len() + payload.len();
                 drop(q);
                 f.insert_len = payload.len();
@@ -825,7 +903,7 @@ impl<'a> Direction<'a> {
         let Some(held) = &mut self.held else {
             return Poll::Ready(());
         };
-        match self.w.poll_write_part(waker, held) {
+        match self.w.poll_write_part(waker, &mut self.w_wait.ticket, held) {
             Poll::Ready(Ok(n)) => {
                 if held.is_empty() {
                     self.held = None;
@@ -838,7 +916,6 @@ impl<'a> Direction<'a> {
                         && f.tail.is_none()
                     {
                         // The inserted capsule was written whole.
-                        charge(self.limiter, f.insert_len);
                         let mut q = lock(f.inserts);
                         q.sent += 1;
                         q.sent_bytes += f.insert_len as u64;
@@ -854,7 +931,7 @@ impl<'a> Direction<'a> {
     /// Waits on `r` (registered by the caller) while `w` is watched for
     /// its end: `Ready` when `w` ended (the phase changed).
     fn watch_downstream(&mut self, waker: &Waker) -> Poll<()> {
-        match self.w.watch(waker) {
+        match self.w.watch(waker, &mut self.w_wait.ticket) {
             Ok(()) => Poll::Pending,
             Err(e) => {
                 self.downstream_failed(&e);
@@ -866,7 +943,7 @@ impl<'a> Direction<'a> {
     /// Watches `r` for its reset or its session's end while the direction
     /// waits on something else; `true` when it ended (the phase changed).
     fn watch_upstream(&mut self, waker: &Waker) -> bool {
-        match self.r.watch(waker) {
+        match self.r.watch(waker, &mut self.r_wait.ticket) {
             Ok(None) => false,
             Ok(Some((code, reliable))) => {
                 self.on_reset(code, reliable);
@@ -879,17 +956,98 @@ impl<'a> Direction<'a> {
         }
     }
 
-    /// `w` took `n` bytes: count and charge them.
+    /// `w` took `n` bytes: count them (the limiter's grant was taken
+    /// when they were read).
     fn took(&mut self, n: usize) {
         self.bytes += n as u64;
-        charge(self.limiter, n);
+        if let Some(f) = &mut self.framing {
+            f.grant = f.grant.saturating_sub(n as u64);
+        }
+    }
+
+    /// A packet relay with a limiter, at a capsule boundary: reads the
+    /// next capsule's Type and Length (only those), then waits for the
+    /// limiter's grant of the whole capsule (`acquire(n, n)`) and takes the
+    /// header in hand; the capsule's Value then goes on without another
+    /// call. A header cut short by the FIN is granted and forwarded as it
+    /// is.
+    fn capsule_header(&mut self, l: &dyn Limiter, waker: &Waker) -> Poll<()> {
+        let Some(f) = &mut self.framing else {
+            return Poll::Ready(());
+        };
+        let length = match capsule::type_length(&f.header[..f.header_len]) {
+            Ok(length) => length,
+            Err(_) if f.truncated => 0,
+            Err(need) => {
+                match self.r.poll_upstream(waker, &mut self.r_wait.ticket) {
+                    Poll::Ready(Ok(Upstream::Reset(code, reliable))) => {
+                        self.on_reset(code, reliable);
+                        return Poll::Ready(());
+                    }
+                    Poll::Ready(Ok(Upstream::Readable(0))) => {
+                        if f.header_len == 0 {
+                            self.forward_fin(waker);
+                        } else {
+                            f.truncated = true;
+                        }
+                        return Poll::Ready(());
+                    }
+                    Poll::Ready(Ok(Upstream::Readable(_))) => {}
+                    Poll::Ready(Err(e)) => {
+                        self.upstream_failed(&e);
+                        return Poll::Ready(());
+                    }
+                    Poll::Pending => return self.watch_downstream(waker),
+                }
+                return match self.r.poll_take_chunk(waker, &mut self.r_wait.ticket, need) {
+                    Poll::Ready(Ok(Some(chunk))) => {
+                        f.header[f.header_len..f.header_len + chunk.len()].copy_from_slice(&chunk);
+                        f.header_len += chunk.len();
+                        Poll::Ready(())
+                    }
+                    Poll::Ready(Ok(None)) => Poll::Ready(()),
+                    Poll::Ready(Err(e)) => {
+                        self.upstream_failed(&e);
+                        Poll::Ready(())
+                    }
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+        };
+        // A Length beyond what a stream can carry is clamped: the stream
+        // ends long before.
+        let n = f.header_len as u64 + length.min(1 << 62);
+        let grant = match Permit::poll_acquire(l, &mut Context::from_waker(waker), n, n) {
+            Poll::Ready(Ok(p)) => p.take_all(),
+            Poll::Ready(Err(_)) => {
+                self.limiter_failed();
+                return Poll::Ready(());
+            }
+            // Only the header is held while the limiter is awaited; `r` is
+            // watched for its reset or its session's end and `w` for its
+            // end meanwhile.
+            Poll::Pending => {
+                if self.watch_upstream(waker) {
+                    return Poll::Ready(());
+                }
+                return self.watch_downstream(waker);
+            }
+        };
+        let header = Bytes::copy_from_slice(&f.header[..f.header_len]);
+        f.scan.scan(&header, false);
+        f.header_len = 0;
+        f.truncated = false;
+        f.grant = grant;
+        self.held = Some(header);
+        self.held_insert = false;
+        self.write_held(waker)
     }
 
     /// The FIN was read: consume it and finish `w`.
     fn forward_fin(&mut self, waker: &Waker) {
         self.close_inserts();
         // Reads the end (nothing is left before it).
-        let _ = self.r.poll_read_chunk(waker, 1);
+        let _ = self.r.poll_read_chunk(waker, &mut self.r_wait.ticket, 1);
         match self.w.finish_shared() {
             Ok(()) | Err(StreamError::ClosedLocally) => {
                 self.phase = Phase::Done(SpliceEnd::Finished);
@@ -929,6 +1087,14 @@ impl<'a> Direction<'a> {
                 self.held_insert = true;
                 return self.write_held(waker);
             }
+            if self.held.is_none() && f.header_len > 0 {
+                // A header read and not yet granted: below the Reliable
+                // Size, it is owed like any other byte.
+                let header = Bytes::copy_from_slice(&f.header[..f.header_len]);
+                f.scan.scan(&header, false);
+                f.header_len = 0;
+                self.held = Some(header);
+            }
             if self.held.is_none() {
                 self.held = f.unscanned.take();
             }
@@ -943,7 +1109,10 @@ impl<'a> Direction<'a> {
                 return self.write_held(waker);
             }
             let m = self.chunk.min(need).min(STEP);
-            let capacity = match self.w.poll_capacity_with(waker, m as u64) {
+            let capacity = match self
+                .w
+                .poll_capacity_with(waker, &mut self.w_wait.ticket, m as u64)
+            {
                 Poll::Ready(Ok(c)) => usize::try_from(c).unwrap_or(usize::MAX),
                 Poll::Ready(Err(e)) => {
                     self.downstream_failed(&e);
@@ -951,10 +1120,11 @@ impl<'a> Direction<'a> {
                 }
                 Poll::Pending => return Poll::Pending,
             };
-            match self
-                .r
-                .poll_read_chunk(waker, capacity.min(self.chunk).min(need))
-            {
+            match self.r.poll_read_chunk(
+                waker,
+                &mut self.r_wait.ticket,
+                capacity.min(self.chunk).min(need),
+            ) {
                 Poll::Ready(Ok(Some(chunk))) => {
                     self.held = Some(chunk);
                     return self.write_held(waker);
@@ -990,7 +1160,7 @@ impl<'a> Direction<'a> {
     /// Without `RESET_STREAM_AT`: the reset once the forwarded bytes were
     /// passed to the carrier.
     fn flush(&mut self, waker: &Waker, code: VarInt) -> Poll<()> {
-        match self.w.poll_sent(waker) {
+        match self.w.poll_sent(waker, &mut self.w_wait.ticket) {
             Poll::Ready(Ok(())) => self.reset_downstream(code),
             Poll::Ready(Err(e)) => self.downstream_failed(&e),
             Poll::Pending => return Poll::Pending,
@@ -1011,6 +1181,16 @@ impl<'a> Direction<'a> {
         self.close_inserts();
         self.phase = Phase::Done(SpliceEnd::Cancelled(code));
         let _ = self.poll(&mut Context::from_waker(Waker::noop()));
+    }
+
+    /// The limiter failed: the direction ends as if cancelled, both parts
+    /// reset and stopped with `ZMUX_CANCELLED`.
+    fn limiter_failed(&mut self) {
+        let c = code(ApplicationErrorCode::ZMUX_CANCELLED);
+        let _ = self.w.reset_shared(c);
+        let _ = self.r.stop_shared(c);
+        self.close_inserts();
+        self.phase = Phase::Done(SpliceEnd::LimiterFailed);
     }
 
     /// `r` ended other than by a FIN or a reset seen as such.
