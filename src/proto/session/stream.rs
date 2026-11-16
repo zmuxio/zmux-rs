@@ -663,6 +663,8 @@ pub(crate) struct SendMp {
     /// The current values of the direction's own `spread-round-robin`
     /// policy, by pipe; absent pipes are at 0.
     pub(crate) rr: Vec<(u64, f64)>,
+    /// The chunk of that policy being filled: its pipe and bytes so far.
+    pub(crate) rr_fill: (u64, u64),
     /// `set_redundant`: `None` follows the session's `redundancy`.
     pub(crate) redundant: Option<bool>,
     /// The ranges with a redundant copy queued or sent, above the bytes released.
@@ -812,6 +814,7 @@ impl SendMp {
         bound: None,
         scheduler: None,
         rr: Vec::new(),
+        rr_fill: (0, 0),
         redundant: None,
         copied: RangeSet::new(),
         copies_unacked: 0,

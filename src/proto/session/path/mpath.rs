@@ -775,6 +775,9 @@ pub(crate) struct Mp {
     batch: crate::proto::session::output::BatchLog,
     /// Custom-policy decisions (`sched.rs`).
     picks: crate::proto::session::sched::Picks,
+    /// The chunk of the session's round-robin being filled: its pipe and
+    /// bytes so far (`sched.rs`).
+    pub(in crate::proto::session) rr_fill: (u64, u64),
     /// The `affinity` bindings' re-evaluation (`sched.rs`).
     affinity: crate::proto::session::sched::Affinity,
     /// The pipe views, tier waits and probation histories (`tier.rs`).
@@ -1214,6 +1217,7 @@ impl SessionCore {
             acks: crate::proto::session::ack::AckState::new(local_mad, threshold),
             batch: crate::proto::session::output::BatchLog::default(),
             picks: crate::proto::session::sched::Picks::default(),
+            rr_fill: (0, 0),
             affinity: crate::proto::session::sched::Affinity::default(),
             tiers: crate::proto::session::tier::Tiers::default(),
             blocked: crate::proto::session::opp::CreditBlocked::default(),

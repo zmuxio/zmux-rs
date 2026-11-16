@@ -26,7 +26,7 @@ use zmux::helpers::{
     splice_packets,
 };
 use zmux::proto::ApplicationErrorCode;
-use zmux::{Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
+use zmux::{Cap, Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
 
 fn packet_error() -> VarInt {
     VarInt::from_u64(ApplicationErrorCode::ZMUX_PACKET_ERROR.0).unwrap()
@@ -554,7 +554,14 @@ fn datagrams_queued_before_the_end_are_delivered_before_it() {
 /// lets the far end read everything: the capsules it received and the
 /// sender's count of those sent, with the sends that returned `Ok`.
 async fn cancel_a_stalled_send(size: usize) -> (u64, u64, u64) {
-    let (a, b) = pair(true).await;
+    // Fixed windows: an auto-tuned window grows with the arrival rate, so
+    // where the credit ends (and whether it ends on a capsule boundary)
+    // would depend on timing.
+    let mut c = config(true);
+    c.max_stream_receive_window = Cap::Fixed(c.initial_stream_receive_window);
+    c.max_connection_receive_window = Cap::Fixed(c.initial_connection_receive_window);
+    let ((x, _), (y, _)) = duplex(1 << 20);
+    let (a, b) = connect(x, y, c.clone(), c).await;
     let (mut p, mut q) = packets(&a, &b, PacketOptions::with_policy(SendPolicy::StreamOnly)).await;
     // A one-byte Context ID and a two-byte Length.
     let payload = Bytes::from(vec![7u8; size - 4]);

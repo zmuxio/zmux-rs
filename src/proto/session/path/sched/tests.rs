@@ -397,3 +397,45 @@ fn t_suspect_includes_the_write_calls_in_progress_ahead() {
     assert!(t_suspect > floor.max(pto * 2));
     assert_eq!(t_fail, Duration::from_secs(2).max((pto + queue) * 8));
 }
+
+/// `spread-round-robin` shares bytes by chunks of `spread_chunk`, not by
+/// write calls: a pipe whose writes stream credit cuts short keeps the turn
+/// until its chunk is full, instead of giving it up after a few bytes while
+/// the other pipe fills whole chunks.
+#[test]
+fn round_robin_turns_are_whole_chunks_however_short_the_writes() {
+    let (mut a, k) = two_pipes(Scheduler::SpreadRoundRobin, Some(FAST), 1 << 20);
+    let chunk = a.config.spread_chunk as u64;
+    let mut out = TransmitBuf::default();
+    let mut sent = [0u64; 2];
+    // Credit comes as a chunk while pipe 0 has a write opportunity, then a
+    // bit while pipe 2 has one: per write call, pipe 2 would get a bit
+    // for each chunk of pipe 0.
+    let s = a.streams.send_mut(k).unwrap();
+    s.max_data = s.offset;
+    for (i, (id, grant)) in [(0u64, chunk), (2, 1024)].repeat(5).into_iter().enumerate() {
+        let s = a.streams.send_mut(k).unwrap();
+        s.max_data += grant;
+        a.schedule(k);
+        let before = a.streams.send(k).unwrap().offset;
+        let now = a.now;
+        a.poll_transmit(PipeId(id), now, &mut out);
+        let n = out.len() as u64;
+        if n > 0 {
+            a.pipe_written(PipeId(id), n, now);
+        }
+        out.clear();
+        sent[i % 2] += a.streams.send(k).unwrap().offset - before;
+        // The two pipes never differ by more than the chunk in turn: a
+        // write past the chunk boundary would be lost to the pipe's share.
+        assert!(
+            sent[0].abs_diff(sent[1]) <= chunk,
+            "round {i}: pipes drift apart by more than a chunk: {sent:?}"
+        );
+    }
+    let total = sent[0] + sent[1];
+    assert!(total > 4 * chunk, "credit-bound run: {sent:?}");
+    for s in sent {
+        assert!(s * 5 >= total * 2, "round-robin shares by bytes: {sent:?}");
+    }
+}

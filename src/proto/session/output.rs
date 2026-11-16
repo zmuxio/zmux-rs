@@ -2164,7 +2164,7 @@ impl SessionCore {
                     .send(key)
                     .is_some_and(|send| self.redundant(send))
             {
-                cap = cap.min(self.config.spread_chunk as u64);
+                cap = cap.min(self.chunk_room(pipe, key, gate.is_some()));
             }
         }
         // The stream and the session's chunk pool are borrowed together.
@@ -2342,7 +2342,7 @@ impl SessionCore {
                 super::Scheduler::SpreadRoundRobin | super::Scheduler::SpreadRateWeighted
             ) && let Some(g) = gate
             {
-                self.round_robin_commit(pipe, key, g);
+                self.round_robin_sent(pipe, key, g, n);
             }
         }
         let s = self.stream_mut(key);

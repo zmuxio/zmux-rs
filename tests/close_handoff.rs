@@ -672,8 +672,11 @@ async fn a_close_after_an_abort_returns_at_once_and_changes_nothing() {
 
 /// N17: a coded close whose data a carrier does not take gives the data up
 /// at its 1 s bound, and the peer still sees the code once the carrier
-/// takes the close.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// takes the close. Runs on paused time: the bound passes when the runtime
+/// is idle, and the carrier is released within the close's second bound
+/// (the one `CONNECTION_CLOSE` has after the first returned the call) at the
+/// same virtual instant, so no scheduling delay under load can end it.
+#[tokio::test(start_paused = true)]
 async fn a_coded_close_gives_up_unsent_data_at_one_second() {
     let mut c = config();
     c.test_hooks().linger_timeout = Some(HOUR);

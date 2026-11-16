@@ -1220,16 +1220,95 @@ impl SessionCore {
             .map(|(_, id)| id)
     }
 
-    /// A chunk of `key` went to `pipe` under a round-robin policy: every
-    /// candidate of the pipe's tier gains its weight and the chosen one
-    /// gives up the sum; pipes that were not candidates gain nothing, and
-    /// a pipe that is not eligible starts from 0 when it is again.
-    pub(in crate::proto::session) fn round_robin_commit(
+    /// The most one write of `key` on `pipe` may carry: `spread_chunk`,
+    /// or under a round-robin policy, with a gate, what is left of the
+    /// chunk `pipe` is filling, so that no write crosses a chunk boundary.
+    pub(in crate::proto::session) fn chunk_room(
+        &self,
+        pipe: u64,
+        key: StreamKey,
+        gated: bool,
+    ) -> u64 {
+        let chunk = (self.config.spread_chunk as u64).max(1);
+        if !gated
+            || !matches!(
+                self.policy_for(key),
+                Scheduler::SpreadRoundRobin | Scheduler::SpreadRateWeighted
+            )
+        {
+            return chunk;
+        }
+        let fill = if self.own_round_robin(key) {
+            self.streams.send(key).map(|s| s.mp().rr_fill)
+        } else {
+            self.mp.as_deref().map(|m| m.rr_fill)
+        };
+        match fill {
+            Some((at, so_far)) if at == pipe && so_far < chunk => chunk - so_far,
+            _ => chunk,
+        }
+    }
+
+    /// `n` bytes of new data of `key` went to `pipe` under a round-robin
+    /// policy. A chunk is `spread_chunk` bytes, or less when the write took
+    /// all the ready data; a write that a limit cut short (stream or
+    /// session credit, record room) while more data waits does not end
+    /// one: the pipe keeps the turn until it has filled its chunk, so a
+    /// pipe whose turns meet a trickle of credit does not get a few bytes
+    /// per turn while the other fills whole chunks. A write on another
+    /// pipe (the turn's pipe stopped being a candidate) starts a chunk
+    /// there.
+    pub(in crate::proto::session) fn round_robin_sent(
         &mut self,
         pipe: u64,
         key: StreamKey,
         gate: &Gate,
+        n: u64,
     ) {
+        if n == 0 {
+            // A FIN alone fills nothing.
+            return;
+        }
+        let chunk = (self.config.spread_chunk as u64).max(1);
+        let own = self.own_round_robin(key);
+        let fill = if own {
+            self.streams.send(key).map(|s| s.mp().rr_fill)
+        } else {
+            self.mp.as_deref().map(|m| m.rr_fill)
+        };
+        let Some((at, so_far)) = fill else {
+            return;
+        };
+        let mut bytes = if at == pipe {
+            so_far.saturating_add(n)
+        } else {
+            n
+        };
+        while bytes >= chunk {
+            self.round_robin_commit(pipe, key, gate);
+            bytes -= chunk;
+        }
+        // A write that took all the ready data ends its chunk: the
+        // application, not a limit, made it short.
+        if bytes > 0 && self.streams.send(key).is_none_or(|s| s.buf.is_empty()) {
+            self.round_robin_commit(pipe, key, gate);
+            bytes = 0;
+        }
+        let fill = (pipe, bytes);
+        if own {
+            if let Some(s) = self.streams.send_mut(key) {
+                s.mp_mut().rr_fill = fill;
+            }
+        } else {
+            self.mp_mut().rr_fill = fill;
+        }
+    }
+
+    /// A chunk of `key` went to `pipe` under a round-robin policy: every
+    /// candidate of the pipe's tier gains its weight and the chosen one
+    /// gives up the sum; pipes that were not candidates gain nothing, and
+    /// a pipe that is not eligible starts from 0 when it is again.
+    fn round_robin_commit(&mut self, pipe: u64, key: StreamKey, gate: &Gate) {
         let Some(tier) = self.att(pipe).map(Attachment::send_tier) else {
             return;
         };
@@ -1280,6 +1359,9 @@ impl SessionCore {
     pub(in crate::proto::session) fn reset_round_robin(&mut self) {
         for o in self.atts.outs_mut() {
             o.rr_step(None);
+        }
+        if let Some(m) = self.mp.as_deref_mut() {
+            m.rr_fill = (0, 0);
         }
     }
 
@@ -1371,7 +1453,9 @@ impl SessionCore {
         if let Some(k) = only
             && let Some(send) = self.streams.send_mut(k)
         {
-            send.mp_mut().rr.clear();
+            let m = send.mp_mut();
+            m.rr.clear();
+            m.rr_fill = (0, 0);
         }
     }
 
