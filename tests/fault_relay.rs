@@ -19,7 +19,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until};
 use zmux::Backoff;
-use zmux::helpers::{PipePool, PoolDecision, PoolView, Rotation, maintain_pipes};
+use zmux::helpers::{
+    AsyncPoolPolicy, OwnedPoolView, PipePool, PolicyFuture, PoolDecision, PoolView, Rotation,
+    maintain_pipes,
+};
 use zmux::{
     Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
     PipeHint, PipeIo, PipeOptions, Session, SessionError, SessionState,
@@ -459,36 +462,56 @@ async fn a_black_hole_is_found_by_the_probe() {
     client.close().await;
 }
 
+/// Runs a policy closure on the maintainer's own task, so that what it
+/// reads of the paused clock is the instant of the look. A synchronous
+/// policy runs on a thread of its own: while the test waits for it the
+/// paused clock keeps advancing, and a thread that starts late (a loaded
+/// host) would make the look appear late in virtual time.
+struct OnTask<F>(Mutex<F>);
+
+impl<F> AsyncPoolPolicy for OnTask<F>
+where
+    F: FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), zmux::helpers::PolicyError> + Send,
+{
+    fn decide(&self, view: OwnedPoolView) -> PolicyFuture {
+        let mut d = PoolDecision::default();
+        let r = (self.0.lock().unwrap())(&view.view(), &mut d).map(|()| d);
+        Box::pin(std::future::ready(r))
+    }
+}
+
 /// The policy of the resume tests: redial 1 s after the last dial, reduced
 /// by up to 30% drawn once per wait; records when it was asked.
 fn redial_policy(
     session: Session,
     asked: Arc<Mutex<Vec<(Instant, SessionState)>>>,
-) -> impl FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), zmux::helpers::PolicyError> + Send {
+) -> Arc<dyn AsyncPoolPolicy> {
     let mut wait: Option<(u32, f64)> = None;
     let mut seed = 0x2545_f491_4f6c_dd1du64;
-    move |v: &PoolView<'_>, d: &mut PoolDecision| {
-        asked
-            .lock()
-            .unwrap()
-            .push((Instant::now(), session.state()));
-        let u = match wait {
-            Some((f, u)) if f == v.failures => u,
-            _ => {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
-                wait = Some((v.failures, u));
-                u
+    Arc::new(OnTask(Mutex::new(
+        move |v: &PoolView<'_>, d: &mut PoolDecision| {
+            asked
+                .lock()
+                .unwrap()
+                .push((Instant::now(), session.state()));
+            let u = match wait {
+                Some((f, u)) if f == v.failures => u,
+                _ => {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
+                    wait = Some((v.failures, u));
+                    u
+                }
+            };
+            let after = Duration::from_secs_f64(1.0 - 0.3 * u);
+            if v.since_last_dial.is_some() {
+                d.set_dial_after(after);
             }
-        };
-        let after = Duration::from_secs_f64(1.0 - 0.3 * u);
-        if v.since_last_dial.is_some() {
-            d.set_dial_after(after);
-        }
-        Ok(())
-    }
+            Ok(())
+        },
+    )))
 }
 
 /// The last pipe is cut with resume on: the pool decides on the
@@ -503,7 +526,7 @@ async fn the_last_pipe_cut_resumes_without_loss() {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let pool = relay
         .pool(1, PipeOptions::new())
-        .with_policy(redial_policy(client.clone(), asked.clone()));
+        .with_async_policy(redial_policy(client.clone(), asked.clone()));
     let handle = maintain_pipes(&client, pool).expect("valid pool");
     until("a pool pipe", Duration::from_secs(10), || {
         active(&client) == 1
