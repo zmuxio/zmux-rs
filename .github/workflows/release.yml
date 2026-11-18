@@ -169,7 +169,9 @@ jobs:
           fi
           # All of them at once, before anything is published: the
           # workspace's own crates resolve locally.
-          cargo publish --locked --dry-run $(printf -- '-p %s ' "${todo[@]}")
+          args=()
+          for crate in "${todo[@]}"; do args+=(-p "$crate"); done
+          cargo publish --locked --dry-run "${args[@]}"
           for crate in "${todo[@]}"; do
             echo "::group::${crate} ${ZMUX_VERSION}"
             cargo publish --locked -p "${crate}"
