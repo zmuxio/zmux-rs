@@ -65,7 +65,7 @@ fn initiator(v: &Value, framing: Framing) -> Result<Initiator, Error> {
             framing,
             handle: &handle,
             psk: &psk,
-            static_secret: &s,
+            static_key: &s,
             binding: &binding,
             max_app_data: max_app_data(v),
         },
@@ -89,7 +89,7 @@ fn responder(v: &Value, framing: Framing, wire: &[u8]) -> Result<(ResponderReply
     );
     let keys = ResponderKeys {
         psk: &psk,
-        static_secret: &s,
+        static_key: &s,
         binding: &binding,
         max_app_data: max_app_data(v),
     };
@@ -478,7 +478,7 @@ fn config_start(v: &Value) -> Result<(), Error> {
         framing: Framing::ByteStream,
         handle: &handle,
         psk: &psk,
-        static_secret: &s,
+        static_key: &s,
         binding: &binding,
         max_app_data: Some(DEFAULT_MAX_APP_DATA),
     })?;

@@ -3,6 +3,8 @@
 //! secure with the connection's exporter, shared by the streams of one
 //! HTTP/2 connection; split halves, h2c and an http origin are not.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +17,7 @@ use zmux_rustls::TlsConnection;
 fn tls() -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcceptor) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -96,204 +98,212 @@ async fn joined_bound(session: &Session, io: PipeIo) -> Result<(), String> {
 /// carrier bootstraps with the connection's exporter and a further one
 /// joins Bound; the streams of one HTTP/2 connection share its Binding,
 /// and its split halves have none.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bound_over_tls() {
-    let (connector, acceptor) = tls();
-    let config = config(PipeAuth::exporter().with_end_to_end());
-    let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
-    let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
-    let (addr, serving) = tls_server(endpoint, acceptor).await;
-    let https = Options::default().with_https(true);
+#[test]
+fn bound_over_tls() {
+    support::run(2, 90, || async {
+        let (connector, acceptor) = tls();
+        let config = config(PipeAuth::exporter().with_end_to_end());
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
+        let (addr, serving) = tls_server(endpoint, acceptor).await;
+        let https = Options::default().with_https(true);
 
-    // HTTP/2.
-    let h2 = Http2Connection::handshake(
-        tls_conn(&connector, addr, b"h2").await,
-        "localhost",
-        https.clone(),
-    )
-    .await
-    .unwrap();
-    let first = h2.open_pipe().await.unwrap();
-    let binding = first.bound_exporter().expect("a bound HTTP/2 stream");
-    let cs = Session::connect(first, config.clone()).await.unwrap();
-    let ss = listener.accept().await.unwrap();
-    assert_eq!(
-        cs.export_keying_material("app", b"", 16).unwrap(),
-        ss.export_keying_material("app", b"", 16).unwrap()
-    );
-    let second = h2.open_pipe().await.unwrap();
-    assert_eq!(
-        second.bound_exporter(),
-        Some(binding),
-        "one Binding per connection"
-    );
-    joined_bound(&cs, second).await.unwrap();
-    let split = h2.open_split().await.unwrap();
-    assert!(
-        split.bound_exporter().is_none(),
-        "split halves are not Bound"
-    );
-    drop(split);
+        // HTTP/2.
+        let h2 = Http2Connection::handshake(
+            tls_conn(&connector, addr, b"h2").await,
+            "localhost",
+            https.clone(),
+        )
+        .await
+        .unwrap();
+        let first = h2.open_pipe().await.unwrap();
+        let binding = first.bound_exporter().expect("a bound HTTP/2 stream");
+        let cs = Session::connect(first, config.clone()).await.unwrap();
+        let ss = listener.accept().await.unwrap();
+        assert_eq!(
+            cs.export_keying_material("app", b"", 16).unwrap(),
+            ss.export_keying_material("app", b"", 16).unwrap()
+        );
+        let second = h2.open_pipe().await.unwrap();
+        assert_eq!(
+            second.bound_exporter(),
+            Some(binding),
+            "one Binding per connection"
+        );
+        joined_bound(&cs, second).await.unwrap();
+        let split = h2.open_split().await.unwrap();
+        assert!(
+            split.bound_exporter().is_none(),
+            "split halves are not Bound"
+        );
+        drop(split);
 
-    // HTTP/1.1, each carrier on a connection of its own.
-    let io = zmux_http::dial_http1_over(
-        tls_conn(&connector, addr, b"http/1.1").await,
-        "localhost",
-        &https,
-    )
-    .await
-    .unwrap();
-    assert!(io.bound_exporter().is_some(), "a bound HTTP/1.1 carrier");
-    joined_bound(&cs, io).await.unwrap();
+        // HTTP/1.1, each carrier on a connection of its own.
+        let io = zmux_http::dial_http1_over(
+            tls_conn(&connector, addr, b"http/1.1").await,
+            "localhost",
+            &https,
+        )
+        .await
+        .unwrap();
+        assert!(io.bound_exporter().is_some(), "a bound HTTP/1.1 carrier");
+        joined_bound(&cs, io).await.unwrap();
 
-    // An http origin over the same TLS: not declared.
-    let io = zmux_http::dial_http1_over(
-        tls_conn(&connector, addr, b"http/1.1").await,
-        "localhost",
-        &Options::default(),
-    )
-    .await
-    .unwrap();
-    assert!(io.bound_exporter().is_none(), "an http origin");
-    drop(io);
+        // An http origin over the same TLS: not declared.
+        let io = zmux_http::dial_http1_over(
+            tls_conn(&connector, addr, b"http/1.1").await,
+            "localhost",
+            &Options::default(),
+        )
+        .await
+        .unwrap();
+        assert!(io.bound_exporter().is_none(), "an http origin");
+        drop(io);
 
-    cs.close().await;
-    drop(ss);
-    listener.close();
-    serving.await.unwrap();
+        cs.close().await;
+        drop(ss);
+        listener.close();
+        serving.await.unwrap();
+    });
 }
 
 /// Without TLS terminated here (h2c, as behind a front that ends TLS) the
 /// server's carrier is not secure: a join that claims Bound fails.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn not_bound_over_h2c() {
-    let config = config(PipeAuth::psk([7u8; 32]));
-    let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = tcp.local_addr().unwrap().to_string();
-    let serving = tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
-    let h2 = Http2Connection::connect(&addr, Options::default())
-        .await
-        .unwrap();
-    let first = h2.open_pipe().await.unwrap();
-    assert!(first.bound_exporter().is_none());
-    let cs = Session::connect(first, config).await.unwrap();
-    let ss = listener.accept().await.unwrap();
-    // A client that claims the contract on its own.
-    let claimed = h2
-        .open_pipe()
-        .await
-        .unwrap()
-        .with_carrier_secure()
-        .with_exporter(|_, _, out| {
-            out.fill(7);
-            true
-        });
-    assert!(joined_bound(&cs, claimed).await.is_err());
-    cs.close().await;
-    drop(ss);
-    listener.close();
-    serving.await.unwrap();
+#[test]
+fn not_bound_over_h2c() {
+    support::run(2, 90, || async {
+        let config = config(PipeAuth::psk([7u8; 32]));
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap().to_string();
+        let serving = tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
+        let h2 = Http2Connection::connect(&addr, Options::default())
+            .await
+            .unwrap();
+        let first = h2.open_pipe().await.unwrap();
+        assert!(first.bound_exporter().is_none());
+        let cs = Session::connect(first, config).await.unwrap();
+        let ss = listener.accept().await.unwrap();
+        // A client that claims the contract on its own.
+        let claimed = h2
+            .open_pipe()
+            .await
+            .unwrap()
+            .with_carrier_secure()
+            .with_exporter(|_, _, out| {
+                out.fill(7);
+                true
+            });
+        assert!(joined_bound(&cs, claimed).await.is_err());
+        cs.close().await;
+        drop(ss);
+        listener.close();
+        serving.await.unwrap();
+    });
 }
 
 /// A WebSocket over an HTTP/2 stream (RFC 8441 extended `CONNECT`) on TLS
 /// the server terminates declares the connection's Binding: a client that
 /// declares the same joins Bound.
 #[cfg(feature = "websocket")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bound_websocket_over_h2() {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use tokio_tungstenite::WebSocketStream;
-    use tokio_tungstenite::tungstenite::protocol::Role;
+#[test]
+fn bound_websocket_over_h2() {
+    support::run(2, 90, || async {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use tokio_tungstenite::WebSocketStream;
+        use tokio_tungstenite::tungstenite::protocol::Role;
 
-    let (connector, acceptor) = tls();
-    let config = config(PipeAuth::exporter().with_end_to_end());
-    let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
-    let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default())
-        .with_websocket(zmux_websocket::Options::default());
-    let (addr, serving) = tls_server(endpoint, acceptor).await;
-    let https = Options::default().with_https(true);
-    let h2 =
-        Http2Connection::handshake(tls_conn(&connector, addr, b"h2").await, "localhost", https)
+        let (connector, acceptor) = tls();
+        let config = config(PipeAuth::exporter().with_end_to_end());
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default())
+            .with_websocket(zmux_websocket::Options::default());
+        let (addr, serving) = tls_server(endpoint, acceptor).await;
+        let https = Options::default().with_https(true);
+        let h2 =
+            Http2Connection::handshake(tls_conn(&connector, addr, b"h2").await, "localhost", https)
+                .await
+                .unwrap();
+        let cs = Session::connect(h2.open_pipe().await.unwrap(), config.clone())
             .await
             .unwrap();
-    let cs = Session::connect(h2.open_pipe().await.unwrap(), config.clone())
-        .await
-        .unwrap();
-    let ss = listener.accept().await.unwrap();
+        let ss = listener.accept().await.unwrap();
 
-    // The WebSocket on a TLS connection of its own, declared by the client.
-    let conn = tls_conn(&connector, addr, b"h2").await;
-    let binding = conn.binding();
-    let (mut sender, driver) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(conn))
-            .await
+        // The WebSocket on a TLS connection of its own, declared by the client.
+        let conn = tls_conn(&connector, addr, b"h2").await;
+        let binding = conn.binding();
+        let (mut sender, driver) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(conn))
+                .await
+                .unwrap();
+        tokio::spawn(driver);
+        let mut req = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://localhost:{}/zmux", addr.port()))
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "qmux-02")
+            .body(zmux_http::PipeBody::empty())
             .unwrap();
-    tokio::spawn(driver);
-    let mut req = http::Request::builder()
-        .method(http::Method::CONNECT)
-        .uri(format!("https://localhost:{}/zmux", addr.port()))
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-protocol", "qmux-02")
-        .body(zmux_http::PipeBody::empty())
-        .unwrap();
-    req.extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-    let resp = sender.send_request(req).await.unwrap();
-    assert_eq!(resp.status(), http::StatusCode::OK);
-    let upgraded = hyper::upgrade::on(resp).await.unwrap();
-    let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
-    let io = binding.apply(zmux_websocket::pipe(ws, Some("qmux-02".into())));
-    assert!(io.bound_exporter().is_some());
-    joined_bound(&cs, io).await.unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let upgraded = hyper::upgrade::on(resp).await.unwrap();
+        let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
+        let io = binding.apply(zmux_websocket::pipe(ws, Some("qmux-02".into())));
+        assert!(io.bound_exporter().is_some());
+        joined_bound(&cs, io).await.unwrap();
 
-    cs.close().await;
-    drop(ss);
-    listener.close();
-    serving.await.unwrap();
+        cs.close().await;
+        drop(ss);
+        listener.close();
+        serving.await.unwrap();
+    });
 }
 
 /// A credential bound to the TLS connection (prefix authentication with a
 /// TLS binding) passes the HTTP server's admission over HTTP/2 and
 /// HTTP/1.1: both ends read the connection's metadata from its one source,
 /// `TlsBinding::info`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bound_prefix_token_passes_over_tls() {
-    let (connector, acceptor) = tls();
-    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 64).unwrap());
-    let mut limits = ListenerConfig::default();
-    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
-    let listener = Listener::new(Config::default(), limits).unwrap();
-    let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
-    let (addr, serving) = tls_server(endpoint, acceptor).await;
-    let https = Options::default()
-        .with_https(true)
-        .with_carrier_credential(Arc::new(auth));
-    let h2 = Http2Connection::handshake(
-        tls_conn(&connector, addr, b"h2").await,
-        "localhost",
-        https.clone(),
-    )
-    .await
-    .unwrap();
-    let cs = Session::connect(h2.open_pipe().await.unwrap(), Config::default())
+#[test]
+fn a_bound_prefix_token_passes_over_tls() {
+    support::run(2, 90, || async {
+        let (connector, acceptor) = tls();
+        let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
+        let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 64).unwrap());
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+        let listener = Listener::new(Config::default(), limits).unwrap();
+        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
+        let (addr, serving) = tls_server(endpoint, acceptor).await;
+        let https = Options::default()
+            .with_https(true)
+            .with_carrier_credential(Arc::new(auth));
+        let h2 = Http2Connection::handshake(
+            tls_conn(&connector, addr, b"h2").await,
+            "localhost",
+            https.clone(),
+        )
         .await
         .unwrap();
-    let ss = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        let cs = Session::connect(h2.open_pipe().await.unwrap(), Config::default())
+            .await
+            .unwrap();
+        let ss = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let io = zmux_http::dial_http1_over(
+            tls_conn(&connector, addr, b"http/1.1").await,
+            "localhost",
+            &https,
+        )
         .await
-        .unwrap()
         .unwrap();
-    let io = zmux_http::dial_http1_over(
-        tls_conn(&connector, addr, b"http/1.1").await,
-        "localhost",
-        &https,
-    )
-    .await
-    .unwrap();
-    let cs1 = Session::connect(io, Config::default()).await.unwrap();
-    assert_eq!(listener.stats().admission.accepted, 2);
-    drop((cs, cs1, ss));
-    listener.close();
-    serving.await.unwrap();
+        let cs1 = Session::connect(io, Config::default()).await.unwrap();
+        assert_eq!(listener.stats().admission.accepted, 2);
+        drop((cs, cs1, ss));
+        listener.close();
+        serving.await.unwrap();
+    });
 }

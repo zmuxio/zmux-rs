@@ -69,7 +69,7 @@ pub fn read_records(
                 Event::Frame(f) => current.push(wire::frame_json(&f)),
             }
         }
-        assert_eq!(input, [] as [u8; 0]);
+        assert_eq!(input, Vec::<u8>::new());
     }
     assert!(reader.at_record_boundary(), "input ended inside a record");
     Ok((records, positions))

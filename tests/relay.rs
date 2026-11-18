@@ -34,7 +34,7 @@ use common::{
     Ctl, Rng, connect, duplex, eventually, multi_thread, settle, snapshot, soak, watchdog,
 };
 use tokio::task::JoinHandle;
-use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
+use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice};
 use zmux::proto::ApplicationErrorCode;
 use zmux::sched::Scheduler;
 use zmux::{
@@ -133,7 +133,7 @@ impl Limiter for Gate {
 }
 
 /// A splice running in a task.
-type Splicing = JoinHandle<Result<Spliced, SpliceError>>;
+type Splicing = JoinHandle<Result<SpliceResult, SpliceError>>;
 
 /// One relay: X's outer session to it, and its outer session to Y. It
 /// splices every stream X opens into a stream it opens towards Y, which Y
@@ -220,7 +220,7 @@ impl Relay {
     }
 
     /// The last splice's result.
-    async fn last(&self) -> Option<Spliced> {
+    async fn last(&self) -> Option<SpliceResult> {
         let h = self.splices.lock().unwrap().pop()?;
         watchdog(20, "splice ends", h).await.ok()?.ok()
     }
@@ -330,7 +330,7 @@ fn relay_events_at_random_points_of_a_bulk_transfer() {
                 // failure over the other pipes and aborts its halves of the
                 // carrier stream, a reset or a
                 // stop with ZMUX_CARRIER_FAILED racing the event's own end.
-                let ends = |s: &Spliced, a_to_b: [SpliceEnd; 2], b_to_a: [SpliceEnd; 2]| {
+                let ends = |s: &SpliceResult, a_to_b: [SpliceEnd; 2], b_to_a: [SpliceEnd; 2]| {
                     assert!(
                         a_to_b.contains(&s.a_to_b.end),
                         "{event:?}: a to b {:?}",

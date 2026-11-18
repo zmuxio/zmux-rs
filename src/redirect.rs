@@ -18,6 +18,7 @@ pub const DEFAULT_MAX_REDIRECTS: usize = 5;
 /// or without a valid `Location`. A dial fails with an [`io::Error`] of
 /// kind [`io::ErrorKind::ConnectionRefused`] that carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RedirectError {
     /// The redirect's status.
     pub status: u16,
@@ -25,6 +26,18 @@ pub struct RedirectError {
     pub location: String,
     /// Why it was not followed.
     pub reason: &'static str,
+}
+
+impl RedirectError {
+    /// The refusal of a redirect with `status` to `location`, for `reason`.
+    #[must_use]
+    pub fn new(status: u16, location: String, reason: &'static str) -> Self {
+        Self {
+            status,
+            location,
+            reason,
+        }
+    }
 }
 
 impl fmt::Display for RedirectError {

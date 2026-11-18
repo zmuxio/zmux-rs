@@ -3,6 +3,8 @@
 //! another host and past the bound, and the URL they led to kept in the
 //! carrier cache.
 
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -121,35 +123,38 @@ async fn within<T>(f: impl Future<Output = T>) -> T {
 /// A streaming carrier follows a 307 with its preface repeated; the
 /// candidate's next carrier starts at the URL it led to, which the carrier
 /// cache keeps.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_redirect_is_followed_with_the_uplink_repeated() {
-    let (backend, listener, serving) = origin().await;
-    let (addr, count, front) = front(backend, &[("/old", "/new")]).await;
-    let options = Options::default().with_path("/old");
-    let candidate = zmux_http::candidate(connect(addr), &addr.to_string(), &options);
-    let cache = CarrierCache::default();
-    let policy = CarrierChoicePolicy::new().with_cache(cache.clone(), "k");
-    let mode = CarrierChoice::auto([candidate.clone()]);
-    let (cs, ss) =
-        within(async { tokio::join!(dial_choice_session(&mode, &policy), listener.accept()) })
-            .await;
-    let (cs, ss) = (cs, ss.unwrap());
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    echo(&cs, &ss).await;
-    assert_eq!(
-        cache.url("k", CarrierKind::Streaming, None).as_deref(),
-        Some(format!("http://{addr}/new").as_str())
-    );
-    // The next carrier starts at /new: no redirect.
-    let io = candidate.dial().await.unwrap();
-    let (c2, s2) =
-        within(async { tokio::join!(Session::connect(io, Config::default()), listener.accept()) })
-            .await;
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    echo(&c2.unwrap(), &s2.unwrap()).await;
-    cs.close().await;
-    front.abort();
-    serving.abort();
+#[test]
+fn a_redirect_is_followed_with_the_uplink_repeated() {
+    support::run(2, 90, || async {
+        let (backend, listener, serving) = origin().await;
+        let (addr, count, front) = front(backend, &[("/old", "/new")]).await;
+        let options = Options::default().with_path("/old");
+        let candidate = zmux_http::candidate(connect(addr), &addr.to_string(), &options);
+        let cache = CarrierCache::default();
+        let policy = CarrierChoicePolicy::new().with_cache(cache.clone(), "k");
+        let mode = CarrierChoice::auto([candidate.clone()]);
+        let (cs, ss) =
+            within(async { tokio::join!(dial_choice_session(&mode, &policy), listener.accept()) })
+                .await;
+        let (cs, ss) = (cs, ss.unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        echo(&cs, &ss).await;
+        assert_eq!(
+            cache.url("k", CarrierKind::Streaming, None).as_deref(),
+            Some(format!("http://{addr}/new").as_str())
+        );
+        // The next carrier starts at /new: no redirect.
+        let io = candidate.dial().await.unwrap();
+        let (c2, s2) = within(async {
+            tokio::join!(Session::connect(io, Config::default()), listener.accept())
+        })
+        .await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        echo(&c2.unwrap(), &s2.unwrap()).await;
+        cs.close().await;
+        front.abort();
+        serving.abort();
+    });
 }
 
 async fn dial_choice_session(mode: &CarrierChoice, policy: &CarrierChoicePolicy) -> Session {
@@ -170,28 +175,30 @@ async fn refused(addr: std::net::SocketAddr, path: &str, options: Options) -> St
     format!("{e:?}")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redirects_to_another_host_or_past_the_bound_are_refused() {
-    let (backend, _listener, serving) = origin().await;
-    let (addr, count, front) = front(
-        backend,
-        &[("/host", "http://localhost:1/zmux"), ("/loop", "/loop")],
-    )
-    .await;
-    let e = refused(addr, "/host", Options::default()).await;
-    assert!(e.contains("ConnectionRefused"), "{e}");
-    assert_eq!(count.swap(0, Ordering::SeqCst), 1);
-    let e = refused(addr, "/loop", Options::default()).await;
-    assert!(e.contains("ConnectionRefused"), "{e}");
-    assert_eq!(
-        count.swap(0, Ordering::SeqCst),
-        zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1
-    );
-    let e = refused(addr, "/loop", Options::default().with_max_redirects(0)).await;
-    assert!(e.contains("ConnectionRefused"), "{e}");
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    front.abort();
-    serving.abort();
+#[test]
+fn redirects_to_another_host_or_past_the_bound_are_refused() {
+    support::run(2, 90, || async {
+        let (backend, _listener, serving) = origin().await;
+        let (addr, count, front) = front(
+            backend,
+            &[("/host", "http://localhost:1/zmux"), ("/loop", "/loop")],
+        )
+        .await;
+        let e = refused(addr, "/host", Options::default()).await;
+        assert!(e.contains("ConnectionRefused"), "{e}");
+        assert_eq!(count.swap(0, Ordering::SeqCst), 1);
+        let e = refused(addr, "/loop", Options::default()).await;
+        assert!(e.contains("ConnectionRefused"), "{e}");
+        assert_eq!(
+            count.swap(0, Ordering::SeqCst),
+            zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1
+        );
+        let e = refused(addr, "/loop", Options::default().with_max_redirects(0)).await;
+        assert!(e.contains("ConnectionRefused"), "{e}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        front.abort();
+        serving.abort();
+    });
 }
 
 /// An origin whose connections (HTTP/1.1 or HTTP/2 by prior knowledge)
@@ -254,46 +261,49 @@ async fn redirecting(
 /// connection, with its preface repeated, and the HTTP/2 connection's
 /// next carrier starts at the URL it led to; one to another host is
 /// refused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http2_requests_follow_redirects_within_the_origin() {
-    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
-    let (addr, listener, count, server) = redirecting(
-        listener,
-        Options::default(),
-        &[
-            ("/old", 307, "/zmux"),
-            ("/host", 308, "http://localhost:1/zmux"),
-        ],
-    )
-    .await;
-    let options = Options::default().with_path("/old");
-    let conn = within(zmux_http::Http2Connection::connect(
-        &addr.to_string(),
-        options,
-    ))
-    .await
-    .unwrap();
-    let (cs, ss) =
-        within(async { tokio::join!(conn.connect_session(Config::default()), listener.accept()) })
-            .await;
-    let (cs, ss) = (cs.unwrap(), ss.unwrap());
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    echo(&cs, &ss).await;
-    cs.close().await;
+#[test]
+fn http2_requests_follow_redirects_within_the_origin() {
+    support::run(2, 90, || async {
+        let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+        let (addr, listener, count, server) = redirecting(
+            listener,
+            Options::default(),
+            &[
+                ("/old", 307, "/zmux"),
+                ("/host", 308, "http://localhost:1/zmux"),
+            ],
+        )
+        .await;
+        let options = Options::default().with_path("/old");
+        let conn = within(zmux_http::Http2Connection::connect(
+            &addr.to_string(),
+            options,
+        ))
+        .await
+        .unwrap();
+        let (cs, ss) = within(async {
+            tokio::join!(conn.connect_session(Config::default()), listener.accept())
+        })
+        .await;
+        let (cs, ss) = (cs.unwrap(), ss.unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        echo(&cs, &ss).await;
+        cs.close().await;
 
-    let conn = within(zmux_http::Http2Connection::connect(
-        &addr.to_string(),
-        Options::default().with_path("/host"),
-    ))
-    .await
-    .unwrap();
-    let Err(e) = within(conn.connect_session(Config::default())).await else {
-        panic!("established");
-    };
-    let e = format!("{e:?}");
-    assert!(e.contains("ConnectionRefused"), "{e}");
-    assert_eq!(count.load(Ordering::SeqCst), 2);
-    server.abort();
+        let conn = within(zmux_http::Http2Connection::connect(
+            &addr.to_string(),
+            Options::default().with_path("/host"),
+        ))
+        .await
+        .unwrap();
+        let Err(e) = within(conn.connect_session(Config::default())).await else {
+            panic!("established");
+        };
+        let e = format!("{e:?}");
+        assert!(e.contains("ConnectionRefused"), "{e}");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        server.abort();
+    });
 }
 
 fn exchange_options() -> zmux_http::ExchangeOptions {
@@ -307,54 +317,57 @@ fn exchange_options() -> zmux_http::ExchangeOptions {
 /// Every exchange request follows a 307 or 308 within the origin with its
 /// body unchanged, per request; a 301 of its POST, another host, and a
 /// loop past the bound fail the carrier.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exchange_requests_follow_redirects_per_request() {
-    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
-    let exchange = zmux_http::ExchangeServer::new(&listener, exchange_options()).unwrap();
-    let (addr, listener, count, server) = redirecting(
-        listener,
-        Options::default().with_exchange(exchange),
-        &[
-            ("/old/", 307, "/zmux/exchange"),
-            ("/moved/", 301, "/zmux/exchange"),
-            ("/host/", 308, "http://localhost:1/zmux/exchange"),
-            ("/loop/", 307, "/loop/exchange"),
-        ],
-    )
-    .await;
-    let options = exchange_options().with_path("/old/exchange");
-    let io = zmux_http::dial_exchange(&addr.to_string(), &options).unwrap();
-    let (cs, ss) =
-        within(async { tokio::join!(Session::connect(io, Config::default()), listener.accept()) })
-            .await;
-    let (cs, ss) = (cs.unwrap(), ss.unwrap());
-    echo(&cs, &ss).await;
-    // Every request was redirected: the path is not remembered.
-    let n = count.load(Ordering::SeqCst);
-    assert!(n >= 3, "{n}");
-    cs.close().await;
-
-    for (path, hops) in [
-        ("/moved/exchange", 1),
-        ("/host/exchange", 1),
-        (
-            "/loop/exchange",
-            zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1,
-        ),
-    ] {
-        count.store(0, Ordering::SeqCst);
-        let options = exchange_options()
-            .with_path(path)
-            .with_down_path("/zmux/exchange");
+#[test]
+fn exchange_requests_follow_redirects_per_request() {
+    support::run(2, 90, || async {
+        let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+        let exchange = zmux_http::ExchangeServer::new(&listener, exchange_options()).unwrap();
+        let (addr, listener, count, server) = redirecting(
+            listener,
+            Options::default().with_exchange(exchange),
+            &[
+                ("/old/", 307, "/zmux/exchange"),
+                ("/moved/", 301, "/zmux/exchange"),
+                ("/host/", 308, "http://localhost:1/zmux/exchange"),
+                ("/loop/", 307, "/loop/exchange"),
+            ],
+        )
+        .await;
+        let options = exchange_options().with_path("/old/exchange");
         let io = zmux_http::dial_exchange(&addr.to_string(), &options).unwrap();
-        let start = std::time::Instant::now();
-        let r = within(Session::connect(io, Config::default())).await;
-        assert!(r.is_err(), "{path} established");
-        // The first UP request failed the carrier, before the deadline of
-        // repeats (its CLOSE may be under way as well).
-        assert!(start.elapsed() < options.deadline, "{path}");
+        let (cs, ss) = within(async {
+            tokio::join!(Session::connect(io, Config::default()), listener.accept())
+        })
+        .await;
+        let (cs, ss) = (cs.unwrap(), ss.unwrap());
+        echo(&cs, &ss).await;
+        // Every request was redirected: the path is not remembered.
         let n = count.load(Ordering::SeqCst);
-        assert!(n >= hops, "{path}: {n}");
-    }
-    server.abort();
+        assert!(n >= 3, "{n}");
+        cs.close().await;
+
+        for (path, hops) in [
+            ("/moved/exchange", 1),
+            ("/host/exchange", 1),
+            (
+                "/loop/exchange",
+                zmux::adapter::redirect::DEFAULT_MAX_REDIRECTS + 1,
+            ),
+        ] {
+            count.store(0, Ordering::SeqCst);
+            let options = exchange_options()
+                .with_path(path)
+                .with_down_path("/zmux/exchange");
+            let io = zmux_http::dial_exchange(&addr.to_string(), &options).unwrap();
+            let start = std::time::Instant::now();
+            let r = within(Session::connect(io, Config::default())).await;
+            assert!(r.is_err(), "{path} established");
+            // The first UP request failed the carrier, before the deadline of
+            // repeats (its CLOSE may be under way as well).
+            assert!(start.elapsed() < options.deadline, "{path}");
+            let n = count.load(Ordering::SeqCst);
+            assert!(n >= hops, "{path}: {n}");
+        }
+        server.abort();
+    });
 }

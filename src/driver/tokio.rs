@@ -5164,6 +5164,17 @@ impl RecvStream {
         self.read_to_end_op(limit).await
     }
 
+    /// Resolves once the next read would not wait: data is readable, or the
+    /// receiving part has ended (the FIN, a reset, a stop by this endpoint,
+    /// the session's end). It resolves in all of these and never fails: the
+    /// read that follows reports the data or the end, once, in its own
+    /// form. Consumes nothing, is cancel-safe, and any number may wait at
+    /// once. With [`try_read`](Self::try_read) it is a read that can be
+    /// cancelled without losing data.
+    pub async fn readable(&self) {
+        self.readable_op().await;
+    }
+
     /// Waits until the peer reset the stream: its code, or `None` when the
     /// stream ended with a FIN instead. Cancel-safe.
     pub async fn received_reset(&mut self) -> Result<Option<VarInt>, StreamError> {

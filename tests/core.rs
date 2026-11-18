@@ -542,7 +542,7 @@ fn a_ping_whose_response_is_late_asks_again() {
         }
         p.out.copy_to_vec(&mut wire);
     }
-    assert_ne!(wire, [] as [u8; 0]);
+    assert_ne!(wire, Vec::new());
     p.now += Duration::from_millis(1500);
     p.a.handle_timeout(p.now);
     p.b.handle_timeout(p.now);

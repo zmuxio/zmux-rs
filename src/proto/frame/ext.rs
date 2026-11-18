@@ -56,16 +56,17 @@ pub struct Priority {
     incremental: bool,
 }
 
-impl Default for Priority {
-    /// [`Priority::DEFAULT`].
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 impl Priority {
-    /// The RFC 9218 default: urgency 3, not incremental.
-    pub const DEFAULT: Self = Self {
+    /// The local default of a new sending part: urgency 3, incremental.
+    pub const LOCAL_DEFAULT: Self = Self {
+        urgency: 3,
+        incremental: true,
+    };
+
+    /// The wire default, what an absent `PRIORITY` signal means (RFC 9218):
+    /// urgency 3, not incremental. Not the local default of a new sending
+    /// part ([`Priority::LOCAL_DEFAULT`]).
+    pub const WIRE_DEFAULT: Self = Self {
         urgency: 3,
         incremental: false,
     };

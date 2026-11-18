@@ -6,9 +6,10 @@
 //! The resource counts are process-wide: the tests run one at a time.
 
 mod exchange_proxy;
+mod support;
 
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use exchange_proxy::{Faults, Proxy, Rng, Stats};
 use sha2::{Digest, Sha256};
@@ -25,19 +26,24 @@ fn serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runs `f` on a fresh runtime under a watchdog of `secs` seconds.
-fn run<F: Future<Output = ()>>(secs: u64, f: F) {
+/// The time the whole binary may take, from its first test: alone it takes
+/// 20 s. The tests run one at a time, so that a machine too slow for them
+/// fails the rest at once instead of spending every watchdog in turn.
+const BUDGET: Duration = Duration::from_secs(300);
+
+/// Runs the future `f` builds on a fresh runtime, one test at a time, under
+/// a watchdog of `secs` seconds that the binary's remaining budget caps
+/// (see `support::run`).
+fn run<F, Fut>(secs: u64, f: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let _g = serial();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(secs), f)
-            .await
-            .expect("the test did not finish in time");
-    });
+    let left = BUDGET.saturating_sub(START.get_or_init(Instant::now).elapsed());
+    assert!(!left.is_zero(), "the test binary's time budget is spent");
+    support::run(4, secs.min(left.as_secs().max(1)), f);
 }
 
 /// Options with short timers, so that faults cost little time.
@@ -180,10 +186,10 @@ async fn finish(
     ready: Snapshot,
 ) {
     client.close().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), client.closing()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), client.closing()).await;
     drop(client);
     // The server's carriers end (complete or idle) without a close.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while srv.exchange.carriers() > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -206,7 +212,7 @@ async fn finish(
     }
     drop(proxies);
     shut_down(srv).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let now = snapshot();
         if now == base {
@@ -224,7 +230,7 @@ async fn finish(
 /// a few MiB each way, several streams at once.
 #[test]
 fn sessions_over_the_carrier() {
-    run(60, async {
+    run(60, || async {
         for options in [
             ExchangeOptions::default().with_unauthenticated(),
             ExchangeOptions::default()
@@ -261,7 +267,7 @@ fn sessions_over_the_carrier() {
 /// the same server.
 #[test]
 fn split_up_and_down_targets() {
-    run(60, async {
+    run(60, || async {
         let base = snapshot();
         let o = quick()
             .with_path("/up/{instance}/{nonce}")
@@ -284,10 +290,24 @@ fn split_up_and_down_targets() {
     });
 }
 
+/// The hold of the DOWN requests where the proxy cuts them, and the time it
+/// cuts them at.
+const CUT_HOLD: Duration = Duration::from_millis(1200);
+const CUT: Duration = Duration::from_millis(500);
+
 /// One session through the proxy with `faults`; returns the proxy's counts.
 async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<Stats> {
     let base = snapshot();
-    let o = quick();
+    let mut o = quick();
+    if faults.cut.is_some() {
+        // The proxy cuts DOWN requests only (their own path) and at well
+        // under their hold, so that a slow machine, which slows every
+        // answer by the same amount, does not reach the cut with requests
+        // that are not held ones and starve the carrier.
+        o.hold = CUT_HOLD;
+        o.idle_timeout = CUT_HOLD * 3;
+        o = o.with_down_path(exchange_proxy::DOWN_PATH);
+    }
     let srv = server(o.clone()).await;
     let proxy = Proxy::start(&srv.addr, faults, seed).await;
     let ready = snapshot();
@@ -296,7 +316,7 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
         .unwrap();
     echo(&client, len, seed).await;
     // Idle: DOWN requests are held to the end of the hold time.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    tokio::time::sleep(o.hold * 2 + Duration::from_millis(100)).await;
     echo(&client, len / 4, seed + 1).await;
     let stats = proxy.stats.clone();
     finish(client, srv, vec![proxy], base, ready).await;
@@ -309,11 +329,12 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
 /// idle session's held requests are answered, not cut.
 #[test]
 fn held_requests_outlive_the_setup_deadline() {
-    run(60, async {
+    run(60, || async {
         let mut o = quick();
-        o.hold = Duration::from_millis(900);
+        o.hold = Duration::from_millis(1500);
+        o.idle_timeout = Duration::from_secs(5);
         let mut limits = ListenerConfig::default();
-        limits.handshake_timeout = Duration::from_millis(200);
+        limits.handshake_timeout = Duration::from_millis(300);
         let srv = server_with(o.clone(), limits).await;
         let proxy = Proxy::start(&srv.addr, Faults::default(), 7).await;
         let client = zmux_http::connect_exchange(&proxy.addr, &o, Config::default())
@@ -321,7 +342,7 @@ fn held_requests_outlive_the_setup_deadline() {
             .unwrap();
         echo(&client, 10_000, 7).await;
         // Idle for several holds: each held DOWN is answered at its end.
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
         echo(&client, 10_000, 8).await;
         assert_eq!(
             srv.listener.stats().setup_failures,
@@ -338,7 +359,7 @@ type Applied = fn(&Stats) -> u64;
 /// Each fault alone, with a check that it happened.
 #[test]
 fn each_fault_alone() {
-    run(240, async {
+    run(120, || async {
         let p = 0.15;
         let cases: [(&str, Faults, Applied); 7] = [
             (
@@ -389,11 +410,11 @@ fn each_fault_alone() {
                 },
                 |s| Stats::get(&s.requests),
             ),
-            // Held DOWN requests (400 ms) are cut at 150 ms.
+            // Held DOWN requests are cut at `CUT`, within their hold.
             (
                 "cut",
                 Faults {
-                    cut: Some(Duration::from_millis(150)),
+                    cut: Some(CUT),
                     ..Faults::default()
                 },
                 |s| Stats::get(&s.cuts),
@@ -417,7 +438,7 @@ fn seeded_fault_mix() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    run(120 * seeds, async move {
+    run(60 * seeds, move || async move {
         for seed in 0..seeds {
             let faults = Faults {
                 drop_request: 0.05,
@@ -426,7 +447,7 @@ fn seeded_fault_mix() {
                 duplicate: 0.05,
                 replay: 0.05,
                 reorder: Duration::from_millis(20),
-                cut: Some(Duration::from_millis(250)),
+                cut: Some(CUT),
             };
             let stats = through_proxy(faults, 1000 + seed, 1 << 20).await;
             assert!(Stats::get(&stats.requests) > 0, "seed {seed}");
@@ -464,7 +485,7 @@ fn authentication_is_required_unless_declined() {
 /// on either side.
 #[test]
 fn wrong_psk_fails_the_carrier() {
-    run(30, async {
+    run(30, || async {
         let base = snapshot();
         let srv = server(quick().with_psk(*b"right")).await;
         let mut o = quick().with_psk(*b"wrong");
@@ -473,7 +494,7 @@ fn wrong_psk_fails_the_carrier() {
         assert!(r.is_err(), "connected with a wrong PSK");
         assert_eq!(srv.exchange.carriers(), 0);
         shut_down(srv).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while snapshot() != base {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -491,7 +512,7 @@ fn wrong_psk_fails_the_carrier() {
 /// deadline (here far away).
 #[test]
 fn a_close_without_a_server_ends_the_carrier() {
-    run(60, async {
+    run(60, || async {
         // The server runs on a runtime of its own, which ends with it.
         let server_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -511,9 +532,9 @@ fn a_close_without_a_server_ends_the_carrier() {
         drop(srv);
         tokio::time::sleep(Duration::from_millis(100)).await;
         client.close().await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), client.closing()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(15), client.closing()).await;
         drop(client);
-        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         // The server's listener went with its runtime: only the client's
         // tasks and pipes are compared.
         let gone = |s: &Snapshot| s.tasks == base.tasks && s.res.pipes == 0 && s.res.sessions == 0;
@@ -532,7 +553,7 @@ fn a_close_without_a_server_ends_the_carrier() {
 /// fails at the client's deadline.
 #[test]
 fn oversized_piece_fails_at_the_deadline() {
-    run(30, async {
+    run(30, || async {
         let base = snapshot();
         let mut so = quick();
         so.max_up_piece = Cap::Fixed(16 << 10);
@@ -547,12 +568,12 @@ fn oversized_piece_fails_at_the_deadline() {
         let started = tokio::time::Instant::now();
         let (mut send, recv) = client.open_bi().await.unwrap();
         let _ = send.write_all(&vec![7u8; 1 << 20]).await;
-        let e = tokio::time::timeout(Duration::from_secs(10), client.closing())
+        let e = tokio::time::timeout(Duration::from_secs(30), client.closing())
             .await
             .expect("the session ends with its only carrier");
-        // The upper bound guards against a hang only (above three deadlines and a second).
+        // The upper bound guards against a hang only; a loaded machine may take many deadlines.
         assert!(
-            started.elapsed() >= o.deadline / 2 && started.elapsed() < o.deadline * 5,
+            started.elapsed() >= o.deadline / 2 && started.elapsed() < o.deadline * 20,
             "{e:?} after {:?}",
             started.elapsed()
         );
@@ -569,7 +590,7 @@ fn fallback_gets_requests_with_their_bodies() {
     use http_body::Body as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    run(30, async {
+    run(30, || async {
         let listener = Listener::new(Config::default(), ListenerConfig::default())
             .expect("valid listener configuration");
         let exchange = ExchangeServer::new(&listener, quick()).unwrap();
@@ -627,7 +648,7 @@ fn fallback_gets_requests_with_their_bodies() {
 fn early_data_is_too_early_and_a_setup_failure() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    run(30, async {
+    run(30, || async {
         let srv = server(quick()).await;
         let mut c = tokio::net::TcpStream::connect(&srv.addr).await.unwrap();
         c.write_all(
@@ -639,8 +660,22 @@ fn early_data_is_too_early_and_a_setup_failure() {
         let mut resp = String::new();
         c.read_to_string(&mut resp).await.unwrap();
         assert!(resp.starts_with("HTTP/1.1 425"), "{resp}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        while srv.listener.stats().setup_failures == 0 {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the setup failure is not counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(srv.listener.stats().setup_failures, 1);
         shut_down(srv).await;
     });
+}
+
+/// A body that never ends fails at its watchdog, not later.
+#[test]
+#[should_panic(expected = "did not finish in time")]
+fn a_stalled_body_fails_at_its_watchdog() {
+    support::run(1, 1, std::future::pending::<()>);
 }

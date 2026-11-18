@@ -8,6 +8,7 @@ use super::{PipeFailure, PipeHalf, PipeId, PrioritySource, SessionError};
 
 /// The GOAWAY watermarks the peer sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GoAway {
     /// Bidirectional streams with a lower index were or may be processed.
     pub max_bidi: u64,
@@ -19,6 +20,7 @@ pub struct GoAway {
 
 /// Support of a protocol extension at each side, a negotiation result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub struct Support {
     /// The local endpoint announced it.
     pub local: bool,
@@ -389,8 +391,9 @@ pub enum TraceRecord {
 /// [`TraceRecord`]s with the session's [`SessionId`] (the sessions of one
 /// configuration share its tracer). Called outside every lock, serially and
 /// in order on each session's hook context, [`TraceRecord::Closed`] last; a
-/// slow tracer never holds a session back: past a bounded backlog, records
-/// other than the end are dropped and counted ([`TraceRecord::Dropped`]). A
+/// slow tracer never holds a session back: past a bounded backlog, the records
+/// that arrive, other than `Established` and the end, are dropped and
+/// counted ([`TraceRecord::Dropped`], where they would have stood). A
 /// panic in a call is caught and ignored. The hook context is a task of the
 /// runtime (a thread of the std driver): a tracer must not block it; one
 /// that would subscribes with [`Config::events`](crate::Config::events)

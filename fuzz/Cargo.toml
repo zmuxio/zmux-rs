@@ -1,0 +1,56 @@
+[package]
+name = "zmux-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "cargo-fuzz targets for the wire parsers of zmux"
+
+# Standalone: not a member of the zmux workspace.
+#   cargo +nightly fuzz run frame
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zmux = { path = "..", features = ["test-hooks"] }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "preamble"
+path = "fuzz_targets/preamble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capsule"
+path = "fuzz_targets/capsule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "params"
+path = "fuzz_targets/params.rs"
+test = false
+doc = false
+bench = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

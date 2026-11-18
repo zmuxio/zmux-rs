@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use super::{InPipe, InState, OutPipe, OutState, TierState};
 use crate::proto::TransportErrorCode as T;
 
+/// What a pipe held when the session retired it, for the handles that
+/// outlive it: its options and how it ended.
+pub(crate) type FinalPipe = std::sync::Arc<std::sync::OnceLock<crate::proto::session::PipeFinal>>;
+
 /// An attachment: one pipe ID with up to one pipe in each direction.
 #[derive(Debug)]
 pub(crate) struct Attachment {
@@ -52,6 +56,8 @@ struct AttMp {
     seq: u64,
     /// The record mode, fixed by its handshake.
     mode: Option<crate::proto::seal::RecordMode>,
+    /// The Group of the join's key share, once the join has chosen it.
+    key_group: Option<u64>,
     /// Our joins refused in a row before this one was confirmed: they
     /// continue if the peer abandons it for a resource limit.
     refusals_at_join: u32,
@@ -76,6 +82,11 @@ struct AttMp {
     /// The options of a pipe the application added (its fields that the
     /// tier state does not hold: label, fate group, detection settings).
     options: Option<Box<crate::proto::session::PipeOptions>>,
+    /// Where the options and the end go when the attachment is retired, once
+    /// a handle asked for it ([`SessionCore::pipe_final`]).
+    ///
+    /// [`SessionCore::pipe_final`]: crate::proto::session::SessionCore::pipe_final
+    final_pipe: Option<FinalPipe>,
     /// The host's value of the admission that accepted the carrier
     /// ([`SessionCore::set_pipe_admitted`]).
     ///
@@ -94,6 +105,7 @@ impl AttMp {
             failed: false,
             seq,
             mode: None,
+            key_group: None,
             refusals_at_join: 0,
             abandon_code: None,
             abandon_pending: false,
@@ -105,6 +117,7 @@ impl AttMp {
             tier: TierState::new(),
             failure: None,
             options: None,
+            final_pipe: None,
             admitted: None,
             variant: None,
         }
@@ -349,6 +362,16 @@ impl Attachment {
         self.mp().mode
     }
 
+    /// The Group of the join's key share, once the join has chosen it.
+    pub(crate) fn key_group(&self) -> Option<u64> {
+        self.mp().key_group
+    }
+
+    /// Fixes the Group of the join's key share.
+    pub(crate) fn set_key_group(&mut self, group: u64) {
+        self.mp_mut().key_group = Some(group);
+    }
+
     /// Fixes the record mode.
     pub(crate) fn set_mode(&mut self, mode: crate::proto::seal::RecordMode) {
         self.mp_mut().mode = Some(mode);
@@ -462,6 +485,25 @@ impl Attachment {
     /// Keeps the options the application adds the pipe with.
     pub(crate) fn set_options(&mut self, options: &crate::proto::session::PipeOptions) {
         self.mp_mut().options = Some(Box::new(options.clone()));
+    }
+
+    /// The slot that receives the pipe's options and its end when it is
+    /// retired, created on the first call.
+    pub(crate) fn final_pipe(&mut self) -> FinalPipe {
+        self.mp_mut()
+            .final_pipe
+            .get_or_insert_with(Default::default)
+            .clone()
+    }
+
+    /// The slot of the final snapshot, when a handle other than the
+    /// attachment holds it.
+    pub(crate) fn final_pipe_wanted(&self) -> Option<&FinalPipe> {
+        self.mp
+            .as_deref()?
+            .final_pipe
+            .as_ref()
+            .filter(|s| std::sync::Arc::strong_count(s) > 1)
     }
 
     // ---- the PIPE_ABANDON exchange --------------------------------------------------

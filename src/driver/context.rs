@@ -21,7 +21,7 @@ thread_local! {
 /// Neither `Send` nor `Sync`: it unmarks the thread that created it.
 #[derive(Debug)]
 pub(crate) struct DriverThread {
-    _live: super::resources::Live,
+    _live: Option<super::resources::Live>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -29,7 +29,19 @@ impl DriverThread {
     pub(crate) fn enter() -> Self {
         DRIVER.set(DRIVER.get() + 1);
         Self {
-            _live: super::resources::Live::new(super::resources::Kind::Thread),
+            _live: Some(super::resources::Live::new(super::resources::Kind::Thread)),
+            _not_send: PhantomData,
+        }
+    }
+
+    /// [`enter`](Self::enter) for a thread of the process that outlives
+    /// every session: not counted among the live threads of sessions (a
+    /// resource check that every thread ended would never see it end).
+    #[cfg(feature = "blocking")]
+    pub(crate) fn enter_process_wide() -> Self {
+        DRIVER.set(DRIVER.get() + 1);
+        Self {
+            _live: None,
             _not_send: PhantomData,
         }
     }

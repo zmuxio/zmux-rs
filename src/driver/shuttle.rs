@@ -18,14 +18,18 @@
 //! ```
 //!
 //! Shuttle does not model time: a call's timeout is modelled as an event (a
-//! thread that marks the wait expired and unparks it).
+//! thread that marks the wait expired and unparks it). The shared timer
+//! thread (`session_timer.rs`) is modelled by [`Scheduler`], which repeats
+//! its steps over logical time: a clock thread advances the time and wakes
+//! the scheduler thread, as the expiry of its timed wait does.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 
+use shuttle::sync::Condvar;
 use shuttle::sync::atomic::{AtomicBool, Ordering};
 use shuttle::thread;
 
@@ -211,17 +215,253 @@ fn writer(s: &Session) {
     }
 }
 
-/// `timer_thread` after the close: waits until no writer is left.
-fn timer(s: &Session) {
-    let me = thread_waker();
-    loop {
-        let mut inner = lock(s);
-        if inner.closed && inner.writers_alive == 0 {
+/// A one-shot event a thread can wait for.
+#[derive(Default)]
+struct Latch {
+    set: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Latch {
+    fn set(&self) {
+        *lock_slot(&self.set) = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut set = lock_slot(&self.set);
+        while !*set {
+            set = self.cv.wait(set).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// `session_timer::Next`, over logical time.
+enum Next {
+    At(u64),
+    Idle,
+    Done,
+    /// The task panicked: the real thread catches the unwinding and ends
+    /// the task (shuttle fails a test at any panic, so it is modelled by
+    /// the outcome).
+    Panicked,
+}
+
+type Run = Box<dyn FnMut(&Waker) -> Next + Send>;
+
+/// `session_timer::Task`: its body and its place in the scheduler.
+struct SchedTask {
+    run: Mutex<Run>,
+    state: Mutex<TaskState>,
+    sched: Arc<Scheduler>,
+}
+
+#[derive(Default)]
+struct TaskState {
+    key: Option<(u64, u64)>,
+    running: bool,
+    again: bool,
+    done: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    entries: BTreeMap<(u64, u64), Arc<SchedTask>>,
+    next: u64,
+    /// The logical time.
+    now: u64,
+    /// The end of the model: the thread leaves once it is set.
+    stop: bool,
+}
+
+/// `session_timer::Timers`: one thread runs the tasks in the order of
+/// their deadlines. The steps are those of `session_timer.rs`; the time is
+/// the queue's `now`, advanced by [`Scheduler::tick`], whose notification
+/// stands for the expiry of the real thread's timed wait.
+#[derive(Default)]
+struct Scheduler {
+    queue: Mutex<Queue>,
+    changed: Condvar,
+}
+
+impl Scheduler {
+    fn place(&self, q: &mut Queue, task: &Arc<SchedTask>, st: &mut TaskState, at: u64) {
+        if let Some(k) = st.key.take() {
+            q.entries.remove(&k);
+        }
+        let key = (at, q.next);
+        q.next += 1;
+        let earliest = q.entries.keys().next().is_none_or(|k| key < *k);
+        q.entries.insert(key, task.clone());
+        st.key = Some(key);
+        if earliest {
+            self.changed.notify_one();
+        }
+    }
+
+    /// `session_timer::spawn`: the task runs at once.
+    fn spawn(self: &Arc<Self>, run: impl FnMut(&Waker) -> Next + Send + 'static) {
+        let task = Arc::new(SchedTask {
+            run: Mutex::new(Box::new(run)),
+            state: Mutex::default(),
+            sched: self.clone(),
+        });
+        let mut q = lock_slot(&self.queue);
+        let mut st = lock_slot(&task.state);
+        let now = q.now;
+        self.place(&mut q, &task, &mut st, now);
+    }
+
+    fn now(&self) -> u64 {
+        lock_slot(&self.queue).now
+    }
+
+    /// The clock: time advances to `to` and the thread looks at the queue.
+    fn tick(&self, to: u64) {
+        lock_slot(&self.queue).now = to;
+        self.changed.notify_one();
+    }
+
+    fn stop(&self) {
+        lock_slot(&self.queue).stop = true;
+        self.changed.notify_one();
+    }
+
+    /// `session_timer::serve`.
+    fn serve(&self) {
+        let mut q = lock_slot(&self.queue);
+        loop {
+            let now = q.now;
+            let Some(entry) = q.entries.first_entry().filter(|e| e.key().0 <= now) else {
+                if q.stop {
+                    return;
+                }
+                q = self.changed.wait(q).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let task = entry.remove();
+            {
+                let mut st = lock_slot(&task.state);
+                st.key = None;
+                st.running = true;
+                st.again = false;
+            }
+            drop(q);
+            let me = Waker::from(task.clone());
+            let next = (lock_slot(&task.run))(&me);
+            drop(me);
+            q = lock_slot(&self.queue);
+            let mut st = lock_slot(&task.state);
+            st.running = false;
+            if matches!(next, Next::Done | Next::Panicked) {
+                st.done = true;
+                drop(st);
+                drop(q);
+                *lock_slot(&task.run) = Box::new(|_| Next::Done);
+                q = lock_slot(&self.queue);
+            } else if st.again {
+                let now = q.now;
+                self.place(&mut q, &task, &mut st, now);
+            } else if let Next::At(at) = next {
+                self.place(&mut q, &task, &mut st, at);
+            }
+        }
+    }
+}
+
+impl Wake for SchedTask {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let t = &self.sched;
+        let mut q = lock_slot(&t.queue);
+        let mut st = lock_slot(&self.state);
+        if st.done {
             return;
         }
+        if st.running {
+            st.again = true;
+        } else {
+            let now = q.now;
+            t.place(&mut q, self, &mut st, now);
+        }
+    }
+}
+
+/// The scheduler thread and the clock (time 1..=`TICKS`), started by the
+/// model; `finish` ends them.
+struct Timers {
+    sched: Arc<Scheduler>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+/// The last logical time.
+const TICKS: u64 = 4;
+
+impl Timers {
+    /// The scheduler thread only; tasks spawned before [`Timers::start_clock`]
+    /// are placed at time 0.
+    fn new() -> Self {
+        let sched = Arc::new(Scheduler::default());
+        let s = sched.clone();
+        Self {
+            sched,
+            threads: vec![thread::spawn(move || s.serve())],
+        }
+    }
+
+    fn start_clock(&mut self) {
+        let s = self.sched.clone();
+        self.threads.push(thread::spawn(move || {
+            for t in 1..=TICKS {
+                s.tick(t);
+            }
+        }));
+    }
+
+    fn finish(self) {
+        self.sched.stop();
+        for t in self.threads {
+            t.join().unwrap();
+        }
+    }
+}
+
+/// How long the session task waits for the writers after the close.
+const FINAL_WRITE: u64 = 2;
+
+/// `blocking::timer_task` after the close: the task re-runs, as the core's
+/// timers ask, until the session is closed; then it waits until no writer is
+/// left or the time ran out, and ends. It registers its waker under the
+/// session lock, like the real task.
+fn timer_task(
+    sched: Arc<Scheduler>,
+    s: Session,
+    ended: Arc<Latch>,
+) -> impl FnMut(&Waker) -> Next + Send + 'static {
+    let mut draining: Option<u64> = None;
+    move |me| {
+        let now = sched.now();
+        let mut inner = lock(&s);
+        let deadline = match draining {
+            Some(d) => d,
+            None if inner.closed => *draining.insert(now + FINAL_WRITE),
+            None => {
+                // The core's timers.
+                inner.timer = Some(me.clone());
+                return Next::At(now + 2);
+            }
+        };
+        if inner.writers_alive == 0 || now >= deadline {
+            inner.timer = None;
+            drop(inner);
+            ended.set();
+            return Next::Done;
+        }
         inner.timer = Some(me.clone());
-        drop(inner);
-        park(None);
+        Next::At(deadline)
     }
 }
 
@@ -235,7 +475,7 @@ fn session() -> Session {
 /// Readers of three streams, a reader thread delivering data, an
 /// application producing output for the writer thread, a thread waiting
 /// for the end, and a close at a random point: every read returns (data in
-/// order, then the end), the writer and the timer end, and no wait is left
+/// order, then the end), the writer and the session's timer task end, and no wait is left
 /// registered.
 fn readers_writer_and_close() {
     let s = session();
@@ -259,10 +499,12 @@ fn readers_writer_and_close() {
         let s = s.clone();
         thread::spawn(move || writer(&s))
     };
-    let t = {
-        let s = s.clone();
-        thread::spawn(move || timer(&s))
-    };
+    let mut timers = Timers::new();
+    let ended = Arc::new(Latch::default());
+    timers
+        .sched
+        .spawn(timer_task(timers.sched.clone(), s.clone(), ended.clone()));
+    timers.start_clock();
     let delivered = {
         let s = s.clone();
         thread::spawn(move || {
@@ -295,7 +537,8 @@ fn readers_writer_and_close() {
     end.join().unwrap();
     delivered.join().unwrap();
     w.join().unwrap();
-    t.join().unwrap();
+    ended.wait();
+    timers.finish();
     assert!(lock(&s).waiters.is_idle(), "a wait stayed registered");
 }
 
@@ -347,6 +590,79 @@ fn openers_credit_and_expiry() {
     assert!(inner.waiters.is_idle(), "an opener stayed queued");
 }
 
+/// The shared scheduler alone: tasks of two deadlines run in the order of
+/// their deadlines and never before them; a wake-up that comes while a task
+/// runs makes it run again; an idle task runs when woken from another
+/// thread; a task that panics ends alone (the model: `Next::Panicked`); a task that is done ignores a
+/// late wake-up. A lost wake-up leaves a wait for a task that never runs
+/// again, which shuttle reports as a deadlock.
+fn timer_scheduler() {
+    let mut timers = Timers::new();
+    let sched = timers.sched.clone();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let ordered = [Arc::new(Latch::default()), Arc::new(Latch::default())];
+    for (id, at) in [(0u8, 2u64), (1, 1)] {
+        let (sched, order, ordered) = (
+            sched.clone(),
+            order.clone(),
+            ordered[usize::from(id)].clone(),
+        );
+        let mut ran = false;
+        timers.sched.spawn(move |_| {
+            if !ran {
+                ran = true;
+                return Next::At(at);
+            }
+            assert!(sched.now() >= at, "task {id} ran before its time");
+            lock_slot(&order).push(id);
+            ordered.set();
+            Next::Done
+        });
+    }
+    timers.sched.spawn(|_| Next::Panicked);
+    let again = Arc::new(Latch::default());
+    let (wtx, waker) = (
+        Arc::new(Mutex::new(None::<Waker>)),
+        Arc::new(Latch::default()),
+    );
+    {
+        let (again, wtx, waker) = (again.clone(), wtx.clone(), waker.clone());
+        let mut runs = 0u32;
+        timers.sched.spawn(move |me| {
+            runs += 1;
+            match runs {
+                1 => {
+                    *lock_slot(&wtx) = Some(me.clone());
+                    waker.set();
+                    // Woken while it runs: it runs again.
+                    me.wake_by_ref();
+                    Next::Idle
+                }
+                2 => {
+                    again.set();
+                    Next::Idle
+                }
+                _ => Next::Done,
+            }
+        });
+    }
+    timers.start_clock();
+    // The third run is the wake-up from here; the second the one during the
+    // first run.
+    waker.wait();
+    again.wait();
+    let w = lock_slot(&wtx).take().unwrap();
+    w.wake_by_ref();
+    // The task is done after the next run, or idle until then; a wake-up of
+    // a task that is done does nothing.
+    w.wake();
+    for o in &ordered {
+        o.wait();
+    }
+    timers.finish();
+    assert_eq!(*lock_slot(&order), [1, 0]);
+}
+
 #[test]
 fn shuttle_readers_writer_and_close() {
     shuttle::check_random(readers_writer_and_close, ITERATIONS);
@@ -357,4 +673,10 @@ fn shuttle_readers_writer_and_close() {
 fn shuttle_openers_credit_and_expiry() {
     shuttle::check_random(openers_credit_and_expiry, ITERATIONS);
     shuttle::check_pct(openers_credit_and_expiry, ITERATIONS, 3);
+}
+
+#[test]
+fn shuttle_timer_scheduler() {
+    shuttle::check_random(timer_scheduler, ITERATIONS);
+    shuttle::check_pct(timer_scheduler, ITERATIONS, 3);
 }

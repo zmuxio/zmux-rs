@@ -14,7 +14,7 @@ use zmux_h3::Options;
 
 async fn pair() -> (Session, Session) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["127.0.0.1".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let opts = Options::default();

@@ -107,6 +107,56 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
     }
 }
 
+/// A carrier evicted for the session's bound of Unconfirmed carriers ends as
+/// refused (a limit of the session), counted in `refused`, not as rejected,
+/// and it counts no join.
+#[tokio::test]
+async fn an_evicted_unconfirmed_carrier_counts_as_refused() {
+    let (a, b) = duplex(1 << 20);
+    let mut limits = ListenerConfig::default();
+    limits.max_pending_per_session = 1;
+    let listener = Listener::new(config(), limits).expect("valid listener configuration");
+    let l = listener.clone();
+    tokio::spawn(async move {
+        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+            .await
+    });
+    let client = Session::connect(PipeIo::new(a), config()).await.unwrap();
+    let _server = listener.accept().await.unwrap();
+    client.established().await.unwrap();
+    let mut handled = Vec::new();
+    let mut pipes = Vec::new();
+    for _ in 0..2 {
+        let (near, relay_a) = duplex(1 << 16);
+        let (relay_b, far) = duplex(1 << 16);
+        let replied = Arc::new(Notify::new());
+        hold_confirm(relay_a, relay_b, replied.clone());
+        let l = listener.clone();
+        handled.push(tokio::spawn(async move {
+            l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+                .await
+        }));
+        pipes.push(
+            client
+                .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+                .unwrap(),
+        );
+        timeout(Duration::from_secs(5), replied.notified())
+            .await
+            .unwrap();
+    }
+    // The second Hello took the room: the first, Unconfirmed longest, ends.
+    let first = handled.remove(0);
+    let r = timeout(Duration::from_secs(3), first)
+        .await
+        .expect("the evicted carrier's handler ended")
+        .unwrap();
+    assert_eq!(r.err(), Some(HandleError::Refused));
+    let st = listener.stats();
+    assert_eq!((st.refused, st.rejected, st.joins), (1, 0, 0));
+    listener.close();
+}
+
 /// A carrier whose write of the Confirm waits for a gate, and which records its drop.
 struct Gated {
     inner: DuplexStream,

@@ -8,68 +8,119 @@
 //!   the one-slot mailbox [`WindowHook`], never through a queue that may
 //!   drop it. A panic counts as a refusal;
 //! - the `tracer` runs on the same hook context, started with the session,
-//!   fed through the bounded [`TraceQueue`]: past [`TRACE_BACKLOG`] events
-//!   are dropped and counted, the session's end never is.
+//!   fed through the bounded [`TraceQueue`], the one queue of the host
+//!   events: past [`TRACE_BACKLOG`] the new record is dropped and counted,
+//!   the session's start and end never are.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use super::wake::WakeList;
+use crate::proto::host_events::{HostEvent, HostEvents, Sender};
 use crate::proto::session::{
     Config, LogLevel, Logger, SessionCore as Core, SessionId, TraceRecord, Tracer, WindowIncrease,
 };
 
-/// Events a tracer may have unread before more are dropped.
+/// Events a tracer callback may have unread before more are dropped.
 pub(crate) const TRACE_BACKLOG: usize = 256;
 
-/// The bounded queue of a session's tracer, and the tracer.
+/// Where a session's trace records go: the queues of the observers of the
+/// session. One queue implementation serves all of them
+/// ([`HostEvents`]): bounded, past its capacity the newly arriving record
+/// is dropped and counted (the session's `Established` and `Closed` never
+/// are). An observer is either a subscription ([`Config::events`]),
+/// whose queue the host reads when it wants, or the tracer callback of the
+/// configuration, whose queue the session's hook context reads and calls the
+/// tracer with. A record is queued once for each, with its own count of what
+/// it dropped.
 pub(crate) struct TraceQueue {
-    pub(crate) tracer: Arc<dyn Tracer>,
     pub(crate) session: SessionId,
-    items: VecDeque<TraceRecord>,
-    dropped: u64,
-    /// The end was queued: the last item.
+    /// The tracer callback and the queue it consumes.
+    callback: Option<(Arc<dyn Tracer>, Sender, HostEvents)>,
+    /// The subscriptions of the configuration.
+    subscriptions: Vec<Sender>,
+    /// The end was queued: the last record.
     closed: bool,
 }
 
 impl TraceQueue {
-    pub(crate) fn new(tracer: Arc<dyn Tracer>, session: SessionId) -> Self {
-        Self {
-            tracer,
+    /// The queues of a session of `config`; `None` when nothing observes it.
+    pub(crate) fn new(config: &Config, session: SessionId) -> Option<Self> {
+        if config.tracer.is_none() && config.subscriptions.is_empty() {
+            return None;
+        }
+        Some(Self {
             session,
-            items: VecDeque::new(),
-            dropped: 0,
+            callback: config.tracer.clone().map(|t| {
+                let (reader, tx) = HostEvents::channel(TRACE_BACKLOG);
+                (t, tx, reader)
+            }),
+            subscriptions: config.subscriptions.clone(),
             closed: false,
-        }
+        })
     }
 
-    /// Queues a record; past the backlog an event is dropped and counted,
-    /// and the end is always queued.
-    pub(crate) fn push(&mut self, item: TraceRecord) {
+    /// The tracer callback, if any.
+    pub(crate) fn tracer(&self) -> Option<Arc<dyn Tracer>> {
+        self.callback.as_ref().map(|c| c.0.clone())
+    }
+
+    /// Queues a record for every observer, nothing once the end was
+    /// queued. Under the session's lock: the wake-ups of the readers go to
+    /// `wakes`. Returns whether the tracer callback has something to read.
+    pub(crate) fn push(&mut self, item: &TraceRecord, wakes: &mut WakeList) -> bool {
         if self.closed {
-            return;
+            return false;
         }
-        let end = matches!(item, TraceRecord::Closed(_));
-        if self.items.len() >= TRACE_BACKLOG && !end {
-            self.dropped += 1;
-            return;
+        let keep = matches!(item, TraceRecord::Established | TraceRecord::Closed(_));
+        self.closed = matches!(item, TraceRecord::Closed(_));
+        let session = self.session;
+        let make = || HostEvent::Trace {
+            session,
+            record: item.clone(),
+        };
+        for tx in &self.subscriptions {
+            tx.push_into(keep, make, &mut |w| wakes.push(w));
         }
-        if self.dropped > 0 {
-            self.items
-                .push_back(TraceRecord::Dropped(std::mem::take(&mut self.dropped)));
+        match &self.callback {
+            Some((_, tx, _)) => {
+                tx.push_into(keep, make, &mut |w| wakes.push(w));
+                true
+            }
+            None => false,
         }
-        self.closed = end;
-        self.items.push_back(item);
     }
 
-    /// The records queued, all of them.
+    /// The records of the tracer callback's queue, all of them.
     pub(crate) fn take(&mut self) -> Option<VecDeque<TraceRecord>> {
-        (!self.items.is_empty()).then(|| std::mem::take(&mut self.items))
+        let (_, _, reader) = self.callback.as_ref()?;
+        let mut items = VecDeque::new();
+        while let Some(e) = reader.try_next() {
+            match e {
+                HostEvent::Trace { record, .. } => items.push_back(record),
+                HostEvent::Overflowed(n) => items.push_back(TraceRecord::Dropped(n)),
+                _ => {}
+            }
+        }
+        (!items.is_empty()).then_some(items)
     }
 
-    /// Everything was taken, the end included.
+    /// The end was queued and, after a [`take`](Self::take) that found
+    /// nothing, everything was taken.
     pub(crate) fn finished(&self) -> bool {
-        self.closed && self.items.is_empty()
+        self.callback.is_none() || self.closed
+    }
+
+    /// The hook context could not be started: the tracer is not called.
+    #[cfg(feature = "blocking")]
+    pub(crate) fn drop_callback(&mut self) {
+        self.callback = None;
+    }
+
+    /// Whether a tracer callback consumes the queue.
+    pub(crate) fn has_callback(&self) -> bool {
+        self.callback.is_some()
     }
 }
 
@@ -241,4 +292,68 @@ pub(crate) async fn first<T>(
         stop.as_mut().poll(cx).map(|()| None)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SessionEvent;
+    use crate::proto::session::SessionError;
+
+    struct Nobody;
+    impl Tracer for Nobody {
+        fn trace(&self, _: SessionId, _: &TraceRecord) {}
+    }
+
+    /// The tracer callback reads one bounded queue: past the backlog the
+    /// new record is dropped, counted where it would have stood, and the
+    /// session's start and end are kept.
+    #[test]
+    fn the_tracer_callback_reads_the_one_bounded_queue() {
+        let mut config = Config {
+            tracer: Some(Arc::new(Nobody)),
+            ..Config::default()
+        };
+        let events = config.events(8);
+        let mut q = TraceQueue::new(&config, SessionId::next()).expect("observed");
+        let mut wakes = WakeList::default();
+        assert!(q.push(&TraceRecord::Established, &mut wakes));
+        for _ in 0..TRACE_BACKLOG + 10 {
+            q.push(
+                &TraceRecord::Event(SessionEvent::SessionResumed),
+                &mut wakes,
+            );
+        }
+        q.push(
+            &TraceRecord::Closed(SessionError::HandshakeTimeout),
+            &mut wakes,
+        );
+        let got: Vec<_> = q.take().expect("records").into_iter().collect();
+        assert_eq!(got.first(), Some(&TraceRecord::Established));
+        assert!(matches!(got.last(), Some(TraceRecord::Closed(_))));
+        // 1 + 255 queued, 11 dropped (counted before the end), the end.
+        assert_eq!(got.len(), TRACE_BACKLOG + 2);
+        assert_eq!(got[TRACE_BACKLOG], TraceRecord::Dropped(11));
+        assert!(q.finished());
+        // The subscription, with its own queue and count, saw the start and
+        // the end too.
+        let mut seen = Vec::new();
+        while let Some(e) = events.try_next() {
+            seen.push(e);
+        }
+        assert!(matches!(
+            seen.first(),
+            Some(HostEvent::Trace {
+                record: TraceRecord::Established,
+                ..
+            })
+        ));
+        assert!(matches!(
+            seen.last(),
+            Some(HostEvent::Trace {
+                record: TraceRecord::Closed(_),
+                ..
+            })
+        ));
+    }
 }

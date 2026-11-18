@@ -1,0 +1,18 @@
+[package]
+name = "zmux-shaping-peer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A zmux peer that runs one traffic-shaping definition, for cross-implementation interoperability tests"
+
+# A member of the zmux workspace (never published):
+#   cargo build --release --locked -p zmux-shaping-peer
+
+[dependencies]
+zmux = { path = "../.." }
+zmux-shaping = { path = "../../shaping" }
+tokio = { version = "1.54", features = ["full"] }
+
+[lints]
+workspace = true

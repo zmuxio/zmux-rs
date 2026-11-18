@@ -726,4 +726,35 @@ mod tests {
         assert!(!credit_due(63 << 10, 256 << 10, 256 << 10, false));
         assert!(credit_due(64 << 10, 256 << 10, 256 << 10, false));
     }
+    /// SPEC.md Section 8.3 rule 4: while the unread buffered bytes stay
+    /// below the cap, a byte's session credit is released when it is
+    /// buffered, so data a stream leaves unread holds back nothing; bytes
+    /// buffered at the cap are held until consumed (under memory pressure,
+    /// only as they are consumed), never longer.
+    #[test]
+    fn credit_is_released_at_buffering_below_the_cap_and_held_at_it() {
+        const CAP: u64 = 1000;
+        let mut f = RecvFlow::new(4000);
+        // Below the cap: released at once, whether read or not.
+        f.received(CAP, 600, 600, 0);
+        assert_eq!((f.released, f.held, f.at_cap), (600, 0, false));
+        // A chunk that starts below the cap is released whole.
+        f.received(CAP, 500, 500, 0);
+        assert_eq!(
+            (f.released, f.held, f.buffered, f.at_cap),
+            (1100, 0, 1100, true)
+        );
+        // At the cap: held.
+        f.received(CAP, 300, 300, 0);
+        assert_eq!((f.released, f.held), (1100, 300));
+        // Reading releases what was held, in order, as it is consumed...
+        f.consumed(CAP, 50, true);
+        assert_eq!((f.released, f.held), (1150, 250));
+        // ... and, without memory pressure, all of it once below the cap.
+        f.consumed(CAP, 450, false);
+        assert_eq!((f.buffered, f.released, f.held), (900, 1400, 0));
+        // Bytes that will never be buffered release their credit at once.
+        f.received(CAP, 0, 0, 40);
+        assert_eq!(f.released, 1440);
+    }
 }

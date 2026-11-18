@@ -79,6 +79,8 @@ mod precise;
 pub(crate) mod resources;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod sealed;
+#[cfg(all(feature = "blocking", not(loom)))]
+mod session_timer;
 #[cfg(all(test, shuttle, feature = "blocking", not(loom)))]
 mod shuttle;
 #[cfg(all(feature = "tokio", not(loom)))]

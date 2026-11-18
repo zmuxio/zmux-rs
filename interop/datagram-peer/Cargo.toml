@@ -1,0 +1,25 @@
+[package]
+name = "zmux-datagram-peer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A zmux peer echoing datagrams and streams over QUIC, for cross-implementation interoperability tests of the datagram channel"
+
+# A member of the zmux workspace (never published):
+#   cargo build --release --locked -p zmux-datagram-peer
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1.54", features = ["full"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# aws-lc parses the PKCS#8 EC keys that Java writes, without the embedded public key.
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws_lc_rs", "std"] }
+zmux = { path = "../.." }
+zmux-quinn = { path = "../../adapter/quinn" }
+
+[dev-dependencies]
+zmux-testcert = { path = "../../testcert", features = ["pem"] }
+
+[lints]
+workspace = true

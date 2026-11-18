@@ -269,7 +269,7 @@ async fn tls_pair() -> (
 ) {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let server = rustls::ServerConfig::builder_with_provider(provider.clone())

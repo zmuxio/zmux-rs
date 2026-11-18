@@ -896,7 +896,7 @@ impl SessionCore {
         if let Change::Set(l) = &u.liveness {
             l.validate().map_err(PipeError::InvalidOptions)?;
         }
-        if let Change::Set(b) = &u.quality_band {
+        if let Change::Set(Some(b)) = &u.quality_band {
             b.validate().map_err(PipeError::InvalidOptions)?;
         }
         if matches!(u.probation, Change::Set(Some(Cap::Fixed(d))) if d.is_zero()) {
@@ -952,20 +952,30 @@ impl SessionCore {
         }
         match u.quality_band {
             Change::Keep => {}
-            Change::Clear => self.set_pipe_quality_band(pipe, None)?,
-            Change::Set(b) => self.set_pipe_quality_band(pipe, Some(b))?,
+            Change::Clear => self.set_pipe_quality_band(pipe, Inherit::Session)?,
+            Change::Set(b) => self.set_pipe_quality_band(pipe, Inherit::Set(b))?,
         }
         Ok(())
     }
 
-    /// The options a pipe is in use with: those it was added with (the
-    /// defaults for one the peer joined), with the tier settings changed
-    /// since; `None` for a pipe not known.
+    /// The options a pipe is in use with: those it was added with (for one
+    /// the peer joined, the direction from this endpoint's view and the
+    /// defaults), each runtime setting as the pipe holds it now (the tier
+    /// settings, the liveness and the quality band, after every update),
+    /// and the values fixed by the join as it made them: the record mode
+    /// and the key group, whoever chose them. `None` for a pipe not known.
     pub fn pipe_options(&self, pipe: PipeId) -> Option<crate::proto::session::PipeOptions> {
         let a = self.att(pipe.0).filter(|a| !a.unattached())?;
         let mut o = a.options().cloned().unwrap_or_default();
         o.report_tier(a.tier().settings());
+        o.report_quality_band(self.pipe_band_setting(pipe));
         o.fate_group = a.fate_group();
+        if let Some(mode) = self.pipe_record_mode(pipe) {
+            o.record_mode = Inherit::Set(mode);
+        }
+        if let Some(group) = a.key_group() {
+            o.key_group = Inherit::Set(group);
+        }
         Some(o)
     }
 
@@ -1485,7 +1495,7 @@ fn effective(a: &Attachment) -> (u64, bool, u64) {
 /// | `send_priority`, `send_standby` | follow the peer's latest request, else 0 and available | this value, which wins over the peer's request |
 /// | `receive_priority`, `receive_standby` | request 0 and available again | request this value |
 /// | `weight` | 1 | this value (0 excludes the pipe) |
-/// | `probation`, `liveness`, `quality_band` | follow the session's | this value (`probation` `None`: off) |
+/// | `probation`, `liveness`, `quality_band` | follow the session's | this value (`probation` and `quality_band` `None`: off for this pipe) |
 ///
 /// A changed request for the peer's outbound direction is sent as one
 /// `PIPE_STATUS`, only when it differs from the request in force.
@@ -1518,6 +1528,7 @@ pub struct PipeUpdate {
     pub probation: Change<Option<Cap<Duration>>>,
     /// The pipe's own liveness settings, as a whole.
     pub liveness: Change<PipeLiveness>,
-    /// The pipe's own quality band ([`QualityBand`](crate::QualityBand)).
-    pub quality_band: Change<crate::QualityBand>,
+    /// The pipe's own quality band ([`QualityBand`](crate::QualityBand));
+    /// `Set(None)` turns its reports off whatever the session's band is.
+    pub quality_band: Change<Option<crate::QualityBand>>,
 }

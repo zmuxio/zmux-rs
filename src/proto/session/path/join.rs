@@ -25,8 +25,8 @@ use crate::proto::session::shaping::{
     pad_fill, pad_item, reply_room, varint_len,
 };
 use crate::proto::session::{
-    CoreEvent, InvalidConfig, PipeError, PipeFailure, PipeId, SessionCore, State,
-    check_record_limit,
+    CoreEvent, InvalidConfig, PipeDirection, PipeError, PipeFailure, PipeId, PipeOptions,
+    SessionCore, State, check_record_limit,
 };
 use crate::proto::{Error, TransportErrorCode as T, keys};
 
@@ -305,6 +305,7 @@ pub type JoinRecords = Option<(Sealer, Opener)>;
 const PADDING_ITEM: u64 = 0;
 
 /// What [`SessionCore::join_finish`] made.
+#[non_exhaustive]
 pub struct JoinFinished {
     /// The confirmation, possibly empty.
     pub confirm: Vec<u8>,
@@ -373,6 +374,8 @@ impl std::fmt::Debug for JoinStep {
 pub struct PeerJoin {
     pipe: JoinPipe,
     mode: RecordMode,
+    /// The Group of the Hello's key share.
+    key_group: u64,
     /// The epoch of the Hello's key.
     epoch: u64,
     suite: &'static Suite,
@@ -712,6 +715,9 @@ impl SessionCore {
         j.sent = Some(sent);
         j.epoch = Some(epoch);
         j.binding = Vec::new();
+        if let Some(a) = self.att_mut(id) {
+            a.set_key_group(group.value());
+        }
         self.epoch_note_join();
         Ok(wire)
     }
@@ -1022,6 +1028,7 @@ impl SessionCore {
             pipe,
             epoch,
             mode: hello.mode(),
+            key_group: opened.group().value(),
             suite: hello.suite(),
             payload,
             state: PeerJoinState::Opened(opened),
@@ -1133,6 +1140,14 @@ impl SessionCore {
         let seq = self.next_att_seq();
         let mut att = Attachment::accepted(id, j.fate_group, seq);
         att.set_mode(join.mode);
+        att.set_key_group(join.key_group);
+        att.set_options(
+            &PipeOptions::new().with_direction(match (want_in, want_out) {
+                (true, false) => PipeDirection::In,
+                (false, true) => PipeDirection::Out,
+                _ => PipeDirection::Bidi,
+            }),
+        );
         let sealed = join.mode == RecordMode::Sealed;
         let framed = |f: Framing| if sealed { Framing::Records } else { f };
         let max = self.local_tp().max_record_size();

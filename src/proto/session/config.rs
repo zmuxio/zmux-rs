@@ -588,7 +588,7 @@ pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 pub const DEFAULT_STANDBY_PROBE: Duration = Duration::from_secs(1);
 
 /// The default idle timeout ([`Config::max_idle_timeout`]).
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The default probe jitter j ([`Liveness::probe_jitter`]).
 pub const DEFAULT_PROBE_JITTER: f64 = 0.25;
@@ -740,7 +740,7 @@ pub struct Config {
     )]
     /// long. It does not depend on `handshake_timeout`.
     pub join_timeout: Duration,
-    /// `max_idle_timeout` (default [`DEFAULT_IDLE_TIMEOUT`], 30 s; `None`
+    /// `max_idle_timeout` (default [`DEFAULT_MAX_IDLE_TIMEOUT`], 30 s; `None`
     /// is no local limit and announces none). A set duration is at least
     /// 1 ms, the unit of the transport parameter, whose 0 means none.
     pub max_idle_timeout: Option<Duration>,
@@ -869,7 +869,7 @@ pub struct Config {
     pub replay_window: Cap,
     /// The lanes accepted on each inbound pipe, lane 0 included, a
     /// parameter of `max_pipes` that applies to every session, single-pipe
-    /// ones included (default 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this
+    /// ones included (default [`DEFAULT_MAX_LANES`](crate::DEFAULT_MAX_LANES), 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this
     /// endpoint sends. Outbound lanes follow the peer's value and the carrier.
     pub max_lanes: std::num::NonZeroU64,
     /// Resume grace period; `None` (the default) disables resume. A set
@@ -962,6 +962,9 @@ pub struct Config {
     /// in order outside every lock on the session's hook context. `None` (the default) costs
     /// nothing.
     pub tracer: Option<Arc<dyn Tracer>>,
+    /// The subscriptions ([`Config::events`]): the sessions queue their
+    /// trace records for each.
+    pub(crate) subscriptions: Vec<crate::proto::host_events::Sender>,
     /// `early_data` (default off): stream data before the peer's
     /// parameters arrive; see [`EarlyData`].
     pub early_data: EarlyData,
@@ -1183,7 +1186,7 @@ impl Default for Config {
         Self {
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
             join_timeout: DEFAULT_JOIN_TIMEOUT,
-            max_idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            max_idle_timeout: Some(DEFAULT_MAX_IDLE_TIMEOUT),
             liveness: Liveness::default(),
             initial_stream_receive_window: 256 * 1024,
             max_stream_receive_window: Cap::Auto,
@@ -1230,6 +1233,7 @@ impl Default for Config {
             pipe_auth: PipeAuth::default(),
             protocols: None,
             tracer: None,
+            subscriptions: Vec::new(),
             early_data: EarlyData::default(),
             locator: Vec::new(),
             hooks: TestHooks::default(),
@@ -1306,14 +1310,21 @@ impl Config {
     /// returned [`HostEvents`](crate::HostEvents) when it wants, on its own
     /// thread, each trace record with its session's
     /// [`SessionId`](crate::SessionId). Every session of the configuration
-    /// (and of its clones made after) writes to it. [`Config::logger`] and
-    /// [`Config::tracer`] become hooks that queue and then call the ones set
-    /// before, so that a second call makes a second subscription that also
-    /// reads every event; a hook set after replaces that part. The
+    /// (and of its clones made after) writes to it. [`Config::logger`]
+    /// becomes a hook that queues and then calls the one set before; a
+    /// logger set after replaces that part. The sessions' trace records
+    /// are queued for the subscription directly, beside [`Config::tracer`],
+    /// which keeps being called (from a queue of its own, each consumer
+    /// having one queue and one count of what it dropped). A second call
+    /// makes a second subscription that also reads every event. The
     /// subscription ends when it is closed ([`HostEvents::close`](crate::HostEvents::close))
     /// or when the configuration, its clones and their sessions are gone.
+    ///
+    /// A full queue drops the event that arrives, counted in
+    /// [`HostEvent::Overflowed`](crate::HostEvent::Overflowed); a session's
+    /// `Established` and `Closed` are never dropped.
     pub fn events(&mut self, capacity: usize) -> crate::proto::host_events::HostEvents {
-        use crate::proto::host_events::{HostEvent, HostEvents, TraceSink};
+        use crate::proto::host_events::{HostEvent, HostEvents};
         let (events, tx) = HostEvents::channel(capacity);
         let log = tx.clone();
         let before = self.logger.take();
@@ -1326,10 +1337,7 @@ impl Config {
                 message: message.to_owned(),
             });
         }));
-        self.tracer = Some(Arc::new(TraceSink {
-            tx,
-            before: self.tracer.take(),
-        }));
+        self.subscriptions.push(tx);
         events
     }
 
@@ -1379,15 +1387,6 @@ impl Config {
     /// automatic cap is the memory allowance, applied as the window grows).
     pub(crate) fn stream_window_cap(&self) -> u64 {
         match self.max_stream_receive_window {
-            Cap::Fixed(v) => v,
-            Cap::Auto => crate::proto::varint::MAX,
-        }
-    }
-
-    /// The session window cap a stream's window settings are held to: a
-    /// fixed cap, or none.
-    pub(crate) fn session_window_cap(&self) -> u64 {
-        match self.max_connection_receive_window {
             Cap::Fixed(v) => v,
             Cap::Auto => crate::proto::varint::MAX,
         }

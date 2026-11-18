@@ -874,13 +874,20 @@ pub async fn serve(
 /// serves each it accepts: the connection takes its source slot (the
 /// peer's address), passes the listener's admission on its first
 /// bidirectional stream and its inbound transform, and its streams then
-/// start sessions and join them. Resolves when the connection closes;
-/// its sessions go on.
+/// start sessions and join them. It never holds the caller beyond the
+/// connection: it resolves when the connection closes (spawn it), and
+/// dropping the future stops handing streams to the listener, with the
+/// connection and its sessions going on.
+///
+/// A connection the listener refuses at a limit (its source has no slot
+/// left, or every slot is taken) is closed and counted
+/// ([`ListenerStats`](zmux::ListenerStats)), and the call succeeds: the
+/// connection ended.
 ///
 /// # Errors
 ///
-/// `ConnectionRefused` when the listener refuses the connection (closed,
-/// or its source has no slot left); the connection is closed then.
+/// `NotConnected` when the listener is closed; the connection is closed
+/// then.
 pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
@@ -889,7 +896,11 @@ pub async fn serve_connection(
 ) -> io::Result<()> {
     let Some(entry) = listener.adapter().enter(conn.remote_address(), None) else {
         conn.close(VarInt::from_u32(0), b"");
-        return Err(io::ErrorKind::ConnectionRefused.into());
+        return if listener.adapter().is_closed() {
+            Err(io::ErrorKind::NotConnected.into())
+        } else {
+            Ok(())
+        };
     };
     serve_entered(conn, None, entry, listener.clone(), options, fallback).await;
     Ok(())
@@ -915,9 +926,26 @@ async fn serve_entered(
     let _ = entry.decide(CarrierInfo::new(), Vec::new()).await;
     drop(entry);
     let carrier = Carrier::start(&conn, Some(listener), options, handshake);
-    // Held while the connection is open: its accept loop serves it.
+    delivering(carrier, &conn).await;
+}
+
+/// Holds `carrier` while its connection is open (its accept loop serves
+/// it); cancelling this stops the accept loop, which pipes already made
+/// from the connection would otherwise keep running.
+async fn delivering(carrier: Carrier, conn: &Connection) {
+    let _stop = StopDelivery(carrier);
     conn.closed().await;
-    drop(carrier);
+}
+
+/// Stops a carrier's accept loop when dropped.
+struct StopDelivery(Carrier);
+
+impl Drop for StopDelivery {
+    fn drop(&mut self) {
+        if let Some(t) = self.0.inner.accept_task.get() {
+            t.abort();
+        }
+    }
 }
 
 /// The admission of one connection whose handshake completed ([`serve`]).
@@ -959,9 +987,7 @@ async fn admit(
             tokio::spawn(async move { l.handle_pipe(first, hint).await });
             // The other streams from here on.
             carrier.inner.listen(Some(listener), admitted);
-            // Held while the connection is open: its accept loop serves it.
-            conn.closed().await;
-            drop(carrier);
+            delivering(carrier, &conn).await;
         }
         Admit::Fallback(prefix) if fallback.is_some() => {
             drop(entry);

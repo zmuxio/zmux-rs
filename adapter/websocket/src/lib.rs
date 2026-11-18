@@ -241,11 +241,11 @@ where
                     .parse()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if hops >= options.max_redirects {
-                    return Err(RedirectError {
+                    return Err(RedirectError::new(
                         status,
-                        location: location.unwrap_or_default(),
-                        reason: "too many redirects",
-                    }
+                        location.unwrap_or_default(),
+                        "too many redirects",
+                    )
                     .into());
                 }
                 hops += 1;
@@ -1353,11 +1353,11 @@ where
                 async move {
                     if r.uri().scheme() != scheme.as_ref() {
                         return Err(Hop::Failed(
-                            RedirectError {
-                                status: 0,
-                                location: r.uri().to_string(),
-                                reason: "another scheme over the same connection",
-                            }
+                            RedirectError::new(
+                                0,
+                                r.uri().to_string(),
+                                "another scheme over the same connection",
+                            )
                             .into(),
                         ));
                     }

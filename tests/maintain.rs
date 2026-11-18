@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use zmux::Backoff;
-use zmux::helpers::{PipePool, PoolDecision, PoolView, RotatePolicy};
+use zmux::helpers::{
+    AsyncPoolPolicy, OwnedPoolView, PipePool, PolicyError, PolicyFuture, PoolDecision, PoolMember,
+    PoolView, Rotation,
+};
 use zmux::{
     Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
     PipeHint, PipeIo, Session,
@@ -98,6 +101,9 @@ impl AsyncWrite for Killable {
 struct Dialer {
     listener: Listener,
     dials: Arc<AtomicUsize>,
+    /// The dials the pool started, counted when it calls the dial function
+    /// (`dials` counts them once their future runs).
+    started: Arc<AtomicUsize>,
     fail_next: Arc<Mutex<usize>>,
     kills: Arc<Mutex<Vec<Arc<Kill>>>>,
     times: Arc<Mutex<Vec<Instant>>>,
@@ -115,6 +121,7 @@ impl Dialer {
         Self {
             listener: listener.clone(),
             dials: Arc::default(),
+            started: Arc::default(),
             fail_next: Arc::default(),
             kills: Arc::default(),
             times: Arc::default(),
@@ -199,6 +206,7 @@ impl Dialer {
         let d = self.clone();
         let mut pool = PipePool::new(count, move |_| {
             let d = d.clone();
+            d.started.fetch_add(1, Ordering::SeqCst);
             async move {
                 d.dials.fetch_add(1, Ordering::SeqCst);
                 d.times.lock().unwrap().push(Instant::now());
@@ -242,34 +250,79 @@ fn usable(s: &Session) -> usize {
 }
 
 /// The starts of the pool's dials as the pool counts them (a view's
-/// `last_dial_at`), which its waits count from. A dial function reads the
-/// clock only once its future runs, later by the scheduler's delay, so the
-/// gaps between such readings can fall short of the waits.
+/// `since_last_dial`, taken back from the clock), which its waits count
+/// from. A dial function reads the clock only once its future runs, later
+/// by the scheduler's delay, so the gaps between such readings can fall
+/// short of the waits.
+///
+/// The dials are told apart by a counter the dial function bumps when the
+/// pool calls it, not by their times: the maintainer starts no dial while a
+/// policy decides, so the counter a policy reads is the number of the dial
+/// its view's `since_last_dial` belongs to, however late the policy runs.
 #[derive(Clone, Default)]
-struct Starts(Arc<Mutex<Vec<Instant>>>);
+struct Starts {
+    /// Dials started so far.
+    started: Arc<AtomicUsize>,
+    /// For each dial seen, its number and its start.
+    seen: Arc<Mutex<Vec<(usize, Instant)>>>,
+}
 
 impl Starts {
-    /// Notes the last dial's start; a policy calls it at each look.
+    /// Counts the dials the pool starts through `started` (a `Dialer`'s).
+    fn counting(started: &Arc<AtomicUsize>) -> Self {
+        Self {
+            started: started.clone(),
+            seen: Arc::default(),
+        }
+    }
+
+    /// A dial function calls it when the pool calls the function, outside
+    /// its future.
+    fn dial_started(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Notes the last dial's start; a policy calls it at each look. The
+    /// clock read here is later than the look's by the time to the call,
+    /// so each start is the least of its readings.
     fn see(&self, v: &PoolView<'_>) {
-        if let Some(t) = v.last_dial_at {
-            let mut s = self.0.lock().unwrap();
-            if s.last() != Some(&t) {
-                s.push(t);
+        let number = self.started.load(Ordering::SeqCst);
+        if let Some(since) = v.since_last_dial {
+            let Some(t) = Instant::now().checked_sub(since) else {
+                return;
+            };
+            let mut s = self.seen.lock().unwrap();
+            match s.last_mut() {
+                Some((n, last)) if *n == number => *last = (*last).min(t),
+                _ => s.push((number, t)),
             }
         }
     }
 
     /// A policy that only notes the starts: it decides nothing.
-    fn policy(&self) -> impl FnMut(&PoolView<'_>, &mut PoolDecision) + Send + 'static {
+    fn policy(
+        &self,
+    ) -> impl FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), PolicyError> + Send + 'static
+    {
         let s = self.clone();
-        move |v: &PoolView<'_>, _: &mut PoolDecision| s.see(v)
+        move |v: &PoolView<'_>, _: &mut PoolDecision| {
+            s.see(v);
+            Ok(())
+        }
     }
 
     /// The starts once `n` were seen (the last one at the look after it).
     async fn wait(&self, n: usize) -> Vec<Instant> {
-        until("dial starts seen", 10, || self.0.lock().unwrap().len() >= n).await;
-        self.0.lock().unwrap().clone()
+        until("dial starts seen", 10, || {
+            self.seen.lock().unwrap().len() >= n
+        })
+        .await;
+        self.seen.lock().unwrap().iter().map(|e| e.1).collect()
     }
+}
+
+fn nz(n: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(n).expect("not 0")
 }
 
 async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
@@ -303,7 +356,7 @@ async fn keeps_count_pipes_and_redials_failures() {
 async fn failed_dials_back_off() {
     let (client, _server, dialer) = setup().await;
     *dialer.fail_next.lock().unwrap() = 4;
-    let starts = Starts::default();
+    let starts = Starts::counting(&dialer.started);
     let pool = dialer.pool(1).with_policy(starts.policy());
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
@@ -378,7 +431,7 @@ async fn transfer(client: &Session, server: &Session, len: usize) {
 async fn rotates_by_bytes_make_before_break() {
     let (client, server, dialer) = setup().await;
     let mut pool = dialer.pool(1);
-    pool.rotate = Some(RotatePolicy::new().with_max_bytes(1 << 20));
+    pool.rotate = Some(Rotation::new().with_max_bytes(1 << 20));
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     // The bootstrap pipe is the fallback tier: the stream's data goes on
@@ -419,7 +472,7 @@ async fn rotates_by_age() {
     let (client, server, dialer) = setup().await;
     let mut pool = dialer.pool(1);
     pool.rotate = Some(
-        RotatePolicy::new()
+        Rotation::new()
             .with_max_age(Duration::from_millis(300))
             .with_jitter(0.1),
     );
@@ -456,7 +509,7 @@ async fn rotates_by_age() {
 async fn stop_closes_a_replacement_being_rotated_in() {
     let (client, _server, dialer) = setup().await;
     let mut pool = dialer.pool(1);
-    pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(1)));
+    pool.rotate = Some(Rotation::new().with_max_age(Duration::from_millis(1)));
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a replacement dialled", 10, || {
         dialer.dials.load(Ordering::SeqCst) >= 3
@@ -594,7 +647,7 @@ async fn split_pool_redials_a_member_whole() {
 async fn split_pool_rotates_a_downlink() {
     let (client, _server, dialer) = setup().await;
     let mut pool = dialer.split_pool(1);
-    pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(300)));
+    pool.rotate = Some(Rotation::new().with_max_age(Duration::from_millis(300)));
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a downlink rotated twice", 10, || {
         downlinks(&dialer).len() >= 3
@@ -610,7 +663,10 @@ async fn policy_count_replaces_the_pool_count() {
     let (client, _server, dialer) = setup().await;
     let pool = dialer
         .pool(1)
-        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(3));
+        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_count(nz(3));
+            Ok(())
+        });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("three usable pipes", 10, || usable(&client) == 3).await;
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 3);
@@ -626,7 +682,10 @@ async fn a_policy_count_above_max_pipes_dials_only_the_room() {
     let (client, _server, dialer) = setup().await;
     let pool = dialer
         .pool(1)
-        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(usize::MAX));
+        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_count(nz(usize::MAX));
+            Ok(())
+        });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("several usable pipes", 10, || usable(&client) >= 3).await;
     let dials = dialer.dials.load(Ordering::SeqCst);
@@ -636,42 +695,84 @@ async fn a_policy_count_above_max_pipes_dials_only_the_room() {
     client.close().await;
 }
 
+/// A count below the members closes the surplus gracefully: those the
+/// policy retires first, then the longest idle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_count_of_zero_keeps_one_pipe() {
+async fn a_lower_policy_count_closes_the_surplus() {
     let (client, _server, dialer) = setup().await;
+    let lower = Arc::new(AtomicBool::new(false));
+    let keep: Arc<Mutex<Option<zmux::PipeId>>> = Arc::default();
+    let (l, k) = (lower.clone(), keep.clone());
     let pool = dialer
-        .pool(2)
-        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| d.count = Some(0));
+        .pool(3)
+        .with_policy(move |v: &PoolView<'_>, d: &mut PoolDecision| {
+            if l.load(Ordering::SeqCst) {
+                d.set_count(nz(1));
+                // Retire all but the newest: the newest stays although
+                // it is not the least idle.
+                let newest = v.members.iter().map(|m| m.pipe).max().unwrap();
+                *k.lock().unwrap() = Some(newest);
+                d.set_retire_pipes(v.members.iter().map(|m| m.pipe).filter(|&p| p != newest));
+            }
+            Ok(())
+        });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
-    until("one usable pipe", 10, || usable(&client) == 1).await;
+    until("three usable pipes", 10, || usable(&client) == 3).await;
+    lower.store(true, Ordering::SeqCst);
+    until("one pool pipe left", 10, || {
+        client
+            .pipe_stats()
+            .iter()
+            .filter(|p| p.pipe.get() != 0)
+            .count()
+            == 1
+    })
+    .await;
+    let kept = keep.lock().unwrap().expect("a decision");
+    assert!(
+        client.pipe(kept).is_some(),
+        "the retired members closed first"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        dialer.dials.load(Ordering::SeqCst),
+        3,
+        "no redial of the surplus"
+    );
     drop(handle);
     client.close().await;
 }
 
-/// A dial held by the policy starts at the policy's time, and a time
-/// beyond the backoff's max holds it only that long.
+/// A dial held by the policy starts its wait after the pool's start, and
+/// a wait beyond the backoff's max holds it only that long.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_next_dial_at_holds_dials_within_the_backoff_max() {
+async fn policy_dial_after_holds_dials_within_the_backoff_max() {
     let (client, _server, dialer) = setup().await;
     let start = Instant::now();
-    let hold = start + Duration::from_millis(150);
     let pool = dialer
         .pool(1)
-        .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| d.next_dial_at = Some(hold));
+        .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_dial_after(Duration::from_millis(150));
+            Ok(())
+        });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
     let first = dialer.times.lock().unwrap()[0];
-    assert!(first >= hold, "{:?}", first - start);
+    assert!(
+        first - start >= Duration::from_millis(150),
+        "{:?}",
+        first - start
+    );
     drop(handle);
 
     // A second maintainer keeps a pipe of its own: its first dial is held
     // for the backoff's max (200 ms), not until the policy's time.
-    let far = Instant::now() + Duration::from_secs(3600);
     let pool = dialer
         .pool(1)
-        .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| d.next_dial_at = Some(far));
+        .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_dial_after(Duration::from_secs(3600));
+            Ok(())
+        });
     let held = Instant::now();
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("a second dial", 10, || {
@@ -688,7 +789,7 @@ async fn policy_next_dial_at_holds_dials_within_the_backoff_max() {
     client.close().await;
 }
 
-/// The policy replaces a pipe, make before break, at the time it names.
+/// The policy replaces a pipe it retires, make before break.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_rotate_replaces_the_named_pipe() {
     let (client, server, dialer) = setup().await;
@@ -698,8 +799,9 @@ async fn policy_rotate_replaces_the_named_pipe() {
         .with_policy(move |v: &PoolView<'_>, d: &mut PoolDecision| {
             if !asked && let Some(p) = v.members.iter().find(|p| p.usable) {
                 asked = true;
-                d.rotate.push((p.id, v.now));
+                d.set_retire_pipes([p.pipe]);
             }
+            Ok(())
         });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one rotation", 10, || {
@@ -733,7 +835,8 @@ async fn decisions_with_recheck(recheck: Duration, window: Duration) -> usize {
         .pool(1)
         .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| {
             n.fetch_add(1, Ordering::SeqCst);
-            d.recheck = Some(recheck);
+            d.set_recheck(recheck).unwrap();
+            Ok(())
         });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
@@ -770,14 +873,17 @@ async fn policy_dial_time_replaces_the_backoff() {
     let (client, _server, dialer) = setup().await;
     *dialer.fail_next.lock().unwrap() = 3;
     let hour = Duration::from_secs(3600);
-    let starts = Starts::default();
+    let starts = Starts::counting(&dialer.started);
     let seen = starts.clone();
     let pool = dialer
         .pool(1)
         .with_backoff(fixed_backoff(hour, hour))
         .with_policy(move |v: &PoolView<'_>, d: &mut PoolDecision| {
             seen.see(v);
-            d.next_dial_at = v.last_dial_at.map(|t| t + Duration::from_millis(10));
+            if v.since_last_dial.is_some() {
+                d.set_dial_after(Duration::from_millis(10));
+            }
+            Ok(())
         });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) == 1).await;
@@ -813,9 +919,9 @@ async fn policy_probe_settings_apply_to_later_pipes() {
         .pool(2)
         .with_policy(move |_: &PoolView<'_>, d: &mut PoolDecision| {
             // One pipe first, then a second with a 1 s probe interval.
-            d.count = Some(1);
+            d.set_count(nz(1));
             if f.load(Ordering::SeqCst) {
-                d.count = Some(2);
+                d.set_count(nz(2));
                 d.set_liveness(zmux::PipeLiveness {
                     probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(1))),
                     probe_jitter: zmux::Inherit::Set(0.0),
@@ -823,6 +929,7 @@ async fn policy_probe_settings_apply_to_later_pipes() {
                 })
                 .unwrap();
             }
+            Ok(())
         });
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one usable pipe", 10, || usable(&client) >= 1).await;
@@ -883,16 +990,16 @@ fn handwritten_liveness_settings_are_checked() {
         Duration::from_nanos(1),
         Duration::from_millis(999),
     ] {
-        assert!(matches!(
-            d.set_liveness(with(zmux::Inherit::Set(Some(bad)), zmux::Inherit::Session)),
-            Err(zmux::PipeError::InvalidOptions(_))
-        ));
+        assert!(
+            d.set_liveness(with(zmux::Inherit::Set(Some(bad)), zmux::Inherit::Session))
+                .is_err()
+        );
     }
     for bad in [-0.1, 1.0, f64::NAN] {
-        assert!(matches!(
-            d.set_liveness(with(zmux::Inherit::Session, zmux::Inherit::Set(bad))),
-            Err(zmux::PipeError::InvalidOptions(_))
-        ));
+        assert!(
+            d.set_liveness(with(zmux::Inherit::Session, zmux::Inherit::Set(bad)))
+                .is_err()
+        );
     }
     assert_eq!(d.liveness(), None);
     let off = with(zmux::Inherit::Set(None), zmux::Inherit::Session);
@@ -906,6 +1013,223 @@ fn handwritten_liveness_settings_are_checked() {
     assert_eq!(d.liveness(), Some(fixed));
 }
 
+/// A decision's setters refuse what is out of range and change nothing;
+/// the default decision sets nothing.
+#[test]
+fn decision_setters_check_their_ranges() {
+    let mut d = PoolDecision::default();
+    assert_eq!(
+        (d.count(), d.dial_after(), d.recheck(), d.retire_pipes()),
+        (None, None, None, &[][..])
+    );
+    assert!(d.set_recheck(Duration::ZERO).is_err());
+    assert_eq!(d.recheck(), None);
+    d.set_recheck(Duration::from_nanos(1)).unwrap();
+    assert_eq!(d.recheck(), Some(Duration::from_nanos(1)));
+    d.set_count(nz(2));
+    d.set_dial_after(Duration::ZERO);
+    d.set_retire_pipes([zmux::PipeId::new(3), zmux::PipeId::new(5)]);
+    d.set_retire_pipes([zmux::PipeId::new(7)]);
+    assert_eq!(d.count(), Some(nz(2)));
+    assert_eq!(d.dial_after(), Some(Duration::ZERO));
+    assert_eq!(d.retire_pipes(), &[zmux::PipeId::new(7)]);
+}
+
+type Seen = (u32, Option<Duration>, Vec<PoolMember>);
+
+/// The view: no last dial before the first, consecutive failures of the
+/// pool's dials, back to 0 once a dial gives a usable member, which is
+/// then seen with its pipe and its traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_view_counts_failures_and_shows_the_members() {
+    let (client, server, dialer) = setup().await;
+    *dialer.fail_next.lock().unwrap() = 2;
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+    let s = seen.clone();
+    let pool = dialer
+        .pool(1)
+        .with_backoff(fixed_backoff(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ))
+        .with_policy(move |v: &PoolView<'_>, _: &mut PoolDecision| {
+            s.lock()
+                .unwrap()
+                .push((v.failures, v.since_last_dial, v.members.to_vec()));
+            Ok(())
+        });
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("one usable pipe", 10, || usable(&client) == 1).await;
+    transfer(&client, &server, 1 << 16).await;
+    until("a usable member seen", 10, || {
+        seen.lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(_, _, m)| m.iter().any(|m| m.usable && m.bytes_sent > 0))
+    })
+    .await;
+    drop(handle);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0].1, None, "no dial before the first look");
+    let most = seen.iter().map(|(f, ..)| *f).max().unwrap();
+    assert_eq!(most, 2, "two failed dials in a row");
+    let (failures, since, members) = seen.last().unwrap();
+    assert_eq!(*failures, 0);
+    assert!(since.is_some());
+    let [m] = members.as_slice() else {
+        panic!("{members:?}")
+    };
+    assert!(m.pipe.get() != 0 && m.pipes == 1 && m.usable && !m.replacing);
+    assert!(m.age >= m.idle, "{m:?}");
+    client.close().await;
+}
+
+/// A policy that panics has its decision rejected: the error goes to the
+/// rejection function, or to the session's logger without one, and the
+/// pool keeps its pipes up by its own behaviour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_policy_is_rejected_and_reported() {
+    let (client, _server, dialer) = setup().await;
+    let errors: Arc<Mutex<Vec<String>>> = Arc::default();
+    let e = errors.clone();
+    let pool = dialer
+        .pool(1)
+        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_count(nz(3));
+            panic!("policy bug");
+        })
+        .with_decision_rejected(move |err| e.lock().unwrap().push(err.to_string()));
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("one usable pipe", 10, || usable(&client) == 1).await;
+    until("a rejection", 10, || !errors.lock().unwrap().is_empty()).await;
+    assert!(
+        errors.lock().unwrap()[0].contains("policy bug"),
+        "{:?}",
+        errors.lock().unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(usable(&client), 1, "the count of the rejected decision");
+    drop(handle);
+    client.close().await;
+
+    let logged: Arc<Mutex<Vec<String>>> = Arc::default();
+    let l = logged.clone();
+    let mut c = config();
+    c.logger = Some(zmux::Logger(Arc::new(move |_, m: &str| {
+        l.lock().unwrap().push(m.to_owned());
+    })));
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let dialer = Dialer::new(&listener);
+    let client = Session::connect(dialer.carrier(), c).await.unwrap();
+    let _server = listener.accept().await.unwrap();
+    let pool = dialer
+        .pool(1)
+        .with_policy(|_: &PoolView<'_>, _: &mut PoolDecision| panic!("policy bug"));
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("a logged rejection", 10, || {
+        logged
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("pool decision rejected") && m.contains("policy bug"))
+    })
+    .await;
+    drop(handle);
+    client.close().await;
+}
+
+/// `decide` may block and never runs on a runtime worker: on a runtime of
+/// one thread, a policy that waits for a task of the same runtime to release
+/// it would never return if the pool called it on that thread.
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocking_policy_does_not_hold_the_runtime() {
+    let (client, _server, dialer) = setup().await;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (released_tx, released_rx) = std::sync::mpsc::channel::<bool>();
+    let mut first = true;
+    let release_rx = Mutex::new(release_rx);
+    let pool = dialer
+        .pool(1)
+        .with_policy(move |_: &PoolView<'_>, _: &mut PoolDecision| {
+            if std::mem::take(&mut first) {
+                entered_tx.send(()).unwrap();
+                let got = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_ok();
+                released_tx.send(got).unwrap();
+            }
+            Ok(())
+        });
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    // The runtime goes on while the policy waits: this task runs, and
+    // releases it.
+    until("the policy entered", 10, || entered_rx.try_recv().is_ok()).await;
+    release_tx.send(()).unwrap();
+    until("the policy returned", 10, || {
+        released_rx.try_recv().is_ok_and(|got| got)
+    })
+    .await;
+    until("a usable pipe", 10, || usable(&client) == 1).await;
+    drop(handle);
+    client.close().await;
+}
+
+/// A policy that returns an error rejects the look as a panic does: an
+/// invalid value refused by a setter and passed on with `?` leaves the
+/// pool's own behaviour, and the error reaches the rejection function.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_error_rejects_the_look() {
+    let (client, _server, dialer) = setup().await;
+    let errors: Arc<Mutex<Vec<String>>> = Arc::default();
+    let e = errors.clone();
+    let pool = dialer
+        .pool(1)
+        .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_count(nz(3));
+            d.set_recheck(Duration::ZERO)?;
+            Ok(())
+        })
+        .with_decision_rejected(move |err| e.lock().unwrap().push(err.to_string()));
+    let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
+    until("one usable pipe", 10, || usable(&client) == 1).await;
+    until("a rejection", 10, || !errors.lock().unwrap().is_empty()).await;
+    assert!(
+        errors.lock().unwrap()[0].contains("recheck"),
+        "{:?}",
+        errors.lock().unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(usable(&client), 1, "the count of the rejected decision");
+    drop(handle);
+    client.close().await;
+}
+
+/// A policy's tests build its views from the defaults.
+#[test]
+fn views_are_built_from_defaults() {
+    let mut m = PoolMember::default();
+    m.idle = Duration::from_secs(5);
+    m.pipes = 1;
+    let members = [m];
+    let mut v = PoolView::default();
+    v.members = &members;
+    v.dialing = 1;
+    let mut d = PoolDecision::default();
+    let mut policy = |v: &PoolView<'_>, d: &mut PoolDecision| -> Result<(), PolicyError> {
+        if v.dialing + v.members.len() > 1 {
+            d.set_count(nz(1));
+        }
+        Ok(())
+    };
+    zmux::helpers::PoolPolicy::decide(&mut policy, &v, &mut d).unwrap();
+    assert_eq!(d.count(), Some(nz(1)));
+    assert_eq!(m.pipe.get(), 0);
+}
+
 /// The redial backoff counts from the start of the previous attempt, not
 /// from its failure: a dial that fails after 300 ms is followed 500 ms
 /// after it started.
@@ -913,9 +1237,13 @@ fn handwritten_liveness_settings_are_checked() {
 async fn backoff_counts_from_the_start_of_the_attempt() {
     let (client, _server, _dialer) = setup().await;
     let starts = Starts::default();
-    let pool = PipePool::new(1, move |_| async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        Err::<PipeIo, _>(io::Error::other("refused"))
+    let counted = starts.clone();
+    let pool = PipePool::new(1, move |_| {
+        counted.dial_started();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Err::<PipeIo, _>(io::Error::other("refused"))
+        }
     })
     .with_backoff(fixed_backoff(
         Duration::from_millis(500),
@@ -941,7 +1269,7 @@ async fn backoff_counts_from_the_start_of_the_attempt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backoff_follows_a_successful_dial() {
     let (client, _server, dialer) = setup().await;
-    let starts = Starts::default();
+    let starts = Starts::counting(&dialer.started);
     let pool = dialer
         .pool(1)
         .with_backoff(fixed_backoff(
@@ -1056,7 +1384,7 @@ async fn rotation_waits_for_the_acceptor_to_attach() {
     });
     // No probation: a replacement is usable as soon as it is attached.
     pool.options.probation = zmux::Change::Set(None);
-    pool.rotate = Some(RotatePolicy::new().with_max_age(Duration::from_millis(400)));
+    pool.rotate = Some(Rotation::new().with_max_age(Duration::from_millis(400)));
     let handle = zmux::helpers::maintain_pipes(&client, pool).expect("valid pool");
     until("one pool pipe", 10, || usable(&client) == 1).await;
     // Pipe 0 goes only once the acceptor attached the member: before, the
@@ -1192,7 +1520,7 @@ async fn replace_pipes_replaces_every_pipe() {
         .into_iter()
         .filter(|p| p.outbound == Some(OutboundState::Active))
         .collect();
-    assert_ne!(live, [] as [zmux::PipeStats; 0]);
+    assert_ne!(live, Vec::new());
     for p in &live {
         assert!(!before.contains(&p.pipe), "{p:?}");
         assert_eq!(p.epoch, Some(1), "{p:?}");
@@ -1217,4 +1545,180 @@ fn fixed_backoff(min: Duration, max: Duration) -> Backoff {
     let mut b = Backoff::new(min, max);
     b.jitter = 0.0;
     b
+}
+
+/// A policy that does not return until `release` is sent (or dropped).
+fn stuck_policy(
+    calls: &Arc<AtomicUsize>,
+    release: std::sync::mpsc::Receiver<()>,
+) -> impl FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), PolicyError> + Send + 'static {
+    let n = calls.clone();
+    move |_: &PoolView<'_>, _: &mut PoolDecision| {
+        n.fetch_add(1, Ordering::SeqCst);
+        let _ = release.recv();
+        Ok(())
+    }
+}
+
+/// A policy that does not return holds the looks of its own pool and
+/// nothing else: its pool is asked once (the looks that fall due meanwhile
+/// merge into the one after it), another pool's policy goes on being
+/// asked and its pool is maintained, and the runtime's blocking pool is
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stuck_policy_holds_only_its_own_pool() {
+    let (client, _server, dialer) = setup().await;
+    let (release, rx) = std::sync::mpsc::channel();
+    let stuck_calls = Arc::new(AtomicUsize::new(0));
+    let stuck = zmux::helpers::maintain_pipes(
+        &client,
+        dialer.pool(1).with_policy(stuck_policy(&stuck_calls, rx)),
+    )
+    .expect("valid pool");
+    until("the stuck policy asked", 10, || {
+        stuck_calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let other_calls = Arc::new(AtomicUsize::new(0));
+    let n = other_calls.clone();
+    let other = zmux::helpers::maintain_pipes(
+        &client,
+        dialer
+            .pool(1)
+            .with_policy(move |_: &PoolView<'_>, _: &mut PoolDecision| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+    )
+    .expect("valid pool");
+    until("the other pool up", 10, || usable(&client) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(other_calls.load(Ordering::SeqCst) >= 4);
+    // Single flight: nothing asked the stuck pool again.
+    assert_eq!(stuck_calls.load(Ordering::SeqCst), 1);
+    // The runtime's blocking pool is not held.
+    assert_eq!(tokio::task::spawn_blocking(|| 7).await.unwrap(), 7);
+    // Freed, its pool is asked again: once for what merged meanwhile.
+    release.send(()).unwrap();
+    until("asked again", 10, || {
+        stuck_calls.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    drop(release);
+    stuck.stop();
+    other.stop();
+    until("stopped", 5, || stuck.is_finished() && other.is_finished()).await;
+    client.close().await;
+}
+
+/// A pool whose policy does not return still stops: the stop does not
+/// wait for the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_stops_while_its_policy_is_stuck() {
+    let (client, _server, dialer) = setup().await;
+    let (release, rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handle = zmux::helpers::maintain_pipes(
+        &client,
+        dialer.pool(1).with_policy(stuck_policy(&calls, rx)),
+    )
+    .expect("valid pool");
+    until("asked", 10, || calls.load(Ordering::SeqCst) == 1).await;
+    handle.stop();
+    until("stopped", 5, || handle.is_finished()).await;
+    drop(release);
+    client.close().await;
+}
+
+/// An asynchronous policy answers on the maintainer's task: more pools
+/// than the policy executor has threads wait for answers that never come,
+/// and a synchronous policy of another pool is asked all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_policies_hold_no_executor_thread() {
+    struct Never(Arc<AtomicUsize>);
+    impl AsyncPoolPolicy for Never {
+        fn decide(&self, _: OwnedPoolView) -> PolicyFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+    let (client, _server, dialer) = setup().await;
+    let asked = Arc::new(AtomicUsize::new(0));
+    let policy: Arc<dyn AsyncPoolPolicy> = Arc::new(Never(asked.clone()));
+    let stuck: Vec<_> = (0..8)
+        .map(|_| {
+            zmux::helpers::maintain_pipes(&client, dialer.pool(1).with_async_policy(policy.clone()))
+                .expect("valid pool")
+        })
+        .collect();
+    until("every pool asked", 10, || asked.load(Ordering::SeqCst) == 8).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let n = calls.clone();
+    let other = zmux::helpers::maintain_pipes(
+        &client,
+        dialer
+            .pool(1)
+            .with_policy(move |_: &PoolView<'_>, _: &mut PoolDecision| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+    )
+    .expect("valid pool");
+    until("the sync policy asked", 10, || {
+        calls.load(Ordering::SeqCst) >= 3
+    })
+    .await;
+    for h in stuck {
+        h.stop();
+        until("stopped", 5, || h.is_finished()).await;
+    }
+    other.stop();
+    client.close().await;
+}
+
+/// An asynchronous policy's decision is applied as a synchronous one's;
+/// its panic rejects the look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_async_policy_decides_the_count() {
+    struct Two;
+    impl AsyncPoolPolicy for Two {
+        fn decide(&self, _: OwnedPoolView) -> PolicyFuture {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                let mut d = PoolDecision::default();
+                d.set_count(nz(2));
+                Ok(d)
+            })
+        }
+    }
+    struct Panics;
+    impl AsyncPoolPolicy for Panics {
+        fn decide(&self, _: OwnedPoolView) -> PolicyFuture {
+            Box::pin(async { panic!("async policy") })
+        }
+    }
+    let (client, _server, dialer) = setup().await;
+    let handle =
+        zmux::helpers::maintain_pipes(&client, dialer.pool(1).with_async_policy(Arc::new(Two)))
+            .expect("valid pool");
+    until("two usable pipes", 10, || usable(&client) == 2).await;
+    handle.stop();
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let r = rejected.clone();
+    let handle = zmux::helpers::maintain_pipes(
+        &client,
+        dialer
+            .pool(1)
+            .with_async_policy(Arc::new(Panics))
+            .with_decision_rejected(move |_| {
+                r.fetch_add(1, Ordering::SeqCst);
+            }),
+    )
+    .expect("valid pool");
+    until("a rejected look", 10, || {
+        rejected.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    handle.stop();
+    client.close().await;
 }

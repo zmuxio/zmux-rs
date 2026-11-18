@@ -229,8 +229,9 @@ pub struct PipeOptions {
     /// the session's.
     pub liveness: Change<PipeLiveness>,
     /// The pipe's own quality band; by default the session's
-    /// ([`QualityBand`](crate::QualityBand)).
-    pub quality_band: Change<crate::QualityBand>,
+    /// ([`QualityBand`](crate::QualityBand)); `Set(None)` turns its reports
+    /// off whatever the session's band is.
+    pub quality_band: Change<Option<crate::QualityBand>>,
     /// The application's name for the pipe, reported by its statistics
     /// (local, never sent).
     pub label: Option<Arc<str>>,
@@ -341,9 +342,10 @@ impl PipeOptions {
         self
     }
 
-    /// The pipe's own quality band.
+    /// The pipe's own quality band; `None` turns its reports off whatever
+    /// the session's band is.
     #[must_use]
-    pub fn with_quality_band(mut self, band: crate::QualityBand) -> Self {
+    pub fn with_quality_band(mut self, band: Option<crate::QualityBand>) -> Self {
         self.quality_band = Change::Set(band);
         self
     }
@@ -364,7 +366,7 @@ impl PipeOptions {
         self.own_liveness()
             .validate()
             .map_err(PipeError::InvalidOptions)?;
-        if let Some(b) = self.own_quality_band() {
+        if let Inherit::Set(Some(b)) = self.own_quality_band() {
             b.validate().map_err(PipeError::InvalidOptions)?;
         }
         let e = |f, r| Err(PipeError::InvalidOptions(InvalidConfig::new(f, r)));
@@ -456,9 +458,9 @@ impl PipeOptions {
         own(self.liveness).unwrap_or_default()
     }
 
-    /// The pipe's own quality band.
-    pub(crate) fn own_quality_band(&self) -> Option<crate::QualityBand> {
-        own(self.quality_band)
+    /// The pipe's quality band setting (`Set(None)`: off).
+    pub(crate) fn own_quality_band(&self) -> Inherit<Option<crate::QualityBand>> {
+        own(self.quality_band).map_or(Inherit::Session, Inherit::Set)
     }
 
     /// Records the tier settings in force, as [`PipeOptions`] reports them.
@@ -474,10 +476,29 @@ impl PipeOptions {
         self.probation = pr.own().map_or(Change::Keep, Change::Set);
     }
 
+    /// Records the pipe's own quality band setting.
+    pub(crate) fn report_quality_band(&mut self, band: Inherit<Option<crate::QualityBand>>) {
+        self.quality_band = match band {
+            Inherit::Session => Change::Keep,
+            Inherit::Set(b) => Change::Set(b),
+        };
+    }
+
     /// Records the pipe's own liveness settings.
     pub(crate) fn report_liveness(&mut self, liveness: PipeLiveness) {
         self.liveness = reported(liveness, &PipeLiveness::default());
     }
+}
+
+/// What a retired pipe held: the snapshot that outlives it for the handles
+/// that kept the slot ([`SessionCore::pipe_final`]).
+#[derive(Debug, Clone)]
+pub struct PipeFinal {
+    /// The options the pipe held ([`SessionCore::pipe_options`]).
+    pub options: PipeOptions,
+    /// What [`SessionCore::pipe_closed`] answered as the pipe was retired:
+    /// the same end for every wait that starts later.
+    pub closed: Result<(), PipeError>,
 }
 
 /// A pipe's quality and settings: a snapshot taken
@@ -1558,7 +1579,15 @@ impl SessionCore {
         };
         let seq = self.next_att_seq();
         let mut att = Attachment::new(id, true, opts.fate_group, seq);
-        att.set_options(opts);
+        // The directions of the carrier are the pipe's direction, fixed.
+        att.set_options(&PipeOptions {
+            direction: match (inbound.is_some(), outbound.is_some()) {
+                (true, false) => PipeDirection::In,
+                (false, true) => PipeDirection::Out,
+                _ => PipeDirection::Bidi,
+            },
+            ..opts.clone()
+        });
         let max = self.local_tp().max_record_size();
         let detection = self.detection(id, Some(opts));
         let rtt = self.initial_rtt(id);
@@ -1572,9 +1601,10 @@ impl SessionCore {
         }
         let pos = self.insert_attachment(att);
         self.init_tier(pos, opts);
-        if let Some(band) = opts.own_quality_band() {
+        let band = opts.own_quality_band();
+        if band != Inherit::Session {
             // Validated with the options.
-            let _ = self.set_pipe_quality_band(PipeId(id), Some(band));
+            let _ = self.set_pipe_quality_band(PipeId(id), band);
         }
         self.stats.pipes_added += 1;
         if let Some(a) = self.att_mut(id) {
@@ -1698,6 +1728,7 @@ impl SessionCore {
     /// Drops a deferred join: the peer never learned its ID, so nothing is
     /// abandoned; its carrier halves are closed.
     pub(in crate::proto::session) fn drop_deferred(&mut self, i: usize) {
+        self.keep_final_pipe(i);
         let a = self.atts.remove(i);
         self.views_changed();
         let id = a.id();
@@ -2165,6 +2196,22 @@ impl SessionCore {
         self.check_standby_takeover();
     }
 
+    /// Hands the options and the end of the attachment at `i`, about to be
+    /// removed, to the handles that outlive it ([`Self::pipe_final`]);
+    /// nothing is read when no handle holds the slot. The end is what
+    /// [`Self::pipe_closed`] answers now: a half still open when the
+    /// retirement is unilateral counts as closed by it.
+    fn keep_final_pipe(&self, i: usize) {
+        let a = self.atts.at(i);
+        let id = PipeId(a.id());
+        if let Some(slot) = a.final_pipe_wanted()
+            && let Some(options) = self.pipe_options(id)
+        {
+            let closed = self.pipe_closed(id).unwrap_or(Ok(()));
+            let _ = slot.set(PipeFinal { options, closed });
+        }
+    }
+
     /// Retires attachments whose exchange is complete.
     pub(in crate::proto::session) fn try_retire(&mut self, now: Instant) {
         let mut i = 0;
@@ -2210,6 +2257,7 @@ impl SessionCore {
             let id = a.id();
             self.reinject(id, now);
         }
+        self.keep_final_pipe(i);
         let a = self.atts.remove(i);
         self.views_changed();
         let id = a.id();
@@ -2519,6 +2567,15 @@ impl SessionCore {
             .collect()
     }
 
+    /// The slot that receives a pipe's options and its end as they are when
+    /// the session retires it, created on the first call; `None` for a pipe
+    /// not known. A handle that outlives the pipe reads them there
+    /// ([`Self::pipe_options`] and [`Self::pipe_closed`] no longer know it).
+    pub fn pipe_final(&mut self, pipe: PipeId) -> Option<Arc<std::sync::OnceLock<PipeFinal>>> {
+        let a = self.att_mut(pipe.0).filter(|a| !a.unattached())?;
+        Some(a.final_pipe())
+    }
+
     /// Why the attachment failed, once it did.
     pub fn pipe_failure(&self, pipe: PipeId) -> Option<PipeFailure> {
         self.att(pipe.0)?.failure()
@@ -2592,7 +2649,8 @@ impl SessionCore {
     /// the failure's [`PipeError`] when it failed,
     /// [`PipeError::SessionLost`] when the
     /// session ended while a half was live; `None` while a half is live.
-    /// A pipe that failed and was retired since reads as `Ok`.
+    /// A pipe the core no longer holds reads as `Ok` here: its end is in
+    /// the snapshot [`Self::pipe_final`] hands to a handle.
     pub fn pipe_closed(&self, pipe: PipeId) -> Option<Result<(), PipeError>> {
         let Some(a) = self.att(pipe.0).filter(|a| !a.unattached()) else {
             return Some(Ok(()));
@@ -2924,7 +2982,9 @@ impl SessionCore {
         let t_fail = Duration::from_secs(2).max(base * 8);
         let dead = self
             .idle_timeout()
-            .map_or(crate::proto::session::DEFAULT_IDLE_TIMEOUT / 2, |t| t / 2);
+            .map_or(crate::proto::session::DEFAULT_MAX_IDLE_TIMEOUT / 2, |t| {
+                t / 2
+            });
         (t_suspect, t_fail, t_fail.max(dead))
     }
 
@@ -3297,7 +3357,9 @@ impl SessionCore {
             let t_fail = Duration::from_secs(2).max(pto * 8);
             let dead = self
                 .idle_timeout()
-                .map_or(crate::proto::session::DEFAULT_IDLE_TIMEOUT / 2, |t| t / 2);
+                .map_or(crate::proto::session::DEFAULT_MAX_IDLE_TIMEOUT / 2, |t| {
+                    t / 2
+                });
             let stall = if let Some(dt) = self.config.liveness.dead_timeout() {
                 t_suspect.max(dt)
             } else if self.mp().resume {

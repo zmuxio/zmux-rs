@@ -2448,8 +2448,9 @@ impl Listener {
         };
         let session = acc.session().expect("named").clone();
         {
-            // A new authenticated Hello may evict the session's oldest Unconfirmed one
-            // and is not refused for lack of room.
+            // A new authenticated Hello is never refused for lack of room: with the
+            // session at its bound of Unconfirmed carriers, the oldest of them is closed
+            // first, as a failed join (MULTIPATH.md 5.4 step 7); below it nothing is.
             let mut wakes = WakeList::default();
             let mut st = self.shared.lock();
             let evicted = st.core.unconfirmed(pending.id, locator);

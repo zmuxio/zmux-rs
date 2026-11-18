@@ -255,8 +255,12 @@ async fn run_server(args: &[String]) -> Res {
         println!("PROOFKEY {}", hex(&key.key_id()));
         opts.signer = Some(Arc::new(zmux_seal::KeySigner(key)));
     }
-    let server = zmux_seal::ServerConfig::new(Arc::new(MatrixGate), SEAL_NODE, opts)
-        .map_err(|e| format!("server config: {e}"))?;
+    let server = zmux_seal::ServerConfig::new(
+        Arc::new(MatrixGate),
+        zmux_seal::StaticKey::from_scalar(SEAL_NODE),
+        opts,
+    )
+    .map_err(|e| format!("server config: {e}"))?;
     let tcp = TcpListener::bind(listen_addr("ZMUX_MATRIX_LISTEN"))
         .await
         .map_err(|e| e.to_string())?;
@@ -377,7 +381,8 @@ async fn run_client(args: &[String]) -> Res {
         cfg.record_mode = RecordMode::Sealed;
     }
     if sc == "appdata" {
-        cfg.static_secret = zmux_seal::StaticSecret::Given(CLIENT_KEY.into());
+        cfg.static_key =
+            zmux_seal::StaticKeySource::Given(zmux_seal::StaticKey::from_scalar(CLIENT_KEY));
         cfg.app_data = Some(app_data(3, b"cli-msg3"));
     }
     let tcp = TcpStream::connect(&addr)

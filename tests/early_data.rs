@@ -118,7 +118,7 @@ fn early_streams_carry_preamble_and_priority() {
         let got = r.preamble();
         assert_eq!(got.info().map(|b| &b[..]), Some(&b"GET /"[..]));
         assert_eq!(got.tlv(0x1000).as_deref(), Some(&b"dest"[..]));
-        assert_eq!(r.requested_priority(), Some(prio));
+        assert_eq!(r.preamble_priority(), Some(prio));
         let data = watchdog(5, "read", r.read_to_end(1 << 10)).await.unwrap();
         assert_eq!(data, b"early");
         client.close().await;

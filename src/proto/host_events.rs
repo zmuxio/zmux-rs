@@ -2,9 +2,17 @@
 //! `on_memory_pressure` are told, queued for the host to read when it wants
 //! ([`crate::Config::events`], [`crate::ListenerConfig::events`]) instead of
 //! a callback on the thread that produced it. The queue is bounded: past
-//! its capacity the oldest event is dropped and counted, and the count is
-//! read as [`HostEvent::Overflowed`] before the events that follow it. Pushing
-//! never blocks and never waits for the host.
+//! its capacity the newly arriving event is dropped and counted, and the
+//! count is read as [`HostEvent::Overflowed`] where the dropped events would
+//! have been (before the next one queued after them). A session's
+//! `Established` and `Closed` are never dropped. Pushing never blocks and
+//! never waits for the host.
+//!
+//! This is the one queue of the observing hooks: the tracer callback of a
+//! session is a reader of such a queue too (its hook context calls the
+//! tracer for what it reads, an [`HostEvent::Overflowed`] as
+//! [`TraceRecord::Dropped`]), so there is no second queue and no second
+//! count between an event and its observer.
 //!
 //! Each `events` call makes a subscription of its own, beside the hooks set
 //! before (which keep being called): two subscriptions each read every
@@ -39,16 +47,14 @@ pub enum HostEvent {
     Trace {
         /// The session.
         session: SessionId,
-        /// The record ([`TraceRecord::Dropped`]: the session's own tracer
-        /// backlog overflowed).
+        /// The record.
         record: TraceRecord,
     },
     /// A listener's memory pressure started or ended.
     MemoryPressure(MemoryPressure),
-    /// The subscription's queue overflowed: this many events were dropped
-    /// before the next one (the events a dropped [`TraceRecord::Dropped`]
-    /// counted included). Not to be confused with
-    /// [`TraceRecord::Dropped`], a session's own tracer backlog.
+    /// The subscription's queue was full: this many events that arrived
+    /// were dropped, after the ones read before this and before the next
+    /// one. A session's `Established` and `Closed` are never dropped.
     Overflowed(u64),
 }
 
@@ -210,10 +216,27 @@ impl Drop for Next<'_> {
 }
 
 fn take(q: &mut Queue) -> Option<HostEvent> {
-    if q.dropped > 0 {
-        return Some(HostEvent::Overflowed(std::mem::take(&mut q.dropped)));
+    // What was dropped after the last queued item, once all is read.
+    q.items
+        .pop_front()
+        .or_else(|| (q.dropped > 0).then(|| HostEvent::Overflowed(std::mem::take(&mut q.dropped))))
+}
+
+/// An event that is never dropped: the start and the end of a session.
+pub(crate) fn kept(event: &HostEvent) -> bool {
+    matches!(
+        event,
+        HostEvent::Trace {
+            record: TraceRecord::Established | TraceRecord::Closed(_),
+            ..
+        }
+    )
+}
+
+impl fmt::Debug for Sender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sender(..)")
     }
-    q.items.pop_front()
 }
 
 impl fmt::Debug for HostEvents {
@@ -228,41 +251,55 @@ impl fmt::Debug for HostEvents {
 }
 
 impl Sender {
-    /// Queues `event`, dropping the oldest when the queue is full; nothing
-    /// once the subscription is closed.
+    /// Queues `event`, dropping it (and counting it) when the queue is
+    /// full, unless it is a session's start or end; nothing once the
+    /// subscription is closed.
     pub(crate) fn push(&self, event: HostEvent) {
-        self.push_with(|| event);
+        let keep = kept(&event);
+        let mut woken = Vec::new();
+        self.push_into(keep, || event, &mut |w| woken.push(w));
+        // Woken readers register again if they find nothing.
+        for w in woken {
+            w.wake();
+        }
     }
 
-    /// [`Sender::push`] of the event `make` builds, called only while the
-    /// subscription is open.
-    pub(crate) fn push_with(&self, make: impl FnOnce() -> HostEvent) {
+    /// [`Sender::push`] of the event `make` builds, called only when it is
+    /// queued; `keep`: it is never dropped. The readers to wake go to
+    /// `wake`, for a caller that holds a lock until it may wake them.
+    pub(crate) fn push_into(
+        &self,
+        keep: bool,
+        make: impl FnOnce() -> HostEvent,
+        wake: &mut dyn FnMut(Waker),
+    ) {
         let waiters = {
             let mut q = self.0.lock();
             if q.closed {
                 return;
             }
-            let event = make();
-            if q.items.len() >= q.capacity {
-                // A dropped count stands for the events it counted.
-                q.dropped += match q.items.pop_front() {
-                    Some(
-                        HostEvent::Overflowed(n)
-                        | HostEvent::Trace {
-                            record: TraceRecord::Dropped(n),
-                            ..
-                        },
-                    ) => n,
-                    _ => 1,
-                };
+            if !keep && q.items.len() >= q.capacity {
+                q.dropped += 1;
+                return;
             }
-            q.items.push_back(event);
+            q.push(make());
             std::mem::take(&mut q.waiters)
         };
-        // Woken readers register again if they find nothing.
         for (_, w) in waiters {
-            w.wake();
+            wake(w);
         }
+    }
+}
+
+impl Queue {
+    /// Appends `event`, after the count of what was dropped since the last
+    /// one queued.
+    fn push(&mut self, event: HostEvent) {
+        if self.dropped > 0 {
+            self.items
+                .push_back(HostEvent::Overflowed(std::mem::take(&mut self.dropped)));
+        }
+        self.items.push_back(event);
     }
 }
 
@@ -289,44 +326,34 @@ impl Drop for Sender {
     }
 }
 
-/// The tracer of a subscription, and the one set before it (still called).
-pub(crate) struct TraceSink {
-    pub(crate) tx: Sender,
-    pub(crate) before: Option<Arc<dyn super::session::Tracer>>,
-}
-
-impl super::session::Tracer for TraceSink {
-    fn trace(&self, session: SessionId, record: &TraceRecord) {
-        if let Some(t) = &self.before {
-            t.trace(session, record);
-        }
-        self.tx.push_with(|| HostEvent::Trace {
-            session,
-            record: record.clone(),
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn log(i: u8) -> HostEvent {
+        HostEvent::Log {
+            level: LogLevel::Info,
+            message: i.to_string(),
+        }
+    }
+
+    fn trace(record: TraceRecord) -> HostEvent {
+        HostEvent::Trace {
+            session: SessionId::next(),
+            record,
+        }
+    }
+
     #[test]
-    fn overflow_drops_the_oldest_and_counts() {
+    fn overflow_drops_the_new_and_counts() {
         let (events, tx) = HostEvents::channel(2);
         for i in 0..4u8 {
-            tx.push(HostEvent::Log {
-                level: LogLevel::Info,
-                message: i.to_string(),
-            });
+            tx.push(log(i));
         }
+        assert_eq!(events.try_next(), Some(log(0)));
+        assert_eq!(events.try_next(), Some(log(1)));
+        // What was dropped follows what was queued.
         assert_eq!(events.try_next(), Some(HostEvent::Overflowed(2)));
-        assert!(
-            matches!(events.try_next(), Some(HostEvent::Log { message, .. }) if message == "2")
-        );
-        assert!(
-            matches!(events.try_next(), Some(HostEvent::Log { message, .. }) if message == "3")
-        );
         assert_eq!(events.try_next(), None);
         let tx2 = tx.clone();
         drop(tx);
@@ -339,18 +366,45 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_count_pushed_out_is_kept_in_the_count() {
+    fn the_count_stands_before_the_next_queued_event() {
         let (events, tx) = HostEvents::channel(1);
-        tx.push(HostEvent::Trace {
-            session: SessionId::next(),
-            record: TraceRecord::Dropped(5),
-        });
-        tx.push(HostEvent::MemoryPressure(MemoryPressure {
-            used: 0,
-            budget: 0,
-            active: false,
-        }));
-        assert_eq!(events.try_next(), Some(HostEvent::Overflowed(5)));
+        tx.push(log(0));
+        tx.push(log(1));
+        tx.push(log(2));
+        assert_eq!(events.try_next(), Some(log(0)));
+        tx.push(log(3));
+        assert_eq!(events.try_next(), Some(HostEvent::Overflowed(2)));
+        assert_eq!(events.try_next(), Some(log(3)));
+        assert_eq!(events.try_next(), None);
+    }
+
+    #[test]
+    fn established_and_closed_are_never_dropped() {
+        let (events, tx) = HostEvents::channel(1);
+        tx.push(log(0));
+        tx.push(trace(TraceRecord::Established));
+        tx.push(log(1));
+        tx.push(trace(TraceRecord::Closed(
+            crate::SessionError::HandshakeTimeout,
+        )));
+        assert_eq!(events.try_next(), Some(log(0)));
+        assert!(matches!(
+            events.try_next(),
+            Some(HostEvent::Trace {
+                record: TraceRecord::Established,
+                ..
+            })
+        ));
+        // What was dropped stands before the end.
+        assert_eq!(events.try_next(), Some(HostEvent::Overflowed(1)));
+        assert!(matches!(
+            events.try_next(),
+            Some(HostEvent::Trace {
+                record: TraceRecord::Closed(_),
+                ..
+            })
+        ));
+        assert_eq!(events.try_next(), None);
     }
 
     #[test]
@@ -380,10 +434,14 @@ mod tests {
         assert_eq!(other.try_next(), Some(HostEvent::Overflowed(1)));
         drop(other);
         let mut built = false;
-        tx.push_with(|| {
-            built = true;
-            HostEvent::Overflowed(1)
-        });
+        tx.push_into(
+            false,
+            || {
+                built = true;
+                HostEvent::Overflowed(1)
+            },
+            &mut |_| {},
+        );
         assert!(!built, "nothing is built for a subscription nobody reads");
         let q = tx.0.lock();
         assert!(q.closed && q.items.is_empty());

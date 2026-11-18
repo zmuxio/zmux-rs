@@ -7,6 +7,8 @@
 
 #![cfg(feature = "websocket")]
 
+mod support;
+
 mod proxy;
 
 use std::sync::Arc;
@@ -133,116 +135,120 @@ fn tries(s: &Session) -> Vec<(CarrierKind, CandidateOutcome)> {
 }
 
 /// Auto mode without joins takes, per path, the first kind that passes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_picks_the_best_kind_each_path_passes() {
-    use CandidateOutcome::{Refused, TimedOut, Usable};
-    use CarrierKind::{Exchange, Split, Streaming, WebSocket};
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let (origin, _listener) = origin(config()).await;
-        let direct = origin.to_string();
-        let policy = CarrierChoicePolicy::default().without_join();
-        let cases: Vec<(&str, Option<Profile>, &[CarrierKind], Vec<_>)> = vec![
-            ("direct", None, &ORDER, vec![(WebSocket, Usable)]),
-            (
-                "transparent proxy",
-                Some(Profile::TRANSPARENT),
-                &[Streaming, WebSocket],
-                vec![(Streaming, Usable)],
-            ),
-            (
-                "reverse proxy",
-                Some(Profile::REVERSE_PROXY),
-                &ORDER,
-                vec![
-                    (WebSocket, Refused),
-                    (Streaming, TimedOut),
-                    (Split, TimedOut),
-                    (Exchange, Usable),
-                ],
-            ),
-            (
-                "half duplex",
-                Some(Profile::HALF_DUPLEX),
-                &ORDER,
-                vec![(WebSocket, Refused), (Streaming, TimedOut), (Split, Usable)],
-            ),
-            (
-                "buffering CDN",
-                Some(Profile::BUFFERING_CDN),
-                &ORDER,
-                vec![
-                    (WebSocket, Refused),
-                    (Streaming, TimedOut),
-                    (Split, TimedOut),
-                    (Exchange, Usable),
-                ],
-            ),
-            (
-                "WebSocket only",
-                Some(Profile::WEBSOCKET_ONLY),
-                &[Streaming, Split, Exchange, WebSocket],
-                vec![
-                    (Streaming, Refused),
-                    (Split, Refused),
-                    (Exchange, TimedOut),
-                    (WebSocket, Usable),
-                ],
-            ),
-        ];
-        for (name, profile, order, expect) in cases {
-            let addr = match profile {
-                Some(p) => proxy::start(p, origin).await.0,
-                None => direct.clone(),
-            };
-            let client = dial_choice(&auto(order, &addr), config(), &policy)
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(tries(&client), expect, "{name}");
-            works(&client).await;
-            client.close().await;
-        }
-    })
-    .await
-    .unwrap();
+#[test]
+fn auto_picks_the_best_kind_each_path_passes() {
+    support::run(4, 90, || async {
+        use CandidateOutcome::{Refused, TimedOut, Usable};
+        use CarrierKind::{Exchange, Split, Streaming, WebSocket};
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let (origin, _listener) = origin(config()).await;
+            let direct = origin.to_string();
+            let policy = CarrierChoicePolicy::default().without_join();
+            let cases: Vec<(&str, Option<Profile>, &[CarrierKind], Vec<_>)> = vec![
+                ("direct", None, &ORDER, vec![(WebSocket, Usable)]),
+                (
+                    "transparent proxy",
+                    Some(Profile::TRANSPARENT),
+                    &[Streaming, WebSocket],
+                    vec![(Streaming, Usable)],
+                ),
+                (
+                    "reverse proxy",
+                    Some(Profile::REVERSE_PROXY),
+                    &ORDER,
+                    vec![
+                        (WebSocket, Refused),
+                        (Streaming, TimedOut),
+                        (Split, TimedOut),
+                        (Exchange, Usable),
+                    ],
+                ),
+                (
+                    "half duplex",
+                    Some(Profile::HALF_DUPLEX),
+                    &ORDER,
+                    vec![(WebSocket, Refused), (Streaming, TimedOut), (Split, Usable)],
+                ),
+                (
+                    "buffering CDN",
+                    Some(Profile::BUFFERING_CDN),
+                    &ORDER,
+                    vec![
+                        (WebSocket, Refused),
+                        (Streaming, TimedOut),
+                        (Split, TimedOut),
+                        (Exchange, Usable),
+                    ],
+                ),
+                (
+                    "WebSocket only",
+                    Some(Profile::WEBSOCKET_ONLY),
+                    &[Streaming, Split, Exchange, WebSocket],
+                    vec![
+                        (Streaming, Refused),
+                        (Split, Refused),
+                        (Exchange, TimedOut),
+                        (WebSocket, Usable),
+                    ],
+                ),
+            ];
+            for (name, profile, order, expect) in cases {
+                let addr = match profile {
+                    Some(p) => proxy::start(p, origin).await.0,
+                    None => direct.clone(),
+                };
+                let client = dial_choice(&auto(order, &addr), config(), &policy)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(tries(&client), expect, "{name}");
+                works(&client).await;
+                client.close().await;
+            }
+        })
+        .await
+        .unwrap();
+    });
 }
 
 /// An explicit mode reports its kind's failure and tries no other.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn explicit_never_falls_back() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let (origin, listener) = origin(config()).await;
-        let (addr, _p) = proxy::start(Profile::REVERSE_PROXY, origin).await;
-        let e = dial_choice(
-            &CarrierChoice::explicit(candidate(CarrierKind::WebSocket, &addr)),
-            config(),
-            &CarrierChoicePolicy::default(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.results.len(), 1);
-        assert_eq!(e.results[0].outcome, CandidateOutcome::Refused);
-        let e = dial_choice(
-            &CarrierChoice::explicit(candidate(CarrierKind::Streaming, &addr)),
-            config(),
-            &CarrierChoicePolicy::default(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.results.len(), 1, "{e}");
-        assert_eq!(listener.stats().sessions, 0);
-        // The kind that passes works explicitly too.
-        let client = dial_choice(
-            &CarrierChoice::explicit(candidate(CarrierKind::Exchange, &addr)),
-            config(),
-            &CarrierChoicePolicy::default(),
-        )
+#[test]
+fn explicit_never_falls_back() {
+    support::run(4, 90, || async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (origin, listener) = origin(config()).await;
+            let (addr, _p) = proxy::start(Profile::REVERSE_PROXY, origin).await;
+            let e = dial_choice(
+                &CarrierChoice::explicit(candidate(CarrierKind::WebSocket, &addr)),
+                config(),
+                &CarrierChoicePolicy::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.results.len(), 1);
+            assert_eq!(e.results[0].outcome, CandidateOutcome::Refused);
+            let e = dial_choice(
+                &CarrierChoice::explicit(candidate(CarrierKind::Streaming, &addr)),
+                config(),
+                &CarrierChoicePolicy::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.results.len(), 1, "{e}");
+            assert_eq!(listener.stats().sessions, 0);
+            // The kind that passes works explicitly too.
+            let client = dial_choice(
+                &CarrierChoice::explicit(candidate(CarrierKind::Exchange, &addr)),
+                config(),
+                &CarrierChoicePolicy::default(),
+            )
+            .await
+            .unwrap();
+            works(&client).await;
+            client.close().await;
+        })
         .await
         .unwrap();
-        works(&client).await;
-        client.close().await;
-    })
-    .await
-    .unwrap();
+    });
 }
 
 fn multipath() -> Config {
@@ -255,62 +261,66 @@ fn multipath() -> Config {
 /// With joins, the session is established on the exchange carrier and
 /// moves to the split kind (two pipes), which the half-duplex path passes;
 /// the exchange pipe is retired.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_with_joins_moves_off_the_exchange() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let (origin, _listener) = origin(multipath()).await;
-        let (addr, _p) = proxy::start(Profile::HALF_DUPLEX, origin).await;
-        let mut policy = CarrierChoicePolicy::default();
-        policy.settle = Duration::from_millis(300);
-        let client = dial_choice(&auto(&ORDER, &addr), multipath(), &policy)
-            .await
-            .unwrap();
-        assert_eq!(client.stats().carrier, Some(CarrierKind::Exchange));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while client.stats().carrier != Some(CarrierKind::Split) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no switch: {:?}",
-                tries(&client)
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        while client.pipes().len() != 2 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "exchange not retired"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        works(&client).await;
-        client.close().await;
-    })
-    .await
-    .unwrap();
+#[test]
+fn auto_with_joins_moves_off_the_exchange() {
+    support::run(4, 90, || async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (origin, _listener) = origin(multipath()).await;
+            let (addr, _p) = proxy::start(Profile::HALF_DUPLEX, origin).await;
+            let mut policy = CarrierChoicePolicy::default();
+            policy.settle = Duration::from_millis(300);
+            let client = dial_choice(&auto(&ORDER, &addr), multipath(), &policy)
+                .await
+                .unwrap();
+            assert_eq!(client.stats().carrier, Some(CarrierKind::Exchange));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while client.stats().carrier != Some(CarrierKind::Split) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no switch: {:?}",
+                    tries(&client)
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            while client.pipes().len() != 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "exchange not retired"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            works(&client).await;
+            client.close().await;
+        })
+        .await
+        .unwrap();
+    });
 }
 
 /// A WebSocket upgrade forwarded from TLS early data is answered 425 by
 /// the endpoint and counted once as a setup failure.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_early_websocket_upgrade_is_too_early_and_a_setup_failure() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let (addr, listener) = origin(config()).await;
-        let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(
-            b"GET /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\nConnection: Upgrade\r\n\
+#[test]
+fn an_early_websocket_upgrade_is_too_early_and_a_setup_failure() {
+    support::run(2, 90, || async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (addr, listener) = origin(config()).await;
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(
+                b"GET /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\nConnection: Upgrade\r\n\
               Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-        )
+            )
+            .await
+            .unwrap();
+            let mut head = [0u8; 12];
+            c.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"HTTP/1.1 425");
+            drop(c);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(listener.stats().setup_failures, 1);
+        })
         .await
         .unwrap();
-        let mut head = [0u8; 12];
-        c.read_exact(&mut head).await.unwrap();
-        assert_eq!(&head, b"HTTP/1.1 425");
-        drop(c);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(listener.stats().setup_failures, 1);
-    })
-    .await
-    .unwrap();
+    });
 }

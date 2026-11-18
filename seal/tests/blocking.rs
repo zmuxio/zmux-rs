@@ -62,7 +62,7 @@ fn config() -> Config {
 fn server(psk: Vec<u8>) -> ServerConfig {
     ServerConfig::new(
         Arc::new(TestGate(psk)),
-        NODE,
+        zmux_seal::StaticKey::from_scalar(NODE),
         zmux_seal::ServerOptions::default(),
     )
     .expect("valid server configuration")
@@ -496,7 +496,7 @@ impl Gate for StuckGate {
 fn a_host_future_past_the_handshake_timeout_is_dropped() {
     let server = ServerConfig::new(
         Arc::new(StuckGate(keys().psk.to_vec())),
-        NODE,
+        zmux_seal::StaticKey::from_scalar(NODE),
         zmux_seal::ServerOptions::default(),
     )
     .unwrap();

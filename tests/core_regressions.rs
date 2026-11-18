@@ -199,7 +199,7 @@ fn shutdown_completed_by_release_still_writes_close() {
     p.b.handle_timeout(p.now);
     assert_eq!(p.b.state(), State::Closing, "the close is still written");
     let wire = take(&mut p.b, &mut p.out, p.now);
-    assert_ne!(wire, [] as [u8; 0]);
+    assert_ne!(wire, Vec::new());
     assert!(p.b.poll_timeout().unwrap() > p.now, "lingers from now");
 }
 
@@ -217,7 +217,7 @@ fn goaway_setup() -> (Pair, Vec<u8>) {
     let w = take(&mut p.a, &mut p.out, p.now);
     p.b.receive(P0, &w, p.now);
     let held = take(&mut p.b, &mut p.out, p.now);
-    assert_ne!(held, [] as [u8; 0]);
+    assert_ne!(held, Vec::new());
     (p, held)
 }
 

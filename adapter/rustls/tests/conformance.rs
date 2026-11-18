@@ -9,7 +9,7 @@ use zmux::test_hooks::carrier_conformance;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_pipes_keep_the_carrier_contract() {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let server = Arc::new(

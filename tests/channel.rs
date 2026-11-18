@@ -88,7 +88,7 @@ fn records_without_a_negotiated_channel() {
     p.a.send_datagram(Bytes::from_static(b"x"), true).unwrap();
     let mut out = Vec::new();
     assert!(!p.a.poll_channel(P0, &mut out), "the channel's task ends");
-    assert_eq!(out, [] as [bytes::Bytes; 0]);
+    assert_eq!(out, Vec::<bytes::Bytes>::new());
     p.pump();
     assert_eq!(p.b.recv_datagram().unwrap().as_deref(), Some(&b"x"[..]));
     assert_eq!(p.a.stats().datagrams_sent_channel, 0);
@@ -147,7 +147,7 @@ fn shaped_pipes_keep_datagrams_in_records() {
         .unwrap();
     let mut out = Vec::new();
     assert!(p.a.poll_channel(P0, &mut out));
-    assert_eq!(out, [] as [bytes::Bytes; 0]);
+    assert_eq!(out, Vec::<bytes::Bytes>::new());
     assert!(p.a.wants_write(P0));
     p.pump();
     assert_eq!(

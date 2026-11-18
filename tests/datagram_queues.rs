@@ -172,3 +172,36 @@ fn zero_is_not_a_queue_size() {
         assert!(r.is_err());
     }
 }
+
+/// Releasing the receiving handle of a stream drops what its datagram queue
+/// holds, counted, and later datagrams for the stream are dropped on arrival
+/// (the sending part may still be held) and not counted as received by the
+/// stream.
+#[test]
+fn releasing_the_receiving_part_drops_the_streams_datagrams() {
+    let mut p = pair(config(|_| {}), config(|_| {}));
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"x").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
+    for i in 0..2u8 {
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true)
+            .unwrap();
+    }
+    p.pump();
+    assert_eq!(p.b.stream_stats(s).unwrap().datagrams_received, 2);
+    assert_eq!(p.b.stats().datagrams_dropped_recv, 0);
+    p.b.release_recv(s);
+    // The two queued ones went with the handle.
+    assert_eq!(p.b.recv_stream_datagram(s).unwrap(), None);
+    assert_eq!(p.b.stats().datagrams_dropped_recv, 2);
+    // A later one is dropped on arrival.
+    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"late"), true)
+        .unwrap();
+    p.pump();
+    assert_eq!(p.b.recv_stream_datagram(s).unwrap(), None);
+    assert_eq!(p.b.stats().datagrams_dropped_recv, 3);
+    let st = p.b.stream_stats(s).unwrap();
+    assert_eq!(st.datagrams_dropped_recv, 3);
+    assert_eq!(st.datagrams_received, 2, "the late one is not counted");
+}

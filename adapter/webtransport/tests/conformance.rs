@@ -12,7 +12,7 @@ use zmux_webtransport::{Carrier, Options, Url};
 async fn webtransport_pipes_keep_the_carrier_contract() {
     let opts = Options::default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["127.0.0.1".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let alpn = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];

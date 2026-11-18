@@ -213,3 +213,17 @@ fn unconfirmed_per_session_is_at_least_one() {
     limits.max_pending_per_session = 0;
     assert!(Listener::new(Config::default(), limits).is_err());
 }
+
+/// The first-record timeout has one exported default, 2 s, which a listener
+/// starts with and the process-level lane entry uses.
+#[test]
+fn the_first_record_timeout_has_one_exported_default() {
+    assert_eq!(
+        zmux::DEFAULT_FIRST_RECORD_TIMEOUT,
+        std::time::Duration::from_secs(2)
+    );
+    assert_eq!(
+        ListenerConfig::default().first_record_timeout,
+        zmux::DEFAULT_FIRST_RECORD_TIMEOUT
+    );
+}

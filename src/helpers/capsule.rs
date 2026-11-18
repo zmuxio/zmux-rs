@@ -347,6 +347,56 @@ impl Decoder {
     }
 }
 
+/// What a decoder made of a byte string fed in pieces (feature `test-hooks`,
+/// for the fuzz targets).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapsuleRun {
+    /// The DATAGRAM capsules found: Context ID and payload.
+    pub packets: Vec<(u64, Vec<u8>)>,
+    /// Capsules of another type skipped whole.
+    pub skipped: usize,
+    /// `Some("oversized")` or `Some("truncated")` when the bytes are
+    /// malformed; decoding stops there.
+    pub fault: Option<&'static str>,
+    /// Whether the bytes end on a capsule boundary (false after a fault).
+    pub at_boundary: bool,
+}
+
+/// Feeds `bytes` to a decoder bounded by `max` in pieces of `step` bytes.
+#[cfg(feature = "test-hooks")]
+#[must_use]
+pub fn decode_run(max: usize, bytes: &[u8], step: usize) -> CapsuleRun {
+    let mut d = Decoder::new(max);
+    let mut run = CapsuleRun {
+        packets: Vec::new(),
+        skipped: 0,
+        fault: None,
+        at_boundary: false,
+    };
+    for chunk in bytes.chunks(step.max(1)) {
+        let mut b = Bytes::copy_from_slice(chunk);
+        loop {
+            match d.decode(&mut b) {
+                Decoded::More => break,
+                Decoded::Packet { context, payload } => {
+                    run.packets.push((context, payload.to_vec()));
+                }
+                Decoded::Skipped => run.skipped += 1,
+                Decoded::Malformed(f) => {
+                    run.fault = Some(match f {
+                        Fault::Oversized => "oversized",
+                        Fault::Truncated => "truncated",
+                    });
+                    return run;
+                }
+            }
+        }
+    }
+    run.at_boundary = d.at_boundary();
+    run
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

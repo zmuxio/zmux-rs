@@ -576,11 +576,8 @@ impl<D: Driver> State<D> {
         let mut window_hook = WindowHook::new(&config);
         // A tracer starts the hook context with the session.
         let id = crate::SessionId::next();
-        let traces = config
-            .tracer
-            .clone()
-            .map(|tracer| Box::new(TraceQueue::new(tracer, id)));
-        let start_hook = traces.is_some();
+        let traces = TraceQueue::new(&config, id).map(Box::new);
+        let start_hook = traces.as_deref().is_some_and(TraceQueue::has_callback);
         if start_hook {
             window_hook.mark_started();
         }
@@ -650,6 +647,13 @@ impl<D: Driver> State<D> {
         end
     }
 
+    /// The slots of a handle of pipe `id`: its join outcome and its final
+    /// snapshot (the latter stays empty for a pipe the core does not hold).
+    fn pipe_slots(&mut self, id: PipeId) -> PipeSlots {
+        let last = self.core.pipe_final(id).unwrap_or_default();
+        (self.pipe_end(id), last)
+    }
+
     /// Drains the core's events and wakes the operations they concern.
     pub(crate) fn dispatch(&mut self) {
         self.dispatch_events();
@@ -674,7 +678,7 @@ impl<D: Driver> State<D> {
                     // The channels' tasks end when the peer did not
                     // negotiate them.
                     w.wake_list(List::Channel, wakes);
-                    self.trace(TraceRecord::Established);
+                    self.trace(&TraceRecord::Established);
                 }
                 CoreEvent::StreamOpened(d) => w.wake_list(List::Accept(di(d)), wakes),
                 CoreEvent::StreamReadable(k) => w.readable(k, wakes),
@@ -734,7 +738,7 @@ impl<D: Driver> State<D> {
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
                     if self.traces.is_some() {
-                        self.trace(TraceRecord::Event(AppEvent::PipesRetired {
+                        self.trace(&TraceRecord::Event(AppEvent::PipesRetired {
                             retired: 1,
                             failed: 0,
                             closed: 0,
@@ -832,7 +836,7 @@ impl<D: Driver> State<D> {
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
                     w.close(wakes);
-                    self.trace(TraceRecord::Closed(e));
+                    self.trace(&TraceRecord::Closed(e));
                 }
                 CoreEvent::Released => {
                     D::session_closed(self);
@@ -873,7 +877,7 @@ impl<D: Driver> State<D> {
 
     fn app_event(&mut self, e: AppEvent) {
         if self.traces.is_some() {
-            self.trace(TraceRecord::Event(e.clone()));
+            self.trace(&TraceRecord::Event(e.clone()));
         }
         self.events.push(e);
         self.waiters.wake_list(List::Events, &mut self.wakes);
@@ -883,7 +887,7 @@ impl<D: Driver> State<D> {
     pub(crate) fn take_hook_start(&mut self) -> Option<HookStart> {
         std::mem::take(&mut self.start_hook).then(|| HookStart {
             predicate: self.window_hook.predicate(),
-            tracer: self.traces.as_deref().map(|t| t.tracer.clone()),
+            tracer: self.traces.as_deref().and_then(TraceQueue::tracer),
             logger: self.logs.logger.clone(),
         })
     }
@@ -901,9 +905,10 @@ impl<D: Driver> State<D> {
         }
     }
 
-    fn trace(&mut self, item: TraceRecord) {
-        if let Some(t) = self.traces.as_deref_mut() {
-            t.push(item);
+    fn trace(&mut self, item: &TraceRecord) {
+        if let Some(t) = self.traces.as_deref_mut()
+            && t.push(item, &mut self.wakes)
+        {
             self.waiters.wake_list(List::Hook, &mut self.wakes);
         }
     }
@@ -920,9 +925,9 @@ impl<D: Driver> State<D> {
 /// its final statistics.
 type Opened = (StreamKey, Arc<Meter>, FinalStats);
 
-/// The statistics a stream had when the session released it, kept for the
-/// handles that outlive it.
-type FinalStats = Arc<OnceLock<StreamStats>>;
+/// The statistics and settings a stream had when the session released it,
+/// kept for the handles that outlive it.
+type FinalStats = Arc<OnceLock<core::StreamFinal>>;
 
 /// The meter and the final-statistics slot of a stream the core holds (a
 /// stream it just opened or offered always is).
@@ -930,7 +935,7 @@ fn with_meter<D: Driver>(core: &mut core::SessionCore, key: StreamKey) -> Opened
     let meter = core
         .stream_meter(key)
         .unwrap_or_else(|| Arc::new(Meter::new()));
-    let last = core.stream_final_stats(key).unwrap_or_default();
+    let last = core.stream_final(key).unwrap_or_default();
     (key, meter, last)
 }
 
@@ -940,8 +945,122 @@ fn stream_stats<D: Driver>(conn: &Shared<D>, key: StreamKey, last: &FinalStats) 
     let st = conn.lock();
     st.core
         .stream_stats(key)
-        .or_else(|| last.get().cloned())
+        .or_else(|| last.get().map(|f| f.stats.clone()))
         .unwrap_or_default()
+}
+
+/// A stream's runtime settings, read from the core under the lock: the one
+/// implementation behind the getters of `SendStream`, `RecvStream` and
+/// `StreamHandle`. The core holds a stream while any of its parts exists;
+/// once it discarded it, the settings it held last are in the final slot
+/// the handles share (the default only stands in for a stream the core
+/// never held). A getter neither fails nor waits.
+fn stream_settings<D: Driver>(
+    conn: &Shared<D>,
+    key: StreamKey,
+    last: &FinalStats,
+) -> core::StreamSettings {
+    let st = conn.lock();
+    st.core
+        .stream_settings(key)
+        .or_else(|| last.get().map(|f| f.settings.clone()))
+        .unwrap_or_default()
+}
+
+/// A send buffer bound as the getters report it.
+fn send_buffer_len(bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Runs a command on stream `key` that may produce output: the one way a
+/// stream's part or handle changes the core.
+fn stream_command<D: Driver, R>(
+    shared: &Shared<D>,
+    key: StreamKey,
+    f: impl FnOnce(&mut core::SessionCore, StreamKey) -> R,
+) -> R {
+    let mut st = shared.lock();
+    let r = f(&mut st.core, key);
+    D::finish_write(shared, st);
+    r
+}
+
+/// Sends a datagram on stream `key` with Context ID `context`: the one
+/// implementation behind `SendStream::send_datagram` and
+/// `StreamHandle::send_datagram`, and the relay helper's `try_send_datagram`.
+/// It acts on the core's stream, so it does not need the sending part and is
+/// not affected by a write in flight. Never waits; `Ok(false)`: the session's
+/// datagram limiter refused it; [`DatagramError::ClosedStream`] when the
+/// stream is gone, released or ended.
+fn stream_send_datagram<D: Driver>(
+    shared: &Shared<D>,
+    key: StreamKey,
+    context: u64,
+    data: Bytes,
+) -> Result<bool, DatagramError> {
+    let allowance = shared.datagram_allowed(data.len());
+    let allowed = allowance.allowed();
+    let queued = stream_command(shared, key, |c, k| {
+        c.send_stream_datagram(k, context, data, allowed)
+    })?;
+    allowance.queued(Ok(queued))?;
+    Ok(queued)
+}
+
+/// The largest datagram payload on stream `key` with Context ID `context`:
+/// the one implementation behind `SendStream::max_datagram_size` and
+/// `StreamHandle::max_datagram_size`; `None` without datagram flows or once
+/// the session discarded the stream.
+fn stream_max_datagram_size<D: Driver>(
+    shared: &Shared<D>,
+    key: StreamKey,
+    context: u64,
+) -> Option<usize> {
+    shared.lock().core.max_stream_datagram_size(key, context)
+}
+
+/// A stream's runtime-setting setters: the one implementation behind the
+/// setters of `SendStream`, `RecvStream` and `StreamHandle`, like
+/// [`stream_settings`] for the getters. They act on the core's stream, so
+/// they do not need the part and are not affected by a read or write of it
+/// in flight; each fails as the core answers: with
+/// [`StreamError::ClosedLocally`] when the stream has no such part left (or
+/// was discarded), and with the setting's own validation errors.
+struct StreamSetters<'a, D: Driver> {
+    shared: &'a Shared<D>,
+    key: StreamKey,
+}
+
+impl<D: Driver> StreamSetters<'_, D> {
+    fn priority(&self, priority: Priority) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| c.set_priority(k, priority))
+    }
+
+    fn scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| {
+            c.set_stream_scheduler(k, policy)
+        })
+    }
+
+    fn redundant(&self, on: Option<bool>) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| c.set_redundant(k, on))
+    }
+
+    fn send_buffer(&self, bytes: u64) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| c.set_send_buffer(k, bytes))
+    }
+
+    fn receive_window(&self, initial: u64, max: u64) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| {
+            c.set_receive_window(k, initial, max)
+        })
+    }
+
+    fn peer_priority(&self, priority: Priority) -> Result<(), StreamError> {
+        stream_command(self.shared, self.key, |c, k| {
+            c.set_peer_priority(k, priority)
+        })
+    }
 }
 
 /// The core's answer to opening a stream, for the openers' queue.
@@ -1172,7 +1291,9 @@ impl<D: Driver> State<D> {
     /// that the core proposes again later.
     pub(crate) fn hook_not_started(&mut self) {
         self.window_hook.not_started(&mut self.core);
-        self.traces = None;
+        if let Some(t) = self.traces.as_deref_mut() {
+            t.drop_callback();
+        }
     }
 }
 
@@ -1484,9 +1605,13 @@ pub(crate) fn replacement<D: Driver>(
         (false, true) => super::PipeDirection::Out,
         _ => super::PipeDirection::Bidi,
     };
-    let mut opts = PipeApi::options(pipe).unwrap_or_default();
+    let mut opts = PipeApi::options(pipe);
     opts.direction = direction;
     opts.return_on_reply = false;
+    // Unmanaged is reported only, never joined: the replacement chooses its own.
+    if opts.record_mode == crate::Inherit::Set(crate::RecordMode::Unmanaged) {
+        opts.record_mode = crate::Inherit::Session;
+    }
     Some((direction, opts))
 }
 
@@ -1589,6 +1714,12 @@ impl<D: Driver> Session<D> {
 
     fn command<R>(&self, f: impl FnOnce(&mut State<D>) -> R) -> R {
         self.conn.command(f)
+    }
+
+    /// Logs a warning through the configuration's logger, if any.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn log_warn(&self, message: String) {
+        self.command(|st| st.log(LogLevel::Warn, message));
     }
 
     fn send_stream(&self, (key, meter, last): Opened) -> SendStream<D> {
@@ -1766,16 +1897,17 @@ impl<D: Driver> Session<D> {
             let before = st.core.epoch().ok_or(PipeError::NotNegotiated)?;
             st.core.advance_epoch(D::now())?;
             let ids: Vec<_> = st.core.pipe_ids();
-            let ids: Vec<_> = ids.into_iter().map(|id| (id, st.pipe_end(id))).collect();
+            let ids: Vec<_> = ids.into_iter().map(|id| (id, st.pipe_slots(id))).collect();
             Ok::<_, PipeError>((ids, before))
         })?;
         // The handles after the lock: cloning one takes it.
         let old = ids
             .into_iter()
-            .map(|(id, end)| Pipe {
+            .map(|(id, (end, last))| Pipe {
                 conn: self.conn.clone(),
                 id,
                 end,
+                last,
             })
             .collect();
         Ok((old, before))
@@ -1911,7 +2043,7 @@ impl<D: Driver> Session<D> {
     fn attach(&self, id: PipeId, pipe: D::Carrier) -> Result<Pipe<D>, PipeError> {
         // The outcome slot exists before the I/O starts, so that an outcome the I/O
         // reports at once is kept.
-        let end = self.conn.lock().pipe_end(id);
+        let (end, last) = self.conn.lock().pipe_slots(id);
         if let Err(e) = D::attach(&self.conn.0, id.0, pipe) {
             drop(end);
             self.command(|st| {
@@ -1924,6 +2056,7 @@ impl<D: Driver> Session<D> {
             conn: self.conn.clone(),
             id,
             end,
+            last,
         })
     }
 
@@ -1974,6 +2107,9 @@ pub struct Pipe<D: Driver> {
     /// How the pipe's join ended when it ended unconfirmed, kept past its
     /// retirement, when the core no longer knows the pipe.
     end: Arc<OnceLock<PipeError>>,
+    /// The options the pipe held and how it ended when the session retired
+    /// it, set by the core under the lock it is read under.
+    last: Arc<OnceLock<core::PipeFinal>>,
 }
 
 impl<D: Driver> Pipe<D> {
@@ -2000,6 +2136,7 @@ impl<D: Driver> Clone for Pipe<D> {
             conn: self.conn.clone(),
             id: self.id,
             end: self.end.clone(),
+            last: self.last.clone(),
         }
     }
 }
@@ -2096,12 +2233,20 @@ impl<D: Driver> Pipe<D> {
         matches!(self.conn.lock().core.pipe_attached(self.id), Some(Ok(())))
     }
 
-    /// Waits until the pipe ended (see the core's `pipe_closed`).
+    /// Waits until the pipe ended (see the core's `pipe_closed`). Once the
+    /// core retired the pipe, the end it had then answers: a wait that
+    /// starts after the retirement reports the same cause as one that
+    /// started before.
     pub(crate) fn closed_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
-        let id = self.id;
-        Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            st.core.pipe_closed(id)
-        })
+        let (id, last) = (self.id, &self.last);
+        Wait::new(
+            &self.conn.inner,
+            List::Pipes,
+            move |st: &mut State<D>| match (st.core.pipe_closed(id), last.get()) {
+                (Some(Ok(())), Some(f)) if !st.core.has_pipe(id) => Some(f.closed.clone()),
+                (r, _) => r,
+            },
+        )
     }
 
     /// The session the pipe belongs to.
@@ -2134,6 +2279,7 @@ fn stream_datagram(
 
 /// What `write_chunks` wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Written {
     /// Whole chunks taken (the next one may be partly taken).
     pub chunks: usize,
@@ -2195,12 +2341,18 @@ pub enum TryRead<T> {
     WouldBlock,
 }
 
+/// Whether the next read of the stream returns at once: data is readable,
+/// or the receiving part ended in any way (a read then reports it).
+fn ready_to_read(core: &core::SessionCore, key: StreamKey) -> bool {
+    !matches!(core.readable_len(key), Ok(None))
+}
+
 /// A cheap, cloneable reference to one stream, for reading its metadata and
 /// waiting for its readiness while its `SendStream` or `RecvStream` is busy
 /// elsewhere (in a read or write in flight, or owned by another task). It
 /// owns no part of the stream: dropping it stops or resets nothing, and it
-/// does not keep the session open. Once the stream's handles are gone, its
-/// waits fail with the stream's error.
+/// does not keep the session open. Once the stream's handles are gone,
+/// `readable` resolves and `writable` fails with the stream's error.
 pub struct StreamHandle<D: Driver> {
     shared: Arc<Shared<D>>,
     key: StreamKey,
@@ -2256,13 +2408,158 @@ impl<D: Driver> StreamHandle<D> {
         &self.meter
     }
 
-    /// Resolves once a read would not wait: data or the FIN is there, or the
-    /// peer reset the stream (`Ok`; the read reports what it is), or with
-    /// the error that ended the receiving part. Consumes nothing, so it is
-    /// cancel-safe at every point; any number may wait at once. With
+    /// The sending part's local scheduling priority: the last one set, or
+    /// the peer's adjustment (PRIORITY TLV, `PRIORITY_UPDATE`) if that came
+    /// later; the local default for a stream without a sending part. Like
+    /// every getter of the handle it reads the core's state, so it answers
+    /// while the part is busy in a write or a wait, never fails and never
+    /// waits, and after the session closed returns the value held last.
+    pub fn priority(&self) -> Priority {
+        stream_settings(&self.shared, self.key, &self.last).priority
+    }
+
+    /// The scheduling policy set on the sending part; `None`: the
+    /// session's. Never fails and never waits.
+    pub fn scheduler(&self) -> Option<Scheduler> {
+        stream_settings(&self.shared, self.key, &self.last).scheduler
+    }
+
+    /// The redundancy set on the sending part; `None`: it follows the
+    /// session's `redundancy` parameter. Never fails and never waits.
+    pub fn redundant(&self) -> Option<bool> {
+        stream_settings(&self.shared, self.key, &self.last).redundant
+    }
+
+    /// The bound of the sending part's written-but-unsent bytes in force
+    /// (0 for a stream without a sending part). Never fails and never
+    /// waits.
+    pub fn send_buffer(&self) -> usize {
+        send_buffer_len(stream_settings(&self.shared, self.key, &self.last).send_buffer)
+    }
+
+    /// The priority last asked of the peer for its sending part of the
+    /// stream; `None`: none asked. Never fails and never waits.
+    pub fn peer_priority(&self) -> Option<Priority> {
+        stream_settings(&self.shared, self.key, &self.last).peer_priority
+    }
+
+    /// The receiving part's window settings, `(initial, max)`: the initial
+    /// window as set (or copied from the session), never the window
+    /// auto-tuning has grown it to (that is `StreamStats::recv_window`), and
+    /// the cap as set, 0 when it is automatic (`(0, 0)` for a stream without
+    /// a receiving part). Never fails and never waits.
+    pub fn receive_window(&self) -> (u64, u64) {
+        stream_settings(&self.shared, self.key, &self.last).receive_window
+    }
+
+    fn setters(&self) -> StreamSetters<'_, D> {
+        StreamSetters {
+            shared: &self.shared,
+            key: self.key,
+        }
+    }
+
+    /// The largest payload of a datagram on the stream with Context ID
+    /// `context` (see [`SendStream::max_datagram_size`]); `None` without
+    /// datagram flows or once the session discarded the stream. Needs no
+    /// part and works while a write is in flight.
+    pub fn max_datagram_size(&self, context: u64) -> Option<usize> {
+        stream_max_datagram_size(&self.shared, self.key, context)
+    }
+
+    /// Sends a datagram on the stream (see [`SendStream::send_datagram`]).
+    /// Never waits; needs no part and works while a write is in flight.
+    ///
+    /// # Errors
+    ///
+    /// As [`SendStream::send_datagram`]: [`DatagramError::ClosedStream`] when
+    /// the stream ended, its sending part was released or the session
+    /// discarded it.
+    pub fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
+        stream_send_datagram(&self.shared, self.key, context, data).map(|_| ())
+    }
+
+    /// Sets the sending part's local scheduling priority (see
+    /// [`SendStream::set_priority`]). A setter of the handle acts on the
+    /// stream, not on the part: it neither needs the part nor waits for it,
+    /// so it works while the part is busy in a write or a wait.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::ClosedLocally`]: the stream has no sending part (or it
+    /// was released and the session discarded the stream).
+    pub fn set_priority(&self, priority: Priority) -> Result<(), StreamError> {
+        self.setters().priority(priority)
+    }
+
+    /// Sets the scheduling policy of the sending part; `None`: the
+    /// session's (see [`SendStream::set_scheduler`]). Works while the part
+    /// is busy.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::ClosedLocally`], as [`Self::set_priority`].
+    pub fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError> {
+        self.setters().scheduler(policy)
+    }
+
+    /// Turns redundancy on or off for the sending part; `None`: it follows
+    /// the session's `redundancy` parameter (see
+    /// [`SendStream::set_redundant`]). Works while the part is busy.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::ClosedLocally`], as [`Self::set_priority`].
+    pub fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError> {
+        self.setters().redundant(on)
+    }
+
+    /// Bounds the sending part's written-but-unsent bytes (see
+    /// [`SendStream::set_send_buffer`]). Works while the part is busy.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::ClosedLocally`], as [`Self::set_priority`].
+    pub fn set_send_buffer(&self, bytes: u64) -> Result<(), StreamError> {
+        self.setters().send_buffer(bytes)
+    }
+
+    /// Sets the receiving part's window (see
+    /// [`RecvStream::set_receive_window`]): `initial` is advertised at once
+    /// when it is above the window in force, `max` caps auto-tuning (0:
+    /// automatic). Works while the part is busy in a read.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::InvalidArgument`]: an `initial` below 4 KiB, an
+    /// `initial` or `max` above the largest varint (2^62 - 1), or a
+    /// nonzero `max` below `initial`; nothing changed. [`StreamError::ClosedLocally`]: the stream has no
+    /// receiving part (or it was released and the session discarded the
+    /// stream).
+    pub fn set_receive_window(&self, initial: u64, max: u64) -> Result<(), StreamError> {
+        self.setters().receive_window(initial, max)
+    }
+
+    /// Asks the peer to schedule its sending part of the stream with
+    /// `priority` (see [`RecvStream::set_peer_priority`]). Works while the
+    /// part is busy.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::NotNegotiated`] without the priority signal;
+    /// [`StreamError::ClosedLocally`] as [`Self::set_receive_window`].
+    pub fn set_peer_priority(&self, priority: Priority) -> Result<(), StreamError> {
+        self.setters().peer_priority(priority)
+    }
+
+    /// Resolves once the next read would not wait: data is readable, or the
+    /// receiving part has ended (the FIN, a reset, a stop by this endpoint,
+    /// the session's end). It never fails: the read that follows reports
+    /// the data or the end, once, in its own form. Consumes nothing, so it
+    /// is cancel-safe at every point; any number may wait at once. With
     /// [`RecvStream::try_read`](crate::RecvStream#method.try_read) it is a read that a binding can cancel
     /// without losing data: wait here, then take synchronously.
-    pub fn readable(&self) -> impl Future<Output = Result<(), StreamError>> + Send + 'static
+    pub fn readable(&self) -> impl Future<Output = ()> + Send + 'static
     where
         D: 'static,
         Shared<D>: Send + Sync,
@@ -2272,16 +2569,9 @@ impl<D: Driver> StreamHandle<D> {
             Wait::new(
                 &shared.inner,
                 List::Readable(key),
-                move |st: &mut State<D>| {
-                    match st.core.received_reset(key) {
-                        Ok(Some(_)) => return Some(Ok(())),
-                        Err(e) => return Some(Err(e)),
-                        Ok(None) => {}
-                    }
-                    st.core.readable_len(key).transpose().map(|r| r.map(drop))
-                },
+                move |st: &mut State<D>| ready_to_read(&st.core, key).then_some(()),
             )
-            .await
+            .await;
         }
     }
 
@@ -2410,10 +2700,14 @@ impl<D: Driver> SendStream<D> {
 
     /// Runs a command that may produce output.
     fn command<R>(&self, f: impl FnOnce(&mut core::SessionCore, StreamKey) -> R) -> R {
-        let mut st = self.conn.lock();
-        let r = f(&mut st.core, self.key);
-        D::finish_write(&self.conn, st);
-        r
+        stream_command(&self.conn.0, self.key, f)
+    }
+
+    fn setters(&self) -> StreamSetters<'_, D> {
+        StreamSetters {
+            shared: &self.conn.0,
+            key: self.key,
+        }
     }
 
     /// One write of `buf`: `Pending` registers the stream's writer.
@@ -2650,11 +2944,7 @@ impl<D: Driver> SendStream<D> {
         context: u64,
         data: Bytes,
     ) -> Result<bool, DatagramError> {
-        let allowance = self.conn.datagram_allowed(data.len());
-        let allowed = allowance.allowed();
-        let queued = self.command(|c, k| c.send_stream_datagram(k, context, data, allowed))?;
-        allowance.queued(Ok(queued))?;
-        Ok(queued)
+        stream_send_datagram(&self.conn.0, self.key, context, data)
     }
 
     /// Whether `recv` is the receiving part of this part's stream.
@@ -2991,6 +3281,13 @@ impl<D: Driver> RecvStream<D> {
         self.conn.command(|st| f(&mut st.core, self.key))
     }
 
+    fn setters(&self) -> StreamSetters<'_, D> {
+        StreamSetters {
+            shared: &self.conn.0,
+            key: self.key,
+        }
+    }
+
     /// Runs a read command, `None` while there is nothing to read; then
     /// reads the carrier through once (the tokio driver on a single pipe,
     /// see `super::through`) and tries again before it registers the
@@ -3151,6 +3448,12 @@ impl<D: Driver> RecvStream<D> {
         })
         .await?;
         Ok(out)
+    }
+
+    /// Resolves once the next read would not wait (see
+    /// [`StreamHandle::readable`]).
+    pub(crate) fn readable_op(&self) -> impl Future<Output = ()> + '_ {
+        self.read_wait(|core, key| ready_to_read(core, key).then_some(()))
     }
 
     pub(crate) fn received_reset_op(
@@ -3747,14 +4050,15 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         let ids: Vec<_> = {
             let mut st = self.conn.lock();
             let ids = st.core.pipe_ids();
-            ids.into_iter().map(|id| (id, st.pipe_end(id))).collect()
+            ids.into_iter().map(|id| (id, st.pipe_slots(id))).collect()
         };
         // The handles after the lock: cloning one takes it.
         ids.into_iter()
-            .map(|(id, end)| Pipe {
+            .map(|(id, (end, last))| Pipe {
                 conn: self.conn.clone(),
                 id,
                 end,
+                last,
             })
             .collect()
     }
@@ -3762,12 +4066,13 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     fn pipe(&self, id: PipeId) -> Option<Pipe<D>> {
         let end = {
             let mut st = self.conn.lock();
-            st.core.has_pipe(id).then(|| st.pipe_end(id))
+            st.core.has_pipe(id).then(|| st.pipe_slots(id))
         };
-        end.map(|end| Pipe {
+        end.map(|(end, last)| Pipe {
             conn: self.conn.clone(),
             id,
             end,
+            last,
         })
     }
 
@@ -4310,6 +4615,10 @@ macro_rules! session_adapter {
 }
 pub(crate) use session_adapter;
 
+/// The shared slots of a [`Pipe`] handle: how its join ended and its last
+/// options.
+type PipeSlots = (Arc<OnceLock<PipeError>>, Arc<OnceLock<core::PipeFinal>>);
+
 /// The Pipe operations both drivers share: the public methods of each
 /// driver's type (`pipe_api!`) call them.
 pub(crate) trait PipeApi<D: Driver> {
@@ -4320,7 +4629,7 @@ pub(crate) trait PipeApi<D: Driver> {
     fn abort(&self) -> Result<(), PipeError>;
     fn update(&self, update: &crate::proto::session::PipeUpdate) -> Result<(), PipeError>;
     fn set_shaper(&self, shaper: Option<Box<dyn core::shaping::Shaper>>) -> Result<(), PipeError>;
-    fn options(&self) -> Option<PipeOptions>;
+    fn options(&self) -> PipeOptions;
     fn revalidate(&self) -> Result<(), PipeError>;
 }
 
@@ -4361,8 +4670,14 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
         })
     }
 
-    fn options(&self) -> Option<PipeOptions> {
-        self.conn.lock().core.pipe_options(self.id)
+    fn options(&self) -> PipeOptions {
+        let st = self.conn.lock();
+        // The core sets the last options as it retires the pipe, under this
+        // lock; the default stands in for a pipe it never held.
+        st.core
+            .pipe_options(self.id)
+            .or_else(|| self.last.get().map(|f| f.options.clone()))
+            .unwrap_or_default()
     }
 
     fn revalidate(&self) -> Result<(), PipeError> {
@@ -4436,9 +4751,10 @@ macro_rules! pipe_api {
         /// The options the pipe is in use with: those it was added with
         /// (the defaults for a pipe the peer joined) and the settings
         /// changed since; the effective values, which may follow the peer's
-        /// request, are in [`stats`](Self::stats). `None` once the session
-        /// released the pipe's state.
-        pub fn options(&self) -> Option<crate::PipeOptions> {
+        /// request, are in [`stats`](Self::stats). Never fails: once the
+        /// session retired the pipe it returns the options the pipe held
+        /// last.
+        pub fn options(&self) -> crate::PipeOptions {
             <Self as crate::driver::handle::PipeApi<$d>>::options(self)
         }
 
@@ -4459,14 +4775,14 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn pin_id(&self) -> Result<StreamId, StreamError>;
     fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError>;
     fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError>;
-    fn scheduler(&self) -> Result<Option<Scheduler>, StreamError>;
-    fn redundant(&self) -> Result<Option<bool>, StreamError>;
-    fn send_buffer(&self) -> Result<u64, StreamError>;
+    fn scheduler(&self) -> Option<Scheduler>;
+    fn redundant(&self) -> Option<bool>;
+    fn send_buffer(&self) -> usize;
     fn finish(&mut self) -> Result<(), StreamError>;
     fn reset(&mut self, code: VarInt) -> Result<(), StreamError>;
     fn set_reliable_boundary(&mut self) -> Result<(), StreamError>;
     fn set_priority(&self, priority: Priority) -> Result<(), StreamError>;
-    fn priority(&self) -> Result<Priority, StreamError>;
+    fn priority(&self) -> Priority;
     fn set_send_buffer(&self, bytes: u64) -> Result<(), StreamError>;
     fn max_datagram_size(&self, context: u64) -> Option<usize>;
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError>;
@@ -4493,27 +4809,23 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn set_scheduler(&self, policy: Option<Scheduler>) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_stream_scheduler(k, policy))
+        self.setters().scheduler(policy)
     }
 
     fn set_redundant(&self, on: Option<bool>) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_redundant(k, on))
+        self.setters().redundant(on)
     }
 
-    fn scheduler(&self) -> Result<Option<Scheduler>, StreamError> {
-        self.conn.lock().core.stream_scheduler(self.key)
+    fn scheduler(&self) -> Option<Scheduler> {
+        stream_settings(&self.conn.0, self.key, &self.last).scheduler
     }
 
-    fn redundant(&self) -> Result<Option<bool>, StreamError> {
-        self.conn.lock().core.stream_redundant(self.key)
+    fn redundant(&self) -> Option<bool> {
+        stream_settings(&self.conn.0, self.key, &self.last).redundant
     }
 
-    fn send_buffer(&self) -> Result<u64, StreamError> {
-        self.conn
-            .lock()
-            .core
-            .stream_send_buffer(self.key)
-            .ok_or(StreamError::ClosedLocally)
+    fn send_buffer(&self) -> usize {
+        send_buffer_len(stream_settings(&self.conn.0, self.key, &self.last).send_buffer)
     }
 
     fn finish(&mut self) -> Result<(), StreamError> {
@@ -4529,33 +4841,23 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn set_priority(&self, priority: Priority) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_priority(k, priority))
+        self.setters().priority(priority)
     }
 
-    fn priority(&self) -> Result<Priority, StreamError> {
-        self.conn
-            .lock()
-            .core
-            .priority(self.key)
-            .ok_or(StreamError::ClosedLocally)
+    fn priority(&self) -> Priority {
+        stream_settings(&self.conn.0, self.key, &self.last).priority
     }
 
     fn set_send_buffer(&self, bytes: u64) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_send_buffer(k, bytes))
+        self.setters().send_buffer(bytes)
     }
 
     fn max_datagram_size(&self, context: u64) -> Option<usize> {
-        self.conn
-            .lock()
-            .core
-            .max_stream_datagram_size(self.key, context)
+        stream_max_datagram_size(&self.conn.0, self.key, context)
     }
 
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
-        let allowance = self.conn.datagram_allowed(data.len());
-        let allowed = allowance.allowed();
-        let queued = self.command(|c, k| c.send_stream_datagram(k, context, data, allowed));
-        allowance.queued(queued)
+        stream_send_datagram(&self.conn.0, self.key, context, data).map(|_| ())
     }
 
     fn meter(&self) -> &Arc<Meter> {
@@ -4645,20 +4947,24 @@ macro_rules! sendstream_api {
         }
 
         /// The scheduling policy set on this stream direction; `None`: the
-        /// session's.
-        pub fn scheduler(&self) -> Result<Option<crate::sched::Scheduler>, crate::StreamError> {
+        /// session's. Never fails and never waits: after the session closed
+        /// it returns the value it held last.
+        pub fn scheduler(&self) -> Option<crate::sched::Scheduler> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::scheduler(self)
         }
 
         /// The redundancy set on this stream direction; `None`: it follows
-        /// the session's `redundancy` parameter.
-        pub fn redundant(&self) -> Result<Option<bool>, crate::StreamError> {
+        /// the session's `redundancy` parameter. Never fails and never
+        /// waits: after the session closed it returns the value it held last.
+        pub fn redundant(&self) -> Option<bool> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::redundant(self)
         }
 
         /// The bound of the stream's written-but-unsent bytes in force: its
         /// own ([`set_send_buffer`](Self::set_send_buffer)) or the session's.
-        pub fn send_buffer(&self) -> Result<u64, crate::StreamError> {
+        /// Never fails and never waits: after the session closed it returns
+        /// the value it held last.
+        pub fn send_buffer(&self) -> usize {
             <Self as crate::driver::handle::SendStreamApi<$d>>::send_buffer(self)
         }
 
@@ -4692,8 +4998,11 @@ macro_rules! sendstream_api {
             <Self as crate::driver::handle::SendStreamApi<$d>>::set_priority(self, priority)
         }
 
-        /// The local scheduling priority.
-        pub fn priority(&self) -> Result<crate::Priority, crate::StreamError> {
+        /// The local scheduling priority: the last one set, or the peer's
+        /// adjustment (PRIORITY TLV, `PRIORITY_UPDATE`) if that came later.
+        /// Never fails and never waits: after the session closed it returns
+        /// the value it held last.
+        pub fn priority(&self) -> crate::Priority {
             <Self as crate::driver::handle::SendStreamApi<$d>>::priority(self)
         }
 
@@ -4812,12 +5121,12 @@ pub(crate) trait RecvStreamApi<D: Driver> {
     fn stop(&mut self, code: VarInt) -> Result<(), StreamError>;
     fn set_receive_window(&self, initial: u64, max: u64) -> Result<(), StreamError>;
     fn set_peer_priority(&self, priority: Priority) -> Result<(), StreamError>;
-    fn receive_window(&self) -> Result<(u64, u64), StreamError>;
-    fn peer_priority(&self) -> Result<Option<Priority>, StreamError>;
+    fn receive_window(&self) -> (u64, u64);
+    fn peer_priority(&self) -> Option<Priority>;
     fn reject(self) -> Result<(), StreamError>;
     fn preamble(&self) -> Preamble;
     fn is_replayable(&self) -> bool;
-    fn requested_priority(&self) -> Option<Priority>;
+    fn preamble_priority(&self) -> Option<Priority>;
     fn meter(&self) -> &Arc<Meter>;
     fn stats(&self) -> StreamStats;
 }
@@ -4836,27 +5145,19 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
     }
 
     fn set_receive_window(&self, initial: u64, max: u64) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_receive_window(k, initial, max))
+        self.setters().receive_window(initial, max)
     }
 
     fn set_peer_priority(&self, priority: Priority) -> Result<(), StreamError> {
-        self.command(|c, k| c.set_peer_priority(k, priority))
+        self.setters().peer_priority(priority)
     }
 
-    fn receive_window(&self) -> Result<(u64, u64), StreamError> {
-        self.conn
-            .lock()
-            .core
-            .receive_window(self.key)
-            .ok_or(StreamError::ClosedLocally)
+    fn receive_window(&self) -> (u64, u64) {
+        stream_settings(&self.conn.0, self.key, &self.last).receive_window
     }
 
-    fn peer_priority(&self) -> Result<Option<Priority>, StreamError> {
-        let c = self.conn.lock();
-        if c.core.receive_window(self.key).is_none() {
-            return Err(StreamError::ClosedLocally);
-        }
-        Ok(c.core.asked_peer_priority(self.key))
+    fn peer_priority(&self) -> Option<Priority> {
+        stream_settings(&self.conn.0, self.key, &self.last).peer_priority
     }
 
     fn reject(self) -> Result<(), StreamError> {
@@ -4871,8 +5172,8 @@ impl<D: Driver> RecvStreamApi<D> for RecvStream<D> {
         self.conn.lock().core.is_replayable(self.key)
     }
 
-    fn requested_priority(&self) -> Option<Priority> {
-        self.conn.lock().core.requested_priority(self.key)
+    fn preamble_priority(&self) -> Option<Priority> {
+        self.conn.lock().core.preamble_priority(self.key)
     }
 
     fn meter(&self) -> &Arc<Meter> {
@@ -4906,8 +5207,20 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::stop(self, code)
         }
 
-        /// Sets the stream's receive window: `initial` is advertised at once,
-        /// `max` caps auto-tuning.
+        /// Sets the stream's receive window: `initial` is advertised at once
+        /// when it is above the window in force, `max` caps auto-tuning, 0
+        /// making the cap automatic whatever the session's configuration
+        /// says. Credit
+        /// already advertised is never withdrawn: an `initial` below the
+        /// window in force changes only what `receive_window` reads back.
+        ///
+        /// # Errors
+        ///
+        /// [`StreamError::InvalidArgument`]: an `initial`
+        /// below 4 KiB, an `initial` or `max` above the largest varint
+        /// (2^62 - 1), or a nonzero `max` below `initial`; nothing changed.
+        /// [`StreamError::ClosedLocally`]: the stream has
+        /// no receiving part left.
         pub fn set_receive_window(&self, initial: u64, max: u64) -> Result<(), crate::StreamError> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::set_receive_window(
                 self, initial, max,
@@ -4923,16 +5236,21 @@ macro_rules! recvstream_api {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::set_peer_priority(self, priority)
         }
 
-        /// The stream's receive window: the window now advertised
-        /// (auto-tuning raises it) and the cap of auto-tuning.
-        pub fn receive_window(&self) -> Result<(u64, u64), crate::StreamError> {
+        /// The stream's receive window settings, `(initial, max)`: the
+        /// initial window as set (or copied from the session), never the
+        /// window auto-tuning has grown it to (that is
+        /// `StreamStats::recv_window`), and the cap as set, 0 when it is
+        /// automatic. Never fails and never waits: after the session closed
+        /// it returns the values it held last.
+        pub fn receive_window(&self) -> (u64, u64) {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::receive_window(self)
         }
 
         /// The priority last asked of the peer for its sending part of this
         /// stream ([`set_peer_priority`](Self::set_peer_priority) or the
-        /// preamble's); `None`: none asked.
-        pub fn peer_priority(&self) -> Result<Option<crate::Priority>, crate::StreamError> {
+        /// preamble's); `None`: none asked. Never fails and never waits:
+        /// after the session closed it returns the value it held last.
+        pub fn peer_priority(&self) -> Option<crate::Priority> {
             <Self as crate::driver::handle::RecvStreamApi<$d>>::peer_priority(self)
         }
 
@@ -4965,8 +5283,8 @@ macro_rules! recvstream_api {
         /// The priority the peer requested for this stream in its opening
         /// preamble (its PRIORITY TLV), `None` when it sent none: the
         /// opening value only, not a later `PRIORITY_UPDATE`.
-        pub fn requested_priority(&self) -> Option<crate::Priority> {
-            <Self as crate::driver::handle::RecvStreamApi<$d>>::requested_priority(self)
+        pub fn preamble_priority(&self) -> Option<crate::Priority> {
+            <Self as crate::driver::handle::RecvStreamApi<$d>>::preamble_priority(self)
         }
 
         /// The application byte counters of the stream:

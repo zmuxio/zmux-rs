@@ -198,3 +198,34 @@ fn blocking_calls_inside_a_tokio_runtime_fail_at_once() {
     still_works(&client, &server);
     client.close();
 }
+
+/// `wait_readable` waits until the next read would not wait: it fails only
+/// with the read timeout, and every end of the receiving part is ready.
+#[test]
+fn wait_readable_is_ok_at_the_end_and_fails_only_by_its_timeout() {
+    use zmux::blocking::WaitError;
+    let (client, server) = pair(None);
+    let (mut send, _r) = client.open_bi().unwrap();
+    send.write_all(b"a").unwrap();
+    let (_s, mut recv) = server.accept_bi().unwrap();
+    recv.set_read_timeout(Some(Duration::from_secs(5)));
+    recv.wait_readable().unwrap();
+    let mut b = [0u8; 8];
+    assert_eq!(recv.read(&mut b).unwrap(), Some(1));
+    // Nothing to read: only the timeout ends the wait.
+    recv.set_read_timeout(Some(Duration::from_millis(100)));
+    assert!(matches!(recv.wait_readable(), Err(WaitError::TimedOut)));
+    // The FIN: ready, and the read reports the end.
+    send.finish().unwrap();
+    recv.set_read_timeout(Some(Duration::from_secs(5)));
+    recv.wait_readable().unwrap();
+    assert_eq!(recv.read(&mut b).unwrap(), None);
+    // A stop by this endpoint is an end too: ready, the read fails.
+    let (mut send2, _r2) = client.open_bi().unwrap();
+    send2.write_all(b"a").unwrap();
+    let (_s2, mut recv2) = server.accept_bi().unwrap();
+    recv2.stop(zmux::VarInt::from_u32(0)).unwrap();
+    recv2.set_read_timeout(Some(Duration::from_secs(5)));
+    recv2.wait_readable().unwrap();
+    assert!(recv2.read(&mut b).is_err());
+}

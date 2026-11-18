@@ -237,7 +237,7 @@ pub use proto::listener::{
 };
 pub use proto::listener::{SessionCarrier, SessionConfigAnswer, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};
-pub use proto::params::DEFAULT_MAX_RECORD_SIZE;
+pub use proto::params::{DEFAULT_MAX_LANES, DEFAULT_MAX_RECORD_SIZE};
 pub use proto::params::{Role, TransportParameters};
 pub use proto::prefix_auth::{
     InvalidPrefixAuth, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL, PREFIX_AUTH_HEADER,
@@ -251,8 +251,8 @@ pub use proto::session::{
 };
 pub use proto::session::{
     CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierKind, Change, Config,
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
-    DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MEMORY_BUDGET,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_JOIN_TIMEOUT, DEFAULT_KEEP_ALIVE_PERIOD,
+    DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET,
     DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
     DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, DatagramError,
     DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, InboundState, Inherit,
@@ -388,6 +388,10 @@ pub mod test_hooks {
     #[cfg(feature = "blocking")]
     pub use crate::driver::blocking::sealed_halves as blocking_sealed_halves;
 
+    /// The packet stream's capsule decoder run over a byte string, for the fuzz
+    /// targets.
+    pub use crate::helpers::capsule::{CapsuleRun, decode_run as decode_capsules};
+
     /// Read buffers in the process-wide pool of idle pipes' buffers.
     #[must_use]
     pub fn read_pool_buffers() -> usize {
@@ -434,6 +438,17 @@ pub mod test_hooks {
 /// refused call fails at once and changes nothing. Calls that never wait,
 /// and waits with a zero timeout, work on any thread.
 ///
+/// # Scale
+///
+/// The std driver runs on threads: two for each pipe of a session (one
+/// reads its carrier, one writes it), one more for a session whose
+/// configuration has a tracer or an `allow_connection_window_increase`
+/// hook, and one thread of the process for the timers of every session.
+/// A session therefore costs at least two threads, and a multipath session
+/// two for each of its pipes. It is for programs with a few sessions (a
+/// client, a tool, a relay of a handful of peers); a server with thousands
+/// of sessions uses the tokio driver, where a session is a task.
+///
 /// What only the tokio driver has, and why:
 ///
 /// | | tokio | std | why not in the std driver |
@@ -442,7 +457,7 @@ pub mod test_hooks {
 /// | `resolve_duplicate` | yes | yes | |
 /// | early data under the zmux floor (`EarlyData::zmux_peer`) | yes | yes | |
 /// | carrier early data (`PipeIo::with_early_data`, QUIC 0-RTT) | yes | no | only the QUIC and TLS adapters, all async, produce it |
-/// | `Listener`: sessions, joins, resumption, `count_setup_failure` | yes | yes | |
+/// | `Listener`: sessions, joins, resumption, `adapter().count_setup_failure()` | yes | yes | |
 /// | `Listener`: split carriers, lanes, admission (`Fallback`, `Prefixed`), memory budget | yes | no | they serve the HTTP and QUIC adapters, all async |
 /// | `CarrierChoice`, `dial_choice`, `CarrierCache` | yes | no | its candidates are the async adapters' carriers |
 /// | streams as pipes (`open_pipe_stream`, `PipeIo::from_stream`) | yes | no | a nested session's pipe threads would block on the outer stream, which a thread that drives sessions may not do |

@@ -151,8 +151,9 @@ fn tasks_and_threads_end_with_their_sessions() {
     settle("session tasks", base, || resources().session_tasks);
     drop(rt);
 
-    // The std driver: closed and dropped sessions; the reader, writer and
-    // timer threads all end.
+    // The std driver: closed and dropped sessions; the reader and writer
+    // threads all end (the timers run on one thread of the process, which
+    // never ends and counts nowhere).
     let base = resources().threads;
     for i in 0..10u32 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -169,10 +170,10 @@ fn tasks_and_threads_end_with_their_sessions() {
         )
         .unwrap();
         let server = server.join().unwrap();
-        // Reader, writer and timer threads of both sessions (they count
-        // themselves once running).
+        // Reader and writer threads of both sessions (they count themselves
+        // once running).
         let start = Instant::now();
-        while resources().threads < base + 6 {
+        while resources().threads < base + 4 {
             assert!(start.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(1));
         }

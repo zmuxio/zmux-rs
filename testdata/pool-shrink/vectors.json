@@ -1,0 +1,366 @@
+{
+  "about": [
+    "Shrink order of a pool, shared by every implementation that has a pool policy.",
+    "A case gives the pool's members, the growth dials in progress (dialing, numbered 0 for the oldest to dialing-1 for the newest) and the decision: count, and retire, the keys the decision names.",
+    "The pool's size is the members and dialing together. While it is above count, growth dials are cancelled first, newest first, then members close: those named in retire first, then the longest idle, ties broken by the fewest pipes, then the least age, then the highest key.",
+    "expect lists the dials cancelled (by number, in order) and the keys closed (in order). An implementation whose pool reports dialing 0 passes the cases with dialing 0 only."
+  ],
+  "cases": [
+    {
+      "name": "no-dialing-longest-idle-first",
+      "members": [
+        {
+          "key": 1,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 0,
+      "decision": {
+        "count": 2,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "dials-cancelled-before-any-member",
+      "members": [
+        {
+          "key": 1,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 2,
+      "decision": {
+        "count": 3,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [
+          1,
+          0
+        ],
+        "close": []
+      }
+    },
+    {
+      "name": "dials-newest-first-partial",
+      "members": [
+        {
+          "key": 1,
+          "idle": 0,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 0,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 3,
+      "decision": {
+        "count": 3,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [
+          2,
+          1
+        ],
+        "close": []
+      }
+    },
+    {
+      "name": "dials-then-members",
+      "members": [
+        {
+          "key": 1,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 1,
+      "decision": {
+        "count": 2,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [
+          0
+        ],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "all-dials-then-several-members",
+      "members": [
+        {
+          "key": 1,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 2,
+      "decision": {
+        "count": 1,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [
+          1,
+          0
+        ],
+        "close": [
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "named-before-idle-after-dials",
+      "members": [
+        {
+          "key": 1,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 1,
+      "decision": {
+        "count": 2,
+        "retire": [
+          2
+        ]
+      },
+      "expect": {
+        "cancel_dials": [
+          0
+        ],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "named-before-idle",
+      "members": [
+        {
+          "key": 1,
+          "idle": 9,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 1,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 3,
+          "idle": 5,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 0,
+      "decision": {
+        "count": 2,
+        "retire": [
+          2
+        ]
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "tie-fewest-pipes",
+      "members": [
+        {
+          "key": 1,
+          "idle": 4,
+          "pipes": 3,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 4,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 0,
+      "decision": {
+        "count": 1,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "tie-least-age",
+      "members": [
+        {
+          "key": 1,
+          "idle": 4,
+          "pipes": 2,
+          "age": 50
+        },
+        {
+          "key": 2,
+          "idle": 4,
+          "pipes": 2,
+          "age": 10
+        }
+      ],
+      "dialing": 0,
+      "decision": {
+        "count": 1,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "tie-highest-key",
+      "members": [
+        {
+          "key": 4,
+          "idle": 4,
+          "pipes": 2,
+          "age": 10
+        },
+        {
+          "key": 9,
+          "idle": 4,
+          "pipes": 2,
+          "age": 10
+        }
+      ],
+      "dialing": 0,
+      "decision": {
+        "count": 1,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": [
+          9
+        ]
+      }
+    },
+    {
+      "name": "size-at-count-changes-nothing",
+      "members": [
+        {
+          "key": 1,
+          "idle": 0,
+          "pipes": 1,
+          "age": 0
+        },
+        {
+          "key": 2,
+          "idle": 0,
+          "pipes": 1,
+          "age": 0
+        }
+      ],
+      "dialing": 1,
+      "decision": {
+        "count": 3,
+        "retire": []
+      },
+      "expect": {
+        "cancel_dials": [],
+        "close": []
+      }
+    }
+  ]
+}

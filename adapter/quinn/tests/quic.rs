@@ -25,7 +25,7 @@ impl Quic {
     /// With the server's transport configuration `transport`.
     fn with_transport(transport: quinn::TransportConfig) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
         let der = CertificateDer::from(cert.cert.der().to_vec());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
         let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -206,7 +206,7 @@ async fn a_bound_join_over_a_second_connection() {
 /// A rustls configuration pair for "localhost" without ALPN identifiers.
 fn plain_tls() -> (rustls::ClientConfig, rustls::ServerConfig) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let server = rustls::ServerConfig::builder_with_provider(provider.clone())

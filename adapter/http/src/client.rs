@@ -225,11 +225,8 @@ impl Follow {
                 .map(str::to_owned);
             // The redirect's body is not the carrier's.
             drop(resp);
-            let refuse = |reason| RedirectError {
-                status,
-                location: location.clone().unwrap_or_default(),
-                reason,
-            };
+            let refuse =
+                |reason| RedirectError::new(status, location.clone().unwrap_or_default(), reason);
             let next = redirect::check(&url, self.method, status, location.as_deref())?;
             if !redirect::same_origin(&next, &url) {
                 return Err(refuse("another origin over the carrier's connections").into());

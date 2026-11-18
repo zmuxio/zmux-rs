@@ -1,0 +1,84 @@
+name: Fuzz
+
+# A short libFuzzer run of every wire-parser target (fuzz/fuzz_targets) every
+# night on the nightly toolchain, and on request. A crash fails the run and
+# uploads its input; the failure opens (or updates) one issue.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: '60'
+  schedule:
+    - cron: '41 2 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: Fuzz smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, varint, preamble, capsule, params]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust nightly
+        shell: bash
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: fuzz-${{ runner.os }}-
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz || cargo install --locked cargo-fuzz
+      - name: Run ${{ matrix.target }}
+        # The input reaches the shell through the environment, never as text.
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '60' }}
+        run: cargo fuzz run "${{ matrix.target }}" --fuzz-dir fuzz -- -max_total_time="$SECONDS_PER_TARGET" -timeout=10
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  report:
+    name: Report failures
+    if: ${{ always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly fuzz run failed"
+          body=$(printf 'A fuzz target crashed or failed to build. The crashing input is an artifact of the run:\n\n%s\n' "$RUN_URL")
+          number=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\"))[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

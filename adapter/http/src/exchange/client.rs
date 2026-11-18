@@ -448,10 +448,8 @@ impl Http {
                 // The redirect's body is not the carrier's; its connection
                 // is not kept.
                 drop(resp);
-                let refuse = |reason| RedirectError {
-                    status,
-                    location: location.clone().unwrap_or_default(),
-                    reason,
+                let refuse = |reason| {
+                    RedirectError::new(status, location.clone().unwrap_or_default(), reason)
                 };
                 let next = redirect::check(&url, "POST", status, location.as_deref())?;
                 if !redirect::same_origin(&next, &url) {

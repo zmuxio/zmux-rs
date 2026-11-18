@@ -1554,7 +1554,7 @@ impl SessionCore {
         let key = self.streams.key_of(stream_id);
         let usable = key
             .and_then(|k| self.streams.get(k))
-            .is_some_and(|s| !s.released && !s.parts_terminal() && s.offer != Offer::Rejected);
+            .is_some_and(Stream::takes_datagrams);
         match key {
             Some(k) if usable => {
                 if let Some(s) = self.streams.get_mut(k) {
@@ -1562,7 +1562,27 @@ impl SessionCore {
                 }
                 self.datagram_arrived(Some((k, context)), data);
             }
-            _ => self.count_dropped(1),
+            _ => self.drop_received_datagram(key.map(|k| (k, context))),
+        }
+    }
+
+    /// Drops the datagrams queued for a stream whose receiving handle was
+    /// released, unread: counted as dropped, their bytes leave the stream's
+    /// and the session's accounting.
+    pub(super) fn clear_stream_datagrams(&mut self, key: StreamKey) {
+        let Some(s) = self.streams.get_mut(key) else {
+            return;
+        };
+        let Some(q) = s.datagrams.as_mut() else {
+            return;
+        };
+        let n = q.queue.len() as u64;
+        let bytes = std::mem::take(&mut q.bytes);
+        q.queue.clear();
+        q.counts.dropped_recv += n;
+        if n > 0 {
+            super::debit(&mut self.dgram_mut().stream_bytes, bytes);
+            self.count_dropped(n);
         }
     }
 

@@ -431,7 +431,7 @@ fn acknowledgements_drive_quality_events() {
     n.pump(10);
     n.ends[A]
         .set_quality_band(Some(QualityBand {
-            min_interval: Duration::ZERO,
+            min_interval: None,
             ..QualityBand::new(Some(Duration::from_millis(2)), None)
         }))
         .unwrap();

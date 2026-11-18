@@ -23,6 +23,8 @@ pub(crate) mod capsule;
 mod duplicate;
 #[cfg(feature = "tokio")]
 mod maintain;
+#[cfg(feature = "tokio")]
+mod policy_exec;
 
 /// Packet streams live in the driver: they read and write with its
 /// low-level stream operations.
@@ -35,7 +37,8 @@ pub use crate::driver::packet::{
 /// with the drivers' own low-level stream operations.
 #[cfg(feature = "tokio")]
 pub use crate::driver::splice::{
-    Forwarded, SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice, splice_packets,
+    SpliceAbort, SpliceDirection, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice,
+    splice_packets,
 };
 pub use duplicate::{DuplicateError, DuplicateRule};
 pub(crate) use duplicate::{duplicate_api, resolve};
@@ -44,8 +47,8 @@ pub(crate) use duplicate::{duplicate_api, resolve};
 duplicate_api!(crate::driver::tokio::Tokio, crate::Session, crate::Dial);
 #[cfg(feature = "tokio")]
 pub use maintain::{
-    MIN_RECHECK, MaintainHandle, PipePool, PoolDecision, PoolMember, PoolPolicy, PoolView,
-    RotatePolicy, maintain_pipes,
+    AsyncPoolPolicy, MIN_RECHECK, MaintainHandle, OwnedPoolView, PipePool, PolicyError,
+    PolicyFuture, PoolDecision, PoolMember, PoolPolicy, PoolView, Rotation, maintain_pipes,
 };
 #[cfg(feature = "tokio")]
 pub(crate) use maintain::{maintain_choice, maintain_redial};

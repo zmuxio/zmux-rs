@@ -15,13 +15,13 @@ mod server;
 mod trust;
 
 pub use establish::{
-    ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticKey, StaticSecret, establish,
+    ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticKey, StaticKeySource, establish,
 };
 pub use server::{ModeCheck, ModeCheckFn, ServerConfig, ServerOptions, reject_reason};
 pub use trust::{
     Admission, AppData, AppDataRequest, AppDataSource, BoxFuture, ConfigError, Credential, Gate,
     KeySigner, PinVerifier, Principal, Signer, Verifier, VerifyError, VerifyInput, VerifyVerdict,
-    static_key_id, static_public,
+    static_key_id,
 };
 pub use zmux_seal_proto::{
     DEFAULT_MAX_APP_DATA, Error, HandlePsk, KEYALG_MLDSA44, KEYALG_X25519, KeyAlg, KeyId, KeyUse,

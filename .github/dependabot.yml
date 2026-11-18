@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # The workspace (one lock file for every member).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # Pinned to the exact release the vectors were verified against.
+      - dependency-name: libcrux-ml-kem
+      - dependency-name: libcrux-ml-dsa
+      - dependency-name: libcrux-sha3
+  # Standalone crates with their own lock files.
+  - package-ecosystem: cargo
+    directories:
+      - /fuzz
+      - /interop/carrier-mem
+      - /interop/peer
+      - /interop/qmux
+      - /interop/qmux-peer
+    schedule:
+      interval: weekly
+    groups:
+      interop:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

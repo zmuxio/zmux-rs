@@ -458,7 +458,7 @@ async fn add_pipe_waits_for_the_attachment() {
     .await
     .expect("add_pipe waited for the attachment")
     .unwrap();
-    assert!(pipe.options().unwrap().return_on_reply);
+    assert!(pipe.options().return_on_reply);
     assert!(
         tokio::time::timeout(Duration::ZERO, pipe.attached())
             .await

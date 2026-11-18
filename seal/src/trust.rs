@@ -18,6 +18,7 @@ pub type Credential = (u64, Vec<u8>);
 
 /// What a [`Verifier`] is told about a peer.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct VerifyInput<'a> {
     /// The role expected of the peer: [`Role::Server`] when a client verifies message 2,
     /// [`Role::Client`] when a server verifies message 3; never [`Role::Auto`].
@@ -35,6 +36,25 @@ pub struct VerifyInput<'a> {
     /// The local application's label of the listener or the dial, as SNI or ALPN would
     /// select: the host's own, never sent.
     pub local_context: &'a [u8],
+}
+
+impl<'a> VerifyInput<'a> {
+    /// A view of a peer for a verifier's test: the role expected of it, the
+    /// handshake's Profile and its static key; no pre-shared key identity, no
+    /// credential, no application data and an empty local context, each a
+    /// public field to set on the result.
+    #[must_use]
+    pub const fn new(role: Role, profile: Profile, peer_static: &'a [u8]) -> Self {
+        Self {
+            role,
+            profile,
+            peer_static,
+            psk_identity: None,
+            credential: None,
+            peer_app_data: &[],
+            local_context: &[],
+        }
+    }
 }
 
 /// Application handshake data of one message: opaque bytes with the message that
@@ -82,6 +102,7 @@ impl AppData {
 /// (1, 2 or 3) and, for messages 2 and 3, what is known of the peer by then (for message
 /// 3, the input its verifier judged; for message 2, no static key yet).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AppDataRequest<'a> {
     /// The message: a client's 1 (Profiles 1 and 3) and 3, a server's 2.
     pub message: u8,
@@ -90,6 +111,20 @@ pub struct AppDataRequest<'a> {
     /// For the client's message 3, the verdict of its verifier on the server; `None`
     /// otherwise, and without a verifier.
     pub verdict: Option<&'a VerifyVerdict>,
+}
+
+impl AppDataRequest<'_> {
+    /// A request for the data of `message` (1, 2 or 3), for a source's test: nothing
+    /// is known of the peer and there is no verdict, each a public field to set on
+    /// the result.
+    #[must_use]
+    pub const fn new(message: u8) -> Self {
+        Self {
+            message,
+            peer: None,
+            verdict: None,
+        }
+    }
 }
 
 /// Supplies the application data of the messages an end sends. An error ends the
@@ -357,20 +392,6 @@ pub(crate) fn check_pq_auth(
     }
 }
 
-/// The X25519 public key of a static secret, as the peer sees it and
-/// [`static_key_id`] names it.
-///
-/// # Panics
-///
-/// Never: X25519 maps every 32-byte secret to a 32-byte public key.
-#[must_use]
-pub fn static_public(secret: &[u8; 32]) -> [u8; 32] {
-    zmux::proto::seal::kex::x25519_public(secret)
-        .ok()
-        .and_then(|k| k.try_into().ok())
-        .expect("a 32-byte X25519 secret has a 32-byte public key")
-}
-
 /// The `KeyId` of a static key (`KeyAlg` 1), for a pin.
 #[must_use]
 pub fn static_key_id(public: &[u8]) -> KeyId {
@@ -379,12 +400,22 @@ pub fn static_key_id(public: &[u8]) -> KeyId {
 
 /// What a server admits after message 3 verified.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Admission<'a> {
     /// The Handle of the handshake, empty for a Profile without a pre-shared key.
     pub handle: &'a [u8],
     /// What the handshake learned of the client: its static key, credential, verdict (when
     /// the server verifies clients), application data and the post-quantum facts.
     pub peer: &'a crate::Peer,
+}
+
+impl<'a> Admission<'a> {
+    /// What a server admits, for a gate's test: the peer the handshake learned and an
+    /// empty Handle (the public field `handle`, to set on the result).
+    #[must_use]
+    pub const fn new(peer: &'a crate::Peer) -> Self {
+        Self { handle: &[], peer }
+    }
 }
 
 /// The server's host: who may establish.

@@ -1,0 +1,19 @@
+[package]
+name = "zmux-testcert"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "Apache-2.0"
+description = "Self-signed certificates for the tests, benchmarks and scripted peers of the workspace"
+
+[dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+time = { version = "0.3", default-features = false }
+
+[features]
+# PEM output (`Certificate::pem`, `KeyPair::serialize_pem`) for peers that read certificate files.
+pem = ["rcgen/pem"]
+
+[lints]
+workspace = true

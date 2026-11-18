@@ -362,7 +362,7 @@ fn a_bidi_attachment_states_its_request_on_itself() {
         .unwrap();
     n.run_for(100);
     assert_eq!(n.links[&id].statuses, [(id, 1, false, 3)]);
-    assert_eq!(n.links[&0].statuses, [] as [(u64, u64, bool, u64); 0]);
+    assert_eq!(n.links[&0].statuses, Vec::new());
 }
 
 #[test]
@@ -573,6 +573,159 @@ fn probation_settings_take_effect_safely() {
     n.run_for(500);
     let info = n.ends[A].pipe_info(PipeId::new(other)).unwrap();
     assert!(info.probation_until.is_none() || info.in_probation);
+}
+
+/// `pipe_options` reads back every runtime setting as the pipe holds it:
+/// the ones added with, and after an update exactly what it set or cleared,
+/// the liveness and the quality band included.
+#[test]
+fn pipe_options_read_back_every_held_setting() {
+    use zmux::{Change, Inherit, PipeLiveness, PipeUpdate, QualityBand};
+    let mut n = net(|_| {});
+    let band = QualityBand::new(Some(Duration::from_millis(5)), Some(1.5));
+    let live = PipeLiveness {
+        probe_interval: Inherit::Set(Some(Duration::from_secs(3))),
+        ..Default::default()
+    };
+    let opts = PipeOptions::new()
+        .with_label("x")
+        .with_weight(4)
+        .with_liveness(live)
+        .with_quality_band(Some(band));
+    let id = PipeId::new(n.add_pipe(&opts).unwrap());
+    let held = n.ends[A].pipe_options(id).unwrap();
+    assert_eq!(held.liveness, Change::Set(live));
+    assert_eq!(held.quality_band, Change::Set(Some(band)));
+    assert_eq!(held.weight, Change::Set(4));
+    assert_eq!(held.label.as_deref(), Some("x"));
+
+    // An update sets some and clears others: the read-back is exactly it.
+    let band2 = QualityBand::new(Some(Duration::from_millis(9)), None);
+    let live2 = PipeLiveness {
+        dead_timeout: Inherit::Set(Duration::from_secs(20)),
+        ..Default::default()
+    };
+    n.ends[A]
+        .update_pipe(
+            id,
+            &PipeUpdate {
+                liveness: Change::Set(live2),
+                quality_band: Change::Set(None),
+                weight: Change::Clear,
+                send_priority: Change::Set(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let held = n.ends[A].pipe_options(id).unwrap();
+    assert_eq!(held.liveness, Change::Set(live2));
+    assert_eq!(held.quality_band, Change::Set(None), "off for the pipe");
+    assert_eq!(held.weight, Change::Keep);
+    assert_eq!(held.send_priority, Change::Set(3));
+    assert_eq!(held.label.as_deref(), Some("x"));
+
+    n.ends[A]
+        .update_pipe(
+            id,
+            &PipeUpdate {
+                quality_band: Change::Set(Some(band2)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        n.ends[A].pipe_options(id).unwrap().quality_band,
+        Change::Set(Some(band2))
+    );
+    n.ends[A]
+        .update_pipe(
+            id,
+            &PipeUpdate {
+                liveness: Change::Clear,
+                quality_band: Change::Clear,
+                send_priority: Change::Clear,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let held = n.ends[A].pipe_options(id).unwrap();
+    assert_eq!(held.liveness, Change::Keep, "follows the session");
+    assert_eq!(held.quality_band, Change::Keep);
+    assert_eq!(held.send_priority, Change::Keep);
+}
+
+/// A pipe's options read back the values the join fixed as they are, whoever
+/// chose them: the adding side reads what it asked for resolved (the record
+/// mode, the key group) and `return_on_reply` as given; the side the peer
+/// joined reads the direction from its own view, the mode and group of the
+/// join, and the defaults elsewhere.
+#[test]
+fn a_joined_pipe_reads_the_values_the_join_fixed() {
+    use zmux::{Change, Inherit, PipeDirection};
+    let mut n = net(|_| {});
+    let opts = PipeOptions::new()
+        .with_label("mine")
+        .with_return_on_reply(true);
+    let id = n.add_pipe_directed(false, true, &opts).unwrap();
+    n.run_for(1000);
+    let id = PipeId::new(id);
+    let a = n.ends[A].pipe_options(id).unwrap();
+    assert_eq!(a.direction, PipeDirection::Out);
+    assert_eq!(a.record_mode, Inherit::Set(zmux::RecordMode::Trusted));
+    assert_eq!(a.key_group, Inherit::Set(1));
+    assert_eq!(a.label.as_deref(), Some("mine"));
+    assert!(a.return_on_reply);
+    let b = n.ends[B].pipe_options(id).unwrap();
+    assert_eq!(b.direction, PipeDirection::In);
+    assert_eq!(b.record_mode, Inherit::Set(zmux::RecordMode::Trusted));
+    assert_eq!(b.key_group, Inherit::Set(1));
+    assert_eq!(b.label, None);
+    assert!(!b.return_on_reply);
+    assert_eq!(b.weight, Change::Keep);
+    assert_eq!(b.send_priority, Change::Keep);
+    assert_eq!(b.liveness, Change::Keep);
+}
+
+/// The core hands a pipe's options to the slot a handle holds as it retires
+/// the pipe, so that the handle reads the last options after the core no
+/// longer knows the pipe; a pipe nobody asked a slot for is retired without
+/// the options being read.
+#[test]
+fn a_retired_pipe_hands_its_last_options_to_its_slot() {
+    use zmux::{Change, PipeUpdate};
+    let mut n = net(|_| {});
+    let id = PipeId::new(
+        n.add_pipe(&PipeOptions::new().with_label("kept").with_weight(4))
+            .unwrap(),
+    );
+    n.run_for(1000);
+    let slot = n.ends[A].pipe_final(id).unwrap();
+    assert!(slot.get().is_none(), "empty while the pipe lives");
+    n.ends[A]
+        .update_pipe(
+            id,
+            &PipeUpdate {
+                send_priority: Change::Set(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    n.ends[A].remove_pipe(id, true, n.now).unwrap();
+    // Simulated time: bounded by the loop, not by the clock.
+    for _ in 0..200 {
+        if n.ends[A].pipe_options(id).is_none() {
+            break;
+        }
+        n.run_for(100);
+    }
+    assert!(n.ends[A].pipe_options(id).is_none(), "the pipe retired");
+    let fin = slot.get().expect("set as the pipe retired");
+    assert!(fin.closed.is_ok(), "a graceful removal ends cleanly");
+    let last = &fin.options;
+    assert_eq!(last.label.as_deref(), Some("kept"));
+    assert_eq!(last.weight, Change::Set(4));
+    assert_eq!(last.send_priority, Change::Set(2), "the update applied");
+    assert!(n.ends[A].pipe_final(id).is_none());
 }
 
 /// A `PIPE_ACK` on a pipe that has carried nothing ack-eliciting for more

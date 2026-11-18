@@ -34,20 +34,21 @@
 //! suspended (each is a rejoin) and stop when it ends.
 //!
 //! An optional [`PoolPolicy`] is asked at each of these looks for a
-//! [`PoolDecision`]: the number of members to keep, the time of the next
-//! dial (in place of the backoff's), the times at which given members are
-//! replaced, the idle-probe settings of the pipes added after it and
-//! the time by which to ask again (looks come sooner, not later, for it). The
-//! maintainer applies it within what it does anyway (dial, add, replace
-//! make before break, close) and bounds it; without a policy nothing
-//! changes.
+//! [`PoolDecision`]: the number of members to keep (members above it
+//! close gracefully), the wait before the next dial (in place of the
+//! backoff's), members to replace now, the liveness settings of the pipes
+//! dialled after it and how soon to look again. The maintainer applies it
+//! within what it does anyway (dial, add, replace make before break,
+//! close); without a policy nothing changes.
 
 use crate::Backoff;
 use crate::backoff::{random_fraction, reduce};
 use crate::util::{f64_of, u64_sat};
+use std::cmp::Reverse;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -61,15 +62,15 @@ use crate::driver::handle::{self, WeakSession, dead, usable};
 use crate::driver::resources::{Kind, Live};
 use crate::driver::tokio::Tokio;
 use crate::proto::session::{
-    InboundState, Inherit, OutboundState, PipeError, PipeId, PipeLiveness, PipeOptions, PipeStats,
-    State,
+    InboundState, Inherit, InvalidConfig, OutboundState, PipeError, PipeId, PipeLiveness,
+    PipeOptions, PipeStats, State,
 };
 use crate::{
     CarrierChoice, CarrierChoicePolicy, ConnectError, Dial, DialRequest, Pipe, PipeIo, Session,
 };
 use atomic_waker::AtomicWaker;
 
-use super::POLL;
+use super::{POLL, policy_exec};
 
 /// The shortest [`PoolDecision::recheck`] a pool honours: a shorter one
 /// is lengthened to this, so that a policy cannot make it spin.
@@ -85,13 +86,13 @@ pub const MIN_RECHECK: Duration = Duration::from_millis(10);
 /// # async fn example(session: zmux::Session) {
 /// use std::time::Duration;
 /// use zmux::PipeOptions;
-/// use zmux::helpers::{PipePool, RotatePolicy, maintain_pipes};
+/// use zmux::helpers::{PipePool, Rotation, maintain_pipes};
 ///
 /// let pool = PipePool::new(2, |_req| async {
 ///     Ok(zmux::PipeIo::from_tcp(tokio::net::TcpStream::connect("10.0.0.2:4433").await?))
 /// })
 /// .with_options(PipeOptions::new().with_send_priority(10).with_receive_priority(10).with_label("relay"))
-/// .with_rotate(RotatePolicy::new().with_max_age(Duration::from_secs(600)));
+/// .with_rotate(Rotation::new().with_max_age(Duration::from_secs(600)));
 /// let _keep = maintain_pipes(&session, pool).expect("valid pool");
 /// # }
 /// ```
@@ -105,17 +106,44 @@ pub struct PipePool {
     /// The options of every pipe of the pool.
     pub options: PipeOptions,
     /// Rotation; none by default.
-    pub rotate: Option<RotatePolicy>,
+    pub rotate: Option<Rotation>,
     /// Redial backoff.
     pub backoff: Backoff,
     /// The policy consulted at each look; see [`PipePool::with_policy`].
-    policy: Option<Arc<Mutex<dyn PoolPolicy>>>,
+    policy: Option<Policy>,
     /// Told of each rejected decision; see
     /// [`PipePool::with_decision_rejected`].
     decision_rejected: Option<RejectFn>,
 }
 
-type RejectFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// A pool's policy: the public synchronous one, or the adapter-level
+/// asynchronous one ([`AsyncPoolPolicy`]).
+#[derive(Clone)]
+enum Policy {
+    Sync(SyncPolicy),
+    Async(Arc<dyn AsyncPoolPolicy>),
+}
+
+/// A synchronous policy, and the gate that lets one look at it run at a
+/// time: pools that share the policy (clones of a pool) wait for the gate
+/// on their own task, so that a `decide` that does not return holds one
+/// thread of the policy executor, however many pools wait for the policy.
+#[derive(Clone)]
+struct SyncPolicy {
+    policy: Arc<Mutex<dyn PoolPolicy>>,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl SyncPolicy {
+    fn new(policy: impl PoolPolicy + 'static) -> Self {
+        Self {
+            policy: Arc::new(Mutex::new(policy)),
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+}
+
+type RejectFn = Arc<dyn Fn(&(dyn std::error::Error + 'static)) + Send + Sync>;
 
 type JoinFuture = Pin<Box<dyn Future<Output = io::Result<Vec<Pipe>>> + Send>>;
 type JoinFn = Arc<dyn Fn(Session, PipeOptions) -> JoinFuture + Send + Sync>;
@@ -221,7 +249,7 @@ impl PipePool {
 
     /// With rotation.
     #[must_use]
-    pub fn with_rotate(mut self, rotate: RotatePolicy) -> Self {
+    pub fn with_rotate(mut self, rotate: Rotation) -> Self {
         self.rotate = Some(rotate);
         self
     }
@@ -238,16 +266,31 @@ impl PipePool {
     /// policy and its state.
     #[must_use]
     pub fn with_policy(mut self, policy: impl PoolPolicy + 'static) -> Self {
-        self.policy = Some(Arc::new(Mutex::new(policy)));
+        self.policy = Some(Policy::Sync(SyncPolicy::new(policy)));
         self
     }
 
-    /// With a function told the reason of each decision of the policy
-    /// that was [rejected](PoolDecision::reject); it runs on the
-    /// maintainer task and must return promptly. Without one, rejected
-    /// decisions are only kept from taking effect.
+    /// With an asynchronous policy, answered on the maintainer's task
+    /// instead of a thread of the policy executor: for an adapter whose
+    /// answer comes from an event loop (a language binding), which would
+    /// otherwise occupy a thread to wait for it. Replaces any
+    /// [`with_policy`](Self::with_policy). Not part of the stable API.
+    #[doc(hidden)]
     #[must_use]
-    pub fn with_decision_rejected(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+    pub fn with_async_policy(mut self, policy: Arc<dyn AsyncPoolPolicy>) -> Self {
+        self.policy = Some(Policy::Async(policy));
+        self
+    }
+
+    /// With a function handed the error of each rejected decision of the
+    /// policy (one that panicked, see [`PoolPolicy`]); it runs on the
+    /// maintainer task and must return promptly. Without one, the error is
+    /// logged through the session's logger.
+    #[must_use]
+    pub fn with_decision_rejected(
+        mut self,
+        f: impl Fn(&(dyn std::error::Error + 'static)) + Send + Sync + 'static,
+    ) -> Self {
         self.decision_rejected = Some(Arc::new(f));
         self
     }
@@ -277,7 +320,7 @@ impl fmt::Debug for PipePool {
 /// When the members of a pool are replaced (make before break).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
-pub struct RotatePolicy {
+pub struct Rotation {
     /// Bytes carried in either direction (a group's pipes summed).
     pub max_bytes: Option<u64>,
     /// Age of the member. For a carrier with a hard lifetime, set it
@@ -288,7 +331,7 @@ pub struct RotatePolicy {
     pub jitter: f64,
 }
 
-impl RotatePolicy {
+impl Rotation {
     /// No limit and no jitter: set the limits with the builders.
     #[must_use]
     pub fn new() -> Self {
@@ -318,153 +361,261 @@ impl RotatePolicy {
 }
 
 /// Decides, at each look of the maintainer, how many members the pool
-/// keeps, when it may dial next and when given members are replaced.
+/// keeps, when it dials next and which members it replaces.
 ///
-/// [`decide`](Self::decide) runs on the maintainer task each time it looks
-/// at its members (at once after a pipe of the session changed state or
-/// the session was suspended or resumed, after 100 ms at the latest, after
-/// each finished dial, and by the [`recheck`](PoolDecision::recheck) of
-/// its last decision); it must return promptly and must not call into the
-/// session. It starts from a default [`PoolDecision`], in which every
-/// field keeps the pool's own behaviour.
+/// [`decide`](Self::decide) runs, on one of a few threads of the crate's own
+/// that serve no other work (no runtime worker, not the runtime's blocking
+/// pool) and while the pool holds no lock, each time the maintainer looks at its
+/// members: at once when a pipe of the session changes state or the
+/// session is suspended or resumed, after each dial attempt ends, no later
+/// than the [`recheck`](PoolDecision::recheck) of the last decision, and
+/// every 100 ms, the maintenance interval. A pool asks one look at a time:
+/// what happens while it is being decided merges into the one look after it.
+/// It may block (nothing bounds it with a timeout: one that does not return
+/// holds the looks of its own pool, and a thread of the policy executor,
+/// of which there are four for the whole process: when all four are held
+/// the looks of other pools wait for one to come free; the runtime's own
+/// threads and every other task are not affected) and must not call into
+/// the session. `out` starts as
+/// [`PoolDecision::default()`], in which every field keeps the pool's own
+/// behaviour. A policy that returns an error (so that
+/// `out.set_recheck(d)?` rejects an invalid value), or panics, has its
+/// decision rejected as a whole: the pool applies the default decision for
+/// that look, hands the error to [`PipePool::with_decision_rejected`]'s
+/// function or, without one, logs it at warning level through the
+/// session's logger, and goes on.
 pub trait PoolPolicy: Send {
     /// Fills `out` from the state of the pool in `view`.
-    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision);
-}
-
-impl<F> PoolPolicy for F
-where
-    F: FnMut(&PoolView<'_>, &mut PoolDecision) + Send,
-{
-    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) {
-        self(view, out);
-    }
-}
-
-/// The state of a pool that a [`PoolPolicy`] sees.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct PoolView<'a> {
-    /// The time of the look.
-    pub now: std::time::Instant,
-    /// The pool's members, replacements included.
-    pub members: &'a [PoolMember],
-    /// Consecutive failed redials (reset when a member becomes usable).
-    pub redial_failures: u32,
-    /// Consecutive failed replacements.
-    pub rotate_failures: u32,
-    /// When the pool last started a dial; `None` before the first.
-    pub last_dial_at: Option<std::time::Instant>,
-    /// When the pool started: dial waits count from it before the first
-    /// dial.
-    pub started: std::time::Instant,
-    /// The session's state.
-    pub session_state: crate::SessionState,
-}
-
-/// A member of the pool in a [`PoolView`].
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct PoolMember {
-    /// The member's identifier: the ID of its first pipe.
-    pub id: PipeId,
-    /// The statistics of its pipes (one for a dialled member).
-    pub pipes: Vec<PipeStats>,
-    /// Every pipe serves its direction (an outbound pipe ACTIVE and out
-    /// of probation, a downlink OPEN) and the peer attached it
-    /// (`Pipe::attached`).
-    pub usable: bool,
-    /// It is the replacement of this member, until it becomes usable.
-    pub replaces: Option<PipeId>,
-    /// A replacement of it is being joined.
-    pub replaced: bool,
-}
-
-impl PoolMember {
-    /// Bytes sent over its pipes.
-    #[must_use]
-    pub fn bytes_sent(&self) -> u64 {
-        self.pipes.iter().map(|p| p.bytes_sent).sum()
-    }
-
-    /// Bytes received over its pipes.
-    #[must_use]
-    pub fn bytes_received(&self) -> u64 {
-        self.pipes.iter().map(|p| p.bytes_received).sum()
-    }
-
-    /// The least time since a traffic frame on any of its pipes.
-    #[must_use]
-    pub fn since_last_traffic(&self) -> Option<Duration> {
-        self.pipes.iter().filter_map(|p| p.since_last_traffic).min()
-    }
-
-    /// How long its oldest pipe has been attached.
-    #[must_use]
-    pub fn age(&self) -> Duration {
-        self.pipes
-            .iter()
-            .map(|p| p.attached_for)
-            .max()
-            .unwrap_or_default()
-    }
-}
-
-/// What a [`PoolPolicy`] decides; each field left at its default keeps the
-/// pool's own behaviour. The maintainer bounds the values.
-#[derive(Debug, Clone, Default, PartialEq)]
-#[non_exhaustive]
-pub struct PoolDecision {
-    /// Usable members to keep instead of [`PipePool::count`]; at least 1.
-    /// A lower count closes no member: members above it are not
-    /// redialled when they fail.
-    pub count: Option<usize>,
-    /// The next dial, redial or replacement starts then, in place of the
-    /// backoff's delay (and its jitter); it is held for at most the
-    /// backoff's [`max`](Backoff::max) after the start of the last dial
-    /// (or the maintainer's start).
-    pub next_dial_at: Option<std::time::Instant>,
-    /// Members of the pool to replace, make before break, from the given
-    /// time on (a past time: at once). A member's replacement time only
-    /// moves earlier; members that are not usable, or already being
-    /// replaced, are skipped.
-    pub rotate: Vec<(PipeId, std::time::Instant)>,
-    /// Ask the policy again within this, even if nothing happens in the
-    /// pool (`None`: no such need; the pool's own looks go on). It is
-    /// lengthened to [`MIN_RECHECK`] at least and is not capped.
-    pub recheck: Option<Duration>,
-    liveness: Option<PipeLiveness>,
-    rejected: Option<String>,
-}
-
-impl PoolDecision {
-    /// Rejects the decision as a whole for `reason`: the pool keeps its
-    /// own behaviour, as for a default decision, and tells the pool's
-    /// [`with_decision_rejected`](PipePool::with_decision_rejected)
-    /// function. For a policy that cannot keep its decision within bounds
-    /// (the setters' errors are for a policy that can).
-    pub fn reject(&mut self, reason: impl Into<String>) {
-        self.rejected = Some(reason.into());
-    }
-
-    /// The reason the decision was rejected, if it was.
-    #[must_use]
-    pub fn rejected(&self) -> Option<&str> {
-        self.rejected.as_deref()
-    }
-
-    /// Sets the liveness settings of the pipes the pool adds after this
-    /// decision: each field set here replaces the one of
-    /// [`PipePool::options`]' [`liveness`](PipeOptions::liveness); pipes
-    /// already added keep theirs. Settings out of range are
-    /// [`PipeError::InvalidOptions`], as for the pipe option, and change
-    /// nothing.
     ///
     /// # Errors
     ///
-    /// [`PipeError::InvalidOptions`] for settings out of range.
-    pub fn set_liveness(&mut self, liveness: PipeLiveness) -> Result<(), PipeError> {
-        liveness.validate().map_err(PipeError::InvalidOptions)?;
+    /// Any error rejects the look: the default decision applies.
+    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) -> Result<(), PolicyError>;
+}
+
+/// A pool policy answered asynchronously, for an adapter (a language
+/// binding) whose answer comes from an event loop. The maintainer polls the
+/// returned future on its own task, so a pending answer occupies no thread
+/// and no slot of the policy executor; it holds no lock of the pool.
+/// Not part of the stable API.
+///
+/// One look is asked at a time per pool (a future that does not complete
+/// holds the looks of its own pool and nothing else); the policy is shared
+/// by the pools that use it, so it keeps its own state behind its own
+/// synchronisation. A panic when the future is created or polled rejects
+/// the look, as for [`PoolPolicy`]; dropping the future (the pool stops)
+/// cancels the look.
+#[doc(hidden)]
+pub trait AsyncPoolPolicy: Send + Sync {
+    /// The decision for the pool in `view`; an error rejects the look.
+    fn decide(&self, view: OwnedPoolView) -> PolicyFuture;
+}
+
+/// The future of [`AsyncPoolPolicy::decide`].
+#[doc(hidden)]
+pub type PolicyFuture = Pin<Box<dyn Future<Output = Result<PoolDecision, PolicyError>> + Send>>;
+
+/// A [`PoolView`] that owns its members, for [`AsyncPoolPolicy`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct OwnedPoolView {
+    /// [`PoolView::members`].
+    pub members: Vec<PoolMember>,
+    /// [`PoolView::failures`].
+    pub failures: u32,
+    /// [`PoolView::since_last_dial`].
+    pub since_last_dial: Option<Duration>,
+    /// [`PoolView::dialing`].
+    pub dialing: usize,
+}
+
+impl OwnedPoolView {
+    /// The borrowed view of it.
+    #[must_use]
+    pub fn view(&self) -> PoolView<'_> {
+        PoolView {
+            members: &self.members,
+            failures: self.failures,
+            since_last_dial: self.since_last_dial,
+            dialing: self.dialing,
+        }
+    }
+}
+
+/// The error with which a [`PoolPolicy`] rejects a look.
+pub type PolicyError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<F> PoolPolicy for F
+where
+    F: FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), PolicyError> + Send,
+{
+    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) -> Result<(), PolicyError> {
+        self(view, out)
+    }
+}
+
+/// The state of a pool that a [`PoolPolicy`] sees. Durations, not points
+/// in time: a policy reads no clock of its own, and is tested with plain
+/// values. A policy's tests build one from [`PoolView::default()`] and set
+/// its fields.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct PoolView<'a> {
+    /// The pool's members; a replacement being joined is not one until it
+    /// replaces its member.
+    pub members: &'a [PoolMember],
+    /// Consecutive failed dial attempts of the pool (redials and
+    /// replacements alike), 0 once a dial gives a usable member.
+    pub failures: u32,
+    /// The time since the start of the pool's last dial attempt; `None`
+    /// before the first.
+    pub since_last_dial: Option<Duration>,
+    /// The dial attempts in progress that would add a member (redials and
+    /// first dials; replacements are not counted).
+    pub dialing: usize,
+}
+
+/// A member of the pool in a [`PoolView`]: a dialled pipe, or the group of
+/// pipes a join function joined. A policy's tests build one from
+/// [`PoolMember::default()`] and set its fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PoolMember {
+    /// The ID of its first pipe, which identifies the member (pipe 0
+    /// included).
+    pub pipe: PipeId,
+    /// The time since its oldest pipe was attached.
+    pub age: Duration,
+    /// The least time since a traffic frame on any of its pipes (since
+    /// attachment for a pipe without traffic).
+    pub idle: Duration,
+    /// The number of its pipes: 1 for a dialled pipe, the group's size for
+    /// a joined member.
+    pub pipes: usize,
+    /// Bytes sent over its pipes.
+    pub bytes_sent: u64,
+    /// Bytes received over its pipes.
+    pub bytes_received: u64,
+    /// Every pipe serves its direction (an outbound pipe ACTIVE and out of
+    /// probation, a downlink OPEN) and the peer attached it
+    /// (`Pipe::attached`).
+    pub usable: bool,
+    /// A replacement of it is being dialled or joined.
+    pub replacing: bool,
+}
+
+impl Default for PoolMember {
+    /// Pipe 0, zero durations and counts, not usable, not being replaced.
+    fn default() -> Self {
+        Self {
+            pipe: PipeId(0),
+            age: Duration::ZERO,
+            idle: Duration::ZERO,
+            pipes: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            usable: false,
+            replacing: false,
+        }
+    }
+}
+
+/// What a [`PoolPolicy`] decides, written with its setters; each field left
+/// unset keeps the pool's own behaviour, so the default decision changes
+/// nothing. No layer corrects a value into range: the setters refuse what
+/// is out of range.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolDecision {
+    count: Option<NonZeroUsize>,
+    dial_after: Option<Duration>,
+    retire_pipes: Vec<PipeId>,
+    recheck: Option<Duration>,
+    liveness: Option<PipeLiveness>,
+}
+
+impl PoolDecision {
+    /// Keeps `count` members instead of [`PipePool::count`]. Above it,
+    /// with members and [`dialing`](PoolView::dialing) counted together,
+    /// the pool shrinks one step at a time: dials that would add a member
+    /// are cancelled first, the most recently started first; then members
+    /// close gracefully, those in [`retire_pipes`](Self::set_retire_pipes)
+    /// first, then the longest idle, ties broken by the fewest pipes, then
+    /// the least age, then the highest pipe ID. A closed member's
+    /// replacement is cancelled or closed with it.
+    pub fn set_count(&mut self, count: NonZeroUsize) {
+        self.count = Some(count);
+    }
+
+    /// The count set, if any.
+    #[must_use]
+    pub fn count(&self) -> Option<NonZeroUsize> {
+        self.count
+    }
+
+    /// Waits `after` from the start of the last dial attempt (the start of
+    /// the pool before the first) to the next dial, redial or replacement,
+    /// in place of the backoff's wait and its jitter; its effect is bounded
+    /// by the backoff's [`max`](Backoff::max). Zero dials at once.
+    pub fn set_dial_after(&mut self, after: Duration) {
+        self.dial_after = Some(after);
+    }
+
+    /// The dial wait set, if any.
+    #[must_use]
+    pub fn dial_after(&self) -> Option<Duration> {
+        self.dial_after
+    }
+
+    /// Replaces these members now, make before break, by the ID of their
+    /// first pipe ([`PoolMember::pipe`]); a member that is not usable or
+    /// already being replaced is skipped.
+    pub fn set_retire_pipes(&mut self, pipes: impl IntoIterator<Item = PipeId>) {
+        self.retire_pipes.clear();
+        self.retire_pipes.extend(pipes);
+    }
+
+    /// The members to replace.
+    #[must_use]
+    pub fn retire_pipes(&self) -> &[PipeId] {
+        &self.retire_pipes
+    }
+
+    /// Looks again no later than `recheck` after this decision, even when
+    /// nothing happens; its effect is bounded below by [`MIN_RECHECK`] so
+    /// that a policy cannot make the pool spin, and not bounded above.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`] for zero; nothing changes.
+    pub fn set_recheck(&mut self, recheck: Duration) -> Result<(), InvalidConfig> {
+        if recheck.is_zero() {
+            return Err(InvalidConfig::new(
+                "PoolDecision::recheck",
+                "zero: leave it unset for no extra look",
+            ));
+        }
+        self.recheck = Some(recheck);
+        Ok(())
+    }
+
+    /// The recheck set, if any.
+    #[must_use]
+    pub fn recheck(&self) -> Option<Duration> {
+        self.recheck
+    }
+
+    /// Sets the liveness settings of the pipes the pool dials after this
+    /// decision: each field set here replaces the one of
+    /// [`PipePool::options`]' [`liveness`](PipeOptions::liveness), and a
+    /// field left to inherit keeps it (else the session's); pipes already
+    /// added keep theirs.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`] for settings out of range, as for the pipe
+    /// option; nothing changes.
+    pub fn set_liveness(&mut self, liveness: PipeLiveness) -> Result<(), InvalidConfig> {
+        liveness.validate()?;
         self.liveness = Some(liveness);
         Ok(())
     }
@@ -473,6 +624,44 @@ impl PoolDecision {
     #[must_use]
     pub fn liveness(&self) -> Option<PipeLiveness> {
         self.liveness
+    }
+}
+
+/// The error handed to [`PipePool::with_decision_rejected`]'s function
+/// for a policy that panicked (one that returned an error hands that).
+#[derive(Debug)]
+struct PolicyPanicked(String);
+
+impl fmt::Display for PolicyPanicked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the pool policy panicked: {}", self.0)
+    }
+}
+
+impl std::error::Error for PolicyPanicked {}
+
+/// The error handed to [`PipePool::with_decision_rejected`]'s function
+/// for a look that no thread of the policy executor answered: the process
+/// is ending.
+#[derive(Debug)]
+struct PolicyUnavailable;
+
+impl fmt::Display for PolicyUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the pool policy was not asked: the policy executor ended")
+    }
+}
+
+impl std::error::Error for PolicyUnavailable {}
+
+impl PolicyPanicked {
+    fn of(payload: &(dyn std::any::Any + Send)) -> Self {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Self(msg)
     }
 }
 
@@ -716,10 +905,13 @@ struct Maintainer {
     rotate_failures: u32,
     /// The backoff of the next replacement, from the last dial's start.
     rotate_delay: Duration,
+    /// Consecutive failed dial attempts, redials and replacements alike
+    /// ([`PoolView::failures`]).
+    failures: u32,
     /// Usable members to keep: the policy's, else the pool's.
     count: usize,
-    /// The policy's next dial; `None`: the backoff's.
-    dial_gate: Option<Instant>,
+    /// The policy's wait before the next dial; `None`: the backoff's.
+    dial_after: Option<Duration>,
     /// The policy's idle-probe interval and jitter for pipes added now.
     liveness: Option<PipeLiveness>,
     /// When the last dial started.
@@ -760,8 +952,9 @@ impl Maintainer {
             redial_wait: Duration::ZERO,
             rotate_failures: 0,
             rotate_delay: Duration::ZERO,
+            failures: 0,
             count: 0,
-            dial_gate: None,
+            dial_after: None,
             liveness: None,
             last_dial_at: None,
             started: now,
@@ -803,7 +996,10 @@ impl Maintainer {
             self.seen = session.pipe_changes();
             self.observe(&session, now);
             let infos = self.infos();
-            self.consult(&session, &infos, now);
+            if !self.consult(&session, &infos, now).await {
+                shared = Some(session.shared().clone());
+                break;
+            }
             self.rotate(&session, &infos, now);
             self.start_dials(&session, now);
             let next = self.next_check(now);
@@ -824,7 +1020,7 @@ impl Maintainer {
                     for i in 0..self.dials.len() {
                         if let Poll::Ready(r) = self.dials[i].future.as_mut().poll(cx) {
                             return Poll::Ready(Wake::Dial(
-                                Box::new(self.dials.swap_remove(i)),
+                                Box::new(self.dials.remove(i)),
                                 Box::new(r),
                             ));
                         }
@@ -891,73 +1087,153 @@ impl Maintainer {
         next
     }
 
-    /// Asks the policy, if any, and applies its decision within bounds.
-    fn consult(&mut self, session: &Session, infos: &[Vec<Option<PipeStats>>], now: Instant) {
+    /// Asks the policy, if any, and applies its decision; `false` when the
+    /// pool stopped or the session closed while it was being decided.
+    async fn consult(
+        &mut self,
+        session: &Session,
+        infos: &[Vec<Option<PipeStats>>],
+        now: Instant,
+    ) -> bool {
         self.count = self.pool.count;
-        self.dial_gate = None;
+        self.dial_after = None;
         self.liveness = None;
         self.recheck_at = None;
         let Some(policy) = self.pool.policy.clone() else {
-            return;
+            return true;
         };
         let members: Vec<PoolMember> = self
             .members
             .iter()
             .zip(infos)
+            // A replacement is not a member until it replaces its member.
+            .filter(|(m, _)| m.replaces.is_none())
             .filter_map(|(m, i)| {
-                let pipes: Option<Vec<PipeStats>> = i.iter().cloned().collect();
+                let pipes: Option<Vec<&PipeStats>> = i.iter().map(Option::as_ref).collect();
                 let pipes = pipes?;
+                let age = pipes
+                    .iter()
+                    .map(|p| p.attached_for)
+                    .max()
+                    .unwrap_or_default();
+                let idle = pipes
+                    .iter()
+                    .map(|p| p.since_last_traffic.unwrap_or(p.attached_for))
+                    .min()
+                    .unwrap_or_default();
                 Some(PoolMember {
-                    id: m.id(),
+                    pipe: m.id(),
+                    age,
+                    idle,
+                    pipes: pipes.len(),
+                    bytes_sent: pipes.iter().map(|p| p.bytes_sent).sum(),
+                    bytes_received: pipes.iter().map(|p| p.bytes_received).sum(),
                     usable: m.pipes.iter().zip(&pipes).all(|(p, i)| usable(p, i)),
-                    pipes,
-                    replaces: m.replaces,
-                    replaced: m.replaced,
+                    replacing: m.replaced,
                 })
             })
             .collect();
-        let view = PoolView {
-            now: now.into_std(),
-            members: &members,
-            redial_failures: self.redial_failures,
-            rotate_failures: self.rotate_failures,
-            last_dial_at: self.last_dial_at.map(Instant::into_std),
-            started: self.started.into_std(),
-            session_state: session.state(),
+        let (failures, since_last_dial, dialing) = (
+            self.failures,
+            self.last_dial_at.map(|t| now.saturating_duration_since(t)),
+            self.adding_dials().count(),
+        );
+        // `decide` may block: a synchronous policy runs on a thread of the
+        // policy executor (no runtime worker, not the blocking pool),
+        // holding no lock of the pool (the policy's own mutex only
+        // serializes the pools that share it); an asynchronous one is
+        // polled here. The wait ends with the pool. A policy that panics is
+        // a rejected decision: the maintainer goes on with the default
+        // one, and ends (and cleans up) as it would otherwise.
+        let owned = OwnedPoolView {
+            members: members.clone(),
+            failures,
+            since_last_dial,
+            dialing,
         };
-        let mut d = PoolDecision::default();
-        // A policy that panics is a rejected decision: the maintainer goes
-        // on, and ends (and cleans up) as it would otherwise.
-        let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            policy
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .decide(&view, &mut d);
-        }));
-        if decided.is_err() {
-            d = PoolDecision::default();
-            d.rejected = Some("the pool policy panicked".into());
-        }
-        if let Some(reason) = d.rejected.take() {
+        let sh = session.shared().clone();
+        let asked = {
+            let mut ask = pin!(ask_policy(policy, owned));
+            let mut closed = pin!(handle::closed_wait(&sh));
+            poll_fn(|cx| {
+                if self.stop.is_stopped(cx.waker()) || closed.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                ask.as_mut().poll(cx).map(Some)
+            })
+            .await
+        };
+        let Some((decided, d)) = asked else {
+            return false;
+        };
+        if let Err(e) = decided {
+            let e: &(dyn std::error::Error + 'static) = &*e;
             if let Some(f) = &self.pool.decision_rejected {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&reason)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(e)));
+            } else {
+                session.log_warn(format!("zmux: pool decision rejected: {e}"));
             }
-            d = PoolDecision::default();
+            return true;
         }
         if let Some(c) = d.count {
-            self.count = c.max(1);
+            self.count = c.get();
         }
-        self.dial_gate = d.next_dial_at.map(Instant::from_std);
+        self.dial_after = d.dial_after;
         self.liveness = d.liveness;
         self.recheck_at = d.recheck.and_then(|r| now.checked_add(r.max(MIN_RECHECK)));
-        for (id, at) in d.rotate {
-            let at = Instant::from_std(at);
-            if let Some(m) = self
-                .members
-                .iter_mut()
-                .find(|m| m.id() == id && m.replaces.is_none() && !m.replaced)
-            {
-                m.max_age = Some(m.max_age.map_or(at, |t| t.min(at)));
+        for &id in &d.retire_pipes {
+            if let Some((m, _)) = self.members.iter_mut().zip(infos).find(|(m, i)| {
+                m.id() == id
+                    && m.replaces.is_none()
+                    && !m.replaced
+                    && m.pipes
+                        .iter()
+                        .zip(i.iter())
+                        .all(|(p, i)| i.as_ref().is_some_and(|i| usable(p, i)))
+            }) {
+                // Due now: replaced as by a limit, make before break.
+                m.max_age = Some(now);
+            }
+        }
+        self.shrink(&members, &d.retire_pipes);
+        true
+    }
+
+    /// Closes what is above the count (the policy's shrinking order): dials that
+    /// would add a member first, the most recently started first; then
+    /// members, those the policy retires first, then the longest idle,
+    /// ties broken by the fewest pipes, the least age and the highest pipe
+    /// ID. A closed member's replacement goes with it.
+    fn shrink(&mut self, view: &[PoolMember], retire: &[PipeId]) {
+        while self.slots() > self.count {
+            let step = shrink_step(
+                self.adding_dials().count(),
+                view,
+                self.members
+                    .iter()
+                    .filter(|m| self.fills_slot(m))
+                    .map(Member::id),
+                retire,
+            );
+            let victim = match step {
+                Some(Shrink::CancelDial) => {
+                    if let Some(i) = self.adding_dials().last() {
+                        // Dropping the future cancels the dial; `remove` keeps
+                        // the others in the order they started.
+                        drop(self.dials.remove(i));
+                    }
+                    continue;
+                }
+                Some(Shrink::Close(victim)) => victim,
+                None => return,
+            };
+            let Some(i) = self.members.iter().position(|m| m.id() == victim) else {
+                return;
+            };
+            self.members.swap_remove(i).close();
+            self.dials.retain(|d| d.purpose != Purpose::Rotate(victim));
+            while let Some(j) = self.members.iter().position(|m| m.replaces == Some(victim)) {
+                self.members.swap_remove(j).close();
             }
         }
     }
@@ -989,15 +1265,13 @@ impl Maintainer {
     }
 
     /// When a dial waiting `delay` from the last dial's start may start:
-    /// the policy's time in place of the backoff's, held for at most the
-    /// backoff's max after the last dial's start; `None`: never.
+    /// the policy's wait in place of the backoff's, at most the backoff's
+    /// max; `None`: never.
     fn dial_time(&self, delay: Duration) -> Option<Instant> {
-        let since = self.since();
-        let Some(g) = self.dial_gate else {
-            return since.checked_add(delay);
-        };
-        let cap = since.checked_add(self.pool.backoff.max);
-        Some(cap.map_or(g, |c| c.min(g)))
+        let delay = self
+            .dial_after
+            .map_or(delay, |d| d.min(self.pool.backoff.max));
+        self.since().checked_add(delay)
     }
 
     fn may_dial(&self, delay: Duration, now: Instant) -> bool {
@@ -1009,19 +1283,29 @@ impl Maintainer {
     /// as an ordinary member), so that the failure of the old one does not
     /// also start a redial that would leave one member too many.
     fn slots(&self) -> usize {
+        self.members.iter().filter(|m| self.fills_slot(m)).count() + self.adding_dials().count()
+    }
+
+    /// Whether a member fills a slot of the count: all but a replacement
+    /// whose old member is still there (the old one holds the slot).
+    fn fills_slot(&self, m: &Member) -> bool {
+        m.replaces
+            .is_none_or(|old| !self.members.iter().any(|o| o.id() == old))
+    }
+
+    /// The indices, in start order, of the dials that would add a member:
+    /// redials, and a rotation dial whose old member is gone (it takes its
+    /// place, [`slots`](Self::slots)).
+    fn adding_dials(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
         let present = |old: PipeId| self.members.iter().any(|o| o.id() == old);
-        self.members
+        self.dials
             .iter()
-            .filter(|m| m.replaces.is_none_or(|old| !present(old)))
-            .count()
-            + self
-                .dials
-                .iter()
-                .filter(|d| match d.purpose {
-                    Purpose::Redial => true,
-                    Purpose::Rotate(old) => !present(old),
-                })
-                .count()
+            .enumerate()
+            .filter(move |(_, d)| match d.purpose {
+                Purpose::Redial => true,
+                Purpose::Rotate(old) => !present(old),
+            })
+            .map(|(i, _)| i)
     }
 
     fn wants_redial(&self) -> bool {
@@ -1050,6 +1334,10 @@ impl Maintainer {
             {
                 m.usable_since = None;
                 continue;
+            }
+            if !m.was_usable {
+                // A dial gave a usable member.
+                self.failures = 0;
             }
             m.was_usable = true;
             usable_now = true;
@@ -1087,6 +1375,7 @@ impl Maintainer {
                 if let (Some(src), Some(k)) = (&mode, m.kind) {
                     src.record(k, false);
                 }
+                self.failures = self.failures.saturating_add(1);
                 self.rotate_failed();
                 continue;
             }
@@ -1099,6 +1388,7 @@ impl Maintainer {
                 r.replaces = None;
                 settled.extend(r.kind);
             } else if !m.was_usable {
+                self.failures = self.failures.saturating_add(1);
                 self.set_redial_failures(self.redial_failures.saturating_add(1));
             }
         }
@@ -1267,6 +1557,7 @@ impl Maintainer {
     /// A dial or join failed: backoff from its start, and nothing more to
     /// do on a session that cannot take pipes.
     fn dial_failed(&mut self, purpose: Purpose, e: Option<&PipeError>) {
+        self.failures = self.failures.saturating_add(1);
         if matches!(
             e,
             Some(PipeError::NotNegotiated | PipeError::SessionLost(_))
@@ -1330,13 +1621,116 @@ impl Maintainer {
     }
 }
 
+/// One look at the policy: the answer, or the reason the look is rejected,
+/// with what the policy filled in (the default decision for a rejection).
+async fn ask_policy(
+    policy: Policy,
+    view: OwnedPoolView,
+) -> (Result<(), PolicyError>, PoolDecision) {
+    let rejected = |e: PolicyError| (Err(e), PoolDecision::default());
+    match policy {
+        Policy::Sync(SyncPolicy { policy, gate }) => {
+            // One look at a policy at a time, in the order they were
+            // asked, before any thread is taken. The permit goes with the
+            // job: it is released when the policy returned (or the job was
+            // dropped unrun), not when this look is given up.
+            let Ok(permit) = gate.acquire_owned().await else {
+                return rejected(Box::new(PolicyUnavailable));
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let job = move || {
+                let _permit = permit;
+                // The pool stopped while the look waited for a thread.
+                if tx.is_closed() {
+                    return;
+                }
+                let mut d = PoolDecision::default();
+                let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    policy
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .decide(&view.view(), &mut d)
+                }))
+                .unwrap_or_else(|payload| {
+                    Err(Box::new(PolicyPanicked::of(&*payload)) as PolicyError)
+                });
+                let _ = tx.send((decided, d));
+            };
+            if let Err(e) = policy_exec::shared().submit(job) {
+                return rejected(Box::new(e));
+            }
+            // No answer: the look's job was dropped, the process is ending.
+            rx.await
+                .unwrap_or_else(|_| rejected(Box::new(PolicyUnavailable)))
+        }
+        Policy::Async(policy) => {
+            let made =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| policy.decide(view)));
+            let mut fut = match made {
+                Ok(f) => f,
+                Err(p) => return rejected(Box::new(PolicyPanicked::of(&*p))),
+            };
+            let answer = poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fut.as_mut().poll(cx)
+                })) {
+                    Ok(p) => p.map(Ok),
+                    Err(p) => Poll::Ready(Err(p)),
+                }
+            })
+            .await;
+            match answer {
+                Ok(Ok(d)) => (Ok(()), d),
+                Ok(Err(e)) => rejected(e),
+                Err(p) => rejected(Box::new(PolicyPanicked::of(&*p))),
+            }
+        }
+    }
+}
+
 /// The member's rotation limits, each reduced by its own random fraction.
-fn set_limits(m: &mut Member, rotate: Option<&RotatePolicy>, now: Instant) {
+fn set_limits(m: &mut Member, rotate: Option<&Rotation>, now: Instant) {
     let Some(r) = rotate else { return };
     let keep = |jitter: f64| 1.0 - jitter.clamp(0.0, 1.0) * random_fraction();
     m.max_bytes = r.max_bytes.map(|b| u64_sat(f64_of(b) * keep(r.jitter)));
     // An age beyond the clock's range never comes.
     m.max_age = r.max_age.and_then(|a| now.checked_add(reduce(a, r.jitter)));
+}
+
+/// One step of shrinking a pool above its count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shrink {
+    /// Cancel the most recently started dial that would add a member.
+    CancelDial,
+    /// Close this member (and its replacement).
+    Close(PipeId),
+}
+
+/// The next step of shrinking (the pool's shrink order): a dial
+/// that would add a member first; else the member the policy retires, then
+/// the longest idle, ties broken by the fewest pipes, the least age and the
+/// highest pipe ID. `members` are the pool's members that are not
+/// replacements; `view` is the look the policy decided on.
+fn shrink_step(
+    adding_dials: usize,
+    view: &[PoolMember],
+    members: impl Iterator<Item = PipeId>,
+    retire: &[PipeId],
+) -> Option<Shrink> {
+    if adding_dials > 0 {
+        return Some(Shrink::CancelDial);
+    }
+    let rank = |id: PipeId| {
+        let v = view.iter().find(|v| v.pipe == id);
+        (
+            retire.contains(&id),
+            v.map(|v| v.idle),
+            v.map(|v| Reverse(v.pipes)),
+            v.map(|v| Reverse(v.age)),
+            id,
+        )
+    };
+    members.max_by_key(|&id| rank(id)).map(Shrink::Close)
 }
 
 #[cfg(test)]
@@ -1350,6 +1744,62 @@ mod tests {
             max_pipes: 4,
             pipe_auth: PipeAuth::psk(*b"maintain-psk----0123456789abcdef").with_end_to_end(),
             ..Config::default()
+        }
+    }
+
+    /// The shrink order every implementation shares (`testdata/pool-shrink/vectors.json`), driven through the maintainer's
+    /// own step function.
+    #[test]
+    fn shrink_order_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/pool-shrink/vectors.json"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let num = |x: &serde_json::Value| x.as_u64().unwrap();
+        let list =
+            |x: &serde_json::Value| -> Vec<u64> { x.as_array().unwrap().iter().map(num).collect() };
+        for case in v["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let view: Vec<PoolMember> = case["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| PoolMember {
+                    pipe: PipeId::new(num(&m["key"])),
+                    idle: Duration::from_secs(num(&m["idle"])),
+                    pipes: usize::try_from(num(&m["pipes"])).unwrap(),
+                    age: Duration::from_secs(num(&m["age"])),
+                    ..PoolMember::default()
+                })
+                .collect();
+            let retire: Vec<PipeId> = list(&case["decision"]["retire"])
+                .into_iter()
+                .map(PipeId::new)
+                .collect();
+            let count = usize::try_from(num(&case["decision"]["count"])).unwrap();
+            let mut dialing = usize::try_from(num(&case["dialing"])).unwrap();
+            let mut members: Vec<PipeId> = view.iter().map(|m| m.pipe).collect();
+            let (mut cancelled, mut closed) = (Vec::new(), Vec::new());
+            while members.len() + dialing > count {
+                match shrink_step(dialing, &view, members.iter().copied(), &retire).unwrap() {
+                    Shrink::CancelDial => {
+                        dialing -= 1;
+                        cancelled.push(dialing as u64);
+                    }
+                    Shrink::Close(id) => {
+                        members.retain(|m| *m != id);
+                        closed.push(id.get());
+                    }
+                }
+            }
+            assert_eq!(
+                cancelled,
+                list(&case["expect"]["cancel_dials"]),
+                "{name}: dials"
+            );
+            assert_eq!(closed, list(&case["expect"]["close"]), "{name}: members");
         }
     }
 
@@ -1385,7 +1835,8 @@ mod tests {
             b
         })
         .with_policy(|_: &PoolView<'_>, d: &mut PoolDecision| {
-            d.recheck = Some(Duration::from_millis(10));
+            d.set_recheck(Duration::from_millis(10)).unwrap();
+            Ok(())
         });
         let before = crate::backoff::DRAWS.with(std::cell::Cell::get);
         let handle = maintain_pipes(&client, pool).expect("valid pool");
@@ -1398,5 +1849,45 @@ mod tests {
         // One at each dial's start, one at its failure.
         assert!(draws <= 2 * n, "{draws} draws for {n} dials");
         client.close().await;
+    }
+
+    /// A `decide` that does not return holds one thread of the policy
+    /// executor however many pools share the policy: with more waiting pools
+    /// than the executor has threads, a pool of another policy still gets
+    /// its answer.
+    #[tokio::test]
+    async fn a_hung_shared_policy_holds_one_executor_thread() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hung = SyncPolicy::new(move |_: &PoolView<'_>, _: &mut PoolDecision| {
+            // Returns once the sender is dropped.
+            let _ = hold.recv();
+            Ok(())
+        });
+        let waiting: Vec<_> = (0..2 * policy_exec::THREADS)
+            .map(|_| {
+                let p = hung.clone();
+                tokio::spawn(ask_policy(Policy::Sync(p), OwnedPoolView::default()))
+            })
+            .collect();
+        // Every look has asked, in turn, before the other policy's.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let quick = SyncPolicy::new(|_: &PoolView<'_>, d: &mut PoolDecision| {
+            d.set_recheck(Duration::from_secs(1))?;
+            Ok(())
+        });
+        let (answer, d) = tokio::time::timeout(
+            Duration::from_secs(10),
+            ask_policy(Policy::Sync(quick), OwnedPoolView::default()),
+        )
+        .await
+        .expect("the other policy's look waits behind the hung one");
+        assert!(answer.is_ok());
+        assert_eq!(d.recheck(), Some(Duration::from_secs(1)));
+        drop(release);
+        for w in waiting {
+            assert!(w.await.unwrap().0.is_ok());
+        }
     }
 }

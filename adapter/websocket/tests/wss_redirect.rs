@@ -13,7 +13,7 @@ use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Session};
 
 fn tls() -> (tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let server = rustls::ServerConfig::builder_with_provider(provider.clone())

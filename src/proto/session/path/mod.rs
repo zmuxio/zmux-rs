@@ -736,12 +736,14 @@ impl SessionCore {
         if s.send.as_ref().is_some_and(|x| x.queued.is_some()) {
             return;
         }
-        // A handle that outlives the stream keeps its final statistics.
-        if let Some(slot) = s.final_stats.clone()
+        // A handle that outlives the stream keeps its final statistics and
+        // settings.
+        if let Some(slot) = s.final_snapshot.clone()
             && Arc::strong_count(&slot) > 1
-            && let Some(st) = self.stream_stats(key)
+            && let Some(stats) = self.stream_stats(key)
+            && let Some(settings) = self.stream_settings(key)
         {
-            let _ = slot.set(st);
+            let _ = slot.set(StreamFinal { stats, settings });
         }
         let Some(s) = self.streams.remove(key) else {
             return;

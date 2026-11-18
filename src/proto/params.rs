@@ -939,6 +939,7 @@ pub fn resolve_role(
     clippy::struct_excessive_bools,
     reason = "features negotiated independently, each a public flag"
 )]
+#[non_exhaustive]
 pub struct Features {
     /// Role negotiation.
     pub role: bool,

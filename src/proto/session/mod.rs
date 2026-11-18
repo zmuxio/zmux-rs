@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::proto::frame::Dir;
+use crate::proto::frame::{Dir, Priority};
 use crate::proto::ident::Classifier;
 use crate::proto::meter::{Count, Meter};
 pub use crate::proto::params::Role;
@@ -91,12 +91,13 @@ pub use app_event::{
 pub use config::TestHooks;
 pub use config::{AllowRecordMode, AuthorizeJoin, RecordPolicy, RecordPolicyInput};
 pub use config::{
-    Cap, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
-    DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MEMORY_BUDGET,
-    DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
-    DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, EarlyData, Inherit,
-    Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT, PipeAuth, Redial, Redundancy,
-    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, UniCredit, WindowIncrease,
+    Cap, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
+    DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET, DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY,
+    DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE,
+    DEFAULT_SUSPECT_FLOOR, EarlyData, Inherit, Liveness, LogFn, LogLevel, Logger,
+    MAX_STREAM_CREDIT, PipeAuth, Redial, Redundancy, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR,
+    UniCredit, WindowIncrease,
 };
 pub(crate) use config::{Period, STAGED_UNI_STREAMS};
 pub use early::EarlyDataState;
@@ -114,7 +115,8 @@ pub use join::{
 };
 pub use lanes::LaneAccept;
 pub use mpath::{
-    LaneStats, Multipath, PipeDirection, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource,
+    LaneStats, Multipath, PipeDirection, PipeFinal, PipeLiveness, PipeOptions, PipeStats,
+    PipeWrite, RttSource,
 };
 pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
 pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Scheduler};
@@ -403,6 +405,49 @@ pub struct SessionStats {
     pub suspended_time: Duration,
 }
 
+/// A stream's runtime settings, the ones its sending and receiving parts
+/// read back: what a part the stream does not
+/// have reads as is the field's default.
+#[derive(Debug, Clone)]
+pub struct StreamSettings {
+    /// The local scheduling priority of the sending part.
+    pub priority: Priority,
+    /// The sending part's own scheduling policy; `None`: the session's.
+    pub scheduler: Option<Scheduler>,
+    /// The sending part's redundancy; `None`: the session's.
+    pub redundant: Option<bool>,
+    /// The bound of the sending part's written-but-unsent bytes in force.
+    pub send_buffer: u64,
+    /// The receiving part's initial window and the cap of its auto-tuning,
+    /// as set (the cap 0: automatic), never the window auto-tuning reached.
+    pub receive_window: (u64, u64),
+    /// The priority asked of the peer for its sending part; `None`: none.
+    pub peer_priority: Option<Priority>,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self {
+            priority: Priority::LOCAL_DEFAULT,
+            scheduler: None,
+            redundant: None,
+            send_buffer: 0,
+            receive_window: (0, 0),
+            peer_priority: None,
+        }
+    }
+}
+
+/// What a stream held when the session discarded it, for the handles that
+/// outlive it: its statistics and its settings.
+#[derive(Debug, Clone, Default)]
+pub struct StreamFinal {
+    /// The statistics ([`SessionCore::stream_stats`]).
+    pub stats: StreamStats,
+    /// The settings ([`SessionCore::stream_settings`]).
+    pub settings: StreamSettings,
+}
+
 /// Stream statistics, in payload bytes (the preamble
 /// excluded): the application bytes as the stream's
 /// [`Meter`] counts them, and the transport counts.
@@ -443,7 +488,7 @@ pub struct StreamStats {
     /// The current (auto-tuned) receive window.
     pub recv_window: u64,
     /// The pipe the sending direction is bound to (`affinity`).
-    pub pipe_id: Option<PipeId>,
+    pub pipe: Option<PipeId>,
 }
 
 /// `QX_PING` state.
@@ -1353,7 +1398,7 @@ impl SessionCore {
                 first
             };
             st.send_buffered = send.held(mp);
-            st.pipe_id = send.mp().bound.map(|b| PipeId(b.pipe));
+            st.pipe = send.mp().bound.map(|b| PipeId(b.pipe));
         }
         if let Some(r) = &s.recv {
             // Application bytes: none before a peer stream's preamble.
@@ -1395,16 +1440,20 @@ impl SessionCore {
         Some(m.clone())
     }
 
-    /// The slot that receives a stream's statistics as they are when the
-    /// stream is discarded, created on the first call; `None` once the core
-    /// no longer holds the stream. A handle that outlives the stream reads
-    /// its final statistics there.
-    pub fn stream_final_stats(
+    /// The slot that receives a stream's statistics and settings as they are
+    /// when the stream is discarded, created on the first call; `None` once
+    /// the core no longer holds the stream. A handle that outlives the
+    /// stream reads them there.
+    pub fn stream_final(
         &mut self,
         key: StreamKey,
-    ) -> Option<Arc<std::sync::OnceLock<StreamStats>>> {
+    ) -> Option<Arc<std::sync::OnceLock<StreamFinal>>> {
         let s = self.streams.get_mut(key)?;
-        Some(s.final_stats.get_or_insert_with(Default::default).clone())
+        Some(
+            s.final_snapshot
+                .get_or_insert_with(Default::default)
+                .clone(),
+        )
     }
 
     /// Heap bytes of received stream data held for the application, with

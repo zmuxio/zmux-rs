@@ -110,7 +110,7 @@ fn check_sender(
     mode: RecordMode,
     handle: &[u8],
     psk: &[u8],
-    static_secret: &[u8],
+    static_key: &[u8],
     binding: &[u8],
 ) -> Result<(), Error> {
     let binding_len = if mode == RecordMode::Bound {
@@ -120,7 +120,7 @@ fn check_sender(
     };
     let fits = handle_fits(profile, handle)
         && psk.len() == profile.psk_len().unwrap_or(0)
-        && static_secret.len() == profile.0.dh.private_len
+        && static_key.len() == profile.0.dh.private_len
         && binding.len() == binding_len;
     fits.then_some(()).ok_or(Error::InvalidConfig)
 }
@@ -154,7 +154,7 @@ pub struct InitiatorConfig<'a> {
     /// The pre-shared key, empty for a Profile without one.
     pub psk: &'a [u8],
     /// The static private key, empty for a Profile that sends none.
-    pub static_secret: &'a [u8],
+    pub static_key: &'a [u8],
     /// The Binding in Bound mode, otherwise empty.
     pub binding: &'a [u8],
     /// The largest application data of a received message, in bytes; `None` sets no
@@ -214,18 +214,18 @@ impl Initiator {
             framing,
             handle,
             psk,
-            static_secret,
+            static_key,
             binding,
             max_app_data,
         } = config;
-        check_sender(profile, mode, handle, psk, static_secret, binding)?;
+        check_sender(profile, mode, handle, psk, static_key, binding)?;
         let prologue = prologue(profile, mode, handle, binding);
         let mut engine = Engine::new(
             profile.0,
             true,
             &prologue,
             psk.into(),
-            static_secret.into(),
+            static_key.into(),
             e,
             kem,
         );
@@ -440,7 +440,7 @@ pub struct ResponderKeys<'a> {
     /// The pre-shared key, empty for a Profile without one.
     pub psk: &'a [u8],
     /// The static private key, empty for a Profile that sends none.
-    pub static_secret: &'a [u8],
+    pub static_key: &'a [u8],
     /// The Binding in Bound mode, otherwise empty.
     pub binding: &'a [u8],
     /// The largest application data of a received message, in bytes; `None` sets no
@@ -454,7 +454,7 @@ impl Default for ResponderKeys<'_> {
     fn default() -> Self {
         ResponderKeys {
             psk: &[],
-            static_secret: &[],
+            static_key: &[],
             binding: &[],
             max_app_data: Some(crate::DEFAULT_MAX_APP_DATA),
         }
@@ -565,7 +565,7 @@ impl Responder {
         // A Binding is empty or BINDING_LEN bytes; whether it suits the received Mode
         // is not judged here, and any disagreement is auth.
         if keys.psk.len() != profile.psk_len().unwrap_or(keys.psk.len())
-            || keys.static_secret.len() != profile.0.dh.private_len
+            || keys.static_key.len() != profile.0.dh.private_len
             || !matches!(keys.binding.len(), 0 | BINDING_LEN)
         {
             return Err(Error::InvalidConfig);
@@ -580,7 +580,7 @@ impl Responder {
             false,
             &prologue,
             keys.psk.into(),
-            keys.static_secret.into(),
+            keys.static_key.into(),
             e,
             kem,
         );

@@ -1,17 +1,27 @@
 name: Scheduled checks
 
-# Long or external-dependency checks, kept out of the default gate: model
-# checking of the drivers' synchronization units, interoperability with an
-# independent QMux implementation.
+# Long or external-dependency checks, kept out of the default gate, run every
+# week: the newest stable toolchain with the newest dependency versions
+# (what a user who resolves afresh gets), model checking of the drivers'
+# synchronization units (loom, shuttle), and interoperability with the
+# newest released peers. A failure opens (or updates) one issue.
 on:
   workflow_dispatch:
     inputs:
+      latest:
+        description: Latest stable toolchain and latest dependencies
+        type: boolean
+        default: true
       loom:
         description: Model-check the synchronization units (loom)
         type: boolean
         default: true
+      shuttle:
+        description: Randomized schedules of the std driver's thread protocol (shuttle)
+        type: boolean
+        default: true
       interop:
-        description: Interoperability with the qmux crate
+        description: Interoperability with the latest released peers
         type: boolean
         default: true
   schedule:
@@ -24,8 +34,56 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  latest:
+    name: Latest stable and latest dependencies (${{ matrix.os }})
+    if: github.event_name == 'schedule' || inputs.latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+      # The lock file is not used: every dependency at its newest release.
+      - name: Update every dependency
+        run: cargo update
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Docs
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-features --no-fail-fast
+
+  audit:
+    name: Advisories of the latest dependencies
+    if: github.event_name == 'schedule' || inputs.latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo update
+      - run: cargo audit
+      - run: cargo deny check
+
   loom:
-    name: Loom
+    name: Loom (preemption bound ${{ matrix.preemptions }})
     if: github.event_name == 'schedule' || inputs.loom
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -34,30 +92,144 @@ jobs:
       matrix:
         preemptions: [2, 3]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Loom (preemption bound ${{ matrix.preemptions }})
+      - name: Loom
         run: cargo test --locked -p zmux --lib --release loom
         env:
           LOOM_MAX_PREEMPTIONS: ${{ matrix.preemptions }}
           RUSTFLAGS: --cfg loom
           CARGO_TARGET_DIR: target/loom
 
-  interop:
-    name: Interop (qmux crate)
-    if: github.event_name == 'schedule' || inputs.interop
+  shuttle:
+    name: Shuttle
+    if: github.event_name == 'schedule' || inputs.shuttle
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - name: Shuttle
+        run: cargo test --locked -p zmux --lib --release --features blocking shuttle
+        env:
+          RUSTFLAGS: --cfg shuttle
+          CARGO_TARGET_DIR: target/shuttle
+
+  interop-qmux:
+    name: Interop (newest qmux crate)
+    if: github.event_name == 'schedule' || inputs.interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # The committed manifest pins the version the tests were written
+      # against; this job takes whatever is newest.
+      - name: Use the newest qmux release
+        run: |
+          sed -i 's/^qmux = { version = "=[0-9.]*"/qmux = { version = "*"/' interop/qmux/Cargo.toml
+          cargo update --manifest-path interop/qmux/Cargo.toml
+          cargo tree --manifest-path interop/qmux/Cargo.toml --depth 1 | grep -E '^.*qmux v'
       - run: cargo test --manifest-path interop/qmux/Cargo.toml
 
+  interop-go:
+    name: Interop (newest released zmux-go)
+    if: github.event_name == 'schedule' || inputs.interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          cache: false
+      - name: Build the scripted peers
+        run: |
+          cargo build --release --locked --manifest-path interop/peer/Cargo.toml
+          cargo build --release --locked -p zmux-shaping-peer -p zmux-datagram-peer
+      - name: Fetch the newest release of the Go implementation
+        id: go
+        run: |
+          tag=$(git ls-remote --tags --refs https://github.com/zmuxio/zmux-go.git 'refs/tags/v[0-9]*' \
+            | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 --branch "$tag" https://github.com/zmuxio/zmux-go.git "$RUNNER_TEMP/zmux-go"
+      # Its interoperability tests start the Rust peers as child processes:
+      # the scripted peer, the shaping peer and the QUIC datagram-channel peer
+      # (a test that needs one is named `...Interop...` and reads its path
+      # from the variable).
+      - name: Interop tests of ${{ steps.go.outputs.tag }}
+        working-directory: ${{ runner.temp }}/zmux-go
+        run: go test -count=1 -timeout 20m -run 'Interop' .
+        env:
+          ZMUX_INTEROP_PEER: ${{ github.workspace }}/interop/peer/target/release/zmux-interop-peer
+          ZMUX_SHAPING_PEER: ${{ github.workspace }}/target/release/zmux-shaping-peer
+          ZMUX_RS_QUIC_CHANNEL_PEER: ${{ github.workspace }}/target/release/zmux-datagram-peer
+      # The QUIC adapter is a module of its own.
+      - name: Interop tests of the QUIC adapter of ${{ steps.go.outputs.tag }}
+        working-directory: ${{ runner.temp }}/zmux-go/zmuxquic
+        run: go test -count=1 -timeout 20m -run 'Interop' .
+        env:
+          ZMUX_INTEROP_PEER: ${{ github.workspace }}/interop/peer/target/release/zmux-interop-peer
+          ZMUX_RS_QUIC_CHANNEL_PEER: ${{ github.workspace }}/target/release/zmux-datagram-peer
+
+  interop-peers:
+    name: Interop peers against themselves
+    if: github.event_name == 'schedule' || inputs.interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # Each peer driven as the other implementations drive it: as child
+      # processes, over their command line and output.
+      - run: cargo test --locked -p zmux-shaping-peer -p zmux-datagram-peer
+
+  report:
+    name: Report failures
+    if: ${{ always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
+    needs: [latest, audit, loom, shuttle, interop-qmux, interop-go, interop-peers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | "- " + .key' <<<"$NEEDS")
+          title="Scheduled checks failed"
+          body=$(printf 'The weekly scheduled checks failed in:\n\n%s\n\nRun: %s\n' "$failed" "$RUN_URL")
+          number=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\"))[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

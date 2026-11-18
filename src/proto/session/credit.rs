@@ -130,12 +130,16 @@ impl SessionCore {
     }
 
     /// The largest stream window the memory budget allows now, through the
-    /// session window: with the automatic cap, at least the 64 MiB floor.
-    fn stream_window_limit(&self) -> u64 {
+    /// session window: for a stream whose cap is automatic (the session's, or
+    /// the one `set_receive_window` made automatic with a `max` of 0, whatever
+    /// the session's cap is), at least the 64 MiB floor; a fixed cap is the
+    /// stream's own `max_window`.
+    fn stream_window_limit(&self, automatic_cap: bool) -> u64 {
         let allowance = self.session_allowance();
-        match self.config.max_stream_receive_window {
-            Cap::Fixed(_) => allowance,
-            Cap::Auto => STREAM_WINDOW_FLOOR.max(allowance).min(MAX_WINDOW),
+        if automatic_cap {
+            STREAM_WINDOW_FLOOR.max(allowance).min(MAX_WINDOW)
+        } else {
+            allowance
         }
     }
 
@@ -269,7 +273,8 @@ impl SessionCore {
         let b = self.config.latency_budget;
         // A stream window is bounded through the session window by the
         // memory allowance as well.
-        let allowance = self.stream_window_limit();
+        let automatic_cap = self.streams.recv(key)?.automatic_cap();
+        let allowance = self.stream_window_limit(automatic_cap);
         let r = self.streams.recv_mut(key)?;
         let mut grew = None;
         let mut no_rtt = false;
@@ -304,6 +309,7 @@ impl SessionCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StreamError;
 
     /// Every reset releases the session credit of
     /// the bytes in [Reliable Size, final size) that never arrived, each
@@ -387,7 +393,7 @@ mod tests {
         s.grow_session_window(1 << 40);
         // The window's growth counts against the budget.
         assert_eq!(s.streams.recv_flow().window, 257 * MIB);
-        assert_eq!(s.stream_window_limit(), 257 * MIB);
+        assert_eq!(s.stream_window_limit(true), 257 * MIB);
         // The receive buffer cap stays at the floor: the DoS bound does not
         // grow with the window.
         assert_eq!(s.buffer_cap(), 96 * MIB);
@@ -413,5 +419,171 @@ mod tests {
         assert_eq!(s.streams.recv_flow().window, 8 * MIB);
         assert_eq!(s.buffer_cap(), 68 * MIB);
         assert_eq!(s.send_buffer_limit(), 2 * MIB);
+    }
+
+    #[test]
+    fn receive_window_getter_reads_the_setting_not_the_tuned_window() {
+        let c = super::super::Config::default();
+        let initial = c.initial_stream_receive_window;
+        let mut s = session(c);
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        // The session's initial window; the automatic cap reads 0.
+        assert_eq!(s.receive_window(k), Some((initial, 0)));
+        // What auto-tuning does to a stream: the window grows.
+        let r = s.streams.recv_mut(k).unwrap();
+        r.window = 8 * initial;
+        assert_eq!(s.streams.recv(k).unwrap().window, 8 * initial);
+        assert_eq!(s.receive_window(k), Some((initial, 0)));
+        // A raised initial window and a cap read as set, and tuning does
+        // not move them either.
+        s.set_receive_window(k, 2 * initial, 16 * initial).unwrap();
+        assert_eq!(s.receive_window(k), Some((2 * initial, 16 * initial)));
+        s.streams.recv_mut(k).unwrap().window = 12 * initial;
+        assert_eq!(s.receive_window(k), Some((2 * initial, 16 * initial)));
+        assert_eq!(
+            s.stream_settings(k).unwrap().receive_window,
+            (2 * initial, 16 * initial)
+        );
+        // A fixed cap in the configuration reads as configured.
+        let c = super::super::Config {
+            max_stream_receive_window: Cap::Fixed(4 * initial),
+            ..Default::default()
+        };
+        let mut s = session(c);
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        assert_eq!(s.receive_window(k), Some((initial, 4 * initial)));
+    }
+
+    #[test]
+    fn set_receive_window_zero_max_is_automatic() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let c = super::super::Config {
+            max_stream_receive_window: Cap::Fixed(4 * initial),
+            ..Default::default()
+        };
+        let mut s = session(c);
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        assert_eq!(s.receive_window(k), Some((initial, 4 * initial)));
+        // A fixed cap above the session's, as set.
+        s.set_receive_window(k, initial, 8 * initial).unwrap();
+        assert_eq!(s.receive_window(k), Some((initial, 8 * initial)));
+        // 0 is the automatic cap: not the previous cap, not the initial
+        // window, not the session's fixed cap.
+        s.set_receive_window(k, initial, 0).unwrap();
+        assert_eq!(s.receive_window(k), Some((initial, 0)));
+        assert_eq!(
+            s.streams.recv(k).unwrap().max_window,
+            crate::proto::varint::MAX
+        );
+        // A cap equal to initial is valid.
+        s.set_receive_window(k, 2 * initial, 2 * initial).unwrap();
+        assert_eq!(s.receive_window(k), Some((2 * initial, 2 * initial)));
+    }
+
+    /// A stream made automatic with a `max` of 0 under a session that fixes
+    /// the cap gets the automatic cap's 64 MiB floor, not the session's cap;
+    /// a stream with a fixed cap does not.
+    #[test]
+    fn a_stream_automatic_under_a_fixed_session_cap_gets_the_floor() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let c = super::super::Config {
+            max_stream_receive_window: Cap::Fixed(4 * initial),
+            memory_budget: Some(1 << 20),
+            ..Default::default()
+        };
+        let mut s = session(c);
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        let limit = |s: &SessionCore| {
+            let auto = s.streams.recv(k).unwrap().automatic_cap();
+            s.stream_window_limit(auto)
+        };
+        assert!(s.stream_window_limit(false) < STREAM_WINDOW_FLOOR);
+        assert_eq!(limit(&s), s.stream_window_limit(false));
+        s.set_receive_window(k, initial, 0).unwrap();
+        assert_eq!(limit(&s), STREAM_WINDOW_FLOOR);
+        s.set_receive_window(k, initial, 2 * initial).unwrap();
+        assert_eq!(limit(&s), s.stream_window_limit(false));
+    }
+
+    /// A window above the largest varint is refused, not cut to it.
+    #[test]
+    fn set_receive_window_rejects_values_above_the_largest_varint() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let mut s = session(super::super::Config::default());
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        let big = crate::proto::varint::MAX + 1;
+        for (i, m) in [(big, 0), (initial, big), (big, big)] {
+            assert_eq!(
+                s.set_receive_window(k, i, m),
+                Err(StreamError::InvalidArgument)
+            );
+        }
+        assert_eq!(s.receive_window(k), Some((initial, 0)));
+        // The largest varint itself is accepted and reads back as set (as
+        // a cap it is the automatic one).
+        let max = crate::proto::varint::MAX;
+        s.set_receive_window(k, max, max - 1).unwrap_err();
+        s.set_receive_window(k, max - 1, max).unwrap();
+        assert_eq!(s.receive_window(k), Some((max - 1, 0)));
+    }
+
+    #[test]
+    fn set_receive_window_rejects_a_max_below_initial() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let mut s = session(super::super::Config::default());
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        s.set_receive_window(k, 2 * initial, 4 * initial).unwrap();
+        let window = s.streams.recv(k).unwrap().window;
+        for (i, m) in [
+            (8 * initial, 4 * initial),
+            (1 << 20, 1),
+            (3 * initial, 2 * initial),
+        ] {
+            assert_eq!(
+                s.set_receive_window(k, i, m),
+                Err(StreamError::InvalidArgument)
+            );
+        }
+        // Nothing changed: the setting, the cap and the window in force.
+        assert_eq!(s.receive_window(k), Some((2 * initial, 4 * initial)));
+        assert_eq!(s.streams.recv(k).unwrap().window, window);
+    }
+
+    #[test]
+    fn set_receive_window_never_withdraws_credit() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let mut s = session(super::super::Config::default());
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        // Above the window in force: raised at once.
+        s.set_receive_window(k, 8 * initial, 0).unwrap();
+        assert_eq!(s.streams.recv(k).unwrap().window, 8 * initial);
+        // Below it: only the setting read back changes; the floor is 16 KiB.
+        s.set_receive_window(k, 2 * initial, 4 * initial).unwrap();
+        assert_eq!(s.streams.recv(k).unwrap().window, 8 * initial);
+        assert_eq!(s.receive_window(k), Some((2 * initial, 4 * initial)));
+        s.set_receive_window(k, 4096, 0).unwrap();
+        assert_eq!(s.streams.recv(k).unwrap().window, 8 * initial);
+        assert_eq!(s.receive_window(k), Some((4096, 0)));
+    }
+
+    #[test]
+    fn set_receive_window_rejects_an_initial_below_4_kib() {
+        let initial = super::super::Config::default().initial_stream_receive_window;
+        let mut s = session(super::super::Config::default());
+        let k = s.open(super::super::Dir::Bidi).unwrap();
+        s.set_receive_window(k, 2 * initial, 4 * initial).unwrap();
+        let window = s.streams.recv(k).unwrap().window;
+        for i in [0, 1, 4095] {
+            assert_eq!(
+                s.set_receive_window(k, i, 0),
+                Err(StreamError::InvalidArgument)
+            );
+        }
+        assert_eq!(s.receive_window(k), Some((2 * initial, 4 * initial)));
+        assert_eq!(s.streams.recv(k).unwrap().window, window);
+        s.set_receive_window(k, 4096, 0).unwrap();
+        assert_eq!(s.receive_window(k), Some((4096, 0)));
+        s.set_receive_window(k, 4096, 4096).unwrap();
+        assert_eq!(s.receive_window(k), Some((4096, 4096)));
     }
 }

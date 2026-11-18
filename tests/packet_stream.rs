@@ -22,8 +22,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{connect, duplex, multi_thread, watchdog};
 use zmux::helpers::{
-    Forwarded, PacketError, PacketOptions, PacketStream, SendPolicy, Sent, SpliceOptions, splice,
-    splice_packets,
+    PacketError, PacketOptions, PacketStream, SendPolicy, Sent, SpliceDirection, SpliceOptions,
+    splice, splice_packets,
 };
 use zmux::proto::ApplicationErrorCode;
 use zmux::{Cap, Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
@@ -286,7 +286,7 @@ fn unknown_capsule_types_are_skipped() {
 struct Hop {
     a: Session,
     b: Session,
-    relay: tokio::task::JoinHandle<(Forwarded, Forwarded)>,
+    relay: tokio::task::JoinHandle<(SpliceDirection, SpliceDirection)>,
     /// The relay's inbound session.
     inbound: Session,
 }
@@ -611,7 +611,7 @@ fn a_send_cancelled_after_writing_part_is_completed_and_counted() {
 /// A packet relay towards a hop without datagrams, with A inside a capsule
 /// when 5 datagrams arrive and then ending its direction (a FIN, or a
 /// reset): the datagrams queued as capsules are never written, and are
-/// counted as dropped, not forwarded.
+/// counted as dropped, not forwarded, and not as too large.
 async fn queued_capsules_dropped_by_the_end(reset: bool) {
     let hop = Hop::new(false, 0, true).await;
     let (mut s, mut r) = hop.a.open_bi().await.unwrap();
@@ -651,7 +651,8 @@ async fn queued_capsules_dropped_by_the_end(reset: bool) {
             ab.datagrams_dropped,
             ab.datagrams_too_large
         ),
-        (0, 0, 5, 5)
+        (0, 0, 5, 0),
+        "dropped by the end, not for their size"
     );
 }
 

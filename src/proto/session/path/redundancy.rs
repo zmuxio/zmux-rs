@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn clearing_the_stream_setting_follows_the_session_again() {
         let mut send = SendPart::with_buf(0, SendBuf::default());
-        send.priority = Priority::new(1, false).unwrap_or(Priority::DEFAULT);
+        send.priority = Priority::new(1, false).unwrap_or(Priority::WIRE_DEFAULT);
         let urgent = |s: &SendPart, r| redundant(s, r, &Scheduler::Affinity);
         // Unset: urgency 1 under "urgent" is redundant, under "off" not.
         assert!(urgent(&send, Redundancy::Urgent));

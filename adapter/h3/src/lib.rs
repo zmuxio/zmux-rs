@@ -593,10 +593,17 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 /// The connection's handshake is complete before its requests are read:
 /// no request is taken from early data.
 ///
+/// Requests are served one by one: a request refused at a limit, one the
+/// listener does not take and a closed listener are answered as that request
+/// (an HTTP response or a reset of its stream) and never end the call. The
+/// call reports only the end of the HTTP/3 connection.
+///
 /// # Errors
 ///
 /// `ConnectionReset` when the HTTP/3 connection fails or ends with an
-/// error; a request's failure ends only that request.
+/// error; a request's failure ends only that request. A connection closed
+/// normally (`H3_NO_ERROR`, or after a GOAWAY once its requests are done)
+/// is `Ok`.
 pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
@@ -643,12 +650,19 @@ pub async fn serve_connection(
             }
         });
     }
-    while let Some(resolver) = h3.accept().await.map_err(h3_error)? {
+    loop {
+        let pending = match h3.accept().await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => break,
+            // The peer's (or this side's) normal close of the connection.
+            Err(e) if e.is_h3_no_error() => break,
+            Err(e) => return Err(h3_error(e)),
+        };
         let shared = shared.clone();
         let resolved = resolved.clone();
         tokio::spawn(async move {
             let Ok(Ok((head, stream))) =
-                tokio::time::timeout(head_limit, resolver.resolve_request()).await
+                tokio::time::timeout(head_limit, pending.resolve_request()).await
             else {
                 return;
             };
@@ -1441,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn drop_reader_after_buffered_data_with_a_pending_transport_read() {
         tokio::time::timeout(Duration::from_secs(10), async {
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
             let der = cert.cert.der().clone();
             let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1523,7 +1537,7 @@ mod tests {
     /// client's pipes and the server's halves of their requests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_pipes_keep_the_carrier_contract() {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let provider = Arc::new(rustls::crypto::ring::default_provider());

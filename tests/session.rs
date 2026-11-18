@@ -847,13 +847,8 @@ async fn negotiation_results_are_reported() {
     for s in [&client, &server] {
         assert!(s.is_established());
         assert_eq!(s.qmux_version(), "draft-02");
-        assert_eq!(
-            s.reset_stream_at_support(),
-            zmux::Support {
-                local: true,
-                peer: true
-            }
-        );
+        let sup = s.reset_stream_at_support();
+        assert_eq!((sup.local, sup.peer), (true, true));
         // Pipe acknowledgement is on by default; resume needs multipath.
         assert!(s.pipe_ack_in_use());
         assert!(!s.resume_in_use());
@@ -861,20 +856,10 @@ async fn negotiation_results_are_reported() {
     }
     assert_eq!(server.tls(), Some(tls));
     assert_eq!(client.tls(), None);
-    assert_eq!(
-        server.datagram_support(),
-        zmux::Support {
-            local: true,
-            peer: false
-        }
-    );
-    assert_eq!(
-        client.datagram_support(),
-        zmux::Support {
-            local: false,
-            peer: true
-        }
-    );
+    let sup = server.datagram_support();
+    assert_eq!((sup.local, sup.peer), (true, false));
+    let sup = client.datagram_support();
+    assert_eq!((sup.local, sup.peer), (false, true));
 }
 
 /// A session without multipath has no epoch.

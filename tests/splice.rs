@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{connect, duplex, eventually, multi_thread, settle, snapshot, watchdog};
 use tokio::task::JoinHandle;
-use zmux::helpers::{SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, Spliced, splice};
+use zmux::helpers::{SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice};
 use zmux::proto::{ApplicationErrorCode, TransportParameters};
 use zmux::{Cap, Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
 
@@ -67,7 +67,7 @@ impl Hop {
 
     /// Relays the next stream A opens: opens the outbound stream with the
     /// carrier flag and TLVs of the inbound one, then splices.
-    fn relay(&self, opts: SpliceOptions) -> JoinHandle<Result<Spliced, SpliceError>> {
+    fn relay(&self, opts: SpliceOptions) -> JoinHandle<Result<SpliceResult, SpliceError>> {
         let (ra, rb) = (self.ra.clone(), self.rb.clone());
         tokio::spawn(async move {
             let (s_in, r_in) = ra.accept_bi().await.unwrap();

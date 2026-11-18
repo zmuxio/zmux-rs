@@ -8,7 +8,7 @@ use bytes::Bytes;
 use super::recv_buf::RecvBuf;
 
 use super::stream::{
-    GoAwayFail, LocalReset, Offer, RECV_KEEP, RecvState, SendOutcome, SendPart, SendState, Stream,
+    GoAwayFail, LocalReset, RECV_KEEP, RecvState, SendOutcome, SendPart, SendState, Stream,
     StreamKey,
 };
 use super::streams::Stopped;
@@ -33,6 +33,9 @@ const PREAMBLE_MARGIN: usize = 32;
 
 /// Smallest per-stream window or send buffer.
 const MIN_STREAM_WINDOW: u64 = 16 * 1024;
+/// The floor of `initial_stream_receive_window`, and of what
+/// `set_receive_window` takes as its initial window.
+const MIN_INITIAL_STREAM_WINDOW: u64 = 4 * 1024;
 
 /// What a read found.
 enum Readable {
@@ -973,6 +976,7 @@ impl SessionCore {
         if s.recv.is_some() {
             self.local_stop(key, 0);
         }
+        self.clear_stream_datagrams(key);
         self.mark_released(key);
     }
 
@@ -1016,6 +1020,7 @@ impl SessionCore {
         if let Some(s) = self.streams.get_mut(key) {
             s.recv_released = true;
         }
+        self.clear_stream_datagrams(key);
         self.mark_released(key);
         Ok(())
     }
@@ -1184,7 +1189,7 @@ impl SessionCore {
         let len = WirePreamble {
             open_info: info.as_deref(),
             // A PRIORITY set before the first frame always fits.
-            priority: Some(Priority::DEFAULT),
+            priority: Some(Priority::WIRE_DEFAULT),
             pipe_carrier: carrier,
             app_tlvs: AppTlvs::whole(tlvs.as_deref().unwrap_or_default()),
         }
@@ -1228,7 +1233,7 @@ impl SessionCore {
     }
 
     /// The PRIORITY the peer requested in its preamble (peer streams).
-    pub fn requested_priority(&self, key: StreamKey) -> Option<Priority> {
+    pub fn preamble_priority(&self, key: StreamKey) -> Option<Priority> {
         let s = self.streams.get(key)?;
         if s.local {
             None
@@ -1237,21 +1242,39 @@ impl SessionCore {
         }
     }
 
-    /// Sets the stream's receive window: `initial` is advertised at once,
-    /// `max` caps auto-tuning.
+    /// Sets the stream's receive window: `initial` is advertised at once
+    /// when it is above the window in force, `max` caps auto-tuning, 0
+    /// making the cap automatic whatever the session's configuration says.
+    /// Both must be at most the largest varint (2^62 - 1). Credit already advertised is never withdrawn: an
+    /// `initial` below the window in force changes only the setting
+    /// [`Self::receive_window`] reads back.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::InvalidArgument`]: an `initial` below 4 KiB (the floor
+    /// of `initial_stream_receive_window`), an `initial` or `max` above the
+    /// largest varint, or a nonzero `max` below `initial`; nothing changed. [`StreamError::ClosedLocally`]: the stream has no
+    /// receiving part.
     pub fn set_receive_window(
         &mut self,
         key: StreamKey,
         initial: u64,
         max: u64,
     ) -> Result<(), StreamError> {
-        let cap = self.config.session_window_cap();
+        let largest = varint::MAX;
+        if initial < MIN_INITIAL_STREAM_WINDOW
+            || initial > largest
+            || max > largest
+            || (max != 0 && max < initial)
+        {
+            return Err(StreamError::InvalidArgument);
+        }
         let r = self
             .streams
             .recv_mut(key)
             .ok_or(StreamError::ClosedLocally)?;
-        let initial = initial.max(MIN_STREAM_WINDOW).min(cap);
-        r.max_window = max.max(initial).min(cap);
+        r.max_window = if max == 0 { largest } else { max };
+        r.initial_window = initial;
         if initial > r.window {
             r.window = initial;
             if r.state == RecvState::Recv
@@ -1265,11 +1288,14 @@ impl SessionCore {
         Ok(())
     }
 
-    /// The stream's receive window: the window now advertised (auto-tuning
-    /// raises it) and the cap of auto-tuning.
+    /// The stream's receive window settings: the initial window as set (the
+    /// session's, or what `set_receive_window` set it to), never the
+    /// window auto-tuning has grown it to, and the cap as set, 0 when it is
+    /// automatic.
     pub fn receive_window(&self, key: StreamKey) -> Option<(u64, u64)> {
         let r = self.streams.recv(key)?;
-        Some((r.window, r.max_window))
+        let cap = if r.automatic_cap() { 0 } else { r.max_window };
+        Some((r.initial_window, cap))
     }
 
     /// The bound of the sending part's written-but-unsent bytes in force:
@@ -1291,13 +1317,34 @@ impl SessionCore {
             .or(if s.local { e.peer_priority } else { None })
     }
 
-    /// Bounds the stream's written-but-unsent bytes.
+    /// The stream's runtime settings as it holds them now: the one place
+    /// that reads them, for the sending part, the receiving part and a
+    /// handle that holds neither. A setting of a part the stream does not
+    /// have is the default of [`StreamSettings`]. `None` once the core no
+    /// longer holds the stream.
+    pub fn stream_settings(&self, key: StreamKey) -> Option<super::StreamSettings> {
+        self.streams.get(key)?;
+        Some(super::StreamSettings {
+            priority: self.priority(key).unwrap_or(Priority::LOCAL_DEFAULT),
+            scheduler: self.stream_scheduler(key).ok().flatten(),
+            redundant: self.stream_redundant(key).ok().flatten(),
+            send_buffer: self.stream_send_buffer(key).unwrap_or_default(),
+            receive_window: self.receive_window(key).unwrap_or_default(),
+            peer_priority: self.asked_peer_priority(key),
+        })
+    }
+
+    /// Bounds the stream's written-but-unsent bytes. A write already
+    /// waiting for room (the setting does not need the part: a handle sets
+    /// it while the part is in a write) takes the new bound: a larger one
+    /// wakes it.
     pub fn set_send_buffer(&mut self, key: StreamKey, bytes: u64) -> Result<(), StreamError> {
         let send = self
             .streams
             .send_mut(key)
             .ok_or(StreamError::ClosedLocally)?;
         send.cold_mut().send_limit = Some(bytes.max(MIN_STREAM_WINDOW));
+        self.wake_send_waiters();
         Ok(())
     }
 
@@ -1411,7 +1458,7 @@ impl SessionCore {
         }
         if self.early_datagrams() {
             let s = self.streams.get(key).ok_or(DatagramError::ClosedStream)?;
-            if s.dir != Dir::Bidi || s.parts_terminal() || context >= 1 << 62 {
+            if s.dir != Dir::Bidi || s.send_released || s.parts_terminal() || context >= 1 << 62 {
                 return Err(DatagramError::ClosedStream);
             }
             if self.admitted(allowed) {
@@ -1442,7 +1489,12 @@ impl SessionCore {
             .max_datagram_frame()
             .ok_or(DatagramError::NotNegotiated)?;
         let s = self.streams.get(key).ok_or(DatagramError::ClosedStream)?;
-        if s.dir != Dir::Bidi || s.parts_terminal() || s.goaway.is_some() || context >= 1 << 62 {
+        if s.dir != Dir::Bidi
+            || s.send_released
+            || s.parts_terminal()
+            || s.goaway.is_some()
+            || context >= 1 << 62
+        {
             return Err(DatagramError::ClosedStream);
         }
         // Checked against the identifier the stream has or would get, so
@@ -1544,11 +1596,9 @@ impl SessionCore {
                 self.stats.datagrams_dropped_limit += 1;
                 continue;
             };
-            let usable = d.stream.is_none_or(|(k, _)| {
-                self.streams.get(k).is_some_and(|s| {
-                    !s.released && !s.parts_terminal() && s.offer != Offer::Rejected
-                })
-            });
+            let usable = d
+                .stream
+                .is_none_or(|(k, _)| self.streams.get(k).is_some_and(Stream::takes_datagrams));
             if !usable {
                 refused += granted;
                 self.drop_received_datagram(d.stream);

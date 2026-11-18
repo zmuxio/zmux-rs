@@ -160,6 +160,9 @@ struct Carrier {
     /// out to be, once accepted, with its unconsumed bytes.
     lane: Option<LaneId>,
     inbuf: Vec<u8>,
+    /// The pipe of the join it accepted (TRACES.md 5.1: steps name the
+    /// carrier by it), Unconfirmed until `pipe` is set.
+    join_pipe: Option<u64>,
 }
 
 /// One running trace.
@@ -305,7 +308,8 @@ impl Runner {
             pipe_rtt_ms,
             pipe_cap,
             lane_key,
-            epoch_locator_prefix
+            epoch_locator_prefix,
+            unconfirmed_cap
         );
 
         let mut config = Config::default();
@@ -427,6 +431,11 @@ impl Runner {
             })
             .collect::<Result<_, &str>>()?;
         th.pipe_cap = hooks.pipe_cap.map(|c| c as usize);
+        let mut listener_config = ListenerConfig::default();
+        if let Some(cap) = hooks.unconfirmed_cap {
+            listener_config.max_pending_per_session =
+                usize::try_from(cap).map_err(|_| "unconfirmed_cap")?;
+        }
         th.epoch_locator_prefix = hooks.epoch_locator_prefix.map(|p| p.0);
         th.lane_key = hooks
             .lane_key
@@ -455,7 +464,7 @@ impl Runner {
             ms: 0,
             pipes: BTreeMap::new(),
             carriers: HashMap::new(),
-            listener: ListenerCore::new(ListenerConfig::default()),
+            listener: ListenerCore::new(listener_config),
             out: TransmitBuf::default(),
             closes: Vec::new(),
             events: Vec::new(),
@@ -1051,6 +1060,7 @@ impl Runner {
         if !self.session.accepts_locator(parsed.locator()) {
             return self.close_carrier(name, "reject");
         }
+        let locator = parsed.locator().to_vec();
         let opened = self.session.open_hello(&parsed, &binding, now);
         self.drain_events();
         let mut join = match opened {
@@ -1094,9 +1104,24 @@ impl Runner {
         match claimed {
             ClaimedHello::Accept(reply) => {
                 let c = self.carriers.get_mut(name).expect("carrier");
+                c.join_pipe = Some(join.pipe().id);
                 c.reply = Some(reply);
                 c.join = Some(join);
                 c.outcome = Some("accept");
+                // Unconfirmed: at the session's bound, the listener closes
+                // its oldest Unconfirmed carrier first (MULTIPATH.md 5.4
+                // step 7), as the drivers do.
+                let evicted = c.id.and_then(|id| self.listener.unconfirmed(id, &locator));
+                if let Some(e) = evicted {
+                    let old = self
+                        .carriers
+                        .iter()
+                        .find(|(_, c)| c.id == Some(e))
+                        .map(|(n, _)| n.clone());
+                    if let Some(old) = old {
+                        self.close_carrier(&old, "evicted");
+                    }
+                }
                 self.peer_reads_reply(name);
                 let c = self.carriers.get_mut(name).expect("carrier");
                 if c.proven.is_some() && c.confirm {
@@ -1490,6 +1515,7 @@ impl Runner {
                             conn: conn.clone(),
                             lane: None,
                             inbuf: Vec::new(),
+                            join_pipe: None,
                         },
                     );
                     return Ok(());
@@ -1540,6 +1566,7 @@ impl Runner {
                     conn: conn.clone(),
                     lane: None,
                     inbuf: Vec::new(),
+                    join_pipe: None,
                 };
                 if let Some(token) = pairing {
                     let token: [u8; 16] =
@@ -2232,10 +2259,22 @@ impl Runner {
                 how,
             } => {
                 self.flush()?;
-                let p = self
-                    .pipes
-                    .get(pipe)
-                    .ok_or_else(|| format!("no pipe {pipe}"))?;
+                let Some(p) = self.pipes.get(pipe) else {
+                    // A carrier that accepted the join of this pipe and was
+                    // closed while Unconfirmed, before the pipe had state
+                    // (an eviction, TRACES.md 5.1).
+                    let c = self
+                        .carriers
+                        .values()
+                        .find(|c| c.join_pipe == Some(*pipe) && c.pipe.is_none())
+                        .ok_or_else(|| format!("no pipe {pipe}"))?;
+                    return match (c.rejected, how) {
+                        (true, ClosedHow::Any | ClosedHow::Abort) => Ok(()),
+                        (closed, want) => Err(format!(
+                            "Unconfirmed carrier of pipe {pipe} closed {closed}, expected {want:?}"
+                        )),
+                    };
+                };
                 let have = match (dir, lane) {
                     (Direction::In, _) => p.in_closed,
                     (_, Some(l)) => p.lane(*l).and_then(|o| o.closed),
@@ -2365,7 +2404,7 @@ impl Runner {
                         if let Some(info) = preamble.info() {
                             r["open_info"] = json!(to_hex(info));
                         }
-                        if let Some(p) = s.requested_priority(key) {
+                        if let Some(p) = s.preamble_priority(key) {
                             r["priority"] =
                                 json!({"urgency": p.urgency(), "incremental": p.incremental()});
                         }

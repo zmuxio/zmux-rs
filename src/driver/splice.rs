@@ -228,7 +228,7 @@ impl Drop for AbortSlot<'_> {
 /// What one direction forwarded (Result).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Forwarded {
+pub struct SpliceDirection {
     /// Stream bytes forwarded: read from the upstream part and taken by the
     /// downstream part.
     pub bytes: u64,
@@ -241,12 +241,13 @@ pub struct Forwarded {
     /// `datagrams_too_large + datagrams_limited`, and also those the
     /// downstream stream or session could no longer carry.
     pub datagrams_dropped: u64,
-    /// Stream datagrams not forwarded because they did not fit a datagram
-    /// of the downstream stream (its largest payload, or no datagrams on
-    /// the downstream session). A packet relay ([`splice_packets`]) drops
-    /// one only when its capsule queue is full, or when the direction
-    /// ended (the upstream's FIN or reset included) before the capsule
-    /// was written whole.
+    /// Stream datagrams dropped for their size: larger than a datagram of
+    /// the downstream stream (`splice`), or, in a packet relay
+    /// ([`splice_packets`]), which writes such a datagram as a capsule
+    /// instead, larger than [`DEFAULT_MAX_PACKET`](crate::helpers::DEFAULT_MAX_PACKET).
+    /// A datagram dropped for another reason (no datagrams on the
+    /// downstream session, a full capsule queue, a capsule the direction's
+    /// end left unwritten) is counted only in `datagrams_dropped`.
     pub datagrams_too_large: u64,
     /// Stream datagrams not forwarded because the direction's limiter or
     /// the downstream session's datagram limiter refused them.
@@ -263,11 +264,11 @@ pub struct Forwarded {
 /// The result of a splice: each direction's counts and end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Spliced {
+pub struct SpliceResult {
     /// From `a` to `b`.
-    pub a_to_b: Forwarded,
+    pub a_to_b: SpliceDirection,
     /// From `b` to `a`.
-    pub b_to_a: Forwarded,
+    pub b_to_a: SpliceDirection,
 }
 
 /// Why a splice was refused.
@@ -330,12 +331,12 @@ impl std::error::Error for SpliceError {}
 /// # Errors
 ///
 /// [`SpliceError::SameStream`], as above; how each direction ended is in
-/// the [`Spliced`] result, not an error.
+/// the [`SpliceResult`] result, not an error.
 pub async fn splice(
     a: (SendStream, RecvStream),
     b: (SendStream, RecvStream),
     opts: SpliceOptions,
-) -> Result<Spliced, SpliceError> {
+) -> Result<SpliceResult, SpliceError> {
     splice_with(a, b, opts, false).await
 }
 
@@ -353,7 +354,7 @@ pub async fn splice(
 ///   stream's datagrams, and otherwise (too large there, or no datagrams
 ///   on the downstream session) as a DATAGRAM capsule with the same
 ///   Context ID and payload, inserted at the next capsule boundary of the
-///   downstream bytes ([`Forwarded::datagrams_as_capsules`]). Those
+///   downstream bytes ([`SpliceDirection::datagrams_as_capsules`]). Those
 ///   waiting for a boundary are bounded (the larger of the chunk and one
 ///   largest datagram); beyond it they are dropped as too large. One the
 ///   direction never wrote (it ended first) is dropped as too large and
@@ -366,7 +367,7 @@ pub async fn splice(
 ///   held while it waits, and then goes on without another call;
 /// - each stream datagram, including one turned into a capsule, is policed
 ///   as a datagram send (`try_acquire(n, n)`): without a grant it is
-///   dropped and counted ([`Forwarded::datagrams_limited`]), never waited
+///   dropped and counted ([`SpliceDirection::datagrams_limited`]), never waited
 ///   for while it is held. An empty datagram passes without a call.
 ///
 /// A capsule is never turned into a datagram: what was sent reliably stays
@@ -379,7 +380,7 @@ pub async fn splice_packets(
     a: (SendStream, RecvStream),
     b: (SendStream, RecvStream),
     opts: SpliceOptions,
-) -> Result<Spliced, SpliceError> {
+) -> Result<SpliceResult, SpliceError> {
     splice_with(a, b, opts, true).await
 }
 
@@ -388,7 +389,7 @@ async fn splice_with(
     b: (SendStream, RecvStream),
     opts: SpliceOptions,
     packets: bool,
-) -> Result<Spliced, SpliceError> {
+) -> Result<SpliceResult, SpliceError> {
     let (a_send, a_recv) = a;
     let (b_send, b_recv) = b;
     if b_send.same_stream(&a_recv) || a_send.same_stream(&b_recv) {
@@ -464,7 +465,7 @@ async fn splice_with(
         })
         .await
     };
-    Ok(Spliced {
+    Ok(SpliceResult {
         a_to_b: ab_datagrams.result(ab.bytes, ab_end, &lock(&ab_inserts)),
         b_to_a: ba_datagrams.result(ba.bytes, ba_end, &lock(&ba_inserts)),
     })
@@ -488,12 +489,14 @@ struct Datagrams {
 
 impl Datagrams {
     /// With what the direction wrote of the capsules queued in `inserts`.
-    fn result(&self, bytes: u64, end: SpliceEnd, inserts: &Inserts) -> Forwarded {
-        Forwarded {
+    fn result(&self, bytes: u64, end: SpliceEnd, inserts: &Inserts) -> SpliceDirection {
+        SpliceDirection {
             bytes,
             datagram_bytes: self.bytes + inserts.sent_bytes,
             datagrams_dropped: self.dropped + inserts.unsent,
-            datagrams_too_large: self.too_large + inserts.unsent,
+            // Only those dropped for their size: a capsule that could not be
+            // written for another reason is only dropped.
+            datagrams_too_large: self.too_large,
             datagrams_limited: self.limited,
             datagrams_as_capsules: inserts.sent,
             end,
@@ -578,14 +581,24 @@ async fn forward_datagrams(
                 count.dropped += 1;
                 count.limited += 1;
             }
-            Err(crate::DatagramError::TooLarge { .. } | crate::DatagramError::NotNegotiated) => {
+            Err(
+                e @ (crate::DatagramError::TooLarge { .. } | crate::DatagramError::NotNegotiated),
+            ) => {
+                // Too large is a size beyond what the downstream carries: a
+                // datagram of `w` for `splice`, a packet of a packet stream
+                // for a packet relay, which writes a smaller one as a capsule.
+                let too_large = match convert {
+                    None => matches!(e, crate::DatagramError::TooLarge { .. }),
+                    Some(_) => len > crate::driver::packet::DEFAULT_MAX_PACKET,
+                };
                 match convert {
                     // Counted once the direction wrote it.
-                    Some((q, bound)) if lock(q).push(context, data, granted, bound) => {}
+                    Some((q, bound))
+                        if !too_large && lock(q).push(context, data, granted, bound) => {}
                     _ => {
                         unsent();
                         count.dropped += 1;
-                        count.too_large += 1;
+                        count.too_large += u64::from(too_large);
                     }
                 }
             }

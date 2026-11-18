@@ -11,7 +11,7 @@ use zmux::{Decision, InboundTransform};
 use zmux_seal_proto::{Error, Hello, Profile, Responder, ResponderKeys};
 
 use crate::carrier::Carrier;
-use crate::establish::{Peer, binding_of, plan_of, read_frame, shaped_payload};
+use crate::establish::{Peer, StaticKey, binding_of, plan_of, read_frame, shaped_payload};
 use crate::profiles::{SERVER_DEFAULT, has_psk};
 use crate::trust::{
     Admission, AppData, AppDataRequest, AppDataSource, ConfigError, Gate, Signer, Verifier,
@@ -134,8 +134,7 @@ impl std::fmt::Debug for ServerOptions {
 #[derive(Clone)]
 pub struct ServerConfig {
     gate: Arc<dyn Gate>,
-    /// Cleared when the last clone is dropped.
-    static_secret: Secret,
+    static_key: StaticKey,
     accepted: Vec<u64>,
     options: ServerOptions,
 }
@@ -149,20 +148,20 @@ impl std::fmt::Debug for ServerConfig {
 }
 
 impl ServerConfig {
-    /// A server with `gate`, its static secret and `options`.
+    /// A server with `gate`, its static key and `options`.
     ///
     /// # Errors
     ///
-    /// [`ConfigError`] for an all-zero static secret, an unknown or reserved Profile
+    /// [`ConfigError`] for an all-zero static key, an unknown or reserved Profile
     /// among the accepted ones, and `require_pq_auth` without a client verifier or with a
     /// pin of a static key alone.
     pub fn new(
         gate: Arc<dyn Gate>,
-        static_secret: [u8; 32],
+        static_key: StaticKey,
         options: ServerOptions,
     ) -> Result<Self, ConfigError> {
-        if static_secret == [0; 32] {
-            return Err(ConfigError("ServerConfig without a static secret"));
+        if *static_key.scalar() == [0; 32] {
+            return Err(ConfigError("ServerConfig without a static key"));
         }
         let listed = &options.accepted_profiles;
         if listed.is_empty() {
@@ -175,10 +174,9 @@ impl ServerConfig {
         }
         check_pq_auth(options.require_pq_auth, options.client_verifier.as_ref())?;
         let accepted = listed.clone();
-        let static_secret = Secret::from(&static_secret[..]);
         Ok(Self {
             gate,
-            static_secret,
+            static_key,
             accepted,
             options,
         })
@@ -321,8 +319,7 @@ impl ServerConfig {
             &parsed,
             ResponderKeys {
                 psk: &psk,
-                static_secret: <&[u8; 32]>::try_from(&self.static_secret[..])
-                    .expect("32 bytes, from the constructor's array"),
+                static_key: self.static_key.scalar(),
                 binding: &binding,
                 max_app_data: self.options.max_app_data,
             },
@@ -415,10 +412,14 @@ impl ServerConfig {
                 let verdict = judge(v.as_ref(), input)
                     .await
                     .map_err(|e| gate_error("credentials_failed", e))?;
-                // The core checks the proof the verdict names.
+                // The core checks the proof the verdict names; the reason names which
+                // requirement failed: the proof, or the PQ authentication required.
                 pq_authenticated = complete
-                    .check_proof(verdict.proof_key.as_ref(), self.options.require_pq_auth)
-                    .map_err(|e| refuse(e.class()))?;
+                    .check_proof(verdict.proof_key.as_ref(), false)
+                    .map_err(|_| refuse("proof"))?;
+                if self.options.require_pq_auth && !pq_authenticated {
+                    return Err(refuse("pq_auth_required"));
+                }
                 Some(verdict)
             }
         };
@@ -631,7 +632,7 @@ mod tests {
         let k = derive_handle_psk(&[9; 32], b"tests", b"").unwrap();
         let server = ServerConfig::new(
             Arc::new(OneKey(k.psk.to_vec())),
-            node,
+            StaticKey::from_scalar(node),
             ServerOptions::default(),
         )
         .unwrap();

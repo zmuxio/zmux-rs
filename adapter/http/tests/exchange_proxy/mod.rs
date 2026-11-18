@@ -13,6 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+/// The path of the DOWN requests of the tests that cut them (the options'
+/// `down_path`).
+pub(crate) const DOWN_PATH: &str = "/zmux/exchange/down";
+
 /// What may happen to a request: the probability of each fault (they are
 /// drawn in this order, at most one per request), and the bounds.
 #[derive(Debug, Clone, Copy, Default)]
@@ -31,7 +35,8 @@ pub(crate) struct Faults {
     /// Every request waits up to this before it is forwarded, so that
     /// requests overtake one another.
     pub(crate) reorder: Duration,
-    /// A request whose response takes longer than this is cut.
+    /// A DOWN request (its target is under [`DOWN_PATH`]) whose response
+    /// takes longer than this is cut.
     pub(crate) cut: Option<Duration>,
 }
 
@@ -257,7 +262,7 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
         });
     }
     let fwd = forward(&shared.origin, &target, &body);
-    let resp = match f.cut {
+    let resp = match f.cut.filter(|_| target.starts_with(DOWN_PATH)) {
         Some(cut) => {
             if let Ok(r) = tokio::time::timeout(cut, fwd).await {
                 r

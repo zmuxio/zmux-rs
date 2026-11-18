@@ -23,7 +23,7 @@ fn every_profile_round_trips_with_random_ephemerals() {
                 b""
             },
             psk,
-            static_secret: &[1; 32],
+            static_key: &[1; 32],
             binding: b"",
             max_app_data: Some(DEFAULT_MAX_APP_DATA),
         })
@@ -33,7 +33,7 @@ fn every_profile_round_trips_with_random_ephemerals() {
         let parsed = Hello::parse(framing, &hello).unwrap();
         let keys = ResponderKeys {
             psk,
-            static_secret: &[2; 32],
+            static_key: &[2; 32],
             binding: b"",
             max_app_data: Some(DEFAULT_MAX_APP_DATA),
         };
@@ -64,7 +64,7 @@ fn a_responder_binding_of_another_length_is_invalid_config() {
             b""
         },
         psk: b"",
-        static_secret: &[1; 32],
+        static_key: &[1; 32],
         binding: b"",
         max_app_data: Some(DEFAULT_MAX_APP_DATA),
     })
@@ -78,7 +78,7 @@ fn a_responder_binding_of_another_length_is_invalid_config() {
         (&[0; 32][..], true),
     ] {
         let keys = ResponderKeys {
-            static_secret: &[2; 32],
+            static_key: &[2; 32],
             binding,
             ..ResponderKeys::default()
         };

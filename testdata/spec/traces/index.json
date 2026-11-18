@@ -861,6 +861,17 @@
       "steps": 14
     },
     {
+      "id": "core.flow.unread_stream_does_not_starve",
+      "file": "fixtures/traces/core/flow/unread_stream_does_not_starve.ndjson",
+      "title": "Data buffered unread on one stream does not hold the session credit: with a session window of one stream window, a full unread stream leaves the peer blocked, and MAX_DATA is raised at once so that another stream gets data",
+      "refs": [
+        "SPEC.md#8.3"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 12
+    },
+    {
       "id": "core.flow.stream_limit_violation",
       "file": "fixtures/traces/core/flow/stream_limit_violation.ndjson",
       "title": "Exceeding a stream window is fatal",
@@ -3822,6 +3833,30 @@
       "findings": [],
       "profile": "zmux-mp",
       "steps": 20
+    },
+    {
+      "id": "multipath.listener.unconfirmed_evicts_oldest",
+      "file": "fixtures/traces/multipath/listener/unconfirmed_evicts_oldest.ndjson",
+      "title": "With the session's bound of Unconfirmed carriers reached, a new authenticated Hello is accepted and the oldest Unconfirmed carrier is closed",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#5.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "multipath.listener.unconfirmed_below_bound_kept",
+      "file": "fixtures/traces/multipath/listener/unconfirmed_below_bound_kept.ndjson",
+      "title": "Below the session's bound of Unconfirmed carriers no carrier is evicted: every accepted carrier can still be confirmed",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "MULTIPATH.md#5.6"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
     },
     {
       "id": "multipath.streams.reset_stream_at_waits_for_credit",

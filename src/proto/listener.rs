@@ -99,8 +99,8 @@ pub struct ListenerConfig {
     /// error), as [`ListenerConfig::source_prefix_v4`] says.
     pub source_prefix_v6: u8,
     /// Unconfirmed carriers per session: joins that passed authentication and wait for the
-    /// joiner's confirmation (default 4). A new authenticated Hello beyond it evicts the one
-    /// Unconfirmed longest and is never refused for lack of room.
+    /// joiner's confirmation (default 4). A new authenticated Hello of a session at the bound
+    /// closes the one Unconfirmed longest first and is never refused for lack of room.
     pub max_pending_per_session: usize,
     /// The first record or Hello must arrive within this (default 2 s).
     pub first_record_timeout: Duration,
@@ -1129,9 +1129,11 @@ impl ListenerCore {
         }
     }
 
-    /// A verified Hello of the session named `locator` is Unconfirmed: beyond the session's
-    /// limit, the carrier that became Unconfirmed first, never this one, is evicted rather
-    /// than the new Hello refused. Returns the carrier to close.
+    /// A verified Hello of the session named `locator` is Unconfirmed. When the session
+    /// already held its bound ([`ListenerConfig::max_pending_per_session`]), the carrier
+    /// that became Unconfirmed first, never this one, MUST be closed as a failed join, and
+    /// the new Hello is never refused for lack of room; below the bound nothing is evicted.
+    /// Returns the carrier to close.
     pub fn unconfirmed(&mut self, id: CarrierId, locator: &[u8]) -> Option<CarrierId> {
         let i = self.find(id)?;
         let seq = self.unconfirmed_seq;

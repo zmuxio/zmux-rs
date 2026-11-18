@@ -152,7 +152,7 @@ async fn fallback_without_a_target_stalls() {
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"0123").await.unwrap();
-    assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut tcp).await, Vec::new());
     let st = listener.stats();
     assert_eq!(
         (st.admission.fallback, st.admission.stalled, st.rejected),
@@ -174,7 +174,7 @@ async fn every_outcome_is_counted_once() {
         let (listener, addr) = serve(Admission::new(4, decide), None).await;
         let mut tcp = TcpStream::connect(&addr).await.unwrap();
         tcp.write_all(b"0123").await.unwrap();
-        assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+        assert_eq!(ended(&mut tcp).await, Vec::new());
         eventually(|| listener.stats().admission.closed == 1).await;
         let st = listener.stats();
         assert_eq!(
@@ -254,7 +254,7 @@ async fn a_late_decision_is_a_peek_timeout() {
     .with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
-    assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut tcp).await, Vec::new());
     eventually(|| listener.stats().admission.peek_timed_out == 1).await;
     assert_eq!(listener.stats().admission.closed, 0);
     listener.close();
@@ -268,7 +268,7 @@ async fn a_late_prefix_is_closed_or_falls_back() {
     let (listener, addr) = serve(late(), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"ab").await.unwrap();
-    assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut tcp).await, Vec::new());
     let a = listener.stats().admission;
     assert_eq!((a.peek_timed_out, a.fallback, a.closed), (1, 0, 0));
     listener.close();
@@ -309,7 +309,7 @@ async fn closing_the_listener_cancels_a_decision() {
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     listener.close();
-    assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut tcp).await, Vec::new());
     eventually(|| listener.stats().admission.closed == 1).await;
 }
 
@@ -330,7 +330,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     eventually(|| listener.adapter().enter(peer, None).is_none()).await;
     // Beyond the share: closed at once, refused, never decided.
     let mut second = TcpStream::connect(&addr).await.unwrap();
-    assert_eq!(ended(&mut second).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut second).await, Vec::new());
     eventually(|| listener.stats().refused >= 2).await;
     // Another source has its own share.
     assert!(
@@ -355,7 +355,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     );
     drop(held);
     listener.close();
-    assert_eq!(ended(&mut first).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut first).await, Vec::new());
 }
 
 #[tokio::test(start_paused = true)]
@@ -749,7 +749,7 @@ async fn more_past_the_end_of_the_carrier_closes() {
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"tok").await.unwrap();
     tcp.shutdown().await.unwrap();
-    assert_eq!(ended(&mut tcp).await, [] as [u8; 0]);
+    assert_eq!(ended(&mut tcp).await, Vec::new());
     let l = listener.clone();
     eventually(move || l.stats().admission.closed == 1).await;
     assert_eq!(listener.stats().admission.accepted, 0);

@@ -53,7 +53,7 @@ impl Gate for TestGate {
 }
 
 fn node_public() -> Vec<u8> {
-    static_public(&NODE).to_vec()
+    StaticKey::from_scalar(NODE).public_key().to_vec()
 }
 
 fn keys() -> HandlePsk {
@@ -63,7 +63,7 @@ fn keys() -> HandlePsk {
 fn listener(cred: Option<Credential>, psk: Vec<u8>) -> Listener {
     let server = ServerConfig::new(
         Arc::new(TestGate { psk, cred }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions::default(),
     )
     .expect("valid server configuration");
@@ -278,7 +278,7 @@ async fn a_split_carrier_without_establish_starts_no_session() {
             psk: keys().psk.to_vec(),
             cred: None,
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             allow_record_mode: None,
             shaper: None,
@@ -322,7 +322,7 @@ fn bound_listener() -> Listener {
             psk: keys().psk.to_vec(),
             cred: None,
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             allow_record_mode: Some(ModeCheck::new(|_, _| true)),
             shaper: None,
@@ -435,7 +435,7 @@ async fn the_handshake_shaper_plans_each_message() {
                 psk: keys().psk.to_vec(),
                 cred: list.clone(),
             }),
-            NODE,
+            StaticKey::from_scalar(NODE),
             ServerOptions {
                 shaper: Some(shaper(server_log.clone(), Duration::ZERO)),
                 ..Default::default()
@@ -577,7 +577,7 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
                 psk: keys().psk.to_vec(),
                 cred: None,
             }),
-            NODE,
+            StaticKey::from_scalar(NODE),
             ServerOptions {
                 allow_record_mode: None,
                 shaper: None,
@@ -673,7 +673,7 @@ fn a_server_configuration_is_checked_when_it_is_made() {
     let made = |profiles: Vec<u64>| {
         ServerConfig::new(
             gate(),
-            NODE,
+            StaticKey::from_scalar(NODE),
             ServerOptions {
                 accepted_profiles: profiles,
                 ..Default::default()
@@ -690,7 +690,14 @@ fn a_server_configuration_is_checked_when_it_is_made() {
     );
     assert!(made(vec![2]).is_err(), "Join is no Establish Profile");
     assert!(made(vec![9]).is_err(), "an unknown Profile");
-    assert!(ServerConfig::new(gate(), [0; 32], ServerOptions::default()).is_err());
+    assert!(
+        ServerConfig::new(
+            gate(),
+            StaticKey::from_scalar([0; 32]),
+            ServerOptions::default()
+        )
+        .is_err()
+    );
 }
 
 /// A client's local mistakes are named, before any byte; an unknown Profile anywhere in
@@ -736,7 +743,7 @@ async fn a_profile_without_a_key_is_accepted_only_when_listed() {
             psk: Vec::new(),
             cred: None,
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             accepted_profiles: vec![4, 5],
             ..Default::default()
@@ -905,7 +912,7 @@ async fn application_data_in_messages_1_2_and_3() {
     let gate = Arc::new(SeesAdmission(std::sync::Mutex::new(Vec::new())));
     let server = ServerConfig::new(
         gate.clone(),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             app_data: Some(server_source),
             client_verifier: Some(Arc::new(SeesClientData)),
@@ -991,7 +998,7 @@ async fn panicking_client_verifier_rejects() {
                 psk: keys().psk.to_vec(),
                 cred: None,
             }),
-            NODE,
+            StaticKey::from_scalar(NODE),
             ServerOptions {
                 client_verifier: Some(v),
                 ..Default::default()
@@ -1045,7 +1052,7 @@ fn proving_listener(
             psk: keys().psk.to_vec(),
             cred: Some((77, b"node".to_vec())),
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             signer,
             client_verifier,
@@ -1123,6 +1130,88 @@ async fn proofs_give_pq_authentication_both_ways() {
     assert!(!peer.pq_authenticated);
 }
 
+/// What a server's reject policy is told of its own credential decisions: a verifier's
+/// rejection is `credentials_failed`, a missing or wrong proof `proof`, a missing PQ
+/// authentication that is required `pq_auth_required`; a verifier that cannot decide closes
+/// the carrier without asking the policy.
+#[tokio::test]
+async fn server_credential_decisions_name_their_reason() {
+    struct Decides(Result<Option<KeyId>, bool>);
+    impl Verifier for Decides {
+        fn verify<'a>(
+            &'a self,
+            i: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
+            Box::pin(async move {
+                match &self.0 {
+                    Ok(proof_key) => Ok(VerifyVerdict {
+                        principal: Principal::StaticKey(i.peer_static.to_vec()),
+                        proof_key: *proof_key,
+                        value: None,
+                    }),
+                    Err(true) => Err(VerifyError::rejected("no")),
+                    Err(false) => Err(VerifyError::unavailable("down")),
+                }
+            })
+        }
+    }
+    let client_key = SigningKey::generate(KEYALG_MLDSA44).unwrap();
+    let client_id = client_key.key_id();
+    let cases: [(Decides, bool, &[&str]); 4] = [
+        (Decides(Err(true)), false, &["credentials_failed"]),
+        (Decides(Err(false)), false, &[]),
+        // The client does not sign: the proof the verdict names is missing.
+        (Decides(Ok(Some(client_id))), false, &["proof"]),
+        // A proof key is not named and PQ authentication is required.
+        (Decides(Ok(None)), true, &["pq_auth_required"]),
+    ];
+    for (verifier, require_pq_auth, want) in cases {
+        let server = ServerConfig::new(
+            Arc::new(TestGate {
+                psk: keys().psk.to_vec(),
+                cred: None,
+            }),
+            StaticKey::from_scalar(NODE),
+            ServerOptions {
+                client_verifier: Some(Arc::new(verifier)),
+                require_pq_auth,
+                ..Default::default()
+            },
+        )
+        .expect("valid server configuration");
+        let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lc = ListenerConfig::default();
+        lc.inbound_transform = Some(server.transform());
+        lc.on_reject = Some(zmux::proto::listener::OnReject::new({
+            let reasons = reasons.clone();
+            move |i| {
+                reasons.lock().unwrap().push(i.reason);
+                zmux::proto::listener::RejectAction::Close
+            }
+        }));
+        let l = Listener::new(config(), lc).expect("valid listener configuration");
+        let (a, b) = duplex(1 << 20);
+        let handled = tokio::spawn({
+            let l = l.clone();
+            async move {
+                l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+                    .await
+            }
+        });
+        let c = client(Arc::new(PinVerifier::new(key_id(
+            KEYALG_X25519,
+            &node_public(),
+        ))));
+        let _ = tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), &c)).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), handled)
+            .await
+            .expect("in time")
+            .expect("no panic escapes");
+        assert_eq!(*reasons.lock().unwrap(), want);
+        assert!(r.is_err());
+    }
+}
+
 /// A server that requires PQ authentication of clients needs a verifier, and not a pin
 /// of a static key alone.
 #[test]
@@ -1133,7 +1222,7 @@ fn pq_authentication_needs_a_proof_key() {
                 psk: Vec::new(),
                 cred: None,
             }),
-            NODE,
+            StaticKey::from_scalar(NODE),
             ServerOptions {
                 client_verifier: v,
                 require_pq_auth: true,
@@ -1151,15 +1240,26 @@ fn pq_authentication_needs_a_proof_key() {
     );
 }
 
-/// The public key of a static secret is X25519's, and its `KeyId` the pin's.
+/// The public key of a static key is X25519's, and its `KeyId` the pin's.
 #[test]
-fn the_public_key_of_a_static_secret() {
-    let public = static_public(&NODE);
+fn the_public_key_of_a_static_key() {
+    let public = StaticKey::from_scalar(NODE).public_key();
     assert_eq!(
         public,
         *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(NODE)).as_bytes()
     );
     assert_eq!(static_key_id(&public), key_id(KEYALG_X25519, &public));
+    assert_eq!(*StaticKey::from_scalar(NODE).scalar(), NODE);
+    let (a, b) = (
+        StaticKey::generate().unwrap(),
+        StaticKey::generate().unwrap(),
+    );
+    assert_ne!(a.scalar(), b.scalar());
+    assert_eq!(format!("{a:?}"), "StaticKey(..)");
+    assert_eq!(
+        a.public_key(),
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*a.scalar())).as_bytes()
+    );
 }
 
 /// The refusals a reject policy saw: reason and record mode.
@@ -1173,7 +1273,7 @@ fn mismatch_listener(action: Option<zmux::RejectAction>, seen: Seen) -> Listener
             psk: keys().psk.to_vec(),
             cred: None,
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             allow_record_mode: Some(ModeCheck::new(|_, _| true)),
             ..Default::default()
@@ -1360,7 +1460,7 @@ async fn message_2_with_a_credential_of(len: usize) -> bool {
             psk: keys().psk.to_vec(),
             cred: Some((77, vec![0x5a; len])),
         }),
-        NODE,
+        StaticKey::from_scalar(NODE),
         ServerOptions {
             signer: Some(Arc::new(KeySigner(
                 SigningKey::from_seed(KEYALG_MLDSA44, &[5; 32]).unwrap(),
@@ -1405,4 +1505,51 @@ async fn message_2_with_a_proof_holds_a_credential_up_to_the_floor() {
     // 3252 bytes of room: the credential, its entry's type (77: two bytes) and length, and the
     // item's own header take five of them.
     assert_eq!(ok, 3247);
+}
+
+/// The hook views are built by `new` with exactly the fields that have no
+/// meaningful default, the others public on the result, so that a host's
+/// verifier, data source and gate are testable without a handshake.
+#[tokio::test]
+async fn hook_views_are_built_by_new() {
+    let profile = Profile::from_value(4).unwrap();
+    let key = [5u8; 32];
+    let mut input = VerifyInput::new(zmux::Role::Client, profile, &key);
+    assert_eq!(input.peer_static, &key);
+    assert!(input.credential.is_none() && input.peer_app_data.is_empty());
+    input.local_context = b"ctx";
+    input.credential = Some((7, &[1, 2]));
+    let verdict = Box::pin(async {
+        // A verifier of the host, called with the built view.
+        struct Pin;
+        impl Verifier for Pin {
+            fn verify<'a>(
+                &'a self,
+                i: VerifyInput<'a>,
+            ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
+                Box::pin(async move {
+                    assert_eq!(i.local_context, b"ctx");
+                    Ok(VerifyVerdict::new(Principal::StaticKey(
+                        i.peer_static.to_vec(),
+                    )))
+                })
+            }
+        }
+        Pin.verify(input).await
+    })
+    .await
+    .unwrap();
+    assert!(matches!(verdict.principal, Principal::StaticKey(ref k) if k == &key));
+
+    let mut request = AppDataRequest::new(3);
+    assert_eq!(request.message, 3);
+    assert!(request.peer.is_none() && request.verdict.is_none());
+    request.peer = Some(&input);
+    assert_eq!(request.peer.map(|p| p.local_context), Some(&b"ctx"[..]));
+
+    let peer = Peer::new(key.to_vec(), profile.value(), RecordMode::Sealed);
+    let mut admission = Admission::new(&peer);
+    assert_eq!(admission.handle, b"");
+    admission.handle = b"h";
+    assert_eq!(admission.peer.static_key, key);
 }

@@ -147,16 +147,16 @@ async fn quality_events_reach_the_application() {
         .begin_add_pipe(carrier(&listener), PipeOptions::default())
         .unwrap();
     pipe.update(&zmux::PipeUpdate {
-        quality_band: zmux::Change::Set(QualityBand::new(
+        quality_band: zmux::Change::Set(Some(QualityBand::new(
             Some(Duration::from_millis(5)),
             Some(1.5),
-        )),
+        ))),
         ..Default::default()
     })
     .unwrap();
     client.set_quality_band(None).unwrap();
-    // A rate ratio other than 0 (off) or finite and at least 1 is rejected.
-    for bad in [f64::NAN, -1.0, 0.5, f64::INFINITY] {
+    // A rate ratio other than finite and at least 1 is rejected, 0 included.
+    for bad in [0.0, f64::NAN, -1.0, 0.5, f64::INFINITY] {
         let band = Some(QualityBand::new(Some(Duration::from_millis(5)), Some(bad)));
         assert!(matches!(
             client.set_quality_band(band),
@@ -164,13 +164,13 @@ async fn quality_events_reach_the_application() {
         ));
         assert!(matches!(
             pipe.update(&zmux::PipeUpdate {
-                quality_band: band.map_or(zmux::Change::Clear, zmux::Change::Set),
+                quality_band: zmux::Change::Set(band),
                 ..Default::default()
             }),
             Err(zmux::PipeError::InvalidOptions(_))
         ));
     }
-    for bad in [f64::NAN, -1.0, 0.5, 0.999, f64::INFINITY] {
+    for bad in [0.0, f64::NAN, -1.0, 0.5, 0.999, f64::INFINITY] {
         let mut floor = CapacityFloor::new(1);
         floor.recovery_ratio = bad;
         assert!(matches!(
@@ -178,10 +178,11 @@ async fn quality_events_reach_the_application() {
             Err(zmux::PipeError::InvalidOptions(_))
         ));
     }
+    assert!(matches!(
+        client.set_capacity_floor(Some(CapacityFloor::new(0))),
+        Err(zmux::PipeError::InvalidOptions(_))
+    ));
     let mut floor = CapacityFloor::new(1);
-    floor.recovery_ratio = 0.0;
-    assert_eq!(floor.effective_recovery_ratio(), 1.25);
-    client.set_capacity_floor(Some(floor)).unwrap();
     floor.recovery_ratio = 1.0;
     client.set_capacity_floor(Some(floor)).unwrap();
     client

@@ -106,7 +106,7 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
         limits.inbound_transform = Some(
             ServerConfig::new(
                 Arc::new(OneKey(keys.psk.to_vec())),
-                NODE,
+                zmux_seal::StaticKey::from_scalar(NODE),
                 zmux_seal::ServerOptions {
                     allow_record_mode: None,
                     shaper: None,

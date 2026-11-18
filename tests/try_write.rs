@@ -305,14 +305,14 @@ async fn readable_then_try_read_loses_nothing() {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         let _ = w.as_mut().poll(&mut cx);
         drop(w);
-        h.readable().await.unwrap();
+        h.readable().await;
         assert_eq!(
             recv.try_read_chunk(100).unwrap(),
             TryRead::Data(Bytes::from_static(b"hello"))
         );
         assert_eq!(recv.try_read_chunk(100).unwrap(), TryRead::WouldBlock);
         send.finish().unwrap();
-        h.readable().await.unwrap();
+        h.readable().await;
         let mut buf = [0u8; 4];
         assert_eq!(recv.try_read(&mut buf).unwrap(), TryRead::Finished);
         // The other direction: a pending wait ends when its part goes.
@@ -326,11 +326,72 @@ async fn readable_then_try_read_loses_nothing() {
         let mut wait = Box::pin(h2.readable());
         assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing to read");
         drop(recv2);
-        let r = tokio::time::timeout(Duration::from_secs(5), wait)
+        // Its part ended (a stop by this endpoint): the wait reports
+        // success, and the read after it the end.
+        tokio::time::timeout(Duration::from_secs(5), wait)
             .await
             .expect("the wait ended with its part");
-        assert!(r.is_err(), "{r:?}");
         drop(s2);
+    })
+    .await;
+}
+
+/// `RecvStream::readable` is ready exactly when the next read returns at
+/// once, and every end of the receiving part is such a case: it reports
+/// `Ok` and the read reports the end, once.
+#[tokio::test]
+async fn readable_is_ok_at_every_end_of_the_receiving_part() {
+    use std::future::Future;
+    use zmux::StreamError;
+    watchdog(20, "readable ends", async {
+        let (client, server) = pair().await;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        // Nothing yet: pending; the FIN: ready, then the read ends.
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        send.write_all(b"a").await.unwrap();
+        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        recv.readable().await;
+        let mut b = [0u8; 8];
+        assert_eq!(recv.read(&mut b).await.unwrap(), Some(1));
+        let mut w = Box::pin(recv.readable());
+        assert!(w.as_mut().poll(&mut cx).is_pending());
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), w)
+            .await
+            .unwrap();
+        assert_eq!(recv.read(&mut b).await.unwrap(), None);
+
+        // A reset by the peer: ready; the read reports the reset.
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        send.write_all(b"a").await.unwrap();
+        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        recv.readable().await;
+        assert_eq!(recv.read(&mut b).await.unwrap(), Some(1));
+        let mut w = Box::pin(recv.readable());
+        assert!(w.as_mut().poll(&mut cx).is_pending());
+        send.reset(VarInt::from_u32(7)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), w)
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv.read(&mut b).await,
+            Err(StreamError::Reset { .. })
+        ));
+
+        // The session's end: ready; the read reports it.
+        let (mut send, _r) = client.open_bi().await.unwrap();
+        send.write_all(b"a").await.unwrap();
+        let (_s, mut recv) = server.accept_bi().await.unwrap();
+        recv.readable().await;
+        assert_eq!(recv.read(&mut b).await.unwrap(), Some(1));
+        let mut w = Box::pin(recv.readable());
+        assert!(w.as_mut().poll(&mut cx).is_pending());
+        client.close().await;
+        tokio::time::timeout(Duration::from_secs(5), w)
+            .await
+            .unwrap();
+        assert!(recv.read(&mut b).await.is_err());
     })
     .await;
 }

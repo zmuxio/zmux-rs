@@ -19,7 +19,7 @@ struct Tls {
 }
 
 fn tls() -> Tls {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     Tls {
         der: CertificateDer::from(cert.cert.der().to_vec()),
         key: PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),

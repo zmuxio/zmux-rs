@@ -237,7 +237,7 @@ async fn run() {
 
 async fn quic_server(n: usize, exporter: bool) {
     CLOSE_REPLY.store(true, Ordering::Relaxed);
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
@@ -425,7 +425,7 @@ async fn seal_server(
 ) -> (Session, Listener, tokio::task::JoinHandle<()>) {
     let server = zmux_seal::ServerConfig::new(
         Arc::new(SealGate),
-        SEAL_NODE,
+        zmux_seal::StaticKey::from_scalar(SEAL_NODE),
         zmux_seal::ServerOptions {
             accepted_profiles: profiles
                 .split(',')
@@ -484,7 +484,7 @@ fn x25519_dalek_public(secret: [u8; 32]) -> Vec<u8> {
 /// bidirectional bootstrap carrier and a join, or a split bootstrap and a
 /// join, as the client's first bytes say.
 async fn tls_server() -> (Session, Listener) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let tls = rustls::ServerConfig::builder_with_provider(provider())
@@ -533,7 +533,7 @@ async fn tls_server() -> (Session, Listener) {
 
 /// A self-signed certificate for `localhost`, offering `alpn`.
 fn tls_server_config(alpn: &[&[u8]]) -> rustls::ServerConfig {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
@@ -801,7 +801,7 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let _ = send.stopped().await;
         }
         "info" => {
-            let prio = recv.requested_priority().map_or_else(
+            let prio = recv.preamble_priority().map_or_else(
                 || "none".into(),
                 |p| format!("{},{}", p.urgency(), p.incremental()),
             );

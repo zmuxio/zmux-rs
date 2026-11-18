@@ -370,6 +370,7 @@ pub struct TestHooks {
     pub pipe_cap: Option<u64>,
     pub lane_key: Option<Hex>,
     pub epoch_locator_prefix: Option<Hex>,
+    pub unconfirmed_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

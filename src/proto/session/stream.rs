@@ -953,7 +953,7 @@ impl SendPart {
             preamble_left: 0,
             base: 0,
             written: 0,
-            priority: Priority::new(3, true).unwrap_or(Priority::DEFAULT),
+            priority: Priority::LOCAL_DEFAULT,
             deficit: 0,
             queued: None,
             waiter: None,
@@ -1161,6 +1161,10 @@ pub(crate) struct RecvPart {
     pub(crate) limit: u64,
     /// The current window (auto-tuned).
     pub(crate) window: u64,
+    /// The initial window as set: the session's, or what
+    /// `set_receive_window` set it to. Auto-tuning never changes it; it
+    /// is what the getter reads.
+    pub(crate) initial_window: u64,
     /// The stream's fixed auto-tuning cap (configured, or set by
     /// `set_receive_window`), or no limit under an automatic cap, which the
     /// session's memory allowance bounds instead.
@@ -1209,6 +1213,12 @@ impl RecvCold {
 }
 
 impl RecvPart {
+    /// Whether the auto-tuning cap is automatic: no fixed cap of its own,
+    /// the session's memory allowance (with the 64 MiB floor) bounds it.
+    pub(crate) fn automatic_cap(&self) -> bool {
+        self.max_window == crate::proto::varint::MAX
+    }
+
     /// A receiving part whose data goes into `buf` (an empty buffer, maybe
     /// with capacity from a discarded stream).
     pub(crate) fn with_buf(window: u64, max_window: u64, storage: BytesMut) -> Self {
@@ -1228,6 +1238,7 @@ impl RecvPart {
             end_read: false,
             limit: window,
             window,
+            initial_window: window,
             tuner: StreamTuner::default(),
             update_pending: false,
             cold: None,
@@ -1590,8 +1601,8 @@ pub(crate) struct Stream {
     /// asked for them ([`super::SessionCore::stream_meter`]).
     pub(crate) meter: Option<Arc<Meter>>,
     /// Where the statistics go when the stream is discarded, once a driver
-    /// asked for it ([`super::SessionCore::stream_final_stats`]).
-    pub(crate) final_stats: Option<Arc<std::sync::OnceLock<super::StreamStats>>>,
+    /// asked for it ([`super::SessionCore::stream_final`]).
+    pub(crate) final_snapshot: Option<Arc<std::sync::OnceLock<super::StreamFinal>>>,
     /// Queued for a control frame.
     pub(crate) ctrl_queued: bool,
     /// Pending readiness notifications.
@@ -1676,6 +1687,15 @@ impl Stream {
                 .is_none_or(|send| send.cold().reset.is_none_or(|r| !r.written))
     }
 
+    /// Whether a datagram that arrives for the stream is queued: not once
+    /// the application released the stream or its receiving handle, nor after the parts ended or the stack rejected the stream.
+    pub(crate) fn takes_datagrams(&self) -> bool {
+        !self.released
+            && !self.recv_released
+            && !self.parts_terminal()
+            && self.offer != Offer::Rejected
+    }
+
     /// The stream's datagram flow, created on first use.
     pub(crate) fn datagrams_mut(&mut self) -> &mut StreamDatagrams {
         self.datagrams.get_or_insert_default()
@@ -1716,7 +1736,7 @@ impl Stream {
             extra: None,
             datagrams: None,
             meter: None,
-            final_stats: None,
+            final_snapshot: None,
             ctrl_queued: false,
             notified_readable: false,
             notified_writable: false,

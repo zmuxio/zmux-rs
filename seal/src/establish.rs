@@ -73,6 +73,7 @@ pub(crate) fn shaped_payload(
 
 /// What an Establish learned of the other end.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Peer {
     /// The peer's static key.
     pub static_key: Vec<u8>,
@@ -91,6 +92,26 @@ pub struct Peer {
     /// The peer's authentication resists an active quantum adversary: the verdict named a
     /// proof key, the proof verified, and its `KeyAlg` is post-quantum.
     pub pq_authenticated: bool,
+}
+
+impl Peer {
+    /// A peer for a host's test (a [`Gate`](crate::Gate) given an
+    /// [`Admission`](crate::Admission)): its static key, the handshake's Profile and
+    /// the record mode, with no credential, no verdict, no application data and no
+    /// post-quantum property, each a public field to set on the result.
+    #[must_use]
+    pub fn new(static_key: Vec<u8>, profile: u64, record_mode: RecordMode) -> Self {
+        Self {
+            static_key,
+            credential: None,
+            verdict: None,
+            profile,
+            record_mode,
+            app_data: Vec::new(),
+            pq_confidential: false,
+            pq_authenticated: false,
+        }
+    }
 }
 
 /// The carrier ended, or the reply timeout passed, before the server's message 2. A server
@@ -118,22 +139,56 @@ impl std::error::Error for NoReply {
 
 /// Where a client's static key comes from.
 #[derive(Clone, Default)]
-pub enum StaticSecret {
+pub enum StaticKeySource {
     /// A key generated once per process and shared by its clients.
     #[default]
     Process,
-    /// This X25519 private scalar, cleared when the last copy is dropped.
+    /// This key.
     Given(StaticKey),
 }
 
-/// An X25519 private scalar held by a [`StaticSecret::Given`]: its bytes
-/// are overwritten when it is dropped, and its `Debug` shows none of them.
+/// A node's X25519 static private key: its scalar is overwritten when it
+/// is dropped, and its `Debug` shows none of it.
 #[derive(Clone)]
 pub struct StaticKey([u8; 32]);
 
-impl From<[u8; 32]> for StaticKey {
-    fn from(key: [u8; 32]) -> Self {
-        Self(key)
+impl StaticKey {
+    /// A new random key, from the operating system's random source.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RandomFailed`] (`random_failed`) when the random source
+    /// fails (early boot, a sandbox without it); there is no fallback.
+    pub fn generate() -> Result<Self, Error> {
+        let mut k = Self([0; 32]);
+        zmux::proto::seal::fill_random(&mut k.0)?;
+        Ok(k)
+    }
+
+    /// The key of this X25519 private scalar.
+    #[must_use]
+    pub fn from_scalar(scalar: [u8; 32]) -> Self {
+        Self(scalar)
+    }
+
+    /// The X25519 public key, for the peer's pin
+    /// ([`static_key_id`](crate::static_key_id)).
+    ///
+    /// # Panics
+    ///
+    /// Never: X25519 maps every 32-byte scalar to a 32-byte public key.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; 32] {
+        zmux::proto::seal::kex::x25519_public(&self.0)
+            .ok()
+            .and_then(|k| k.try_into().ok())
+            .expect("a 32-byte X25519 scalar has a 32-byte public key")
+    }
+
+    /// The private scalar.
+    #[must_use]
+    pub fn scalar(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -149,7 +204,7 @@ impl fmt::Debug for StaticKey {
     }
 }
 
-impl fmt::Debug for StaticSecret {
+impl fmt::Debug for StaticKeySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Process => f.write_str("Process"),
@@ -174,8 +229,8 @@ pub struct ClientConfig {
     pub handle: Vec<u8>,
     /// The pre-shared key (cleared when dropped).
     pub psk: zmux::proto::seal::Secret,
-    /// The client's static key (default [`StaticSecret::Process`]).
-    pub static_secret: StaticSecret,
+    /// The client's static key (default [`StaticKeySource::Process`]).
+    pub static_key: StaticKeySource,
     /// The Profiles this client may use, the first that fits the pre-shared key being
     /// used (default: both ciphers, the one with hardware support first; an empty list
     /// is the configuration error). A refusal never makes a client choose another
@@ -215,7 +270,7 @@ impl Default for ClientConfig {
             allow_psk_only: false,
             handle: Vec::new(),
             psk: zmux::proto::seal::Secret::default(),
-            static_secret: StaticSecret::Process,
+            static_key: StaticKeySource::Process,
             allowed_profiles: client_default().to_vec(),
             record_mode: RecordMode::Sealed,
             credential: None,
@@ -241,7 +296,7 @@ impl fmt::Debug for ClientConfig {
     }
 }
 
-fn process_secret() -> Result<[u8; 32], Error> {
+fn process_key() -> Result<[u8; 32], Error> {
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();
     if let Some(k) = KEY.get() {
         return Ok(*k);
@@ -363,9 +418,9 @@ pub(crate) async fn run_client<C: Carrier>(
         )));
     }
     // A copy cleared when this call ends.
-    let secret = match &cfg.static_secret {
-        StaticSecret::Given(s) => s.clone(),
-        StaticSecret::Process => StaticKey(process_secret().map_err(invalid)?),
+    let key = match &cfg.static_key {
+        StaticKeySource::Given(k) => k.clone(),
+        StaticKeySource::Process => StaticKey(process_key().map_err(invalid)?),
     };
     let mode = cfg.record_mode;
     let binding = binding_of(&p, mode).map_err(invalid)?;
@@ -376,7 +431,7 @@ pub(crate) async fn run_client<C: Carrier>(
         framing,
         handle: &cfg.handle,
         psk: &cfg.psk,
-        static_secret: &secret.0,
+        static_key: &key.0,
         binding: &binding,
         max_app_data: cfg.max_app_data,
     })

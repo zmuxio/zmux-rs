@@ -127,7 +127,7 @@ async fn mp_server(addr: &str, tls: bool) {
 
 fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+    let cert = zmux_testcert::self_signed(vec!["localhost".into(), "127.0.0.1".into()])
         .expect("certificate");
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));

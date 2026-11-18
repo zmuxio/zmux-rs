@@ -439,3 +439,44 @@ fn round_robin_turns_are_whole_chunks_however_short_the_writes() {
         assert!(s * 5 >= total * 2, "round-robin shares by bytes: {sent:?}");
     }
 }
+
+/// The current value of a pipe that is eligible but not writable is neither
+/// increased nor reset: a pipe the limiter holds
+/// back keeps the claim it had, and a pipe that is full never builds up one
+/// it would redeem in a burst later.
+#[test]
+fn round_robin_keeps_the_current_value_of_a_pipe_that_is_not_writable() {
+    let (mut a, k) = two_pipes(Scheduler::SpreadRoundRobin, Some(FAST), 1 << 20);
+    let chunk = a.config.spread_chunk as u64;
+    let mut out = TransmitBuf::default();
+    let now = a.now;
+    let s = a.streams.send_mut(k).unwrap();
+    s.max_data = s.offset;
+    // One chunk of credit at a time, so each write is one chunk.
+    let mut write = |a: &mut SessionCore, id: u64| {
+        a.streams.send_mut(k).unwrap().max_data += chunk;
+        a.schedule(k);
+        a.poll_transmit(PipeId(id), now, &mut out);
+        let n = out.len() as u64;
+        assert!(n > 0, "pipe {id} took a chunk");
+        a.pipe_written(PipeId(id), n, now);
+        out.clear();
+    };
+    write(&mut a, 0);
+    let before = a.out_ref(0).unwrap().rr_current();
+    assert!(
+        before < 0.0,
+        "the pipe that took the chunk paid for it: {before}"
+    );
+    let o = a.out_mut(0).unwrap();
+    o.set_paced(true, now);
+    o.limiter_parts().unwrap().0.hold();
+    assert!(a.out_ref(0).unwrap().limiter_held());
+    for _ in 0..4 {
+        write(&mut a, 2);
+    }
+    assert!(
+        (a.out_ref(0).unwrap().rr_current() - before).abs() < f64::EPSILON,
+        "a held pipe keeps its value, neither reset nor increased"
+    );
+}

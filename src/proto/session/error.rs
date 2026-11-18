@@ -446,6 +446,10 @@ pub enum StreamError {
     /// This direction was already closed locally (finished, reset or
     /// stopped).
     ClosedLocally,
+    /// A setting's argument is not valid (a receive window below 4 KiB, or
+    /// whose nonzero maximum is below its initial window); nothing was
+    /// changed.
+    InvalidArgument,
     /// The operation needs a feature the peer did not negotiate (for
     /// example peer priorities with a plain QMux peer).
     NotNegotiated,
@@ -478,7 +482,7 @@ impl StreamError {
             Self::Rejected | Self::GoingAway => io::ErrorKind::ConnectionRefused,
             Self::ClosedLocally | Self::NotEstablished => io::ErrorKind::NotConnected,
             Self::NotNegotiated => io::ErrorKind::Unsupported,
-            Self::PreambleTooLarge { .. } => io::ErrorKind::InvalidInput,
+            Self::PreambleTooLarge { .. } | Self::InvalidArgument => io::ErrorKind::InvalidInput,
             Self::Blocked => io::ErrorKind::WouldBlock,
             Self::SessionLost(e) => e.kind(),
         }
@@ -494,6 +498,7 @@ impl fmt::Display for StreamError {
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
             Self::PreambleTooLarge { max } => write!(f, "preamble above the {max}-byte limit"),
             Self::ClosedLocally => f.write_str("stream direction closed locally"),
+            Self::InvalidArgument => f.write_str("setting not valid for this stream"),
             Self::NotNegotiated => f.write_str("not negotiated with the peer"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::Blocked => f.write_str("waiting for stream credit"),

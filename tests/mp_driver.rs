@@ -151,6 +151,8 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         Err(zmux::PipeError::Failed(zmux::PipeFailure::Carrier(_))) | Ok(())
     ));
     assert_eq!(pipe.session().stable_id(), client.stable_id());
+    let held = pipe.options();
+    assert_eq!(held.label.as_deref(), Some("second"));
     pipe.close().unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.closed())
         .await
@@ -160,6 +162,12 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
         .await
         .expect("the peer's half closed in time")
         .unwrap();
+    // A getter never fails: once the session retired the pipe, the options
+    // are the ones it held last (a read, so the retirement is awaited).
+    common::eventually(10, "the pipe retired", || pipe.stats().is_none()).await;
+    assert_eq!(pipe.options(), held);
+    assert_eq!(pipe.options().label.as_deref(), Some("second"));
+    assert_eq!(pipe.clone().options(), held);
     let zero = client.pipe(zmux::PipeId::new(0)).unwrap();
     client.close().await;
     let e = tokio::time::timeout(Duration::from_secs(10), zero.closed())
@@ -283,4 +291,63 @@ async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
     .await
     .expect("the count reported");
     s.close().await;
+}
+
+/// A pipe's end cause is stable: after a local `abort` a wait that was
+/// registered before it and one that starts after the session retired the
+/// pipe report the same `Aborted`, in both orders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aborted_pipe_reports_the_same_end_to_every_wait() {
+    use std::future::{Future, poll_fn};
+    use std::pin::pin;
+    use std::task::Poll;
+
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let listener = Listener::new(config(Scheduler::Affinity), ListenerConfig::default())
+        .expect("valid listener configuration");
+    let l = listener.clone();
+    let serving = tokio::spawn(async move { l.serve(tcp).await });
+    let client = Session::connect(
+        PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
+        config(Scheduler::Affinity),
+    )
+    .await
+    .unwrap();
+    let _server = listener.accept().await.unwrap();
+    let is_aborted = |r: Result<(), zmux::PipeError>| {
+        matches!(r, Err(zmux::PipeError::Failed(zmux::PipeFailure::Aborted)))
+    };
+    for registered_first in [true, false] {
+        let second = TcpStream::connect(addr).await.unwrap();
+        let pipe = client
+            .begin_add_pipe(PipeIo::from_tcp(second), PipeOptions::new())
+            .unwrap();
+        common::watchdog(10, "joined", pipe.joined()).await.unwrap();
+        let clone = pipe.clone();
+        let mut early = pin!(clone.closed());
+        if registered_first {
+            // Polled once: the wait is registered, and still pending.
+            let first = poll_fn(|cx| Poll::Ready(early.as_mut().poll(cx))).await;
+            assert!(first.is_pending(), "a live pipe is not closed");
+        }
+        pipe.abort().unwrap();
+        if registered_first {
+            let got = common::watchdog(10, "the registered wait", early).await;
+            assert!(is_aborted(got), "the registered wait");
+        }
+        // The core reclaims the pipe after the abort's exchange; a wait that
+        // starts then reports the same end.
+        common::eventually(10, "the pipe retired", || pipe.stats().is_none()).await;
+        let late = common::watchdog(10, "the late wait", pipe.closed()).await;
+        assert!(
+            is_aborted(late),
+            "late wait, registered_first={registered_first}"
+        );
+        let again = common::watchdog(10, "a clone's wait", pipe.clone().closed()).await;
+        assert!(is_aborted(again), "a clone's wait");
+    }
+    client.close().await;
+    listener.close();
+    serving.await.unwrap();
 }

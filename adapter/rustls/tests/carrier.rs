@@ -28,7 +28,7 @@ struct Tls {
 /// A client and a server configuration for "localhost", with `alpn`.
 fn configs(alpn: &[&[u8]]) -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -65,7 +65,7 @@ async fn proxy(to: std::net::SocketAddr) -> (std::net::SocketAddr, tokio::task::
 impl Tls {
     async fn new() -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
         let der = CertificateDer::from(cert.cert.der().to_vec());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
         let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())

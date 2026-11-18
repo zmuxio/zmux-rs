@@ -1,5 +1,6 @@
 //! The std driver: a reader thread and a writer thread per pipe own its
-//! I/O, a timer thread runs the core's timers. The application's handles
+//! I/O, one timer thread of the process runs the core's timers of every
+//! session ([`session_timer`]). The application's handles
 //! (`super::handle`) are the tokio driver's: a waiting call runs the shared
 //! future on the calling thread, parking it between polls ([`run`]).
 
@@ -8,7 +9,7 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use bytes::Bytes;
 use super::context::{DriverThread, on_driver_thread};
 use super::engine::{self, Calls, Outbound, Progress};
 use super::handle::{self, CarrierInfo, Driver, Shared, State};
+use super::session_timer::{self, Next};
 use super::sync::{park, thread_waker};
 use super::tcp::{Probe, TcpSocket};
 use super::unsent::{RetransmittedQuery, Unsent, UnsentQuery};
@@ -821,7 +823,7 @@ impl std::fmt::Debug for PipeIo {
 // Concurrency (see `super::wake`): one core lock per session. Threads wait
 // by parking: a waiting thread registers its waker under the lock, and
 // wake-ups and carrier shutdowns decided under the lock are carried out
-// after it was released. A timer thread per session runs the core's timers,
+// after it was released. A timer thread of the process runs each session's timers,
 // so they fire while every writer is blocked in a write or gone, and once
 // the session is closed it ends every carrier with a closer, so that no
 // thread stays blocked in its I/O. The pipe threads own their halves
@@ -845,7 +847,7 @@ pub struct Io {
     /// Writer threads running.
     writers_alive: usize,
     /// The timer thread while it waits, and its deadline.
-    timer: Option<(std::task::Waker, Option<Instant>)>,
+    timer: Option<(Waker, Option<Instant>)>,
     /// The listener's account the session reports its charge to.
     pub(crate) account: Option<Box<super::account::AccountLink<Shared<Blocking>>>>,
 }
@@ -2044,13 +2046,36 @@ fn writer_thread(
     }
 }
 
-/// Runs the session's timers until it is closed; then, after the last
-/// batches had [`FINAL_WRITE`] to be written, ends every carrier with a
-/// closer, so that no thread stays blocked in a read or write of a peer that
-/// went silent. Starts the session's hook thread when the core needs it.
-fn timer_thread(shared: &Arc<Shared<Blocking>>) {
-    let _driver = DriverThread::enter();
-    let me = thread_waker();
+/// The session's timer task (see [`session_timer`]): runs the core's
+/// timers until the session is closed; then, after the last batches had
+/// [`FINAL_WRITE`] to be written, ends every carrier with a closer, so that
+/// no thread stays blocked in a read or write of a peer that went silent.
+/// Starts the session's hook thread when the core needs it.
+fn timer_task(shared: Arc<Shared<Blocking>>) -> impl FnMut(&Waker) -> Next + Send + 'static {
+    // The end of the wait for the writers, once the session is closed.
+    let mut draining: Option<Instant> = None;
+    move |me| {
+        let deadline = match draining {
+            Some(d) => d,
+            None => match fire_timers(&shared, me) {
+                Some(next) => return next,
+                None => *draining.insert(Instant::now() + engine::FINAL_WRITE),
+            },
+        };
+        let mut st = shared.lock();
+        if st.io.writers_alive == 0 || Instant::now() >= deadline {
+            st.io.timer = None;
+            st.shut_down_all();
+            return Next::Done;
+        }
+        st.io.timer = Some((me.clone(), Some(deadline)));
+        Next::At(deadline)
+    }
+}
+
+/// One run of the timer task while the session lives: what it asks next, or
+/// `None` once the session is closed.
+fn fire_timers(shared: &Arc<Shared<Blocking>>, me: &Waker) -> Option<Next> {
     loop {
         let mut st = shared.lock();
         let now = Instant::now();
@@ -2095,11 +2120,11 @@ fn timer_thread(shared: &Arc<Shared<Blocking>>) {
             continue;
         }
         // After the hook start: a tracer is told even of a session that
-        // ended before this thread's first round.
+        // ended before the first round.
         if st.core.state() == CoreState::Closed {
             // Its charge leaves the listener's account.
             st.io.account = None;
-            break;
+            return None;
         }
         let mut until = engine::timer_deadline(st.core.poll_timeout(), now);
         // A charge report the interval held back.
@@ -2107,20 +2132,7 @@ fn timer_thread(shared: &Arc<Shared<Blocking>>) {
             until = Some(until.map_or(t, |d| d.min(t)));
         }
         st.io.timer = Some((me.clone(), until));
-        drop(st);
-        park(until);
-    }
-    let deadline = Instant::now() + engine::FINAL_WRITE;
-    loop {
-        let mut st = shared.lock();
-        if st.io.writers_alive == 0 || Instant::now() >= deadline {
-            st.io.timer = None;
-            st.shut_down_all();
-            return;
-        }
-        st.io.timer = Some((me.clone(), Some(deadline)));
-        drop(st);
-        park(Some(deadline));
+        return Some(until.map_or(Next::Idle, Next::At));
     }
 }
 
@@ -2226,10 +2238,7 @@ impl Session {
         // The handle counted first: if a thread cannot be started, dropping
         // it closes the session, and the threads started end.
         let establish = shared.clone().established();
-        let s = shared.clone();
-        thread::Builder::new()
-            .name("zmux-timer".into())
-            .spawn(move || timer_thread(&s))
+        session_timer::spawn(timer_task(shared.clone()))
             .map_err(|e| ConnectError::Io(Arc::new(e)))?;
         spawn_pipe(&shared, 0, pipe).map_err(|e| ConnectError::Io(Arc::new(e)))?;
         drop(shared);
@@ -2713,6 +2722,21 @@ impl RecvStream {
     /// timeout bounds the whole call.
     pub fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, WaitError<ReadToEndError>> {
         call_timeout(self.timeout, self.read_to_end_op(limit))
+    }
+
+    /// Waits until the next read would not wait: data is readable, or the
+    /// receiving part has ended (the FIN, a reset, a stop by this endpoint,
+    /// the session's end). `Ok` in all of these: the read that follows
+    /// reports the data or the end, once, in its own form. Consumes
+    /// nothing; the read timeout bounds the wait and is its only error
+    /// ([`WaitError::TimedOut`], besides the refusal on a driver thread):
+    /// it never returns [`WaitError::Failed`], the error type being the one
+    /// every blocking stream call shares.
+    pub fn wait_readable(&self) -> Result<(), WaitError<StreamError>> {
+        call_timeout(self.timeout, async {
+            self.readable_op().await;
+            Ok(())
+        })
     }
 
     /// Waits until the peer reset the stream: its code, or `None` when the

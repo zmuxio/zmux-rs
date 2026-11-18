@@ -317,7 +317,7 @@ fn fixed_values_labels_and_limits_match() {
     }
     // The alias rule, byte-exact.
     let examples = protocol["alpn_alias_examples"].as_array().unwrap();
-    assert_ne!(examples.as_slice(), [] as [serde_json::Value; 0]);
+    assert_ne!(examples, &Vec::<serde_json::Value>::new());
     for ex in examples {
         let configured = ex["configured"].as_str().unwrap().as_bytes();
         let alias = ex["alias"].as_str().map(str::as_bytes);

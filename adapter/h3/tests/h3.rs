@@ -16,6 +16,36 @@ use zmux::{
 };
 use zmux_h3::{Carrier, Fallback, Options};
 
+/// A server endpoint with a fresh certificate and a client endpoint that
+/// trusts it, over loopback.
+fn endpoints(opts: &Options) -> (quinn::Endpoint, quinn::Endpoint, std::net::SocketAddr) {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = zmux_testcert::self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let der = CertificateDer::from(cert.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key)
+        .unwrap();
+    // The configuration helpers add `h3`.
+    let server_config = zmux_h3::server_config(tls, opts).unwrap();
+    let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_config = zmux_h3::client_config(tls, opts).unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(client_config);
+    (server, client, addr)
+}
+
 /// A served HTTP/3 endpoint and a client endpoint for it over loopback.
 struct H3 {
     client: quinn::Endpoint,
@@ -37,31 +67,7 @@ impl H3 {
     }
 
     fn with_listener(config: Config, lc: ListenerConfig, opts: &Options) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        // The configuration helpers add `h3`.
-        let server_config = zmux_h3::server_config(tls, opts).unwrap();
-        let server =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let client_config = zmux_h3::client_config(tls, opts).unwrap();
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(client_config);
+        let (server, client, addr) = endpoints(opts);
         let listener = Listener::new(config, lc).expect("valid listener configuration");
         let serving = tokio::spawn(zmux_h3::serve(listener.clone(), server, opts.clone()));
         Self {
@@ -592,5 +598,39 @@ fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
     for s in sessions {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));
+    }
+}
+
+/// `serve_connection` reports only the end of the HTTP/3 connection: a close
+/// with `H3_NO_ERROR` is success, any other code the connection's error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_connection_reports_only_the_connection_end() {
+    for (code, ok) in [(0x100u32, true), (7, false)] {
+        let opts = Options::default();
+        let (server, client, addr) = endpoints(&opts);
+        let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+        let l = listener.clone();
+        let o = opts.clone();
+        let serving = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            zmux_h3::serve_connection(&l, conn, &o).await
+        });
+        let uri: http::Uri = format!("https://127.0.0.1:{}/zmux", addr.port())
+            .parse()
+            .unwrap();
+        let conn = client.connect(addr, "127.0.0.1").unwrap().await.unwrap();
+        let carrier = Carrier::new(conn, uri, &opts).await.unwrap();
+        // A request the listener answers by itself while it is closed does
+        // not end the call.
+        listener.close();
+        let pipe = carrier.open_pipe().await.unwrap();
+        let _ = Session::connect(pipe, Config::default()).await;
+        assert!(!serving.is_finished(), "a closed listener ends no call");
+        carrier.connection().close(code.into(), b"done");
+        let r = tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("ended")
+            .unwrap();
+        assert_eq!(r.is_ok(), ok, "{r:?}");
     }
 }

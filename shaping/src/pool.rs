@@ -41,8 +41,10 @@ impl PoolMember {
     }
 }
 
-/// The answer of [`MachinePoolPolicy::decide_members`]; `None` and an empty list keep the
-/// pool's own behaviour.
+/// The answer of [`MachinePoolPolicy::decide_members`], the policy's values as it
+/// evaluates them, out of range ones included (building the pool's `PoolDecision` from
+/// them, in [`zmux::helpers::PoolPolicy::decide`], is where one is refused); `None` and
+/// an empty list keep the pool's own behaviour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemberDecision {
@@ -58,23 +60,6 @@ pub struct MemberDecision {
     pub probe_interval: Option<u64>,
     /// Their idle-probe jitter, parts per million.
     pub probe_jitter: Option<u32>,
-}
-
-impl MemberDecision {
-    /// Whether the decision is valid: an idle-probe interval, if set, of 0 or in
-    /// \[10^6, 10^15\] microseconds. A pool rejects one that is not as a whole.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the probe interval is set and outside that range.
-    pub fn validate(&self) -> Result<(), Error> {
-        match self.probe_interval {
-            Some(x) if x != 0 && !(1_000_000..=1_000_000_000_000_000).contains(&x) => {
-                Err(err("range", format!("pool probe_interval: {x}")))
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,55 +439,51 @@ impl MachinePoolPolicy {
 
 #[cfg(feature = "tokio")]
 impl zmux::helpers::PoolPolicy for MachinePoolPolicy {
-    /// Members are the view's members (ID = their first pipe's, idle for the least
-    /// `since_last_traffic` of their pipes, bytes summed); failures are the consecutive
-    /// failed redials; the next dial is at the start of the last dial (or of the pool) plus
-    /// the delay; retired members are replaced now. A decision that is not
-    /// [valid](MemberDecision::validate) is rejected.
+    /// Members are the view's members (ID = their first pipe's); failures are the
+    /// pool's consecutive failed dials; the next dial waits the delay from the start of
+    /// the last dial (or of the pool); retired members are replaced now. The values of
+    /// [`MachinePoolPolicy::decide_members`] are given to the `PoolDecision` as they are;
+    /// one it refuses (an idle-probe interval in (0, 1 s)) is returned as the error,
+    /// which the pool rejects and reports.
     fn decide(
         &mut self,
         view: &zmux::helpers::PoolView<'_>,
         out: &mut zmux::helpers::PoolDecision,
-    ) {
+    ) -> Result<(), zmux::helpers::PolicyError> {
         use std::time::Duration;
         let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        let now = view.now;
         let members: Vec<PoolMember> = view
             .members
             .iter()
             .map(|m| PoolMember {
-                id: m.id.get(),
-                age: micros(m.age()),
-                idle: m.since_last_traffic().map_or(0, micros),
-                pipes: m.pipes.len() as u64,
-                bytes_sent: m.bytes_sent(),
-                bytes_received: m.bytes_received(),
+                id: m.pipe.get(),
+                age: micros(m.age),
+                idle: micros(m.idle),
+                pipes: m.pipes as u64,
+                bytes_sent: m.bytes_sent,
+                bytes_received: m.bytes_received,
             })
             .collect();
         let mut d = MemberDecision::default();
-        let since = view
-            .last_dial_at
-            .map(|t| micros(now.saturating_duration_since(t)));
-        self.decide_members(view.redial_failures, since, &members, &mut d);
-        if let Err(e) = d.validate() {
-            out.reject(e.to_string());
-            return;
-        }
-        if let Some(c) = d.count {
-            out.count = Some(usize::try_from(c).unwrap_or(usize::MAX));
+        let since = view.since_last_dial.map(micros);
+        self.decide_members(view.failures, since, &members, &mut d);
+        // The decision's setters refuse a value out of range; the error is the
+        // pool's rejection: the default decision applies and it is reported.
+        if let Some(c) = d
+            .count
+            .and_then(|c| std::num::NonZeroUsize::new(usize::try_from(c).unwrap_or(usize::MAX)))
+        {
+            out.set_count(c);
         }
         if let Some(after) = d.dial_after {
-            let after = Duration::from_micros(after);
-            out.next_dial_at = view.last_dial_at.unwrap_or(view.started).checked_add(after);
+            out.set_dial_after(Duration::from_micros(after));
         }
-        out.rotate
-            .extend(d.retire.into_iter().map(|id| (zmux::PipeId::new(id), now)));
+        out.set_retire_pipes(d.retire.into_iter().map(zmux::PipeId::new));
         if let Some(r) = d.recheck {
-            let r = Duration::from_micros(r);
-            out.recheck = Some(out.recheck.map_or(r, |o| o.min(r)));
+            out.set_recheck(Duration::from_micros(r))?;
         }
-        // Both are within bounds: the interval was validated above, the jitter when the
-        // policy was built. A file's 0 turns the probes off.
+        // The jitter is within bounds from the policy's construction, the interval
+        // is refused by `set_liveness`. A file's 0 turns the probes off.
         if d.probe_interval.is_some() || d.probe_jitter.is_some() {
             let mut live = zmux::PipeLiveness::default();
             if let Some(i) = d.probe_interval {
@@ -512,7 +493,8 @@ impl zmux::helpers::PoolPolicy for MachinePoolPolicy {
             if let Some(j) = d.probe_jitter {
                 live.probe_jitter = zmux::Inherit::Set(f64::from(j) / 1e6);
             }
-            let _ = out.set_liveness(live);
+            out.set_liveness(live)?;
         }
+        Ok(())
     }
 }
