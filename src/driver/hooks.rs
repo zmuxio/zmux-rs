@@ -8,32 +8,31 @@
 //!   the one-slot mailbox [`WindowHook`], never through a queue that may
 //!   drop it. A panic counts as a refusal;
 //! - the `tracer` runs on the same hook context, started with the session,
-//!   fed through the bounded [`TraceQueue`], the one queue of the host
-//!   events: past [`TRACE_BACKLOG`] the new record is dropped and counted,
-//!   the session's start and end never are.
+//!   fed through the [`TraceQueue`], the one queue of the host events: the
+//!   session's backlog holds 256 events, past it the new event is dropped
+//!   and counted, the session's start, the counts and its end never are.
 
-use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use super::wake::WakeList;
+#[cfg(test)]
+use crate::proto::host_events::TRACE_BACKLOG;
 use crate::proto::host_events::{HostEvent, HostEvents, Sender};
 use crate::proto::session::{
     Config, LogLevel, Logger, SessionCore as Core, SessionId, TraceRecord, Tracer, WindowIncrease,
 };
 
-/// Events a tracer callback may have unread before more are dropped.
-pub(crate) const TRACE_BACKLOG: usize = 256;
-
 /// Where a session's trace records go: the queues of the observers of the
 /// session. One queue implementation serves all of them
-/// ([`HostEvents`]): bounded, past its capacity the newly arriving record
-/// is dropped and counted (the session's `Established` and `Closed` never
-/// are). An observer is either a subscription ([`Config::events`]),
-/// whose queue the host reads when it wants, or the tracer callback of the
-/// configuration, whose queue the session's hook context reads and calls the
-/// tracer with. A record is queued once for each, with its own count of what
-/// it dropped.
+/// ([`HostEvents`]): the session's backlog holds 256 events, past it the
+/// newly arriving event is dropped and counted, where it would have stood
+/// (the session's `Established`, the counts and its `Closed` take no room
+/// and are never dropped). An observer is either a subscription
+/// ([`Config::events`]), whose queue the host reads when it wants, or the
+/// tracer callback of the configuration, whose queue the session's hook
+/// context reads and calls the tracer with. A record is queued once for
+/// each, with its own count of what it dropped.
 pub(crate) struct TraceQueue {
     pub(crate) session: SessionId,
     /// The tracer callback and the queue it consumes.
@@ -53,7 +52,7 @@ impl TraceQueue {
         Some(Self {
             session,
             callback: config.tracer.clone().map(|t| {
-                let (reader, tx) = HostEvents::channel(TRACE_BACKLOG);
+                let (reader, tx) = HostEvents::channel(1);
                 (t, tx, reader)
             }),
             subscriptions: config.subscriptions.clone(),
@@ -73,37 +72,40 @@ impl TraceQueue {
         if self.closed {
             return false;
         }
-        let keep = matches!(item, TraceRecord::Established | TraceRecord::Closed(_));
         self.closed = matches!(item, TraceRecord::Closed(_));
-        let session = self.session;
-        let make = || HostEvent::Trace {
-            session,
-            record: item.clone(),
-        };
         for tx in &self.subscriptions {
-            tx.push_into(keep, make, &mut |w| wakes.push(w));
+            tx.push_trace(self.session, item, &mut |w| wakes.push(w));
         }
         match &self.callback {
             Some((_, tx, _)) => {
-                tx.push_into(keep, make, &mut |w| wakes.push(w));
+                tx.push_trace(self.session, item, &mut |w| wakes.push(w));
                 true
             }
             None => false,
         }
     }
 
-    /// The records of the tracer callback's queue, all of them.
-    pub(crate) fn take(&mut self) -> Option<VecDeque<TraceRecord>> {
-        let (_, _, reader) = self.callback.as_ref()?;
-        let mut items = VecDeque::new();
-        while let Some(e) = reader.try_next() {
-            match e {
-                HostEvent::Trace { record, .. } => items.push_back(record),
-                HostEvent::Overflowed(n) => items.push_back(TraceRecord::Dropped(n)),
-                _ => {}
-            }
+    /// What the observers are told when `pipe` is retired: one
+    /// `PipesRetired` per pipe, counting its end, `failed` as the core
+    /// reports it (observers read nothing, so every end counts).
+    pub(crate) fn retired(pipe: crate::PipeId, failed: bool) -> crate::SessionEvent {
+        crate::SessionEvent::PipesRetired {
+            retired: 1,
+            failed: u64::from(failed),
+            closed: u64::from(!failed),
+            last: vec![pipe],
         }
-        (!items.is_empty()).then_some(items)
+    }
+
+    /// The next record of the tracer callback's queue. One at a time, so
+    /// that what the tracer has not been told yet is what the backlog
+    /// holds, never more.
+    pub(crate) fn take(&mut self) -> Option<TraceRecord> {
+        let (_, _, reader) = self.callback.as_ref()?;
+        match reader.try_next()? {
+            HostEvent::Trace { record, .. } => Some(record),
+            _ => None,
+        }
     }
 
     /// The end was queued and, after a [`take`](Self::take) that found
@@ -124,22 +126,20 @@ impl TraceQueue {
     }
 }
 
-/// Tells the tracer `items` of `session`, outside every lock; a panic is
+/// Tells the tracer `item` of `session`, outside every lock; a panic is
 /// ignored.
 pub(crate) fn trace(
     tracer: &Arc<dyn Tracer>,
     session: SessionId,
-    items: VecDeque<TraceRecord>,
+    item: &TraceRecord,
     logger: Option<&Logger>,
 ) {
-    for item in items {
-        let r = catch_unwind(AssertUnwindSafe(|| tracer.trace(session, &item)));
-        if let (Err(_), Some(l)) = (r, logger) {
-            l.log(
-                LogLevel::Error,
-                "zmux: the tracer panicked; the panic was contained",
-            );
-        }
+    let r = catch_unwind(AssertUnwindSafe(|| tracer.trace(session, item)));
+    if let (Err(_), Some(l)) = (r, logger) {
+        l.log(
+            LogLevel::Error,
+            "zmux: the tracer panicked; the panic was contained",
+        );
     }
 }
 
@@ -305,16 +305,16 @@ mod tests {
         fn trace(&self, _: SessionId, _: &TraceRecord) {}
     }
 
-    /// The tracer callback reads one bounded queue: past the backlog the
-    /// new record is dropped, counted where it would have stood, and the
-    /// session's start and end are kept.
+    /// The tracer callback reads one queue with the session's backlog of
+    /// 256 events: past it the new event is dropped and counted before the
+    /// end; the start, the count and the end take no room.
     #[test]
     fn the_tracer_callback_reads_the_one_bounded_queue() {
         let mut config = Config {
             tracer: Some(Arc::new(Nobody)),
             ..Config::default()
         };
-        let events = config.events(8);
+        let events = config.events();
         let mut q = TraceQueue::new(&config, SessionId::next()).expect("observed");
         let mut wakes = WakeList::default();
         assert!(q.push(&TraceRecord::Established, &mut wakes));
@@ -328,12 +328,14 @@ mod tests {
             &TraceRecord::Closed(SessionError::HandshakeTimeout),
             &mut wakes,
         );
-        let got: Vec<_> = q.take().expect("records").into_iter().collect();
+        // Nothing follows the end.
+        assert!(!q.push(&TraceRecord::Established, &mut wakes));
+        let got: Vec<_> = std::iter::from_fn(|| q.take()).collect();
         assert_eq!(got.first(), Some(&TraceRecord::Established));
         assert!(matches!(got.last(), Some(TraceRecord::Closed(_))));
-        // 1 + 255 queued, 11 dropped (counted before the end), the end.
-        assert_eq!(got.len(), TRACE_BACKLOG + 2);
-        assert_eq!(got[TRACE_BACKLOG], TraceRecord::Dropped(11));
+        // The start, 256 events, the 10 dropped counted before the end, the end.
+        assert_eq!(got.len(), TRACE_BACKLOG + 3);
+        assert_eq!(got[TRACE_BACKLOG + 1], TraceRecord::Dropped(10));
         assert!(q.finished());
         // The subscription, with its own queue and count, saw the start and
         // the end too.

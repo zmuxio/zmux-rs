@@ -79,8 +79,8 @@ async fn a_session_config_past_the_handshake_deadline_rejects() {
 async fn events_report_a_session_from_start_to_end() {
     let mut client = Config::default();
     // Two subscriptions: each reads every event.
-    let first = client.events(64);
-    let events = client.events(64);
+    let first = client.events();
+    let events = client.events();
     let (listener, addr) = serve(Config::default(), ListenerConfig::default()).await;
     let tcp = TcpStream::connect(&addr).await.unwrap();
     let session = zmux::Session::connect(PipeIo::from_tcp(tcp), client.clone())
@@ -116,56 +116,6 @@ async fn events_report_a_session_from_start_to_end() {
             .is_none()
     );
     drop((session, other));
-    listener.close();
-}
-
-/// A full subscription drops what arrives and counts it, and a session's
-/// start and end are never dropped.
-#[tokio::test]
-async fn a_full_subscription_keeps_the_start_and_the_end() {
-    let mut client = Config::default();
-    let events = client.events(1);
-    let (listener, addr) = serve(Config::default(), ListenerConfig::default()).await;
-    let tcp = TcpStream::connect(&addr).await.unwrap();
-    let session = zmux::Session::connect(PipeIo::from_tcp(tcp), client)
-        .await
-        .unwrap();
-    let id = session.id();
-    // Nothing is read until the session ended.
-    let () = session.close().await;
-    let mut seen = Vec::new();
-    while seen.last().is_none_or(|e| {
-        !matches!(
-            e,
-            HostEvent::Trace {
-                record: TraceRecord::Closed(_),
-                ..
-            }
-        )
-    }) {
-        seen.push(
-            tokio::time::timeout(LIMIT, events.next())
-                .await
-                .unwrap()
-                .expect("open"),
-        );
-    }
-    let mine = |e: &HostEvent| matches!(e, HostEvent::Trace { session, .. } if *session == id);
-    assert!(matches!(
-        seen.first(),
-        Some(HostEvent::Trace {
-            record: TraceRecord::Established,
-            ..
-        })
-    ));
-    // Nothing but the count stands between them, once.
-    assert!(
-        seen[1..seen.len() - 1]
-            .iter()
-            .all(|e| matches!(e, HostEvent::Overflowed(n) if *n > 0))
-    );
-    assert!(seen.iter().filter(|e| mine(e)).count() >= 2);
-    drop(events);
     listener.close();
 }
 

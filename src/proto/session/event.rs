@@ -105,6 +105,10 @@ pub enum CoreEvent {
         /// join among them): the outcome its handles keep
         /// ([`super::SessionCore::pipe_joined`] no longer knows the pipe).
         join_failure: Option<PipeFailure>,
+        /// The pipe's own end was a failure (its outbound direction FAILED),
+        /// not a close: how the pipe counts in the retirement summary when
+        /// the application had not read its terminal state.
+        failed: bool,
     },
     /// The effective priority, standby flag or weight of a pipe's outbound
     /// direction changed.

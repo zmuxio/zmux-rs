@@ -306,6 +306,35 @@ impl Drop for DatagramAllowance<'_> {
     }
 }
 
+/// The logger of a session: the configuration's, called directly, and the
+/// subscriptions' queues ([`Config::events`]), which hold at most 256 of the
+/// session's lines unread; a line that finds one full is dropped there and
+/// counted in `dropped`.
+fn session_logger(
+    config: &Config,
+    session: crate::SessionId,
+    dropped: &Arc<std::sync::atomic::AtomicU64>,
+) -> Option<Logger> {
+    if config.subscriptions.is_empty() {
+        return config.logger.clone();
+    }
+    let (direct, subs, dropped) = (
+        config.logger.clone(),
+        config.subscriptions.clone(),
+        dropped.clone(),
+    );
+    Some(Logger::new(move |level, message| {
+        if let Some(d) = &direct {
+            d.log(level, message);
+        }
+        for s in &subs {
+            if !s.push_log(session, level, message, &mut |w| w.wake()) {
+                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }))
+}
+
 /// Messages for the logger, logged after the unlock.
 #[derive(Default)]
 pub(crate) struct LogBatch {
@@ -440,6 +469,8 @@ pub struct State<D: Driver> {
     pub(crate) redial_sources: usize,
     /// Messages for the configuration's logger, after the unlock.
     logs: LogBatch,
+    /// Log lines lost to a full subscription backlog (`log_lines_dropped`).
+    log_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) io: D::Io,
 }
 
@@ -572,7 +603,7 @@ impl<D: Driver> State<D> {
             )));
         }
         check_pipe_record_limit(carrier.max_record).map_err(ConnectError::InvalidConfig)?;
-        let events = EventQueue::new(&config);
+        let events = EventQueue::new();
         let mut window_hook = WindowHook::new(&config);
         // A tracer starts the hook context with the session.
         let id = crate::SessionId::next();
@@ -582,7 +613,8 @@ impl<D: Driver> State<D> {
             window_hook.mark_started();
         }
         let datagram_limiter = config.datagram_limiter.clone();
-        let logger = config.logger.clone();
+        let log_dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let logger = session_logger(&config, id, &log_dropped);
         let mut core = core::SessionCore::new(config, role, transport, now)
             .map_err(ConnectError::InvalidConfig)?;
         if let Some(l) = locator {
@@ -633,6 +665,7 @@ impl<D: Driver> State<D> {
                 logger,
                 items: Vec::new(),
             },
+            log_dropped,
             io,
         })
     }
@@ -726,7 +759,11 @@ impl<D: Driver> State<D> {
                     self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
-                CoreEvent::PipeRetired { pipe, join_failure } => {
+                CoreEvent::PipeRetired {
+                    pipe,
+                    join_failure,
+                    failed,
+                } => {
                     self.pipe_changes += 1;
                     // Set before the waits wake: a join that ended unconfirmed
                     // (refused, say) keeps its error for its handles.
@@ -738,15 +775,10 @@ impl<D: Driver> State<D> {
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
                     if self.traces.is_some() {
-                        self.trace(&TraceRecord::Event(AppEvent::PipesRetired {
-                            retired: 1,
-                            failed: 0,
-                            closed: 0,
-                            dropped: 0,
-                            last: vec![pipe],
-                        }));
+                        let e = TraceQueue::retired(pipe, failed);
+                        self.trace(&TraceRecord::Event(e));
                     }
-                    self.events.retire(pipe.0);
+                    self.events.retire(pipe.0, failed);
                     self.waiters.wake_list(List::Events, &mut self.wakes);
                 }
                 CoreEvent::JoinAuthFailed { reason } => {
@@ -836,6 +868,9 @@ impl<D: Driver> State<D> {
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
                     w.close(wakes);
+                    // From CLOSED on nothing enters the queue, and the
+                    // tracer's `closed` is the last call.
+                    self.events.freeze();
                     self.trace(&TraceRecord::Closed(e));
                 }
                 CoreEvent::Released => {
@@ -1210,7 +1245,7 @@ impl<D: Driver> Shared<D> {
 /// Work for the hook context.
 enum HookWork {
     Window(u64, u64),
-    Trace(crate::SessionId, VecDeque<TraceRecord>),
+    Trace(crate::SessionId, TraceRecord),
     /// The answer to the proposal of this generation.
     Answered(u64, bool),
 }
@@ -1237,9 +1272,9 @@ pub(crate) async fn run_hook<D: Driver>(shared: Arc<Shared<D>>, hooks: HookStart
                         return Some(Some(HookWork::Window(generation, delta)));
                     }
                     if let Some(q) = st.traces.as_deref_mut()
-                        && let Some(items) = q.take()
+                        && let Some(item) = q.take()
                     {
-                        return Some(Some(HookWork::Trace(q.session, items)));
+                        return Some(Some(HookWork::Trace(q.session, item)));
                     }
                     let traced = st.traces.as_deref().is_none_or(TraceQueue::finished);
                     (st.core.error().is_some() && traced).then_some(None)
@@ -1256,9 +1291,9 @@ pub(crate) async fn run_hook<D: Driver>(shared: Arc<Shared<D>>, hooks: HookStart
         };
         match next {
             None => return,
-            Some(HookWork::Trace(session, items)) => {
+            Some(HookWork::Trace(session, item)) => {
                 if let Some(t) = &hooks.tracer {
-                    trace(t, session, items, hooks.logger.as_ref());
+                    trace(t, session, &item, hooks.logger.as_ref());
                 }
             }
             Some(HookWork::Window(generation, delta)) => match &hooks.predicate {
@@ -3813,6 +3848,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         let mut stats = st.core.stats();
         stats.carrier = st.carrier.as_deref().map(|c| c.0);
         stats.carrier_candidates = st.carrier_tries.iter().cloned().collect();
+        stats.log_lines_dropped = st.log_dropped.load(std::sync::atomic::Ordering::Relaxed);
         stats
     }
 

@@ -149,17 +149,20 @@ pub struct CandidateResult {
 )]
 #[cfg_attr(not(feature = "tokio"), doc = " `Session::next_event`.")]
 ///
-/// The queue is bounded however many pipes a session goes through: unread
-/// events coalesce (a pipe direction reports its latest state event among
-/// `PipeJoined`, `PipeSuspect`, `PipeRecovered`, `PipeFailed` and
-/// `PipeClosed`, a pipe its `PipeAdded`, latest priority change and quality
-/// report, a tier its latest saturation, the session its latest GOAWAY,
-/// suspension and capacity state; failed join authentications are
-/// counted), a terminal event ([`SessionEvent::is_terminal`]: `PipeFailed`,
-/// `PipeClosed`) is never replaced, and the unread events of a
-/// pipe that is retired fold into one [`SessionEvent::PipesRetired`]. After the
-/// session ended, the queued events are still delivered before the end of
-/// the stream.
+/// The queue is keyed and never drops an event: each event has a key (its
+/// kind, and for a pipe event the pipe and direction, for a tier its
+/// priority, for a failed join its reason, for a carrier candidate its
+/// kind and variant), and an event whose key has one unread updates it
+/// (the latest replaces, failed joins are counted, a terminal event stays)
+/// and moves it to the tail, so events are read in the order of their keys'
+/// latest occurrences. The keys are those of what the session holds, so the
+/// queue is bounded however many pipes the session goes through: the unread
+/// events of a pipe that is retired leave with it and its unread end is
+/// counted in one [`SessionEvent::PipesRetired`]. A
+/// [`SessionEvent::SessionResumed`] removes an unread
+/// [`SessionEvent::ResumeUnattended`]. After the session ended nothing more
+/// is queued; the queued events are still delivered before the end of the
+/// stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
@@ -214,9 +217,12 @@ pub enum SessionEvent {
     /// A Hello did not verify at this endpoint (a secret mismatch, or in Bound an
     /// intermediary that terminates the carrier).
     JoinAuthFailed {
-        /// The error class, `auth`.
+        /// The error class: `auth`, `kex`, or that of a payload that does not
+        /// parse.
         reason: &'static str,
-        /// How many joins failed since the last such event was read.
+        /// How many joins failed with this reason since the last such
+        /// event was read (at least 1; a [`Tracer`] gets one event per
+        /// failure, with 1).
         count: u64,
     },
     /// The effective priority, standby flag or weight of a pipe's outbound
@@ -300,20 +306,20 @@ pub enum SessionEvent {
     CarrierChosen(CarrierKind, Option<std::sync::Arc<str>>),
     /// Pipes were retired since the last such event was read (at least
     /// one): their unread events left the queue (only unretired pipes hold
-    /// events), and their unread terminal states are counted here. It is
-    /// queued at the first such retirement.
+    /// events), and the pipes whose terminal state the application had not
+    /// read are counted here. It is queued at the first such retirement and
+    /// moves to the tail at each one. A [`Tracer`] gets one per retired
+    /// pipe, with `retired` 1 and the pipe in `failed` or in `closed`.
     PipesRetired {
         /// Pipes retired.
         retired: u64,
-        /// Of those, pipes with an unread failure (a direction FAILED).
+        /// Of those, pipes that ended failed (a direction FAILED), the
+        /// application not having read a `PipeFailed` or `PipeClosed` of
+        /// them; a terminal event never queued counts as unread.
         failed: u64,
-        /// Of those, pipes with an unread end (CLOSED or ENDED) and no
-        /// unread failure.
+        /// Of those, the other pipes (CLOSED or ENDED) whose terminal state
+        /// the application had not read.
         closed: u64,
-        /// Non-terminal events dropped because more pipes were live than
-        /// the session allows (a defence; the core bounds them), since the
-        /// last such event was read. Terminal states are never dropped.
-        dropped: u64,
         /// The last retired pipes, oldest first (at most 4).
         last: Vec<PipeId>,
     },
@@ -370,8 +376,8 @@ impl fmt::Display for SessionId {
 }
 
 /// What a [`Tracer`] is told of a session, in order: `Established` once
-/// it is, its events, `Dropped` where its backlog overflowed, and `Closed`
-/// last.
+/// it is, its events (each occurrence, before the event queue merges it),
+/// `Dropped` where its backlog overflowed, and `Closed` last.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraceRecord {
@@ -379,8 +385,9 @@ pub enum TraceRecord {
     Established,
     /// A session event.
     Event(SessionEvent),
-    /// This many of the session's events were dropped here: the tracer's
-    /// backlog was full.
+    /// This many of the session's events were dropped here: the session's
+    /// backlog of 256 events was full. It stands before the next event
+    /// accepted, or before `Closed`.
     Dropped(u64),
     /// The session ended; nothing of it follows.
     Closed(SessionError),
@@ -390,10 +397,13 @@ pub enum TraceRecord {
 /// not the application reads them with `next_event`, and its end, as
 /// [`TraceRecord`]s with the session's [`SessionId`] (the sessions of one
 /// configuration share its tracer). Called outside every lock, serially and
-/// in order on each session's hook context, [`TraceRecord::Closed`] last; a
-/// slow tracer never holds a session back: past a bounded backlog, the records
-/// that arrive, other than `Established` and the end, are dropped and
-/// counted ([`TraceRecord::Dropped`], where they would have stood). A
+/// in order on each session's hook context, [`TraceRecord::Closed`] last
+/// (nothing that happens after the session is closed is traced); a
+/// slow tracer never holds a session back: a session has a backlog of 256
+/// events (fixed), and an event that arrives when it is full is dropped and
+/// counted ([`TraceRecord::Dropped`], where it would have stood: before the
+/// next event accepted, or before `Closed`). `Established`, `Dropped` and
+/// `Closed` take no room from the backlog and are never dropped. A
 /// panic in a call is caught and ignored. The hook context is a task of the
 /// runtime (a thread of the std driver): a tracer must not block it; one
 /// that would subscribes with [`Config::events`](crate::Config::events)

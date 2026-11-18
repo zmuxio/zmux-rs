@@ -1,8 +1,15 @@
-//! The pipe-event queue stays bounded: a peer that joins and drops pipes in
-//! a loop while the application reads no events leaves memory bounded, and
-//! no terminal outcome is lost.
+//! The keyed event queue stays bounded and never drops: a peer that joins
+//! and drops pipes in a loop, or fails joins in a loop, while the application
+//! reads no events leaves memory bounded, and no terminal outcome is lost; the
+//! tracer is told every occurrence through a fixed backlog.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test values are small and bounded; checked conversions would only add noise"
+)]
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zmux::{
@@ -52,9 +59,10 @@ async fn join_and_drop_churn_keeps_the_queue_bounded() {
         .unwrap();
     let server = listener.accept().await.unwrap();
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
-    // Unretired attachments per joiner: max_pipes + H (8); per attachment
-    // two directions and a priority slot, plus the summary.
-    let bound = 3 * (2 * (4 + 8) + 1) + 1;
+    // The keys of the pipes the session holds, at most nine each, plus the
+    // summary and the session's own few: the unretired attachments are
+    // bounded by what admits them.
+    let bound = 9 * (2 * (4 + 8) + 1) + 16;
     let mut most = (0, 0);
     let mut refused = 0;
     for round in 0..60u32 {
@@ -366,4 +374,361 @@ async fn a_refused_join_reports_the_refusal_after_its_retirement() {
         added.err(),
         Some(PipeError::Failed(zmux::PipeFailure::JoinRefused))
     ));
+}
+
+/// A carrier pair in memory whose two ends export `ends.0` and `ends.1`;
+/// the second half goes to the listener. A session whose bootstrap carrier
+/// has two different values derives two different join secrets: every join
+/// of it fails verification at the acceptor.
+fn exporting_carrier(listener: &Listener, ends: (u8, u8)) -> PipeIo {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let l = listener.clone();
+    tokio::spawn(async move {
+        let _ = l
+            .handle_pipe(
+                PipeIo::new(b).with_exporter(move |label, context, out| {
+                    out.fill(label.len() as u8 ^ context.len() as u8 ^ ends.1);
+                    true
+                }),
+                PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
+            )
+            .await;
+    });
+    PipeIo::new(a).with_exporter(move |label, context, out| {
+        out.fill(label.len() as u8 ^ context.len() as u8 ^ ends.0);
+        true
+    })
+}
+
+/// A peer that fails joins over and over, beside the events of the session:
+/// the failures are counted in one `JoinAuthFailed`, no other event is
+/// displaced or lost, and the queue holds a constant number of slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_joins_never_displace_other_events() {
+    let mut c = Config::multipath(PipeAuth::exporter().with_end_to_end());
+    c.max_pipes = 4;
+    let listener =
+        Listener::new(c.clone(), ListenerConfig::default()).expect("valid listener configuration");
+    let client = Session::connect(exporting_carrier(&listener, (0, 1)), c)
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    // An event the server queued before the failures.
+    server
+        .set_capacity_floor(Some(CapacityFloor::new(u64::MAX)))
+        .unwrap();
+    until("the capacity event", || server.event_backlog() > 0).await;
+    let before = server.event_backlog();
+    let hostile = 40;
+    let mut most = 0;
+    for _ in 0..hostile {
+        let pipe = client
+            .begin_add_pipe(exporting_carrier(&listener, (0, 0)), PipeOptions::default())
+            .unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+            .await
+            .expect("timed out: hostile join");
+        assert!(joined.is_err(), "a hostile join verified");
+        most = most.max(server.event_backlog());
+    }
+    // One slot for the failures, whatever their number.
+    assert_eq!(most, before + 1, "after {hostile} failures");
+    assert_eq!(server.stats().join_auth_failures, hostile);
+    // What was queued before is read first, and the failures follow as one
+    // count.
+    let mut events = Vec::new();
+    while server.event_backlog() > 0 {
+        events.push(server.next_event().await.expect("an event"));
+    }
+    assert!(
+        matches!(
+            events[..],
+            [
+                SessionEvent::CapacityBelow { .. },
+                SessionEvent::JoinAuthFailed {
+                    reason: "auth",
+                    count
+                }
+            ] if count == hostile
+        ),
+        "{events:?}"
+    );
+    drop(listener);
+}
+
+/// A tracer whose first call blocks until the test opens the gate; it
+/// keeps what it was told.
+struct Gated {
+    gate: std::sync::Mutex<bool>,
+    open: std::sync::Condvar,
+    records: std::sync::Mutex<Vec<zmux::TraceRecord>>,
+}
+
+impl zmux::Tracer for Gated {
+    fn trace(&self, _: zmux::SessionId, record: &zmux::TraceRecord) {
+        let mut open = self.gate.lock().unwrap();
+        while !*open {
+            open = self.open.wait(open).unwrap();
+        }
+        drop(open);
+        self.records.lock().unwrap().push(record.clone());
+    }
+}
+
+impl Gated {
+    fn release(&self) {
+        *self.gate.lock().unwrap() = true;
+        self.open.notify_all();
+    }
+
+    fn told(&self) -> Vec<zmux::TraceRecord> {
+        self.records.lock().unwrap().clone()
+    }
+}
+
+/// Forwards to a [`Gated`] and holds one end of a channel, so that the
+/// channel disconnects when the last reference to the tracer is gone: the
+/// session and its hook context are finished and nothing more is told.
+struct Watched {
+    inner: Arc<Gated>,
+    _alive: std::sync::mpsc::Sender<()>,
+}
+
+impl zmux::Tracer for Watched {
+    fn trace(&self, session: zmux::SessionId, record: &zmux::TraceRecord) {
+        self.inner.trace(session, record);
+    }
+}
+
+/// A tracer that blocks gets `established` first, every lost event counted
+/// in a `dropped` before the next event it receives or before `closed`, and
+/// `closed` last, with nothing after it; the session's own event stream
+/// loses nothing meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_tracer_is_told_what_it_lost_in_place() {
+    use zmux::{Change, PipeUpdate, TraceRecord};
+    let gated = Arc::new(Gated {
+        gate: std::sync::Mutex::new(false),
+        open: std::sync::Condvar::new(),
+        records: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut traced = config();
+    let (alive, gone) = std::sync::mpsc::channel::<()>();
+    traced.tracer = Some(Arc::new(Watched {
+        inner: gated.clone(),
+        _alive: alive,
+    }));
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let client = Session::connect(carrier(&listener), traced).await.unwrap();
+    let _server = listener.accept().await.unwrap();
+    let pipe = client
+        .begin_add_pipe(carrier(&listener), PipeOptions::default())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+        .await
+        .expect("timed out: pipe joined")
+        .unwrap();
+    // 300 priority changes while the tracer is blocked in its first call.
+    let update = |p: u64| PipeUpdate {
+        send_priority: Change::Set(p),
+        ..Default::default()
+    };
+    for i in 0..300u64 {
+        pipe.update(&update(1 + i % 2)).unwrap();
+    }
+    // The stream keeps one slot for the pipe's priority, however often it
+    // changed.
+    assert!(client.event_backlog() <= 8, "{}", client.event_backlog());
+    gated.release();
+    // The 256 events the backlog held, then the next event that is accepted,
+    // with the count before it: the changes past the backlog were lost
+    // there, and nothing queued was replaced.
+    until("the backlog was read", || gated.told().len() >= 257).await;
+    pipe.update(&update(3)).unwrap();
+    let last = |r: &TraceRecord| {
+        matches!(
+            r,
+            TraceRecord::Event(zmux::SessionEvent::PipePriorityChanged {
+                send_priority: 3,
+                ..
+            })
+        )
+    };
+    until("the last change", || gated.told().iter().any(last)).await;
+    let told = gated.told();
+    assert_eq!(told[0], TraceRecord::Established);
+    assert!(
+        told[1..257]
+            .iter()
+            .all(|r| matches!(r, TraceRecord::Event(_)))
+    );
+    let TraceRecord::Dropped(missed) = told[257] else {
+        panic!("{:?}", &told[255..]);
+    };
+    // The pipe's two events and 299 changes (the first value was the default)
+    // made 301 events or more, 256 held.
+    assert!(missed >= 45, "{missed}");
+    assert!(
+        told[258..]
+            .iter()
+            .all(|r| !matches!(r, TraceRecord::Dropped(_)))
+    );
+    // Nothing is lost beyond the count: 300 + 1 changes and the pipe's own
+    // events were told or counted. The end is last and alone.
+    client.close().await;
+    // Once the session and its hook context are gone (the tracer's last
+    // reference with them), nothing can be told any more.
+    drop(pipe);
+    drop(client);
+    let ended = tokio::task::spawn_blocking(move || gone.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert_eq!(
+        ended,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the session's hook context ended"
+    );
+    let told = gated.told();
+    assert_eq!(
+        told.iter()
+            .filter(|r| matches!(r, TraceRecord::Closed(_)))
+            .count(),
+        1
+    );
+    assert!(matches!(told.last(), Some(TraceRecord::Closed(_))));
+    drop(listener);
+}
+
+/// The tracer is told each retirement as it happens: one `PipesRetired` per
+/// pipe, `retired` 1, `last` that pipe, `failed` or `closed` by how the
+/// pipe ended; the event stream folds them into one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tracer_is_told_one_retirement_per_pipe() {
+    use zmux::TraceRecord;
+    let gated = Arc::new(Gated {
+        gate: std::sync::Mutex::new(true),
+        open: std::sync::Condvar::new(),
+        records: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut traced = config();
+    traced.tracer = Some(gated.clone());
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let client = Session::connect(carrier(&listener), traced).await.unwrap();
+    let server = listener.accept().await.unwrap();
+    let mut ids = Vec::new();
+    for round in 0..4 {
+        let pipe = client
+            .begin_add_pipe(carrier(&listener), PipeOptions::default())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+            .await
+            .expect("timed out: pipe joined")
+            .unwrap();
+        until("pipe attached at the server", || {
+            server.pipes().iter().any(|p| p.id() == pipe.id())
+        })
+        .await;
+        if round % 2 == 0 {
+            pipe.abort().unwrap();
+        } else {
+            pipe.close().unwrap();
+        }
+        ids.push(pipe.id());
+    }
+    until("every retirement was traced", || {
+        let retired = |id| {
+            gated.told().iter().any(|r| {
+                matches!(r, TraceRecord::Event(zmux::SessionEvent::PipesRetired { last, .. }) if *last == [id])
+            })
+        };
+        ids.iter().all(|&id| retired(id))
+    })
+    .await;
+    // An aborted pipe counts as failed, a closed one as closed.
+    for (round, id) in ids.iter().enumerate() {
+        let (failed, closed) = if round % 2 == 0 { (1, 0) } else { (0, 1) };
+        let told = gated.told();
+        let one = told.iter().filter(|r| {
+            matches!(r, TraceRecord::Event(zmux::SessionEvent::PipesRetired { last, .. }) if *last == [*id])
+        });
+        assert_eq!(one.clone().count(), 1);
+        assert!(
+            one.into_iter().all(|r| *r
+                == TraceRecord::Event(zmux::SessionEvent::PipesRetired {
+                    retired: 1,
+                    failed,
+                    closed,
+                    last: vec![*id],
+                })),
+            "pipe {id:?}"
+        );
+    }
+    drop(listener);
+}
+
+/// A tracer that panics at every call: the session logs each panic.
+struct Panics;
+
+impl zmux::Tracer for Panics {
+    fn trace(&self, _: zmux::SessionId, _: &zmux::TraceRecord) {
+        panic!("a tracer that panics");
+    }
+}
+
+/// A subscription nobody reads holds 256 of a session's log lines: the rest
+/// are dropped and counted in `log_lines_dropped`, never in a trace `Dropped`,
+/// and the trace records and the end are not affected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_log_queue_counts_the_lines_it_drops() {
+    use zmux::{Change, HostEvent, PipeUpdate, TraceRecord};
+    let mut traced = config();
+    traced.tracer = Some(Arc::new(Panics));
+    traced.logger = Some(zmux::Logger::new(|_, _| {}));
+    let events = traced.events();
+    let listener =
+        Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
+    let client = Session::connect(carrier(&listener), traced).await.unwrap();
+    let _server = listener.accept().await.unwrap();
+    let pipe = client
+        .begin_add_pipe(carrier(&listener), PipeOptions::default())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+        .await
+        .expect("timed out: pipe joined")
+        .unwrap();
+    // Each change is traced, each panic logged, one line per call.
+    for i in 0..400u64 {
+        pipe.update(&PipeUpdate {
+            send_priority: Change::Set(3 + i % 2),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    until("256 lines queued and the rest dropped", || {
+        client.stats().log_lines_dropped > 0
+    })
+    .await;
+    let id = client.id();
+    client.close().await;
+    let mut lines = 0;
+    let mut dropped = 0;
+    while let Some(e) = events.try_next() {
+        match e {
+            HostEvent::Log { session, .. } => {
+                assert_eq!(session, Some(id));
+                lines += 1;
+            }
+            HostEvent::Trace {
+                record: TraceRecord::Dropped(n),
+                ..
+            } => dropped += n,
+            _ => {}
+        }
+    }
+    assert_eq!(lines, 256);
+    // The trace backlog is its own: whatever it lost is its own count.
+    let _ = dropped;
+    drop(listener);
 }

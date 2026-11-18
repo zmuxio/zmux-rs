@@ -1347,6 +1347,7 @@ mod tests {
         core.push_event(crate::proto::session::CoreEvent::PipeRetired {
             pipe: PipeId(1),
             join_failure: None,
+            failed: false,
         });
         assert!(core.shaping().index(1).is_none());
     }

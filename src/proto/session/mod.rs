@@ -380,6 +380,10 @@ pub struct SessionStats {
     pub pipe_failures: u64,
     /// Hellos that did not verify.
     pub join_auth_failures: u64,
+    /// Log lines not delivered to a subscription because the session's
+    /// queue of 256 lines was full ([`Config::events`]);
+    /// 0 for a logger called directly.
+    pub log_lines_dropped: u64,
     /// Peer joins held while join pending, per offer.
     pub join_pending: u64,
     /// Frames of a first batch or of return frames dropped in error.

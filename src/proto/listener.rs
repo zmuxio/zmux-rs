@@ -650,8 +650,8 @@ impl ListenerConfig {
     /// Subscribes to what the listener's logger and `on_memory_pressure`
     /// are told: [`ListenerConfig::logger`] and
     /// [`ListenerConfig::on_memory_pressure`] become hooks that queue it, at
-    /// most `capacity` events, and call the ones set before, with the
-    /// subscription semantics of [`crate::Config::events`]. The listener's
+    /// most `capacity` log lines and reports unread, and call the ones set
+    /// before, with the subscription semantics of [`crate::Config::events`] (a listener's lines are not a session's: `capacity` bounds them). The listener's
     /// sessions log and trace through their own configuration's
     /// subscription.
     pub fn events(&mut self, capacity: usize) -> crate::proto::host_events::HostEvents {
@@ -664,6 +664,7 @@ impl ListenerConfig {
                 b.0(level, message);
             }
             log.push(HostEvent::Log {
+                session: None,
                 level,
                 message: message.to_owned(),
             });

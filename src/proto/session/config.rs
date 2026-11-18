@@ -1306,37 +1306,30 @@ pub struct TestHooks {
 
 impl Config {
     /// Subscribes to what this configuration's logger and tracer are told:
-    /// at most `capacity` events queued for the host to read from the
-    /// returned [`HostEvents`](crate::HostEvents) when it wants, on its own
-    /// thread, each trace record with its session's
-    /// [`SessionId`](crate::SessionId). Every session of the configuration
-    /// (and of its clones made after) writes to it. [`Config::logger`]
-    /// becomes a hook that queues and then calls the one set before; a
-    /// logger set after replaces that part. The sessions' trace records
-    /// are queued for the subscription directly, beside [`Config::tracer`],
-    /// which keeps being called (from a queue of its own, each consumer
-    /// having one queue and one count of what it dropped). A second call
-    /// makes a second subscription that also reads every event. The
-    /// subscription ends when it is closed ([`HostEvents::close`](crate::HostEvents::close))
-    /// or when the configuration, its clones and their sessions are gone.
+    /// queued for the host to read from the returned
+    /// [`HostEvents`](crate::HostEvents) when it wants, on its own thread,
+    /// each trace record with its session's [`SessionId`](crate::SessionId).
+    /// Every session of the configuration (and of its clones made after)
+    /// writes to it. The sessions' log lines (beside [`Config::logger`],
+    /// which keeps being called directly) and trace records are queued for
+    /// the subscription directly, beside [`Config::tracer`], which keeps
+    /// being called (from a queue of its own, each consumer having one queue
+    /// and one count of what it dropped). A second call makes a second subscription that also reads
+    /// every event. The subscription ends when it is closed
+    /// ([`HostEvents::close`](crate::HostEvents::close)) or when the
+    /// configuration, its clones and their sessions are gone.
     ///
-    /// A full queue drops the event that arrives, counted in
-    /// [`HostEvent::Overflowed`](crate::HostEvent::Overflowed); a session's
-    /// `Established` and `Closed` are never dropped.
-    pub fn events(&mut self, capacity: usize) -> crate::proto::host_events::HostEvents {
-        use crate::proto::host_events::{HostEvent, HostEvents};
-        let (events, tx) = HostEvents::channel(capacity);
-        let log = tx.clone();
-        let before = self.logger.take();
-        self.logger = Some(Logger::new(move |level, message| {
-            if let Some(b) = &before {
-                b.0(level, message);
-            }
-            log.push(HostEvent::Log {
-                level,
-                message: message.to_owned(),
-            });
-        }));
+    /// Each session's trace records have a backlog of 256 events, fixed: an
+    /// event that finds it full is dropped and counted in a
+    /// [`TraceRecord::Dropped`](crate::TraceRecord::Dropped) of that session,
+    /// which stands before the next event accepted or before its end; the
+    /// session's `Established`, those counts and its `Closed` are never
+    /// dropped. A session's log lines have a backlog of 256 lines, fixed: a
+    /// line that finds it full is dropped and counted in the session's
+    /// `log_lines_dropped` statistic, never in a trace `Dropped`.
+    pub fn events(&mut self) -> crate::proto::host_events::HostEvents {
+        use crate::proto::host_events::HostEvents;
+        let (events, tx) = HostEvents::channel(1);
         self.subscriptions.push(tx);
         events
     }

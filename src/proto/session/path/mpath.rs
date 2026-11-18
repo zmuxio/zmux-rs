@@ -1752,6 +1752,7 @@ impl SessionCore {
             self.push_event(CoreEvent::PipeRetired {
                 pipe: PipeId(id),
                 join_failure: a.join_failure(),
+                failed: a.failed(),
             });
         }
     }
@@ -2281,6 +2282,7 @@ impl SessionCore {
             self.push_event(CoreEvent::PipeRetired {
                 pipe: PipeId(id),
                 join_failure: a.join_failure(),
+                failed: a.failed(),
             });
         }
         if !peer && a.joined() && !a.limit_abandoned() {
