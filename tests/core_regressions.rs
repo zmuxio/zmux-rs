@@ -1091,3 +1091,68 @@ fn a_peer_s_idle_end_drains_nothing() {
         "{e:?}"
     );
 }
+
+/// A pair in which B finished (or reset, with `reset`) its stream without a
+/// byte, then closed; A processed the close and both carriers ended, with A
+/// not having read the stream.
+fn end_before_the_close(reset: bool) -> (Pair, StreamKey) {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"x").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
+    // The end alone: A's stream never receives a byte.
+    if reset {
+        p.b.reset(s, VarInt::from_u32(9)).unwrap();
+    } else {
+        p.b.finish(s).unwrap();
+    }
+    p.pump();
+    p.b.close(VarInt::from_u32(0x2a), b"bye", p.now);
+    p.pump();
+    p.a.pipe_ended(P0, zmux::proto::session::PipeEnd::Eof, p.now);
+    (p, k)
+}
+
+/// The read drain keeps a stream's end, not only its bytes (SPEC.md Section
+/// 6.5): a finish or a reset received before the peer's close holds the
+/// closing session until the application reads it, though every carrier has
+/// ended, and the read reports the end, not the session's error.
+#[test]
+fn a_received_end_stays_readable_after_the_peer_s_close() {
+    for reset in [false, true] {
+        let (mut p, k) = end_before_the_close(reset);
+        assert_eq!(
+            p.a.state(),
+            State::Closing,
+            "reset={reset}: the unread end holds the session"
+        );
+        let mut buf = [0u8; 16];
+        let r = p.a.read(k, &mut buf);
+        if reset {
+            assert!(
+                matches!(r, Err(zmux::StreamError::Reset { .. })),
+                "reset: {r:?}"
+            );
+        } else {
+            assert!(matches!(r, Ok(Some((0, true)))), "fin: {r:?}");
+        }
+        assert_eq!(
+            p.a.state(),
+            State::Closed,
+            "reset={reset}: the read ends the session"
+        );
+    }
+}
+
+/// An unread end waits no longer than the linger timeout.
+#[test]
+fn an_unread_end_after_the_peer_s_close_ends_at_the_linger() {
+    for reset in [false, true] {
+        let (mut p, _) = end_before_the_close(reset);
+        assert_eq!(p.a.state(), State::Closing);
+        p.now += Duration::from_secs(3);
+        p.a.handle_timeout(p.now);
+        assert_eq!(p.a.state(), State::Closed, "reset={reset}");
+    }
+}

@@ -2086,8 +2086,8 @@ impl SessionCore {
     }
 
     /// The peer's `CONNECTION_CLOSE` was processed: counts the streams the
-    /// application holds (opened or accepted) with received data unread,
-    /// which stays readable until read, or until the linger deadline ends
+    /// application holds (opened or accepted) with received data or an end
+    /// (finish or reset) unread, which stays readable until read, or until the linger deadline ends
     /// the session as for every close. Nothing arrives after it, so the
     /// count only falls ([`Self::unread_drained`]).
     pub(super) fn peer_close_received(&mut self) {
@@ -2100,18 +2100,25 @@ impl SessionCore {
     }
 
     /// Whether `key` counts in [`Self::peer_close_unread`]: the application
-    /// holds it and it has received data unread.
+    /// holds it and it has received data unread, or an end not yet reported
+    /// to it: a finish whose data all arrived, or a reset (SPEC.md Section
+    /// 6.5: the read drain runs up to the end of the stream).
     pub(super) fn holds_unread(&self, key: StreamKey) -> bool {
         self.streams.get(key).is_some_and(|s| {
             matches!(s.offer, stream::Offer::Local | stream::Offer::Accepted)
-                && s.recv
-                    .as_ref()
-                    .is_some_and(|r| !r.buf.is_empty() && r.cold().stopped.is_none())
+                && s.recv.as_ref().is_some_and(|r| {
+                    r.cold().stopped.is_none()
+                        && (!r.buf.is_empty()
+                            || matches!(
+                                r.state,
+                                stream::RecvState::DataRecvd | stream::RecvState::ResetRecvd
+                            ))
+                })
         })
     }
 
-    /// A counted stream's unread data was read or discarded after the peer's
-    /// close: the session may be CLOSED now.
+    /// A counted stream's unread data or end was read or discarded after the
+    /// peer's close: the session may be CLOSED now.
     pub(super) fn unread_drained(&mut self) {
         if self.peer_close_unread > 0 {
             self.peer_close_unread -= 1;

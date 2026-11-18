@@ -819,6 +819,21 @@ impl SessionCore {
         max: usize,
         take: impl FnOnce(&mut RecvBuf, usize) -> (usize, T),
     ) -> Result<Option<(usize, bool, T)>, StreamError> {
+        let counted = self.draining_peer_close() && self.holds_unread(key);
+        let r = self.read_inner(key, max, take);
+        if counted && !self.holds_unread(key) {
+            // The last unread data or end after the peer's close may hold CLOSED.
+            self.unread_drained();
+        }
+        r
+    }
+
+    fn read_inner<T: Default>(
+        &mut self,
+        key: StreamKey,
+        max: usize,
+        take: impl FnOnce(&mut RecvBuf, usize) -> (usize, T),
+    ) -> Result<Option<(usize, bool, T)>, StreamError> {
         let n = match self.readable(key) {
             Ok(Readable::Data(n)) => n.min(max),
             Ok(Readable::End) => {
@@ -853,15 +868,10 @@ impl SessionCore {
         self.meter.add(Count::Read, n as u64);
         let fin =
             r.buf.is_empty() && r.cold().reset.is_none() && r.final_size == Some(r.read_offset);
-        let drained = r.buf.is_empty();
         self.credit_consumed(n as u64);
         self.streams.check_stream_credit(key);
         if fin {
             self.end_read(key);
-        }
-        if drained && self.draining_peer_close() {
-            // The last unread data after the peer's close may hold CLOSED.
-            self.unread_drained();
         }
         Ok(Some((n, fin, out)))
     }
