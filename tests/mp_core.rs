@@ -1302,3 +1302,224 @@ fn a_reply_after_an_abrupt_removal_revives_nothing() {
     assert_eq!(n.s.recv[&0].len(), 10_000);
     assert!(n.alive());
 }
+
+/// The peer of a multipath session closes on the first `CONNECTION_CLOSE`
+/// it reads and discards what arrives afterwards: an application close waits
+/// until a `PIPE_ACK` covers what every pipe carried, so data still in
+/// flight on a slower pipe is read in full.
+#[test]
+fn an_application_close_waits_for_data_in_flight_on_every_pipe() {
+    let mut n = net(Scheduler::SpreadEta, false);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&id].attached());
+    n.links.get_mut(&0).unwrap().flows[A].delay = Duration::from_millis(5);
+    n.links.get_mut(&id).unwrap().flows[A].delay = Duration::from_millis(80);
+    for _ in 0..2 {
+        n.open_and_write(128 << 10, true);
+    }
+    // The data leaves on both pipes, then the close follows at once.
+    n.step(usize::MAX);
+    let now = n.now;
+    n.ends[A].close(zmux::proto::VarInt::from_u32(0x10), b"", now);
+    for _ in 0..200 {
+        n.step(usize::MAX);
+        n.read_b();
+        n.advance(5);
+    }
+    n.read_b();
+    n.check_prefix();
+    for (tag, sent) in &n.s.sent {
+        assert_eq!(
+            n.s.recv.get(tag).map_or(0, Vec::len),
+            sent.len(),
+            "stream {tag}"
+        );
+    }
+    assert_eq!(n.ends[B].state(), State::Closed, "{:?}", n.ends[B].error());
+}
+
+/// A pipe that fails while an application close waits for its
+/// acknowledgements is waited for no longer: the close goes on the pipe
+/// left at once, not at the end of the wait.
+#[test]
+fn a_pipe_failing_during_the_close_wait_ends_its_wait() {
+    let mut a_cfg = config(Scheduler::SpreadEta, false);
+    a_cfg.test_hooks().linger_timeout = Some(Duration::from_secs(10));
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&id].attached());
+    n.links.get_mut(&id).unwrap().flows[A].stalled = true;
+    for _ in 0..2 {
+        n.open_and_write(64 << 10, true);
+    }
+    n.step(usize::MAX);
+    let now = n.now;
+    n.ends[A].close(zmux::proto::VarInt::from_u32(0x10), b"", now);
+    for _ in 0..20 {
+        n.step(usize::MAX);
+        n.advance(5);
+    }
+    assert!(
+        n.ends[B].state() < State::Closing,
+        "the close did not wait for the stalled pipe"
+    );
+    n.fail(id);
+    for _ in 0..20 {
+        n.step(usize::MAX);
+        n.read_b();
+        n.advance(5);
+    }
+    assert_eq!(n.ends[B].state(), State::Closed, "{:?}", n.ends[B].error());
+    // What the failed pipe carried was reinjected on the pipe left and
+    // covered before the close went.
+    n.read_b();
+    n.check_prefix();
+    for (tag, sent) in &n.s.sent {
+        assert_eq!(
+            n.s.recv.get(tag).map_or(0, Vec::len),
+            sent.len(),
+            "stream {tag}"
+        );
+    }
+}
+
+/// Both ends close at once with data of their own unacknowledged: each
+/// keeps acknowledging what it receives during its close wait, so both
+/// waits end after about one round trip, not at the linger timeout.
+#[test]
+fn a_simultaneous_close_ends_both_waits_within_a_round_trip() {
+    let mut a_cfg = config(Scheduler::SpreadEta, false);
+    a_cfg.test_hooks().linger_timeout = Some(Duration::from_secs(10));
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    b_cfg.test_hooks().linger_timeout = Some(Duration::from_secs(10));
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&id].attached());
+    for l in n.links.values_mut() {
+        for f in &mut l.flows {
+            f.delay = Duration::from_millis(20);
+        }
+    }
+    n.open_and_write(64 << 10, true);
+    let k = n.ends[B].open(Dir::Bidi).unwrap();
+    let data = vec![7u8; 64 << 10];
+    let w = n.ends[B].write(k, &data).unwrap();
+    assert!(w > 0);
+    n.ends[B].finish(k).unwrap();
+    // The data leaves on both ends, then both close at once.
+    n.step(usize::MAX);
+    let start = n.now;
+    n.ends[A].close(zmux::proto::VarInt::from_u32(0x10), b"", start);
+    n.ends[B].close(zmux::proto::VarInt::from_u32(0x11), b"", start);
+    while n.now - start < Duration::from_secs(2)
+        && (n.ends[A].state() != State::Closed || n.ends[B].state() != State::Closed)
+    {
+        n.step(usize::MAX);
+        n.advance(5);
+    }
+    let took = n.now - start;
+    assert_eq!(n.ends[A].state(), State::Closed, "{:?}", n.ends[A].error());
+    assert_eq!(n.ends[B].state(), State::Closed, "{:?}", n.ends[B].error());
+    assert!(took < Duration::from_millis(500), "took {took:?}");
+}
+
+/// A pipe that only stalls during the close wait (no carrier error) is
+/// detected as failed by the timers that keep running in the wait: what it
+/// carried is reinjected and the close completes before the linger bound.
+#[test]
+fn a_pipe_stalling_during_the_close_wait_fails_and_is_reinjected() {
+    let mut a_cfg = config(Scheduler::SpreadEta, false);
+    a_cfg.test_hooks().linger_timeout = Some(Duration::from_secs(30));
+    a_cfg.test_hooks().close_handoff_limit = Some(Duration::from_secs(30));
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&id].attached());
+    n.links.get_mut(&id).unwrap().flows[A].blackhole = true;
+    for _ in 0..2 {
+        n.open_and_write(64 << 10, true);
+    }
+    n.step(usize::MAX);
+    let start = n.now;
+    n.ends[A].close(zmux::proto::VarInt::from_u32(0x10), b"", start);
+    while n.ends[B].state() != State::Closed && n.now - start < Duration::from_secs(25) {
+        n.step(usize::MAX);
+        n.read_b();
+        n.advance(20);
+    }
+    assert_eq!(n.ends[B].state(), State::Closed, "{:?}", n.ends[B].error());
+    n.read_b();
+    n.check_prefix();
+    for (tag, sent) in &n.s.sent {
+        assert_eq!(
+            n.s.recv.get(tag).map_or(0, Vec::len),
+            sent.len(),
+            "stream {tag}"
+        );
+    }
+    assert!(
+        n.now - start < Duration::from_secs(20),
+        "{:?}",
+        n.now - start
+    );
+}
+
+/// The close wait lasts up to the linger timeout of its own, longer than
+/// the hand-off limit of `CONNECTION_CLOSE` (1 s), which counts from the
+/// end of the wait: a pipe that stalls is detected as failed after more
+/// than 1 s, its data reinjected, and the close still goes out.
+#[test]
+fn the_close_wait_may_outlast_the_hand_off_limit() {
+    let mut a_cfg = config(Scheduler::SpreadEta, false);
+    a_cfg.test_hooks().linger_timeout = Some(Duration::from_secs(2));
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    let id = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&id].attached());
+    n.links.get_mut(&id).unwrap().flows[A].blackhole = true;
+    for _ in 0..2 {
+        n.open_and_write(64 << 10, true);
+    }
+    n.step(usize::MAX);
+    let start = n.now;
+    n.ends[A].close(zmux::proto::VarInt::from_u32(0x10), b"", start);
+    while n.ends[B].state() != State::Closed && n.now - start < Duration::from_secs(4) {
+        n.step(usize::MAX);
+        n.read_b();
+        n.advance(20);
+    }
+    let took = n.now - start;
+    assert!(took > Duration::from_secs(1), "{took:?}");
+    assert_eq!(n.ends[B].state(), State::Closed, "{:?}", n.ends[B].error());
+    assert!(
+        matches!(
+            n.ends[B].error(),
+            Some(zmux::SessionError::ApplicationClosed { remote: true, .. })
+        ),
+        "{:?}",
+        n.ends[B].error()
+    );
+    n.read_b();
+    n.check_prefix();
+    for (tag, sent) in &n.s.sent {
+        assert_eq!(
+            n.s.recv.get(tag).map_or(0, Vec::len),
+            sent.len(),
+            "stream {tag}"
+        );
+    }
+}

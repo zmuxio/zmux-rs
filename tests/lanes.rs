@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{
-    Config, CoreEvent, LaneAccept, LaneId, PipeId, Role, SessionCore, State, StreamKey, TransmitBuf,
+    Config, CoreEvent, LaneAccept, LaneId, PipeId, Role, SessionCore, State, StreamKey, Transmit,
+    TransmitBuf,
 };
 
 const P0: PipeId = PipeId::new(0);
@@ -53,6 +54,8 @@ struct LanePair {
     hold_a0: Option<Vec<Vec<u8>>>,
     /// The largest record (its Size) either side wrote on any lane.
     widest: usize,
+    /// When each side (A, B) shut lane 0 down: its `CONNECTION_CLOSE`.
+    shut: [Option<Instant>; 2],
 }
 
 impl LanePair {
@@ -78,6 +81,7 @@ impl LanePair {
             refuse: false,
             hold_a0: None,
             widest: 0,
+            shut: [None; 2],
         };
         p.run(Duration::from_millis(100));
         assert!(p.a.is_established() && p.b.is_established());
@@ -117,6 +121,7 @@ impl LanePair {
             (&mut self.b, &mut self.a, &self.lanes_b)
         };
         let first_a = &mut self.first_a;
+        let shut = &mut self.shut[usize::from(!a_to_b)];
         let mut order: Vec<u64> = std::iter::once(0).chain(lanes.iter().copied()).collect();
         if self.reverse {
             order.reverse();
@@ -125,7 +130,10 @@ impl LanePair {
         for lane in order {
             let at: LaneId = P0.lane(lane);
             while from.wants_write(at) {
-                from.poll_transmit(at, self.now, &mut self.out);
+                let t = from.poll_transmit(at, self.now, &mut self.out);
+                if lane == 0 && t == Transmit::Shutdown {
+                    shut.get_or_insert(self.now);
+                }
                 if self.out.is_empty() {
                     break;
                 }
@@ -571,6 +579,67 @@ fn a_lane_first_record_is_shaped_and_held_with_its_pipe() {
         assert!(
             n >= 400,
             "lane {lane}'s first record of {n} bytes was not shaped"
+        );
+    }
+}
+
+/// Both ends of a pipe with lanes close at once while their data on the
+/// lanes is unacknowledged: each keeps acknowledging what arrives during
+/// its close wait, timer driven, so both write `CONNECTION_CLOSE` within
+/// the acknowledgement delay, not at the end of the close's bound.
+#[test]
+fn a_simultaneous_close_with_lanes_ends_both_waits_at_once() {
+    let mut cfg = Config::default();
+    cfg.test_hooks().linger_timeout = Some(Duration::from_secs(10));
+    let mut p = LanePair::new(cfg.clone(), cfg);
+    p.reverse = false;
+    const LEN: usize = 192 * 1024;
+    let mut keys = Vec::new();
+    for (i, s) in [&mut p.a, &mut p.b].into_iter().enumerate() {
+        for j in 0..4 {
+            let k = s.open(Dir::Uni).unwrap();
+            let data = pattern(i * 4 + j, LEN);
+            let n = s.write(k, &data).unwrap();
+            assert!(n > 0);
+            s.finish(k).ok();
+            keys.push(k);
+        }
+    }
+    // Lanes open and carry data; then both close with data in flight.
+    p.run(Duration::from_millis(2));
+    assert!(p.a.pipe_info(P0).unwrap().lanes_out > 1);
+    assert!(p.b.pipe_info(P0).unwrap().lanes_out > 1);
+    let start = p.now;
+    p.a.close(zmux::proto::VarInt::from_u32(1), b"", start);
+    p.b.close(zmux::proto::VarInt::from_u32(2), b"", start);
+    // Time moves from timer to timer only: an acknowledgement that no
+    // timer asks for never goes.
+    while p.shut.iter().any(Option::is_none) && p.now - start < Duration::from_secs(5) {
+        for _ in 0..64 {
+            p.events();
+            let moved = p.send(true) + p.send(false);
+            p.events();
+            if moved == 0 {
+                break;
+            }
+        }
+        let Some(t) = [p.a.poll_timeout(), p.b.poll_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
+        else {
+            break;
+        };
+        p.now = t.max(p.now);
+        p.a.handle_timeout(p.now);
+        p.b.handle_timeout(p.now);
+    }
+    for (side, at) in p.shut.iter().enumerate() {
+        let at = at.unwrap_or_else(|| panic!("side {side} never wrote its close"));
+        assert!(
+            at - start < Duration::from_millis(200),
+            "side {side} waited {:?}",
+            at - start
         );
     }
 }

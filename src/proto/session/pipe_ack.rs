@@ -148,7 +148,7 @@ impl SessionCore {
     /// The acknowledgement timer, while a `PIPE_ACK` is not due yet.
     pub(super) fn single_pipe_ack_timer(&self) -> Option<Instant> {
         let pa = self.pipe_ack.as_ref()?;
-        if pa.due || self.state >= super::State::Closing {
+        if pa.due || self.state >= super::State::Closing && !self.close_waiting() {
             return None;
         }
         self.single_ack_deadline(pa).filter(|&t| t > self.now)

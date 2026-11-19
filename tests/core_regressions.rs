@@ -1156,3 +1156,22 @@ fn an_unread_end_after_the_peer_s_close_ends_at_the_linger() {
         assert_eq!(p.a.state(), State::Closed, "reset={reset}");
     }
 }
+
+/// A stream reset just before a close holds the close's flush until its
+/// `RESET_STREAM` is written: the peer reads the reset, not the session's
+/// error, during its read drain.
+#[test]
+fn a_reset_just_before_the_close_reaches_the_peer() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"x").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
+    p.b.reset(s, VarInt::from_u32(9)).unwrap();
+    p.b.close(VarInt::from_u32(0x2a), b"bye", p.now);
+    p.pump();
+    assert!(p.a.state() >= State::Closing, "A read the close");
+    let mut buf = [0u8; 16];
+    let r = p.a.read(k, &mut buf);
+    assert!(matches!(r, Err(zmux::StreamError::Reset { .. })), "{r:?}");
+}

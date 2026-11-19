@@ -351,3 +351,49 @@ async fn an_aborted_pipe_reports_the_same_end_to_every_wait() {
     listener.close();
     serving.await.unwrap();
 }
+
+/// In a multipath session the client writes 256 KiB on a stream and closes
+/// with a code at once; the server reads all of it before the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_application_close_delivers_the_tail_on_every_pipe() {
+    const LEN: usize = 256 << 10;
+    for run in 0..10 {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let listener = Listener::new(config(Scheduler::SpreadEta), ListenerConfig::default())
+            .expect("valid listener configuration");
+        let l = listener.clone();
+        let serve = tokio::spawn(async move { l.serve(tcp).await });
+        let l = listener.clone();
+        let reader = tokio::spawn(async move {
+            let s = l.accept().await.expect("a session");
+            let mut recv = s.accept_uni().await.expect("a stream");
+            recv.read_to_end(LEN + 1).await.map_or(0, |b| b.len())
+        });
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = Session::connect(PipeIo::from_tcp(c), config(Scheduler::SpreadEta))
+            .await
+            .unwrap();
+        let c2 = TcpStream::connect(addr).await.unwrap();
+        let pipe = s
+            .begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
+            .unwrap();
+        pipe.joined().await.unwrap();
+        let mut send = s.open_uni().await.unwrap();
+        let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        send.write_all(&data).await.unwrap();
+        send.finish().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            s.close_with_error(zmux::VarInt::from_u32(0x10), b""),
+        )
+        .await
+        .expect("the close completes");
+        let n = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the reader ends")
+            .unwrap();
+        assert_eq!(n, LEN, "run {run}");
+        serve.abort();
+    }
+}

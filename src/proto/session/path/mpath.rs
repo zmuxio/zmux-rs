@@ -2117,6 +2117,8 @@ impl SessionCore {
                 self.shape_pipe_failed(id);
             }
             self.unsettle(id);
+            // The close waits for this pipe no longer.
+            self.recheck_close_wait();
             self.pipe_event(id, PipeHalf::Outbound);
             if report {
                 self.push_event(CoreEvent::ClosePipe {
@@ -2378,7 +2380,9 @@ impl SessionCore {
         clean: bool,
         now: Instant,
     ) {
-        let closing = self.state >= State::Closing;
+        // During the close wait an unexpected end fails the pipe as before:
+        // what it carried is reinjected.
+        let closing = self.state >= State::Closing && !self.close_waiting();
         // Expected after the peer's PIPE_ABANDON, and during a graceful
         // removal this endpoint started: the peer may shut its side down
         // once it has our PIPE_ABANDON, before its own reaches us over
@@ -3378,7 +3382,18 @@ impl SessionCore {
     pub(in crate::proto::session) fn mp_deadline(&self) -> Option<Instant> {
         let mp = self.mp.as_deref()?;
         if self.state >= State::Closing {
-            return None;
+            // The close wait keeps acknowledging, reinjecting and detecting
+            // failed pipes; nothing else of the multipath layer runs.
+            let mut next = self.close_wait_deadline();
+            if self.close_waiting() {
+                let (inbound_live, now) = (self.atts.any_in_live(), self.now);
+                for a in &self.atts {
+                    if let Some(t) = self.pipe_deadline(a, inbound_live, now) {
+                        next = Some(next.map_or(t, |n| n.min(t)));
+                    }
+                }
+            }
+            return next;
         }
         let now = self.now;
         let inbound_live = self.atts.any_in_live();
@@ -3408,6 +3423,19 @@ impl SessionCore {
     /// direction): the pass repeats until it changes no pipe's state.
     pub(in crate::proto::session) fn mp_timeout(&mut self, now: Instant) {
         if self.state >= State::Closing {
+            if self.close_waiting() {
+                // Failure detection and probes go on during the close wait:
+                // a pipe that stalls fails, and what it carried is
+                // reinjected.
+                let mut next = self.atts.first().map(Attachment::id);
+                while let Some(id) = next {
+                    if !self.close_waiting() {
+                        return;
+                    }
+                    self.check_pipe(id, now);
+                    next = self.atts.next_after(id);
+                }
+            }
             return;
         }
         if self.resume_timeout_fired(now) {

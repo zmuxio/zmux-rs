@@ -617,6 +617,8 @@ impl SessionCore {
             }
             self.ack_progress(id, now);
         }
+        // The close may stop waiting for acknowledgements.
+        self.recheck_close_wait();
         self.check_drained(id, now);
         self.try_retire(now);
         if self.state == crate::proto::session::State::Suspended {

@@ -952,6 +952,27 @@ async fn bidi(session: Session, mut send: SendStream, mut recv: RecvStream) {
             let _ = recv.read_to_end(1 << 20).await;
             reply(&mut send, "draining").await;
         }
+        "tail" => {
+            // The bytes of a stream written just before the peer's close:
+            // all must arrive before its CONNECTION_CLOSE.
+            let n = recv.read_to_end(1 << 30).await.map_or(0, |d| d.len());
+            println!("TAIL {n}");
+        }
+        "close-tail" => {
+            // Writes the given number of bytes on a new stream and closes
+            // with the code at once: the close must not overtake them.
+            let (code, n) = arg.split_once(':').unwrap_or((arg, "0"));
+            let code: u64 = code.parse().unwrap_or(0);
+            let n: usize = n.parse().unwrap_or(0);
+            let _ = recv.read_to_end(1 << 20).await;
+            if let Ok((mut s2, _r2)) = session.open_bi().await {
+                let _ = s2.write_all(&vec![0u8; n]).await;
+                let _ = s2.finish();
+                session
+                    .close_with_error(VarInt::from_u64(code).unwrap_or(VarInt::ZERO), b"")
+                    .await;
+            }
+        }
         "close" => {
             let (code, reason) = arg.split_once(':').unwrap_or((arg, ""));
             let code: u64 = code.parse().unwrap_or(0);

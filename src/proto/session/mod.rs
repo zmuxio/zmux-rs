@@ -988,6 +988,10 @@ pub struct SessionCore {
     /// The generator of the keep-alive waits' draws.
     keep_alive_rng: u64,
     linger_deadline: Option<Instant>,
+    /// An orderly close waits until a `PIPE_ACK` covers what
+    /// `CONNECTION_CLOSE` must not overtake, at most until then
+    /// ([`SessionCore::start_close_wait`]).
+    close_wait: Option<Instant>,
     /// When an application close stops waiting for the carriers to take
     /// `CONNECTION_CLOSE` ([`SessionCore::close_handed_off`]).
     handoff_deadline: Option<Instant>,
@@ -1186,6 +1190,7 @@ impl SessionCore {
             keep_alive_sent: false,
             keep_alive_rng,
             linger_deadline: None,
+            close_wait: None,
             handoff_deadline: None,
             handoff_expired: false,
             close_flush: None,
@@ -1738,8 +1743,8 @@ impl SessionCore {
             return;
         }
         self.expire_waiting(now);
-        if self.close_wait_deadline().is_some_and(|d| now >= d) {
-            // The close waited for the other lanes long enough.
+        if self.close_wait.is_some_and(|d| now >= d) {
+            // The close waited for the acknowledgements long enough.
             self.end_close_wait();
         }
         if self.handoff_deadline.is_some_and(|d| now >= d) {
@@ -2005,10 +2010,11 @@ impl SessionCore {
         while let Some(i) = self.atts.iter().position(Attachment::deferred) {
             self.drop_deferred(i);
         }
-        for o in self.atts.outs_mut() {
-            o.shut_down();
+        if !self.close_waiting() {
+            // A close that waits keeps its pipes usable for the transport
+            // work of the wait ([`Self::end_close_wait`] shuts them down).
+            self.shut_down_outs();
         }
-        self.views_changed();
         if let Some(mp) = &mut self.mp {
             mp.closing(now);
         }
@@ -2246,6 +2252,15 @@ impl SessionCore {
         self.close_with(code, reason, now);
     }
 
+    /// The session is closing: the write side of every live pipe is shut
+    /// down after `CONNECTION_CLOSE`.
+    pub(super) fn shut_down_outs(&mut self) {
+        for o in self.atts.outs_mut() {
+            o.shut_down();
+        }
+        self.views_changed();
+    }
+
     /// Ends the flush of a graceful close once every stream has sent what
     /// it was given ([`Self::close_flushed`]); the hand-off limit ends it
     /// otherwise.
@@ -2258,12 +2273,12 @@ impl SessionCore {
         }
     }
 
-    /// Whether every stream has sent what it was given: its buffer is
-    /// empty or it was reset, or no outbound pipe can carry anything. Data
-    /// that waits for the peer's credit (flow control, a stream ID) holds
-    /// the flush, which the hand-off limit bounds: a peer that reads gets
-    /// it ahead of `CONNECTION_CLOSE`.
-    fn close_flushed(&self) -> bool {
+    /// Whether every stream has sent what it was given: its buffer and
+    /// FIN, or its `RESET_STREAM` once reset, or no outbound pipe can carry
+    /// anything. Data that waits for the peer's credit (flow control, a
+    /// stream ID) holds the flush, which the hand-off limit bounds: a peer
+    /// that reads gets it ahead of `CONNECTION_CLOSE`.
+    pub(super) fn close_flushed(&self) -> bool {
         if !self.atts.outs().any(OutPipe::is_live) {
             return true;
         }
@@ -2271,8 +2286,12 @@ impl SessionCore {
             let Some(send) = self.streams.send(k) else {
                 return true;
             };
-            send.outcome == Some(stream::SendOutcome::Reset)
-                || send.buf.is_empty() && send.preamble_left == 0
+            match send.cold().reset {
+                // A reset sends nothing more than its frame (an unopened
+                // stream's is written at once: it sends nothing).
+                Some(r) => r.written,
+                None => send.buf.is_empty() && send.preamble_left == 0 && send.fin == send.fin_sent,
+            }
         })
     }
 

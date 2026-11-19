@@ -173,6 +173,9 @@ pub(crate) struct OutPipe {
     /// The position after the last ack-eliciting batch: what follows it
     /// (records of `PIPE_ACK` alone) the peer need not acknowledge.
     eliciting_end: u64,
+    /// Lane 0's position after its last ack-eliciting batch (the pipe's
+    /// position without lanes): what a close waits to see acknowledged.
+    eliciting_zero: u64,
     /// Carrier bytes not yet transmitted, as the adapter reports them.
     carrier_unsent: u64,
     /// The carrier's own RTT estimate, as the adapter reports it.
@@ -477,6 +480,7 @@ impl OutPipe {
             writing: 0,
             unsent_reported: false,
             eliciting_end: 0,
+            eliciting_zero: 0,
             carrier_unsent: 0,
             carrier_rtt: None,
             bottleneck_epoch: 0,
@@ -1107,6 +1111,11 @@ impl OutPipe {
         eliciting: Option<u64>,
     ) {
         let base = self.sent;
+        if lane == 0
+            && let Some(end) = eliciting
+        {
+            self.eliciting_zero = self.sent_on(0) + end;
+        }
         if let Some(l) = self.lanes.as_deref_mut() {
             l.wrote(lane, base, total);
         }
@@ -1195,6 +1204,14 @@ impl OutPipe {
     #[inline]
     pub(crate) fn acked(&self) -> u64 {
         self.acked
+    }
+
+    /// Whether a `PIPE_ACK` covers every ack-eliciting record of lane 0
+    /// (of the pipe without lanes); records of `PIPE_ACK` alone after them
+    /// need no acknowledgement.
+    #[inline]
+    pub(crate) fn zero_covered(&self) -> bool {
+        self.acked_on(0) >= self.eliciting_zero
     }
 
     /// The position after the last ack-eliciting batch.

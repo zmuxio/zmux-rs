@@ -3295,7 +3295,31 @@
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 14
+      "steps": 16
+    },
+    {
+      "id": "multipath.close.waits_for_pipe_ack",
+      "file": "fixtures/traces/multipath/close/waits_for_pipe_ack.ndjson",
+      "title": "In a multipath session an application close waits until a PIPE_ACK covers every record written, lane 0 included: the peer closes on the first copy it reads",
+      "refs": [
+        "SPEC.md#6.5",
+        "MULTIPATH.md#13"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 16
+    },
+    {
+      "id": "multipath.close.wait_keeps_acknowledging",
+      "file": "fixtures/traces/multipath/close/wait_keeps_acknowledging.ndjson",
+      "title": "While an application close waits for PIPE_ACK coverage the endpoint keeps acknowledging what it receives, so a peer closing at the same time ends its own wait; the CONNECTION_CLOSE stays pending until its own records are covered",
+      "refs": [
+        "SPEC.md#6.5",
+        "MULTIPATH.md#13"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
     },
     {
       "id": "multipath.idle.received_records_only",

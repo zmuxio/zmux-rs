@@ -1,14 +1,14 @@
 {
   "protocol": "zmux",
   "counts": {
-    "traces": 379,
-    "trace_steps": 7173,
+    "traces": 381,
+    "trace_steps": 7211,
     "traces_by_group": {
       "compat": 10,
       "core": 157,
       "ext": 51,
       "findings": 3,
-      "multipath": 140,
+      "multipath": 142,
       "resume": 18
     },
     "wire_valid": 57,
@@ -19,9 +19,9 @@
     "fixtures/profiles.json": "8efe1ec711b76bf85c657c16eb9411682b7101aa0db1a5ed2a8c1698f38ac89c",
     "fixtures/wire/valid.ndjson": "7cafc4488518721b044644fcf7979000f6fa4cb0d375d9853ed6367157352a69",
     "fixtures/wire/invalid.ndjson": "027805f0ff24796d9d847473a4cab8cc08d1f1447ef818d22b0d44ccb6a2a106",
-    "fixtures/traces/index.json": "0c3bee13dffe77ac92c0d21db1245e6c2eeb5fdc7f4cbacda00065679aeef27f",
+    "fixtures/traces/index.json": "746adba45a499f4d7625e8ad103a0f22adf7af905a1e28408cf2eb18159652a1",
     "fixtures/capsules.json": "eb1e8eae3c52ce610344cb440c4eaf6c6cda74671c72f1edcc682ea92d3a5fa6",
     "WIRE_EXAMPLES.md": "0df557fa54d0abae95381e0fa303efc1e5d9684cd92d3cf17b4afd82301ca312"
   },
-  "traces_sha256": "a4bf1eac86ac690f7b6463d853c0d2424816a1f70c1f4f519b41f19bbcd5df63"
+  "traces_sha256": "7d27de4f7201e2f5654346cc8ab5e3d0fb960a578915ca15dcd83d6e5f3a6ceb"
 }

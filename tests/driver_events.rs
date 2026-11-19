@@ -668,11 +668,17 @@ async fn the_tracer_is_told_one_retirement_per_pipe() {
     drop(listener);
 }
 
-/// A tracer that panics at every call: the session logs each panic.
-struct Panics;
+/// A tracer that panics at every call before `Closed`, the last record it
+/// gets: the session logs each panic. `Closed` sets the flag instead, after
+/// which the tracer is called no more and so logs nothing more.
+struct Panics(Arc<std::sync::atomic::AtomicBool>);
 
 impl zmux::Tracer for Panics {
-    fn trace(&self, _: zmux::SessionId, _: &zmux::TraceRecord) {
+    fn trace(&self, _: zmux::SessionId, r: &zmux::TraceRecord) {
+        if matches!(r, zmux::TraceRecord::Closed { .. }) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         panic!("a tracer that panics");
     }
 }
@@ -684,7 +690,8 @@ impl zmux::Tracer for Panics {
 async fn a_full_log_queue_counts_the_lines_it_drops() {
     use zmux::{Change, HostEvent, PipeUpdate, TraceRecord};
     let mut traced = config();
-    traced.tracer = Some(Arc::new(Panics));
+    let traced_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    traced.tracer = Some(Arc::new(Panics(traced_all.clone())));
     traced.logger = Some(zmux::Logger::new(|_, _| {}));
     let events = traced.events();
     let listener =
@@ -712,6 +719,13 @@ async fn a_full_log_queue_counts_the_lines_it_drops() {
     .await;
     let id = client.id();
     client.close().await;
+    // The tracer runs apart from the close: once it has had the last
+    // record no panic adds a line while the queue is read (a read frees a
+    // place in the backlog).
+    until("the tracer had the last record", || {
+        traced_all.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
     let mut lines = 0;
     let mut dropped = 0;
     while let Some(e) = events.try_next() {

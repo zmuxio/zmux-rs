@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use super::pipes::{Attachment, LaneEnd, LaneState, OutLane, OutLanes, OutPipe};
+use super::pipes::{Attachment, LaneEnd, LaneState, OutLane, OutLanes, OutPipe, OutState};
 use super::tp::TpValues;
 use super::{CoreEvent, LaneId, PipeEnd, SessionCore, SessionError, State, StreamKey};
 
@@ -366,21 +366,122 @@ impl SessionCore {
                 .is_some_and(|l| l.state() == LaneState::Confirmed && !l.writes_ended())
     }
 
-    // ---- the orderly close outside multipath ---------------
+    // ---- the orderly close ---------------------------------
 
-    /// Whether an orderly `CONNECTION_CLOSE` of a session without multipath
-    /// waits for a `PIPE_ACK` to cover the other lanes of its pipe: the peer would otherwise discard
-    /// data that a written FIN or reset counts as delivered.
+    /// Whether an orderly `CONNECTION_CLOSE` waits for a `PIPE_ACK` to
+    /// cover the records it must not overtake ([`Self::close_covered`]).
     pub(super) fn close_waiting(&self) -> bool {
-        !self.is_multipath()
-            && self
+        self.close_wait.is_some()
+    }
+
+    /// Whether a `PIPE_ACK` covers the records `CONNECTION_CLOSE` must not
+    /// overtake. Without multipath those on the lanes other than 0 of the
+    /// pipe: the peer would otherwise discard data that a written FIN or
+    /// reset counts as delivered. In a multipath session, whose peer closes
+    /// on the first copy it reads and discards what arrives afterwards,
+    /// those on every lane of every outbound pipe that has not failed, and
+    /// first of all what a failed pipe carried: reinjected stream data, a
+    /// FIN or a reset still to be written again counts as uncovered while
+    /// a live pipe can carry it.
+    pub(super) fn close_covered(&self) -> bool {
+        if !self.is_multipath() {
+            return self
                 .out_ref(0)
                 .and_then(OutPipe::lanes)
-                .is_some_and(|l| l.close_wait().is_some())
+                .is_none_or(OutLanes::others_covered);
+        }
+        if self.reinjection_pending() && self.atts.outs().any(OutPipe::is_live) {
+            return false;
+        }
+        self.atts
+            .iter()
+            .filter(|a| !a.failed())
+            .filter_map(Attachment::out)
+            .filter(|o| o.state() != OutState::Failed)
+            .all(|o| o.zero_covered() && o.lanes().is_none_or(OutLanes::others_covered))
+    }
+
+    /// Whether reinjected stream data, a FIN or a `RESET_STREAM` waits to
+    /// be written again (multipath).
+    pub(super) fn reinjection_pending(&self) -> bool {
+        self.streams.keys().any(|k| {
+            self.streams
+                .send(k)
+                .is_some_and(|s| !s.state.is_terminal() && (s.has_lost() || s.mp().reset_lost))
+        })
+    }
+
+    /// During the close wait, whether multipath pipe `id` has transport
+    /// work for lane 0: the pipe-layer frames (`PIPE_ACK` above all, which
+    /// the peer's own close wait depends on), reinjected stream data, and on
+    /// the control pipe a reset written again. Nothing new.
+    pub(super) fn close_wait_owed(&self, id: u64) -> bool {
+        let Some(a) = self.att(id) else {
+            return false;
+        };
+        let Some(o) = a.out() else {
+            return false;
+        };
+        if self.mp.is_none() || !o.is_live() {
+            return false;
+        }
+        let now = self.now;
+        if a.abandon_owed(true) || self.wants_pipe_ack(id, now) || self.ping_due(id, now) {
+            return true;
+        }
+        let control = self.control_pipe(None) == Some(id);
+        if control
+            && (self.mp_control_pending()
+                || self.streams.keys().any(|k| {
+                    self.streams
+                        .send(k)
+                        .is_some_and(|s| s.mp().reset_lost && !s.state.is_terminal())
+                }))
+        {
+            return true;
+        }
+        o.writable() && self.reinject_room(id) > 0 && self.reinjection_data_pending()
+    }
+
+    /// Whether reinjected stream data or a FIN waits to be written again.
+    /// The streams themselves tell, not the scheduler's queue: a closing
+    /// session schedules nothing.
+    pub(super) fn reinjection_data_pending(&self) -> bool {
+        self.close_wait_lost().is_some()
+    }
+
+    /// The first stream whose reinjected data or FIN waits to be written
+    /// again during the close wait.
+    pub(super) fn close_wait_lost(&self) -> Option<StreamKey> {
+        self.streams.keys().find(|&k| {
+            self.streams
+                .send(k)
+                .is_some_and(|s| !s.state.is_terminal() && s.has_lost())
+        })
+    }
+
+    /// The timers of the close wait: the acknowledgement deadline, and the
+    /// end of a reinjection hold that keeps reinjected data back.
+    pub(super) fn close_wait_deadline(&self) -> Option<Instant> {
+        if self.close_wait.is_none() || self.mp.is_none() {
+            return None;
+        }
+        let now = self.now;
+        let hold = self
+            .reinjection_data_pending()
+            .then(|| {
+                self.atts
+                    .outs()
+                    .filter(|o| o.is_live())
+                    .filter_map(|o| o.reinject_hold_after(now))
+                    .min()
+            })
+            .flatten();
+        [self.ack_timer(), hold].into_iter().flatten().min()
     }
 
     /// The close starts: an orderly one (no error, or the application's)
-    /// of a session without multipath waits for the other lanes, at most
+    /// waits until the records it must not overtake are covered, at most
     /// `until`.
     pub(super) fn start_close_wait(&mut self, until: Instant) {
         let remote = self.error.as_deref().is_some_and(SessionError::is_remote);
@@ -389,27 +490,36 @@ impl SessionCore {
             Some(super::CloseFrame::Transport { code, .. }) => *code == 0,
             None => false,
         };
-        if self.is_multipath() || remote || !orderly {
+        if remote || !orderly || self.close_covered() {
             return;
         }
-        if let Some(l) = self.out_mut(0).and_then(OutPipe::lanes_mut)
-            && !l.others_covered()
-        {
-            l.wait_close(until);
+        self.close_wait = Some(until);
+        // The hand-off limit of CONNECTION_CLOSE counts from the end of the
+        // wait, which lasts up to the linger timeout of its own.
+        if self.handoff_deadline.is_some() {
+            self.handoff_deadline = Some(until + self.handoff_limit());
         }
     }
 
-    /// The close waits no longer: the other lanes are covered, the wait
-    /// is over, or the peer's `CONNECTION_CLOSE` arrived.
+    /// The close waits no longer: the records are covered, the wait is
+    /// over, or the peer's `CONNECTION_CLOSE` arrived.
     pub(super) fn end_close_wait(&mut self) {
-        if let Some(l) = self.out_mut(0).and_then(OutPipe::lanes_mut) {
-            l.end_close_wait();
+        if self.close_wait.take().is_some() && self.state == State::Closing {
+            // The write sides the wait kept open shut down after
+            // CONNECTION_CLOSE, which gets its whole hand-off limit from now.
+            self.shut_down_outs();
+            if self.handoff_deadline.is_some() {
+                self.handoff_deadline = Some(self.now + self.handoff_limit());
+            }
         }
     }
 
-    /// When the close stops waiting for the other lanes.
-    pub(super) fn close_wait_deadline(&self) -> Option<Instant> {
-        self.out_ref(0)?.lanes()?.close_wait()
+    /// An acknowledgement moved or a pipe failed: the close stops waiting
+    /// once what it waits for is covered (a failed pipe no longer counts).
+    pub(super) fn recheck_close_wait(&mut self) {
+        if self.close_wait.is_some() && self.close_covered() {
+            self.end_close_wait();
+        }
     }
 
     /// A lane's position moved on the single pipe: the directions it
@@ -426,13 +536,7 @@ impl SessionCore {
                 self.streams.queue_ctrl(key);
             }
         }
-        if self
-            .out_ref(0)
-            .and_then(OutPipe::lanes)
-            .is_some_and(|l| l.close_wait().is_some() && l.others_covered())
-        {
-            self.end_close_wait();
-        }
+        self.recheck_close_wait();
     }
 
     /// Outside multipath, whether the control frames of `key`'s sending

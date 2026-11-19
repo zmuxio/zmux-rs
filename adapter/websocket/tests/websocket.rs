@@ -759,9 +759,12 @@ async fn wss_with_the_feature() {
 #[cfg(not(feature = "wss"))]
 #[tokio::test]
 async fn wss_without_the_feature_is_invalid_input() {
-    let e = zmux_websocket::dial("wss://localhost:1/zmux", &Default::default())
-        .await
-        .expect_err("refused");
+    let e = zmux_websocket::dial(
+        "wss://localhost:1/zmux",
+        &zmux_websocket::Options::default(),
+    )
+    .await
+    .expect_err("refused");
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
 

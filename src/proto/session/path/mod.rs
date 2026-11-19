@@ -352,6 +352,10 @@ impl SessionCore {
         if at.lane.0 != 0 {
             return self.lane_wants_write(at.pipe.0, at.lane.0);
         }
+        if self.close_flush.is_some() && self.close_flushed() {
+            // The flush is over: the write that ends it sends CONNECTION_CLOSE.
+            return true;
+        }
         let id = at.pipe.0;
         let Some(a) = self.att(id) else {
             return false;
@@ -366,10 +370,15 @@ impl SessionCore {
         // sends nothing else meanwhile but CONNECTION_CLOSE.
         let delayed = self.shape.is_some() && self.shape_delayed(id);
         if self.state == State::Closing {
-            // An orderly close that waits for the other lanes writes only
-            // the PIPE_ACK due meanwhile.
+            // An orderly close that waits for its acknowledgements writes
+            // only the transport work due meanwhile: PIPE_ACK, and in a
+            // multipath session the pipe-layer frames and what a failed
+            // pipe carried.
             return !self.close_waiting()
-                || !delayed && (o.leading_frames_owed() || self.single_pipe_ack_due(self.now));
+                || !delayed
+                    && (o.leading_frames_owed()
+                        || self.single_pipe_ack_due(self.now)
+                        || self.close_wait_owed(id));
         }
         if o.shutdown_pending() {
             // Drained, or failed: the write side is to be closed.
@@ -891,7 +900,8 @@ impl SessionCore {
             return;
         }
         self.views_changed();
-        if self.mp.is_some() && self.state < State::Closing {
+        if self.mp.is_some() && (self.state < State::Closing || self.close_waiting()) {
+            // During the close wait a failed pipe's records are reinjected.
             self.mp_outbound_failed(pipe, cause, now);
             return;
         }

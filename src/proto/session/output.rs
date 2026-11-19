@@ -596,13 +596,23 @@ impl SessionCore {
             }
         }
         if self.state == State::Closing && self.close_waiting() {
-            // The close waits for the other lanes; the acknowledgements the peer waits for
-            // meanwhile go.
-            self.write_single_pipe_ack(&mut w, now);
+            // The close waits for its acknowledgements; meanwhile the
+            // transport goes on for what was handed to it: the
+            // acknowledgements the peer waits for, and in a multipath
+            // session the pipe-layer frames and what a failed pipe carried.
+            // Nothing new.
+            self.write_path_frames(id, &mut w, now);
+            if self.mp.is_some() {
+                if self.is_control_pipe(id) {
+                    self.write_stream_controls(&mut w, now);
+                }
+                self.write_close_wait_lost(id, &mut w);
+            }
             w.end_record();
+            let eliciting = w.eliciting_end();
             let records = self.shape_finish(w);
             self.count_sent(out.len(), records);
-            self.after_batch(id, out, None, now);
+            self.after_batch(id, out, eliciting, now);
             return if out.is_empty() {
                 Transmit::Idle
             } else {
@@ -1834,6 +1844,36 @@ impl SessionCore {
             i = 0;
         }
         None
+    }
+
+    /// During the close wait, the reinjected stream data pipe `id` can
+    /// carry, on lane 0 whatever lane or pipe its stream was bound to: the
+    /// session schedules nothing new, so only the reinjection hold limits
+    /// it.
+    fn write_close_wait_lost(&mut self, id: u64, w: &mut Records<'_>) {
+        if !self
+            .out_ref(id)
+            .is_some_and(|o| o.is_live() && o.writable())
+        {
+            return;
+        }
+        while self.reinject_room(id) > 0 {
+            let Some(key) = self.close_wait_lost() else {
+                return;
+            };
+            let owed = |c: &Self| {
+                c.streams
+                    .send(key)
+                    .map(|s| (s.mp().lost.first(), s.mp().fin_lost))
+            };
+            let before = owed(self);
+            if matches!(self.write_lost_frame(key, w), Step::Full | Step::Budget)
+                || owed(self) == before
+            {
+                // Full, held, or nothing more this batch can carry.
+                return;
+            }
+        }
     }
 
     /// The first direction with reinjected information pending, by urgency

@@ -9,7 +9,9 @@
 {"step": 8, "op": "advance", "ms": 25}
 {"step": 9, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "PIPE_PING"}]}
 {"step": 10, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
-{"step": 11, "op": "api", "call": "close", "args": {"code": 0, "reason": "", "app": true}, "expect": {"ok": true}}
-{"step": 12, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": true, "code": 0, "reason": ""}]}
-{"step": 13, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": true, "code": 0, "reason": ""}]}
-{"step": 14, "op": "expect_close", "error": {"space": "application", "code": 0, "remote": false}, "wire": true}
+{"step": 11, "op": "peer_send", "pipe": 0, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": {"$sent": 0}, "delay": 0}]}]]}
+{"step": 12, "op": "peer_send", "pipe": 2, "records": [[{"type": "PIPE_ACK", "entries": [{"pipe": 2, "lane": 0, "position": {"$sent": 2}, "delay": 0}]}]]}
+{"step": 13, "op": "api", "call": "close", "args": {"code": 0, "reason": "", "app": true}, "expect": {"ok": true}}
+{"step": 14, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": true, "code": 0, "reason": ""}]}
+{"step": 15, "op": "expect_frames", "pipe": 2, "match": "contains", "frames": [{"type": "CONNECTION_CLOSE", "app": true, "code": 0, "reason": ""}]}
+{"step": 16, "op": "expect_close", "error": {"space": "application", "code": 0, "remote": false}, "wire": true}

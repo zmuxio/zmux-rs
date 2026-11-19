@@ -212,9 +212,6 @@ pub(crate) struct OutLanes {
     copy_lane: Option<u64>,
     copy_wanted: bool,
     copies: VecDeque<QueuedCopy>,
-    /// Outside multipath, the orderly `CONNECTION_CLOSE` waits until a `PIPE_ACK`
-    /// covers the other lanes, at most until then.
-    close_wait: Option<Instant>,
     /// The held bytes and their minimum over the last `RTT_base_p`.
     held: HeldBytes,
 }
@@ -299,7 +296,6 @@ impl OutLanes {
             copy_lane: None,
             copy_wanted: false,
             copies: VecDeque::new(),
-            close_wait: None,
             held: HeldBytes::default(),
         }
     }
@@ -601,21 +597,6 @@ impl OutLanes {
             .iter()
             .filter(|l| l.state != LaneState::Refused)
             .all(|l| l.tx.acked >= l.tx.sent)
-    }
-
-    /// The orderly close waits for the other lanes until `until`.
-    pub(crate) fn wait_close(&mut self, until: Instant) {
-        self.close_wait = Some(until);
-    }
-
-    /// Until when the orderly close waits, while it does.
-    pub(crate) fn close_wait(&self) -> Option<Instant> {
-        self.close_wait
-    }
-
-    /// The close waits no longer.
-    pub(crate) fn end_close_wait(&mut self) {
-        self.close_wait = None;
     }
 
     // ---- write progress of the lanes ---------------------------------------------
