@@ -195,8 +195,18 @@ fn carrier_response(
 ///   credential in a header field. `Accept(k)` returns the response at
 ///   once, the carrier having the prefix after `k` bytes in front, and the
 ///   request body is read on while the response flows (also on
-///   HTTP/1.1); `Fallback` returns [`Unhandled::Fallback`] with every byte
-///   read given back in front of the rest of the body; `Stall` reads and
+///   HTTP/1.1); `Fallback` on the start of the body, with a listener's
+///   fallback ([`zmux::ListenerConfig::fallback`]), hands the carrier to
+///   it as a [`zmux::Takeover`]: the response is returned at once as for
+///   an acceptance, and the takeover's pipe is the request body, every
+///   byte read replayed in front, and (but for an uplink, whose empty
+///   response ends once the host drops the request body) the response
+///   body, full duplex, each half closed on its own; once the fallback's
+///   future completed, a response the host did not end is reset, unless
+///   it detached the takeover ([`zmux::Takeover::detach`]). `Fallback` on
+///   the head (no body), or without a listener's fallback, returns
+///   [`Unhandled::Fallback`] with every byte read given back in front of
+///   the rest of the body; `Stall` reads and
 ///   discards the body for a stall's duration (or until it ends) and then
 ///   returns [`Unhandled::Abort`]; `Close` returns that at once.
 /// - Without, the response is returned when the listener first writes on
@@ -264,8 +274,18 @@ where
     // nothing, is held until the carrier ends, and ends with it.
     let carrier = {
         let abort = abort.clone();
-        move |reader: BodyReader<B>, writer: StartWriter| {
+        move |reader: BodyReader<B>, writer: StartWriter, taken_over: bool| {
             let (io, held) = match class {
+                // An uplink taken over: its empty response ends once the
+                // host is done with the request body.
+                RequestClass::Uplink if taken_over => (
+                    PipeIo::reader(UplinkBody {
+                        inner: reader,
+                        end: Some((abort.clone(), writer)),
+                    })
+                    .with_carrier(zmux::CarrierKind::Split),
+                    None,
+                ),
                 RequestClass::Uplink => (
                     PipeIo::reader(reader).with_carrier(zmux::CarrierKind::Split),
                     Some(writer),
@@ -326,12 +346,27 @@ where
                     inner: writer,
                     started: None,
                 };
-                let (io, start) = carrier(reader, writer);
+                let (io, start) = carrier(reader, writer, false);
                 tokio::spawn(handled(
                     listener.clone(),
                     (io.with_prefix(rest), start),
                     hint_of(entry),
                 ));
+                Ok(carrier_response(class, version, resp_body))
+            }
+            Admit::TakeOver(prefix) => {
+                // A carrier decided on its body, to the listener's
+                // fallback: answered as an accepted one, its pipe the
+                // request body in and the response body out.
+                let writer = StartWriter {
+                    inner: writer,
+                    started: None,
+                };
+                let (io, _) = carrier(reader, writer, true);
+                // The request is closed with the call unless detached: a
+                // response the host did not end is reset.
+                let io = zmux::adapter::AdmitIo::pipe(io).with_on_return(move || abort.run());
+                tokio::spawn(async move { entry.take_over(io, prefix).await });
                 Ok(carrier_response(class, version, resp_body))
             }
             Admit::Fallback(prefix) => {
@@ -362,6 +397,7 @@ where
             inner: writer,
             started: Some(started),
         },
+        false,
     );
     let io = io.with_taken(move || {
         on_taken.send_replace(true);
@@ -379,6 +415,32 @@ where
         parts,
         ReplayBody::new([Bytes::new(), Bytes::new()], None),
     ))))
+}
+
+/// The request body of an uplink taken over: dropped, it ends the
+/// request's empty response cleanly.
+struct UplinkBody<R> {
+    inner: R,
+    end: Option<(body::Abort, StartWriter)>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for UplinkBody<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R> Drop for UplinkBody<R> {
+    fn drop(&mut self) {
+        if let Some((end, held)) = self.end.take() {
+            end.finish();
+            drop(held);
+        }
+    }
 }
 
 /// The sending half of a carrier: one whose response is returned at its

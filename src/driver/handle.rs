@@ -203,6 +203,8 @@ pub struct CarrierInfo {
     pub(crate) secure: bool,
     /// A split carrier: no Bound.
     pub(crate) split: bool,
+    /// The carrier reports its own failure ([`crate::PipeIo::with_reports_failure`]).
+    pub(crate) reports_failure: bool,
     /// The record mode of an Establish this carrier ran.
     pub(crate) first_mode: Option<crate::proto::seal::RecordMode>,
 }
@@ -255,6 +257,7 @@ impl CarrierInfo {
         core.set_pipe_carrier(id, self.kind);
         core.set_pipe_variant(id, self.variant.clone());
         core.set_pipe_write_overhead(id, self.write_overhead);
+        core.set_pipe_reports_failure(id, self.reports_failure);
         if let Some(max) = self.max_record {
             // Checked before: `connect` (`check_pipe_record_limit`).
             let _ = core.set_pipe_max_record(id, max);
@@ -1577,10 +1580,11 @@ impl<D: Driver> Shared<D> {
         &self,
         join: crate::proto::session::PeerJoin,
         carrier: crate::proto::session::PeerCarrier,
-        (kind, overhead, admitted): (
+        (kind, overhead, admitted, reports_failure): (
             Option<crate::CarrierKind>,
             u16,
             Option<crate::AdmittedValue>,
+            bool,
         ),
     ) -> crate::proto::session::ConfirmedJoin {
         use crate::proto::session::ConfirmedJoin;
@@ -1591,6 +1595,7 @@ impl<D: Driver> Shared<D> {
             let pipe = *pipe;
             st.core.set_pipe_carrier(pipe, kind);
             st.core.set_pipe_write_overhead(pipe, overhead);
+            st.core.set_pipe_reports_failure(pipe, reports_failure);
             st.core.set_pipe_admitted(pipe, admitted);
         }
         st.after_command();

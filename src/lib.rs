@@ -256,13 +256,13 @@ pub use proto::session::{
     DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET,
     DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
     DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, DatagramError,
-    DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, InboundState, Inherit,
-    JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT, Multipath, OpenError,
-    OutboundState, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeLiveness, PipeOptions,
-    PipeStats, PipeUpdate, Preamble, PrioritySource, QualityBand, Redial, Redundancy, RttSource,
-    SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionId, SessionStats,
-    State as SessionState, StreamError, StreamStats, Support, TraceRecord, Tracer, UniCredit,
-    WindowIncrease,
+    DeadTimeout, DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, InboundState,
+    Inherit, JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT, Multipath,
+    OpenError, OutboundState, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeLiveness,
+    PipeOptions, PipeStats, PipeUpdate, Preamble, PrioritySource, QualityBand, Redial, Redundancy,
+    RttSource, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionId,
+    SessionStats, State as SessionState, StreamError, StreamStats, Support, TraceRecord, Tracer,
+    UniCredit, WindowIncrease,
 };
 pub use proto::session::{InvalidConfig, check_max_record};
 pub use proto::{Decision, LaterFuture};
@@ -281,7 +281,10 @@ pub use proto::{DetailKey, VarInt};
 // The drivers are left out of loom builds, which check their
 // synchronization units only (src/driver/loom.rs).
 #[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::admission::{Fallback, Prefixed, Takeover, TakeoverStream};
+pub use driver::admission::{
+    Fallback, MessageReader, MessageWriter, Messages, Prefixed, Takeover, TakeoverReturned,
+    TakeoverStream,
+};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::cache::{
     CacheOutcome, CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime,

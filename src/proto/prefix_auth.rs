@@ -298,7 +298,7 @@ impl PrefixAuthVerifier {
         let header;
         let (token, accept) = if info.is_head() {
             let Some(t) = self.header_token(info) else {
-                return AdmissionVerdict::Fallback;
+                return AdmissionVerdict::fallback();
             };
             header = t;
             (&header[..], 0)
@@ -306,12 +306,12 @@ impl PrefixAuthVerifier {
             (prefix, PREFIX_TOKEN_LEN)
         };
         let Ok(binding) = self.auth.binding(info) else {
-            return AdmissionVerdict::Fallback;
+            return AdmissionVerdict::fallback();
         };
         if self.verify(token, binding.as_ref()) {
             AdmissionVerdict::accept(accept)
         } else {
-            AdmissionVerdict::Fallback
+            AdmissionVerdict::fallback()
         }
     }
 
@@ -484,24 +484,27 @@ mod tests {
         assert_eq!(v.decide(&upgrade(&ok), &[]), AdmissionVerdict::accept(0));
         assert_eq!(
             v.decide(&upgrade(&ok), &[]),
-            AdmissionVerdict::Fallback,
+            AdmissionVerdict::fallback(),
             "Nonce used"
         );
         // The token as a prefix is not looked at on an upgrade.
-        assert_eq!(v.decide(&upgrade(&[]), &tok), AdmissionVerdict::Fallback);
+        assert_eq!(v.decide(&upgrade(&[]), &tok), AdmissionVerdict::fallback());
         let tok = a.token_at(None, unix_now(), [7; 16]);
         let val = PrefixAuth::header_value(&tok);
         let twice = [
             (PREFIX_AUTH_HEADER, val.as_str()),
             (PREFIX_AUTH_HEADER, val.as_str()),
         ];
-        assert_eq!(v.decide(&upgrade(&twice), &[]), AdmissionVerdict::Fallback);
+        assert_eq!(
+            v.decide(&upgrade(&twice), &[]),
+            AdmissionVerdict::fallback()
+        );
         let (padded, plus) = (format!("{val}="), format!("+{}", &val[1..]));
         for bad in [&val[..42], padded.as_str(), plus.as_str()] {
             let f = [(PREFIX_AUTH_HEADER, bad)];
             assert_eq!(
                 v.decide(&upgrade(&f), &[]),
-                AdmissionVerdict::Fallback,
+                AdmissionVerdict::fallback(),
                 "{bad}"
             );
         }
@@ -510,7 +513,7 @@ mod tests {
             .started_at(0);
         assert_eq!(
             v.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
-            AdmissionVerdict::Fallback
+            AdmissionVerdict::fallback()
         );
         assert_eq!(
             other.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
@@ -532,7 +535,7 @@ mod tests {
         let f = [(PREFIX_AUTH_HEADER, value.as_str())];
         assert_eq!(
             v.decide(&upgrade(&f), &[]),
-            AdmissionVerdict::Fallback,
+            AdmissionVerdict::fallback(),
             "no exporter"
         );
         let info = upgrade(&f).with_exporter(exported);

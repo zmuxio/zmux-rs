@@ -373,8 +373,8 @@ impl Runner {
         if let Some(f) = cfg.suspect_floor {
             config.liveness.suspect_floor = Duration::from_millis(f);
         }
-        config.liveness.dead_timeout = cfg.dead_timeout.map_or(zmux::Cap::Auto, |t| {
-            zmux::Cap::Fixed(Duration::from_millis(t))
+        config.liveness.dead_timeout = cfg.dead_timeout.map_or(zmux::DeadTimeout::Auto, |t| {
+            zmux::DeadTimeout::After(Duration::from_millis(t))
         });
         config.probation = match cfg.probation.flatten() {
             None => Some(zmux::Cap::Auto),

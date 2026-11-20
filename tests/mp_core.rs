@@ -345,7 +345,7 @@ fn a_new_keep_alive_counts_from_the_last_activity() {
 fn a_suspect_pipe_keeps_its_dead_timeout() {
     let mut n = net(Scheduler::SpreadEta, false);
     let mut l = n.ends[A].config().liveness;
-    l.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(50));
+    l.dead_timeout = zmux::DeadTimeout::After(Duration::from_secs(50));
     n.ends[A].set_liveness(&l).unwrap();
     n.open_and_write(200_000, true);
     n.step(4000);
@@ -363,7 +363,7 @@ fn a_suspect_pipe_keeps_its_dead_timeout() {
         n.advance(10);
     }
     assert!(suspect(&n));
-    l.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(1));
+    l.dead_timeout = zmux::DeadTimeout::After(Duration::from_secs(1));
     n.ends[A].set_liveness(&l).unwrap();
     for _ in 0..500 {
         n.pump(1);
@@ -1522,4 +1522,169 @@ fn the_close_wait_may_outlast_the_hand_off_limit() {
             "stream {tag}"
         );
     }
+}
+
+// ---- dead timeout off (stall-based failure) ----------------------------
+
+/// What a silent stall of a second pipe for `ms` did on A: whether it turned
+/// suspect, its outbound state at the end and whether every stream was
+/// delivered (over pipe 0). `f` sets A's configuration and `fb` B's, `opts` are
+/// the pipe's options, `carrier` whether its carrier reports its own
+/// failure at both ends.
+fn stall_case(
+    f: impl Fn(&mut Config),
+    fb: impl Fn(&mut Config),
+    opts: &PipeOptions,
+    carrier: bool,
+    ms: u64,
+) -> (Net, u64, bool, Option<OutboundState>) {
+    let mut a_cfg = config(Scheduler::SpreadEta, false);
+    f(&mut a_cfg);
+    let mut b_cfg = config(Scheduler::SpreadEta, false);
+    b_cfg.test_hooks().locator = b"server".to_vec();
+    fb(&mut b_cfg);
+    let mut n = Net::new(a_cfg, b_cfg, Book::default());
+    n.pump(10);
+    let id = n.add_pipe(opts).unwrap();
+    n.pump(10);
+    n.advance(5);
+    n.pump(10);
+    if carrier {
+        for side in [A, B] {
+            assert!(n.ends[side].set_pipe_reports_failure(PipeId::new(id), true));
+        }
+    }
+    for _ in 0..3 {
+        n.open_and_write(200_000, true);
+    }
+    for _ in 0..5 {
+        n.step(4000);
+        n.read_b();
+        n.advance(1);
+    }
+    let l = n.links.get_mut(&id).unwrap();
+    l.stall(true);
+    l.cap = 64 * 1024;
+    let state = |n: &Net| match n.ends[A].pipe_state(PipeId::new(id), PipeHalf::Outbound) {
+        Some(DirectionState::Outbound(s)) => Some(s),
+        _ => None,
+    };
+    let mut suspect = false;
+    for _ in 0..ms / 10 {
+        n.pump(1);
+        n.advance(10);
+        suspect |= state(&n) == Some(OutboundState::Suspect);
+    }
+    let s = state(&n);
+    (n, id, suspect, s)
+}
+
+fn delivered(n: &Net) -> bool {
+    n.s.sent
+        .iter()
+        .all(|(t, s)| n.s.recv.get(t).map_or(0, Vec::len) == s.len())
+}
+
+fn failed(s: Option<OutboundState>) -> bool {
+    s.is_none_or(OutboundState::is_terminal)
+}
+
+fn pipe_dead(d: zmux::DeadTimeout) -> PipeOptions {
+    PipeOptions::default().with_liveness(zmux::PipeLiveness {
+        dead_timeout: zmux::Inherit::Set(d),
+        ..zmux::PipeLiveness::default()
+    })
+}
+
+/// The default still fails a dead pipe.
+#[test]
+fn a_stalled_pipe_fails_by_default() {
+    let (n, _, suspect, s) = stall_case(|_| {}, |_| {}, &PipeOptions::default(), false, 60_000);
+    assert!(suspect && failed(s), "{s:?}");
+    assert!(delivered(&n));
+}
+
+/// Off at the session: the stalled pipe turns suspect, traffic moves to
+/// pipe 0, and it never fails; once its path delivers again it recovers.
+#[test]
+fn dead_timeout_off_never_fails_a_stalled_pipe() {
+    let off = |c: &mut Config| c.liveness.dead_timeout = zmux::DeadTimeout::Off;
+    let (mut n, id, suspect, s) = stall_case(off, off, &PipeOptions::default(), false, 120_000);
+    assert!(suspect, "it still turns suspect");
+    assert_eq!(s, Some(OutboundState::Suspect));
+    assert!(delivered(&n), "traffic moved away from it");
+    assert!(n.ends[A].error().is_none() && n.ends[B].error().is_none());
+    n.links.get_mut(&id).unwrap().stall(false);
+    for _ in 0..2000 {
+        n.pump(1);
+        n.advance(10);
+    }
+    assert_eq!(
+        n.ends[A].pipe_state(PipeId::new(id), PipeHalf::Outbound),
+        Some(DirectionState::Outbound(OutboundState::Active)),
+        "it recovers"
+    );
+}
+
+/// A carrier that reports its own failure has stall-based failure off by
+/// default; the pipe's own dead timeout overrides that.
+#[test]
+fn a_carrier_reporting_failure_turns_it_off_unless_the_pipe_says() {
+    let (n, _, suspect, s) = stall_case(|_| {}, |_| {}, &PipeOptions::default(), true, 120_000);
+    assert!(suspect && s == Some(OutboundState::Suspect), "{s:?}");
+    assert!(delivered(&n));
+    let fixed = pipe_dead(zmux::DeadTimeout::After(Duration::from_secs(2)));
+    let (_, _, _, s) = stall_case(|_| {}, |_| {}, &fixed, true, 60_000);
+    assert!(failed(s), "own After: {s:?}");
+    let (_, _, _, s) = stall_case(
+        |_| {},
+        |_| {},
+        &pipe_dead(zmux::DeadTimeout::Auto),
+        true,
+        60_000,
+    );
+    assert!(failed(s), "own Auto: {s:?}");
+    // And a pipe's own Off beats the session's fixed value (B, which
+    // follows its own session, has it off).
+    let off = |c: &mut Config| c.liveness.dead_timeout = zmux::DeadTimeout::Off;
+    let short = |c: &mut Config| {
+        c.liveness.dead_timeout = zmux::DeadTimeout::After(Duration::from_secs(1));
+    };
+    let (_, _, _, s) = stall_case(
+        short,
+        off,
+        &pipe_dead(zmux::DeadTimeout::Off),
+        false,
+        60_000,
+    );
+    assert_eq!(s, Some(OutboundState::Suspect));
+}
+
+/// A huge dead timeout is safe: deadlines beyond the clock never come. It
+/// bounds only the last usable pipe; beside another ACTIVE one, `T_fail`
+/// still applies.
+#[test]
+fn a_huge_dead_timeout_is_safe() {
+    let huge = |c: &mut Config| c.liveness.dead_timeout = zmux::DeadTimeout::After(Duration::MAX);
+    let opts = pipe_dead(zmux::DeadTimeout::After(Duration::MAX));
+    let (n, _, suspect, s) = stall_case(huge, huge, &opts, false, 60_000);
+    assert!(suspect && failed(s), "{s:?}");
+    assert!(delivered(&n));
+    assert!(n.ends[A].error().is_none());
+}
+
+#[test]
+fn a_dead_timeout_below_one_second_is_invalid() {
+    let mut l = zmux::Liveness {
+        dead_timeout: zmux::DeadTimeout::After(Duration::from_millis(999)),
+        ..zmux::Liveness::default()
+    };
+    assert!(l.validate().is_err());
+    l.dead_timeout = zmux::DeadTimeout::Off;
+    assert!(l.validate().is_ok());
+    let p = zmux::PipeLiveness {
+        dead_timeout: zmux::Inherit::Set(zmux::DeadTimeout::After(Duration::from_millis(1))),
+        ..zmux::PipeLiveness::default()
+    };
+    assert!(p.validate().is_err());
 }

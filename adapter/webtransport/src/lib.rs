@@ -415,7 +415,12 @@ async fn admit_first_stream(
     // pipe; the session's other streams reach the listener after that.
     let made = Arc::new(std::sync::Mutex::new(None::<(Carrier, Session)>));
     let first = {
-        let (made, l, options) = (made.clone(), listener.clone(), options.clone());
+        let (made, l, options, closing) = (
+            made.clone(),
+            listener.clone(),
+            options.clone(),
+            conn.clone(),
+        );
         async move {
             let session = request.ok().await.map_err(io::Error::other)?;
             let (send, recv) = session.accept_bi().await.map_err(io::Error::other)?;
@@ -431,7 +436,11 @@ async fn admit_first_stream(
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((carrier, s));
                 pipe
             });
-            Ok(io.with_connection(Arc::new(session)))
+            // Closed once a fallback's future returned it, also when this
+            // admission is dropped meanwhile.
+            Ok(io
+                .with_connection(Arc::new(session))
+                .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
         }
     };
     let accepted = entry.admit_first(CarrierInfo::new(), first).await;
@@ -440,8 +449,11 @@ async fn admit_first_stream(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     let (Some(first), Some((carrier, session))) = (accepted, made) else {
-        // Not accepted, the verdict acted on (a fallback has completed).
-        conn.close(VarInt::from_u32(0), b"");
+        // Not accepted, the verdict acted on (a fallback has completed);
+        // a carrier the host detached leaves its session to the host.
+        if !entry.is_detached() {
+            conn.close(VarInt::from_u32(0), b"");
+        }
         return;
     };
     let admitted = entry.admitted();
@@ -457,8 +469,9 @@ async fn admit_first_stream(
 /// The WebTransport session of a stream the listener's fallback took over
 /// ([`zmux::ListenerConfig::fallback`]) from [`admit`]: the session's first
 /// bidirectional stream, as [`Takeover::into_stream`] gives it, after its
-/// head deferred the decision. The session is closed once the fallback
-/// completed.
+/// head deferred the decision. The session is closed once the fallback's
+/// future completed, unless the host detached the takeover
+/// ([`Takeover::detach`]): it is then the host's to close.
 #[must_use]
 pub fn takeover_session(takeover: &Takeover) -> Option<Session> {
     takeover.connection()?.downcast_ref::<Session>().cloned()

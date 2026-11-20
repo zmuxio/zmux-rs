@@ -496,6 +496,29 @@ fn a_stream_carrier_takes_no_exporter() {
     });
 }
 
+/// A stream carrier reports its own failure (its outer session's liveness
+/// ends it), so its stall never fails the nested pipe; a transform and a
+/// replayed prefix keep that.
+#[test]
+fn a_stream_carrier_reports_its_own_failure() {
+    multi_thread(async {
+        let base = snapshot();
+        {
+            let (oc, os) = outer(Config::default(), Config::default()).await;
+            let carrier = oc.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
+            assert!(carrier.reports_failure());
+            let carrier = carrier.with_prefix(b"x".to_vec());
+            assert!(carrier.reports_failure());
+            assert!(!carrier.with_reports_failure(false).reports_failure());
+            let ((a, _), _) = duplex(1 << 10);
+            assert!(!a.reports_failure());
+            oc.close().await;
+            watchdog(10, "outer closed", os.closing()).await;
+        }
+        settle(base, 10, "stream carrier reports failure").await;
+    });
+}
+
 /// `PipeIo::from_stream` takes the two parts of one stream: the parts of two
 /// different streams are refused.
 #[test]

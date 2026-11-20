@@ -152,10 +152,15 @@ pub struct ListenerConfig {
     /// [`crate::Listener::handle_pipe`]), message-framed carriers (a
     /// WebSocket decided on its first message), and the first stream of a
     /// QUIC connection or a WebTransport session, as a [`crate::Takeover`]
-    /// with what was read replayed. Without one such a carrier is stalled.
-    /// An HTTP request that is itself the carrier (an HTTP request carrier,
-    /// an upgrade refused on its head) is taken over as a request, by its
-    /// adapter's HTTP fallback. It never decides whether the admission
+    /// with what was read replayed, and an HTTP request carrier decided on
+    /// the start of its body, as the full-duplex pipe of its request and
+    /// response bodies. Without one such a carrier is stalled (a request
+    /// carrier goes to its adapter's HTTP fallback). An HTTP request
+    /// decided on its head (a request without a body, an upgrade refused on
+    /// its head, an exchange request) is taken over as a request, by its
+    /// adapter's HTTP fallback. Its future runs on a task of its own and
+    /// owns the carrier until it completes, unless the host detaches it
+    /// ([`crate::Takeover`]). It never decides whether the admission
     /// runs.
     #[cfg(all(feature = "tokio", not(loom)))]
     pub fallback: Option<crate::driver::admission::Fallback>,

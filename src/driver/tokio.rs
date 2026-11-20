@@ -362,7 +362,7 @@ pub struct PipeIo {
     pub(crate) abort: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) exporter: Option<crate::proto::exporter::CarrierExporter>,
     /// When the exporter can be read ([`PipeIo::with_early_data_in`]).
-    exporter_ready: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    pub(crate) exporter_ready: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     pub(crate) protocol: Option<String>,
     /// The carrier's kind ([`PipeIo::with_carrier`]).
     pub(crate) carrier: Option<crate::CarrierKind>,
@@ -392,6 +392,8 @@ pub struct PipeIo {
     pub(crate) secure: bool,
     /// Two halves paired as one carrier.
     pub(crate) split: bool,
+    /// The carrier reports its own failure ([`PipeIo::with_reports_failure`]).
+    pub(crate) reports_failure: bool,
     /// The record mode of an Establish this carrier ran
     /// ([`PipeIo::with_secure_first_pipe`]).
     pub(crate) first_mode: Option<crate::proto::seal::RecordMode>,
@@ -808,6 +810,7 @@ impl PipeIo {
             max_record: None,
             secure: false,
             split: false,
+            reports_failure: false,
             first_mode: None,
         }
     }
@@ -897,6 +900,7 @@ impl PipeIo {
             max_record: None,
             secure: false,
             split: false,
+            reports_failure: true,
             first_mode: None,
         }
     }
@@ -1021,6 +1025,31 @@ impl PipeIo {
         self
     }
 
+    /// Declares whether the carrier reports its own failure: when the path
+    /// under it fails, its reads or writes fail (an error, a reset, an
+    /// unexpected end), as a stream of an outer session does when that
+    /// session's liveness ends it ([`PipeIo::from_stream`] sets it). The
+    /// pipe's stall then never fails it: a carrier queued behind a rate
+    /// limit stalls without being dead, and its own end is the failure
+    /// signal. The stalled pipe still turns suspect, is avoided and probed.
+    /// The pipe's own [`PipeLiveness::dead_timeout`](crate::PipeLiveness::dead_timeout)
+    /// overrides it. A transform that fails when the carrier below it
+    /// fails keeps it. Two one-way halves made one carrier
+    /// (`PipeIo::paired_join`) report their failure only if both do: a
+    /// half that does not (a raw TCP stream) can stall silently.
+    #[must_use]
+    pub fn with_reports_failure(mut self, on: bool) -> Self {
+        self.reports_failure = on;
+        self
+    }
+
+    /// Whether the carrier reports its own failure
+    /// ([`PipeIo::with_reports_failure`]).
+    #[must_use]
+    pub fn reports_failure(&self) -> bool {
+        self.reports_failure
+    }
+
     /// The carrier ran an Establish with this record mode: a session's first pipe is then
     /// on the secure carrier, its exporter being the handshake's.
     #[must_use]
@@ -1123,6 +1152,7 @@ impl PipeIo {
         up.split = true;
         // Bound's contract holds for the carrier only if both halves declare it.
         up.secure &= down.secure;
+        up.reports_failure &= down.reports_failure;
         // The sending half's own: its overhead and retransmissions.
         if up.writer.is_none() {
             up.write_overhead = down.write_overhead;
@@ -1967,6 +1997,7 @@ impl Driver for Tokio {
             handshake_padding: carrier.handshake_padding,
             admitted: carrier.admitted.take().map(|v| *v),
             secure: carrier.secure,
+            reports_failure: carrier.reports_failure,
             split: carrier.split,
             first_mode: carrier.first_mode,
         }
@@ -5281,6 +5312,23 @@ mod tests {
         );
         assert_eq!((p.write_overhead, p.max_record), (5, Some(9000)));
         assert_eq!(p.variant().map(|v| &**v), Some("up"));
+    }
+
+    /// A split carrier reports its own failure only if both halves do: a
+    /// half that does not can stall silently, so stall death stays on.
+    #[test]
+    fn split_halves_report_failure_only_together() {
+        let half = |on: bool| PipeIo::new(tokio::io::empty()).with_reports_failure(on);
+        for (up, down) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                PipeIo::paired(half(up), half(down)).reports_failure(),
+                up && down
+            );
+            assert_eq!(
+                PipeIo::paired_join(half(up), half(down)).reports_failure(),
+                up && down
+            );
+        }
     }
 
     struct ChunkTestWriter;

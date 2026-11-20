@@ -526,7 +526,7 @@ fn an_admitted_request_carries_a_session() {
 #[test]
 fn a_fallback_request_reaches_the_handler_with_its_whole_body() {
     support::run(2, 90, || async {
-        let admission = || zmux::Admission::new(32, |_, _| zmux::AdmissionVerdict::Fallback);
+        let admission = || zmux::Admission::new(32, |_, _| zmux::AdmissionVerdict::fallback());
         let (addr, _l) =
             serve_admitted(Options::default().with_fallback(echo()), Some(admission())).await;
         let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
@@ -762,5 +762,174 @@ fn an_idle_connection_is_closed_after_it_was_used() {
             .expect("the idle connection is closed")
             .unwrap()
             .unwrap();
+    });
+}
+
+/// One POST to `path` of `addr` with `body` over HTTP/2 (prior knowledge).
+async fn post2<B>(
+    addr: &str,
+    path: &str,
+    body: B,
+) -> hyper::Result<http::Response<hyper::body::Incoming>>
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tcp),
+    )
+    .await?;
+    tokio::spawn(conn);
+    let req = http::Request::post(format!("http://{addr}{path}"))
+        .body(body)
+        .unwrap();
+    sender.send_request(req).await
+}
+
+/// A request carrier decided on the start of its body with a fallback
+/// verdict goes to the listener's fallback as a carrier: answered 200 by
+/// zmux, its pipe the request body (the decided bytes replayed) and the
+/// response body, full duplex, over HTTP/1.1 and HTTP/2. The host detaches
+/// it and serves it after the fallback's future; it ends the response
+/// first (half-close) and reads the request body on to its end.
+#[test]
+fn a_request_carrier_decided_on_its_body_is_taken_over() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    support::run(2, 90, || async {
+        for h2 in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
+                let tx = tx.clone();
+                async move {
+                    assert_eq!(t.info().stage, zmux::AdmissionStage::Carrier);
+                    let value = t.value().and_then(|v| v.downcast_ref::<&str>()).copied();
+                    t.detach().unwrap();
+                    let mut s = t.into_pipe().into_stream();
+                    tokio::spawn(async move {
+                        let mut head = [0; 8];
+                        s.read_exact(&mut head).await.unwrap();
+                        s.write_all(b"pong").await.unwrap();
+                        // The response ends; the request body reads on.
+                        s.shutdown().await.unwrap();
+                        let mut rest = Vec::new();
+                        s.read_to_end(&mut rest).await.unwrap();
+                        let _ = tx.send((value, head.to_vec(), rest));
+                    });
+                }
+            });
+            let admission = zmux::Admission::new(4, |_, p: &[u8]| {
+                if p == b"HELO" {
+                    zmux::AdmissionVerdict::fallback().with_value(Arc::new("echo"))
+                } else {
+                    zmux::AdmissionVerdict::Close
+                }
+            });
+            let mut limits = ListenerConfig::default();
+            limits.admission = Some(admission);
+            limits.fallback = Some(fallback);
+            let listener = Listener::new(Config::default(), limits).unwrap();
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap().to_string();
+            tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
+            let (mut ours, theirs) = tokio::io::duplex(1024);
+            ours.write_all(b"HELOping").await.unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), async {
+                if h2 {
+                    post2(&addr, "/zmux", StreamBody(theirs)).await
+                } else {
+                    post(&addr, "/zmux", StreamBody(theirs)).await
+                }
+            })
+            .await
+            .expect("answered")
+            .unwrap();
+            assert_eq!(resp.status(), 200, "h2 {h2}");
+            // The response ends before the request does.
+            let got = tokio::time::timeout(Duration::from_secs(5), read_all(resp))
+                .await
+                .expect("the response ended");
+            assert_eq!(got, b"pong", "h2 {h2}");
+            ours.write_all(b"tail").await.unwrap();
+            drop(ours);
+            let (value, head, tail) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the host read the request to its end")
+                .unwrap();
+            assert_eq!(
+                (value, &head[..], &tail[..]),
+                (Some("echo"), &b"HELOping"[..], &b"tail"[..]),
+                "h2 {h2}"
+            );
+            let a = listener.stats().admission;
+            assert_eq!((a.fallback, a.accepted), (1, 0));
+        }
+    });
+}
+
+/// A request carrier taken over and not detached is closed with the
+/// fallback's future, wherever the host keeps its pipe: the response it
+/// did not end is reset (the client sees a failure, not an end), over
+/// HTTP/1.1 and HTTP/2.
+#[test]
+fn an_undetached_request_carrier_is_reset_when_the_fallback_returns() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    support::run(2, 90, || async {
+        for h2 in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            // The client has the response head: the future may return.
+            let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+            let go = std::sync::Mutex::new(Some(go));
+            let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
+                let tx = tx.clone();
+                let go = go.lock().unwrap().take();
+                async move {
+                    let mut s = t.into_pipe().into_stream();
+                    let mut head = [0; 4];
+                    s.read_exact(&mut head).await.unwrap();
+                    s.write_all(b"pong").await.unwrap();
+                    s.flush().await.unwrap();
+                    // Kept past the future, never ended.
+                    let _ = tx.send(s);
+                    let _ = go.unwrap().await;
+                }
+            });
+            let admission =
+                zmux::Admission::new(4, |_, _: &[u8]| zmux::AdmissionVerdict::fallback());
+            let mut limits = ListenerConfig::default();
+            limits.admission = Some(admission);
+            limits.fallback = Some(fallback);
+            let listener = Listener::new(Config::default(), limits).unwrap();
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap().to_string();
+            tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
+            let (mut ours, theirs) = tokio::io::duplex(1024);
+            ours.write_all(b"HELO").await.unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), async {
+                if h2 {
+                    post2(&addr, "/zmux", StreamBody(theirs)).await
+                } else {
+                    post(&addr, "/zmux", StreamBody(theirs)).await
+                }
+            })
+            .await
+            .expect("answered")
+            .unwrap();
+            assert_eq!(resp.status(), 200, "h2 {h2}");
+            go_tx.send(()).unwrap();
+            let held = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut r = IncomingReader(resp.into_body(), bytes::Bytes::new());
+            let mut got = Vec::new();
+            let end = tokio::time::timeout(Duration::from_secs(5), r.read_to_end(&mut got))
+                .await
+                .expect("the response ended");
+            assert!(end.is_err(), "reset, not ended: h2 {h2}, {got:?}");
+            drop(held);
+            drop(ours);
+        }
     });
 }

@@ -602,7 +602,7 @@ fn pipe_options_read_back_every_held_setting() {
     // An update sets some and clears others: the read-back is exactly it.
     let band2 = QualityBand::new(Some(Duration::from_millis(9)), None);
     let live2 = PipeLiveness {
-        dead_timeout: Inherit::Set(Duration::from_secs(20)),
+        dead_timeout: Inherit::Set(zmux::DeadTimeout::After(Duration::from_secs(20))),
         ..Default::default()
     };
     n.ends[A]
@@ -848,7 +848,7 @@ fn huge_timer_settings_never_overflow_the_clock() {
         },
         &|c| {
             c.liveness.suspect_floor = huge;
-            c.liveness.dead_timeout = zmux::Cap::Fixed(huge);
+            c.liveness.dead_timeout = zmux::DeadTimeout::After(huge);
             c.probation = Some(zmux::Cap::Fixed(huge));
         },
     ];

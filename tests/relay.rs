@@ -205,12 +205,17 @@ impl Relay {
 
     /// Joins a pipe of X through this relay.
     async fn join(&self, x: &Session) -> Pipe {
+        self.join_with(x, PipeOptions::default()).await
+    }
+
+    /// [`Relay::join`] with the pipe's options.
+    async fn join_with(&self, x: &Session, opts: PipeOptions) -> Pipe {
         let pipe = self
             .xr
             .open_pipe_stream(&zmux::Preamble::new().with_tlv(0x1002, [8]))
             .await
             .unwrap();
-        let p = x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = x.begin_add_pipe(pipe, opts).unwrap();
         eventually(10, "relayed pipe active", || {
             p.stats()
                 .is_some_and(|i| i.outbound == Some(OutboundState::Active) && !i.in_probation)
@@ -403,7 +408,13 @@ fn a_stalled_downstream_fails_the_relayed_pipe_and_every_hop_releases_its_credit
         {
             let n = Nested::new().await;
             let relay = Relay::new(&n).await;
-            let pipe = relay.join(&n.x).await;
+            // A stream carrier reports its own failure, which turns
+            // stall-based failure off; the pipe's own setting turns it on.
+            let opts = PipeOptions::default().with_liveness(zmux::PipeLiveness {
+                dead_timeout: zmux::Inherit::Set(zmux::DeadTimeout::Auto),
+                ..zmux::PipeLiveness::default()
+            });
+            let pipe = relay.join_with(&n.x, opts).await;
             let stop = Arc::new(AtomicBool::new(false));
             let transfer = bulk(&n.x, &n.y, stop.clone());
             tokio::time::sleep(Duration::from_millis(100)).await;

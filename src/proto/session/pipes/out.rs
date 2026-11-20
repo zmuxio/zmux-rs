@@ -277,9 +277,9 @@ struct OutMp {
     /// When the join was sent (handshake timeout of an unconfirmed pipe).
     joined_at: Instant,
     suspect_floor: Duration,
-    dead_timeout: Option<Duration>,
+    dead_timeout: crate::DeadTimeout,
     /// The two above when the pipe last turned suspect.
-    suspect_held: (Duration, Option<Duration>),
+    suspect_held: (Duration, crate::DeadTimeout),
     /// The pipe's own idle-probe interval and jitter (`None`: the
     /// session's), and the draw u of the current wait, k (1 - j u), made
     /// when the wait starts from the pipe's generator.
@@ -353,7 +353,7 @@ struct OutMp {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Detection {
     pub(crate) suspect_floor: Duration,
-    pub(crate) dead_timeout: Option<Duration>,
+    pub(crate) dead_timeout: crate::DeadTimeout,
     pub(crate) probe_interval: Option<Period>,
     pub(crate) probe_jitter: Option<f64>,
     pub(crate) probe_seed: u64,
@@ -363,7 +363,7 @@ impl Detection {
     /// The settings of a pipe outside multipath (none is used).
     const NONE: Self = Self {
         suspect_floor: Duration::ZERO,
-        dead_timeout: None,
+        dead_timeout: crate::DeadTimeout::Auto,
         probe_interval: None,
         probe_jitter: None,
         probe_seed: 0,
@@ -998,7 +998,7 @@ impl OutPipe {
     }
 
     /// Replaces the floor of `T_suspect` and the dead timeout of this pipe.
-    pub(crate) fn set_detection_limits(&mut self, floor: Duration, dead: Option<Duration>) {
+    pub(crate) fn set_detection_limits(&mut self, floor: Duration, dead: crate::DeadTimeout) {
         if self.mp.is_some() {
             let m = self.mp_mut();
             m.suspect_floor = floor;
@@ -1018,13 +1018,13 @@ impl OutPipe {
     /// The floor of `T_suspect` and the dead timeout when the pipe last turned
     /// suspect.
     #[inline]
-    pub(crate) fn held_detection(&self) -> (Duration, Option<Duration>) {
+    pub(crate) fn held_detection(&self) -> (Duration, crate::DeadTimeout) {
         self.mp().suspect_held
     }
 
     /// The floor of `T_suspect` and the dead timeout of this pipe.
     #[inline]
-    pub(crate) fn detection(&self) -> (Duration, Option<Duration>) {
+    pub(crate) fn detection(&self) -> (Duration, crate::DeadTimeout) {
         (self.mp().suspect_floor, self.mp().dead_timeout)
     }
 
@@ -2610,7 +2610,7 @@ mod tests {
         OutPipe::new(Framing::ByteStream, OutState::Active, MS * 100, now).with_mp(
             Detection {
                 suspect_floor: MS * 250,
-                dead_timeout: None,
+                dead_timeout: crate::DeadTimeout::Auto,
                 probe_interval: None,
                 probe_jitter: None,
                 probe_seed: 0,

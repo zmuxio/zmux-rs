@@ -386,6 +386,11 @@ pub struct Entry {
     value: Option<AdmittedValue>,
     /// The label the admission gave it.
     variant: Option<Arc<str>>,
+    /// The metadata (set once a request carrier is to be taken over,
+    /// [`Admit::TakeOver`]) and the value of a fallback verdict.
+    fallback: Option<(Option<CarrierInfo>, Option<AdmittedValue>)>,
+    /// The host detached the carrier it took over ([`Entry::is_detached`]).
+    detached: bool,
 }
 
 impl std::fmt::Debug for Entry {
@@ -425,8 +430,11 @@ impl SetupTasks {
 
 /// What the listener's admission decided on an HTTP request taken as a
 /// carrier ([`Entry::decide_request`], [`Entry::decide_upgrade`]). A
-/// request is taken over as a request, by its adapter's HTTP fallback, not
-/// by the listener's ([`ListenerConfig::fallback`]).
+/// request decided on its head is taken over as a request, by its
+/// adapter's HTTP fallback; a request carrier decided on the start of its
+/// body is a carrier, which the listener's fallback
+/// ([`ListenerConfig::fallback`]) takes over when there is one
+/// ([`Admit::TakeOver`]).
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Admit {
@@ -441,6 +449,13 @@ pub enum Admit {
     /// To the adapter's HTTP fallback, every byte of the body read
     /// replayed in front (none on a head).
     Fallback(Vec<u8>),
+    /// A request carrier decided on its body, to the listener's fallback:
+    /// answer it as an accepted carrier (the response head), make its
+    /// carrier (request body in, response body out for a bidirectional
+    /// one) and hand it, these bytes replayed in front of the body, to
+    /// [`Entry::take_over`]. Without a listener's fallback the verdict is
+    /// [`Admit::Fallback`].
+    TakeOver(Vec<u8>),
     /// Stall it ([`Entry::stall`]), then end it without a response.
     Stall,
     /// End it at once.
@@ -614,7 +629,7 @@ impl Entry {
         let reader = if records { None } else { io.reader() };
         match self.decide_on(&info, prefix, reader, false).await {
             Admit::Accept(rest) => Some(io.into_pipe(rest)),
-            Admit::Fallback(replay) => {
+            Admit::Fallback(replay) | Admit::TakeOver(replay) => {
                 self.fall_back(info, replay, io).await;
                 None
             }
@@ -721,7 +736,18 @@ impl Entry {
             }
             Some(r) => reader = Some(r),
         }
-        self.decide_on(&info, prefix, reader, true).await
+        let admit = self.decide_on(&info, prefix, reader, true).await;
+        match admit {
+            // A carrier decided on its body is one to take over.
+            Admit::Fallback(p)
+                if info.stage == AdmissionStage::Carrier && self.shared.fallback.is_some() =>
+            {
+                let value = self.fallback.take().and_then(|(_, v)| v);
+                self.fallback = Some((Some(info), value));
+                Admit::TakeOver(p)
+            }
+            admit => admit,
+        }
     }
 
     /// The listener's decision on the head of an HTTP upgrade (WebSocket,
@@ -946,8 +972,9 @@ impl Entry {
                 prefix.drain(..skip);
                 Admit::Accept(prefix)
             }
-            AdmissionVerdict::Fallback => {
+            AdmissionVerdict::Fallback { value } => {
                 c.count(Outcome::Fallback, variant.as_ref());
+                self.fallback = Some((None, value));
                 Admit::Fallback(prefix)
             }
             AdmissionVerdict::Stall if self.start_stall() => {
@@ -976,7 +1003,36 @@ impl Entry {
         if let Some(slot) = self.slot.take() {
             self.shared.lock().core.release(slot);
         }
-        self.listener().adapter().take_over(info, io, replay).await;
+        let value = self.fallback.take().and_then(|(_, v)| v);
+        self.detached = self
+            .listener()
+            .adapter()
+            .hand_over(info, io, replay, value)
+            .await;
+    }
+
+    /// Hands a request carrier the admission gave to the listener's
+    /// fallback ([`Admit::TakeOver`]) over: `io`, its carrier, `replay` in
+    /// front, its slots given back first, until the fallback's future
+    /// completed. The adapter answered the request as an accepted
+    /// carrier's before, and closes what it holds of the request after,
+    /// unless the host detached it ([`Entry::is_detached`]). Nothing
+    /// happens on an entry the admission did not hand over so.
+    pub async fn take_over(&mut self, io: impl Into<AdmitIo>, replay: Vec<u8>) {
+        let Some((Some(info), _)) = &self.fallback else {
+            return;
+        };
+        let info = info.clone();
+        self.fall_back(info, replay, io.into()).await;
+    }
+
+    /// Whether the host detached the carrier the listener's fallback took
+    /// over ([`Takeover::detach`](crate::Takeover::detach)): its adapter
+    /// then leaves what it holds of it (a QUIC connection, a WebTransport
+    /// session, an HTTP request) to the host, instead of closing it.
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        self.detached
     }
 
     /// Stalls `io` ([`Entry::stall`]), then ends its sending half
@@ -1302,12 +1358,26 @@ impl<'a> ListenerAdapter<'a> {
     /// fallback completed (at once without one, the connection dropped).
     /// Counted nowhere: the adapter counts the refusal. The carriers the
     /// admission hands back reach the fallback through [`Entry::admit`].
-    pub async fn take_over(&self, info: CarrierInfo, io: AdmitIo, replay: Vec<u8>) {
+    /// `true` when the host detached the carrier
+    /// ([`Takeover::detach`](crate::Takeover::detach)): the adapter leaves
+    /// what it holds of the connection to the host then.
+    pub async fn take_over(&self, info: CarrierInfo, io: AdmitIo, replay: Vec<u8>) -> bool {
+        self.hand_over(info, io, replay, None).await
+    }
+
+    async fn hand_over(
+        &self,
+        info: CarrierInfo,
+        io: AdmitIo,
+        replay: Vec<u8>,
+        value: Option<AdmittedValue>,
+    ) -> bool {
         let Some(f) = self.listener.shared.fallback.clone() else {
-            return;
+            return false;
         };
         let info = info.with_framing(io.framing());
-        if !f.serve(io.into_takeover(info, replay)).await
+        let served = f.serve(io.into_takeover(info, replay, value)).await;
+        if served.panicked
             && let Some(l) = &self.listener.shared.logger
         {
             l.log(
@@ -1315,6 +1385,7 @@ impl<'a> ListenerAdapter<'a> {
                 "zmux: the listener's fallback panicked; its carrier is closed",
             );
         }
+        served.detached
     }
 
     /// For use in an admission's decision: whether `prefix`, a byte-stream
@@ -1585,6 +1656,8 @@ impl Listener {
             deadline: None,
             deferred: None,
             value: None,
+            fallback: None,
+            detached: false,
         })
     }
 
@@ -2645,6 +2718,7 @@ impl Listener {
             binding,
             has_exporter: pipe.exporter.is_some(),
             secure: pipe.secure,
+            reports_failure: pipe.reports_failure,
             admitted: pipe.admitted.as_deref().cloned(),
             inbound: pipe.reader.is_some(),
             outbound: pipe.writer.is_some(),

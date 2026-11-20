@@ -252,6 +252,57 @@ async fn a_wrong_token_goes_to_the_fallback_with_every_byte() {
     }
 }
 
+/// A detached takeover keeps its QUIC connection past the fallback's
+/// future: the host serves the stream and opens another on the connection
+/// afterwards, and the library never closes it; the host does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_takeover_keeps_its_connection() {
+    let fallback = Fallback::new(|t: Takeover| async move {
+        t.detach().unwrap();
+        let conn = zmux_quinn::takeover_connection(&t).expect("a QUIC connection");
+        let mut stream = t.into_stream().expect("the first stream");
+        tokio::spawn(async move {
+            // Served once the future completed and its entry moved on.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).await.unwrap();
+            stream.write_all(&got).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut more = conn.open_uni().await.unwrap();
+            more.write_all(b"later").await.unwrap();
+            more.finish().unwrap();
+            // Done once the client has read it: it says so.
+            let _ = tokio::time::timeout(LIMIT, conn.accept_uni()).await;
+            conn.close(quinn::VarInt::from_u32(7), b"host");
+        });
+    });
+    let server = Server::new(admission(), Some(fallback));
+    let conn = server.connect().await;
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let payload = vec![9u8; zmux::PREFIX_TOKEN_LEN + 10];
+    send.write_all(&payload).await.unwrap();
+    send.finish().unwrap();
+    let echo = tokio::time::timeout(LIMIT, recv.read_to_end(1024))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, payload);
+    let mut later = tokio::time::timeout(LIMIT, conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.read_to_end(64).await.unwrap(), b"later");
+    let mut done = conn.open_uni().await.unwrap();
+    done.write_all(b"read").await.unwrap();
+    done.finish().unwrap();
+    let closed = tokio::time::timeout(LIMIT, conn.closed()).await.unwrap();
+    match closed {
+        quinn::ConnectionError::ApplicationClosed(c) => assert_eq!(c.error_code.into_inner(), 7),
+        e => panic!("{e:?}"),
+    }
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_fallback_a_wrong_token_closes_the_connection() {
     let server = Server::new(admission(), None);

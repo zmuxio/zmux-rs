@@ -634,3 +634,152 @@ async fn serve_connection_reports_only_the_connection_end() {
         assert_eq!(r.is_ok(), ok, "{r:?}");
     }
 }
+
+/// A request carrier decided on its body with a fallback verdict, given
+/// to the listener's fallback: answered 200, `detach` the host's or not.
+/// Returns what the host read after the replay and how the client's
+/// response body ended (its data, and whether it failed), and whether the
+/// client's request body was stopped.
+async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // The client read the head and "pong": the future may return (a reset
+    // before would discard them).
+    let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+    let go = std::sync::Mutex::new(Some(go));
+    let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
+        let tx = tx.clone();
+        let go = go.lock().unwrap().take();
+        async move {
+            assert_eq!(t.info().stage, zmux::AdmissionStage::Carrier);
+            if detach {
+                t.detach().unwrap();
+            }
+            let mut s = t.into_pipe().into_stream();
+            let mut head = [0; 8];
+            s.read_exact(&mut head).await.unwrap();
+            s.write_all(b"pong").await.unwrap();
+            s.flush().await.unwrap();
+            if detach {
+                // Served on after the future; ended by the host.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    s.write_all(b"!").await.unwrap();
+                    s.shutdown().await.unwrap();
+                    let _ = tx.send((head.to_vec(), Some(s)));
+                });
+            } else {
+                // Kept past the future, never ended.
+                let _ = tx.send((head.to_vec(), Some(s)));
+                let _ = go.unwrap().await;
+            }
+        }
+    });
+    let mut go_tx = Some(go_tx);
+    let admission = Admission::new(4, |_, p: &[u8]| {
+        if p == b"HELO" {
+            AdmissionVerdict::fallback()
+        } else {
+            AdmissionVerdict::Close
+        }
+    });
+    let mut lc = ListenerConfig::default();
+    lc.admission = Some(admission);
+    lc.fallback = Some(fallback);
+    let h3 = H3::with_listener(Config::default(), lc, &Options::default());
+    let conn = h3
+        .client
+        .connect(h3.addr, "127.0.0.1")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let request = http::Request::post(h3.uri.clone()).body(()).unwrap();
+    let stream = send.send_request(request).await.unwrap();
+    let (mut req, mut resp) = stream.split();
+    req.send_data(bytes::Bytes::from_static(b"HELOping"))
+        .await
+        .unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), resp.recv_response())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.status(), http::StatusCode::OK);
+    let mut got = Vec::new();
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match resp.recv_data().await {
+                Ok(Some(mut b)) => {
+                    while b.has_remaining() {
+                        let c = b.chunk();
+                        got.extend_from_slice(c);
+                        let n = c.len();
+                        b.advance(n);
+                    }
+                    if got.len() >= 4
+                        && let Some(go) = go_tx.take()
+                    {
+                        let _ = go.send(());
+                    }
+                }
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        }
+    })
+    .await
+    .expect("the response ended or failed");
+    let (head, kept) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // The request body: stopped when the carrier was cut, open (read on
+    // by the host) when detached.
+    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if req
+                .send_data(bytes::Bytes::from_static(b"x"))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    drop(kept);
+    drive.abort();
+    conn.close(0u32.into(), b"");
+    h3.stop().await;
+    (head, got, failed, stopped)
+}
+
+/// A detached request carrier is the host's after the fallback's future:
+/// it reads the replayed body bytes first, answers, and ends the response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_request_carrier_is_served_after_the_fallback() {
+    let (head, got, failed, stopped) = request_takeover(true).await;
+    assert_eq!(head, b"HELOping");
+    assert_eq!(got, b"pong!");
+    assert!(!failed, "the response ended gracefully");
+    assert!(!stopped, "the request body is the host's");
+}
+
+/// A request carrier not detached is cut when the fallback's future
+/// returns, though the host keeps its pipe: the response not ended is
+/// reset and the request body stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undetached_request_carrier_is_reset_when_the_fallback_returns() {
+    let (head, got, failed, stopped) = request_takeover(false).await;
+    assert_eq!(head, b"HELOping");
+    assert!(b"pong".starts_with(&got), "{got:?}");
+    assert!(failed, "the response is reset, not ended");
+    assert!(stopped, "the request body is stopped");
+}

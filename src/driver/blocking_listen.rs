@@ -692,6 +692,7 @@ impl Listener {
             overhead: pipe.overhead(),
             max_record: pipe.record_limit(),
             kind: pipe.carrier(),
+            reports_failure: pipe.reports_failure,
         };
         let session = inner.locators.get(locator);
         let mut acc = JoinAccept::new(session, inner.config.join_timeout, hello, carrier);

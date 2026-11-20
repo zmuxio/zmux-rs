@@ -562,7 +562,7 @@ fn a_suspicion_and_a_failure_due_together_fire_in_one_pass() {
     let mut n = net(
         &|c| {
             c.liveness.suspect_floor = Duration::from_secs(3);
-            c.liveness.dead_timeout = zmux::Cap::Fixed(Duration::from_secs(1));
+            c.liveness.dead_timeout = zmux::DeadTimeout::After(Duration::from_secs(1));
         },
         &|_| {},
     );

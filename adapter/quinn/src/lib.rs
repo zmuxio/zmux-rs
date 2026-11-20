@@ -970,7 +970,12 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(carrier);
                 pipe
             });
-            Ok(io.with_connection(Arc::new(conn)))
+            // Closed once a fallback's future returned it, also when this
+            // admission is dropped meanwhile.
+            let closing = conn.clone();
+            Ok(io
+                .with_connection(Arc::new(conn))
+                .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
         }
     };
     let info = Handshake::of(&conn).carrier_info(&conn);
@@ -981,8 +986,11 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
         .take();
     let (Some(first), Some(carrier)) = (accepted, carrier) else {
         // Not accepted, the verdict acted on (a fallback has completed):
-        // closed before the streams are dropped, nothing sent on them.
-        conn.close(VarInt::from_u32(0), b"");
+        // closed before the streams are dropped, nothing sent on them;
+        // a carrier the host detached leaves its connection to the host.
+        if !entry.is_detached() {
+            conn.close(VarInt::from_u32(0), b"");
+        }
         return;
     };
     let admitted = entry.admitted();
@@ -998,7 +1006,9 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
 /// ([`zmux::ListenerConfig::fallback`]) from [`serve`] or
 /// [`serve_connection`]: its first bidirectional stream, as
 /// [`Takeover::into_stream`] gives it. The connection is closed once the
-/// fallback completed.
+/// fallback's future completed, unless the host detached the takeover
+/// ([`Takeover::detach`]): it is then the host's to close (it is closed
+/// as well once every handle of it and every stream of it is dropped).
 #[must_use]
 pub fn takeover_connection(takeover: &Takeover) -> Option<Connection> {
     takeover.connection()?.downcast_ref::<Connection>().cloned()

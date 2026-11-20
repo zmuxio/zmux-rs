@@ -133,11 +133,13 @@ pub struct Options {
     /// open at once (quinn's `max_concurrent_bidi_streams`) bound them too.
     pub windows: LaneWindows,
     /// Server: the handler of the requests that carry no pipe: those the
-    /// listener's admission hands to the fallback and those the listener does not
-    /// take (none by default: such requests are answered with 404). A
-    /// request is the carrier here, taken over as a request: the listener's
-    /// fallback ([`zmux::ListenerConfig::fallback`]) takes over carriers and
-    /// never sees one.
+    /// listener's admission hands to the fallback on their head (a request
+    /// whose body ends before its first byte), every request the admission
+    /// hands to the fallback without a listener's fallback, and those the
+    /// listener does not take (none by default: such requests are answered
+    /// with 404). A request carrier decided on the start of its body goes
+    /// to the listener's fallback ([`zmux::ListenerConfig::fallback`]) as a
+    /// carrier when there is one.
     pub fallback: Option<Fallback>,
     /// Client: the credential whose prefix ([`CarrierCredential::prefix`], given
     /// the connection's [`zmux_quinn::Handshake::carrier_info`]) is written
@@ -423,7 +425,7 @@ impl Carrier {
         reader.left = Some(left);
         let (r, w) = paired(
             reader,
-            BodyWriter::new(SendHalf::Client(send), Some(inner.clone())),
+            BodyWriter::new(SendHalf::Client(send), Some(inner.clone() as Keep)),
         );
         let io = PipeIo::from_chunk_halves(r, w)
             .with_drain(drain(response, inner.clone()), zmux::adapter::DRAIN_LIMIT)
@@ -436,7 +438,7 @@ impl Carrier {
                     let (send, recv) = inner.request().await?;
                     // The response stays open, unread: stopping it would make
                     // the server drop the request before the lane is routed.
-                    let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner));
+                    let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner as Keep));
                     lane.response = Some(recv);
                     Ok(zmux::adapter::Lane::from_chunks(lane))
                 }
@@ -582,9 +584,15 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 ///   [`zmux::CarrierInfo::with_request`] value) and the connection's
 ///   metadata ([`zmux_quinn::Handshake::carrier_info`]). `Accept(k)`
 ///   answers 200 and hands the carrier to the listener, the prefix after
-///   `k` bytes in front; `Fallback` hands the request to
-///   [`Options::fallback`] with every byte read ([`FallbackRequest`]), or
-///   answers 404 without one; `Stall` reads and discards the body for a
+///   `k` bytes in front; `Fallback` on the start of the body, with a
+///   listener's fallback ([`zmux::ListenerConfig::fallback`]), answers 200
+///   and hands the carrier to it as a [`zmux::Takeover`] (request body in,
+///   every byte read replayed, response body out, each half closed on its
+///   own; the halves keep the connection's state, so a detached one
+///   outlives the request's task); `Fallback` on the head, or without a
+///   listener's fallback, hands the request to [`Options::fallback`] with
+///   every byte read ([`FallbackRequest`]), or answers 404 without one;
+///   `Stall` reads and discards the body for a
 ///   stall's duration (or until it ends) and then resets the request
 ///   without a response; `Close` resets it at once.
 /// - Without, 200 is answered when the listener first writes on the
@@ -819,6 +827,36 @@ impl Served {
                 )
                 .await;
             }
+            Admit::TakeOver(prefix) => {
+                // A carrier decided on its body, to the listener's
+                // fallback: answered as an accepted one. Its halves keep
+                // the connection's state: a detached carrier outlives this
+                // request's task.
+                if send.send_response(http::Response::new(())).await.is_err() {
+                    return;
+                }
+                let channel = self.channel(&send);
+                let keep: Keep = self.clone();
+                #[expect(
+                    clippy::used_underscore_binding,
+                    reason = "a field held only for its drop, set late"
+                )]
+                {
+                    reader._keep = Some(keep.clone());
+                }
+                let (r, w) = paired(reader, BodyWriter::new(SendHalf::Server(send), Some(keep)));
+                // Cut when the fallback's future returns the carrier
+                // without a detach, wherever the host keeps the halves: a
+                // response not ended is reset, the request body stopped.
+                let (r, w, cut) = (Cut::new(r), Cut::new(w), Cutter::default());
+                let cut = cut.with(&r).with(&w);
+                let io = PipeIo::from_chunk_halves(r, w)
+                    .with_carrier(zmux::CarrierKind::Http3)
+                    .with_datagram_channel(channel);
+                let io = with_connection(io, self.id.clone(), self, |s| &s.conn);
+                let io = zmux::adapter::AdmitIo::pipe(io).with_on_return(move || cut.run());
+                entry.take_over(io, prefix).await;
+            }
             Admit::Fallback(prefix) => {
                 drop(entry);
                 let (recv, unread) = reader.into_server();
@@ -1012,6 +1050,119 @@ impl Drop for Answer {
 
 // ---- bodies -----------------------------------------------------------------
 
+/// A half of a carrier that can be cut from outside, wherever it is held
+/// ([`Cutter`]): the half inside is dropped (a body writer not ended
+/// resets its stream, a body reader stops the peer's body) and the
+/// wrapper's calls fail from then on. Dropping the wrapper drops the half
+/// at once.
+struct Cut<T>(Arc<Mutex<CutSlot<T>>>);
+
+struct CutSlot<T> {
+    half: Option<T>,
+    /// The task a pending call waits in, woken by the cut.
+    waker: Option<std::task::Waker>,
+}
+
+impl<T: Unpin> Cut<T> {
+    fn new(half: T) -> Self {
+        Self(Arc::new(Mutex::new(CutSlot {
+            half: Some(half),
+            waker: None,
+        })))
+    }
+
+    fn poll_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(half) = slot.half.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the takeover was returned",
+            )));
+        };
+        let r = f(Pin::new(half), cx);
+        if r.is_pending() {
+            match &slot.waker {
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => slot.waker = Some(cx.waker().clone()),
+            }
+        }
+        r
+    }
+}
+
+/// Takes the half out of `slot` and drops it outside the lock, waking a
+/// pending call.
+fn cut_slot<T>(slot: &Mutex<CutSlot<T>>) {
+    let (half, waker) = {
+        let mut s = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        (s.half.take(), s.waker.take())
+    };
+    drop(half);
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+impl<T> Drop for Cut<T> {
+    fn drop(&mut self) {
+        cut_slot(&self.0);
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Cut<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_with(cx, |h, cx| h.poll_read(cx, buf))
+    }
+}
+
+impl<T: ChunkWrite + Unpin> ChunkWrite for Cut<T> {
+    fn poll_write_chunks(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        chunks: &mut [Bytes],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_with(cx, |h, cx| h.poll_write_chunks(cx, chunks))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_with(cx, ChunkWrite::poll_flush)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_with(cx, ChunkWrite::poll_shutdown)
+    }
+}
+
+/// Cuts the halves it was given ([`Cut`]), once.
+#[derive(Default)]
+struct Cutter(Vec<Box<dyn FnOnce() + Send>>);
+
+impl Cutter {
+    fn with<T: Send + 'static>(mut self, half: &Cut<T>) -> Self {
+        let slot = Arc::downgrade(&half.0);
+        self.0.push(Box::new(move || {
+            if let Some(slot) = slot.upgrade() {
+                cut_slot(&slot);
+            }
+        }));
+        self
+    }
+
+    fn run(self) {
+        for cut in self.0 {
+            cut();
+        }
+    }
+}
+
 /// A request or response body being sent.
 enum SendHalf {
     Client(ClientSend),
@@ -1104,14 +1255,15 @@ struct BodyWriter {
     /// Set once the body ended gracefully, for the reader of the same
     /// pipe (see `paired`).
     ended_gracefully: Arc<AtomicBool>,
-    /// The client a pipe's body keeps alive.
-    _keep: Option<Arc<ClientInner>>,
+    /// The client a pipe's body keeps alive, or the served connection of
+    /// a request taken over.
+    _keep: Option<Keep>,
     /// A lane's response, held unread while the lane lives.
     response: Option<ClientRecv>,
 }
 
 impl BodyWriter {
-    fn new(half: SendHalf, keep: Option<Arc<ClientInner>>) -> Self {
+    fn new(half: SendHalf, keep: Option<Keep>) -> Self {
         Self {
             sending: Sending::Idle(Box::new(half)),
             finishing: false,
@@ -1259,6 +1411,9 @@ impl ChunkWrite for BodyWriter {
 
 /// The two bodies of one pipe: a graceful end of the sent body keeps the
 /// reader from stopping the received one when it is dropped.
+/// What a carrier's half keeps alive while it lives.
+type Keep = Arc<dyn std::any::Any + Send + Sync>;
+
 fn paired(mut r: BodyReader, w: BodyWriter) -> (BodyReader, BodyWriter) {
     r.peer_may_finish = w.ended_gracefully.clone();
     (r, w)
@@ -1284,8 +1439,9 @@ struct BodyReader {
     /// gracefully: the carrier closes cleanly, and the peer's body is not
     /// stopped, or its sender could fail before it reads what was sent.
     peer_may_finish: Arc<AtomicBool>,
-    /// The client a pipe's response keeps alive.
-    _keep: Option<Arc<ClientInner>>,
+    /// The client a pipe's response keeps alive, or the served connection
+    /// of a request taken over.
+    _keep: Option<Keep>,
     /// A client's response not read to its end, for the pipe's drain.
     left: Option<tokio::sync::oneshot::Sender<Left>>,
     /// A server's request served without admission: the half returns to

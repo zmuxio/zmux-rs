@@ -13,6 +13,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
 use super::tokio::PipeIo;
-use crate::proto::admission::CarrierInfo;
+use crate::proto::admission::{AdmittedValue, CarrierInfo};
 use crate::proto::record::Framing;
 
 /// Reads on until `prefix` holds `need` bytes, the carrier ends, or
@@ -182,10 +183,11 @@ impl<T> Prefixed<T> {
         &self.inner
     }
 
-    /// The stream, mutably: reading it directly skips what remains of the
-    /// prefix.
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.inner
+    /// The stream, mutably, once the prefix is read: `None` while some of
+    /// it remains, since reading the stream directly would skip it. The
+    /// stream and the unread prefix together: [`Prefixed::into_parts`].
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        (self.pos == self.prefix.len()).then_some(&mut self.inner)
     }
 
     /// The prefix bytes not read yet.
@@ -254,10 +256,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
 
 /// The byte stream of a carrier taken over by a fallback
 /// ([`Takeover::into_stream`]): the connection itself (a TCP or TLS
-/// stream, a QUIC stream's two halves joined).
-pub trait TakeoverStream: AsyncRead + AsyncWrite + Send + Unpin {}
+/// stream, a QUIC stream's two halves joined). It is [`Any`], so that the
+/// host reaches the connection's own type and its capabilities (a TLS
+/// stream's connection state): [`Takeover::stream`] before taking it,
+/// `(&**prefixed.get_ref() as &dyn Any).downcast_ref::<T>()` after.
+pub trait TakeoverStream: AsyncRead + AsyncWrite + Send + Unpin + Any {}
 
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> TakeoverStream for T {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + Any> TakeoverStream for T {}
 
 /// A host's value of the connection under a carrier, for the fallback of
 /// its adapter's kind (a QUIC connection): see the adapter.
@@ -270,7 +275,12 @@ pub type ConnectionValue = Arc<dyn Any + Send + Sync>;
 pub struct AdmitIo {
     io: Box<dyn Subject>,
     connection: Option<ConnectionValue>,
+    on_return: Option<OnReturn>,
 }
+
+/// What an adapter closes of a carrier beside its parts once the
+/// fallback's future returned it ([`AdmitIo::with_on_return`]).
+type OnReturn = Box<dyn FnOnce() + Send>;
 
 impl std::fmt::Debug for AdmitIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -296,15 +306,18 @@ impl AdmitIo {
         Self {
             io: Box::new(pipe),
             connection: None,
+            on_return: None,
         }
     }
 
     /// A byte stream on one connection (a TCP or TLS stream): read
-    /// directly, made a [`PipeIo`] by `carrier` once accepted, and given to
-    /// a fallback as it is ([`Takeover::into_stream`]).
+    /// directly, made a [`PipeIo`] by `carrier` once accepted (and by a
+    /// takeover's [`Takeover::into_pipe`], so that it has every capability
+    /// `carrier` gives it), and given to a fallback as it is
+    /// ([`Takeover::into_stream`]).
     pub fn stream<C>(conn: C, carrier: impl FnOnce(C) -> PipeIo + Send + 'static) -> Self
     where
-        C: TakeoverStream + 'static,
+        C: TakeoverStream,
     {
         Self {
             io: Box::new(StreamIo {
@@ -312,6 +325,7 @@ impl AdmitIo {
                 carrier: Box::new(carrier),
             }),
             connection: None,
+            on_return: None,
         }
     }
 
@@ -320,6 +334,20 @@ impl AdmitIo {
     #[must_use]
     pub fn with_connection(mut self, connection: ConnectionValue) -> Self {
         self.connection = Some(connection);
+        self
+    }
+
+    /// With what the adapter closes of the carrier beside its parts (a
+    /// QUIC connection, a WebTransport session, an HTTP request) once a
+    /// fallback took it over and its future completed, or panicked,
+    /// without [`Takeover::detach`]. It runs once, on the fallback's own
+    /// task, whether or not the task that admitted the carrier still
+    /// waits for it (a cancelled request, a dropped connection), and also
+    /// when the runtime shuts down under the future. Not run when the
+    /// carrier goes to no fallback.
+    #[must_use]
+    pub fn with_on_return(mut self, close: impl FnOnce() + Send + 'static) -> Self {
+        self.on_return = Some(Box::new(close));
         self
     }
 
@@ -346,13 +374,22 @@ impl AdmitIo {
         std::future::poll_fn(|cx| self.io.poll_shutdown(cx)).await
     }
 
-    /// The carrier taken over, `replay` in front.
-    pub(crate) fn into_takeover(self, info: CarrierInfo, replay: Vec<u8>) -> Takeover {
+    /// The carrier taken over, `replay` in front, with the value of the
+    /// verdict that handed it over.
+    pub(crate) fn into_takeover(
+        self,
+        info: CarrierInfo,
+        replay: Vec<u8>,
+        value: Option<AdmittedValue>,
+    ) -> Takeover {
         Takeover(Box::new(TakeoverParts {
             info,
             replay,
+            value,
             io: self.io.into_takeover(),
             connection: self.connection,
+            on_return: self.on_return,
+            state: Arc::new(TakeoverState::default()),
         }))
     }
 }
@@ -401,12 +438,15 @@ impl Subject for PipeIo {
     }
 }
 
+/// How a byte stream becomes its [`PipeIo`], type-erased.
+type MakePipe = Box<dyn FnOnce(Box<dyn TakeoverStream>) -> PipeIo + Send>;
+
 struct StreamIo<C> {
     conn: C,
     carrier: Box<dyn FnOnce(C) -> PipeIo + Send>,
 }
 
-impl<C: TakeoverStream + 'static> Subject for StreamIo<C> {
+impl<C: TakeoverStream> Subject for StreamIo<C> {
     fn framing(&self) -> Framing {
         Framing::ByteStream
     }
@@ -429,14 +469,73 @@ impl<C: TakeoverStream + 'static> Subject for StreamIo<C> {
     }
 
     fn into_takeover(self: Box<Self>) -> TakeoverIo {
-        TakeoverIo::Stream(Box::new(self.conn))
+        let Self { conn, carrier } = *self;
+        let make: MakePipe = Box::new(move |s: Box<dyn TakeoverStream>| {
+            let s: Box<dyn Any> = s;
+            match s.downcast::<C>() {
+                Ok(c) => carrier(*c),
+                // The stream is the one it was made with.
+                Err(_) => unreachable!("a takeover's stream of another type"),
+            }
+        });
+        TakeoverIo::Stream(Box::new(conn), make)
     }
 }
 
 enum TakeoverIo {
     Pipe(Box<PipeIo>),
-    Stream(Box<dyn TakeoverStream>),
+    Stream(Box<dyn TakeoverStream>, MakePipe),
 }
+
+/// Whose a taken-over carrier is: the fallback's for its future, then the
+/// adapter's to close (returned), unless the host detached it first.
+#[derive(Debug, Default)]
+pub(crate) struct TakeoverState(AtomicU8);
+
+const HELD: u8 = 0;
+const DETACHED: u8 = 1;
+const RETURNED: u8 = 2;
+
+impl TakeoverState {
+    /// The fallback's future completed: whether the host detached the
+    /// carrier (else it is returned, and a later detach fails).
+    pub(crate) fn finish(&self) -> bool {
+        match self
+            .0
+            .compare_exchange(HELD, RETURNED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => false,
+            Err(s) => s == DETACHED,
+        }
+    }
+
+    fn is_detached(&self) -> bool {
+        self.0.load(Ordering::Acquire) == DETACHED
+    }
+
+    fn detach(&self) -> Result<(), TakeoverReturned> {
+        match self
+            .0
+            .compare_exchange(HELD, DETACHED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(DETACHED) => Ok(()),
+            Err(_) => Err(TakeoverReturned),
+        }
+    }
+}
+
+/// [`Takeover::detach`] after the fallback's future completed: what the
+/// adapter held of the carrier is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakeoverReturned;
+
+impl std::fmt::Display for TakeoverReturned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the fallback's future completed before the takeover was detached")
+    }
+}
+
+impl std::error::Error for TakeoverReturned {}
 
 /// A carrier the listener's admission hands to the host
 /// ([`crate::ListenerConfig::fallback`]): on
@@ -444,24 +543,42 @@ enum TakeoverIo {
 /// prefix that [`Admission::with_fallback_on_peek_timeout`](crate::Admission::with_fallback_on_peek_timeout)
 /// gave up on, whatever entry took it (a TCP or TLS stream, a WebSocket
 /// after a deferred decision, a QUIC connection's or a WebTransport
-/// session's first stream, a [`PipeIo`] given to
-/// [`Listener::handle_pipe`](crate::Listener::handle_pipe)). What was read
-/// of it is replayed: the bytes of a byte stream, the first message of a
-/// message-framed carrier (always a whole binary message: a carrier whose
-/// first read fails is closed without a decision).
+/// session's first stream, an HTTP request carrier decided on its body, a
+/// [`PipeIo`] given to [`Listener::handle_pipe`](crate::Listener::handle_pipe)).
+/// What was read of it is replayed: the bytes of a byte stream, the first
+/// message of a message-framed carrier (always a whole, non-empty binary
+/// message: a carrier whose first read fails is closed without a
+/// decision).
 ///
-/// The carrier is the fallback's for its future: everything of it that
-/// the future owns is dropped, and so closed, when it completes, and the
-/// adapter closes what it holds of the carrier then (a QUIC connection, a
-/// WebTransport session). A host that serves the carrier does so inside
-/// the future.
+/// # Ownership
+///
+/// The carrier's parts are owned values: whoever holds a part closes it,
+/// once, by shutting it down or dropping it (the host, or the library when
+/// the fallback's future drops what it did not take). A part closes on its
+/// own: the sending half shut down, the receiving one read on to its end.
+///
+/// The fallback's future is the call: it runs on a task of its own, from
+/// the admission to its completion, at every entry point. Nothing the entry
+/// does (the listener's close, the setup bound of
+/// [`Listener::serve_connections`](crate::Listener::serve_connections), a
+/// cancelled HTTP request) cancels it. When it completes, the adapter
+/// closes what it holds of the carrier beside its parts (the QUIC
+/// connection of a stream, the WebTransport session, the HTTP request of a
+/// request carrier, whose response is then reset if not ended), unless the
+/// host called [`Takeover::detach`] in the future: all of it is then the
+/// host's, to serve on any task after the future completed and to close
+/// once done.
 pub struct Takeover(Box<TakeoverParts>);
 
 struct TakeoverParts {
     info: CarrierInfo,
     replay: Vec<u8>,
+    value: Option<AdmittedValue>,
     io: TakeoverIo,
     connection: Option<ConnectionValue>,
+    /// Taken by [`Fallback::serve`], never the host's.
+    on_return: Option<OnReturn>,
+    state: Arc<TakeoverState>,
 }
 
 impl std::fmt::Debug for Takeover {
@@ -470,6 +587,7 @@ impl std::fmt::Debug for Takeover {
             .field("info", &self.0.info)
             .field("replayed", &self.0.replay.len())
             .field("stream", &self.has_stream())
+            .field("value", &self.0.value.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -494,6 +612,16 @@ impl Takeover {
         &self.0.replay
     }
 
+    /// The host's value of the verdict that handed the carrier over
+    /// ([`AdmissionVerdict::with_value`](crate::AdmissionVerdict::with_value)
+    /// on [`AdmissionVerdict::Fallback`](crate::AdmissionVerdict::Fallback)):
+    /// its routing of the carrier to a service of its own; `None` without
+    /// one, and after a peek timeout.
+    #[must_use]
+    pub fn value(&self) -> Option<&AdmittedValue> {
+        self.0.value.as_ref()
+    }
+
     /// The connection under the carrier, as its adapter gives it (a
     /// `quinn::Connection`): downcast it, or use the adapter's accessor.
     #[must_use]
@@ -505,26 +633,69 @@ impl Takeover {
     /// ([`Takeover::into_stream`] gives it).
     #[must_use]
     pub fn has_stream(&self) -> bool {
-        matches!(self.0.io, TakeoverIo::Stream(_))
+        matches!(self.0.io, TakeoverIo::Stream(..))
+    }
+
+    /// The byte stream of a carrier on one connection as its own type `T`
+    /// (a TLS stream, for its connection state), before it is taken.
+    #[must_use]
+    pub fn stream<T: Any>(&self) -> Option<&T> {
+        match &self.0.io {
+            TakeoverIo::Stream(s, _) => (&**s as &dyn Any).downcast_ref::<T>(),
+            TakeoverIo::Pipe(_) => None,
+        }
+    }
+
+    /// Makes the carrier the host's for good: the adapter does not close
+    /// what it holds of it when the fallback's future completes (see
+    /// [`Takeover`]), so that the host may hand the carrier, or what it
+    /// made of it, to another task and complete. The host then closes all
+    /// of it once done: dropping or shutting down its parts, and the
+    /// adapter's connection, if it took it ([`Takeover::connection`]). A
+    /// second call is `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// [`TakeoverReturned`] once the future completed without it (the host
+    /// moved the takeover out of the future): what the adapter held is
+    /// closed then.
+    pub fn detach(&self) -> Result<(), TakeoverReturned> {
+        self.0.state.detach()
+    }
+
+    /// Whether [`Takeover::detach`] made the carrier the host's.
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        self.0.state.is_detached()
     }
 
     /// The carrier as a pipe, what was read replayed first: on a
     /// message-framed carrier the first message is the first message read
-    /// again. Read and write it by units with [`PipeIo::read_handshake`]
-    /// and [`PipeIo::write_handshake`] (a message each on a message-framed
-    /// carrier).
+    /// again. It is the carrier an acceptance would have handed on, with
+    /// every capability of it (TLS state, exporter, Bound contract, failure
+    /// reporting, carrier connection, lanes, abort, close code, unsent and
+    /// retransmission counts, ...): the [`PipeIo`] is the one place a
+    /// carrier's capabilities are kept, and a takeover moves it as a whole.
+    /// Read and write it by units with [`PipeIo::read_handshake`] and
+    /// [`PipeIo::write_handshake`] (a message each on a message-framed
+    /// carrier, see also [`Takeover::into_messages`]), or as a stream with
+    /// [`PipeIo::into_stream`]; both read the replay first.
     #[must_use]
     pub fn into_pipe(self) -> PipeIo {
         let TakeoverParts { io, replay, .. } = *self.0;
         match io {
             TakeoverIo::Pipe(p) => p.with_prefix(replay),
-            TakeoverIo::Stream(s) => PipeIo::new(s).with_prefix(replay),
+            TakeoverIo::Stream(s, make) => make(s).with_prefix(replay),
         }
     }
 
     /// The carrier as the byte stream it is on one connection, with the
     /// same replay in front ([`Prefixed`]): once it is read, reads go to
-    /// the connection itself. `Err(self)` when the carrier is not one
+    /// the connection itself, which [`Prefixed::get_mut`] gives only then
+    /// (no direct read skips the replay; [`Prefixed::into_parts`] hands
+    /// the connection and what remains of the replay together). The
+    /// capabilities are the stream's own, through its type
+    /// ([`TakeoverStream`]). `Err(self)` when the carrier is not one
     /// ([`Takeover::has_stream`]): use [`Takeover::into_pipe`].
     ///
     /// # Errors
@@ -533,17 +704,203 @@ impl Takeover {
     pub fn into_stream(self) -> Result<Prefixed<Box<dyn TakeoverStream>>, Self> {
         let parts = *self.0;
         match parts.io {
-            TakeoverIo::Stream(s) => Ok(Prefixed::new(s, parts.replay)),
+            TakeoverIo::Stream(s, _) => Ok(Prefixed::new(s, parts.replay)),
             io @ TakeoverIo::Pipe(_) => Err(Self(Box::new(TakeoverParts { io, ..parts }))),
         }
     }
+
+    /// The halves of a message-framed carrier ([`Framing::Records`], such
+    /// as a WebSocket), read and written by whole messages, the first one
+    /// read again first. `Err(self)` for a byte stream.
+    ///
+    /// # Errors
+    ///
+    /// The takeover, unchanged, for a carrier that is not message-framed.
+    pub fn into_messages(self) -> Result<Messages, Self> {
+        if self.framing() != Framing::Records {
+            return Err(self);
+        }
+        Ok(Messages {
+            io: self.into_pipe(),
+            buf: Vec::new(),
+        })
+    }
+}
+
+/// A taken-over message-framed carrier ([`Takeover::into_messages`]): each
+/// read a whole message, each write one, the replayed first message
+/// first. The [`PipeIo`] under it keeps the carrier's capabilities.
+#[derive(Debug)]
+pub struct Messages {
+    io: PipeIo,
+    /// The read buffer, reused across reads.
+    buf: Vec<u8>,
+}
+
+impl Messages {
+    /// The next message, of at most `max` bytes (a longer one is an
+    /// error, its message discarded: the replayed first message too);
+    /// `None` at the carrier's end.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's read error, one for a message over `max`, or
+    /// [`io::ErrorKind::UnexpectedEof`] without a receiving half.
+    pub async fn read_message(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+        let p = &mut self.io;
+        read_unit(&mut p.prefix, p.reader.as_mut(), &mut self.buf, max).await
+    }
+
+    /// Writes `message` as one message.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's write error, or [`io::ErrorKind::BrokenPipe`] without
+    /// a sending half.
+    pub async fn write_message(&mut self, message: &[u8]) -> io::Result<()> {
+        super::sealed::write_unit(&mut self.io, message).await
+    }
+
+    /// Ends the sending half gracefully; the receiving half reads on.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's error.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| match self.io.writer.as_mut() {
+            Some(w) => w.poll_shutdown(cx),
+            None => Poll::Ready(Ok(())),
+        })
+        .await
+    }
+
+    /// The carrier, with its capabilities.
+    #[must_use]
+    pub fn get_ref(&self) -> &PipeIo {
+        &self.io
+    }
+
+    /// The carrier as a pipe, what remains of the replay in front.
+    #[must_use]
+    pub fn into_inner(self) -> PipeIo {
+        self.io
+    }
+
+    /// The two halves, owned, to read and write from two tasks at once:
+    /// the reader gets the receiving half and what remains of the replayed
+    /// first message, the writer the sending half and the carrier's other
+    /// capabilities ([`MessageWriter::get_ref`]). Each half closes its own
+    /// part once, when dropped.
+    #[must_use]
+    pub fn split(self) -> (MessageReader, MessageWriter) {
+        let mut io = self.io;
+        let reader = MessageReader {
+            reader: io.reader.take(),
+            replay: std::mem::take(&mut io.prefix),
+            buf: self.buf,
+        };
+        (reader, MessageWriter(io))
+    }
+}
+
+/// The receiving half of a split [`Messages`] ([`Messages::split`]).
+pub struct MessageReader {
+    reader: Option<super::tokio::Reader>,
+    replay: Vec<u8>,
+    buf: Vec<u8>,
+}
+
+impl std::fmt::Debug for MessageReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageReader")
+            .field("replayed", &self.replay.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MessageReader {
+    /// The next message, as [`Messages::read_message`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Messages::read_message`].
+    pub async fn read_message(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+        read_unit(&mut self.replay, self.reader.as_mut(), &mut self.buf, max).await
+    }
+}
+
+/// The sending half of a split [`Messages`] ([`Messages::split`]), with
+/// the carrier's capabilities.
+#[derive(Debug)]
+pub struct MessageWriter(PipeIo);
+
+impl MessageWriter {
+    /// Writes `message` as one message.
+    ///
+    /// # Errors
+    ///
+    /// As [`Messages::write_message`].
+    pub async fn write_message(&mut self, message: &[u8]) -> io::Result<()> {
+        super::sealed::write_unit(&mut self.0, message).await
+    }
+
+    /// Ends the sending half gracefully.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's error.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| match self.0.writer.as_mut() {
+            Some(w) => w.poll_shutdown(cx),
+            None => Poll::Ready(Ok(())),
+        })
+        .await
+    }
+
+    /// The carrier, with its capabilities (its receiving half is the
+    /// reader's).
+    #[must_use]
+    pub fn get_ref(&self) -> &PipeIo {
+        &self.0
+    }
+}
+
+/// One message of at most `max` bytes: the replayed one first, then the
+/// carrier's, read into `buf` (reused, grown to the largest `max`) and
+/// copied out at its own length.
+async fn read_unit<R: AsyncRead + Unpin + ?Sized>(
+    replay: &mut Vec<u8>,
+    reader: Option<&mut R>,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    if !replay.is_empty() {
+        let first = std::mem::take(replay);
+        if first.len() > max {
+            return Err(crate::adapter::message_too_large());
+        }
+        return Ok(Some(first));
+    }
+    let r = reader.ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?;
+    let room = max.max(1);
+    if buf.len() < room {
+        buf.resize(room, 0);
+    }
+    let mut rb = ReadBuf::new(&mut buf[..room]);
+    std::future::poll_fn(|cx| Pin::new(&mut *r).poll_read(cx, &mut rb)).await?;
+    let n = rb.filled().len();
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(buf[..n].to_vec()))
 }
 
 type FallbackFn = dyn Fn(Takeover) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
 
 /// The listener's fallback ([`crate::ListenerConfig::fallback`]): a
 /// handler given every carrier the admission hands back, as a
-/// [`Takeover`]. A handler that panics closes that carrier, not the
+/// [`Takeover`]. Its future runs on a task of its own (see
+/// [`Takeover`]). A handler that panics closes that carrier, not the
 /// process: a peer reaches it with any bytes that are not zmux's. Cheap
 /// to clone.
 #[derive(Clone)]
@@ -553,6 +910,15 @@ impl std::fmt::Debug for Fallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Fallback(..)")
     }
+}
+
+/// How a fallback's future ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Served {
+    /// The handler panicked.
+    pub(crate) panicked: bool,
+    /// The host detached the carrier.
+    pub(crate) detached: bool,
 }
 
 impl Fallback {
@@ -565,14 +931,48 @@ impl Fallback {
         Self(Arc::new(move |t| Box::pin(f(t))))
     }
 
-    /// Serves `takeover` to its end: `false` when the handler panicked.
-    pub(crate) async fn serve(&self, takeover: Takeover) -> bool {
-        let handler = &self.0;
-        let fut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(takeover)));
-        let Ok(fut) = fut else {
-            return false;
+    /// Serves `takeover` to its end, on a task of its own: the caller's
+    /// cancellation does not end it, and the end of the future (completed,
+    /// panicked, or dropped by the runtime's shutdown) is acted on there:
+    /// the takeover returned unless detached, and the adapter's
+    /// [`AdmitIo::with_on_return`] run then.
+    pub(crate) async fn serve(&self, mut takeover: Takeover) -> Served {
+        let state = takeover.0.state.clone();
+        let end = Returned {
+            state: state.clone(),
+            on_return: takeover.0.on_return.take(),
         };
-        crate::proto::Decision::Later(fut).settle().await.is_some()
+        let handler = self.0.clone();
+        let task = tokio::spawn(async move {
+            let _end = end;
+            handler(takeover).await;
+        });
+        let panicked = match task.await {
+            Ok(()) => false,
+            // A runtime shutting down cancelled it: no failure of the host.
+            Err(e) => e.is_panic(),
+        };
+        Served {
+            panicked,
+            detached: state.is_detached(),
+        }
+    }
+}
+
+/// The end of a fallback's future, however it ends: dropped with its
+/// task.
+struct Returned {
+    state: Arc<TakeoverState>,
+    on_return: Option<OnReturn>,
+}
+
+impl Drop for Returned {
+    fn drop(&mut self) {
+        if !self.state.finish()
+            && let Some(close) = self.on_return.take()
+        {
+            close();
+        }
     }
 }
 
@@ -673,5 +1073,271 @@ mod tests {
         let mut r = Messages(vec![Err(crate::adapter::message_too_large()), Ok(vec![1])].into());
         discard(&mut r, 16, Duration::from_secs(5), false).await;
         assert_eq!(r.0.len(), 1);
+    }
+
+    /// A carrier with every capability a host can declare.
+    fn capable(io: PipeIo) -> PipeIo {
+        let conn = Arc::new(());
+        io.with_abort(|| {})
+            .with_exporter(|_, _, out| {
+                out.fill(7);
+                true
+            })
+            .with_protocol("p")
+            .with_carrier(crate::CarrierKind::Streaming)
+            .with_variant("v")
+            .with_terminated_tls(|| Some(crate::TlsState::new(Some(b"h2".to_vec()), None)))
+            .with_unsent(|| Some(1))
+            .with_retransmitted(|| Some(2))
+            .with_handshake_padding(3)
+            .with_write_overhead(4)
+            .with_max_record(16_384)
+            .unwrap()
+            .with_carrier_secure()
+            .with_secure_first_pipe(crate::proto::seal::RecordMode::Bound)
+            .with_admitted(Arc::new(5u8))
+            .with_low_water()
+            .with_partial_reads()
+            .with_carrier_conn(super::super::lanes::CarrierConnId::new(&conn))
+            .with_lanes(true)
+            .with_connection_memory(6)
+            .with_taken(|| {})
+            .with_close_code(|_| {})
+            .with_drain(async {}, Duration::from_secs(1))
+            .with_reports_failure(true)
+    }
+
+    /// Every capability of a carrier reaches the host through a takeover,
+    /// of either kind of carrier: the [`PipeIo`] is the one place they are
+    /// kept, and the takeover moves it whole. The destructuring has no
+    /// rest pattern: a new field fails to compile here until it is
+    /// classified.
+    fn assert_forwarded(p: PipeIo, replay: &[u8]) {
+        let PipeIo {
+            reader,
+            writer,
+            framing,
+            abort,
+            exporter,
+            // Set with early data only; part of the moved carrier.
+            exporter_ready: _,
+            protocol,
+            carrier,
+            variant,
+            tls,
+            prefix,
+            // A TCP socket's: part of the moved carrier.
+            socket: _,
+            unsent,
+            retransmitted,
+            handshake_padding,
+            write_overhead,
+            max_record,
+            secure,
+            // A paired split carrier's, which is never taken over.
+            split: _,
+            first_mode,
+            admitted,
+            low_water,
+            partial_reads,
+            // A stream carrier's outer session: part of the moved carrier.
+            outer: _,
+            lanes,
+            conn_memory,
+            // Carrier early data: part of the moved carrier.
+            early: _,
+            taken,
+            // A split bootstrap's, which is never taken over.
+            split_bootstrap: _,
+            close_code,
+            drain,
+            reports_failure,
+        } = p;
+        assert!(reader.is_some() && writer.is_some());
+        assert_eq!(framing, Framing::ByteStream);
+        assert!(abort.is_some() && exporter.is_some() && tls.is_some());
+        assert_eq!(protocol.as_deref(), Some("p"));
+        assert_eq!(carrier, Some(crate::CarrierKind::Streaming));
+        assert_eq!(variant.as_deref(), Some("v"));
+        assert_eq!(prefix, replay);
+        assert!(unsent.is_some() && retransmitted.is_some());
+        assert_eq!((handshake_padding, write_overhead), (3, 4));
+        assert_eq!(max_record, Some(16_384));
+        assert!(secure && low_water && partial_reads && reports_failure);
+        assert_eq!(first_mode, Some(crate::proto::seal::RecordMode::Bound));
+        assert!(admitted.is_some());
+        let lanes = lanes.expect("lane capabilities");
+        assert!(lanes.conn.is_some() && lanes.on == Some(true));
+        assert_eq!(conn_memory, 6);
+        assert!(taken.is_some() && close_code.is_some() && drain.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_takeover_forwards_every_capability() {
+        let info = CarrierInfo::new();
+        // A carrier given as a pipe.
+        let (a, _b) = tokio::io::duplex(64);
+        let io = AdmitIo::pipe(capable(PipeIo::new(a)));
+        let t = io.into_takeover(info.clone(), b"replay".to_vec(), None);
+        assert_forwarded(t.into_pipe(), b"replay");
+        // A byte stream, made a pipe as an acceptance would.
+        let (a, _b) = tokio::io::duplex(64);
+        let io = AdmitIo::stream(a, |s| capable(PipeIo::new(s)));
+        let t = io.into_takeover(info, b"replay".to_vec(), None);
+        assert!(t.stream::<tokio::io::DuplexStream>().is_some());
+        assert_forwarded(t.into_pipe(), b"replay");
+    }
+
+    /// A message-framed carrier taken over, `first` replayed.
+    fn messages(first: &[u8]) -> (super::Messages, tokio::io::DuplexStream) {
+        let (a, b) = tokio::io::duplex(1024);
+        let info = CarrierInfo::new().with_framing(Framing::Records);
+        let t = AdmitIo::pipe(PipeIo::new(a).records()).into_takeover(info, first.to_vec(), None);
+        (t.into_messages().expect("message-framed"), b)
+    }
+
+    #[tokio::test]
+    async fn the_replayed_message_is_bounded_too() {
+        let (mut m, _b) = messages(b"0123456789");
+        let e = m.read_message(4).await.unwrap_err();
+        assert_eq!(e.kind(), crate::adapter::message_too_large().kind());
+        let (mut m, _b) = messages(b"0123");
+        assert_eq!(m.read_message(4).await.unwrap(), Some(b"0123".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn message_reads_reuse_one_buffer() {
+        let (mut m, mut b) = messages(b"x");
+        m.read_message(16).await.unwrap();
+        for msg in [&b"ab"[..], b"cde"] {
+            b.write_all(msg).await.unwrap();
+            assert_eq!(m.read_message(64).await.unwrap().as_deref(), Some(msg));
+        }
+        assert_eq!(m.buf.len(), 64, "grown once, to the largest bound");
+        let p = m.buf.as_ptr();
+        b.write_all(b"f").await.unwrap();
+        m.read_message(8).await.unwrap();
+        assert_eq!(m.buf.as_ptr(), p, "not reallocated");
+    }
+
+    /// The halves of a split carrier work from two tasks: a read pending
+    /// on one does not hold up writes on the other.
+    #[tokio::test]
+    async fn split_messages_are_full_duplex() {
+        let (m, b) = messages(b"first");
+        let (mut r, mut w) = m.split();
+        assert_eq!(r.read_message(16).await.unwrap(), Some(b"first".to_vec()));
+        let reading = tokio::spawn(async move { (r.read_message(16).await, r) });
+        tokio::task::yield_now().await;
+        assert!(!reading.is_finished(), "the read waits for a message");
+        let (mut br, mut bw) = tokio::io::split(b);
+        for msg in [&b"one"[..], b"two"] {
+            w.write_message(msg).await.unwrap();
+            let mut got = vec![0; msg.len()];
+            br.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, msg);
+        }
+        assert!(!reading.is_finished());
+        bw.write_all(b"back").await.unwrap();
+        let (got, r) = reading.await.unwrap();
+        assert_eq!(got.unwrap(), Some(b"back".to_vec()));
+        // Each half ends its own part.
+        w.shutdown().await.unwrap();
+        let mut end = Vec::new();
+        br.read_to_end(&mut end).await.unwrap();
+        assert_eq!(end, b"");
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn prefixed_gives_the_stream_only_after_the_replay() {
+        let (mut a, b) = tokio::io::duplex(64);
+        a.write_all(b"!").await.unwrap();
+        let mut p = Prefixed::new(b, b"ab".to_vec());
+        assert!(p.get_mut().is_none(), "the replay is unread");
+        let mut one = [0u8; 1];
+        p.read_exact(&mut one).await.unwrap();
+        assert!(p.get_mut().is_none(), "one byte of it remains");
+        p.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"b");
+        let inner = p.get_mut().expect("the replay is read");
+        inner.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"!");
+    }
+
+    /// The fallback's future ends on its own task even when the admitting
+    /// future is dropped: the takeover is returned (a later detach fails)
+    /// and the adapter's close runs.
+    #[tokio::test]
+    async fn a_dropped_admission_still_returns_the_takeover() {
+        use std::sync::atomic::AtomicBool;
+        let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+        let (held_tx, held) = tokio::sync::oneshot::channel::<Takeover>();
+        let go = std::sync::Mutex::new(Some((go, held_tx)));
+        let f = Fallback::new(move |t: Takeover| {
+            let (go, held_tx) = go.lock().unwrap().take().unwrap();
+            async move {
+                let _ = go.await;
+                // The host keeps the takeover past its future.
+                let _ = held_tx.send(t);
+            }
+        });
+        let closed = Arc::new(AtomicBool::new(false));
+        let c = closed.clone();
+        let (a, _b) = tokio::io::duplex(64);
+        let t = AdmitIo::pipe(PipeIo::new(a))
+            .with_on_return(move || c.store(true, Ordering::SeqCst))
+            .into_takeover(CarrierInfo::new(), Vec::new(), None);
+        let mut serving = Box::pin(f.serve(t));
+        assert!(futures_poll_once(serving.as_mut()).await.is_none());
+        drop(serving);
+        assert!(!closed.load(Ordering::SeqCst), "held while the future runs");
+        go_tx.send(()).unwrap();
+        let t = held.await.unwrap();
+        // The future completed: returned, closed.
+        tokio::task::yield_now().await;
+        assert!(closed.load(Ordering::SeqCst), "the adapter's close ran");
+        assert_eq!(t.detach(), Err(TakeoverReturned));
+    }
+
+    /// A panicking fallback is reported, the carrier closed.
+    #[tokio::test]
+    async fn a_panicking_fallback_closes_the_carrier() {
+        use std::sync::atomic::AtomicBool;
+        let f = Fallback::new(|_t: Takeover| async move { panic!("host bug") });
+        let closed = Arc::new(AtomicBool::new(false));
+        let c = closed.clone();
+        let (a, _b) = tokio::io::duplex(64);
+        let t = AdmitIo::pipe(PipeIo::new(a))
+            .with_on_return(move || c.store(true, Ordering::SeqCst))
+            .into_takeover(CarrierInfo::new(), Vec::new(), None);
+        let served = f.serve(t).await;
+        assert!(served.panicked && !served.detached);
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    /// A detached takeover leaves the close to the host.
+    #[tokio::test]
+    async fn a_detached_takeover_is_not_closed() {
+        use std::sync::atomic::AtomicBool;
+        let f = Fallback::new(|t: Takeover| async move { t.detach().unwrap() });
+        let closed = Arc::new(AtomicBool::new(false));
+        let c = closed.clone();
+        let (a, _b) = tokio::io::duplex(64);
+        let t = AdmitIo::pipe(PipeIo::new(a))
+            .with_on_return(move || c.store(true, Ordering::SeqCst))
+            .into_takeover(CarrierInfo::new(), Vec::new(), None);
+        let served = f.serve(t).await;
+        assert!(served.detached && !served.panicked);
+        assert!(!closed.load(Ordering::SeqCst));
+    }
+
+    /// Polls `f` once.
+    async fn futures_poll_once<F: Future + Unpin>(mut f: F) -> Option<F::Output> {
+        std::future::poll_fn(|cx| match Pin::new(&mut f).poll(cx) {
+            Poll::Ready(v) => Poll::Ready(Some(v)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await
     }
 }

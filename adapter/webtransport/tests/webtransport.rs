@@ -332,7 +332,7 @@ async fn an_admission_decides_on_the_session_request() {
         assert!(info.has_exporter());
         match req.url.path() {
             "/zmux" => zmux::AdmissionVerdict::accept(0),
-            _ => zmux::AdmissionVerdict::Fallback,
+            _ => zmux::AdmissionVerdict::fallback(),
         }
     });
     let opts = Options::default();
@@ -379,7 +379,7 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
         match classify_first_bytes(prefix, info.framing) {
             FirstBytes::Record => AdmissionVerdict::accept(0),
             FirstBytes::NeedMore(n) => AdmissionVerdict::More { need: n },
-            FirstBytes::Other => AdmissionVerdict::Fallback,
+            FirstBytes::Other => AdmissionVerdict::fallback(),
         }
     })
     .with_max_peek(zmux::adapter::MAX_FIRST_BYTES)

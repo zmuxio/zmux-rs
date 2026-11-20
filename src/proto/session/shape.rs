@@ -900,6 +900,24 @@ impl SessionCore {
         }
     }
 
+    /// Records whether `pipe`'s carrier reports its own failure (its reads
+    /// or writes fail when its path fails): its stall then never fails it
+    /// unless its own dead timeout is set. Set when the pipe is created;
+    /// `false` when there is no such pipe.
+    pub fn set_pipe_reports_failure(&mut self, pipe: PipeId, on: bool) -> bool {
+        let c = self.config.liveness;
+        let Some(a) = self.att_mut(pipe.0) else {
+            return false;
+        };
+        a.set_carrier_reports_failure(on);
+        let own = a.own_liveness();
+        let dead = crate::proto::session::path::mpath::dead_timeout_of(&c, own.dead_timeout, on);
+        if let Some(o) = a.out_mut() {
+            o.set_detection_limits(own.suspect_floor.or(c.suspect_floor), dead);
+        }
+        true
+    }
+
     /// Records the kind of pipe `pipe`'s carrier: the [`ShapedPipe`] a
     /// shaper factory sees, and the kind in pipe events and statistics.
     /// Set it before the pipe's first record is made (on the bootstrap

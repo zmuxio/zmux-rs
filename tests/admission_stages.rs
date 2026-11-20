@@ -129,7 +129,7 @@ fn defer_then(ok: &'static [u8]) -> impl Fn(&CarrierInfo, &[u8]) -> AdmissionVer
         } else if p == ok {
             AdmissionVerdict::accept(0)
         } else {
-            AdmissionVerdict::Fallback
+            AdmissionVerdict::fallback()
         }
     }
 }
@@ -451,7 +451,7 @@ async fn panics_in_the_decision_and_the_fallback_close_the_carrier() {
         }
     });
     let l = listener(
-        Admission::new(1, |_, _| AdmissionVerdict::Fallback),
+        Admission::new(1, |_, _| AdmissionVerdict::fallback()),
         Some(fallback),
     );
     for _ in 0..2 {

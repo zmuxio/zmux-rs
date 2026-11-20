@@ -150,7 +150,7 @@ async fn stall_sends_nothing_and_ends_with_the_peer() {
 
 #[tokio::test]
 async fn fallback_without_a_target_stalls() {
-    let admission = Admission::new(4, |_, _| AdmissionVerdict::Fallback)
+    let admission = Admission::new(4, |_, _| AdmissionVerdict::fallback())
         .with_stall_interval(Duration::from_millis(50), Duration::from_millis(100));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();

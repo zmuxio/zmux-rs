@@ -222,6 +222,10 @@ impl HandshakeWait {
 
 /// A carrier for a blocking session: a readable half, a writable half, or
 /// both.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent properties of the carrier"
+)]
 pub struct PipeIo {
     wait: HandshakeWait,
     reader: Option<Box<dyn Read + Send>>,
@@ -251,6 +255,8 @@ pub struct PipeIo {
     secure: bool,
     /// Two halves paired as one carrier.
     split: bool,
+    /// The carrier reports its own failure.
+    pub(crate) reports_failure: bool,
     /// The largest record the carrier takes.
     max_record: Option<usize>,
     /// The record mode of an Establish this carrier ran.
@@ -266,6 +272,7 @@ impl PipeIo {
         uplink.reader = downlink.reader.take();
         uplink.split = true;
         uplink.secure &= downlink.secure;
+        uplink.reports_failure &= downlink.reports_failure;
         // Both halves end with the attachment.
         uplink.closer = match (uplink.closer.take(), downlink.closer.take()) {
             (Some(a), Some(b)) => Some(Box::new(move |how| {
@@ -290,6 +297,31 @@ impl PipeIo {
     pub fn with_carrier_secure(mut self) -> Self {
         self.secure = true;
         self
+    }
+
+    /// Declares whether the carrier reports its own failure: when the path
+    /// under it fails, its reads or writes fail (an error, a reset, an
+    /// unexpected end), as a stream of an outer session does when that
+    /// session's liveness ends it (the tokio `PipeIo::from_stream` sets it). The
+    /// pipe's stall then never fails it: a carrier queued behind a rate
+    /// limit stalls without being dead, and its own end is the failure
+    /// signal. The stalled pipe still turns suspect, is avoided and probed.
+    /// The pipe's own [`PipeLiveness::dead_timeout`](crate::PipeLiveness::dead_timeout)
+    /// overrides it. A transform that fails when the carrier below it
+    /// fails keeps it. Two one-way halves made one carrier
+    /// (`PipeIo::paired_join`) report their failure only if both do: a
+    /// half that does not (a raw TCP stream) can stall silently.
+    #[must_use]
+    pub fn with_reports_failure(mut self, on: bool) -> Self {
+        self.reports_failure = on;
+        self
+    }
+
+    /// Whether the carrier reports its own failure
+    /// ([`PipeIo::with_reports_failure`]).
+    #[must_use]
+    pub fn reports_failure(&self) -> bool {
+        self.reports_failure
     }
 
     /// The carrier ran an Establish with this record mode: a session's first pipe is then
@@ -517,6 +549,7 @@ impl PipeIo {
         Self {
             secure: false,
             split: false,
+            reports_failure: false,
             max_record: None,
             first_mode: None,
             wait: HandshakeWait::default(),
@@ -577,6 +610,7 @@ impl PipeIo {
             handshake_padding: 0,
             secure: false,
             split: false,
+            reports_failure: false,
             max_record: None,
             first_mode: None,
             wait: HandshakeWait::default(),
@@ -1012,6 +1046,7 @@ impl Driver for Blocking {
             max_record: carrier.max_record,
             handshake_padding: carrier.handshake_padding,
             secure: carrier.secure,
+            reports_failure: carrier.reports_failure,
             split: carrier.split,
             first_mode: carrier.first_mode,
             admitted: carrier.admitted.take(),
@@ -2785,5 +2820,24 @@ impl std::fmt::Debug for Io {
 impl std::fmt::Debug for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Deferred").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PipeIo;
+
+    /// A split carrier reports its own failure only if both halves do: a
+    /// half that does not can stall silently, so stall death stays on.
+    #[test]
+    fn split_halves_report_failure_only_together() {
+        for (up, down) in [(false, false), (true, false), (false, true), (true, true)] {
+            let up_half = PipeIo::writer(std::io::sink()).with_reports_failure(up);
+            let down_half = PipeIo::reader(std::io::empty()).with_reports_failure(down);
+            assert_eq!(
+                PipeIo::paired_join(up_half, down_half).reports_failure(),
+                up && down
+            );
+        }
     }
 }

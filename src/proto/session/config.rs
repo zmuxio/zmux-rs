@@ -362,12 +362,12 @@ impl fmt::Debug for AuthorizeJoin {
 ///
 /// ```
 /// use std::time::Duration;
-/// use zmux::{Cap, Config, Liveness};
+/// use zmux::{Config, DeadTimeout, Liveness};
 ///
 /// let mut config = Config::default();
 /// config.liveness = Liveness {
 ///     keep_alive_period: None,
-///     dead_timeout: Cap::Fixed(Duration::from_secs(5)),
+///     dead_timeout: DeadTimeout::After(Duration::from_secs(5)),
 ///     ..Liveness::default()
 /// };
 /// assert!(config.liveness.validate().is_ok());
@@ -386,11 +386,11 @@ pub struct Liveness {
     /// The floor of `T_suspect` for every pipe (default 250 ms, at least
     /// 50 ms).
     pub suspect_floor: Duration,
-    /// How long a suspect pipe stays suspect before it fails, effective
-    /// `max(T_suspect`, `dead_timeout`). [`Cap::Auto`] (the default) is `T_fail`
-    /// with resume and `max(T_fail`, half the idle timeout) without; a fixed
-    /// value is at least 1 s.
-    pub dead_timeout: Cap<Duration>,
+    /// How long a suspect pipe stays suspect before it fails
+    /// ([`DeadTimeout`]; default [`DeadTimeout::Auto`]). A pipe whose
+    /// carrier reports its own failure has it off unless its own
+    /// [`PipeLiveness::dead_timeout`](crate::PipeLiveness::dead_timeout) is set.
+    pub dead_timeout: DeadTimeout,
     /// How often standby pipes and pipes of a less-preferred tier get a
     /// `PIPE_PING` while the session is busy, a traffic frame having been
     /// sent or received within the last 15 s (default
@@ -427,7 +427,7 @@ impl Default for Liveness {
         Self {
             keep_alive_period: Some(DEFAULT_KEEP_ALIVE_PERIOD),
             suspect_floor: DEFAULT_SUSPECT_FLOOR,
-            dead_timeout: Cap::Auto,
+            dead_timeout: DeadTimeout::Auto,
             standby_probe: Some(DEFAULT_STANDBY_PROBE),
             probe_interval: Some(DEFAULT_PROBE_INTERVAL),
             probe_jitter: DEFAULT_PROBE_JITTER,
@@ -444,9 +444,7 @@ impl Liveness {
         if self.suspect_floor < Duration::from_millis(50) {
             return Err(e("liveness.suspect_floor", "below 50 ms"));
         }
-        if matches!(self.dead_timeout, Cap::Fixed(d) if d < Duration::from_secs(1)) {
-            return Err(e("liveness.dead_timeout", "below 1 s"));
-        }
+        self.dead_timeout.validate()?;
         if !(0.0..1.0).contains(&self.probe_jitter) {
             return Err(e("liveness.probe_jitter", "outside [0, 1)"));
         }
@@ -461,13 +459,37 @@ impl Liveness {
         }
         Ok(())
     }
+}
 
-    /// The dead timeout of a fixed setting; `None` for the derived one.
-    pub(crate) fn dead_timeout(&self) -> Option<Duration> {
-        match self.dead_timeout {
-            Cap::Fixed(d) => Some(d),
-            Cap::Auto => None,
+/// How long a suspect pipe stays suspect before it fails
+/// ([`Liveness::dead_timeout`], [`PipeLiveness::dead_timeout`](crate::PipeLiveness::dead_timeout)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DeadTimeout {
+    /// Derived: effective `max(T_suspect`, `T_fail`) with resume and
+    /// `max(T_fail`, half the idle timeout) without.
+    #[default]
+    Auto,
+    /// Effective `max(T_suspect`, this); at least 1 s, any larger value is
+    /// safe (deadlines beyond the clock's range never come).
+    After(Duration),
+    /// Stall-based failure off: a stalled pipe still turns suspect, is
+    /// avoided by the scheduler, has its data reinjected and is probed, and
+    /// recovers when acknowledgements resume, but only its carrier's error
+    /// or end, its drain deadline, its removal (and the inbound silence of
+    /// a receive-only pipe that is not the last live inbound one) fail it.
+    Off,
+}
+
+impl DeadTimeout {
+    /// Whether the setting is valid: [`DeadTimeout::After`] at least 1 s.
+    pub fn validate(self) -> Result<(), crate::InvalidConfig> {
+        if matches!(self, Self::After(d) if d < Duration::from_secs(1)) {
+            return Err(crate::InvalidConfig::new(
+                "liveness.dead_timeout",
+                "below 1 s",
+            ));
         }
+        Ok(())
     }
 }
 

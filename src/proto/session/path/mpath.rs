@@ -138,8 +138,12 @@ pub enum PipeDirection {
 pub struct PipeLiveness {
     /// The floor of `T_suspect` (at least 50 ms).
     pub suspect_floor: Inherit<Duration>,
-    /// How long the pipe may stay suspect before it fails (at least 1 s).
-    pub dead_timeout: Inherit<Duration>,
+    /// How long the pipe may stay suspect before it fails
+    /// ([`DeadTimeout`](crate::DeadTimeout)). [`Inherit::Session`] follows
+    /// the carrier ([`DeadTimeout::Off`](crate::DeadTimeout::Off) when it
+    /// reports its own failure), else the session; an own value overrides
+    /// both.
+    pub dead_timeout: Inherit<crate::DeadTimeout>,
     /// The idle-probe interval of the outbound pipe (`Set(None)`: no idle
     /// probes; a period is at least 1 s). An attachment without an outbound
     /// direction at the peer uses at most 15 s.
@@ -156,8 +160,8 @@ impl PipeLiveness {
         if matches!(self.suspect_floor, Inherit::Set(f) if f < Duration::from_millis(50)) {
             return Err(e("liveness.suspect_floor", "below 50 ms"));
         }
-        if matches!(self.dead_timeout, Inherit::Set(d) if d < Duration::from_secs(1)) {
-            return Err(e("liveness.dead_timeout", "below 1 s"));
+        if let Inherit::Set(d) = self.dead_timeout {
+            d.validate()?;
         }
         if matches!(self.probe_interval, Inherit::Set(Some(d)) if d < Duration::from_secs(1)) {
             return Err(e("liveness.probe_interval", "below 1 s"));
@@ -1915,11 +1919,9 @@ impl SessionCore {
         let c = self.config.liveness;
         for a in self.atts.iter_mut() {
             let own = a.own_liveness();
+            let dead = dead_timeout_of(&c, own.dead_timeout, a.carrier_reports_failure());
             if let Some(o) = a.out_mut() {
-                o.set_detection_limits(
-                    own.suspect_floor.or(c.suspect_floor),
-                    own.dead_timeout.own().or(c.dead_timeout()),
-                );
+                o.set_detection_limits(own.suspect_floor.or(c.suspect_floor), dead);
             }
         }
         Ok(())
@@ -1939,11 +1941,9 @@ impl SessionCore {
         let c = self.config.liveness;
         let a = self.att_mut(pipe.0).ok_or(PipeError::UnknownPipe)?;
         a.set_options(&opts);
+        let dead = dead_timeout_of(&c, liveness.dead_timeout, a.carrier_reports_failure());
         if let Some(o) = a.out_mut() {
-            o.set_detection_limits(
-                liveness.suspect_floor.or(c.suspect_floor),
-                liveness.dead_timeout.own().or(c.dead_timeout()),
-            );
+            o.set_detection_limits(liveness.suspect_floor.or(c.suspect_floor), dead);
             o.set_probe(liveness.period(), liveness.probe_jitter.own());
         }
         Ok(())
@@ -3165,7 +3165,12 @@ impl SessionCore {
         let own = opts.map(PipeOptions::own_liveness).unwrap_or_default();
         crate::proto::session::pipes::Detection {
             suspect_floor: own.suspect_floor.or(c.liveness.suspect_floor),
-            dead_timeout: own.dead_timeout.own().or(c.liveness.dead_timeout()),
+            dead_timeout: dead_timeout_of(
+                &c.liveness,
+                own.dead_timeout,
+                self.att(id)
+                    .is_some_and(Attachment::carrier_reports_failure),
+            ),
             probe_interval: own.period(),
             probe_jitter: own.probe_jitter.own(),
             probe_seed: c
@@ -3314,6 +3319,12 @@ impl SessionCore {
     ) -> (Option<Duration>, Duration) {
         let other = self.other_active(id);
         let (floor, dead) = o.held_detection();
+        let dead = match dead {
+            // Stall-based failure off: neither T_fail nor the dead timeout.
+            crate::DeadTimeout::Off => return (None, Duration::MAX),
+            crate::DeadTimeout::After(dt) => Some(dt),
+            crate::DeadTimeout::Auto => None,
+        };
         if !other && let Some(dt) = dead {
             let base = o.est().pto(self.mp().peer_mad) + o.queue_term();
             return (None, floor.max(base * 2).max(dt));
@@ -3366,13 +3377,15 @@ impl SessionCore {
                 .map_or(crate::proto::session::DEFAULT_MAX_IDLE_TIMEOUT / 2, |t| {
                     t / 2
                 });
-            let stall = if let Some(dt) = self.config.liveness.dead_timeout() {
-                t_suspect.max(dt)
-            } else if self.mp().resume {
-                t_fail
-            } else {
-                t_fail.max(dead)
-            };
+            let own = a.own_liveness().dead_timeout;
+            let stall =
+                match dead_timeout_of(&self.config.liveness, own, a.carrier_reports_failure()) {
+                    // The last live inbound pipe's patience is unlimited.
+                    crate::DeadTimeout::Off => return None,
+                    crate::DeadTimeout::After(dt) => t_suspect.max(dt),
+                    crate::DeadTimeout::Auto if self.mp().resume => t_fail,
+                    crate::DeadTimeout::Auto => t_fail.max(dead),
+                };
             return Some(l_in.max(stall));
         }
         Some(l_in)
@@ -3620,6 +3633,20 @@ fn displacement_rank(
         (true, true) => (0, None, seq),
         (true, false) => (1, None, seq),
         (false, _) => (2, last_progress, seq),
+    }
+}
+
+/// The dead timeout in force for a pipe: its own setting, else off on a
+/// carrier that reports its own failure, else the session's.
+pub(in crate::proto::session) fn dead_timeout_of(
+    session: &crate::Liveness,
+    own: Inherit<crate::DeadTimeout>,
+    reports_failure: bool,
+) -> crate::DeadTimeout {
+    match own {
+        Inherit::Set(d) => d,
+        Inherit::Session if reports_failure => crate::DeadTimeout::Off,
+        Inherit::Session => session.dead_timeout,
     }
 }
 

@@ -147,12 +147,13 @@ pub struct Options {
     pub exchange: Option<ExchangeServer>,
     /// Server: the HTTP handler of the requests that carry no pipe: those
     /// to other paths, those the listener's admission hands to the
-    /// fallback, and those
-    /// the listener does not take (none by default: such requests are
-    /// answered with 404). A request is the carrier here, taken over as a
-    /// request: the listener's fallback ([`zmux::ListenerConfig::fallback`])
-    /// takes over carriers, such as a WebSocket decided on its first message
-    /// after a deferral, and never sees a request.
+    /// fallback on their head (a downlink, a request whose body ends
+    /// before its first byte, an exchange request), every request it hands
+    /// to the fallback without a listener's fallback, and those the
+    /// listener does not take (none by default: such requests are answered
+    /// with 404). A request carrier decided on the start of its body goes
+    /// to the listener's fallback ([`zmux::ListenerConfig::fallback`]) as a
+    /// carrier when there is one ([`handle_request`]).
     pub fallback: Option<Fallback>,
     /// Client: the credential presented for a server's admission
     /// ([`zmux::ListenerConfig::admission`], none by default): its prefix

@@ -1012,7 +1012,15 @@ async fn serve_over<C, S, SF>(
                     if adapter.has_fallback() {
                         let (conn, prefix) = conn.into_parts();
                         let info = CarrierInfo::new().with_source(source);
-                        let io = zmux::adapter::AdmitIo::stream(conn, PipeIo::new);
+                        // Made a pipe with the capabilities of the other
+                        // paths: the TCP socket and the TLS binding.
+                        let io = zmux::adapter::AdmitIo::stream(conn, move |c| {
+                            let io = with_socket(PipeIo::new(c), socket);
+                            match &binding {
+                                Some(b) => b.apply(io),
+                                None => io,
+                            }
+                        });
                         adapter.take_over(info, io, prefix).await;
                     } else {
                         let mut conn = conn;

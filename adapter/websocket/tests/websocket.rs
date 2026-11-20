@@ -534,7 +534,7 @@ async fn an_admission_decides_on_the_request_head() {
         if parts.headers.contains_key("x-pass") {
             AdmissionVerdict::accept(0)
         } else {
-            AdmissionVerdict::Fallback
+            AdmissionVerdict::fallback()
         }
     });
     let mut limits = ListenerConfig::default();
@@ -898,7 +898,7 @@ async fn a_deferred_decision_on_the_first_message_accepts_or_takes_over() {
             .or_default() += 1;
         match classify_first_bytes(first, info.framing) {
             FirstBytes::Record => AdmissionVerdict::accept(0),
-            FirstBytes::NeedMore(_) | FirstBytes::Other => AdmissionVerdict::Fallback,
+            FirstBytes::NeedMore(_) | FirstBytes::Other => AdmissionVerdict::fallback(),
         }
     })
     .with_peek_timeout(Duration::from_secs(10));
@@ -979,4 +979,163 @@ async fn a_deferred_decision_on_the_first_message_accepts_or_takes_over() {
     client.close().await;
     listener.close();
     serving.await.unwrap();
+}
+
+/// A WebSocket the listener's fallback took over after a deferred decision
+/// and detached is the host's: it is served by typed messages after the
+/// fallback's future completed, and closed only when the host is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_websocket_is_served_after_the_fallback() {
+    use futures_util::SinkExt;
+    use zmux::{Admission, AdmissionVerdict, Fallback, Takeover};
+
+    let admission = Admission::new(0, |info, _| {
+        if info.is_head() {
+            AdmissionVerdict::Defer
+        } else {
+            AdmissionVerdict::fallback()
+        }
+    })
+    .with_peek_timeout(Duration::from_secs(10));
+    let (returned_tx, returned) = tokio::sync::oneshot::channel::<()>();
+    let returned_tx = std::sync::Mutex::new(Some(returned_tx));
+    let fallback = Fallback::new(move |t: Takeover| {
+        let returned_tx = returned_tx.lock().unwrap().take();
+        async move {
+            t.detach().unwrap();
+            let mut m = t.into_messages().expect("message-framed");
+            tokio::spawn(async move {
+                // Served once the fallback's future completed.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                while let Some(msg) = m.read_message(1024).await.unwrap() {
+                    let mut echo = b"echo ".to_vec();
+                    echo.extend_from_slice(&msg);
+                    m.write_message(&echo).await.unwrap();
+                    if msg == b"bye" {
+                        break;
+                    }
+                }
+                m.shutdown().await.unwrap();
+            });
+            let _ = returned_tx.unwrap().send(());
+        }
+    });
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(admission);
+    limits.fallback = Some(fallback);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        zmux_websocket::Options::default(),
+    ));
+    let mut request = format!("ws://{addr}/tunnel").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", "qmux-02".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.send(Message::binary(b"first".to_vec())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), returned)
+        .await
+        .unwrap()
+        .unwrap();
+    for msg in [&b"first"[..], b"second", b"bye"] {
+        if msg != b"first" {
+            ws.send(Message::binary(msg.to_vec())).await.unwrap();
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut want = b"echo ".to_vec();
+        want.extend_from_slice(msg);
+        assert_eq!(reply, Message::binary(want));
+    }
+    let end = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(end, None | Some(Err(_) | Ok(Message::Close(_)))),
+        "{end:?}"
+    );
+    assert_eq!(listener.stats().admission.fallback, 1);
+    listener.close();
+    serving.await.unwrap();
+}
+
+/// A request refused before its upgrade over TLS reaches the fallback as a
+/// carrier with the capabilities of an accepted one: the terminated TLS
+/// and, the connection bound, its exporter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_request_over_tls_keeps_its_capabilities() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
+    let der = CertificateDer::from(cert.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key)
+        .unwrap();
+    server_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
+    let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+    let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
+        let seen_tx = seen_tx.clone();
+        async move {
+            let mut pipe = t.into_pipe();
+            let _ = seen_tx.send((
+                pipe.terminated_tls().is_some(),
+                pipe.bound_exporter().is_some(),
+            ));
+            let _ = pipe
+                .write_handshake(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await;
+        }
+    });
+    let mut limits = ListenerConfig::default();
+    limits.fallback = Some(fallback);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve_tls(
+        listener.clone(),
+        tcp,
+        acceptor,
+        zmux_websocket::Options::default(),
+    ));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut tls = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .unwrap();
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut seen = seen;
+    let got = tokio::time::timeout(Duration::from_secs(10), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, (true, true), "terminated TLS and its exporter");
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut response)).await;
+    assert!(response.starts_with(b"HTTP/1.1 204"), "{response:?}");
+    listener.close();
+    serving.abort();
 }

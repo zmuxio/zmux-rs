@@ -118,6 +118,19 @@ attach the pipe; it fails with `PipeError::Failed(PipeFailure::JoinRefused)`
 when the peer refused the join. `helpers::maintain_pipes` keeps a pool of pipes up per
 path, redialling with backoff.
 
+A pipe whose acknowledgements stall turns suspect, traffic moves away from
+it, and it fails after `Liveness::dead_timeout` (a `DeadTimeout`: `Auto`,
+derived from the RTT and the idle timeout; `After(d)`, at least 1 s, any
+larger value safe). `DeadTimeout::Off` turns stall-based failure off: a
+stalled pipe still turns suspect, is avoided, has its data reinjected and
+is probed, but only its carrier's error or end, its drain deadline or its
+removal fail it. It is off by default on a carrier that reports its own
+failure (`PipeIo::with_reports_failure`), such as a stream of an outer
+session (`PipeIo::from_stream`, `Session::open_pipe_stream`), whose outer
+session ends it when its path fails; a pipe's own
+`PipeLiveness::dead_timeout` (`Inherit::Set`, `Set(DeadTimeout::Auto)`
+included) overrides both.
+
 ## Resume
 
 With `Config::resume_timeout` set, a session whose pipes are all lost is
@@ -186,8 +199,34 @@ that, with the same application error code.
   `Fallback` given a `Takeover`), stalls it, or closes it
   (`AdmissionVerdict`). An HTTP upgrade (WebSocket, WebTransport) is decided
   on its request head, which may defer the decision to the carrier's first
-  message or bytes (`AdmissionVerdict::Defer`); a request that is itself the
-  carrier is taken over as a request by its adapter's HTTP fallback.
+  message or bytes (`AdmissionVerdict::Defer`). An HTTP request carrier
+  decided on the start of its body is taken over as a carrier, the
+  full-duplex pipe of its request and response bodies; one decided on its
+  head is taken over as a request by its adapter's HTTP fallback.
+- **Takeover.** The fallback's future runs on a task of its own and owns
+  the carrier until it completes: what it did not take is dropped then,
+  and the adapter closes what it holds of the carrier (a QUIC connection,
+  a WebTransport session, an HTTP request). `Takeover::detach` makes all
+  of it the host's, to serve on another task afterwards and to close once
+  done. `AdmissionVerdict::fallback().with_value(..)` routes the carrier
+  (`Takeover::value`); `Takeover::into_pipe` keeps every capability of the
+  carrier, `into_stream` gives the connection itself (`Takeover::stream`
+  to look at its type), `into_messages` the whole messages of a WebSocket.
+
+```rust,no_run
+use zmux::{Fallback, Takeover};
+
+let fallback = Fallback::new(|t: Takeover| async move {
+    // Keep the carrier past this future: served on a task of the host's.
+    if t.detach().is_ok() {
+        let pipe = t.into_pipe();
+        tokio::spawn(async move {
+            let _stream = pipe.into_stream(); // replay first, then the carrier
+        });
+    }
+});
+# let _ = fallback;
+```
   `PrefixAuth` is a ready-made credential check, bound to the
   TLS connection where the carrier has an exporter; a client presents it
   as a `CarrierCredential`. `TrustedProxies` names the intermediaries whose report

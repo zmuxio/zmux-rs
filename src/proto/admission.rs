@@ -366,8 +366,16 @@ pub enum AdmissionVerdict {
     /// request rather than a carrier to take over: its adapter's HTTP
     /// fallback serves it (without one: a not-found response). The carrier
     /// of an upgrade decided after an [`AdmissionVerdict::Defer`] is a
-    /// carrier: it goes to the listener's fallback.
-    Fallback,
+    /// carrier: it goes to the listener's fallback. An HTTP request
+    /// carrier decided on the start of its body is a carrier too: with a
+    /// listener's fallback it is taken over as the full-duplex pipe of its
+    /// request and response bodies. `value` is the host's value for the
+    /// takeover (`Takeover::value`), routing it to the host's service; it
+    /// does not reach an adapter's HTTP fallback.
+    Fallback {
+        /// The host's value for the carrier's takeover.
+        value: Option<AdmittedValue>,
+    },
     /// Nothing is sent; what arrives is read and discarded, and the carrier
     /// is closed gracefully (a byte stream's write side first) when the
     /// peer ends it or when a duration drawn from the configured stall
@@ -429,15 +437,12 @@ impl PartialEq for AdmissionVerdict {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Accept { skip: a, value: x }, Self::Accept { skip: b, value: y }) => {
-                a == b
-                    && match (x, y) {
-                        (None, None) => true,
-                        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                        _ => false,
-                    }
+                a == b && same(x.as_ref(), y.as_ref())
             }
-            (Self::Fallback, Self::Fallback)
-            | (Self::Stall, Self::Stall)
+            (Self::Fallback { value: x }, Self::Fallback { value: y }) => {
+                same(x.as_ref(), y.as_ref())
+            }
+            (Self::Stall, Self::Stall)
             | (Self::Close, Self::Close)
             | (Self::Defer, Self::Defer) => true,
             (Self::More { need: a }, Self::More { need: b }) => a == b,
@@ -448,6 +453,15 @@ impl PartialEq for AdmissionVerdict {
 
 impl Eq for AdmissionVerdict {}
 
+/// Whether two optional values are the same one.
+fn same(x: Option<&AdmittedValue>, y: Option<&AdmittedValue>) -> bool {
+    match (x, y) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
 impl AdmissionVerdict {
     /// [`AdmissionVerdict::Accept`] removing `skip` prefix bytes, without a value.
     #[must_use]
@@ -455,8 +469,15 @@ impl AdmissionVerdict {
         Self::Accept { skip, value: None }
     }
 
-    /// With the host's value for an accepted carrier; other verdicts carry
-    /// none and are returned as they are.
+    /// [`AdmissionVerdict::Fallback`] without a value.
+    #[must_use]
+    pub const fn fallback() -> Self {
+        Self::Fallback { value: None }
+    }
+
+    /// With the host's value for an accepted carrier or a takeover
+    /// ([`AdmissionVerdict::Accept`], [`AdmissionVerdict::Fallback`]); other
+    /// verdicts carry none and are returned as they are.
     #[must_use]
     pub fn with_value(self, value: AdmittedValue) -> Self {
         match self {
@@ -464,6 +485,7 @@ impl AdmissionVerdict {
                 skip,
                 value: Some(value),
             },
+            Self::Fallback { .. } => Self::Fallback { value: Some(value) },
             v => v,
         }
     }

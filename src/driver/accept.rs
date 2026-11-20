@@ -39,6 +39,7 @@ pub(crate) struct JoinCarrier {
     pub(crate) overhead: u16,
     pub(crate) max_record: Option<usize>,
     pub(crate) kind: Option<crate::CarrierKind>,
+    pub(crate) reports_failure: bool,
 }
 
 /// What the listener does next.
@@ -281,7 +282,7 @@ impl<D: Driver> JoinAccept<D> {
         };
         let (want_in, want_out) = (join.pipe().direction != 1, join.pipe().direction != 0);
         let c = &self.carrier;
-        let meta = (c.kind, c.overhead, c.admitted.clone());
+        let meta = (c.kind, c.overhead, c.admitted.clone(), c.reports_failure);
         match session.confirm_join(*join, peer, meta) {
             ConfirmedJoin::Attached { pipe, records } => Ok(Attached {
                 pipe,

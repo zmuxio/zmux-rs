@@ -25,6 +25,8 @@ pub(crate) struct Attachment {
     ///
     /// [`SessionCore::set_pipe_carrier`]: crate::proto::session::SessionCore::set_pipe_carrier
     carrier: Option<crate::proto::session::CarrierKind>,
+    /// The carrier reports its own failure (`PipeIo::with_reports_failure`).
+    carrier_reports_failure: bool,
     /// The carrier's write overhead
     /// ([`SessionCore::set_pipe_write_overhead`]).
     ///
@@ -137,6 +139,7 @@ impl Attachment {
             out: None,
             mp: Some(Box::new(AttMp::new(fate_group, seq))),
             carrier: None,
+            carrier_reports_failure: false,
             write_overhead: 0,
             traffic_at: None,
         }
@@ -183,6 +186,7 @@ impl Attachment {
             out: None,
             mp: None,
             carrier: None,
+            carrier_reports_failure: false,
             write_overhead: 0,
             traffic_at: None,
         }
@@ -419,6 +423,15 @@ impl Attachment {
     }
 
     /// Sets the carrier's kind.
+    pub(crate) fn set_carrier_reports_failure(&mut self, on: bool) {
+        self.carrier_reports_failure = on;
+    }
+
+    /// Whether the carrier reports its own failure.
+    pub(crate) fn carrier_reports_failure(&self) -> bool {
+        self.carrier_reports_failure
+    }
+
     pub(crate) fn set_carrier(&mut self, kind: Option<crate::proto::session::CarrierKind>) {
         self.carrier = kind;
     }

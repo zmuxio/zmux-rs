@@ -293,7 +293,9 @@ impl Setup {
             Some(p) => Some(zmux::Cap::Fixed(p)),
         };
         c.spread_chunk = self.spread_chunk;
-        c.liveness.dead_timeout = self.dead_timeout.map_or(zmux::Cap::Auto, zmux::Cap::Fixed);
+        c.liveness.dead_timeout = self
+            .dead_timeout
+            .map_or(zmux::DeadTimeout::Auto, zmux::DeadTimeout::After);
         if self.resume {
             c.resume_timeout = Some(Duration::from_secs(30));
         }
@@ -1158,7 +1160,7 @@ fn pipe_options() -> impl Strategy<Value = PipeOptions> {
                 o.weight = zmux::Change::Set(weight);
                 o.probation = self::probation(probation);
                 live(&mut o).suspect_floor = inherit(floor);
-                live(&mut o).dead_timeout = inherit(dead);
+                live(&mut o).dead_timeout = inherit(dead.map(zmux::DeadTimeout::After));
                 o
             },
         )
@@ -1474,7 +1476,7 @@ macro_rules! po_set {
         live(&mut $o).suspect_floor = inherit($v)
     };
     ($o:ident, dead_timeout, $v:expr) => {
-        live(&mut $o).dead_timeout = inherit($v)
+        live(&mut $o).dead_timeout = inherit($v.map(zmux::DeadTimeout::After))
     };
     ($o:ident, send_priority, $v:expr) => {
         $o.send_priority = change($v)
