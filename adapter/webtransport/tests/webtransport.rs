@@ -385,8 +385,12 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
     .with_max_peek(zmux::adapter::MAX_FIRST_BYTES)
     .with_peek_timeout(Duration::from_secs(10));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // Why the fallback ended, for a failure's report.
+    let ended = Arc::new(std::sync::Mutex::new(None::<String>));
+    let ended_by = ended.clone();
     let fallback = Fallback::new(move |t: Takeover| {
         let tx = tx.clone();
+        let ended = ended_by.clone();
         async move {
             let session = zmux_webtransport::takeover_session(&t).expect("the session");
             let replayed = t.replayed().to_vec();
@@ -397,7 +401,13 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
             stream.shutdown().await.unwrap();
             let _ = tx.send((replayed, got));
             // Served until the client has read the answer.
-            let _ = tokio::time::timeout(Duration::from_secs(10), session.accept_uni()).await;
+            let answered = std::time::Instant::now();
+            let done = tokio::time::timeout(Duration::from_secs(10), session.accept_uni()).await;
+            *ended.lock().unwrap() = Some(format!(
+                "accept_uni {:?} after {:?}",
+                done.map(|r| r.map(|_| ())),
+                answered.elapsed()
+            ));
         }
     });
     let opts = Options::default();
@@ -431,7 +441,20 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
             .await
             .unwrap();
         assert_eq!(answer, b"not zmux");
-        let mut done = session.open_uni().await.unwrap();
+        let mut done = match session.open_uni().await {
+            Ok(done) => done,
+            Err(e) => {
+                // A record of the end: the client's error alone does not
+                // tell a lost connection from one the server closed.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let server = ended.lock().unwrap().clone();
+                let closed = tokio::time::timeout(Duration::from_secs(1), session.closed()).await;
+                panic!(
+                    "open_uni: {e:?}; session closed: {closed:?}; fallback ended: {server:?}; listener {:?}",
+                    listener.stats()
+                );
+            }
+        };
         done.write_all(b"read").await.unwrap();
         done.finish().unwrap();
         let _ = session.closed().await;
