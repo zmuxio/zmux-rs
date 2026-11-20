@@ -121,7 +121,7 @@ async fn bad_pairs_are_refused() {
         // A pair whose uplink sends no first record times out, and nothing is read of a
         // half before its partner arrives.
         let mut limits = ListenerConfig::default();
-        limits.first_record_timeout = Duration::from_millis(100);
+        limits.limits.first_record_timeout = Duration::from_millis(100);
         let l = Listener::new(Config::default(), limits).expect("valid listener configuration");
         let (e, _ke) = duplex(64);
         let (er, _) = tokio::io::split(e);

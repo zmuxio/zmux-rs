@@ -346,7 +346,7 @@ fn add_pipe_releases_a_failed_carrier_once() {
 fn a_listener_releases_a_failed_carrier_once() {
     watchdog(30, "listener", || {
         let mut limits = ListenerConfig::default();
-        limits.first_record_timeout = Duration::from_millis(100);
+        limits.limits.first_record_timeout = Duration::from_millis(100);
         let mut config = Config::default();
         config.handshake_timeout = Some(Duration::from_millis(200));
         let l = Listener::new(config, limits, None).unwrap();

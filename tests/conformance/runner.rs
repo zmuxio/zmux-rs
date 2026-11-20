@@ -433,7 +433,7 @@ impl Runner {
         th.pipe_cap = hooks.pipe_cap.map(|c| c as usize);
         let mut listener_config = ListenerConfig::default();
         if let Some(cap) = hooks.unconfirmed_cap {
-            listener_config.max_pending_per_session =
+            listener_config.limits.max_pending_per_session =
                 usize::try_from(cap).map_err(|_| "unconfirmed_cap")?;
         }
         th.epoch_locator_prefix = hooks.epoch_locator_prefix.map(|p| p.0);

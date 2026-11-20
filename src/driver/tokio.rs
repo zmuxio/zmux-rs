@@ -8,7 +8,7 @@ use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use super::account::AccountLink;
+use super::account::{AccountLink, Evictions};
 use super::channel::DatagramChannel;
 use super::handle::StreamDatagram;
 use std::task::{Context, Poll, Waker};
@@ -4316,8 +4316,8 @@ impl Future for Task {
             }
 
             // Suspended sessions the listener's account asks to close, after
-            // the lock (allocated only then).
-            let mut closing = Vec::new();
+            // the lock.
+            let mut closing = Evictions::new();
             let mut st = shared.lock();
             progress |= housekeeping(&mut this.pipes, &mut this.closes, &mut st);
             if let Some(w) = this.lane_work.as_deref_mut() {
@@ -4424,7 +4424,7 @@ impl Future for Task {
                         abort();
                     }
                     apply_closes(&mut this.pipes, &mut this.closes);
-                    for s in closing.drain(..) {
+                    for s in closing.take() {
                         s.close_suspended();
                     }
                     released(&mut this.pipes, shared);
@@ -4501,7 +4501,7 @@ impl Future for Task {
             {
                 lanes_after_lock(&this.shared, &mut this.pipes, w);
             }
-            for s in closing.drain(..) {
+            for s in closing.take() {
                 s.close_suspended();
             }
             if pick {

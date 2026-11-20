@@ -215,7 +215,7 @@ macro_rules! duplicate_api {
             s2: &$session,
             opts: &DuplicateOptions,
         ) -> Result<Resolved, $crate::helpers::DuplicateError> {
-            let (survivor, loser, rule, rejoin_started) = $crate::helpers::resolve::<$d>(
+            let (survivor, loser, rule, rejoin_started) = $crate::helpers::duplicate::resolve::<$d>(
                 s1,
                 s2,
                 opts.local_identity.as_deref(),

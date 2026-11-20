@@ -324,7 +324,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
             .with_peek_timeout(Duration::from_secs(3600)),
         None,
     );
-    limits.max_pending_per_source = 2;
+    limits.limits.max_pending_per_source = 2;
     let (listener, addr) = serve_with(limits).await;
     let peer = "127.0.0.1:1".parse().unwrap();
     // One slot of the source held by the host.
@@ -389,7 +389,7 @@ async fn a_source_stalls_at_most_its_share_less_one() {
     let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall)
         .with_stall_interval(Duration::from_secs(1), Duration::from_secs(1));
     let mut config = limits(admission, None);
-    config.max_pending_per_source = 3;
+    config.limits.max_pending_per_source = 3;
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let none = || None::<&mut tokio::io::Empty>;
     let enter = |s: &str| listener.adapter().enter(s.parse().unwrap(), None).unwrap();
@@ -442,7 +442,7 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
     let (min, max) = (Duration::from_secs(1), Duration::from_secs(1000));
     let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall).with_stall_interval(min, max);
     let mut config = limits(admission, None);
-    config.max_pending_per_source = 3;
+    config.limits.max_pending_per_source = 3;
     config.source_prefix_v4 = 24;
     config.source_prefix_v6 = 56;
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
@@ -529,11 +529,11 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
 fn a_share_below_two_is_invalid() {
     for share in [0, 1] {
         let mut config = ListenerConfig::default();
-        config.max_pending_per_source = share;
+        config.limits.max_pending_per_source = share;
         assert!(Listener::new(Config::default(), config).is_err(), "{share}");
     }
     let mut config = ListenerConfig::default();
-    config.max_pending_per_source = 2;
+    config.limits.max_pending_per_source = 2;
     assert!(Listener::new(Config::default(), config).is_ok());
 }
 
@@ -546,7 +546,7 @@ async fn the_global_bound_evicts_the_oldest_stall() {
     let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall)
         .with_stall_interval(Duration::from_secs(3600), Duration::from_secs(3600));
     let mut config = limits(admission, None);
-    config.max_pending = Some(4);
+    config.limits.max_pending = Some(4);
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let enter = |n: u8| {
         listener

@@ -36,7 +36,7 @@ fn dial(
 async fn a_listener_over_its_budget_refuses_sessions_until_charges_leave() {
     let mut limits = ListenerConfig::default();
     // Below one idle session's charge.
-    limits.memory_budget = Some(1024);
+    limits.limits.memory_budget = Some(1024);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(
@@ -130,7 +130,7 @@ fn mp_config() -> Config {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_oldest_suspended_session_beyond_the_limit_is_closed() {
     let mut limits = ListenerConfig::default();
-    limits.max_suspended = 1;
+    limits.limits.max_suspended = 1;
     let listener = Listener::new(mp_config(), limits).expect("valid listener configuration");
     let mut pairs = Vec::new();
     for _ in 0..2 {
@@ -171,7 +171,7 @@ async fn the_oldest_suspended_session_beyond_the_limit_is_closed() {
 async fn a_join_under_pressure_goes_to_the_reject_policy() {
     let mut limits = ListenerConfig::default();
     // Below one idle session's charge.
-    limits.memory_budget = Some(1024);
+    limits.limits.memory_budget = Some(1024);
     let reasons = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     limits.on_reject = Some(zmux::OnReject::new(move |i| {
@@ -208,9 +208,9 @@ async fn a_join_under_pressure_goes_to_the_reject_policy() {
 /// The per-session bound on Unconfirmed carriers is 4 by default and at least 1.
 #[test]
 fn unconfirmed_per_session_is_at_least_one() {
-    assert_eq!(ListenerConfig::default().max_pending_per_session, 4);
+    assert_eq!(ListenerConfig::default().limits.max_pending_per_session, 4);
     let mut limits = ListenerConfig::default();
-    limits.max_pending_per_session = 0;
+    limits.limits.max_pending_per_session = 0;
     assert!(Listener::new(Config::default(), limits).is_err());
 }
 
@@ -223,7 +223,46 @@ fn the_first_record_timeout_has_one_exported_default() {
         std::time::Duration::from_secs(2)
     );
     assert_eq!(
-        ListenerConfig::default().first_record_timeout,
+        ListenerConfig::default().limits.first_record_timeout,
         zmux::DEFAULT_FIRST_RECORD_TIMEOUT
     );
+}
+
+/// A budget set while the listener runs applies at once, as if the sum
+/// crossed it: unlimited to below one session's charge starts pressure (the
+/// hook is told, new sessions are refused), and unlimited again ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_set_while_running_applies_at_once() {
+    let mut limits = ListenerConfig::default();
+    limits.limits.memory_budget = None;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(
+        move |p: zmux::MemoryPressure| log.lock().unwrap().push(p.active),
+    ));
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    let (io, _ctl, _) = dial(&listener);
+    let _client = watchdog(10, "connect", Session::connect(io, Config::default()))
+        .await
+        .expect("connect");
+    let _server = watchdog(10, "accept", listener.accept())
+        .await
+        .expect("accept");
+    let mut lim = listener.limits();
+    lim.memory_budget = Some(1024);
+    listener.set_limits(lim).unwrap();
+    assert_eq!(listener.limits().memory_budget, Some(1024));
+    eventually(10, "pressure on", || *seen.lock().unwrap() == [true]).await;
+    let (io, _ctl, handled) = dial(&listener);
+    let _dialer = tokio::spawn(Session::connect(io, Config::default()));
+    assert_eq!(
+        watchdog(10, "refusal", handled).await.unwrap(),
+        Err(HandleError::Refused)
+    );
+    lim.memory_budget = None;
+    listener.set_limits(lim).unwrap();
+    eventually(10, "pressure off", || {
+        *seen.lock().unwrap() == [true, false]
+    })
+    .await;
 }

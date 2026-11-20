@@ -114,7 +114,7 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
 async fn an_evicted_unconfirmed_carrier_counts_as_refused() {
     let (a, b) = duplex(1 << 20);
     let mut limits = ListenerConfig::default();
-    limits.max_pending_per_session = 1;
+    limits.limits.max_pending_per_session = 1;
     let listener = Listener::new(config(), limits).expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move {

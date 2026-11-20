@@ -20,7 +20,7 @@ pub(crate) const POLL: std::time::Duration = std::time::Duration::from_millis(10
 
 #[cfg_attr(any(not(feature = "tokio"), loom), allow(dead_code))]
 pub(crate) mod capsule;
-mod duplicate;
+pub(crate) mod duplicate;
 #[cfg(feature = "tokio")]
 mod maintain;
 #[cfg(feature = "tokio")]
@@ -40,8 +40,8 @@ pub use crate::driver::splice::{
     SpliceAbort, SpliceDirection, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice,
     splice_packets,
 };
+pub(crate) use duplicate::duplicate_api;
 pub use duplicate::{DuplicateError, DuplicateRule};
-pub(crate) use duplicate::{duplicate_api, resolve};
 
 #[cfg(feature = "tokio")]
 duplicate_api!(crate::driver::tokio::Tokio, crate::Session, crate::Dial);

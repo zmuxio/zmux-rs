@@ -841,9 +841,9 @@ async fn a_carrier_over_its_source_limit_is_closed_at_once() {
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = reasons.clone();
     let mut lc = ListenerConfig::default();
-    lc.max_pending_per_source = 3;
+    lc.limits.max_pending_per_source = 3;
     lc.handshake_timeout = Duration::from_millis(500);
-    lc.first_record_timeout = Duration::from_secs(60);
+    lc.limits.first_record_timeout = Duration::from_secs(60);
     lc.on_reject = Some(OnReject::new(move |i| {
         seen.lock().unwrap().push((i.profile, i.reason.to_string()));
         RejectAction::Stall

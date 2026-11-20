@@ -670,7 +670,7 @@ pub async fn serve_connection_with<IO, H, HF>(
     H: Fn(Request<Incoming>, Option<SocketAddr>, CarrierConnId) -> HF + Send + Sync + 'static,
     HF: Future<Output = Result<Response<PipeBody>, Unhandled<Incoming>>> + Send + 'static,
 {
-    let limit = listener.limits().handshake_timeout;
+    let limit = listener.adapter().handshake_timeout();
     let fallback = options.fallback.clone();
     let route = Arc::new(route);
     // The connection's identity for the requests of HTTP/2.

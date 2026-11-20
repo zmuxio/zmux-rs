@@ -9,7 +9,7 @@
 //! after the session's own lock is released).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 #[cfg(feature = "tokio")]
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -21,11 +21,54 @@ use crate::proto::session::SessionCore as Core;
 /// visiting period, as an upper bound).
 const CHARGE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// [`Account::budget`]'s encoding of no budget.
+const UNLIMITED: u64 = u64::MAX;
+
+/// The reader of a listener's live `max_suspended`.
+type MaxSuspended = Box<dyn Fn() -> Option<usize> + Send + Sync>;
+
+/// Suspended sessions a session's report picked for closing, and whether
+/// the suspended limit is to be applied, both done once the session's lock
+/// is released ([`Evictions::take`]).
+pub(crate) struct Evictions<S> {
+    close: Vec<Arc<S>>,
+    trim: Option<Arc<Account<S>>>,
+}
+
+impl<S> Evictions<S> {
+    pub(crate) fn new() -> Self {
+        Self {
+            close: Vec::new(),
+            trim: None,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.close.is_empty() && self.trim.is_none()
+    }
+
+    /// The sessions to close: those picked, and the longest-suspended ones
+    /// beyond the listener's limit. Called without the session's lock.
+    pub(crate) fn take(&mut self) -> Vec<Arc<S>> {
+        let mut close = std::mem::take(&mut self.close);
+        if let Some(a) = self.trim.take() {
+            close.extend(a.trim());
+        }
+        close
+    }
+}
+
 /// The listener's side.
 pub(crate) struct Account<S> {
-    /// The memory budget in bytes (`None`: unlimited).
-    budget_bytes: Option<u64>,
-    max_suspended: usize,
+    /// The listener's live `memory_budget`, read without a lock by every
+    /// session's report ([`UNLIMITED`]: none): the enforcement value of the
+    /// core's limits, written with them under the listener's lock
+    /// ([`Account::set_budget`]).
+    budget: AtomicU64,
+    /// Reads the listener's live `max_suspended` from its core (`None`
+    /// once the listener is gone); it takes the listener's lock, so it is
+    /// called with no session lock held ([`Evictions::take`]).
+    max_suspended: OnceLock<MaxSuspended>,
     /// The sessions' charges, summed.
     used: AtomicU64,
     /// Sessions that grew since their last allowance (at least one share).
@@ -162,7 +205,6 @@ impl<S> Account<S> {
     /// it cannot be started).
     pub(crate) fn new(
         budget_bytes: Option<u64>,
-        max_suspended: usize,
         hook: Option<OnMemoryPressure>,
         context: HookContext,
     ) -> Option<Arc<Self>> {
@@ -193,14 +235,14 @@ impl<S> Account<S> {
             }
         };
         Some(Arc::new(Self {
-            budget_bytes,
-            max_suspended,
+            budget: AtomicU64::new(budget_bytes.unwrap_or(UNLIMITED)),
+            max_suspended: OnceLock::new(),
             used: AtomicU64::new(0),
             growing: AtomicU64::new(0),
             pressure: AtomicBool::new(false),
             signal,
             state: Mutex::new(State {
-                budget: MemoryBudget::new(budget_bytes),
+                budget: MemoryBudget::new(),
                 suspended: Vec::new(),
             }),
         }))
@@ -210,6 +252,28 @@ impl<S> Account<S> {
     /// only joins that resume a session pass.
     pub(crate) fn pressure(&self) -> bool {
         self.pressure.load(Ordering::Acquire)
+    }
+
+    /// Binds the reader of the listener's live `max_suspended`, once.
+    pub(crate) fn bind_max_suspended(&self, read: MaxSuspended) {
+        let _ = self.max_suspended.set(read);
+    }
+
+    /// The longest-suspended sessions beyond `max`, for the caller to
+    /// close without any lock held.
+    pub(crate) fn trim_to(&self, max: usize) -> Vec<Arc<S>> {
+        let mut close = Vec::new();
+        AccountLink::enforce(&mut self.lock(), max, false, &mut close);
+        close
+    }
+
+    /// [`Account::trim_to`] the listener's live `max_suspended`: takes the
+    /// listener's lock, then this one.
+    fn trim(&self) -> Vec<Arc<S>> {
+        match self.max_suspended.get().and_then(|read| read()) {
+            Some(max) => self.trim_to(max),
+            None => Vec::new(),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State<S>> {
@@ -227,28 +291,53 @@ impl<S> Account<S> {
         } else {
             self.used.fetch_sub(old - new, Ordering::AcqRel);
         }
-        let Some(budget) = self.budget_bytes else {
+        if self.budget().is_none() && !self.pressure() {
             return;
-        };
-        // The sum read under the lock: the last update decides.
-        let mut st = self.lock();
+        }
+        // The sum and the budget read under the lock: the last update
+        // decides.
+        let st = self.lock();
+        self.update(st);
+    }
+
+    /// The budget in effect (`None`: unlimited).
+    fn budget(&self) -> Option<u64> {
+        Some(self.budget.load(Ordering::Acquire)).filter(|&b| b != UNLIMITED)
+    }
+
+    /// Follows the sum and the budget with the pressure, telling the hook
+    /// of a change; the guard is released before the hook is woken.
+    fn update(&self, mut st: std::sync::MutexGuard<'_, State<S>>) -> Option<bool> {
         let used = self.used.load(Ordering::Acquire);
-        let Some(on) = st.budget.update(used) else {
-            return;
-        };
+        let budget = self.budget();
+        let on = st.budget.update(used, budget)?;
         self.pressure.store(on, Ordering::Release);
         // Stored under the lock, so that the last change is the latest;
         // the hook's task is woken after it.
-        let Some(s) = &self.signal else {
-            return;
-        };
-        s.latest.lock().unwrap_or_else(PoisonError::into_inner).0 = Some(MemoryPressure {
-            used,
-            budget,
-            active: on,
-        });
-        drop(st);
-        s.wake();
+        if let Some(s) = &self.signal {
+            s.latest.lock().unwrap_or_else(PoisonError::into_inner).0 = Some(MemoryPressure {
+                used,
+                budget: budget.unwrap_or(0),
+                active: on,
+            });
+            drop(st);
+            s.wake();
+        }
+        Some(on)
+    }
+
+    /// A new `memory_budget`, applied at once as if the sum crossed it:
+    /// pressure that starts closes every suspended session (returned, for
+    /// the caller to close without any lock held).
+    pub(crate) fn set_budget(&self, budget: Option<u64>) -> Vec<Arc<S>> {
+        let st = self.lock();
+        self.budget
+            .store(budget.unwrap_or(UNLIMITED), Ordering::Release);
+        let mut close = Vec::new();
+        if self.update(st) == Some(true) {
+            AccountLink::enforce(&mut self.lock(), usize::MAX, true, &mut close);
+        }
+        close
     }
 }
 
@@ -297,14 +386,14 @@ impl<S> AccountLink<S> {
     /// Reports the session's charge, at most every [`CHARGE_INTERVAL`]
     /// (`force`: now, for a suspension), and hands the core its allowance
     /// and the budget's pressure. Suspended sessions beyond the limit (all
-    /// of them under pressure) go to `close`, to be closed once this
+    /// of them under pressure) go to `out`, to be closed once this
     /// session's lock is released.
     pub(crate) fn report(
         &mut self,
         core: &mut Core,
         me: &Arc<S>,
         now: Instant,
-        close: &mut Vec<Arc<S>>,
+        out: &mut Evictions<S>,
     ) {
         let suspended = core.suspended_since();
         let force = suspended.is_some() != self.suspended;
@@ -331,13 +420,12 @@ impl<S> AccountLink<S> {
             }
             self.growing = grew;
         }
-        if let Some(budget) = a.budget_bytes {
-            // What is left is shared between the sessions that grew, so
-            // that sessions growing at once do not each take all of it.
-            let used = a.used.load(Ordering::Acquire);
-            let growing = a.growing.load(Ordering::Acquire).max(1);
-            core.set_memory_allowance(Some(budget.saturating_sub(used) / growing));
-        }
+        // What is left is shared between the sessions that grew, so that
+        // sessions growing at once do not each take all of it; the
+        // listener's budget replaces the session's own, unlimited too.
+        let used = a.used.load(Ordering::Acquire);
+        let growing = a.growing.load(Ordering::Acquire).max(1);
+        core.set_memory_allowance(a.budget().map(|b| b.saturating_sub(used) / growing));
         let pressure = a.pressure();
         let pressure_on = pressure && !self.pressure;
         if pressure != self.pressure {
@@ -362,8 +450,11 @@ impl<S> AccountLink<S> {
             let i = st.suspended.partition_point(|&(u, _)| u <= t);
             st.suspended.insert(i, (t, Arc::downgrade(me)));
         }
-        if started.is_some() || pressure_on {
-            Self::enforce(&mut st, a.max_suspended, pressure, close);
+        if pressure_on {
+            Self::enforce(&mut st, usize::MAX, true, &mut out.close);
+        } else if started.is_some() {
+            // The limit is the listener's, read without this session's lock.
+            out.trim = Some(a.clone());
         }
     }
 
@@ -412,11 +503,10 @@ mod tests {
     fn a_report_held_back_by_the_interval_is_due_after_it() {
         let t0 = Instant::now();
         let mut core = Core::new(Config::default(), Role::Client, None, t0).unwrap();
-        let account =
-            Account::<()>::new(Some(1 << 20), 4, None, HookContext::Task).expect("no hook");
+        let account = Account::<()>::new(Some(1 << 20), None, HookContext::Task).expect("no hook");
         let me = Arc::new(());
         let mut link = AccountLink::new(account.clone());
-        let mut close = Vec::new();
+        let mut close = Evictions::new();
         link.report(&mut core, &me, t0, &mut close);
         assert!(link.due().is_none());
         let used = account.used.load(Ordering::Acquire);
@@ -427,6 +517,23 @@ mod tests {
         assert!(link.due().is_none());
         drop(link);
         assert_eq!(account.used.load(Ordering::Acquire), 0, "the charge left");
-        assert_eq!(close, Vec::<Arc<()>>::new());
+        assert!(close.is_empty());
+    }
+
+    /// A lowered `max_suspended` gives the longest-suspended sessions
+    /// beyond it back for closing.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_lowered_max_suspended_trims_the_oldest() {
+        let account = Account::<u8>::new(None, None, HookContext::Task).expect("no hook");
+        let t0 = Instant::now();
+        let s: Vec<_> = (0..3u8).map(Arc::new).collect();
+        account.lock().suspended = s
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (t0 + Duration::from_secs(i as u64), Arc::downgrade(x)))
+            .collect();
+        assert_eq!(account.trim_to(1), vec![s[0].clone(), s[1].clone()]);
+        assert_eq!(account.lock().suspended.len(), 1);
     }
 }

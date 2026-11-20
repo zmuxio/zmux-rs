@@ -233,8 +233,8 @@ pub use proto::host_events::{HostEvent, HostEvents};
 pub use proto::ident::{alpn_protocols, default_alpn};
 pub use proto::limit::{DatagramLimiter, LimitError, Limiter, Permit};
 pub use proto::listener::{
-    DEFAULT_FIRST_RECORD_TIMEOUT, HandleError, ListenerConfig, MAX_INSTANCE_ID_LEN, MemoryPressure,
-    OnMemoryPressure, OnReject, RejectAction, RejectError, RejectInfo,
+    DEFAULT_FIRST_RECORD_TIMEOUT, HandleError, ListenerConfig, ListenerLimits, MAX_INSTANCE_ID_LEN,
+    MemoryPressure, OnMemoryPressure, OnReject, RejectAction, RejectError, RejectInfo,
 };
 pub use proto::listener::{SessionCarrier, SessionConfigAnswer, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};

@@ -2120,7 +2120,7 @@ fn fire_timers(shared: &Arc<Shared<Blocking>>, me: &Waker) -> Option<Next> {
         // The listener's account: the charge, allowance, pressure and
         // suspended limit (`super::account`); suspended sessions it asks to
         // close are closed after the lock.
-        let mut closing = Vec::new();
+        let mut closing = super::account::Evictions::new();
         {
             let s = &mut *st;
             if let Some(link) = s.io.account.as_mut() {
@@ -2129,7 +2129,7 @@ fn fire_timers(shared: &Arc<Shared<Blocking>>, me: &Waker) -> Option<Next> {
         }
         if !closing.is_empty() {
             drop(st);
-            for s in closing {
+            for s in closing.take() {
                 s.close_suspended();
             }
             continue;

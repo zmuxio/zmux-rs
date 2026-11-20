@@ -781,7 +781,7 @@ fn the_std_listener_keeps_the_memory_budget() {
     let told = Arc::new(AtomicUsize::new(0));
     let t = told.clone();
     let mut limits = ListenerConfig::default();
-    limits.memory_budget = Some(1);
+    limits.limits.memory_budget = Some(1);
     limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(move |p| {
         if p.active {
             t.fetch_add(1, Ordering::SeqCst);

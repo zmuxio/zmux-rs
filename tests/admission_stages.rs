@@ -94,7 +94,7 @@ fn listener(adm: Admission, fallback: Option<Fallback>) -> Listener {
     let mut limits = ListenerConfig::default();
     limits.admission = Some(adm);
     limits.fallback = fallback;
-    limits.max_pending_per_source = 2;
+    limits.limits.max_pending_per_source = 2;
     Listener::new(Config::default(), limits).expect("valid listener configuration")
 }
 

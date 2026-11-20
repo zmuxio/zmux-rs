@@ -25,7 +25,7 @@ use crate::proto::VarInt;
 use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
     AdmissionStats, CarrierId, Classified, Entered, HandleError, ListenerConfig, ListenerCore,
-    ListenerStats, RejectAction, RejectError, RejectInfo, Slot, random_locator,
+    ListenerLimits, ListenerStats, RejectAction, RejectError, RejectInfo, Slot, random_locator,
 };
 use crate::proto::record::Framing;
 use crate::proto::session::Config;
@@ -248,6 +248,21 @@ impl Listener {
         limits: ListenerConfig,
         transform: Option<InboundTransform>,
     ) -> Result<Self, crate::ConnectError> {
+        Self::with_stall_max(
+            config,
+            limits,
+            transform,
+            crate::proto::admission::draw_stall_max(),
+        )
+    }
+
+    /// [`Listener::new`] with the longest stall of a refused Establish.
+    fn with_stall_max(
+        config: impl Into<Arc<Config>>,
+        limits: ListenerConfig,
+        transform: Option<InboundTransform>,
+        stall_max: Duration,
+    ) -> Result<Self, crate::ConnectError> {
         use crate::ConnectError::InvalidConfig;
         if limits.admission.is_some() {
             return Err(InvalidConfig(crate::InvalidConfig::new(
@@ -267,8 +282,7 @@ impl Listener {
         config.validate().map_err(InvalidConfig)?;
         let instance_id = limits.instance_id.clone();
         let account = super::account::Account::new(
-            limits.memory_budget,
-            limits.max_suspended,
+            limits.limits.memory_budget,
             limits.on_memory_pressure.clone(),
             super::account::HookContext::Thread,
         )
@@ -278,33 +292,38 @@ impl Listener {
                 "its hook thread could not be started",
             ))
         })?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                locators: handle::LocatorTable::default(),
-                config,
-                transform,
-                instance_id,
-                stall_max: crate::proto::admission::draw_stall_max(),
-                st: Mutex::new(State {
-                    core: ListenerCore::new(limits),
-                    live: Vec::new(),
-                    live_prune: 16,
-                    accept: VecDeque::new(),
-                    carriers: HashMap::new(),
-                    stalled: Vec::new(),
-                    evicted_slots: Vec::new(),
-                    stop_wakers: Vec::new(),
-                    stop_key: 0,
-                    closed: false,
-                    draining: false,
-                    serving: Vec::new(),
-                }),
-                accepted: Condvar::new(),
-                stalls: Condvar::new(),
-                counts: Counts::default(),
-                account,
+        let inner = Arc::new(Inner {
+            locators: handle::LocatorTable::default(),
+            config,
+            transform,
+            instance_id,
+            stall_max,
+            st: Mutex::new(State {
+                core: ListenerCore::new(limits),
+                live: Vec::new(),
+                live_prune: 16,
+                accept: VecDeque::new(),
+                carriers: HashMap::new(),
+                stalled: Vec::new(),
+                evicted_slots: Vec::new(),
+                stop_wakers: Vec::new(),
+                stop_key: 0,
+                closed: false,
+                draining: false,
+                serving: Vec::new(),
             }),
-        })
+            accepted: Condvar::new(),
+            stalls: Condvar::new(),
+            counts: Counts::default(),
+            account,
+        });
+        let weak = Arc::downgrade(&inner);
+        inner.account.bind_max_suspended(Box::new(move || {
+            let i = weak.upgrade()?;
+            let max = i.lock().core.config().limits.max_suspended;
+            Some(max)
+        }));
+        Ok(Self { inner })
     }
 
     /// Takes a carrier: returns once it started a session or joined one, or was not used.
@@ -400,7 +419,7 @@ impl Listener {
             inner.lock().core.set_framing(id, pipe.handshake_framing());
         }
         pipe.resolve_exporter(Instant::now().checked_add(limits.handshake_timeout));
-        watchdog.reset(limits.first_record_timeout);
+        watchdog.reset(limits.limits.first_record_timeout);
         let classified = Self::first_record(inner, id, &mut pipe);
         if watchdog.fired() {
             return Err(HandleError::TimedOut);
@@ -1058,6 +1077,34 @@ impl Listener {
         ListenerAdapter { listener: self }
     }
 
+    /// The limits in effect ([`Listener::set_limits`]).
+    #[must_use]
+    pub fn limits(&self) -> ListenerLimits {
+        self.inner.lock().core.config().limits
+    }
+
+    /// Replaces the listener's limits, as the tokio listener's
+    /// [`crate::Listener::set_limits`] says.
+    ///
+    /// # Errors
+    ///
+    /// Invalid limits, as [`ListenerLimits::validate`] says.
+    pub fn set_limits(&self, limits: ListenerLimits) -> Result<(), crate::InvalidConfig> {
+        // Trimmed under the listener's lock (then the account's), so that
+        // no suspension slips past the new limit; closed after it.
+        let over = {
+            let mut st = self.inner.lock();
+            st.core.set_limits(limits)?;
+            let mut over = self.inner.account.set_budget(limits.memory_budget);
+            over.extend(self.inner.account.trim_to(limits.max_suspended));
+            over
+        };
+        for s in over {
+            s.close_suspended();
+        }
+        Ok(())
+    }
+
     /// What happened to the carriers handed to the listener.
     #[must_use]
     pub fn stats(&self) -> ListenerStats {
@@ -1100,6 +1147,7 @@ impl ListenerAdapter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ListenerLimits;
     use std::io::Read;
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::time::{Duration, Instant};
@@ -1118,9 +1166,7 @@ mod tests {
                 p,
             ))
         });
-        let mut l = Listener::new(Config::default(), limits, Some(t)).unwrap();
-        std::sync::Arc::get_mut(&mut l.inner).unwrap().stall_max = stall_max;
-        l
+        Listener::with_stall_max(Config::default(), limits, Some(t), stall_max).unwrap()
     }
 
     fn pair() -> (TcpStream, TcpStream) {
@@ -1203,8 +1249,11 @@ mod tests {
     fn a_source_with_its_stalls_full_is_closed_at_once() {
         let hour = Duration::from_secs(3600);
         let limits = ListenerConfig {
+            limits: ListenerLimits {
+                max_pending_per_source: 2,
+                ..ListenerLimits::default()
+            },
             handshake_timeout: hour,
-            max_pending_per_source: 2,
             ..Default::default()
         };
         let l = refusing(1, limits, hour);
@@ -1255,9 +1304,12 @@ mod tests {
         let reasons = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = reasons.clone();
         let limits = ListenerConfig {
+            limits: ListenerLimits {
+                first_record_timeout: Duration::from_secs(3600),
+                max_pending_per_source: 3,
+                ..ListenerLimits::default()
+            },
             handshake_timeout: Duration::from_secs(3600),
-            first_record_timeout: Duration::from_secs(3600),
-            max_pending_per_source: 3,
             on_reject: Some(OnReject::new(move |i| {
                 seen.lock().unwrap().push((i.profile, i.reason));
                 RejectAction::Stall
@@ -1309,9 +1361,12 @@ mod tests {
             assert!(Listener::new(Config::default(), limits, None).is_err());
         }
         let limits = ListenerConfig {
+            limits: ListenerLimits {
+                first_record_timeout: Duration::from_secs(3600),
+                max_pending_per_source: 2,
+                ..ListenerLimits::default()
+            },
             handshake_timeout: Duration::from_secs(3600),
-            first_record_timeout: Duration::from_secs(3600),
-            max_pending_per_source: 2,
             source_prefix_v4: 24,
             source_prefix_v6: 56,
             ..Default::default()
@@ -1391,14 +1446,16 @@ mod tests {
         use std::io::Write;
         let hour = Duration::from_secs(3600);
         let limits = ListenerConfig {
+            limits: ListenerLimits {
+                first_record_timeout: hour,
+                max_pending: Some(2),
+                ..ListenerLimits::default()
+            },
             handshake_timeout: hour,
-            first_record_timeout: hour,
-            max_pending: Some(2),
             on_reject: Some(OnReject::new(|_| RejectAction::Stall)),
             ..Default::default()
         };
-        let mut l = Listener::new(Config::default(), limits, None).unwrap();
-        std::sync::Arc::get_mut(&mut l.inner).unwrap().stall_max = hour;
+        let l = Listener::with_stall_max(Config::default(), limits, None, hour).unwrap();
         let total = |l: &Listener| l.inner.lock().core.held(0).0;
         let stalls = |l: &Listener| l.inner.lock().core.stalled(0).0;
         let wait = |what: &str, f: &dyn Fn() -> bool| {

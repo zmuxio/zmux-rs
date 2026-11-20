@@ -163,7 +163,7 @@ fn timeouts_and_refusals() {
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = asked.clone();
     let mut limits = ListenerConfig::default();
-    limits.first_record_timeout = Duration::from_millis(100);
+    limits.limits.first_record_timeout = Duration::from_millis(100);
     limits.on_reject = Some(OnReject::new(move |_| {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         RejectAction::Close
@@ -184,7 +184,7 @@ fn timeouts_and_refusals() {
     t.join().unwrap();
     // A carrier that says nothing.
     let mut limits = ListenerConfig::default();
-    limits.first_record_timeout = Duration::from_millis(100);
+    limits.limits.first_record_timeout = Duration::from_millis(100);
     let l = blocking::Listener::new(config(), limits, None).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let silent = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();

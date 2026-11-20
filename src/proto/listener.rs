@@ -25,7 +25,7 @@ use crate::proto::varint;
 pub struct MemoryPressure {
     /// The sum of the sessions' charges, in bytes, when it changed.
     pub used: u64,
-    /// The budget.
+    /// The budget in effect (0 once it was made unlimited).
     pub budget: u64,
     /// Pressure started (`true`) or ended.
     pub active: bool,
@@ -54,14 +54,22 @@ impl std::fmt::Debug for OnMemoryPressure {
 }
 
 /// The default bound on a carrier's first record
-/// ([`ListenerConfig::first_record_timeout`]); also the bound of a lane's
+/// ([`ListenerLimits::first_record_timeout`]); also the bound of a lane's
 /// first record on an endpoint without a listener.
 pub const DEFAULT_FIRST_RECORD_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Listener limits.
-#[derive(Debug, Clone)]
+/// The bounds of a listener that `set_limits` changes while it runs (the
+/// tokio and std listeners' `set_limits`, [`ListenerCore::set_limits`]);
+/// [`ListenerConfig::limits`] gives the initial values.
+///
+/// The rest of [`ListenerConfig`] is fixed for the listener's life: the
+/// source prefixes, the instance id, the hooks and
+/// the handshake timeout. The bounds of a session itself are its
+/// [`crate::Config`]: [`ListenerConfig::session_config`], called for every
+/// new session, answers the configuration current at the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ListenerConfig {
+pub struct ListenerLimits {
     /// The listener's bound on carriers before they belong to a session
     /// (default [`DEFAULT_MAX_PENDING`]; `None` is unlimited): a carrier
     /// holds one of these slots with its source slot, from the moment it
@@ -78,11 +86,68 @@ pub struct ListenerConfig {
     /// Carriers before a session per source (default 8; a source counted
     /// by its prefix, [`ListenerConfig::source_prefix_v4`] and
     /// [`ListenerConfig::source_prefix_v6`]), held as
-    /// [`ListenerConfig::max_pending`] says. A source stalls at most one
+    /// [`ListenerLimits::max_pending`] says. A source stalls at most one
     /// fewer, so that it always keeps a slot for a new attempt. At least 2,
     /// since a split bootstrap holds two slots and an exchange carrier's
     /// further requests compete with the request that created it.
     pub max_pending_per_source: usize,
+    /// Unconfirmed carriers per session: joins that passed authentication and wait for the
+    /// joiner's confirmation (default 4). A new authenticated Hello of a session at the bound
+    /// closes the one Unconfirmed longest first and is never refused for lack of room.
+    pub max_pending_per_session: usize,
+    /// Suspended sessions held at once (default 1024).
+    pub max_suspended: usize,
+    /// The first record or Hello must arrive within this (default 2 s).
+    pub first_record_timeout: Duration,
+    /// Bytes the sessions may hold together (default 1 GiB; `None` is
+    /// unlimited), in place of their own [`crate::Config::memory_budget`]:
+    /// above it sessions grant no new credit, new sessions and pipes are
+    /// refused and the suspended sessions are closed, until the sum falls
+    /// below three quarters of it. A change applies at once, as if the sum
+    /// crossed the new bound.
+    pub memory_budget: Option<u64>,
+}
+
+impl Default for ListenerLimits {
+    fn default() -> Self {
+        Self {
+            max_pending: Some(DEFAULT_MAX_PENDING),
+            max_pending_per_source: 8,
+            max_pending_per_session: 4,
+            max_suspended: 1024,
+            first_record_timeout: DEFAULT_FIRST_RECORD_TIMEOUT,
+            memory_budget: Some(super::session::DEFAULT_MEMORY_BUDGET),
+        }
+    }
+}
+
+impl ListenerLimits {
+    /// Checks the limits as creating a listener does.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        let e = crate::InvalidConfig::new;
+        if self.max_pending == Some(0) || self.max_pending_per_session == 0 {
+            return Err(e(
+                "ListenerLimits::max_pending",
+                "max_pending and max_pending_per_session must be at least 1",
+            ));
+        }
+        if self.max_pending_per_source < 2 {
+            return Err(e(
+                "ListenerLimits::max_pending_per_source",
+                "at least 2: a split bootstrap holds two slots",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Listener limits.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ListenerConfig {
+    /// The bounds the listener's `set_limits` changes while it runs: their
+    /// initial values, the listener holding the live ones from then on.
+    pub limits: ListenerLimits,
     /// The prefix an IPv4 source is counted by: its first this many bits
     /// (default 32, the address on its own; 1 to 32, another value being
     /// the configuration error). An IPv4-mapped IPv6 address counts as
@@ -98,12 +163,6 @@ pub struct ListenerConfig {
     /// (default 64; 1 to 128, another value being the configuration
     /// error), as [`ListenerConfig::source_prefix_v4`] says.
     pub source_prefix_v6: u8,
-    /// Unconfirmed carriers per session: joins that passed authentication and wait for the
-    /// joiner's confirmation (default 4). A new authenticated Hello of a session at the bound
-    /// closes the one Unconfirmed longest first and is never refused for lack of room.
-    pub max_pending_per_session: usize,
-    /// The first record or Hello must arrive within this (default 2 s).
-    pub first_record_timeout: Duration,
     /// A pending carrier is closed after this (default 10 s).
     pub handshake_timeout: Duration,
     /// The listener's own `max_record_size` (default 65535).
@@ -116,11 +175,6 @@ pub struct ListenerConfig {
     /// transport parameters (`CONNECTION_REFUSED`), so that an application
     /// that does not keep up with `accept` holds a bounded backlog.
     pub max_unaccepted: Option<usize>,
-    /// Suspended sessions held at once (default 1024).
-    pub max_suspended: usize,
-    /// Bytes the sessions may hold together (default 1 GiB; `None` is
-    /// unlimited).
-    pub memory_budget: Option<u64>,
     /// Called when memory pressure starts and ends (unset by default).
     pub on_memory_pressure: Option<OnMemoryPressure>,
     /// Bytes at the start of every session locator, for load-balancer
@@ -485,7 +539,7 @@ impl std::fmt::Debug for SessionConfigFn {
 /// `max_record_size`.
 pub const MAX_HELLO: usize = 2 + 8 + 1 + 1 + 255 + 64 + 2 + 65_535;
 
-/// The default of [`ListenerConfig::max_pending`].
+/// The default of [`ListenerLimits::max_pending`].
 pub const DEFAULT_MAX_PENDING: usize = 1024;
 
 /// The default of [`ListenerConfig::max_unaccepted`].
@@ -498,18 +552,13 @@ pub const MAX_INSTANCE_ID_LEN: usize = 8;
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
-            max_pending: Some(DEFAULT_MAX_PENDING),
-            max_pending_per_source: 8,
+            limits: ListenerLimits::default(),
             source_prefix_v4: 32,
             source_prefix_v6: 64,
-            max_pending_per_session: 4,
-            first_record_timeout: DEFAULT_FIRST_RECORD_TIMEOUT,
             handshake_timeout: Duration::from_secs(10),
             max_record_size: 65535,
             accept_sessions: true,
             max_unaccepted: Some(DEFAULT_MAX_UNACCEPTED),
-            max_suspended: 1024,
-            memory_budget: Some(super::session::DEFAULT_MEMORY_BUDGET),
             on_memory_pressure: None,
             instance_id: Vec::new(),
             trusted_proxies: super::trusted::TrustedProxies::new(),
@@ -614,6 +663,8 @@ struct Pending {
     /// holds it for the carrier ([`ListenerCore::open`]).
     slot: Option<Slot>,
     opened: Instant,
+    /// The first-record timeout when it arrived.
+    first_timeout: Duration,
     framing: Framing,
     classifier: Classifier,
     buf: Vec<u8>,
@@ -712,18 +763,7 @@ impl ListenerConfig {
                 "above ZMUX_MAX_RECORD_SIZE",
             ));
         }
-        if self.max_pending == Some(0) || self.max_pending_per_session == 0 {
-            return Err(e(
-                "ListenerConfig::max_pending",
-                "max_pending and max_pending_per_session must be at least 1",
-            ));
-        }
-        if self.max_pending_per_source < 2 {
-            return Err(e(
-                "ListenerConfig::max_pending_per_source",
-                "at least 2: a split bootstrap holds two slots",
-            ));
-        }
+        self.limits.validate()?;
         if !(1..=32).contains(&self.source_prefix_v4) {
             return Err(e("ListenerConfig::source_prefix_v4", "outside 1..=32"));
         }
@@ -836,6 +876,17 @@ impl ListenerCore {
         &self.config
     }
 
+    /// Replaces the limits in the configuration; invalid ones change
+    /// nothing. The pending bounds apply to new carriers and the next
+    /// decisions on held ones, closing none; `max_pending_per_session` to
+    /// the next join; `first_record_timeout` to carriers opened after it.
+    /// `max_suspended` is the driver's to enforce.
+    pub fn set_limits(&mut self, limits: ListenerLimits) -> Result<(), crate::InvalidConfig> {
+        limits.validate()?;
+        self.config.limits = limits;
+        Ok(())
+    }
+
     /// Carriers pending.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -878,6 +929,7 @@ impl ListenerCore {
             id,
             slot,
             opened: now,
+            first_timeout: self.config.limits.first_record_timeout,
             framing,
             classifier: if stream {
                 classifier.with_lanes()
@@ -898,12 +950,13 @@ impl ListenerCore {
     /// `evicted`, to be closed now), or the carrier is refused
     /// ([`Entered::Full`]) when none is stalled.
     pub fn enter(&mut self, source: u64) -> Entered {
-        if self.held_by(source) >= self.config.max_pending_per_source {
+        if self.held_by(source) >= self.config.limits.max_pending_per_source {
             return Entered::SourceFull;
         }
         let mut evicted = None;
         if self
             .config
+            .limits
             .max_pending
             .is_some_and(|max| self.slots.len() >= max)
         {
@@ -951,10 +1004,10 @@ impl ListenerCore {
         if from == source {
             return true;
         }
-        if self.held_by(source) >= self.config.max_pending_per_source
+        if self.held_by(source) >= self.config.limits.max_pending_per_source
             || stalled
                 && self.stalled_by.get(&source).copied().unwrap_or(0) + 1
-                    >= self.config.max_pending_per_source
+                    >= self.config.limits.max_pending_per_source
         {
             return false;
         }
@@ -986,9 +1039,10 @@ impl ListenerCore {
         }
         let source = s.source;
         let per = self.stalled_by.get(&source).copied().unwrap_or(0);
-        if per + 1 >= self.config.max_pending_per_source
+        if per + 1 >= self.config.limits.max_pending_per_source
             || self
                 .config
+                .limits
                 .max_pending
                 .is_some_and(|max| self.stalls.len() >= max / 2)
         {
@@ -1146,7 +1200,7 @@ impl ListenerCore {
     }
 
     /// A verified Hello of the session named `locator` is Unconfirmed. When the session
-    /// already held its bound ([`ListenerConfig::max_pending_per_session`]), the carrier
+    /// already held its bound ([`ListenerLimits::max_pending_per_session`]), the carrier
     /// that became Unconfirmed first, never this one, MUST be closed as a failed join, and
     /// the new Hello is never refused for lack of room; below the bound nothing is evicted.
     /// Returns the carrier to close.
@@ -1161,7 +1215,8 @@ impl ListenerCore {
                 .filter(|(l, _)| l.as_slice() == locator)
                 .map(|&(_, seq)| seq)
         };
-        if self.pending.iter().filter_map(of).count() <= self.config.max_pending_per_session {
+        if self.pending.iter().filter_map(of).count() <= self.config.limits.max_pending_per_session
+        {
             return None;
         }
         let (i, _) = self
@@ -1258,7 +1313,7 @@ impl ListenerCore {
                 p.opened.checked_add(if p.first {
                     self.config.handshake_timeout
                 } else {
-                    self.config.first_record_timeout
+                    p.first_timeout
                 })
             })
             .min()
@@ -1267,13 +1322,12 @@ impl ListenerCore {
     /// Carriers whose first-record or handshake timeout expired: close
     /// them.
     pub fn expired(&mut self, now: Instant) -> Vec<CarrierId> {
-        let first_timeout = self.config.first_record_timeout;
         let handshake = self.config.handshake_timeout;
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.pending.len() {
             let p = &self.pending[i];
-            let limit = if p.first { handshake } else { first_timeout };
+            let limit = if p.first { handshake } else { p.first_timeout };
             if p.opened.checked_add(limit).is_some_and(|t| now >= t) {
                 out.extend(self.remove(i));
             } else {
@@ -1389,29 +1443,27 @@ impl LaneProbe {
 /// resumes below three quarters of it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryBudget {
-    budget: Option<u64>,
     pressure: bool,
 }
 
 impl MemoryBudget {
-    /// A budget of `bytes`; `None` is unlimited.
+    /// A budget not under pressure.
     #[must_use]
-    pub fn new(bytes: Option<u64>) -> Self {
-        Self {
-            budget: bytes,
-            pressure: false,
-        }
+    pub fn new() -> Self {
+        Self { pressure: false }
     }
 
-    /// Updates with the bytes the sessions hold; returns the new pressure
+    /// Updates with the bytes the sessions hold and the budget in effect
+    /// (`None`: unlimited, which ends pressure); returns the new pressure
     /// state when it changed.
-    pub fn update(&mut self, used: u64) -> Option<bool> {
-        let budget = self.budget?;
-        let next = if self.pressure {
-            used >= budget / 4 * 3
-        } else {
-            used > budget
-        };
+    pub fn update(&mut self, used: u64, budget: Option<u64>) -> Option<bool> {
+        let next = budget.is_some_and(|budget| {
+            if self.pressure {
+                used >= budget / 4 * 3
+            } else {
+                used > budget
+            }
+        });
         (next != self.pressure).then(|| {
             self.pressure = next;
             next
@@ -1452,8 +1504,8 @@ pub struct AdmissionStats {
     /// A Stall, decided by the admission or by [`ListenerConfig::on_reject`], that the
     /// listener could not carry out: its source already stalled
     /// `max_pending_per_source - 1` carriers
-    /// ([`ListenerConfig::max_pending_per_source`]), the listener's stalls held half of
-    /// [`ListenerConfig::max_pending`], or the listener closed meanwhile. Closed at once.
+    /// ([`ListenerLimits::max_pending_per_source`]), the listener's stalls held half of
+    /// [`ListenerLimits::max_pending`], or the listener closed meanwhile. Closed at once.
     pub stall_overflow: u64,
     /// The first message of a message-framed carrier was longer than
     /// [`crate::Admission::with_max_message`]: closed without a decision.
@@ -1517,7 +1569,7 @@ pub struct ListenerStats {
     /// Inputs closed without a distinguishable reason: unknown,
     /// unauthenticated or replayed joins, lanes that name no pipe, or not
     /// zmux at all ([`HandleError::Rejected`]); and new carriers closed at once
-    /// because every slot of [`ListenerConfig::max_pending`] was taken and none
+    /// because every slot of [`ListenerLimits::max_pending`] was taken and none
     /// was stalled. An admission's decisions count in [`ListenerStats::admission`]
     /// only, and a stalled carrier closed to make room is not counted again.
     pub rejected: u64,
@@ -1629,11 +1681,38 @@ mod tests {
         assert_eq!(l.held(a), (0, 0));
     }
 
+    /// `set_limits` validates, round-trips, bounds the next decision without
+    /// closing held carriers, and times only later carriers by a new
+    /// `first_record_timeout`.
+    #[test]
+    fn set_limits_applies_to_what_comes_next() {
+        let mut l = ListenerCore::new(ListenerConfig::default());
+        let now = Instant::now();
+        let a = source_name("a");
+        let (slot, _) = taken(l.enter(a));
+        let old = l.open(Some(slot), Framing::ByteStream, now);
+        let mut lim = l.config().limits;
+        assert_eq!(lim, ListenerLimits::default());
+        lim.max_pending_per_source = 1;
+        assert!(l.set_limits(lim).is_err());
+        assert_eq!(l.config().limits, ListenerLimits::default());
+        lim.max_pending_per_source = 2;
+        lim.max_pending = None;
+        lim.first_record_timeout = Duration::MAX;
+        l.set_limits(lim).unwrap();
+        assert_eq!(l.config().limits, lim);
+        let (slot, _) = taken(l.enter(a));
+        l.open(Some(slot), Framing::ByteStream, now);
+        assert_eq!(l.enter(a), Entered::SourceFull);
+        assert_eq!(l.expired(now + Duration::from_secs(3600)), vec![old]);
+    }
+
     #[test]
     fn slots_are_held_until_released() {
-        let mut l = ListenerCore::new(ListenerConfig {
-            max_pending_per_source: 2,
-            ..ListenerConfig::default()
+        let mut l = ListenerCore::new({
+            let mut c = ListenerConfig::default();
+            c.limits.max_pending_per_source = 2;
+            c
         });
         let now = Instant::now();
         let (a, b) = (source_name("a"), source_name("b"));
@@ -1658,10 +1737,11 @@ mod tests {
     /// A stalled slot moves only to a source with room for one more stall.
     #[test]
     fn a_stalled_slot_moves_within_the_stall_share() {
-        let mut l = ListenerCore::new(ListenerConfig {
-            max_pending: None,
-            max_pending_per_source: 3,
-            ..ListenerConfig::default()
+        let mut l = ListenerCore::new({
+            let mut c = ListenerConfig::default();
+            c.limits.max_pending = None;
+            c.limits.max_pending_per_source = 3;
+            c
         });
         let (a, b) = (source_name("a"), source_name("b"));
         let (b1, _) = taken(l.enter(b));
@@ -1685,9 +1765,10 @@ mod tests {
     /// slot taken evicts the oldest stall, and is refused when none is stalled.
     #[test]
     fn the_global_bound_evicts_the_oldest_stall() {
-        let mut l = ListenerCore::new(ListenerConfig {
-            max_pending: Some(4),
-            ..ListenerConfig::default()
+        let mut l = ListenerCore::new({
+            let mut c = ListenerConfig::default();
+            c.limits.max_pending = Some(4);
+            c
         });
         let slots: Vec<_> = (0..4).map(|n| taken(l.enter(n)).0).collect();
         assert_eq!(l.enter(9), Entered::Full);
@@ -1709,9 +1790,10 @@ mod tests {
     /// finds the listener full.
     #[test]
     fn one_slot_stalls_nothing() {
-        let mut l = ListenerCore::new(ListenerConfig {
-            max_pending: Some(1),
-            ..ListenerConfig::default()
+        let mut l = ListenerCore::new({
+            let mut c = ListenerConfig::default();
+            c.limits.max_pending = Some(1);
+            c
         });
         let (slot, _) = taken(l.enter(0));
         assert!(!l.stall(slot), "half of one slot, rounded down, is none");
@@ -1725,10 +1807,11 @@ mod tests {
     /// listener never refuses for its own bound.
     #[test]
     fn a_source_keeps_a_slot_and_unlimited_never_fills() {
-        let mut l = ListenerCore::new(ListenerConfig {
-            max_pending: None,
-            max_pending_per_source: 3,
-            ..ListenerConfig::default()
+        let mut l = ListenerCore::new({
+            let mut c = ListenerConfig::default();
+            c.limits.max_pending = None;
+            c.limits.max_pending_per_source = 3;
+            c
         });
         let a: Vec<_> = (0..3).map(|_| taken(l.enter(1)).0).collect();
         assert!(l.stall(a[0]) && l.stall(a[1]));
@@ -1819,10 +1902,13 @@ mod tests {
 
     #[test]
     fn memory_budget_hysteresis() {
-        let mut m = MemoryBudget::new(Some(1000));
-        assert_eq!(m.update(900), None);
-        assert_eq!(m.update(1001), Some(true));
-        assert_eq!(m.update(800), None);
-        assert_eq!(m.update(700), Some(false));
+        let mut m = MemoryBudget::new();
+        let b = Some(1000);
+        assert_eq!(m.update(900, b), None);
+        assert_eq!(m.update(1001, b), Some(true));
+        assert_eq!(m.update(800, b), None);
+        assert_eq!(m.update(700, b), Some(false));
+        assert_eq!(m.update(1001, b), Some(true));
+        assert_eq!(m.update(1001, None), Some(false), "unlimited ends it");
     }
 }

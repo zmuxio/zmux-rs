@@ -48,7 +48,7 @@ impl Rig {
         let addr = server.local_addr().unwrap();
         let mut lc = ListenerConfig::default();
         lc.admission = admission;
-        lc.max_pending_per_source = per_source;
+        lc.limits.max_pending_per_source = per_source;
         let listener = Listener::new(Config::default(), lc).expect("valid listener configuration");
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der).unwrap();

@@ -232,9 +232,11 @@ let fallback = Fallback::new(|t: Takeover| async move {
   as a `CarrierCredential`. `TrustedProxies` names the intermediaries whose report
   of the client address (PROXY protocol, a forwarding header field) is
   believed.
-- **Carriers before a session.** Every carrier holds a slot of its source
-  (`ListenerConfig::max_pending_per_source`, default 8, at least 2) and one of the
-  listener (`ListenerConfig::max_pending`, default 1024, `None` for
+- **Carriers before a session.** `ListenerConfig::limits` holds the bounds
+  that `Listener::set_limits` changes while the listener runs
+  (`Listener::limits` reads them). Every carrier holds a slot of its source
+  (`ListenerLimits::max_pending_per_source`, default 8, at least 2) and one of the
+  listener (`ListenerLimits::max_pending`, default 1024, `None` for
   unlimited) from the moment it is taken, through its handshake,
   admission, transform, pairing and classification, and through a stall,
   until it enters a session or is closed. A source is counted by its

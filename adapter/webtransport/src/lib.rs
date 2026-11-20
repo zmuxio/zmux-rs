@@ -506,7 +506,7 @@ fn source_of(
 async fn refuse(request: wt::Request, status: wt::http::StatusCode, listener: &Listener) {
     let conn = request.conn().clone();
     if request.reject(status).await.is_ok() {
-        let _ = tokio::time::timeout(listener.limits().handshake_timeout, conn.closed()).await;
+        let _ = tokio::time::timeout(listener.adapter().handshake_timeout(), conn.closed()).await;
     }
 }
 

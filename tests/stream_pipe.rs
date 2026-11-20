@@ -629,7 +629,7 @@ fn streams_of_a_connection_without_our_pipes_are_held_to_the_pending_limits() {
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending_per_source = 2;
+            limits.limits.max_pending_per_source = 2;
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
             let mut held = Vec::new();
@@ -686,7 +686,7 @@ fn a_connection_with_our_pipe_exempts_one_waiting_stream_per_pipe() {
             // One pipe of a session of this process on the connection.
             let (nc, ns) = nested_over(&oc, &os, &[]).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending_per_source = 2;
+            limits.limits.max_pending_per_source = 2;
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
             let handle = |send, recv| {
@@ -753,8 +753,8 @@ fn a_carrier_beyond_the_global_bound_is_closed_at_once() {
         {
             let (oc, os) = outer(Config::default(), Config::default()).await;
             let mut limits = ListenerConfig::default();
-            limits.max_pending = Some(1);
-            limits.first_record_timeout = Duration::from_secs(60);
+            limits.limits.max_pending = Some(1);
+            limits.limits.first_record_timeout = Duration::from_secs(60);
             let listener =
                 Listener::new(Config::default(), limits).expect("valid listener configuration");
             let mut held = Vec::new();

@@ -31,7 +31,8 @@ use crate::proto::admission::{
 };
 use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
-    CarrierId, Classified, Entered, ListenerConfig, ListenerCore as Core, Paired, Slot,
+    CarrierId, Classified, Entered, ListenerConfig, ListenerCore as Core, ListenerLimits, Paired,
+    Slot,
 };
 use crate::proto::listener::{RejectAction, RejectInfo, SessionConfigFn};
 use crate::proto::oob::PAIRING_TOKEN_LEN;
@@ -59,8 +60,8 @@ pub struct PipeHint {
     /// A half waits for its partner in a slot of the listener, until the
     /// other half arrives or the handshake timeout ends: 1024 per
     /// listener and 8 per source by default
-    /// ([`crate::ListenerConfig::max_pending`],
-    /// [`crate::ListenerConfig::max_pending_per_source`]), a source
+    /// ([`crate::ListenerLimits::max_pending`],
+    /// [`crate::ListenerLimits::max_pending_per_source`]), a source
     /// counted by its prefix ([`crate::ListenerConfig::source_prefix_v4`]).
     /// Without an admission
     /// ([`crate::ListenerConfig::admission`]), a few sources can keep
@@ -349,8 +350,8 @@ impl ListenShared {
 }
 
 /// A carrier that entered a listener ([`ListenerAdapter::enter`]): it holds a
-/// source slot ([`ListenerConfig::max_pending_per_source`]) and a slot of
-/// the listener ([`ListenerConfig::max_pending`]) from before its outer
+/// source slot ([`ListenerLimits::max_pending_per_source`]) and a slot of
+/// the listener ([`ListenerLimits::max_pending`]) from before its outer
 /// handshake, through its admission and, handed to
 /// [`Listener::handle_pipe`] with [`PipeHint::from_entry`], until it enters
 /// a session; or until it goes to the listener's fallback, is released
@@ -1101,8 +1102,8 @@ impl Entry {
     /// the carriers it decides on itself.
     ///
     /// A source stalls at most `max_pending_per_source - 1` carriers at
-    /// once ([`ListenerConfig::max_pending_per_source`]), and the listener
-    /// at most half of [`ListenerConfig::max_pending`]: beyond them, a
+    /// once ([`ListenerLimits::max_pending_per_source`]), and the listener
+    /// at most half of [`ListenerLimits::max_pending`]: beyond them, a
     /// [`AdmissionVerdict::Stall`] is [`Admit::Close`] (counted in
     /// [`AdmissionStats::stall_overflow`]).
     pub async fn stall<R>(&mut self, reader: Option<&mut R>)
@@ -1417,6 +1418,12 @@ impl<'a> ListenerAdapter<'a> {
         &self.listener.shared.trusted
     }
 
+    /// [`ListenerConfig::handshake_timeout`], fixed for the listener's life.
+    #[must_use]
+    pub fn handshake_timeout(&self) -> Duration {
+        self.listener.shared.lock().core.config().handshake_timeout
+    }
+
     /// Whether the listener is closed ([`Listener::close`]): an adapter
     /// tells with it why [`ListenerAdapter::enter`] gave no place.
     #[must_use]
@@ -1508,8 +1515,7 @@ impl Listener {
         let on_reject = limits.on_reject.clone();
         let logger = limits.logger.clone();
         let account = Account::new(
-            limits.memory_budget,
-            limits.max_suspended,
+            limits.limits.memory_budget,
             limits.on_memory_pressure.clone(),
             super::account::HookContext::Task,
         )
@@ -1552,6 +1558,12 @@ impl Listener {
             logger,
             _live: Live::new(Kind::Listener),
         });
+        let weak = Arc::downgrade(&shared);
+        shared.account.bind_max_suspended(Box::new(move || {
+            let s = weak.upgrade()?;
+            let max = s.lock().core.config().limits.max_suspended;
+            Some(max)
+        }));
         Ok(Self { shared })
     }
 
@@ -1749,10 +1761,38 @@ impl Listener {
         &self.shared.config
     }
 
-    /// The listener's limits.
+    /// The limits in effect ([`Listener::set_limits`]).
     #[must_use]
-    pub fn limits(&self) -> ListenerConfig {
-        self.shared.lock().core.config().clone()
+    pub fn limits(&self) -> ListenerLimits {
+        self.shared.lock().core.config().limits
+    }
+
+    /// Replaces the listener's limits; invalid ones change nothing. New
+    /// carriers and the next decisions on held ones use them at once:
+    /// lowered pending bounds refuse or displace new carriers until the
+    /// count is below them but close no carrier already held, a lowered
+    /// `max_pending_per_session` applies to the next join of a session, a
+    /// lowered `max_suspended` closes the longest-suspended sessions beyond
+    /// it (`ZMUX_RESUME_TIMEOUT`), and a changed `first_record_timeout`
+    /// applies to carriers that arrive after the call.
+    ///
+    /// # Errors
+    ///
+    /// Invalid limits, as [`ListenerLimits::validate`] says.
+    pub fn set_limits(&self, limits: ListenerLimits) -> Result<(), crate::InvalidConfig> {
+        // Trimmed under the listener's lock (then the account's), so that
+        // no suspension slips past the new limit; closed after it.
+        let over = {
+            let mut st = self.shared.lock();
+            st.core.set_limits(limits)?;
+            let mut over = self.shared.account.set_budget(limits.memory_budget);
+            over.extend(self.shared.account.trim_to(limits.max_suspended));
+            over
+        };
+        for s in over {
+            s.close_suspended();
+        }
+        Ok(())
     }
 
     /// Serves a TCP listener until [`Listener::close`]: every connection
@@ -1896,8 +1936,7 @@ impl Listener {
         H: Fn(Listener, C) -> HF + Send + Sync + 'static,
         HF: Future<Output = ()> + Send + 'static,
     {
-        let limits = self.limits();
-        let (limit, most) = (limits.handshake_timeout, limits.max_pending);
+        let limit = self.shared.lock().core.config().handshake_timeout;
         let serve = Arc::new(serve);
         // The setup tasks, oldest first; each spawns its serving apart, so
         // that aborting it ends only the setup.
@@ -1910,7 +1949,7 @@ impl Listener {
                     continue;
                 }
             };
-            setups.make_room(most);
+            setups.make_room(self.limits().max_pending);
             let (l, made, serve) = (self.clone(), setup(conn), serve.clone());
             let task = tokio::spawn(async move {
                 let made = l.accept_or_close(tokio::time::timeout(limit, made)).await;
@@ -2117,7 +2156,7 @@ impl Listener {
         };
         let classified = {
             let first = tokio::time::timeout(
-                limits.first_record_timeout,
+                limits.limits.first_record_timeout,
                 Self::first_record(shared, id, &mut pipe),
             );
             let mut first = std::pin::pin!(first);
@@ -2430,7 +2469,7 @@ impl Listener {
         shared.lock().core.set_framing(id, io.framing);
         let classified = {
             let first = tokio::time::timeout(
-                limits.first_record_timeout,
+                limits.limits.first_record_timeout,
                 Self::first_record(shared, id, &mut io),
             );
             let mut first = std::pin::pin!(first);
@@ -3453,7 +3492,10 @@ mod setup_bound_tests {
     async fn setups_without_an_entry_stay_within_max_pending() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let limits = ListenerConfig {
-                max_pending: Some(3),
+                limits: ListenerLimits {
+                    max_pending: Some(3),
+                    ..ListenerLimits::default()
+                },
                 ..ListenerConfig::default()
             };
             let listener =

@@ -643,7 +643,7 @@ pub async fn serve_connection(
     // A request's head arrives within the handshake timeout, and so does
     // the connection's first one: a peer that opens streams and sends no
     // HEADERS holds neither tasks nor the connection beyond it.
-    let head_limit = listener.limits().handshake_timeout;
+    let head_limit = listener.adapter().handshake_timeout();
     let first_by = tokio::time::Instant::now() + head_limit;
     let resolved = Arc::new(AtomicBool::new(false));
     {

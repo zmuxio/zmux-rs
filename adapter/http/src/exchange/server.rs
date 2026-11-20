@@ -64,9 +64,6 @@ struct Shared {
     options: ExchangeOptions,
     /// The time window in seconds.
     window: i64,
-    /// The listener's first-record timeout: the authentication header
-    /// arrives within it.
-    first_record: Duration,
     /// The listener's handshake timeout: the rest of an authenticated body
     /// arrives within it.
     handshake: Duration,
@@ -150,15 +147,13 @@ impl ExchangeServer {
         let window = i64::try_from(options.time_window.as_secs())
             .unwrap_or(i64::MAX)
             .min(i64::from(i32::MAX) + 1);
-        let limits = listener.limits();
         let enc = options.encoding;
         Ok(Self {
             inner: Arc::new(Shared {
                 listener: listener.clone(),
                 window,
                 record: Record::new(window, options.max_recorded),
-                first_record: limits.first_record_timeout,
-                handshake: limits.handshake_timeout,
+                handshake: listener.adapter().handshake_timeout(),
                 bodies: wire::encoded_len(enc, REQUEST_OVERHEAD)
                     ..=wire::encoded_len(
                         enc,
@@ -265,6 +260,7 @@ impl ExchangeServer {
             return back(parts, Bytes::new(), body);
         }
         let s = &self.inner;
+        let first_record = s.listener.limits().first_record_timeout;
         if crate::forwarded_early_data(&parts.headers) {
             // Forwarded from TLS early data: no carrier is taken from it.
             s.listener.adapter().count_setup_failure();
@@ -289,9 +285,9 @@ impl ExchangeServer {
         };
 
         // The authentication header, and nothing more, within the
-        // first-record timeout.
+        // listener's first-record timeout as the request arrived.
         let mut read = Gathered::default();
-        let arrived = read_to(&mut body, &mut read, s.header_len, arrival + s.first_record).await;
+        let arrived = read_to(&mut body, &mut read, s.header_len, arrival + first_record).await;
         let authenticated = arrived
             .then(|| s.header(&read.as_slice()[..s.header_len]))
             .flatten()
@@ -1406,7 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn requests_take_the_sources_pending_share() {
         let mut limits = zmux::ListenerConfig::default();
-        limits.max_pending_per_source = 2;
+        limits.limits.max_pending_per_source = 2;
         let listener =
             Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =
@@ -1475,7 +1471,7 @@ mod tests {
     #[tokio::test]
     async fn no_global_slot_is_503() {
         let mut limits = zmux::ListenerConfig::default();
-        limits.max_pending = Some(1);
+        limits.limits.max_pending = Some(1);
         let listener =
             Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =
@@ -1496,7 +1492,12 @@ mod tests {
     /// session, and its next requests need another one.
     #[tokio::test]
     async fn the_default_source_bound_admits_a_carriers_next_requests() {
-        assert!(zmux::ListenerConfig::default().max_pending_per_source >= 2);
+        assert!(
+            zmux::ListenerConfig::default()
+                .limits
+                .max_pending_per_source
+                >= 2
+        );
         let (listener, server) = server(ExchangeOptions::default());
         let cid = [4; 16];
         assert_eq!(send(&server, &cid, Kind::Up, 0, 0, b"a").await.flags, 0);
@@ -1662,7 +1663,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_data_mac_creates_nothing() {
         let mut limits = zmux::ListenerConfig::default();
-        limits.max_pending_per_source = 2;
+        limits.limits.max_pending_per_source = 2;
         let listener =
             Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =
@@ -1714,7 +1715,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_header_is_handed_back() {
         let mut limits = zmux::ListenerConfig::default();
-        limits.first_record_timeout = Duration::from_millis(50);
+        limits.limits.first_record_timeout = Duration::from_millis(50);
         let listener =
             Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
         let server =
