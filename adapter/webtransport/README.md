@@ -18,9 +18,14 @@ new WebTransport session; `serve(listener, endpoint, options)` accepts
 WebTransport sessions on a QUIC endpoint, within the listener's setup
 limits, and hands their streams to a listener. With the listener's
 admission (`ListenerConfig::admission`), each session request is decided on before it is
-answered (`admit`, without a prefix): accepted requests get 200, the
-others go to `Options::fallback` (`Fallback`) or get 404, or
-are stalled or closed without a response. A client's `zmux::CarrierCredential`
+answered (`admit`, without a prefix): accepted requests get 200, those it
+refuses get 404, or are stalled or closed without a response. The head may
+defer the decision to the session's first bidirectional stream
+(`AdmissionVerdict::Defer`): the session is answered, nothing else of it
+reaches the listener before, and a first stream not accepted goes to the
+listener's fallback (`ListenerConfig::fallback`, a `zmux::Takeover`;
+`takeover_session` gives the session), which is closed once the fallback
+completed. A client's `zmux::CarrierCredential`
 (`Options::with_carrier_credential`) travels in a request header field, such as a
 `zmux::PrefixAuth` token in `Zmux-Prefix-Auth`; `dial_over` makes the
 session on a QUIC connection of the application's, whose exporter binds

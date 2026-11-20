@@ -445,11 +445,6 @@ impl<B> BodyReader<B> {
         }
     }
 
-    /// Whether the body ended (cleanly) and every byte was read.
-    pub(crate) fn ended(&self) -> bool {
-        self.ended && self.chunk.is_empty()
-    }
-
     /// The body and the part of its last frame not read yet.
     pub(crate) fn into_parts(self) -> (B, Bytes) {
         (self.body, self.chunk)

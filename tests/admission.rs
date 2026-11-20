@@ -1,7 +1,7 @@
 //! Carrier admission, the listener's one admission at every entry:
 //! accepted carriers reach the listener without the accepted prefix,
-//! others reach the fallback with every byte read replayed, or are
-//! stalled; each outcome is counted once in the admission statistics.
+//! others reach the listener's fallback with every byte read replayed, or
+//! are stalled; each outcome is counted once in the admission statistics.
 
 #![allow(
     clippy::many_single_char_names,
@@ -18,10 +18,11 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use zmux::adapter::{Admit, Fallback, JoinPrefix};
+use zmux::adapter::{Admit, JoinPrefix};
 use zmux::{
-    Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, HandleError,
-    Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier, Session,
+    Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, Fallback,
+    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier,
+    Session, Takeover,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -99,9 +100,11 @@ async fn fallback_receives_every_byte_read() {
     let wrong = PrefixAuth::new(b"other", Duration::from_secs(30), false).unwrap();
     let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024).unwrap());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = Fallback::new(move |mut conn, source: SocketAddr| {
+    let fallback = Fallback::new(move |t: Takeover| {
         let tx = tx.clone();
         async move {
+            let source = t.info().source.unwrap();
+            let mut conn = t.into_stream().expect("a TCP stream");
             let mut got = Vec::new();
             let _ = conn.read_to_end(&mut got).await;
             let _ = conn.write_all(b"fallback").await;
@@ -166,8 +169,8 @@ async fn every_outcome_is_counted_once() {
     // Close, an Accept beyond the prefix, and a decision that panics are
     // all closed.
     for decide in [
-        (|_: &CarrierInfo, _: &[u8]| AdmissionVerdict::Close)
-            as fn(&CarrierInfo, &[u8]) -> AdmissionVerdict,
+        (|_: CarrierInfo, _: &[u8]| AdmissionVerdict::Close)
+            as fn(CarrierInfo, &[u8]) -> AdmissionVerdict,
         |_, _| AdmissionVerdict::accept(5),
         |_, _| panic!("a failing decision"),
     ] {
@@ -207,7 +210,7 @@ async fn every_outcome_is_counted_once() {
 struct Slow(Duration, AdmissionVerdict);
 
 impl Decide for Slow {
-    fn decide(&self, _: &CarrierInfo, _: &[u8]) -> zmux::Decision<zmux::AdmissionDecision> {
+    fn decide(&self, _: CarrierInfo, _: &[u8]) -> zmux::Decision<zmux::AdmissionDecision> {
         let (wait, verdict) = (self.0, self.1.clone());
         zmux::Decision::later(async move {
             tokio::time::sleep(wait).await;
@@ -263,7 +266,7 @@ async fn a_late_decision_is_a_peek_timeout() {
 #[tokio::test]
 async fn a_late_prefix_is_closed_or_falls_back() {
     // Two of four bytes, then silence: the decision is never asked.
-    let never = |_: &CarrierInfo, _: &[u8]| -> AdmissionVerdict { panic!("decided a late prefix") };
+    let never = |_: CarrierInfo, _: &[u8]| -> AdmissionVerdict { panic!("decided a late prefix") };
     let late = || Admission::new(4, never).with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(late(), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
@@ -274,9 +277,10 @@ async fn a_late_prefix_is_closed_or_falls_back() {
     listener.close();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = Fallback::new(move |mut conn, _| {
+    let fallback = Fallback::new(move |t: Takeover| {
         let tx = tx.clone();
         async move {
+            let mut conn = t.into_stream().expect("a TCP stream");
             let mut got = Vec::new();
             let _ = conn.read_to_end(&mut got).await;
             let _ = tx.send(got);
@@ -390,7 +394,7 @@ async fn a_source_stalls_at_most_its_share_less_one() {
     let none = || None::<&mut tokio::io::Empty>;
     let enter = |s: &str| listener.adapter().enter(s.parse().unwrap(), None).unwrap();
     async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
-        e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+        e.decide_request(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
     let counts = || {
@@ -444,7 +448,7 @@ async fn source_prefixes_aggregate_every_per_source_limit() {
     let listener = Listener::new(Config::default(), config).expect("valid listener configuration");
     let enter = |s: &str| listener.adapter().enter(s.parse().unwrap(), None);
     async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
-        e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+        e.decide_request(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
     let d = async |s: &str| {
@@ -550,7 +554,7 @@ async fn the_global_bound_evicts_the_oldest_stall() {
             .enter(SocketAddr::from(([192, 0, 2, n], 1)), None)
     };
     async fn admit(e: &mut zmux::adapter::Entry) -> Admit {
-        e.admit(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+        e.decide_request(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
             .await
     }
     let none = || None::<&mut tokio::io::Empty>;
@@ -817,10 +821,12 @@ async fn a_bound_token_with_a_later_exporter_is_admitted() {
         }));
     let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let mut entry = listener.adapter().enter(peer, None).unwrap();
-    let _ = entry.peek_deadline();
-    let admit = tokio::time::timeout(LIMIT, entry.decide(server, token))
+    let (_a, b) = tokio::io::duplex(64);
+    let carrier = PipeIo::new(b).with_prefix(token);
+    let admitted = tokio::time::timeout(LIMIT, entry.admit(server, carrier))
         .await
         .unwrap();
-    assert!(matches!(admit, Admit::Accept(_)), "{admit:?}");
+    assert!(admitted.is_some());
+    assert_eq!(listener.stats().admission.accepted, 1);
     listener.close();
 }

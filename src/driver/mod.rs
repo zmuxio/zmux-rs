@@ -401,6 +401,43 @@ pub(crate) fn is_empty_message(e: &std::io::Error) -> bool {
     e.get_ref().is_some_and(|i| i.is::<EmptyMessage>())
 }
 
+/// The marker of a message too large for the read (see [`message_too_large`]).
+#[cfg(all(feature = "tokio", not(loom)))]
+#[derive(Debug)]
+struct MessageTooLarge;
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl fmt::Display for MessageTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a message larger than the read buffer")
+    }
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl std::error::Error for MessageTooLarge {}
+
+/// For message-framed carriers ([`PipeIo::records`](crate::PipeIo::records)):
+/// the read result that reports a message longer than the read's buffer,
+/// which the reader has consumed and dropped. A carrier's reader never
+/// splits a message: it returns this error instead, so that an admission
+/// tells an over-long first message from a failed carrier and a stall goes
+/// on discarding.
+#[cfg(all(feature = "tokio", not(loom)))]
+#[must_use]
+pub fn message_too_large() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, MessageTooLarge)
+}
+
+/// Whether a read error is [`message_too_large`].
+#[cfg(all(feature = "tokio", not(loom)))]
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the path form is `<dyn Error + Send + Sync>::is`, harder to read"
+)]
+pub(crate) fn is_message_too_large(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<MessageTooLarge>())
+}
+
 /// How long accepting pauses after an error that says nothing of the next connection.
 pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 

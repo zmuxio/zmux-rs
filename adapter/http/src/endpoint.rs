@@ -125,7 +125,7 @@ impl Endpoint {
             RequestUpgrade::Accepted { response, carrier } => {
                 let l = self.listener.clone();
                 tokio::spawn(async move {
-                    if let Ok((io, hint)) = carrier.await {
+                    if let Some((io, hint)) = carrier.await {
                         let _ = l.handle_pipe(io, hint).await;
                     }
                 });

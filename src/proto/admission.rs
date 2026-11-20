@@ -2,7 +2,9 @@
 //! carrier ([`Admission`], [`crate::ListenerConfig::admission`]), the
 //! metadata of a carrier ([`CarrierInfo`]), the decision taken on it
 //! ([`Decide`], [`AdmissionVerdict`]), and what a client presents to it
-//! ([`CarrierCredential`]).
+//! ([`CarrierCredential`]). The rules that turn a decision into the next
+//! step (`step`) are here, apart from any I/O; the listener drivers read
+//! the prefix and act on the outcome.
 
 use std::any::Any;
 use std::future::Future;
@@ -13,36 +15,38 @@ use std::time::Duration;
 
 use super::exporter::CarrierExporter;
 use super::prefix_auth::{PREFIX_TOKEN_LEN, PrefixAuthVerifier};
+use super::record::Framing;
 
 /// The decision on a carrier from its metadata and its prefix: called
-/// once per carrier, outside the listener's locks, concurrently for
-/// different carriers. A decision that takes time (a lookup) answers
-/// [`Decision::Later`](crate::Decision::Later): it is bound by what remains
-/// of the peek timeout, and is cancelled (its future dropped) when that ends
-/// or when the listener stops taking carriers; the carrier is then closed.
-/// A later answer clones what it keeps of `info` (cheap: shared fields) and
-/// of `prefix`.
+/// once per carrier, once more after each [`AdmissionVerdict::More`] and
+/// once more after an [`AdmissionVerdict::Defer`], outside the listener's
+/// locks, concurrently for different carriers. Each call gets its own
+/// `info` (cheap: its fields are shared), the same metadata on every call
+/// of one carrier but for its stage and framing. A decision that takes
+/// time (a lookup) answers [`Decision::Later`](crate::Decision::Later): it
+/// is bound by what remains of the peek timeout, and is cancelled (its
+/// future dropped) when that ends or when the listener stops taking
+/// carriers; the carrier is then closed, as it is when the decision
+/// panics. A later answer keeps `info` and clones what it keeps of
+/// `prefix`.
 ///
-/// A synchronous function `Fn(&CarrierInfo, &[u8]) -> AdmissionVerdict` is a
+/// A synchronous function `Fn(CarrierInfo, &[u8]) -> AdmissionVerdict` is a
 /// `Decide`; implement the trait for one that waits.
 pub trait Decide: Send + Sync + 'static {
-    /// The decision on the carrier `info` describes, whose first bytes are
-    /// `prefix`.
-    fn decide(
-        &self,
-        info: &CarrierInfo,
-        prefix: &[u8],
-    ) -> crate::proto::Decision<AdmissionDecision>;
+    /// The decision on the carrier `info` describes, whose first bytes (or
+    /// first message) are `prefix`.
+    fn decide(&self, info: CarrierInfo, prefix: &[u8])
+    -> crate::proto::Decision<AdmissionDecision>;
 }
 
 impl<F, D> Decide for F
 where
-    F: Fn(&CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
+    F: Fn(CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
     D: Into<AdmissionDecision>,
 {
     fn decide(
         &self,
-        info: &CarrierInfo,
+        info: CarrierInfo,
         prefix: &[u8],
     ) -> crate::proto::Decision<AdmissionDecision> {
         crate::proto::Decision::Now(self(info, prefix).into())
@@ -59,20 +63,26 @@ pub const STALL_MAX_DRAWN: (Duration, Duration) =
     (Duration::from_secs(30), Duration::from_secs(120));
 
 /// The admission of a listener's new carriers
-/// ([`crate::ListenerConfig::admission`]): how many bytes are read before
-/// the decision ([`Admission::peek`]), how long reading them and deciding
-/// may take from the end of the carrier's outer handshake
-/// ([`Admission::peek_timeout`]), the interval stall durations are in
-/// ([`Admission::stall_interval`]), and the decision itself ([`Decide`]).
-/// Every entry of the listener applies it, in the same order: the
-/// carrier's source slot, its outer handshake (TLS, an HTTP upgrade,
-/// QUIC), the admission, then its first record. Nothing is written on a
+/// ([`crate::ListenerConfig::admission`]): how many bytes of a byte stream
+/// are read before the decision ([`Admission::peek`]) and how many it may
+/// ask for ([`Admission::with_max_peek`]), the largest first message of a
+/// message-framed carrier ([`Admission::with_max_message`]), how long
+/// reading and deciding may take from the end of the carrier's outer
+/// handshake ([`Admission::peek_timeout`]), the interval stall durations
+/// are in ([`Admission::stall_interval`]), and the decision itself
+/// ([`Decide`]). Every entry of the listener applies it, in the same order:
+/// the carrier's source slot, its outer handshake (TLS, an HTTP upgrade,
+/// QUIC), the admission, then its first record. An HTTP request carrier
+/// and an HTTP upgrade are decided on their request head
+/// ([`AdmissionStage::Head`]); an upgrade's head may defer the decision to
+/// the carrier ([`AdmissionVerdict::Defer`]). Nothing is written on a
 /// carrier before it is accepted. Cheap to clone; the clones share the
 /// drawn values.
 #[derive(Clone)]
 pub struct Admission {
     peek: usize,
     max_peek: usize,
+    max_message: usize,
     peek_timeout: Duration,
     stall: (Duration, Duration),
     discard_buffer: usize,
@@ -85,6 +95,7 @@ impl std::fmt::Debug for Admission {
         f.debug_struct("Admission")
             .field("peek", &self.peek)
             .field("max_peek", &self.max_peek)
+            .field("max_message", &self.max_message)
             .field("peek_timeout", &self.peek_timeout)
             .field("stall", &self.stall)
             .field("discard_buffer", &self.discard_buffer)
@@ -93,25 +104,33 @@ impl std::fmt::Debug for Admission {
     }
 }
 
+/// The largest first message an admission reads by default, and the bound
+/// of [`Admission::with_max_message`]: the largest record (the most a zmux
+/// first record can be).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "65535 fits every usize zmux builds for"
+)]
+pub const MAX_ADMISSION_MESSAGE: usize = super::params::ZMUX_MAX_RECORD_SIZE as usize;
+
 impl Admission {
-    /// An admission that reads up to `peek` bytes (0: none) and then calls
-    /// `decide` with the carrier's metadata and the bytes read (fewer when
-    /// the carrier ends; one whose prefix does not arrive within the peek
-    /// timeout is closed, or see
+    /// An admission that reads up to `peek` bytes of a byte stream (0:
+    /// none) and then calls `decide` with the carrier's metadata and the
+    /// bytes read (fewer when the carrier ends; one whose prefix does not
+    /// arrive within the peek timeout is closed, or see
     /// [`Admission::with_fallback_on_peek_timeout`]): a synchronous
-    /// decision ([`Admission::with_decider`] takes one that waits).
+    /// decision ([`Admission::with_decider`] takes one that waits). On a
+    /// message-framed carrier a `peek` above 0, and a decision an upgrade's
+    /// head deferred with any `peek`, reads the carrier's first message
+    /// instead ([`Admission::with_max_message`]).
     pub fn new<D: Into<AdmissionDecision>>(
         peek: usize,
-        decide: impl Fn(&CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
+        decide: impl Fn(CarrierInfo, &[u8]) -> D + Send + Sync + 'static,
     ) -> Self {
         Self::with_decider(peek, decide)
     }
 
-    /// An admission that reads up to `peek` bytes (0: none) and then asks
-    /// `decide` with the carrier's metadata and the bytes read (fewer when
-    /// the carrier ends; one whose prefix does not arrive within the peek
-    /// timeout is closed, or see
-    /// [`Admission::with_fallback_on_peek_timeout`]).
+    /// [`Admission::new`] with a decision that may wait.
     ///
     /// The peek timeout is drawn here, once, uniformly from
     /// [`PEEK_TIMEOUT_DRAWN`], and the stall interval's upper end from
@@ -126,6 +145,7 @@ impl Admission {
         Self {
             peek,
             max_peek: 0,
+            max_message: 0,
             peek_timeout,
             stall: (min, max),
             discard_buffer: 512,
@@ -140,13 +160,14 @@ impl Admission {
     /// decided by [`PrefixAuthVerifier::decide`].
     pub fn prefix_auth(verifier: Arc<PrefixAuthVerifier>) -> Self {
         Self::new(PREFIX_TOKEN_LEN, move |info, prefix| {
-            verifier.decide(info, prefix)
+            verifier.decide(&info, prefix)
         })
     }
 
     /// With this peek timeout: the limit on reading the prefix and
-    /// deciding, from the end of the carrier's outer handshake. Zero keeps
-    /// the drawn one.
+    /// deciding, every [`AdmissionVerdict::More`] round and a deferred
+    /// decision included, from the end of the carrier's outer handshake.
+    /// Zero keeps the drawn one.
     #[must_use]
     pub fn with_peek_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
@@ -155,12 +176,26 @@ impl Admission {
         self
     }
 
-    /// The largest prefix a decision may ask for with [`AdmissionVerdict::More`].
-    /// 0, the default: the peek length, so that [`AdmissionVerdict::More`] is not
-    /// valid.
+    /// The largest prefix of a byte stream a decision may ask for with
+    /// [`AdmissionVerdict::More`]. 0, the default: the peek length, so that
+    /// [`AdmissionVerdict::More`] is [`AdmissionVerdict::Close`]. It bounds
+    /// byte streams only: a first message is bounded by
+    /// [`Admission::with_max_message`].
     #[must_use]
     pub fn with_max_peek(mut self, bytes: usize) -> Self {
         self.max_peek = bytes;
+        self
+    }
+
+    /// The largest first message of a message-framed carrier (a WebSocket)
+    /// that the decision reads: a longer one is closed without a decision
+    /// (`AdmissionStats::too_large`). 0, the default:
+    /// [`MAX_ADMISSION_MESSAGE`], the largest record; a host that decides on
+    /// messages of its own sets the largest it accepts. Above
+    /// [`MAX_ADMISSION_MESSAGE`] the listener's configuration is invalid.
+    #[must_use]
+    pub fn with_max_message(mut self, bytes: usize) -> Self {
+        self.max_message = bytes;
         self
     }
 
@@ -186,11 +221,11 @@ impl Admission {
     /// Takes a byte-stream carrier whose prefix has not arrived when the
     /// peek timeout ends, in the first read or in a [`AdmissionVerdict::More`]
     /// round, to [`AdmissionVerdict::Fallback`] with every byte read replayed,
-    /// instead of closing it (default off). Without a fallback target it
-    /// is stalled, as for any fallback. It is counted in both
-    /// `peek_timed_out` and `fallback`. A carrier read without a reader
-    /// (message-framed), an HTTP request carrier and a decision that does
-    /// not return in time are closed either way.
+    /// instead of closing it (default off). Without a fallback
+    /// (`ListenerConfig::fallback`) it is stalled, as for any
+    /// fallback. It is counted in both `peek_timed_out` and `fallback`. A
+    /// message-framed carrier, an HTTP request carrier and a decision that
+    /// does not return in time are closed either way.
     #[must_use]
     pub fn with_fallback_on_peek_timeout(mut self, on: bool) -> Self {
         self.fallback_on_peek_timeout = on;
@@ -204,17 +239,28 @@ impl Admission {
         self.fallback_on_peek_timeout
     }
 
-    /// The number of bytes read before the decision.
+    /// The number of bytes of a byte stream read before the decision.
     #[must_use]
     pub fn peek(&self) -> usize {
         self.peek
     }
 
-    /// The largest prefix: [`Admission::with_max_peek`], at least the peek
-    /// length.
+    /// The largest prefix of a byte stream: [`Admission::with_max_peek`], at
+    /// least the peek length.
     #[must_use]
     pub fn max_peek(&self) -> usize {
         self.max_peek.max(self.peek)
+    }
+
+    /// The largest first message: [`Admission::with_max_message`], or
+    /// [`MAX_ADMISSION_MESSAGE`] for 0.
+    #[must_use]
+    pub fn max_message(&self) -> usize {
+        if self.max_message == 0 {
+            MAX_ADMISSION_MESSAGE
+        } else {
+            self.max_message
+        }
     }
 
     /// The peek timeout.
@@ -239,6 +285,18 @@ impl Admission {
     #[must_use]
     pub fn decider(&self) -> &dyn Decide {
         &*self.decide
+    }
+
+    /// Checks the bounds: [`Admission::with_max_message`] at most
+    /// [`MAX_ADMISSION_MESSAGE`].
+    pub(crate) fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        if self.max_message > MAX_ADMISSION_MESSAGE {
+            return Err(crate::InvalidConfig::new(
+                "Admission::max_message",
+                "above MAX_ADMISSION_MESSAGE",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -284,18 +342,31 @@ pub type AdmittedValue = Arc<dyn Any + Send + Sync>;
 pub enum AdmissionVerdict {
     /// The first `skip` bytes of the prefix are removed; the rest of the
     /// prefix, then the rest of the carrier, go to the listener. A `skip`
-    /// beyond the prefix is [`AdmissionVerdict::Close`]. `value` is the host's
-    /// value for the carrier ([`AdmittedValue`]).
+    /// beyond the prefix is [`AdmissionVerdict::Close`], and so is one that
+    /// would split a first message (neither 0 nor the whole message).
+    /// `value` is the host's value for the carrier ([`AdmittedValue`]).
     Accept {
         /// Prefix bytes removed.
         skip: usize,
         /// The host's value for the carrier.
         value: Option<AdmittedValue>,
     },
-    /// The carrier, every prefix byte read replayed in front of the rest,
-    /// goes to the adapter's fallback target; without one, a stream
-    /// carrier is stalled and an HTTP request receives the not-found
-    /// response of its server.
+    /// The carrier, with every byte or the first message read replayed,
+    /// goes to the listener's fallback
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " ([`crate::ListenerConfig::fallback`], a [`crate::Takeover`]); without"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " (`ListenerConfig::fallback`, a `Takeover`); without"
+    )]
+    /// one it is stalled. An HTTP request that is itself the carrier
+    /// (decided on its head or body, an upgrade refused on its head) is a
+    /// request rather than a carrier to take over: its adapter's HTTP
+    /// fallback serves it (without one: a not-found response). The carrier
+    /// of an upgrade decided after an [`AdmissionVerdict::Defer`] is a
+    /// carrier: it goes to the listener's fallback.
     Fallback,
     /// Nothing is sent; what arrives is read and discarded, and the carrier
     /// is closed gracefully (a byte stream's write side first) when the
@@ -305,31 +376,24 @@ pub enum AdmissionVerdict {
     Stall,
     /// The carrier is closed at once.
     Close,
-    /// Read until the prefix holds `need` bytes in all (or the carrier
-    /// ends, or the peek timeout passes, all rounds sharing it), then decide
-    /// again with the longer prefix. `need` must exceed the prefix and not
-    /// exceed [`Admission::max_peek`], and the carrier must be a byte
-    #[cfg_attr(
-        feature = "tokio",
-        doc = " stream read by [`crate::adapter::Entry::admit`] or"
-    )]
-    #[cfg_attr(
-        not(feature = "tokio"),
-        doc = " stream read by `adapter::Entry::admit` or"
-    )]
-    #[cfg_attr(
-        feature = "tokio",
-        doc = " [`crate::adapter::Entry::decide_reading`]; otherwise it counts as"
-    )]
-    #[cfg_attr(
-        not(feature = "tokio"),
-        doc = " `adapter::Entry::decide_reading`; otherwise it counts as"
-    )]
-    /// [`AdmissionVerdict::Close`], as it does when the carrier ended short.
+    /// Read the byte stream on until the prefix holds `need` bytes in all
+    /// (or the carrier ends, or the peek timeout passes, all rounds sharing
+    /// it), then decide again with the longer prefix. `need` must exceed
+    /// the prefix and not exceed [`Admission::max_peek`]; anything else,
+    /// a carrier that ended short of an earlier `need`, a message-framed
+    /// carrier and a request head make it [`AdmissionVerdict::Close`].
     More {
         /// The total prefix length wanted.
         need: usize,
     },
+    /// On the head of an HTTP upgrade ([`CarrierInfo::upgrade`],
+    /// [`AdmissionStage::Head`]): complete the upgrade and decide again on
+    /// the carrier, with the same metadata at [`AdmissionStage::Carrier`]
+    /// and the carrier's first message, or its first [`Admission::peek`]
+    /// bytes (the first stream of a WebTransport session). The peek timeout
+    /// runs on from the head's decision, and the carrier keeps its slots
+    /// throughout. On any other decision it is [`AdmissionVerdict::Close`].
+    Defer,
 }
 
 /// A decision on a carrier: its [`AdmissionVerdict`] and the host's label of the kind
@@ -374,7 +438,8 @@ impl PartialEq for AdmissionVerdict {
             }
             (Self::Fallback, Self::Fallback)
             | (Self::Stall, Self::Stall)
-            | (Self::Close, Self::Close) => true,
+            | (Self::Close, Self::Close)
+            | (Self::Defer, Self::Defer) => true,
             (Self::More { need: a }, Self::More { need: b }) => a == b,
             _ => false,
         }
@@ -411,15 +476,89 @@ impl AdmissionVerdict {
             variant: Some(variant.into()),
         }
     }
+}
 
-    /// The verdict with `Accept` bounded by a prefix of `len` bytes: a
-    /// `skip` beyond it is [`AdmissionVerdict::Close`].
-    #[must_use]
-    pub fn bounded(self, len: usize) -> Self {
-        match self {
-            Self::Accept { skip, .. } if skip > len => Self::Close,
-            v => v,
+/// What of a carrier a decision is taken on ([`CarrierInfo::stage`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AdmissionStage {
+    /// The carrier's start: the prefix is its first bytes
+    /// ([`Admission::peek`], [`AdmissionVerdict::More`]) or its first
+    /// message ([`CarrierInfo::framing`]).
+    #[default]
+    Carrier,
+    /// An HTTP request's head, before any body byte is read or the upgrade
+    /// is answered: an HTTP upgrade (WebSocket, WebTransport;
+    /// [`CarrierInfo::upgrade`]), or an HTTP request carrier without a
+    /// body. There is no prefix, and a credential travels in a request
+    /// header field.
+    Head,
+}
+
+/// Where a decision is taken, for [`step`]: what the rules of the
+/// verdicts depend on.
+#[cfg(any(test, all(feature = "tokio", not(loom))))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Round {
+    /// The stage of the decision.
+    pub stage: AdmissionStage,
+    /// The carrier's framing at [`AdmissionStage::Carrier`].
+    pub framing: Framing,
+    /// An HTTP upgrade's head, which may defer.
+    pub upgrade: bool,
+    /// The length of the prefix decided on.
+    pub len: usize,
+    /// More of the byte stream can be read.
+    pub can_read: bool,
+    /// The carrier ended short of an earlier [`AdmissionVerdict::More`].
+    pub short: bool,
+    /// [`Admission::max_peek`].
+    pub max_peek: usize,
+}
+
+/// What a decision leads to ([`step`]).
+#[cfg(any(test, all(feature = "tokio", not(loom))))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The outcome: [`AdmissionVerdict::Accept`] with a `skip` within the
+    /// prefix, [`AdmissionVerdict::Fallback`], [`AdmissionVerdict::Stall`]
+    /// or [`AdmissionVerdict::Close`].
+    Final(AdmissionVerdict),
+    /// Read the byte stream on to this many bytes and decide again.
+    Read(usize),
+    /// Complete the upgrade and decide again on the carrier.
+    Defer,
+}
+
+/// The step a decision leads to at `round`, the one place of the rules of
+/// [`AdmissionVerdict::More`], [`AdmissionVerdict::Defer`] and an
+/// [`AdmissionVerdict::Accept`]'s `skip`; every misuse is
+/// [`AdmissionVerdict::Close`].
+#[cfg(any(test, all(feature = "tokio", not(loom))))]
+pub(crate) fn step(verdict: AdmissionVerdict, round: &Round) -> Step {
+    let head = round.stage == AdmissionStage::Head;
+    let records = !head && round.framing == Framing::Records;
+    match verdict {
+        AdmissionVerdict::Defer if head && round.upgrade => Step::Defer,
+        AdmissionVerdict::More { need }
+            if !head
+                && !records
+                && round.can_read
+                && !round.short
+                && need > round.len
+                && need <= round.max_peek =>
+        {
+            Step::Read(need)
         }
+        AdmissionVerdict::Defer | AdmissionVerdict::More { .. } => {
+            Step::Final(AdmissionVerdict::Close)
+        }
+        AdmissionVerdict::Accept { skip, .. }
+            if skip > round.len || records && skip != 0 && skip != round.len =>
+        {
+            Step::Final(AdmissionVerdict::Close)
+        }
+        v => Step::Final(v),
     }
 }
 
@@ -463,11 +602,29 @@ pub struct CarrierInfo {
     /// header fields are also given independently of the type
     /// ([`CarrierInfo::for_each_header`]).
     pub request: Option<Arc<dyn Any + Send + Sync>>,
-    /// Whether the carrier is decided on its HTTP request head, without a
-    /// prefix: an HTTP upgrade (WebSocket,
-    /// WebTransport), or an HTTP request carrier whose request has no
-    /// body. A token travels in a request header field.
-    pub head: bool,
+    /// What of the carrier the decision is taken on: its HTTP request head
+    /// ([`AdmissionStage::Head`], without a prefix: an HTTP upgrade, or an
+    /// HTTP request carrier whose request has no body; a token travels in
+    /// a request header field) or its start ([`AdmissionStage::Carrier`],
+    /// the default).
+    pub stage: AdmissionStage,
+    /// The carrier's framing at [`AdmissionStage::Carrier`]: the prefix is
+    /// the start of a byte stream, or the carrier's first message with
+    /// [`Framing::Records`]; as
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " [`crate::adapter::classify_first_bytes`] takes it. [`Framing::ByteStream`]"
+    )]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        doc = " `classify_first_bytes` takes it. [`Framing::ByteStream`]"
+    )]
+    /// on a head.
+    pub framing: Framing,
+    /// The carrier of an HTTP upgrade (WebSocket, WebTransport), on its
+    /// head and on the decision an [`AdmissionVerdict::Defer`] on that head
+    /// takes on the carrier.
+    pub upgrade: bool,
     headers: Option<Arc<HeadersFn>>,
     exporter: Option<CarrierExporter>,
 }
@@ -480,7 +637,9 @@ impl std::fmt::Debug for CarrierInfo {
             .field("alpn", &self.alpn)
             .field("server_name", &self.server_name)
             .field("request", &self.request.is_some())
-            .field("head", &self.head)
+            .field("stage", &self.stage)
+            .field("framing", &self.framing)
+            .field("upgrade", &self.upgrade)
             .field("headers", &self.headers.is_some())
             .field("exporter", &self.exporter.is_some())
             .finish()
@@ -543,12 +702,32 @@ impl CarrierInfo {
             .with_headers(move |each| fields(&r, each))
     }
 
-    /// As a carrier decided on its HTTP request head
-    /// ([`CarrierInfo::head`]).
+    /// At this stage ([`CarrierInfo::stage`]).
     #[must_use]
-    pub fn with_head(mut self) -> Self {
-        self.head = true;
+    pub fn with_stage(mut self, stage: AdmissionStage) -> Self {
+        self.stage = stage;
         self
+    }
+
+    /// With the carrier's framing ([`CarrierInfo::framing`]).
+    #[must_use]
+    pub fn with_framing(mut self, framing: Framing) -> Self {
+        self.framing = framing;
+        self
+    }
+
+    /// As the carrier of an HTTP upgrade ([`CarrierInfo::upgrade`]).
+    #[must_use]
+    pub fn with_upgrade(mut self) -> Self {
+        self.upgrade = true;
+        self
+    }
+
+    /// Whether the decision is taken on an HTTP request head
+    /// ([`AdmissionStage::Head`]).
+    #[must_use]
+    pub fn is_head(&self) -> bool {
+        self.stage == AdmissionStage::Head
     }
 
     /// With an HTTP carrier's request header fields: `fields(each)` calls
@@ -627,8 +806,8 @@ pub trait CarrierCredential: Send + Sync + std::fmt::Debug {
     fn prefix(&self, info: &CarrierInfo) -> io::Result<Vec<u8>>;
 
     /// The request header field, `(name, value)`, of a carrier decided on
-    /// its HTTP request head: an HTTP upgrade (WebSocket, WebTransport), or
-    /// an HTTP request without a body.
+    /// its HTTP request head ([`AdmissionStage::Head`]): an HTTP upgrade
+    /// (WebSocket, WebTransport), or an HTTP request without a body.
     fn header(&self, info: &CarrierInfo) -> io::Result<(String, String)>;
 }
 
@@ -639,13 +818,13 @@ mod tests {
     #[test]
     fn drawn_bounds() {
         for _ in 0..64 {
-            let a = Admission::new(0, |_, _| AdmissionVerdict::Close);
+            let a = Admission::new(0, |_, _: &[u8]| AdmissionVerdict::Close);
             assert!((PEEK_TIMEOUT_DRAWN.0..=PEEK_TIMEOUT_DRAWN.1).contains(&a.peek_timeout()));
             let (min, max) = a.stall_interval();
             assert!((STALL_MAX_DRAWN.0..=STALL_MAX_DRAWN.1).contains(&max));
             assert!(min >= max / 4 && min <= max * 3 / 4);
         }
-        let a = Admission::new(0, |_, _| AdmissionVerdict::Close)
+        let a = Admission::new(0, |_, _: &[u8]| AdmissionVerdict::Close)
             .with_stall_interval(Duration::from_secs(3), Duration::from_secs(1));
         assert_eq!(
             a.stall_interval(),
@@ -653,17 +832,111 @@ mod tests {
         );
     }
 
+    fn round(stage: AdmissionStage, framing: Framing, len: usize) -> Round {
+        Round {
+            stage,
+            framing,
+            upgrade: false,
+            len,
+            can_read: true,
+            short: false,
+            max_peek: 16,
+        }
+    }
+
     #[test]
     fn accept_beyond_prefix_is_close() {
+        let r = round(AdmissionStage::Carrier, Framing::ByteStream, 3);
+        let close = Step::Final(AdmissionVerdict::Close);
         assert_eq!(
-            AdmissionVerdict::accept(3).bounded(3),
-            AdmissionVerdict::accept(3)
+            step(AdmissionVerdict::accept(3), &r),
+            Step::Final(AdmissionVerdict::accept(3))
+        );
+        assert_eq!(step(AdmissionVerdict::accept(4), &r), close);
+        assert_eq!(
+            step(AdmissionVerdict::Stall, &r),
+            Step::Final(AdmissionVerdict::Stall)
+        );
+        // A message is replayed whole or not at all.
+        let m = round(AdmissionStage::Carrier, Framing::Records, 3);
+        assert_eq!(
+            step(AdmissionVerdict::accept(0), &m),
+            Step::Final(AdmissionVerdict::accept(0))
         );
         assert_eq!(
-            AdmissionVerdict::accept(4).bounded(3),
-            AdmissionVerdict::Close
+            step(AdmissionVerdict::accept(3), &m),
+            Step::Final(AdmissionVerdict::accept(3))
         );
-        assert_eq!(AdmissionVerdict::Stall.bounded(0), AdmissionVerdict::Stall);
+        assert_eq!(step(AdmissionVerdict::accept(1), &m), close);
+    }
+
+    #[test]
+    fn more_reads_a_byte_stream_only() {
+        let close = Step::Final(AdmissionVerdict::Close);
+        let more = |need| AdmissionVerdict::More { need };
+        let r = round(AdmissionStage::Carrier, Framing::ByteStream, 4);
+        assert_eq!(step(more(8), &r), Step::Read(8));
+        assert_eq!(step(more(16), &r), Step::Read(16));
+        // Not beyond max_peek, not at or below the prefix.
+        assert_eq!(step(more(17), &r), close);
+        assert_eq!(step(more(4), &r), close);
+        // Nothing more to read: ended short, or no reader.
+        assert_eq!(step(more(8), &Round { short: true, ..r }), close);
+        assert_eq!(
+            step(
+                more(8),
+                &Round {
+                    can_read: false,
+                    ..r
+                }
+            ),
+            close
+        );
+        // A message carrier, a head (an upgrade's included).
+        let m = round(AdmissionStage::Carrier, Framing::Records, 4);
+        assert_eq!(step(more(8), &m), close);
+        let h = Round {
+            upgrade: true,
+            ..round(AdmissionStage::Head, Framing::ByteStream, 0)
+        };
+        assert_eq!(step(more(8), &h), close);
+    }
+
+    #[test]
+    fn defer_only_on_an_upgrade_head() {
+        let close = Step::Final(AdmissionVerdict::Close);
+        let head = round(AdmissionStage::Head, Framing::ByteStream, 0);
+        let upgrade = Round {
+            upgrade: true,
+            ..head
+        };
+        assert_eq!(step(AdmissionVerdict::Defer, &upgrade), Step::Defer);
+        // A request head, and the carrier of an upgrade, cannot defer.
+        assert_eq!(step(AdmissionVerdict::Defer, &head), close);
+        let carrier = Round {
+            stage: AdmissionStage::Carrier,
+            ..upgrade
+        };
+        assert_eq!(step(AdmissionVerdict::Defer, &carrier), close);
+        let m = round(AdmissionStage::Carrier, Framing::Records, 3);
+        assert_eq!(step(AdmissionVerdict::Defer, &m), close);
+    }
+
+    #[test]
+    fn max_message_default_and_bound() {
+        let a = Admission::new(0, |_, _: &[u8]| AdmissionVerdict::Close);
+        assert_eq!(a.max_message(), MAX_ADMISSION_MESSAGE);
+        assert!(a.validate().is_ok());
+        let a = a.with_max_message(100);
+        assert_eq!(a.max_message(), 100);
+        let a = a.with_max_message(MAX_ADMISSION_MESSAGE);
+        assert!(a.validate().is_ok());
+        let a = a.with_max_message(MAX_ADMISSION_MESSAGE + 1);
+        assert!(a.validate().is_err());
+        // max_peek bounds byte streams only.
+        let a = Admission::new(4, |_, _: &[u8]| AdmissionVerdict::Close).with_max_peek(2);
+        assert_eq!(a.max_peek(), 4);
+        assert_eq!(a.max_message(), MAX_ADMISSION_MESSAGE);
     }
 
     #[test]

@@ -222,8 +222,9 @@ pub use backoff::{Backoff, DEFAULT_BACKOFF_JITTER};
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
 pub use proto::admission::{
-    Admission, AdmissionDecision, AdmissionVerdict, AdmittedValue, CarrierCredential, CarrierInfo,
-    Decide, PEEK_TIMEOUT_DRAWN, STALL_MAX_DRAWN,
+    Admission, AdmissionDecision, AdmissionStage, AdmissionVerdict, AdmittedValue,
+    CarrierCredential, CarrierInfo, Decide, MAX_ADMISSION_MESSAGE, PEEK_TIMEOUT_DRAWN,
+    STALL_MAX_DRAWN,
 };
 pub use proto::error::{ApplicationErrorCode, TransportErrorCode};
 pub use proto::exporter::{CarrierExporter, ExportError, ExportFuture, ExportRequest, TlsState};
@@ -280,6 +281,8 @@ pub use proto::{DetailKey, VarInt};
 // The drivers are left out of loom builds, which check their
 // synchronization units only (src/driver/loom.rs).
 #[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::admission::{Fallback, Prefixed, Takeover, TakeoverStream};
+#[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::cache::{
     CacheOutcome, CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime,
 };
@@ -324,11 +327,10 @@ pub mod sched {
 /// `with_datagram_channel` and `with_protocol`.
 #[cfg(all(feature = "tokio", not(loom)))]
 pub mod adapter {
-    pub use crate::driver::admission::{Fallback, FallbackStream, Prefixed, proxied_source};
+    pub use crate::driver::admission::{AdmitIo, ConnectionValue, proxied_source};
     pub use crate::driver::channel::{
         ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
     };
-    pub use crate::driver::empty_message;
     pub use crate::driver::lanes::{CarrierConnId, Lane, handle_lane};
     pub use crate::driver::listen::{
         Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, SetupGuard,
@@ -336,6 +338,7 @@ pub mod adapter {
     pub use crate::driver::tokio::{
         ChunkBuf, ChunkWrite, DRAIN_LIMIT, SessionAdapter, spawn_drain, within,
     };
+    pub use crate::driver::{empty_message, message_too_large};
     pub use crate::proto::exporter::{CarrierExporter, RESERVED_EXPORTER_PREFIX};
     pub use crate::proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
     pub use crate::proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
@@ -458,7 +461,7 @@ pub mod test_hooks {
 /// | early data under the zmux floor (`EarlyData::zmux_peer`) | yes | yes | |
 /// | carrier early data (`PipeIo::with_early_data`, QUIC 0-RTT) | yes | no | only the QUIC and TLS adapters, all async, produce it |
 /// | `Listener`: sessions, joins, resumption, `adapter().count_setup_failure()` | yes | yes | |
-/// | `Listener`: split carriers, lanes, admission (`Fallback`, `Prefixed`), memory budget | yes | no | they serve the HTTP and QUIC adapters, all async |
+/// | `Listener`: split carriers, lanes, admission (`Fallback`, `Takeover`), memory budget | yes | no | they serve the HTTP and QUIC adapters, all async |
 /// | `CarrierChoice`, `dial_choice`, `CarrierCache` | yes | no | its candidates are the async adapters' carriers |
 /// | streams as pipes (`open_pipe_stream`, `PipeIo::from_stream`) | yes | no | a nested session's pipe threads would block on the outer stream, which a thread that drives sessions may not do |
 /// | lanes, `handle_lane` | yes | no | only multi-stream carriers (QUIC, HTTP/2 and 3) have lanes, all async |

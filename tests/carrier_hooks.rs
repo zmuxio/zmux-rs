@@ -453,7 +453,7 @@ fn the_cache_takes_reports_per_variant() {
 fn admission_timeouts_beyond_the_clock_do_not_panic() {
     multi_thread(async {
         use zmux::{Listener, ListenerConfig};
-        let adm = Admission::new(2, |_: &zmux::CarrierInfo, prefix: &[u8]| {
+        let adm = Admission::new(2, |_: zmux::CarrierInfo, prefix: &[u8]| {
             if prefix.len() < 5 {
                 AdmissionVerdict::More { need: 5 }.labelled("x")
             } else {
@@ -470,7 +470,7 @@ fn admission_timeouts_beyond_the_clock_do_not_panic() {
         let mut entry = listener.adapter().enter(peer, None).unwrap();
         let mut bytes: &[u8] = b"abcdefgh";
         let admit = entry
-            .admit(zmux::CarrierInfo::new(), Some(&mut bytes))
+            .decide_request(zmux::CarrierInfo::new(), Some(&mut bytes))
             .await;
         assert_eq!(admit, zmux::adapter::Admit::Accept(Vec::new()));
         assert_eq!(bytes, b"fgh");

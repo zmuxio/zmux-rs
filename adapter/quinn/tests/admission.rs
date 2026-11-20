@@ -1,17 +1,18 @@
 //! Connections under a listener admission: a bound prefix authentication
-//! token on the first stream, the fallback handler, the close without one,
-//! and streams held back until the first stream is accepted.
+//! token on the first stream, the listener's fallback taking the first
+//! stream over, the close without one, and streams held back until the
+//! first stream is accepted.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zmux::{
-    Admission, AdmissionVerdict, Config, Listener, ListenerConfig, OutboundState, PipeAuth,
-    PipeOptions, PrefixAuth, PrefixAuthVerifier, Session,
+    Admission, AdmissionVerdict, Config, Fallback, Listener, ListenerConfig, OutboundState,
+    PipeAuth, PipeOptions, PrefixAuth, PrefixAuthVerifier, Session, Takeover,
 };
-use zmux_quinn::{Carrier, Fallback, Options};
+use zmux_quinn::{Carrier, Options};
 
 const LIMIT: Duration = Duration::from_secs(20);
 
@@ -53,6 +54,7 @@ impl Server {
         c.pipe_auth = PipeAuth::exporter().with_end_to_end();
         let mut lc = ListenerConfig::default();
         lc.admission = Some(admission);
+        lc.fallback = fallback;
         let listener = Listener::new(c, lc).expect("valid listener configuration");
         let serving = if one_by_one {
             let (l, opts) = (listener.clone(), opts.clone());
@@ -66,19 +68,14 @@ impl Server {
                     };
                     let Some(incoming) = incoming else { return };
                     let Ok(conn) = incoming.await else { continue };
-                    let (l, opts, f) = (l.clone(), opts.clone(), fallback.clone());
+                    let (l, opts) = (l.clone(), opts.clone());
                     tokio::spawn(async move {
-                        let _ = zmux_quinn::serve_connection(&l, conn, &opts, f.as_ref()).await;
+                        let _ = zmux_quinn::serve_connection(&l, conn, &opts).await;
                     });
                 }
             })
         } else {
-            tokio::spawn(zmux_quinn::serve(
-                listener.clone(),
-                endpoint,
-                opts.clone(),
-                fallback,
-            ))
+            tokio::spawn(zmux_quinn::serve(listener.clone(), endpoint, opts.clone()))
         };
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der).unwrap();
@@ -199,32 +196,60 @@ async fn bound_token(server: Server) {
     server.stop().await;
 }
 
+/// The listener's fallback takes the first stream over, every byte read
+/// replayed, with the connection; its answer reaches the client, and the
+/// connection is closed once the fallback completed. Served one by one
+/// too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_token_goes_to_the_fallback_with_every_byte() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = Fallback::new(move |conn, _send, mut recv| {
-        let tx = tx.clone();
-        async move {
-            let mut got = Vec::new();
-            recv.read_to_end(&mut got).await.unwrap();
-            let _ = tx.send(got);
-            conn.close(0u32.into(), b"");
-        }
-    });
-    let server = Server::new(admission(), Some(fallback));
-    let conn = server.connect().await;
-    let (mut send, _recv) = conn.open_bi().await.unwrap();
-    let payload: Vec<u8> = (0..100u8).collect();
-    send.write_all(&payload).await.unwrap();
-    send.finish().unwrap();
-    let got = tokio::time::timeout(LIMIT, rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(got, payload);
-    tokio::time::timeout(LIMIT, conn.closed()).await.unwrap();
-    assert_eq!(server.listener.stats().sessions, 0);
-    server.stop().await;
+    for one_by_one in [false, true] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fallback = Fallback::new(move |t: Takeover| {
+            let tx = tx.clone();
+            async move {
+                let conn = zmux_quinn::takeover_connection(&t).expect("a QUIC connection");
+                let replayed = t.replayed().len();
+                let mut stream = t.into_stream().expect("the first stream");
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                stream.write_all(b"not zmux").await.unwrap();
+                stream.shutdown().await.unwrap();
+                let _ = tx.send((got, replayed, conn.remote_address()));
+                // Served until the client has read the reply: it says so on
+                // a stream of its own; the library closes the connection.
+                let _ = tokio::time::timeout(LIMIT, conn.accept_uni()).await;
+            }
+        });
+        let server = Server::with(admission(), Some(fallback), one_by_one);
+        let conn = server.connect().await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let payload: Vec<u8> = (0..100u8).collect();
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        let (got, replayed, peer) = tokio::time::timeout(LIMIT, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(replayed, zmux::PREFIX_TOKEN_LEN);
+        assert_eq!(peer, server.client.local_addr().unwrap());
+        let reply = tokio::time::timeout(LIMIT, recv.read_to_end(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, b"not zmux");
+        let mut done = conn.open_uni().await.unwrap();
+        done.write_all(b"read").await.unwrap();
+        done.finish().unwrap();
+        let closed = tokio::time::timeout(LIMIT, conn.closed()).await.unwrap();
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "{closed:?}"
+        );
+        let st = server.listener.stats();
+        assert_eq!((st.sessions, st.admission.fallback), (0, 1));
+        server.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

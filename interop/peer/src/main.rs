@@ -253,7 +253,7 @@ async fn quic_server(n: usize, exporter: bool) {
     println!("LISTEN {}", ep.local_addr().expect("addr"));
     let listener = Listener::new(quic_config(exporter), ListenerConfig::default())
         .expect("valid listener configuration");
-    let task = tokio::spawn(zmux_quinn::serve(listener.clone(), ep.clone(), opts, None));
+    let task = tokio::spawn(zmux_quinn::serve(listener.clone(), ep.clone(), opts));
     for _ in 0..n {
         let s = listener.accept().await.expect("accept session");
         if exporter {

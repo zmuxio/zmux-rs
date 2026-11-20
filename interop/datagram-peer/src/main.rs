@@ -108,7 +108,7 @@ async fn run() {
             println!("LISTEN {}", ep.local_addr().unwrap());
             let listener = Listener::new(cfg(), ListenerConfig::default())
                 .expect("valid listener configuration");
-            tokio::spawn(zmux_quinn::serve(listener.clone(), ep, opts, None));
+            tokio::spawn(zmux_quinn::serve(listener.clone(), ep, opts));
             let s = listener.accept().await.expect("a session");
             {
                 let s = s.clone();

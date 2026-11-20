@@ -14,7 +14,12 @@
 //! it answers it ([`admit`]), on the request head: a client's credential
 //! travels in a request header field ([`Options::with_carrier_credential`]), such
 //! as a prefix authentication token in `Zmux-Prefix-Auth`, bound to the
-//! QUIC connection with [`dial_over`]. The QUIC endpoints carry the HTTP/3
+//! QUIC connection with [`dial_over`]. The head may defer the decision to
+//! the session's first bidirectional stream
+//! ([`AdmissionVerdict::Defer`](zmux::AdmissionVerdict::Defer)), which the
+//! listener's fallback may then take over
+//! ([`ListenerConfig::fallback`](zmux::ListenerConfig::fallback),
+//! [`takeover_session`]). The QUIC endpoints carry the HTTP/3
 //! ALPN identifier `h3` ([`web_transport_quinn::ALPN`]), which names the
 //! HTTP layer; zmux's own identifiers do not apply. Build their transport
 //! configuration with [`Options::transport_config`], so that the stream
@@ -90,10 +95,10 @@ pub use web_transport_quinn;
 use web_transport_quinn::proto::ConnectRequest;
 use web_transport_quinn::quinn::{self, VarInt};
 use web_transport_quinn::{self as wt, Session};
-use zmux::adapter::{Admit, Admitted, Entry};
+use zmux::adapter::{Admit, AdmitIo, Admitted, Entry};
 use zmux::adapter::{CarrierConnId, ChannelDemux, MemoryCharge};
 use zmux::proto::ApplicationErrorCode;
-use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo};
+use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Takeover};
 pub use zmux_quinn::LaneWindows;
 use zmux_quinn::parts::{self, AcceptQueue, DatagramConn, Datagrams, RecvPart, SendPart};
 
@@ -102,18 +107,13 @@ use zmux_quinn::parts::{self, AcceptQueue, DatagramConn, Datagrams, RecvPart, Se
 const H3_UNI_STREAMS: u32 = 3;
 
 /// The adapter's options: how the carrier sizes the connection's flow
-/// control for lanes, the fallback of session requests, and a client's
-/// credential.
+/// control for lanes, and a client's credential.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Options {
     /// The windows; [`LaneWindows::lanes`] is the lanes the peer may open
     /// on the session at once.
     pub windows: LaneWindows,
-    /// Server: the handler of the session requests the listener's
-    /// admission hands to the fallback or that are not upgraded (none by default: such
-    /// requests are answered with 404).
-    pub fallback: Option<Fallback>,
     /// Client: the credential whose header field
     /// ([`CarrierCredential::header`]) goes on each session request (none by
     /// default).
@@ -128,7 +128,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             windows: LaneWindows::default(),
-            fallback: None,
             carrier_credential: None,
             timeout: zmux::adapter::DIAL_TIMEOUT,
         }
@@ -161,13 +160,6 @@ impl Options {
     #[must_use]
     pub fn with_carrier_credential(mut self, credential: Arc<dyn CarrierCredential>) -> Self {
         self.carrier_credential = Some(credential);
-        self
-    }
-
-    /// Serves the session requests that are not accepted with `fallback`.
-    #[must_use]
-    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
-        self.fallback = Some(fallback);
         self
     }
 
@@ -315,11 +307,12 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 /// ([`zmux::ListenerConfig::admission`]) and serves it until it ends;
 /// `entry` is the connection's entry into the listener
 /// ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter), taken before its QUIC handshake). Nothing is
-/// answered before the decision. The decision has no prefix; its metadata
+/// answered before the decision. The decision on the head
+/// ([`Entry::decide_upgrade`]) has no prefix; its metadata
 /// is the connection's ([`zmux_quinn::Handshake::carrier_info`]), with the
 /// request ([`ConnectRequest`] as the [`CarrierInfo::with_request`]
 /// value, its header fields as [`CarrierInfo::for_each_header`] gives
-/// them) and [`CarrierInfo::head`] set, so that
+/// them), the head stage and [`CarrierInfo::upgrade`], so that
 /// [`zmux::Admission::prefix_auth`] takes its token from the request
 /// header field; behind an intermediary the listener trusts, the source is
 /// the client it reports in a forwarding header field
@@ -327,9 +320,20 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 ///
 /// - `Accept`: 200 OK, and the session is a [`Carrier`] of
 ///   `listener` for as long as it is open, its streams admitted with it;
-/// - `Fallback`:
-///   [`Options::fallback`] is given the request, or it is answered with
-///   404 without one;
+/// - `Defer`: 200 OK, and the decision is taken again on the session's
+///   first bidirectional stream ([`Entry::admit_first`]): its first
+///   [`zmux::Admission::peek`] bytes, with the same metadata; the stream
+///   arrives and its prefix is read within what remains of the peek
+///   timeout, and nothing else of the session (no further stream, no
+///   lane) reaches the listener before. Accepted, the stream is the
+///   session's first pipe and the session a [`Carrier`] of `listener`; on
+///   `Fallback` the listener's fallback takes the stream over, every byte
+///   read replayed ([`Takeover::into_stream`], [`takeover_session`]); the
+///   session is closed once the fallback completed, or when the stream
+///   was stalled or closed;
+/// - `Fallback`: the request is answered with 404 (a request, which this
+///   adapter has no HTTP handler for: a server that serves other requests
+///   routes them before [`admit`]);
 /// - `Stall`: nothing is answered; once a stall's duration has passed, or
 ///   the connection closed, the request is ended without a response and
 ///   the connection closed;
@@ -354,13 +358,13 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
         let conn = request.conn();
         let handshake = zmux_quinn::Handshake::of(conn);
         let connect: &ConnectRequest = &request;
-        let info = handshake.carrier_info(conn).with_head().with_request_head(
-            Arc::new(connect.clone()),
-            |c, each| {
-                zmux::adapter::visit_fields(&c.headers, each);
-            },
-        );
-        entry.decide(info, Vec::new()).await
+        let info =
+            handshake
+                .carrier_info(conn)
+                .with_request_head(Arc::new(connect.clone()), |c, each| {
+                    zmux::adapter::visit_fields(&c.headers, each);
+                });
+        entry.decide_upgrade(info).await
     };
     let conn = request.conn().clone();
     match decided {
@@ -376,12 +380,10 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
             session.closed().await;
             drop(carrier);
         }
+        Admit::Defer => admit_first_stream(request, entry, listener, options).await,
         Admit::Fallback(_) => {
             drop(entry);
-            match &options.fallback {
-                Some(f) => f.serve(request).await,
-                None => refuse(request, wt::http::StatusCode::NOT_FOUND, listener).await,
-            }
+            refuse(request, wt::http::StatusCode::NOT_FOUND, listener).await;
         }
         Admit::Stall => {
             let mut closed = pin!(conn.closed());
@@ -398,6 +400,68 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
         }
         _ => conn.close(VarInt::from_u32(0), b""),
     }
+}
+
+/// The session of a request whose head deferred the decision ([`admit`]):
+/// answered, and admitted on its first bidirectional stream.
+async fn admit_first_stream(
+    request: wt::Request,
+    mut entry: Entry,
+    listener: &Listener,
+    options: &Options,
+) {
+    let conn = request.conn().clone();
+    // The carrier is made once the first stream is accepted, for its first
+    // pipe; the session's other streams reach the listener after that.
+    let made = Arc::new(std::sync::Mutex::new(None::<(Carrier, Session)>));
+    let first = {
+        let (made, l, options) = (made.clone(), listener.clone(), options.clone());
+        async move {
+            let session = request.ok().await.map_err(io::Error::other)?;
+            let (send, recv) = session.accept_bi().await.map_err(io::Error::other)?;
+            let s = session.clone();
+            let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
+                let (recv, send) = streams.into_inner();
+                let carrier = Carrier::make(s.clone(), Some(&l), &options);
+                let pipe = carrier
+                    .inner
+                    .pipe(Send::new(WtSend(send)), Recv::new(WtRecv(recv)));
+                *made
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((carrier, s));
+                pipe
+            });
+            Ok(io.with_connection(Arc::new(session)))
+        }
+    };
+    let accepted = entry.admit_first(CarrierInfo::new(), first).await;
+    let made = made
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (Some(first), Some((carrier, session))) = (accepted, made) else {
+        // Not accepted, the verdict acted on (a fallback has completed).
+        conn.close(VarInt::from_u32(0), b"");
+        return;
+    };
+    let admitted = entry.admitted();
+    let hint = PipeHint::from_entry(entry);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(first, hint).await });
+    // The session's other streams from here on.
+    carrier.listen(Some(listener.clone()), admitted);
+    session.closed().await;
+    drop(carrier);
+}
+
+/// The WebTransport session of a stream the listener's fallback took over
+/// ([`zmux::ListenerConfig::fallback`]) from [`admit`]: the session's first
+/// bidirectional stream, as [`Takeover::into_stream`] gives it, after its
+/// head deferred the decision. The session is closed once the fallback
+/// completed.
+#[must_use]
+pub fn takeover_session(takeover: &Takeover) -> Option<Session> {
+    takeover.connection()?.downcast_ref::<Session>().cloned()
 }
 
 /// The source of a WebTransport session a server accepted: the client a
@@ -430,39 +494,6 @@ async fn refuse(request: wt::Request, status: wt::http::StatusCode, listener: &L
     let conn = request.conn().clone();
     if request.reject(status).await.is_ok() {
         let _ = tokio::time::timeout(listener.limits().handshake_timeout, conn.closed()).await;
-    }
-}
-
-type FallbackFn = dyn Fn(wt::Request) -> Pin<Box<dyn Future<Output = ()> + std::marker::Send>>
-    + std::marker::Send
-    + Sync;
-
-/// The handler of the session requests that are not accepted
-/// ([`Options::fallback`]), given the request, not answered yet. Cheap to
-/// clone.
-#[derive(Clone)]
-pub struct Fallback(Arc<FallbackFn>);
-
-impl std::fmt::Debug for Fallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Fallback(..)")
-    }
-}
-
-impl Fallback {
-    /// The handler `f`.
-    pub fn new<F, Fut>(f: F) -> Self
-    where
-        F: Fn(wt::Request) -> Fut + std::marker::Send + Sync + 'static,
-        Fut: Future<Output = ()> + std::marker::Send + 'static,
-    {
-        Self(Arc::new(move |r| Box::pin(f(r))))
-    }
-
-    /// Serves `request`.
-    pub async fn serve(&self, request: wt::Request) {
-        let handler = &self.0;
-        handler(request).await;
     }
 }
 
@@ -567,6 +598,13 @@ impl Carrier {
         options: &Options,
         admitted: Option<Admitted>,
     ) -> Self {
+        let carrier = Self::make(conn, listener.as_ref(), options);
+        carrier.listen(listener, admitted);
+        carrier
+    }
+
+    /// The carrier, its accept loop not started yet ([`Carrier::listen`]).
+    fn make(conn: Session, listener: Option<&Listener>, options: &Options) -> Self {
         let window = options.windows.receive_window();
         conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
         // The HTTP/3 control and QPACK streams stay open beside the lanes.
@@ -580,11 +618,19 @@ impl Carrier {
             own_charge,
             accepted: AcceptQueue::default(),
             accept_task: OnceLock::new(),
-            _charge: listener.as_ref().map(|l| l.adapter().charge_memory(window)),
-            datagrams: Datagrams::with(WtDatagrams(conn.clone())),
+            _charge: listener.map(|l| l.adapter().charge_memory(window)),
+            datagrams: Datagrams::with(WtDatagrams(conn)),
             close_code: std::sync::atomic::AtomicU64::new(0),
         });
         let _ = inner.id.set(CarrierConnId::new(&inner));
+        Self { inner }
+    }
+
+    /// Starts the accept loop: the streams the peer opens go to `listener`
+    /// (as further carriers of `admitted`), or wait for
+    /// [`Carrier::accept_pipe`].
+    fn listen(&self, listener: Option<Listener>, admitted: Option<Admitted>) {
+        let conn = self.inner.conn.clone();
         let peer = conn.remote_address();
         let source = listener.as_ref().map_or(peer, |l| session_source(&conn, l));
         let hint = move || match &admitted {
@@ -593,12 +639,11 @@ impl Carrier {
         };
         let task = tokio::spawn(parts::accept_loop(
             WtStreams(conn),
-            Arc::downgrade(&inner),
+            Arc::downgrade(&self.inner),
             listener,
             hint,
         ));
-        let _ = inner.accept_task.set(task.abort_handle());
-        Self { inner }
+        let _ = self.inner.accept_task.set(task.abort_handle());
     }
 
     /// The WebTransport session, for its own features (statistics,

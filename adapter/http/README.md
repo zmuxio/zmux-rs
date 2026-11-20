@@ -59,7 +59,11 @@ error at the other end, never a clean end.
   decision replayed in front of the rest) or one to end without a response
   (`Unhandled::Abort`: an admission's stall, once over, or close). Requests
   that carry no pipe go to `Options::fallback`, an HTTP handler
-  (`Fallback`), or are answered with 404. A served connection that has
+  (`Fallback`), or are answered with 404. A request is the carrier here,
+  so the admission's `Fallback` takes it over as a request, by this HTTP
+  fallback, never by the listener's (`ListenerConfig::fallback`, which
+  takes over carriers); a WebSocket upgrade decided on its first message
+  after a deferral is a carrier, and goes to the listener's. A served connection that has
   had no request or response in progress for `Options::idle_timeout`
   (60 s) is closed gracefully, on HTTP/2 as on HTTP/1.1; a carrier's
   response lasts as long as the carrier. Once a connection has opened an

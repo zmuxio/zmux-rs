@@ -71,12 +71,7 @@ async fn pair() -> (Session, Session) {
     let addr = server.local_addr().unwrap();
     let listener = Listener::new(Config::default(), ListenerConfig::default())
         .expect("valid listener configuration");
-    tokio::spawn(zmux_quinn::serve(
-        listener.clone(),
-        server,
-        opts.clone(),
-        None,
-    ));
+    tokio::spawn(zmux_quinn::serve(listener.clone(), server, opts.clone()));
     let c = zmux_quinn::connect(&client, addr, "localhost", &opts, Config::default())
         .await
         .unwrap();

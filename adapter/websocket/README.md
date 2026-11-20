@@ -31,9 +31,14 @@ as HTTP/1.1 parsers accept.
 Only a request that is a valid upgrade, offers an accepted subprotocol and
 passes the listener's admission (`ListenerConfig::admission`, decided on
 the upgrade request head) is upgraded. Every other request is refused before
-anything is written: `serve` hands it to the listener's fallback
-(`ListenerConfig::fallback`, a `zmux::adapter::Fallback`) with the bytes read replayed, or answers
-`404 Not Found` without one.
+anything is written: `serve` hands its connection to the listener's fallback
+(`ListenerConfig::fallback`, a `zmux::Takeover` with the bytes read
+replayed), or answers `404 Not Found` without one. The admission may defer
+its decision from the head to the carrier's first message
+(`AdmissionVerdict::Defer`): the upgrade completes, the first message (at
+most `Admission::with_max_message` bytes) is decided on, and a carrier not
+accepted goes to the listener's fallback, its first message replayed
+(`Takeover::into_pipe`), and is closed once the fallback completed.
 
 A Close frame is the graceful end of a pipe; a connection that ends
 without one is a failure. Over plain TCP a failed pipe is aborted without a

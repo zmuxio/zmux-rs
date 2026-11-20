@@ -180,10 +180,15 @@ that, with the same application error code.
 
 - **Admission.** `ListenerConfig::admission` (an `Admission`) decides on
   every carrier of a `Listener`, whatever adapter took it, before anything
-  is sent on it: from its first bytes and its metadata (`CarrierInfo`) it
-  accepts the carrier, hands it to the fallback of its kind with the bytes
-  read replayed (`ListenerConfig::fallback`), stalls it, or closes it
-  (`AdmissionVerdict`). `PrefixAuth` is a ready-made credential check, bound to the
+  is sent on it: from its first bytes or first message and its metadata
+  (`CarrierInfo`) it accepts the carrier, hands it to the listener's one
+  fallback with what was read replayed (`ListenerConfig::fallback`, a
+  `Fallback` given a `Takeover`), stalls it, or closes it
+  (`AdmissionVerdict`). An HTTP upgrade (WebSocket, WebTransport) is decided
+  on its request head, which may defer the decision to the carrier's first
+  message or bytes (`AdmissionVerdict::Defer`); a request that is itself the
+  carrier is taken over as a request by its adapter's HTTP fallback.
+  `PrefixAuth` is a ready-made credential check, bound to the
   TLS connection where the carrier has an exporter; a client presents it
   as a `CarrierCredential`. `TrustedProxies` names the intermediaries whose report
   of the client address (PROXY protocol, a forwarding header field) is

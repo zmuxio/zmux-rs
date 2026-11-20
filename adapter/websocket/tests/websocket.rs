@@ -466,7 +466,8 @@ async fn an_unaccepted_subprotocol_is_refused_with_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_request_reaches_the_fallback_with_every_byte() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let fallback = zmux::adapter::Fallback::new(|mut conn, _source| async move {
+    let fallback = zmux::Fallback::new(|t: zmux::Takeover| async move {
+        let mut conn = t.into_stream().expect("the TCP connection");
         // Echo the request as the body of a 200, then end.
         let mut got = vec![0u8; 4096];
         let mut n = 0;
@@ -521,7 +522,7 @@ async fn an_admission_decides_on_the_request_head() {
     let admission = Admission::new(0, |info, prefix| {
         assert_eq!(prefix, []);
         assert!(info.source.is_some());
-        assert!(info.head);
+        assert!(info.is_head() && info.upgrade);
         let mut upgrade = false;
         info.for_each_header(|n, v| upgrade |= n == "upgrade" && v == b"websocket");
         assert!(upgrade);
@@ -865,4 +866,117 @@ async fn a_close_is_delivered_with_its_code() {
         listener.close();
         serving.await.unwrap();
     }
+}
+
+/// The reverse-tunnel flow: the head defers, and the decision is taken on
+/// the first message, a zmux client's first record accepted (a working
+/// session) and anything else taken over by the listener's fallback, which
+/// reads the first message again and then the next, answers, and returns;
+/// the carrier is closed then. Per-source counts kept by the decision see
+/// both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_decision_on_the_first_message_accepts_or_takes_over() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use futures_util::SinkExt;
+    use zmux::adapter::{FirstBytes, classify_first_bytes};
+    use zmux::{Admission, AdmissionVerdict, Fallback, Takeover};
+
+    let per_source: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> = Arc::default();
+    let seen = per_source.clone();
+    let admission = Admission::new(0, move |info, first| {
+        if info.is_head() {
+            return AdmissionVerdict::Defer;
+        }
+        assert!(info.upgrade && info.request.is_some());
+        assert_eq!(info.framing, zmux::adapter::Framing::Records);
+        *seen
+            .lock()
+            .unwrap()
+            .entry(info.source.unwrap().ip())
+            .or_default() += 1;
+        match classify_first_bytes(first, info.framing) {
+            FirstBytes::Record => AdmissionVerdict::accept(0),
+            FirstBytes::NeedMore(_) | FirstBytes::Other => AdmissionVerdict::Fallback,
+        }
+    })
+    .with_peek_timeout(Duration::from_secs(10));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let fallback = Fallback::new(move |t: Takeover| {
+        let tx = tx.clone();
+        async move {
+            assert_eq!(t.framing(), zmux::adapter::Framing::Records);
+            assert!(!t.has_stream());
+            let replayed = t.replayed().to_vec();
+            let mut pipe = t.into_pipe();
+            let mut first = Vec::new();
+            pipe.read_handshake(&mut first).await.unwrap();
+            let mut second = Vec::new();
+            pipe.read_handshake(&mut second).await.unwrap();
+            pipe.write_handshake(b"tunnel reply").await.unwrap();
+            let _ = tx.send((replayed, first, second));
+        }
+    });
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(admission);
+    limits.fallback = Some(fallback);
+    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let serving = tokio::spawn(zmux_websocket::serve(
+        listener.clone(),
+        tcp,
+        zmux_websocket::Options::default(),
+    ));
+
+    // A zmux client: accepted on its first record.
+    let client = zmux_websocket::connect(
+        format!("ws://{addr}/zmux"),
+        &zmux_websocket::Options::default(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let server = listener.accept().await.unwrap();
+    round_trip(&client, &server).await;
+
+    // A tunnel client: its messages reach the fallback, the first again.
+    let mut request = format!("ws://{addr}/tunnel").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", "qmux-02".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.send(Message::binary(b"hello tunnel".to_vec()))
+        .await
+        .unwrap();
+    ws.send(Message::binary(b"second".to_vec())).await.unwrap();
+    let (replayed, first, second) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed, b"hello tunnel");
+    assert_eq!(first, b"hello tunnel");
+    assert_eq!(second, b"second");
+    let reply = ws.next().await.unwrap().unwrap();
+    assert_eq!(reply, Message::binary(b"tunnel reply".to_vec()));
+    // Closed once the fallback returned.
+    let end = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(end, None | Some(Err(_) | Ok(Message::Close(_)))),
+        "{end:?}"
+    );
+
+    let a = listener.stats().admission;
+    assert_eq!(
+        (a.accepted, a.fallback, a.closed, a.peek_timed_out),
+        (1, 1, 0, 0)
+    );
+    let ip = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert_eq!(per_source.lock().unwrap()[&ip], 2);
+    client.close().await;
+    listener.close();
+    serving.await.unwrap();
 }

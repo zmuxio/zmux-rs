@@ -403,9 +403,10 @@ async fn admission_by_bound_prefix_auth() {
         .with_peek_timeout(Duration::from_millis(300))
         .with_stall_interval(STALL_MIN, Duration::from_millis(100));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let fallback = zmux::adapter::Fallback::new(move |mut conn, _| {
+    let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
         let tx = tx.clone();
         async move {
+            let mut conn = t.into_stream().expect("the TLS stream");
             let mut got = Vec::new();
             let _ = conn.read_to_end(&mut got).await;
             let _ = tx.send(got);

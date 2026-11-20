@@ -116,10 +116,12 @@ use bytes::Bytes;
 use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use zmux::adapter::{Admit, Admitted, Entry, Prefixed};
+use zmux::adapter::{AdmitIo, Admitted, Entry};
 use zmux::adapter::{CarrierConnId, ChannelDemux, MemoryCharge};
 use zmux::proto::ApplicationErrorCode;
-use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
+use zmux::{
+    CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session, Takeover,
+};
 
 /// How a QUIC connection's flow control is sized for lanes: the base of
 /// the options of every carrier over quinn (this crate's, and those of
@@ -784,23 +786,26 @@ fn remember(
 /// With an admission, the arrival of a connection's first bidirectional
 /// stream and the reading of its prefix, the first [`zmux::Admission::peek`]
 /// bytes of that stream, together take at most the admission's peek
-/// timeout from the end of the handshake; a connection that opens no
-/// bidirectional stream in time is closed and counts as a failed
-/// handshake. The decision's metadata ([`CarrierInfo`]) is the source and
-/// the peer and, with quinn's rustls crypto layer, the negotiated ALPN
-/// identifier, the client's server name and the connection's TLS
-/// exporter. Then:
+/// timeout from the end of the handshake ([`Entry::admit_first`]); a
+/// connection that opens no bidirectional stream in time is closed and
+/// counts as timed out. The decision's metadata ([`CarrierInfo`]) is the
+/// source and the peer and, with quinn's rustls crypto layer, the
+/// negotiated ALPN identifier, the client's server name and the
+/// connection's TLS exporter. Then:
 ///
 /// - `Accept(k)`: the connection becomes a [`Carrier`] of `listener`;
 ///   its first stream is its first pipe, the prefix after `k` bytes in
 ///   front, and only from then on do its other streams, bidirectional and
 ///   unidirectional, opened before or after, reach the listener, each
 ///   with a source slot of its own;
-/// - `Fallback` with `fallback` set: the handler is given the connection
-///   and its first stream, every byte read replayed in front;
-/// - `Stall`, and `Fallback` without a handler: what arrives on the first
-///   stream is read and discarded for a stall's duration, then the
-///   connection is closed;
+/// - `Fallback`: the first stream goes to the listener's fallback
+///   ([`zmux::ListenerConfig::fallback`]) as a [`Takeover`], every byte
+///   read replayed: its two halves joined as one stream
+///   ([`Takeover::into_stream`]), and the connection
+///   ([`takeover_connection`]); the connection is closed once the
+///   fallback completed. Without a fallback, as `Stall`;
+/// - `Stall`: what arrives on the first stream is read and discarded for
+///   a stall's duration, then the connection is closed;
 /// - `Close`: the connection is closed at once.
 ///
 /// Nothing is written on a connection's streams before it is accepted.
@@ -815,12 +820,7 @@ fn remember(
     not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
     doc = " `server_config` does with options without [`Options::with_zero_rtt`]."
 )]
-pub async fn serve(
-    listener: Listener,
-    endpoint: Endpoint,
-    options: Options,
-    fallback: Option<Fallback>,
-) {
+pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
     let admitted = listener.adapter().admission().is_some();
     // 0-RTT data is taken before the handshake completes only when the
     // sessions allow carrier early data; otherwise it is processed once
@@ -829,7 +829,7 @@ pub async fn serve(
         !admitted && options.zero_rtt.is_some() && listener.config().early_data.carrier_early_data;
     let l = listener.clone();
     let endpoint = &endpoint;
-    let shared = Arc::new((options, fallback));
+    let options = Arc::new(options);
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         move |incoming: quinn::Incoming| {
@@ -860,10 +860,9 @@ pub async fn serve(
             }
         },
         move |listener, (conn, handshake, entry): (Connection, _, Entry)| {
-            let shared = shared.clone();
+            let options = options.clone();
             async move {
-                let (options, fallback) = &*shared;
-                serve_entered(conn, handshake, entry, listener, options, fallback.as_ref()).await;
+                serve_entered(conn, handshake, entry, listener, &options).await;
             }
         },
     )
@@ -892,7 +891,6 @@ pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
     options: &Options,
-    fallback: Option<&Fallback>,
 ) -> io::Result<()> {
     let Some(entry) = listener.adapter().enter(conn.remote_address(), None) else {
         conn.close(VarInt::from_u32(0), b"");
@@ -902,7 +900,7 @@ pub async fn serve_connection(
             Ok(())
         };
     };
-    serve_entered(conn, None, entry, listener.clone(), options, fallback).await;
+    serve_entered(conn, None, entry, listener.clone(), options).await;
     Ok(())
 }
 
@@ -915,16 +913,13 @@ async fn serve_entered(
     entry: Entry,
     listener: Listener,
     options: &Options,
-    fallback: Option<&Fallback>,
 ) {
     if listener.adapter().admission().is_some() {
-        admit(conn, entry, listener, options, fallback).await;
+        admit(conn, entry, listener, options).await;
         return;
     }
     // Without an admission: accepted, its streams enter one by one.
-    let mut entry = entry;
-    let _ = entry.decide(CarrierInfo::new(), Vec::new()).await;
-    drop(entry);
+    entry.release();
     let carrier = Carrier::start(&conn, Some(listener), options, handshake);
     delivering(carrier, &conn).await;
 }
@@ -949,106 +944,64 @@ impl Drop for StopDelivery {
 }
 
 /// The admission of one connection whose handshake completed ([`serve`]).
-async fn admit(
-    conn: Connection,
-    mut entry: Entry,
-    listener: Listener,
-    options: &Options,
-    fallback: Option<&Fallback>,
-) {
-    // One deadline for the stream's arrival and its prefix.
-    let deadline = entry
-        .peek_deadline()
-        .map_or_else(tokio::time::Instant::now, Into::into);
-    let Ok(Ok((send, mut recv))) = tokio::time::timeout_at(deadline, conn.accept_bi()).await else {
-        // No stream in time: the entry dropped counts it.
+async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: &Options) {
+    // The carrier is made once the first stream is accepted, for its
+    // first pipe; the rest of its streams reach the listener after that.
+    let made = Arc::new(std::sync::Mutex::new(None::<Carrier>));
+    let first = {
+        let (conn, made, l, options) = (
+            conn.clone(),
+            made.clone(),
+            listener.clone(),
+            options.clone(),
+        );
+        async move {
+            let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
+            let c = conn.clone();
+            let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
+                let (recv, send) = streams.into_inner();
+                let carrier = Carrier::make(&c, Some(&l), &options, None);
+                let pipe = carrier.inner.pipe(
+                    Send::new(QuinnSend::new(send)),
+                    Recv::new(QuinnRecv::new(recv)),
+                );
+                *made
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(carrier);
+                pipe
+            });
+            Ok(io.with_connection(Arc::new(conn)))
+        }
+    };
+    let info = Handshake::of(&conn).carrier_info(&conn);
+    let accepted = entry.admit_first(info, first).await;
+    let carrier = made
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (Some(first), Some(carrier)) = (accepted, carrier) else {
+        // Not accepted, the verdict acted on (a fallback has completed):
+        // closed before the streams are dropped, nothing sent on them.
         conn.close(VarInt::from_u32(0), b"");
         return;
     };
-    let prefix = entry.read_prefix(&mut recv).await;
-    let admit = {
-        let handshake = Handshake::of(&conn);
-        let info = handshake.carrier_info(&conn);
-        entry.decide_reading(info, prefix, &mut recv).await
-    };
-    match admit {
-        Admit::Accept(rest) => {
-            let admitted = entry.admitted();
-            let hint = PipeHint::from_entry(entry);
-            let carrier = Carrier::make(&conn, Some(&listener), options, None);
-            let first = carrier
-                .inner
-                .pipe(
-                    Send::new(QuinnSend::new(send)),
-                    Recv::new(QuinnRecv::new(recv)),
-                )
-                .with_prefix(rest);
-            let l = listener.clone();
-            tokio::spawn(async move { l.handle_pipe(first, hint).await });
-            // The other streams from here on.
-            carrier.inner.listen(Some(listener), admitted);
-            delivering(carrier, &conn).await;
-        }
-        Admit::Fallback(prefix) if fallback.is_some() => {
-            drop(entry);
-            if let Some(f) = fallback {
-                f.serve(conn, send, Prefixed::new(recv, prefix)).await;
-            }
-        }
-        Admit::Fallback(_) | Admit::Stall => {
-            entry.stall(Some(&mut recv)).await;
-            // Closed before the streams are dropped: nothing is sent on them.
-            conn.close(VarInt::from_u32(0), b"");
-        }
-        _ => conn.close(VarInt::from_u32(0), b""),
-    }
+    let admitted = entry.admitted();
+    let hint = PipeHint::from_entry(entry);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(first, hint).await });
+    // The other streams from here on.
+    carrier.inner.listen(Some(listener), admitted);
+    delivering(carrier, &conn).await;
 }
 
-type QuicFallbackFn = dyn Fn(
-        Connection,
-        quinn::SendStream,
-        Prefixed<quinn::RecvStream>,
-    ) -> Pin<Box<dyn Future<Output = ()> + std::marker::Send>>
-    + std::marker::Send
-    + Sync;
-
-/// The fallback target of [`serve`]: a handler given a connection
-/// that was not accepted and its first bidirectional stream, the bytes the
-/// admission read from it replayed in front ([`Prefixed`]). The connection
-/// is the handler's: it closes when the handler has dropped every handle of
-/// it and of its streams. Cheap to clone.
-#[derive(Clone)]
-pub struct Fallback(Arc<QuicFallbackFn>);
-
-impl std::fmt::Debug for Fallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Fallback(..)")
-    }
-}
-
-impl Fallback {
-    /// The handler `f`.
-    pub fn new<F, Fut>(f: F) -> Self
-    where
-        F: Fn(Connection, quinn::SendStream, Prefixed<quinn::RecvStream>) -> Fut
-            + std::marker::Send
-            + Sync
-            + 'static,
-        Fut: Future<Output = ()> + std::marker::Send + 'static,
-    {
-        Self(Arc::new(move |c, s, r| Box::pin(f(c, s, r))))
-    }
-
-    /// Serves `conn` and its first stream.
-    pub async fn serve(
-        &self,
-        conn: Connection,
-        send: quinn::SendStream,
-        recv: Prefixed<quinn::RecvStream>,
-    ) {
-        let handler = &self.0;
-        handler(conn, send, recv).await;
-    }
+/// The QUIC connection of a stream the listener's fallback took over
+/// ([`zmux::ListenerConfig::fallback`]) from [`serve`] or
+/// [`serve_connection`]: its first bidirectional stream, as
+/// [`Takeover::into_stream`] gives it. The connection is closed once the
+/// fallback completed.
+#[must_use]
+pub fn takeover_connection(takeover: &Takeover) -> Option<Connection> {
+    takeover.connection()?.downcast_ref::<Connection>().cloned()
 }
 
 /// A QUIC connection whose streams carry zmux pipes and lanes (see the

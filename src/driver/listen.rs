@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::time::Instant;
 
 use super::account::{Account, AccountLink};
-use super::admission::{Fallback, FallbackStream, Prefixed, discard, read_more, read_prefix};
+use super::admission::{AdmitIo, Fallback, FirstMessage, discard, read_message, read_more};
 use super::handle::{self, Shared, WeakSession};
 use super::resources::{Kind, Live};
 use super::sealed::{read_unit, seal_carrier, until, write_unit};
@@ -26,7 +26,9 @@ use super::transform::InboundTransform;
 use super::wait::{PipeDone, Ticket, WaitList};
 use super::wake::WakeList;
 use crate::proto::VarInt;
-use crate::proto::admission::{Admission, AdmissionVerdict, AdmittedValue, CarrierInfo};
+use crate::proto::admission::{
+    Admission, AdmissionStage, AdmissionVerdict, AdmittedValue, CarrierInfo, Round, Step, step,
+};
 use crate::proto::exporter::CarrierExporter;
 use crate::proto::listener::{
     CarrierId, Classified, Entered, ListenerConfig, ListenerCore as Core, Paired, Slot,
@@ -156,12 +158,49 @@ struct AdmissionCounts {
     stalled: AtomicU64,
     closed: AtomicU64,
     stall_overflow: AtomicU64,
+    too_large: AtomicU64,
     peek_timed_out: AtomicU64,
     handshake_failed: AtomicU64,
     variants: Mutex<AdmissionVariants>,
 }
 
+/// The outcome of a carrier's admission, counted once
+/// ([`AdmissionStats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Accepted,
+    Fallback,
+    Stalled,
+    StallOverflow,
+    Closed,
+    TooLarge,
+    PeekTimedOut,
+    HandshakeFailed,
+}
+
 impl AdmissionCounts {
+    /// Counts an outcome, and the verdict of a labelled decision.
+    fn count(&self, outcome: Outcome, variant: Option<&Arc<str>>) {
+        let total = match outcome {
+            Outcome::Accepted => &self.accepted,
+            Outcome::Fallback => &self.fallback,
+            Outcome::Stalled => &self.stalled,
+            Outcome::StallOverflow => &self.stall_overflow,
+            Outcome::Closed => &self.closed,
+            Outcome::TooLarge => &self.too_large,
+            Outcome::PeekTimedOut => &self.peek_timed_out,
+            Outcome::HandshakeFailed => &self.handshake_failed,
+        };
+        total.fetch_add(1, Relaxed);
+        match outcome {
+            Outcome::Accepted => self.count_variant(variant, |v| v.accepted += 1),
+            Outcome::Fallback => self.count_variant(variant, |v| v.fallback += 1),
+            Outcome::Stalled => self.count_variant(variant, |v| v.stalled += 1),
+            Outcome::Closed => self.count_variant(variant, |v| v.closed += 1),
+            _ => {}
+        }
+    }
+
     fn count_variant(&self, variant: Option<&Arc<str>>, bump: impl FnOnce(&mut VariantStats)) {
         if let Some(v) = variant {
             let mut m = self.variants.lock().unwrap_or_else(PoisonError::into_inner);
@@ -314,9 +353,13 @@ impl ListenShared {
 /// the listener ([`ListenerConfig::max_pending`]) from before its outer
 /// handshake, through its admission and, handed to
 /// [`Listener::handle_pipe`] with [`PipeHint::from_entry`], until it enters
-/// a session; or until it goes to a fallback target, is released
+/// a session; or until it goes to the listener's fallback, is released
 /// ([`Entry::release`]) or dropped. Dropped before its admission
-/// ([`Entry::admit`]), its outer handshake counts as failed.
+/// ([`Entry::admit`], [`Entry::admit_first`], [`Entry::decide_request`],
+/// [`Entry::decide_upgrade`]), its outer handshake counts as failed;
+/// dropped while an upgrade's head deferred its decision, the decision
+/// that never came counts as timed out once the peek timeout passed, and
+/// as closed before.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent facts of the carrier's admission"
@@ -324,7 +367,8 @@ impl ListenShared {
 pub struct Entry {
     shared: Arc<ListenShared>,
     key: u64,
-    /// Its slots; `None` once a new carrier evicted it while it stalled.
+    /// Its slots; `None` once a new carrier evicted it while it stalled,
+    /// or once it went to the fallback.
     slot: Option<Slot>,
     source: SocketAddr,
     peer: SocketAddr,
@@ -335,8 +379,9 @@ pub struct Entry {
     stalling: bool,
     /// The end of the peek timeout, from the end of the outer handshake.
     deadline: Option<Instant>,
-    /// The prefix did not arrive within the peek timeout.
-    late: bool,
+    /// The metadata of the decision an upgrade's head deferred to its
+    /// carrier ([`AdmissionVerdict::Defer`]), at the carrier's stage.
+    deferred: Option<CarrierInfo>,
     /// The value the admission accepted it with.
     value: Option<AdmittedValue>,
     /// The label the admission gave it.
@@ -349,6 +394,7 @@ impl std::fmt::Debug for Entry {
             .field("source", &self.source)
             .field("peer", &self.peer)
             .field("admitted", &self.admitted)
+            .field("deferred", &self.deferred.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -377,29 +423,46 @@ impl SetupTasks {
     }
 }
 
-/// What the listener's admission decided on an entered carrier
-/// ([`Entry::admit`]).
+/// What the listener's admission decided on an HTTP request taken as a
+/// carrier ([`Entry::decide_request`], [`Entry::decide_upgrade`]). A
+/// request is taken over as a request, by its adapter's HTTP fallback, not
+/// by the listener's ([`ListenerConfig::fallback`]).
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Admit {
-    /// Accepted: the prefix bytes after those the decision removed, to be
-    /// given back in front of the carrier ([`PipeIo::with_prefix`]) handed
-    /// to [`Listener::handle_pipe`] with [`PipeHint::from_entry`].
+    /// Accepted: the prefix bytes of the body after those the decision
+    /// removed, to be given back in front of the carrier
+    /// ([`PipeIo::with_prefix`]; none on a head), handed to
+    /// [`Listener::handle_pipe`] with [`PipeHint::from_entry`].
     Accept(Vec<u8>),
-    /// To the fallback target of the carrier's kind, every prefix byte read
-    /// replayed in front; without a target, stall it ([`Entry::stall`]).
+    /// An upgrade's head deferred the decision to its carrier: complete the
+    /// upgrade and admit the carrier with [`Entry::admit_first`].
+    Defer,
+    /// To the adapter's HTTP fallback, every byte of the body read
+    /// replayed in front (none on a head).
     Fallback(Vec<u8>),
-    /// Stall it ([`Entry::stall`]), then close it.
+    /// Stall it ([`Entry::stall`]), then end it without a response.
     Stall,
-    /// Close it at once.
+    /// End it at once.
     Close,
 }
 
-/// What one decision on a prefix led to.
-enum Round {
-    Done(Admit),
-    /// Another decision once the prefix has this many bytes.
-    Read(usize),
+/// What a bounded read of a prefix gave.
+enum Read {
+    /// The bytes, and whether the carrier ended short of the length asked.
+    Got(Vec<u8>, bool),
+    /// The peek timeout passed first: the bytes read so far.
+    Late(Vec<u8>),
+    /// The listener stopped taking carriers.
+    Closed,
+}
+
+/// Why a decision gave no verdict.
+enum NoDecision {
+    /// Not within the peek timeout.
+    Late,
+    /// It panicked, or the listener stopped taking carriers.
+    Closed,
 }
 
 /// What a carrier's prefix is to the listener's sessions
@@ -447,8 +510,8 @@ impl Entry {
         self.admitted
     }
 
-    /// The admitted source of this carrier's connection, once
-    /// [`Entry::admit`] accepted it.
+    /// The admitted source of this carrier's connection, once its
+    /// admission accepted it.
     #[must_use]
     pub fn admitted(&self) -> Option<Admitted> {
         self.admitted.then(|| Admitted {
@@ -458,48 +521,242 @@ impl Entry {
         })
     }
 
-    /// Applies the listener's admission once the carrier's outer handshake
-    /// completed: [`Entry::read_prefix`] from `reader` (none without one,
-    /// for a carrier decided on its request head), then
-    /// [`Entry::decide_reading`] with `info`.
-    pub async fn admit<R>(&mut self, info: CarrierInfo, reader: Option<&mut R>) -> Admit
-    where
-        R: AsyncRead + Unpin + Send + ?Sized,
-    {
-        match reader {
-            Some(r) => {
-                let prefix = self.read_prefix(r).await;
-                self.decide_reading(info, prefix, r).await
+    /// Applies the listener's admission to a carrier once its outer
+    /// handshake completed (or right away for one without), and acts on
+    /// the decision: the accepted carrier, the bytes read given back in
+    /// front, to be handed to [`Listener::handle_pipe`] with
+    /// [`PipeHint::from_entry`]; `None` when it was not accepted, once it
+    /// was handed to the listener's fallback
+    /// ([`ListenerConfig::fallback`], a [`Takeover`](crate::Takeover); a
+    /// stall without one) and the fallback completed, stalled, or closed.
+    ///
+    /// The prefix is read within the peek timeout and until the listener
+    /// closes: up to [`Admission::peek`] bytes of a byte stream (more on
+    /// [`AdmissionVerdict::More`]), or a message-framed carrier's first
+    /// message, whole, at most [`Admission::max_message`] bytes (with a
+    /// peek above 0, or after an upgrade's head deferred the decision). A
+    /// longer message is closed without a decision
+    /// ([`AdmissionStats::too_large`]), and so is a carrier whose first
+    /// message does not come (it ends, fails, or sends an empty or a
+    /// non-binary message), counted as closed, as is one the listener's
+    /// close interrupts. `info` is the carrier's metadata (its source and
+    /// peer are the entry's, its stage [`AdmissionStage::Carrier`] and its
+    /// framing the carrier's), unless an upgrade's head deferred the
+    /// decision ([`Entry::decide_upgrade`]): the head's is used then. Once
+    /// the carrier is accepted, or without an admission, it is returned at
+    /// once.
+    pub async fn admit(&mut self, info: CarrierInfo, io: impl Into<AdmitIo>) -> Option<PipeIo> {
+        let mut io = io.into();
+        let deferred = self.deferred.take();
+        let deadline = self.start();
+        let (adm, deadline) = match (self.shared.admission.clone(), deadline) {
+            (Some(adm), Some(deadline)) if !self.admitted => (adm, deadline),
+            _ => {
+                self.admitted = true;
+                let given = io.given_back();
+                return Some(io.into_pipe(given));
             }
-            None => self.decide(info, Vec::new()).await,
+        };
+        let framing = io.framing();
+        let records = framing == Framing::Records;
+        let mut info = match &deferred {
+            Some(head) => head.clone(),
+            None => self.carrier_info(info, AdmissionStage::Carrier),
+        };
+        info.framing = framing;
+        let c = &self.shared.counts.admission;
+        let mut prefix = io.given_back();
+        if records && (adm.peek() > 0 || deferred.is_some()) {
+            if prefix.is_empty() {
+                let Some(r) = io.reader() else {
+                    c.count(Outcome::Closed, None);
+                    return None;
+                };
+                let listener = self.listener();
+                let read = read_message(r, adm.max_message(), deadline);
+                match until(listener.adapter().closed(), read).await {
+                    Some(FirstMessage::Message(m)) => prefix = m,
+                    Some(FirstMessage::TooLarge) => {
+                        c.count(Outcome::TooLarge, None);
+                        return None;
+                    }
+                    Some(FirstMessage::Late) => {
+                        c.count(Outcome::PeekTimedOut, None);
+                        return None;
+                    }
+                    Some(FirstMessage::Failed) | None => {
+                        c.count(Outcome::Closed, None);
+                        return None;
+                    }
+                }
+            } else if prefix.len() > adm.max_message() {
+                c.count(Outcome::TooLarge, None);
+                return None;
+            }
+        } else if !records
+            && prefix.len() < adm.peek()
+            && let Some(r) = io.reader()
+        {
+            match self.read_bounded(prefix, adm.peek(), r, deadline).await {
+                Read::Got(p, _) => prefix = p,
+                Read::Late(p) => {
+                    if let Admit::Fallback(p) = self.late_outcome(p, false, None) {
+                        self.fall_back(info, p, io).await;
+                    }
+                    return None;
+                }
+                Read::Closed => {
+                    self.shared.counts.admission.count(Outcome::Closed, None);
+                    return None;
+                }
+            }
+        }
+        let reader = if records { None } else { io.reader() };
+        match self.decide_on(&info, prefix, reader, false).await {
+            Admit::Accept(rest) => Some(io.into_pipe(rest)),
+            Admit::Fallback(replay) => {
+                self.fall_back(info, replay, io).await;
+                None
+            }
+            Admit::Stall => {
+                self.stall_io(io).await;
+                None
+            }
+            Admit::Close | Admit::Defer => None,
         }
     }
 
-    /// Once the carrier's outer handshake completed: starts the peek
-    /// timeout, and reads up to the admission's prefix length from
-    /// `reader` within it (nothing without an admission).
-    pub async fn read_prefix<R>(&mut self, reader: &mut R) -> Vec<u8>
+    /// [`Entry::admit`] for an adapter whose first carrier comes after the
+    /// carrier's head decision or its outer handshake: `first` completes an
+    /// HTTP upgrade or waits for the carrier (the first stream of a QUIC
+    /// connection or a WebTransport session) and yields it.
+    ///
+    /// Unless the head was accepted already (or there is no admission),
+    /// `first` runs within the peek timeout, counted from the head's
+    /// decision ([`AdmissionVerdict::Defer`]) or from the end of the outer
+    /// handshake (now, when nothing started it), and until the listener
+    /// closes: a carrier that does not come in time counts as timed out
+    /// ([`AdmissionStats::peek_timed_out`]), one the close interrupted as
+    /// closed and one `first` fails as a failed handshake, without a
+    /// decision; the carrier then passes the admission as with
+    /// [`Entry::admit`], `info` its metadata unless the head deferred the
+    /// decision. When the head was accepted, `first` runs until the
+    /// listener closes and its carrier is returned as it comes; a failure
+    /// then counts as a setup failure. On `None` the adapter closes what it
+    /// upgraded.
+    pub async fn admit_first<F>(&mut self, info: CarrierInfo, first: F) -> Option<PipeIo>
     where
-        R: AsyncRead + Unpin + Send + ?Sized,
+        F: Future<Output = std::io::Result<AdmitIo>>,
+    {
+        let listener = self.listener();
+        if self.admitted || self.shared.admission.is_none() {
+            if let Some(Ok(io)) = until(listener.adapter().closed(), first).await {
+                return self.admit(info, io).await;
+            }
+            self.handshaken = true;
+            self.shared.counts.setup_failures.fetch_add(1, Relaxed);
+            return None;
+        }
+        let deadline = self.start()?;
+        let came = until(
+            listener.adapter().closed(),
+            tokio::time::timeout_at(deadline, first),
+        )
+        .await;
+        let outcome = match came {
+            Some(Ok(Ok(io))) => return self.admit(info, io).await,
+            Some(Ok(Err(_))) => Outcome::HandshakeFailed,
+            Some(Err(_)) => Outcome::PeekTimedOut,
+            None => Outcome::Closed,
+        };
+        // Counted here: the deferral, if any, ends without its decision.
+        self.deferred = None;
+        self.shared.counts.admission.count(outcome, None);
+        None
+    }
+
+    /// The listener's decision on an HTTP request whose body (or nothing
+    /// after its head) is the carrier, before anything is answered: up to
+    /// [`Admission::peek`] bytes of `body` are read within the peek
+    /// timeout and until the listener closes (more on
+    /// [`AdmissionVerdict::More`]), and the decision is taken on them with
+    /// `info` (the request head among it; its source and peer the entry's).
+    /// A request without a body (`None`, or one that ends before its first
+    /// byte) is decided on its head ([`AdmissionStage::Head`]). A late
+    /// prefix ends the request ([`Admit::Close`]), whatever
+    /// [`Admission::with_fallback_on_peek_timeout`] says. Without an
+    /// admission it accepts at once.
+    pub async fn decide_request<R>(&mut self, info: CarrierInfo, body: Option<&mut R>) -> Admit
+    where
+        R: AsyncRead + Unpin + Send,
     {
         let deadline = self.start();
-        match (&self.shared.admission, deadline) {
-            (Some(adm), Some(d)) if adm.peek() > 0 => {
-                let (prefix, late) = read_prefix(adm.peek(), reader, d).await;
-                self.late = late;
-                prefix
+        let (Some(adm), Some(deadline)) = (self.shared.admission.clone(), deadline) else {
+            self.admitted = true;
+            return Admit::Accept(Vec::new());
+        };
+        let mut info = self.carrier_info(info, AdmissionStage::Carrier);
+        let mut prefix = Vec::new();
+        let mut reader: Option<&mut (dyn AsyncRead + Unpin + Send)> = None;
+        match body {
+            None => info.stage = AdmissionStage::Head,
+            Some(r) if adm.peek() > 0 => {
+                match self
+                    .read_bounded(Vec::new(), adm.peek(), &mut *r, deadline)
+                    .await
+                {
+                    Read::Got(p, ended) if p.is_empty() && ended => {
+                        info.stage = AdmissionStage::Head;
+                    }
+                    Read::Got(p, _) => {
+                        prefix = p;
+                        reader = Some(r);
+                    }
+                    Read::Late(p) => return self.late_outcome(p, true, None),
+                    Read::Closed => {
+                        self.shared.counts.admission.count(Outcome::Closed, None);
+                        return Admit::Close;
+                    }
+                }
             }
-            _ => Vec::new(),
+            Some(r) => reader = Some(r),
+        }
+        self.decide_on(&info, prefix, reader, true).await
+    }
+
+    /// The listener's decision on the head of an HTTP upgrade (WebSocket,
+    /// WebTransport), before anything is answered: `info` carries the
+    /// request head (its source and peer the entry's; its stage
+    /// [`AdmissionStage::Head`] and [`CarrierInfo::upgrade`] are set here).
+    /// [`Admit::Defer`] defers the decision to the carrier: complete the
+    /// upgrade and admit the carrier with [`Entry::admit_first`], which
+    /// decides again with the same metadata at
+    /// [`AdmissionStage::Carrier`]; the peek timeout runs on meanwhile.
+    /// Without an admission it accepts at once.
+    pub async fn decide_upgrade(&mut self, info: CarrierInfo) -> Admit {
+        let info = self.carrier_info(info, AdmissionStage::Head).with_upgrade();
+        let admit = self
+            .decide_on(&info, Vec::new(), None::<&mut tokio::io::Empty>, true)
+            .await;
+        if admit == Admit::Defer {
+            self.deferred = Some(info.with_stage(AdmissionStage::Carrier));
+        }
+        admit
+    }
+
+    /// The entry's listener, for its close.
+    fn listener(&self) -> Listener {
+        Listener {
+            shared: self.shared.clone(),
         }
     }
 
-    /// The admission's peek deadline, started now if it was not (the end
-    /// of the carrier's outer handshake): what an adapter waits for the
-    /// carrier's first stream within, so that the stream's arrival and the
-    /// reading of its prefix together take at most the peek timeout. `None`
-    /// without an admission.
-    pub fn peek_deadline(&mut self) -> Option<Instant> {
-        self.start()
+    /// `info` with the entry's source and peer, at `stage`, a byte stream.
+    fn carrier_info(&self, info: CarrierInfo, stage: AdmissionStage) -> CarrierInfo {
+        info.with_source(self.source)
+            .with_peer(self.peer)
+            .with_stage(stage)
+            .with_framing(Framing::ByteStream)
     }
 
     /// The deadline of the admission, started at the first call: the end
@@ -514,223 +771,220 @@ impl Entry {
         }))
     }
 
-    /// The listener's decision on the carrier, from `info` (whose source
-    /// and peer are the entry's) and `prefix` (read by
-    /// [`Entry::read_prefix`]), within what remains of the peek timeout;
-    /// cancelled when the listener closes. Without an admission it accepts
-    /// at once. Counted in [`ListenerStats::admission`]. With no reader to
-    /// read more from, [`AdmissionVerdict::More`] closes the carrier.
-    pub async fn decide(&mut self, info: CarrierInfo, prefix: Vec<u8>) -> Admit {
-        self.decide_rounds(info, prefix, None::<&mut tokio::io::Empty>)
-            .await
-    }
-
-    /// [`Entry::decide`] of a byte-stream carrier: [`AdmissionVerdict::More`] reads
-    /// on from `reader` and decides again.
-    pub async fn decide_reading<R>(
-        &mut self,
-        info: CarrierInfo,
+    /// Reads `prefix` on to `need` bytes from `r`, by `deadline` and
+    /// until the listener closes.
+    async fn read_bounded<R>(
+        &self,
         prefix: Vec<u8>,
-        reader: &mut R,
-    ) -> Admit
+        need: usize,
+        r: &mut R,
+        deadline: Instant,
+    ) -> Read
     where
         R: AsyncRead + Unpin + Send + ?Sized,
     {
-        self.decide_rounds(info, prefix, Some(reader)).await
-    }
-
-    /// One decision or more, reading on from `reader` for [`AdmissionVerdict::More`].
-    async fn decide_rounds<R>(
-        &mut self,
-        info: CarrierInfo,
-        mut prefix: Vec<u8>,
-        mut reader: Option<&mut R>,
-    ) -> Admit
-    where
-        R: AsyncRead + Unpin + Send + ?Sized,
-    {
-        let info = info.with_source(self.source).with_peer(self.peer);
-        // The carrier ended short of what was asked for.
-        let mut short = false;
-        loop {
-            let can_read = reader.is_some();
-            match self.decide_round(&info, &mut prefix, can_read, short).await {
-                Round::Done(admit) => return admit,
-                Round::Read(need) => {
-                    let Some(r) = reader.as_deref_mut() else {
-                        return Admit::Close;
-                    };
-                    short = self.read_round(&mut prefix, need, r).await;
-                }
+        let listener = self.listener();
+        let read = read_more(prefix, need, r, deadline);
+        match until(listener.adapter().closed(), read).await {
+            None => Read::Closed,
+            Some((p, true)) => Read::Late(p),
+            Some((p, false)) => {
+                let ended = p.len() < need;
+                Read::Got(p, ended)
             }
         }
-    }
-
-    /// [`Entry::decide_reading`] when the metadata borrows the carrier the
-    /// reads come from: `info` is taken again for each decision.
-    async fn decide_carrier<C, I>(&mut self, conn: &mut C, info: &I, mut prefix: Vec<u8>) -> Admit
-    where
-        C: AsyncRead + Unpin + Send,
-        I: Fn(&C) -> CarrierInfo,
-    {
-        let mut short = false;
-        loop {
-            let round = {
-                let info = info(&*conn).with_source(self.source).with_peer(self.peer);
-                self.decide_round(&info, &mut prefix, true, short).await
-            };
-            match round {
-                Round::Done(admit) => return admit,
-                Round::Read(need) => short = self.read_round(&mut prefix, need, conn).await,
-            }
-        }
-    }
-
-    /// Reads `prefix` on to `need` bytes within the peek timeout: whether
-    /// the carrier ended short of it. Past the timeout the entry is late,
-    /// which the next round decides.
-    async fn read_round<R>(&mut self, prefix: &mut Vec<u8>, need: usize, reader: &mut R) -> bool
-    where
-        R: AsyncRead + Unpin + Send + ?Sized,
-    {
-        let Some(deadline) = self.start() else {
-            return false;
-        };
-        let have = std::mem::take(prefix);
-        let (more, late) = read_more(have, need, reader, deadline).await;
-        self.late = late;
-        let short = more.len() < need;
-        *prefix = more;
-        short
     }
 
     /// The outcome of a prefix that did not arrive within the peek
     /// timeout: counted in `peek_timed_out`, then closed, or taken to the
     /// fallback with `prefix` replayed when the admission says so
     /// ([`Admission::with_fallback_on_peek_timeout`]; counted in
-    /// `fallback` as well), except an HTTP request carrier (`request`),
-    /// which is always closed.
-    fn late_outcome(&mut self, adm: &Admission, prefix: &mut Vec<u8>, request: bool) -> Admit {
+    /// `fallback` as well, under `variant`), except an HTTP request carrier
+    /// (`request`), which is always closed.
+    fn late_outcome(&self, prefix: Vec<u8>, request: bool, variant: Option<&Arc<str>>) -> Admit {
         let c = &self.shared.counts.admission;
-        c.peek_timed_out.fetch_add(1, Relaxed);
-        if adm.fallback_on_peek_timeout() && !request {
-            c.fallback.fetch_add(1, Relaxed);
-            return Admit::Fallback(std::mem::take(prefix));
+        c.count(Outcome::PeekTimedOut, None);
+        let fallback = self
+            .shared
+            .admission
+            .as_ref()
+            .is_some_and(Admission::fallback_on_peek_timeout);
+        if fallback && !request {
+            c.count(Outcome::Fallback, variant);
+            return Admit::Fallback(prefix);
         }
         Admit::Close
     }
 
-    /// One decision on `prefix`, with `info`'s source and peer filled in:
-    /// its outcome, or how far to read for another when `can_read` and the
-    /// carrier did not end `short`.
-    async fn decide_round(
+    /// The decision on `prefix` at `info`'s stage, again on a longer one
+    /// read from `reader` (a byte stream) after each
+    /// [`AdmissionVerdict::More`], within the peek timeout and until the
+    /// listener closes, counted once it is final ([`Admit::Defer`] is not:
+    /// the decision then is the carrier's). `request`: an HTTP request,
+    /// which a late prefix closes.
+    async fn decide_on<R>(
         &mut self,
         info: &CarrierInfo,
-        prefix: &mut Vec<u8>,
-        can_read: bool,
-        short: bool,
-    ) -> Round {
-        let Some(deadline) = self.start() else {
+        mut prefix: Vec<u8>,
+        mut reader: Option<&mut R>,
+        request: bool,
+    ) -> Admit
+    where
+        R: AsyncRead + Unpin + Send + ?Sized,
+    {
+        let deadline = self.start();
+        let (Some(adm), Some(deadline)) = (self.shared.admission.clone(), deadline) else {
             self.admitted = true;
-            return Round::Done(Admit::Accept(std::mem::take(prefix)));
+            return Admit::Accept(prefix);
         };
-        let Some(adm) = self.shared.admission.clone() else {
-            return Round::Done(Admit::Close);
-        };
-        if self.late {
-            return Round::Done(self.late_outcome(&adm, prefix, info.request.is_some()));
-        }
         let shared = self.shared.clone();
         let c = &shared.counts.admission;
-        let listener = Listener {
-            shared: self.shared.clone(),
-        };
         // An exporter whose values come later is resolved first, within the
         // peek deadline and the listener's life: a decision reads its values
         // synchronously ([`CarrierInfo::export`]).
         if let Some(e) = info.exporter().filter(|e| !e.is_resolved()) {
             let resolve = tokio::time::timeout_at(deadline, e.resolve());
-            let resolved = until(listener.adapter().closed(), resolve).await;
-            match resolved {
+            match until(self.listener().adapter().closed(), resolve).await {
                 Some(Ok(())) => {}
                 Some(Err(_)) => {
-                    self.late = true;
-                    return Round::Done(self.late_outcome(&adm, prefix, info.request.is_some()));
+                    let records = info.framing == Framing::Records;
+                    return self.late_outcome(prefix, request || records, None);
                 }
-                None => return Round::Done(Admit::Close),
+                None => {
+                    c.count(Outcome::Closed, None);
+                    return Admit::Close;
+                }
             }
         }
-        let decided = {
-            // A synchronous decision panics in the call itself.
-            let Some(decide) = crate::Decision::catch(|| adm.decider().decide(info, prefix)) else {
-                c.closed.fetch_add(1, Relaxed);
-                return Round::Done(Admit::Close);
+        let mut short = false;
+        loop {
+            let decision = match self
+                .call_decide(&adm, info.clone(), &prefix, deadline)
+                .await
+            {
+                Ok(d) => d,
+                Err(NoDecision::Late) => {
+                    c.count(Outcome::PeekTimedOut, None);
+                    return Admit::Close;
+                }
+                Err(NoDecision::Closed) => {
+                    c.count(Outcome::Closed, None);
+                    return Admit::Close;
+                }
             };
-            match decide {
-                crate::Decision::Now(d) => Some(Ok(Some(d))),
-                later @ crate::Decision::Later(_) => {
-                    let timed = tokio::time::timeout_at(deadline, later.settle());
-                    let mut timed = std::pin::pin!(timed);
-                    let mut closed = std::pin::pin!(listener.adapter().closed());
-                    std::future::poll_fn(|cx| {
-                        if closed.as_mut().poll(cx).is_ready() {
-                            return Poll::Ready(None);
+            let crate::AdmissionDecision { verdict, variant } = decision;
+            let round = Round {
+                stage: info.stage,
+                framing: info.framing,
+                upgrade: info.upgrade,
+                len: prefix.len(),
+                can_read: reader.is_some(),
+                short,
+                max_peek: adm.max_peek(),
+            };
+            match step(verdict, &round) {
+                Step::Defer => return Admit::Defer,
+                Step::Read(need) => {
+                    let Some(r) = reader.as_deref_mut() else {
+                        unreachable!("a read without a reader");
+                    };
+                    match self.read_bounded(prefix, need, r, deadline).await {
+                        Read::Got(p, ended) => (prefix, short) = (p, ended),
+                        Read::Late(p) => return self.late_outcome(p, request, variant.as_ref()),
+                        Read::Closed => {
+                            c.count(Outcome::Closed, variant.as_ref());
+                            return Admit::Close;
                         }
-                        timed.as_mut().poll(cx).map(Some)
-                    })
-                    .await
+                    }
                 }
+                Step::Final(v) => return self.finish(v, variant, prefix),
             }
+        }
+    }
+
+    /// One call of the decision, within the peek timeout and until the
+    /// listener closes.
+    async fn call_decide(
+        &self,
+        adm: &Admission,
+        info: CarrierInfo,
+        prefix: &[u8],
+        deadline: Instant,
+    ) -> Result<crate::AdmissionDecision, NoDecision> {
+        // A synchronous decision panics in the call itself.
+        let decide = crate::Decision::catch(|| adm.decider().decide(info, prefix));
+        let later = match decide {
+            None => return Err(NoDecision::Closed),
+            Some(crate::Decision::Now(d)) => return Ok(d),
+            Some(later @ crate::Decision::Later(_)) => later,
         };
-        let decision = match decided {
-            Some(Ok(Some(d))) => d,
-            Some(Err(_)) => {
-                c.peek_timed_out.fetch_add(1, Relaxed);
-                return Round::Done(Admit::Close);
-            }
+        let listener = self.listener();
+        let timed = tokio::time::timeout_at(deadline, later.settle());
+        match until(listener.adapter().closed(), timed).await {
+            Some(Ok(Some(d))) => Ok(d),
+            Some(Err(_)) => Err(NoDecision::Late),
             // Panicked, or cancelled with the listener.
-            Some(Ok(None)) | None => AdmissionVerdict::Close.into(),
-        };
-        let crate::AdmissionDecision { verdict, variant } = decision;
-        let verdict = match verdict.bounded(prefix.len()) {
-            AdmissionVerdict::More { need } => {
-                if can_read && !short && need > prefix.len() && need <= adm.max_peek() {
-                    return Round::Read(need);
-                }
-                AdmissionVerdict::Close
-            }
-            v => v,
-        };
-        Round::Done(match verdict {
+            Some(Ok(None)) | None => Err(NoDecision::Closed),
+        }
+    }
+
+    /// Counts a final verdict and keeps an acceptance's value and label.
+    fn finish(
+        &mut self,
+        verdict: AdmissionVerdict,
+        variant: Option<Arc<str>>,
+        mut prefix: Vec<u8>,
+    ) -> Admit {
+        let shared = self.shared.clone();
+        let c = &shared.counts.admission;
+        match verdict {
             AdmissionVerdict::Accept { skip, value } => {
-                c.accepted.fetch_add(1, Relaxed);
-                c.count_variant(variant.as_ref(), |v| v.accepted += 1);
+                c.count(Outcome::Accepted, variant.as_ref());
                 self.admitted = true;
                 self.value = value;
                 self.variant = variant;
                 prefix.drain(..skip);
-                Admit::Accept(std::mem::take(prefix))
+                Admit::Accept(prefix)
             }
             AdmissionVerdict::Fallback => {
-                c.fallback.fetch_add(1, Relaxed);
-                c.count_variant(variant.as_ref(), |v| v.fallback += 1);
-                Admit::Fallback(std::mem::take(prefix))
+                c.count(Outcome::Fallback, variant.as_ref());
+                Admit::Fallback(prefix)
             }
             AdmissionVerdict::Stall if self.start_stall() => {
-                c.stalled.fetch_add(1, Relaxed);
-                c.count_variant(variant.as_ref(), |v| v.stalled += 1);
+                c.count(Outcome::Stalled, variant.as_ref());
                 Admit::Stall
             }
             AdmissionVerdict::Stall => {
-                c.stall_overflow.fetch_add(1, Relaxed);
+                c.count(Outcome::StallOverflow, None);
                 Admit::Close
             }
-            AdmissionVerdict::Close | AdmissionVerdict::More { .. } => {
-                c.closed.fetch_add(1, Relaxed);
-                c.count_variant(variant.as_ref(), |v| v.closed += 1);
+            _ => {
+                c.count(Outcome::Closed, variant.as_ref());
                 Admit::Close
             }
-        })
+        }
+    }
+
+    /// Hands `io`, `replay` in front, to the listener's fallback, its slots
+    /// given back first, until the fallback completes; without a fallback
+    /// it is stalled (not counted as a stall: the decision was a fallback).
+    async fn fall_back(&mut self, info: CarrierInfo, replay: Vec<u8>, io: AdmitIo) {
+        if self.shared.fallback.is_none() {
+            self.stall_io(io).await;
+            return;
+        }
+        if let Some(slot) = self.slot.take() {
+            self.shared.lock().core.release(slot);
+        }
+        self.listener().adapter().take_over(info, io, replay).await;
+    }
+
+    /// Stalls `io` ([`Entry::stall`]), then ends its sending half
+    /// gracefully, within [`DRAIN_LIMIT`](super::tokio::DRAIN_LIMIT).
+    async fn stall_io(&mut self, mut io: AdmitIo) {
+        let records = io.framing() == Framing::Records;
+        self.stall_reading(io.reader(), records).await;
+        let _ = tokio::time::timeout(super::tokio::DRAIN_LIMIT, io.shutdown()).await;
     }
 
     /// Counts the carrier as stalled: `false` when the listener closed,
@@ -775,28 +1029,44 @@ impl Entry {
     /// belong to a carrier already set up), read as far as it goes.
     pub fn release(mut self) {
         self.handshaken = true;
+        self.deferred = None;
     }
 
-    /// Stalls the carrier: reads and discards what arrives on `reader`
-    /// (or only waits, without one) until it ends, fails, the listener
+    /// Stalls a carrier the admission did not accept ([`Admit::Stall`] of
+    /// an HTTP request): reads and discards what arrives on `reader` (or
+    /// only waits, without one) until it ends, fails, the listener
     /// closes, or a duration in the admission's stall interval has passed,
     /// a function of the source alone for the listener's lifetime (a keyed
     /// MAC of the source, aggregated to its prefix as for every per-source
     /// limit, [`ListenerConfig::source_prefix_v4`]), or a new
     /// carrier that found every slot of the listener taken evicts it. The
     /// slots stay held meanwhile, until the entry is dropped. The caller
-    /// then closes the carrier gracefully and drops the entry.
+    /// then ends the carrier and drops the entry. [`Entry::admit`] stalls
+    /// the carriers it decides on itself.
     ///
     /// A source stalls at most `max_pending_per_source - 1` carriers at
     /// once ([`ListenerConfig::max_pending_per_source`]), and the listener
     /// at most half of [`ListenerConfig::max_pending`]: beyond them, a
     /// [`AdmissionVerdict::Stall`] is [`Admit::Close`] (counted in
-    /// [`AdmissionStats::stall_overflow`]) and a stall after
-    /// [`Admit::Fallback`] returns at once.
+    /// [`AdmissionStats::stall_overflow`]).
     pub async fn stall<R>(&mut self, reader: Option<&mut R>)
     where
-        R: AsyncRead + Unpin + Send + ?Sized,
+        R: AsyncRead + Unpin + Send,
     {
+        self.stall_reading(
+            reader.map(|r| r as &mut (dyn AsyncRead + Unpin + Send)),
+            false,
+        )
+        .await;
+    }
+
+    /// [`Entry::stall`] of a byte stream or of a message-framed carrier
+    /// (`records`), which discards message by message.
+    async fn stall_reading(
+        &mut self,
+        reader: Option<&mut (dyn AsyncRead + Unpin + Send)>,
+        records: bool,
+    ) {
         let Some(adm) = self.shared.admission.clone() else {
             return;
         };
@@ -812,7 +1082,7 @@ impl Entry {
         let duration = min.saturating_add(Duration::from_nanos(off));
         let wait = async {
             match reader {
-                Some(r) => discard(r, adm.discard_buffer(), duration).await,
+                Some(r) => discard(r, adm.discard_buffer(), duration, records).await,
                 None => tokio::time::sleep(duration).await,
             }
         };
@@ -848,14 +1118,25 @@ impl Entry {
 
 impl Drop for Entry {
     fn drop(&mut self) {
+        let c = &self.shared.counts;
         if !self.handshaken {
-            let c = &self.shared.counts;
             if self.shared.admission.is_some() {
                 &c.admission.handshake_failed
             } else {
                 &c.setup_failures
             }
             .fetch_add(1, Relaxed);
+        }
+        if self.deferred.take().is_some() {
+            // A deferred decision that never came: its carrier did not
+            // arrive in time, or ended first.
+            let late = self.deadline.is_some_and(|d| Instant::now() >= d);
+            let outcome = if late {
+                Outcome::PeekTimedOut
+            } else {
+                Outcome::Closed
+            };
+            c.admission.count(outcome, None);
         }
         self.end_stall();
         if let Some(slot) = self.slot.take() {
@@ -1006,6 +1287,34 @@ impl<'a> ListenerAdapter<'a> {
     #[must_use]
     pub fn admission(&self) -> Option<&'a Admission> {
         self.listener.shared.admission.as_ref()
+    }
+
+    /// Whether the listener has a fallback ([`ListenerConfig::fallback`]).
+    #[must_use]
+    pub fn has_fallback(&self) -> bool {
+        self.listener.shared.fallback.is_some()
+    }
+
+    /// Hands a connection that never became a carrier to the listener's
+    /// fallback ([`ListenerConfig::fallback`]), `replay` (what the adapter
+    /// read of it) in front: for an adapter's own refusals, such as a
+    /// request on a WebSocket server that is no upgrade. Resolves once the
+    /// fallback completed (at once without one, the connection dropped).
+    /// Counted nowhere: the adapter counts the refusal. The carriers the
+    /// admission hands back reach the fallback through [`Entry::admit`].
+    pub async fn take_over(&self, info: CarrierInfo, io: AdmitIo, replay: Vec<u8>) {
+        let Some(f) = self.listener.shared.fallback.clone() else {
+            return;
+        };
+        let info = info.with_framing(io.framing());
+        if !f.serve(io.into_takeover(info, replay)).await
+            && let Some(l) = &self.listener.shared.logger
+        {
+            l.log(
+                crate::LogLevel::Error,
+                "zmux: the listener's fallback panicked; its carrier is closed",
+            );
+        }
     }
 
     /// For use in an admission's decision: whether `prefix`, a byte-stream
@@ -1274,7 +1583,7 @@ impl Listener {
             admitted: false,
             handshaken: false,
             deadline: None,
-            late: false,
+            deferred: None,
             value: None,
         })
     }
@@ -1462,26 +1771,13 @@ impl Listener {
                     Ok((conn, entry))
                 }
             },
-            move |l, (mut conn, mut entry): (C, Entry)| {
+            move |l, (conn, mut entry): (C, Entry)| {
                 let (info, carrier) = (info.clone(), carrier.clone());
                 async move {
-                    let prefix = entry.read_prefix(&mut conn).await;
-                    match entry.decide_carrier(&mut conn, &*info, prefix).await {
-                        Admit::Accept(rest) => {
-                            let io = carrier(conn).with_prefix(rest);
-                            let _ = l.handle_pipe(io, PipeHint::from_entry(entry)).await;
-                        }
-                        Admit::Fallback(prefix) => match l.shared.fallback.clone() {
-                            Some(f) => {
-                                let source = entry.source();
-                                drop(entry);
-                                let conn: Box<dyn FallbackStream> = Box::new(conn);
-                                f.serve(Prefixed::new(conn, prefix), source).await;
-                            }
-                            None => stall_stream(entry, conn).await,
-                        },
-                        Admit::Stall => stall_stream(entry, conn).await,
-                        Admit::Close => {}
+                    let meta = info(&conn);
+                    let io = AdmitIo::stream(conn, move |c| carrier(c));
+                    if let Some(io) = entry.admit(meta, io).await {
+                        let _ = l.handle_pipe(io, PipeHint::from_entry(entry)).await;
                     }
                 }
             },
@@ -1646,6 +1942,7 @@ impl Listener {
                     stalled: a.stalled.load(Relaxed),
                     closed: a.closed.load(Relaxed),
                     stall_overflow: a.stall_overflow.load(Relaxed),
+                    too_large: a.too_large.load(Relaxed),
                     peek_timed_out: a.peek_timed_out.load(Relaxed),
                     handshake_failed: a.handshake_failed.load(Relaxed),
                 }
@@ -1654,8 +1951,12 @@ impl Listener {
     }
 
     /// The carrier's entry: the adapter's, or one taken now, with the
-    /// listener's admission applied to the carrier's own bytes.
-    async fn entered(&self, pipe: &mut PipeIo, hint: &mut PipeHint) -> Result<Entry, HandleError> {
+    /// listener's admission applied to the carrier ([`Entry::admit`]).
+    async fn entered(
+        &self,
+        pipe: PipeIo,
+        hint: &mut PipeHint,
+    ) -> Result<(PipeIo, Entry), HandleError> {
         let mut entry = if let Some(e) = hint.entry.take() {
             e
         } else {
@@ -1667,29 +1968,12 @@ impl Listener {
             e
         };
         if entry.admitted {
-            return Ok(entry);
+            return Ok((pipe, entry));
         }
-        // Bytes come apart into records on a message carrier: its prefix is
-        // its first message's start.
-        let mut reader = pipe.reader.take();
-        let admit = entry.admit(CarrierInfo::new(), reader.as_mut()).await;
-        let r = match admit {
-            Admit::Accept(rest) => {
-                pipe.reader = reader;
-                let mut rest = rest;
-                rest.extend_from_slice(&pipe.prefix);
-                pipe.prefix = rest;
-                return Ok(entry);
-            }
-            // A carrier handed over directly has no fallback target.
-            Admit::Fallback(_) | Admit::Stall => {
-                entry.stall(reader.as_mut()).await;
-                Err(HandleError::NotAdmitted)
-            }
-            Admit::Close => Err(HandleError::NotAdmitted),
-        };
-        pipe.reader = reader;
-        r
+        match entry.admit(CarrierInfo::new(), pipe).await {
+            Some(pipe) => Ok((pipe, entry)),
+            None => Err(HandleError::NotAdmitted),
+        }
     }
 
     /// Sets up a carrier: what its pipe's end is waited for with, if it
@@ -1711,7 +1995,9 @@ impl Listener {
             hint.entry = None;
             None
         } else {
-            Some(self.entered(&mut pipe, &mut hint).await?)
+            let (admitted, entry) = self.entered(pipe, &mut hint).await?;
+            pipe = admitted;
+            Some(entry)
         };
         // The admission's value goes with the carrier, whatever the caller
         // set: to the transform, the session and the pipe.
@@ -2924,16 +3210,6 @@ impl Drop for SetupGuard {
             s.counts.setup_failures.fetch_add(1, Relaxed);
         }
     }
-}
-
-/// Stalls a byte-stream connection that was not admitted, then shuts its
-/// write side down; the source slot is given back once it is closed.
-async fn stall_stream<C: AsyncRead + AsyncWrite + Unpin + Send>(mut entry: Entry, mut conn: C) {
-    use tokio::io::AsyncWriteExt;
-    entry.stall(Some(&mut conn)).await;
-    let _ = conn.shutdown().await;
-    drop(conn);
-    drop(entry);
 }
 
 /// After a failed accept: a connection that went away before it was

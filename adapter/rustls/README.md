@@ -32,9 +32,9 @@ identifier: the application's rustls configuration does
 (`ListenerConfig::admission`, a `zmux::Admission`): each connection takes its
 source slot before the handshake; after it, the connection's first bytes and
 its metadata (source and peer, ALPN identifier, server name, TLS exporter)
-decide whether it reaches the listener, the listener's fallback connection
-handler (`ListenerConfig::fallback`) with the bytes read replayed, or
-neither. Nothing is written above TLS before acceptance, and
+decide whether it reaches the listener, the listener's fallback
+(`ListenerConfig::fallback`, a `zmux::Takeover` of the TLS stream) with the
+bytes read replayed, or neither. Nothing is written above TLS before acceptance, and
 TLS early data is refused. `zmux_rustls::dial` and `zmux_rustls::connect`
 take a `zmux_rustls::Options`: with `Options::with_carrier_credential` (a
 `zmux::CarrierCredential` such as `zmux::PrefixAuth`), its prefix goes as the

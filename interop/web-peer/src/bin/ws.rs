@@ -26,7 +26,10 @@ async fn main() {
 }
 
 async fn server(addr: &str) {
-    let fallback = zmux::adapter::Fallback::new(|mut conn, _| async move {
+    let fallback = zmux::Fallback::new(|t: zmux::Takeover| async move {
+        let Ok(mut conn) = t.into_stream() else {
+            return;
+        };
         let mut head = Vec::new();
         let mut b = [0u8; 1024];
         // A test peer's fallback, bounded all the same.

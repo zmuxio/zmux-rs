@@ -134,7 +134,10 @@ pub struct Options {
     pub windows: LaneWindows,
     /// Server: the handler of the requests that carry no pipe: those the
     /// listener's admission hands to the fallback and those the listener does not
-    /// take (none by default: such requests are answered with 404).
+    /// take (none by default: such requests are answered with 404). A
+    /// request is the carrier here, taken over as a request: the listener's
+    /// fallback ([`zmux::ListenerConfig::fallback`]) takes over carriers and
+    /// never sees one.
     pub fallback: Option<Fallback>,
     /// Client: the credential whose prefix ([`CarrierCredential::prefix`], given
     /// the connection's [`zmux_quinn::Handshake::carrier_info`]) is written
@@ -790,7 +793,6 @@ impl Served {
         recv: ServerRecv,
     ) {
         let mut reader = BodyReader::server(recv);
-        let prefix = entry.read_prefix(&mut reader).await;
         let (parts, ()) = head.into_parts();
         let admit = {
             let info = self.handshake.carrier_info(&self.conn).with_request_head(
@@ -799,7 +801,7 @@ impl Served {
                     zmux::adapter::visit_fields(&p.headers, each);
                 },
             );
-            entry.decide_reading(info, prefix, &mut reader).await
+            entry.decide_request(info, Some(&mut reader)).await
         };
         match admit {
             Admit::Accept(rest) => {
@@ -847,7 +849,9 @@ impl Served {
         recv: ServerRecv,
     ) {
         // Without an admission, accepted at once.
-        let _ = entry.decide(zmux::CarrierInfo::new(), Vec::new()).await;
+        let _ = entry
+            .decide_request(zmux::CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+            .await;
         let channel = self.channel(&send);
         let answer = Arc::new(Answer::new(send));
         let mut reader = BodyReader::server(recv);

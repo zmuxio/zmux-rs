@@ -288,14 +288,15 @@ impl PrefixAuthVerifier {
     /// verifies, with the binding of `info`'s exporter when tokens are
     /// bound, and [`AdmissionVerdict::Fallback`] for every other outcome. The token
     /// is the prefix ([`PREFIX_TOKEN_LEN`] bytes, accepted with them), or,
-    /// on a carrier decided on its request head ([`CarrierInfo::head`]),
+    /// on a carrier decided on its request head
+    /// ([`AdmissionStage::Head`](crate::proto::admission::AdmissionStage::Head)),
     /// the one value of the request header field
     /// ([`PrefixAuth::header_name`]), 43 base64url characters (accepted with
     /// no prefix): a missing, repeated or malformed field fails like a
     /// wrong token.
     pub fn decide(&self, info: &CarrierInfo, prefix: &[u8]) -> AdmissionVerdict {
         let header;
-        let (token, accept) = if info.head {
+        let (token, accept) = if info.is_head() {
             let Some(t) = self.header_token(info) else {
                 return AdmissionVerdict::Fallback;
             };
@@ -459,11 +460,13 @@ mod tests {
             .iter()
             .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
             .collect();
-        CarrierInfo::new().with_head().with_headers(move |each| {
-            for (n, v) in &fields {
-                each(n, v.as_bytes());
-            }
-        })
+        CarrierInfo::new()
+            .with_stage(crate::proto::admission::AdmissionStage::Head)
+            .with_headers(move |each| {
+                for (n, v) in &fields {
+                    each(n, v.as_bytes());
+                }
+            })
     }
 
     /// The header form of the test vectors verifies at their time,

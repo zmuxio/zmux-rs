@@ -92,7 +92,7 @@ async fn a_connection_refused_at_a_limit_is_closed_counted_and_ok() {
     ];
     assert_eq!(rig.listener.stats().refused, 0);
     let (c, s) = rig.connect().await;
-    let r = tokio::time::timeout(LIMIT, serve_connection(&rig.listener, s, &rig.opts, None))
+    let r = tokio::time::timeout(LIMIT, serve_connection(&rig.listener, s, &rig.opts))
         .await
         .expect("the refused connection ends the call");
     r.expect("refused at a limit is not an error");
@@ -106,7 +106,7 @@ async fn a_closed_listener_fails_the_call_with_not_connected() {
     let rig = Rig::new(None, 8);
     let (c, s) = rig.connect().await;
     rig.listener.close();
-    let r = serve_connection(&rig.listener, s, &rig.opts, None).await;
+    let r = serve_connection(&rig.listener, s, &rig.opts).await;
     assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::NotConnected);
     tokio::time::timeout(LIMIT, c.closed()).await.unwrap();
 }
@@ -117,7 +117,7 @@ async fn the_call_resolves_when_the_connection_ends() {
     let rig = Rig::new(None, 8);
     let (c, s) = rig.connect().await;
     let (l, o) = (rig.listener.clone(), rig.opts.clone());
-    let call = tokio::spawn(async move { serve_connection(&l, s, &o, None).await });
+    let call = tokio::spawn(async move { serve_connection(&l, s, &o).await });
     c.close(0u32.into(), b"");
     tokio::time::timeout(LIMIT, call)
         .await
@@ -133,7 +133,7 @@ async fn dropping_the_call_stops_the_delivery_and_keeps_the_connection() {
     let rig = Rig::new(None, 8);
     let (c, s) = rig.connect().await;
     let (l, o) = (rig.listener.clone(), rig.opts.clone());
-    let call = tokio::spawn(async move { serve_connection(&l, s, &o, None).await });
+    let call = tokio::spawn(async move { serve_connection(&l, s, &o).await });
     let carrier = Carrier::new(c.clone(), Options::default());
     let client = Session::connect(carrier.open_pipe().await.unwrap(), Config::default())
         .await

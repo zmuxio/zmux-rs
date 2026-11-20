@@ -191,7 +191,7 @@ fn carrier_response(
 ///   request's head (`&http::request::Parts` as the
 ///   [`CarrierInfo::with_request`] value) and the source. A request without
 ///   a body (a downlink `GET`, or a body that ends before its first byte)
-///   is decided on its head ([`CarrierInfo::head`]): no prefix, a
+///   is decided on its head ([`CarrierInfo::stage`]): no prefix, a
 ///   credential in a header field. `Accept(k)` returns the response at
 ///   once, the carrier having the prefix after `k` bytes in front, and the
 ///   request body is read on while the response flows (also on
@@ -304,28 +304,21 @@ where
         r
     };
     if listener.adapter().admission().is_some() {
-        let prefix = if bodiless {
-            Vec::new()
-        } else {
-            entry.read_prefix(&mut reader).await
-        };
-        let head = bodiless || (prefix.is_empty() && reader.ended());
         let admit = {
             // The TLS connection's metadata, when the request came over one.
             let base = parts
                 .extensions
                 .get::<TlsBinding>()
                 .map_or_else(CarrierInfo::new, TlsBinding::info);
-            let mut info = base.with_request_head(
+            let info = base.with_request_head(
                 Arc::new(parts.clone()),
                 |p: &http::request::Parts, each| {
                     zmux::adapter::visit_fields(&p.headers, each);
                 },
             );
-            if head {
-                info = info.with_head();
-            }
-            entry.decide_reading(info, prefix, &mut reader).await
+            // A request without a body is decided on its head.
+            let body = (!bodiless).then_some(&mut reader);
+            entry.decide_request(info, body).await
         };
         return match admit {
             Admit::Accept(rest) => {
@@ -356,7 +349,9 @@ where
         };
     }
     // Without an admission, accepted at once.
-    let _ = entry.decide(CarrierInfo::new(), Vec::new()).await;
+    let _ = entry
+        .decide_request(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+        .await;
     let hint = hint_of(entry);
     let (started, mut start) = tokio::sync::watch::channel(false);
     let started = Arc::new(started);

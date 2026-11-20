@@ -116,8 +116,9 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
+use zmux::Prefixed;
 use zmux::adapter::ChunkWrite;
-use zmux::adapter::{Admit, Entry, Prefixed};
+use zmux::adapter::{Admit, Entry};
 use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
 use zmux_rustls::{TlsBinding, TlsConnection};
 
@@ -577,14 +578,53 @@ pub async fn connect(
 // Returned once per connection and taken apart at once.
 #[allow(clippy::large_enum_variant)]
 pub enum Upgrade<S> {
-    /// Upgraded: the carrier and its hint, for [`Listener::handle_pipe`].
-    Accepted(PipeIo, PipeHint),
+    /// Upgraded: the carrier, which passes the admission its head deferred
+    /// (or goes on as accepted) with [`Upgraded::admit`].
+    Upgraded(Upgraded),
     /// Not upgraded: the connection, every byte read from it replayed in
-    /// front, for the application's HTTP handler; without one, answer it
-    /// with [`not_found`].
+    /// front, for the application's HTTP handler (a request taken over as
+    /// a request, not as a carrier); without one, answer it with
+    /// [`not_found`].
     Refused(Prefixed<S>),
     /// Stalled or closed by the admission; nothing more to do.
     Ended,
+}
+
+/// An upgraded WebSocket carrier ([`Upgrade::Upgraded`]), its entry into
+/// the listener with it.
+#[derive(Debug)]
+pub struct Upgraded {
+    pipe: PipeIo,
+    entry: Entry,
+}
+
+impl Upgraded {
+    /// The carrier changed by `f` before its admission, for what the
+    /// caller knows of the connection under it
+    /// ([`PipeIo::with_tcp_socket`], a TLS binding).
+    #[must_use]
+    pub fn map_pipe(self, f: impl FnOnce(PipeIo) -> PipeIo) -> Self {
+        Self {
+            pipe: f(self.pipe),
+            entry: self.entry,
+        }
+    }
+
+    /// The carrier through the rest of its admission
+    /// ([`Entry::admit_first`]): when the head deferred the decision
+    /// ([`zmux::AdmissionVerdict::Defer`]), it is taken on the carrier's
+    /// first message, within what remains of the peek timeout; a
+    /// `Fallback` then hands the carrier, its first message replayed, to
+    /// the listener's fallback ([`zmux::ListenerConfig::fallback`], a
+    /// [`zmux::Takeover`]) and returns once that completed. The accepted
+    /// carrier and its hint, for [`Listener::handle_pipe`]; `None` when it
+    /// was not accepted.
+    pub async fn admit(self) -> Option<(PipeIo, PipeHint)> {
+        let Self { pipe, mut entry } = self;
+        let first = std::future::ready(Ok(zmux::adapter::AdmitIo::pipe(pipe)));
+        let io = entry.admit_first(CarrierInfo::new(), first).await?;
+        Some((io, PipeHint::from_entry(entry)))
+    }
 }
 
 /// Upgrades one accepted connection, any byte stream such as a TLS
@@ -601,34 +641,37 @@ pub enum Upgrade<S> {
 /// 13 and a key), the client offers a subprotocol that `options` accepts
 /// (an identifier of it or its draft-01 alias; the first offered one is
 /// selected), and the listener's admission
-/// ([`zmux::ListenerConfig::admission`]) accepts it. The admission decides
+/// ([`zmux::ListenerConfig::admission`]) accepts it or defers its decision
+/// to the carrier ([`Entry::decide_upgrade`]). The admission decides
 /// on the request head, which the metadata carries
 /// ([`CarrierInfo::request`], an `http::request::Parts`, and its header
-/// fields, [`CarrierInfo::for_each_header`]; [`CarrierInfo::head`] is
-/// set), without a prefix ([`zmux::Admission::prefix_auth`] takes its
-/// token from the request header field), so that nothing is answered or
-/// read as a WebSocket before the decision and a refused request is replayed
-/// as it came; no message of the carrier is read for it. It also has what
-/// `info` gives
+/// fields, [`CarrierInfo::for_each_header`]; [`CarrierInfo::stage`] is the
+/// head and [`CarrierInfo::upgrade`] is set), without a prefix
+/// ([`zmux::Admission::prefix_auth`] takes its token from the request
+/// header field), so that nothing is answered or read as a WebSocket
+/// before the decision and a refused request is replayed as it came. A
+/// decision deferred to the carrier ([`zmux::AdmissionVerdict::Defer`])
+/// is taken on its first message by [`Upgraded::admit`], with the same
+/// metadata. It also has what `info` gives
 /// of the connection (over TLS its exporter, ALPN identifier and server
 /// name: `zmux_rustls::carrier_info`). Every other request, a malformed
 /// or oversized head included, is [`Upgrade::Refused`], the bytes read
-/// replayed, as is one the admission decides on with `Fallback`; `Stall`
+/// replayed, as is one the admission decides on with `Fallback` on its
+/// head (a request, taken over as one); `Stall`
 /// reads and discards for a stall's duration and then closes, and `Close`
 /// closes, without a response ([`Upgrade::Ended`]). When the entry's peer
 /// is an intermediary the listener trusts to report its client in a
 /// forwarding header field, the client it reports is the carrier's source
-/// instead ([`zmux::TrustedProxies::source`], [`Entry::set_source`]). The
-/// hint carries the entry,
-/// for [`Listener::handle_pipe`]. An upgrade that an intermediary
+/// instead ([`zmux::TrustedProxies::source`], [`Entry::set_source`]). An
+/// upgrade that an intermediary
 /// forwarded from TLS early data (`Early-Data: 1`) is answered
 /// `425 Too Early` before any admission and is [`Upgrade::Ended`]. A
 /// refused or too-early request counts in the listener's statistics as a
 /// failed handshake. Over TLS, give the carrier the TCP socket underneath
-/// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without
-/// a Close frame. The carrier has no exporter and is not declared
-/// secure ([`PipeIo::with_carrier_secure`]): the stream is the caller's,
-/// and [`serve_tls`] gives both.
+/// ([`PipeIo::with_tcp_socket`], [`Upgraded::map_pipe`]) so that a failed
+/// pipe is aborted without a Close frame. The carrier has no exporter and
+/// is not declared secure ([`PipeIo::with_carrier_secure`]): the stream is
+/// the caller's, and [`serve_tls`] gives both.
 ///
 /// ```no_run
 /// # async fn example(listener: zmux::Listener, tcp: tokio::net::TcpListener,
@@ -646,8 +689,10 @@ pub enum Upgrade<S> {
 /// let options = zmux_websocket::Options::default();
 /// let upgraded = zmux_websocket::accept(conn, entry, |_| zmux::CarrierInfo::new(), &listener, &options);
 /// match upgraded.await? {
-///     Upgrade::Accepted(pipe, hint) => {
-///         let _ = listener.handle_pipe(pipe, hint).await;
+///     Upgrade::Upgraded(carrier) => {
+///         if let Some((pipe, hint)) = carrier.admit().await {
+///             let _ = listener.handle_pipe(pipe, hint).await;
+///         }
 ///     }
 ///     Upgrade::Refused(mut conn) => zmux_websocket::not_found(&mut conn).await?,
 ///     Upgrade::Ended => {}
@@ -699,13 +744,11 @@ where
         return Ok(Upgrade::Ended);
     }
     let admit = {
-        let info = info(&io)
-            .with_head()
-            .with_request_head(Arc::new(upgrade.parts.clone()), header_fields);
-        entry.decide(info, Vec::new()).await
+        let info = info(&io).with_request_head(Arc::new(upgrade.parts.clone()), header_fields);
+        entry.decide_upgrade(info).await
     };
     match admit {
-        Admit::Accept(_) => {}
+        Admit::Accept(_) | Admit::Defer => {}
         Admit::Fallback(_) => return Ok(Upgrade::Refused(Prefixed::new(io, buf))),
         Admit::Stall => {
             entry.stall(Some(&mut io)).await;
@@ -728,8 +771,10 @@ where
     io.flush().await?;
     let rest = buf[head_len..].to_vec();
     let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
-    let hint = PipeHint::from_entry(entry);
-    Ok(Upgrade::Accepted(pipe(ws, upgrade.protocol), hint))
+    Ok(Upgrade::Upgraded(Upgraded {
+        pipe: pipe(ws, upgrade.protocol),
+        entry,
+    }))
 }
 
 /// Answers a refused request with `404 Not Found` and ends the
@@ -950,19 +995,25 @@ async fn serve_over<C, S, SF>(
     let served =
         move |l: Listener, (upgraded, socket, source, binding): (_, _, _, Option<TlsBinding>)| async move {
             match upgraded {
-                Upgrade::Accepted(io, hint) => {
-                    let io = with_socket(io, socket);
-                    let io = match &binding {
-                        Some(b) => b.apply(io),
-                        None => io,
-                    };
-                    let _ = l.handle_pipe(io, hint).await;
+                Upgrade::Upgraded(carrier) => {
+                    let carrier = carrier.map_pipe(|io| {
+                        let io = with_socket(io, socket);
+                        match &binding {
+                            Some(b) => b.apply(io),
+                            None => io,
+                        }
+                    });
+                    if let Some((io, hint)) = carrier.admit().await {
+                        let _ = l.handle_pipe(io, hint).await;
+                    }
                 }
                 Upgrade::Refused(conn) => {
-                    if let Some(f) = l.limits().fallback {
+                    let adapter = l.adapter();
+                    if adapter.has_fallback() {
                         let (conn, prefix) = conn.into_parts();
-                        let conn: Box<dyn zmux::adapter::FallbackStream> = Box::new(conn);
-                        f.serve(Prefixed::new(conn, prefix), source).await;
+                        let info = CarrierInfo::new().with_source(source);
+                        let io = zmux::adapter::AdmitIo::stream(conn, PipeIo::new);
+                        adapter.take_over(info, io, prefix).await;
                     } else {
                         let mut conn = conn;
                         let _ = not_found(&mut conn).await;
@@ -1226,14 +1277,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
                     buf.put_slice(&b);
                     return Poll::Ready(Ok(()));
                 }
-                // Cannot happen with zmux's driver, whose buffer holds the
-                // largest message `ws_config` lets through; another reader
-                // with less room gets an error rather than a split record.
+                // Not with zmux's session reader, whose buffer holds the
+                // largest message `ws_config` lets through; a reader with
+                // less room (an admission's bound, a stall) gets the error
+                // that says so rather than a split record.
                 Message::Binary(_) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "a message larger than the read buffer",
-                    )));
+                    return Poll::Ready(Err(zmux::adapter::message_too_large()));
                 }
                 Message::Text(_) => {
                     return Poll::Ready(Err(io::Error::new(

@@ -149,7 +149,10 @@ pub struct Options {
     /// to other paths, those the listener's admission hands to the
     /// fallback, and those
     /// the listener does not take (none by default: such requests are
-    /// answered with 404).
+    /// answered with 404). A request is the carrier here, taken over as a
+    /// request: the listener's fallback ([`zmux::ListenerConfig::fallback`])
+    /// takes over carriers, such as a WebSocket decided on its first message
+    /// after a deferral, and never sees a request.
     pub fallback: Option<Fallback>,
     /// Client: the credential presented for a server's admission
     /// ([`zmux::ListenerConfig::admission`], none by default): its prefix

@@ -21,7 +21,7 @@ pub fn auth(key: &[u8]) -> zmux::PrefixAuth {
 ///
 /// If `key` is not a valid prefix authentication key.
 #[must_use]
-pub fn listener(key: &[u8], fallback: Option<zmux::adapter::Fallback>) -> Listener {
+pub fn listener(key: &[u8], fallback: Option<zmux::Fallback>) -> Listener {
     let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth(key), 1, 1 << 16).unwrap());
     let mut limits = zmux::ListenerConfig::default();
     limits.admission = Some(zmux::Admission::prefix_auth(verifier));

@@ -21,7 +21,7 @@ rustls-aws-lc-rs = ["web-transport-quinn/aws-lc-rs", "zmux-quinn/rustls-aws-lc-r
 bytes = "1"
 url = "2"
 web-transport-quinn = { version = "0.13.6", default-features = false }
-tokio = { version = "1.54", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.54", default-features = false, features = ["io-util", "rt", "sync", "time"] }
 zmux = { version = "1.3.3", path = "../.." }
 zmux-quinn = { version = "1.3.3", path = "../quinn", default-features = false }
 

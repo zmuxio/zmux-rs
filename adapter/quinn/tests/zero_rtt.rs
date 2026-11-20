@@ -88,7 +88,6 @@ fn server(
         listener.clone(),
         ep.clone(),
         opts.clone(),
-        None,
     ));
     (ep, listener)
 }
@@ -271,7 +270,6 @@ fn sharing_servers(
             listener.clone(),
             ep.clone(),
             opts.clone(),
-            None,
         ));
         (ep, listener)
     };

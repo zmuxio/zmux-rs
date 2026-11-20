@@ -39,9 +39,10 @@ pub fn encode_size(body_len: u64, buf: &mut [u8]) -> Result<usize, EncodeError> 
 }
 
 /// How a pipe delimits records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Framing {
     /// Records are concatenated, each with its Size field.
+    #[default]
     ByteStream,
     /// Each carrier message is one record's Frames field and the message
     /// length is the Size.

@@ -243,12 +243,7 @@ async fn connect_and_serve_with_zmux_alpn() {
     let addr = server_ep.local_addr().unwrap();
     let listener = Listener::new(Config::default(), ListenerConfig::default())
         .expect("valid listener configuration");
-    let serving = tokio::spawn(zmux_quinn::serve(
-        listener.clone(),
-        server_ep,
-        opts.clone(),
-        None,
-    ));
+    let serving = tokio::spawn(zmux_quinn::serve(listener.clone(), server_ep, opts.clone()));
     let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client_ep.set_default_client_config(zmux_quinn::client_config(client_tls, &opts).unwrap());
     let client = zmux_quinn::connect(&client_ep, addr, "localhost", &opts, Config::default())

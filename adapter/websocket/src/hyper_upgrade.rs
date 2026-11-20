@@ -13,20 +13,25 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue, Method, StatusCode, Version};
 use tokio_tungstenite::tungstenite::protocol::Role;
-use zmux::adapter::Admit;
+use zmux::adapter::{Admit, AdmitIo};
 use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::{Options, PROTOCOL_HEADER, pipe, ws_config};
 
-/// The carrier of an accepted upgrade, once hyper has upgraded the
-/// connection (or HTTP/2 stream): the carrier and its hint, for
-/// [`Listener::handle_pipe`].
-pub type UpgradedCarrier = Pin<Box<dyn Future<Output = io::Result<(PipeIo, PipeHint)>> + Send>>;
+/// The carrier of an upgrade, once hyper has upgraded the connection (or
+/// HTTP/2 stream) and the carrier passed the rest of its admission
+/// ([`zmux::adapter::Entry::admit_first`]): the carrier and its hint, for
+/// [`Listener::handle_pipe`]; `None` when the upgrade failed or did not
+/// come within the peek timeout of a deferred decision, or when the
+/// decision on the carrier did not accept it (a fallback has then
+/// completed).
+pub type UpgradedCarrier = Pin<Box<dyn Future<Output = Option<(PipeIo, PipeHint)>> + Send>>;
 
 /// What became of a request ([`accept_request`]).
 pub enum RequestUpgrade<B> {
-    /// Accepted: answer the request with `response` (101 on HTTP/1.1, 200
-    /// on HTTP/2); `carrier` resolves once the connection is upgraded.
+    /// Accepted, or the decision deferred to the carrier: answer the
+    /// request with `response` (101 on HTTP/1.1, 200 on HTTP/2); `carrier`
+    /// resolves once the connection is upgraded and the carrier admitted.
     Accepted {
         /// The response, without a body.
         response: http::Response<()>,
@@ -34,7 +39,8 @@ pub enum RequestUpgrade<B> {
         carrier: UpgradedCarrier,
     },
     /// Not a WebSocket upgrade this server takes, or not accepted by the
-    /// admission: the request, untouched, for the host's HTTP handler.
+    /// admission on its head: the request, untouched, for the host's HTTP
+    /// handler (a request taken over as a request).
     Refused(http::Request<B>),
     /// A WebSocket upgrade that an intermediary forwarded from TLS early
     /// data (`Early-Data: 1`): answer `425 (Too Early)` and take no carrier.
@@ -102,12 +108,16 @@ fn has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
 /// `options` accepts, it gets its source slot ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter); the
 /// source is the client a trusted intermediary reports,
 /// [`zmux::TrustedProxies::source`] of `peer` and the request's header
-/// fields), and the listener's admission accepts it on the request head.
-/// `info` adds the connection's metadata to the carrier's (the TLS
-/// exporter); the source, the peer, the request, its header fields and
-/// [`CarrierInfo::head`] are set here. Nothing is answered before the
-/// decision; a stall waits for its duration and ends the request. The
-/// hint carries the entry. No TCP
+/// fields), and the listener's admission accepts it on the request head
+/// or defers its decision to the carrier ([`zmux::AdmissionVerdict::Defer`]:
+/// the carrier's first message is then decided on, with the same
+/// metadata, and a `Fallback` hands the carrier to the listener's fallback,
+/// [`zmux::ListenerConfig::fallback`], before [`UpgradedCarrier`]
+/// resolves). `info` adds the connection's metadata to the carrier's (the
+/// TLS exporter); the source, the peer, the request, its header fields,
+/// the head stage and [`CarrierInfo::upgrade`] are set here. Nothing is
+/// answered before the decision on the head; a stall waits for its
+/// duration and ends the request. The hint carries the entry. No TCP
 /// socket is known: a pipe that zmux fails ends with a Close frame. A
 /// request whose extensions hold the [`zmux_rustls::TlsBinding`] of the
 /// TLS connection it arrived on (the HTTP adapter's servers add it for a
@@ -153,13 +163,12 @@ where
             .extensions
             .get::<zmux_rustls::TlsBinding>()
             .map_or_else(CarrierInfo::new, zmux_rustls::TlsBinding::info);
-        let info = info(base)
-            .with_head()
-            .with_request_head(std::sync::Arc::new(parts.clone()), crate::header_fields);
-        entry.decide(info, Vec::new()).await
+        let info =
+            info(base).with_request_head(std::sync::Arc::new(parts.clone()), crate::header_fields);
+        entry.decide_upgrade(info).await
     };
     match admit {
-        Admit::Accept(_) => {}
+        Admit::Accept(_) | Admit::Defer => {}
         Admit::Fallback(_) => {
             return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
         }
@@ -192,27 +201,27 @@ where
     if let Some(Ok(p)) = protocol.as_deref().map(HeaderValue::from_str) {
         h.insert(PROTOCOL_HEADER, p);
     }
-    let hint = PipeHint::from_entry(entry);
     let binding = parts.extensions.get::<zmux_rustls::TlsBinding>().cloned();
-    let l = listener.clone();
     let carrier = Box::pin(async move {
-        let upgraded = on_upgrade.await.map_err(|e| {
-            // A failed upgrade.
-            l.adapter().count_setup_failure();
-            io::Error::other(e)
-        })?;
-        let ws = WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded),
-            Role::Server,
-            Some(ws_config()),
-        )
-        .await;
-        let io = pipe(ws, protocol);
-        let io = match &binding {
-            Some(b) => b.apply(io),
-            None => io,
+        // The upgrade, within what remains of a deferred decision's peek
+        // timeout.
+        let first = async move {
+            let upgraded = on_upgrade.await.map_err(io::Error::other)?;
+            let ws = WebSocketStream::from_raw_socket(
+                TokioIo::new(upgraded),
+                Role::Server,
+                Some(ws_config()),
+            )
+            .await;
+            let io = pipe(ws, protocol);
+            let io = match &binding {
+                Some(b) => b.apply(io),
+                None => io,
+            };
+            Ok(AdmitIo::pipe(io))
         };
-        Ok((io, hint))
+        let io = entry.admit_first(CarrierInfo::new(), first).await?;
+        Some((io, PipeHint::from_entry(entry)))
     });
     RequestUpgrade::Accepted { response, carrier }
 }

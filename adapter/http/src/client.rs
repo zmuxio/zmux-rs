@@ -90,7 +90,8 @@ impl Options {
         }
         let (body, writer) = if get {
             if let Some(c) = &self.carrier_credential {
-                let (name, value) = c.header(&info.clone().with_head())?;
+                let (name, value) =
+                    c.header(&info.clone().with_stage(zmux::AdmissionStage::Head))?;
                 req = req.header(name, value);
             }
             (PipeBody::empty(), None)

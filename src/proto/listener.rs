@@ -145,11 +145,18 @@ pub struct ListenerConfig {
     /// for new sessions): read its prefix, decide, act on the decision
     /// (none by default: every carrier is accepted).
     pub admission: Option<super::admission::Admission>,
-    /// Where byte-stream carriers (TCP, TLS, Unix) that the admission
-    /// decided on with [`crate::AdmissionVerdict::Fallback`] go, every byte read
-    /// replayed in front; without one they are stalled. HTTP and QUIC
-    /// carriers have the fallback of their adapter's options. It never
-    /// decides whether the admission runs.
+    /// Takes over every carrier that the admission hands back
+    /// ([`crate::AdmissionVerdict::Fallback`], or a late prefix with
+    /// [`crate::Admission::with_fallback_on_peek_timeout`]), whatever entry
+    /// took it: byte streams (TCP, TLS, Unix, any carrier given to
+    /// [`crate::Listener::handle_pipe`]), message-framed carriers (a
+    /// WebSocket decided on its first message), and the first stream of a
+    /// QUIC connection or a WebTransport session, as a [`crate::Takeover`]
+    /// with what was read replayed. Without one such a carrier is stalled.
+    /// An HTTP request that is itself the carrier (an HTTP request carrier,
+    /// an upgrade refused on its head) is taken over as a request, by its
+    /// adapter's HTTP fallback. It never decides whether the admission
+    /// runs.
     #[cfg(all(feature = "tokio", not(loom)))]
     pub fallback: Option<crate::driver::admission::Fallback>,
     /// The inbound transform every carrier passes through after its
@@ -717,6 +724,9 @@ impl ListenerConfig {
         }
         if !(1..=128).contains(&self.source_prefix_v6) {
             return Err(e("ListenerConfig::source_prefix_v6", "outside 1..=128"));
+        }
+        if let Some(a) = &self.admission {
+            a.validate()?;
         }
         Ok(())
     }
@@ -1427,9 +1437,12 @@ pub struct AdmissionStats {
     pub fallback: u64,
     /// Decided with [`crate::AdmissionVerdict::Stall`], counted when the stall starts.
     pub stalled: u64,
-    /// Decided with [`crate::AdmissionVerdict::Close`], an `Accept` beyond the prefix, a
-    /// decision that panicked, or one cancelled because the listener
-    /// closed.
+    /// Decided with [`crate::AdmissionVerdict::Close`] or a verdict that is
+    /// one where it was taken (an `Accept` beyond the prefix, a misplaced
+    /// `More` or `Defer`), a decision that panicked, a carrier the
+    /// listener's close interrupted, a message-framed carrier without a
+    /// first message to decide on, or a deferred decision whose carrier
+    /// ended first.
     pub closed: u64,
     /// A Stall, decided by the admission or by [`ListenerConfig::on_reject`], that the
     /// listener could not carry out: its source already stalled
@@ -1437,8 +1450,11 @@ pub struct AdmissionStats {
     /// ([`ListenerConfig::max_pending_per_source`]), the listener's stalls held half of
     /// [`ListenerConfig::max_pending`], or the listener closed meanwhile. Closed at once.
     pub stall_overflow: u64,
-    /// The prefix or the decision did not come before the end of the peek
-    /// timeout.
+    /// The first message of a message-framed carrier was longer than
+    /// [`crate::Admission::with_max_message`]: closed without a decision.
+    pub too_large: u64,
+    /// The prefix, the carrier a deferred decision waited for, or the
+    /// decision did not come before the end of the peek timeout.
     pub peek_timed_out: u64,
     /// The outer handshake (TLS, an HTTP upgrade, QUIC) failed or timed
     /// out: never decided on. Not counted in
