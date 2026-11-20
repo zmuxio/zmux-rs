@@ -43,6 +43,7 @@ impl<S> Evictions<S> {
         }
     }
 
+    #[cfg(feature = "blocking")]
     pub(crate) fn is_empty(&self) -> bool {
         self.close.is_empty() && self.trim.is_none()
     }

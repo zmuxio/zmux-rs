@@ -1773,8 +1773,10 @@ impl Listener {
     /// count is below them but close no carrier already held, a lowered
     /// `max_pending_per_session` applies to the next join of a session, a
     /// lowered `max_suspended` closes the longest-suspended sessions beyond
-    /// it (`ZMUX_RESUME_TIMEOUT`), and a changed `first_record_timeout`
-    /// applies to carriers that arrive after the call.
+    /// it (`ZMUX_RESUME_TIMEOUT`), a changed `first_record_timeout`
+    /// applies to carriers that arrive after the call, and a changed
+    /// `memory_budget` starts or ends memory pressure at once, as if the
+    /// sum had crossed the new bounds.
     ///
     /// # Errors
     ///

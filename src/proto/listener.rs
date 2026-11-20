@@ -100,7 +100,8 @@ pub struct ListenerLimits {
     /// The first record or Hello must arrive within this (default 2 s).
     pub first_record_timeout: Duration,
     /// Bytes the sessions may hold together (default 1 GiB; `None` is
-    /// unlimited), in place of their own [`crate::Config::memory_budget`]:
+    /// unlimited), in place of their own
+    /// [`Config::memory_budget`](crate::Config#structfield.memory_budget):
     /// above it sessions grant no new credit, new sessions and pipes are
     /// refused and the suspended sessions are closed, until the sum falls
     /// below three quarters of it. A change applies at once, as if the sum
