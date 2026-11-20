@@ -965,9 +965,7 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
                     Send::new(QuinnSend::new(send)),
                     Recv::new(QuinnRecv::new(recv)),
                 );
-                *made
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(carrier);
+                *made.lock().unwrap_or_else(PoisonError::into_inner) = Some(carrier);
                 pipe
             });
             // Closed once a fallback's future returned it, also when this
@@ -980,10 +978,7 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
     };
     let info = Handshake::of(&conn).carrier_info(&conn);
     let accepted = entry.admit_first(info, first).await;
-    let carrier = made
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let carrier = made.lock().unwrap_or_else(PoisonError::into_inner).take();
     let (Some(first), Some(carrier)) = (accepted, carrier) else {
         // Not accepted, the verdict acted on (a fallback has completed):
         // closed before the streams are dropped, nothing sent on them;
