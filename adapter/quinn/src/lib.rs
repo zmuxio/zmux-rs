@@ -947,7 +947,7 @@ impl Drop for StopDelivery {
 async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: &Options) {
     // The carrier is made once the first stream is accepted, for its
     // first pipe; the rest of its streams reach the listener after that.
-    let made = Arc::new(std::sync::Mutex::new(None::<Carrier>));
+    let made = Arc::new(Mutex::new(None::<Carrier>));
     let first = {
         let (conn, made, l, options) = (
             conn.clone(),
@@ -967,7 +967,7 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
                 );
                 *made
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(carrier);
+                    .unwrap_or_else(PoisonError::into_inner) = Some(carrier);
                 pipe
             });
             // Closed once a fallback's future returned it, also when this
@@ -982,7 +982,7 @@ async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: 
     let accepted = entry.admit_first(info, first).await;
     let carrier = made
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .take();
     let (Some(first), Some(carrier)) = (accepted, carrier) else {
         // Not accepted, the verdict acted on (a fallback has completed):

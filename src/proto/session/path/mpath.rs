@@ -3639,7 +3639,7 @@ fn displacement_rank(
 /// The dead timeout in force for a pipe: its own setting, else off on a
 /// carrier that reports its own failure, else the session's.
 pub(in crate::proto::session) fn dead_timeout_of(
-    session: &crate::Liveness,
+    session: &Liveness,
     own: Inherit<crate::DeadTimeout>,
     reports_failure: bool,
 ) -> crate::DeadTimeout {
